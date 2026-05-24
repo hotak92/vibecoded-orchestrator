@@ -49,6 +49,10 @@
   onMount(load);
 </script>
 
+<svelte:head>
+  <title>Hub — VCT Launcher</title>
+</svelte:head>
+
 <div class="hub-page">
   <header class="hub-header">
     <button class="hub-back" onclick={() => goto('/')}>← Back</button>

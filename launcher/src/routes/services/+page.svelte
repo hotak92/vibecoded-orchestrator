@@ -339,6 +339,10 @@
   });
 </script>
 
+<svelte:head>
+  <title>Services — VCT Launcher</title>
+</svelte:head>
+
 <section class="services-page">
   <!-- v0.2.22 Item #12: runtime-missing banner. Self-mounts/unmounts
        based on `system.has_podman` / `system.has_docker` in the

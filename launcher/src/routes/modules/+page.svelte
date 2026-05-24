@@ -3,6 +3,10 @@
   import { ui } from '$lib/stores/ui';
 </script>
 
+<svelte:head>
+  <title>Modules — VCT Launcher</title>
+</svelte:head>
+
 <div class="page">
   <ModuleCatalog
     onOpenActivation={() => ui.openActivation()}

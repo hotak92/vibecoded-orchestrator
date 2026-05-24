@@ -358,12 +358,107 @@ async fn ls_remote_sha(repo: &Path, branch: &str) -> Result<String, String> {
         .ok_or_else(|| format!("ls-remote returned empty output for {}", branch))
 }
 
-/// Fetch the canonical upstream (NOT `origin`). Caller MUST have run
-/// `ensure_upstream_remote` first.
+/// Retry delays for `fetch_upstream`. Total wall-time across all retries
+/// is 1+5+30+120 = 156 seconds — long enough to absorb transient network
+/// blips at boot (Wi-Fi reconnect, VPN handshake, DNS stagger) but short
+/// enough that a check truly stuck on a dead network surfaces as an error
+/// to the UI within a few minutes rather than silently hanging.
+///
+/// Under `cfg(test)` the unit is milliseconds so the retry tests don't
+/// burn 156s of CI wall-time. Production code interprets the same values
+/// as seconds.
+#[cfg(not(test))]
+const FETCH_RETRY_DELAYS_MS: [u64; 4] = [1_000, 5_000, 30_000, 120_000];
+#[cfg(test)]
+const FETCH_RETRY_DELAYS_MS: [u64; 4] = [1, 5, 30, 120];
+
+/// Fetch the canonical upstream (NOT `origin`) with retry-on-failure.
+/// Caller MUST have run `ensure_upstream_remote` first.
+///
+/// Retry policy: first attempt immediate, then back off at 1s / 5s / 30s
+/// / 120s (5 attempts total, 156s upper bound). Each non-zero git exit
+/// is treated as a retryable error — we don't try to discriminate "DNS
+/// failure" from "auth rejected" because the cheapest, most reliable
+/// signal is "did it succeed yet". Surfaces the last git stderr line as
+/// the error message after all attempts exhausted.
+///
+/// v0.2.32 UB1 (2026-05-23): replaces the single-shot `git fetch` that
+/// left the launcher stuck on stale state after a transient network
+/// hiccup at boot — symptom: badge never refreshes without restart.
 async fn fetch_upstream(repo: &Path) -> Result<(), String> {
-    run_git(repo, &["fetch", "--quiet", VCO_UPSTREAM_REMOTE])
-        .await
-        .map(|_| ())
+    let try_once = || async {
+        let fetch = tokio::process::Command::new("git")
+            .args(["fetch", "--quiet", VCO_UPSTREAM_REMOTE])
+            .current_dir(repo)
+            .output()
+            .await
+            .map_err(|e| format!("git fetch spawn: {}", e))?;
+        if fetch.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&fetch.stderr).to_string();
+        // Surface the last non-empty stderr line — git pipes one final
+        // human-readable summary there; preceding lines are usually
+        // progress noise.
+        let last = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .unwrap_or("")
+            .to_string();
+        Err(last)
+    };
+    fetch_with_retry(repo, try_once).await
+}
+
+/// Inner retry loop, parametrised over the actual fetch attempt so unit
+/// tests can swap in a closure that simulates failures without invoking
+/// a real `git` binary. The first attempt is immediate; subsequent
+/// attempts sleep for `FETCH_RETRY_DELAYS_MS[i-1]` before retrying.
+///
+/// `repo` is passed through for diagnostic logging only — the closure
+/// already captures the directory it needs.
+async fn fetch_with_retry<F, Fut>(repo: &Path, mut attempt_fn: F) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last_err: Option<String> = None;
+    // First attempt is index 0 (no delay); subsequent attempts wait
+    // FETCH_RETRY_DELAYS_MS[attempt - 1].
+    for attempt in 0..=FETCH_RETRY_DELAYS_MS.len() {
+        if attempt > 0 {
+            let delay = Duration::from_millis(FETCH_RETRY_DELAYS_MS[attempt - 1]);
+            tokio::time::sleep(delay).await;
+        }
+        match attempt_fn().await {
+            Ok(()) => {
+                if attempt > 0 {
+                    eprintln!(
+                        "[vct] check_for_updates: git fetch succeeded after {} retries at {}",
+                        attempt,
+                        repo.display()
+                    );
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] check_for_updates: git fetch attempt {} failed at {}: {}",
+                    attempt + 1,
+                    repo.display(),
+                    if e.is_empty() { "(no stderr)" } else { &e }
+                );
+                // Only retain non-empty errors — empty stderr is useless
+                // for the UI, so falling through to the sentinel below
+                // gives a more honest message.
+                if !e.is_empty() {
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "git fetch failed (no stderr)".to_string()))
 }
 
 async fn count_commits_ahead(repo: &Path, branch: &str) -> Result<u32, String> {
@@ -1346,5 +1441,112 @@ mod tests {
         assert!(!looks_like_remote_url("garbage"));
         assert!(!looks_like_remote_url(""));
         assert!(!looks_like_remote_url("ftp://old.example.com/repo"));
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.2.32 UB1 (2026-05-23): fetch-with-retry-on-failure.
+    // ---------------------------------------------------------------------
+    //
+    // These tests exercise the retry helper directly via an injected
+    // closure that simulates success/failure counts. We don't shell out
+    // to a real `git` binary here — the helper is intentionally
+    // parametric so the retry policy is the unit under test, independent
+    // of the git invocation.
+    //
+    // Under `cfg(test)` FETCH_RETRY_DELAYS_MS is in milliseconds (1, 5,
+    // 30, 120), so all five attempts complete in <200ms of wall time.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn fetch_upstream_with_retry_succeeds_first_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let result = fetch_with_retry(Path::new("/tmp/fake"), move || {
+            let calls_c = calls_c.clone();
+            async move {
+                calls_c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "should succeed first attempt");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should only call fetch once when the first attempt succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_upstream_with_retry_succeeds_on_third_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let result = fetch_with_retry(Path::new("/tmp/fake"), move || {
+            let calls_c = calls_c.clone();
+            async move {
+                let n = calls_c.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(format!("simulated failure {}", n))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(result.is_ok(), "should succeed on third attempt");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "should call fetch exactly three times (2 failures + 1 success)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_upstream_with_retry_fails_after_all_attempts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let result = fetch_with_retry(Path::new("/tmp/fake"), move || {
+            let calls_c = calls_c.clone();
+            async move {
+                let n = calls_c.fetch_add(1, Ordering::SeqCst) + 1;
+                Err(format!("permanent failure {}", n))
+            }
+        })
+        .await;
+        assert!(result.is_err(), "should error after exhausting retries");
+        // 5 attempts total: 1 immediate + 4 delayed retries
+        // (matches the length of FETCH_RETRY_DELAYS_MS + 1).
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "should call fetch 5 times (1 immediate + 4 retries)"
+        );
+        // The error should carry the LAST stderr-derived message so the UI
+        // shows the most-recent failure, not the first one.
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("permanent failure 5"),
+            "error should contain the last attempt's failure message, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_upstream_with_retry_carries_empty_stderr_as_sentinel() {
+        // Some git failure modes (network reset mid-transfer) drain stderr
+        // before exit. The helper must still return a non-empty error
+        // string in that case so the UI doesn't render a blank toast.
+        let result = fetch_with_retry(Path::new("/tmp/fake"), move || async move {
+            Err::<(), String>(String::new())
+        })
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            !err.is_empty(),
+            "error should be non-empty even when every attempt returned empty stderr"
+        );
     }
 }

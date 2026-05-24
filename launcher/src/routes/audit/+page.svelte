@@ -235,6 +235,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>Audit — VCT Launcher</title>
+</svelte:head>
+
 <div class="page">
   <header class="page-header">
     <h1>Audit log</h1>

@@ -111,6 +111,10 @@
   $effect(() => { if (project) void load(); });
 </script>
 
+<svelte:head>
+  <title>Coordination — VCT Launcher</title>
+</svelte:head>
+
 <div class="co-page">
   <header class="co-header">
     <button class="co-back" onclick={() => goto('/')}>← Back</button>

@@ -23,7 +23,12 @@
   import type { ModuleCatalogEntry } from '$lib/types/launcher';
 
   onMount(() => {
-    orchestrator.checkStatus();
+    // v0.2.32 UB2 (2026-05-23): orchestrator.checkStatus() moved up to
+    // +layout.svelte's onMount + periodic refresh (so the status badge
+    // refreshes regardless of which route the launcher opens to, and
+    // doesn't go stale after install/uninstall from another process).
+    // We DON'T re-call it here — the layout already did.
+    //
     // Populate `system` (has_podman / has_docker) so RuntimeMissingBanner
     // can decide whether to render. The banner self-triggers detection
     // too as a fallback, but the home page is the first surface a user
@@ -125,6 +130,12 @@
     selectCard(c);
   }
 </script>
+
+<!-- v0.2.32 M1 (2026-05-23): per-route document title for browser/OS
+     window-title consistency. -->
+<svelte:head>
+  <title>Home — VCT Launcher</title>
+</svelte:head>
 
 <div class="page">
   <div class="content">

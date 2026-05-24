@@ -1573,6 +1573,10 @@
   });
 </script>
 
+<svelte:head>
+  <title>Preferences — VCT Launcher</title>
+</svelte:head>
+
 <div class="pr-page">
   <header class="pr-header">
     <button class="pr-back" onclick={() => goto('/')}>← Back</button>

@@ -19,7 +19,14 @@
   // ergonomic balance: user sees the exact fix and copy-pastes it.
 
   import { onMount } from 'svelte';
-  import { invoke } from '@tauri-apps/api/core';
+  // v0.2.32 E1 (2026-05-23): use the wrapper from $lib/tauri instead of
+  // importing `invoke` from '@tauri-apps/api/core' directly. The direct
+  // import resolves to `undefined` under `vite dev` (browser mode), and
+  // calling it throws `TypeError: Cannot read properties of undefined`
+  // before the existing try/catch in onMount has a chance to fire. The
+  // wrapper's browser-mode guard surfaces a clear "Tauri not available"
+  // error that the catch handles gracefully.
+  import { invoke } from '$lib/tauri';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   type CdiDriftReport =

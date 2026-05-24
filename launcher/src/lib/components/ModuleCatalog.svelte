@@ -328,6 +328,23 @@
 
   {#if mState.loading && visible.length === 0}
     <div class="catalog-empty">Loading catalog…</div>
+  {:else if !project}
+    <!-- v0.2.32 V2 (2026-05-23): when no project is selected the subtitle
+         above already says "Create a project first" or "Select a project
+         from the menu bar". Showing "No modules in catalog yet" in
+         parallel is misleading (the catalog has plenty — it's the install
+         target that's missing). Suppress the catalog body entirely until
+         the user picks a project. -->
+    <div class="catalog-empty">
+      <p>Modules install into a specific project.</p>
+      <p class="hint">
+        {#if projectsState.projects.length === 0}
+          Create a project first using the menu bar above.
+        {:else}
+          Select a project from the menu bar above to browse and install modules.
+        {/if}
+      </p>
+    </div>
   {:else if visible.length === 0}
     <div class="catalog-empty">
       {#if mState.catalog.length === 0}
@@ -515,9 +532,13 @@
     z-index: 1;
   }
 
+  /* v0.2.32 V1 (2026-05-23): align the search input vertically with the
+     H1+subtitle block instead of pinning to the top edge. Previously
+     `flex-start` placed the input at the H1's top, leaving a visual gap
+     below it that read as "input disconnected from the title". */
   .catalog-header {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     justify-content: space-between;
     gap: 20px;
     margin-bottom: 18px;

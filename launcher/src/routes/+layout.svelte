@@ -166,7 +166,24 @@
       }
     })();
 
-    return () => unsub();
+    // v0.2.32 UB2 (2026-05-23): periodic orchestrator-status refresh.
+    // The status badge previously updated only on home-page mount, so a
+    // user who installed/uninstalled the orchestrator from another
+    // process (CLI, launcher in a second window) never saw the badge
+    // refresh until they restarted the launcher. We now run an initial
+    // check on layout mount (regardless of which route the launcher
+    // opened to) and re-poll once an hour. Cheap: each check is a
+    // single file-existence probe + manifest read.
+    void orchestrator.checkStatus();
+    const orchStatusInterval = setInterval(
+      () => void orchestrator.checkStatus(),
+      60 * 60 * 1000,
+    );
+
+    return () => {
+      unsub();
+      clearInterval(orchStatusInterval);
+    };
   });
 
   // Routes that render outside the chrome shell (no MenuBar / Sidebar /

@@ -4,6 +4,10 @@
   const entries = allEntries();
 </script>
 
+<svelte:head>
+  <title>Glossary — VCT Launcher</title>
+</svelte:head>
+
 <div class="page">
   <header class="page-header">
     <h1>Glossary</h1>

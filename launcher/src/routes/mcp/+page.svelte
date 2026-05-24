@@ -108,6 +108,10 @@
   onMount(load);
 </script>
 
+<svelte:head>
+  <title>MCP — VCT Launcher</title>
+</svelte:head>
+
 <div class="mcp-page">
   <header class="mcp-header">
     <button class="mcp-back" onclick={() => goto('/')}>← Back</button>

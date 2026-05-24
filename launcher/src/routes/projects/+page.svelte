@@ -32,6 +32,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>Projects — VCT Launcher</title>
+</svelte:head>
+
 <Toast />
 <UpdateAllProjectsModal bind:open={updateAllOpen} />
 

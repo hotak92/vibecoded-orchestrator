@@ -175,6 +175,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>Code Graph — VCT Launcher</title>
+</svelte:head>
+
 <Toast />
 
 <div class="cg-page">

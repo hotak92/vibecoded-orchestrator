@@ -119,6 +119,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>Store — VCT Launcher</title>
+</svelte:head>
+
 <div class="page">
   <div class="content">
     <div class="main-inner">

@@ -123,6 +123,10 @@
   }
 </script>
 
+<svelte:head>
+  <title>Knowledge Graph — VCT Launcher</title>
+</svelte:head>
+
 <div class="kg-page">
   <header class="kg-pageheader">
     <button class="kg-back" onclick={() => goto('/')}>← Back</button>

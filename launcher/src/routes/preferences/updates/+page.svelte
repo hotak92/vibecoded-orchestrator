@@ -74,12 +74,22 @@
   async function loadCached() {
     // get_cached_update_status is non-blocking — pulls from
     // ~/.vct/launcher-update-state.json without making a network call.
-    const cached = await invoke<UpdateStatus>('get_cached_update_status');
-    if (cached) status = cached;
-    const paths = await invoke<string[]>('get_user_owned_paths');
-    if (paths) userOwnedPaths = paths;
-    const auto = await invoke<boolean>('get_auto_check_enabled');
-    if (auto !== null) autoCheckEnabled = auto;
+    //
+    // v0.2.32 E2 (2026-05-23): wrap in try/catch with console.warn so
+    // browser-mode (vite dev) lands on a soft warning instead of an
+    // unhandled-rejection console.error. Matches the convention used by
+    // other Tauri-missing surfaces (e.g. preferences/+page.svelte's
+    // get_default_embedding_models handler).
+    try {
+      const cached = await invoke<UpdateStatus>('get_cached_update_status');
+      if (cached) status = cached;
+      const paths = await invoke<string[]>('get_user_owned_paths');
+      if (paths) userOwnedPaths = paths;
+      const auto = await invoke<boolean>('get_auto_check_enabled');
+      if (auto !== null) autoCheckEnabled = auto;
+    } catch (e) {
+      console.warn('[updates] loadCached skipped:', e);
+    }
   }
 
   async function checkNow() {
@@ -178,6 +188,10 @@
     }
   }
 </script>
+
+<svelte:head>
+  <title>Launcher updates — VCT Launcher</title>
+</svelte:head>
 
 <div class="upd-page">
   <header class="upd-header">

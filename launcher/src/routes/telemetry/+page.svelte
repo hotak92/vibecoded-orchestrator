@@ -64,6 +64,10 @@
   });
 </script>
 
+<svelte:head>
+  <title>Telemetry — VCT Launcher</title>
+</svelte:head>
+
 <div class="t-page">
   <header class="t-header">
     <button class="t-back" onclick={() => goto('/')}>← Back</button>

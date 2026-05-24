@@ -14,6 +14,10 @@
   import RetrievalTuningPanel from '$lib/components/RetrievalTuningPanel.svelte';
 </script>
 
+<svelte:head>
+  <title>Retrieval tuning — VCT Launcher</title>
+</svelte:head>
+
 <div class="rt-page">
   <header class="rt-page-header">
     <button class="rt-back" onclick={() => goto('/preferences')}>← Back</button>
