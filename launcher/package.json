@@ -21,6 +21,7 @@
     "@tauri-apps/plugin-opener": "^2",
     "graphology": "^0.26.0",
     "marked": "^18.0.3",
+    "mermaid": "11.15.0",
     "sigma": "^3.0.3"
   },
   "devDependencies": {
