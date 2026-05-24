@@ -200,6 +200,17 @@
             "if": "Edit(*)"
           }
         ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-diagram-path-validation.sh",
+            "timeout": 3,
+            "if": "Write(.claude/diagrams/**)|Edit(.claude/diagrams/**)"
+          }
+        ]
       }
     ],
     "ConfigChange": [

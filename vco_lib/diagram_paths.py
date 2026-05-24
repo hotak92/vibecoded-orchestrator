@@ -298,3 +298,62 @@ def extract_category_tags(path: str) -> tuple[str, ...]:
     # Normalise mixed separators that the regex tolerated to a single
     # forward-slash split.
     return tuple(s for s in PurePosixPath(category.replace("\\", "/")).parts if s)
+
+
+# ─── CLI entry point (Phase 1.5.A integration) ────────────────────────────
+#
+# The PreToolUse hook templates/hooks/pre-diagram-path-validation.{sh,ps1}
+# invokes `python -m vco_lib.diagram_paths validate <path> [--kind <k>]`.
+# Phase 1.2's canonical API returns `str | None`; the CLI wraps it to emit
+# the corrective message on stderr + exit 2 (PreToolUse block-the-write
+# convention) so hook authors don't have to re-derive the format.
+
+
+def _cli(argv: list[str] | None = None) -> int:
+    """Validate a single diagram path. Exit 0 = OK, exit 2 = violation."""
+    import argparse
+    import sys
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        prog="python -m vco_lib.diagram_paths",
+        description="Validate diagram paths against the scoped-path rule.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_val = sub.add_parser(
+        "validate",
+        help="Validate a single path; exit 0 ok, exit 2 violation.",
+    )
+    p_val.add_argument("file_path", type=Path)
+    p_val.add_argument(
+        "--kind",
+        default="auto",
+        choices=["auto", "mermaid", "excalidraw"],
+        help="Force a diagram_type expectation (default: auto from suffix).",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.cmd != "validate":  # pragma: no cover — argparse handles this
+        parser.error("unknown command")
+
+    kind: DiagramKind | None = None if args.kind == "auto" else args.kind  # type: ignore[assignment]
+    err = validate_scoped_path(str(args.file_path), kind=kind)
+    if err is not None:
+        # Hooks expect the corrective message on stderr — piped straight to
+        # Claude. Exit 2 = block-the-write per PreToolUse hook spec.
+        print(err, file=sys.stderr)
+        return 2
+
+    # On success, print the parsed category tags + filename for any caller
+    # that wants them (the indexer uses these).
+    tags = extract_category_tags(str(args.file_path))
+    name = Path(args.file_path).stem
+    suffix = Path(args.file_path).suffix.lstrip(".")
+    print(f"OK type={suffix} category={'/'.join(tags)} name={name}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover — CLI entry point
+    raise SystemExit(_cli())

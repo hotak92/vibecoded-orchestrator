@@ -100,6 +100,92 @@ if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     .claude/scripts/kg-sync "$REL_PATH" &
 fi
 
+# 2b. Auto-index diagrams (Phase 1.5 — Mermaid + Excalidraw).
+# Fires on any change under .claude/diagrams/. Throttled to 60s per
+# file to avoid re-indexing during rapid in-editor save bursts.
+# Sidecar `.meta.json` writes are NOT re-indexed (would infinite-loop).
+# Notifies vct-hub for live UI refresh in DiagramsTab (best-effort —
+# the /api/v1/notify/diagram-changed route is Phase 1.2's; 404s here
+# are swallowed silently until that route lands).
+DIAGRAMS_DIR="$PROJECT_ROOT/.claude/diagrams"
+if [[ "$EDITED_FILE" == "$DIAGRAMS_DIR"/* ]] \
+    && [[ "$EDITED_FILE" != *.meta.json ]] \
+    && [[ "$EDITED_FILE" == *.mmd || "$EDITED_FILE" == *.excalidraw ]]; then
+
+    # 60s per-file throttle. Mirrors the SEEN_NODES_FILE-style pattern
+    # used by the KG dedup logic in pre-edit-context-inject.sh — bash 3.2
+    # compatible (no associative arrays), file-as-set semantics.
+    THROTTLE_DIR="$PROJECT_ROOT/.claude/state"
+    mkdir -p "$THROTTLE_DIR" 2>/dev/null || true
+    # Hash the path (md5 via Python — same portable pattern as
+    # pre-edit-context-inject.sh). Avoids slashes in the throttle key.
+    DIAGRAM_HASH=$(printf '%s' "$EDITED_FILE" \
+        | "$PY" -c "import hashlib,sys; print(hashlib.md5(sys.stdin.buffer.read()).hexdigest())" \
+        2>/dev/null || echo "_")
+    THROTTLE_FILE="$THROTTLE_DIR/diagram_idx_${DIAGRAM_HASH}.ts"
+    NOW_TS=$(date +%s)
+    LAST_TS=0
+    if [ -f "$THROTTLE_FILE" ]; then
+        LAST_TS=$(cat "$THROTTLE_FILE" 2>/dev/null || echo 0)
+        # Guard against non-numeric content
+        case "$LAST_TS" in
+            ''|*[!0-9]*) LAST_TS=0 ;;
+        esac
+    fi
+    AGE=$(( NOW_TS - LAST_TS ))
+    if [ "$AGE" -ge 60 ]; then
+        echo "$NOW_TS" > "$THROTTLE_FILE" 2>/dev/null || true
+
+        # Resolve venv-Python so `import vco_lib.diagram_indexer` works.
+        # Same chain as pre-edit-context-inject.sh.
+        _VENV_BASE="${VCT_INSTALL_ROOT:-$PROJECT_ROOT}"
+        _DIAG_VENV=""
+        if [ -n "${VCT_VENV:-}" ] && [ -x "$VCT_VENV/bin/python" ]; then
+            _DIAG_VENV="$VCT_VENV/bin/python"
+        fi
+        if [ -z "$_DIAG_VENV" ]; then
+            for _cand in \
+                "$_VENV_BASE/.venv/bin/python" \
+                "$_VENV_BASE/claude_mcp_servers/.venv/bin/python"; do
+                if [ -x "$_cand" ]; then
+                    _DIAG_VENV="$_cand"
+                    break
+                fi
+            done
+        fi
+        [ -z "$_DIAG_VENV" ] && _DIAG_VENV="$PY"
+
+        # Index in background — never block the hook on Weaviate slowness.
+        ( "$_DIAG_VENV" -m vco_lib.diagram_indexer index "$EDITED_FILE" \
+            >/dev/null 2>&1 || true ) &
+
+        # Notify vct-hub for live UI refresh. The route is Phase 1.2's;
+        # if it's not registered yet the hub returns 404, which we swallow.
+        # TODO(Phase 1.2): the `/api/v1/notify/diagram-changed` route is
+        # to be added in the broadcast follow-up. Until then this curl
+        # is a no-op (404 silently); we still wire it up here so the
+        # hook contract is final.
+        if command -v curl >/dev/null 2>&1; then
+            _HUB_PORT="${VCT_HUB_PORT:-7700}"
+            _HUB_TOKEN_FILE="${VCT_STATE_DIR:-$HOME/.vct}/hub.token"
+            _HUB_TOKEN=""
+            if [ -n "${VCT_HUB_TOKEN:-}" ]; then
+                _HUB_TOKEN="$VCT_HUB_TOKEN"
+            elif [ -f "$_HUB_TOKEN_FILE" ]; then
+                _HUB_TOKEN=$(cat "$_HUB_TOKEN_FILE" 2>/dev/null || echo "")
+            fi
+            if [ -n "$_HUB_TOKEN" ]; then
+                ( curl -s -o /dev/null -X POST \
+                    -H "Authorization: Bearer $_HUB_TOKEN" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"file_path\":\"$EDITED_FILE\",\"change\":\"edit\"}" \
+                    "http://127.0.0.1:${_HUB_PORT}/api/v1/notify/diagram-changed" \
+                    --max-time 2 2>/dev/null || true ) &
+            fi
+        fi
+    fi
+fi
+
 # 3. Code file changes: incremental code graph update + LLM nudge.
 # v0.2.21 Step 18 (caller migration): resolve the code-graph collection
 # prefix via the launcher's vct-hub first (`vct_project_config.sh --field

@@ -1,0 +1,1072 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+"""Diagram indexer — Phase 1.5.A of the Diagrams Integration.
+
+Idempotent indexer for `.claude/diagrams/<category>/<name>.{mmd,excalidraw}`
+files. On every save (wrapper-MCP path) and every manual edit (hook path)
+this module:
+
+  1. Reads the file and parses derived metadata (title, kind, content_text,
+     node/edge counts for Mermaid; scene name + text labels + element-type
+     counts for Excalidraw).
+  2. Upserts a row in SQLite `project_diagrams` (UPSERT on
+     `project_id` + `diagram_name`).
+  3. Writes a sidecar `<file_path>.meta.json` atomically (tempfile + os.replace).
+  4. Upserts a Weaviate object in the per-project `<Project>_Diagrams`
+     collection.
+
+Failure handling (see `index_diagram` docstring):
+  - DB write failure: raises, no sidecar, no Weaviate.
+  - Sidecar failure: DB row committed, raises (caller decides retry).
+  - Weaviate failure: DB + sidecar committed, row enqueued to
+    `diagram_index_retry` (best-effort), warning logged, row returned.
+
+Stubs / cross-team dependencies (Phase 1.1 + 1.2 siblings):
+  - The `project_diagrams` table schema lives in launcher migration 021
+    (Phase 1.1). This module reads/writes against that schema; if the
+    table doesn't exist (e.g. sibling not yet merged) the DB write raises
+    a clear error.
+  - `vco_lib.diagram_paths.validate_scoped_path` is owned by Phase 1.2.
+    A local fallback copy lives in this worktree at
+    `vco_lib/diagram_paths.py` so this module imports cleanly during
+    parallel development; the integrator drops the local copy when the
+    sibling lands.
+  - The retry table `diagram_index_retry` ships as a Phase 1.1 addendum
+    (SQL in this file's module docstring, also in
+    `migrations_addendum/021_diagram_index_retry.sql`).
+
+CLI usage (called by the post-file-edit hook):
+    python -m vco_lib.diagram_indexer index <file_path>
+        Indexes a single file (resolves project_id from CWD, chat_id
+        from CLAUDE_CODE_SESSION_ID env). Prints the resulting row as
+        JSON. Exit 0 on success, non-zero on failure.
+
+Retry table SQL (to be folded into migration 021 by Phase 1.1 integrator):
+
+    CREATE TABLE IF NOT EXISTS diagram_index_retry (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        error TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL,
+        last_error_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_diagram_retry_next
+        ON diagram_index_retry(next_attempt_at);
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Recognised Mermaid diagram-kind keywords (Mermaid 11.x).
+# Longest-prefix-wins ordering matters: "graph" must come AFTER specific
+# kinds that start with it (none currently do) but BEFORE the generic
+# fallback. Sort by length DESC to avoid premature short-prefix matches
+# (e.g. `classDiagram` must beat `class` if any future spec adds that).
+_MERMAID_KINDS = sorted(
+    [
+        "flowchart",
+        "classDiagram",
+        "sequenceDiagram",
+        "stateDiagram-v2",
+        "stateDiagram",
+        "erDiagram",
+        "gantt",
+        "pie",
+        "journey",
+        "gitGraph",
+        "mindmap",
+        "timeline",
+        "quadrantChart",
+        "requirementDiagram",
+        "c4Context",
+        "C4Context",
+        "graph",
+    ],
+    key=len,
+    reverse=True,
+)
+
+# Mermaid frontmatter detection — anchored to the file start with a
+# permissive whitespace prefix. We deliberately accept `title` as the
+# canonical key (per Mermaid 10+ spec); the wider `{}` YAML-style block
+# is not parsed beyond the title field (out of scope).
+_MERMAID_FRONTMATTER_RE = re.compile(
+    r"\A\s*---\s*\n(?P<body>.*?)\n---\s*(?:\n|\Z)",
+    re.DOTALL,
+)
+_MERMAID_TITLE_RE = re.compile(
+    r"^\s*title\s*:\s*(?P<title>[^\n]+?)\s*$",
+    re.MULTILINE,
+)
+
+# Mermaid edge patterns: order matters — longer arrows MUST be matched
+# before their shorter prefixes (e.g. `-->` before `--`). We use a
+# single OR-alternation regex that scans left-to-right and greedily.
+_MERMAID_EDGE_PATTERNS = [
+    r"<-->",
+    r"<==>",
+    r"-\.->",
+    r"==>",
+    r"-->",
+    r"<--",
+    r"<==",
+    r"===",
+    r"---",
+    r"==",
+    r"--",
+]
+_MERMAID_EDGE_RE = re.compile("|".join(_MERMAID_EDGE_PATTERNS))
+
+# Mermaid node-ID heuristic: matches an identifier immediately preceding
+# a `[...]`, `(...)`, `{...}`, `((...))`, `[[...]]`, etc. shape. Captures
+# the bare identifier (alphanumeric + `_`). This is a rough count of
+# UNIQUE node IDs — not a parse of Mermaid grammar. Documented as
+# best-effort in the metadata table.
+_MERMAID_NODE_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*[\[\({]"
+)
+
+# Comment lines (Mermaid 10+): `%%` at line start (after optional
+# whitespace). Used to skip past comments when detecting `diagram_kind`.
+_MERMAID_COMMENT_RE = re.compile(r"^\s*%%")
+
+# Filename humanizer: turn "auth-flow-v2" / "auth_flow_v2" / "AuthFlowV2"
+# into "Auth Flow V2". Splits on `-`, `_`, and on lowercase-to-uppercase
+# transitions; capitalises each token.
+_HUMANIZE_SEP_RE = re.compile(r"[-_]+")
+_HUMANIZE_CAMEL_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MermaidMetadata:
+    """Parsed Mermaid diagram metadata."""
+
+    title: Optional[str]
+    diagram_kind: Optional[str]
+    node_count: int
+    edge_count: int
+    content_text: str
+
+
+@dataclass
+class ExcalidrawMetadata:
+    """Parsed Excalidraw scene metadata."""
+
+    scene_name: Optional[str]
+    text_labels: list[str] = field(default_factory=list)
+    element_counts: dict[str, int] = field(default_factory=dict)
+    content_text: str = ""
+
+
+@dataclass
+class DiagramRow:
+    """Mirrors the DB row from Phase 1.1's project_diagrams table.
+
+    `id` is None until the row is persisted. After UPSERT it carries the
+    rowid (autoincrement on insert, lookup-by-unique on update).
+    """
+
+    project_id: str
+    diagram_name: str
+    diagram_type: str  # "mermaid" | "excalidraw"
+    file_path: str
+    category_path: str
+    enabled: int
+    inferred_title: Optional[str]
+    diagram_kind: Optional[str]
+    content_text: Optional[str]
+    node_count: Optional[int]
+    edge_count: Optional[int]
+    chat_id: Optional[str]
+    linked_session_summary: Optional[str]
+    config_json: Optional[str]
+    created_at: int
+    updated_at: int
+    id: Optional[int] = None
+
+    def to_sidecar_dict(self) -> dict[str, Any]:
+        """Project the row into a sidecar-friendly dict.
+
+        Excludes DB rowid (sidecars travel with the file across machines
+        where the rowid is meaningless). Includes a small schema version
+        so future indexer changes can migrate older sidecars.
+        """
+        d = asdict(self)
+        d.pop("id", None)
+        d["_sidecar_schema_version"] = 1
+        return d
+
+
+# ---------------------------------------------------------------------------
+# Filename / category helpers
+# ---------------------------------------------------------------------------
+
+
+def humanize_filename(stem: str) -> str:
+    """Convert a filename stem into a human-readable title.
+
+    Examples:
+        humanize_filename("auth-flow-v2")    -> "Auth Flow V2"
+        humanize_filename("auth_flow_v2")    -> "Auth Flow V2"
+        humanize_filename("AuthFlowV2")      -> "Auth Flow V2"
+        humanize_filename("login")           -> "Login"
+        humanize_filename("")                -> ""
+
+    Splits on `-`/`_` AND on camelCase boundaries, capitalises each
+    surviving token, joins with single spaces. Token boundaries that
+    produce empty strings (e.g. leading `-`) are collapsed.
+    """
+    if not stem:
+        return ""
+    # First, split on -/_ separators.
+    parts = _HUMANIZE_SEP_RE.split(stem)
+    # Then split each part again on camelCase boundaries.
+    expanded: list[str] = []
+    for p in parts:
+        if not p:
+            continue
+        expanded.extend(_HUMANIZE_CAMEL_RE.split(p))
+    # Capitalise and drop empties.
+    return " ".join(t[:1].upper() + t[1:] for t in expanded if t)
+
+
+def category_path_from_file(file_path: Path, diagrams_root: Path) -> str:
+    """Extract the `<category>` portion of a diagram path.
+
+    For `<diagrams_root>/gui/auth/login.mmd`, returns "gui/auth".
+    For `<diagrams_root>/architecture/data-flow.mmd`, returns "architecture".
+    For a file directly under `<diagrams_root>` (flat), returns "" — but
+    callers should reject this via `validate_scoped_path` BEFORE reaching
+    here. We don't enforce it twice; that's the path validator's job.
+
+    Cross-OS: uses `Path.resolve()` and `relative_to`; the `/` separator
+    is the canonical form returned (matching the SQLite `category_path`
+    column convention defined in the plan).
+    """
+    rel = file_path.resolve().relative_to(diagrams_root.resolve())
+    parts = rel.parts[:-1]  # drop the filename
+    return "/".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Mermaid parser
+# ---------------------------------------------------------------------------
+
+
+def _strip_mermaid_frontmatter(source: str) -> tuple[Optional[str], str]:
+    """Return (title, body_without_frontmatter)."""
+    m = _MERMAID_FRONTMATTER_RE.match(source)
+    if not m:
+        return None, source
+    body_after = source[m.end():]
+    title_m = _MERMAID_TITLE_RE.search(m.group("body"))
+    title = title_m.group("title") if title_m else None
+    return title, body_after
+
+
+def _detect_mermaid_kind(body: str) -> Optional[str]:
+    """First non-comment / non-blank line determines the diagram kind.
+
+    Mermaid permits arbitrary leading comments and blank lines. We
+    iterate lines, skip blanks and `%%...` comments, then match the
+    longest-prefix-wins keyword. Returns the canonical keyword
+    (case-preserved as it appears in the source) or None when no kind
+    can be inferred (malformed Mermaid).
+    """
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _MERMAID_COMMENT_RE.match(line):
+            continue
+        for kind in _MERMAID_KINDS:
+            # Case-insensitive prefix match — Mermaid accepts both
+            # `flowchart TD` and `Flowchart TD`; we normalise to the
+            # spec form (`flowchart`, `classDiagram`, ...).
+            if line.lower().startswith(kind.lower()):
+                return kind
+        # First non-comment line didn't match any kind — bail with None
+        # (no point scanning further; downstream lines are content).
+        return None
+    return None
+
+
+def parse_mermaid(source: str) -> MermaidMetadata:
+    """Parse Mermaid source into derived metadata.
+
+    All fields are best-effort: malformed Mermaid yields a metadata
+    object with `diagram_kind=None`, `node_count=0`, `edge_count=0`,
+    `content_text=source` (the raw file). The indexer never raises on
+    parse failure — saving a broken Mermaid file should still produce a
+    row (the user might be mid-edit).
+    """
+    title, body = _strip_mermaid_frontmatter(source)
+    diagram_kind = _detect_mermaid_kind(body)
+
+    # Edge count: scan body for arrow patterns. Subgraph fences and
+    # comment lines are NOT excluded — overcounting on `%%` comment
+    # lines that contain `-->` is acceptable for a "rough" metric.
+    edge_count = len(_MERMAID_EDGE_RE.findall(body))
+
+    # Node count: unique identifiers preceding a shape opener. Excludes
+    # the diagram-kind keyword itself by matching on identifier + shape.
+    node_ids = set(_MERMAID_NODE_RE.findall(body))
+    node_count = len(node_ids)
+
+    return MermaidMetadata(
+        title=title,
+        diagram_kind=diagram_kind,
+        node_count=node_count,
+        edge_count=edge_count,
+        content_text=source,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Excalidraw parser
+# ---------------------------------------------------------------------------
+
+
+def parse_excalidraw(scene_json: dict) -> ExcalidrawMetadata:
+    """Parse an Excalidraw scene-JSON dict into derived metadata.
+
+    Excalidraw scene shape (excerpt):
+        {
+          "type": "excalidraw",
+          "version": 2,
+          "appState": {"name": "Auth flow sketch", ...},
+          "elements": [
+            {"type": "rectangle", ...},
+            {"type": "text", "text": "Login", ...},
+            ...
+          ]
+        }
+
+    Best-effort: missing `appState` / `elements` keys yield empty
+    defaults. Non-dict element entries are skipped silently.
+    """
+    if not isinstance(scene_json, dict):
+        return ExcalidrawMetadata(scene_name=None)
+
+    app_state = scene_json.get("appState") or {}
+    scene_name: Optional[str] = None
+    if isinstance(app_state, dict):
+        raw_name = app_state.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            scene_name = raw_name.strip()
+
+    elements = scene_json.get("elements") or []
+    text_labels: list[str] = []
+    element_counts: dict[str, int] = {}
+
+    if isinstance(elements, list):
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            el_type = el.get("type")
+            if isinstance(el_type, str) and el_type:
+                element_counts[el_type] = element_counts.get(el_type, 0) + 1
+            if el_type == "text":
+                txt = el.get("text") or el.get("originalText")
+                if isinstance(txt, str) and txt.strip():
+                    text_labels.append(txt.strip())
+
+    return ExcalidrawMetadata(
+        scene_name=scene_name,
+        text_labels=text_labels,
+        element_counts=element_counts,
+        content_text="\n".join(text_labels),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Path validation (depends on sibling Phase 1.2 — local fallback)
+# ---------------------------------------------------------------------------
+
+
+def _validate_scoped_path(file_path: Path) -> tuple[str, str, str]:
+    """Wrapper around `vco_lib.diagram_paths.validate_scoped_path`.
+
+    Falls back to a local in-module implementation when the sibling
+    module isn't present yet (Phase 1.2 hasn't landed in this worktree).
+    Returns `(diagram_type, category_path, diagram_name)`.
+
+    Raises ValueError with a clear corrective message on violation.
+    """
+    try:
+        from vco_lib.diagram_paths import validate_scoped_path  # type: ignore
+        return validate_scoped_path(file_path)
+    except ImportError:
+        return _local_validate_scoped_path(file_path)
+
+
+def _local_validate_scoped_path(file_path: Path) -> tuple[str, str, str]:
+    """Local fallback when `vco_lib.diagram_paths` isn't available.
+
+    Mirrors the validator contract Phase 1.2 will own. When the sibling
+    module lands, the integrator removes this fallback (and the
+    try/except in `_validate_scoped_path`) — the canonical implementation
+    takes over.
+
+    Contract:
+      - path must contain `.claude/diagrams/` (anywhere in its parents).
+      - relative to that anchor, structure must be
+        `<category>/<name>.{mmd,excalidraw}` with at least one category
+        directory.
+      - name must match `[a-z0-9][a-z0-9-]*`.
+      - Path-traversal (`..`) is rejected.
+    """
+    parts = file_path.parts
+    try:
+        anchor_idx = max(
+            i for i, p in enumerate(parts[:-1])
+            if p == "diagrams" and i > 0 and parts[i - 1] == ".claude"
+        )
+    except ValueError:
+        raise ValueError(
+            f"Diagram path '{file_path}' must live under "
+            f".claude/diagrams/<category>/<name>.{{mmd,excalidraw}}. "
+            f"Example: .claude/diagrams/gui/auth/login-form.mmd"
+        )
+
+    rel_parts = parts[anchor_idx + 1:]
+    if len(rel_parts) < 2:
+        raise ValueError(
+            f"Diagram path '{file_path}' is flat — must include at "
+            f"least one category directory. "
+            f"Example: .claude/diagrams/gui/auth/login-form.mmd"
+        )
+
+    if any(p == ".." for p in rel_parts):
+        raise ValueError(
+            f"Diagram path '{file_path}' contains '..' traversal — "
+            f"refused for security."
+        )
+
+    name_with_ext = rel_parts[-1]
+    suffix = file_path.suffix.lower()
+    if suffix == ".mmd":
+        diagram_type = "mermaid"
+    elif suffix == ".excalidraw":
+        diagram_type = "excalidraw"
+    else:
+        raise ValueError(
+            f"Diagram path '{file_path}' has unsupported extension "
+            f"'{suffix}' — must be .mmd or .excalidraw."
+        )
+
+    diagram_name = name_with_ext[: -len(suffix)]
+    if not re.match(r"^[a-z0-9][a-z0-9-]*$", diagram_name):
+        raise ValueError(
+            f"Diagram name '{diagram_name}' must match "
+            f"[a-z0-9][a-z0-9-]* (lowercase-kebab-case). "
+            f"Example: 'login-form-v2', not 'LoginForm' or 'login_form'."
+        )
+
+    category_path = "/".join(rel_parts[:-1])
+    return diagram_type, category_path, diagram_name
+
+
+# ---------------------------------------------------------------------------
+# Atomic sidecar write
+# ---------------------------------------------------------------------------
+
+
+def _write_sidecar_atomic(sidecar_path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON payload to sidecar_path atomically.
+
+    Uses tempfile + os.replace so a reader of the sidecar never observes
+    a half-written file. Tempfile is created in the SAME directory as
+    the target so os.replace is atomic (cross-device renames are not).
+    """
+    sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".meta.",
+        suffix=".json.tmp",
+        dir=str(sidecar_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp_path, sidecar_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------------------
+# SQLite UPSERT
+# ---------------------------------------------------------------------------
+
+
+_UPSERT_SQL = """
+INSERT INTO project_diagrams (
+    project_id, diagram_name, diagram_type, file_path, category_path,
+    enabled, inferred_title, diagram_kind, content_text,
+    node_count, edge_count, chat_id, linked_session_summary,
+    config_json, created_at, updated_at
+) VALUES (
+    :project_id, :diagram_name, :diagram_type, :file_path, :category_path,
+    :enabled, :inferred_title, :diagram_kind, :content_text,
+    :node_count, :edge_count, :chat_id, :linked_session_summary,
+    :config_json, :created_at, :updated_at
+)
+ON CONFLICT(project_id, diagram_name) DO UPDATE SET
+    diagram_type = excluded.diagram_type,
+    file_path = excluded.file_path,
+    category_path = excluded.category_path,
+    enabled = excluded.enabled,
+    inferred_title = excluded.inferred_title,
+    diagram_kind = excluded.diagram_kind,
+    content_text = excluded.content_text,
+    node_count = excluded.node_count,
+    edge_count = excluded.edge_count,
+    chat_id = COALESCE(excluded.chat_id, project_diagrams.chat_id),
+    linked_session_summary = COALESCE(
+        excluded.linked_session_summary, project_diagrams.linked_session_summary
+    ),
+    config_json = excluded.config_json,
+    updated_at = excluded.updated_at
+"""
+
+_SELECT_BY_KEY_SQL = """
+SELECT id, project_id, diagram_name, diagram_type, file_path, category_path,
+       enabled, inferred_title, diagram_kind, content_text,
+       node_count, edge_count, chat_id, linked_session_summary,
+       config_json, created_at, updated_at
+FROM project_diagrams
+WHERE project_id = :project_id AND diagram_name = :diagram_name
+"""
+
+
+def _upsert_row(db_path: Path, row: DiagramRow) -> DiagramRow:
+    """UPSERT a DiagramRow into project_diagrams and return the persisted row.
+
+    Returns a NEW DiagramRow with `id` populated (and `created_at`
+    preserved from the existing row on UPDATE — the UPSERT only updates
+    `updated_at`).
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        # Look up existing created_at so UPSERT-as-update preserves it.
+        existing = conn.execute(
+            _SELECT_BY_KEY_SQL,
+            {"project_id": row.project_id, "diagram_name": row.diagram_name},
+        ).fetchone()
+        if existing is not None:
+            # Preserve original created_at on update. Column index 15
+            # in _SELECT_BY_KEY_SQL (0=id, ..., 14=config_json,
+            # 15=created_at, 16=updated_at).
+            row.created_at = int(existing[15])
+
+        params = {
+            "project_id": row.project_id,
+            "diagram_name": row.diagram_name,
+            "diagram_type": row.diagram_type,
+            "file_path": row.file_path,
+            "category_path": row.category_path,
+            "enabled": row.enabled,
+            "inferred_title": row.inferred_title,
+            "diagram_kind": row.diagram_kind,
+            "content_text": row.content_text,
+            "node_count": row.node_count,
+            "edge_count": row.edge_count,
+            "chat_id": row.chat_id,
+            "linked_session_summary": row.linked_session_summary,
+            "config_json": row.config_json,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+        conn.execute(_UPSERT_SQL, params)
+        conn.commit()
+
+        # Re-fetch to get the canonical rowid.
+        persisted = conn.execute(
+            _SELECT_BY_KEY_SQL,
+            {"project_id": row.project_id, "diagram_name": row.diagram_name},
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if persisted is None:
+        raise RuntimeError(
+            f"UPSERT succeeded but row not found on re-fetch: "
+            f"project_id={row.project_id}, diagram_name={row.diagram_name}"
+        )
+
+    return DiagramRow(
+        id=int(persisted[0]),
+        project_id=str(persisted[1]),
+        diagram_name=str(persisted[2]),
+        diagram_type=str(persisted[3]),
+        file_path=str(persisted[4]),
+        category_path=str(persisted[5]),
+        enabled=int(persisted[6]),
+        inferred_title=persisted[7],
+        diagram_kind=persisted[8],
+        content_text=persisted[9],
+        node_count=persisted[10],
+        edge_count=persisted[11],
+        chat_id=persisted[12],
+        linked_session_summary=persisted[13],
+        config_json=persisted[14],
+        created_at=int(persisted[15]),
+        updated_at=int(persisted[16]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Retry-table enqueue (Weaviate failures)
+# ---------------------------------------------------------------------------
+
+
+_RETRY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS diagram_index_retry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    error TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    last_error_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_diagram_retry_next
+    ON diagram_index_retry(next_attempt_at);
+"""
+
+
+def _enqueue_retry(
+    db_path: Path,
+    project_id: str,
+    file_path: str,
+    error: str,
+) -> None:
+    """Append (or refresh) a row in diagram_index_retry.
+
+    Best-effort: the table is created on demand if missing (so callers
+    don't depend on migration 021's retry-table fragment being applied
+    yet). Failure to enqueue is logged at WARNING and swallowed — the
+    primary indexing path already succeeded for SQLite + sidecar; this
+    retry is purely the Weaviate catch-up safety net.
+    """
+    now = int(time.time())
+    # 60-second back-off for the first retry; let the cron / sweeper
+    # apply exponential backoff via attempt_count when it reads the row.
+    next_attempt_at = now + 60
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executescript(_RETRY_SCHEMA_SQL)
+            conn.execute(
+                "INSERT INTO diagram_index_retry "
+                "(project_id, file_path, error, attempt_count, "
+                "next_attempt_at, last_error_at) "
+                "VALUES (?, ?, ?, 0, ?, ?)",
+                (project_id, file_path, error, next_attempt_at, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("Failed to enqueue retry for %s: %s", file_path, exc)
+
+
+# ---------------------------------------------------------------------------
+# Weaviate upsert (optional — best-effort)
+# ---------------------------------------------------------------------------
+
+
+def _weaviate_upsert(
+    row: DiagramRow,
+    *,
+    weaviate_url: Optional[str],
+    collection_name: Optional[str],
+) -> None:
+    """Upsert the row into `<Project>_Diagrams` Weaviate collection.
+
+    Raises on any Weaviate error so the caller can decide whether to
+    enqueue a retry. Skipped silently when:
+      - `weaviate_url` is None and no `WEAVIATE_URL` env is set, OR
+      - `collection_name` is None (no per-project diagrams collection
+        configured — common during early-stage installs).
+
+    The actual embedding is computed server-side via Ollama (matching
+    the KG / Development collections' pattern). We pass only the
+    properties; the named-vector slot is populated by the MCP layer's
+    embedding pipeline during a follow-on sync — same pattern as
+    `<Project>_Development`.
+
+    This is deliberately a thin shim: the heavyweight upsert path lives
+    in `claude_mcp_servers/weaviate_mcp/server.py::store_knowledge_node`.
+    For Phase 1.5.A we use a minimal direct insert (no chunking — diagram
+    sources are small) so the indexer can run from the hook without
+    pulling in the full MCP machinery.
+    """
+    url = weaviate_url or os.environ.get("WEAVIATE_URL")
+    if not url or not collection_name:
+        logger.debug(
+            "Weaviate upsert skipped (url=%s, collection=%s)",
+            url, collection_name,
+        )
+        return
+
+    try:
+        import weaviate  # type: ignore
+        from weaviate.classes.query import Filter  # type: ignore
+    except ImportError as exc:
+        logger.warning(
+            "weaviate-client not installed — skipping Weaviate upsert: %s",
+            exc,
+        )
+        return
+
+    # Parse host/port — match the pattern used by the MCP server.
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    http_port = parsed.port or 8081
+    grpc_port = int(os.environ.get("GRPC_PORT", "50052"))
+
+    client = weaviate.connect_to_custom(
+        http_host=host,
+        http_port=http_port,
+        http_secure=parsed.scheme == "https",
+        grpc_host=host,
+        grpc_port=grpc_port,
+        grpc_secure=parsed.scheme == "https",
+    )
+    try:
+        collection = client.collections.get(collection_name)
+
+        # Build properties. path_tags is derived from category_path at
+        # write time — matches the schema in §1.5.3.
+        path_tags = [t for t in row.category_path.split("/") if t]
+
+        properties = {
+            "title": row.inferred_title or row.diagram_name,
+            "content": row.content_text or "",
+            "path_tags": path_tags,
+            "diagram_kind": row.diagram_kind or "",
+            "chat_id": row.chat_id or "",
+            "linked_session_summary": row.linked_session_summary or "",
+            "file_path": row.file_path,
+            "created_at": row.created_at,
+            "updated_at": row.updated_at,
+        }
+
+        # Delete-then-insert (mirrors store_knowledge_node semantics).
+        existing = collection.query.fetch_objects(
+            filters=Filter.by_property("file_path").equal(row.file_path),
+            limit=10,
+        )
+        for obj in existing.objects:
+            collection.data.delete_by_id(obj.uuid)
+
+        collection.data.insert(properties=properties)
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def index_diagram(
+    file_path: Path,
+    project_id: str,
+    chat_id: Optional[str] = None,
+    *,
+    db_path: Optional[Path] = None,
+    weaviate_url: Optional[str] = None,
+    diagrams_collection: Optional[str] = None,
+    enabled: int = 1,
+) -> DiagramRow:
+    """Idempotent diagram indexer.
+
+    Steps:
+      1. Validate scoped path (raises ValueError on bad layout).
+      2. Read file content; parse derived metadata.
+      3. Build DiagramRow and UPSERT into SQLite project_diagrams.
+      4. Write sidecar `<file_path>.meta.json` atomically.
+      5. Upsert Weaviate object in <Project>_Diagrams (best-effort).
+
+    Failure modes (see module docstring):
+      - DB write failure: raises, no sidecar, no Weaviate write.
+      - Sidecar write failure: row committed, raises (caller retries).
+      - Weaviate failure: row + sidecar committed, retry-table row
+        enqueued, warning logged, RETURNS the row (no raise).
+
+    Args:
+        file_path: Absolute or relative path to the `.mmd` / `.excalidraw`
+            file. Relative paths resolved against the CWD.
+        project_id: Project UUID from the launcher's `projects` table.
+            Required — no implicit resolution at the public entry point;
+            see `index_diagram_async` for the convenience wrapper that
+            resolves from CWD via vct-hub.
+        chat_id: Optional Claude Code session UUID. None when the file
+            is being indexed outside a Claude session (e.g. via
+            `vco rebuild-diagram-index`).
+        db_path: Path to the launcher's SQLite DB. Defaults to
+            `${VCT_STATE_DIR:-$HOME/.vct}/launcher.db`.
+        weaviate_url: Override for WEAVIATE_URL env var. None falls back
+            to env, then skips Weaviate write if neither is set.
+        diagrams_collection: Per-project Weaviate collection name (e.g.
+            `MyProj_Diagrams`). Required for Weaviate upsert; if None,
+            Weaviate write is skipped (DB + sidecar still happen).
+        enabled: Initial enabled flag for new rows (existing rows
+            preserve their enabled value via the UPSERT).
+
+    Returns:
+        The canonical DiagramRow (with persisted `id`).
+
+    Raises:
+        ValueError: scoped-path validation failed.
+        FileNotFoundError: file_path doesn't exist on disk.
+        sqlite3.Error: DB write failed.
+        OSError: Sidecar write failed (DB row already committed).
+    """
+    file_path = file_path.resolve()
+    if not file_path.exists():
+        raise FileNotFoundError(f"Diagram file not found: {file_path}")
+
+    diagram_type, category_path, diagram_name = _validate_scoped_path(file_path)
+
+    source_bytes = file_path.read_bytes()
+    source = source_bytes.decode("utf-8", errors="replace")
+
+    inferred_title: Optional[str]
+    diagram_kind: Optional[str]
+    content_text: Optional[str]
+    node_count: Optional[int]
+    edge_count: Optional[int]
+
+    if diagram_type == "mermaid":
+        md = parse_mermaid(source)
+        inferred_title = md.title or humanize_filename(diagram_name)
+        diagram_kind = md.diagram_kind
+        content_text = md.content_text
+        node_count = md.node_count
+        edge_count = md.edge_count
+    elif diagram_type == "excalidraw":
+        try:
+            scene = json.loads(source)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Malformed Excalidraw JSON at %s: %s — indexing with empty metadata",
+                file_path, exc,
+            )
+            scene = {}
+        ed = parse_excalidraw(scene)
+        inferred_title = ed.scene_name or humanize_filename(diagram_name)
+        diagram_kind = "excalidraw"
+        content_text = ed.content_text
+        # node_count = total element count; edge_count = arrows/lines.
+        node_count = sum(ed.element_counts.values()) if ed.element_counts else 0
+        edge_count = (
+            ed.element_counts.get("arrow", 0)
+            + ed.element_counts.get("line", 0)
+        )
+    else:
+        # Defensive: _validate_scoped_path already rejects other types.
+        raise ValueError(f"Unsupported diagram_type: {diagram_type}")
+
+    now = int(time.time())
+
+    row = DiagramRow(
+        project_id=project_id,
+        diagram_name=diagram_name,
+        diagram_type=diagram_type,
+        file_path=str(file_path),
+        category_path=category_path,
+        enabled=enabled,
+        inferred_title=inferred_title,
+        diagram_kind=diagram_kind,
+        content_text=content_text,
+        node_count=node_count,
+        edge_count=edge_count,
+        chat_id=chat_id,
+        linked_session_summary=None,  # populated by Phase 2 follow-up
+        config_json=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+    # Step 3: SQLite UPSERT.
+    if db_path is None:
+        state_dir = Path(
+            os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct")
+        )
+        db_path = state_dir / "launcher.db"
+    persisted = _upsert_row(db_path, row)
+
+    # Step 4: Atomic sidecar write.
+    sidecar_path = file_path.with_suffix(file_path.suffix + ".meta.json")
+    _write_sidecar_atomic(sidecar_path, persisted.to_sidecar_dict())
+
+    # Step 5: Weaviate upsert (best-effort).
+    try:
+        _weaviate_upsert(
+            persisted,
+            weaviate_url=weaviate_url,
+            collection_name=diagrams_collection,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort + retry queue
+        logger.warning(
+            "Weaviate upsert failed for %s: %s — enqueued for retry",
+            file_path, exc,
+        )
+        _enqueue_retry(db_path, project_id, str(file_path), str(exc))
+
+    return persisted
+
+
+async def index_diagram_async(
+    file_path: Path,
+    project_id: Optional[str] = None,
+    chat_id: Optional[str] = None,
+) -> DiagramRow:
+    """Async variant for wrapper-MCP post_tool_success callbacks (Phase 1.2).
+
+    Resolves `project_id` from CWD via the launcher's hub when not
+    provided. Resolves `chat_id` from CLAUDE_CODE_SESSION_ID env var
+    when not provided. Both falls-back to a hub-less default to keep
+    the hook path resilient when the launcher isn't running.
+
+    The actual work runs synchronously inside an executor — sqlite3 is
+    not async-aware and the indexer has no IO that benefits from
+    cooperative scheduling at this scale.
+    """
+    import asyncio
+
+    if chat_id is None:
+        chat_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+
+    if project_id is None:
+        project_id = _resolve_project_id_from_cwd() or "unknown"
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: index_diagram(file_path, project_id, chat_id),
+    )
+
+
+def _resolve_project_id_from_cwd() -> Optional[str]:
+    """Best-effort: ask vct-hub for the project_id of the current CWD.
+
+    Returns None on any failure (hub down, project not registered, etc.)
+    so callers can fall back to a sentinel value. Hub discovery mirrors
+    `vct_secrets_resolve.sh`.
+    """
+    try:
+        from vco_lib.project_config import resolve_project_id  # type: ignore
+        return resolve_project_id(Path.cwd())
+    except Exception:  # noqa: BLE001 — best-effort
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m vco_lib.diagram_indexer",
+        description="Index a single diagram file (Phase 1.5.A).",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_index = sub.add_parser("index", help="Index one file.")
+    p_index.add_argument("file_path", type=Path)
+    p_index.add_argument(
+        "--project-id",
+        help="Project UUID. Resolved from CWD via vct-hub if omitted.",
+    )
+    p_index.add_argument(
+        "--chat-id",
+        help="Claude Code session UUID. Falls back to "
+             "CLAUDE_CODE_SESSION_ID env var.",
+    )
+    p_index.add_argument(
+        "--db-path",
+        type=Path,
+        help="Override launcher SQLite DB path "
+             "(default ${VCT_STATE_DIR:-$HOME/.vct}/launcher.db).",
+    )
+    p_index.add_argument(
+        "--diagrams-collection",
+        help="Weaviate collection name (e.g. MyProj_Diagrams). Skips "
+             "Weaviate upsert if omitted.",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.cmd != "index":  # pragma: no cover — argparse handles this
+        parser.error("unknown command")
+
+    project_id = args.project_id or _resolve_project_id_from_cwd()
+    if not project_id:
+        print(
+            "ERROR: could not resolve project_id (pass --project-id or "
+            "register the project with the launcher).",
+            file=sys.stderr,
+        )
+        return 2
+
+    chat_id = args.chat_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
+
+    try:
+        row = index_diagram(
+            args.file_path,
+            project_id,
+            chat_id,
+            db_path=args.db_path,
+            diagrams_collection=args.diagrams_collection,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as exc:
+        print(f"ERROR: SQLite write failed: {exc}", file=sys.stderr)
+        return 3
+    except OSError as exc:
+        print(f"ERROR: Sidecar write failed: {exc}", file=sys.stderr)
+        return 4
+
+    print(json.dumps(asdict(row), indent=2))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover — CLI entry point
+    raise SystemExit(_cli())

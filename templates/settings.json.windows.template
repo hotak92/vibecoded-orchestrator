@@ -200,6 +200,17 @@
             "if": "Edit(*)"
           }
         ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-diagram-path-validation.ps1",
+            "timeout": 3,
+            "if": "Write(.claude/diagrams/**)|Edit(.claude/diagrams/**)"
+          }
+        ]
       }
     ],
     "ConfigChange": [

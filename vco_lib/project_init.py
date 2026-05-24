@@ -124,6 +124,17 @@ def derive_project_dev_name(project_name: str) -> str:
     return f"{sanitize_for_weaviate_class(project_name)}_Development"
 
 
+def derive_project_diagrams_name(project_name: str) -> str:
+    """Public: derive a per-project Diagrams collection name from a
+    project name string.
+
+    Mirrors the naming convention of the KG / Development collections —
+    `<sanitized>_Diagrams`. Used by `vco_lib.diagram_indexer` (Phase
+    1.5) when upserting Mermaid + Excalidraw entries into Weaviate.
+    """
+    return f"{sanitize_for_weaviate_class(project_name)}_Diagrams"
+
+
 def derive_project_collection_names(project_name: str) -> dict:
     """Canonical collection-name dict for a project.
 
@@ -131,6 +142,7 @@ def derive_project_collection_names(project_name: str) -> dict:
         {
           "kg_collection":              "<sanitized>_KnowledgeGraph",
           "development_collection":     "<sanitized>_Development",   # uppercase D
+          "diagrams_collection":        "<sanitized>_Diagrams",      # uppercase D
           "project_name":               <raw, not sanitized>,
           "shared_kg_collection":       "VibeCodedOrchestrator_KnowledgeGraph",
           "shared_kg_write_disabled":   "false",
@@ -141,6 +153,13 @@ def derive_project_collection_names(project_name: str) -> dict:
     model since 2026-05-01: all projects always READ the shared KG; only
     writes are gated). Default "false" (writes allowed). Stored as a
     string so all 4 env surfaces can pass it through unchanged.
+
+    `diagrams_collection` is the per-project Weaviate class that holds
+    Mermaid/Excalidraw diagrams indexed by `vco_lib.diagram_indexer`
+    (Phase 1.5 of the Diagrams Integration). Auto-paired with the KG
+    collection on project init by `derive_project_diagrams_name`
+    callers; reads are unconditional, writes flow through the indexer
+    module only.
     """
     basename = sanitize_for_weaviate_class(project_name)
     # Canonical shared KG class name. Aligned across:
@@ -159,6 +178,7 @@ def derive_project_collection_names(project_name: str) -> dict:
     return {
         "kg_collection": f"{basename}_KnowledgeGraph",
         "development_collection": f"{basename}_Development",
+        "diagrams_collection": f"{basename}_Diagrams",
         "project_name": project_name,
         "shared_kg_collection": "VibeCodedOrchestrator_KnowledgeGraph",
         "shared_kg_write_disabled": "false",
@@ -403,10 +423,71 @@ def development_class_definition(name: str) -> dict:
     }
 
 
+def diagrams_class_definition(name: str) -> dict:
+    """Weaviate class definition for a per-project Diagrams collection.
+
+    Phase 1.5 of the Diagrams Integration (2026-05-24). Mirrors the
+    `indexNullState=True` invariant of the KG / Dev schemas and uses
+    the same multi-slot named-vector config so KG-style search ranking
+    works without translation.
+
+    Property surface (matches `vco_lib/diagram_indexer.py::_weaviate_upsert`):
+
+    * ``title``           — `inferred_title` (mermaid frontmatter title,
+                            excalidraw scene name, or humanised filename)
+    * ``content``         — Mermaid source OR concatenated Excalidraw
+                            text labels (the embedding target)
+    * ``path_tags``       — split of `category_path` ("gui/auth" →
+                            ["gui","auth"]) — primary tag axis
+    * ``diagram_kind``    — "flowchart" / "classDiagram" / ... / "excalidraw"
+    * ``chat_id``         — Claude Code session UUID when the wrapper-MCP
+                            saved the diagram; nullable when user saved
+                            outside a Claude session
+    * ``linked_session_summary`` — first 200 chars of the chat's
+                            summary file (best-effort)
+    * ``file_path``       — absolute path on disk (used for dedup +
+                            click-through from search results)
+    * ``created_at`` / ``updated_at`` — unix epoch ints (NOT date strings
+                            — the indexer writes Python ints from
+                            `int(time.time())` to keep the SQLite +
+                            Weaviate shapes identical)
+
+    Explicitly NOT included (rationale documented inline):
+
+    * ``status`` — diagrams have no archival workflow yet; if a Phase-3
+      need emerges, add via the additive patch_props migration path.
+    * ``content_hash`` — content_text already serves as the dedup key
+      for now; adding hash later is an additive migration.
+    * ``tags`` / ``links`` / ``typed_links`` — diagrams use `path_tags`
+      as their sole tag axis (the path IS the tag). No WikiLink graph.
+    """
+    return {
+        "class": name,
+        "description": (
+            "VibeCoded Tools per-project diagrams collection "
+            "(Mermaid + Excalidraw)"
+        ),
+        "vectorConfig": named_vector_config(),
+        "invertedIndexConfig": {"indexNullState": True},
+        "properties": [
+            {"name": "title", "dataType": ["text"]},
+            {"name": "content", "dataType": ["text"]},
+            {"name": "path_tags", "dataType": ["text[]"]},
+            {"name": "diagram_kind", "dataType": ["text"]},
+            {"name": "chat_id", "dataType": ["text"]},
+            {"name": "linked_session_summary", "dataType": ["text"]},
+            {"name": "file_path", "dataType": ["text"]},
+            {"name": "created_at", "dataType": ["int"]},
+            {"name": "updated_at", "dataType": ["int"]},
+        ],
+    }
+
+
 # Internal aliases preserving install.py's underscored names.
 _named_vector_config = named_vector_config
 _kg_class_definition = kg_class_definition
 _development_class_definition = development_class_definition
+_diagrams_class_definition = diagrams_class_definition
 
 
 # ---------------------------------------------------------------------------
