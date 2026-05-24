@@ -1595,6 +1595,16 @@ pub async fn update_all_projects(
 /// keys at the same level are preserved across re-runs. See
 /// `secrets-and-access-matrix-audit-2026-05-06.md` §6 for the prior
 /// wholesale-replace bug.
+///
+/// Phase 0.B migration marker (2026-05-24): this function is the
+/// canonical Rust writer that the new `vco_lib.config_projection`
+/// contract is designed to supersede. The contract's `apply_project_env`
+/// produces byte-identical output (parity-tested) and will be the only
+/// production writer in a follow-up PR. Until then, this function is
+/// allowlisted by the single-writer lint
+/// (`tests/test_config_projection_single_writer.py`) via the
+/// _LEGACY_PRODUCTION_WRITERS set + this marker:
+/// config_projection: legacy_caller_pending_migration
 pub fn write_project_env_files(
     folder: &Path,
     settings: &ProjectEnvSettings,
