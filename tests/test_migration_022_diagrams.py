@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Migration 021 (diagrams) schema-level tests.
+"""Migration 022 (diagrams) schema-level tests.
 
 The launcher's migrations live in Rust and are not callable directly
 from Python — the `vct-launcher-core` crate owns `apply()`. The same
@@ -38,7 +38,7 @@ MIGRATION_PATH = (
     / "src"
     / "db"
     / "migrations"
-    / "021_diagrams.sql"
+    / "022_diagrams.sql"
 )
 
 
@@ -60,7 +60,7 @@ CREATE TABLE projects (
 
 def _conn() -> sqlite3.Connection:
     """Open an in-memory SQLite DB with FK enforcement enabled, then
-    apply the projects prerequisite + migration 021.
+    apply the projects prerequisite + migration 022.
     """
     if not MIGRATION_PATH.exists():
         raise FileNotFoundError(
@@ -85,8 +85,8 @@ def _seed_project(conn: sqlite3.Connection, pid: str, name: str) -> None:
     )
 
 
-class TestMigration021Diagrams(unittest.TestCase):
-    """Schema + constraint smoke tests for migration 021."""
+class TestMigration022Diagrams(unittest.TestCase):
+    """Schema + constraint smoke tests for migration 022."""
 
     # ─── table existence ────────────────────────────────────────────────
 

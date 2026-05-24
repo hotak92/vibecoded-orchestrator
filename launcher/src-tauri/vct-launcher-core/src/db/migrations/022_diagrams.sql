@@ -1,11 +1,16 @@
 -- launcher.db — diagrams registry + snapshots + per-tool MCP grants +
--- per-project modules (migration 021)
+-- per-project modules + diagram_index_retry (migration 022)
 --
--- Backs Phase 1.1 of the Excalidraw + Mermaid diagrams integration plan
+-- Backs Phase 1.1 + Phase 1.5.A of the Excalidraw + Mermaid diagrams
+-- integration plan
 -- (.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md).
 --
--- Five new tables land here in a single migration so the schema is
--- consistent at the boundary: a downstream caller that sees migration 021
+-- Renumbered from 021 → 022 at integration time: v0.2.33's
+-- 021_module_installs_broken_status.sql shipped concurrently from a
+-- parallel chat. No semantic conflict, just a numbering collision.
+--
+-- Six new tables land here in a single migration so the schema is
+-- consistent at the boundary: a downstream caller that sees migration 022
 -- applied can rely on every table being present.
 --
 -- Design notes:
@@ -110,3 +115,21 @@ CREATE TABLE IF NOT EXISTS project_modules (
     registered_at   INTEGER NOT NULL,
     PRIMARY KEY (project_id, module_name)
 );
+
+-- Phase 1.5.A retry-queue for Weaviate upsert failures (folded in from
+-- migrations_addendum/021_diagram_index_retry.sql at integration time).
+-- Soft FK on project_id (no constraint) so retry rows survive a
+-- project rename-recreate cycle. The indexer also runs CREATE TABLE
+-- IF NOT EXISTS defensively before each enqueue, so retries work
+-- even on installs where migration 022 hasn't run yet.
+CREATE TABLE IF NOT EXISTS diagram_index_retry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    error TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    last_error_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_diagram_retry_next
+    ON diagram_index_retry(next_attempt_at);
