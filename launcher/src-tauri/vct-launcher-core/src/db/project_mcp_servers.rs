@@ -45,12 +45,35 @@ use super::Db;
 ///    MCP" entry).
 pub const BUNDLED_MCP_NAMES: &[&str] = &[
     "code-embedding",
+    "mermaid",
     "ollama",
     "playwright",
     "search",
     "vct-coordination",
     "weaviate-kg",
 ];
+
+/// MCPs that are bundled but DEFAULT-DISABLED per project. The launcher's
+/// project-create flow registers them with `enabled=false` so the user
+/// has to opt in via the launcher GUI before they fire.
+///
+/// Plan §3 Phase 1 item 2: "mermaid — Default-enabled: off (opt-in per
+/// project, unlike Playwright). Reasoning: not all projects need diagrams;
+/// mermaid MCP boot adds ~150 ms."
+///
+/// Keep this list narrow — most bundled MCPs should default to on so the
+/// orchestrator "just works". This list is the explicit opt-out for the
+/// few that don't apply universally.
+pub const BUNDLED_MCP_DEFAULT_DISABLED: &[&str] = &[
+    "mermaid",
+];
+
+/// True iff `name` is bundled AND ships default-disabled (per
+/// `BUNDLED_MCP_DEFAULT_DISABLED`). Used by the per-project install/
+/// populate flow to decide the initial `enabled` flag for a new row.
+pub fn is_default_disabled_mcp(name: &str) -> bool {
+    BUNDLED_MCP_DEFAULT_DISABLED.iter().any(|b| *b == name)
+}
 
 /// True iff `name` is one of the bundled orchestrator MCPs.
 pub fn is_bundled_mcp(name: &str) -> bool {
@@ -250,6 +273,27 @@ impl Db {
         Ok(())
     }
 
+    /// True iff a row exists for (project_id, mcp_name). Used by the
+    /// populate flow to decide whether a default-disabled MCP gets
+    /// its initial `enabled=false` flag (only on fresh inserts —
+    /// re-population MUST preserve the user's toggle).
+    pub fn project_mcp_server_exists(
+        &self,
+        project_id: &str,
+        mcp_name: &str,
+    ) -> Result<bool, String> {
+        let guard = self.lock();
+        let exists: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM project_mcp_servers
+                 WHERE project_id = ?1 AND mcp_name = ?2",
+                params![project_id, mcp_name],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("project_mcp_server_exists: {}", e))?;
+        Ok(exists > 0)
+    }
+
     /// Quick existence check used by the startup backfill: a project
     /// with zero rows is one that was registered before migration 010
     /// shipped and needs a populate-from-disk pass.
@@ -308,6 +352,40 @@ mod tests {
         // Empty string and case sensitivity sanity.
         assert!(!is_bundled_mcp(""));
         assert!(!is_bundled_mcp("Weaviate-KG")); // case-sensitive
+    }
+
+    #[test]
+    fn default_disabled_is_subset_of_bundled() {
+        // Anything in BUNDLED_MCP_DEFAULT_DISABLED must ALSO be in
+        // BUNDLED_MCP_NAMES — the disabled list is an opt-out, not a
+        // separate namespace. Catches a future PR that adds an entry
+        // here without registering it as bundled.
+        for name in BUNDLED_MCP_DEFAULT_DISABLED {
+            assert!(
+                is_bundled_mcp(name),
+                "default-disabled MCP '{}' must also be in BUNDLED_MCP_NAMES",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn default_disabled_includes_mermaid() {
+        // Plan §3 Phase 1 item 2 contract.
+        assert!(is_default_disabled_mcp("mermaid"));
+    }
+
+    #[test]
+    fn default_disabled_excludes_playwright() {
+        // Playwright stays default-enabled (plan calls this out
+        // explicitly as the contrast case).
+        assert!(!is_default_disabled_mcp("playwright"));
+    }
+
+    #[test]
+    fn default_disabled_excludes_unknown() {
+        assert!(!is_default_disabled_mcp("never-shipped"));
+        assert!(!is_default_disabled_mcp(""));
     }
 
     #[test]

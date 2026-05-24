@@ -251,7 +251,8 @@ class BuildEntriesTests(unittest.TestCase):
             # Critical: ollama MCP was deprecated in v0.2.11 (see
             # install.py:_check_ollama_mcp_remnants). Must NOT be in the
             # bundled list. vct-coordination is Pro-tier and also excluded.
-            self.assertEqual(names, ["weaviate-kg", "search"])
+            # Phase 1.2 (diagrams plan): mermaid wrapper appended.
+            self.assertEqual(names, ["weaviate-kg", "search", "mermaid"])
 
     def test_weaviate_entry_shape(self):
         with tempfile.TemporaryDirectory() as td:
@@ -331,11 +332,19 @@ class PythonFallbackWriterTests(unittest.TestCase):
             target = Path(td) / "fake_home" / ".claude.json"
             self.assertFalse(target.exists())
             success, errors = install._python_fallback_write_mcp_entries(target, entries)
-            self.assertEqual(success, 2)
+            # Phase 1.2 (diagrams plan): mermaid wrapper appended → 3 entries.
+            self.assertEqual(success, 3)
             self.assertEqual(errors, [])
             data = json.loads(target.read_text(encoding="utf-8"))
             self.assertIn("weaviate-kg", data["mcpServers"])
             self.assertIn("search", data["mcpServers"])
+            self.assertIn("mermaid", data["mcpServers"])
+            # Mermaid points at the wrapper module, NOT direct npx — the
+            # wrapper spawns npx as its own child.
+            self.assertEqual(
+                data["mcpServers"]["mermaid"]["args"][:2],
+                ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
+            )
             # Ollama MUST NOT be written.
             self.assertNotIn("ollama", data["mcpServers"])
 
@@ -357,7 +366,8 @@ class PythonFallbackWriterTests(unittest.TestCase):
             }
             target.write_text(json.dumps(existing, indent=2), encoding="utf-8")
             success, errors = install._python_fallback_write_mcp_entries(target, entries)
-            self.assertEqual(success, 2)
+            # Phase 1.2 (diagrams plan): mermaid wrapper appended → 3 entries.
+            self.assertEqual(success, 3)
             data = json.loads(target.read_text(encoding="utf-8"))
             # User's pre-existing MCP survives.
             self.assertEqual(
@@ -369,6 +379,7 @@ class PythonFallbackWriterTests(unittest.TestCase):
             # Orchestrator MCPs were added.
             self.assertIn("weaviate-kg", data["mcpServers"])
             self.assertIn("search", data["mcpServers"])
+            self.assertIn("mermaid", data["mcpServers"])
 
     def test_no_secrets_in_written_entries(self):
         """End-to-end: a candidate env with GITHUB_TOKEN never reaches disk."""
@@ -508,7 +519,7 @@ class RegisterMcpsOrchestrationTests(unittest.TestCase):
             )
             data = json.loads(target.read_text(encoding="utf-8"))
             # Critical: orchestrator-written entries must NOT contain GITHUB_TOKEN.
-            for orch_name in ("weaviate-kg", "search"):
+            for orch_name in ("weaviate-kg", "search", "mermaid"):
                 env = data["mcpServers"].get(orch_name, {}).get("env", {})
                 self.assertNotIn(
                     "GITHUB_TOKEN", env,
