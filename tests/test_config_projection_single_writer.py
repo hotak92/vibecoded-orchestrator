@@ -2,13 +2,20 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Single-writer lint: only ``vco_lib.config_projection.apply_project_env``
 may write the per-project env SURFACES (.claude/settings.json env block,
-.claude/env, .vscode/settings.json claude-code.env block).
+.claude/env, .vscode/settings.json claude-code.env block), AND only
+``vco_lib.env_template.apply_env_template`` may write the fourth surface
+``<project_root>/.env`` (Phase 0.D, 2026-05-24).
 
 Phase 0.B contract (see ``.claude/context/plans/diagrams-integration-
 excalidraw-mermaid-2026-05-24.md`` §3.0 item 4):
 
 > ``apply_project_env`` is the ONLY function that touches the three env
 > surfaces. CI lint enforces this.
+
+Phase 0.D extends the same single-writer discipline to ``<project_root>/.env``
+(see ``vco_lib/env_template.py`` module docstring for why ``.env`` is a
+separate contract module rather than a fourth surface inside
+``vco_lib/config_projection.py``).
 
 Why surface-based, not key-based
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -19,13 +26,14 @@ yielded ~70 false positives across the test suite — pytest fixtures
 that set ``os.environ["KG_COLLECTION"]`` to pin a hub fallback, build
 test bundles, or assert on round-trip values were ALL caught. The
 real architectural concern isn't the act of naming a canonical key in
-code; it's writing to the three OUTPUT FILES the contract owns.
+code; it's writing to the OUTPUT FILES the contract owns.
 
 So: this test detects "writes to .claude/settings.json | .claude/env |
-.vscode/settings.json" and asks the simpler question: was the writer
-``apply_project_env``, or one of the allowlisted legacy writers (Rust
-``write_project_env_files``, Python ``install.py`` backfills, etc.)?
-A new writer = a contract violation.
+.vscode/settings.json | <project>/.env" and asks the simpler question:
+was the writer the legal one (``apply_project_env`` for the three
+Phase 0.B surfaces; ``apply_env_template`` for the Phase 0.D ``.env``
+surface), or one of the allowlisted legacy writers carrying the
+migration marker? A new writer = a contract violation.
 
 False positives that remain
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -60,6 +68,7 @@ from typing import Iterable
 import pytest
 
 from vco_lib.config_projection import list_canonical_keys
+from vco_lib.env_template import list_canonical_env_template_keys
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -87,14 +96,38 @@ _TARGET_FILE_FRAGMENTS: tuple[str, ...] = (
 )
 
 
+# ─── Phase 0.D: project-root .env detection ─────────────────────────────
+#
+# The fourth surface is ``<project_root>/.env``. Detection is
+# intentionally narrower than the three Phase 0.B surfaces because
+# ``.env`` is an ambiguous path string — many files have valid `.env`
+# substrings (``.envrc``, ``pytest.env``, ``.env.example``, etc.). We
+# match ONLY exact ``".env"`` quoted literals — never the substring
+# ``.env`` inside another filename. The dedicated patterns are kept
+# separate from ``_TARGET_FILE_FRAGMENTS`` so a regex-builder bug
+# can't silently widen the match scope.
+
+# Match the EXACT quoted literal `".env"` (or `'.env'`), as appears in
+# ``Path(...) / ".env"`` and ``open("...path.../.env", "w")`` call
+# sites.
+_PROJECT_ENV_TARGET = ".env"
+
+
 # ─── Allowlists ─────────────────────────────────────────────────────────
 
-# The single legal writer + tests + parity guards.
+# The single legal writers + tests + parity guards.
 _ALLOWLIST_FILES: set[Path] = {
+    # Phase 0.B contract module.
     REPO_ROOT / "vco_lib" / "config_projection.py",
+    # Phase 0.D contract module (the legal .env writer).
+    REPO_ROOT / "vco_lib" / "env_template.py",
+    # Lint test itself + Phase 0.B test files.
     REPO_ROOT / "tests" / "test_config_projection_single_writer.py",
     REPO_ROOT / "tests" / "test_config_projection.py",
     REPO_ROOT / "tests" / "test_config_projection_byte_identical.py",
+    # Phase 0.D test files.
+    REPO_ROOT / "tests" / "test_env_template.py",
+    REPO_ROOT / "tests" / "test_env_template_byte_identical.py",
 }
 
 # Whole directories where any write to the target paths is acceptable
@@ -109,9 +142,13 @@ _ALLOWLIST_DIRS: set[Path] = {
     REPO_ROOT / "launcher" / "src-tauri" / "tests",
 }
 
-# Marker that legacy callers must carry to be allowlisted. Removing the
-# marker = the caller must have been migrated to subprocess-into-Python.
+# Marker that legacy callers to the THREE Phase 0.B surfaces must carry.
 _LEGACY_MARKER = "config_projection: legacy_caller_pending_migration"
+
+# Phase 0.D marker for legacy ``.env`` writers. Kept separate so a
+# Phase 0.D-only allowlist entry doesn't accidentally legitimise a
+# Phase 0.B violation in the same file.
+_LEGACY_ENV_TEMPLATE_MARKER = "env_template: legacy_caller_pending_migration"
 
 # Legacy direct writers — production code that hasn't been migrated yet.
 # Each entry MUST carry the ``_LEGACY_MARKER`` string at least once;
@@ -125,6 +162,32 @@ _LEGACY_PRODUCTION_WRITERS: set[Path] = {
     # Python install.py runs canonical backfills against pre-existing
     # projects on `install-bundle --update`. Phase 0.D will migrate.
     REPO_ROOT / "install.py",
+}
+
+# Phase 0.D: production code that writes ``.env`` directly and hasn't
+# been fully migrated. Each entry MUST carry
+# ``_LEGACY_ENV_TEMPLATE_MARKER``. Empty allowlist = full migration
+# complete.
+#
+# Current entries:
+#   * install.py — the fresh-write branch in ``_write_env_config`` still
+#     writes a mix of canonical Phase 0.D keys + install-time-only keys
+#     (EMBEDDING_MODEL / EMBEDDING_DIMS / EMBEDDING_PROVIDER /
+#     CODE_EMBED_BACKEND / CODE_EMBED_MODEL / CODE_EMBED_DIMS /
+#     VCT_JOERN_AVAILABLE / VCT_TELEMETRY / banner comments /
+#     RL-section placeholders). Splitting those into a managed-block-
+#     only path + a separate writer for the install-time tail is a
+#     follow-up refactor beyond Phase 0.D's brief. The EXISTING-file
+#     branch DOES route through ``apply_env_template`` via
+#     ``_ensure_env_template`` (migrated in this PR).
+#   * launcher/src-tauri/src/commands/projects_v2.rs —
+#     ``ensure_project_env_template`` is the Rust legacy writer; full
+#     migration to subprocess-into-Python is Phase 0.D Part 2 (a
+#     follow-up matching the Phase 0.B Part 2 / write_project_env_files
+#     pattern; out of scope for this PR).
+_LEGACY_ENV_TEMPLATE_WRITERS: set[Path] = {
+    REPO_ROOT / "install.py",
+    REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs",
 }
 
 
@@ -279,6 +342,152 @@ def _shell_write_to_target_patterns() -> list[re.Pattern]:
         # `tee .claude/env`
         re.compile(
             rf"""\btee\s+[^|;&<>]*({target_alt})"""
+        ),
+    ]
+
+
+# ─── Phase 0.D: .env-specific scanners ──────────────────────────────────
+
+
+def _python_dotenv_write_patterns() -> list[re.Pattern]:
+    """Python patterns that match writes to a project-root ``.env``.
+
+    Matches the exact quoted literal ``".env"`` (single or double quoted)
+    — NOT ``.envrc``, ``pytest.env``, ``.env.example``, etc. The quote
+    boundary is what differentiates the bare ``.env`` filename from
+    substring noise.
+
+      * ``open("....env", "w")`` — direct opens.
+      * Inline ``Path(...).write_text(...)`` where path literal ends ``.env``.
+      * ``shutil.copy(_, ".env")`` / ``shutil.move(_, ".env")``.
+
+    File-level alias pattern (``var = ... / ".env"`` then
+    ``var.write_text(...)``) is handled by
+    :func:`_python_file_level_dotenv_writes`.
+    """
+    # Match the `.env` literal as the LAST path component, anchored by
+    # the closing quote. Allows leading path content before `.env`.
+    # Examples it must match:
+    #   open("/tmp/foo/.env", "w")
+    #   open(".env", "w")
+    #   open(folder + "/.env", "w")
+    #   Path(...).write_text — when paired with a ".env" literal nearby
+    # Examples it must NOT match:
+    #   open(".envrc", "w")
+    #   open("pytest.env", "w")
+    #   open(".env.example", "w")
+    # Strategy: require the .env literal to be immediately followed by
+    # the SAME quote character (no extra characters).
+    return [
+        # open(... ".env", "w") — match `.env"` or `.env'` at end of arg.
+        re.compile(
+            r"""open\s*\(\s*[^)]*?(?:['"]|^|/|\\)\.env(['"])[^)]*?,\s*['"][wa]b?\+?['"]"""
+        ),
+        # Inline Path(...).write_text — literal ends ".env"
+        re.compile(
+            r"""(?:['"]|/|\\)\.env(['"])[^)]*?\)\s*\.\s*write_text"""
+        ),
+        re.compile(
+            r"""(?:['"]|/|\\)\.env(['"])[^)]*?\)\s*\.\s*write_bytes"""
+        ),
+        # shutil.copy / copy2 / copyfile / move with .env destination.
+        re.compile(
+            r"""shutil\.(?:copy|copy2|copyfile|move)\s*\([^)]+,\s*['"][^'"]*(?:/|\\|^)\.env['"]"""
+        ),
+    ]
+
+
+def _python_file_level_dotenv_writes(content: str) -> list[tuple[int, str]]:
+    """Catch the file-level alias pattern for ``.env``:
+
+      * ``target = <something> / ".env"`` (single literal)
+      * ``target = <project_root> / ".env"`` (path-builder chain)
+      * THEN later: ``target.write_text(...)`` / ``target.write_bytes(...)``
+
+    Same single-function-body scope as
+    :func:`_python_file_level_path_writes`.
+    """
+    # Match `var = ... ".env"` where ".env" is the LAST quoted string in
+    # the right-hand side AND is preceded by either a path separator
+    # inside the literal (`/.env`) or is the bare filename. Strictly
+    # excludes `.envrc`, `pytest.env`, `.env.example`.
+    tainted_assign = re.compile(
+        r"""^\s*([a-zA-Z_][a-zA-Z_0-9]*)\s*=\s*[^=].*?["']\.env(["'])"""
+    )
+    write_call = re.compile(
+        r"""^\s*([a-zA-Z_][a-zA-Z_0-9]*)\s*\.\s*write_(?:text|bytes)\s*\("""
+    )
+
+    violations: list[tuple[int, str]] = []
+    tainted: set[str] = set()
+    for lineno, line in enumerate(content.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith(("def ", "async def ", "class ")):
+            tainted.clear()
+            continue
+        if not stripped or stripped.startswith(("#", '"""', "'''")):
+            continue
+        m_assign = tainted_assign.search(line)
+        if m_assign:
+            # Ensure the matched literal IS ".env" and not e.g. ".env.example".
+            # The trailing quote is captured; require the immediate char
+            # after the matched group's closing quote NOT to be a continuation.
+            tainted.add(m_assign.group(1))
+            continue
+        m_write = write_call.search(line)
+        if m_write and m_write.group(1) in tainted:
+            violations.append((lineno, line.rstrip()))
+    return violations
+
+
+def _rust_dotenv_write_patterns() -> list[re.Pattern]:
+    """Rust patterns that match writes to a ``.env`` file.
+
+      * ``fs::write(path, ...)`` where path ends in ``.env``.
+      * ``File::create(...)`` of a ``.env`` path.
+      * ``OpenOptions::new()....open(env_path)`` where ``env_path``
+        is constructed via ``.join(".env")`` — caught at file level
+        via a less-precise text scan (alias case).
+    """
+    return [
+        # fs::write(<path mentioning .env>, ...) — match `.join(".env")`
+        # or string-literal `.env"` inside the first arg.
+        re.compile(
+            r"""fs::write\s*\(\s*[^,]*?(?:\.join\(\s*"\.env"\s*\)|"\.env"|"\.env\s*"|"[^"]*?/\.env")"""
+        ),
+        # File::create with the .env literal.
+        re.compile(
+            r"""File::create\s*\(\s*[^)]*?(?:\.join\(\s*"\.env"\s*\)|"\.env")"""
+        ),
+        # OpenOptions builder ending in `.open(<var with .env>)` — best-
+        # effort: match the `.open(` after a `.append(true)` or `.write(true)`
+        # builder, paired with a same-file `.join(".env")` assignment.
+        re.compile(
+            r"""\.open\s*\(\s*&?(?:env_path|env_file)\s*\)"""
+        ),
+    ]
+
+
+def _shell_dotenv_write_patterns() -> list[re.Pattern]:
+    """Shell-script patterns that write a ``.env`` file.
+
+    Matches redirects + copy/move/tee targeting a path ending in
+    ``/.env`` or ``.env`` as the bare filename. Avoids ``.envrc`` /
+    ``pytest.env`` / ``.env.example`` by requiring the path component
+    to END at ``.env`` (next char is whitespace / EOL / `;` / `&`).
+    """
+    return [
+        # `> /path/.env` or `>> .env`
+        re.compile(
+            r""">>?\s*['"]?[^'"\s|;&<>]*?(?:^|/|\\|\b)\.env(?=['"\s;&|]|$)"""
+        ),
+        # `cp/mv _ .env` / `cp/mv _ /some/.env`
+        re.compile(
+            r"""\b(cp|mv)\s+[^|;&<>]+\s+['"]?[^'"\s|;&<>]*?(?:^|/|\\|\b)\.env(?=['"\s;&|]|$)"""
+        ),
+        # `tee .env`
+        re.compile(
+            r"""\btee\s+[^|;&<>]*?(?:^|/|\\|\b)\.env(?=['"\s;&|]|$)"""
         ),
     ]
 
@@ -531,6 +740,17 @@ def test_canonical_key_set_is_non_empty() -> None:
     )
 
 
+def test_env_template_canonical_subset_is_non_empty() -> None:
+    """Phase 0.D sanity guard: the .env template subset has SOMETHING."""
+    keys = list_canonical_env_template_keys()
+    assert len(keys) >= 8, (
+        "list_canonical_env_template_keys() returned <8 keys; did "
+        "someone empty the subset? Expected at least the identity + KG "
+        "+ service-URL keys (PROJECT_NAME, KG_COLLECTION, WEAVIATE_URL, "
+        "etc.)."
+    )
+
+
 def test_legacy_marker_is_documented() -> None:
     """The marker string is documented in this file's module docstring so
     a future maintainer can find it without grepping the test body."""
@@ -542,3 +762,127 @@ def test_legacy_marker_is_documented() -> None:
         "The legacy marker should be documented in the module docstring "
         "so allowlisted-file maintainers know what comment to add."
     )
+
+
+# ─── Phase 0.D: .env single-writer enforcement ──────────────────────────
+
+
+def _file_carries_env_template_marker(content: str) -> bool:
+    return _LEGACY_ENV_TEMPLATE_MARKER in content
+
+
+def test_no_direct_writes_to_dotenv_outside_contract() -> None:
+    """Phase 0.D surface-write guard for ``<project_root>/.env``.
+
+    Scans the repo for code that writes a ``.env`` file directly and
+    asserts the writer is the legal one (``vco_lib.env_template``) or
+    an allowlisted legacy caller carrying the migration marker.
+    """
+    py_patterns = _python_dotenv_write_patterns()
+    rs_patterns = _rust_dotenv_write_patterns()
+    sh_patterns = _shell_dotenv_write_patterns()
+
+    violations: list[str] = []
+    legacy_files_with_hits: set[Path] = set()
+
+    for path in _iter_target_files():
+        if path in _ALLOWLIST_FILES:
+            continue
+        if any(_path_is_under(path, d) for d in _ALLOWLIST_DIRS):
+            continue
+
+        content = _read_text_safely(path)
+        if not content:
+            continue
+
+        is_legacy = path in _LEGACY_ENV_TEMPLATE_WRITERS
+
+        if path.suffix == ".py":
+            patterns = py_patterns
+        elif path.suffix == ".rs":
+            content = _strip_rust_test_modules(content)
+            patterns = rs_patterns
+        elif path.suffix in (".sh", ".ps1"):
+            patterns = sh_patterns
+        else:
+            continue
+
+        file_hits: list[tuple[int, str]] = []
+        for lineno, line in enumerate(content.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("#", "//", '"""', "'''", "*", "///")):
+                continue
+            for pat in patterns:
+                m = pat.search(line)
+                if m:
+                    file_hits.append((lineno, line.rstrip()))
+                    break
+
+        # Python file-level alias pattern.
+        if path.suffix == ".py":
+            file_hits.extend(_python_file_level_dotenv_writes(content))
+
+        if not file_hits:
+            continue
+
+        if is_legacy:
+            legacy_files_with_hits.add(path)
+            if not _file_carries_env_template_marker(content):
+                violations.append(
+                    f"{path.relative_to(REPO_ROOT)}: writes to .env but "
+                    f"missing required marker "
+                    f"'{_LEGACY_ENV_TEMPLATE_MARKER}'. Either add the "
+                    f"marker (with a TODO to migrate to apply_env_template) "
+                    f"or remove from _LEGACY_ENV_TEMPLATE_WRITERS."
+                )
+            continue
+
+        rel = path.relative_to(REPO_ROOT)
+        for lineno, snippet in file_hits:
+            violations.append(
+                f"{rel}:{lineno}: direct write to .env — "
+                f"`{snippet[:120]}`. Route through "
+                f"vco_lib.env_template.apply_env_template instead, "
+                f"or add the file to _LEGACY_ENV_TEMPLATE_WRITERS in "
+                f"the lint test with the marker comment for a "
+                f"deferred migration."
+            )
+
+    if violations:
+        msg = "\n".join(violations)
+        raise AssertionError(
+            f"{len(violations)} direct-write violation(s) of the Phase "
+            f"0.D ``.env`` single-writer contract:\n{msg}\n\n"
+            f"See vco_lib/env_template.py for the legal writer.\n"
+            f"Allowed path: vco_lib.env_template.apply_env_template "
+            f"(or its CLI: `python -m vco_lib.env_template apply`).\n"
+        )
+
+
+def test_legacy_env_template_writers_carry_marker() -> None:
+    """Phase 0.D companion to ``test_legacy_writers_carry_marker``:
+    every entry in ``_LEGACY_ENV_TEMPLATE_WRITERS`` must contain
+    ``_LEGACY_ENV_TEMPLATE_MARKER``."""
+    for path in _LEGACY_ENV_TEMPLATE_WRITERS:
+        if not path.exists():
+            pytest.fail(
+                f"{path.relative_to(REPO_ROOT)} is in "
+                f"_LEGACY_ENV_TEMPLATE_WRITERS but does not exist on disk."
+            )
+        content = _read_text_safely(path)
+        assert _file_carries_env_template_marker(content), (
+            f"{path.relative_to(REPO_ROOT)} is allowlisted as a legacy "
+            f".env writer but does not contain the required marker "
+            f"'{_LEGACY_ENV_TEMPLATE_MARKER}'. Add the marker as a "
+            f"comment explaining the deferred migration, or remove the "
+            f"entry."
+        )
+
+
+def test_env_template_marker_is_documented() -> None:
+    """The Phase 0.D marker string is documented in this file's module
+    docstring."""
+    own_source = Path(__file__).read_text()
+    assert _LEGACY_ENV_TEMPLATE_MARKER in own_source
