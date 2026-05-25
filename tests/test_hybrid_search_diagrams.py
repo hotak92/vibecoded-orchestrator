@@ -172,7 +172,16 @@ def test_diagrams_access_list_explicit_var(monkeypatch, fresh_server):
     assert "C_Diagrams" in diagrams
 
 
-def test_diagrams_access_falls_back_to_kg_list(monkeypatch, fresh_server):
+def test_diagrams_access_does_not_fall_back_to_kg_list(monkeypatch, fresh_server):
+    """v0.2.34 A7 regression guard.
+
+    Pre-v0.2.34 (Phase 1.5.C) the MCP fell back to ``VCT_KG_ACCESS_LIST``
+    when ``VCT_DIAGRAMS_ACCESS_LIST`` was unset — wrong granularity:
+    granting KG access leaked diagram visibility. A7 removed the
+    fallback. With KG access set + diagrams-specific UNSET, peers must
+    NOT appear in the diagrams fan-out (only the project's own
+    DIAGRAMS_COLLECTION is searched).
+    """
     _set_env(
         monkeypatch,
         KG_COLLECTION="A_KnowledgeGraph",
@@ -184,10 +193,10 @@ def test_diagrams_access_falls_back_to_kg_list(monkeypatch, fresh_server):
     )
     server = fresh_server()
     diagrams = server._diagrams_collections_to_search()
-    # Phase 1.5.C documented simplification: when diagrams-specific var
-    # is unset, fall back to the KG access list (same access surface).
-    assert "B_Diagrams" in diagrams
-    assert "C_Diagrams" in diagrams
+    # Only self — KG-only grant must NOT leak into diagrams.
+    assert diagrams == ["A_Diagrams"]
+    assert "B_Diagrams" not in diagrams
+    assert "C_Diagrams" not in diagrams
 
 
 def test_diagrams_no_duplicates(monkeypatch, fresh_server):

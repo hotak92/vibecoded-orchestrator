@@ -231,6 +231,15 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "VCT_INFRASTRUCTURE_DIR",
     "VCT_KG_ACCESS_LIST",
     "VCT_CODE_GRAPH_ACCESS_LIST",
+    # Diagrams cross-project visibility (v0.2.34, A7). Previously the MCP
+    # piggybacked on ``VCT_KG_ACCESS_LIST`` — wrong granularity: granting
+    # KG access leaked diagram visibility, and granting diagram-only
+    # access never reached the MCP. This key is sourced from the
+    # ``diagram_access`` SQLite table (joined to ``projects.name`` on
+    # the grantor side) and consumed by ``weaviate_mcp/server.py::
+    # _diagrams_peer_collections`` with no fallback to the KG list.
+    # Conditionally emitted: omitted when no peers granted diagram read.
+    "VCT_DIAGRAMS_ACCESS_LIST",
     "GITHUB_TOKEN",
 )
 
@@ -495,6 +504,52 @@ def _fetch_code_graph_access_list(
     return sorted({str(r["slug"]) for r in cur.fetchall()})
 
 
+def _fetch_diagram_access_list(
+    conn: sqlite3.Connection, project_id: str
+) -> list[str]:
+    """Resolve the ``VCT_DIAGRAMS_ACCESS_LIST`` value.
+
+    Joins ``diagram_access`` to ``projects`` on the grantor side, pulling
+    the grantor's display ``name``. The MCP consumer
+    (``weaviate_mcp/server.py::_diagrams_peer_collections``) sanitises
+    each name through ``_sanitize_collection_prefix`` and appends
+    ``_Diagrams`` to derive the canonical Weaviate class name.
+
+    Why ``p.name`` and not ``p.slug`` (as ``VCT_CODE_GRAPH_ACCESS_LIST``
+    uses): the diagrams collection-prefix derivation is currently keyed
+    on the project NAME (sanitised) — same rule the launcher's
+    ``project_diagrams`` indexer uses when it writes
+    ``<SanitizedName>_Diagrams`` rows into Weaviate. Switching to slugs
+    would create a prefix mismatch between writer and reader.
+
+    Excludes self by construction — the ``diagram_access`` schema's
+    grantor/grantee pair is always cross-project (no self-grants).
+    Empty / blank names are filtered (defensive against malformed DB
+    rows; mirrors ``_fetch_kg_access_list``'s defensive prefix check).
+
+    SQL uses parameterised ``?`` — no string concat. Same prepared-
+    statement discipline as the sibling resolvers in this module.
+
+    Phase 1.5.C (2026-05-24) had the MCP piggyback on
+    ``VCT_KG_ACCESS_LIST`` as a temporary simplification. v0.2.34 A7
+    splits the two: the MCP now reads ``VCT_DIAGRAMS_ACCESS_LIST``
+    exclusively (no KG fallback), and this resolver is the single
+    legal writer of that env var.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.name FROM diagram_access da "
+        "JOIN projects p ON p.id = da.grantor_project_id "
+        "WHERE da.grantee_project_id = ? AND da.access_level = 'read' "
+        "ORDER BY p.name",
+        (project_id,),
+    )
+    # Use a set for dedup, sort for deterministic output (matches the
+    # ORDER BY in the SQL but defends against the case where two
+    # grantors share a name — sort+dedup keeps the env var stable).
+    return sorted({str(r["name"]) for r in cur.fetchall() if r["name"]})
+
+
 # ─── Sanitization (mirrors Rust ``sanitize_kg_collection``) ─────────────
 #
 # Same rule as ``vco_lib.project_init.sanitize_for_weaviate_class``:
@@ -649,6 +704,11 @@ def project_env_from_db(
             shared_kg=shared_kg,
         )
         code_graph_access = _fetch_code_graph_access_list(conn, project_id)
+        # v0.2.34 A7: independent diagrams access matrix. Previously the
+        # MCP fell back to VCT_KG_ACCESS_LIST, which had the wrong
+        # granularity (granting KG leaked diagrams; granting only
+        # diagrams was invisible to the MCP). See `_fetch_diagram_access_list`.
+        diagram_access = _fetch_diagram_access_list(conn, project_id)
 
         # Module settings — orchestrator-core scope.
         shared_kg_write_disabled = _fetch_module_setting_bool(
@@ -729,6 +789,13 @@ def project_env_from_db(
         _set("VCT_KG_ACCESS_LIST", ",".join(kg_access))
     if code_graph_access:
         _set("VCT_CODE_GRAPH_ACCESS_LIST", ",".join(code_graph_access))
+    if diagram_access:
+        # v0.2.34 A7. CSV of grantor project NAMES (not slugs); the MCP
+        # sanitises + appends `_Diagrams`. Conditionally emitted: omitted
+        # when no peers granted diagram read — matches the access-list
+        # omit semantics used for VCT_KG_ACCESS_LIST and
+        # VCT_CODE_GRAPH_ACCESS_LIST (signal-to-remove on apply).
+        _set("VCT_DIAGRAMS_ACCESS_LIST", ",".join(diagram_access))
 
     # GITHUB_TOKEN intentionally NOT resolved here. The Rust resolver
     # pulls it from the OS keychain with active-flag gating; replicating

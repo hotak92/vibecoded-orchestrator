@@ -38,6 +38,13 @@ Adding a new key requires updating both the Python registry AND the Rust
 `CANONICAL_INSTALL_ENV_KEYS` const in
 `launcher/src-tauri/src/commands/projects_v2.rs`.
 
+**v0.2.34 update (A7)** — `VCT_DIAGRAMS_ACCESS_LIST` joined the canonical key
+set. Sourced from `diagram_access` (joined to `projects.name`) and consumed
+by `weaviate_mcp/server.py::_diagrams_peer_collections`. Replaces the Phase
+1.5.C piggyback on `VCT_KG_ACCESS_LIST` that had wrong granularity (KG-only
+grants leaked diagram visibility; diagram-only grants were invisible to the
+MCP). Hub-side parallel field: `diagrams_access_list` on `ProjectConfigResponse`.
+
 ## Why a contract and not just a function
 
 Pre-Phase-0, env values reached on-disk surfaces via **four independent

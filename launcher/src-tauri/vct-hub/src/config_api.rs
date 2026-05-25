@@ -215,6 +215,21 @@ struct ProjectConfigResponse {
     embedding_models: EmbeddingModels,
     kg_access_list: Vec<String>,
     codegraph_access_list: Vec<String>,
+    /// v0.2.34 A7 — peer-project diagrams collection names this
+    /// project may search. Sourced from the ``diagram_access`` table
+    /// (grantor side joined to ``projects.name`` for the grantee =
+    /// this project), then sanitised + suffixed to canonical Weaviate
+    /// class names (``<SanitizedName>_Diagrams``).
+    ///
+    /// Discrete from ``kg_access_list``: pre-v0.2.34 the MCP fell
+    /// back to the KG list (wrong granularity). The MCP now reads
+    /// this field via ``ProjectConfig.diagrams_access_list`` with
+    /// no KG fallback. Additive field — pre-v0.2.34 clients see an
+    /// unknown field and ignore it; pre-v0.2.34 hubs paired with
+    /// v0.2.34+ clients fall back to the env CSV
+    /// (``VCT_DIAGRAMS_ACCESS_LIST`` — written by the Python
+    /// ``config_projection`` contract via the same JOIN).
+    diagrams_access_list: Vec<String>,
     weaviate_url: String,
     ollama_url: String,
     grpc_port: u16,
@@ -322,6 +337,27 @@ async fn project_config(
         Ok(v) => v,
         Err(e) => return db_error_response("list codegraph access", e),
     };
+
+    // 5b. Diagrams access matrix (v0.2.34 A7). Same JOIN shape as the
+    // codegraph variant above, but reads ``diagram_access`` and
+    // pulls ``projects.name`` (display name) rather than ``slug`` —
+    // the diagrams collection-naming rule keys on the canonicalised
+    // project NAME (the indexer writes ``<SanitizedName>_Diagrams``
+    // rows into Weaviate). Returns the already-canonical Weaviate
+    // class names so the MCP can use them as-is (mirrors the
+    // kg_access_list contract: hub returns canonical class names,
+    // env-fallback returns raw names + MCP sanitises).
+    let diagrams_access_list_raw =
+        match list_diagram_grantor_names_for_grantee(&h.0, &project.id) {
+            Ok(v) => v,
+            Err(e) => return db_error_response("list diagram access", e),
+        };
+    let mut diagrams_access_list: Vec<String> = diagrams_access_list_raw
+        .iter()
+        .map(|name| format!("{}_Diagrams", sanitize_diagrams_class_prefix(name)))
+        .collect();
+    diagrams_access_list.sort();
+    diagrams_access_list.dedup();
 
     // 6. active_embedding (module_settings → orchestrator-core).
     // Default 'qwen3' matches the launcher's compiled default.
@@ -494,6 +530,7 @@ async fn project_config(
         },
         kg_access_list,
         codegraph_access_list,
+        diagrams_access_list,
         weaviate_url,
         ollama_url,
         grpc_port,
@@ -585,6 +622,85 @@ fn list_codegraph_grantor_slugs_for_grantee(
         .map_err(|e| format!("query list_codegraph_grantor_slugs: {}", e))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("collect list_codegraph_grantor_slugs: {}", e))
+}
+
+/// JOIN over ``diagram_access`` (grantee filter) + ``projects``
+/// (grantor name lookup). Returns the list of grantor project NAMES
+/// (display names — ``projects.name``) whose diagrams this project
+/// may search.
+///
+/// v0.2.34 A7. Mirrors ``list_codegraph_grantor_slugs_for_grantee``
+/// in shape but reads from a different access-matrix table and
+/// pulls the display NAME rather than ``slug`` — the diagrams
+/// indexer's collection-naming rule keys on the canonicalised
+/// project name, not the slug. Caller is expected to sanitise +
+/// suffix the returned names into ``<Sanitized>_Diagrams`` class
+/// names; this helper stays close to the raw DB shape so a future
+/// caller that wants names for a different purpose (audit panel,
+/// UI rendering) can consume them directly.
+///
+/// Inlined here rather than promoted to vct-launcher-core for the
+/// same reason as the codegraph sibling: single caller today.
+/// Parameterised SQL — no string concat.
+fn list_diagram_grantor_names_for_grantee(
+    db: &vct_launcher_core::db::Db,
+    grantee_project_id: &str,
+) -> Result<Vec<String>, String> {
+    let guard = db.lock();
+    let mut stmt = guard
+        .prepare(
+            "SELECT p.name
+               FROM diagram_access da
+               JOIN projects p ON p.id = da.grantor_project_id
+              WHERE da.grantee_project_id = ?1
+                AND da.access_level = 'read'
+              ORDER BY p.name",
+        )
+        .map_err(|e| format!("prepare list_diagram_grantor_names: {}", e))?;
+    let rows = stmt
+        .query_map(params![grantee_project_id], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("query list_diagram_grantor_names: {}", e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("collect list_diagram_grantor_names: {}", e))
+}
+
+/// Sanitiser for a project display name → Weaviate class prefix used
+/// in diagrams collection names (``<Sanitized>_Diagrams``).
+///
+/// Mirrors the Python ``_sanitize_collection_prefix`` in
+/// ``claude_mcp_servers/weaviate_mcp/server.py`` (which is the
+/// indexer's writer-side rule). Critical: returns the SAME class
+/// prefix the indexer wrote, so the hub-resolved
+/// ``diagrams_access_list`` round-trips against the actual
+/// collection names in Weaviate.
+///
+/// Rule (matches Python):
+///   1. Replace each non ``[A-Za-z0-9_]`` char with ``_``.
+///   2. Capitalize the first char if it's lowercase.
+///
+/// Distinct from ``sanitize_collection_prefix`` (slug → codegraph
+/// prefix) above: that one trims underscores (sanitised slugs are
+/// hyphen-shaped); this one preserves them (display names commonly
+/// contain underscores that the indexer KEEPS verbatim).
+fn sanitize_diagrams_class_prefix(project_name: &str) -> String {
+    let mut out = String::with_capacity(project_name.len());
+    for ch in project_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let mut chars = out.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {
+            let mut result = String::with_capacity(out.len());
+            result.push(first.to_ascii_uppercase());
+            result.extend(chars);
+            result
+        }
+        _ => out,
+    }
 }
 
 /// Compute Claude Code's session-jsonl directory for a workspace.
@@ -1351,6 +1467,175 @@ kg_tier_full = 0.8
             obj.get("schema_version").and_then(|v| v.as_u64()),
             Some(RESOLVER_PROTOCOL_VERSION as u64),
         );
+    }
+
+    /// Seed a project with an explicit display NAME (distinct from the
+    /// slug). The default `seed_full_project` helper hard-codes
+    /// "Test Display Name" which is fine for tests that only care
+    /// about IDs / slugs, but A7's diagrams resolver reads
+    /// `projects.name` and sanitises it into a class prefix — so
+    /// per-test distinct names are needed for the cross-grant assertions.
+    fn seed_project_with_distinct_name(
+        handle: &LauncherDbHandle,
+        id: &str,
+        name: &str,
+        slug: &str,
+    ) {
+        let folder = format!("/tmp/test-config-project-{}", id);
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = handle.0.lock();
+        guard
+            .execute(
+                "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'base', ?4, ?5, ?5)",
+                rusqlite::params![id, name, folder, slug, now],
+            )
+            .unwrap();
+        drop(guard);
+        handle
+            .0
+            .set_project_kg_binding(
+                id,
+                "primary",
+                &format!("{}_KnowledgeGraph", capitalize(slug)),
+                Some("qwen3-embedding:0.6b"),
+                Some(1024),
+                None,
+                None,
+                &empty_json_obj(),
+            )
+            .unwrap();
+        handle
+            .0
+            .set_project_kg_binding(
+                id,
+                "shared",
+                "VibeCodedOrchestrator_KnowledgeGraph",
+                Some("qwen3-embedding:0.6b"),
+                Some(1024),
+                None,
+                None,
+                &empty_json_obj(),
+            )
+            .unwrap();
+        handle
+            .0
+            .set_project_kg_binding(
+                id,
+                "archive",
+                &format!("{}_Development", capitalize(slug)),
+                Some("qwen3-embedding:0.6b"),
+                Some(1024),
+                None,
+                None,
+                &empty_json_obj(),
+            )
+            .unwrap();
+        handle
+            .0
+            .set_project_codegraph_binding(
+                id,
+                &capitalize(slug),
+                Some("CodeSage-Large-v2"),
+                Some(2048),
+                None,
+                None,
+                true,
+                &empty_json_obj(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_diagrams_access_list_resolves_grantor_names() {
+        // v0.2.34 A7 — independent diagrams access matrix. Project A
+        // grants project B read access to A's diagrams; B's resolver
+        // response must list A's *_Diagrams collection name. The
+        // grant uses `set_diagram_access` (project-id-based) and the
+        // hub joins back to projects.name + sanitises.
+        let (base, h) = spawn_config_api_hub().await;
+        seed_project_with_distinct_name(&h, "proj-a", "ProjectA", "project-a");
+        seed_project_with_distinct_name(&h, "proj-b", "ProjectB", "project-b");
+        h.0.set_diagram_access("proj-a", "proj-b", "read").unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/proj-b/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let dg_list: Vec<String> = body
+            .get("diagrams_access_list")
+            .and_then(|v| v.as_array())
+            .expect("diagrams_access_list present")
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        // ProjectA → sanitised "ProjectA" + "_Diagrams"
+        assert!(
+            dg_list.contains(&"ProjectA_Diagrams".to_string()),
+            "expected ProjectA_Diagrams, got: {:?}",
+            dg_list,
+        );
+
+        // Inverse: A's response must NOT contain B's diagrams collection
+        // (no grant the other way).
+        let resp_a = reqwest::get(format!("{}/projects/proj-a/config", base))
+            .await
+            .expect("hub reachable");
+        let body_a: serde_json::Value = resp_a.json().await.expect("json body");
+        let dg_list_a: Vec<String> = body_a
+            .get("diagrams_access_list")
+            .and_then(|v| v.as_array())
+            .expect("diagrams_access_list present")
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(
+            !dg_list_a.contains(&"ProjectB_Diagrams".to_string()),
+            "ProjectB_Diagrams should NOT be in proj-a's list: {:?}",
+            dg_list_a,
+        );
+    }
+
+    #[tokio::test]
+    async fn config_diagrams_access_list_independent_of_kg_access() {
+        // Granular bug guard: granting KG access alone must NOT leak
+        // diagrams visibility, and vice versa. Pre-v0.2.34 the MCP
+        // piggybacked VCT_KG_ACCESS_LIST → granting KG leaked diagrams.
+        let (base, h) = spawn_config_api_hub().await;
+        seed_project_with_distinct_name(&h, "p-a", "ProjectA", "project-a");
+        seed_project_with_distinct_name(&h, "p-b", "ProjectB", "project-b");
+        // KG-only grant (A → B).
+        h.0.kg_set_access("p-b", "ProjectA_KnowledgeGraph", "read")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-b/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let dg_list: Vec<String> = body
+            .get("diagrams_access_list")
+            .and_then(|v| v.as_array())
+            .expect("diagrams_access_list present")
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(
+            dg_list.is_empty(),
+            "KG-only grant must NOT populate diagrams_access_list, got: {:?}",
+            dg_list,
+        );
+    }
+
+    #[test]
+    fn sanitize_diagrams_class_prefix_matches_python_rule() {
+        // Mirrors python `_sanitize_collection_prefix` in weaviate MCP.
+        assert_eq!(sanitize_diagrams_class_prefix("Foo"), "Foo");
+        assert_eq!(sanitize_diagrams_class_prefix("foo"), "Foo");
+        assert_eq!(sanitize_diagrams_class_prefix("Foo Bar"), "Foo_Bar");
+        assert_eq!(sanitize_diagrams_class_prefix("foo-bar"), "Foo_bar");
+        assert_eq!(sanitize_diagrams_class_prefix("My_Project"), "My_Project");
+        assert_eq!(sanitize_diagrams_class_prefix(""), "");
     }
 
     #[tokio::test]
