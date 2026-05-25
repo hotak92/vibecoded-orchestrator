@@ -106,11 +106,104 @@ maintain.
 
 ## Out of scope
 
-* User-bucket secrets (`user_secret_pairs` / `user_secret_known_keys`
-  in `ProjectEnvSettings`). Lifecycle B's active-flag gate is currently
-  Rust-only; bridging to Python is a follow-up.
 * `GITHUB_TOKEN` keychain-resolved emission. Stays in the Rust resolver
   until a keychain bridge from Python exists.
+
+## Phase 0.E — user-secret writes through Python contract (2026-05-25)
+
+Phase 0.B explicitly excluded `user_secret_pairs` / `user_secret_known_keys`
+because their VALUE side lives in the OS keychain (Rust-owned; no Python
+bridge). Phase 0.E extends the contract to cover their WRITE side without
+bridging the keychain — the asymmetry is intentional:
+
+* The Rust caller resolves keychain VALUES via the existing
+  `commands::project_env_settings::resolve_user_secret_state` code path.
+* The Rust caller serialises the resolved pairs to JSON and invokes
+  `python -m vco_lib.config_projection apply-user-secrets
+   --project-id <id> --pairs-json <file>`.
+* Python owns the **byte LAYOUT**: settings.json deep-merge,
+  `.claude/env` BEGIN/END managed block (with the user-secret section
+  header byte-identical to the Rust writer), `.vscode/settings.json`
+  deep-merge.
+* Python reads the launcher DB via `user_secret_known_keys_from_db`
+  to compute the STRIP set — union of three buckets
+  (`per_project`, `shared`, `global`) from `secret_active_state`.
+* Pairs in input AND in known-keys are EMITTED; known-keys NOT in
+  input are STRIPPED from the JSON env blocks (signal-to-remove;
+  `.claude/env` strip is implicit via wholesale BEGIN/END rebuild).
+
+### New public API
+
+* `UserSecretBundle` typed dict — Rust-side payload shape.
+* `user_secret_known_keys_from_db(project_id, db_path=None)` — STRIP
+  set resolver. Dedups across the three buckets; ASCII-sorts.
+* `apply_user_secrets(secret_bundle, surfaces=None)` — surface writer.
+  Returns `{surface: {emitted: [...], stripped: [...]}}` for audit.
+* `apply_project_env(bundle, surfaces=None, user_secret_bundle=None)`
+  gained the optional `user_secret_bundle` kwarg so canonical + secrets
+  can be written in ONE atomic-per-surface pass.
+
+### New CLI verbs
+
+* `apply-user-secrets --project-id <id> --pairs-json <file>
+  [--surfaces csv] [--db-path PATH]` — exit codes 0/2/3/4/5
+  (success / project_not_found / db_unreachable / apply_failed /
+  pairs_json_invalid).
+* `user-secret-known-keys --project-id <id> [--json] [--db-path PATH]`
+  — print the STRIP set without applying.
+
+### Three lifecycle scenarios covered
+
+1. **Fresh secret creation** — KEY in pairs AND in known-keys
+   (because `set_secret_v2` writes the active-flag row before
+   triggering the env-refresh hook). EMITTED to every surface.
+2. **Secret update (overwrite existing)** — same shape as creation;
+   new VALUE replaces old in JSON env blocks; `.claude/env` managed
+   block is rebuilt with the new pair.
+3. **Secret deletion / pause** — KEY in known-keys but NOT in pairs
+   (keychain returned None / active flag is 0 / keychain unreachable).
+   REMOVED from JSON env blocks via explicit strip; absent from the
+   rebuilt `.claude/env` managed block.
+
+### Why asymmetric (values stay Rust-owned, layout moves to Python)
+
+* The OS keychain APIs (Linux Secret Service, macOS Keychain Services,
+  Windows Credential Manager) have well-tested Rust bindings; a Python
+  parallel implementation would duplicate the soft-fail discipline
+  surface for no real win.
+* The cross-launcher active-flag walker
+  (`db::secret_active::is_secret_active_cross_launcher`) does
+  sibling-DB discovery + version-tolerant column probing; re-
+  implementing it defensively in Python doubles the bug surface.
+* Two implementations of the same security-sensitive lifecycle is
+  worse than one — but Python owning LAYOUT (shared with the canonical
+  writer) eliminates the byte-drift risk Phase 0.B already solved.
+
+### Tests (36 new in `tests/test_config_projection_user_secrets.py`)
+
+* DB resolver: 10 cases including soft-fail on missing table,
+  per-bucket coverage, dedup, sort, inactive-row inclusion, cross-
+  project isolation, DbUnreachable.
+* `apply_user_secrets`: 11 cases covering the three lifecycle
+  scenarios across both JSON and `.claude/env` surfaces, idempotence,
+  atomicity, double-quote escaping, opt-in VS Code surface.
+* `apply_project_env(user_secret_bundle=...)` combined pass: 2 cases
+  asserting canonical + secrets in one atomic-per-surface write
+  with correct BYTE ORDER (canonical first, secrets after in
+  `.claude/env`).
+* CLI: 7 cases covering happy paths + every documented exit code
+  (0/2/3/5) and edge cases (empty pairs strips known; invalid pair
+  shape; omitted --pairs-json treated as empty).
+
+The single-writer lint allowlist (`_LEGACY_PRODUCTION_WRITERS`) stays
+EMPTY post-Phase 0.E. The Rust caller that triggers
+`apply-user-secrets` is the existing `apply_project_env_via_python`
+subprocess bridge — no new direct env-surface writer was introduced.
+
+### Out of scope (still)
+
+* Bridging the OS keychain into Python (see "Why asymmetric" above).
+* Cross-launcher sibling-DB walker in Python (see same).
 
 ## Phase 0.B Part 2 — empty legacy-writer allowlist (2026-05-25)
 
