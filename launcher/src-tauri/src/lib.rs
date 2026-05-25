@@ -1278,10 +1278,19 @@ pub fn run() {
             commands::diagrams_cmd::list_project_mcp_tools,
             commands::diagrams_cmd::set_project_module_enabled,
             commands::diagrams_cmd::list_project_modules,
+            // Phase 1.5.7 wire-up: DiagramsTab calls
+            // `is_project_module_active` on mount to decide whether to
+            // render the diagrams UI or the "module disabled" overlay.
+            // Missing → tab silently treats every project as inactive.
+            commands::diagrams_cmd::is_project_module_active,
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
             commands::claude_env::set_claude_env_value,
+            // C8 wire-up (2026-05-25): read-only process env lookup, with
+            // a credential-name blocklist. DiagramsTab calls this for the
+            // Wayland-fallback decision (XDG_SESSION_TYPE).
+            commands::env_cmd::read_env_var,
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,

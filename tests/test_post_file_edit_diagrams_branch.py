@@ -202,6 +202,26 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
     assert "index" in content
     assert str(diagram) in content
 
+    # A6 wire-up: after the indexer call, the hook must also dispatch
+    # `snapshot create <file> --quiet`. Both calls share the same
+    # `vco_lib.diagram_indexer` module + file path, so we grep for the
+    # subcommand keyword `snapshot` to disambiguate from the `index`
+    # call we just asserted. Background-spawned: give it a moment to
+    # flush, same as the index assertion above.
+    import time as _t
+    for _ in range(20):
+        if "snapshot" in record_file.read_text():
+            break
+        _t.sleep(0.05)
+    snap_content = record_file.read_text()
+    assert "snapshot" in snap_content, (
+        f"snapshot subcommand never dispatched; record_file content:\n"
+        f"{snap_content}"
+    )
+    assert "create" in snap_content
+    # --quiet keeps the hook output clean
+    assert "--quiet" in snap_content
+
 
 @pytest.mark.skipif(not _have_bash(), reason="bash unavailable")
 def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
@@ -260,18 +280,30 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
     r1 = run_hook()
     assert r1.returncode == 0
 
-    # Wait for the background invocation to flush.
+    # Wait for the background invocation to flush. The hook now
+    # dispatches TWO calls per uncomma-throttled edit: one `index ...`
+    # and one `snapshot create ...` (A6 wire-up 2026-05-25). We wait
+    # for BOTH to land before asserting throttle behaviour, otherwise
+    # the second-hook-call assertion below races the still-flushing
+    # background spawns.
     import time as _t
-    for _ in range(20):
-        if record_file.exists() and "vco_lib.diagram_indexer" in record_file.read_text():
-            break
+    for _ in range(30):
+        if record_file.exists():
+            text = record_file.read_text()
+            if text.count("vco_lib.diagram_indexer") >= 2:
+                break
         _t.sleep(0.05)
     first_calls = (
         record_file.read_text() if record_file.exists() else ""
     )
-    assert first_calls.count("vco_lib.diagram_indexer") == 1
+    assert first_calls.count("vco_lib.diagram_indexer") == 2, (
+        "expected exactly two dispatches per edit (index + snapshot); "
+        f"got log:\n{first_calls}"
+    )
 
-    # Second call within throttle window → indexer NOT invoked again.
+    # Second call within throttle window → neither indexer nor
+    # snapshot invoked again. The whole diagrams-branch is gated on
+    # the 60s throttle, so the count stays at 2.
     r2 = run_hook()
     assert r2.returncode == 0
 
@@ -280,6 +312,6 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
     second_calls = (
         record_file.read_text() if record_file.exists() else ""
     )
-    assert second_calls.count("vco_lib.diagram_indexer") == 1, (
+    assert second_calls.count("vco_lib.diagram_indexer") == 2, (
         f"throttle failed; calls log:\n{second_calls}"
     )

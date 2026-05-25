@@ -371,7 +371,162 @@ pub async fn set_project_module_enabled(
             "enabled": enabled,
         }),
     )?;
+
+    // Phase 1.5.7 — when a module's enabled flag changes, the
+    // `{{#if_module_active <name>}}` block in CLAUDE.md needs to be
+    // re-evaluated. Spawn a background subprocess so the toggle
+    // remains snappy from the user's perspective; never block the
+    // command result on the re-render. Soft-fail throughout: if the
+    // subprocess can't be spawned (missing venv, missing project on
+    // disk, CLI error) we log a warning and return success — the
+    // user already saw the DB toggle land; the re-render is a
+    // side-effect.
+    spawn_re_render_claude_md(&db, &project_id);
+
     Ok(())
+}
+
+/// Background re-render of `<project_folder>/CLAUDE.md` after a module
+/// toggle. Resolves the project folder via `Db::get_project`, locates a
+/// usable Python interpreter, and spawns `python -m vco_lib.project_init
+/// re-render-claude-md --folder <path> --project-name <name>
+/// --project-id <id> --json` detached from the Tauri command. The
+/// command returns immediately — the re-render runs in the background.
+///
+/// Soft-fail philosophy: every error in this path is logged and
+/// swallowed. The DB row write already happened in the caller; the
+/// template re-render is a follow-on side effect, not a contract.
+/// Failures here surface only in the launcher's log and (eventually)
+/// the next time `re-render-claude-md` is invoked by some other path.
+fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
+    let project = match db.get_project(project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            eprintln!(
+                "[vct] re-render-claude-md: project {} not found; \
+                 skipping background re-render",
+                project_id
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] re-render-claude-md: db lookup for {} failed: {}; \
+                 skipping background re-render",
+                project_id, e
+            );
+            return;
+        }
+    };
+
+    let folder = PathBuf::from(&project.folder_path);
+    if !folder.is_dir() {
+        eprintln!(
+            "[vct] re-render-claude-md: project folder {} does not exist; \
+             skipping background re-render",
+            folder.display()
+        );
+        return;
+    }
+
+    let python = match resolve_project_python(&folder) {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[vct] re-render-claude-md: no usable Python for project \
+                 {} (folder={}); skipping background re-render",
+                project_id,
+                folder.display()
+            );
+            return;
+        }
+    };
+
+    // Spawn detached — we don't await stdout/stderr from this child.
+    // The CLI itself writes its own logs and falls back gracefully.
+    let project_id_str = project_id.to_string();
+    let project_name = project.name.clone();
+    let folder_str = folder.to_string_lossy().into_owned();
+    let spawn_result = std::process::Command::new(&python)
+        .arg("-m")
+        .arg("vco_lib.project_init")
+        .arg("re-render-claude-md")
+        .arg("--folder")
+        .arg(&folder_str)
+        .arg("--project-name")
+        .arg(&project_name)
+        .arg("--project-id")
+        .arg(&project_id_str)
+        .arg("--json")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .spawn();
+
+    match spawn_result {
+        Ok(child) => {
+            eprintln!(
+                "[vct] re-render-claude-md: spawned pid={} for project {} ({})",
+                child.id(),
+                project_name,
+                project_id_str
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] re-render-claude-md: spawn failed for project {} ({}): {}",
+                project_name, project_id_str, e
+            );
+        }
+    }
+}
+
+/// Pick a Python interpreter for the project-folder re-render. Prefers
+/// the project's own `.venv` and the orchestrator's `claude_mcp_servers/.venv`
+/// (the canonical install layout). Falls back to `python3` / `python` on
+/// PATH. Returns `None` only when nothing usable is found — the caller
+/// soft-fails in that case.
+fn resolve_project_python(folder: &Path) -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) { "python.exe" } else { "python" };
+    let bin_dir = if cfg!(windows) { "Scripts" } else { "bin" };
+
+    let candidates = [
+        folder.join(".venv").join(bin_dir).join(exe_name),
+        folder
+            .join("claude_mcp_servers")
+            .join(".venv")
+            .join(bin_dir)
+            .join(exe_name),
+    ];
+    for c in candidates.iter() {
+        if c.is_file() {
+            return Some(c.clone());
+        }
+    }
+    // Last resort: PATH lookup. Use `which`-style on POSIX, where the
+    // PATH chain typically has `python3` first. We avoid shelling out
+    // to `which` directly; the spawn will fail later if PATH lookup is
+    // empty and we'll log a warning then.
+    if cfg!(windows) {
+        Some(PathBuf::from("python.exe"))
+    } else {
+        Some(PathBuf::from("python3"))
+    }
+}
+
+// ─── Module-active lookup ───────────────────────────────────────────────
+
+/// Phase 1.5.7 — the DiagramsTab Svelte calls this to decide whether
+/// the module is on or off for a given project. Returns `false` for
+/// unknown (project, module) pairs (no row in `project_modules`).
+#[command]
+pub async fn is_project_module_active(
+    project_id: String,
+    module_name: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    db.is_module_active(&project_id, &module_name)
+        .map_err(|e| format!("is_project_module_active: {e}"))
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -570,6 +725,63 @@ mod tests {
             .unwrap();
         let abs = resolve_diagram_abs_path(&db, &d).unwrap();
         assert_eq!(abs, PathBuf::from(&abs_path_str));
+    }
+
+    #[test]
+    fn is_module_active_returns_false_for_absent_row() {
+        // A3 wire-up regression: the DiagramsTab calls this every mount.
+        // For an unregistered (project, module) pair the answer is `false`
+        // — never an error. The Svelte falls back to "module on" on error,
+        // so an error here would mask a real misconfig.
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        let r = db.is_module_active("p1", "diagrams").unwrap();
+        assert!(!r, "unknown module should be inactive (got {})", r);
+    }
+
+    #[test]
+    fn is_module_active_round_trips_through_set_then_get() {
+        // Toggle on → reflects as true; toggle off → reflects as false.
+        // Mirrors the lifecycle exercised by `set_project_module_enabled`
+        // + `is_project_module_active` from DiagramsTab.
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        db.set_project_module_enabled("p1", "diagrams", true).unwrap();
+        assert!(db.is_module_active("p1", "diagrams").unwrap());
+        db.set_project_module_enabled("p1", "diagrams", false).unwrap();
+        assert!(!db.is_module_active("p1", "diagrams").unwrap());
+    }
+
+    #[test]
+    fn resolve_project_python_prefers_project_venv() {
+        // Mirror the canonical install layout: <project>/.venv/{bin|Scripts}/python
+        // wins over <project>/claude_mcp_servers/.venv/...
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = if cfg!(windows) { "Scripts" } else { "bin" };
+        let exe_name = if cfg!(windows) { "python.exe" } else { "python" };
+        let project_venv_py = dir.path().join(".venv").join(bin_dir).join(exe_name);
+        let mcp_venv_py = dir
+            .path()
+            .join("claude_mcp_servers")
+            .join(".venv")
+            .join(bin_dir)
+            .join(exe_name);
+        fs::create_dir_all(project_venv_py.parent().unwrap()).unwrap();
+        fs::create_dir_all(mcp_venv_py.parent().unwrap()).unwrap();
+        fs::write(&project_venv_py, b"").unwrap();
+        fs::write(&mcp_venv_py, b"").unwrap();
+        let picked = resolve_project_python(dir.path()).unwrap();
+        assert_eq!(picked, project_venv_py);
+    }
+
+    #[test]
+    fn resolve_project_python_falls_back_to_path_when_no_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        let picked = resolve_project_python(dir.path()).unwrap();
+        // The fallback is OS-dependent but never None — the caller
+        // soft-fails on spawn if the PATH lookup also misses.
+        let expected = if cfg!(windows) { "python.exe" } else { "python3" };
+        assert_eq!(picked, PathBuf::from(expected));
     }
 
     /// End-to-end logic test for the snapshot create-then-restore path,
