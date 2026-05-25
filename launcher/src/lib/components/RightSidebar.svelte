@@ -38,6 +38,31 @@
      *   every selectedApp got Launch + Check Update regardless of stage.
      */
     stage?: 'shipped' | 'not_installed' | 'coming_soon';
+    /**
+     * v0.2.33 (Agent E, L11): the catalog entry's `kind` field
+     * straight from `ModuleCatalogEntry.kind`. When set, this is
+     * the AUTHORITATIVE signal for the right-rail Status badge
+     * (the same field the home tile renders).
+     *
+     * Pre-v0.2.33 the right-rail inferred status from a static
+     * COMING_SOON_IDS list, which fell through to "Installed" for
+     * any unknown id (e.g. an `available` paid module the catalog
+     * had just learnt about via L0). User-reported bug: home tile
+     * says "Available" but the right-rail says "Installed" for the
+     * same `vct-rl-reranker` row. Routing both through the same
+     * `kind` field eliminates the drift.
+     *
+     * Optional for back-compat with callers that don't have a
+     * catalog entry (e.g. orchestrator-only flows).
+     */
+    catalogKind?:
+      | 'bundled'
+      | 'available'
+      | 'installed'
+      | 'update_available'
+      | 'broken'
+      | 'subcomponent'
+      | 'coming_soon';
   }
 
   let {
@@ -49,17 +74,39 @@
   } = $props();
 
   const orchState = $derived($orchestrator);
-  // Effective stage: explicit prop wins; otherwise infer for known IDs.
-  // Coming-soon products get inferred from a static set so the home
-  // catalog (which doesn't pass stage) still suppresses Launch/Update.
+  // v0.2.33 (Agent E, L11): COMING_SOON_IDS is retained as a fallback
+  // for callers that don't pass a catalogKind (e.g. legacy code paths
+  // that still construct an `App` from scratch). New callers should
+  // pass `catalogKind` straight from `ModuleCatalogEntry.kind` so the
+  // right-rail badge agrees with the home tile.
   const COMING_SOON_IDS = new Set([
     'orchestrator-pro', 'mao', 'transcrypt', 'arzillibus',
     'convertifacile', 'dataweave', 'formcraft', 'pixelsnap',
     'rl-reranker',
   ]);
+  // Effective stage: explicit prop wins; otherwise derive from
+  // catalogKind (v0.2.33 single source of truth); finally fall
+  // back to legacy heuristics for back-compat.
   const effectiveStage = $derived.by(() => {
     if (!selectedApp) return 'shipped' as const;
     if (selectedApp.stage) return selectedApp.stage;
+    // v0.2.33 (Agent E, L11): if the caller passed the catalog
+    // entry's kind, that's the authoritative signal — same source
+    // as the home tile.
+    if (selectedApp.catalogKind) {
+      switch (selectedApp.catalogKind) {
+        case 'bundled':
+        case 'installed':
+        case 'update_available':
+        case 'subcomponent':
+        case 'broken':
+          return 'shipped' as const;
+        case 'available':
+          return 'not_installed' as const;
+        case 'coming_soon':
+          return 'coming_soon' as const;
+      }
+    }
     if (selectedApp.id === 'orchestrator') {
       return orchState.status === 'installed' ? 'shipped' : 'not_installed';
     }
@@ -70,6 +117,57 @@
       return orchState.status === 'installed' ? 'shipped' : 'not_installed';
     }
     return 'shipped' as const;
+  });
+
+  /**
+   * v0.2.33 (Agent E, L11): the canonical Status-row label. Driven
+   * by the catalog `kind` when available so the home tile and the
+   * right-rail show the same string for the same module.
+   *
+   * Maps:
+   *   - 'available'       → 'Not installed'
+   *   - 'installed'       → 'Installed'
+   *   - 'update_available'→ 'Update available'
+   *   - 'broken'          → 'Reinstall needed'
+   *   - 'bundled'         → 'Installed' (the launcher itself)
+   *   - 'subcomponent'    → 'Included'
+   *   - 'coming_soon'     → 'Coming soon'
+   *
+   * When `catalogKind` is absent, falls back to effectiveStage —
+   * keeps the pre-v0.2.33 markup in lock-step for legacy callers.
+   */
+  const statusLabel = $derived.by(() => {
+    if (!selectedApp) return 'Installed';
+    if (selectedApp.catalogKind) {
+      switch (selectedApp.catalogKind) {
+        case 'available':
+          return 'Not installed';
+        case 'installed':
+          return 'Installed';
+        case 'update_available':
+          return 'Update available';
+        case 'broken':
+          return 'Reinstall needed';
+        case 'bundled':
+          return 'Installed';
+        case 'subcomponent':
+          return 'Included';
+        case 'coming_soon':
+          return 'Coming soon';
+      }
+    }
+    if (effectiveStage === 'coming_soon') return 'Coming soon';
+    if (effectiveStage === 'not_installed') return 'Not installed';
+    return 'Installed';
+  });
+
+  const statusClass = $derived.by(() => {
+    if (effectiveStage === 'coming_soon') return 'sidebar-info-status-soon';
+    if (effectiveStage === 'not_installed') return 'sidebar-info-status-pending';
+    if (selectedApp?.catalogKind === 'broken') return 'sidebar-info-status-warn';
+    if (selectedApp?.catalogKind === 'update_available')
+      return 'sidebar-info-status-warn';
+    return '';
   });
   // Whether to show the install/launch quick actions.
   const showLaunchActions = $derived(
@@ -260,13 +358,13 @@
         {/if}
         <div class="sidebar-info-row">
           <span class="sidebar-info-key">Status</span>
-          {#if effectiveStage === 'coming_soon'}
-            <span class="sidebar-info-status sidebar-info-status-soon">Coming soon</span>
-          {:else if effectiveStage === 'not_installed'}
-            <span class="sidebar-info-status sidebar-info-status-pending">Not installed</span>
-          {:else}
-            <span class="sidebar-info-status">Installed</span>
-          {/if}
+          <!-- v0.2.33 (Agent E, L11): single source of truth. When
+               the caller passes `catalogKind` (every Home tile path
+               now does), this row's label matches the tile's badge
+               byte-for-byte. Pre-v0.2.33 fall-through left this row
+               always rendering "Installed" for unknown ids; that
+               drift is the bug we're closing. -->
+          <span class="sidebar-info-status {statusClass}">{statusLabel}</span>
         </div>
       </div>
     </div>
@@ -431,6 +529,15 @@
   .sidebar-info-status-pending {
     color: var(--color-muted);
     background: rgba(255, 255, 255, 0.06);
+  }
+  /* v0.2.33 (Agent E, L11): warn variant covers
+     `update_available` + `broken` — both surface as amber so the user
+     knows "this isn't a clean Installed state" without conflating them
+     with coming-soon / not-installed. */
+  .sidebar-info-status-warn {
+    color: #f1c40f;
+    background: rgba(241, 196, 15, 0.12);
+    border: 1px solid rgba(241, 196, 15, 0.30);
   }
   .sidebar-coming-soon {
     display: flex;

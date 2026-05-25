@@ -199,6 +199,22 @@
     return controls.some((c) => c.kind === 'info_dynamic');
   }
 
+  /**
+   * v0.2.33 (Agent E): per-section roll-up. UnsupportedControl
+   * renders a placeholder for each individual unrecognised control;
+   * this helper drives the SECTION-level banner that summarises
+   * "1+ controls here require a newer launcher version" so the user
+   * doesn't miss the affordance when several controls fall under
+   * the placeholder.
+   *
+   * Counts (not just bool) so the banner can say "1+ controls" with
+   * a real number. Bumped to a Map-style return only when a future
+   * UI needs the individual `kind_string` list.
+   */
+  function sectionUnsupportedControlCount(controls: ConfigControl[]): number {
+    return controls.reduce((n, c) => n + (c.kind === 'Unsupported' ? 1 : 0), 0);
+  }
+
   function refreshSection(sectionIdx: number) {
     sectionRefreshNonces[sectionIdx] = (sectionRefreshNonces[sectionIdx] ?? 0) + 1;
   }
@@ -642,6 +658,7 @@
     {@const sectionDisabled = !sectionHasProject}
     {@const hasDynamic = sectionHasDynamicControl(section.controls)}
     {@const refreshNonce = sectionRefreshNonces[sectionIdx] ?? 0}
+    {@const unsupportedCount = sectionUnsupportedControlCount(section.controls)}
     <section class="config-section">
       <div class="section-header-row">
         <button
@@ -717,6 +734,26 @@
                 aria-label="More info"
               >?</span>
             </label>
+          </div>
+        {/if}
+
+        {#if unsupportedCount > 0}
+          <!-- v0.2.33 (Agent E): per-section roll-up of the
+               `UnsupportedControl` placeholders below. Reads as
+               "you'll see N controls fall back to placeholder
+               cards in this section; updating the launcher unlocks
+               them". The individual placeholders still render
+               inside the .controls loop. -->
+          <div
+            class="section-unsupported-banner"
+            role="status"
+            aria-live="polite"
+          >
+            <span class="icon" aria-hidden="true">!</span>
+            <span class="text">
+              This section has {unsupportedCount} control{unsupportedCount === 1 ? '' : 's'}
+              requiring a newer launcher version. Update launcher to render them.
+            </span>
           </div>
         {/if}
 
@@ -1069,6 +1106,41 @@
   .section-project-picker-empty {
     color: #e74c3c;
     font-size: 12px;
+  }
+
+  /* v0.2.33 (Agent E): per-section Unsupported roll-up banner. Same
+     amber palette as `UnsupportedControl`'s individual cards so the
+     visual relationship reads naturally — "this banner summarises
+     the warnings below". Sits between the project picker (if any)
+     and the controls grid. */
+  .section-unsupported-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 10px 16px 0 16px;
+    padding: 8px 12px;
+    background: rgba(255, 196, 0, 0.06);
+    border: 1px dashed rgba(255, 196, 0, 0.35);
+    border-radius: 6px;
+    color: var(--color-text, #e5e5e5);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .section-unsupported-banner .icon {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: rgba(255, 196, 0, 0.2);
+    color: #ffc400;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 12px;
+  }
+  .section-unsupported-banner .text {
+    flex: 1;
   }
 
   .control {

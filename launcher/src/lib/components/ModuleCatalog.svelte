@@ -20,6 +20,14 @@
   import type { ModuleCatalogEntry, ModuleInstallRow } from '$lib/types/launcher';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import DeprecationBanner from '$lib/components/DeprecationBanner.svelte';
+  // v0.2.33 (Agent E, 2026-05-25):
+  //   - L9 banner+modal for aggregated manifest-parse errors.
+  //   - L0 freshness indicator (stale / unavailable).
+  //   - Dev-affordance toast (review §10.c).
+  import ManifestParseErrorBanner from '$lib/components/ManifestParseErrorBanner.svelte';
+  import ManifestParseErrorModal from '$lib/components/ManifestParseErrorModal.svelte';
+  import L0StatusIndicator from '$lib/components/L0StatusIndicator.svelte';
+  import DevAffordanceToast from '$lib/components/DevAffordanceToast.svelte';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -27,6 +35,17 @@
   let search = $state('');
   let openActivation = $state(false);
   let openSecretsPrompt = $state<ModuleCatalogEntry | null>(null);
+  // v0.2.33 (Agent E, L9): modal open state for the parse-error
+  // detail view. Closed by default; opened from the banner click.
+  let parseErrorModalOpen = $state(false);
+  // v0.2.33 (Agent E): retry-in-flight flag for the L0 unavailable
+  // banner. Local state — the store's `loading` flag is too coarse
+  // (it gates initial render too).
+  let l0Retrying = $state(false);
+  // v0.2.33 (Agent E, L9): hash of parse-error payload last logged,
+  // so a Modules-tab remount that returns the SAME errors doesn't
+  // double-append the JSONL line on every re-render.
+  let lastLoggedParseErrorsHash = $state('');
 
   let { onOpenActivation, onOpenSettings }: {
     onOpenActivation: () => void;
@@ -52,6 +71,48 @@
       modules.loadInstalled(project.id);
     }
   });
+
+  // v0.2.33 (Agent E, L9): persist every fresh batch of parse errors
+  // to `<install>/state/logs/launcher_errors.jsonl` (or
+  // `~/.vct/launcher_errors.jsonl` when no install root is resolvable).
+  // The Rust command swallows write errors — this side effect is
+  // purely "best-effort logging for postmortem". We guard against
+  // double-logging the same payload by hashing module_id|source|error
+  // tuples; a remount that re-reads the same store state won't re-write.
+  $effect(() => {
+    const errs = mState.parseErrors;
+    if (errs.length === 0) {
+      // Reset so the next non-empty batch logs.
+      lastLoggedParseErrorsHash = '';
+      return;
+    }
+    const hash = errs
+      .map((e) => `${e.module_id}|${e.source}|${e.error}`)
+      .join('\n');
+    if (hash === lastLoggedParseErrorsHash) return;
+    lastLoggedParseErrorsHash = hash;
+    void invoke<string>('log_manifest_parse_errors', { errors: errs }).catch(
+      (e) => {
+        // Soft-fail: the Rust side already swallows write errors,
+        // so the only way we land here is a transport / argument
+        // error. Surface to console for the dev who's looking.
+        console.warn('[ModuleCatalog] log_manifest_parse_errors failed:', e);
+      },
+    );
+  });
+
+  async function reloadCatalog() {
+    l0Retrying = true;
+    try {
+      await modules.loadCatalog();
+    } finally {
+      l0Retrying = false;
+    }
+  }
+
+  async function dismissDevHint() {
+    await modules.dismissDevAffordance();
+  }
 
   // Bug 33: hide private-test modules from non-admin users. Admin
   // (server-classified via LS_ADMIN_VARIANT_IDS) sees ALL modules
@@ -322,6 +383,20 @@
     {/each}
   </div>
 
+  <!-- v0.2.33 (Agent E): L0 freshness indicator + L9 parse-error
+       banner. Banner is placed above DeprecationBanner so the user
+       reads "catalog couldn't be parsed → deprecated modules →
+       catalog body" top-to-bottom. -->
+  <L0StatusIndicator
+    status={mState.l0Status}
+    onRetry={reloadCatalog}
+    retrying={l0Retrying}
+  />
+  <ManifestParseErrorBanner
+    errors={mState.parseErrors}
+    onOpen={() => (parseErrorModalOpen = true)}
+  />
+
   {#each deprecatedInstalled as m (m.id)}
     <DeprecationBanner module={m} />
   {/each}
@@ -491,6 +566,32 @@
     <div class="msg msg-error">{mState.error}</div>
   {/if}
 </div>
+
+<!-- v0.2.33 (Agent E): L9 parse-error detail modal, paired with the
+     banner above. Reload calls back into the store. -->
+<ManifestParseErrorModal
+  open={parseErrorModalOpen}
+  errors={mState.parseErrors}
+  onClose={() => (parseErrorModalOpen = false)}
+  onReload={async () => {
+    await reloadCatalog();
+    // If the reload cleared the parse errors, the user has nothing
+    // left to inspect — close the modal so they see the clean catalog.
+    if (mState.parseErrors.length === 0) {
+      parseErrorModalOpen = false;
+    }
+  }}
+/>
+
+<!-- v0.2.33 (Agent E, review §10.c): dev-affordance toast. Mounted
+     here so it surfaces over the entire Modules tab, not just the
+     catalog grid. Render is gated on `devAffordanceHint != null`,
+     which the Rust side already cross-references with the
+     `paid-modules/` + env-var + dismissed checks. -->
+<DevAffordanceToast
+  hint={mState.devAffordanceHint}
+  onDismiss={dismissDevHint}
+/>
 
 <!-- Missing-secret prompt — Bug 26: native <dialog> top-layer via DialogRoot. -->
 {#if openSecretsPrompt}

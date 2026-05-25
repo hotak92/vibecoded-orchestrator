@@ -909,6 +909,104 @@ pub async fn dismiss_dev_affordance_hint(db: State<'_, Db>) -> Result<(), String
     Ok(())
 }
 
+// ─── L9 manifest-parse-error logger (v0.2.33, Agent E) ─────────────────
+//
+// `CatalogResponse.parse_errors` already surfaces failures to the GUI
+// (yellow banner + modal). For postmortem we also append each error to
+// `<install>/state/logs/launcher_errors.jsonl` (one JSON object per line)
+// so support pings can quote the entry without screenshotting the modal.
+//
+// Fallback path: when no install root is resolvable we land in
+// `~/.vct/launcher_errors.jsonl`. Mirrors the services-watcher pattern.
+
+/// Resolve the canonical JSONL log path. Mirrors
+/// `services::watcher::resolve_log_path` so both logs sit beside each
+/// other under `state/logs/` when an install root exists.
+fn resolve_launcher_errors_log_path() -> PathBuf {
+    if let Ok(root) = crate::commands::installer::find_local_repo_root() {
+        return root.join("state/logs/launcher_errors.jsonl");
+    }
+    // Fallback when run outside an install (cargo run, CI shell).
+    crate::paths::vct_root_dir().join("launcher_errors.jsonl")
+}
+
+/// One line written to `launcher_errors.jsonl`. The schema is
+/// narrow-on-purpose: `ts` (RFC 3339 UTC), `kind` (event family),
+/// then the entry's fields. Future event families bolt on with
+/// their own `kind` value; consumers filter by `kind` first.
+#[derive(Debug, Clone, Serialize)]
+struct LauncherErrorLogEntry<'a> {
+    ts: String,
+    kind: &'a str,
+    module_id: &'a str,
+    source: &'a str,
+    error: &'a str,
+}
+
+/// Append a single `manifest_parse_error` event to the given JSONL
+/// log path. Best-effort: write failures are swallowed (the log is
+/// debugging aid, not load-bearing). Returns the path that was passed
+/// in for convenience (so callers can chain).
+///
+/// Pulled out from `append_manifest_parse_error_log` so tests can
+/// exercise it directly with a tempdir-rooted path without depending
+/// on the live `find_local_repo_root` resolver.
+fn append_manifest_parse_error_log_at(path: &std::path::Path, err: &ManifestParseError) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = LauncherErrorLogEntry {
+        ts: chrono::Utc::now().to_rfc3339(),
+        kind: "manifest_parse_error",
+        module_id: &err.module_id,
+        source: &err.source,
+        error: &err.error,
+    };
+    let line = match serde_json::to_string(&entry) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+/// Production entry-point: resolve the canonical log path and append
+/// the error there. Wraps `append_manifest_parse_error_log_at` with
+/// the path resolution so callers in the Tauri command don't need to
+/// know about the install-root vs `~/.vct/` fallback.
+fn append_manifest_parse_error_log(err: &ManifestParseError) -> PathBuf {
+    let path = resolve_launcher_errors_log_path();
+    append_manifest_parse_error_log_at(&path, err);
+    path
+}
+
+/// Tauri command: persist a batch of manifest-parse errors to the
+/// launcher's JSONL postmortem log. The renderer calls this once per
+/// `loadCatalog` round-trip when `parse_errors` is non-empty.
+///
+/// Soft-fail throughout: filesystem errors are swallowed (the log is
+/// debugging aid, not load-bearing). Returns the resolved log path
+/// purely so the renderer can quote it in the modal footer.
+#[command]
+pub async fn log_manifest_parse_errors(
+    errors: Vec<ManifestParseError>,
+) -> Result<String, String> {
+    if errors.is_empty() {
+        return Ok(resolve_launcher_errors_log_path().display().to_string());
+    }
+    let mut last_path = PathBuf::new();
+    for err in &errors {
+        last_path = append_manifest_parse_error_log(err);
+    }
+    Ok(last_path.display().to_string())
+}
+
 // ─── Pre-install vs post-install manifest split (v0.2.33) ──────────────
 //
 // `find_manifest` was a single function serving both install-time
@@ -3557,5 +3655,79 @@ mod tests {
         );
 
         restore_env(prev_state, prev_dev);
+    }
+
+    // ─── L9 manifest-parse-error JSONL logger (v0.2.33, Agent E) ──────
+    //
+    // Two regression guards for `append_manifest_parse_error_log`:
+    //   * a single call writes a well-formed JSON line carrying the
+    //     entry's fields + a `ts` timestamp + the `manifest_parse_error`
+    //     kind tag;
+    //   * repeated calls append (don't overwrite) so multi-error
+    //     batches survive a single catalog round-trip.
+    //
+    // We don't assert on the resolved path beyond "ends with
+    // launcher_errors.jsonl" — the fallback vs install-root branch is
+    // covered by `resolve_log_path`'s own tests in the watcher.
+
+    #[test]
+    fn log_manifest_parse_error_writes_jsonl_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log_path = tmp.path().join("launcher_errors.jsonl");
+        let err = ManifestParseError {
+            module_id: "vct-rl-reranker".into(),
+            source: "L0:/functions/v1/module-catalog".into(),
+            error: "missing field `version`".into(),
+        };
+        append_manifest_parse_error_log_at(&log_path, &err);
+
+        let raw = std::fs::read_to_string(&log_path).expect("read jsonl");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 1, "expected one line, got {:?}", lines);
+        let parsed: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("each line must be valid JSON");
+        assert_eq!(parsed["kind"], "manifest_parse_error");
+        assert_eq!(parsed["module_id"], "vct-rl-reranker");
+        assert_eq!(parsed["source"], "L0:/functions/v1/module-catalog");
+        assert_eq!(parsed["error"], "missing field `version`");
+        assert!(
+            parsed["ts"].as_str().is_some_and(|s| !s.is_empty()),
+            "ts must be a non-empty string, got {:?}",
+            parsed["ts"],
+        );
+    }
+
+    #[test]
+    fn log_manifest_parse_error_appends_not_overwrites() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let log_path = tmp.path().join("launcher_errors.jsonl");
+        let first = ManifestParseError {
+            module_id: "module-a".into(),
+            source: "/tmp/a/vct-module.json".into(),
+            error: "first failure".into(),
+        };
+        let second = ManifestParseError {
+            module_id: "module-b".into(),
+            source: "L0:/functions/v1/module-catalog".into(),
+            error: "second failure".into(),
+        };
+        append_manifest_parse_error_log_at(&log_path, &first);
+        append_manifest_parse_error_log_at(&log_path, &second);
+
+        let raw = std::fs::read_to_string(&log_path).expect("read jsonl");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected two lines after two appends; got {:?}",
+            lines,
+        );
+
+        let a: serde_json::Value = serde_json::from_str(lines[0]).expect("line 1 json");
+        let b: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 json");
+        assert_eq!(a["module_id"], "module-a");
+        assert_eq!(b["module_id"], "module-b");
+        assert_eq!(a["error"], "first failure");
+        assert_eq!(b["error"], "second failure");
     }
 }

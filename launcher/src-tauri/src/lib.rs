@@ -1112,6 +1112,12 @@ pub fn run() {
             // (not dismissed). The renderer surfaces this as a toast;
             // clicking "Got it" calls this command.
             commands::modules::dismiss_dev_affordance_hint,
+            // v0.2.33 Agent E (L9): append manifest-parse errors to
+            // `<install>/state/logs/launcher_errors.jsonl` (or
+            // `~/.vct/launcher_errors.jsonl` when no install root is
+            // resolvable). The renderer calls this once per catalog
+            // load whenever `parse_errors[]` is non-empty.
+            commands::modules::log_manifest_parse_errors,
             commands::modules::install_module_for_project,
             // v0.2.31 #20-Fix-3: in-place update path (parallel to install).
             // Reads manifest.upgrade UpgradeBlock — runs pre_upgrade, re-fetches

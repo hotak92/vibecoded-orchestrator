@@ -235,8 +235,21 @@
     </div>
   </div>
 
+  <!-- v0.2.33 (Agent E, L11): pass the catalog entry's `kind` straight
+       through so the right-rail Status row reads from the same source
+       as the tile badge. Pre-v0.2.33 the right-rail inferred status
+       from a static COMING_SOON_IDS lookup, which fell through to
+       "Installed" for any module not in that list — leading to the
+       user-reported drift on `vct-rl-reranker` (tile said Available,
+       right-rail said Installed). -->
   <RightSidebar
-    selectedApp={selectedCard ? { id: selectedCard.entry.id, name: selectedCard.entry.name, color: selectedCard.color, version: selectedCard.entry.version } : null}
+    selectedApp={selectedCard ? {
+      id: selectedCard.entry.id,
+      name: selectedCard.entry.name,
+      color: selectedCard.color,
+      version: selectedCard.entry.version,
+      catalogKind: selectedCard.entry.kind,
+    } : null}
     onOpenActivation={() => ui.openActivation()}
   />
 </div>
