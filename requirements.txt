@@ -70,7 +70,7 @@ sentence-transformers>=5.4.1
 # `post_init()` in `__init__` AND (b) import Conv1D from pytorch_utils
 # with a fallback, OR migrate to a v5-native code-embedding model
 # (Jina Code v3, Voyage Code 3, etc.).
-transformers>=4.40.0,<4.50.0
+transformers>=4.40.0,<5.10.0
 # PyTorch (BSD-3-Clause) — for RL pipeline (Pro) and code embeddings (CPU fallback)
 # NOTE: torch>=2.11 ships CUDA 13.0 wheels by default on PyPI. Users with
 # CUDA 12.x drivers, Volta/Pascal/Maxwell GPUs, or CPU-only systems should
