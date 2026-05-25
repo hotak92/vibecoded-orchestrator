@@ -1728,6 +1728,58 @@ pub struct McpRegistration {
     pub target_projects: serde_json::Value, // "all" | "none" | ["path"]
     #[serde(default = "default_user_scope")]
     pub scope: String, // "user" | "project"
+    /// v0.2.34 (Agent E — Phase 4 generalisation, 2026-05-25): optional
+    /// per-tool allowlist defaults for the wrapper MCP this module ships.
+    ///
+    /// When present, the launcher persists each entry into
+    /// `module_mcp_tool_defaults` at install time (keyed by
+    /// `(mcp_name, tool_name)`), and the hub's
+    /// `/api/v1/projects/{project_id}/mcp-tool-grants/{mcp_name}` route
+    /// composes the resolved allowlist from these defaults PLUS any
+    /// per-project overrides in `project_mcp_tool_grants`. Per-project
+    /// rows always win; absent rows fall through to `default_enabled`.
+    ///
+    /// Empty `Vec` and `None` are semantically equivalent here — the hub
+    /// returns the hardcoded fallback allowlist (diagrams-era constants)
+    /// when no rows are registered for `mcp_name`. This means an
+    /// orchestrator-bundled MCP (mermaid/excalidraw) that ships WITHOUT
+    /// a manifest still gets sensible defaults; a paid module that ships
+    /// WITH a manifest declares its own.
+    ///
+    /// Reconciliation contract on module update: tools added in the new
+    /// version are inserted with their declared `default_enabled`. Tools
+    /// removed from the manifest are dropped from
+    /// `module_mcp_tool_defaults` (no soft-delete — defaults are
+    /// inherently version-current). Per-project overrides in
+    /// `project_mcp_tool_grants` are LEFT IN PLACE so a user who
+    /// explicitly disabled a tool keeps that override even if the tool
+    /// later returns; the override applies if the tool is re-added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_allowlist: Option<Vec<ToolAllowlistEntry>>,
+}
+
+/// v0.2.34 (Agent E): one tool the wrapper MCP exposes, plus its
+/// default-enabled state and an optional human-readable description.
+///
+/// Mirrors the in-DB shape of `module_mcp_tool_defaults` (migration 023);
+/// see the SQL file for the rationale on why this lives at the
+/// MCP/module level rather than per-project.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ToolAllowlistEntry {
+    /// Tool name as exposed by the wrapper's upstream MCP (e.g.
+    /// `"render"`, `"save_diagram"`, `"export_png"`). Case-sensitive.
+    pub tool: String,
+    /// Whether the wrapper allows this tool when no per-project
+    /// override exists. Defaults to `true` so an absent value in the
+    /// manifest enables the tool — safer for module authors who
+    /// declare a flat list of tools they intend to expose.
+    #[serde(default = "default_true")]
+    pub default_enabled: bool,
+    /// Optional one-line description rendered as the tooltip in the
+    /// launcher's per-tool toggle UI. Best-effort sourced from the
+    /// upstream MCP's `tools/list`; absence is non-fatal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 fn default_target_all() -> serde_json::Value {
     serde_json::Value::String("all".into())
@@ -4320,7 +4372,7 @@ mod tests {
         );
     }
 
-    // ─── v0.2.34: validate_install_dir hardening ────────────────────
+    // ─── v0.2.34: validate_install_dir hardening (Agent A) ──────────
     //
     // The dogfood install of RL Reranker v0.2.7 on 2026-05-25 surfaced
     // a guard-vs-bootstrap ordering bug: `~/.vct/modules/` is created
@@ -4400,6 +4452,76 @@ mod tests {
         );
     }
 
+    // ─── v0.2.34 Agent E (Phase 4 generalisation) tests ──────────────
+
+    #[test]
+    fn mcp_registration_accepts_tool_allowlist_field() {
+        // v0.2.34: paid module declares a per-tool allowlist in its
+        // manifest. The launcher parses + persists this into
+        // `module_mcp_tool_defaults` at install time. Verify the
+        // serde shape lands cleanly.
+        let raw = r#"{
+            "id": "vendor-reranker",
+            "name": "Vendor Reranker",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "pro" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "mcp_stdio", "command": "python", "args": ["-m", "x"] },
+            "mcp_registration": {
+                "mcp_name": "vendor-reranker",
+                "tool_allowlist": [
+                    { "tool": "rerank", "default_enabled": true, "description": "re-rank results" },
+                    { "tool": "explain", "default_enabled": false },
+                    { "tool": "debug" }
+                ]
+            }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("parse");
+        let reg = m.mcp_registration.expect("mcp_registration present");
+        let allowlist = reg.tool_allowlist.expect("tool_allowlist present");
+        assert_eq!(allowlist.len(), 3);
+        assert_eq!(allowlist[0].tool, "rerank");
+        assert!(allowlist[0].default_enabled);
+        assert_eq!(allowlist[0].description.as_deref(), Some("re-rank results"));
+        assert_eq!(allowlist[1].tool, "explain");
+        assert!(!allowlist[1].default_enabled);
+        assert!(allowlist[1].description.is_none());
+        // Field omitted entirely → defaults to true (safer for module authors
+        // who declare a flat tool list).
+        assert_eq!(allowlist[2].tool, "debug");
+        assert!(
+            allowlist[2].default_enabled,
+            "omitted `default_enabled` must default to true; got {:?}",
+            allowlist[2]
+        );
+        assert!(allowlist[2].description.is_none());
+    }
+
+    #[test]
+    fn mcp_registration_without_tool_allowlist_back_compat() {
+        // Pre-v0.2.34 manifests didn't declare `tool_allowlist`. Verify
+        // they still parse cleanly — `tool_allowlist` defaults to None,
+        // matching the "no per-tool defaults; fall through to hub
+        // fallback" semantic on the hub side.
+        let raw = r#"{
+            "id": "older-mod",
+            "name": "Older Module",
+            "version": "0.1.0",
+            "category": "paid-orchestrator",
+            "license": { "min_orchestrator_tier": "pro" },
+            "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+            "runtime": { "type": "mcp_stdio", "command": "python", "args": [] },
+            "mcp_registration": { "mcp_name": "older-mcp" }
+        }"#;
+        let m = ModuleManifest::from_json(raw).expect("parse");
+        let reg = m.mcp_registration.expect("mcp_registration present");
+        assert!(
+            reg.tool_allowlist.is_none(),
+            "absent tool_allowlist must deserialize as None for v0.2.33 back-compat"
+        );
+    }
+
     #[test]
     fn validate_install_dir_rejects_relative_candidate() {
         // The function explicitly refuses relative paths (callers
@@ -4413,6 +4535,41 @@ mod tests {
             err.contains("must be absolute"),
             "error must say 'must be absolute'; got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn tool_allowlist_entry_serializes_round_trip() {
+        // Wire-shape stability check: a round-trip through JSON
+        // preserves every field. The skip_serializing_if on
+        // `description` means a None description doesn't show up in
+        // the serialized JSON — matches v0.2.33's `description: null`
+        // omission convention.
+        let entry = ToolAllowlistEntry {
+            tool: "render".into(),
+            default_enabled: true,
+            description: Some("renders mermaid".into()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"tool\":\"render\""));
+        assert!(json.contains("\"default_enabled\":true"));
+        assert!(json.contains("\"description\":\"renders mermaid\""));
+        let parsed: ToolAllowlistEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn tool_allowlist_entry_skips_none_description() {
+        let entry = ToolAllowlistEntry {
+            tool: "render".into(),
+            default_enabled: true,
+            description: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("description"),
+            "None description should be skipped during serialize, got: {}",
+            json
         );
     }
 }

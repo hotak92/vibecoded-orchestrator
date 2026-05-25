@@ -50,6 +50,11 @@ pub mod module_db_migrations;
 // Phase 1.1 of the diagrams integration plan
 // (.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md).
 pub mod diagrams;
+// Migration 023 — module-shipped MCP tool allowlist defaults
+// (v0.2.34 Agent E — Phase 4 generalisation). Populated at install
+// time from manifest.mcp_registration.tool_allowlist; read by the hub's
+// /mcp-tool-grants route to compose per-project allowlists.
+pub mod mcp_tool_defaults;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {

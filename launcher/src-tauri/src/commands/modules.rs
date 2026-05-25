@@ -1373,6 +1373,16 @@ pub async fn install_module_for_project(
                 &serde_json::json!({ "install_dir": resolved_dir.display().to_string() }),
             )?;
 
+            // v0.2.34 Agent E (Phase 4 generalisation): reconcile this
+            // module's MCP tool-allowlist defaults into
+            // `module_mcp_tool_defaults`. The hub's
+            // `/mcp-tool-grants/{mcp_name}` route reads these rows when
+            // assembling a wrapper's allowlist, merging with per-project
+            // overrides from `project_mcp_tool_grants`. Soft-fail: a DB
+            // error here is logged but doesn't break the install
+            // (defaults can be reconciled again on next install/update).
+            reconcile_module_tool_allowlist(&manifest, &module_id, &db);
+
             // Phase 1E: per-project container lifecycle. For
             // container_pull modules we resolve `runtime.container_name_
             // template`, allocate an `rl_port` if not yet set, and
@@ -1563,6 +1573,12 @@ pub async fn update_module_for_project(
                     "new_version": manifest.version,
                 }),
             )?;
+            // v0.2.34 Agent E (Phase 4 generalisation): reconcile the
+            // tool_allowlist set on update too. v0.2.7 → v0.2.8 might
+            // ADD or REMOVE tools — `reconcile_mcp_tool_defaults` does
+            // delete-then-insert inside a transaction so the rows
+            // match the new manifest.
+            reconcile_module_tool_allowlist(&manifest, &module_id, &db);
             let _ = app.emit(
                 "module://install-complete",
                 serde_json::json!({
@@ -1789,6 +1805,17 @@ pub async fn uninstall_module_v2(
 
     db.delete_module_install(&project_id, &module_id)?;
     db.clear_module_settings(&project_id, &module_id)?;
+    // v0.2.34 Agent E (Phase 4 generalisation): drop any MCP tool
+    // defaults this module owned. Per-project overrides in
+    // `project_mcp_tool_grants` are LEFT IN PLACE — they belong to the
+    // project, not the module, and may apply again if the module is
+    // reinstalled.
+    if let Err(e) = db.clear_mcp_tool_defaults_for_module(&module_id) {
+        eprintln!(
+            "[uninstall] clear_mcp_tool_defaults_for_module({}) failed: {}",
+            module_id, e
+        );
+    }
     db.audit(
         "module_uninstall",
         Some(&project_id),
@@ -1816,6 +1843,60 @@ fn default_uninstall_block() -> UninstallBlock {
         preserve_paths: Vec::new(),
         deregister_mcp: true,
         clear_secrets: false,
+    }
+}
+
+/// v0.2.34 Agent E (Phase 4 generalisation): write the manifest's
+/// `mcp_registration.tool_allowlist` block into `module_mcp_tool_defaults`.
+/// Soft-fail: errors are logged but never block the install/update.
+///
+/// When the manifest declares no `mcp_registration` block, or declares
+/// one without a `tool_allowlist`, this helper short-circuits with no
+/// DB write — preserves the v0.2.33 contract for modules that haven't
+/// adopted the new field yet.
+///
+/// When the manifest DOES declare a tool_allowlist, reconcile fully
+/// replaces the (mcp_name, module_id) slice in
+/// `module_mcp_tool_defaults`: new tools land with their
+/// `default_enabled` value, removed tools disappear, unchanged tools
+/// are upserted in-place. Per-project overrides in
+/// `project_mcp_tool_grants` are LEFT IN PLACE — they belong to the
+/// project, not the module.
+fn reconcile_module_tool_allowlist(
+    manifest: &ModuleManifest,
+    module_id: &str,
+    db: &Db,
+) {
+    let mcp = match manifest.mcp_registration.as_ref() {
+        Some(m) => m,
+        None => return,
+    };
+    let allowlist = match mcp.tool_allowlist.as_ref() {
+        Some(list) => list,
+        None => return,
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let entries: Vec<(String, bool, Option<String>)> = allowlist
+        .iter()
+        .map(|e| (e.tool.clone(), e.default_enabled, e.description.clone()))
+        .collect();
+    match db.reconcile_mcp_tool_defaults(&mcp.mcp_name, module_id, &entries, now_ms) {
+        Ok(n) => {
+            eprintln!(
+                "[v0.2.34] reconciled {} MCP tool default(s) for {} (mcp={})",
+                n, module_id, mcp.mcp_name
+            );
+        }
+        Err(e) => {
+            // Don't return the error — the install / update succeeded;
+            // the defaults can be reconciled again next time.
+            eprintln!(
+                "[v0.2.34] reconcile_mcp_tool_defaults({}, {}) failed: {} \
+                 (install/update continues; hub will fall back to hardcoded \
+                  defaults until next reconcile)",
+                mcp.mcp_name, module_id, e
+            );
+        }
     }
 }
 

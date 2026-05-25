@@ -128,6 +128,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "diagrams registry: project_diagrams + diagram_snapshots + diagram_access + project_mcp_tool_grants + project_modules + diagram_index_retry (Excalidraw/Mermaid Phase 1.1 + 1.5.A retry-queue)",
         sql: include_str!("migrations/022_diagrams.sql"),
     },
+    Migration {
+        version: 23,
+        description: "module-shipped MCP tool allowlist defaults: module_mcp_tool_defaults table populated from vct-module.json::mcp_registration.tool_allowlist at install time, read by hub /mcp-tool-grants route (v0.2.34 Agent E — Phase 4 generalisation)",
+        sql: include_str!("migrations/023_module_mcp_tool_defaults.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

@@ -33,20 +33,26 @@
 //!     "defaults_applied": true|false
 //!   }
 //!   ```
-//!   Returns 200 with the resolved grant map. When the project has
-//!   no per-tool overrides in `project_mcp_tool_grants` (Phase 1.1
-//!   sibling table), falls back to a hardcoded default for the
-//!   wrapped MCP — see `_default_allowlist_for` below.
+//!   Returns 200 with the resolved grant map.
+//!
+//!   Resolution order (v0.2.34 Agent E — Phase 4 generalisation):
+//!     1. Module-shipped defaults from `module_mcp_tool_defaults`
+//!        (populated at module-install time from
+//!        `manifest.mcp_registration.tool_allowlist`).
+//!     2. Hardcoded fallback defaults for orchestrator-bundled MCPs
+//!        (`mermaid`, `excalidraw`) when no module defaults are
+//!        registered — preserves v0.2.33 behaviour for projects whose
+//!        bundled MCPs have never been part of a paid-module install
+//!        cycle.
+//!     3. Per-project overrides from `project_mcp_tool_grants` ALWAYS
+//!        win — any row in that table replaces the corresponding
+//!        default for that one project.
+//!
+//!   The `defaults_applied` boolean stays true ONLY when ZERO per-project
+//!   override rows exist for `(project_id, mcp_name)`. Used by the
+//!   launcher GUI to show a "(defaults)" badge next to the tool list.
 //!
 //!   Returns 404 when the project doesn't exist.
-//!   Returns 200 with `{"defaults_applied": true, "grants": <defaults>}`
-//!   when the project exists but the grants table is empty / hasn't
-//!   shipped yet (Phase 1.1 sibling).
-//!
-//! TODO-Phase-4 (marker for the future sibling): replace the hardcoded
-//! `MERMAID_DEFAULT_ALLOWLIST` with a lookup against
-//! `bundled_tool_defaults.toml` + the `mcp_tool_defaults` SQLite table.
-//! When that lands, this module turns into a thin pass-through.
 //!
 //! `GET /api/v1/projects/by-path?path=<abs-path>` is INTENTIONALLY NOT
 //! re-implemented here — it already lives in `modules_api.rs::get_
@@ -67,15 +73,27 @@ use super::modules_api::LauncherDbHandle;
 
 // ─── Default allowlists ──────────────────────────────────────────────────
 //
-// TODO-Phase-4: move to `bundled_tool_defaults.toml`. Mirror the Python
-// loader pattern used for bundled_mcp_versions.toml so both the Rust
-// hub and any Python tooling parse the SAME file.
+// v0.2.34 Agent E (Phase 4 generalisation): defaults can now also be
+// supplied by ANY module's `manifest.mcp_registration.tool_allowlist`
+// block, which the launcher's install flow writes into
+// `module_mcp_tool_defaults` (migration 023). The hardcoded constants
+// below remain as a FALLBACK for orchestrator-bundled MCPs (mermaid,
+// excalidraw) so they keep working even when no module-install cycle
+// has run yet — i.e. on a fresh launcher install where no paid module
+// has been touched.
+//
+// Resolution: module-shipped defaults (from the DB) take priority over
+// hardcoded constants when both exist for the same `mcp_name`. The
+// hub's GET handler queries the DB first and falls back to the const
+// only when the DB has zero rows.
 
-/// Default per-tool allowlist for the Mermaid wrapper. Mirrors plan
-/// §3 Phase 1 item 5: the three "save / render / validate" tools are
-/// enabled; the optional ones are off by default and require explicit
-/// opt-in. Sorted alphabetically so a future audit can diff it
-/// against the wrapper's known surface without churn.
+/// Hardcoded fallback per-tool allowlist for the Mermaid wrapper.
+/// Used when no module has registered defaults for `"mermaid"` in
+/// `module_mcp_tool_defaults`. Mirrors plan §3 Phase 1 item 5: the
+/// three "save / render / validate" tools are enabled; the optional
+/// ones are off by default and require explicit opt-in. Sorted
+/// alphabetically so a future audit can diff it against the wrapper's
+/// known surface without churn.
 const MERMAID_DEFAULT_ALLOWLIST: &[(&str, bool)] = &[
     ("export_png", false),  // Chromium-dependent; lazy enable.
     ("list_themes", false), // Low value; can re-enable per project.
@@ -128,16 +146,23 @@ const EXCALIDRAW_DEFAULT_ALLOWLIST: &[(&str, bool)] = &[
     ("update_element", true),
 ];
 
-/// Look up the hardcoded default allowlist for a given MCP name.
-/// Returns an empty slice for an unknown MCP — the wrapper will see
-/// an empty grants map and block everything except via tools the
+/// Look up the hardcoded fallback default allowlist for a given MCP
+/// name. Returns an empty slice for an unknown MCP — the wrapper will
+/// see an empty grants map and block everything except via tools the
 /// project explicitly enables (failsafe-DENY for unknown MCPs, not
 /// failsafe-ALLOW; matches Phase 4 "new tools default off" rule).
+///
+/// v0.2.34 (Agent E): this constant-table lookup is now the FALLBACK
+/// path. `get_mcp_tool_grants` first consults `module_mcp_tool_defaults`
+/// (manifest-driven) and only walks here when zero rows exist for
+/// `mcp_name`. The match arms continue to enumerate orchestrator-
+/// bundled MCPs that don't ship as installable modules.
 fn _default_allowlist_for(mcp_name: &str) -> &'static [(&'static str, bool)] {
     match mcp_name {
         "mermaid" => MERMAID_DEFAULT_ALLOWLIST,
         "excalidraw" => EXCALIDRAW_DEFAULT_ALLOWLIST,
-        // Phase 4 expands this match arm.
+        // Other MCPs supply defaults via their manifest's tool_allowlist
+        // block (v0.2.34 Agent E). Empty fallback when not registered.
         _ => &[],
     }
 }
@@ -194,26 +219,49 @@ async fn get_mcp_tool_grants(
         Err(e) => return err500(e),
     }
 
-    // Phase 1.1 sibling owns `project_mcp_tool_grants`. Until it
-    // lands, the launcher_core Db has no `list_project_mcp_tool_grants`
-    // accessor; we fall through to defaults unconditionally. The
-    // grants table merge happens in the same place when the sibling
-    // adds the accessor — see the integration note in the module
-    // doc-comment above.
-    //
-    // Pre-merge contract: this branch ALWAYS returns
-    // `defaults_applied: true`. Post-merge, it returns false when
-    // the DB has at least one row for (project_id, mcp_name).
-    let defaults = _default_allowlist_for(&mcp_name);
-    let grants: BTreeMap<String, bool> = defaults
-        .iter()
-        .map(|(name, en)| (name.to_string(), *en))
-        .collect();
+    // ─── Layer 1: assemble defaults ──────────────────────────────────
+    // Prefer module-shipped defaults (manifest.mcp_registration.
+    // tool_allowlist → module_mcp_tool_defaults via migration 023).
+    // Fall back to the hardcoded constants only when the DB carries
+    // ZERO rows for `mcp_name`.
+    let mut grants: BTreeMap<String, bool> = BTreeMap::new();
+    match h.0.list_mcp_tool_defaults(&mcp_name) {
+        Ok(rows) if !rows.is_empty() => {
+            for row in rows {
+                grants.insert(row.tool_name, row.default_enabled);
+            }
+        }
+        Ok(_) => {
+            // No module-shipped defaults — fall back to the hardcoded
+            // table for orchestrator-bundled MCPs.
+            for (name, en) in _default_allowlist_for(&mcp_name) {
+                grants.insert(name.to_string(), *en);
+            }
+        }
+        Err(e) => return err500(e),
+    }
+
+    // ─── Layer 2: apply per-project overrides ────────────────────────
+    // Per-project rows in `project_mcp_tool_grants` ALWAYS override the
+    // default (whether the default came from the DB or the hardcoded
+    // table). A row for a tool not in the default set is honoured too
+    // — useful when a user toggles an experimental tool the manifest
+    // hasn't yet declared.
+    let project_overrides = match h.0.list_project_mcp_tools(&project_id, &mcp_name) {
+        Ok(rows) => rows,
+        Err(e) => return err500(e),
+    };
+    let has_overrides = !project_overrides.is_empty();
+    for row in project_overrides {
+        grants.insert(row.tool_name, row.enabled);
+    }
 
     let body = McpToolGrantsResponse {
         mcp_name: mcp_name.clone(),
         grants,
-        defaults_applied: true,
+        // `defaults_applied: true` ⇔ NO per-project overrides exist.
+        // The GUI uses this to show a "(defaults)" badge.
+        defaults_applied: !has_overrides,
     };
     Json(body).into_response()
 }
@@ -436,5 +484,204 @@ mod tests {
              upstream surface — drop them or bump the upstream-tools \
              reference list in this test if v2.x added them",
         );
+    }
+
+    // ─── v0.2.34 Agent E (Phase 4 generalisation) tests ──────────────────
+    //
+    // The hub route now consults `module_mcp_tool_defaults` and merges
+    // any rows in `project_mcp_tool_grants`. The existing tests above
+    // exercise the FALLBACK path (hardcoded constants + no per-project
+    // rows). The tests below cover the GENERALISED path:
+    //   * module-shipped defaults take priority over the hardcoded
+    //     constants when both exist;
+    //   * a non-bundled (paid) MCP whose defaults live ONLY in
+    //     `module_mcp_tool_defaults` is fully served;
+    //   * per-project overrides ALWAYS win over either default source;
+    //   * `defaults_applied: false` when ANY override exists.
+
+    #[tokio::test]
+    async fn module_shipped_defaults_take_priority_over_hardcoded() {
+        // A paid module re-skins the mermaid wrapper with a different
+        // policy (export_png on by default; list_themes still off; the
+        // module ADDS a new "lint" tool with default off). The DB
+        // values must win — the hardcoded MERMAID_DEFAULT_ALLOWLIST is
+        // only consulted when the DB has zero rows.
+        let state = make_db_with_project("p1");
+        state
+            .0
+            .reconcile_mcp_tool_defaults(
+                "mermaid",
+                "third-party-diagrams",
+                &[
+                    ("export_png".to_string(), true, None),
+                    ("list_themes".to_string(), false, None),
+                    ("render".to_string(), true, None),
+                    ("save_diagram".to_string(), true, None),
+                    ("validate_syntax".to_string(), true, None),
+                    ("lint".to_string(), false, None),
+                ],
+                123,
+            )
+            .unwrap();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/projects/p1/mcp-tool-grants/mermaid", base))
+            .send()
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 200);
+        let parsed: serde_json::Value = resp.json().await.unwrap();
+        // Module-shipped row overrides hardcoded entry.
+        assert_eq!(parsed["grants"]["export_png"], true);
+        // Newly-added tool surfaces.
+        assert_eq!(parsed["grants"]["lint"], false);
+        // No per-project rows → defaults_applied stays true.
+        assert_eq!(parsed["defaults_applied"], true);
+    }
+
+    #[tokio::test]
+    async fn module_shipped_defaults_for_non_bundled_mcp() {
+        // A paid module ships a brand-new MCP (no hardcoded fallback
+        // exists). The route must still return its declared defaults.
+        let state = make_db_with_project("p1");
+        state
+            .0
+            .reconcile_mcp_tool_defaults(
+                "code-reranker",
+                "vct-rl-reranker",
+                &[
+                    ("rerank".to_string(), true, Some("re-rank results".into())),
+                    ("explain".to_string(), false, None),
+                ],
+                100,
+            )
+            .unwrap();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "{}/projects/p1/mcp-tool-grants/code-reranker",
+                base
+            ))
+            .send()
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 200);
+        let parsed: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(parsed["mcp_name"], "code-reranker");
+        assert_eq!(parsed["grants"]["rerank"], true);
+        assert_eq!(parsed["grants"]["explain"], false);
+        assert_eq!(parsed["defaults_applied"], true);
+    }
+
+    #[tokio::test]
+    async fn per_project_overrides_win_over_module_defaults() {
+        // Module defaults rerank=on; the user disabled it for THIS
+        // project. Hub response must show rerank=false AND
+        // defaults_applied=false.
+        let state = make_db_with_project("p1");
+        state
+            .0
+            .reconcile_mcp_tool_defaults(
+                "code-reranker",
+                "vct-rl-reranker",
+                &[
+                    ("rerank".to_string(), true, None),
+                    ("explain".to_string(), false, None),
+                ],
+                100,
+            )
+            .unwrap();
+        state
+            .0
+            .set_mcp_tool_enabled("p1", "code-reranker", "rerank", false)
+            .unwrap();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "{}/projects/p1/mcp-tool-grants/code-reranker",
+                base
+            ))
+            .send()
+            .await
+            .expect("GET");
+        let parsed: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(parsed["grants"]["rerank"], false);
+        // Tool NOT overridden keeps its default.
+        assert_eq!(parsed["grants"]["explain"], false);
+        // ANY override flips defaults_applied to false.
+        assert_eq!(parsed["defaults_applied"], false);
+    }
+
+    #[tokio::test]
+    async fn per_project_override_for_tool_not_in_defaults_surfaces() {
+        // User toggles a tool the manifest hasn't declared (e.g. an
+        // experimental tool the upstream surfaces but the wrapper
+        // author didn't anticipate). The merge must STILL include it
+        // — the user's row in `project_mcp_tool_grants` is the
+        // source of truth.
+        let state = make_db_with_project("p1");
+        state
+            .0
+            .set_mcp_tool_enabled("p1", "code-reranker", "experimental_x", true)
+            .unwrap();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "{}/projects/p1/mcp-tool-grants/code-reranker",
+                base
+            ))
+            .send()
+            .await
+            .expect("GET");
+        let parsed: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(parsed["grants"]["experimental_x"], true);
+        assert_eq!(parsed["defaults_applied"], false);
+    }
+
+    #[tokio::test]
+    async fn reconcile_removes_old_tool_on_module_update() {
+        // v0.2.7 of a module ships [tool_a, tool_b]; v0.2.8 drops
+        // tool_b. After re-reconcile the hub response must NOT include
+        // tool_b. Per-project overrides for tool_b survive in the DB
+        // (we don't soft-delete them) but since `grants` is composed
+        // from defaults + overrides, the override surfaces ONLY if a
+        // row exists. If the user never toggled tool_b, it disappears.
+        let state = make_db_with_project("p1");
+        state
+            .0
+            .reconcile_mcp_tool_defaults(
+                "fancy-mcp",
+                "fancy-module",
+                &[
+                    ("tool_a".to_string(), true, None),
+                    ("tool_b".to_string(), false, None),
+                ],
+                100,
+            )
+            .unwrap();
+        // Re-reconcile with tool_b removed.
+        state
+            .0
+            .reconcile_mcp_tool_defaults(
+                "fancy-mcp",
+                "fancy-module",
+                &[("tool_a".to_string(), true, None)],
+                200,
+            )
+            .unwrap();
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/projects/p1/mcp-tool-grants/fancy-mcp", base))
+            .send()
+            .await
+            .expect("GET");
+        let parsed: serde_json::Value = resp.json().await.unwrap();
+        assert!(parsed["grants"].get("tool_b").is_none());
+        assert_eq!(parsed["grants"]["tool_a"], true);
     }
 }
