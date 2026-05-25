@@ -42,11 +42,21 @@ use serde::Deserialize;
 /// Embedded copy of the .toml, read at compile time.
 ///
 /// Path: 4 levels up from this file
-/// (`src` → `vct-launcher-core` → `src-tauri` → `launcher` → repo root).
-/// Same depth as `installer.rs`'s `ORCHESTRATOR_MANAGED_PATHS_TXT`
-/// include path.
+/// (`src` → `vct-launcher-core` → `src-tauri` → `launcher` → repo root),
+/// then down into `vco_lib/`.
+///
+/// The .toml moved from the repo root into `vco_lib/` in v0.2.34 so it
+/// ships in the Python wheel — see `vco_lib/bundled_versions.py`'s
+/// `_DEFAULT_MANIFEST_PATH` docstring for the full rationale. The Rust
+/// loader is unaffected functionally (the embed is compile-time), but
+/// the include path must follow the file move in lockstep.
+///
+/// Note: `installer.rs`'s `ORCHESTRATOR_MANAGED_PATHS_TXT` include path
+/// remains 4-up-only (`../../../../orchestrator-managed-paths.txt`)
+/// because that file did NOT move — it is consumed only by `install.py`
+/// (repo-root-only, not in the wheel) and by the Rust installer here.
 const BUNDLED_VERSIONS_TOML: &str =
-    include_str!("../../../../bundled_mcp_versions.toml");
+    include_str!("../../../../vco_lib/bundled_mcp_versions.toml");
 
 /// Errors raised by [`reload_from_path`] and the lazy initialiser.
 ///

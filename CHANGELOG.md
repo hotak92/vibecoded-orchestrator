@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Sidecars (`.claude/diagrams/<file>.meta.json`) are tracked by git** by design — they're the portable metadata that travels with diagrams across machines. Users who prefer not to track them can add `.claude/diagrams/**/*.meta.json` to their `.gitignore`; the indexer regenerates them deterministically from SQLite + file content on next save.
 - **Pre-alpha**: codegraph→Mermaid output is experimental; verify against source before sharing.
-- **Excalidraw vendored fork** (`claude_mcp_servers/excalidraw_mcp_fork/`) — `excalidraw-mcp-server@2.0.0` bit-identical from npm; MIT-licensed, AGPL-compatible.
+- **Excalidraw vendored fork** (`vco_lib/excalidraw_mcp_fork/`) — `excalidraw-mcp-server@2.0.0` bit-identical from npm; MIT-licensed, AGPL-compatible. (Moved here from `claude_mcp_servers/excalidraw_mcp_fork/` in v0.2.34 so it ships in the Python wheel.)
 
 ## [0.2.33] — 2026-05-25
 

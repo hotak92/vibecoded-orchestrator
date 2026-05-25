@@ -35,13 +35,34 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-# Path resolution mirrors install.py's ``_MANAGED_PATHS_FILE`` style:
-# ``__file__`` → ``vco_lib/bundled_versions.py`` → parent.parent is the
-# repo root, where the .toml sits next to install.py and the .txt
-# allowlist. ``.resolve()`` so symlinks / relative-CWD invocations still
-# land on the right file.
+# Path resolution: ``__file__`` → ``vco_lib/bundled_versions.py``;
+# ``.parent`` is the ``vco_lib/`` package directory, where the .toml
+# now lives as a SIBLING of this loader (moved from the repo root in
+# the v0.2.34 wheel-packaging fix, see CHANGELOG / `tests/
+# test_wheel_install.py` for the failure mode it cured).
+#
+# Why co-located with the loader and NOT the repo root:
+# ``bundled_mcp_versions.toml`` is consumed at RUNTIME by code that
+# also ships in the wheel (this module + the
+# ``claude_mcp_servers.wrappers.*_proxy`` MCP wrappers, which import
+# from ``vco_lib.bundled_versions``). Keeping the .toml at the repo
+# root meant it was NOT included in the wheel (``pyproject.toml``
+# ships only ``packages = ["vco_lib"]``), so a fresh
+# ``pip install vibecoded-orchestrator`` produced an install where
+# the wrappers crashed with SystemExit(1) the first time Claude Code
+# spawned them. Co-locating the .toml under ``vco_lib/`` makes it
+# part of the wheel automatically (hatchling ships every file under
+# the listed packages).
+#
+# ``orchestrator-managed-paths.txt`` was left at the repo root — it is
+# consumed ONLY by ``install.py`` (also repo-root-only, NOT shipped in
+# the wheel) and by Rust's ``installer.rs`` via ``include_str!``;
+# neither path is reachable from a pip-installed wheel.
+#
+# ``.resolve()`` so symlinks / relative-CWD invocations still land on
+# the right file.
 _DEFAULT_MANIFEST_PATH: Path = (
-    Path(__file__).resolve().parent.parent / "bundled_mcp_versions.toml"
+    Path(__file__).resolve().parent / "bundled_mcp_versions.toml"
 )
 
 

@@ -47,7 +47,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib import bundled_versions  # noqa: E402
 
-MANIFEST_PATH = REPO_ROOT / "bundled_mcp_versions.toml"
+MANIFEST_PATH = REPO_ROOT / "vco_lib" / "bundled_mcp_versions.toml"
 RUST_SRC_PATH = (
     REPO_ROOT
     / "launcher" / "src-tauri" / "vct-launcher-core"
@@ -113,20 +113,27 @@ class BundledVersionsParityTests(unittest.TestCase):
     def test_rust_source_includes_manifest_at_expected_path(self) -> None:
         """Pin the Rust `include_str!` path. If `bundled_versions.rs`
         moves, the include-path AND this assertion must update in
-        lockstep. Same guard shape as `test_managed_paths_consistency`."""
+        lockstep. Same guard shape as `test_managed_paths_consistency`.
+
+        Note (v0.2.34): the .toml moved from the repo root into
+        ``vco_lib/`` so the file ships in the Python wheel. The Rust
+        include path was updated in lockstep: 4 levels up (to repo
+        root) then back down into ``vco_lib/``.
+        """
         self.assertTrue(
             RUST_SRC_PATH.is_file(),
             f"Rust loader missing at {RUST_SRC_PATH}",
         )
         rust_src = RUST_SRC_PATH.read_text(encoding="utf-8")
         expected_include = (
-            'include_str!("../../../../bundled_mcp_versions.toml")'
+            'include_str!("../../../../vco_lib/bundled_mcp_versions.toml")'
         )
         self.assertIn(
             expected_include, rust_src,
             f"Rust {RUST_SRC_PATH.name} must embed bundled_mcp_versions.toml "
-            f"via include_str! with a 4-level relative path. If the .rs file "
-            f"moved, update both the include_str! call and this assertion.",
+            f"via include_str! with a 4-level relative path into vco_lib/. "
+            f"If the .rs file moved, update both the include_str! call and "
+            f"this assertion.",
         )
 
     def test_rust_unit_test_pins_same_key_set(self) -> None:
@@ -174,14 +181,17 @@ class BundledVersionsParityTests(unittest.TestCase):
         # impossible (paranoia: there are no substrings, but we keep
         # the discipline matching `_independent_parse` from
         # `test_managed_paths_consistency`).
+        #
+        # Path is ``vco_lib/bundled_mcp_versions.toml`` since v0.2.34
+        # (moved from repo root so the .toml ships in the Python wheel).
         present = any(
-            line.strip() == "bundled_mcp_versions.toml"
+            line.strip() == "vco_lib/bundled_mcp_versions.toml"
             for line in contents.splitlines()
             if line.strip() and not line.strip().startswith("#")
         )
         self.assertTrue(
             present,
-            "`bundled_mcp_versions.toml` must appear in "
+            "`vco_lib/bundled_mcp_versions.toml` must appear in "
             "`orchestrator-managed-paths.txt` so `update_orchestrator_at` "
             "propagates manifest edits to existing installs.",
         )

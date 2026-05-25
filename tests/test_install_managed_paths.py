@@ -54,7 +54,12 @@ EXPECTED_MANAGED_PATHS: tuple[str, ...] = (
     # `update_orchestrator_at` propagates new editions of the manifest
     # to existing installs — same fail-safe self-reference shape used
     # for `orchestrator-managed-paths.txt` itself.
-    "bundled_mcp_versions.toml",
+    #
+    # (v0.2.34: the .toml moved from the repo root into ``vco_lib/`` so
+    # it ships in the Python wheel — see
+    # ``vco_lib/bundled_versions.py`` docstring. The whitelist entry
+    # updated in lockstep so update propagation still finds it.)
+    "vco_lib/bundled_mcp_versions.toml",
 )
 
 

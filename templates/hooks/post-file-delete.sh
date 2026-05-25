@@ -4,17 +4,34 @@
 # delete across SQLite + sidecar + Weaviate via
 # `vco_lib.diagram_indexer drop <file>`.
 #
-# Triggers on Bash commands matching:
-#   - `rm [-flags] <path>`        (single + multiple targets)
-#   - `unlink <path>`
-#   - `mv <src> <dest>`           (when src is under .claude/diagrams/)
+# Triggers on Bash commands matching ANY segment in a chain whose
+# (possibly-wrapped) verb is one of:
+#   - `rm`/`unlink`/`mv`          (single + multiple targets)
+#   - `Remove-Item`/`Move-Item`   (PowerShell — also handled in .ps1)
+# AND whose target path is a .mmd / .excalidraw file under
+# .claude/diagrams/. The parser handles chains (`cd /tmp && rm ...`),
+# wrapper verbs (`sudo rm`, `nice rm`, `taskset`), env-prefix
+# (`KEY=val rm ...`), and `bash -c "rm ..."` sub-commands — see
+# `vco_lib/diagram_delete_parser.py` for the full rules + the B4
+# regression note documenting why the previous "first-token-only"
+# parser missed most real Claude-generated deletes.
+#
+# Retroactive cleanup of orphans
+# ------------------------------
+# False negatives (a delete via Python script or some other non-Bash
+# path the parser doesn't recognise) can leave stale SQLite rows /
+# sidecars / Weaviate objects behind. The canonical "sweep up" path
+# for those is `vco rebuild-diagram-index --prune` (re-walks
+# .claude/diagrams/, removes index entries for files that no longer
+# exist on disk). This replaced the previously-planned
+# `cleanup-orphan-diagrams.sh` SessionStart hook — the CLI subcommand
+# is on-demand + visible + scriptable, which matched the v0.2.34
+# design review's preference for explicit-user-invocation cleanups
+# over silent SessionStart sweeps.
 #
 # False positives are tolerated (`vco_lib.diagram_indexer drop` is
 # idempotent — calling it on a path that has no DB row / sidecar /
-# Weaviate object is a no-op). False negatives — a delete via Python
-# script or other non-Bash path — are caught by the session-start
-# `cleanup-orphan-diagrams.sh` hook (sweeps for sidecars whose target
-# file no longer exists).
+# Weaviate object is a no-op).
 #
 # Always exits 0 (never blocks the user's Bash). Silent when no diagram
 # delete is detected.
@@ -74,68 +91,15 @@ case "$COMMAND" in
     *) exit 0 ;;
 esac
 
-# Parse the command to extract candidate paths. Pure-Python parser
-# avoids bash word-splitting surprises with quoted paths + globs.
-PATHS=$(printf '%s' "$COMMAND" | "$PY" -c "
-import json, shlex, sys, glob, os
-cmd = sys.stdin.read().strip()
-# Strip leading env assignments + sudo etc — find the actual verb.
-try:
-    tokens = shlex.split(cmd, posix=True)
-except ValueError:
-    sys.exit(0)
-if not tokens:
-    sys.exit(0)
-# Skip leading env-style 'KEY=VAL' assignments.
-i = 0
-while i < len(tokens) and '=' in tokens[i] and not tokens[i].startswith('-'):
-    eq = tokens[i].index('=')
-    head = tokens[i][:eq]
-    if head and head.replace('_','').isalnum() and head[0].isalpha():
-        i += 1
-        continue
-    break
-if i >= len(tokens):
-    sys.exit(0)
-# Support multi-command chains separated by ; && ||. We only inspect
-# the first verb to keep matching tight; a chain that deletes diagrams
-# in the second clause is missed (caught by session-start sweeper).
-verb = os.path.basename(tokens[i])
-if verb not in ('rm', 'unlink', 'mv'):
-    sys.exit(0)
-# Collect positional arguments (skip flags).
-args = []
-for tok in tokens[i+1:]:
-    if tok.startswith('-'):
-        # rm -rf, -f, -i, etc. — skip
-        continue
-    if tok in (';', '&&', '||', '|'):
-        break
-    args.append(tok)
-# For 'mv', only the SOURCE (first positional) counts as a delete.
-# Destination is irrelevant — if dest is also under .claude/diagrams/
-# the post-file-edit hook will re-index it.
-if verb == 'mv' and len(args) >= 2:
-    args = args[:1]
-# Expand globs (the shell already did this for the actual rm, but we
-# need to enumerate too).
-expanded = []
-for a in args:
-    if any(c in a for c in '*?['):
-        expanded.extend(glob.glob(a))
-    else:
-        expanded.append(a)
-# Filter to .mmd / .excalidraw under .claude/diagrams.
-for p in expanded:
-    if not p:
-        continue
-    if not p.endswith('.mmd') and not p.endswith('.excalidraw'):
-        continue
-    norm = os.path.normpath(p)
-    if '.claude/diagrams/' not in norm and '.claude' + os.sep + 'diagrams' + os.sep not in norm:
-        continue
-    print(norm)
-" 2>/dev/null)
+# Parse the command via vco_lib.diagram_delete_parser. The parser
+# module is unit-tested (`tests/test_post_file_delete_parser.py`) so we
+# can rely on it to handle chains (`cd /tmp && rm ...`), wrapper verbs
+# (`sudo rm`, `nice rm`), and `bash -c "rm ..."` sub-commands. PYTHONPATH
+# is set to PROJECT_ROOT so the import resolves even from outside an
+# installed package context.
+PATHS=$(printf '%s' "$COMMAND" | \
+    PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PY" -m vco_lib.diagram_delete_parser 2>/dev/null)
 
 [ -z "$PATHS" ] && exit 0
 

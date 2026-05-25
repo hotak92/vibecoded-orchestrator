@@ -5,7 +5,7 @@ shape (Phase 2 of the diagrams-integration plan, 2026-05-25).
 
 Companion to ``test_install_pinned_npm.py``: that suite covers the
 registry-pin path (claude-mermaid@1.6.3 style), this one covers the
-file: pin path (file:claude_mcp_servers/excalidraw_mcp_fork style)
+file: pin path (file:vco_lib/excalidraw_mcp_fork style)
 that we introduced for the vendored Excalidraw fork.
 
 Mocks ``subprocess.run`` and ``_NPM_PATH`` so the suite never touches a
@@ -116,10 +116,10 @@ def _make_synthetic_vendor(root: Path,
     """Create a minimal vendored package layout under ``root``.
 
     Returns the absolute vendor dir. Mirrors the real
-    ``claude_mcp_servers/excalidraw_mcp_fork/`` shape just enough for
+    ``vco_lib/excalidraw_mcp_fork/`` shape just enough for
     the install path's package.json reads to succeed.
     """
-    vendor_dir = root / "claude_mcp_servers" / "excalidraw_mcp_fork"
+    vendor_dir = root / "vco_lib" / "excalidraw_mcp_fork"
     vendor_dir.mkdir(parents=True)
     pkg_json = {
         "name": name,
@@ -154,7 +154,7 @@ class FilePinHappyPathTests(unittest.TestCase):
         # the install path expects. The vendor's actual package.json
         # declares name=excalidraw-mcp-server, version=2.0.0.
         manifest = _make_file_pin_manifest(
-            "claude_mcp_servers/excalidraw_mcp_fork",
+            "vco_lib/excalidraw_mcp_fork",
         )
         # Stages:
         #   1. initial `npm view -g <name> version` (absent → empty stdout)
@@ -188,7 +188,7 @@ class FilePinHappyPathTests(unittest.TestCase):
 
     def test_file_pin_already_pinned_short_circuits(self) -> None:
         manifest = _make_file_pin_manifest(
-            "claude_mcp_servers/excalidraw_mcp_fork",
+            "vco_lib/excalidraw_mcp_fork",
         )
         # First query reports the vendored version → no install.
         stages = [
@@ -219,7 +219,7 @@ class FilePinSkipPathTests(unittest.TestCase):
 
     def test_env_var_skip_returns_false_without_subprocess(self) -> None:
         manifest = _make_file_pin_manifest(
-            "claude_mcp_servers/excalidraw_mcp_fork",
+            "vco_lib/excalidraw_mcp_fork",
         )
         with _patch_manifest(manifest), _patch_npm_path(), \
              _patch_audit_log(self.tmpdir), \
@@ -235,7 +235,7 @@ class FilePinSkipPathTests(unittest.TestCase):
 
     def test_npm_missing_returns_false_without_subprocess(self) -> None:
         manifest = _make_file_pin_manifest(
-            "claude_mcp_servers/excalidraw_mcp_fork",
+            "vco_lib/excalidraw_mcp_fork",
         )
         with _patch_manifest(manifest), _patch_npm_path(None), \
              _patch_audit_log(self.tmpdir), \
@@ -370,7 +370,7 @@ class FilePinDriftDetectorTests(unittest.TestCase):
 
     def test_file_pin_never_reports_drift(self) -> None:
         manifest = _make_file_pin_manifest(
-            "claude_mcp_servers/excalidraw_mcp_fork",
+            "vco_lib/excalidraw_mcp_fork",
         )
         with _patch_manifest(manifest), _patch_npm_path(), \
              mock.patch.object(subprocess, "run") as run:

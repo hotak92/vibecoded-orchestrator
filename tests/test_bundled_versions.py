@@ -119,17 +119,20 @@ class LoadBundledVersionsTests(unittest.TestCase):
         versions = bundled_versions.load_bundled_versions(tmp_path)
         self.assertEqual(versions, {})
 
-    def test_manifest_path_points_to_repo_root(self) -> None:
+    def test_manifest_path_points_inside_vco_lib(self) -> None:
         """`manifest_path()` exposes the resolved absolute path used by
         the default branch of `load_bundled_versions`. The file must be
-        a sibling of install.py at the repo root."""
+        a sibling of ``bundled_versions.py`` inside ``vco_lib/`` — that
+        co-location is what makes the .toml ship in the Python wheel
+        (the v0.2.34 wheel-packaging fix; pre-fix, the .toml lived at
+        the repo root and was silently dropped from the wheel)."""
         path = bundled_versions.manifest_path()
         self.assertTrue(
             path.is_absolute(),
             f"manifest_path() returned non-absolute: {path}",
         )
         self.assertEqual(path.name, "bundled_mcp_versions.toml")
-        self.assertEqual(path.parent, REPO_ROOT)
+        self.assertEqual(path.parent, REPO_ROOT / "vco_lib")
         self.assertTrue(path.is_file(), f"{path} does not exist on disk")
 
 
