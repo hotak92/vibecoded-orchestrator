@@ -393,6 +393,163 @@ def _fetch_project_row(conn: sqlite3.Connection, project_id: str) -> _DbProjectR
     )
 
 
+# ─── Public project-row helpers (Phase 0.B Part 2) ──────────────────────
+#
+# These two functions are the canonical lookup primitives used by the
+# diagrams CLIs (``vco rebuild-diagram-index`` and ``vco verify-diagrams
+# --all``). They read the ``projects`` table via :func:`_open_db_read_only`
+# so the launcher remains the only writer of its own DB.
+#
+# Resolution semantics:
+#   * ``resolve_project_folder`` accepts either a project id (UUID) or a
+#     slug; tries id first because that's the canonical handle in the
+#     Rust commands, falls back to slug for the URL-addressable
+#     ``/p/<slug>/...`` flow.
+#   * ``list_registered_projects`` returns the closed set of fields the
+#     consumers need (id, name, slug, folder_path), sorted by name so
+#     the ``--all`` iteration order is deterministic across runs (useful
+#     for CI diffs and progress-bar UX). A ``folder`` alias is included
+#     alongside ``folder_path`` for back-compat with the rebuild CLI's
+#     consumer that pre-dated the canonical spec.
+
+
+def resolve_project_folder(
+    project_id_or_slug: str,
+    *,
+    db_path: Path | None = None,
+) -> Path:
+    """Look up a project by id OR slug; return its absolute folder_path.
+
+    Tries ``projects.id`` first (the canonical handle); if no match,
+    falls back to ``projects.slug``. Both columns are unique in the
+    launcher schema (id is PRIMARY KEY; slug has a UNIQUE index per
+    migration 003), so the lookup is at most two indexed point reads.
+
+    Args:
+        project_id_or_slug: Either the UUID stored in ``projects.id``
+            or the URL-safe slug stored in ``projects.slug``.
+        db_path: Optional override of the launcher DB location. Defaults
+            to :func:`_resolve_launcher_db_path`. Tests should pass an
+            explicit path to avoid touching the real launcher DB.
+
+    Returns:
+        The absolute folder path as a :class:`pathlib.Path`.
+
+    Raises:
+        LookupError: when neither id nor slug matches. The diagrams CLIs
+            translate this to ``EXIT_ENV_PROBLEM`` (exit code 2).
+        DbUnreachable: when the launcher DB is missing or unopenable.
+            Distinct from LookupError so callers can distinguish "no
+            launcher installed" from "project not registered".
+    """
+    if db_path is None:
+        db_path = _resolve_launcher_db_path()
+    try:
+        conn = _open_db_read_only(db_path)
+    except FileNotFoundError as exc:
+        raise DbUnreachable(str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        raise DbUnreachable(
+            f"cannot open launcher.db at {db_path}: {exc}"
+        ) from exc
+    try:
+        cur = conn.cursor()
+        # Try id first (canonical handle).
+        cur.execute(
+            "SELECT folder_path FROM projects WHERE id = ?",
+            (project_id_or_slug,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            # Fall back to slug (URL-addressable handle).
+            cur.execute(
+                "SELECT folder_path FROM projects WHERE slug = ?",
+                (project_id_or_slug,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            raise LookupError(
+                f"no project with id or slug {project_id_or_slug!r}"
+            )
+        return Path(str(row["folder_path"]))
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def list_registered_projects(
+    *, db_path: Path | None = None,
+) -> list[Mapping[str, str]]:
+    """Return every registered project as ``{id, name, slug, folder_path}``.
+
+    Sorted by ``name`` for deterministic ``--all`` iteration order. Used
+    by:
+
+      * ``vco rebuild-diagram-index --all``
+      * ``vco verify-diagrams --all``
+
+    Each dict also carries a ``folder`` alias for ``folder_path`` so the
+    rebuild CLI's existing consumer (``project.get("folder")``) keeps
+    working without modification.
+
+    Args:
+        db_path: Optional override of the launcher DB location. Defaults
+            to :func:`_resolve_launcher_db_path`. Tests should pass an
+            explicit path to avoid touching the real launcher DB.
+
+    Returns:
+        List of mappings — empty list when no projects are registered
+        (NOT an error). Each mapping has keys: ``id``, ``name``,
+        ``slug``, ``folder_path``, and ``folder`` (alias).
+
+    Raises:
+        DbUnreachable: when the launcher DB is missing or unopenable.
+    """
+    if db_path is None:
+        db_path = _resolve_launcher_db_path()
+    try:
+        conn = _open_db_read_only(db_path)
+    except FileNotFoundError as exc:
+        raise DbUnreachable(str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        raise DbUnreachable(
+            f"cannot open launcher.db at {db_path}: {exc}"
+        ) from exc
+    try:
+        cur = conn.cursor()
+        # ORDER BY name keeps the iteration order stable across
+        # launcher runs; the slug-fallback in the WHERE clause defends
+        # against rows where ``name`` was wiped to an empty string by a
+        # bad rename (Bug-12 in the launcher's project-rename flow,
+        # 2026-02-11).
+        cur.execute(
+            "SELECT id, name, folder_path, slug FROM projects "
+            "ORDER BY name, slug"
+        )
+        out: list[Mapping[str, str]] = []
+        for row in cur.fetchall():
+            folder_path = str(row["folder_path"])
+            out.append(
+                {
+                    "id": str(row["id"]),
+                    "name": str(row["name"]),
+                    "slug": str(row["slug"]),
+                    "folder_path": folder_path,
+                    # Back-compat alias for rebuild_diagram_index.py's
+                    # consumer that pre-dated the canonical spec.
+                    "folder": folder_path,
+                }
+            )
+        return out
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
 def _fetch_module_setting_bool(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1410,5 +1567,7 @@ __all__ = [
     "ProjectNotFound",
     "apply_project_env",
     "list_canonical_keys",
+    "list_registered_projects",
     "project_env_from_db",
+    "resolve_project_folder",
 ]

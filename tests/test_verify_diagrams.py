@@ -529,6 +529,15 @@ def test_env_projection_key_not_in_canonical(monkeypatch, project_folder):
 
 
 def test_env_projection_fix_delegates(monkeypatch, project_folder):
+    """``--fix`` re-resolves the canonical bundle and calls
+    :func:`apply_project_env` with the (bundle, surfaces=...) contract.
+
+    Regression guard for code-review B5: the prior call site invoked
+    ``apply_project_env(expected, project_folder=...)`` — wrong type AND
+    wrong kwarg — every ``--fix`` invocation that reached this branch
+    died with ``KeyError("project_root")`` because ``expected`` was a
+    flat env mapping, not a ProjectEnvBundle.
+    """
     monkeypatch.setattr(
         vd, "_project_env_from_db",
         lambda _pid: {
@@ -542,16 +551,53 @@ def test_env_projection_fix_delegates(monkeypatch, project_folder):
         "{}", encoding="utf-8"
     )
 
-    # Stub apply_project_env to "succeed".
-    fake_apply = mock.Mock(return_value=mock.Mock(ok=True))
-    fake_cp = mock.Mock(apply_project_env=fake_apply)
+    # Stub the real config_projection contract: project_env_from_db
+    # returns a ProjectEnvBundle, apply_project_env writes surfaces and
+    # returns a per-surface key report.
+    fake_bundle = {
+        "canonical_env": {
+            "KG_COLLECTION": "Demo_KnowledgeGraph",
+            "DIAGRAMS_COLLECTION": "Demo_Diagrams",
+        },
+        "project_id": "p-1",
+        "project_root": project_folder,
+    }
+    fake_from_db = mock.Mock(return_value=fake_bundle)
+    fake_apply = mock.Mock(return_value={
+        "claude_settings_json": ["KG_COLLECTION", "DIAGRAMS_COLLECTION"],
+        "claude_env": ["KG_COLLECTION", "DIAGRAMS_COLLECTION"],
+        "vscode_settings_json": ["KG_COLLECTION", "DIAGRAMS_COLLECTION"],
+    })
+    fake_cp = mock.Mock(
+        apply_project_env=fake_apply,
+        project_env_from_db=fake_from_db,
+    )
     monkeypatch.setitem(sys.modules, "vco_lib.config_projection", fake_cp)
     result = vd._check_env_projection("p-1", project_folder, fix=True)
-    assert result.status == vd.STATUS_FIXED
+    assert result.status == vd.STATUS_FIXED, result.detail
+
+    # Real contract: apply_project_env(bundle, surfaces=(...)). The
+    # bundle must be the ProjectEnvBundle (NOT the flat expected env)
+    # and project_folder must NOT appear as a kwarg.
     fake_apply.assert_called_once()
+    call_args = fake_apply.call_args
+    assert call_args.args[0] is fake_bundle
+    assert "project_folder" not in call_args.kwargs
+    # All 3 surfaces should be written (drift detector reads all 3).
+    surfaces = tuple(call_args.kwargs.get("surfaces", ()))
+    assert set(surfaces) == {
+        "claude_settings_json",
+        "claude_env",
+        "vscode_settings_json",
+    }
+    # Bundle re-resolution wired through project_env_from_db.
+    fake_from_db.assert_called_once_with("p-1")
 
 
 def test_env_projection_fix_apply_failure(monkeypatch, project_folder):
+    """``apply_project_env`` raising ConfigProjectionError surfaces as
+    STATUS_FIX_FAILED (not a silent success). The real contract signals
+    failure by raising — not by an "ok" return field."""
     monkeypatch.setattr(
         vd, "_project_env_from_db",
         lambda _pid: {
@@ -563,11 +609,20 @@ def test_env_projection_fix_apply_failure(monkeypatch, project_folder):
     (project_folder / ".vscode" / "settings.json").write_text(
         "{}", encoding="utf-8"
     )
-    fake_apply = mock.Mock(return_value=mock.Mock(ok=False))
-    fake_cp = mock.Mock(apply_project_env=fake_apply)
+    fake_bundle = {
+        "canonical_env": {"KG_COLLECTION": "Demo_KnowledgeGraph"},
+        "project_id": "p-1",
+        "project_root": project_folder,
+    }
+    fake_apply = mock.Mock(side_effect=RuntimeError("surface write failed"))
+    fake_cp = mock.Mock(
+        apply_project_env=fake_apply,
+        project_env_from_db=mock.Mock(return_value=fake_bundle),
+    )
     monkeypatch.setitem(sys.modules, "vco_lib.config_projection", fake_cp)
     result = vd._check_env_projection("p-1", project_folder, fix=True)
     assert result.status == vd.STATUS_FIX_FAILED
+    assert "surface write failed" in result.detail
 
 
 # ===========================================================================

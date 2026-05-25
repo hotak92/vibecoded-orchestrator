@@ -40,7 +40,9 @@ from vco_lib.config_projection import (
     ProjectNotFound,
     apply_project_env,
     list_canonical_keys,
+    list_registered_projects,
     project_env_from_db,
+    resolve_project_folder,
 )
 
 
@@ -900,3 +902,191 @@ def test_canonical_keys_returns_fresh_set() -> None:
     a.add("FAKE_KEY")
     b = list_canonical_keys()
     assert "FAKE_KEY" not in b
+
+
+# ─── resolve_project_folder tests (Phase 0.B Part 2) ────────────────────
+
+
+def test_resolve_project_folder_by_id(tmp_path: Path) -> None:
+    """Lookup by ``projects.id`` returns the absolute folder_path."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "myproj"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="proj-uuid-1", project_name="Demo",
+        project_folder=str(proj), project_slug="demo",
+    )
+    folder = resolve_project_folder("proj-uuid-1", db_path=db)
+    assert folder == proj
+    assert isinstance(folder, Path)
+
+
+def test_resolve_project_folder_by_slug(tmp_path: Path) -> None:
+    """Lookup falls back to ``projects.slug`` when id doesn't match.
+
+    Slug fallback drives the URL-addressable ``/p/<slug>/...`` flow that
+    the Phase 0.B brief calls out as a valid entry point.
+    """
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "by-slug"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="some-uuid", project_name="X",
+        project_folder=str(proj), project_slug="my-slug",
+    )
+    folder = resolve_project_folder("my-slug", db_path=db)
+    assert folder == proj
+
+
+def test_resolve_project_folder_not_found_raises_lookup_error(tmp_path: Path) -> None:
+    """Neither id nor slug matches → :class:`LookupError`.
+
+    The diagrams CLIs translate this exit code to ``EXIT_ENV_PROBLEM``;
+    using LookupError (not ConfigProjectionError) keeps the
+    ``except LookupError`` branch in those CLIs un-coupled to this
+    module's exception hierarchy.
+    """
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="real-id", project_name="P",
+        project_folder=str(proj), project_slug="real-slug",
+    )
+    with pytest.raises(LookupError) as exc_info:
+        resolve_project_folder("ghost", db_path=db)
+    assert "ghost" in str(exc_info.value)
+
+
+def test_resolve_project_folder_id_wins_over_slug(tmp_path: Path) -> None:
+    """When the same string matches an id AND a sibling project's slug,
+    the id wins (canonical-handle precedence).
+
+    This guards against a regression where slug-first lookup silently
+    redirects to a different project; the launcher's UI uses id as the
+    primary handle so id-precedence is the user-expected behaviour.
+    """
+    db = tmp_path / "launcher.db"
+    proj_a = tmp_path / "a"
+    proj_a.mkdir()
+    proj_b = tmp_path / "b"
+    proj_b.mkdir()
+    _make_launcher_db(
+        db, project_id="conflict-token", project_name="A",
+        project_folder=str(proj_a), project_slug="a-slug",
+        extra_projects=[
+            ("other-uuid", "B", str(proj_b), "conflict-token"),
+        ],
+    )
+    # The string "conflict-token" matches project A's id AND project B's
+    # slug. id-precedence means we should land on A.
+    folder = resolve_project_folder("conflict-token", db_path=db)
+    assert folder == proj_a
+
+
+def test_resolve_project_folder_db_missing(tmp_path: Path) -> None:
+    """DB file absent → :class:`DbUnreachable`, distinct from LookupError.
+
+    Lets callers distinguish "no launcher installed" from "project not
+    registered" — useful for the diagrams CLIs' error messages.
+    """
+    with pytest.raises(DbUnreachable):
+        resolve_project_folder("any", db_path=tmp_path / "does-not-exist.db")
+
+
+# ─── list_registered_projects tests (Phase 0.B Part 2) ──────────────────
+
+
+def test_list_registered_projects_empty(tmp_path: Path) -> None:
+    """Zero-row DB returns an empty list (NOT an error)."""
+    db = tmp_path / "launcher.db"
+    # Use the same schema fixture but immediately drop the single row.
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X",
+        project_folder=str(proj), project_slug="x",
+    )
+    conn = sqlite3.connect(str(db))
+    conn.execute("DELETE FROM projects")
+    conn.commit()
+    conn.close()
+    rows = list_registered_projects(db_path=db)
+    assert rows == []
+
+
+def test_list_registered_projects_multiple_sorted_by_name(tmp_path: Path) -> None:
+    """Multiple rows returned sorted by name for deterministic --all.
+
+    The diagrams CLIs iterate the result and emit per-project reports;
+    a stable order keeps CI diffs and progress-bar UX predictable.
+    """
+    db = tmp_path / "launcher.db"
+    a = tmp_path / "alpha"
+    a.mkdir()
+    b = tmp_path / "bravo"
+    b.mkdir()
+    c = tmp_path / "charlie"
+    c.mkdir()
+    _make_launcher_db(
+        db, project_id="id-c", project_name="Charlie",
+        project_folder=str(c), project_slug="charlie",
+        extra_projects=[
+            ("id-a", "Alpha", str(a), "alpha"),
+            ("id-b", "Bravo", str(b), "bravo"),
+        ],
+    )
+    rows = list_registered_projects(db_path=db)
+    names = [r["name"] for r in rows]
+    assert names == ["Alpha", "Bravo", "Charlie"]
+
+
+def test_list_registered_projects_returns_canonical_shape(tmp_path: Path) -> None:
+    """Every row carries id, name, slug, folder_path + folder alias.
+
+    ``folder`` is a back-compat alias for ``folder_path`` so the
+    rebuild-diagram-index CLI's existing ``project.get("folder")``
+    consumer keeps working without coordinated update.
+    """
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "demo"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="uuid-1", project_name="DemoProj",
+        project_folder=str(proj), project_slug="demo-slug",
+    )
+    rows = list_registered_projects(db_path=db)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["id"] == "uuid-1"
+    assert row["name"] == "DemoProj"
+    assert row["slug"] == "demo-slug"
+    assert row["folder_path"] == str(proj)
+    # Back-compat alias matches folder_path byte-for-byte.
+    assert row["folder"] == row["folder_path"]
+
+
+def test_list_registered_projects_deterministic_repeat(tmp_path: Path) -> None:
+    """Repeated calls return the same ordering — defends against an
+    accidental dict→set conversion or a DB-iterator order regression."""
+    db = tmp_path / "launcher.db"
+    a = tmp_path / "a"
+    a.mkdir()
+    b = tmp_path / "b"
+    b.mkdir()
+    _make_launcher_db(
+        db, project_id="id-a", project_name="Alpha",
+        project_folder=str(a), project_slug="alpha",
+        extra_projects=[
+            ("id-b", "Bravo", str(b), "bravo"),
+        ],
+    )
+    first = [r["name"] for r in list_registered_projects(db_path=db)]
+    second = [r["name"] for r in list_registered_projects(db_path=db)]
+    assert first == second == ["Alpha", "Bravo"]
+
+
+def test_list_registered_projects_db_missing(tmp_path: Path) -> None:
+    """DB file absent → :class:`DbUnreachable`."""
+    with pytest.raises(DbUnreachable):
+        list_registered_projects(db_path=tmp_path / "does-not-exist.db")

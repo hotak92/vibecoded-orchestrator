@@ -108,37 +108,28 @@ STATUS_FIX_FAILED = "fix_failed"
 
 
 def _resolve_project_folder(project_id: str) -> Path:
-    """Phase 0.B dependency wrapper.
+    """Phase 0.B Part 2 dependency wrapper.
 
-    Resolves a project slug / rowid to its on-disk folder. Tests stub
-    this; production wires it to
-    ``vco_lib.config_projection.resolve_project_folder`` once Part 2
-    lands.
+    Resolves a project id (UUID) or slug to its on-disk folder via
+    :func:`vco_lib.config_projection.resolve_project_folder`. Kept as a
+    thin wrapper so tests can monkey-patch ``_resolve_project_folder``
+    on this module without touching the shared ``config_projection``
+    symbol.
+
+    Raises:
+        LookupError: when no project matches the supplied id/slug.
     """
-    # Phase 0.B dependency — actual import wired post-merge.
-    try:
-        from vco_lib.config_projection import resolve_project_folder  # type: ignore  # noqa: E501
-    except ImportError as exc:  # pragma: no cover — exercised post-merge
-        raise RuntimeError(
-            "vco_lib.config_projection.resolve_project_folder() is not "
-            "available. This subcommand requires Phase 0.B (Part 2) to "
-            "be merged. If you're running tests, monkey-patch "
-            "`_resolve_project_folder` on `vco_lib.cli.verify_diagrams`."
-        ) from exc
+    from vco_lib.config_projection import resolve_project_folder
     return resolve_project_folder(project_id)
 
 
 def _list_registered_projects() -> Iterable[Mapping[str, str]]:
-    """Phase 0.B dependency wrapper. Drives ``--all``."""
-    # Phase 0.B dependency — actual import wired post-merge.
-    try:
-        from vco_lib.config_projection import list_registered_projects  # type: ignore  # noqa: E501
-    except ImportError as exc:  # pragma: no cover — exercised post-merge
-        raise RuntimeError(
-            "vco_lib.config_projection.list_registered_projects() is not "
-            "available. This subcommand requires Phase 0.B (Part 2) to be "
-            "merged."
-        ) from exc
+    """Phase 0.B Part 2 dependency wrapper. Drives ``--all``.
+
+    Returns ``{"id", "name", "slug", "folder_path", "folder"}`` dicts;
+    ``folder`` is a back-compat alias for ``folder_path``.
+    """
+    from vco_lib.config_projection import list_registered_projects
     return list_registered_projects()
 
 
@@ -743,8 +734,24 @@ def _check_env_projection(
             ),
         )
     # --fix path: delegate to apply_project_env (single-writer contract).
+    #
+    # Contract (vco_lib.config_projection.apply_project_env):
+    #   def apply_project_env(bundle: ProjectEnvBundle, *, surfaces=...)
+    #       -> dict[str, list[str]]
+    # It takes a full ProjectEnvBundle TypedDict (NOT a flat env mapping
+    # and NOT a project_folder kwarg) and returns a report mapping each
+    # written surface to the list of canonical keys it wrote. Failure is
+    # signalled by raising ConfigProjectionError, not by an "ok" field.
+    #
+    # We re-resolve the bundle here (it's a cheap DB read) rather than
+    # threading it through _project_env_from_db so the lazy-import
+    # wrapper's flat-env return type stays unchanged for the drift-only
+    # branch above.
     try:
-        from vco_lib.config_projection import apply_project_env  # type: ignore
+        from vco_lib.config_projection import (  # type: ignore
+            apply_project_env,
+            project_env_from_db,
+        )
     except ImportError as exc:
         return _CheckResult(
             "env_projection",
@@ -752,26 +759,43 @@ def _check_env_projection(
             f"apply_project_env unavailable: {exc}",
         )
     try:
-        result = apply_project_env(expected, project_folder=project_folder)
+        bundle = project_env_from_db(project_id)
+    except Exception as exc:
+        return _CheckResult(
+            "env_projection",
+            STATUS_FIX_FAILED,
+            f"project_env_from_db raised: {exc}",
+        )
+    try:
+        # Write to all 3 surfaces — the drift-detection above reads all
+        # 3, so a half-write would re-fail on the next verify run.
+        report = apply_project_env(
+            bundle,
+            surfaces=(
+                "claude_settings_json",
+                "claude_env",
+                "vscode_settings_json",
+            ),
+        )
     except Exception as exc:
         return _CheckResult(
             "env_projection",
             STATUS_FIX_FAILED,
             f"apply_project_env raised: {exc}",
         )
-    ok = bool(getattr(result, "ok", None))
-    if not ok and isinstance(result, Mapping):
-        ok = bool(result.get("ok", False))
-    if not ok:
-        return _CheckResult(
-            "env_projection",
-            STATUS_FIX_FAILED,
-            "apply_project_env reported failure",
-        )
+    # apply_project_env signals success by returning without raising;
+    # the dict it returns maps each written surface to the canonical
+    # keys that landed. Defensive: a non-Mapping return (e.g. a mocked-
+    # out test stub) is treated as success since no exception was
+    # raised.
+    surfaces_written = (
+        sorted(report.keys()) if isinstance(report, Mapping) else []
+    )
     return _CheckResult(
         "env_projection",
         STATUS_FIXED,
-        f"projected {len(expected)} canonical keys to all 3 surfaces",
+        f"projected {len(expected)} canonical keys to "
+        f"{len(surfaces_written) or 3} surfaces",
     )
 
 
