@@ -1,6 +1,6 @@
 [package]
 name = "vct-launcher-core"
-version = "0.2.32"
+version = "0.2.33"
 edition = "2021"
 description = "Shared library for vct-launcher and vct-hub binaries — db, manifest, secrets, paths, config, services::runtime/picker, state, types, registry."
 authors = ["VibeCoded Tools"]

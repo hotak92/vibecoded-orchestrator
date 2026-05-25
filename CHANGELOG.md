@@ -77,6 +77,43 @@ The dev affordance for module-authoring local workflows (co-located `paid-module
 
 Detailed migration instructions for the RL Reranker publisher are at `.claude/context/plans/instructions-to-rl-chat-v0.2.33-2026-05-25.md` (private; not in this public repo).
 
+### Coincident parallel-track deliverables
+
+The v0.2.33 tag also includes a substantial diagrams + packaging + config-projection work-stream shipped in parallel (Phases 0.A through 3, plus follow-up hardening). These commits were authored independently of the catalog-architecture work narrated above but landed in the same release window. Summarised here so the v0.2.33 tag's history is fully accounted for:
+
+#### Diagrams integration (Phase 1 + 1.5 + 2 + 3)
+- **DB substrate (Phase 1.1)**: migration `022_diagrams.sql` (6 tables) + 14 Tauri commands + Rust db layer + diagram-snapshot history. Scoped-path validation via `vco_lib/diagram_paths.py` + cascade-delete bash parser at `vco_lib/diagram_delete_parser.py` with chain walk + wrapper peel + security filter.
+- **Indexing (Phase 1.5A + 1.5C)**: `vco_lib/diagram_indexer.py` + Weaviate `Diagrams_<Project>` collection + path-validation hook + `vco rebuild-diagram-index` CLI + `hybrid_search` diagrams support.
+- **Conditional CLAUDE.md template primitive (Phase 1.5B)**: `{{#if_module_active}}` directive + re-render CLI + per-project active-module gates.
+- **GUI (Phase 1.3)**: `DiagramsTab.svelte` + `PermissionsTab` MCP-Tools sub-section.
+- **Excalidraw (Phase 2)**: vendored MIT fork at `vco_lib/excalidraw_mcp_fork/` + `claude_mcp_servers/wrappers/excalidraw_proxy.py` + embedded React-in-Svelte `ExcalidrawEditor.svelte`.
+- **codegraph→Mermaid (Phase 3, PRE-ALPHA)**: `vco codegraph-diagram` CLI + slash skill + auto-index pipeline. Marked PRE-ALPHA on 5 surfaces (CLI help, stderr banner, `.mmd` header, slash skill, docs) to signal API instability.
+- **Wrapper MCP base (Phase 1.2)**: `claude_mcp_servers/wrappers/_base.py` + `mermaid_proxy.py` + vct-hub allowlist route for module-contributed MCPs.
+
+#### Packaging + CLI (Phase 0)
+- **`vco` Python CLI via hatchling**: `pyproject.toml` + 5 subcommands (`verify-pins`, `verify-env-projection`, `verify-diagrams`, `rebuild-diagram-index`, `codegraph-diagram`). Drops the legacy `scripts/vco` shim path.
+- **`bundled_mcp_versions.toml` pinning manifest** + Rust + Python parsers + `_install_pinned_npm` enforcement.
+- **`vco_lib/config_projection.py`**: single-writer contract for per-project canonical env across 3 surfaces (`.claude/settings.json env` / `.claude/env` / launcher `app_state`). CI lint enforces.
+- **`vco_lib/env_template.py` (Phase 0.D)**: sibling for the bare `.env` template with bracket-marker semantics.
+- **Phase 0.B Part 2**: legacy Rust env writers migrated to Python subprocess; `_LEGACY_PRODUCTION_WRITERS` allowlist is empty for Phase 0.B keys (regression-guarded).
+
+#### Hardening (cr-b1..b5 + cr-r1..r7)
+- **Wheel install fix** (cr-b3) + delete-parser hardening (cr-b4): manifest + vendored fork moved under `vco_lib/` for wheel-distribution; bash cascade-delete parser walks chains + peels wrappers + filters dangerous patterns.
+- **Diagrams class name sanitizer unified** (cr-b2): shared JSON fixture pinning Python + Rust + MCP all sanitize to the same string. 67 cross-language parity tests.
+- **`config_projection` edge fixes** (cr-b1 + cr-b5 + cr-r1..r7): missing helpers, `apply_project_env` signature alignment, tolerate-missing-diagram-access-table guard, and 7 single-thread code-review fixes.
+
+#### Hooks
+- **`templates/hooks/pre-diagram-path-validation.{sh,ps1}`**: native Write/Edit + `mcp__mermaid__*` + `mcp__excalidraw__*` matchers — defense-in-depth path validation.
+- **`templates/hooks/post-file-edit.{sh,ps1}`** extended: indexer + snapshot serial chain (R2 race fix).
+- **`templates/hooks/post-file-delete.{sh,ps1}`** (new): cascade-delete SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer drop`.
+
+#### KG + docs
+- New node `knowledge/concepts/config-projection-contract-2026-05-24.md` documenting the single-writer contract + Phase 0.B Part 2 + Phase 0.D sections.
+- Extended `parallel-pr-coordination-gotchas-2026-05-10.md` with §6 / §7 (audit-after-merge) / §8 (shared working tree between chats) / §9 (MCP-matcher gaps).
+- Extended `claude-code-hook-input-output-contract.md` with consumer-side gotchas §C1 / C2 / C3.
+
+The catalog-architecture work and the diagrams work touched disjoint code paths (the only overlap was append-only registry files like `commands/mod.rs` + `lib.rs` + `db/migrations.rs`, all benign). Both work-streams ship together under v0.2.33.
+
 ## [0.2.32] — 2026-05-24
 
 A **manifest-renderer + paid-module-v0.2.7-unblock** release. Closes 7 launcher items (L1–L7) requested by the RL chat's post-v0.2.6 GUI test, the two real-world update-detection bugs surfaced during v0.2.30→v0.2.31 dogfooding (UB1+UB2), the GUI-tour polish backlog (V1+V2+E1+E2+M1), and the v0.2.31-deferred License-dialog UI half (D1+D2).
