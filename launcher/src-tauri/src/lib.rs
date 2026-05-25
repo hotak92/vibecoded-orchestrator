@@ -1276,6 +1276,12 @@ pub fn run() {
             commands::diagrams_cmd::list_diagram_access,
             commands::diagrams_cmd::set_project_mcp_tool_enabled,
             commands::diagrams_cmd::list_project_mcp_tools,
+            // v0.2.34 Agent E (Phase 4 generalisation, 2026-05-25):
+            // PermissionsTab's "Customize" button populates the
+            // per-tool allowlist from manifest-shipped defaults (or
+            // the hardcoded fallback). Generalised so any MCP — not
+            // just diagrams — gets the same surface.
+            commands::diagrams_cmd::seed_project_mcp_tool_grants,
             commands::diagrams_cmd::set_project_module_enabled,
             commands::diagrams_cmd::list_project_modules,
             // Phase 1.5.7 wire-up: DiagramsTab calls

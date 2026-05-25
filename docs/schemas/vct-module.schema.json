@@ -886,6 +886,41 @@
         "scope": {
           "default": "user",
           "type": "string"
+        },
+        "tool_allowlist": {
+          "description": "v0.2.34 (Agent E — Phase 4 generalisation, 2026-05-25): optional per-tool allowlist defaults for the wrapper MCP this module ships.\n\nWhen present, the launcher persists each entry into `module_mcp_tool_defaults` at install time (keyed by `(mcp_name, tool_name)`), and the hub's `/api/v1/projects/{project_id}/mcp-tool-grants/{mcp_name}` route composes the resolved allowlist from these defaults PLUS any per-project overrides in `project_mcp_tool_grants`. Per-project rows always win; absent rows fall through to `default_enabled`.\n\nEmpty `Vec` and `None` are semantically equivalent here — the hub returns the hardcoded fallback allowlist (diagrams-era constants) when no rows are registered for `mcp_name`. This means an orchestrator-bundled MCP (mermaid/excalidraw) that ships WITHOUT a manifest still gets sensible defaults; a paid module that ships WITH a manifest declares its own.\n\nReconciliation contract on module update: tools added in the new version are inserted with their declared `default_enabled`. Tools removed from the manifest are dropped from `module_mcp_tool_defaults` (no soft-delete — defaults are inherently version-current). Per-project overrides in `project_mcp_tool_grants` are LEFT IN PLACE so a user who explicitly disabled a tool keeps that override even if the tool later returns; the override applies if the tool is re-added.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/ToolAllowlistEntry"
+          }
+        }
+      }
+    },
+    "ToolAllowlistEntry": {
+      "description": "v0.2.34 (Agent E): one tool the wrapper MCP exposes, plus its default-enabled state and an optional human-readable description.\n\nMirrors the in-DB shape of `module_mcp_tool_defaults` (migration 023); see the SQL file for the rationale on why this lives at the MCP/module level rather than per-project.",
+      "type": "object",
+      "required": [
+        "tool"
+      ],
+      "properties": {
+        "tool": {
+          "description": "Tool name as exposed by the wrapper's upstream MCP (e.g. `\"render\"`, `\"save_diagram\"`, `\"export_png\"`). Case-sensitive.",
+          "type": "string"
+        },
+        "default_enabled": {
+          "description": "Whether the wrapper allows this tool when no per-project override exists. Defaults to `true` so an absent value in the manifest enables the tool — safer for module authors who declare a flat list of tools they intend to expose.",
+          "default": true,
+          "type": "boolean"
+        },
+        "description": {
+          "description": "Optional one-line description rendered as the tooltip in the launcher's per-tool toggle UI. Best-effort sourced from the upstream MCP's `tools/list`; absence is non-fatal.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
