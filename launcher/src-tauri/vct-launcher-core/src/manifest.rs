@@ -2108,6 +2108,20 @@ impl PlaceholderCtx {
 ///
 /// Symlinks resolved via `canonicalize` — if the user has no such
 /// directory yet we canonicalize the parent and append the module name.
+///
+/// v0.2.34: harden the "neither candidate nor root exists" case. The
+/// pre-v0.2.34 code fell back to the literal `allowed_root` path when
+/// canonicalisation failed, then compared the candidate's
+/// canonicalized ancestor (e.g. `/home/user`) against it. That
+/// comparison is asymmetric: `/home/user` does NOT start with
+/// `/home/user/.vct/modules` (the ancestor is SHORTER than the
+/// literal root), so every install would fail with a spurious
+/// "escapes allowed root" error before the bootstrap mkdir got a
+/// chance to create the directory. The fix walks UP from
+/// `allowed_root` to find the closest canonicalizable ancestor, then
+/// re-appends the stripped components literally — so the produced
+/// `canonical_root` is always well-formed and lexically comparable
+/// to the candidate's walked-up canonical base.
 pub fn validate_install_dir(candidate: &Path, allowed_root: &Path) -> Result<(), String> {
     let abs = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -2115,21 +2129,39 @@ pub fn validate_install_dir(candidate: &Path, allowed_root: &Path) -> Result<(),
         return Err(format!("install_dir must be absolute: {}", candidate.display()));
     };
 
-    // If the exact path doesn't exist yet, canonicalize the closest existing
-    // ancestor (avoid the "directory doesn't exist" canonicalize failure).
-    let mut probe = abs.as_path();
-    let canonical_base = loop {
-        match probe.canonicalize() {
-            Ok(p) => break p,
-            Err(_) => match probe.parent() {
-                Some(p) => probe = p,
-                None => return Err("install_dir has no canonicalizable ancestor".into()),
-            },
-        }
-    };
-    let canonical_root = allowed_root
-        .canonicalize()
-        .unwrap_or_else(|_| allowed_root.to_path_buf());
+    // v0.2.34: both sides go through `canonicalize_with_walkup` so
+    // their lexical shapes are symmetric. The pre-v0.2.34 code
+    // canonicalized the candidate by walking UP to the closest
+    // existing ancestor (losing the trailing components) but then
+    // compared against either the literal allowed_root (when the
+    // root didn't exist) or the canonical allowed_root (when it
+    // did). Mixing those two shapes meant the `starts_with` check
+    // could fail in either direction:
+    //
+    //   * root literal, candidate walked-up too short →
+    //     `/tmp/foo.starts_with("/tmp/foo/.vct/modules")` = false
+    //   * root walked-up, candidate walked-up further →
+    //     `/tmp.starts_with("/tmp/foo")` = false
+    //
+    // After v0.2.34, both sides walk up to their closest existing
+    // ancestor and re-append the stripped tail components. The
+    // resulting paths share a real on-disk prefix (any symlinks
+    // resolved) plus a literal nonexistent-tail suffix, which is
+    // exactly what `starts_with` was designed to compare.
+    let canonical_base = canonicalize_with_walkup(&abs).ok_or_else(|| {
+        format!(
+            "install_dir has no canonicalizable ancestor: {}",
+            candidate.display()
+        )
+    })?;
+
+    let canonical_root = canonicalize_with_walkup(allowed_root)
+        .ok_or_else(|| {
+            format!(
+                "allowed_root has no canonicalizable ancestor: {}",
+                allowed_root.display()
+            )
+        })?;
 
     if !canonical_base.starts_with(&canonical_root) {
         return Err(format!(
@@ -2139,6 +2171,49 @@ pub fn validate_install_dir(candidate: &Path, allowed_root: &Path) -> Result<(),
         ));
     }
     Ok(())
+}
+
+/// v0.2.34: canonicalise a (possibly nonexistent) absolute path by
+/// walking up to the closest existing ancestor, canonicalising THAT,
+/// and re-appending the components that were stripped along the way.
+/// Returns `None` only if no ancestor canonicalises (e.g. the root
+/// `/` itself fails — practically impossible on any real OS).
+///
+/// Differs from a bare `path.canonicalize()` in that the input does
+/// NOT need to exist on disk. Differs from a lexical-only normaliser
+/// (e.g. `path-clean`) in that symlinks in existing ancestors ARE
+/// resolved — preserving the security property that a symlink
+/// pointing outside `allowed_root` still fails the `starts_with`
+/// check downstream.
+fn canonicalize_with_walkup(path: &Path) -> Option<PathBuf> {
+    let mut probe = path.to_path_buf();
+    // Components stripped during the walk-up, in REVERSE order
+    // (closest-to-input first). We re-append them in `.iter().rev()`
+    // order at the end to reconstruct the original tail.
+    let mut stripped: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match probe.canonicalize() {
+            Ok(mut canonical) => {
+                for component in stripped.iter().rev() {
+                    canonical.push(component);
+                }
+                return Some(canonical);
+            }
+            Err(_) => {
+                let last = probe.file_name().map(|s| s.to_os_string());
+                let parent = probe.parent().map(|p| p.to_path_buf());
+                match (last, parent) {
+                    (Some(name), Some(p)) => {
+                        stripped.push(name);
+                        probe = p;
+                    }
+                    // Reached `/` (or a Windows drive root) and it
+                    // still doesn't canonicalise — give up.
+                    _ => return None,
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4242,6 +4317,102 @@ mod tests {
             msg.contains("unknown variant") || msg.contains("future_step_kind") || msg.contains("kind"),
             "error must reference the unknown step kind, got: {}",
             msg,
+        );
+    }
+
+    // ─── v0.2.34: validate_install_dir hardening ────────────────────
+    //
+    // The dogfood install of RL Reranker v0.2.7 on 2026-05-25 surfaced
+    // a guard-vs-bootstrap ordering bug: `~/.vct/modules/` is created
+    // lazily by container_pull LATER in the install flow, so on a
+    // fresh machine both the candidate install_dir AND the allowed
+    // root are absent when `validate_install_dir` runs. The
+    // pre-v0.2.34 fallback (`unwrap_or_else(|_| allowed_root.to_path_buf())`)
+    // produced a non-canonical literal path which was lexically
+    // incomparable with the canonicalized candidate ancestor — every
+    // first install failed with a spurious "escapes allowed root"
+    // error. These tests pin down the four corners of the matrix:
+    //   1. neither exists yet (the dogfood failure case);
+    //   2. root exists, candidate doesn't (typical second install);
+    //   3. both exist (typical reinstall path);
+    //   4. candidate escapes root (security guarantee preserved).
+
+    #[test]
+    fn validate_install_dir_succeeds_when_neither_root_nor_candidate_exists() {
+        // The reproducer for the v0.2.34 dogfood bug. The temp dir is
+        // created so its parent canonicalises; we then point both
+        // `allowed_root` and `candidate` AT NON-EXISTENT subpaths of
+        // it. Pre-fix this asserted err; post-fix it must succeed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let allowed_root = tmp.path().join("vct").join("modules");
+        let candidate = allowed_root.join("vct-rl-reranker");
+        assert!(!allowed_root.exists(), "test precondition: root must not exist");
+        assert!(!candidate.exists(), "test precondition: candidate must not exist");
+
+        validate_install_dir(&candidate, &allowed_root).unwrap_or_else(|e| {
+            panic!(
+                "validate_install_dir must succeed when neither path exists yet \
+                 (the bootstrap mkdir creates them later); got error: {}",
+                e
+            )
+        });
+    }
+
+    #[test]
+    fn validate_install_dir_succeeds_when_root_exists_candidate_does_not() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let allowed_root = tmp.path().join("modules");
+        std::fs::create_dir_all(&allowed_root).expect("mkdir root");
+        let candidate = allowed_root.join("vct-rl-reranker");
+        assert!(!candidate.exists());
+
+        validate_install_dir(&candidate, &allowed_root)
+            .expect("typical second-install case: root exists, candidate to be created");
+    }
+
+    #[test]
+    fn validate_install_dir_succeeds_when_both_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let allowed_root = tmp.path().join("modules");
+        let candidate = allowed_root.join("vct-rl-reranker");
+        std::fs::create_dir_all(&candidate).expect("mkdir candidate (which also creates root)");
+
+        validate_install_dir(&candidate, &allowed_root)
+            .expect("reinstall case: both exist on disk");
+    }
+
+    #[test]
+    fn validate_install_dir_rejects_candidate_outside_root() {
+        // Security guarantee: even when neither path exists, a
+        // candidate that lexically escapes the root must be refused.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let allowed_root = tmp.path().join("vct").join("modules");
+        // `candidate` shares an ancestor with `allowed_root` but is
+        // NOT under it.
+        let candidate = tmp.path().join("other").join("evil-module");
+
+        let err = validate_install_dir(&candidate, &allowed_root)
+            .expect_err("candidate outside root must be rejected");
+        assert!(
+            err.contains("escapes allowed root"),
+            "error must name the failure mode; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_install_dir_rejects_relative_candidate() {
+        // The function explicitly refuses relative paths (callers
+        // resolve via `PlaceholderCtx::resolve_install_dir` first).
+        let err = validate_install_dir(
+            Path::new("relative/path"),
+            Path::new("/tmp/vct/modules"),
+        )
+        .expect_err("relative candidate must be rejected");
+        assert!(
+            err.contains("must be absolute"),
+            "error must say 'must be absolute'; got: {}",
+            err
         );
     }
 }

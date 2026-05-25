@@ -105,6 +105,23 @@ async fn run_install_inner(
     let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
     let allowed_root = ctx.vct_modules.clone();
 
+    // v0.2.34: bootstrap `<vct_root>/modules/` BEFORE the security
+    // guard runs. On a fresh machine this directory is created
+    // lazily by container_pull's `tokio::fs::create_dir_all` LATER
+    // in the install flow — but `validate_install_dir` runs FIRST,
+    // and even after the v0.2.34 hardening pass we want the canonical
+    // path comparison to operate on a real directory (so the canonicalize
+    // call resolves any user-level symlinks like `~/.vct → /mnt/data/.vct`).
+    // `create_dir_all` is idempotent — a no-op when the directory
+    // already exists — so the cost on the warm path is one stat().
+    std::fs::create_dir_all(&allowed_root).map_err(|e| {
+        format!(
+            "bootstrap allowed_root {}: {}",
+            allowed_root.display(),
+            e
+        )
+    })?;
+
     // Security: refuse paths outside ~/.vct/modules/.
     crate::manifest::validate_install_dir(&install_dir, &allowed_root)?;
 
@@ -739,6 +756,14 @@ fn emit_progress(
 /// When `gpu_image_variants` is absent (legacy modules + non-container
 /// runtimes), returns `base_tag` unchanged — preserves single-tag
 /// behavior for modules that only ship one image.
+///
+/// v0.2.34: variant strings from the L0 catalog ship as templates
+/// (e.g. `"{version}-cuda"`) so the same manifest fixture serves
+/// every released version. This function performs the `{version}`
+/// substitution against `base_tag` so callers receive a ready-to-pull
+/// image tag (`"0.2.7-cuda"`) rather than the literal template
+/// string. Variants that don't contain `{version}` are returned
+/// unchanged — backwards-compatible with pre-template manifests.
 pub(crate) fn resolve_variant_tag(
     manifest: &ModuleManifest,
     base_tag: &str,
@@ -749,11 +774,12 @@ pub(crate) fn resolve_variant_tag(
         Some(v) => v,
         None => return base_tag.to_string(),
     };
-    match gpu_mode {
-        GpuMode::Cuda => variants.cuda.clone(),
-        GpuMode::Rocm => variants.rocm.clone(),
-        GpuMode::Cpu | GpuMode::Metal => variants.cpu.clone(),
-    }
+    let template = match gpu_mode {
+        GpuMode::Cuda => &variants.cuda,
+        GpuMode::Rocm => &variants.rocm,
+        GpuMode::Cpu | GpuMode::Metal => &variants.cpu,
+    };
+    template.replace("{version}", base_tag)
 }
 
 /// v0.2.31 (#27): emit a terminal `InstallStage::Failed` event on the
@@ -866,6 +892,17 @@ async fn run_upgrade_inner(
 
     let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
     let allowed_root = ctx.vct_modules.clone();
+    // v0.2.34: same bootstrap as `run_install_inner` — upgrades on a
+    // never-installed-before machine (rare but possible: catalog-only
+    // entry whose previous install never actually completed) still
+    // need the root to exist before the guard runs.
+    std::fs::create_dir_all(&allowed_root).map_err(|e| {
+        format!(
+            "bootstrap allowed_root {}: {}",
+            allowed_root.display(),
+            e
+        )
+    })?;
     crate::manifest::validate_install_dir(&install_dir, &allowed_root)?;
 
     let upgrade_block = match manifest.upgrade.as_ref() {
@@ -1312,6 +1349,91 @@ mod tests {
         let m = manifest_with_variants(None);
         assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Cuda), "0.1.0");
         assert_eq!(resolve_variant_tag(&m, "0.1.0", GpuMode::Cpu), "0.1.0");
+    }
+
+    // ─── v0.2.34: `{version}` template substitution ────────────────
+    //
+    // The L0 catalog seeds `gpu_image_variants` with template strings
+    // like `"{version}-cuda"` so the same manifest fixture serves
+    // every released version. Before v0.2.34 `resolve_variant_tag`
+    // returned the raw template, which then got handed verbatim to
+    // `podman pull` — the pull failed with a manifest-not-found error
+    // because no image tagged `"{version}-cuda"` exists in the
+    // registry. The fix substitutes `base_tag` for the `{version}`
+    // marker. Cover all four GpuMode variants so a future refactor
+    // that drops the substitution from one arm breaks the build.
+
+    #[test]
+    fn variant_tag_substitutes_version_template_cuda() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        }));
+        assert_eq!(
+            resolve_variant_tag(&m, "0.2.7", GpuMode::Cuda),
+            "0.2.7-cuda",
+            "template `{{version}}-cuda` with base_tag=0.2.7 must produce `0.2.7-cuda`",
+        );
+    }
+
+    #[test]
+    fn variant_tag_substitutes_version_template_rocm() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        }));
+        assert_eq!(
+            resolve_variant_tag(&m, "0.2.7", GpuMode::Rocm),
+            "0.2.7-rocm",
+        );
+    }
+
+    #[test]
+    fn variant_tag_substitutes_version_template_cpu() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        }));
+        assert_eq!(
+            resolve_variant_tag(&m, "0.2.7", GpuMode::Cpu),
+            "0.2.7-cpu",
+        );
+    }
+
+    /// Metal still routes to the CPU variant — the template substitution
+    /// happens AFTER the Metal→Cpu mapping, so the produced tag is the
+    /// substituted CPU variant string.
+    #[test]
+    fn variant_tag_substitutes_version_template_metal_routes_to_cpu() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        }));
+        assert_eq!(
+            resolve_variant_tag(&m, "0.2.7", GpuMode::Metal),
+            "0.2.7-cpu",
+        );
+    }
+
+    /// Variant strings without `{version}` markers must be returned
+    /// unchanged — backwards-compatible with manifests that pre-date
+    /// the template convention (or hand-pinned literal tags).
+    #[test]
+    fn variant_tag_leaves_non_templated_string_unchanged() {
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "latest-cpu".into(),
+            cuda: "latest-cuda".into(),
+            rocm: "latest-rocm".into(),
+        }));
+        assert_eq!(
+            resolve_variant_tag(&m, "0.2.7", GpuMode::Cuda),
+            "latest-cuda",
+            "variant string without `{{version}}` marker must pass through verbatim",
+        );
     }
 
     // ─── v0.2.29: version_lt + min_launcher_version gate ────────────

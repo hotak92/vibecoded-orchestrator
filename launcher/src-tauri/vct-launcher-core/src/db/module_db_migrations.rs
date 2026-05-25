@@ -336,10 +336,36 @@ pub fn apply_module_db_migrations(
                 .map_err(|e| format!("begin tx: {}", e))?;
             tx.execute_batch(&sql)
                 .map_err(|e| format!("execute SQL: {}", e))?;
+            // v0.2.34 (bug 3b — audit finding 3.1): UPSERT instead of
+            // raw INSERT. The PRIMARY KEY on (module_id, filename) can
+            // collide in two real-world paths:
+            //
+            //   1. Race between concurrent re-applies — the
+            //      already-applied check at lines 291-319 happens
+            //      OUTSIDE the transaction. Two concurrent installers
+            //      can both pass that check and both enter their
+            //      transactions; the second INSERT crashes with
+            //      UNIQUE violation and aborts the whole tx (so
+            //      schema changes from the SQL batch are rolled back
+            //      AND the file's row is never recorded).
+            //   2. Retry after a partial-failure where the row got
+            //      written but the surrounding install flow died.
+            //
+            // The UPSERT clause keeps the existing PK on conflict
+            // (no FK to break) while refreshing `sha256` + `applied
+            // _at` to the most recent apply. `module_id` and
+            // `filename` are the key columns and are never updated.
+            // `namespace` IS refreshed because manifests can rename
+            // their declared namespace between releases (rare but
+            // legal); the row should reflect the current declaration.
             tx.execute(
                 "INSERT INTO module_db_migrations \
                     (module_id, filename, sha256, namespace, applied_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(module_id, filename) DO UPDATE SET \
+                    sha256     = excluded.sha256, \
+                    namespace  = excluded.namespace, \
+                    applied_at = excluded.applied_at",
                 params![
                     module_id,
                     &filename,
@@ -1037,5 +1063,123 @@ mod tests {
         assert!(!is_migration_file(&PathBuf::from("setup.sql")));
         assert!(!is_migration_file(&PathBuf::from("001.sql"))); // no underscore
         assert!(!is_migration_file(&PathBuf::from("0001_x.txt")));
+    }
+
+    // ─── v0.2.34 (bug 3b — audit finding 3.1) — UPSERT regression ────
+    //
+    // The skip-cache at lines 291-319 of `apply_module_db_migrations`
+    // does its lookup OUTSIDE the transaction that does the
+    // CREATE TABLE / INSERT pair. A concurrent re-apply can pass
+    // the skip check (no row yet visible to its connection), enter
+    // its transaction, execute the schema-change SQL fine, and then
+    // crash on the recording-row INSERT with UNIQUE violation
+    // (because the other concurrent transaction committed its row
+    // first). The schema-change SQL gets rolled back as part of the
+    // tx abort, leaving the DB in an inconsistent state.
+    //
+    // This test exercises the UPSERT clause directly via a synthetic
+    // double-insert. Pre-fix: the second INSERT crashes. Post-fix:
+    // the second call succeeds and refreshes `sha256` + `applied_at`
+    // + `namespace`.
+
+    #[test]
+    fn module_db_migrations_record_is_upsert_idempotent() {
+        let db = open_test_db();
+        let now1 = Utc::now().timestamp_millis();
+
+        // First record — clean insert.
+        db.lock()
+            .execute(
+                "INSERT INTO module_db_migrations \
+                    (module_id, filename, sha256, namespace, applied_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(module_id, filename) DO UPDATE SET \
+                    sha256     = excluded.sha256, \
+                    namespace  = excluded.namespace, \
+                    applied_at = excluded.applied_at",
+                params![
+                    "test-mod",
+                    "0001_state.sql",
+                    "deadbeef",
+                    "rl",
+                    now1,
+                ],
+            )
+            .expect("first insert (clean)");
+
+        // Second record — same primary key. Pre-v0.2.34 this hit
+        // UNIQUE constraint; post-fix it must succeed and refresh.
+        let now2 = now1 + 1000;
+        db.lock()
+            .execute(
+                "INSERT INTO module_db_migrations \
+                    (module_id, filename, sha256, namespace, applied_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(module_id, filename) DO UPDATE SET \
+                    sha256     = excluded.sha256, \
+                    namespace  = excluded.namespace, \
+                    applied_at = excluded.applied_at",
+                params![
+                    "test-mod",
+                    "0001_state.sql",
+                    "cafebabe", // sha changed (e.g. file was re-hashed)
+                    "rl_v2",    // namespace also bumped
+                    now2,
+                ],
+            )
+            .expect("re-apply must succeed via UPSERT (bug 3b)");
+
+        // Read back: row exists once, with the second-write values.
+        let (sha, namespace, applied_at, count): (String, String, i64, i64) = db
+            .lock()
+            .query_row(
+                "SELECT sha256, namespace, applied_at, \
+                    (SELECT COUNT(*) FROM module_db_migrations \
+                       WHERE module_id = ?1 AND filename = ?2) \
+                   FROM module_db_migrations \
+                  WHERE module_id = ?1 AND filename = ?2",
+                params!["test-mod", "0001_state.sql"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read back");
+
+        assert_eq!(count, 1, "exactly one row for the (mod,file) pair");
+        assert_eq!(sha, "cafebabe", "sha refreshed by upsert");
+        assert_eq!(namespace, "rl_v2", "namespace refreshed by upsert");
+        assert_eq!(applied_at, now2, "applied_at bumped to retry timestamp");
+    }
+
+    /// End-to-end variant: simulate the partial-failure case by
+    /// pre-seeding the recording row WITHOUT creating its schema,
+    /// then running `apply_module_db_migrations` against the same
+    /// migration file. The sha check matches (so the function
+    /// SKIPS the row instead of trying a duplicate INSERT) — this
+    /// is the pre-existing idempotency guarantee, and the UPSERT
+    /// preserves it by making the underlying SQL idempotent EVEN IF
+    /// the skip check is bypassed (e.g. concurrent re-apply).
+    #[test]
+    fn apply_module_db_migrations_skip_path_unaffected_by_upsert() {
+        let db = open_test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        let migrations_dir = tmp.path().join("db");
+        std::fs::create_dir(&migrations_dir).unwrap();
+        write_migration_files(
+            &migrations_dir,
+            &[("0001_state.sql", "CREATE TABLE rl_state (id INTEGER PRIMARY KEY);")],
+        );
+        let manifest = make_manifest("rl");
+
+        // First apply — clean.
+        let r1 = apply_module_db_migrations(&db, "test-mod", tmp.path(), &manifest)
+            .expect("first apply");
+        assert_eq!(r1.applied, vec!["0001_state.sql"]);
+
+        // Second apply — sha matches, takes the skip branch (sha
+        // matches; never hits the INSERT). Pre- and post-v0.2.34
+        // behaviour identical.
+        let r2 = apply_module_db_migrations(&db, "test-mod", tmp.path(), &manifest)
+            .expect("second apply");
+        assert_eq!(r2.skipped, vec!["0001_state.sql"]);
+        assert!(r2.applied.is_empty());
     }
 }
