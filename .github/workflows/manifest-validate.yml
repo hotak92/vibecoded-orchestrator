@@ -97,9 +97,15 @@ jobs:
         with:
           workspaces: launcher/src-tauri
 
-      # No tauri-build deps required: the bins live in `vct-launcher-core`
-      # (the shared-types crate) and don't link against WebKit. Saves
-      # ~3-5 min of apt-get install vs the main CI workflow.
+      # vct-launcher-core pulls dbus-secret-service (keychain on Linux)
+      # → libdbus-sys, which links against libdbus-1. Without the system
+      # library the build fails with `pkg_config: dbus-1 not found`.
+      # No WebKit/Tauri-build deps needed otherwise (the bins don't link
+      # against WebKit), so this stays minimal vs the main CI workflow.
+      - name: Install libdbus-1-dev (for vct-launcher-core's keychain dep)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Build manifest-CI bins
         working-directory: launcher/src-tauri
