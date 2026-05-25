@@ -76,7 +76,8 @@ This project has the diagrams module active. When you sketch a flowchart, archit
 - **Save path is enforced**: `.claude/diagrams/<category>/<name>.{mmd,excalidraw}`. The MCP rejects saves outside this structure. Category is the primary tag (e.g. `gui/auth/`, `architecture/data-flow/`).
 - Don't worry about metadata: the launcher auto-derives title, tags, and indexes the diagram for retrieval. Just pick a sensible category path and filename.
 - To find an earlier diagram, use `hybrid_search("topic")` — diagrams are indexed alongside the KG. Results with `result_kind="diagram"` are diagrams; open them via `Read(file_path)` for Mermaid or `describe_excalidraw(file_path)` for Excalidraw.
-- Snapshots are automatic on every save (throttled 1/min, deduplicated).
+- Snapshots are automatic on every save (throttled 1/min, deduplicated). Delete a diagram via `rm` and the SQLite row + sidecar + Weaviate object cascade-clean automatically.
+- **Sidecars `<file>.meta.json` are git-tracked** by default — they're the portable metadata that travels with diagrams across machines. If you prefer not to track them, add `.claude/diagrams/**/*.meta.json` to `.gitignore`; sidecars regenerate deterministically from SQLite + file content via `vco rebuild-diagram-index`.
 
 To disable diagrams for this project, toggle it off in the launcher's DiagramsTab — CLAUDE.md will re-render and this section will disappear.
 
