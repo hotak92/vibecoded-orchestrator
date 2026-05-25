@@ -554,7 +554,31 @@ pub fn run() {
             // (e.g. nvidia-smi not on PATH) never blocks boot. The
             // Preferences → Hardware "Re-detect" button overwrites this
             // later with a fresh snapshot.
+            //
+            // v0.2.34 (Agent B): this remains the FALLBACK path for the
+            // genuinely-first-ever launcher boot, BEFORE any update cycle
+            // has run. The post-update boundary trigger
+            // (`consume_pending_hardware_redetect_if_set`, immediately
+            // below) covers every subsequent launcher boot that follows
+            // a self-update — together they make snapshot freshness an
+            // invariant: a partial-schema row from an older launcher
+            // version can never silently linger past one update cycle.
+            // The install-time guard (`ensure_fresh_hardware_snapshot_for_install`
+            // in `install_module_for_project`) is belt-and-suspenders for
+            // manual binary swaps that bypassed the in-app update flow.
             commands::installer::seed_initial_hardware_snapshot_if_missing(
+                app.handle().clone(),
+            );
+
+            // v0.2.34 (Agent B): if the previous launcher process flagged
+            // the next boot as "needs a fresh hardware redetect" (set by
+            // `self_update::finish_apply_after_pull` right before
+            // restart), consume the flag here and spawn a background
+            // redetect job. Catches v0.2.20-style schema gaps where a
+            // newly-shipped field needs to be backfilled on the user's
+            // existing snapshot. Soft-fails — the manual Preferences
+            // button remains the recovery path.
+            commands::installer::consume_pending_hardware_redetect_if_set(
                 app.handle().clone(),
             );
 

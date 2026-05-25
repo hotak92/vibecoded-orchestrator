@@ -1354,14 +1354,27 @@ pub async fn install_module_for_project(
     //
     // v0.2.20: probe the persisted hardware snapshot for the current
     // GpuMode so container_pull can pick a per-variant image tag (when
-    // the manifest declares `runtime.gpu_image_variants`). Falls back
-    // to `Cpu` when no snapshot exists yet — safe default; user can
-    // redetect-hardware later and reinstall to switch variants.
-    let gpu_mode = crate::commands::installer::read_persisted_hardware_snapshot(db.inner())
-        .ok()
-        .flatten()
-        .map(|snap| snap.gpu_mode_decided)
-        .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
+    // the manifest declares `runtime.gpu_image_variants`).
+    //
+    // v0.2.34 (Agent B): the persisted snapshot MUST be fresh +
+    // structurally complete here, otherwise a partial schema (e.g. the
+    // dogfooded v0.2.20 → v0.2.21 upgrade path where `gpu_mode_decided`
+    // was added without backfilling existing snapshots) would let an
+    // RTX 4080 SUPER host serde-default to `GpuMode::Cpu` and pull the
+    // `-cpu` image variant. `ensure_fresh_hardware_snapshot_for_install`
+    // runs `redetect_hardware` synchronously here with a soft-fail
+    // fallback to the last-known persisted snapshot — install never
+    // blocks on a transient probe failure (nvidia-smi briefly missing,
+    // etc.). When neither a probe nor a last-known snapshot is
+    // available, we fall back to `GpuMode::Cpu` (the pre-v0.2.34
+    // behaviour) so first-time installs on hosts where `nvidia-smi`
+    // failed at every boot still complete — they just get the CPU
+    // image, which is the safe degradation path.
+    let gpu_mode =
+        crate::commands::installer::ensure_fresh_hardware_snapshot_for_install(db.inner())
+            .await
+            .map(|snap| snap.gpu_mode_decided)
+            .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
 
     match installer_engine::run_install(&app, &manifest, &ctx, &project_id, gpu_mode, &db).await {
         Ok(resolved_dir) => {
@@ -1529,11 +1542,17 @@ pub async fn update_module_for_project(
     )?;
 
     let ctx = PlaceholderCtx::new(&module_id);
-    let gpu_mode = crate::commands::installer::read_persisted_hardware_snapshot(db.inner())
-        .ok()
-        .flatten()
-        .map(|snap| snap.gpu_mode_decided)
-        .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
+    // v0.2.34 (Agent B): same freshness invariant as `install_module_for_project`
+    // — a version upgrade is just as susceptible to the v0.2.20-style schema
+    // gap as a first-time install, and a user updating from v0.2.7 to v0.2.8
+    // on an RTX 4080 SUPER host with a stale snapshot would still pull the
+    // wrong variant. Same soft-fail fallback chain: fresh probe → last-known
+    // → `GpuMode::Cpu`.
+    let gpu_mode =
+        crate::commands::installer::ensure_fresh_hardware_snapshot_for_install(db.inner())
+            .await
+            .map(|snap| snap.gpu_mode_decided)
+            .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
 
     match installer_engine::run_upgrade(
         &app,

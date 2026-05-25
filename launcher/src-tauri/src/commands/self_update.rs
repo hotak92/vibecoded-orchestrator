@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::{command, AppHandle, Emitter, Runtime};
+use tauri::{command, AppHandle, Emitter, Manager, Runtime};
 use tokio::process::Command as TokioCommand;
 
 /// Refresh cadence for the daily background check. The user said "once a
@@ -756,6 +756,27 @@ async fn finish_apply_after_pull<R: Runtime>(
         eprintln!(
             "[apply_launcher_update] install-manifest refresh failed (non-fatal): {}",
             e
+        );
+    }
+
+    // v0.2.34 (Agent B): mark the next launcher boot as needing a
+    // hardware re-detect. The launcher process is about to exit and
+    // respawn; spawning a `redetect_hardware` task HERE would be
+    // killed before completion. Instead we set an `app_state` flag
+    // that the NEW launcher process reads on boot via
+    // `consume_pending_hardware_redetect_if_set` and turns into a
+    // background redetect job. Catches the v0.2.20-style "new field
+    // added to HardwareSnapshot" case: every launcher update that
+    // ships a snapshot-schema change automatically refreshes the
+    // user's persisted snapshot on next boot, regardless of what
+    // shape was on disk before. Soft-fail.
+    if let Some(db) = app.try_state::<crate::db::Db>() {
+        crate::commands::installer::mark_hardware_redetect_pending_after_update(
+            db.inner(),
+        );
+    } else {
+        eprintln!(
+            "[apply_launcher_update] could not acquire Db State to mark hardware-redetect-pending; the next boot will skip the post-update redetect (Preferences button remains available)."
         );
     }
 
