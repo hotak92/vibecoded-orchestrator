@@ -295,4 +295,81 @@ mod tests {
             msg
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // v0.2.34 B2 follow-up — underscore boundary cases.
+    //
+    // Phase chat's v0.2.33 review surfaced a (since-resolved) suspicion
+    // that the Rust port diverged from Python on `_` handling. These
+    // five tests pin the Rust-side behaviour explicitly so any future
+    // refactor that re-introduces the divergence fails loudly. The
+    // shared `tests/fixtures/project_naming.json` covers the same
+    // cases for cross-language parity; this module-local test gives
+    // a focused first-line signal independent of the fixture loader.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn boundary_simracing_ai_preserves_single_underscore() {
+        // Documented Phase-chat suspicion: Rust → "SimRacing_AI_KnowledgeGraph"
+        // (correct), Python → "SimRacingAI_KnowledgeGraph" (wrong claim).
+        // Both implementations actually produce "SimRacing_AI"; this
+        // test pins it so a regression to either of the two legacy
+        // sanitizers (which DID drop the underscore) fails here.
+        assert_eq!(
+            canonical_class_prefix("SimRacing_AI").unwrap(),
+            "SimRacing_AI"
+        );
+    }
+
+    #[test]
+    fn boundary_double_underscore_preserved_verbatim() {
+        // Each underscore passes through the regex unchanged (the
+        // negated char class includes `_`), so "foo__bar" stays as
+        // "Foo__bar". We do NOT collapse runs of underscores — that
+        // would mask user intent (e.g. visually-grouped segments).
+        assert_eq!(
+            canonical_class_prefix("foo__bar").unwrap(),
+            "Foo__bar"
+        );
+    }
+
+    #[test]
+    fn boundary_leading_underscore_rejected_as_non_letter() {
+        // Leading `_` fails the step-4 "first char must be ASCII
+        // letter" check. The Weaviate server would also reject this,
+        // but we surface the error early via LeadingNonLetter so the
+        // caller gets a precise validation message.
+        let result = canonical_class_prefix("_leading");
+        assert!(
+            matches!(
+                result,
+                Err(CanonicalPrefixError::LeadingNonLetter { ref sanitized, .. })
+                    if sanitized == "_leading"
+            ),
+            "Expected LeadingNonLetter with sanitized='_leading', got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn boundary_trailing_underscore_preserved() {
+        // Trailing underscore is a valid class-name suffix (Weaviate
+        // only constrains the FIRST char). We preserve it verbatim
+        // because stripping it would be a silent surprise.
+        assert_eq!(
+            canonical_class_prefix("trailing_").unwrap(),
+            "Trailing_"
+        );
+    }
+
+    #[test]
+    fn boundary_three_consecutive_underscores_preserved() {
+        // Three consecutive underscores stay as three underscores —
+        // same rationale as `boundary_double_underscore_preserved`.
+        // This is the strongest "no run-collapsing" pin.
+        assert_eq!(
+            canonical_class_prefix("foo___bar").unwrap(),
+            "Foo___bar"
+        );
+    }
 }

@@ -265,3 +265,55 @@ class TestDeterminism:
         # output (no hidden state, no time-dependent behaviour).
         for inp in ["X", "FooBar", "a b"]:
             assert canonical_class_prefix(inp) == canonical_class_prefix(inp)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v0.2.34 B2 follow-up — underscore boundary cases
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestUnderscoreBoundaryCases:
+    """Phase chat's v0.2.33 review documented a (since-resolved)
+    suspicion that the Rust port diverged from Python on ``_``
+    handling. These five tests pin the Python-side behaviour
+    explicitly so a regression to either legacy sanitizer fails
+    loudly here — independently of the cross-language parity test in
+    ``test_project_naming_parity.py``.
+
+    The shared ``tests/fixtures/project_naming.json`` covers the same
+    cases for the Rust port; these Python-side tests give a focused
+    first-line signal without the JSON loader."""
+
+    def test_simracing_ai_preserves_single_underscore(self):
+        # Documented Phase-chat suspicion: Rust → "SimRacing_AI"
+        # (correct), Python → "SimRacingAI" (wrong claim). Both
+        # implementations actually produce "SimRacing_AI"; this test
+        # pins it so a regression to either of the two legacy
+        # sanitizers (which DID drop the underscore) fails here.
+        assert canonical_class_prefix("SimRacing_AI") == "SimRacing_AI"
+
+    def test_double_underscore_preserved_verbatim(self):
+        # Each underscore passes through the regex unchanged (the
+        # negated char class includes ``_``), so "foo__bar" stays as
+        # "Foo__bar". We do NOT collapse runs of underscores — that
+        # would mask user intent.
+        assert canonical_class_prefix("foo__bar") == "Foo__bar"
+
+    def test_leading_underscore_rejected_as_non_letter(self):
+        # Leading ``_`` fails the step-4 "first char must be a letter"
+        # check. Weaviate would reject server-side too; we surface
+        # the error early via ValueError("non-letter").
+        with pytest.raises(ValueError, match="non-letter"):
+            canonical_class_prefix("_leading")
+
+    def test_trailing_underscore_preserved(self):
+        # Trailing underscore is a valid class-name suffix (Weaviate
+        # only constrains the FIRST char). We preserve it verbatim
+        # because stripping it would be a silent surprise.
+        assert canonical_class_prefix("trailing_") == "Trailing_"
+
+    def test_three_consecutive_underscores_preserved(self):
+        # Three consecutive underscores stay as three underscores —
+        # same rationale as ``test_double_underscore_preserved``.
+        # This is the strongest "no run-collapsing" pin.
+        assert canonical_class_prefix("foo___bar") == "Foo___bar"

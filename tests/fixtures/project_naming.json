@@ -26,7 +26,12 @@
     ["MOE_tasks", "MOE_tasks"],
     ["BaliHospitality", "BaliHospitality"],
     ["Bali Hospitality", "BaliHospitality"],
-    ["Bali_Hospitality", "Bali_Hospitality"]
+    ["Bali_Hospitality", "Bali_Hospitality"],
+    ["foo__bar", "Foo__bar"],
+    ["foo___bar", "Foo___bar"],
+    ["trailing_", "Trailing_"],
+    ["a__b__c", "A__b__c"],
+    ["Foo_-_Bar", "Foo___Bar"]
   ],
   "errors": [
     "",
@@ -36,6 +41,8 @@
     "123abc",
     "...!!!",
     "_only_underscores_",
-    "9"
+    "9",
+    "_leading",
+    "__double_leading"
   ]
 }
