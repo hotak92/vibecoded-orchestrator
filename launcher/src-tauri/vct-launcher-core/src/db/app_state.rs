@@ -47,6 +47,22 @@ impl Db {
         Ok(())
     }
 
+    /// Delete rows whose keys match a SQL LIKE pattern. Returns the number
+    /// of rows removed. Used by v0.2.34 launcher-version-change cache-bust
+    /// to wipe `module_catalog.cache*` entries (envelope + fetched-at)
+    /// after an orchestrator update. No-op (Ok(0)) when nothing matches —
+    /// callers don't need to pre-check existence.
+    pub fn app_state_delete_like(&self, pattern: &str) -> Result<usize, String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "DELETE FROM app_state WHERE key LIKE ?1",
+                params![pattern],
+            )
+            .map_err(|e| format!("app_state_delete_like({}): {}", pattern, e))?;
+        Ok(n)
+    }
+
     /// Boolean convenience reader. Returns `None` (no row) vs
     /// `Some(true)` / `Some(false)` so callers can distinguish "user
     /// explicitly opted out" from "unset, apply default".
@@ -86,6 +102,34 @@ mod tests {
         assert_eq!(db.app_state_get_bool("onboarding").unwrap(), Some(false));
         db.app_state_set_bool("onboarding", true).unwrap();
         assert_eq!(db.app_state_get_bool("onboarding").unwrap(), Some(true));
+    }
+
+    #[test]
+    fn app_state_delete_like_removes_matching_keys() {
+        // v0.2.34: launcher-version-change cache-bust wipes
+        // `module_catalog.cache*` keys via LIKE pattern. Verify both
+        // the envelope key and the fetched-at sibling are removed in
+        // one shot.
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.app_state_set("module_catalog.cache", "{}").unwrap();
+        db.app_state_set("module_catalog.cache_fetched_at", "1700000000")
+            .unwrap();
+        db.app_state_set("unrelated.flag", "keep_me").unwrap();
+        let n = db.app_state_delete_like("module_catalog.cache%").unwrap();
+        assert_eq!(n, 2, "should remove envelope + fetched-at rows");
+        assert_eq!(db.app_state_get("module_catalog.cache").unwrap(), None);
+        assert_eq!(
+            db.app_state_get("module_catalog.cache_fetched_at").unwrap(),
+            None,
+        );
+        // Unrelated rows must survive.
+        assert_eq!(
+            db.app_state_get("unrelated.flag").unwrap().as_deref(),
+            Some("keep_me"),
+        );
+        // Pattern that matches nothing: no error, returns 0.
+        let n2 = db.app_state_delete_like("nope.%").unwrap();
+        assert_eq!(n2, 0);
     }
 
     #[test]
