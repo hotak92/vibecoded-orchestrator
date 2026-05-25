@@ -5711,6 +5711,53 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     print("  OK")
     _log_install_event("4/10", "ok", "pip install completed")
 
+    # Editable-install the orchestrator's own Python distribution so the
+    # `vco` console-script lands on PATH inside `.venv/bin/` (cross-OS:
+    # hatchling generates `vco.exe` on Windows). Replaces the
+    # `scripts/vco{,.ps1}` shim wrappers from Phase 0.C.
+    #
+    # Gated on pyproject.toml's existence so older clones (pre-0.2.34) or
+    # exotic install paths that strip pyproject.toml don't fail loudly —
+    # they just don't get the `vco` entry point (shim wrappers were the
+    # previous answer; we don't ship them anymore).
+    pyproject = PROJECT_ROOT / "pyproject.toml"
+    if not pyproject.exists():
+        _log_install_event(
+            "4/10", "skip",
+            "pyproject.toml missing; skipping editable install of vco CLI",
+            data={"pyproject_path": str(pyproject)},
+        )
+        return
+
+    print("[4/10] Installing vco CLI (editable) ... ", end="", flush=True)
+    _log_install_event("4/10", "start", "pip install -e . (vco CLI)")
+    editable_result = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "-e", "."],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True, text=True,
+    )
+    if editable_result.returncode != 0:
+        print("FAIL")
+        for line in (editable_result.stderr or "").strip().splitlines()[-15:]:
+            print(f"    {line}")
+        print()
+        print("  The orchestrator install completed, but the `vco` CLI entry "
+              "point did NOT register. You can still invoke it via")
+        print("  `python -m vco_lib.cli <subcommand>` until this is resolved.")
+        _log_install_event(
+            "4/10", "warn",
+            f"editable install failed (exit {editable_result.returncode}); "
+            "vco CLI unavailable on PATH",
+            data={"exit_code": editable_result.returncode,
+                  "stderr_tail": (editable_result.stderr or "")
+                                 .strip()[-400:]},
+        )
+        # Soft-fail: don't kill the whole install over the CLI entry
+        # point. `python -m vco_lib.cli` keeps working regardless.
+        return
+    print("OK")
+    _log_install_event("4/10", "ok", "vco CLI editable install completed")
+
 
 # ---------------------------------------------------------------------------
 # Step 5b: Materialize orchestrator-self .claude/ from templates
