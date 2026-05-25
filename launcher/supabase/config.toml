@@ -30,7 +30,8 @@ verify_jwt = false
 # launcher's `module_catalog_client.rs` before the user has any
 # license — anonymous reads are intentional. Same auth posture as
 # validate-tier / rl-latest-version. The actual security gate is at
-# rl-pull-token (license JWT required) for image pulls, not at the
+# rl-artifact-url (license-validated GHCR token issuance) for image
+# pulls, not at the
 # catalog-read layer (catalog metadata is marketing-tile-equivalent).
 [functions.module-catalog]
 verify_jwt = false

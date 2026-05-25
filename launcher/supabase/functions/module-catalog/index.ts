@@ -4,7 +4,7 @@
 // about. Anonymous-callable (no per-user identity required); the response
 // shape is non-sensitive ("here is what exists, here is how you'd pull it if
 // you were authorised"). The actual pull-token + signed-URL flows stay behind
-// the existing /rl-pull-token + /validate-tier surfaces — this function ONLY
+// the existing /rl-artifact-url + /validate-tier surfaces — this function ONLY
 // answers "does this module exist; if so, what's its current catalog metadata".
 //
 // v0.2.33 design rationale: the launcher GUI must NEVER depend on parsing a

@@ -24,7 +24,7 @@
       "image": "ghcr.io/hotak92/vct-rl-reranker",
       "tag_from_version": true,
       "registry": "ghcr.io",
-      "pull_token_endpoint": "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-pull-token",
+      "pull_token_endpoint": "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url",
       "pull_token_method": "POST"
     }
   },
