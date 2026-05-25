@@ -106,16 +106,34 @@ maintain.
 
 ## Out of scope
 
-* The `<project_root>/.env` template file (`ensure_project_env_template`
-  in Rust, `_ensure_env_template` in Python). That file uses different
-  rules (append-only, `# added by vco` markers, commented placeholders)
-  and a different audience (CLI users). Will be migrated through a
-  parallel `apply_project_env_template` contract in a future Phase 0.D.
 * User-bucket secrets (`user_secret_pairs` / `user_secret_known_keys`
   in `ProjectEnvSettings`). Lifecycle B's active-flag gate is currently
   Rust-only; bridging to Python is a follow-up.
 * `GITHUB_TOKEN` keychain-resolved emission. Stays in the Rust resolver
   until a keychain bridge from Python exists.
+
+## Phase 0.D — `.env` template contract (2026-05-25)
+
+Phase 0.B explicitly carved out `<project_root>/.env` as out-of-scope (different rules, different audience). Phase 0.D builds the parallel contract:
+
+* **Writer module**: `vco_lib/env_template.py` (sibling of `vco_lib/config_projection.py`).
+* **Public API**: `project_env_template_from_db(project_id)` (resolver, filters Phase 0.B canonical to a curated subset), `apply_env_template(keys, project_folder)` (writer, block-replace under `# >>> VCO-MANAGED ENV (do not edit between markers) >>>` / `# <<< VCO-MANAGED ENV <<<` markers), `list_canonical_env_template_keys()` (closed subset).
+* **CLI**: `python -m vco_lib.env_template {apply,list-keys,from-db}` (mirrors Phase 0.B CLI shape for Rust subprocess callers).
+* **Canonical subset**: 15/20 Phase 0.B keys — INCLUDE identity + KG + service URLs + feature flags; EXCLUDE access-lists (per-session runtime), orchestrator-root paths (launcher-install-local), `GITHUB_TOKEN` (secret).
+* **Marker pattern**: `# >>> VCO-MANAGED ENV (do not edit between markers) >>>` / `# <<< VCO-MANAGED ENV <<<` — frozen byte string; intentionally louder than `.claude/env`'s markers because `.env` is human-edited. Each managed line is preceded by a forensic `# added by vco — KEY=VALUE` comment.
+* **Semantics**: block-replace (idempotent, byte-identical re-runs); content outside markers preserved verbatim. Legacy `# added by vco YYYY-MM-DD` append-only lines outside the markers are preserved unchanged.
+* **Cross-OS**: LF line endings forced even on Windows (POSIX-shell consumption via WSL2 / git-bash); atomic write via `tempfile.mkstemp` + `os.replace`.
+* **Single-writer lint**: `tests/test_config_projection_single_writer.py` extended with `.env`-write scanners (Python / Rust / shell, anchored to `".env"` quoted literals to avoid `.envrc` / `.env.example` false positives) + `_LEGACY_ENV_TEMPLATE_WRITERS` allowlist + `_LEGACY_ENV_TEMPLATE_MARKER` = `env_template: legacy_caller_pending_migration`.
+* **Migrated**: `install.py::_ensure_env_template` (delegates to `apply_env_template`).
+* **Phase 0.D Part 2 (follow-up)**: full migration of Rust `ensure_project_env_template` to subprocess-into-Python (mirrors Phase 0.B Part 2 / `write_project_env_files`); `install.py`'s fresh-write branch (currently writes non-canonical install-time-only keys directly) refactored to split managed-block keys from install-snapshot keys. Both currently on the legacy allowlist with markers.
+
+## Cross-feature integration bug + fix (2026-05-25)
+
+When Phase 0.D's tests landed, `test_cli_from_db_happy` crashed with `sqlite3.OperationalError: no such table: diagram_access` — because A7 (cross-project diagrams access split, same release) added a `_fetch_diagram_access_list` JOIN to `project_env_from_db` that assumes migration 022 has been applied. Phase 0.D's test fixtures create a minimal launcher DB without that table.
+
+**Fix** (`config_projection.py::_fetch_diagram_access_list`): defensive catch on `sqlite3.OperationalError` with `"no such table"` in the message → return `[]`. Pre-migration-022 DBs + partial-install scenarios now resolve cleanly with an empty diagrams-access list (semantically "no grants"). Both Phase 0.D and Phase 1 fixtures pass.
+
+The lesson is sibling to the wiring-audit one: same-release features can break each other's test fixtures even when individual branches pass. Defensive table-existence checks for any new cross-feature query are cheap insurance.
 
 ## See also
 
