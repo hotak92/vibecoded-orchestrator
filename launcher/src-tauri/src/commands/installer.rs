@@ -7708,7 +7708,15 @@ fn inspect_install_health_at(root: &Path) -> InstallHealth {
     };
 
     let mcp_dir = root.join("claude_mcp_servers");
-    let mcp_servers_ok = mcp_dir.is_dir() && mcp_dir.join(".venv").is_dir();
+    // Accept EITHER the modern `<root>/.venv` (post-migration default created
+    // by install.py Step 4) OR the legacy `<root>/claude_mcp_servers/.venv`
+    // (older installs). install.py:7656-7669 documents the modern path as
+    // canonical and the legacy as fallback; _resolve_venv_python_for_install
+    // (install.py:9809) tries both. The launcher's health-check must follow
+    // the same contract — otherwise every fresh install on every OS shows
+    // the "Installation incomplete" modal even though install.py succeeded.
+    let mcp_servers_ok = mcp_dir.is_dir()
+        && (has_venv || mcp_dir.join(".venv").is_dir());
 
     let all_ok = has_venv && has_state_dir && has_env_with_kg && mcp_servers_ok;
 
@@ -9825,19 +9833,71 @@ MemAvailable:   23456789 kB
     }
 
     #[test]
-    fn test_inspect_install_health_mcp_dir_without_venv() {
-        // claude_mcp_servers/ exists but its .venv/ does not — must NOT
-        // count as healthy. This is the "user copied the source tree but
-        // never ran the MCP server bootstrap" failure mode.
+    fn test_inspect_install_health_modern_venv_satisfies_mcp_servers_ok() {
+        // Modern path (post-migration): install.py creates the venv at
+        // <root>/.venv and does NOT create <root>/claude_mcp_servers/.venv
+        // (the latter is marked as a stale legacy path in install.py:7656).
+        // The launcher's health check must accept the modern layout —
+        // `claude_mcp_servers/` present + `<root>/.venv` present — as
+        // sufficient evidence of a completed install. Otherwise every
+        // fresh install on every OS shows the "Installation incomplete"
+        // modal even though install.py succeeded (2026-05-23 fork bomb
+        // symptom).
         let p = tmp();
         fs::create_dir_all(p.join(".venv")).unwrap();
         fs::create_dir_all(p.join("state")).unwrap();
         fs::write(p.join(".env"), "KG_COLLECTION=Foo\n").unwrap();
         fs::create_dir_all(p.join("claude_mcp_servers")).unwrap();
-        // .venv intentionally absent inside claude_mcp_servers/
+        // claude_mcp_servers/.venv intentionally absent — the modern
+        // install layout does not create it.
 
         let health = inspect_install_health_at(&p);
+        assert!(health.mcp_servers_ok,
+            "mcp_servers_ok must accept the modern <root>/.venv path");
+        assert!(health.all_ok);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_install_health_no_venv_anywhere() {
+        // Neither <root>/.venv nor <root>/claude_mcp_servers/.venv exist
+        // — this is the genuine "user copied source tree but never ran
+        // install.py" failure mode. Health check must flag it.
+        let p = tmp();
+        fs::create_dir_all(p.join("state")).unwrap();
+        fs::write(p.join(".env"), "KG_COLLECTION=Foo\n").unwrap();
+        fs::create_dir_all(p.join("claude_mcp_servers")).unwrap();
+        // No .venv anywhere.
+
+        let health = inspect_install_health_at(&p);
+        assert!(!health.has_venv);
         assert!(!health.mcp_servers_ok);
+        assert!(!health.all_ok);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_inspect_install_health_legacy_venv_path() {
+        // Legacy path: pre-migration installs put the venv at
+        // <root>/claude_mcp_servers/.venv/. install.py:9809
+        // (_resolve_venv_python_for_install) still accepts this layout
+        // as a fallback; the launcher's health check must too, so users
+        // who haven't re-run a modern install.py don't get the modal.
+        let p = tmp();
+        // No <root>/.venv (legacy layout).
+        fs::create_dir_all(p.join("state")).unwrap();
+        fs::write(p.join(".env"), "KG_COLLECTION=Foo\n").unwrap();
+        fs::create_dir_all(p.join("claude_mcp_servers").join(".venv")).unwrap();
+
+        let health = inspect_install_health_at(&p);
+        assert!(!health.has_venv,
+            "<root>/.venv intentionally absent — checking legacy fallback");
+        assert!(health.mcp_servers_ok,
+            "mcp_servers_ok must accept the legacy claude_mcp_servers/.venv path");
+        // has_venv still false → all_ok still false; mcp_servers_ok alone
+        // is not sufficient for the install to be considered complete in
+        // the modern world, but it documents that the legacy fallback is
+        // recognized.
         assert!(!health.all_ok);
         fs::remove_dir_all(&p).ok();
     }
