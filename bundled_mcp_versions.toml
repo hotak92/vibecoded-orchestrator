@@ -44,33 +44,28 @@ version = "1.6.3"
 shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
 
 [npm.excalidraw_mcp]
-# TODO (Phase 0 — known gap): the fork named in the plan
-# (`@sanjibdevnathlabs/mcp-excalidraw-local`) is NOT published to the
-# npm registry as of 2026-05-25. Until it is, this entry stays as a
-# placeholder so the loader contract is uniform across keys and the
-# Phase 2 install pipeline has a slot to populate.
+# Phase 2 (2026-05-25): Resolved via plan §8.3 path (b/c hybrid).
+# The plan-named fork `@sanjibdevnathlabs/mcp-excalidraw-local` is not
+# on npm, so we adopted upstream `excalidraw-mcp-server@2.0.0` (by
+# debu-sinha) — MIT-licensed, actively maintained, bundles
+# `@excalidraw/excalidraw@0.18.0` matching our [npm.excalidraw_lib] pin
+# below — and vendored it in-tree at
+# `claude_mcp_servers/excalidraw_mcp_fork/`.
 #
-# Resolution options when Phase 2 lands:
-#   (a) Publish the fork to npm under our scope and replace this entry
-#       with the real package@version+shasum.
-#   (b) Switch to a git+ref pin — change `package` to a `git+https://`
-#       URL and `version` to the commit SHA; document that the shasum
-#       field is unused for git pins. Vendor a copy under
-#       `claude_mcp_servers/excalidraw_mcp_fork/` for offline installs.
-#   (c) Adopt one of the alternative packages enumerated by
-#       `npm search excalidraw mcp` (excalidraw-mcp / -mcp-server /
-#       -mcp-sentinel) if any of them already exposes the surface we
-#       need (read_scene / create_scene / add_element / modify_element /
-#       export_svg). Re-pin to that package@version here.
+# See `claude_mcp_servers/excalidraw_mcp_fork/VENDORED.md` for the full
+# audit trail (upstream URL, commit/version, modifications, update
+# policy).
 #
-# Whichever path is taken, the bump happens HERE and ships in a VCO
-# release — never auto-resolved at install time.
-#
-# Upstream reference (the plan-named fork):
-# https://github.com/sanjibdevnathlabs/mcp-excalidraw-local
-package = "@sanjibdevnathlabs/mcp-excalidraw-local"
-version = "0.0.0-PLACEHOLDER"
-shasum  = "0000000000000000000000000000000000000000"
+# `package` is a `file:` URL so install.py routes to the local-path
+# branch of `_install_pinned_npm` (`npm install -g <local-dir>` rather
+# than `<pkg>@<version>` registry fetch). `version` carries the source
+# version string + vendor date so audit logs + the launcher GUI can
+# show provenance; `shasum` is empty because integrity is verified by
+# the on-disk tree (git tracks the vendored files), not by npm's
+# tarball integrity field.
+package = "file:claude_mcp_servers/excalidraw_mcp_fork"
+version = "git+vendored-2.0.0-2026-05-25"
+shasum  = ""
 
 [npm.mermaid_lib]
 package = "mermaid"

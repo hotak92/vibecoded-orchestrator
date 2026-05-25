@@ -45,6 +45,7 @@ use super::Db;
 ///    MCP" entry).
 pub const BUNDLED_MCP_NAMES: &[&str] = &[
     "code-embedding",
+    "excalidraw",
     "mermaid",
     "ollama",
     "playwright",
@@ -61,10 +62,16 @@ pub const BUNDLED_MCP_NAMES: &[&str] = &[
 /// project, unlike Playwright). Reasoning: not all projects need diagrams;
 /// mermaid MCP boot adds ~150 ms."
 ///
+/// Plan §3 Phase 2 (2026-05-25): excalidraw follows the same posture —
+/// opt-in per project. The wrapper spawns a vendored Node MCP
+/// (~10 MB on disk via the in-tree fork) plus its own subprocess on
+/// project use, so default-off keeps idle projects free of the cost.
+///
 /// Keep this list narrow — most bundled MCPs should default to on so the
 /// orchestrator "just works". This list is the explicit opt-out for the
 /// few that don't apply universally.
 pub const BUNDLED_MCP_DEFAULT_DISABLED: &[&str] = &[
+    "excalidraw",
     "mermaid",
 ];
 
@@ -373,6 +380,13 @@ mod tests {
     fn default_disabled_includes_mermaid() {
         // Plan §3 Phase 1 item 2 contract.
         assert!(is_default_disabled_mcp("mermaid"));
+    }
+
+    #[test]
+    fn default_disabled_includes_excalidraw() {
+        // Plan §3 Phase 2 contract: excalidraw is opt-in per project.
+        assert!(is_default_disabled_mcp("excalidraw"));
+        assert!(is_bundled_mcp("excalidraw"));
     }
 
     #[test]

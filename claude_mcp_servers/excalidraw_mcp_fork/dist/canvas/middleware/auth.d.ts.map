@@ -1,0 +1,1 @@
+{"version":3,"file":"auth.d.ts","sourceRoot":"","sources":["../../../src/canvas/middleware/auth.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,OAAO,EAAE,QAAQ,EAAE,YAAY,EAAE,MAAM,SAAS,CAAC;AAE/D,OAAO,KAAK,EAAE,MAAM,EAAE,MAAM,wBAAwB,CAAC;AAErD,wBAAgB,oBAAoB,CAAC,MAAM,EAAE,MAAM,IAGzC,KAAK,OAAO,EAAE,KAAK,QAAQ,EAAE,MAAM,YAAY,KAAG,IAAI,CA+B/D"}

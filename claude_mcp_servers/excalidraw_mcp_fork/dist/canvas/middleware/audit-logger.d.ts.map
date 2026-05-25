@@ -1,0 +1,1 @@
+{"version":3,"file":"audit-logger.d.ts","sourceRoot":"","sources":["../../../src/canvas/middleware/audit-logger.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,OAAO,EAAE,QAAQ,EAAE,YAAY,EAAE,MAAM,SAAS,CAAC;AAC/D,OAAO,KAAK,EAAE,MAAM,EAAE,MAAM,wBAAwB,CAAC;AAKrD,wBAAgB,iBAAiB,CAAC,MAAM,EAAE,MAAM,UAE9B,OAAO,QAAQ,QAAQ,QAAQ,YAAY,UAmB5D"}

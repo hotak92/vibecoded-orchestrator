@@ -2919,6 +2919,19 @@ def main() -> int:
     # invoked, so the path is graceful.
     _install_pinned_npm("mermaid_mcp", skip_env_var="VCT_SKIP_MERMAID")
 
+    # Phase 2 (diagrams plan): pre-pin the vendored Excalidraw MCP
+    # (see `bundled_mcp_versions.toml::[npm.excalidraw_mcp]`). The pin
+    # is a `file:` URL pointing at
+    # `claude_mcp_servers/excalidraw_mcp_fork/`; the install branch in
+    # `_install_pinned_npm` calls `npm install -g <vendor-dir>` rather
+    # than fetching from the registry. Default-disabled per project
+    # (same posture as Mermaid). Opt-out: VCT_SKIP_EXCALIDRAW=1.
+    # Non-fatal: returns False on skip / npm missing / vendor missing;
+    # the wrapper still works at runtime via `node <vendor-entry>`
+    # because the wrapper spawns Node directly on the vendored path,
+    # bypassing the global install entirely if it didn't land.
+    _install_pinned_npm("excalidraw_mcp", skip_env_var="VCT_SKIP_EXCALIDRAW")
+
     # Step 11: Initial code graph analysis (if repo has code)
     # Skipped on first install — user runs manually after setup
 
@@ -11357,10 +11370,32 @@ def _build_python_mcp_entries(
         "env": mermaid_env,
     }
 
+    # excalidraw (Phase 2 — diagrams plan)
+    # Wrapper MCP that proxies the in-tree-vendored
+    # `excalidraw-mcp-server` (see
+    # claude_mcp_servers/excalidraw_mcp_fork/VENDORED.md). Spawned as
+    # `<venv-python> -m claude_mcp_servers.wrappers.excalidraw_proxy`
+    # — the wrapper itself spawns Node on the vendored entry point
+    # once it's resolved the per-project tool allowlist. Mirrors the
+    # Rust path's excalidraw entry in
+    # mcp_registration.rs::build_default_mcp_entries.
+    excalidraw_env_raw = {"PYTHONPATH": pythonpath}
+    excalidraw_env, excalidraw_dropped = _filter_env_for_global_json(excalidraw_env_raw)
+    excalidraw_entry = {
+        "type": "stdio",
+        "command": venv_python_str,
+        "args": [
+            "-m",
+            "claude_mcp_servers.wrappers.excalidraw_proxy",
+        ],
+        "env": excalidraw_env,
+    }
+
     return [
         ("weaviate-kg", weaviate_entry, weaviate_dropped),
         ("search", search_entry, search_dropped),
         ("mermaid", mermaid_entry, mermaid_dropped),
+        ("excalidraw", excalidraw_entry, excalidraw_dropped),
     ]
 
 
@@ -14271,6 +14306,45 @@ def _truthy_env(env_value: str | None) -> bool:
     return env_value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _read_vendored_package_json(local_dir: Path) -> dict | None:
+    """Read ``<local_dir>/package.json`` and return the parsed dict.
+
+    Returns ``None`` if the file is missing or unreadable / malformed.
+    Used by ``_install_pinned_npm`` to resolve the npm package name and
+    semver for ``file:``-style pins (where the pin's own ``package``
+    field is a path, not a name).
+
+    Cross-OS: pure Path + stdlib JSON; no shell.
+    """
+    pkg_json = local_dir / "package.json"
+    try:
+        text = pkg_json.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def _read_vendored_package_name(local_dir: Path) -> str | None:
+    """Return the ``name`` field of the vendored package.json, or None."""
+    pkg = _read_vendored_package_json(local_dir)
+    if pkg is None:
+        return None
+    name = pkg.get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def _read_vendored_package_version(local_dir: Path) -> str | None:
+    """Return the ``version`` field of the vendored package.json, or None."""
+    pkg = _read_vendored_package_json(local_dir)
+    if pkg is None:
+        return None
+    ver = pkg.get("version")
+    return ver if isinstance(ver, str) and ver else None
+
+
 def _install_pinned_npm(package_key: str,
                         *,
                         skip_env_var: str | None = None,
@@ -14323,10 +14397,37 @@ def _install_pinned_npm(package_key: str,
     version = spec["version"]
     expected_shasum = spec["shasum"]
 
-    print(f"[bundled-versions] Installing {package}@{version} "
-          f"(key={package_key}) ... ", end="", flush=True)
-    _log_install_event("bundled_versions", "start",
-                       f"pinning {package}@{version}")
+    # Two supported pin shapes (Phase 2, 2026-05-25):
+    #   1. Registry pin: ``package`` is an npm package name (e.g.
+    #      "claude-mermaid"), ``version`` is exact semver. Installed via
+    #      ``npm install -g <pkg>@<version>``; version + shasum verified
+    #      after. This is the original Phase 0 path.
+    #   2. File: pin: ``package`` starts with ``file:`` — the value
+    #      after the prefix is a repo-relative (or absolute) directory
+    #      containing a vendored npm package. Installed via
+    #      ``npm install -g <absolute-dir>``; shasum verification is
+    #      structurally not applicable (the source-of-truth is the
+    #      on-disk tree tracked by git, not an npm-tarball integrity
+    #      field). ``version`` is treated as a label string for the
+    #      audit log only.
+    is_file_pin = package.startswith("file:")
+
+    if is_file_pin:
+        # Resolve the file: path against the repo root (install.py's
+        # location is the canonical anchor; PROJECT_ROOT is computed at
+        # import time).
+        rel = package[len("file:"):]
+        local_dir = (PROJECT_ROOT / rel).resolve()
+        print(f"[bundled-versions] Installing {package} (vendored, "
+              f"label={version}, key={package_key}) ... ",
+              end="", flush=True)
+        _log_install_event("bundled_versions", "start",
+                           f"pinning vendored {package} ({version})")
+    else:
+        print(f"[bundled-versions] Installing {package}@{version} "
+              f"(key={package_key}) ... ", end="", flush=True)
+        _log_install_event("bundled_versions", "start",
+                           f"pinning {package}@{version}")
 
     if skip_env_var is not None and _truthy_env(os.environ.get(skip_env_var)):
         print(f"SKIPPED ({skip_env_var}=truthy)")
@@ -14362,11 +14463,51 @@ def _install_pinned_npm(package_key: str,
         })
         return False
 
+    # For file: pins we need to know the npm-package-name (from the
+    # vendored package.json) to query the global registry. The pin's
+    # `package` field is the file: URL, NOT the package name. Resolve
+    # via a small package.json read so the rest of the verify chain
+    # treats it like a normal install.
+    if is_file_pin:
+        vendor_pkg_name = _read_vendored_package_name(local_dir)
+        if vendor_pkg_name is None:
+            print(f"  WARN: vendored package.json missing or unreadable "
+                  f"at {local_dir}.")
+            _log_install_event("bundled_versions", "warn",
+                               f"vendored package.json unreadable at {local_dir}",
+                               data={"package": package, "version": version})
+            _append_bundled_versions_audit({
+                "package": package,
+                "package_key": package_key,
+                "version": version,
+                "shasum_expected": expected_shasum,
+                "shasum_actual": None,
+                "result": "vendor_unreadable",
+                "vendor_path": str(local_dir),
+            })
+            return False
+        query_pkg_name = vendor_pkg_name
+    else:
+        query_pkg_name = package
+
     # If already at the pin, skip the install subprocess but still
     # confirm via audit log so a `tail -1 bundled_versions.jsonl`
-    # reflects the latest state.
-    currently_installed = _query_installed_npm_version(package)
-    if currently_installed == version:
+    # reflects the latest state. For file: pins, "already pinned" means
+    # the global install resolves to a version matching what the vendor
+    # directory's package.json declares (best-effort idempotency — npm
+    # treats every `npm install -g <dir>` as a fresh install, but
+    # repeatedly running it on the same dir is a no-op in terms of
+    # behaviour, so we skip the subprocess if the version matches).
+    currently_installed = _query_installed_npm_version(query_pkg_name)
+    if is_file_pin:
+        vendor_version = _read_vendored_package_version(local_dir)
+        already_pinned = (
+            vendor_version is not None
+            and currently_installed == vendor_version
+        )
+    else:
+        already_pinned = currently_installed == version
+    if already_pinned:
         print("OK (already pinned)")
         _log_install_event("bundled_versions", "ok",
                            f"{package} already at pinned {version}")
@@ -14375,18 +14516,27 @@ def _install_pinned_npm(package_key: str,
             "package_key": package_key,
             "version": version,
             "shasum_expected": expected_shasum,
-            "shasum_actual": _installed_npm_integrity(package),
+            "shasum_actual": _installed_npm_integrity(query_pkg_name),
             "result": "already_pinned",
         })
         return True
 
     print(f"(install; was {currently_installed or 'absent'})")
 
-    # 1) Pin install. Exact form `<pkg>@<version>` — no `@latest`, no
-    #    caret/tilde.
+    # 1) Pin install. Two argv shapes depending on pin type:
+    #    - Registry pin: ``npm install -g <pkg>@<version>`` (exact, no
+    #      @latest, no caret/tilde).
+    #    - File: pin: ``npm install -g <absolute-local-dir>`` (npm
+    #      reads package.json + symlinks the local tree into the global
+    #      prefix; idempotent for re-runs).
+    if is_file_pin:
+        install_argv = [_NPM_PATH, "install", "-g", str(local_dir)]
+    else:
+        install_argv = [_NPM_PATH, "install", "-g", f"{package}@{version}"]
+
     try:
         result = subprocess.run(
-            [_NPM_PATH, "install", "-g", f"{package}@{version}"],
+            install_argv,
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -14443,14 +14593,21 @@ def _install_pinned_npm(package_key: str,
     # 2) Verify the installed version matches the pin. Defends against
     #    npm's silent best-effort resolution paths (peer-dep conflicts,
     #    workspace overrides) that could land a non-matching version.
-    actual_version = _query_installed_npm_version(package)
-    if actual_version != version:
+    #    For file: pins we compare against the vendored package.json's
+    #    version, NOT the pin's `version` label (which is a free-form
+    #    vendor tag like ``git+vendored-2.0.0-2026-05-25``).
+    actual_version = _query_installed_npm_version(query_pkg_name)
+    if is_file_pin:
+        expected_version = _read_vendored_package_version(local_dir)
+    else:
+        expected_version = version
+    if expected_version is not None and actual_version != expected_version:
         print(f"  WARN: post-install version mismatch — "
-              f"expected {version}, got {actual_version}.")
+              f"expected {expected_version}, got {actual_version}.")
         _log_install_event("bundled_versions", "warn",
                            "post-install version mismatch",
                            data={"package": package,
-                                 "expected": version,
+                                 "expected": expected_version,
                                  "actual": actual_version})
         _append_bundled_versions_audit({
             "package": package,
@@ -14463,8 +14620,27 @@ def _install_pinned_npm(package_key: str,
         })
         return False
 
-    # 3) Best-effort integrity check.
-    actual_shasum = _installed_npm_integrity(package)
+    # 3) Best-effort integrity check. SKIPPED for file: pins — the
+    #    source-of-truth is the on-disk tree tracked by git, not an
+    #    npm-tarball integrity field. ``expected_shasum`` is empty for
+    #    file: pins (see bundled_mcp_versions.toml comment).
+    if is_file_pin:
+        print(f"[bundled-versions] {package} OK (vendored, "
+              f"label={version}; integrity = on-disk tree).")
+        _log_install_event("bundled_versions", "ok",
+                           f"{package} ({version}) installed from vendor")
+        _append_bundled_versions_audit({
+            "package": package,
+            "package_key": package_key,
+            "version": version,
+            "shasum_expected": expected_shasum,
+            "shasum_actual": None,
+            "result": "ok_vendored",
+            "vendor_path": str(local_dir),
+        })
+        return True
+
+    actual_shasum = _installed_npm_integrity(query_pkg_name)
     if actual_shasum is None:
         # Older npm clients don't expose `_shasum` in `npm ls --json` —
         # log WARN per docstring and return True (version pin already
@@ -14540,6 +14716,14 @@ def _check_npm_pin_drift(package_key: str) -> tuple[bool, str | None]:
     if _NPM_PATH is None:
         # No npm means no drift to report. The user will see "npm
         # missing" from the install path instead.
+        return (True, None)
+
+    # For file: pins, the vendor IS the pin — there is no separate
+    # registry version to drift against. The on-disk tree (tracked by
+    # git) is the source of truth; if the user edited the vendor
+    # directory, that's a checked-in change, not a runtime drift. Skip
+    # the npm-query path entirely.
+    if package.startswith("file:"):
         return (True, None)
 
     installed = _query_installed_npm_version(package)

@@ -1,0 +1,1 @@
+{"version":3,"file":"elements.d.ts","sourceRoot":"","sources":["../../../src/canvas/routes/elements.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,MAAM,EAAE,MAAM,SAAS,CAAC;AAEjC,OAAO,KAAK,EAAE,YAAY,EAAE,MAAM,mBAAmB,CAAC;AACtD,OAAO,KAAK,EAAE,SAAS,EAAE,MAAM,kBAAkB,CAAC;AAkDlD,wBAAgB,oBAAoB,CAClC,KAAK,EAAE,YAAY,EACnB,EAAE,EAAE,SAAS,GACZ,MAAM,CAkNR"}

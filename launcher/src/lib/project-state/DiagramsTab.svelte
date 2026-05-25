@@ -24,6 +24,7 @@
     SnapshotTrigger,
   } from '$lib/types/project-state';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import ExcalidrawEditor from './ExcalidrawEditor.svelte';
 
   // ─── Props ────────────────────────────────────────────────────────────
   let { projectId }: { projectId: string } = $props();
@@ -226,6 +227,120 @@
   let creatingSnapshot = $state(false);
   let mermaidModulePromise: Promise<typeof import('mermaid').default> | null = null;
 
+  // ─── Excalidraw embedded editor state (Phase 2, 2026-05-25) ──────────
+  // The embedded React-in-Svelte editor mounts via ExcalidrawEditor.svelte
+  // when the selected diagram is .excalidraw AND the runtime environment
+  // doesn't trip the Wayland+webkit2gtk fallback. The fallback path
+  // shows an "Open externally" prompt instead of an inline editor — see
+  // docs/EXCALIDRAW_WAYLAND_TEST.md for the threshold + rationale.
+  //
+  // `excalidrawSource` is the JSON string read from disk; passed into
+  // the editor as `initialSceneJson`. The editor calls back with the
+  // serialised scene on every (debounced 300ms) change.
+  let excalidrawSource = $state<string>('');
+  let excalidrawLoading = $state(false);
+  let excalidrawWaylandFallback = $state<boolean | null>(null); // null = unchecked
+  let excalidrawExportSvg = $state<(() => Promise<string | null>) | null>(null);
+
+  async function detectExcalidrawFallback(): Promise<boolean> {
+    // Wayland + webkit2gtk has documented canvas latency / pointer
+    // event issues for Excalidraw (plan §4 Risk 5, docs/
+    // EXCALIDRAW_WAYLAND_TEST.md). Two signals trigger the fallback:
+    //   1. Tauri exposes XDG_SESSION_TYPE via an env-read command
+    //      (best signal; only fires when the launcher backend confirms
+    //      Wayland is the active session type).
+    //   2. Navigator UA contains "WebKit" (covers webkit2gtk webview,
+    //      Safari, and Tauri's macOS WebKit — macOS is fine, but the
+    //      env-read signal disambiguates).
+    //
+    // We require BOTH signals before falling back so we don't
+    // accidentally disable the embed for Safari users testing the
+    // launcher in a browser preview (rare but possible).
+    try {
+      const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+      const hasWebkit = /WebKit/i.test(ua);
+      let sessionType = '';
+      try {
+        sessionType = await invoke<string>('read_env_var', {
+          name: 'XDG_SESSION_TYPE',
+        });
+      } catch {
+        // Backend command not present → skip the env check; fall back
+        // only on a webview confirmation later, never silently.
+        sessionType = '';
+      }
+      const isWayland = sessionType.toLowerCase() === 'wayland';
+      return hasWebkit && isWayland;
+    } catch {
+      return false;
+    }
+  }
+
+  async function loadExcalidrawSource() {
+    if (!selected) {
+      excalidrawSource = '';
+      return;
+    }
+    excalidrawLoading = true;
+    try {
+      const txt = await readFile(selected.file_path);
+      excalidrawSource = txt;
+    } catch (e) {
+      // File doesn't exist yet (just-registered diagram with no
+      // starter content) — boot empty.
+      console.info('[diagrams] excalidraw source unreadable, booting empty:', e);
+      excalidrawSource = '';
+    } finally {
+      excalidrawLoading = false;
+    }
+  }
+
+  async function saveExcalidrawSource(sceneJsonString: string) {
+    if (!selected) return;
+    // Resolve relative file_path → absolute (the existing helper
+    // `resolve_project_path` already does this for Open in editor).
+    try {
+      const absPath = await invoke<string>('resolve_project_path', {
+        projectId,
+        relPath: selected.file_path,
+      });
+      await invoke('write_text_file', {
+        path: absPath,
+        contents: sceneJsonString,
+      });
+      // The PostToolUse hook on Write(.claude/diagrams/**) will fire
+      // the indexer; we don't need to invoke it here. The live-push
+      // subscription will refresh `diagrams` in turn.
+    } catch (e) {
+      // Surface a single toast per session-of-failures rather than
+      // one per debounced save; the editor will retry on next change.
+      console.warn('[diagrams] excalidraw save failed:', e);
+      toast.error(e);
+    }
+  }
+
+  async function exportExcalidrawSvg() {
+    if (!selected || selected.diagram_type !== 'excalidraw') return;
+    if (!excalidrawExportSvg) return;
+    try {
+      const svg = await excalidrawExportSvg();
+      if (!svg) {
+        toast.error('Excalidraw export returned nothing — try again.');
+        return;
+      }
+      const { save } = await import('@tauri-apps/plugin-dialog');
+      const path = await save({
+        defaultPath: `${selected.diagram_name}.svg`,
+        filters: [{ name: 'SVG', extensions: ['svg'] }],
+      });
+      if (!path) return;
+      await invoke('write_text_file', { path, contents: svg });
+      toast.success('SVG exported');
+    } catch (e) {
+      toast.error(e);
+    }
+  }
+
   async function ensureMermaid() {
     if (!mermaidModulePromise) {
       mermaidModulePromise = (async () => {
@@ -300,9 +415,14 @@
         previewError = e instanceof Error ? e.message : String(e);
       }
     } else {
-      // Excalidraw embedded editor ships in Phase 2; placeholder for now.
+      // Excalidraw embedded editor (Phase 2, 2026-05-25). The actual
+      // canvas lives in <ExcalidrawEditor>; this branch just loads the
+      // on-disk JSON source so the editor's `initialSceneJson` prop is
+      // current. The Mermaid-specific `previewSvg`/`previewError` are
+      // unused for excalidraw rows.
       previewSvg = '';
       previewError = null;
+      await loadExcalidrawSource();
     }
   }
 
@@ -439,6 +559,19 @@
   // ─── Lifecycle ───────────────────────────────────────────────────────
   onMount(async () => {
     await loadModuleState();
+    // Run Wayland detection in parallel with the module-state load —
+    // it's a single env-var read so cost is negligible, but we want
+    // the result settled before the user clicks on an excalidraw row.
+    void detectExcalidrawFallback().then((flag) => {
+      excalidrawWaylandFallback = flag;
+      if (flag) {
+        console.warn(
+          '[diagrams] Wayland+webkit2gtk detected — Excalidraw ' +
+          'embedded editor disabled, will fall back to Open externally. ' +
+          'See docs/EXCALIDRAW_WAYLAND_TEST.md',
+        );
+      }
+    });
     if (moduleActive) {
       await load();
       await subscribeToChanges();
@@ -668,6 +801,15 @@
               >
                 Export SVG
               </button>
+            {:else if selected.diagram_type === 'excalidraw' && !excalidrawWaylandFallback}
+              <button
+                class="ps-btn-link"
+                onclick={exportExcalidrawSvg}
+                disabled={!excalidrawExportSvg}
+                title="Export the Excalidraw scene to SVG"
+              >
+                Export SVG
+              </button>
             {/if}
           </div>
 
@@ -686,12 +828,36 @@
                 <p class="ps-loading">Rendering…</p>
               {/if}
             {:else}
-              <div class="diagrams-excalidraw-placeholder">
-                <p>Excalidraw embedded editor lands in Phase 2.</p>
-                <button class="ps-btn-link" onclick={openInEditor}>
-                  Open in browser / OS editor
-                </button>
-              </div>
+              <!-- Excalidraw branch (Phase 2, 2026-05-25). Three states:
+                   1. fallback triggered (Wayland+webkit2gtk) → "Open
+                      externally" prompt. Doc reference baked into the
+                      info text so the user can find the test recipe.
+                   2. source loading → spinner.
+                   3. ready → embedded editor mounted. -->
+              {#if excalidrawWaylandFallback}
+                <div class="diagrams-excalidraw-placeholder">
+                  <p>
+                    Embedded Excalidraw editor disabled on Wayland +
+                    webkit2gtk (known canvas latency / pointer issue).
+                  </p>
+                  <p class="ps-hint">
+                    See <code>docs/EXCALIDRAW_WAYLAND_TEST.md</code> for the
+                    test recipe and reproduction steps.
+                  </p>
+                  <button class="ps-btn-link" onclick={openInEditor}>
+                    Open in OS default editor
+                  </button>
+                </div>
+              {:else if excalidrawLoading}
+                <p class="ps-loading">Loading scene…</p>
+              {:else}
+                <ExcalidrawEditor
+                  diagramName={selected.diagram_name}
+                  initialSceneJson={excalidrawSource}
+                  onSave={saveExcalidrawSource}
+                  bind:exportSvgFn={excalidrawExportSvg}
+                />
+              {/if}
             {/if}
           </div>
 
