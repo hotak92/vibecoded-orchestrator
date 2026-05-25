@@ -42,6 +42,12 @@ pub mod manifest;
 // mismatch handling. Consumed by `list_module_catalog` (Agent B's L0a
 // refactor) and by the renderer's `↻` button via `refresh_module_catalog`.
 pub mod module_catalog_client;
+// v0.2.33 Agent B2 (cold-start synth): builds a thin in-memory ModuleManifest
+// from the L0 install-slice so `installer_engine::run_install` can drive
+// `container_pull` BEFORE the real manifest is extracted from the pulled
+// image. The synth is replaced on disk by Agent C's extract step immediately
+// after pull succeeds — its lifespan is the install run only.
+pub mod l0_manifest_synth;
 pub mod module_db;
 // v0.2.32 #D: explicit "download default RL weights" Tauri command +
 // runtime-value resolver for L6 MultiSelectFilter. Separate from

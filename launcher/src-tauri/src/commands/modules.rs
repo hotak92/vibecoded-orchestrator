@@ -1008,8 +1008,14 @@ pub fn find_installed_manifest(
 /// v0.2.33 install-path manifest lookup. Tries the on-disk extracted
 /// manifest first (re-install / reinstall-from-broken case), then
 /// falls back to the dev-affordance scan when the passthrough env var
-/// is set. Returns an Err carrying the L0-aware action the user
-/// should take if neither source matches.
+/// is set. Returns Err when neither source has a matching manifest.
+///
+/// Used by `uninstall_module_v2` which (by definition) never needs the
+/// L0-synth cold-start branch — uninstall only ever runs against a
+/// module that's already installed (so the on-disk extract is present).
+/// `install_module_for_project` / `update_module_for_project` use
+/// `resolve_manifest_for_install` instead, which adds the L0-synth
+/// fallback for the cold-start case.
 fn install_path_manifest_lookup(
     db: &Db,
     module_id: &str,
@@ -1029,15 +1035,121 @@ fn install_path_manifest_lookup(
         }
     }
     Err(format!(
-        "module {} has no manifest available for install. \
-         Cold-start install from L0 metadata only is a v0.2.34 follow-up — \
-         either install via the dev affordance (set \
-         VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1 with the manifest \
-         co-located at <install_root>/paid-modules/<id>/) or wait for the \
-         v0.2.34 launcher release that wires L0 install-slice into the \
-         installer engine.",
-        module_id
+        "module {} has no on-disk manifest available. Either the \
+         module has never been installed (use install_module_for_project, \
+         which falls back to L0-synth on cold-start), or its install \
+         was incomplete (no `~/.vct/modules/{}/vct-module.json`).",
+        module_id, module_id,
     ))
+}
+
+/// Which lookup branch produced the manifest in
+/// [`resolve_manifest_for_install`]. Carried alongside the manifest so
+/// callers (`install_module_for_project`, `update_module_for_project`)
+/// can audit-log where the install metadata came from and surface
+/// useful diagnostics on the install-complete event.
+///
+/// The variants are ordered by preference — `Installed` wins over `Dev`
+/// wins over `L0Synth`. The audit row carries the source variant verbatim
+/// so post-incident triage can answer "was this a cold-start install or a
+/// re-install from on-disk?" without grepping logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManifestSource {
+    /// On-disk extracted manifest at
+    /// `~/.vct/modules/<id>/vct-module.json` — produced by Agent C's
+    /// post-pull `extract_manifest_from_image`. Carries the absolute
+    /// path for audit logging.
+    Installed(PathBuf),
+    /// Dev-affordance: `<install_root>/paid-modules/<id>/vct-module.json`,
+    /// gated by `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1`. Used by module
+    /// developers running the launcher against a local
+    /// pre-publish working copy of their module.
+    Dev(PathBuf),
+    /// Synthesized from the cached L0 install-slice — the v0.2.33 B2
+    /// cold-start path. The synth is in-memory only; Agent C's extract
+    /// will overwrite the on-disk file immediately after `container_pull`
+    /// succeeds.
+    L0Synth,
+}
+
+impl ManifestSource {
+    /// Stringification for the audit row. Stable identifiers — don't
+    /// rename without coordinating with the audit-log consumers.
+    pub(crate) fn as_audit_str(&self) -> String {
+        match self {
+            ManifestSource::Installed(p) => format!("installed:{}", p.display()),
+            ManifestSource::Dev(p) => format!("dev:{}", p.display()),
+            ManifestSource::L0Synth => "l0-synth".to_string(),
+        }
+    }
+}
+
+/// v0.2.33 B2: three-phase install manifest resolver. Returns the
+/// manifest the installer engine should consume plus a tag describing
+/// where it came from.
+///
+/// Phase order (first one that succeeds wins):
+///   1. **Installed**: on-disk extracted manifest at
+///      `~/.vct/modules/<id>/vct-module.json`. Wins for re-installs +
+///      reinstalls-from-broken (the prior install already extracted the
+///      real manifest; we have authoritative data on disk).
+///   2. **Dev**: `<install_root>/paid-modules/<id>/vct-module.json`,
+///      gated on `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1`. Wins for
+///      module-author workflows running against a local working copy
+///      before publishing the GHCR image.
+///   3. **L0Synth**: synthesise a thin `ModuleManifest` from the cached
+///      L0 install-slice (see `l0_manifest_synth`). This is the
+///      cold-start path — closes the v0.2.33 G-J3-a gap from the
+///      architecture review. The synth lives only for the duration of
+///      this install; Agent C's `extract_manifest_from_image` REPLACES
+///      it on disk immediately after `container_pull` succeeds.
+///
+/// Cold-start preconditions for phase 3:
+///   * The catalog cache must contain an entry for `module_id` (set by
+///     the Modules-tab visit or a `refresh_module_catalog` call).
+///   * The L0 install-slice must be complete (image non-empty etc. —
+///     see `synthesize_install_manifest_from_l0` for the full guard).
+///
+/// If phase 3 fails (cache empty, module not in L0, malformed slice),
+/// the error message names the missing precondition so the user sees
+/// "visit the Modules tab first" rather than a confusing low-level
+/// failure.
+pub(crate) fn resolve_manifest_for_install(
+    db: &Db,
+    module_id: &str,
+) -> Result<(ModuleManifest, ManifestSource), String> {
+    // Phase 1: on-disk extracted manifest.
+    if let Ok((m, path)) = find_installed_manifest(db, module_id) {
+        return Ok((m, ManifestSource::Installed(path)));
+    }
+
+    // Phase 2: dev affordance.
+    if dev_catalog_passthrough_enabled() {
+        for path in dev_paid_modules_paths(db) {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Ok(m) = ModuleManifest::from_json(&raw) {
+                    if m.id == module_id {
+                        return Ok((m, ManifestSource::Dev(path)));
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 3: cold-start synth from L0 install-slice.
+    //
+    // resolve_install_metadata reads `app_state[module_catalog.cache]`
+    // synchronously — no network hit. The cache is populated by the
+    // Modules-tab mount + the `↻` refresh button. When the user clicks
+    // Install directly from a stale Home tile WITHOUT visiting Modules
+    // first, the cache may be empty — in which case resolve_install_metadata
+    // surfaces "visit the Modules tab or call refresh_module_catalog
+    // first", which is actionable for the user.
+    let l0_slice = crate::commands::modules::resolve_install_metadata(db, module_id)?;
+    let synth = crate::commands::l0_manifest_synth::synthesize_install_manifest_from_l0(
+        &l0_slice,
+    )?;
+    Ok((synth, ManifestSource::L0Synth))
 }
 
 /// Compatibility shim for module_service's restart path. Same
@@ -1083,19 +1195,24 @@ pub async fn install_module_for_project(
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
-    // 2. Manifest lookup.
+    // 2. Manifest lookup — v0.2.33 B2 cold-start synth wired in.
     //
-    // v0.2.33: the install path now resolves the manifest in three
-    // phases (in order — first one that succeeds wins):
-    //   a. on-disk extracted manifest at `~/.vct/modules/<id>/` (if a
-    //      prior install already pulled the image — re-install case).
-    //   b. dev-affordance: `<install_root>/paid-modules/<id>/` when
-    //      `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1`.
-    //   c. (NOT implemented for v0.2.33) build a thin ModuleManifest
-    //      from the L0 install-time slice, drive container_pull, then
-    //      re-read the extracted manifest mid-install. Tracked as the
-    //      v0.2.34 "true cold-start install" gap (review §G-J3-a).
-    let (manifest, manifest_path) = install_path_manifest_lookup(&db, &module_id)?;
+    // Resolves the manifest in three phases (first match wins):
+    //   a. on-disk extracted manifest at `~/.vct/modules/<id>/`
+    //      (re-install / reinstall-from-broken case).
+    //   b. dev-affordance `<install_root>/paid-modules/<id>/` when
+    //      `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1` (module-author
+    //      workflows running against a local working copy).
+    //   c. cold-start: synthesise a thin ModuleManifest from the
+    //      cached L0 install-slice. Closes the G-J3-a gap from the
+    //      v0.2.33 architecture review — a true first-install on a
+    //      real-user machine where neither the extracted on-disk
+    //      manifest nor the dev paid-modules/ exists. After
+    //      `container_pull` succeeds, Agent C's
+    //      `extract_manifest_from_image` writes the REAL manifest to
+    //      `~/.vct/modules/<id>/vct-module.json` — the synth is
+    //      replaced in-flight, never persisted.
+    let (manifest, manifest_source) = resolve_manifest_for_install(&db, &module_id)?;
 
     // 3. Host compatibility
     let host_str = project.host.as_str();
@@ -1131,7 +1248,7 @@ pub async fn install_module_for_project(
         Some(&module_id),
         &serde_json::json!({
             "version": manifest.version,
-            "manifest_source": manifest_path.display().to_string(),
+            "manifest_source": manifest_source.as_audit_str(),
         }),
     )?;
 
@@ -1272,14 +1389,25 @@ pub async fn update_module_for_project(
 
     // 2. Project exists + manifest lookup.
     //
-    // v0.2.33: update path uses the same three-phase lookup as install
-    // — typically the on-disk extracted manifest from the prior
-    // version is already present, and Agent C's post-pull extract
-    // will overwrite it with the new version's manifest mid-update.
+    // v0.2.33 B2: update path uses the same three-phase resolver as
+    // install. In practice the on-disk extracted manifest from the
+    // PRIOR version is already present (we're updating, not first-
+    // installing), so phase 1 wins. The L0-synth phase 3 is a safety
+    // net for the "module_installs row exists but on-disk file went
+    // missing" case (e.g. user manually rm'd ~/.vct/modules/<id>/) —
+    // Agent C's reconciler should mark such rows broken at startup,
+    // but if the row survived we'd rather drive update from L0 than
+    // hard-fail.
+    //
+    // Note: the synth's version will be the L0 CURRENT version, which
+    // is what we want for an update (`installer_engine::run_upgrade`
+    // reads `manifest.version` to pick the new tag). The previous
+    // version stays in `previous_install.module_version` for the
+    // audit row.
     let _project = db
         .get_project(&project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
-    let (manifest, manifest_path) = install_path_manifest_lookup(&db, &module_id)?;
+    let (manifest, manifest_source) = resolve_manifest_for_install(&db, &module_id)?;
 
     // 3. License gate (same as install — paid modules require an active
     //    license at update time too, in case a Pro subscription lapsed
@@ -1298,7 +1426,7 @@ pub async fn update_module_for_project(
         &serde_json::json!({
             "previous_version": previous_install.module_version,
             "new_version": manifest.version,
-            "manifest_source": manifest_path.display().to_string(),
+            "manifest_source": manifest_source.as_audit_str(),
         }),
     )?;
 
@@ -3143,6 +3271,289 @@ mod tests {
             rl_on.version, "9.9.9",
             "with passthrough on, the dev manifest overrides the L0 \
              record for the same module_id — explicit opt-in semantics"
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    // ─── v0.2.33 B2: cold-start install resolver integration ────────────
+    //
+    // These three tests pin the three-phase manifest resolution
+    // contract that closes the G-J3-a gap from the v0.2.33 architecture
+    // review. They exercise `resolve_manifest_for_install` directly —
+    // the unit under test — rather than spinning up
+    // `installer_engine::run_install` (which would try to invoke
+    // podman). The boundary is deliberate: the resolver hands the
+    // synthesized manifest to the installer engine; what the engine
+    // does with it is covered by the engine's own tests.
+
+    /// Test 5 (cold-start): no on-disk manifest, no dev passthrough,
+    /// but the L0 cache holds a valid entry → resolver returns the
+    /// synthesised manifest tagged `ManifestSource::L0Synth`. This is
+    /// the load-bearing case for the G-J3-a fix: a real-user machine
+    /// installing a paid module for the first time, the manifest is
+    /// inside the (unpulled) image, only the L0 install-slice is on
+    /// hand.
+    #[test]
+    fn cold_start_install_flow_uses_l0_synth_when_no_installed_or_dev_manifest() {
+        let (_lock, _tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // Seed the catalog cache the way `cached_module_catalog` would
+        // after a successful fetch from the L0 edge function.
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-05-25T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.7")],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .expect("seed catalog cache");
+
+        // Pre-condition checks: phase 1 (on-disk) must MISS, phase 2
+        // (dev) must MISS. We've redirected VCT_STATE_DIR to a fresh
+        // tempdir via isolate_state, so `~/.vct/modules/` is empty
+        // under that prefix. And isolate_state cleared the dev env var.
+        assert!(
+            find_installed_manifest(&db, "vct-rl-reranker").is_err(),
+            "test pre-cond: no on-disk manifest"
+        );
+        assert!(
+            !dev_catalog_passthrough_enabled(),
+            "test pre-cond: dev passthrough OFF"
+        );
+
+        // Exercise the resolver.
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("L0-synth must succeed when catalog cache is populated");
+        assert_eq!(source, ManifestSource::L0Synth, "must take phase 3");
+
+        // The synthesised manifest carries the L0 install-slice — enough
+        // for installer_engine::run_install to drive container_pull.
+        // Phase 3 of `installer_engine::run_install_inner` would consume
+        // these fields IF we proceeded to actually pull (we don't —
+        // that'd require podman).
+        assert_eq!(manifest.id, "vct-rl-reranker");
+        assert_eq!(manifest.version, "0.2.7");
+        assert_eq!(
+            manifest.install.method,
+            crate::manifest::InstallMethod::ContainerPull
+        );
+        let c = manifest
+            .install
+            .container
+            .as_ref()
+            .expect("synth carries install.container");
+        assert_eq!(c.image, "ghcr.io/hotak92/vct-rl-reranker");
+        assert!(c.tag_from_version);
+        // License gate is_module_licensed (called immediately after the
+        // resolver in install_module_for_project) reads these — pinning
+        // them confirms the gate sees the L0-derived values, not some
+        // accidental builtin default.
+        assert!(manifest.license.required);
+        assert_eq!(manifest.license.min_orchestrator_tier, "pro");
+
+        // Audit-string format must encode the cold-start path so
+        // post-incident triage can identify L0-synth installs.
+        assert_eq!(source.as_audit_str(), "l0-synth");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 6 (re-install preference): even when the L0 cache holds an
+    /// entry, the on-disk installed manifest wins. The version on disk
+    /// may be older than L0 (e.g. user installed v0.2.7 last week, L0
+    /// has been bumped to v0.2.8 today) — install (as opposed to
+    /// update) MUST drive against the on-disk one, not L0; otherwise a
+    /// "reinstall to fix a broken state" silently morphs into an
+    /// upgrade and we'd surprise the user.
+    #[test]
+    fn cold_start_install_prefers_installed_manifest_when_present() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // Seed L0 cache with v0.2.8 (newer than what's on disk).
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-05-25T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.8")],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        // Plant an installed manifest at v0.2.7 under the
+        // VCT_STATE_DIR-redirected modules tree. The contents mirror
+        // what Agent C's extract step would have written after a real
+        // pull.
+        let module_dir = tmp.path().join("modules").join("vct-rl-reranker");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let installed_manifest = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-rl-reranker",
+            "name": "RL Reranker",
+            "version": "0.2.7",
+            "description": "installed-on-disk fixture",
+            "category": "paid-independent",
+            "license": {
+                "required": true,
+                "variant_ids": ["x"],
+                "min_orchestrator_tier": "pro"
+            },
+            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
+            "install": {
+                "method": "container_pull",
+                "container": {
+                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "pull_token_endpoint": "https://example/pull-token"
+                }
+            },
+            "runtime": {"type": "container", "command": ""}
+        });
+        std::fs::write(
+            module_dir.join("vct-module.json"),
+            installed_manifest.to_string(),
+        )
+        .unwrap();
+
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("must resolve");
+        // Phase 1 wins — must NOT be L0Synth.
+        match &source {
+            ManifestSource::Installed(p) => {
+                assert!(
+                    p.ends_with("vct-module.json"),
+                    "installed source path must point at the extract: {}",
+                    p.display()
+                );
+            }
+            other => panic!(
+                "expected ManifestSource::Installed, got {:?} — \
+                 phase-1 preference is broken (would silently turn a \
+                 re-install into a version upgrade against the user's \
+                 expectations)",
+                other,
+            ),
+        }
+        // The version MUST be the on-disk v0.2.7, NOT the L0 v0.2.8.
+        // If this ever fails it means phase 3 leaked in front of
+        // phase 1.
+        assert_eq!(
+            manifest.version, "0.2.7",
+            "on-disk version must win — phase 1 must run before phase 3"
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Test 7 (dev preference): when the on-disk manifest is absent BUT
+    /// the dev paid-modules/ exists AND `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1`,
+    /// the dev manifest wins (phase 2). Without the env var, phase 2 is
+    /// skipped entirely and phase 3 (L0-synth) takes over — that branch
+    /// is covered by test 5. This test pins the dev-preference contract
+    /// specifically.
+    #[test]
+    fn cold_start_install_prefers_dev_paid_modules_when_env_var_set() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // Seed L0 cache (would be phase 3 if dev didn't win).
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-05-25T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.7")],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        // Plant a dev paid-modules entry with a sentinel version that
+        // we can distinguish from the L0 version (0.2.7 → 9.9.9).
+        let install_root = plant_install_root(tmp.path(), &db);
+        let dev_dir = install_root.join("paid-modules").join("vct-rl-reranker");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        let dev_manifest = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-rl-reranker",
+            "name": "RL Reranker (DEV)",
+            "version": "9.9.9",
+            "description": "dev paid-modules fixture",
+            "category": "paid-independent",
+            "license": {
+                "required": true,
+                "variant_ids": ["x"],
+                "min_orchestrator_tier": "pro"
+            },
+            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
+            "install": {
+                "method": "container_pull",
+                "container": {
+                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "pull_token_endpoint": "https://example/pull-token"
+                }
+            },
+            "runtime": {"type": "container", "command": ""}
+        });
+        std::fs::write(
+            dev_dir.join("vct-module.json"),
+            dev_manifest.to_string(),
+        )
+        .unwrap();
+
+        // Phase A: env var UNSET → phase 2 skipped, phase 3 (L0-synth)
+        // takes over and we'd see v0.2.7.
+        std::env::remove_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH");
+        let (manifest_off, source_off) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("L0-synth path");
+        assert_eq!(
+            source_off,
+            ManifestSource::L0Synth,
+            "env unset → dev branch is skipped, phase 3 fires"
+        );
+        assert_eq!(
+            manifest_off.version, "0.2.7",
+            "L0-synth version wins when dev branch is gated off"
+        );
+
+        // Phase B: env var ON → dev branch fires, v9.9.9 wins.
+        std::env::set_var("VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH", "1");
+        let (manifest_on, source_on) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("dev path");
+        match &source_on {
+            ManifestSource::Dev(p) => {
+                assert!(
+                    p.ends_with("vct-module.json"),
+                    "dev source path must point at paid-modules manifest: {}",
+                    p.display()
+                );
+                // Audit-string format must distinguish dev from
+                // installed (operationally critical — a Dev-source
+                // install means the user's running with the env var
+                // set, which we want visible post-incident).
+                assert!(
+                    source_on.as_audit_str().starts_with("dev:"),
+                    "audit string must be tagged 'dev:', got {}",
+                    source_on.as_audit_str()
+                );
+            }
+            other => panic!(
+                "expected ManifestSource::Dev when env var is set, got {:?}",
+                other,
+            ),
+        }
+        assert_eq!(
+            manifest_on.version, "9.9.9",
+            "dev manifest version must win over L0 when the env var is set"
         );
 
         restore_env(prev_state, prev_dev);
