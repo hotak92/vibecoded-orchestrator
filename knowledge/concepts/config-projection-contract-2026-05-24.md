@@ -112,6 +112,48 @@ maintain.
 * `GITHUB_TOKEN` keychain-resolved emission. Stays in the Rust resolver
   until a keychain bridge from Python exists.
 
+## Phase 0.B Part 2 — empty legacy-writer allowlist (2026-05-25)
+
+The legacy direct writers were migrated:
+
+* **Rust** (`projects_v2.rs`): production callers (`create_project_v2`,
+  `rename_project_v2`, `set_shared_kg_write_disabled`,
+  `refresh_project_env_with_db`) now go through
+  `apply_project_env_via_python` which subprocesses
+  `python -m vco_lib.config_projection apply --project-id <id>`.
+  The legacy `write_project_env_files` body is retained (still used
+  by the user-secret SecretsPanel flow + `#[cfg(test)]` byte-layout
+  fixtures); just no longer reached from production code paths.
+* **Python** (`install.py`, `vco_lib/project_init.py`): the
+  `_backfill_*_env_in_project` helpers are bypassed in favor of
+  direct `apply_project_env(project_env_from_db(...))` calls
+  (Python→Python, no subprocess overhead).
+* **`_LEGACY_PRODUCTION_WRITERS`** in
+  `tests/test_config_projection_single_writer.py` is now EMPTY.
+  A new regression-guard test
+  (`test_legacy_writers_allowlist_is_empty_post_part_2`) fails
+  loudly if anyone re-introduces a direct writer.
+
+**Subprocess pattern (Rust → Python)**:
+- argv: `<python> -m vco_lib.config_projection apply --project-id <id>`
+- python resolution chain: `$VCT_VENV` → `$VCT_INSTALL_ROOT/.venv` →
+  `$VCT_INSTALL_ROOT/claude_mcp_servers/.venv` → walks up from
+  `current_exe()` (8 parents) → `python3` / `python.exe` on PATH.
+- `env_clear()` + re-inject: `PATH`, `VCT_STATE_DIR`, `VCT_HUB_PORT`,
+  `VCT_HUB_TOKEN`, `VCT_INSTALL_ROOT`, `TEMP`/`TMP`/`TMPDIR`, `HOME`
+  (POSIX) or `USERPROFILE` + `APPDATA` + `LOCALAPPDATA` + `HOMEDRIVE`
+  + `HOMEPATH` (Windows).
+- `current_dir = folder`.
+- Timeout: 30s wall-clock, polled at 50ms.
+
+**Known regression**: user-secret writes (`GITHUB_TOKEN` from
+SecretsPanel) no longer reach env surfaces via the create/rename/refresh
+paths because the Python contract explicitly excludes user secrets
+(active-flag gate lives in Rust). Tracked as Phase 0.E. Mitigation
+today: SecretsPanel triggers `refresh_env_after_user_secret_change`
+which still ends up at the Python writer; the active-set surface
+only re-converges when the user toggles a secret in the GUI.
+
 ## Phase 0.D — `.env` template contract (2026-05-25)
 
 Phase 0.B explicitly carved out `<project_root>/.env` as out-of-scope (different rules, different audience). Phase 0.D builds the parallel contract:
