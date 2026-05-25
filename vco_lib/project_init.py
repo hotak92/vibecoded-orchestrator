@@ -206,6 +206,18 @@ def _derive_project_dev_name(project_root: Path) -> str:
     return derive_project_dev_name(project_root.name or "")
 
 
+def _derive_project_diagrams_name(project_root: Path) -> str:
+    """Internal alias — path-based Diagrams name derivation.
+
+    Added by fix/a1-indexing-pipeline (2026-05-25) so install.py's
+    self-install bootstrap (``_ensure_collections``) can derive the
+    diagrams collection name with the same path-based helper shape
+    used for KG / Dev. Behavior matches ``derive_project_diagrams_name``
+    fed ``project_root.name``.
+    """
+    return derive_project_diagrams_name(project_root.name or "")
+
+
 # ---------------------------------------------------------------------------
 # Schema definitions (relocated from install.py:4212-4270)
 # ---------------------------------------------------------------------------
@@ -1205,6 +1217,13 @@ def _build_plan(
     pairs = [
         ("KG_COLLECTION", kg_class_definition),
         ("DEVELOPMENT_COLLECTION", development_class_definition),
+        # fix/a1-indexing-pipeline (2026-05-25): include the Diagrams
+        # collection in the smart-migration plan so future schema bumps
+        # (e.g. adding `status` / `content_hash` via the additive
+        # patch_props action) flow through the same code path that
+        # handles KG / Dev. Skipped silently when DIAGRAMS_COLLECTION
+        # is unset in env (e.g. older projects pre-config_projection).
+        ("DIAGRAMS_COLLECTION", diagrams_class_definition),
     ]
     for env_key, target_def_fn in pairs:
         name = os.environ.get(env_key, "")
@@ -1270,6 +1289,11 @@ def migrate_collections(
     _recover_targets = {
         "KG_COLLECTION": kg_class_definition,
         "DEVELOPMENT_COLLECTION": development_class_definition,
+        # fix/a1-indexing-pipeline (2026-05-25): include Diagrams in the
+        # orphan-staging recovery sweep so a crashed migration of the
+        # diagrams collection doesn't leave a `<Project>_Diagrams_staging`
+        # orphan that the bootstrap path then trips over on its next run.
+        "DIAGRAMS_COLLECTION": diagrams_class_definition,
     }
     for env_key, target_fn in _recover_targets.items():
         name = os.environ.get(env_key, "")
@@ -2025,13 +2049,25 @@ def bootstrap_collections(
     # 2. Build the target list. Each tuple carries the canonical target
     # name AND the def-fn (so we can re-derive the spec when regenerating
     # under a case-conflict alias). Order matters: KG first, Dev second,
-    # shared KG last.
+    # Diagrams third (when not kg_only), shared KG last.
     targets: list[tuple[str, Callable[[str], dict]]] = [
         (derived["kg_collection"], kg_class_definition),
     ]
     if not kg_only:
         targets.append(
             (derived["development_collection"], development_class_definition),
+        )
+        # Phase 1.5 — Diagrams collection (fix/a1-indexing-pipeline
+        # 2026-05-25). Auto-paired with the KG collection on every
+        # bootstrap so `vco_lib.diagram_indexer::_weaviate_upsert` has a
+        # class to write into the first time the user saves a .mmd /
+        # .excalidraw file (otherwise upsert fails with "no such class"
+        # — Bug-3 of the wiring audit). The class is also unconditionally
+        # bootstrapped on every existing project's next session because
+        # the existence check + POST-on-absent path below makes the
+        # bootstrap idempotent.
+        targets.append(
+            (derived["diagrams_collection"], diagrams_class_definition),
         )
     # Shared KG: always created when missing (per coordinator: shared KG is
     # READ by every project regardless of per-project opt-out, so creation
@@ -2273,6 +2309,21 @@ def _write_bootstrap_deferral(
     if kg_only:
         cmd_lines[-1] += " --kg-only"
 
+    # Compose the list of expected collections for the deferral message.
+    # In kg_only mode we skip Dev and Diagrams (matching the bootstrap
+    # target tuple); otherwise list all three per-project collections
+    # plus the shared KG. fix/a1-indexing-pipeline (2026-05-25): added
+    # `<Project>_Diagrams` so users see all collections that didn't get
+    # created and can plan the re-run accordingly.
+    if kg_only:
+        _collections_human = f"{derived['kg_collection']}, {_SHARED_KG_NAME}"
+    else:
+        _collections_human = (
+            f"{derived['kg_collection']}, "
+            f"{derived['development_collection']}, "
+            f"{derived['diagrams_collection']}, "
+            f"{_SHARED_KG_NAME}"
+        )
     entry = DeferralEntry(
         condition_id="weaviate_unreachable_at_bootstrap",
         title="Weaviate collection bootstrap deferred",
@@ -2280,8 +2331,7 @@ def _write_bootstrap_deferral(
             f"Weaviate at {weaviate_url} was unreachable during project "
             f"creation, and the auto-restart attempt did not bring it back. "
             f"The project's KG collections "
-            f"({derived['kg_collection']}, "
-            f"{derived['development_collection']}, {_SHARED_KG_NAME}) "
+            f"({_collections_human}) "
             f"have not been created. Knowledge-graph search and writes will "
             f"fail until Weaviate is up and bootstrap is re-run."
         ),
@@ -7565,7 +7615,16 @@ def _cmd_drop_collections(args: argparse.Namespace) -> int:
     request hit a non-404 HTTP error.
     """
     derived = derive_project_collection_names(args.name)
-    targets = [derived["kg_collection"], derived["development_collection"]]
+    # fix/a1-indexing-pipeline (2026-05-25): include the per-project
+    # Diagrams collection so unregister cleans up the full set the
+    # bootstrap path creates. Idempotent — a 404 from Weaviate on a
+    # never-created Diagrams class still counts as a successful drop
+    # (consistent with the existing KG / Dev semantics).
+    targets = [
+        derived["kg_collection"],
+        derived["development_collection"],
+        derived["diagrams_collection"],
+    ]
     weaviate_url = args.weaviate_url
 
     result: dict = {

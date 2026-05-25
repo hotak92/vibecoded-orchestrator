@@ -35,6 +35,7 @@ from vco_lib.diagram_indexer import (
     _upsert_row,
     humanize_filename,
     index_diagram,
+    index_diagram_async,
     parse_excalidraw,
     parse_mermaid,
 )
@@ -687,6 +688,160 @@ class TestRetryTableEnqueue:
 # ---------------------------------------------------------------------------
 # DiagramRow → sidecar_dict
 # ---------------------------------------------------------------------------
+
+
+class TestIndexDiagramAsync:
+    """Verifies the async wrapper correctly resolves and forwards the
+    diagrams_collection kwarg (fix/a1-indexing-pipeline 2026-05-25).
+
+    Pre-fix, ``index_diagram_async`` called ``index_diagram(file_path,
+    project_id, chat_id)`` positionally — never passing ``diagrams_collection``
+    — so every wrapper-MCP save silently skipped the Weaviate upsert
+    (Bug-1 of the wiring audit)."""
+
+    def _async_run(self, coro):
+        """Tiny event-loop helper so we don't need pytest-asyncio."""
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_async_passes_explicit_diagrams_collection_kwarg(
+        self, db_path: Path, diagrams_root: Path, monkeypatch
+    ):
+        """When caller passes ``diagrams_collection=X``, the value flows
+        through to ``index_diagram`` and reaches ``_weaviate_upsert``."""
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "explicit-collection.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        # Clear the env so the explicit kwarg is the ONLY source.
+        monkeypatch.delenv("DIAGRAMS_COLLECTION", raising=False)
+
+        seen: dict = {}
+
+        def _fake_upsert(row, *, weaviate_url, collection_name):
+            seen["collection_name"] = collection_name
+            seen["weaviate_url"] = weaviate_url
+            return True
+
+        with patch(
+            "vco_lib.diagram_indexer._weaviate_upsert",
+            side_effect=_fake_upsert,
+        ):
+            row = self._async_run(
+                index_diagram_async(
+                    f,
+                    project_id="proj-async-uuid",
+                    chat_id=None,
+                    diagrams_collection="ExplicitProj_Diagrams",
+                    db_path=db_path,
+                )
+            )
+
+        assert row.id is not None
+        assert seen["collection_name"] == "ExplicitProj_Diagrams"
+
+    def test_async_resolves_diagrams_collection_from_env(
+        self, db_path: Path, diagrams_root: Path, monkeypatch
+    ):
+        """When caller omits ``diagrams_collection``, the wrapper reads
+        ``DIAGRAMS_COLLECTION`` from the env var (this is the hot-path
+        the post_tool_success callback exercises in production)."""
+        cat = diagrams_root / "architecture"
+        cat.mkdir(parents=True)
+        f = cat / "from-env.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        monkeypatch.setenv("DIAGRAMS_COLLECTION", "EnvProj_Diagrams")
+
+        seen: dict = {}
+
+        def _fake_upsert(row, *, weaviate_url, collection_name):
+            seen["collection_name"] = collection_name
+            return True
+
+        with patch(
+            "vco_lib.diagram_indexer._weaviate_upsert",
+            side_effect=_fake_upsert,
+        ):
+            self._async_run(
+                index_diagram_async(
+                    f,
+                    project_id="proj-async-uuid",
+                    chat_id=None,
+                    db_path=db_path,
+                )
+            )
+
+        assert seen["collection_name"] == "EnvProj_Diagrams"
+
+    def test_async_no_kwarg_no_env_skips_weaviate(
+        self, db_path: Path, diagrams_root: Path, monkeypatch
+    ):
+        """When neither kwarg nor env is set, ``diagrams_collection`` is
+        None — ``_weaviate_upsert`` STILL gets called, but with
+        ``collection_name=None`` (the inner function then short-circuits
+        and returns False). This is the back-compat path for projects
+        that haven't been re-projected via config_projection yet."""
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "no-collection.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        monkeypatch.delenv("DIAGRAMS_COLLECTION", raising=False)
+        # Empty string is treated as unset (defensive coerce).
+        monkeypatch.setenv("DIAGRAMS_COLLECTION", "")
+
+        seen: dict = {}
+
+        def _fake_upsert(row, *, weaviate_url, collection_name):
+            seen["collection_name"] = collection_name
+            return False
+
+        with patch(
+            "vco_lib.diagram_indexer._weaviate_upsert",
+            side_effect=_fake_upsert,
+        ):
+            self._async_run(
+                index_diagram_async(
+                    f,
+                    project_id="proj-async-uuid",
+                    chat_id=None,
+                    db_path=db_path,
+                )
+            )
+
+        # Confirmed None — empty-string env coerced to None.
+        assert seen["collection_name"] is None
+
+    def test_async_resolves_chat_id_from_env(
+        self, db_path: Path, diagrams_root: Path, monkeypatch
+    ):
+        """``CLAUDE_CODE_SESSION_ID`` env auto-populates ``chat_id``
+        when caller passes None — pre-existing contract preserved."""
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "chat-from-env.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "session-xyz")
+        monkeypatch.delenv("DIAGRAMS_COLLECTION", raising=False)
+
+        with patch(
+            "vco_lib.diagram_indexer._weaviate_upsert",
+            return_value=False,
+        ):
+            row = self._async_run(
+                index_diagram_async(
+                    f, project_id="proj-async-uuid", db_path=db_path,
+                )
+            )
+
+        assert row.chat_id == "session-xyz"
 
 
 class TestSidecarDict:

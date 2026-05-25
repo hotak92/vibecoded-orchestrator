@@ -179,24 +179,29 @@ class EnsureCollectionsTests(unittest.TestCase):
     def test_skips_existing_collections(self):
         server, port, _ = _start_server()
         try:
-            # Pre-seed all three collections (project + dev + shared) so
-            # _ensure_collections has nothing to POST. The shared collection
-            # name comes from SHARED_KG_COLLECTION (default
-            # VibeCodedOrchestrator_KnowledgeGraph) — pin it explicitly here to
-            # decouple the test from the default value.
+            # Pre-seed all four collections (project + dev + diagrams +
+            # shared) so _ensure_collections has nothing to POST. The
+            # shared collection name comes from SHARED_KG_COLLECTION
+            # (default VibeCodedOrchestrator_KnowledgeGraph) — pin it
+            # explicitly here to decouple the test from the default value.
+            # fix/a1-indexing-pipeline (2026-05-25): TestDiagrams added
+            # because _ensure_collections now also bootstraps the
+            # per-project Diagrams class (Bug-3 of the wiring audit).
             _Handler.schema = {"classes": [
                 {"class": "TestKG"},
                 {"class": "TestDev"},
+                {"class": "TestDiagrams"},
                 {"class": "TestShared"},
             ]}
             with mock.patch.dict(
                 "os.environ",
                 {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
+                 "DIAGRAMS_COLLECTION": "TestDiagrams",
                  "SHARED_KG_COLLECTION": "TestShared"},
             ):
                 install._ensure_collections({})
-            # All three collections already in schema → no POSTs.
+            # All four collections already in schema → no POSTs.
             self.assertEqual(_Handler.posted, [])
         finally:
             server.shutdown()
@@ -204,20 +209,26 @@ class EnsureCollectionsTests(unittest.TestCase):
     def test_creates_only_missing_subset(self):
         server, port, _ = _start_server()
         try:
-            # Pre-seed project KG and shared KG; only the dev collection
-            # should be POSTed.
+            # Pre-seed project KG, diagrams, and shared KG; only the
+            # dev collection should be POSTed.
+            # fix/a1-indexing-pipeline (2026-05-25): pin DIAGRAMS_COLLECTION
+            # + pre-seed TestDiagrams so the assertion stays focused on
+            # the "only missing subset is POSTed" invariant rather than
+            # accidentally tracking the new diagrams bootstrap branch.
             _Handler.schema = {"classes": [
                 {"class": "TestKG"},
+                {"class": "TestDiagrams"},
                 {"class": "TestShared"},
             ]}
             with mock.patch.dict(
                 "os.environ",
                 {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
+                 "DIAGRAMS_COLLECTION": "TestDiagrams",
                  "SHARED_KG_COLLECTION": "TestShared"},
             ):
                 install._ensure_collections({})
-            # Only TestDev should be POSTed; TestKG + TestShared already there.
+            # Only TestDev should be POSTed; the other three already there.
             posted_classes = [p.get("class") for p in _Handler.posted]
             self.assertEqual(posted_classes, ["TestDev"])
         finally:
@@ -233,6 +244,7 @@ class EnsureCollectionsTests(unittest.TestCase):
                 "os.environ",
                 {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
                  "DEVELOPMENT_COLLECTION": "TestDev",
+                 "DIAGRAMS_COLLECTION": "TestDiagrams",
                  "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph"},
             ):
                 install._ensure_collections({})
@@ -247,6 +259,34 @@ class EnsureCollectionsTests(unittest.TestCase):
             self.assertIn("title", prop_names)
             self.assertIn("content", prop_names)
             self.assertIn("typed_links", prop_names)
+        finally:
+            server.shutdown()
+
+    def test_creates_diagrams_collection(self):
+        """fix/a1-indexing-pipeline (2026-05-25): Step 7b also bootstraps
+        the per-project Diagrams collection so `diagram_indexer._weaviate_upsert`
+        has a class to write to on the first .mmd / .excalidraw save
+        (Bug-3 of the wiring audit)."""
+        server, port, _ = _start_server()
+        try:
+            _Handler.schema = {"classes": []}
+            with mock.patch.dict(
+                "os.environ",
+                {"WEAVIATE_PORT": str(port), "KG_COLLECTION": "TestKG",
+                 "DEVELOPMENT_COLLECTION": "TestDev",
+                 "DIAGRAMS_COLLECTION": "TestDiagrams",
+                 "SHARED_KG_COLLECTION": "TestShared"},
+            ):
+                install._ensure_collections({})
+            posted_classes = [p.get("class") for p in _Handler.posted]
+            self.assertIn("TestDiagrams", posted_classes)
+            # Diagrams schema carries the canonical property surface.
+            diag = next(p for p in _Handler.posted
+                        if p.get("class") == "TestDiagrams")
+            prop_names = {p["name"] for p in diag["properties"]}
+            for required in ("title", "content", "path_tags",
+                             "diagram_kind", "file_path"):
+                self.assertIn(required, prop_names)
         finally:
             server.shutdown()
 

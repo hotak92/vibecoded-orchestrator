@@ -198,6 +198,10 @@ def test_from_db_minimal_project(tmp_path: Path) -> None:
     assert env["CODE_GRAPH_PROJECT"] == "MyApp"
     assert env["KG_COLLECTION"] == "MyApp_KnowledgeGraph"
     assert env["DEVELOPMENT_COLLECTION"] == "MyApp_Development"
+    # Phase 1.5 — diagrams paired with KG via the suffix-swap rule
+    # (`<basename>_Diagrams`), matching the canonical naming in
+    # `vco_lib.project_init.derive_project_collection_names`.
+    assert env["DIAGRAMS_COLLECTION"] == "MyApp_Diagrams"
     assert env["SHARED_KG_COLLECTION"] == "VibeCodedOrchestrator_KnowledgeGraph"
     assert env["SHARED_KG_WRITE_DISABLED"] == "false"
     assert env["SHARED_KG_OPT_OUT"] == "false"
@@ -236,6 +240,37 @@ def test_from_db_with_kg_bindings(tmp_path: Path) -> None:
     assert env["KG_COLLECTION"] == "MyKnowledgeGraph"
     assert env["SHARED_KG_COLLECTION"] == "TeamSharedKG"
     assert env["DEVELOPMENT_COLLECTION"] == "MyDev"
+    # Phase 1.5 — diagrams derived from the primary KG via suffix swap.
+    # "MyKnowledgeGraph" does NOT end with "_KnowledgeGraph" (no
+    # underscore separator), so suffix swap doesn't apply and the
+    # sanitized-project-name fallback fires → "X_Diagrams" (project
+    # name "X" → sanitized "X"). This confirms the rule degrades
+    # gracefully when bindings carry non-canonical names.
+    assert env["DIAGRAMS_COLLECTION"] == "X_Diagrams"
+
+
+def test_from_db_diagrams_suffix_swap_from_canonical_kg(tmp_path: Path) -> None:
+    """Phase 1.5 — fix/a1-indexing-pipeline 2026-05-25.
+
+    When the primary KG binding follows the canonical "<X>_KnowledgeGraph"
+    pattern, the diagrams collection is derived via suffix swap →
+    "<X>_Diagrams" (preserves an explicit rename). This matches the
+    Rust hub's derivation rule in config_api.rs."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="Original", project_folder=str(proj),
+        kg_bindings={
+            "primary": "Renamed_KnowledgeGraph",  # canonical suffix
+            "shared": "VibeCodedOrchestrator_KnowledgeGraph",
+            "archive": "Renamed_Development",
+        },
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["KG_COLLECTION"] == "Renamed_KnowledgeGraph"
+    # Suffix swap honoured: Renamed_KnowledgeGraph → Renamed_Diagrams.
+    assert env["DIAGRAMS_COLLECTION"] == "Renamed_Diagrams"
 
 
 def test_from_db_kg_access_list_strips_self_and_shared(tmp_path: Path) -> None:
@@ -702,6 +737,27 @@ def test_apply_unknown_surface_raises(tmp_path: Path) -> None:
         apply_project_env(bundle, surfaces=["bogus"])
 
 
+def test_apply_writes_diagrams_collection_to_surfaces(tmp_path: Path) -> None:
+    """Phase 1.5 — fix/a1-indexing-pipeline 2026-05-25.
+
+    DIAGRAMS_COLLECTION must land in both the settings.json env block
+    and .claude/env so the indexer hook (which reads the env var) and
+    the MCP server (which reads via the hub, which then falls back to
+    the env var) both see the canonical name."""
+    bundle = _bundle(tmp_path, DIAGRAMS_COLLECTION="TestProj_Diagrams")
+    apply_project_env(
+        bundle, surfaces=["claude_settings_json", "claude_env"],
+    )
+
+    settings = json.loads(
+        (tmp_path / ".claude" / "settings.json").read_text()
+    )
+    assert settings["env"]["DIAGRAMS_COLLECTION"] == "TestProj_Diagrams"
+
+    env_text = (tmp_path / ".claude" / "env").read_text()
+    assert 'export DIAGRAMS_COLLECTION="TestProj_Diagrams"' in env_text
+
+
 def test_apply_returns_audit_report(tmp_path: Path) -> None:
     """The returned dict lists which canonical keys landed per surface."""
     bundle = _bundle(tmp_path)
@@ -832,6 +888,10 @@ def test_canonical_keys_includes_expected() -> None:
     # Foundational keys.
     for k in ("KG_COLLECTION", "PROJECT_NAME", "ACTIVE_EMBEDDING"):
         assert k in keys
+    # Phase 1.5 — fix/a1-indexing-pipeline 2026-05-25.
+    # DIAGRAMS_COLLECTION must be canonical so the indexer + MCP server
+    # both see the same value via the standard env-projection pipeline.
+    assert "DIAGRAMS_COLLECTION" in keys
 
 
 def test_canonical_keys_returns_fresh_set() -> None:

@@ -215,6 +215,29 @@ from vco_lib.paths import vct_root_dir
 _CANONICAL_KEYS: tuple[str, ...] = (
     "KG_COLLECTION",
     "DEVELOPMENT_COLLECTION",
+    # DIAGRAMS_COLLECTION (Phase 1.5 — Diagrams Integration, fix/a1-
+    # indexing-pipeline 2026-05-25). Paired with KG_COLLECTION via the
+    # canonical sanitized-basename + "_Diagrams" suffix (see the
+    # ``derive_project_collection_names`` rule in vco_lib.project_init).
+    # Consumed by:
+    #   * `vco_lib.diagram_indexer::index_diagram` for the Weaviate
+    #     upsert target (Phase 1.5.A indexer hot path).
+    #   * `claude_mcp_servers/weaviate_mcp/server.py::DIAGRAMS_COLLECTION`
+    #     for hybrid_search fan-out into diagram results (Phase 1.5.C).
+    # The Rust ``CANONICAL_INSTALL_ENV_KEYS`` constant
+    # (launcher/src-tauri/src/commands/projects_v2.rs L3087) does NOT
+    # yet include this key — adding it there is a separate Rust-side PR.
+    # Until that lands, the Rust ``write_project_env_files`` path will
+    # NOT emit DIAGRAMS_COLLECTION (only this Python contract does).
+    # That's deliberate: the Python ``vco_lib.config_projection apply``
+    # CLI is the canonical writer per the Option-A interop strategy
+    # documented at the top of this module; production callers that
+    # need DIAGRAMS_COLLECTION on disk subprocess into the Python CLI.
+    # The byte-identical parity test
+    # (tests/test_config_projection_byte_identical.py) feeds a bundle
+    # that doesn't include DIAGRAMS_COLLECTION, so its assertions are
+    # unaffected by this addition.
+    "DIAGRAMS_COLLECTION",
     "SHARED_KG_COLLECTION",
     "SHARED_KG_WRITE_DISABLED",
     "SHARED_KG_OPT_OUT",
@@ -695,6 +718,23 @@ def project_env_from_db(
             "archive", f"{sanitized}_Development"
         )
 
+        # Phase 1.5 — Diagrams collection. The launcher's DB doesn't (yet)
+        # have a kg_bindings role for diagrams; derive from the primary
+        # KG collection via the canonical suffix swap so an explicit
+        # `primary` override (e.g. a user-renamed `MyKG`) carries through
+        # to `MyKG_Diagrams` correctly. Falls back to the sanitized-name
+        # default when the primary doesn't end with `_KnowledgeGraph`.
+        # Mirrors `vco_lib.project_init.derive_project_collection_names`'s
+        # rule (`<sanitized>_Diagrams`) — both code paths must agree on
+        # the same canonical name or the indexer would write to one
+        # collection while the MCP reads from another.
+        if kg_collection.endswith("_KnowledgeGraph"):
+            diagrams_collection = (
+                kg_collection[: -len("_KnowledgeGraph")] + "_Diagrams"
+            )
+        else:
+            diagrams_collection = f"{sanitized}_Diagrams"
+
         # Access lists.
         kg_access = _fetch_kg_access_list(
             conn,
@@ -760,6 +800,7 @@ def project_env_from_db(
 
     _set("KG_COLLECTION", kg_collection)
     _set("DEVELOPMENT_COLLECTION", dev_collection)
+    _set("DIAGRAMS_COLLECTION", diagrams_collection)
     _set("SHARED_KG_COLLECTION", shared_kg)
     # Boolean → "true"/"false" (lowercase, matching Rust's
     # `shared_kg_write_disabled_str()` -> bool::to_string()).
