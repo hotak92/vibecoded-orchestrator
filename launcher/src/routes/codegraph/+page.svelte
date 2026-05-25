@@ -233,8 +233,8 @@
 </div>
 
 {#if assignModalFor}
-  <div class="cg-modal-back" onclick={closeAssign}>
-    <div class="cg-modal" role="dialog" onclick={(e) => e.stopPropagation()}>
+  <div class="cg-modal-back" role="presentation" onclick={closeAssign}>
+    <div class="cg-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
       <header class="cg-modal-head">
         <h3>Codegraph access — {assignModalFor.project_name}</h3>
         <button class="cg-close" onclick={closeAssign} aria-label="Close">×</button>

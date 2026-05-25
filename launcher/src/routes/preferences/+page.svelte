@@ -2880,7 +2880,7 @@
        DialogRoot (which is a layout-level component). This keeps /preferences
        self-contained. -->
   <div class="pr-overlay" role="presentation" onclick={() => (showOnboardingConfirm = false)}>
-    <div class="pr-modal" role="dialog" aria-modal="true" aria-labelledby="pr-modal-title"
+    <div class="pr-modal" role="dialog" aria-modal="true" tabindex="-1" aria-labelledby="pr-modal-title"
          onclick={(e) => e.stopPropagation()}>
       <h3 id="pr-modal-title" class="pr-modal-title">Re-run onboarding wizard?</h3>
       <p class="pr-modal-body">
@@ -2897,7 +2897,7 @@
 
 {#if showPatClearConfirm}
   <div class="pr-overlay" role="presentation" onclick={() => (showPatClearConfirm = false)}>
-    <div class="pr-modal" role="dialog" aria-modal="true" aria-labelledby="pr-pat-clear-title"
+    <div class="pr-modal" role="dialog" aria-modal="true" tabindex="-1" aria-labelledby="pr-pat-clear-title"
          onclick={(e) => e.stopPropagation()}>
       <h3 id="pr-pat-clear-title" class="pr-modal-title">Clear GitHub token?</h3>
       <p class="pr-modal-body">

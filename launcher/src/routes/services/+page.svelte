@@ -491,6 +491,7 @@
         onkeydown={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
+        tabindex="-1"
         aria-label="Pick a container for {pickerService}"
       >
         <header class="modal-header">
