@@ -7,7 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added — diagrams integration (Phases 0–3, targeting v0.2.34)
+## [0.2.34] — 2026-05-25
+
+A **dogfooding-driven hardening release.** Real install of the RL Reranker v0.2.7 module on a clean launcher uncovered FIVE bugs in the v0.2.33 install pipeline (`~/.vct/modules/` not bootstrapped, `validate_install_dir` brittle, `module_installs` INSERT vs UPSERT, `{version}` template substitution missing, hardware snapshot stale + missing `gpu_mode_decided`). All five fixed plus a sibling bug (`module_db_migrations` UPSERT) surfaced by a follow-up audit, plus the previously-narrowed Phase 4 per-tool allowlist generalised to all module-shipped MCPs, plus the Mermaid + Excalidraw integration completed (UI catalog, gating, four missing Tauri commands), plus L0 cache stale-on-empty fix, plus Phase 0.E user-secret single-writer contract, plus the a11y sweep clearing all 36 svelte-check warnings to zero. 9 agents, one-week fanout.
+
+### Fixed — install pipeline (5 bugs blocking every first-time paid-module install)
+
+- **Bootstrap `<vct_root>/modules/`** before the path-traversal guard runs. Previously the directory was created lazily by the container-pull step, which ran AFTER the guard, so every clean launcher install failed with a spurious `escapes allowed root` error. (`installer_engine.rs::run_install_inner`, `run_upgrade`)
+- **Harden `validate_install_dir`** for the "neither candidate nor root exists yet" case. New shared helper `canonicalize_with_walkup` applies symmetric ancestor-canonicalisation on both sides of the `starts_with` comparison, so the guard works regardless of disk state. (`vct-launcher-core::manifest`)
+- **UPSERT for `module_installs`** — previously `INSERT … VALUES(…)` crashed with `UNIQUE constraint failed: module_installs.project_id, module_installs.module_id` on retry-after-error, version upgrade, OR reinstall-after-uninstall paths. Now `INSERT … ON CONFLICT … DO UPDATE`. Covers all three retry/update scenarios + adds 5 regression tests. (`vct-launcher-core::db::modules`)
+- **`{version}` template substitution in `resolve_variant_tag`** — manifests declare `"gpu_image_variants.cuda": "{version}-cuda"` as a template, but the launcher returned the literal template string un-substituted, so `podman pull` failed with `<image>:{version}-cuda` (registry returns 401 for nonexistent tags on private repos, which the error path misdiagnosed as "Phase 3A pull-token gateway not deployed yet"). Now substitutes correctly for cuda/rocm/cpu/metal. (`installer_engine.rs`)
+- **Hardware-snapshot freshness invariant** — v0.2.20 added the `gpu_mode_decided` field but pre-v0.2.20 snapshots never got backfilled, so CUDA machines pulled CPU variants. Three new trigger points make freshness an architectural invariant: (a) background re-detect at launcher-update completion (via `app_state.hardware_redetect_pending` flag consumed at next-boot — survives the self-update restart); (b) blocking install-time guard in `install_module_for_project` (also covers manual binary-swap upgrade); (c) manual "Re-detect hardware" button in Preferences. Soft-fails to last-known snapshot if probe transiently errors. (`installer.rs`, `self_update.rs`, `preferences/+page.svelte`)
+- **UPSERT for `module_db_migrations`** (audit follow-up) — same anti-pattern as `module_installs`. A migration applied once would crash on re-application with `UNIQUE constraint failed: module_db_migrations.module_id, module_db_migrations.filename`, blocking every install retry-after-migration-failure flow. Now `ON CONFLICT(module_id, filename) DO UPDATE SET sha256=excluded.sha256, applied_at=excluded.applied_at`. (`vct-launcher-core::db::module_db_migrations`)
+
+### Added — Mermaid + Excalidraw integration completeness
+
+- **UI catalog entries**: `mermaid` + `excalidraw` now appear in the launcher's global MCP Servers tab AND in each project's Permissions tab. (Previously the MCPs were registered in `~/.claude.json` and worked from Claude Code, but the launcher GUI's catalog was missing the rows, so users couldn't toggle or configure them via the UI.)
+- **DiagramsTab gating** — `is_project_module_active("diagrams")` now correctly resolves to true for the orchestrator project (auto-seeds `project_modules('diagrams')` with `enabled=true`; explicit user opt-outs preserved). Previously the per-project Diagrams tab was unreachable because the gate returned false.
+- **Four previously-missing Tauri commands** that the DiagramsTab + ExcalidrawEditor invoked but were never implemented (defensive try/catch + 5-second polling masked the gap during v0.2.33 svelte-check):
+  - `read_project_diagram_source(project_id, rel_path)` — scoped read enforcing `.claude/diagrams/` boundary.
+  - `write_text_file(path, contents)` — atomic write via `tempfile::NamedTempFile::persist`, two-layer path validation.
+  - `resolve_project_path(project_id, rel_path)` — canonical + traversal-refusing path resolver (new `path_utils` module, reusable).
+  - `subscribe_to_diagram_changes(project_id)` + `diagram-changed` Tauri event — `notify-debouncer-mini` file watcher with ~200ms debounce; replaces the prior 5-second polling fallback. (New file: `commands/diagram_watcher.rs`.)
+
+### Added — Phase 4 generalisation
+
+- **Per-tool MCP allowlist for ALL module-shipped MCPs**, not just diagrams. Modules declare `mcp_registration.tool_allowlist: [{tool, default_enabled, description}]` in their `vct-module.json`; the launcher persists them into a new `module_mcp_tool_defaults` table (migration 023, keyed on `(mcp_name, tool_name)`). The vct-hub allowlist route now MERGES module-shipped defaults with per-project overrides instead of returning the hardcoded diagrams-only constants. Module-update path: `reconcile_module_tool_allowlist` runs on install + update, `clear_mcp_tool_defaults_for_module` on uninstall. Forward-compatible: pre-v0.2.34 manifests without `tool_allowlist` continue to work (treated as "no per-tool defaults"). (`vct-launcher-core::manifest`, `vct-launcher-core::db::mcp_tool_defaults`, `vct-hub::mcp_tool_grants_api`)
+
+### Added — L0 catalog cache improvements
+
+- **Short TTL for empty-modules responses** (60s) vs the existing 15-min TTL for populated responses — prevents the "publisher uploads catalog mid-session, user sits looking at empty catalog for 15 min" trap. (`module_catalog_client.rs::ttl_for`)
+- **Always-visible ↻ refresh button** on the Modules tab title row, alongside "Fetched 3m ago" relative-time label. Click bypasses TTL via the existing `refresh_module_catalog` Tauri command. The pre-existing `L0StatusIndicator` stale/unavailable banners are preserved as additive surface. (`ModuleCatalog.svelte`, `stores/modules.ts`)
+- **Cache-bust on launcher-version change** — `app_state.last_seen_version` compared with `env!("CARGO_PKG_VERSION")` at startup; if different, `module_catalog.cache*` keys are wiped so the next visit fetches fresh against the new launcher's L0 schema knowledge. Same-version restarts are a no-op (cache preserved → first-paint latency unchanged). Soft-fails. (`module_catalog_client.rs`, `vct-launcher-core::db::app_state::app_state_delete_like`)
+
+### Added — Phase 0.E user-secret single-writer contract
+
+- **`vco_lib/config_projection.py::apply_user_secrets`** extends the v0.2.33 Phase 0.B Part 2 contract to cover `user_secret_pairs` writes (previously explicitly out of scope). Three buckets covered: `per_project`, `shared`, `global` — all at `module_id='user'`. New CLI verbs `apply-user-secrets` + `user-secret-known-keys`. The Python side owns the byte LAYOUT (settings.json deep-merge, `.claude/env` BEGIN/END managed block, `.vscode/settings.json` opt-in); Rust still owns the OS keychain VALUES — intentionally asymmetric. Rust callers bridging into the new CLI verbs is deferred to a future Phase 0.E Part 2 parallel to how Phase 0.B Part 2 staged it. (`vco_lib/config_projection.py`, new `tests/test_config_projection_user_secrets.py` — 36 tests.)
+
+### Added — discoverability + tests
+
+- **State-directory readout in Preferences** — read-only "State directory: `<resolved-path>`" with copy-to-clipboard button and a tooltip explaining when to override via the `VCT_STATE_DIR` environment variable (dev launcher isolation, portable USB-stick state, per-test environments). The path is rendered cross-platform: `~/.vct/` on Linux/macOS, `%LOCALAPPDATA%\\.vct` on Windows. New Tauri command `get_resolved_vct_root_dir`. (`preferences/+page.svelte`, `storage_ux.rs`)
+- **Rust/Python parity test hardening for `canonical_class_prefix`** — Phase chat's v0.2.33 follow-up identified divergence between Rust and Python `_` handling in KG class-name generation. Investigation confirmed parity was already aligned in v0.2.15 by the shared `tests/fixtures/project_naming.json` parity-pinning. Pivot: added 5 boundary-case unit tests on the Rust side + 5 on the Python side + 7 new shared fixture rows so any future refactor reintroducing the legacy divergence fails loudly. (`project_naming.rs`, `tests/test_project_naming.py`)
+
+### Fixed — a11y sweep (36 warnings → 0)
+
+- All 36 v0.2.33-baseline svelte-check warnings cleared. Categories: `a11y_label_has_associated_control` (10), `a11y_click_events_have_key_events` (8 + 2 paired on `projects/+page.svelte:77`), `css_unused_selector` (12), `state_referenced_locally` (5). Patterns applied: read-only meta-rows in IdentityTab converted from `<label>` to `<span>` (no input being labeled); `<article>` with click handler in `projects/+page.svelte:77` switched to `<div role="button" tabindex="0">` + Enter/Space keydown (interactive content can't go inside `<button>`); modal click-stopPropagation overlays got paired `onkeydown={(e) => e.stopPropagation()}`; state-referenced-locally cases wrapped in `untrack(() => ...)` to declare intentional prop-snapshot init. (`accessibility-checker` skill methodology end-to-end across 20 Svelte files.) `<dialog>` native modal migration NOT done — separate v0.2.34+ refactor, out of scope.
+
+### Notes
+
+- **No legacy paid-module data shapes need supporting.** Paid-module install was never working end-to-end in the wild (no v0.2.7 user has ever successfully completed an install due to the v0.2.33 install-pipeline bugs above), so module-side backward-compatibility for pre-v0.2.7 data shapes is not required. The **launcher** side, however, fully supports update from v0.2.33-and-earlier: re-detect-at-update-time IS the migration path for the hardware-snapshot schema gap, and migration 023 (`module_mcp_tool_defaults`) is purely additive.
+- **Module update path (v0.2.7 → v0.2.8 etc.) is fully tested and deployed.** UPSERT contract, manifest re-extract, DB migrations diff, container restart on version change, config tab re-render from disk — all have regression tests + the install-time hardware-redetect guard ensures the right variant is pulled even when a user updates between hardware changes.
+- **Phase 0.E Part 2 (Rust callers bridging to the new Python CLI verbs)** is deferred to a future release, mirroring how Phase 0.B Part 2 was staged.
+
+### Added — diagrams integration (Phases 0–3, completed in v0.2.34)
 
 - **Mermaid + Excalidraw as first-class diagram artifacts.** Save `.mmd` / `.excalidraw` files under `.claude/diagrams/<category>/<name>.{mmd,excalidraw}` and they're auto-indexed for retrieval. Wrapper MCPs (`mermaid_proxy`, `excalidraw_proxy`) gate per-tool access via vct-hub allowlist; default-disabled per project, opt-in via the launcher's per-project DiagramsTab.
 - **Metadata-by-construction**: scoped paths enforced at the wrapper MCP AND at a PreToolUse hook (defense in depth on both native `Write`/`Edit` and `mcp__mermaid__*` / `mcp__excalidraw__*` matchers). Filesystem layout becomes the primary tag source; derived metadata (Mermaid frontmatter, Excalidraw scene name + text labels) feeds per-project Weaviate `Diagrams_<Project>` collection. `hybrid_search` auto-includes it; results carry `result_kind="diagram"` discriminator.
@@ -18,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **DB-as-source-of-truth contract** (`vco_lib/config_projection.py`) — launcher SQLite is the single source for per-project canonical env; `apply_project_env` is the only legal writer to `.claude/settings.json`, `.claude/env`, `.vscode/settings.json`. CI lint enforces single-writer discipline.
 - **Conditional `{{#if_module_active}}` template primitive** in `templates/CLAUDE.md.template` — sections rendered only when their module is active per `project_modules` table.
 
-### Notes
+### Diagrams notes
 
 - **Sidecars (`.claude/diagrams/<file>.meta.json`) are tracked by git** by design — they're the portable metadata that travels with diagrams across machines. Users who prefer not to track them can add `.claude/diagrams/**/*.meta.json` to their `.gitignore`; the indexer regenerates them deterministically from SQLite + file content on next save.
 - **Pre-alpha**: codegraph→Mermaid output is experimental; verify against source before sharing.
