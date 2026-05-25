@@ -45,7 +45,7 @@
     initialSceneJson = '',
     diagramName,
     onSave,
-    bind:exportSvgFn = $bindable<(() => Promise<string | null>) | null>(null),
+    exportSvgFn = $bindable<(() => Promise<string | null>) | null>(null),
   }: {
     initialSceneJson?: string;
     diagramName: string;
@@ -55,7 +55,7 @@
 
   // ─── Mount-point + React handle ───────────────────────────────────────
   let mountEl: HTMLDivElement | null = $state(null);
-  let reactRoot: { unmount: () => void } | null = null;
+  let reactRoot: import('react-dom/client').Root | null = null;
   let excalidrawApiRef: { current: any | null } = { current: null };
 
   // Version-drift check (parallel to the Mermaid one in DiagramsTab).

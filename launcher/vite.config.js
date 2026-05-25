@@ -26,6 +26,11 @@ const host = process.env.TAURI_DEV_HOST;
 // Phase 2 (2026-05-25) generalises this to also read `[npm.excalidraw_lib]`
 // for the embedded Excalidraw editor's `@excalidraw/excalidraw` pin —
 // same shape, same drift-warning contract.
+/**
+ * Read a pinned version string from bundled_mcp_versions.toml.
+ * @param {string} blockName - TOML block name under [npm.<blockName>], e.g. "mermaid_lib".
+ * @returns {string | null} The pinned version, or null if the block / version is absent.
+ */
 function readNpmPin(blockName) {
   try {
     const here = dirname(fileURLToPath(import.meta.url));
