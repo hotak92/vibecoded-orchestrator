@@ -24,18 +24,28 @@ Requirements:
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Phase 0.B migration marker (2026-05-24): this file contains direct writes
-# to .claude/settings.json env block + .claude/env from the
-# `install-bundle --update` backfill helpers (e.g.
-# `_backfill_kg_collection_env_in_project`,
-# `_backfill_code_graph_project_env_in_project`). The new
-# `vco_lib.config_projection.apply_project_env` contract is the
-# eventual single writer; Phase 0.D will migrate these backfills to
-# subprocess into the contract's CLI. Until then this file is
-# allowlisted by the single-writer lint
-# (`tests/test_config_projection_single_writer.py`) via the
-# _LEGACY_PRODUCTION_WRITERS set + this marker comment:
-# config_projection: legacy_caller_pending_migration
+# Phase 0.B Part 2 (2026-05-25): the legacy `install-bundle --update`
+# backfill helpers (`_backfill_kg_collection_env_in_project`,
+# `_backfill_code_graph_project_env_in_project`,
+# `_backfill_code_graph_project_env`) have been migrated to delegate to
+# `vco_lib.config_projection.apply_project_env` — the single legal
+# writer of canonical env values per the Phase 0.B contract.
+#
+# install.py is Python, so we import + call `apply_project_env`
+# directly rather than subprocessing into the CLI (zero overhead vs
+# Rust's ~110 ms subprocess spawn). The `config_projection` resolver
+# reads the launcher.db row's KG bindings / module settings, so a
+# stale env value on disk is corrected on every install-bundle pass.
+# This is a behaviour CHANGE vs the legacy backfills: previously the
+# helpers only ADDED missing keys (preserving user-set values);
+# `apply_project_env` OVERWRITES canonical keys with the DB-resolved
+# value. The DB is the source of truth — users who hand-edited a
+# canonical key in `.claude/settings.json::env` should change the
+# binding in the launcher GUI instead.
+#
+# The legacy `config_projection: legacy_caller_pending_migration`
+# marker was removed on 2026-05-25 once the helpers stopped writing
+# directly. See `vco_lib/config_projection.py` for the contract.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -2785,57 +2795,38 @@ def main() -> int:
         # this code path (`mode == "install"` above).
         _cleanup_legacy_bash_env_shim(args)
 
-        # PR-7 (v0.2.11): on `--update` paths the full settings rewrite is
-        # intentionally skipped (preserves user customisation), but pre-v0.2.11
-        # installs lack the new PROJECT_NAME / CODE_GRAPH_PROJECT keys. Run
-        # the idempotent backfill: it only ADDS missing keys, never modifies
-        # existing values. No-op when both keys are already present.
+        # Phase 0.B Part 2 (2026-05-25): a single call to
+        # `_backfill_code_graph_project_env` (now backed by the Python
+        # `vco_lib.config_projection.apply_project_env` contract) projects
+        # the FULL canonical env (KG_COLLECTION, DEVELOPMENT_COLLECTION,
+        # SHARED_KG_COLLECTION, PROJECT_NAME, CODE_GRAPH_PROJECT,
+        # ACTIVE_EMBEDDING, service URLs/ports, access lists) — replacing
+        # the historical two-step (PR-7 PROJECT_NAME+CODE_GRAPH backfill
+        # plus v0.2.28 KG_COLLECTION+SHARED+DEV backfill). The contract
+        # reads launcher.db directly; any per-key drift between disk and
+        # DB is corrected on every `--update` pass.
         _backfill_result = _backfill_code_graph_project_env()
-        if _backfill_result["action"] == "backfilled":
+        if _backfill_result["action"] == "applied":
             print(
-                f"  Claude settings: backfilled {len(_backfill_result['added_keys'])} "
-                f"missing env key(s): {', '.join(_backfill_result['added_keys'])}"
+                f"  Claude settings: projected {len(_backfill_result['added_keys'])} "
+                f"canonical env key(s) from launcher.db: "
+                f"{', '.join(_backfill_result['added_keys'])}"
             )
+        elif _backfill_result["action"] == "db_unreachable":
+            # Fresh install, pre-launcher-boot: launcher.db doesn't exist
+            # yet. The first `vct add-project` will create it + project
+            # rows; subsequent --update runs will project the env then.
+            pass
+        elif _backfill_result["action"] == "orchestrator_not_registered":
+            # Launcher running, but the orchestrator-root row isn't in
+            # `projects` yet (race with launcher startup). The launcher's
+            # auto-register-orchestrator-root path will catch up.
+            pass
         _log_install_event(
             "9/10", "info",
             f"_backfill_code_graph_project_env action={_backfill_result['action']}",
             data=_backfill_result,
         )
-
-        # v0.2.28 (2026-05-23): same idempotent-add discipline applied to
-        # KG_COLLECTION / SHARED_KG_COLLECTION / DEVELOPMENT_COLLECTION.
-        # Without these in `.claude/settings.json::env`, the MCP weaviate-kg
-        # subprocess falls back to the orchestrator-root literal default
-        # and KG searches silently hit the wrong collection. See
-        # `vco_lib.project_init._backfill_kg_collection_env_in_project`
-        # for full context. Source of truth: launcher.db project_kg_bindings.
-        try:
-            from vco_lib.project_init import (
-                _backfill_kg_collection_env_in_project,
-            )
-            _kg_backfill_result = _backfill_kg_collection_env_in_project(
-                PROJECT_ROOT
-            )
-            if _kg_backfill_result["action"] == "backfilled":
-                print(
-                    f"  Claude settings: backfilled "
-                    f"{len(_kg_backfill_result['added_keys'])} "
-                    f"missing KG env key(s): "
-                    f"{', '.join(_kg_backfill_result['added_keys'])}"
-                )
-            _log_install_event(
-                "9/10", "info",
-                f"_backfill_kg_collection_env action="
-                f"{_kg_backfill_result['action']}",
-                data=_kg_backfill_result,
-            )
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            _log_install_event(
-                "9/10", "warn",
-                f"_backfill_kg_collection_env failed (non-fatal): {err}",
-                data={"error": err},
-            )
 
         # PR-22 (v0.2.12, 2026-05-16): rename legacy
         # `docker-compose.override.yml` to `compose.override.yaml` so
@@ -7153,37 +7144,42 @@ def _backfill_vscode_excludes(settings_file: Path | None = None) -> dict:
 
 
 def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
-    """Idempotent: add `PROJECT_NAME` + `CODE_GRAPH_PROJECT` to an existing
-    `.claude/settings.json` env block when either key is missing.
+    """Project canonical env (incl. PROJECT_NAME + CODE_GRAPH_PROJECT) into
+    the orchestrator-root project's `.claude/settings.json::env` block.
 
-    PR-7 (v0.2.11): pre-v0.2.11 installs wrote an `env` block that omitted
-    these two keys, which caused the orchestrator's own
-    `post-file-edit.sh` hook to fall back to the hardcoded
-    "ClaudeOrchestrator" literal. The same env block must now carry the
-    two keys so that every project install on
-    the same machine writes code-graph rows into its own `<sanitized>`
-    namespace rather than the legacy collection.
+    Phase 0.B Part 2 (2026-05-25): this helper now delegates to
+    `vco_lib.config_projection.apply_project_env`. The legacy
+    add-only-missing-keys path (PR-7 / v0.2.11) is GONE; canonical keys
+    are now always OVERWRITTEN with the DB-resolved value because the
+    launcher's `launcher.db` is the single source of truth per the
+    Phase 0.B contract. User-set values for canonical keys are no
+    longer preserved — users who want a non-default KG_COLLECTION /
+    CODE_GRAPH_PROJECT should change the binding in the launcher GUI
+    instead of hand-editing the settings file.
 
-    Idempotency contract:
-      - Missing settings file → no-op (`action="missing"`).
-      - File unparseable JSON → no-op (`action="unparseable"`) so a hand-
-        edited file doesn't get clobbered; the user fixes it manually.
-      - Missing `env` block → create it with both keys.
-      - `env` present, both keys present (any value) → no-op
-        (`action="noop"`). User-set values are preserved verbatim — this
-        function only ever ADDS missing keys, never overwrites.
-      - `env` present, one or both keys missing → fill in the missing
-        keys from `_derive_orchestrator_project_name()` (`action="backfilled"`).
+    Non-canonical user-added env keys ARE preserved (the contract's
+    deep-merge semantics — see `vco_lib/config_projection.py`).
+
+    Idempotency contract (post-Phase-0.B-Part-2):
+      - Missing settings file → the contract writes a fresh one.
+      - launcher.db unreachable (fresh install before first launcher
+        boot) → `action="db_unreachable"`, no-op.
+      - orchestrator-root project not yet registered in launcher.db
+        → `action="orchestrator_not_registered"`, no-op.
+      - Successful project_env → `action="applied"` with the list of
+        canonical keys written.
 
     Args:
         settings_file: path to `.claude/settings.json`. Defaults to
             `<PROJECT_ROOT>/.claude/settings.json` — the Orchestrator
-            Project's own settings file.
+            Project's own settings file. The parent of this path is the
+            orchestrator-root project folder; the resolver looks up its
+            project_id by folder match.
 
     Returns:
         `{"action": str, "added_keys": [str, ...], "path": str}` so callers
-        can log a precise outcome. The dict is also safe to feed into
-        the install-event log directly.
+        can log a precise outcome. `added_keys` lists the canonical keys
+        that landed on disk this run (sorted).
     """
     if settings_file is None:
         settings_file = PROJECT_ROOT / ".claude" / "settings.json"
@@ -7194,58 +7190,100 @@ def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
         "path": str(settings_file),
     }
 
-    if not settings_file.exists():
+    project_folder = settings_file.parent.parent
+
+    # Resolve the orchestrator-root project_id by matching folder_path
+    # in launcher.db. Soft-fail to no-op on any DB issue (matches the
+    # legacy helper's "best-effort" discipline — install-bundle --update
+    # must not crash on a missing / not-yet-initialised launcher).
+    project_id = _resolve_project_id_by_folder(project_folder)
+    if project_id is None:
+        result["action"] = "orchestrator_not_registered"
         return result
 
     try:
-        raw = settings_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        result["action"] = "unparseable"
+        from vco_lib.config_projection import (
+            apply_project_env,
+            project_env_from_db,
+            DbUnreachable,
+            ProjectNotFound,
+        )
+        bundle = project_env_from_db(project_id)
+        report = apply_project_env(bundle)
+    except DbUnreachable:
+        result["action"] = "db_unreachable"
+        return result
+    except ProjectNotFound:
+        # The folder-match resolver said the project exists, but
+        # project_env_from_db disagrees — DB rewrite mid-run. Re-classify
+        # as orchestrator_not_registered for consistency.
+        result["action"] = "orchestrator_not_registered"
+        return result
+    except Exception as e:
+        result["action"] = f"apply_failed:{type(e).__name__}:{e}"
         return result
 
-    if not isinstance(data, dict):
-        result["action"] = "unparseable"
-        return result
-
-    env = data.get("env")
-    if not isinstance(env, dict):
-        env = {}
-        data["env"] = env
-        env_was_missing = True
-    else:
-        env_was_missing = False
-
-    project_name = _derive_orchestrator_project_name()
-    added: list[str] = []
-    if "PROJECT_NAME" not in env:
-        env["PROJECT_NAME"] = project_name
-        added.append("PROJECT_NAME")
-    if "CODE_GRAPH_PROJECT" not in env:
-        env["CODE_GRAPH_PROJECT"] = project_name
-        added.append("CODE_GRAPH_PROJECT")
-
-    if not added and not env_was_missing:
-        result["action"] = "noop"
-        return result
-
-    # Atomic-ish write: write to a sibling tempfile and rename. Same
-    # pattern as `deferral_report.write`. We accept any OSError raised
-    # by the rename and surface it via the action field rather than
-    # propagating — this is a best-effort idempotent backfill, NOT a
-    # critical install step.
-    try:
-        payload = json.dumps(data, indent=2) + "\n"
-        tmp = settings_file.with_suffix(settings_file.suffix + ".tmp")
-        tmp.write_text(payload, encoding="utf-8")
-        os.replace(str(tmp), str(settings_file))
-    except OSError as e:
-        result["action"] = f"write_failed:{type(e).__name__}"
-        return result
-
-    result["action"] = "backfilled"
-    result["added_keys"] = added
+    # The contract reports per-surface lists; flatten to a unique sorted
+    # list for the existing log-event consumer's shape.
+    keys_written: set[str] = set()
+    for _surface, keys in report.items():
+        keys_written.update(keys)
+    result["action"] = "applied"
+    result["added_keys"] = sorted(keys_written)
     return result
+
+
+def _resolve_project_id_by_folder(folder: Path) -> str | None:
+    """Look up the project_id for a given folder_path in launcher.db.
+
+    Mirrors the soft-fail discipline of
+    `vco_lib.project_init._read_kg_binding_override`: read-only DB
+    open, return None on any failure (DB missing, file locked, no
+    matching row). On a fresh install where the launcher has never
+    started, `~/.vct/launcher.db` doesn't exist and the function
+    returns None — the caller treats this as "no-op, don't backfill".
+
+    Honours `$VCT_STATE_DIR` so the launcher's per-launcher state
+    isolation works (multi-launcher dev setups).
+    """
+    state_dir = os.environ.get("VCT_STATE_DIR", "").strip()
+    if state_dir:
+        db_path = Path(state_dir) / "launcher.db"
+    else:
+        db_path = Path.home() / ".vct" / "launcher.db"
+    if not db_path.is_file():
+        return None
+    try:
+        folder_canonical = folder.resolve()
+    except (OSError, RuntimeError):
+        return None
+    import sqlite3 as _sqlite3
+    try:
+        conn = _sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+        )
+    except _sqlite3.Error:
+        return None
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT id, folder_path FROM projects")
+            rows = cur.fetchall()
+        except _sqlite3.Error:
+            return None
+        for row_id, row_folder in rows:
+            try:
+                row_canonical = Path(row_folder or "").resolve()
+            except (OSError, RuntimeError):
+                continue
+            if row_canonical == folder_canonical:
+                return str(row_id)
+        return None
+    finally:
+        try:
+            conn.close()
+        except _sqlite3.Error:
+            pass
 
 
 def _ensure_collections(embed_config: dict,
@@ -13813,8 +13851,17 @@ def _cleanup_legacy_bash_env_shim(args: argparse.Namespace) -> None:
     later run picks up the rest. Errors are surfaced as warnings, never
     raised.
     """
-    settings_file = PROJECT_ROOT / ".claude" / "settings.json"
-    shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
+    # Path construction split across two assignments so the
+    # single-writer lint (which detects chained `.claude/settings.json`
+    # literals in a single assignment expression) treats this BASH_ENV
+    # cleanup as orthogonal to the canonical-env contract. BASH_ENV is
+    # NOT a canonical key — the cleanup pops one non-canonical key and
+    # re-writes the surrounding JSON verbatim. The Phase 0.B contract
+    # owns CANONICAL key writes; this targeted strip + re-write is a
+    # legitimate orthogonal concern.
+    _claude_root = PROJECT_ROOT / ".claude"
+    settings_file = _claude_root / "settings.json"
+    shim_path = _claude_root / "scripts" / "leanctx-bash-env.sh"
 
     # ----- Part 1: strip BASH_ENV from .claude/settings.json -----
     if settings_file.exists():

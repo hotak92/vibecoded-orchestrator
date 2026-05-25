@@ -108,6 +108,20 @@ class DeriveOrchestratorProjectNameTests(unittest.TestCase):
             self.assertEqual(result, "MyFancyOrch")
 
 
+@unittest.skip(
+    "Phase 0.B Part 2 (2026-05-25): "
+    "`install._backfill_code_graph_project_env` now delegates to "
+    "`vco_lib.config_projection.apply_project_env`, which projects "
+    "the FULL canonical env from launcher.db rather than the legacy "
+    "two-key add-only-missing-keys contract. New behavioral contract "
+    "covered by `tests/test_config_projection_subprocess.py` (CLI/"
+    "in-process parity) and `tests/test_config_projection.py` "
+    "(apply_project_env semantics). Pre-Phase-0.B legacy behaviors "
+    "(add-only-missing-keys, file-existence noop, user-value "
+    "preservation for canonical keys) are intentional regressions: "
+    "the DB is now the source of truth and canonical keys are always "
+    "OVERWRITTEN with the DB-resolved value."
+)
 class BackfillCodeGraphProjectEnvTests(unittest.TestCase):
     """`_backfill_code_graph_project_env` — idempotent fill-in of two
     missing keys in `.claude/settings.json::env`.

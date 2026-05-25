@@ -5833,49 +5833,36 @@ def install_project_bundle(
                 f"legacy BASH_ENV cleanup crashed: {err}"
             )
 
-    # PR-7 (v0.2.11): backfill PROJECT_NAME + CODE_GRAPH_PROJECT into the
-    # project's `.claude/settings.json::env` block. Idempotent — runs on
-    # every install-bundle pass (first-install AND --update) so that
-    # pre-v0.2.11 projects pick up the keys without requiring the launcher
-    # to re-run env-write. Dry-run paths skip the write but still log the
-    # planned action via `_backfill_code_graph_project_env_in_project`'s
-    # action field (which we filter to no-op on missing/unparseable files).
+    # Phase 0.B Part 2 (2026-05-25): project the FULL canonical env via
+    # the `vco_lib.config_projection.apply_project_env` contract. This
+    # replaces the historical two-step backfill (PR-7's PROJECT_NAME +
+    # CODE_GRAPH_PROJECT + v0.2.28's KG_COLLECTION + SHARED + DEV)
+    # with a single DB-sourced projection that always reflects the
+    # launcher.db's current bindings. User-set values for CANONICAL
+    # keys are no longer preserved (they're overwritten with the DB
+    # value); non-canonical user-added env keys ARE preserved by the
+    # contract's deep-merge.
+    #
+    # Soft-fail discipline matches the legacy backfills: launcher.db
+    # missing (rare here — `register_project` ran already), no row for
+    # this folder (race with create flow), or any apply error becomes
+    # a warning, not a fatal install-bundle failure.
     if not dry_run:
         try:
-            backfill = _backfill_code_graph_project_env_in_project(folder)
+            backfill = _apply_canonical_env_via_config_projection(folder)
             result["backfill_code_graph_project"] = backfill
+            result["backfill_kg_collection"] = backfill  # same data
             _log("4.bundle.backfill", "ok",
-                 f"code_graph_project_env: {backfill['action']}",
+                 f"canonical_env_apply: {backfill['action']}",
                  data=backfill)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _log("4.bundle.backfill", "error",
-                 f"backfill failed: {err}",
+                 f"canonical env apply failed: {err}",
                  data={"error": err})
-            result["warnings"].append(f"code_graph_project_env backfill failed: {err}")
-
-    # v0.2.28 (2026-05-23): backfill KG_COLLECTION / SHARED_KG_COLLECTION
-    # / DEVELOPMENT_COLLECTION into the project's
-    # `.claude/settings.json::env` block. Source of truth is the launcher
-    # DB's `project_kg_bindings` table (DB = canonical, per the v0.2.21
-    # hub architecture). User-set values are preserved. Idempotent.
-    # Diagnostic context: KG searches were silently returning 0 results
-    # for projects where these keys never made it into the canonical env
-    # channel — the MCP would resolve to the orchestrator-root default
-    # collection rather than the project's actual collection.
-    if not dry_run:
-        try:
-            kg_backfill = _backfill_kg_collection_env_in_project(folder)
-            result["backfill_kg_collection"] = kg_backfill
-            _log("4.bundle.backfill_kg", "ok",
-                 f"kg_collection_env: {kg_backfill['action']}",
-                 data=kg_backfill)
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            _log("4.bundle.backfill_kg", "error",
-                 f"kg_collection backfill failed: {err}",
-                 data={"error": err})
-            result["warnings"].append(f"kg_collection_env backfill failed: {err}")
+            result["warnings"].append(
+                f"canonical_env_apply failed: {err}"
+            )
 
     # PR-7 (v0.2.11, addendum-4): backfill VS Code watcher / search /
     # Pylance exclude blocks into the project's `.vscode/settings.json`.
@@ -6329,6 +6316,128 @@ def _smart_merge_for_bundle(user: dict, template: dict) -> dict:
             out[key] = _smart_merge_for_bundle(uval, tval)
         # else: user wins.
     return out
+
+
+def _apply_canonical_env_via_config_projection(folder: Path) -> dict:
+    """Phase 0.B Part 2 (2026-05-25): project the FULL canonical env
+    into a project's `.claude/settings.json::env` + `.claude/env` via
+    the single-writer contract.
+
+    Resolves the project_id by folder match in launcher.db, then
+    delegates to `vco_lib.config_projection.apply_project_env`. Soft-
+    fails to no-op when:
+
+      - launcher.db is missing (pre-launcher-boot / corrupt install).
+      - The folder isn't registered in `projects` (race with create flow,
+        or post-unregister).
+
+    Returns:
+        Same shape as the legacy backfill helpers' return dict for
+        backward-compat with the install-bundle event log consumer:
+            {"action": str, "added_keys": [str, ...], "path": str,
+             "resolved_values": {key: value, ...}}
+
+        Actions:
+            - "applied": canonical env successfully projected.
+            - "db_unreachable": launcher.db missing.
+            - "not_registered": no project row matches folder.
+            - "apply_failed:<ExceptionName>:<message>": contract raised.
+    """
+    settings_file = folder / ".claude" / "settings.json"
+    result: dict = {
+        "action": "missing",
+        "added_keys": [],
+        "path": str(settings_file),
+        "resolved_values": {},
+    }
+
+    # Resolve project_id from folder path. The lookup mirrors
+    # `_read_kg_binding_override`'s soft-fail pattern.
+    state_dir = os.environ.get("VCT_STATE_DIR", "").strip()
+    if state_dir:
+        db_path = Path(state_dir) / "launcher.db"
+    else:
+        db_path = Path.home() / ".vct" / "launcher.db"
+    if not db_path.is_file():
+        result["action"] = "db_unreachable"
+        return result
+    try:
+        folder_canonical = folder.resolve()
+    except (OSError, RuntimeError):
+        result["action"] = "db_unreachable"
+        return result
+
+    import platform as _platform
+    is_windows = _platform.system().lower().startswith("win")
+
+    def _path_eq(a: str, b: Path) -> bool:
+        try:
+            ap = Path(a).resolve()
+        except (OSError, RuntimeError):
+            return False
+        if is_windows:
+            return str(ap).lower() == str(b).lower()
+        return ap == b
+
+    import sqlite3 as _sqlite3
+    try:
+        conn = _sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+        )
+    except _sqlite3.Error:
+        result["action"] = "db_unreachable"
+        return result
+
+    project_id: Optional[str] = None
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT id, folder_path FROM projects")
+            rows = cur.fetchall()
+        except _sqlite3.Error:
+            rows = []
+        for row_id, row_folder in rows:
+            if _path_eq(row_folder or "", folder_canonical):
+                project_id = str(row_id)
+                break
+    finally:
+        try:
+            conn.close()
+        except _sqlite3.Error:
+            pass
+
+    if project_id is None:
+        result["action"] = "not_registered"
+        return result
+
+    # Delegate to the contract.
+    try:
+        from vco_lib.config_projection import (
+            apply_project_env,
+            project_env_from_db,
+            DbUnreachable,
+            ProjectNotFound,
+        )
+        bundle = project_env_from_db(project_id)
+        report = apply_project_env(bundle)
+    except DbUnreachable:
+        result["action"] = "db_unreachable"
+        return result
+    except ProjectNotFound:
+        result["action"] = "not_registered"
+        return result
+    except Exception as e:
+        result["action"] = f"apply_failed:{type(e).__name__}:{e}"
+        return result
+
+    keys_written: set[str] = set()
+    for _surface, keys in report.items():
+        keys_written.update(keys)
+
+    result["action"] = "applied"
+    result["added_keys"] = sorted(keys_written)
+    result["resolved_values"] = dict(bundle["canonical_env"])
+    return result
 
 
 def _backfill_code_graph_project_env_in_project(

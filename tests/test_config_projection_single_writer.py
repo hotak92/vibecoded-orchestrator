@@ -143,6 +143,13 @@ _ALLOWLIST_DIRS: set[Path] = {
 }
 
 # Marker that legacy callers to the THREE Phase 0.B surfaces must carry.
+# Phase 0.B Part 2 (2026-05-25): the marker is now PURELY HISTORICAL for
+# Phase 0.B surfaces — the allowlist set is empty, and
+# `test_legacy_writers_allowlist_is_empty_post_part_2` guards against
+# any re-introduction. The marker constant is retained so that future
+# deferred migrations (Phase 0.E for user-secret writes once the
+# active-flag bridge lands in Python) can re-use the same allowlist +
+# marker discipline without re-inventing the lint contract.
 _LEGACY_MARKER = "config_projection: legacy_caller_pending_migration"
 
 # Phase 0.D marker for legacy ``.env`` writers. Kept separate so a
@@ -151,18 +158,25 @@ _LEGACY_MARKER = "config_projection: legacy_caller_pending_migration"
 _LEGACY_ENV_TEMPLATE_MARKER = "env_template: legacy_caller_pending_migration"
 
 # Legacy direct writers — production code that hasn't been migrated yet.
-# Each entry MUST carry the ``_LEGACY_MARKER`` string at least once;
-# the test asserts the marker is present and fails loudly if removed.
-# Removing both the marker AND the entry from this set in the same PR
-# is the migration completion checklist.
-_LEGACY_PRODUCTION_WRITERS: set[Path] = {
-    # The canonical Rust writer — write_project_env_files +
-    # ensure_project_env_template + the user-secret strip helpers.
-    REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs",
-    # Python install.py runs canonical backfills against pre-existing
-    # projects on `install-bundle --update`. Phase 0.D will migrate.
-    REPO_ROOT / "install.py",
-}
+#
+# Phase 0.B Part 2 (2026-05-25): EMPTY. All historical entries were
+# migrated to delegate to `vco_lib.config_projection.apply_project_env`:
+#   * launcher/src-tauri/src/commands/projects_v2.rs — production
+#     callers (create / rename / refresh / write-disabled-toggle) now
+#     subprocess into `python -m vco_lib.config_projection apply`
+#     via `apply_project_env_via_python`. The legacy
+#     `write_project_env_files` function is retained for test fixtures
+#     and for the user-secret SecretsPanel flow (which uses an in-Rust
+#     code path the Python contract doesn't cover yet — Phase 0.E).
+#   * install.py — `_backfill_code_graph_project_env` (orchestrator-root
+#     env projection) now imports + calls `apply_project_env` directly.
+#   * vco_lib/project_init.py — the per-user-project install-bundle
+#     backfills now call `_apply_canonical_env_via_config_projection`,
+#     a thin wrapper around the contract.
+#
+# Future entries (Phase 0.D / 0.E) re-populate this set with the same
+# marker-comment discipline, then empty it again on full migration.
+_LEGACY_PRODUCTION_WRITERS: set[Path] = set()
 
 # Phase 0.D: production code that writes ``.env`` directly and hasn't
 # been fully migrated. Each entry MUST carry
@@ -748,6 +762,39 @@ def test_env_template_canonical_subset_is_non_empty() -> None:
         "someone empty the subset? Expected at least the identity + KG "
         "+ service-URL keys (PROJECT_NAME, KG_COLLECTION, WEAVIATE_URL, "
         "etc.)."
+    )
+
+
+def test_legacy_writers_allowlist_is_empty_post_part_2() -> None:
+    """Phase 0.B Part 2 (2026-05-25) migrated every legacy direct
+    writer to delegate to ``vco_lib.config_projection.apply_project_env``.
+
+    The Rust production callers (`create_project_v2`, `rename_project_v2`,
+    `set_shared_kg_write_disabled`, `refresh_project_env_with_db`) now
+    invoke `apply_project_env_via_python` which subprocesses into the
+    Python contract. The Python install.py + project_init.py backfills
+    now import + call the contract directly.
+
+    The allowlist set MUST stay empty going forward. Any re-introduction
+    of a direct env-surface writer is the regression we're guarding
+    against: route new writers through
+    ``python -m vco_lib.config_projection apply`` (subprocess from Rust)
+    or ``apply_project_env(project_env_from_db(project_id))`` (direct
+    Python import) instead of adding to this allowlist.
+
+    Future deferred migrations (Phase 0.E for user-secret writes once
+    the active-flag bridge lands in Python) MAY re-populate the
+    allowlist with the same marker-comment discipline; they MUST
+    re-empty it on full migration.
+    """
+    assert _LEGACY_PRODUCTION_WRITERS == set(), (
+        "Phase 0.B Part 2 migrated all legacy writers. New entries in "
+        "_LEGACY_PRODUCTION_WRITERS indicate a regression. Migrate the "
+        "new writer to subprocess via "
+        "`python -m vco_lib.config_projection apply` (Rust) or "
+        "`from vco_lib.config_projection import apply_project_env` "
+        "(Python) instead of adding to the allowlist.\n\n"
+        f"Currently allowlisted: {sorted(p.name for p in _LEGACY_PRODUCTION_WRITERS)}"
     )
 
 
