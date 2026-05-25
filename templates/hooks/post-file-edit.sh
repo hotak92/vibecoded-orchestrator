@@ -155,8 +155,20 @@ if [[ "$EDITED_FILE" == "$DIAGRAMS_DIR"/* ]] \
         fi
         [ -z "$_DIAG_VENV" ] && _DIAG_VENV="$PY"
 
+        # Build the indexer command. Pass --diagrams-collection when
+        # DIAGRAMS_COLLECTION is set in the env (fix/a1-indexing-pipeline
+        # 2026-05-25). Without this kwarg, the indexer's Weaviate upsert
+        # silently skips even though SQLite + sidecar still happen —
+        # Bug-1 of the wiring audit. Older projects without
+        # DIAGRAMS_COLLECTION in env (pre-config_projection write of
+        # this key) get the legacy sidecar-only behaviour automatically.
+        _DIAG_ARGS=( -m vco_lib.diagram_indexer index "$EDITED_FILE" )
+        if [ -n "${DIAGRAMS_COLLECTION:-}" ]; then
+            _DIAG_ARGS+=( --diagrams-collection "$DIAGRAMS_COLLECTION" )
+        fi
+
         # Index in background — never block the hook on Weaviate slowness.
-        ( "$_DIAG_VENV" -m vco_lib.diagram_indexer index "$EDITED_FILE" \
+        ( "$_DIAG_VENV" "${_DIAG_ARGS[@]}" \
             >/dev/null 2>&1 || true ) &
 
         # A6 wire-up (Phase 1 item 9 + §1.5.6): auto-snapshot the file

@@ -211,6 +211,22 @@ struct ProjectConfigResponse {
     kg_collection: String,
     shared_kg_collection: String,
     development_collection: String,
+    /// Per-project Weaviate diagrams collection (Phase 1.5 — Diagrams
+    /// Integration, fix/a1-indexing-pipeline 2026-05-25). Derived from
+    /// `kg_collection` by swapping the `_KnowledgeGraph` suffix for
+    /// `_Diagrams`. Falls back to `<slug-sanitized>_Diagrams` when the
+    /// primary KG binding's collection name doesn't end with
+    /// `_KnowledgeGraph` (a non-default rename pattern). Consumed by
+    /// `claude_mcp_servers/weaviate_mcp/server.py::DIAGRAMS_COLLECTION`
+    /// for the hybrid_search diagrams fan-out and by
+    /// `vco_lib.diagram_indexer::index_diagram_async` for the Weaviate
+    /// upsert target.
+    ///
+    /// Additive field — pre-fix Python clients see an unknown field and
+    /// ignore it (the Python ProjectConfig parser back-fills with an
+    /// empty string when missing, mirroring the existing `shared_kg_collection`
+    /// / `development_collection` empty-string-on-missing pattern).
+    diagrams_collection: String,
     active_embedding: String,
     embedding_models: EmbeddingModels,
     kg_access_list: Vec<String>,
@@ -397,6 +413,16 @@ async fn project_config(
         .map(|b| b.collection_name.clone())
         .unwrap_or_default();
 
+    // Diagrams collection (Phase 1.5 — fix/a1-indexing-pipeline 2026-05-25).
+    // No dedicated kg_bindings role yet; derive from the primary KG
+    // collection via the canonical suffix swap (`_KnowledgeGraph` →
+    // `_Diagrams`). Mirrors the Python rule in
+    // `vco_lib.config_projection::project_env_from_db` and
+    // `vco_lib.project_init::derive_project_collection_names` so the
+    // indexer (Python) and the MCP resolver (Python via hub) agree on
+    // the same canonical name. Computed after `kg_collection` is
+    // unwrapped below so we have the post-binding-resolution name.
+
     // service_misconfigured gate: every registered project should
     // have a primary KG binding after the launcher's startup
     // backfill (parent plan §"Acceptance criterion" / step 19).
@@ -415,6 +441,17 @@ async fn project_config(
                 ),
             );
         }
+    };
+
+    // Diagrams collection name — derived from `kg_collection` once it's
+    // unwrapped from the Option above. Suffix swap mirrors the Python
+    // contract; the slug-sanitized fallback handles the non-canonical
+    // rename case (primary binding doesn't end with `_KnowledgeGraph`).
+    let diagrams_collection = if kg_collection.ends_with("_KnowledgeGraph") {
+        let basename = &kg_collection[..kg_collection.len() - "_KnowledgeGraph".len()];
+        format!("{}_Diagrams", basename)
+    } else {
+        format!("{}_Diagrams", sanitize_collection_prefix(&project.slug))
     };
 
     // Codegraph collection prefix: bind row first, slug-derived
@@ -523,6 +560,7 @@ async fn project_config(
         kg_collection,
         shared_kg_collection,
         development_collection,
+        diagrams_collection,
         active_embedding,
         embedding_models: EmbeddingModels {
             text: text_embedding,
@@ -1069,6 +1107,13 @@ mod tests {
         assert_eq!(
             body.get("development_collection").and_then(|v| v.as_str()),
             Some("Myproject_Development")
+        );
+        // Phase 1.5 — fix/a1-indexing-pipeline 2026-05-25. Diagrams
+        // collection is derived from the primary KG via the canonical
+        // `_KnowledgeGraph` → `_Diagrams` suffix swap.
+        assert_eq!(
+            body.get("diagrams_collection").and_then(|v| v.as_str()),
+            Some("Myproject_Diagrams")
         );
         assert_eq!(
             body.get("code_graph_collection_prefix").and_then(|v| v.as_str()),

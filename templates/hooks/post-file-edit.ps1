@@ -162,9 +162,20 @@ if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) 
         }
 
         if ($diagVenv) {
+            # Build the indexer arguments. Pass --diagrams-collection
+            # when DIAGRAMS_COLLECTION is set in the env (fix/a1-indexing-
+            # pipeline 2026-05-25). Without this kwarg the indexer's
+            # Weaviate upsert silently skips (Bug-1 of the wiring audit).
+            # Older projects without DIAGRAMS_COLLECTION in env keep the
+            # legacy sidecar-only behaviour automatically.
+            $diagArgs = @('-m', 'vco_lib.diagram_indexer', 'index', $EditedFile)
+            if ($env:DIAGRAMS_COLLECTION) {
+                $diagArgs += @('--diagrams-collection', $env:DIAGRAMS_COLLECTION)
+            }
+
             # Background index — never block the hook on Weaviate slowness.
             Start-Process -FilePath $diagVenv `
-                -ArgumentList @('-m', 'vco_lib.diagram_indexer', 'index', $EditedFile) `
+                -ArgumentList $diagArgs `
                 -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
 
             # A6 wire-up (Phase 1 item 9 + §1.5.6): auto-snapshot mirror

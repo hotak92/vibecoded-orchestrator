@@ -311,6 +311,18 @@ class ProjectConfig:
     #: ``VCT_DIAGRAMS_ACCESS_LIST``. Placed after the other defaulted
     #: fields to keep frozen-dataclass init signature backward-compat.
     diagrams_access_list: tuple[str, ...] = ()
+    #: Per-project Weaviate diagrams collection name (Phase 1.5 —
+    #: fix/a1-indexing-pipeline 2026-05-25). The hub derives this from
+    #: the primary KG collection via the `_KnowledgeGraph` → `_Diagrams`
+    #: suffix swap. Pre-fix hubs paired with post-fix clients omit the
+    #: field; the parser back-fills with the empty string. The MCP
+    #: server's ``_config_field("diagrams_collection", ...,
+    #: empty_means_unset=True)`` treats empty as unset and falls
+    #: through to the env-var path (``DIAGRAMS_COLLECTION``), which
+    #: preserves backward compatibility while letting newer hubs serve
+    #: the canonical name directly. Additive (declared last so callers
+    #: that construct ``ProjectConfig`` positionally don't break).
+    diagrams_collection: str = ""
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -697,6 +709,10 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             kg_collection=str(body["kg_collection"]),
             shared_kg_collection=str(body.get("shared_kg_collection", "")),
             development_collection=str(body.get("development_collection", "")),
+            # fix/a1-indexing-pipeline (2026-05-25) — additive field.
+            # Pre-fix hubs omit it; empty-string sentinel signals "compute
+            # locally / fall through to env var" to MCP consumers.
+            diagrams_collection=str(body.get("diagrams_collection", "")),
             active_embedding=str(body["active_embedding"]),
             embedding_models=EmbeddingModels(
                 text=str(em["text"]),

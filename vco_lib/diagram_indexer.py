@@ -1143,6 +1143,10 @@ async def index_diagram_async(
     file_path: Path,
     project_id: Optional[str] = None,
     chat_id: Optional[str] = None,
+    *,
+    diagrams_collection: Optional[str] = None,
+    db_path: Optional[Path] = None,
+    weaviate_url: Optional[str] = None,
 ) -> DiagramRow:
     """Async variant for wrapper-MCP post_tool_success callbacks (Phase 1.2).
 
@@ -1150,6 +1154,15 @@ async def index_diagram_async(
     provided. Resolves `chat_id` from CLAUDE_CODE_SESSION_ID env var
     when not provided. Both falls-back to a hub-less default to keep
     the hook path resilient when the launcher isn't running.
+
+    `diagrams_collection` resolution order (when caller passes None):
+      1. ``$DIAGRAMS_COLLECTION`` env var (set by config_projection on
+         every install + the per-project .claude/settings.json env
+         block + .claude/env — see Fix 2 in fix/a1-indexing-pipeline).
+      2. Falls back to ``None`` → ``index_diagram`` skips the Weaviate
+         upsert silently (DB + sidecar still happen). This preserves
+         the pre-fix behaviour for projects that haven't been
+         re-projected yet via ``vco_lib.config_projection apply``.
 
     The actual work runs synchronously inside an executor — sqlite3 is
     not async-aware and the indexer has no IO that benefits from
@@ -1163,10 +1176,25 @@ async def index_diagram_async(
     if project_id is None:
         project_id = _resolve_project_id_from_cwd() or "unknown"
 
+    # Resolve diagrams_collection from env when caller didn't pass it.
+    # Empty string is treated as unset (defensive coerce — same shape as
+    # claude_mcp_servers/weaviate_mcp/server.py's ``empty_means_unset``
+    # handling for KG_COLLECTION since v0.2.27).
+    if diagrams_collection is None:
+        env_val = os.environ.get("DIAGRAMS_COLLECTION", "")
+        diagrams_collection = env_val.strip() or None
+
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
-        lambda: index_diagram(file_path, project_id, chat_id),
+        lambda: index_diagram(
+            file_path,
+            project_id,
+            chat_id,
+            db_path=db_path,
+            weaviate_url=weaviate_url,
+            diagrams_collection=diagrams_collection,
+        ),
     )
 
 

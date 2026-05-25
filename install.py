@@ -7072,6 +7072,11 @@ _development_class_definition = _project_init._development_class_definition
 _SAFE_CLASS_RE = _project_init._SAFE_CLASS_RE
 _derive_project_kg_name = _project_init._derive_project_kg_name
 _derive_project_dev_name = _project_init._derive_project_dev_name
+# fix/a1-indexing-pipeline (2026-05-25) — path-based Diagrams name
+# derivation, matching the KG / Dev helper shape so _ensure_collections
+# can include the diagrams class in its bootstrap pass.
+_derive_project_diagrams_name = _project_init._derive_project_diagrams_name
+_diagrams_class_definition = _project_init._diagrams_class_definition
 
 
 def _derive_orchestrator_project_name() -> str:
@@ -7316,6 +7321,15 @@ def _ensure_collections(embed_config: dict,
     else:
         dev_name = _derive_project_dev_name(PROJECT_ROOT)
 
+    # Per-project Diagrams collection (Phase 1.5 — fix/a1-indexing-
+    # pipeline 2026-05-25). Resolution mirrors KG / Dev: env var
+    # overrides, else path-based derivation.
+    env_diagrams = os.environ.get("DIAGRAMS_COLLECTION")
+    if env_diagrams:
+        diagrams_name = env_diagrams
+    else:
+        diagrams_name = _derive_project_diagrams_name(PROJECT_ROOT)
+
     # Cross-project shared KG. All vibecoded installs read from the same shared
     # collection name (default "VibeCodedOrchestrator_KnowledgeGraph" since
     # v0.2.23 B1 — was lowercase-c "VibecodedOrchestrator_KnowledgeGraph"
@@ -7408,6 +7422,7 @@ def _ensure_collections(embed_config: dict,
 
     kg_name = _resolve_existing_casing(kg_name)
     dev_name = _resolve_existing_casing(dev_name)
+    diagrams_name = _resolve_existing_casing(diagrams_name)
     if shared_name:
         shared_name = _resolve_existing_casing(shared_name)
 
@@ -7424,6 +7439,7 @@ def _ensure_collections(embed_config: dict,
     # casing so .env writes and binding rows match what Weaviate actually has.
     os.environ["KG_COLLECTION"] = kg_name
     os.environ["DEVELOPMENT_COLLECTION"] = dev_name
+    os.environ["DIAGRAMS_COLLECTION"] = diagrams_name
     if shared_name:
         os.environ["SHARED_KG_COLLECTION"] = shared_name
 
@@ -7432,6 +7448,11 @@ def _ensure_collections(embed_config: dict,
     required: list[tuple[str, "callable"]] = [
         (kg_name, _kg_class_definition),
         (dev_name, _development_class_definition),
+        # fix/a1-indexing-pipeline (2026-05-25): include the Diagrams
+        # class in the self-install bootstrap so the orchestrator clone
+        # has somewhere to write when the user starts saving .mmd /
+        # .excalidraw files. Symmetric with project_init.bootstrap_collections.
+        (diagrams_name, _diagrams_class_definition),
     ]
     # Shared cross-project KG. Same schema as the per-project KG (the MCP
     # server reads them with the same shape). Created once per Weaviate
