@@ -58,6 +58,7 @@ def _make_launcher_db(
     kg_bindings: dict[str, str] | None = None,
     kg_access: list[tuple[str, str]] | None = None,
     codegraph_access: list[tuple[str, str]] | None = None,
+    diagram_access: list[tuple[str, str]] | None = None,
     module_settings: list[tuple[str, str, str, str]] | None = None,
 ) -> None:
     """Build a minimal launcher.db with the schema this module reads.
@@ -74,6 +75,10 @@ def _make_launcher_db(
             ``project_id``.
         codegraph_access: list of (grantor_project_id, access_level)
             rows where ``project_id`` is the grantee.
+        diagram_access: list of (grantor_project_id, access_level)
+            rows where ``project_id`` is the grantee (v0.2.34 A7 —
+            sibling of codegraph_access but reads grantor.name for
+            the env-side CSV value).
         module_settings: list of (project_id, module_id, key, value)
             with ``value`` being a JSON string.
         extra_projects: additional (id, name, folder_path, slug) rows
@@ -103,6 +108,13 @@ def _make_launcher_db(
             PRIMARY KEY (project_id, collection_name)
         );
         CREATE TABLE codegraph_access (
+            grantor_project_id TEXT NOT NULL,
+            grantee_project_id TEXT NOT NULL,
+            access_level TEXT NOT NULL,
+            granted_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (grantor_project_id, grantee_project_id)
+        );
+        CREATE TABLE diagram_access (
             grantor_project_id TEXT NOT NULL,
             grantee_project_id TEXT NOT NULL,
             access_level TEXT NOT NULL,
@@ -143,6 +155,12 @@ def _make_launcher_db(
     for grantor, level in codegraph_access or []:
         cur.execute(
             "INSERT INTO codegraph_access (grantor_project_id, grantee_project_id, "
+            "access_level, granted_at) VALUES (?, ?, ?, ?)",
+            (grantor, project_id, level, 0),
+        )
+    for grantor, level in diagram_access or []:
+        cur.execute(
+            "INSERT INTO diagram_access (grantor_project_id, grantee_project_id, "
             "access_level, granted_at) VALUES (?, ?, ?, ?)",
             (grantor, project_id, level, 0),
         )
@@ -193,6 +211,8 @@ def test_from_db_minimal_project(tmp_path: Path) -> None:
     # Conditional keys are absent (no peers granted, no orchestrator root).
     assert "VCT_KG_ACCESS_LIST" not in env
     assert "VCT_CODE_GRAPH_ACCESS_LIST" not in env
+    # v0.2.34 A7 — diagrams access is independent; no peers ⇒ no key.
+    assert "VCT_DIAGRAMS_ACCESS_LIST" not in env
     assert "VCT_ORCHESTRATOR_ROOT" not in env
     assert "VCT_INFRASTRUCTURE_DIR" not in env
     # GITHUB_TOKEN never resolved by this contract.
@@ -268,6 +288,144 @@ def test_from_db_codegraph_access_list(tmp_path: Path) -> None:
     )
     env = project_env_from_db("grantee", db_path=db)["canonical_env"]
     assert env["VCT_CODE_GRAPH_ACCESS_LIST"] == "alpha,beta"
+
+
+def test_from_db_diagram_access_list_emits_grantor_names(tmp_path: Path) -> None:
+    """v0.2.34 A7: ``VCT_DIAGRAMS_ACCESS_LIST`` carries grantor project
+    NAMES (display names — distinct from VCT_CODE_GRAPH_ACCESS_LIST
+    which carries slugs)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="grantee", project_name="Grantee",
+        project_folder=str(proj), project_slug="grantee",
+        extra_projects=[
+            ("a", "Alpha Project", "/tmp/a", "alpha"),
+            ("b", "Beta", "/tmp/b", "beta"),
+        ],
+        diagram_access=[
+            ("a", "read"),
+            ("b", "read"),
+        ],
+    )
+    env = project_env_from_db("grantee", db_path=db)["canonical_env"]
+    # Note: names sorted alphabetically; the MCP-side sanitiser handles
+    # the space in "Alpha Project" by replacing it with `_`.
+    assert env["VCT_DIAGRAMS_ACCESS_LIST"] == "Alpha Project,Beta"
+
+
+def test_from_db_diagram_access_independent_of_kg_access(tmp_path: Path) -> None:
+    """KG-only grants must NOT populate ``VCT_DIAGRAMS_ACCESS_LIST``;
+    diagram-only grants must NOT populate ``VCT_KG_ACCESS_LIST``.
+
+    This is the v0.2.34 A7 bug-fix regression guard. Pre-A7 the MCP fell
+    back to VCT_KG_ACCESS_LIST when VCT_DIAGRAMS_ACCESS_LIST was unset,
+    which meant (1) granting KG access leaked diagram visibility and
+    (2) granting only diagram access was invisible to the MCP because
+    no KG row existed to piggyback on. The split contract here makes
+    each surface track its own access matrix."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+        kg_bindings={
+            "primary": "X_KnowledgeGraph",
+            "shared": "VibeCodedOrchestrator_KnowledgeGraph",
+            "archive": "X_Development",
+        },
+        # KG access only — diagram access not granted.
+        kg_access=[("Peer_KnowledgeGraph", "read")],
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["VCT_KG_ACCESS_LIST"] == "Peer"
+    assert "VCT_DIAGRAMS_ACCESS_LIST" not in env
+
+
+def test_from_db_diagram_only_grant_populates_only_diagrams_list(
+    tmp_path: Path,
+) -> None:
+    """Diagram-only grant: VCT_DIAGRAMS_ACCESS_LIST populated, KG list
+    absent. Pre-v0.2.34 A7 this case was completely invisible to the
+    MCP (it would not surface the peer)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+        extra_projects=[("a", "Alpha", "/tmp/a", "alpha")],
+        diagram_access=[("a", "read")],
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["VCT_DIAGRAMS_ACCESS_LIST"] == "Alpha"
+    assert "VCT_KG_ACCESS_LIST" not in env
+
+
+def test_from_db_diagram_and_kg_grants_populate_both(tmp_path: Path) -> None:
+    """Both grants present → both env keys present, independently."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+        kg_bindings={
+            "primary": "X_KnowledgeGraph",
+            "shared": "VibeCodedOrchestrator_KnowledgeGraph",
+            "archive": "X_Development",
+        },
+        extra_projects=[("a", "Alpha", "/tmp/a", "alpha")],
+        kg_access=[("Foo_KnowledgeGraph", "read")],
+        diagram_access=[("a", "read")],
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["VCT_KG_ACCESS_LIST"] == "Foo"
+    assert env["VCT_DIAGRAMS_ACCESS_LIST"] == "Alpha"
+
+
+def test_from_db_diagram_access_level_none_filtered(tmp_path: Path) -> None:
+    """``access_level='none'`` rows must not appear in the env var
+    (mirrors the kg_access_list filtering rule)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="x", project_name="X", project_folder=str(proj),
+        extra_projects=[
+            ("a", "Alpha", "/tmp/a", "alpha"),
+            ("b", "Beta", "/tmp/b", "beta"),
+        ],
+        diagram_access=[
+            ("a", "read"),
+            ("b", "none"),
+        ],
+    )
+    env = project_env_from_db("x", db_path=db)["canonical_env"]
+    assert env["VCT_DIAGRAMS_ACCESS_LIST"] == "Alpha"
+    assert "Beta" not in env["VCT_DIAGRAMS_ACCESS_LIST"]
+
+
+def test_apply_diagrams_access_list_signal_to_remove(tmp_path: Path) -> None:
+    """A canonical key absent from the bundle but present in the existing
+    surface is DELETED (signal-to-remove semantics). The diagrams list
+    needs the same behaviour as the KG list so a grant-revoke flow
+    actually wipes the env var."""
+    settings_path = tmp_path / ".claude" / "settings.json"
+    settings_path.parent.mkdir()
+    settings_path.write_text(json.dumps({
+        "env": {
+            "KG_COLLECTION": "TestKG",
+            "VCT_DIAGRAMS_ACCESS_LIST": "OldPeer1,OldPeer2",  # stale
+            "OPENAI_API_BASE": "preserved",
+        },
+    }))
+
+    bundle = _bundle(tmp_path)  # no VCT_DIAGRAMS_ACCESS_LIST in bundle
+    apply_project_env(bundle, surfaces=["claude_settings_json"])
+
+    data = json.loads(settings_path.read_text())
+    assert "VCT_DIAGRAMS_ACCESS_LIST" not in data["env"]
+    assert data["env"]["OPENAI_API_BASE"] == "preserved"
 
 
 def test_from_db_shared_kg_write_disabled(tmp_path: Path) -> None:
@@ -669,6 +827,8 @@ def test_canonical_keys_includes_expected() -> None:
     assert "VCT_KG_ACCESS_LIST" in keys
     assert "VCT_CODE_GRAPH_ACCESS_LIST" in keys
     assert "SHARED_KG_WRITE_DISABLED" in keys
+    # v0.2.34 A7 — diagrams cross-project access list.
+    assert "VCT_DIAGRAMS_ACCESS_LIST" in keys
     # Foundational keys.
     for k in ("KG_COLLECTION", "PROJECT_NAME", "ACTIVE_EMBEDDING"):
         assert k in keys

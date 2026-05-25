@@ -1373,23 +1373,34 @@ def _kg_peer_collections() -> list[str]:
 
 def _diagrams_peer_collections() -> list[str]:
     """Return the list of peer-project diagrams-collection names this
-    process should also search (Phase 1.5.C).
+    process should also search.
 
-    Source-of-truth: ``VCT_DIAGRAMS_ACCESS_LIST`` env var (CSV of peer
-    project names, sanitized to the collection-prefix shape). The
-    diagrams access matrix is conceptually parallel to the KG access
-    matrix (the plan's §1 calls these "the same access surface"); for
-    Phase 1.5.C we fall back to ``VCT_KG_ACCESS_LIST`` when the
-    diagrams-specific var is unset so users on existing installs get
-    consistent cross-project visibility without having to set a second
-    env var.
+    Source-of-truth (v0.2.34 A7):
 
-    Phase 4 follow-up: split into independent ``diagram_access`` /
-    ``kg_collection_access`` SQLite tables behind the launcher. For
-    Phase 1.5.C the env-fallback is documented (see plan §1.5.3 / "for
-    Phase 1.5.C: same value as VCT_KG_ACCESS_LIST since diagram_access
-    and kg_collection_access tables are conceptually parallel — treat
-    them as one access surface for now").
+      * Hub: ``ProjectConfig.diagrams_access_list`` — already-canonical
+        Weaviate class names (e.g. ``Foo_Diagrams``). Consumed as-is.
+      * Env-fallback: ``VCT_DIAGRAMS_ACCESS_LIST`` — CSV of peer
+        project names (the launcher's display names); each is
+        sanitised through ``_sanitize_collection_prefix`` and the
+        ``_Diagrams`` suffix is appended.
+
+    Discrete from the KG access matrix. v0.2.34 A7 removed the
+    ``VCT_KG_ACCESS_LIST`` env-fallback that Phase 1.5.C left in
+    place. Empty list now means **no peers** — granting only KG
+    access no longer leaks diagram visibility, and granting only
+    diagram access is now reachable (previously invisible to the MCP
+    because there was no KG row to piggyback on). See
+    ``knowledge/concepts/config-projection-contract-2026-05-24.md``
+    for the canonical-key registration.
+
+    The hub-side value is populated by ``vct-hub::project_config``
+    via a JOIN over ``diagram_access`` + ``projects``; the env-side
+    value is populated by ``vco_lib.config_projection`` via
+    ``_fetch_diagram_access_list`` (same JOIN, returning ``p.name``).
+    The two surfaces agree on **what peers** are visible; they
+    disagree only on **format** (hub: canonical class names; env:
+    raw project names) — both consumed correctly by the branches
+    below.
     """
     # Hub-first path: if the hub exposes ``diagrams_access_list``, use
     # it. Falls back to env CSV otherwise.
@@ -1413,11 +1424,11 @@ def _diagrams_peer_collections() -> list[str]:
                 out.append(coll)
             return out
 
-    # Env path. Prefer the diagrams-specific var; fall back to the KG
-    # access list (per the Phase 1.5.C simplification).
-    peers = _parse_csv_env("VCT_DIAGRAMS_ACCESS_LIST") or _parse_csv_env(
-        "VCT_KG_ACCESS_LIST"
-    )
+    # Env-fallback path. v0.2.34 A7: read VCT_DIAGRAMS_ACCESS_LIST
+    # exclusively — no KG-list fallback. Empty / unset env var means
+    # no peers; the MCP returns [] and the per-project DIAGRAMS_COLLECTION
+    # is the only collection searched (see _diagrams_collections_to_search).
+    peers = _parse_csv_env("VCT_DIAGRAMS_ACCESS_LIST")
     out: list[str] = []
     seen: set[str] = set()
     for p in peers:
@@ -1436,9 +1447,12 @@ def _diagrams_peer_collections() -> list[str]:
 
 def _diagrams_collections_to_search() -> list[str]:
     """Return the union of diagrams collections this process should
-    fan-out across: self + peers (from ``VCT_DIAGRAMS_ACCESS_LIST`` /
-    ``VCT_KG_ACCESS_LIST`` fallback). No shared diagrams collection —
-    diagrams are project-scoped by design (unlike the shared KG).
+    fan-out across: self + peers (from the hub's
+    ``diagrams_access_list`` or, when the hub is unreachable, the
+    ``VCT_DIAGRAMS_ACCESS_LIST`` env var). No shared diagrams
+    collection — diagrams are project-scoped by design (unlike the
+    shared KG). v0.2.34 A7 removed the ``VCT_KG_ACCESS_LIST``
+    fallback this used to honour during Phase 1.5.C.
 
     Returns ``[]`` when ``DIAGRAMS_COLLECTION`` is unset, which is the
     correct behaviour for projects that don't use the diagrams module
