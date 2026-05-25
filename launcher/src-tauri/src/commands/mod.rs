@@ -19,6 +19,13 @@ pub mod desktop_shortcut;
 // Sibling Phase 1.2/1.3/1.5 agents stub these command names — keep
 // stable; the merge wires their tabs/wrappers against these.
 pub mod diagrams_cmd;
+// v0.2.34 Agent D — `subscribe_to_diagram_changes` + filesystem watcher
+// that emits `diagram-changed` Tauri events. Split from `diagrams_cmd`
+// because it owns process-wide state (`HashMap<project_id,
+// RecommendedWatcher>` + debounce slots) that doesn't belong on the
+// per-command shape. See
+// `.claude/context/plans/diagrams-frontend-wiring-handoff-2026-05-25.md`.
+pub mod diagram_watcher;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;
 // C8 wire-up (2026-05-25): Tauri command `read_env_var` consumed by the

@@ -516,17 +516,300 @@ fn resolve_project_python(folder: &Path) -> Option<PathBuf> {
 
 // ─── Module-active lookup ───────────────────────────────────────────────
 
+/// Set of modules that are orchestrator-bundled-default-active. When
+/// `is_project_module_active` is called for one of these and no row
+/// exists in `project_modules` yet, we treat the absence as a
+/// pre-v0.2.33 backfill gap (these projects existed before the seed
+/// path in `projects_v2.rs:521` was wired) — auto-seed the row with
+/// `enabled=true` and return true. This makes existing-project
+/// upgraders see the Diagrams tab without having to manually toggle.
+///
+/// The user's explicit opt-out (toggling off in DiagramsTab) writes
+/// `enabled=0` which is a real row, so the backfill never re-enables
+/// what the user disabled.
+///
+/// Resolution (a) chosen over (b) per v0.2.34 Agent D's spec: "diagrams"
+/// stays a logical module-active flag (gates CLAUDE.md template
+/// `{{#if_module_active diagrams}}` + the DiagramsTab visibility);
+/// "mermaid" and "excalidraw" are the actual wrapper MCPs surfaced
+/// through `default_mcp_servers()` in `types.rs`. The two concerns
+/// don't collapse into one default-mcp-servers entry.
+const ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES: &[&str] = &["diagrams"];
+
 /// Phase 1.5.7 — the DiagramsTab Svelte calls this to decide whether
 /// the module is on or off for a given project. Returns `false` for
-/// unknown (project, module) pairs (no row in `project_modules`).
+/// unknown (project, module) pairs (no row in `project_modules`) UNLESS
+/// the module is in the orchestrator-bundled-default-active set (see
+/// `ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES`), in which case the
+/// row is seeded with `enabled=true` and we return true.
+///
+/// Soft-fail: if the seed write fails (e.g. transient DB lock) we log
+/// + still return `true` so the user-facing tab visibility isn't
+/// blocked on a write retry. The next call retries the seed.
 #[command]
 pub async fn is_project_module_active(
     project_id: String,
     module_name: String,
     db: State<'_, Db>,
 ) -> Result<bool, String> {
-    db.is_module_active(&project_id, &module_name)
-        .map_err(|e| format!("is_project_module_active: {e}"))
+    // First check: row exists?
+    let active = db
+        .is_module_active(&project_id, &module_name)
+        .map_err(|e| format!("is_project_module_active: {e}"))?;
+    if active {
+        return Ok(true);
+    }
+
+    // Row absent or explicitly disabled. The DB layer collapses both
+    // cases into `false`, so we need to disambiguate before deciding
+    // whether to backfill. A direct query keeps the DB layer pure
+    // (no new method needed on `Db`) and is cheap (~1 row scan).
+    if ORCHESTRATOR_BUNDLED_DEFAULT_ACTIVE_MODULES.contains(&module_name.as_str())
+        && !has_module_row(&db, &project_id, &module_name)?
+    {
+        // Backfill: pre-v0.2.33 projects predate the seed path in
+        // `projects_v2.rs:521`, so the row is missing rather than
+        // user-disabled. Seed it default-active.
+        if let Err(e) = db.set_project_module_enabled(&project_id, &module_name, true) {
+            eprintln!(
+                "[vct] is_project_module_active: backfill seed failed for \
+                 ({}, {}): {} — returning true anyway; next call retries",
+                project_id, module_name, e
+            );
+        } else {
+            // Audit so we can trace retroactive seeds in support cases.
+            let _ = db.audit(
+                "project_module_backfill_seed",
+                Some(&project_id),
+                None,
+                &serde_json::json!({
+                    "module": module_name,
+                    "reason": "orchestrator_bundled_default_active",
+                }),
+            );
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Returns true if `(project_id, module_name)` has any row in
+/// `project_modules` (regardless of `enabled` value). Used to
+/// disambiguate "row absent" from "row present, disabled" in
+/// `is_project_module_active`. Soft-fails on DB errors — returns
+/// false so the caller's backfill path runs (the row will get
+/// recreated, idempotent UPSERT).
+fn has_module_row(db: &Db, project_id: &str, module_name: &str) -> Result<bool, String> {
+    let guard = db.lock();
+    let exists: bool = guard
+        .query_row(
+            "SELECT 1 FROM project_modules
+             WHERE project_id = ?1 AND module_name = ?2
+             LIMIT 1",
+            rusqlite::params![project_id, module_name],
+            |_| Ok(true),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            other => Err(format!("has_module_row({}, {}): {}", project_id, module_name, other)),
+        })?;
+    Ok(exists)
+}
+
+// ─── Diagrams file IO (v0.2.34 Agent D) ─────────────────────────────────
+//
+// The DiagramsTab + ExcalidrawEditor invoke these three commands to
+// load + persist diagram source files. Until v0.2.34 they were
+// missing — the frontend caught the "command not found" error and
+// silently degraded (empty preview, Excalidraw boots empty every
+// mount, SVG export silently fails). See
+// `diagrams-frontend-wiring-handoff-2026-05-25.md` for the full
+// gap analysis.
+//
+// Security boundary: every read/write is scoped to the project root.
+// The `read_project_diagram_source` command additionally restricts
+// reads to `.claude/diagrams/` (mirrors `vco_lib/diagram_paths.py`).
+// `write_text_file` accepts any path inside the project (so it can
+// be used for SVG export to user-chosen locations) but rejects any
+// path that resolves outside the project root.
+
+/// Read a file inside the project's `.claude/diagrams/` directory and
+/// return its UTF-8 contents.
+///
+/// Security: enforces two boundaries — (1) `rel_path` must resolve
+/// inside the project folder (no `..` escapes, no absolute paths
+/// pointing elsewhere), (2) the resolved path must live under
+/// `<project>/.claude/diagrams/`. Mirrors the Python-side enforcement
+/// in `vco_lib/diagram_paths.py`.
+#[command]
+pub async fn read_project_diagram_source(
+    project_id: String,
+    rel_path: String,
+    db: State<'_, Db>,
+) -> Result<String, String> {
+    let project_folder = lookup_project_folder(&db, &project_id)?;
+    let abs = resolve_inside_project(&project_folder, &rel_path)?;
+
+    // Second boundary: the resolved absolute path must live under
+    // `<project>/.claude/diagrams/`. This is the diagrams scoped
+    // boundary from `vco_lib/diagram_paths.py`.
+    let diagrams_root = project_folder.join(".claude").join("diagrams");
+    if !abs.starts_with(&diagrams_root) {
+        return Err(format!(
+            "read_project_diagram_source: path {} escapes diagrams root {}",
+            abs.display(),
+            diagrams_root.display(),
+        ));
+    }
+
+    fs::read_to_string(&abs).map_err(|e| {
+        format!(
+            "read_project_diagram_source: read {} failed: {}",
+            abs.display(),
+            e
+        )
+    })
+}
+
+/// Atomically write UTF-8 `contents` to `path`. `path` MUST be an
+/// absolute path inside one of the registered projects (the frontend
+/// resolves via `resolve_project_path` first). We re-validate against
+/// every registered project's folder as a two-layer defence — a
+/// frontend bug or malicious caller can't direct writes outside any
+/// project root.
+///
+/// Atomic via sibling-tempfile + rename (same pattern as
+/// `write_file_atomic` higher up in this file).
+///
+/// Used by:
+/// - Excalidraw scene saves (debounced editor writes).
+/// - Mermaid SVG export (user-chosen path inside the project).
+/// - Excalidraw SVG export (same).
+#[command]
+pub async fn write_text_file(
+    path: String,
+    contents: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    let abs = PathBuf::from(&path);
+    if !abs.is_absolute() {
+        return Err(format!(
+            "write_text_file: path must be absolute (got {})",
+            abs.display()
+        ));
+    }
+
+    // Defence-in-depth: the frontend already resolved this path via
+    // `resolve_project_path`, but we re-check that the absolute path
+    // lives inside SOME registered project's folder before writing.
+    // A bug in the frontend (or a non-frontend caller) shouldn't be
+    // able to write to arbitrary locations on the user's disk.
+    if !path_is_inside_any_project(&db, &abs)? {
+        return Err(format!(
+            "write_text_file: refusing to write outside any registered project folder ({})",
+            abs.display()
+        ));
+    }
+
+    write_file_atomic(&abs, contents.as_bytes())
+}
+
+/// Resolve a project-relative path to an absolute path, refusing any
+/// escapes outside the project folder.
+///
+/// Used by the frontend before invoking `write_text_file` and before
+/// handing the absolute path to `@tauri-apps/plugin-opener` for
+/// "Open in editor". Lives in `crate::path_utils` so it's reusable
+/// outside the diagrams flow.
+#[command]
+pub async fn resolve_project_path(
+    project_id: String,
+    rel_path: String,
+    db: State<'_, Db>,
+) -> Result<String, String> {
+    let project_folder = lookup_project_folder(&db, &project_id)?;
+    let abs = resolve_inside_project(&project_folder, &rel_path)?;
+    Ok(abs.to_string_lossy().into_owned())
+}
+
+/// Shared resolver used by `read_project_diagram_source` and
+/// `resolve_project_path`. Joins `rel_path` against `project_folder`
+/// (or uses it verbatim if absolute), then refuses any result that
+/// doesn't start with `project_folder` after lexical normalisation.
+///
+/// We use a lexical normalisation step (manual `..`/`.` collapse)
+/// instead of `fs::canonicalize` because the diagram file may not
+/// exist yet (Excalidraw's first save creates the file). `canonicalize`
+/// would fail on the missing file; the lexical normalisation gives a
+/// well-defined answer regardless of disk state.
+fn resolve_inside_project(project_folder: &Path, rel_path: &str) -> Result<PathBuf, String> {
+    let candidate = if Path::new(rel_path).is_absolute() {
+        PathBuf::from(rel_path)
+    } else {
+        project_folder.join(rel_path)
+    };
+
+    let normalised = lexical_normalize(&candidate);
+
+    // The project folder itself should be canonicalised for the
+    // comparison — but if it doesn't exist (rare; a deleted project
+    // folder that's still in the DB), fall back to lexical
+    // normalisation. dunce::canonicalize gives us the conventional
+    // Windows form (no `\\?\` prefix) so the `starts_with` check
+    // works across OS.
+    let project_canonical = match dunce::canonicalize(project_folder) {
+        Ok(p) => p,
+        Err(_) => lexical_normalize(project_folder),
+    };
+
+    if !normalised.starts_with(&project_canonical) {
+        return Err(format!(
+            "path {} escapes project folder {}",
+            normalised.display(),
+            project_canonical.display(),
+        ));
+    }
+    Ok(normalised)
+}
+
+/// Lexical (no-disk-touch) path normaliser. Collapses `.` and `..`
+/// without consulting the filesystem so non-existent paths still get
+/// a well-defined absolute form. Used in `resolve_inside_project`
+/// because diagram files may not exist yet at save time.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Check whether `abs` is inside ANY registered project folder.
+/// Used by `write_text_file` as the second layer of path validation.
+fn path_is_inside_any_project(db: &Db, abs: &Path) -> Result<bool, String> {
+    let projects = db
+        .list_projects()
+        .map_err(|e| format!("path_is_inside_any_project: list projects: {}", e))?;
+    let normalised = lexical_normalize(abs);
+    for p in projects {
+        let folder = PathBuf::from(&p.folder_path);
+        let folder_canonical = match dunce::canonicalize(&folder) {
+            Ok(c) => c,
+            Err(_) => lexical_normalize(&folder),
+        };
+        if normalised.starts_with(&folder_canonical) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -733,10 +1016,200 @@ mod tests {
         // For an unregistered (project, module) pair the answer is `false`
         // — never an error. The Svelte falls back to "module on" on error,
         // so an error here would mask a real misconfig.
+        //
+        // NOTE: this exercises the DB layer directly (Db::is_module_active),
+        // NOT the Tauri command. The command layer adds the v0.2.34 Agent D
+        // backfill for "diagrams" specifically — see
+        // `has_module_row_distinguishes_absent_from_disabled` below for
+        // the command-layer contract.
         let dir = tempfile::tempdir().unwrap();
         let db = make_db_with_project("p1", "Acme", dir.path());
         let r = db.is_module_active("p1", "diagrams").unwrap();
         assert!(!r, "unknown module should be inactive (got {})", r);
+    }
+
+    #[test]
+    fn has_module_row_distinguishes_absent_from_disabled() {
+        // The Tauri command layer's backfill relies on `has_module_row`
+        // to tell apart "no row exists yet" from "row exists with
+        // enabled=0". Without this distinction we'd re-enable modules
+        // the user explicitly opted out of.
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+
+        // Absent row → returns false.
+        assert!(!has_module_row(&db, "p1", "diagrams").unwrap());
+
+        // Disabled row → returns true (row exists, even if enabled=0).
+        db.set_project_module_enabled("p1", "diagrams", false).unwrap();
+        assert!(has_module_row(&db, "p1", "diagrams").unwrap());
+
+        // Enabled row → also true.
+        db.set_project_module_enabled("p1", "diagrams", true).unwrap();
+        assert!(has_module_row(&db, "p1", "diagrams").unwrap());
+    }
+
+    #[test]
+    fn lexical_normalize_collapses_dot_segments() {
+        // We use lexical normalisation (no disk touch) so non-existent
+        // paths still get a well-defined form. Cover the canonical
+        // cases that drive `resolve_inside_project`.
+        let p = Path::new("/proj/.claude/diagrams/../etc/passwd");
+        let n = lexical_normalize(p);
+        // Should collapse to `/proj/.claude/etc/passwd` (one level up
+        // from `diagrams/`). Whether that's "still inside project"
+        // depends on the project folder used by the caller — covered
+        // separately by `resolve_inside_project_rejects_traversal`.
+        assert_eq!(n, PathBuf::from("/proj/.claude/etc/passwd"));
+
+        // Trailing `..` that escapes the project entirely.
+        let escape = Path::new("/proj/.claude/diagrams/../../../etc/passwd");
+        let escape_n = lexical_normalize(escape);
+        assert_eq!(escape_n, PathBuf::from("/etc/passwd"));
+
+        // No-op for already-normal paths.
+        let clean = Path::new("/proj/.claude/diagrams/x.mmd");
+        assert_eq!(lexical_normalize(clean), PathBuf::from("/proj/.claude/diagrams/x.mmd"));
+
+        // `.` segments stripped.
+        let dot = Path::new("/proj/./diagrams/./x.mmd");
+        assert_eq!(lexical_normalize(dot), PathBuf::from("/proj/diagrams/x.mmd"));
+    }
+
+    #[test]
+    fn resolve_inside_project_rejects_dotdot_traversal() {
+        // The diagrams flow accepts relative paths from the frontend.
+        // A `..` escape must be rejected (not silently rewritten).
+        let dir = tempfile::tempdir().unwrap();
+        // Need a real folder so dunce::canonicalize works — the
+        // resolver uses lexical normalisation as a fallback when the
+        // canonicalize fails, but the canonical path makes the test's
+        // expectations cross-OS predictable.
+        let project = dir.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+
+        let result = resolve_inside_project(&project, "../etc/passwd");
+        assert!(result.is_err(), "`..` traversal must be rejected (got {:?})", result);
+        let err = result.unwrap_err();
+        assert!(err.contains("escapes project folder"), "error should mention escape (got {:?})", err);
+    }
+
+    #[test]
+    fn resolve_inside_project_rejects_absolute_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+
+        let outside = if cfg!(windows) {
+            r"C:\etc\passwd".to_string()
+        } else {
+            "/etc/passwd".to_string()
+        };
+
+        let result = resolve_inside_project(&project, &outside);
+        assert!(result.is_err(), "absolute path outside project must be rejected (got {:?})", result);
+    }
+
+    #[test]
+    fn resolve_inside_project_accepts_relative_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+
+        let result = resolve_inside_project(&project, ".claude/diagrams/g/x.mmd")
+            .expect("clean relative path inside project must succeed");
+        // Should be canonicalized project + appended subpath.
+        let expected = dunce::canonicalize(&project).unwrap().join(".claude/diagrams/g/x.mmd");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn resolve_inside_project_accepts_absolute_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+        let canonical = dunce::canonicalize(&project).unwrap();
+        let abs_inside = canonical.join(".claude/diagrams/g/x.mmd");
+
+        let result = resolve_inside_project(&project, abs_inside.to_string_lossy().as_ref())
+            .expect("absolute path inside project must succeed");
+        assert_eq!(result, abs_inside);
+    }
+
+    #[test]
+    fn path_is_inside_any_project_finds_match() {
+        // Two registered projects. A path inside either should match;
+        // a path outside both should not.
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("proj1");
+        let p2 = dir.path().join("proj2");
+        fs::create_dir_all(&p1).unwrap();
+        fs::create_dir_all(&p2).unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let s1 = db.generate_unique_slug("P1").unwrap();
+        let s2 = db.generate_unique_slug("P2").unwrap();
+        db.insert_project("p1", "P1", p1.to_string_lossy().as_ref(), ProjectHost::Base, &s1).unwrap();
+        db.insert_project("p2", "P2", p2.to_string_lossy().as_ref(), ProjectHost::Base, &s2).unwrap();
+
+        let inside_p1 = dunce::canonicalize(&p1).unwrap().join(".claude/diagrams/x.mmd");
+        assert!(path_is_inside_any_project(&db, &inside_p1).unwrap());
+
+        let inside_p2 = dunce::canonicalize(&p2).unwrap().join(".claude/diagrams/y.mmd");
+        assert!(path_is_inside_any_project(&db, &inside_p2).unwrap());
+
+        // Outside both.
+        let outside = dir.path().join("other").join("z.mmd");
+        // Create the dir so canonicalize works for parent.
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        assert!(!path_is_inside_any_project(&db, &outside).unwrap());
+    }
+
+    #[test]
+    fn write_file_atomic_writes_inside_temp() {
+        // End-to-end test for the atomic write helper used by
+        // `write_text_file`. We can't drive the Tauri command directly
+        // (no State<Db> in unit tests), so we exercise the
+        // write-and-replace primitive that backs it.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".claude/diagrams/excalidraw/scene.excalidraw");
+        write_file_atomic(&target, b"{\"version\":2,\"elements\":[]}").unwrap();
+        let content = fs::read_to_string(&target).unwrap();
+        assert!(content.contains("elements"));
+    }
+
+    #[test]
+    fn read_project_diagram_source_logic_inside_diagrams_root() {
+        // Smoke test for the read path's two-layer enforcement:
+        // (1) `resolve_inside_project` keeps us inside the project,
+        // (2) the `.claude/diagrams/` boundary further restricts us.
+        // We can't drive the Tauri command (needs State<Db>) so we
+        // exercise the underlying resolver + manually check the
+        // diagrams-root constraint that the command body would apply.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        let diagrams = project.join(".claude/diagrams");
+        fs::create_dir_all(&diagrams).unwrap();
+        let target = diagrams.join("g/x.mmd");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "flowchart TD; A-->B").unwrap();
+
+        // Path inside diagrams/ — resolves cleanly.
+        let resolved = resolve_inside_project(&project, ".claude/diagrams/g/x.mmd").unwrap();
+        let diagrams_canonical = dunce::canonicalize(&diagrams).unwrap();
+        assert!(resolved.starts_with(&diagrams_canonical), "inside-diagrams path should be under diagrams root");
+        // Read works.
+        assert_eq!(fs::read_to_string(&resolved).unwrap(), "flowchart TD; A-->B");
+
+        // Path inside project but OUTSIDE diagrams/ — resolves but the
+        // command's second boundary would reject it. We just check the
+        // resolved path is not under diagrams_canonical.
+        let outside_dir = project.join("secrets");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join("creds.txt"), "S3CR3T").unwrap();
+        let outside_resolved = resolve_inside_project(&project, "secrets/creds.txt").unwrap();
+        assert!(!outside_resolved.starts_with(&diagrams_canonical),
+            "path outside diagrams/ should NOT match diagrams_root prefix");
     }
 
     #[test]

@@ -153,10 +153,11 @@
       group.customized = tools.length > 0;
       group.loaded = true;
     } catch (e) {
-      // Backend (Phase 1.1) not landed yet → render placeholder. Don't
-      // toast on this one — it would fire per-MCP and spam the user
-      // during the brief integration window.
-      console.warn('[permissions] list_project_mcp_tools unavailable:', e);
+      // Defensive — `list_project_mcp_tools` is wired since v0.2.33,
+      // so this branch only fires on a real Tauri-IPC error (DB lock,
+      // schema migration mid-flight). No toast: each MCP would fire
+      // its own and the user can't act on the failure anyway.
+      console.warn('[permissions] list_project_mcp_tools failed:', e);
       group.tools = [];
       group.customized = false;
       group.loaded = true;

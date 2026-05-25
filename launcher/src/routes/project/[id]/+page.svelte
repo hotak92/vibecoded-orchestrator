@@ -98,9 +98,12 @@
         moduleName: 'diagrams',
       });
     } catch (e) {
-      // Phase 1.1 not landed → hide the tab. We don't toast here because
-      // every page load would fire it; log instead.
-      console.warn('[project-page] is_project_module_active unavailable:', e);
+      // Defensive — Tauri command is wired since v0.2.33 and v0.2.34
+      // added orchestrator-bundled backfill so the absent-row case
+      // returns true instead of throwing. Reach this branch only on
+      // IPC-level failures; log without toasting (every page load
+      // would surface it).
+      console.warn('[project-page] is_project_module_active failed:', e);
       diagramsModuleActive = false;
     }
   }
