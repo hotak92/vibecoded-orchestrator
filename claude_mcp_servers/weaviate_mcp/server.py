@@ -121,6 +121,29 @@ except Exception as _embed_import_err:  # pragma: no cover (rare half-install)
     EmbeddingService = None  # type: ignore[assignment]
     NoEmbeddingBackendError = Exception  # type: ignore[assignment]
 
+# v0.2.34 cr-b2 (2026-05-25): canonical sanitiser for Weaviate class
+# prefixes. The diagrams-collection naming bug (silent cross-project
+# visibility break for any project with non-alphanumeric chars) was
+# caused by `_sanitize_collection_prefix` re-implementing a divergent
+# rule. Lock onto Python's source-of-truth instead — see the docstring
+# on `_sanitize_collection_prefix` below for the full rationale.
+# Import is graceful for the same reason as EmbeddingService: a
+# half-installed env shouldn't crash the MCP at first call.
+try:
+    from vco_lib.project_init import (
+        sanitize_for_weaviate_class as _canonical_sanitize_for_weaviate_class,
+    )
+    _HAS_CANONICAL_SANITIZER = True
+except Exception as _sanitiser_import_err:  # pragma: no cover (rare half-install)
+    logger.warning(
+        "vco_lib.project_init.sanitize_for_weaviate_class import failed (%s) "
+        "— falling back to inline implementation. Run install.py --update "
+        "to refresh vco_lib.",
+        _sanitiser_import_err,
+    )
+    _HAS_CANONICAL_SANITIZER = False
+    _canonical_sanitize_for_weaviate_class = None  # type: ignore[assignment]
+
 
 # ─── v0.2.21 Step 18: per-project config resolver ───────────────────────
 #
@@ -1649,11 +1672,60 @@ else:
 
 
 def _sanitize_collection_prefix(name: str) -> str:
-    """Sanitize project name for use as Weaviate collection prefix."""
-    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
-    if sanitized and not sanitized[0].isupper():
-        sanitized = sanitized[0].upper() + sanitized[1:]
-    return sanitized
+    """Sanitize project name for use as a Weaviate collection prefix.
+
+    **Canonical rule** (cross-language, locked 2026-05-25 by cr-b2):
+    delegates to ``vco_lib.project_init.sanitize_for_weaviate_class`` —
+    the documented source-of-truth per ``derive_project_collection_names``'s
+    docstring. Replaces the pre-cr-b2 underscore-replace implementation
+    which diverged from the canonical Python rule (and from the
+    indexer's writer-side naming) for any project name containing
+    non-alphanumeric characters (spaces, hyphens, dots). The
+    divergence silently broke cross-project diagrams visibility on
+    first invocation — the indexer wrote under one class, this MCP
+    searched a different one, the hub's ``diagrams_access_list``
+    pointed at a third.
+
+    Rule (must match ``sanitize_for_weaviate_class``):
+      1. Split on any non-alphanumeric run (``[^A-Za-z0-9]+``).
+      2. PascalCase each surviving part (uppercase first char,
+         preserve rest).
+      3. Concatenate (NO joiner — no underscore between parts).
+      4. If nothing survives OR result starts with a non-letter,
+         fall back to ``"vct"`` (lowercase — Weaviate uppercases on
+         POST regardless).
+
+    The Rust mirror is
+    ``launcher/src-tauri/vct-hub/src/config_api.rs::sanitize_diagrams_class_prefix``;
+    cross-language parity is pinned by
+    ``tests/test_diagrams_class_name_parity.py`` /
+    ``launcher/src-tauri/tests/diagrams_class_name_parity.rs``
+    consuming the shared JSON fixture at
+    ``tests/fixtures/diagrams_class_name_parity.json``.
+
+    Fallback: if ``vco_lib`` isn't importable (half-installed env),
+    re-implements the same rule inline. The fallback path is
+    behaviour-identical to the imported function — kept so the MCP
+    boots on partial installs rather than crashing at first call.
+    """
+    if _HAS_CANONICAL_SANITIZER:
+        try:
+            return _canonical_sanitize_for_weaviate_class(name)
+        except Exception:
+            # Defensive: never let a sanitiser exception take the MCP down.
+            # Falls through to the inline implementation below.
+            pass
+
+    # Inline fallback — behaviour-identical to
+    # `sanitize_for_weaviate_class`. Kept for partial-install resilience.
+    base = name or ""
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", base) if p]
+    if not parts:
+        return "vct"
+    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
+    if not pascal or not pascal[0].isalpha():
+        return "vct"
+    return pascal
 
 
 def _code_collection(base: str) -> str:

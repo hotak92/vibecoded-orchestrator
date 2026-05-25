@@ -705,40 +705,93 @@ fn list_diagram_grantor_names_for_grantee(
 /// Sanitiser for a project display name → Weaviate class prefix used
 /// in diagrams collection names (``<Sanitized>_Diagrams``).
 ///
-/// Mirrors the Python ``_sanitize_collection_prefix`` in
-/// ``claude_mcp_servers/weaviate_mcp/server.py`` (which is the
-/// indexer's writer-side rule). Critical: returns the SAME class
-/// prefix the indexer wrote, so the hub-resolved
-/// ``diagrams_access_list`` round-trips against the actual
-/// collection names in Weaviate.
+/// **Canonical rule** (cross-language, locked 2026-05-25 by cr-b2):
+/// mirrors the Python ``vco_lib.project_init.sanitize_for_weaviate_class``
+/// — the documented source-of-truth per
+/// ``derive_project_collection_names``'s docstring. Replaces the
+/// pre-cr-b2 underscore-replace algorithm that diverged from Python
+/// for any project name containing non-alphanumeric characters
+/// (spaces, hyphens, dots). The divergence silently broke
+/// cross-project diagrams visibility on first invocation — the
+/// indexer wrote under one class, the MCP searched a different one,
+/// the hub's ``diagrams_access_list`` pointed at a third.
 ///
-/// Rule (matches Python):
-///   1. Replace each non ``[A-Za-z0-9_]`` char with ``_``.
-///   2. Capitalize the first char if it's lowercase.
+/// Rule (must match Python's ``sanitize_for_weaviate_class``):
+///   1. Split on any non-alphanumeric run (``[^A-Za-z0-9]+`` —
+///      treats ``_``, ``-``, space, dot, etc. as separators).
+///   2. PascalCase each surviving part (uppercase first char,
+///      preserve rest).
+///   3. Concatenate (NO joiner — no underscore between parts).
+///   4. If nothing survives OR the result starts with a non-letter,
+///      fall back to ``"vct"`` (lowercase — Weaviate uppercases the
+///      first char on POST regardless, and the prefix flags the
+///      class as installer-managed).
+///
+/// Examples (pinned by ``tests/fixtures/diagrams_class_name_parity.json``):
+///   ``"Foo Bar"``        → ``"FooBar"``     (was ``"Foo_Bar"`` pre-cr-b2)
+///   ``"my-project_v2"``  → ``"MyProjectV2"`` (was ``"My_project_v2"``)
+///   ``"VCODev"``         → ``"VCODev"``     (round-trips identically)
+///   ``"étude"``          → ``"Tude"``       (non-ASCII stripped, matches Python)
+///   ``"123abc"``         → ``"vct"``        (leading digit invalid → fallback)
+///   ``"!!!"``            → ``"vct"``        (all-symbol → empty → fallback)
+///
+/// **Cross-language parity** is verified by
+/// ``launcher/src-tauri/tests/diagrams_class_name_parity.rs`` (Rust)
+/// and ``tests/test_diagrams_class_name_parity.py`` (Python), both
+/// consuming the shared JSON fixture at
+/// ``tests/fixtures/diagrams_class_name_parity.json``.
 ///
 /// Distinct from ``sanitize_collection_prefix`` (slug → codegraph
-/// prefix) above: that one trims underscores (sanitised slugs are
-/// hyphen-shaped); this one preserves them (display names commonly
-/// contain underscores that the indexer KEEPS verbatim).
+/// prefix) above: that one is a separate algorithm for the codegraph
+/// fallback path (replaces non-alnum with ``_``, preserves
+/// underscores, capitalises first char) and is only used when the
+/// codegraph binding row hasn't been written yet. The two functions
+/// are deliberately distinct — codegraph keeps underscores because
+/// its on-disk schema convention does (``SimRacing_AI_CodeFunction``),
+/// diagrams strips them because ``sanitize_for_weaviate_class`` does.
 fn sanitize_diagrams_class_prefix(project_name: &str) -> String {
-    let mut out = String::with_capacity(project_name.len());
+    const FALLBACK: &str = "vct";
+    // Step 1 + 2: split on non-alphanumeric runs; PascalCase each part
+    // (uppercase first char, preserve the rest verbatim). Mirrors Python's
+    // `re.split(r"[^A-Za-z0-9]+", ...)` followed by `p[:1].upper() + p[1:]`.
+    let mut pascal = String::with_capacity(project_name.len());
+    let mut in_part = false;
+    let mut first_char_of_part = true;
     for ch in project_name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            out.push(ch);
+        if ch.is_ascii_alphanumeric() {
+            if !in_part {
+                in_part = true;
+                first_char_of_part = true;
+            }
+            if first_char_of_part {
+                // Uppercase first char of each part (ASCII-only matches
+                // Python's behaviour exactly for the chars we accept;
+                // non-ASCII chars are already filtered by the alnum check
+                // above, so the codepath never sees them here).
+                for upper in ch.to_uppercase() {
+                    pascal.push(upper);
+                }
+                first_char_of_part = false;
+            } else {
+                pascal.push(ch);
+            }
         } else {
-            out.push('_');
+            // Non-alphanumeric → separator; end current part.
+            in_part = false;
         }
     }
-    let mut chars = out.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_lowercase() => {
-            let mut result = String::with_capacity(out.len());
-            result.push(first.to_ascii_uppercase());
-            result.extend(chars);
-            result
-        }
-        _ => out,
+
+    // Step 3 + 4: fallback if empty or doesn't start with a letter.
+    // Python's `sanitize_for_weaviate_class` falls back to lowercase
+    // `"vct"` (Weaviate uppercases the first char on POST regardless).
+    if pascal.is_empty() {
+        return FALLBACK.to_string();
     }
+    let first = pascal.chars().next().expect("pascal non-empty above");
+    if !first.is_ascii_alphabetic() {
+        return FALLBACK.to_string();
+    }
+    pascal
 }
 
 /// Compute Claude Code's session-jsonl directory for a workspace.
@@ -1673,14 +1726,195 @@ kg_tier_full = 0.8
     }
 
     #[test]
-    fn sanitize_diagrams_class_prefix_matches_python_rule() {
-        // Mirrors python `_sanitize_collection_prefix` in weaviate MCP.
+    fn sanitize_diagrams_class_prefix_matches_python_canonical_rule() {
+        // v0.2.34 cr-b2 (2026-05-25): rule is now Python's canonical
+        // `vco_lib.project_init.sanitize_for_weaviate_class` (split on
+        // any non-alphanumeric run, PascalCase each part, concatenate).
+        // Replaces the pre-cr-b2 underscore-replace algorithm that
+        // diverged from the indexer's writer-side naming for any
+        // non-alphanumeric input. Cross-language parity for the wider
+        // input set is pinned by `diagrams_class_name_parity.rs`
+        // (integration test) against the shared JSON fixture.
+
+        // All-alphanumeric inputs (round-trip unchanged — these passed
+        // pre-cr-b2 too, but are pinned here as smoke).
         assert_eq!(sanitize_diagrams_class_prefix("Foo"), "Foo");
         assert_eq!(sanitize_diagrams_class_prefix("foo"), "Foo");
-        assert_eq!(sanitize_diagrams_class_prefix("Foo Bar"), "Foo_Bar");
-        assert_eq!(sanitize_diagrams_class_prefix("foo-bar"), "Foo_bar");
-        assert_eq!(sanitize_diagrams_class_prefix("My_Project"), "My_Project");
-        assert_eq!(sanitize_diagrams_class_prefix(""), "");
+        assert_eq!(sanitize_diagrams_class_prefix("VCODev"), "VCODev");
+        assert_eq!(sanitize_diagrams_class_prefix("SD15"), "SD15");
+
+        // Non-alphanumeric inputs (THE bug being fixed — these are the
+        // cases pre-cr-b2 returned divergent results for, silently
+        // breaking cross-project diagrams visibility).
+        assert_eq!(sanitize_diagrams_class_prefix("Foo Bar"), "FooBar");
+        assert_eq!(sanitize_diagrams_class_prefix("foo-bar"), "FooBar");
+        assert_eq!(sanitize_diagrams_class_prefix("My_Project"), "MyProject");
+        assert_eq!(sanitize_diagrams_class_prefix("my-project_v2"), "MyProjectV2");
+        assert_eq!(sanitize_diagrams_class_prefix("Foo.Bar"), "FooBar");
+        assert_eq!(sanitize_diagrams_class_prefix("Foo--Bar"), "FooBar");
+        assert_eq!(sanitize_diagrams_class_prefix("  spaced  out  "), "SpacedOut");
+        assert_eq!(
+            sanitize_diagrams_class_prefix("Foo Bar 2026-05-25"),
+            "FooBar20260525"
+        );
+
+        // Empty / all-symbol / leading-digit → fallback "vct" (Weaviate
+        // uppercases first char on POST regardless).
+        assert_eq!(sanitize_diagrams_class_prefix(""), "vct");
+        assert_eq!(sanitize_diagrams_class_prefix("---"), "vct");
+        assert_eq!(sanitize_diagrams_class_prefix("!!!"), "vct");
+        assert_eq!(sanitize_diagrams_class_prefix("..."), "vct");
+        assert_eq!(sanitize_diagrams_class_prefix("12_project"), "vct");
+        assert_eq!(sanitize_diagrams_class_prefix("123abc"), "vct");
+
+        // Unicode: non-ASCII chars are treated as separators (matches
+        // Python's `[^A-Za-z0-9]+` behaviour). `étude` → `["tude"]` →
+        // `"Tude"` (the `é` is stripped). Documented as expected
+        // behaviour in both the Python canonical and this port.
+        assert_eq!(sanitize_diagrams_class_prefix("étude"), "Tude");
+        assert_eq!(sanitize_diagrams_class_prefix("α-beta"), "Beta");
+
+        // Inputs with only leading/trailing non-alnum still have valid
+        // surviving parts — `_only_` → `["only"]` → `"Only"` (NOT
+        // fallback — there's a valid PascalCase result).
+        assert_eq!(sanitize_diagrams_class_prefix("_only_"), "Only");
+
+        // Idempotency: sanitiser output must be a fixed point.
+        for input in &["FooBar", "VCODev", "SD15", "MyProjectV2"] {
+            let once = sanitize_diagrams_class_prefix(input);
+            let twice = sanitize_diagrams_class_prefix(&once);
+            assert_eq!(once, twice, "Not idempotent for {:?}", input);
+        }
+    }
+
+    /// Cross-language parity test: load the shared JSON fixture (also
+    /// consumed by ``tests/test_diagrams_class_name_parity.py`` on the
+    /// Python side) and assert that the Rust sanitiser produces the
+    /// EXACT same output for every fixture row.
+    ///
+    /// Mechanism choice: in-process fixture-driven assertion. Cheaper
+    /// than the alternative (spinning up a cargo run binary or a full
+    /// end-to-end seed-project-and-read-back-from-DB test), and the
+    /// pure-function nature of ``sanitize_diagrams_class_prefix`` means
+    /// we don't gain anything from going through the DB layer for this
+    /// particular parity check (the access-list code path already has
+    /// its own integration test that hits the DB).
+    ///
+    /// Fixture path resolution: ``CARGO_MANIFEST_DIR`` at test time is
+    /// ``<repo>/launcher/src-tauri/vct-hub/``. The fixture lives at
+    /// ``<repo>/tests/fixtures/diagrams_class_name_parity.json`` —
+    /// three ``parent()`` calls to climb out of ``vct-hub/src-tauri/launcher/``.
+    #[test]
+    fn diagrams_class_name_parity_with_python_fixture() {
+        use std::path::PathBuf;
+
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            #[serde(rename = "_format_version", default)]
+            format_version: u32,
+            cases: Vec<(String, String)>,
+            fallback_cases: Vec<(String, String)>,
+            unicode_cases: Vec<(String, String)>,
+        }
+
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // <vct-hub> -> <src-tauri> -> <launcher> -> <repo>
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .expect("CARGO_MANIFEST_DIR doesn't have three parents — unexpected build layout");
+
+        let fixture_path = repo_root
+            .join("tests")
+            .join("fixtures")
+            .join("diagrams_class_name_parity.json");
+        assert!(
+            fixture_path.exists(),
+            "Parity fixture missing: {} — this file is shared with \
+             tests/test_diagrams_class_name_parity.py",
+            fixture_path.display(),
+        );
+
+        let raw = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|e| panic!("read fixture {}: {}", fixture_path.display(), e));
+        let fix: Fixture = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parse fixture {}: {}", fixture_path.display(), e));
+
+        assert_eq!(
+            fix.format_version, 1,
+            "Fixture _format_version != 1 — Python parity test may not \
+             know how to parse this version; coordinate the bump across \
+             both sides",
+        );
+
+        let mut failures: Vec<String> = Vec::new();
+        let all = fix
+            .cases
+            .iter()
+            .chain(fix.fallback_cases.iter())
+            .chain(fix.unicode_cases.iter());
+        for (input, expected) in all {
+            let actual = sanitize_diagrams_class_prefix(input);
+            if actual != *expected {
+                failures.push(format!(
+                    "  sanitize_diagrams_class_prefix({:?}) = {:?}, fixture says {:?}",
+                    input, actual, expected,
+                ));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "Rust diagrams sanitiser diverges from fixture in {} case(s):\n{}\n\
+             If this divergence is intentional, update the fixture, the \
+             Python canonical (vco_lib.project_init.sanitize_for_weaviate_class), \
+             AND the Python MCP fallback (claude_mcp_servers/weaviate_mcp/server.py::\
+             _sanitize_collection_prefix) in the same commit.",
+            failures.len(),
+            failures.join("\n"),
+        );
+    }
+
+    /// End-to-end DB seeding check: a project whose display name
+    /// contains non-alphanumeric chars must produce the canonical
+    /// ``<Pascal>_Diagrams`` class name when looked up through the
+    /// real hub resolver (``GET /api/v1/projects/{id}/config``).
+    ///
+    /// Pre-cr-b2 this test would have caught the bug: seeding "Foo Bar"
+    /// would have produced the divergent ``Foo_Bar_Diagrams`` rather
+    /// than the canonical ``FooBar_Diagrams``.
+    #[tokio::test]
+    async fn config_diagrams_access_list_handles_non_alnum_grantor_name() {
+        let (base, h) = spawn_config_api_hub().await;
+        // Grantor display name has a SPACE — the canary for the cr-b2 bug.
+        seed_project_with_distinct_name(&h, "p-spaced", "Foo Bar", "p-spaced");
+        seed_project_with_distinct_name(&h, "p-grantee", "Grantee", "p-grantee");
+        h.0.set_diagram_access("p-spaced", "p-grantee", "read")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-grantee/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let dg_list: Vec<String> = body
+            .get("diagrams_access_list")
+            .and_then(|v| v.as_array())
+            .expect("diagrams_access_list present")
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        // Post-cr-b2: must be the canonical PascalCase-concat form.
+        // Pre-cr-b2 would have produced "Foo_Bar_Diagrams" (underscore).
+        assert!(
+            dg_list.contains(&"FooBar_Diagrams".to_string()),
+            "expected canonical FooBar_Diagrams (cr-b2 canonical), got: {:?}. \
+             If this fails with 'Foo_Bar_Diagrams', sanitize_diagrams_class_prefix \
+             reverted to the pre-cr-b2 underscore-replace algorithm.",
+            dg_list,
+        );
     }
 
     #[tokio::test]

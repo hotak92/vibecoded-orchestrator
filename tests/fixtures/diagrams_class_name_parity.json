@@ -1,0 +1,45 @@
+{
+  "_comment": "Cross-language parity fixture for the canonical Diagrams class-prefix sanitiser — consumed by tests/test_diagrams_class_name_parity.py (Python) AND launcher/src-tauri/tests/diagrams_class_name_parity.rs (Rust). Each [input, expected_prefix] entry pins the behaviour of vco_lib.project_init.sanitize_for_weaviate_class (Python source-of-truth) AND launcher/src-tauri/vct-hub/src/config_api.rs::sanitize_diagrams_class_prefix (Rust mirror) AND claude_mcp_servers/weaviate_mcp/server.py::_sanitize_collection_prefix (Python MCP — delegates to vco_lib.project_init). Drift between ANY of the three layers fails this fixture's parity tests. The bug being pinned (cr-b2, 2026-05-25): the Rust + MCP layers used a divergent underscore-replace algorithm for non-alphanumeric inputs, silently breaking cross-project diagrams visibility. See knowledge/concepts/cross-language-sanitiser-divergence-cr-b2.md for the post-mortem.",
+  "_format_version": 1,
+  "cases": [
+    ["Foo Bar", "FooBar"],
+    ["my-project_v2", "MyProjectV2"],
+    ["VCODev", "VCODev"],
+    ["SD15", "SD15"],
+    ["foo", "Foo"],
+    ["Foo", "Foo"],
+    ["Foo Bar 2026-05-25", "FooBar20260525"],
+    ["Foo.Bar", "FooBar"],
+    ["Foo/Bar", "FooBar"],
+    ["Foo--Bar", "FooBar"],
+    ["  spaced  out  ", "SpacedOut"],
+    ["My_Project", "MyProject"],
+    ["SimRacing_AI", "SimRacingAI"],
+    ["VibeCoded Orchestrator", "VibeCodedOrchestrator"],
+    ["vibecoded-orchestrator", "VibecodedOrchestrator"],
+    ["snake_case_name", "SnakeCaseName"],
+    ["Already CamelCase", "AlreadyCamelCase"],
+    ["A", "A"],
+    ["a", "A"],
+    ["AB", "AB"],
+    ["ab", "Ab"],
+    ["a b c", "ABC"]
+  ],
+  "_comment_cases": "All entries above MUST produce the listed output across all three layers. Note that this rule is INTENTIONALLY DIFFERENT from canonical_class_prefix (project_naming.json) — that one preserves underscores ('SimRacing_AI' stays 'SimRacing_AI'), this one drops them ('SimRacing_AI' → 'SimRacingAI'). The two rules coexist by historical accident: canonical_class_prefix is used for code-graph collections (CodeFunction/CodeClass/etc.) where the on-disk schema convention keeps underscores; sanitize_for_weaviate_class is used for KG/Dev/Diagrams collections where it doesn't. See knowledge/concepts/canonical-class-prefix-design.md for the history of the two-sanitiser split.",
+  "fallback_cases": [
+    ["", "vct"],
+    ["---", "vct"],
+    ["!!!", "vct"],
+    ["...", "vct"],
+    ["12_project", "vct"],
+    ["123abc", "vct"],
+    ["9", "vct"]
+  ],
+  "unicode_cases": [
+    ["_only_", "Only"],
+    ["étude", "Tude"],
+    ["α-beta", "Beta"]
+  ],
+  "_comment_fallback": "Inputs that fall back to 'vct' (lowercase, intentional — Weaviate uppercases first char on POST regardless, and the prefix flags the class as installer-managed). Triggered when nothing survives the split-on-non-alphanumeric pass, OR when the surviving PascalCase result starts with a non-letter (leading-digit case '12_project' / '123abc' / '9' — '12' and '123' are kept as digits but the leading digit is invalid for a Weaviate class).",
+  "_comment_unicode": "Non-ASCII chars are treated as separators (regex [^A-Za-z0-9]+), so 'étude' loses the 'é' and produces 'Tude' (matches the existing install.py / _derive_project_kg_name behaviour exactly). '_only_' splits to ['only'] → 'Only' (no fallback — there's a valid surviving part). Unicode-aware sanitisation is out of scope — would require a migration plan for any project that already exists with a stripped name."
+}
