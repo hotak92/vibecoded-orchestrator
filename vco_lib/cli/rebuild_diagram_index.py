@@ -71,40 +71,32 @@ EXIT_IDEMPOTENCY_BROKEN = 3
 
 
 def _resolve_project_folder(project_id: str) -> Path:
-    """Phase 0.B dependency wrapper.
+    """Phase 0.B Part 2 dependency wrapper.
 
-    Resolves a project slug / rowid to its on-disk folder. Tests stub
-    this; production wires it to
-    ``vco_lib.config_projection.resolve_project_folder``.
+    Resolves a project id (UUID) or slug to its on-disk folder via
+    :func:`vco_lib.config_projection.resolve_project_folder`. Kept as a
+    thin wrapper (rather than a direct import) so tests can monkey-patch
+    ``_resolve_project_folder`` on this module without touching the
+    shared ``config_projection`` symbol.
+
+    Raises:
+        LookupError: when no project matches the supplied id/slug.
     """
-    # Phase 0.B dependency — actual import wired post-merge.
-    try:
-        from vco_lib.config_projection import resolve_project_folder  # type: ignore  # noqa: E501
-    except ImportError as exc:  # pragma: no cover — exercised post-merge
-        raise RuntimeError(
-            "vco_lib.config_projection.resolve_project_folder() is not "
-            "available. This subcommand requires Phase 0.B (Part 2) to be "
-            "merged. If you're running tests, monkey-patch "
-            "`_resolve_project_folder` on `vco_lib.cli.rebuild_diagram_index`."
-        ) from exc
+    from vco_lib.config_projection import resolve_project_folder
     return resolve_project_folder(project_id)
 
 
 def _list_registered_projects() -> Iterable[Mapping[str, str]]:
-    """Phase 0.B dependency wrapper.
+    """Phase 0.B Part 2 dependency wrapper.
 
-    Iterable of ``{"id": str, "slug": str, "folder": str}`` dicts.
-    Drives ``--all``. Tests stub this.
+    Iterable of ``{"id", "name", "slug", "folder_path", "folder"}`` dicts.
+    ``folder`` is a back-compat alias for ``folder_path`` — this CLI's
+    consumer reads ``project.get("folder")`` so it keeps working without
+    a coordinated update. Drives ``--all``. Tests can monkey-patch this
+    wrapper OR stub the launcher DB and let it flow through the real
+    :func:`vco_lib.config_projection.list_registered_projects`.
     """
-    # Phase 0.B dependency — actual import wired post-merge.
-    try:
-        from vco_lib.config_projection import list_registered_projects  # type: ignore  # noqa: E501
-    except ImportError as exc:  # pragma: no cover — exercised post-merge
-        raise RuntimeError(
-            "vco_lib.config_projection.list_registered_projects() is not "
-            "available. This subcommand requires Phase 0.B (Part 2) to be "
-            "merged."
-        ) from exc
+    from vco_lib.config_projection import list_registered_projects
     return list_registered_projects()
 
 

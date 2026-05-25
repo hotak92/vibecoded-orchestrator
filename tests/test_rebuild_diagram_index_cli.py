@@ -247,27 +247,44 @@ def test_prune_removes_orphan_sidecar(stubbed_resolver, project_folder, capsys):
 
 
 def test_all_iterates_projects(monkeypatch, tmp_path, capsys):
+    """``--all`` flows through the real config_projection helpers when a
+    seeded launcher DB is in place.
+
+    This exercises the Phase 0.B Part 2 path end-to-end: the test stubs
+    the launcher DB (not the helper), so ``list_registered_projects``
+    and ``resolve_project_folder`` run for real. Regression guard for
+    code-review B1: prior to Part 2, ``--all`` died with
+    ``RuntimeError("Phase 0.B Part 2 not merged")``.
+    """
     # Two projects, each with one diagram.
     p1_folder = tmp_path / "p1"
     p2_folder = tmp_path / "p2"
     _write_mermaid(p1_folder / ".claude" / "diagrams" / "gui" / "a.mmd")
     _write_mermaid(p2_folder / ".claude" / "diagrams" / "arch" / "b.mmd")
 
-    folder_map = {"p1": p1_folder, "p2": p2_folder}
+    # Seed a real launcher DB with the schema config_projection reads.
+    import sqlite3
+    db = tmp_path / "launcher.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "folder_path TEXT NOT NULL, slug TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO projects (id, name, folder_path, slug) VALUES (?,?,?,?)",
+        ("p1", "AlphaProj", str(p1_folder), "p1"),
+    )
+    conn.execute(
+        "INSERT INTO projects (id, name, folder_path, slug) VALUES (?,?,?,?)",
+        ("p2", "BravoProj", str(p2_folder), "p2"),
+    )
+    conn.commit()
+    conn.close()
 
-    def _resolve(pid: str) -> Path:
-        if pid not in folder_map:
-            raise LookupError(pid)
-        return folder_map[pid]
-
-    def _list() -> Iterable[Mapping[str, str]]:
-        return [
-            {"id": "p1", "slug": "p1", "folder": str(p1_folder)},
-            {"id": "p2", "slug": "p2", "folder": str(p2_folder)},
-        ]
-
-    monkeypatch.setattr(rdi, "_resolve_project_folder", _resolve)
-    monkeypatch.setattr(rdi, "_list_registered_projects", _list)
+    # Pin the launcher-DB resolver inside config_projection so both
+    # helpers transparently read our tmp DB.
+    from vco_lib import config_projection as cp
+    monkeypatch.setattr(cp, "_resolve_launcher_db_path", lambda: db)
 
     code = rdi.cmd_rebuild_diagram_index(_args(all_=True, json_mode=True))
     assert code == rdi.EXIT_OK
@@ -279,6 +296,43 @@ def test_all_iterates_projects(monkeypatch, tmp_path, capsys):
     for p in payload["projects"]:
         assert p["total"] == 1
         assert p["indexed"] == 1
+
+
+def test_all_iterates_projects_deterministic_order(monkeypatch, tmp_path, capsys):
+    """``--all`` iterates projects in name-sorted order — deterministic
+    across runs so CI diffs and progress UX stay stable."""
+    folders = {}
+    for slug in ("zulu", "alpha", "mike"):
+        f = tmp_path / slug
+        # Diagrams require a category subdirectory (see the
+        # diagram_paths flat-folder rejection rule).
+        _write_mermaid(f / ".claude" / "diagrams" / "gui" / "x.mmd")
+        folders[slug] = f
+
+    import sqlite3
+    db = tmp_path / "launcher.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+        "folder_path TEXT NOT NULL, slug TEXT NOT NULL)"
+    )
+    # Insert in NON-alphabetical order; helper must sort by name.
+    for slug, name in (("zulu", "Zulu"), ("alpha", "Alpha"), ("mike", "Mike")):
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, slug) VALUES (?,?,?,?)",
+            (slug, name, str(folders[slug]), slug),
+        )
+    conn.commit()
+    conn.close()
+
+    from vco_lib import config_projection as cp
+    monkeypatch.setattr(cp, "_resolve_launcher_db_path", lambda: db)
+
+    code = rdi.cmd_rebuild_diagram_index(_args(all_=True, json_mode=True))
+    assert code == rdi.EXIT_OK
+    payload = _read_payload_from_stdout(capsys)
+    order = [p["project_id"] for p in payload["projects"]]
+    assert order == ["alpha", "mike", "zulu"]
 
 
 def test_dry_run_writes_nothing(stubbed_resolver, project_folder, capsys):
