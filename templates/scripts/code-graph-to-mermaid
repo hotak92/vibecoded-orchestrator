@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Code Graph to Mermaid wrapper — Phase 3 of the diagrams-integration plan.
+#
+# Thin shim around `vco codegraph-diagram` for users who haven't put
+# `vco` on their PATH and prefer the .claude/scripts/ entry point
+# (matching the layout of code-graph-query / kg-search / kg-info).
+#
+# Usage: code-graph-to-mermaid <seed_symbol> [--hops N] [--scope ...]
+#
+# See `docs/CODEGRAPH_DIAGRAM.md` for the full flag reference.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Probe canonical .venv locations in priority order — see code-graph-query
+# for the rationale (OSS install root precedes the legacy
+# claude_mcp_servers/.venv layout).
+VENV_PATH=""
+for _c in "$SCRIPT_DIR/../../.venv" "$SCRIPT_DIR/../../claude_mcp_servers/.venv"; do
+    if [ -x "$_c/bin/python" ] || [ -x "$_c/bin/python3" ]; then
+        VENV_PATH="$_c"
+        break
+    fi
+done
+
+if [ -n "$VENV_PATH" ]; then
+    # shellcheck disable=SC1090
+    source "$VENV_PATH/bin/activate"
+fi
+
+# Resolve project-root so `python -m vco_lib.cli` can find the package
+# regardless of the user's cwd.
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
+exec python3 -m vco_lib.cli codegraph-diagram "$@"
