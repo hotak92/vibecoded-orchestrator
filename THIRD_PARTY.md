@@ -23,9 +23,9 @@ For the launcher binary's compiled-in Rust crates, see `launcher/dist/THIRD_PART
 
 ### Excalidraw MCP — `excalidraw-mcp-server@2.0.0` (vendored in-tree)
 
-- **License:** MIT, Copyright (c) 2025 Debu Sinha (`claude_mcp_servers/excalidraw_mcp_fork/LICENSE`)
-- **Pin:** `bundled_mcp_versions.toml::[npm.excalidraw_mcp]` (`file:claude_mcp_servers/excalidraw_mcp_fork`)
-- **Vendor audit:** `claude_mcp_servers/excalidraw_mcp_fork/VENDORED.md`
+- **License:** MIT, Copyright (c) 2025 Debu Sinha (`vco_lib/excalidraw_mcp_fork/LICENSE`)
+- **Pin:** `bundled_mcp_versions.toml::[npm.excalidraw_mcp]` (`file:vco_lib/excalidraw_mcp_fork`)
+- **Vendor audit:** `vco_lib/excalidraw_mcp_fork/VENDORED.md`
 - **Wrapped by:** `claude_mcp_servers/wrappers/excalidraw_proxy.py`
 - **Upstream:** <https://github.com/debu-sinha/excalidraw-mcp-server>
 
@@ -69,6 +69,6 @@ For the launcher binary's compiled-in Rust crates, see `launcher/dist/THIRD_PART
 
 ## License compatibility note
 
-The orchestrator is AGPL-3.0; all bundled third-party software is under permissive (MIT, Apache 2.0, BSD) or LGPL licenses. AGPL is compatible with redistribution of MIT/Apache/BSD-licensed dependencies under their own license terms. Vendored copies (such as `claude_mcp_servers/excalidraw_mcp_fork/`) retain their original LICENSE files verbatim; modifying any of those vendor directories triggers the vendoring discipline in their respective `VENDORED.md` files.
+The orchestrator is AGPL-3.0; all bundled third-party software is under permissive (MIT, Apache 2.0, BSD) or LGPL licenses. AGPL is compatible with redistribution of MIT/Apache/BSD-licensed dependencies under their own license terms. Vendored copies (such as `vco_lib/excalidraw_mcp_fork/`) retain their original LICENSE files verbatim; modifying any of those vendor directories triggers the vendoring discipline in their respective `VENDORED.md` files.
 
 If you're packaging vibecoded-orchestrator for redistribution, this file plus the per-dependency LICENSE files inside each vendor directory satisfies the MIT/Apache attribution requirements. The AGPL terms apply to the orchestrator code itself.

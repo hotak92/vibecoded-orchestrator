@@ -17,10 +17,17 @@ Spawn shape
 Unlike :mod:`mermaid_proxy` (which spawns ``npx -y claude-mermaid@<pin>``
 because Mermaid MCP is a published registry package), Excalidraw's
 ``bundled_mcp_versions.toml::[npm.excalidraw_mcp]`` uses a
-``file:claude_mcp_servers/excalidraw_mcp_fork`` pin. The vendored copy
-lives in-tree and is invoked directly via Node:
+``file:vco_lib/excalidraw_mcp_fork`` pin. The vendored copy lives
+in-tree and is invoked directly via Node:
 
-    node <repo-root>/claude_mcp_servers/excalidraw_mcp_fork/dist/mcp/index.js
+    node <repo-root>/vco_lib/excalidraw_mcp_fork/dist/mcp/index.js
+
+(The vendored tree moved from ``claude_mcp_servers/`` to ``vco_lib/``
+in v0.2.34 so it ships in the Python wheel — see
+``vco_lib/bundled_versions.py`` for the rationale. The resolver itself
+is unchanged: it still computes ``repo_root / <pin-relative-path>``,
+which now resolves to the new location automatically because the pin
+in the .toml moved too.)
 
 This avoids:
 
@@ -232,7 +239,7 @@ def _resolve_upstream_argv() -> list[str]:
                 f"[excalidraw_proxy] ERROR: vendored entry point not "
                 f"found at {entry}. Check that {candidate} contains the "
                 f"vendored excalidraw-mcp-server tree (see "
-                f"claude_mcp_servers/excalidraw_mcp_fork/VENDORED.md).\n"
+                f"vco_lib/excalidraw_mcp_fork/VENDORED.md).\n"
             )
             raise SystemExit(1)
         return [node, str(entry)]

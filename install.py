@@ -2913,7 +2913,9 @@ def main() -> int:
     # Phase 2 (diagrams plan): pre-pin the vendored Excalidraw MCP
     # (see `bundled_mcp_versions.toml::[npm.excalidraw_mcp]`). The pin
     # is a `file:` URL pointing at
-    # `claude_mcp_servers/excalidraw_mcp_fork/`; the install branch in
+    # `vco_lib/excalidraw_mcp_fork/` (moved from
+    # `claude_mcp_servers/excalidraw_mcp_fork/` in v0.2.34 so the
+    # vendored tree ships in the Python wheel); the install branch in
     # `_install_pinned_npm` calls `npm install -g <vendor-dir>` rather
     # than fetching from the registry. Default-disabled per project
     # (same posture as Mermaid). Opt-out: VCT_SKIP_EXCALIDRAW=1.
@@ -11479,7 +11481,8 @@ def _build_python_mcp_entries(
     # excalidraw (Phase 2 — diagrams plan)
     # Wrapper MCP that proxies the in-tree-vendored
     # `excalidraw-mcp-server` (see
-    # claude_mcp_servers/excalidraw_mcp_fork/VENDORED.md). Spawned as
+    # vco_lib/excalidraw_mcp_fork/VENDORED.md — moved here from
+    # claude_mcp_servers/excalidraw_mcp_fork/ in v0.2.34). Spawned as
     # `<venv-python> -m claude_mcp_servers.wrappers.excalidraw_proxy`
     # — the wrapper itself spawns Node on the vendored entry point
     # once it's resolved the per-project tool allowlist. Mirrors the

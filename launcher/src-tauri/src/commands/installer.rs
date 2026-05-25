@@ -7970,7 +7970,13 @@ mod tests {
             // the manifest to existing installs — same fail-safe
             // self-reference shape used for
             // `orchestrator-managed-paths.txt` itself.
-            "bundled_mcp_versions.toml",
+            //
+            // v0.2.34: the .toml moved from the repo root into
+            // `vco_lib/` so it ships in the Python wheel — see
+            // `vco_lib/bundled_versions.py` docstring for the
+            // wheel-packaging rationale. Whitelist entry updated in
+            // lockstep so update propagation still finds it.
+            "vco_lib/bundled_mcp_versions.toml",
         ];
         let actual: Vec<&str> = ORCHESTRATOR_MANAGED_PATHS.iter().copied().collect();
         assert_eq!(

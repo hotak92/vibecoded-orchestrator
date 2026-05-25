@@ -49,11 +49,11 @@ If we ever need to patch (e.g. upstream removes a tool we depend on, or a securi
 
 ## How VCO consumes it
 
-1. **Pin reference**: `bundled_mcp_versions.toml::[npm.excalidraw_mcp]` carries `package = "file:claude_mcp_servers/excalidraw_mcp_fork"` and `version = "git+vendored-2.0.0-2026-05-25"`. The `file:` prefix tells `install.py::_install_pinned_npm` to take the local-path branch (`npm install -g <local-dir>`) instead of the registry branch.
+1. **Pin reference**: `bundled_mcp_versions.toml::[npm.excalidraw_mcp]` carries `package = "file:vco_lib/excalidraw_mcp_fork"` and `version = "git+vendored-2.0.0-2026-05-25"`. The `file:` prefix tells `install.py::_install_pinned_npm` to take the local-path branch (`npm install -g <local-dir>`) instead of the registry branch. (Moved from `claude_mcp_servers/excalidraw_mcp_fork/` to `vco_lib/excalidraw_mcp_fork/` in v0.2.34 so the vendored tree ships in the Python wheel — see `vco_lib/bundled_versions.py` docstring for the rationale.)
 
 2. **Wrapper MCP**: `claude_mcp_servers/wrappers/excalidraw_proxy.py` spawns the upstream as:
    ```
-   <node> <vendor>/dist/mcp/index.js
+   <node> <repo-root>/vco_lib/excalidraw_mcp_fork/dist/mcp/index.js
    ```
    The wrapper proxies stdio JSON-RPC and applies per-project allowlist + scoped-path enforcement on tool calls. See `claude_mcp_servers/wrappers/_base.py` for the base contract.
 
@@ -65,7 +65,7 @@ If we ever need to patch (e.g. upstream removes a tool we depend on, or a securi
 
 1. Run `npm view excalidraw-mcp-server` to confirm a newer version is published.
 2. `npm pack excalidraw-mcp-server@<new-ver>` → unpack into a scratch directory.
-3. Audit the diff vs the currently vendored version: `diff -r claude_mcp_servers/excalidraw_mcp_fork/dist /tmp/scratch/package/dist` (focus on `dist/mcp/`).
+3. Audit the diff vs the currently vendored version: `diff -r vco_lib/excalidraw_mcp_fork/dist /tmp/scratch/package/dist` (focus on `dist/mcp/`).
 4. If clean (no surprise dependencies, no malicious-looking additions, license still MIT): replace the directory contents, update `version` in `bundled_mcp_versions.toml::[npm.excalidraw_mcp]`, update this file's "Vendor date" + adjust the version reference, run `pytest tests/test_excalidraw_proxy.py tests/test_install_excalidraw_pinned_npm.py`, ship in a VCO release with a changelog note.
 5. If the diff is dirty: file an upstream issue, defer the bump.
 

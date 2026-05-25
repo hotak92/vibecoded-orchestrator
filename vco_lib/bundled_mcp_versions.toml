@@ -50,9 +50,14 @@ shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
 # debu-sinha) — MIT-licensed, actively maintained, bundles
 # `@excalidraw/excalidraw@0.18.0` matching our [npm.excalidraw_lib] pin
 # below — and vendored it in-tree at
-# `claude_mcp_servers/excalidraw_mcp_fork/`.
+# `vco_lib/excalidraw_mcp_fork/`.
 #
-# See `claude_mcp_servers/excalidraw_mcp_fork/VENDORED.md` for the full
+# (v0.2.34: vendored tree moved from `claude_mcp_servers/` to
+# `vco_lib/` so it ships in the Python wheel — see
+# `vco_lib/bundled_versions.py` docstring for the wheel-packaging
+# rationale.)
+#
+# See `vco_lib/excalidraw_mcp_fork/VENDORED.md` for the full
 # audit trail (upstream URL, commit/version, modifications, update
 # policy).
 #
@@ -63,7 +68,7 @@ shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
 # show provenance; `shasum` is empty because integrity is verified by
 # the on-disk tree (git tracks the vendored files), not by npm's
 # tarball integrity field.
-package = "file:claude_mcp_servers/excalidraw_mcp_fork"
+package = "file:vco_lib/excalidraw_mcp_fork"
 version = "git+vendored-2.0.0-2026-05-25"
 shasum  = ""
 

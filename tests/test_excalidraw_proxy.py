@@ -41,7 +41,11 @@ sys.path.insert(0, str(REPO_ROOT))
 _FILE_PIN_MANIFEST = {
     "npm": {
         "excalidraw_mcp": {
-            "package": "file:claude_mcp_servers/excalidraw_mcp_fork",
+            # Moved from `claude_mcp_servers/excalidraw_mcp_fork` to
+            # `vco_lib/excalidraw_mcp_fork` in v0.2.34 so the vendored
+            # tree ships in the Python wheel (see
+            # vco_lib/bundled_versions.py docstring).
+            "package": "file:vco_lib/excalidraw_mcp_fork",
             "version": "git+vendored-2.0.0-2026-05-25",
             "shasum": "",
         },
