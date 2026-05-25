@@ -14,7 +14,7 @@ sentence-transformers>=5.0.0
 #      imports fail, FastAPI app exits → restart loop forever.
 #      Validated 2026-05-16 against 4.57.6.
 transformers>=4.40.0,<4.50.0
-fastapi>=0.136.1
+fastapi>=0.136.3
 uvicorn>=0.46.0
 pydantic>=2.13.3
 requests>=2.33.1
