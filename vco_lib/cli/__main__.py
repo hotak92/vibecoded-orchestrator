@@ -24,6 +24,7 @@ from typing import Optional, Sequence
 from vco_lib.cli import codegraph_diagram as _codegraph_diagram
 from vco_lib.cli import rebuild_diagram_index as _rebuild_diagram_index
 from vco_lib.cli import verify as _verify
+from vco_lib.cli import verify_diagrams as _verify_diagrams
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -38,6 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
     _verify.add_subparsers(sub)
+    _verify_diagrams.add_subparsers(sub)
     _rebuild_diagram_index.add_subparsers(sub)
     _codegraph_diagram.add_subparsers(sub)
     return parser
