@@ -4,11 +4,11 @@
   // that lists project diagrams (Mermaid + Excalidraw), previews them,
   // and exposes snapshot + access controls.
   //
-  // Sibling Phase 1.1 (Tauri commands) and 1.5.A (diagram_indexer.py)
-  // land in parallel; the `invoke<...>` calls here are stubs against
-  // the plan's command signatures. Until the backend lands they fail
-  // with a clear "command not found" error which the toast layer
-  // surfaces — no silent UI breakage.
+  // Backend wiring (v0.2.34 Agent D): all `invoke<...>` calls below
+  // hit real Tauri commands — `read_project_diagram_source`,
+  // `write_text_file`, `resolve_project_path`, and
+  // `subscribe_to_diagram_changes` were the four missing commands
+  // (added in v0.2.34); the rest were in v0.2.33.
   //
   // Layout: split-pane (CSS grid). Left = diagram list + add modal.
   // Right = preview of the selected diagram with snapshot toolbar.
@@ -44,10 +44,11 @@
       });
       moduleActive = active;
     } catch (e) {
-      // Phase 1.1 not landed yet → assume active so the rest of the UI
-      // is reachable. The downstream `list_project_diagrams` call will
-      // surface its own error if THAT command is also missing.
-      console.warn('[diagrams] is_project_module_active not available:', e);
+      // Defensive fallback — `is_project_module_active` is wired since
+      // v0.2.33 and v0.2.34 added a backfill for orchestrator-bundled
+      // modules so an absent row resolves to `true` rather than `false`.
+      // This branch now only fires on Tauri-IPC-level errors.
+      console.warn('[diagrams] is_project_module_active failed:', e);
       moduleActive = true;
     }
   }
@@ -76,12 +77,15 @@
   let diagrams = $state<DiagramRow[]>([]);
   let loading = $state(true);
   let selectedId = $state<number | null>(null);
-  // 5-second fallback polling kicks in if `diagram-changed` events are
-  // not delivered within 10s of mount (Phase 1.5.A may not have wired
-  // the chokidar push yet at merge time). pollTimer is `$state` so the
-  // `Live updates pending` badge re-renders when it transitions
-  // null → number; the handle itself never gets used reactively, only
-  // the truthiness of "are we polling?".
+  // 5-second polling fallback. Kicks in if `diagram-changed` events
+  // don't arrive within 10s of mount — soft-fail safety net for the
+  // case where `subscribe_to_diagram_changes` short-circuited on a
+  // watcher init error (read-only volume, permission denied, etc).
+  // The Tauri command always returns Ok so the frontend can't tell
+  // setup failed; the 10s probe is how we self-heal to polling.
+  // pollTimer is `$state` so the `Live updates pending` badge
+  // re-renders when it transitions null → number; the handle itself
+  // never gets used reactively, only the truthiness of "are we polling?".
   let livePushOk = $state(false);
   let pollTimer = $state<ReturnType<typeof setInterval> | null>(null);
 
@@ -382,9 +386,9 @@
   }
 
   async function readFile(absPath: string): Promise<string> {
-    // Backend command will resolve relative `file_path` against the
-    // project root. Phase 1.1 owns the implementation; we call it by
-    // name so the merge integrator can wire it up.
+    // Backend resolves `relPath` against the project root and
+    // enforces the `.claude/diagrams/` scoped boundary (see
+    // `commands/diagrams_cmd.rs::read_project_diagram_source`).
     return await invoke<string>('read_project_diagram_source', {
       projectId,
       relPath: absPath,
@@ -548,8 +552,11 @@
         }
       }, 10_000);
     } catch (e) {
+      // The backend command returns Ok even on watcher init failure
+      // (soft-fail design — see `commands/diagram_watcher.rs`), so we
+      // only reach this branch on a Tauri-IPC-level error. Polling
+      // fallback keeps the feature usable.
       console.warn('[diagrams] subscribe_to_diagram_changes failed:', e);
-      // Backend not wired yet → poll.
       pollTimer = setInterval(() => {
         void load();
       }, 5000);

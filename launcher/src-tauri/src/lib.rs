@@ -1302,6 +1302,16 @@ pub fn run() {
             // render the diagrams UI or the "module disabled" overlay.
             // Missing → tab silently treats every project as inactive.
             commands::diagrams_cmd::is_project_module_active,
+            // v0.2.34 Agent D — four missing commands the DiagramsTab +
+            // ExcalidrawEditor invoke for their core load/save/open/
+            // live-push paths. Pre-v0.2.34 each call threw
+            // "command not found" and the frontend silently degraded
+            // (empty preview, 5s polling fallback). See
+            // `.claude/context/plans/diagrams-frontend-wiring-handoff-2026-05-25.md`.
+            commands::diagrams_cmd::read_project_diagram_source,
+            commands::diagrams_cmd::write_text_file,
+            commands::diagrams_cmd::resolve_project_path,
+            commands::diagram_watcher::subscribe_to_diagram_changes,
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
