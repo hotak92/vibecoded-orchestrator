@@ -171,7 +171,7 @@
   .ps-form { background: rgba(255,255,255,0.04); padding: 12px; border-radius: 6px; margin-bottom: 16px; }
   .ps-form-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
   .ps-form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: #888; }
-  .ps-form-grid input, .ps-form-grid select {
+  .ps-form-grid input {
     background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12);
     color: inherit; padding: 5px 8px; border-radius: 4px; font-size: 12px;
   }

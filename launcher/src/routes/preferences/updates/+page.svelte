@@ -279,7 +279,7 @@
 
   {#if confirmingApply}
     <div class="upd-modal-backdrop" role="presentation" onclick={() => (confirmingApply = false)}>
-      <div class="upd-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="upd-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
         <h3>Update launcher?</h3>
         <p>
           This will pull the latest changes from <code>{status?.branch || 'main'}</code>,
@@ -306,7 +306,7 @@
         if (!resyncing) nonFastForward = null;
       }}
     >
-      <div class="upd-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+      <div class="upd-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
         <h3>Local clone diverged from upstream</h3>
         <p>
           Your local copy can't fast-forward to the latest version because history

@@ -43,7 +43,7 @@
   //   The modal kicks off the enrichment loop automatically on mount;
   //   onClose fires after the user dismisses any final-state UI.
 
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import { invoke, listen } from '$lib/tauri';
   import type {
@@ -79,13 +79,15 @@
   };
 
   let rows = $state<PerClassRow[]>(
-    collections.map((c) => ({
-      name: c.name,
-      new_slot: c.new_slot,
-      status: 'pending',
-      report: null,
-      error: null,
-    })),
+    untrack(() =>
+      collections.map((c) => ({
+        name: c.name,
+        new_slot: c.new_slot,
+        status: 'pending' as PerClassStatus,
+        report: null,
+        error: null,
+      })),
+    ),
   );
 
   // Which collection is currently being processed (index into `rows`).

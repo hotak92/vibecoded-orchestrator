@@ -74,10 +74,18 @@
   {:else}
     <div class="pl-grid">
       {#each store.projects as p (p.id)}
-        <article
+        <div
           class="pl-card"
           class:active={active?.id === p.id}
+          role="button"
+          tabindex="0"
           onclick={() => open(p.id)}
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              open(p.id);
+            }
+          }}
         >
           <header class="pl-card-head">
             <h3>{p.name}</h3>
@@ -89,7 +97,7 @@
           <p class="pl-card-meta">
             <span>{p.host?.toUpperCase() ?? 'BASE'}</span>
           </p>
-        </article>
+        </div>
       {/each}
     </div>
   {/if}
