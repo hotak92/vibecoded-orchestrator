@@ -118,11 +118,18 @@ def _index_diagram(file_path: Path, project_id: str, chat_id: Optional[str] = No
     return index_diagram(file_path, project_id, chat_id)
 
 
-def _drop_weaviate_diagram(content_hash: str, project_id: str) -> bool:
-    """Orphan-prune wrapper. Best-effort — Weaviate side of orphan cleanup."""
-    from vco_lib.diagram_indexer import drop_diagram_by_hash
+def _drop_diagram_full_cascade(diagram_path: Path, project_id: str) -> bool:
+    """Orphan-prune wrapper. Cascades SQLite + sidecar + Weaviate cleanup
+    via drop_diagram_by_path. Returns True if any layer reported a delete.
+    Best-effort across layers; failures are logged inside the indexer."""
+    from vco_lib.diagram_indexer import drop_diagram_by_path
     try:
-        return bool(drop_diagram_by_hash(content_hash, project_id))
+        result = drop_diagram_by_path(
+            diagram_path,
+            project_id=project_id,
+            remove_sidecar=False,  # caller already walks sidecars
+        )
+        return any(result.values())
     except Exception:  # pragma: no cover — best-effort cleanup
         return False
 
@@ -284,14 +291,9 @@ def _handle_orphans(
         # Diagram is gone → orphan sidecar.
         report.orphans.append(str(sidecar))
         if prune and not dry_run:
-            # Drop the Weaviate object first (best-effort; the indexer
-            # silently no-ops when Weaviate is unreachable / unconfigured).
-            try:
-                content_hash = json.loads(sidecar.read_text(encoding="utf-8")).get("content_hash", "")
-            except (OSError, ValueError):
-                content_hash = ""
-            if content_hash:
-                _drop_weaviate_diagram(content_hash, report.project_id)
+            # Full cascade: SQLite row + Weaviate object (sidecar removed
+            # explicitly below since the CLI is walking sidecars).
+            _drop_diagram_full_cascade(diagram_path, report.project_id)
             try:
                 sidecar.unlink()
                 report.orphans_pruned += 1

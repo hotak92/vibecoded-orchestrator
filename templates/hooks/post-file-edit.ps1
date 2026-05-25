@@ -168,27 +168,12 @@ if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) 
                 -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
         }
 
-        # vct-hub notification (best-effort, 404 silent until Phase 1.2).
-        $hubPort = if ($env:VCT_HUB_PORT) { $env:VCT_HUB_PORT } else { "7700" }
-        $hubTokenFile = Join-Path (if ($env:VCT_STATE_DIR) { $env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }) "hub.token"
-        $hubToken = ""
-        if ($env:VCT_HUB_TOKEN) {
-            $hubToken = $env:VCT_HUB_TOKEN
-        } elseif (Test-Path $hubTokenFile) {
-            try { $hubToken = (Get-Content $hubTokenFile -Raw -ErrorAction Stop).Trim() } catch { $hubToken = "" }
-        }
-        if ($hubToken) {
-            $body = @{ file_path = $EditedFile; change = "edit" } | ConvertTo-Json -Compress
-            try {
-                Invoke-RestMethod -Method POST `
-                    -Uri "http://127.0.0.1:${hubPort}/api/v1/notify/diagram-changed" `
-                    -Headers @{ Authorization = "Bearer $hubToken" } `
-                    -ContentType "application/json" `
-                    -Body $body -TimeoutSec 2 -ErrorAction SilentlyContinue | Out-Null
-            } catch {
-                # 404 / hub down — silent best-effort
-            }
-        }
+        # Live UI refresh in DiagramsTab is driven by the launcher's
+        # frontend file-watcher (chokidar) — NOT a hub broadcast. The
+        # original Phase 1.5.A design called for /api/v1/notify/diagram-changed
+        # but pub/sub from hub → frontend would need SSE/WebSocket
+        # plumbing the launcher does not have today. Re-evaluate if
+        # multi-machine notification ever becomes a real requirement.
     }
 }
 

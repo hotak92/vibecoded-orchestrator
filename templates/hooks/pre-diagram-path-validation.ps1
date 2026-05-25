@@ -15,7 +15,14 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 # pre-diagram-path-validation.ps1
 # PreToolUse hook (Phase 1.5 diagrams integration).
-# Blocks Write/Edit calls whose file_path is under .claude/diagrams/ but
+#
+# Defense-in-depth on TWO entry points:
+#   1. Native Write/Edit on .claude/diagrams/** paths.
+#   2. MCP-routed saves via mcp__mermaid__* / mcp__excalidraw__* — the
+#      wrapper MCP validates internally; this hook catches the call
+#      BEFORE the wrapper subprocess spawns.
+#
+# Blocks calls whose path argument is under .claude/diagrams/ but
 # violates the scoped-path rule (`<category>/<name>.{mmd,excalidraw}`
 # with lowercase-kebab-case name).
 
@@ -29,10 +36,14 @@ $FilePath = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload -and $payload.tool_input) {
-        if ($payload.tool_input.file_path) {
-            $FilePath = [string]$payload.tool_input.file_path
-        } elseif ($payload.tool_input.path) {
-            $FilePath = [string]$payload.tool_input.path
+        # Probe order: native-tool conventional keys first, then MCP
+        # wrapper save-tool conventional keys. First non-empty wins.
+        foreach ($key in @('file_path', 'path', 'output', 'target', 'scene_path', 'name')) {
+            $v = $payload.tool_input.$key
+            if ($v -and ($v -is [string])) {
+                $FilePath = [string]$v
+                break
+            }
         }
     }
 } catch {

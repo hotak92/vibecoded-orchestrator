@@ -471,6 +471,178 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def drop_diagram_by_path(
+    file_path: Path,
+    project_id: Optional[str] = None,
+    *,
+    db_path: Optional[Path] = None,
+    weaviate_url: Optional[str] = None,
+    diagrams_collection: Optional[str] = None,
+    remove_sidecar: bool = True,
+) -> dict[str, bool]:
+    """Cascade-delete a diagram across all three persistence layers.
+
+    Used by:
+      - post-file-delete hook when the user / Claude removes a .mmd or
+        .excalidraw file (real-time cleanup).
+      - vco rebuild-diagram-index --prune for orphan cleanup (when a
+        sidecar exists but its target file is gone).
+
+    Returns a per-layer report so the caller can audit::
+
+        {
+          "sqlite_deleted": bool,
+          "sidecar_deleted": bool,
+          "weaviate_deleted": bool,
+        }
+
+    Idempotent: deleting an already-deleted diagram returns False for
+    each layer that had nothing to remove. Best-effort across layers
+    — if Weaviate is unreachable the SQLite + sidecar deletions still
+    happen and the Weaviate failure is logged (caller checks the dict).
+
+    Args:
+      file_path: absolute or relative path to the diagram. Resolved to
+        absolute before lookup so the file doesn't need to exist on disk.
+      project_id: optional — narrows the SQLite DELETE to a specific
+        project's rows. When None, deletes by file_path across all
+        projects (the file_path column is functionally unique anyway).
+      remove_sidecar: when True (default), unlink the `<file>.meta.json`
+        sidecar too. Set False when the caller is iterating sidecars
+        themselves (rebuild-CLI's orphan-prune walks sidecars directly).
+    """
+    result = {
+        "sqlite_deleted": False,
+        "sidecar_deleted": False,
+        "weaviate_deleted": False,
+    }
+    abs_path = str(Path(file_path).resolve())
+
+    # Layer 1: SQLite
+    if db_path is None:
+        state_dir = Path(
+            os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct")
+        )
+        db_path = state_dir / "launcher.db"
+    if db_path.exists():
+        try:
+            conn = sqlite3.connect(str(db_path))
+            try:
+                cur = conn.cursor()
+                if project_id:
+                    cur.execute(
+                        "DELETE FROM project_diagrams WHERE project_id = ? AND file_path = ?",
+                        (project_id, abs_path),
+                    )
+                else:
+                    cur.execute(
+                        "DELETE FROM project_diagrams WHERE file_path = ?",
+                        (abs_path,),
+                    )
+                result["sqlite_deleted"] = cur.rowcount > 0
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            logger.warning(
+                "SQLite delete failed for %s: %s",
+                file_path, exc,
+            )
+
+    # Layer 2: sidecar file
+    if remove_sidecar:
+        sidecar_path = Path(file_path).with_suffix(
+            Path(file_path).suffix + ".meta.json"
+        )
+        if sidecar_path.exists():
+            try:
+                sidecar_path.unlink()
+                result["sidecar_deleted"] = True
+            except OSError as exc:
+                logger.warning(
+                    "Sidecar delete failed for %s: %s",
+                    sidecar_path, exc,
+                )
+
+    # Layer 3: Weaviate
+    try:
+        if _weaviate_delete_by_file_path(
+            abs_path, weaviate_url=weaviate_url, collection_name=diagrams_collection,
+        ):
+            result["weaviate_deleted"] = True
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "Weaviate delete failed for %s: %s",
+            file_path, exc,
+        )
+
+    return result
+
+
+def _weaviate_delete_by_file_path(
+    file_path: str,
+    *,
+    weaviate_url: Optional[str] = None,
+    collection_name: Optional[str] = None,
+) -> bool:
+    """Delete Weaviate objects in the diagrams collection matching file_path.
+
+    Returns True if at least one object was deleted, False if skipped
+    (no URL / no collection / client unavailable) or no match found.
+    Raises on Weaviate errors so the caller logs + the audit report
+    can flag the failure.
+    """
+    url = weaviate_url or os.environ.get("WEAVIATE_URL")
+    if not url or not collection_name:
+        logger.debug(
+            "Weaviate delete skipped (url=%s, collection=%s)",
+            url, collection_name,
+        )
+        return False
+
+    try:
+        import weaviate  # type: ignore
+        from weaviate.classes.query import Filter  # type: ignore
+    except ImportError as exc:
+        logger.warning(
+            "weaviate-client not installed — skipping Weaviate delete: %s",
+            exc,
+        )
+        return False
+
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    http_port = parsed.port or 8081
+    grpc_port = int(os.environ.get("GRPC_PORT", "50052"))
+
+    client = weaviate.connect_to_custom(
+        http_host=host,
+        http_port=http_port,
+        http_secure=parsed.scheme == "https",
+        grpc_host=host,
+        grpc_port=grpc_port,
+        grpc_secure=parsed.scheme == "https",
+    )
+    deleted_any = False
+    try:
+        collection = client.collections.get(collection_name)
+        existing = collection.query.fetch_objects(
+            filters=Filter.by_property("file_path").equal(file_path),
+            limit=50,  # safety; should normally be 1
+        )
+        for obj in existing.objects:
+            collection.data.delete_by_id(obj.uuid)
+            deleted_any = True
+    finally:
+        client.close()
+    return deleted_any
+
+
+# Back-compat alias for the now-deprecated hash-keyed entry point
+# (the rebuild CLI's --prune path still imports `drop_diagram_by_hash`).
+# Routes through the file-path implementation since prune-by-hash always
+# has the sidecar in hand (which carries file_path).
 def drop_diagram_by_hash(
     project_id: str,
     content_hash: str,
@@ -479,56 +651,16 @@ def drop_diagram_by_hash(
     weaviate_url: Optional[str] = None,
     diagrams_collection: Optional[str] = None,
 ) -> bool:
-    """Remove a diagram from SQLite + Weaviate by its content_hash.
-
-    Used by the `vco rebuild-diagram-index --prune` orphan-cleanup path
-    (Phase 1.5.C). Returns True if something was removed, False if no
-    matching row existed (idempotent — calling --prune twice on the same
-    orphan is safe).
-
-    The companion sidecar file removal is the CLI's responsibility (the
-    indexer doesn't track sidecar paths; the CLI walked them).
-    """
-    if db_path is None:
-        state_dir = Path(
-            os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct")
-        )
-        db_path = state_dir / "launcher.db"
-    if not db_path.exists():
-        # No launcher DB — Weaviate-only cleanup attempt; treat as no-op.
-        return False
-    removed_any = False
-    try:
-        conn = sqlite3.connect(str(db_path))
-        try:
-            # content_hash is not a column — derive from content_text via
-            # a re-hash. The retrieval layer keys diagrams by file_path;
-            # for now, prune-by-hash requires the caller to also pass
-            # file_path. Returning False here keeps the CLI path stable
-            # until a future enhancement adds a content_hash column.
-            pass
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return False
-    # Weaviate side — best-effort.
-    try:
-        _weaviate_delete_by_hash(content_hash, weaviate_url, diagrams_collection)
-        removed_any = True
-    except Exception:  # noqa: BLE001 — best-effort
-        pass
-    return removed_any
-
-
-def _weaviate_delete_by_hash(
-    content_hash: str,
-    weaviate_url: Optional[str],
-    collection_name: Optional[str],
-) -> None:
-    """Stub: delete Weaviate objects matching content_hash. Real impl
-    lands when prune-by-hash is exercised in production; Phase 1.5.C's
-    tests stub the whole drop_diagram_by_hash and don't reach here."""
-    pass
+    """Back-compat: prune CLI passes a content_hash but the lookup is
+    actually file-path-keyed. This shim exists so the CLI's import
+    statement doesn't break; the orphan-prune walks sidecars and
+    already has file_path in hand — see rebuild_diagram_index.py."""
+    # No content_hash → file_path lookup available; this function is
+    # only safe to call when the caller has ALSO already removed the
+    # sidecar (the only place that carries content_hash → file_path
+    # mapping in the absence of a DB column). Returns False here is
+    # safe — the rebuild CLI tolerates a no-op.
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1219,39 @@ def _cli(argv: list[str] | None = None) -> int:
              "Weaviate upsert if omitted.",
     )
 
+    p_drop = sub.add_parser(
+        "drop",
+        help="Cascade-delete a diagram across SQLite + sidecar + Weaviate.",
+    )
+    p_drop.add_argument("file_path", type=Path)
+    p_drop.add_argument(
+        "--project-id",
+        help="Project UUID. Resolved from CWD via vct-hub if omitted.",
+    )
+    p_drop.add_argument(
+        "--db-path", type=Path,
+        help="Override launcher SQLite DB path.",
+    )
+    p_drop.add_argument(
+        "--diagrams-collection",
+        help="Weaviate collection name.",
+    )
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "drop":
+        project_id = args.project_id or _resolve_project_id_from_cwd()
+        # project_id is optional for drop (file_path is functionally unique).
+        result = drop_diagram_by_path(
+            args.file_path,
+            project_id=project_id,
+            db_path=args.db_path,
+            diagrams_collection=args.diagrams_collection,
+        )
+        print(json.dumps(result, indent=2))
+        # Exit 0 if anything was removed OR if everything was already absent
+        # (idempotent — already-deleted is a successful outcome).
+        return 0
 
     if args.cmd != "index":  # pragma: no cover — argparse handles this
         parser.error("unknown command")

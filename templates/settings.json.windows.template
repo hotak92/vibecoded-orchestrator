@@ -222,6 +222,16 @@
             "if": "Write(.claude/diagrams/**)|Edit(.claude/diagrams/**)"
           }
         ]
+      },
+      {
+        "matcher": "mcp__mermaid__.*|mcp__excalidraw__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-diagram-path-validation.ps1",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "ConfigChange": [
@@ -336,6 +346,12 @@
             "if": "Bash(git commit *)",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-git-commit-kg-sync.ps1",
             "timeout": 10,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-file-delete.ps1",
+            "timeout": 5,
             "async": true
           }
         ]

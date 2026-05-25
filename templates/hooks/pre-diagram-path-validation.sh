@@ -6,20 +6,34 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # pre-diagram-path-validation.sh — PreToolUse guard for Phase 1.5
 # diagrams integration.
 #
-# Defense-in-depth: the wrapper MCP (Phase 1.2) ALSO validates the
-# scoped-path rule, but this hook catches direct Write/Edit tool calls
-# that bypass the MCP entirely (e.g. Claude calling `Write` instead of
-# `save_diagram`).
+# Defense-in-depth on TWO entry points:
+#
+#   1. Native Write/Edit — Claude calls `Write` / `Edit` with a path
+#      under `.claude/diagrams/`. The matcher catches the call BEFORE
+#      the file write lands; we reject violations with exit 2.
+#
+#   2. MCP-routed saves — Claude calls `mcp__mermaid__save_diagram` or
+#      `mcp__excalidraw__create_element` etc. The wrapper MCP (Phase 1.2)
+#      ALSO validates the scoped-path rule inside its process, but a
+#      buggy / disabled wrapper would let violations through. This hook
+#      catches MCP-tool calls BEFORE the wrapper subprocess even
+#      spawns — true belt-and-suspenders.
 #
 # Hook contract (Claude Code v2.1.x):
-#   - Reads tool_input JSON from stdin.
-#   - If the tool_input.file_path is under `.claude/diagrams/` AND
-#     violates the scoped-path rule, prints the corrective message to
-#     stderr and exits 2 (BLOCKS the write).
-#   - Otherwise exits 0 silently (allows the write).
+#   - Reads tool_input JSON from stdin (different shape per tool).
+#   - For native Write/Edit: tool_input.file_path (or .path) carries the
+#     write target.
+#   - For MCP tools: tool_input is the raw arguments dict; we probe
+#     common path key names (file_path, path, output, target, name).
+#   - If a probed path is under `.claude/diagrams/` AND violates the
+#     scoped-path rule, prints the corrective message to stderr and
+#     exits 2 (BLOCKS the call).
+#   - Otherwise exits 0 silently (allows the call).
 #
-# Matcher (in settings.json):
+# Matchers (in settings.json):
 #   Write(.claude/diagrams/**)|Edit(.claude/diagrams/**)
+#   mcp__mermaid__*
+#   mcp__excalidraw__*
 #
 # Bypass: VCT_DISABLE_HOOKS=1 in the shell, or remove from settings.json.
 
@@ -36,15 +50,28 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 # Positional args are EMPTY; do NOT rely on $CLAUDE_TOOL_NAME etc.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 
-# Parse tool_input.file_path in a single Python call.
+# Parse the write target from tool_input. Shape differs per tool:
+#   - Native Write/Edit: ti['file_path'] (some legacy: 'path').
+#   - MCP mermaid/excalidraw save tools: arguments dict — path may live
+#     under file_path, path, output, target, name, or scene_path
+#     depending on the wrapper's tool surface.
+# We probe common key names; the first non-empty match wins. If the
+# tool doesn't carry a path (e.g. mcp__mermaid__list_themes), this
+# returns empty and the hook allows the call.
 FILE_PATH=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
 import json, sys
 try:
     d = json.loads(sys.stdin.read())
     ti = d.get('tool_input', {}) or {}
-    # Edit and Write both use 'file_path' as the key per the v2.1.x
-    # tool_input contract. Some legacy tools used 'path' — accept either.
-    print(ti.get('file_path') or ti.get('path') or '')
+    # Probe order: native-tool conventional keys first, then MCP wrapper
+    # save-tool conventional keys. The first non-empty string wins.
+    for key in ('file_path', 'path', 'output', 'target', 'scene_path', 'name'):
+        v = ti.get(key)
+        if isinstance(v, str) and v:
+            print(v)
+            break
+    else:
+        print('')
 except Exception:
     print('')
 " 2>/dev/null || echo "")
@@ -52,11 +79,15 @@ except Exception:
 # No path → nothing to validate; allow the call.
 [ -z "$FILE_PATH" ] && exit 0
 
-# Only validate paths under .claude/diagrams/. The matcher in
-# settings.json already filters by glob; this is a belt-and-suspenders
-# check in case the matcher fires on a sibling pattern.
+# Only validate paths under .claude/diagrams/. The native Write/Edit
+# matcher already filters by glob; the MCP matchers fire on any tool
+# call (including ones that don't touch a file at all, e.g.
+# mcp__mermaid__validate_syntax), so we need the path filter here.
+# Accept BOTH forward slash AND Windows backslash separators since
+# MCP tool_input may carry either depending on the client's platform.
 case "$FILE_PATH" in
     *.claude/diagrams/*) ;;
+    *.claude\\diagrams\\*) ;;
     *) exit 0 ;;
 esac
 

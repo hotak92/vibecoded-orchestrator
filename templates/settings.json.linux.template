@@ -222,6 +222,16 @@
             "if": "Write(.claude/diagrams/**)|Edit(.claude/diagrams/**)"
           }
         ]
+      },
+      {
+        "matcher": "mcp__mermaid__.*|mcp__excalidraw__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-diagram-path-validation.sh",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "ConfigChange": [
@@ -336,6 +346,12 @@
             "if": "Bash(git commit *)",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-git-commit-kg-sync.sh",
             "timeout": 10,
+            "async": true
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-file-delete.sh",
+            "timeout": 5,
             "async": true
           }
         ]

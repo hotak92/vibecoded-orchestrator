@@ -159,30 +159,15 @@ if [[ "$EDITED_FILE" == "$DIAGRAMS_DIR"/* ]] \
         ( "$_DIAG_VENV" -m vco_lib.diagram_indexer index "$EDITED_FILE" \
             >/dev/null 2>&1 || true ) &
 
-        # Notify vct-hub for live UI refresh. The route is Phase 1.2's;
-        # if it's not registered yet the hub returns 404, which we swallow.
-        # TODO(Phase 1.2): the `/api/v1/notify/diagram-changed` route is
-        # to be added in the broadcast follow-up. Until then this curl
-        # is a no-op (404 silently); we still wire it up here so the
-        # hook contract is final.
-        if command -v curl >/dev/null 2>&1; then
-            _HUB_PORT="${VCT_HUB_PORT:-7700}"
-            _HUB_TOKEN_FILE="${VCT_STATE_DIR:-$HOME/.vct}/hub.token"
-            _HUB_TOKEN=""
-            if [ -n "${VCT_HUB_TOKEN:-}" ]; then
-                _HUB_TOKEN="$VCT_HUB_TOKEN"
-            elif [ -f "$_HUB_TOKEN_FILE" ]; then
-                _HUB_TOKEN=$(cat "$_HUB_TOKEN_FILE" 2>/dev/null || echo "")
-            fi
-            if [ -n "$_HUB_TOKEN" ]; then
-                ( curl -s -o /dev/null -X POST \
-                    -H "Authorization: Bearer $_HUB_TOKEN" \
-                    -H "Content-Type: application/json" \
-                    -d "{\"file_path\":\"$EDITED_FILE\",\"change\":\"edit\"}" \
-                    "http://127.0.0.1:${_HUB_PORT}/api/v1/notify/diagram-changed" \
-                    --max-time 2 2>/dev/null || true ) &
-            fi
-        fi
+        # Live UI refresh in DiagramsTab is driven by the launcher's
+        # frontend file-watcher (chokidar in launcher/src/lib/...) — NOT
+        # a hub broadcast. The original Phase 1.5.A design called for a
+        # vct-hub /api/v1/notify/diagram-changed route, but pub/sub from
+        # hub → frontend would need an SSE/WebSocket plumbing layer the
+        # launcher does not have today. The frontend-side watcher is
+        # already reliable for the live-preview UX and avoids the
+        # broker complexity. Re-evaluate if multi-machine notification
+        # ever becomes a real requirement.
     fi
 fi
 
