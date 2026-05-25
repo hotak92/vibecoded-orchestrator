@@ -542,14 +542,26 @@ class WrapperMCP:
 
             project_id = await self._resolve_project_id()
             if project_id is None:
+                # R3 (code-review 2026-05-25): the no-project failsafe
+                # opens the full upstream tool surface for the entire
+                # cache window. Shorten the TTL aggressively (10 s
+                # instead of the full allowlist_cache_ttl) AND escalate
+                # the log to WARNING every miss — a user who hasn't
+                # registered their project in the launcher should not
+                # silently get an open allowlist for ~60 s after each
+                # cache miss. Re-check the hub on every call after the
+                # short cache expires so registration takes effect
+                # within seconds of completing.
+                no_project_ttl = min(10, self.allowlist_cache_ttl)
                 logger.warning(
                     "wrapper(%s): no VCT_PROJECT_ID and hub by-path failed; "
-                    "running in allow-all failsafe mode",
-                    self.mcp_name,
+                    "running in allow-all failsafe mode for %ds. Register "
+                    "the project via the launcher to enable per-tool grants.",
+                    self.mcp_name, no_project_ttl,
                 )
                 self._allowlist_cache = _AllowlistCacheEntry(
                     grants={},
-                    expires_at=now + self.allowlist_cache_ttl,
+                    expires_at=now + no_project_ttl,
                     failsafe_mode=True,
                 )
                 return None
@@ -757,17 +769,69 @@ def _hashable_id(msg_id: Any) -> Any:
 # ─── Stdin reader factory ────────────────────────────────────────────────
 
 
-async def _stdin_reader() -> asyncio.StreamReader:
-    """Wrap process stdin in an asyncio StreamReader.
+async def _stdin_reader() -> "_StdinReader":
+    """Return a stdin reader compatible with the current event loop.
 
-    sys.stdin is blocking by default; we need a non-blocking reader
-    plumbed through asyncio.
+    POSIX (SelectorEventLoop): wraps sys.stdin via connect_read_pipe →
+    real asyncio.StreamReader.
+
+    Windows (ProactorEventLoop, default on 3.8+): connect_read_pipe
+    raises NotImplementedError for stdin (console handles need
+    overlapped I/O bridging). Falls back to a thread-pool reader
+    (R5 from code review 2026-05-25) — sys.stdin.readline runs in
+    the default executor; the coroutine wraps awaitability.
+
+    Both paths expose the same .readline() coroutine surface so callers
+    don't branch on platform.
     """
+    if sys.platform == "win32":
+        return _ThreadedStdinReader()
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-    return reader
+    try:
+        await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+    except NotImplementedError:
+        # Defensive: if a future event-loop policy lacks pipe support
+        # even on POSIX, fall through to the threaded reader.
+        return _ThreadedStdinReader()
+    return _StreamReaderWrapper(reader)
+
+
+class _StreamReaderWrapper:
+    """Thin wrapper to give asyncio.StreamReader the same surface as
+    _ThreadedStdinReader (just .readline()). Lets the caller code
+    not care which backend it got."""
+
+    def __init__(self, reader: asyncio.StreamReader):
+        self._reader = reader
+
+    async def readline(self) -> bytes:
+        return await self._reader.readline()
+
+
+class _ThreadedStdinReader:
+    """Asyncio-compatible reader for Windows-style event loops where
+    `connect_read_pipe(sys.stdin)` is unavailable. Runs the blocking
+    `sys.stdin.buffer.readline()` in the default executor so the event
+    loop can interleave other tasks.
+
+    EOF: when readline returns empty bytes, that's the upstream-disconnect
+    signal — propagated identically to the POSIX path.
+    """
+
+    async def readline(self) -> bytes:
+        loop = asyncio.get_running_loop()
+        # sys.stdin.buffer is the underlying binary stream; .readline()
+        # blocks the executor thread until a newline or EOF. Returning
+        # b'' on EOF matches asyncio.StreamReader.readline() semantics.
+        return await loop.run_in_executor(None, sys.stdin.buffer.readline)
+
+
+# Type alias for the union — the caller treats both as "a thing with
+# an async readline returning bytes". Either backend's interface is
+# minimal enough that a Protocol/ABC would be overkill.
+_StdinReader = "_StreamReaderWrapper | _ThreadedStdinReader"
 
 
 __all__ = [

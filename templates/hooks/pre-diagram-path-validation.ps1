@@ -38,7 +38,12 @@ try {
     if ($payload -and $payload.tool_input) {
         # Probe order: native-tool conventional keys first, then MCP
         # wrapper save-tool conventional keys. First non-empty wins.
-        foreach ($key in @('file_path', 'path', 'output', 'target', 'scene_path', 'name')) {
+        # R1 (code review 2026-05-25): 'name' DROPPED — Excalidraw
+        # upstream tools accept 'name' as an element label, not a path.
+        # The hook over-blocked legitimate non-save MCP calls when the
+        # label happened to contain '/'. Save-class tools use
+        # file_path / path / output / target / scene_path.
+        foreach ($key in @('file_path', 'path', 'output', 'target', 'scene_path')) {
             $v = $payload.tool_input.$key
             if ($v -and ($v -is [string])) {
                 $FilePath = [string]$v

@@ -117,6 +117,18 @@ def validate_scoped_path(
             hint="provide a path under .claude/diagrams/<category>/",
         )
 
+    # R6 defense-in-depth: reject embedded null bytes. Python's pathlib +
+    # filesystem APIs raise ValueError on null in path, but the validator
+    # is the first line of defense — surface a clear corrective message
+    # instead of letting the downstream raise.
+    if "\x00" in path:
+        return _format_error(
+            path,
+            "path contains embedded null byte",
+            kind=kind,
+            hint="remove the null byte from the path",
+        )
+
     # Traversal check FIRST — gives a clearer message for ``../``-laden
     # paths than the structural regex would.
     if _TRAVERSAL_RE.search(path):

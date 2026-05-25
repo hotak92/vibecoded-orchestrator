@@ -65,7 +65,15 @@ try:
     ti = d.get('tool_input', {}) or {}
     # Probe order: native-tool conventional keys first, then MCP wrapper
     # save-tool conventional keys. The first non-empty string wins.
-    for key in ('file_path', 'path', 'output', 'target', 'scene_path', 'name'):
+    # R1 (code review 2026-05-25): 'name' DROPPED — Excalidraw upstream
+    # tools (create_view, create_element, query_elements, get_resource)
+    # accept a 'name' argument that carries element labels, not paths.
+    # The hook over-blocked legitimate non-save MCP calls when the label
+    # happened to contain '/'. The save-class tools (save_scene,
+    # save_diagram, export_scene, export_svg) all use file_path / path /
+    # output / target / scene_path; the wrapper MCP also validates
+    # internally as defense-in-depth.
+    for key in ('file_path', 'path', 'output', 'target', 'scene_path'):
         v = ti.get(key)
         if isinstance(v, str) and v:
             print(v)

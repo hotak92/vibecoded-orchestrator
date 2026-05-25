@@ -167,20 +167,27 @@ if [[ "$EDITED_FILE" == "$DIAGRAMS_DIR"/* ]] \
             _DIAG_ARGS+=( --diagrams-collection "$DIAGRAMS_COLLECTION" )
         fi
 
-        # Index in background — never block the hook on Weaviate slowness.
-        ( "$_DIAG_VENV" "${_DIAG_ARGS[@]}" \
-            >/dev/null 2>&1 || true ) &
-
-        # A6 wire-up (Phase 1 item 9 + §1.5.6): auto-snapshot the file
-        # before the next edit can land. Uses the same SQLite table
-        # (`diagram_snapshots`) the launcher's Tauri command writes,
-        # with trigger=`auto_pre_edit_save`. Throttle is shared with
-        # the indexer above (one snapshot per file per 60s); content
-        # dedup is enforced inside the CLI (UNIQUE constraint +
-        # explicit hash check). Soft-fail: snapshot failure must
-        # never block the user's edit, so we background + `|| true`.
-        ( "$_DIAG_VENV" -m vco_lib.diagram_indexer snapshot create \
-            "$EDITED_FILE" --quiet >/dev/null 2>&1 || true ) &
+        # Index + snapshot in a SERIAL background chain.
+        # R2 (code review 2026-05-25): previously these ran in PARALLEL
+        # via two separate `( ... ) &` forks. The snapshot CLI queries
+        # `project_diagrams WHERE project_id=? AND file_path=?` to find
+        # the row to snapshot AGAINST. On the very first edit per file,
+        # the indexer hasn't UPSERT'd that row yet → snapshot returns
+        # "no row" → first-version content lost forever. Serializing the
+        # two so the indexer always commits the row before the snapshot
+        # query closes the race. Whole chain stays backgrounded so the
+        # hook itself never blocks the user.
+        (
+            "$_DIAG_VENV" "${_DIAG_ARGS[@]}" >/dev/null 2>&1 || true
+            # A6 wire-up (Phase 1 item 9 + §1.5.6): auto-snapshot the
+            # file before the next edit can land. Throttle is shared
+            # with the indexer above (one snapshot per file per 60s);
+            # content dedup is enforced inside the CLI (UNIQUE constraint
+            # + explicit hash check). Soft-fail: snapshot failure must
+            # never block the user's edit.
+            "$_DIAG_VENV" -m vco_lib.diagram_indexer snapshot create \
+                "$EDITED_FILE" --quiet >/dev/null 2>&1 || true
+        ) &
 
         # Live UI refresh in DiagramsTab is driven by the launcher's
         # frontend file-watcher (chokidar in launcher/src/lib/...) — NOT

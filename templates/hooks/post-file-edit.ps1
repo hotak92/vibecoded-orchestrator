@@ -173,20 +173,24 @@ if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) 
                 $diagArgs += @('--diagrams-collection', $env:DIAGRAMS_COLLECTION)
             }
 
-            # Background index — never block the hook on Weaviate slowness.
-            Start-Process -FilePath $diagVenv `
-                -ArgumentList $diagArgs `
-                -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
-
-            # A6 wire-up (Phase 1 item 9 + §1.5.6): auto-snapshot mirror
-            # of the .sh sibling. Same trigger (`auto_pre_edit_save`),
-            # same `--quiet` flag, same soft-fail discipline.
-            Start-Process -FilePath $diagVenv `
-                -ArgumentList @(
-                    '-m', 'vco_lib.diagram_indexer',
-                    'snapshot', 'create', $EditedFile, '--quiet'
-                ) `
-                -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+            # Serialized index + snapshot in a single background job.
+            # R2 (code review 2026-05-25): previously two separate
+            # Start-Process calls ran in parallel; the snapshot CLI's
+            # `project_diagrams WHERE file_path=?` query returned no
+            # row on first-edit-per-file because the indexer UPSERT
+            # hadn't committed yet → first-version snapshot lost
+            # forever. Use Start-Job to run the two CLIs sequentially
+            # (index → snapshot) without blocking the hook itself.
+            $snapArgs = @(
+                '-m', 'vco_lib.diagram_indexer',
+                'snapshot', 'create', $EditedFile, '--quiet'
+            )
+            Start-Job -ScriptBlock {
+                param($vp, $iargs, $sargs, $cwd)
+                Set-Location $cwd
+                & $vp @iargs *> $null
+                & $vp @sargs *> $null
+            } -ArgumentList $diagVenv, $diagArgs, $snapArgs, $ProjectRoot | Out-Null
         }
 
         # Live UI refresh in DiagramsTab is driven by the launcher's

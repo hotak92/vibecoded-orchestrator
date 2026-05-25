@@ -600,6 +600,12 @@ def _weaviate_delete_by_file_path(
         )
         return False
 
+    # R4 defense-in-depth: refuse remote URLs.
+    err = _validate_weaviate_url(url)
+    if err is not None:
+        logger.warning("Weaviate delete refused: %s", err)
+        return False
+
     try:
         import weaviate  # type: ignore
         from weaviate.classes.query import Filter  # type: ignore
@@ -637,30 +643,6 @@ def _weaviate_delete_by_file_path(
     finally:
         client.close()
     return deleted_any
-
-
-# Back-compat alias for the now-deprecated hash-keyed entry point
-# (the rebuild CLI's --prune path still imports `drop_diagram_by_hash`).
-# Routes through the file-path implementation since prune-by-hash always
-# has the sidecar in hand (which carries file_path).
-def drop_diagram_by_hash(
-    project_id: str,
-    content_hash: str,
-    *,
-    db_path: Optional[Path] = None,
-    weaviate_url: Optional[str] = None,
-    diagrams_collection: Optional[str] = None,
-) -> bool:
-    """Back-compat: prune CLI passes a content_hash but the lookup is
-    actually file-path-keyed. This shim exists so the CLI's import
-    statement doesn't break; the orphan-prune walks sidecars and
-    already has file_path in hand — see rebuild_diagram_index.py."""
-    # No content_hash → file_path lookup available; this function is
-    # only safe to call when the caller has ALSO already removed the
-    # sidecar (the only place that carries content_hash → file_path
-    # mapping in the absence of a DB column). Returns False here is
-    # safe — the rebuild CLI tolerates a no-op.
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +828,52 @@ def _enqueue_retry(
 # ---------------------------------------------------------------------------
 
 
+# Allowlist of Weaviate hosts. Defense-in-depth (R4 from code review):
+# WEAVIATE_URL can flow from a user's project env, which is attacker-
+# controllable if they pull a hostile .env in a CI variable injection
+# scenario. Restrict the indexer's network destinations to local loopback
+# / private addresses + the user-pinned WEAVIATE_URL host. Anything
+# remote-routable gets refused with a clear log line.
+_WEAVIATE_ALLOWED_HOSTNAMES = frozenset(("localhost", "127.0.0.1", "::1", "0.0.0.0"))
+_WEAVIATE_ALLOWED_SCHEMES = frozenset(("http", "https"))
+
+
+def _validate_weaviate_url(url: str) -> Optional[str]:
+    """Return None if url is acceptable for indexer writes, else a reason
+    string. Pinned to loopback by default; private-net 10/192.168/172.16
+    accepted (Docker/Podman networks). Public IPs + non-http(s) schemes
+    rejected. The MCP server's WEAVIATE_URL config can override the
+    indexer's view but doesn't bypass this check — env-var injection is
+    the exact threat model."""
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+    except (ValueError, AttributeError):
+        return f"unparseable Weaviate URL: {url!r}"
+    if parsed.scheme not in _WEAVIATE_ALLOWED_SCHEMES:
+        return f"refused Weaviate scheme {parsed.scheme!r}; expected http or https"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return "Weaviate URL has no hostname"
+    if host in _WEAVIATE_ALLOWED_HOSTNAMES:
+        return None
+    # Allow private-net IPv4 (Docker/Podman bridge networks).
+    if host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
+        return None
+    if host.startswith("172."):
+        try:
+            second = int(host.split(".", 2)[1])
+            if 16 <= second <= 31:
+                return None
+        except (IndexError, ValueError):
+            pass
+    return (
+        f"refused remote Weaviate URL {url!r}; indexer is restricted to "
+        f"loopback / private-net hosts. Set WEAVIATE_URL=http://localhost:8081 "
+        f"or a docker-bridge address."
+    )
+
+
 def _weaviate_upsert(
     row: DiagramRow,
     *,
@@ -882,6 +910,12 @@ def _weaviate_upsert(
             "Weaviate upsert skipped (url=%s, collection=%s)",
             url, collection_name,
         )
+        return False
+
+    # R4 defense-in-depth: refuse remote URLs.
+    err = _validate_weaviate_url(url)
+    if err is not None:
+        logger.warning("Weaviate upsert refused: %s", err)
         return False
 
     try:
