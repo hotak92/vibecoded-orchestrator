@@ -1,0 +1,2 @@
+export declare function createSecurityHeaders(): (req: import("http").IncomingMessage, res: import("http").ServerResponse, next: (err?: unknown) => void) => void;
+//# sourceMappingURL=security-headers.d.ts.map

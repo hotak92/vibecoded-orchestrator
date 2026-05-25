@@ -22,16 +22,21 @@ const host = process.env.TAURI_DEV_HOST;
 // over a separate CI lint because the assertion lives next to the code
 // that depends on it and surfaces drift at the earliest possible point
 // (dev server start / production build).
-function readMermaidPin() {
+//
+// Phase 2 (2026-05-25) generalises this to also read `[npm.excalidraw_lib]`
+// for the embedded Excalidraw editor's `@excalidraw/excalidraw` pin —
+// same shape, same drift-warning contract.
+function readNpmPin(blockName) {
   try {
     const here = dirname(fileURLToPath(import.meta.url));
     const tomlPath = resolve(here, "..", "bundled_mcp_versions.toml");
     const text = readFileSync(tomlPath, "utf8");
     // Minimal TOML scan — we only need one string value out of one
     // table. Pulling a full TOML parser into vite.config purely for
-    // this is overkill; the regex is bounded to a `[npm.mermaid_lib]`
-    // block so it's robust against other tables moving around the file.
-    const block = text.match(/\[npm\.mermaid_lib\][^[]*/);
+    // this is overkill; the regex is bounded to a `[npm.<block>]` block
+    // so it's robust against other tables moving around the file.
+    const blockRe = new RegExp(`\\[npm\\.${blockName}\\][^[]*`);
+    const block = text.match(blockRe);
     if (!block) return null;
     const m = block[0].match(/^\s*version\s*=\s*"([^"]+)"/m);
     return m ? m[1] : null;
@@ -40,7 +45,8 @@ function readMermaidPin() {
   }
 }
 
-const MERMAID_PIN = readMermaidPin();
+const MERMAID_PIN = readNpmPin("mermaid_lib");
+const EXCALIDRAW_PIN = readNpmPin("excalidraw_lib");
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -52,6 +58,7 @@ export default defineConfig(async () => ({
     // assertion logs an error in that case so the failure is visible but
     // doesn't block all UI for an unrelated workflow.
     "import.meta.env.VITE_MERMAID_PIN": JSON.stringify(MERMAID_PIN ?? "unknown"),
+    "import.meta.env.VITE_EXCALIDRAW_PIN": JSON.stringify(EXCALIDRAW_PIN ?? "unknown"),
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

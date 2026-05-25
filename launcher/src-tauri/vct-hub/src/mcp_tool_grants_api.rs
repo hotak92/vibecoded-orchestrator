@@ -84,6 +84,50 @@ const MERMAID_DEFAULT_ALLOWLIST: &[(&str, bool)] = &[
     ("validate_syntax", true),
 ];
 
+/// Default per-tool allowlist for the Excalidraw wrapper (Phase 2,
+/// 2026-05-25). Adapted to the ACTUAL tool surface of the vendored
+/// `excalidraw-mcp-server@2.0.0` upstream (the plan §3 Phase 2 item 3
+/// guessed `create_scene` / `read_scene` / `save_scene` but the real
+/// v2.0.0 API is element-centric — the plan anticipated this revision).
+///
+/// Default ON (the basic scene-construction surface a project usually
+/// wants):
+///   create_element, update_element, delete_element, query_elements,
+///   batch_create_elements, get_resource, read_me, create_view,
+///   align_elements, distribute_elements.
+///
+/// Default OFF (require explicit opt-in via the launcher's Permissions
+/// tab):
+///   - export_scene — Chromium-dependent for PNG export + can also be
+///     used to write to arbitrary disk paths (`.svg` / `.png`). Same
+///     posture as Mermaid's export_png.
+///   - group_elements / ungroup_elements / lock_elements /
+///     unlock_elements — niche; opt-in for projects that need grouping.
+///   - create_from_mermaid — overlaps with the Mermaid MCP's
+///     `render` / `save_diagram` tools; using Mermaid directly avoids
+///     an extra round-trip and keeps the two MCPs' surfaces orthogonal.
+///
+/// Sorted alphabetically (a future audit can diff against the wrapper's
+/// known surface without churn).
+const EXCALIDRAW_DEFAULT_ALLOWLIST: &[(&str, bool)] = &[
+    ("align_elements", true),
+    ("batch_create_elements", true),
+    ("create_element", true),
+    ("create_from_mermaid", false), // Overlaps with Mermaid MCP.
+    ("create_view", true),
+    ("delete_element", true),
+    ("distribute_elements", true),
+    ("export_scene", false), // Chromium/PNG path + arbitrary disk write; lazy enable.
+    ("get_resource", true),
+    ("group_elements", false),  // Niche; opt-in.
+    ("lock_elements", false),   // Niche; opt-in.
+    ("query_elements", true),
+    ("read_me", true),
+    ("ungroup_elements", false), // Niche; opt-in.
+    ("unlock_elements", false),  // Niche; opt-in.
+    ("update_element", true),
+];
+
 /// Look up the hardcoded default allowlist for a given MCP name.
 /// Returns an empty slice for an unknown MCP — the wrapper will see
 /// an empty grants map and block everything except via tools the
@@ -92,7 +136,8 @@ const MERMAID_DEFAULT_ALLOWLIST: &[(&str, bool)] = &[
 fn _default_allowlist_for(mcp_name: &str) -> &'static [(&'static str, bool)] {
     match mcp_name {
         "mermaid" => MERMAID_DEFAULT_ALLOWLIST,
-        // Phase 2 / Phase 4 expand this match arm.
+        "excalidraw" => EXCALIDRAW_DEFAULT_ALLOWLIST,
+        // Phase 4 expands this match arm.
         _ => &[],
     }
 }
@@ -295,5 +340,101 @@ mod tests {
     fn default_allowlist_for_unknown_returns_empty_slice() {
         assert!(_default_allowlist_for("playwright").is_empty());
         assert!(_default_allowlist_for("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn returns_default_allowlist_for_excalidraw() {
+        let state = make_db_with_project("p1");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/projects/p1/mcp-tool-grants/excalidraw", base))
+            .send()
+            .await
+            .expect("GET");
+        assert_eq!(resp.status(), 200);
+        let parsed: serde_json::Value = resp.json().await.unwrap();
+
+        assert_eq!(parsed["mcp_name"], "excalidraw");
+        assert_eq!(parsed["defaults_applied"], true);
+        // Core scene-construction tools enabled by default:
+        assert_eq!(parsed["grants"]["create_element"], true);
+        assert_eq!(parsed["grants"]["update_element"], true);
+        assert_eq!(parsed["grants"]["delete_element"], true);
+        assert_eq!(parsed["grants"]["query_elements"], true);
+        assert_eq!(parsed["grants"]["get_resource"], true);
+        // Lazy/niche tools disabled by default:
+        assert_eq!(parsed["grants"]["export_scene"], false);
+        assert_eq!(parsed["grants"]["group_elements"], false);
+        assert_eq!(parsed["grants"]["create_from_mermaid"], false);
+    }
+
+    #[test]
+    fn excalidraw_default_allowlist_is_sorted_and_unique() {
+        // Catches a future PR that adds an entry out of order or twice.
+        let mut sorted = EXCALIDRAW_DEFAULT_ALLOWLIST.to_vec();
+        sorted.sort_by_key(|(name, _)| *name);
+        assert_eq!(
+            sorted,
+            EXCALIDRAW_DEFAULT_ALLOWLIST.to_vec(),
+            "EXCALIDRAW_DEFAULT_ALLOWLIST must be sorted by tool name"
+        );
+        let mut names: Vec<&str> = EXCALIDRAW_DEFAULT_ALLOWLIST
+            .iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            EXCALIDRAW_DEFAULT_ALLOWLIST.len(),
+            "EXCALIDRAW_DEFAULT_ALLOWLIST contains duplicate entries",
+        );
+    }
+
+    #[test]
+    fn excalidraw_allowlist_covers_v2_upstream_tool_surface() {
+        // Phase 2 contract: every tool exposed by the vendored
+        // excalidraw-mcp-server@2.0.0 must have an entry here so the
+        // wrapper's allowlist filter has an explicit policy for it
+        // (no implicit "default-allow because not listed").
+        //
+        // Source: `grep -hoE "server\\.tool\\('[a-z_]+'"
+        // claude_mcp_servers/excalidraw_mcp_fork/dist/mcp/index.js`
+        // captured 2026-05-25. If an upstream bump adds tools, this
+        // assertion fails until they're explicitly classified.
+        let upstream_v2_tools: &[&str] = &[
+            "align_elements",
+            "batch_create_elements",
+            "create_element",
+            "create_from_mermaid",
+            "create_view",
+            "delete_element",
+            "distribute_elements",
+            "export_scene",
+            "get_resource",
+            "group_elements",
+            "lock_elements",
+            "query_elements",
+            "read_me",
+            "ungroup_elements",
+            "unlock_elements",
+            "update_element",
+        ];
+        let listed: std::collections::BTreeSet<&str> =
+            EXCALIDRAW_DEFAULT_ALLOWLIST.iter().map(|(n, _)| *n).collect();
+        for tool in upstream_v2_tools {
+            assert!(
+                listed.contains(tool),
+                "v2.0.0 upstream tool `{}` is not classified in \
+                 EXCALIDRAW_DEFAULT_ALLOWLIST — add an explicit entry",
+                tool,
+            );
+        }
+        assert_eq!(
+            listed.len(),
+            upstream_v2_tools.len(),
+            "EXCALIDRAW_DEFAULT_ALLOWLIST has entries beyond v2.0.0 \
+             upstream surface — drop them or bump the upstream-tools \
+             reference list in this test if v2.x added them",
+        );
     }
 }

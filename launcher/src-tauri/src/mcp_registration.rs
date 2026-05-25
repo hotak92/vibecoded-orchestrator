@@ -458,10 +458,38 @@ pub fn build_default_mcp_entries(
         "env": serde_json::Value::Object(mermaid_env_safe),
     });
 
+    // ── excalidraw (Phase 2 — wrapper MCP) ──────────────────────────
+    // The wrapper proxies the in-tree-vendored `excalidraw-mcp-server`
+    // (see claude_mcp_servers/excalidraw_mcp_fork/VENDORED.md) and
+    // filters its tool surface per-project. Spawn command:
+    // `<venv-python> -m claude_mcp_servers.wrappers.excalidraw_proxy`.
+    // The wrapper itself spawns Node on the vendored entry point
+    // once it's resolved the per-project allowlist.
+    //
+    // Default-disabled per project (see `BUNDLED_MCP_DEFAULT_DISABLED`
+    // in vct-launcher-core/src/db/project_mcp_servers.rs). The user
+    // opts in via the launcher's DiagramsTab. Until opted in the entry
+    // sits in ~/.claude.json but the launcher's per-project gate keeps
+    // Claude Code from spawning it. Same posture as Mermaid above.
+    let mut excalidraw_env = serde_json::Map::new();
+    excalidraw_env.insert("PYTHONPATH".into(), pythonpath.clone().into());
+    let (excalidraw_env_safe, excalidraw_dropped) =
+        filter_env_for_global_json(&excalidraw_env);
+    let excalidraw_entry = serde_json::json!({
+        "type": "stdio",
+        "command": venv_python_str.clone(),
+        "args": [
+            "-m",
+            "claude_mcp_servers.wrappers.excalidraw_proxy",
+        ],
+        "env": serde_json::Value::Object(excalidraw_env_safe),
+    });
+
     vec![
         ("weaviate-kg".to_string(), weaviate_entry, weaviate_dropped),
         ("search".to_string(), search_entry, search_dropped),
         ("mermaid".to_string(), mermaid_entry, mermaid_dropped),
+        ("excalidraw".to_string(), excalidraw_entry, excalidraw_dropped),
     ]
 }
 
@@ -968,7 +996,11 @@ mod tests {
         // (see install.py:_check_ollama_mcp_remnants); we explicitly do NOT
         // include it here. vct-coordination is Pro-tier and likewise excluded.
         // Phase 1.2 (diagrams plan): mermaid wrapper appended.
-        assert_eq!(names, vec!["weaviate-kg", "search", "mermaid"]);
+        // Phase 2 (diagrams plan): excalidraw wrapper appended.
+        assert_eq!(
+            names,
+            vec!["weaviate-kg", "search", "mermaid", "excalidraw"]
+        );
 
         // ── weaviate-kg shape ────────────────────────────────────────
         let (_, weaviate, _) = &entries[0];
@@ -1029,10 +1061,11 @@ mod tests {
 
         assert!(report.all_succeeded(), "report.outcomes: {:?}", report.outcomes);
         // Phase 1.2 (diagrams plan): mermaid wrapper added → 3 entries.
-        // Prior: weaviate-kg + search (2). The mermaid entry registers
-        // in ~/.claude.json but is default-DISABLED at the per-project
+        // Phase 2 (diagrams plan): excalidraw wrapper added → 4 entries.
+        // Prior: weaviate-kg + search (2). Both wrappers register in
+        // ~/.claude.json but are default-DISABLED at the per-project
         // gate (see BUNDLED_MCP_DEFAULT_DISABLED in vct-launcher-core).
-        assert_eq!(report.success_count(), 3);
+        assert_eq!(report.success_count(), 4);
 
         let raw = fs::read_to_string(&target).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1041,6 +1074,10 @@ mod tests {
         assert!(
             json["mcpServers"]["mermaid"].is_object(),
             "mermaid wrapper MCP must be registered in ~/.claude.json"
+        );
+        assert!(
+            json["mcpServers"]["excalidraw"].is_object(),
+            "excalidraw wrapper MCP must be registered in ~/.claude.json"
         );
         // ollama MCP must NOT be written (deprecated in v0.2.11).
         assert!(
@@ -1056,6 +1093,16 @@ mod tests {
         assert_eq!(
             mermaid_args[1], "claude_mcp_servers.wrappers.mermaid_proxy",
             "mermaid MCP must point at the wrapper module, not direct npx"
+        );
+        // Excalidraw entry points at the wrapper module, NOT direct node.
+        // The wrapper internally spawns Node on the vendored entry point.
+        let excalidraw_args = json["mcpServers"]["excalidraw"]["args"]
+            .as_array()
+            .expect("excalidraw.args is an array");
+        assert_eq!(excalidraw_args[0], "-m");
+        assert_eq!(
+            excalidraw_args[1], "claude_mcp_servers.wrappers.excalidraw_proxy",
+            "excalidraw MCP must point at the wrapper module, not direct node"
         );
 
         fs::remove_file(&target).ok();

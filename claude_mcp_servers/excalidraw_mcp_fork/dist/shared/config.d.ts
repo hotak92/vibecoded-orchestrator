@@ -1,0 +1,54 @@
+import { z } from 'zod';
+declare const configSchema: z.ZodObject<{
+    CANVAS_HOST: z.ZodDefault<z.ZodString>;
+    CANVAS_PORT: z.ZodDefault<z.ZodNumber>;
+    EXCALIDRAW_API_KEY: z.ZodDefault<z.ZodString>;
+    CORS_ALLOWED_ORIGINS: z.ZodDefault<z.ZodString>;
+    RATE_LIMIT_WINDOW_MS: z.ZodDefault<z.ZodNumber>;
+    RATE_LIMIT_MAX_REQUESTS: z.ZodDefault<z.ZodNumber>;
+    PERSISTENCE_ENABLED: z.ZodDefault<z.ZodBoolean>;
+    PERSISTENCE_DIR: z.ZodDefault<z.ZodString>;
+    CANVAS_SERVER_URL: z.ZodDefault<z.ZodString>;
+    LOG_LEVEL: z.ZodDefault<z.ZodEnum<["debug", "info", "warn", "error"]>>;
+    AUDIT_LOG_ENABLED: z.ZodDefault<z.ZodBoolean>;
+    MAX_ELEMENTS: z.ZodDefault<z.ZodNumber>;
+    MAX_BATCH_SIZE: z.ZodDefault<z.ZodNumber>;
+    STANDALONE_MODE: z.ZodDefault<z.ZodBoolean>;
+    STREAMABLE_HTTP_PORT: z.ZodOptional<z.ZodNumber>;
+}, "strip", z.ZodTypeAny, {
+    CANVAS_HOST: string;
+    CANVAS_PORT: number;
+    EXCALIDRAW_API_KEY: string;
+    CORS_ALLOWED_ORIGINS: string;
+    RATE_LIMIT_WINDOW_MS: number;
+    RATE_LIMIT_MAX_REQUESTS: number;
+    PERSISTENCE_ENABLED: boolean;
+    PERSISTENCE_DIR: string;
+    CANVAS_SERVER_URL: string;
+    LOG_LEVEL: "debug" | "info" | "warn" | "error";
+    AUDIT_LOG_ENABLED: boolean;
+    MAX_ELEMENTS: number;
+    MAX_BATCH_SIZE: number;
+    STANDALONE_MODE: boolean;
+    STREAMABLE_HTTP_PORT?: number | undefined;
+}, {
+    CANVAS_HOST?: string | undefined;
+    CANVAS_PORT?: number | undefined;
+    EXCALIDRAW_API_KEY?: string | undefined;
+    CORS_ALLOWED_ORIGINS?: string | undefined;
+    RATE_LIMIT_WINDOW_MS?: number | undefined;
+    RATE_LIMIT_MAX_REQUESTS?: number | undefined;
+    PERSISTENCE_ENABLED?: boolean | undefined;
+    PERSISTENCE_DIR?: string | undefined;
+    CANVAS_SERVER_URL?: string | undefined;
+    LOG_LEVEL?: "debug" | "info" | "warn" | "error" | undefined;
+    AUDIT_LOG_ENABLED?: boolean | undefined;
+    MAX_ELEMENTS?: number | undefined;
+    MAX_BATCH_SIZE?: number | undefined;
+    STANDALONE_MODE?: boolean | undefined;
+    STREAMABLE_HTTP_PORT?: number | undefined;
+}>;
+export type Config = z.infer<typeof configSchema>;
+export declare function loadConfig(): Config;
+export {};
+//# sourceMappingURL=config.d.ts.map
