@@ -2512,12 +2512,35 @@
           <div class="pr-hw-grid">
             <div class="pr-hw-row"><span class="pr-hw-label">GPU (NVIDIA)</span>
               <span class="pr-hw-value">{formatHwField('has_nvidia_gpu', hwDiff.after)}</span></div>
+            <!-- v0.2.34 (Agent B): surface AMD presence next to NVIDIA so
+                 the snapshot summary covers all three vendors symmetrically. -->
+            <div class="pr-hw-row"><span class="pr-hw-label">GPU (AMD)</span>
+              <span class="pr-hw-value">{formatHwField('has_amd_gpu', hwDiff.after)}</span></div>
             <div class="pr-hw-row"><span class="pr-hw-label">GPU name</span>
               <span class="pr-hw-value">{formatHwField('gpu_name', hwDiff.after)}</span></div>
             <div class="pr-hw-row"><span class="pr-hw-label">Apple Silicon</span>
               <span class="pr-hw-value">{formatHwField('has_apple_silicon', hwDiff.after)}</span></div>
             <div class="pr-hw-row"><span class="pr-hw-label">RAM</span>
               <span class="pr-hw-value">{formatHwField('ram_gb', hwDiff.after)}</span></div>
+            <!-- v0.2.34 (Agent B): VRAM was already part of the persisted
+                 snapshot since v0.2.9 (Bug K, threshold logic) but the UI
+                 didn't surface it. Adding it next to the decided mode
+                 makes the "why CUDA vs CPU" decision auditable from the
+                 Preferences card — critical for diagnosing the
+                 dogfooded RTX 4080 SUPER bug class. -->
+            <div class="pr-hw-row"><span class="pr-hw-label">VRAM</span>
+              <span class="pr-hw-value">{formatHwField('vram_gb', hwDiff.after)}</span></div>
+            <!-- v0.2.34 (Agent B): the DECIDED GPU mode is the field that
+                 drives container_pull's image-variant choice. Surfacing
+                 it explicitly (vs just the derived `use_gpu` boolean
+                 below) lets the user verify the install will pick the
+                 right variant BEFORE clicking Install. The
+                 dogfooded 2026-05-25 bug had `has_nvidia_gpu:true` but
+                 `gpu_mode_decided` defaulted to Cpu because of a
+                 v0.2.20-era schema gap; this row would have made the
+                 mismatch visible at a glance. -->
+            <div class="pr-hw-row"><span class="pr-hw-label">Decided mode</span>
+              <span class="pr-hw-value">{formatHwField('gpu_mode_decided', hwDiff.after)}</span></div>
             <div class="pr-hw-row"><span class="pr-hw-label">Compute mode</span>
               <span class="pr-hw-value">{formatHwField('use_gpu', hwDiff.after)}</span></div>
             <div class="pr-hw-row"><span class="pr-hw-label">Resource tier</span>

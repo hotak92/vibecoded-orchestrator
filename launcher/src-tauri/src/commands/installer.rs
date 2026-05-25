@@ -82,6 +82,23 @@ pub(crate) const APP_STATE_KEY_HARDWARE_SNAPSHOT: &str = "launcher.hardware_snap
 pub(crate) const APP_STATE_KEY_HARDWARE_LAST_RECONFIGURED: &str =
     "launcher.hardware_last_reconfigured_at";
 
+/// v0.2.34 (Agent B): app_state flag set by the launcher self-update flow
+/// right before the rebuild + restart, so the next launcher boot knows it
+/// just came back from an update and should re-detect hardware in the
+/// background. Cleared by the boot-time consumer after the background job
+/// is scheduled.
+///
+/// Why a flag instead of always re-detecting on every boot: keeps the
+/// invariant precise — re-detection happens at the points that matter
+/// (update boundary + install boundary), without paying the detect cost
+/// on every routine launcher start. The flag survives the process restart
+/// because it lives in SQLite (`launcher.db`), not in-memory state.
+///
+/// See `mark_hardware_redetect_pending_after_update` (writer) and
+/// `consume_pending_hardware_redetect_if_set` (reader).
+pub(crate) const APP_STATE_KEY_HARDWARE_REDETECT_PENDING: &str =
+    "launcher.hardware_redetect_pending";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -1359,11 +1376,39 @@ fn write_persisted_hardware_snapshot(db: &Db, snap: &HardwareSnapshot) -> Result
 /// pre-detection one.
 #[command]
 pub async fn redetect_hardware(db: State<'_, Db>) -> Result<HardwareDetectionDiff, String> {
-    let before = read_persisted_hardware_snapshot(db.inner())?;
-    let system = detect_system().await?;
+    redetect_hardware_with_probe(db.inner(), detect_system).await
+}
+
+/// v0.2.34 (Agent B): inner re-detect implementation parameterised over
+/// the system probe so non-Tauri callers (background job spawned from
+/// `lib.rs::setup`, install-time pre-check in `install_module_for_project`)
+/// can reuse the same logic without going through `State<'_, Db>`, AND so
+/// tests can inject a fixture probe (e.g. RTX 4080 SUPER, or a probe that
+/// returns an error to exercise the fallback path).
+///
+/// Contract:
+///   - Reads the existing snapshot from `app_state` (may be `None`,
+///     partial-schema-but-parsable, or unparseable).
+///   - Runs `probe()` to get a fresh `SystemDetection`. On error, returns
+///     the error immediately WITHOUT touching the persisted row.
+///   - Persists the fresh snapshot.
+///   - Returns the diff (before may be `None`).
+///
+/// The probe is a `FnOnce() -> impl Future` — `detect_system` matches
+/// directly. Tests pass closures returning fixture data.
+pub(crate) async fn redetect_hardware_with_probe<F, Fut>(
+    db: &Db,
+    probe: F,
+) -> Result<HardwareDetectionDiff, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<SystemDetection, String>>,
+{
+    let before = read_persisted_hardware_snapshot(db)?;
+    let system = probe().await?;
     let after = snapshot_from_system(&system);
 
-    write_persisted_hardware_snapshot(db.inner(), &after)?;
+    write_persisted_hardware_snapshot(db, &after)?;
 
     let changed_fields = match &before {
         Some(prev) => snapshot_changed_fields(prev, &after),
@@ -1375,6 +1420,184 @@ pub async fn redetect_hardware(db: State<'_, Db>) -> Result<HardwareDetectionDif
         after,
         changed_fields,
     })
+}
+
+/// v0.2.34 (Agent B): install-time hardware-snapshot freshness guard.
+///
+/// Called from `install_module_for_project` BEFORE reading
+/// `gpu_mode_decided`. Belt-and-suspenders against three failure modes:
+///
+///   1. **v0.2.20-style schema gap**: the persisted row predates a new
+///      snapshot field, serde defaults the missing field, and the install
+///      flow reads stale data (the dogfooded RTX 4080 SUPER bug —
+///      `gpu_mode_decided` missing → defaulted to `Cpu` → CUDA host
+///      pulled `-cpu` variant).
+///   2. **Hardware change between launcher updates**: user added a GPU,
+///      swapped RAM, etc. between the last `redetect_hardware` (or update
+///      boundary) and this install.
+///   3. **Manual binary swap**: user replaced the launcher binary
+///      without going through the in-app update flow, so the
+///      update-boundary trigger never fired.
+///
+/// Resilience: if the probe fails (transient `nvidia-smi` not on PATH,
+/// permission error, etc.) we DO NOT block the install. We fall back to
+/// the last-known persisted snapshot and log a warning. If there is no
+/// last-known snapshot either, we propagate the probe error — without
+/// any hardware data the install cannot pick a variant safely.
+///
+/// Returns the fresh-or-fallback snapshot for the caller to read fields
+/// from. The persisted row is updated only on probe success.
+pub(crate) async fn resolve_fresh_or_last_known_snapshot_with_probe<F, Fut>(
+    db: &Db,
+    probe: F,
+) -> Result<HardwareSnapshot, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<SystemDetection, String>>,
+{
+    match redetect_hardware_with_probe(db, probe).await {
+        Ok(diff) => Ok(diff.after),
+        Err(probe_err) => {
+            // Probe failed. Try last-known snapshot.
+            match read_persisted_hardware_snapshot(db) {
+                Ok(Some(snap)) => {
+                    eprintln!(
+                        "[vct] install-time hw redetect failed ({}), falling back to last-known snapshot",
+                        probe_err
+                    );
+                    Ok(snap)
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "[vct] install-time hw redetect failed ({}) and no last-known snapshot — propagating",
+                        probe_err
+                    );
+                    Err(probe_err)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[vct] install-time hw redetect failed ({}) and last-known snapshot read failed ({}) — propagating probe error",
+                        probe_err, e
+                    );
+                    Err(probe_err)
+                }
+            }
+        }
+    }
+}
+
+/// v0.2.34 (Agent B): production wrapper around
+/// `resolve_fresh_or_last_known_snapshot_with_probe` that uses the real
+/// `detect_system` probe. Returns `Option<HardwareSnapshot>` so callers
+/// that should soft-degrade (e.g. install can still proceed with
+/// `GpuMode::Cpu` default if probe fails AND no snapshot exists) can do
+/// so without rewrapping the error.
+///
+/// `install_module_for_project` consumes this to ensure the
+/// `gpu_mode_decided` it reads downstream is fresh + structurally
+/// complete.
+pub(crate) async fn ensure_fresh_hardware_snapshot_for_install(
+    db: &Db,
+) -> Option<HardwareSnapshot> {
+    match resolve_fresh_or_last_known_snapshot_with_probe(db, detect_system).await {
+        Ok(snap) => Some(snap),
+        Err(e) => {
+            eprintln!(
+                "[vct] ensure_fresh_hardware_snapshot_for_install: no snapshot available ({}); install will fall back to GpuMode::Cpu",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// v0.2.34 (Agent B): mark the next launcher boot as needing a hardware
+/// re-detection. Called from `self_update::finish_apply_after_pull` right
+/// before the new launcher process is spawned. Soft-fails: a write error
+/// here only means the next boot won't auto-re-detect — the user can
+/// still hit the Preferences button.
+pub(crate) fn mark_hardware_redetect_pending_after_update(db: &Db) {
+    if let Err(e) = db.app_state_set(APP_STATE_KEY_HARDWARE_REDETECT_PENDING, "1") {
+        eprintln!(
+            "[vct] mark_hardware_redetect_pending_after_update: app_state write failed: {}",
+            e
+        );
+    }
+}
+
+/// v0.2.34 (Agent B): predicate used by the boot-time consumer to check
+/// whether the previous launcher process flagged a pending re-detect.
+pub(crate) fn is_hardware_redetect_pending(db: &Db) -> bool {
+    matches!(
+        db.app_state_get(APP_STATE_KEY_HARDWARE_REDETECT_PENDING),
+        Ok(Some(ref s)) if s == "1"
+    )
+}
+
+/// v0.2.34 (Agent B): clear the pending flag (writes empty string, which
+/// `app_state_get` returns as "unset" via the read-path's empty-string
+/// guard at all call sites). Best-effort.
+pub(crate) fn clear_hardware_redetect_pending(db: &Db) {
+    if let Err(e) = db.app_state_set(APP_STATE_KEY_HARDWARE_REDETECT_PENDING, "") {
+        eprintln!(
+            "[vct] clear_hardware_redetect_pending: app_state write failed: {}",
+            e
+        );
+    }
+}
+
+/// v0.2.34 (Agent B): boot-time consumer of the
+/// `launcher.hardware_redetect_pending` flag. Spawns a background
+/// `redetect_hardware_with_probe` job when the flag is set, then clears
+/// the flag. Soft-fails throughout — a probe hiccup just leaves the
+/// existing snapshot in place (the manual Preferences button is the
+/// recovery path) and the cleared flag avoids retry-loops on the next
+/// boot if `detect_system` is broken for a deeper reason.
+///
+/// Spawning is done via `tauri::async_runtime::spawn` so the boot setup
+/// path doesn't block on detection. The flag is cleared SYNCHRONOUSLY
+/// before the spawn so a fast restart-during-restart doesn't double-fire.
+pub fn consume_pending_hardware_redetect_if_set<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) {
+    let Some(db) = app.try_state::<Db>() else {
+        return;
+    };
+    if !is_hardware_redetect_pending(db.inner()) {
+        return;
+    }
+    // Clear synchronously so a race / restart-during-restart doesn't
+    // double-spawn. The redetect runs even if the clear write fails — the
+    // worst case is a duplicate redetect on the next boot, which is
+    // idempotent.
+    clear_hardware_redetect_pending(db.inner());
+
+    tauri::async_runtime::spawn(async move {
+        let Some(db) = app.try_state::<Db>() else {
+            return;
+        };
+        match redetect_hardware_with_probe(db.inner(), detect_system).await {
+            Ok(diff) => {
+                if diff.changed_fields.is_empty() {
+                    eprintln!(
+                        "[vct] post-update hardware redetect: snapshot unchanged"
+                    );
+                } else {
+                    eprintln!(
+                        "[vct] post-update hardware redetect: {} field(s) changed: {:?}",
+                        diff.changed_fields.len(),
+                        diff.changed_fields
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] post-update hardware redetect failed (non-fatal, last-known snapshot retained): {}",
+                    e
+                );
+            }
+        }
+    });
 }
 
 /// Spawn `install.py --update <flags>` from the known install path,
@@ -11348,6 +11571,341 @@ MemAvailable:   23456789 kB
                     }
                 }
             });
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // v0.2.34 (Agent B): hardware-snapshot freshness invariant.
+    //
+    // Coverage for bug #5 of the v0.2.34 backlog (dogfooded RTX 4080 SUPER
+    // bug — persisted snapshot had `has_nvidia_gpu:true` but missing
+    // `gpu_mode_decided` because v0.2.20 added the field without
+    // backfilling existing snapshots; serde defaulted to `Cpu` → CUDA
+    // host pulled `-cpu` variant).
+    //
+    // The invariant we are testing here: a snapshot in
+    // `app_state.launcher.hardware_snapshot` is fresh + structurally
+    // complete whenever it is READ for an install decision. Three trigger
+    // points enforce it (1) at launcher-update completion via the
+    // `launcher.hardware_redetect_pending` flag, (2) at install-time via
+    // `resolve_fresh_or_last_known_snapshot_with_probe`, (3) the manual
+    // Preferences button (uses the same code path, no test needed here).
+    //
+    // Tests inject a probe closure so they don't depend on the host
+    // having `nvidia-smi` / `system_profiler` etc. on PATH.
+    // ------------------------------------------------------------------
+    mod hardware_snapshot_freshness_tests {
+        use super::super::*;
+        use crate::commands::gpu_policy::GpuMode;
+
+        /// Build a `SystemDetection` fixture that mimics the RTX 4080
+        /// SUPER host the dogfooding pass produced — `has_nvidia_gpu`
+        /// true, 16 GB VRAM (well above the 8 GB threshold).
+        fn rtx4080_super_fixture() -> SystemDetection {
+            SystemDetection {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                has_nvidia_gpu: true,
+                gpu_name: "NVIDIA GeForce RTX 4080 SUPER".to_string(),
+                has_apple_silicon: false,
+                has_docker: false,
+                has_podman: true,
+                has_python: true,
+                python_version: "3.12.0".to_string(),
+                python_cmd: "python3".to_string(),
+                has_claude_cli: true,
+                has_git: true,
+                has_node: true,
+                container_runtime: Some("podman 4.9.0".to_string()),
+                ram_gb: 64,
+                vram_gb: 16,
+                gpu_vendor: Some("NVIDIA".to_string()),
+            }
+        }
+
+        /// CPU-only fallback fixture for the "no GPU detected" path.
+        fn cpu_only_fixture() -> SystemDetection {
+            SystemDetection {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                has_nvidia_gpu: false,
+                gpu_name: String::new(),
+                has_apple_silicon: false,
+                has_docker: false,
+                has_podman: false,
+                has_python: false,
+                python_version: String::new(),
+                python_cmd: String::new(),
+                has_claude_cli: false,
+                has_git: false,
+                has_node: false,
+                container_runtime: None,
+                ram_gb: 8,
+                vram_gb: 0,
+                gpu_vendor: None,
+            }
+        }
+
+        /// Write a deliberately-partial JSON blob to `app_state` to
+        /// simulate the v0.2.20 schema gap that broke the user's
+        /// production install. The shape mirrors what a pre-v0.2.9
+        /// snapshot would look like on disk: no `gpu_mode_decided`,
+        /// no `vram_gb`, no `has_amd_gpu`.
+        fn write_partial_schema_snapshot(db: &Db) {
+            // `has_nvidia_gpu: true` + 16 GB ram + no decided-mode key —
+            // serde defaults `gpu_mode_decided` to `Cpu` via the
+            // `default_gpu_mode` fn, which is exactly the bug.
+            let raw = r#"{
+                "has_nvidia_gpu": true,
+                "gpu_name": "NVIDIA GeForce RTX 4080 SUPER",
+                "has_apple_silicon": false,
+                "ram_gb": 64,
+                "use_gpu": true,
+                "low_resource": false
+            }"#;
+            db.app_state_set(APP_STATE_KEY_HARDWARE_SNAPSHOT, raw).unwrap();
+        }
+
+        /// (Test c) RTX-4080-style fixture (has_nvidia_gpu=true,
+        /// vram_gb=16) → `gpu_mode_decided` resolves to `Cuda`, NOT the
+        /// stale `Cpu` the bug produced. Direct test of the snapshot
+        /// builder so the contract is locked at the lowest layer.
+        #[test]
+        fn rtx4080_super_resolves_to_cuda_not_cpu() {
+            let sys = rtx4080_super_fixture();
+            let snap = snapshot_from_system(&sys);
+            assert_eq!(
+                snap.gpu_mode_decided,
+                GpuMode::Cuda,
+                "RTX 4080 SUPER (16 GB VRAM, has_nvidia_gpu=true) must decide CUDA, got {:?}",
+                snap.gpu_mode_decided
+            );
+            assert!(snap.use_gpu, "derived use_gpu must be true for CUDA");
+            assert!(!snap.low_resource, "64 GB RAM is not low_resource");
+            assert_eq!(snap.vram_gb, 16.0);
+            assert!(snap.has_nvidia_gpu);
+        }
+
+        /// (Test a) Snapshot missing `gpu_mode_decided` → install-time
+        /// re-detect populates it before `gpu_mode` is read.
+        ///
+        /// Reproduces the dogfooded production bug: persisted row is the
+        /// v0.2.20-era partial schema (no `gpu_mode_decided`), install
+        /// flow reads it, serde defaults missing field to `Cpu`. After
+        /// `resolve_fresh_or_last_known_snapshot_with_probe` runs with
+        /// an RTX-4080-style probe, the returned snapshot has the
+        /// correctly-decided `Cuda` mode AND the persisted row is now
+        /// fresh + structurally complete.
+        #[tokio::test]
+        async fn install_time_redetect_populates_missing_gpu_mode_decided() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+
+            // Seed the partial-schema row.
+            write_partial_schema_snapshot(&db);
+
+            // Sanity: the partial row parses but defaults to Cpu — i.e.
+            // we've successfully reproduced the bug's initial state.
+            let stale = read_persisted_hardware_snapshot(&db)
+                .unwrap()
+                .expect("partial-schema row should still parse");
+            assert_eq!(
+                stale.gpu_mode_decided,
+                GpuMode::Cpu,
+                "partial-schema serde default must reproduce the production bug"
+            );
+
+            // Run the install-time guard with an RTX-4080-style probe.
+            let fresh = resolve_fresh_or_last_known_snapshot_with_probe(&db, || async {
+                Ok(rtx4080_super_fixture())
+            })
+            .await
+            .expect("probe success must yield a snapshot");
+
+            // The returned snapshot must have the correct decided mode.
+            assert_eq!(
+                fresh.gpu_mode_decided,
+                GpuMode::Cuda,
+                "install-time redetect must populate gpu_mode_decided=Cuda"
+            );
+
+            // The persisted row is now fresh — a subsequent read picks
+            // up the correct mode WITHOUT another redetect.
+            let after_persist = read_persisted_hardware_snapshot(&db)
+                .unwrap()
+                .expect("snapshot must be persisted after successful probe");
+            assert_eq!(after_persist.gpu_mode_decided, GpuMode::Cuda);
+            assert_eq!(after_persist.vram_gb, 16.0);
+            assert_eq!(after_persist.gpu_name, "NVIDIA GeForce RTX 4080 SUPER");
+        }
+
+        /// (Test b) Re-detect failure during install → falls back to
+        /// last-known snapshot + emits warning (logged via eprintln,
+        /// not asserted; the architectural contract is that the install
+        /// receives SOME snapshot even when the probe is broken).
+        ///
+        /// Production parallel: nvidia-smi not on PATH due to a driver
+        /// reinstall, OR the binary missing in a hardened container
+        /// host. The install must NOT block on this; it falls back to
+        /// the last known good state.
+        #[tokio::test]
+        async fn install_time_redetect_falls_back_when_probe_fails() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+
+            // Seed a KNOWN-GOOD snapshot (full schema, GpuMode::Cuda).
+            let known = snapshot_from_system(&rtx4080_super_fixture());
+            write_persisted_hardware_snapshot(&db, &known).unwrap();
+
+            // Probe that always fails (mimics nvidia-smi missing).
+            let result = resolve_fresh_or_last_known_snapshot_with_probe(&db, || async {
+                Err("nvidia-smi not on PATH (mock)".to_string())
+            })
+            .await;
+
+            let snap = result.expect("probe failure must fall back, not propagate, when a last-known snapshot exists");
+            // Returned snapshot is the LAST-KNOWN one, not a default
+            // empty value.
+            assert_eq!(snap.gpu_mode_decided, GpuMode::Cuda);
+            assert_eq!(snap.vram_gb, 16.0);
+            assert!(snap.has_nvidia_gpu);
+
+            // Persisted row is unchanged (probe failed → no write).
+            let after = read_persisted_hardware_snapshot(&db).unwrap().unwrap();
+            assert_eq!(after.gpu_mode_decided, GpuMode::Cuda);
+        }
+
+        /// Probe failure WITHOUT a last-known snapshot must propagate
+        /// the error — there is no safe default and the caller (via
+        /// `ensure_fresh_hardware_snapshot_for_install`) chooses how to
+        /// degrade (currently: fall back to GpuMode::Cpu at the call
+        /// site in `install_module_for_project`, which preserves the
+        /// pre-v0.2.34 behaviour for the no-snapshot case).
+        #[tokio::test]
+        async fn install_time_redetect_propagates_when_no_fallback() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+            // No prior snapshot.
+
+            let result = resolve_fresh_or_last_known_snapshot_with_probe(&db, || async {
+                Err("probe broken".to_string())
+            })
+            .await;
+
+            assert!(
+                result.is_err(),
+                "probe failure with no last-known snapshot must propagate the error"
+            );
+        }
+
+        /// (Test d) Background re-detect at launcher-update boundary
+        /// writes back to app_state correctly.
+        ///
+        /// We can't easily mount a full `tauri::AppHandle` in a unit
+        /// test, so this exercises the same code path the
+        /// `consume_pending_hardware_redetect_if_set` spawn task runs —
+        /// the flag-flip + the underlying `redetect_hardware_with_probe`
+        /// — and asserts the persisted row was updated.
+        #[tokio::test]
+        async fn post_update_redetect_writes_back_to_app_state() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+
+            // Step 1: simulate the previous launcher's update flow
+            // marking the next boot as pending re-detect.
+            mark_hardware_redetect_pending_after_update(&db);
+            assert!(
+                is_hardware_redetect_pending(&db),
+                "flag must be set after mark_hardware_redetect_pending_after_update"
+            );
+
+            // Step 2: simulate the boot-time consumer's flag-clear +
+            // background-redetect work.
+            clear_hardware_redetect_pending(&db);
+            assert!(
+                !is_hardware_redetect_pending(&db),
+                "flag must be cleared before the background job runs (so a fast restart-during-restart can't double-fire)"
+            );
+
+            // The background job itself.
+            let diff = redetect_hardware_with_probe(&db, || async {
+                Ok(rtx4080_super_fixture())
+            })
+            .await
+            .expect("redetect_hardware_with_probe must succeed with mock probe");
+
+            // before is None (no prior snapshot) so changed_fields is
+            // empty by contract.
+            assert!(diff.before.is_none());
+            assert!(diff.changed_fields.is_empty());
+            assert_eq!(diff.after.gpu_mode_decided, GpuMode::Cuda);
+
+            // The persisted row reflects the fresh snapshot.
+            let persisted = read_persisted_hardware_snapshot(&db).unwrap().unwrap();
+            assert_eq!(persisted.gpu_mode_decided, GpuMode::Cuda);
+            assert_eq!(persisted.vram_gb, 16.0);
+        }
+
+        /// Edge case: the pending flag, once consumed, must NOT
+        /// re-fire on the next boot unless the update flow sets it
+        /// again. Catches a double-clear bug where a stale flag would
+        /// trigger an unnecessary redetect on every subsequent boot.
+        #[test]
+        fn pending_flag_idempotent_clear() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+            assert!(!is_hardware_redetect_pending(&db));
+
+            mark_hardware_redetect_pending_after_update(&db);
+            assert!(is_hardware_redetect_pending(&db));
+
+            clear_hardware_redetect_pending(&db);
+            assert!(!is_hardware_redetect_pending(&db));
+
+            // Second clear is a no-op (idempotent).
+            clear_hardware_redetect_pending(&db);
+            assert!(!is_hardware_redetect_pending(&db));
+        }
+
+        /// Diff path: a snapshot whose stale `gpu_mode_decided=Cpu`
+        /// gets corrected to `Cuda` after redetect emits the field name
+        /// in `changed_fields` so the Preferences UI can surface the
+        /// "Apply reconfiguration" CTA. Locks the user-visible diff
+        /// behaviour for the exact production-bug scenario.
+        #[tokio::test]
+        async fn redetect_diff_reports_gpu_mode_decided_change() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+            write_partial_schema_snapshot(&db);
+
+            let diff = redetect_hardware_with_probe(&db, || async {
+                Ok(rtx4080_super_fixture())
+            })
+            .await
+            .expect("redetect must succeed");
+
+            assert!(diff.before.is_some(), "partial-schema row must parse as Some(before)");
+            assert!(
+                diff.changed_fields.iter().any(|f| f == "gpu_mode_decided"),
+                "diff must surface gpu_mode_decided change, got {:?}",
+                diff.changed_fields
+            );
+            assert!(
+                diff.changed_fields.iter().any(|f| f == "vram_gb"),
+                "diff must surface vram_gb change (0.0 → 16.0), got {:?}",
+                diff.changed_fields
+            );
+        }
+
+        /// Smoke-test the CPU-only probe path: confirms the helper
+        /// doesn't accidentally hard-code the GPU branch.
+        #[tokio::test]
+        async fn cpu_only_probe_resolves_to_cpu() {
+            let db = crate::db::Db::open_in_memory().unwrap();
+            let diff =
+                redetect_hardware_with_probe(&db, || async { Ok(cpu_only_fixture()) })
+                    .await
+                    .expect("probe success");
+            assert_eq!(diff.after.gpu_mode_decided, GpuMode::Cpu);
+            assert!(!diff.after.use_gpu);
+            assert_eq!(diff.after.vram_gb, 0.0);
+            assert_eq!(diff.after.ram_gb, 8);
+            // 8 GB RAM is on the boundary — low_resource is strict `<8`.
+            assert!(!diff.after.low_resource);
         }
     }
 
