@@ -558,6 +558,25 @@ pub fn run() {
                 app.handle().clone(),
             );
 
+            // v0.2.34 (Agent C): launcher-version-change cache-bust for
+            // the L0 module catalog. After an `Update orchestrator` the
+            // running binary is a new version; the previous launcher's
+            // cached L0 envelope may pre-date schema changes or new
+            // module entries. Wipe `module_catalog.cache*` so the next
+            // Modules-tab visit re-fetches. Same-version restarts are a
+            // no-op (cache preserved → first-paint latency unchanged).
+            // Soft-fails: a DB hiccup here MUST NOT block boot — the
+            // worst case is "user clicks ↻ manually" or "cache survives
+            // until its TTL".
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    let _ = commands::module_catalog_client::bust_cache_if_launcher_version_changed(
+                        db.inner(),
+                    );
+                }
+            }
+
             // Migration 010 follow-up (2026-05-10): backfill the
             // `project_mcp_servers` table for projects registered before
             // this migration shipped. For each existing project with zero

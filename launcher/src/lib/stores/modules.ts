@@ -58,28 +58,76 @@ function createModulesStore() {
     });
   }
 
+  // Extracted as a closure so `forceRefresh` can call it directly
+  // without going through `this` (which can be unbound when consumers
+  // destructure the store API).
+  async function loadCatalogImpl(): Promise<void> {
+    if (!tauriAvailable()) return;
+    update((s) => ({ ...s, loading: true, error: null }));
+    try {
+      const response = await invoke<CatalogResponse>('list_module_catalog');
+      update((s) => ({
+        ...s,
+        catalog: response.modules,
+        l0Status: response.l0_status,
+        parseErrors: response.parse_errors,
+        devAffordanceHint: response.dev_affordance_hint,
+        loading: false,
+      }));
+    } catch (e) {
+      update((s) => ({
+        ...s,
+        loading: false,
+        error: e instanceof Error ? e.message : String(e),
+      }));
+    }
+  }
+
   return {
     subscribe,
 
-    async loadCatalog(): Promise<void> {
-      if (!tauriAvailable()) return;
+    loadCatalog: loadCatalogImpl,
+
+    /**
+     * v0.2.34 (Agent C): force a fresh L0 fetch, bypassing the DB-backed
+     * 15-min TTL. Wired to the always-visible `↻` button on the Modules
+     * tab. Returns true on success (cache rewritten), false on failure
+     * (existing store state preserved, error stored on the store for
+     * the caller to surface as a toast).
+     *
+     * Why a separate method from `loadCatalog`:
+     *   - `loadCatalog` invokes `list_module_catalog`, which honours
+     *     the DB-backed cache (great for first-paint, wrong for
+     *     manual refresh).
+     *   - `refresh_module_catalog` (Rust) bypasses the cache, rewrites
+     *     it with the fresh fetch; then `loadCatalogImpl` re-reads
+     *     the authoritative envelope through `list_module_catalog`
+     *     so all the L0Status / parseErrors / devAffordanceHint
+     *     fields stay derived consistently with the standard path.
+     *
+     * The two-step (refresh → reload) keeps the store-update logic
+     * single-source-of-truth inside `loadCatalogImpl`.
+     */
+    async forceRefresh(): Promise<boolean> {
+      if (!tauriAvailable()) return false;
       update((s) => ({ ...s, loading: true, error: null }));
       try {
-        const response = await invoke<CatalogResponse>('list_module_catalog');
-        update((s) => ({
-          ...s,
-          catalog: response.modules,
-          l0Status: response.l0_status,
-          parseErrors: response.parse_errors,
-          devAffordanceHint: response.dev_affordance_hint,
-          loading: false,
-        }));
+        // First: bypass-TTL fetch + cache rewrite. We don't read the
+        // returned envelope here — loadCatalogImpl below re-reads it
+        // through the standard `list_module_catalog` path so all the
+        // envelope-derived store fields stay consistent.
+        await invoke<unknown>('refresh_module_catalog');
+        // Second: pull the freshly-cached envelope through the
+        // canonical store-loading path.
+        await loadCatalogImpl();
+        return true;
       } catch (e) {
         update((s) => ({
           ...s,
           loading: false,
           error: e instanceof Error ? e.message : String(e),
         }));
+        return false;
       }
     },
 

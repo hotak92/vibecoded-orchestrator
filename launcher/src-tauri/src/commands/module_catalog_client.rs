@@ -60,6 +60,23 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 #[allow(dead_code)] // consumed by Agent B's `list_module_catalog_impl` refactor (v0.2.33 L0a)
 pub(crate) const L0_TTL_SECONDS: u64 = 15 * 60;
 
+/// Short TTL applied when the L0 response contains zero modules
+/// (v0.2.34 — dogfooded 2026-05-25 "stale-on-empty-modules trap"). An
+/// empty catalog is almost always transient: the user opened the
+/// Modules tab BEFORE a publisher pushed their entry, or the edge
+/// function returned nothing during a brief outage. Keeping the empty
+/// response cached for 15 minutes makes the launcher feel broken right
+/// at the moment the user MOST wants fresh data. 60s gives the network
+/// path a short cooldown without locking in an empty view.
+///
+/// Populated responses keep the longer [`L0_TTL_SECONDS`] — they
+/// represent real work by the publisher that's unlikely to change
+/// within 15 minutes, and the always-visible `↻` button in
+/// `ModuleCatalog.svelte` gives the user a manual force-refresh path
+/// for the rare mid-session republish case.
+#[allow(dead_code)] // consumed by Agent B's `list_module_catalog_impl` refactor (v0.2.33 L0a)
+pub(crate) const L0_TTL_EMPTY_SECONDS: u64 = 60;
+
 /// `app_state` key holding the serialized L0 response (full JSON envelope).
 pub(crate) const APP_STATE_KEY_CATALOG: &str = "module_catalog.cache";
 
@@ -67,6 +84,26 @@ pub(crate) const APP_STATE_KEY_CATALOG: &str = "module_catalog.cache";
 /// cache value above was written. Stored as a decimal string so it round-
 /// trips through `app_state_get` / `app_state_set` (TEXT column).
 pub(crate) const APP_STATE_KEY_CATALOG_AT: &str = "module_catalog.cache_fetched_at";
+
+/// `app_state` key holding the launcher version (e.g. "0.2.34") that
+/// last wrote to the L0 cache. Read at launcher startup; if it differs
+/// from the running `env!("CARGO_PKG_VERSION")` we wipe
+/// `module_catalog.cache*` so the fresh launcher does a clean re-fetch.
+///
+/// Rationale: after `Update orchestrator`, the L0 schema may have
+/// changed (new optional fields, new module categories, deprecation
+/// shifts). Forcing a re-fetch on the first launch of a new version
+/// avoids the footgun where users wonder why their freshly-updated
+/// launcher is still showing the cached pre-update view.
+///
+/// Same-version restarts preserve the cache (no bust), so cold-boot
+/// latency is unchanged for the common case.
+pub(crate) const APP_STATE_KEY_LAUNCHER_VERSION: &str = "launcher.last_seen_version";
+
+/// LIKE pattern matching every cache key written by this module. Used
+/// by [`bust_cache_if_launcher_version_changed`] to wipe the envelope
+/// + fetched-at in one DB call.
+pub(crate) const APP_STATE_CACHE_LIKE: &str = "module_catalog.cache%";
 
 // ─── Retry/backoff constants ──────────────────────────────────────────────
 
@@ -418,16 +455,41 @@ where
     Err(last_err.unwrap_or_else(|| "L0 fetch failed (no detail)".to_string()))
 }
 
+/// Pick the TTL appropriate for a given cached envelope.
+///
+/// Empty-module responses (publisher hasn't pushed yet, or transient
+/// edge-function blank) use the short TTL so the launcher recovers
+/// within ~1 minute. Populated responses use the long TTL — they
+/// represent real publisher state and rarely change within 15 minutes,
+/// and the `↻` refresh button in the renderer provides a manual escape
+/// hatch for the rare mid-session republish case.
+///
+/// Pure function (no I/O, no clock); safe to call from any context.
+pub(crate) fn ttl_for(envelope: &L0CatalogResponse) -> u64 {
+    if envelope.modules.is_empty() {
+        L0_TTL_EMPTY_SECONDS
+    } else {
+        L0_TTL_SECONDS
+    }
+}
+
 /// Read the cached envelope if it exists AND is within TTL. Returns None
 /// otherwise (caller should re-fetch).
+///
+/// v0.2.34: the TTL is now envelope-dependent (see [`ttl_for`]) — an
+/// empty-modules cache expires after [`L0_TTL_EMPTY_SECONDS`] instead
+/// of the longer [`L0_TTL_SECONDS`]. We have to load the envelope
+/// BEFORE deciding freshness because the TTL depends on what's inside.
 #[allow(dead_code)] // consumed by `cached_module_catalog` (whose only non-test caller lands in Agent B's L0a refactor)
 fn read_cache_if_fresh(db: &Db) -> Option<L0CatalogResponse> {
     let fetched_at = read_cache_fetched_at(db)?;
+    let envelope = read_cache_raw(db)?;
     let now = now_epoch_seconds();
-    if now.saturating_sub(fetched_at) >= L0_TTL_SECONDS {
+    let ttl = ttl_for(&envelope);
+    if now.saturating_sub(fetched_at) >= ttl {
         return None;
     }
-    read_cache_raw(db)
+    Some(envelope)
 }
 
 /// Read the cached envelope regardless of TTL. Used both by the fresh path
@@ -462,6 +524,108 @@ fn now_epoch_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Cache-bust the L0 module catalog when the running launcher version
+/// differs from the version that last wrote the cache.
+///
+/// Called once at launcher startup. Compares
+/// `app_state.launcher.last_seen_version` against the running
+/// `env!("CARGO_PKG_VERSION")`:
+///   - no row recorded yet → record current version, NO bust (first boot
+///     of any launcher; no prior cache to invalidate).
+///   - same version → leave cache alone (steady-state cold boot).
+///   - different version → delete `module_catalog.cache*` keys and
+///     record the new version (post-update refresh).
+///
+/// Soft-fails: any DB error logs to stderr and proceeds — startup
+/// MUST NOT block on this cleanup path. Returns the outcome for tests.
+///
+/// Pure-ish wrapper over [`bust_cache_if_version_changed_inner`] which
+/// takes the version string as an argument; the wrapper supplies the
+/// compile-time `CARGO_PKG_VERSION` so unit tests can inject arbitrary
+/// versions without recompiling.
+#[allow(dead_code)] // wired from `lib.rs::setup` startup hook
+pub fn bust_cache_if_launcher_version_changed(db: &Db) -> VersionBustOutcome {
+    bust_cache_if_version_changed_inner(db, env!("CARGO_PKG_VERSION"))
+}
+
+/// Outcome of the launcher-version-change cache-bust check. Exposed for
+/// tests; production callers can ignore the return value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionBustOutcome {
+    /// No prior version recorded; this is the first boot of any launcher
+    /// version, and the version key has now been seeded. The cache (if
+    /// any happens to exist from a pre-v0.2.34 launcher) is left alone
+    /// — pre-v0.2.34 cache writes used the same envelope shape, so they
+    /// remain valid.
+    FirstBoot,
+    /// Same version as last boot. Cache preserved.
+    SameVersion,
+    /// Different version detected. Cache wiped (rows_deleted = number of
+    /// `module_catalog.cache*` rows removed).
+    VersionChanged { rows_deleted: usize },
+    /// A DB read failed; logged on stderr and treated as a no-op. We
+    /// don't propagate the error because startup paths can't usefully
+    /// recover.
+    Skipped,
+}
+
+fn bust_cache_if_version_changed_inner(db: &Db, running_version: &str) -> VersionBustOutcome {
+    let prior = match db.app_state_get(APP_STATE_KEY_LAUNCHER_VERSION) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[module-catalog] version-change check: app_state_get failed: {}",
+                e
+            );
+            return VersionBustOutcome::Skipped;
+        }
+    };
+    match prior.as_deref() {
+        None => {
+            // Seed the key so the next boot can compare cleanly. Failure
+            // here is non-fatal — next boot just goes through the same
+            // FirstBoot branch.
+            if let Err(e) = db.app_state_set(APP_STATE_KEY_LAUNCHER_VERSION, running_version) {
+                eprintln!(
+                    "[module-catalog] version-change seed failed: {}",
+                    e
+                );
+            }
+            VersionBustOutcome::FirstBoot
+        }
+        Some(prev) if prev == running_version => VersionBustOutcome::SameVersion,
+        Some(prev) => {
+            // Version changed: nuke the cache + update the marker. Each
+            // step soft-fails because the worst case is "cache survives
+            // until its TTL or the user clicks ↻".
+            let rows_deleted = match db.app_state_delete_like(APP_STATE_CACHE_LIKE) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!(
+                        "[module-catalog] version-change cache wipe failed ({} → {}): {}",
+                        prev, running_version, e
+                    );
+                    0
+                }
+            };
+            if let Err(e) = db.app_state_set(APP_STATE_KEY_LAUNCHER_VERSION, running_version) {
+                eprintln!(
+                    "[module-catalog] version-change marker update failed: {}",
+                    e
+                );
+            }
+            if rows_deleted > 0 {
+                eprintln!(
+                    "[module-catalog] launcher version changed {} → {}; \
+                     wiped {} stale cache row(s)",
+                    prev, running_version, rows_deleted
+                );
+            }
+            VersionBustOutcome::VersionChanged { rows_deleted }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -784,6 +948,266 @@ mod tests {
         assert!(read_cache_if_fresh(&db).is_none());
         // Raw read still finds the value (stale fallback works):
         assert!(read_cache_raw(&db).is_some());
+    }
+
+    // ─── 3b. v0.2.34 — empty-modules short TTL ───────────────────────────
+
+    fn empty_envelope() -> L0CatalogResponse {
+        // Same envelope shape as the canonical fixture but with no
+        // modules. Mirrors what L0 returns when no publisher has
+        // pushed an entry yet (or during a transient blank).
+        L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-05-25T00:00:00Z".to_string(),
+            modules: vec![],
+        }
+    }
+
+    // Compile-time invariant: the short TTL MUST be strictly smaller
+    // than the long TTL — otherwise the whole feature is a no-op. Lift
+    // this out of the runtime test below so it's caught at compile
+    // (clippy `assertions_on_constants` complains about runtime
+    // asserts on compile-time-known values).
+    const _: () = assert!(
+        L0_TTL_EMPTY_SECONDS < L0_TTL_SECONDS,
+        "the whole point is that empty TTL is SHORTER than populated TTL",
+    );
+
+    #[test]
+    fn ttl_for_returns_short_ttl_on_empty_modules() {
+        // v0.2.34 dogfood fix: empty envelope must NOT use the long
+        // 15min TTL. The publication-window bug (user opens Modules
+        // tab BEFORE publisher pushes their L0 entry) only resolves
+        // when the empty response expires quickly.
+        let empty = empty_envelope();
+        assert_eq!(ttl_for(&empty), L0_TTL_EMPTY_SECONDS);
+    }
+
+    #[test]
+    fn ttl_for_returns_long_ttl_on_populated_modules() {
+        // Sanity: a populated response keeps the original 15min TTL.
+        // The L0 happy-path should NOT regress to refetching every
+        // minute on populated responses.
+        let populated = parse_response_text(canonical_fixture()).unwrap();
+        assert!(!populated.modules.is_empty());
+        assert_eq!(ttl_for(&populated), L0_TTL_SECONDS);
+    }
+
+    #[test]
+    fn l0_empty_cache_invalidates_at_60s_boundary() {
+        // Write an empty-modules cache, then forge a timestamp 61s old:
+        // fresh read returns None (short TTL has expired). Verifies the
+        // boundary chosen by L0_TTL_EMPTY_SECONDS.
+        let db = open_db();
+        let empty = empty_envelope();
+        write_cache(&db, &empty).expect("cache write");
+        // Immediately after write: still fresh.
+        assert!(read_cache_if_fresh(&db).is_some());
+        // 61s old (past the 60s empty TTL):
+        let sixty_one_s_ago = now_epoch_seconds().saturating_sub(L0_TTL_EMPTY_SECONDS + 1);
+        db.app_state_set(APP_STATE_KEY_CATALOG_AT, &sixty_one_s_ago.to_string())
+            .unwrap();
+        assert!(read_cache_if_fresh(&db).is_none(),
+            "empty cache must expire at 60s, not 15min");
+        // Raw still finds the empty value for the stale-fallback path:
+        assert!(read_cache_raw(&db).is_some());
+    }
+
+    #[test]
+    fn l0_empty_cache_is_still_fresh_at_30s() {
+        // Belt-and-suspenders: at 30s the empty cache is still inside
+        // the 60s TTL window. We don't want to re-fetch on EVERY
+        // catalog render — that would defeat the whole cache.
+        let db = open_db();
+        let empty = empty_envelope();
+        write_cache(&db, &empty).expect("cache write");
+        let thirty_s_ago = now_epoch_seconds().saturating_sub(30);
+        db.app_state_set(APP_STATE_KEY_CATALOG_AT, &thirty_s_ago.to_string())
+            .unwrap();
+        assert!(read_cache_if_fresh(&db).is_some(),
+            "empty cache at 30s old must still be served");
+    }
+
+    #[test]
+    fn l0_populated_cache_is_still_fresh_at_5min() {
+        // Belt-and-suspenders for the OTHER side: a populated cache
+        // at 5min must stay fresh (long TTL = 15min). Asserts we
+        // didn't accidentally shorten the populated TTL.
+        let db = open_db();
+        let populated = parse_response_text(canonical_fixture()).unwrap();
+        write_cache(&db, &populated).expect("cache write");
+        let five_min_ago = now_epoch_seconds().saturating_sub(5 * 60);
+        db.app_state_set(APP_STATE_KEY_CATALOG_AT, &five_min_ago.to_string())
+            .unwrap();
+        assert!(read_cache_if_fresh(&db).is_some(),
+            "populated cache at 5min old must still be served (long TTL)");
+    }
+
+    #[test]
+    fn l0_empty_vs_populated_ttl_branching_at_2min() {
+        // Crux test for the bug: at 2min old, an EMPTY cache must be
+        // expired (60s TTL) but a POPULATED cache must NOT be expired
+        // (15min TTL). Single forged timestamp, two different
+        // envelopes — proves the branching logic.
+        let two_min_ago = now_epoch_seconds().saturating_sub(120);
+
+        // Empty side.
+        let db_empty = open_db();
+        write_cache(&db_empty, &empty_envelope()).unwrap();
+        db_empty
+            .app_state_set(APP_STATE_KEY_CATALOG_AT, &two_min_ago.to_string())
+            .unwrap();
+        assert!(
+            read_cache_if_fresh(&db_empty).is_none(),
+            "empty @ 2min must expire (60s TTL)"
+        );
+
+        // Populated side.
+        let db_pop = open_db();
+        let populated = parse_response_text(canonical_fixture()).unwrap();
+        write_cache(&db_pop, &populated).unwrap();
+        db_pop
+            .app_state_set(APP_STATE_KEY_CATALOG_AT, &two_min_ago.to_string())
+            .unwrap();
+        assert!(
+            read_cache_if_fresh(&db_pop).is_some(),
+            "populated @ 2min must remain fresh (15min TTL)"
+        );
+    }
+
+    // ─── 3c. v0.2.34 — launcher-version-change cache-bust ────────────────
+
+    #[test]
+    fn version_bust_first_boot_seeds_marker_without_busting_cache() {
+        // Fresh DB: no prior version key. Function should seed the
+        // running version + return FirstBoot. Any pre-existing cache
+        // rows (would only be there if pre-v0.2.34 code path wrote
+        // them) are LEFT ALONE — same envelope shape, still valid.
+        let db = open_db();
+        // Seed a cache so we can assert it's NOT wiped.
+        let envelope = parse_response_text(canonical_fixture()).unwrap();
+        write_cache(&db, &envelope).unwrap();
+        assert!(read_cache_raw(&db).is_some());
+
+        let outcome = bust_cache_if_version_changed_inner(&db, "0.2.34");
+        assert_eq!(outcome, VersionBustOutcome::FirstBoot);
+        // Marker now seeded:
+        assert_eq!(
+            db.app_state_get(APP_STATE_KEY_LAUNCHER_VERSION)
+                .unwrap()
+                .as_deref(),
+            Some("0.2.34"),
+        );
+        // Cache preserved:
+        assert!(read_cache_raw(&db).is_some());
+    }
+
+    #[test]
+    fn version_bust_same_version_preserves_cache() {
+        // Marker already matches running version → cache survives.
+        // This is the steady-state case for users who don't update.
+        let db = open_db();
+        db.app_state_set(APP_STATE_KEY_LAUNCHER_VERSION, "0.2.34")
+            .unwrap();
+        let envelope = parse_response_text(canonical_fixture()).unwrap();
+        write_cache(&db, &envelope).unwrap();
+
+        let outcome = bust_cache_if_version_changed_inner(&db, "0.2.34");
+        assert_eq!(outcome, VersionBustOutcome::SameVersion);
+        // Cache untouched:
+        assert!(read_cache_raw(&db).is_some());
+        assert!(read_cache_fetched_at(&db).is_some());
+    }
+
+    #[test]
+    fn version_bust_different_version_wipes_cache() {
+        // Marker says 0.2.33, running version is 0.2.34. Expect both
+        // cache rows (envelope + fetched-at) gone, marker updated.
+        let db = open_db();
+        db.app_state_set(APP_STATE_KEY_LAUNCHER_VERSION, "0.2.33")
+            .unwrap();
+        let envelope = parse_response_text(canonical_fixture()).unwrap();
+        write_cache(&db, &envelope).unwrap();
+        // Sanity: cache present BEFORE the bust.
+        assert!(read_cache_raw(&db).is_some());
+        assert!(read_cache_fetched_at(&db).is_some());
+
+        let outcome = bust_cache_if_version_changed_inner(&db, "0.2.34");
+        match outcome {
+            VersionBustOutcome::VersionChanged { rows_deleted } => {
+                assert_eq!(rows_deleted, 2, "should remove envelope + fetched-at rows");
+            }
+            other => panic!("expected VersionChanged, got {:?}", other),
+        }
+        // Cache gone:
+        assert!(read_cache_raw(&db).is_none());
+        assert!(read_cache_fetched_at(&db).is_none());
+        // Marker updated:
+        assert_eq!(
+            db.app_state_get(APP_STATE_KEY_LAUNCHER_VERSION)
+                .unwrap()
+                .as_deref(),
+            Some("0.2.34"),
+        );
+    }
+
+    #[test]
+    fn version_bust_different_version_does_not_touch_unrelated_app_state() {
+        // Negative: only `module_catalog.cache*` rows should disappear.
+        // The LIKE pattern must NOT collateral-damage other keys.
+        let db = open_db();
+        db.app_state_set(APP_STATE_KEY_LAUNCHER_VERSION, "0.2.33")
+            .unwrap();
+        write_cache(
+            &db,
+            &parse_response_text(canonical_fixture()).unwrap(),
+        )
+        .unwrap();
+        // Plant a few unrelated keys that share a common prefix or
+        // similar structure — they MUST survive.
+        db.app_state_set("onboarding.complete", "true").unwrap();
+        db.app_state_set("module_catalog_dev_affordance.dismissed", "true")
+            .unwrap();
+        db.app_state_set("module_catalog.something_else_entirely", "x")
+            .unwrap();
+
+        let _ = bust_cache_if_version_changed_inner(&db, "0.2.34");
+        // Cache cleared:
+        assert!(read_cache_raw(&db).is_none());
+        // Unrelated rows preserved:
+        assert_eq!(
+            db.app_state_get("onboarding.complete").unwrap().as_deref(),
+            Some("true"),
+        );
+        assert_eq!(
+            db.app_state_get("module_catalog_dev_affordance.dismissed")
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+        );
+        // Note: "module_catalog.something_else_entirely" DOES match
+        // the LIKE pattern by design — anything starting with
+        // `module_catalog.cache` is owned by this module. The third
+        // key here uses `module_catalog.` (no `cache` segment), so
+        // it survives. Re-verify:
+        assert_eq!(
+            db.app_state_get("module_catalog.something_else_entirely")
+                .unwrap()
+                .as_deref(),
+            Some("x"),
+            "keys under module_catalog.* that don't start with cache must survive",
+        );
+    }
+
+    #[test]
+    fn version_bust_idempotent_on_repeated_calls_same_version() {
+        // Calling the bust function twice in a row at the same
+        // version is a steady-state no-op. Defensive — startup paths
+        // might invoke this via several hooks in some future refactor.
+        let db = open_db();
+        bust_cache_if_version_changed_inner(&db, "0.2.34"); // FirstBoot, seeds marker
+        let outcome = bust_cache_if_version_changed_inner(&db, "0.2.34");
+        assert_eq!(outcome, VersionBustOutcome::SameVersion);
     }
 
     #[test]

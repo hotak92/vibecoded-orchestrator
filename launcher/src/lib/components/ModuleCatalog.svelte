@@ -17,6 +17,7 @@
   import { modules, installedIds } from '$lib/stores/modules';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { license } from '$lib/stores/license';
+  import { toast } from '$lib/stores/toast';
   import type { ModuleCatalogEntry, ModuleInstallRow } from '$lib/types/launcher';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import DeprecationBanner from '$lib/components/DeprecationBanner.svelte';
@@ -109,6 +110,75 @@
       l0Retrying = false;
     }
   }
+
+  // v0.2.34 (Agent C): always-visible ↻ refresh button — additive
+  // surface to L0StatusIndicator's stale/unavailable banners. The
+  // existing reloadCatalog goes through `list_module_catalog` which
+  // honours the 15-min DB-backed TTL; the manual refresh path here
+  // calls `refresh_module_catalog` (via modules.forceRefresh) which
+  // bypasses the cache. Why separate: clicking ↻ in the happy-path
+  // must do something visible — going through the cached path would
+  // be a silent no-op on second click within 15 minutes.
+  let manualRefreshing = $state(false);
+
+  async function handleManualRefresh() {
+    if (manualRefreshing) return;
+    manualRefreshing = true;
+    try {
+      const ok = await modules.forceRefresh();
+      if (!ok) {
+        // forceRefresh stores the error on the store; surface it
+        // through the toast so the user sees something concrete
+        // (the store-level `error` text is already rendered at the
+        // bottom of the catalog as a fallback, but that's far from
+        // the click target).
+        const errText = mState.error || 'Refresh failed.';
+        toast.error(`Catalog refresh failed: ${errText}`);
+      }
+    } finally {
+      manualRefreshing = false;
+    }
+  }
+
+  // v0.2.34 (Agent C): "Fetched 3m ago" display next to the refresh
+  // button. Derives from `l0Status` (which carries either `fetched_at`
+  // or `cached_fetched_at`). The `now` tick state forces re-evaluation
+  // of the relative-time string once per minute so the user sees the
+  // counter advance without having to re-trigger a fetch.
+  let now = $state(Date.now());
+  $effect(() => {
+    const handle = setInterval(() => {
+      now = Date.now();
+    }, 60 * 1000);
+    return () => clearInterval(handle);
+  });
+
+  function fetchedAtIso(status: typeof mState.l0Status): string | null {
+    if (!status) return null;
+    if (status.kind === 'ok') return status.fetched_at;
+    if (status.kind === 'stale') return status.cached_fetched_at;
+    return null; // 'unavailable' has no timestamp surface
+  }
+
+  function relativeFetched(iso: string | null, _tick: number): string {
+    if (!iso) return '';
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return '';
+    const deltaMs = Math.max(0, _tick - t);
+    const sec = Math.floor(deltaMs / 1000);
+    if (sec < 30) return 'just now';
+    if (sec < 60) return `${sec}s ago`;
+    const min = Math.floor(sec / 60);
+    if (min < 60) return `${min}m ago`;
+    const hr = Math.floor(min / 60);
+    if (hr < 24) return `${hr}h ago`;
+    const day = Math.floor(hr / 24);
+    return `${day}d ago`;
+  }
+
+  const lastFetchedLabel = $derived(
+    relativeFetched(fetchedAtIso(mState.l0Status), now),
+  );
 
   async function dismissDevHint() {
     await modules.dismissDevAffordance();
@@ -381,6 +451,37 @@
         {/if}
       </button>
     {/each}
+    <!-- v0.2.34 (Agent C): always-visible refresh button, mounted
+         UNCONDITIONALLY (NOT inside L0StatusIndicator's status-gated
+         render). Bypasses the 15-min DB-backed TTL via
+         `refresh_module_catalog` so the user has a reliable manual
+         force-refresh path — particularly important for the
+         "publisher uploaded their L0 entry mid-session" case where
+         the 15-min stale-empty cache would otherwise lock the user
+         out of fresh data. -->
+    <div class="refresh-cluster">
+      {#if lastFetchedLabel}
+        <span class="last-fetched" aria-label="Catalog last fetched">
+          Fetched {lastFetchedLabel}
+        </span>
+      {/if}
+      <button
+        type="button"
+        class="refresh-btn"
+        onclick={handleManualRefresh}
+        disabled={manualRefreshing}
+        aria-label="Refresh module catalog"
+        title="Refresh catalog (bypasses 15-min cache)"
+      >
+        {#if manualRefreshing}
+          <span class="spinner-sm" aria-hidden="true"></span>
+          <span class="refresh-label">Refreshing…</span>
+        {:else}
+          <span class="refresh-icon" aria-hidden="true">↻</span>
+          <span class="refresh-label">Refresh</span>
+        {/if}
+      </button>
+    </div>
   </div>
 
   <!-- v0.2.33 (Agent E): L0 freshness indicator + L9 parse-error
@@ -681,6 +782,54 @@
     display: flex;
     gap: 6px;
     margin-bottom: 16px;
+    align-items: center;
+  }
+
+  /* v0.2.34 (Agent C): refresh cluster on the right edge of the
+     filter row. Uses `margin-left: auto` so the existing filter
+     pills stay left-anchored regardless of how many fit. */
+  .refresh-cluster {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .last-fetched {
+    font-size: 11px;
+    color: var(--color-muted);
+    white-space: nowrap;
+  }
+
+  .refresh-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 999px;
+    color: var(--color-mid);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .refresh-btn:hover:not(:disabled) {
+    color: var(--color-text);
+    border-color: rgba(0, 191, 166, 0.3);
+    background: rgba(0, 191, 166, 0.08);
+  }
+  .refresh-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .refresh-icon {
+    font-size: 13px;
+    line-height: 1;
+  }
+  .refresh-label {
+    font-size: 11px;
   }
 
   .filter-pill {
