@@ -854,6 +854,23 @@ pub async fn detect_legacy_volumes() -> Result<Vec<DetectedLegacyVolume>, String
     Ok(detect_legacy_volumes_inner().await)
 }
 
+/// v0.2.34 (Agent I) — Read-only resolver for the launcher's state-root
+/// directory. Surfaces the same path that `crate::paths::vct_root_dir()`
+/// returns so the Preferences UI can render it (with a tooltip explaining
+/// the `VCT_STATE_DIR` override) without duplicating the resolution logic.
+///
+/// Returns the absolute path as a `String` (the `Display` form of the
+/// `PathBuf`). This command does NOT create the directory — callers that
+/// only want to *display* the resolved path shouldn't have a side effect.
+///
+/// Lives in `storage_ux.rs` because the Preferences "Storage" section is
+/// the natural surface for it; no separate `preferences_cmd.rs` module
+/// existed at the time this was added.
+#[command]
+pub async fn get_resolved_vct_root_dir() -> Result<String, String> {
+    Ok(crate::paths::vct_root_dir().display().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // PR-28 (Group G, v0.2.12) — install-time CLI entrypoint
 // ---------------------------------------------------------------------------
@@ -1856,6 +1873,84 @@ mod tests {
             Some("yaml"),
             "override file extension must be .yaml (podman-compose \
              auto-loads compose.override.yaml / compose.override.yml)"
+        );
+    }
+
+    // ----- v0.2.34 (Agent I): state-directory discoverability ---------------
+    //
+    // The Preferences "Storage" section calls `get_resolved_vct_root_dir`
+    // to render the launcher's state-root path read-only. The resolver
+    // delegates to `crate::paths::vct_root_dir()` which honours the
+    // `VCT_STATE_DIR` env var. The tests below pin both branches so a
+    // future refactor of the resolver can't silently break the GUI
+    // tooltip the user relies on to discover the override.
+
+    use std::sync::Mutex;
+    /// VCT_STATE_DIR is process-wide; serialise tests that mutate it so
+    /// parallel cargo runs don't observe each other (same pattern as
+    /// `vct-launcher-core::paths::tests::SERIALIZE`). Poisoning is benign
+    /// here (another test panicked while holding the lock): tear down the
+    /// env regardless and continue.
+    static RESOLVER_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Async wrapper around the VCT_STATE_DIR env mutation. The Tauri
+    /// `#[command]` surface returns `Future`, so the test body must
+    /// `.await` inside the locked region.
+    ///
+    /// We intentionally hold the `std::sync::Mutex` guard across the
+    /// `.await` — the env var is process-global and the whole point of
+    /// the lock is to serialise the get/set/restore cycle so parallel
+    /// tests can't observe each other's value. Switching to
+    /// `tokio::sync::Mutex` would not change semantics (the resolver
+    /// itself is sync, body is short) and would couple the test helper
+    /// to the tokio runtime version. The clippy lint about holding a
+    /// MutexGuard across an await is acknowledged via the targeted
+    /// allow below — the body never blocks on I/O while holding the
+    /// lock, only on the body of the closure under test.
+    #[allow(clippy::await_holding_lock)]
+    async fn with_vct_state_dir_env_async<F, Fut, T>(val: Option<&str>, f: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let _g = RESOLVER_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("VCT_STATE_DIR").ok();
+        match val {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+        let out = f().await;
+        match prev {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn get_resolved_vct_root_dir_honors_env_override() {
+        let resolved = with_vct_state_dir_env_async(
+            Some("/tmp/vct-test-resolver-override"),
+            || async { get_resolved_vct_root_dir().await.unwrap() },
+        )
+        .await;
+        assert_eq!(
+            resolved, "/tmp/vct-test-resolver-override",
+            "VCT_STATE_DIR override must reach the GUI-facing resolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_resolved_vct_root_dir_falls_back_to_dot_vct_when_unset() {
+        let resolved = with_vct_state_dir_env_async(None, || async {
+            get_resolved_vct_root_dir().await.unwrap()
+        })
+        .await;
+        // Don't pin the absolute home directory (varies by CI worker);
+        // assert the structural invariant the tooltip documents.
+        assert!(
+            resolved.ends_with(".vct"),
+            "expected default ~/.vct fallback, got {resolved:?}"
         );
     }
 }

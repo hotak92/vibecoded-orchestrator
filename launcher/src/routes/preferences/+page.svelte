@@ -1529,6 +1529,56 @@
     }
   }
 
+  // ── State directory (v0.2.34 Agent I) ────────────────────────────────
+  // Read-only display of `vct_root_dir()` — the launcher's state-root
+  // (launcher.db, hub.port, hub.db, modules/, projects.json, ...). The
+  // resolver lives in `vct-launcher-core::paths::vct_root_dir()`, honours
+  // the `VCT_STATE_DIR` env var, and falls back to `~/.vct/` (Linux/macOS)
+  // or the directories-crate equivalent on Windows. Surfacing it in
+  // Preferences gives users a way to discover where launcher state lives
+  // without grepping the docs — and the tooltip documents the env-var
+  // override so dev runs can be isolated from production state. The
+  // companion Tauri command is `storage_ux::get_resolved_vct_root_dir`.
+  // A "Move state directory" button is intentionally NOT added here —
+  // that's deferred to v0.2.35 per the backlog (it would need a
+  // structured migration pipeline + restart, not just a path resolver).
+  let stateDir = $state<string>('');
+  let stateDirError = $state<string | null>(null);
+  let stateDirCopied = $state(false);
+
+  async function loadStateDir() {
+    stateDirError = null;
+    try {
+      stateDir = await invoke<string>('get_resolved_vct_root_dir');
+    } catch (e) {
+      stateDirError = String(e);
+      stateDir = '';
+    }
+  }
+
+  /**
+   * Copy the resolved state directory path to the system clipboard. Same
+   * defensive fallback pattern as `OrchestratorUpdateDivergenceModal`'s
+   * `openClone()` — `navigator.clipboard.writeText` is gated behind a
+   * presence check so the function doesn't throw in non-browser contexts
+   * (no SSR here in Tauri, but the pattern is consistent across the
+   * codebase). Shows a transient "Copied!" hint that clears after 2s.
+   */
+  async function copyStateDir() {
+    if (!stateDir) return;
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard) {
+        await navigator.clipboard.writeText(stateDir);
+        stateDirCopied = true;
+        setTimeout(() => { stateDirCopied = false; }, 2000);
+      } else {
+        toast.error('Clipboard API unavailable');
+      }
+    } catch (e) {
+      toast.error(`Copy failed: ${e}`);
+    }
+  }
+
   onMount(() => {
     void load();
     void loadPat();
@@ -1550,6 +1600,9 @@
     void loadActiveEmbedding();
     void refreshVolumes();
     void loadAppVersion();
+    // v0.2.34 (Agent I): resolve the launcher's state-root for the
+    // Preferences → Storage discoverability surface.
+    void loadStateDir();
   });
   $effect(() => { if (project) void load(); });
   $effect(() => { if ($selectedProject) void loadRlLocalState(); });
@@ -2141,6 +2194,46 @@
          self-update). -->
     <section class="pr-section">
       <h2 class="pr-section-title">Storage</h2>
+      <!-- v0.2.34 (Agent I): state-directory discoverability.
+           Read-only display of the launcher's resolved state-root
+           (`vct_root_dir()`) with a copy-to-clipboard button and a
+           tooltip documenting the `VCT_STATE_DIR` override. Surfaces
+           where the launcher's database, hub state, installed modules,
+           and per-project config live. A "Move state directory" button
+           is intentionally NOT added here — that's deferred to v0.2.35
+           (would need a migration pipeline + restart, not just a
+           resolver). -->
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>State directory</strong>
+          <span class="pr-onboarding-hint">
+            Where the launcher stores its database, hub state, installed
+            modules, and per-project config. Hover the path for details
+            on the <code>VCT_STATE_DIR</code> override.
+          </span>
+          {#if stateDirError}
+            <span class="pr-state-dir-error" role="alert">
+              Failed to resolve state directory: {stateDirError}
+            </span>
+          {:else if stateDir}
+            <code
+              class="pr-state-dir-value"
+              title={'Where the launcher stores its database, hub state, installed modules, and per-project config. Defaults to ~/.vct/ on Linux/macOS, %LOCALAPPDATA%\\.vct on Windows.\n\nOverride via the VCT_STATE_DIR environment variable — useful for:\n  1. Running a dev launcher against an in-development clone without contaminating production state\n  2. Keeping launcher state on a portable USB stick next to the binary\n  3. Isolating per-test-environment state on shared machines\n\nRestart the launcher after changing the env var.'}
+            >{stateDir}</code>
+          {:else}
+            <span class="pr-onboarding-hint"><em>Resolving…</em></span>
+          {/if}
+        </div>
+        <button
+          class="pr-btn"
+          type="button"
+          onclick={() => void copyStateDir()}
+          disabled={!stateDir}
+          aria-label="Copy state directory path to clipboard"
+        >
+          {stateDirCopied ? 'Copied!' : 'Copy path'}
+        </button>
+      </div>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
           <strong>Container data location</strong>
@@ -3108,6 +3201,30 @@
     font-size: 12px; font-weight: 600; white-space: nowrap;
   }
   .pr-btn-primary:hover { background: rgb(0,210,183); }
+
+  /* State directory (v0.2.34, Agent I) — monospace inline path display
+     with a subtle background so it visually anchors as a code value
+     even when wrapped. The cursor:help hint reminds users that the
+     `title` tooltip carries the VCT_STATE_DIR override docs. */
+  .pr-state-dir-value {
+    margin-top: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: #cfcfcf;
+    background: rgba(255,255,255,0.06);
+    padding: 3px 8px;
+    border-radius: 3px;
+    word-break: break-all;
+    max-width: 480px;
+    cursor: help;
+  }
+  .pr-state-dir-error {
+    margin-top: 4px;
+    font-size: 11px;
+    color: rgb(255,140,140);
+    max-width: 480px;
+    line-height: 1.5;
+  }
 
   /* GitHub PAT section */
   .pr-pat-row {

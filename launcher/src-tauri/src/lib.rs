@@ -1480,6 +1480,11 @@ pub fn run() {
             commands::storage_ux::detect_legacy_volumes,
             commands::storage_ux::migrate_to_named_volume,
             commands::storage_ux::migrate_to_bind_path,
+            // v0.2.34 (Agent I): read-only resolver for the launcher's
+            // state-root directory. Backs the Preferences → Storage
+            // discoverability surface (renders the resolved path +
+            // tooltip explaining VCT_STATE_DIR override).
+            commands::storage_ux::get_resolved_vct_root_dir,
             commands::installer::update_orchestrator,
             // v0.2.23 (B4 / D19): divergence-recovery commands for
             // update_orchestrator. When the user's local clone has
