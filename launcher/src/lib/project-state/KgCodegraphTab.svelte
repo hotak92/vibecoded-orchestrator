@@ -442,7 +442,7 @@ Continue?`;
   .ps-section h4 { font-size: 13px; margin: 0 0 12px; color: #c4b3ff; }
   .ps-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
   .ps-form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: #888; }
-  .ps-form-grid input, .ps-form-grid select {
+  .ps-form-grid input {
     background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); color: inherit;
     padding: 6px 10px; border-radius: 4px; font-size: 13px;
   }

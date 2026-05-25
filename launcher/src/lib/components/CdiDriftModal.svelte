@@ -95,12 +95,6 @@
 {/if}
 
 <style>
-  .cdi-drift-modal {
-    max-width: 720px;
-    padding: 1.5rem;
-    color: var(--text-color, #e0e0e0);
-  }
-
   h2 {
     margin: 0 0 1rem;
     font-size: 1.25rem;
@@ -118,12 +112,6 @@
     max-height: 50vh;
     overflow-y: auto;
     margin: 0 0 1.25rem;
-  }
-
-  .cdi-actions {
-    display: flex;
-    justify-content: flex-end;
-    margin-bottom: 1rem;
   }
 
   button.primary {

@@ -350,18 +350,6 @@
     color: var(--color-mid);
   }
 
-  .auth-demo-hint {
-    text-align: center;
-    margin-top: 16px;
-    padding: 10px;
-    background: rgba(123, 95, 255, 0.08);
-    border: 1px solid rgba(123, 95, 255, 0.15);
-    border-radius: 10px;
-    font-size: 11px;
-    color: var(--color-mid);
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-  }
-
   /* Spinner */
   .spinner {
     display: inline-block;

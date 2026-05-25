@@ -1198,9 +1198,6 @@
   .host-help p {
     margin: 0;
   }
-  .host-help p + p {
-    margin-top: 6px;
-  }
   .host-help strong {
     color: var(--color-text);
   }

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import type { AccessMode } from '$lib/types/project-state';
@@ -19,9 +19,9 @@
   } = $props();
 
   let mode = $state<'shared' | 'projects' | 'private'>(
-    (initial?.mode as any) ?? 'private',
+    untrack(() => (initial?.mode as any) ?? 'private'),
   );
-  let selected = $state<Set<string>>(new Set(initial?.project_ids ?? []));
+  let selected = $state<Set<string>>(untrack(() => new Set(initial?.project_ids ?? [])));
   let allProjects = $state<ProjectView[]>([]);
   let saving = $state(false);
 

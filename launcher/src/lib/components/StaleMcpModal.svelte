@@ -15,6 +15,7 @@
   // user reviewed, not just the ones they accepted.
 
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import { untrack } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
 
@@ -43,7 +44,7 @@
   // Per-entry checkbox state — keyed by mcp name. Initialized to false
   // (must opt in explicitly).
   let checked = $state<Record<string, boolean>>(
-    Object.fromEntries(stale.map((e) => [e.name, false])),
+    untrack(() => Object.fromEntries(stale.map((e) => [e.name, false]))),
   );
   let running = $state(false);
   let report = $state<RewriteReport | null>(null);

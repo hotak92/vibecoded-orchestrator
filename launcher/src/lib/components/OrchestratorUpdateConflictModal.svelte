@@ -103,7 +103,7 @@
 </script>
 
 <div class="cfl-backdrop" role="presentation" onclick={dismiss}>
-  <div class="cfl-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()}>
+  <div class="cfl-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
     <h3>{operationLabel} produced conflicts</h3>
     <p>
       <code>git {payload.operation}</code> started but couldn't combine your

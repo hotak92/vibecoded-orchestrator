@@ -314,7 +314,7 @@
     <div class="ps-section">
       <div class="ps-meta-grid">
         <div>
-          <label class="ps-meta-label">Display name</label>
+          <span class="ps-meta-label">Display name</span>
           <p class="ps-meta-value">
             <strong>{identity.name}</strong>
             <span class="ps-host-badge {hostBadgeClass(identity)}">
@@ -335,20 +335,20 @@
           {/if}
         </div>
         <div>
-          <label class="ps-meta-label">Slug</label>
+          <span class="ps-meta-label">Slug</span>
           <p class="ps-meta-value"><code>{identity.slug}</code></p>
         </div>
         <div class="ps-span2">
-          <label class="ps-meta-label">Folder</label>
+          <span class="ps-meta-label">Folder</span>
           <p class="ps-meta-value"><code>{identity.folder_path}</code></p>
         </div>
         <div class="ps-span2">
-          <label class="ps-meta-label">Identity source on disk</label>
+          <span class="ps-meta-label">Identity source on disk</span>
           <p class="ps-meta-value"><code>{identity.identity_source}</code></p>
         </div>
         {#if identity.vct_module_version}
           <div class="ps-span2">
-            <label class="ps-meta-label">vct-module.json version</label>
+            <span class="ps-meta-label">vct-module.json version</span>
             <p class="ps-meta-value"><code>v{identity.vct_module_version}</code></p>
           </div>
         {/if}

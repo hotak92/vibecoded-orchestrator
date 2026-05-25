@@ -168,8 +168,8 @@
           <h3>Configuration</h3>
 
           <div class="config-field">
-            <label>Install path</label>
-            <input type="text" bind:value={installPath} />
+            <label for="iw-install-path">Install path</label>
+            <input id="iw-install-path" type="text" bind:value={installPath} />
           </div>
 
           <!-- GPU toggle -->
@@ -189,10 +189,11 @@
           <!-- Container runtime -->
           {#if system.has_docker || system.has_podman}
             <div class="config-field">
-              <label>Container runtime</label>
+              <label for="iw-container-runtime">Container runtime</label>
               <div class="select-row">
                 {#if system.has_docker && system.has_podman}
                   <Dropdown
+                    id="iw-container-runtime"
                     options={RUNTIME_OPTIONS}
                     value={containerRuntime ?? 'podman'}
                     onChange={(v: string) => (containerRuntime = v)}
@@ -216,8 +217,8 @@
           {/if}
 
           <!-- Embedding mode -->
-          <div class="config-field">
-            <label>Embedding mode</label>
+          <div class="config-field" role="radiogroup" aria-labelledby="iw-embed-mode-label">
+            <span id="iw-embed-mode-label" class="config-field-label">Embedding mode</span>
             <div class="radio-group">
               <label class="radio-option" class:selected={!cpuOnly && !useOpenai}>
                 <input type="radio" name="embed" checked={!cpuOnly && !useOpenai}
@@ -236,8 +237,8 @@
 
           {#if useOpenai}
             <div class="config-field">
-              <label>OpenAI API Key</label>
-              <input type="password" bind:value={openaiKey} placeholder="sk-..." />
+              <label for="iw-openai-key">OpenAI API Key</label>
+              <input id="iw-openai-key" type="password" bind:value={openaiKey} placeholder="sk-..." />
             </div>
           {/if}
         </div>
@@ -333,7 +334,8 @@
   .config-section { margin-top: 20px; }
   .config-section h3 { font-size: 14px; font-weight: 600; color: var(--color-mid); margin-bottom: 16px; text-transform: uppercase; letter-spacing: 1px; }
   .config-field { margin-bottom: 16px; }
-  .config-field > label { display: block; font-size: 13px; color: var(--color-mid); margin-bottom: 6px; }
+  .config-field > label,
+  .config-field > .config-field-label { display: block; font-size: 13px; color: var(--color-mid); margin-bottom: 6px; }
   .config-field input[type="text"],
   .config-field input[type="password"] {
     width: 100%;
@@ -391,15 +393,6 @@
 
   /* Select */
   .select-row { display: flex; align-items: center; gap: 16px; }
-  .select-row select {
-    padding: 8px 12px;
-    background: var(--color-bg);
-    border: 1px solid var(--color-border);
-    border-radius: 8px;
-    color: var(--color-text);
-    font-size: 14px;
-  }
-  .select-row select:focus { outline: none; border-color: var(--color-teal); }
   .auto-value { font-size: 14px; color: var(--color-mid); }
 
   /* Progress */

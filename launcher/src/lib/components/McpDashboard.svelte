@@ -197,21 +197,22 @@
                   {#if editingMcp === server.id}
                     <div class="settings-panel">
                       {#each Object.entries(server.settings) as [key, setting]}
+                        {@const inputId = `mcp-setting-${server.id}-${key}`}
                         <div class="setting-row">
-                          <label class="setting-label" title={setting.description}>
+                          <label class="setting-label" title={setting.description} for={inputId}>
                             {setting.label}
                           </label>
                           {#if setting.setting_type === 'bool'}
-                            <input type="checkbox" checked={setting.value === 'true'}
+                            <input id={inputId} type="checkbox" checked={setting.value === 'true'}
                               disabled={!setting.editable}
                               onchange={(e) => updateMcpSetting(server.id, key, String((e.target as HTMLInputElement).checked))} />
                           {:else if setting.setting_type === 'secret'}
-                            <input type="password" value={setting.value}
+                            <input id={inputId} type="password" value={setting.value}
                               disabled={!setting.editable}
                               onblur={(e) => updateMcpSetting(server.id, key, (e.target as HTMLInputElement).value)}
                               placeholder="Enter value..." />
                           {:else}
-                            <input type="text" value={setting.value}
+                            <input id={inputId} type="text" value={setting.value}
                               disabled={!setting.editable}
                               onblur={(e) => updateMcpSetting(server.id, key, (e.target as HTMLInputElement).value)} />
                           {/if}

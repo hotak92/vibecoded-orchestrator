@@ -2904,7 +2904,7 @@
        self-contained. -->
   <div class="pr-overlay" role="presentation" onclick={() => (showOnboardingConfirm = false)}>
     <div class="pr-modal" role="dialog" aria-modal="true" tabindex="-1" aria-labelledby="pr-modal-title"
-         onclick={(e) => e.stopPropagation()}>
+         onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <h3 id="pr-modal-title" class="pr-modal-title">Re-run onboarding wizard?</h3>
       <p class="pr-modal-body">
         This will show the setup wizard again from step 1.
@@ -2921,7 +2921,7 @@
 {#if showPatClearConfirm}
   <div class="pr-overlay" role="presentation" onclick={() => (showPatClearConfirm = false)}>
     <div class="pr-modal" role="dialog" aria-modal="true" tabindex="-1" aria-labelledby="pr-pat-clear-title"
-         onclick={(e) => e.stopPropagation()}>
+         onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <h3 id="pr-pat-clear-title" class="pr-modal-title">Clear GitHub token?</h3>
       <p class="pr-modal-body">
         Removes the token from your OS keychain and strips <code>GITHUB_TOKEN</code>
@@ -2942,7 +2942,7 @@
   <div class="pr-overlay" role="presentation" onclick={() => (openaiShowClearConfirm = false)}>
     <div class="pr-modal" role="dialog" aria-modal="true" tabindex="-1"
          aria-labelledby="pr-openai-clear-title"
-         onclick={(e) => e.stopPropagation()}>
+         onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
       <h3 id="pr-openai-clear-title" class="pr-modal-title">Clear OpenAI key?</h3>
       <p class="pr-modal-body">
         Removes the API key from your OS keychain and clears the recovery
@@ -2985,6 +2985,7 @@
       aria-labelledby="pr-openai-confirm-title"
       aria-describedby="pr-openai-confirm-body"
       onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
       use:focusTrap
     >
       <h3 id="pr-openai-confirm-title" class="pr-modal-title">

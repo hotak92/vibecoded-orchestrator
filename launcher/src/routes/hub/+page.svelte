@@ -179,10 +179,6 @@
   .hub-section h2 { font-size: 13px; margin: 0 0 8px; color: #c4b3ff; }
   .hub-section-h { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; gap: 8px; }
   .hub-poll { display: flex; gap: 6px; align-items: center; }
-  .hub-poll select {
-    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); color: inherit;
-    padding: 3px 8px; border-radius: 4px; font-size: 11px;
-  }
   .hub-empty { color: #888; padding: 16px; text-align: center; font-size: 12px; }
   .hub-placeholder {
     margin: 14px 24px; padding: 12px 14px;
