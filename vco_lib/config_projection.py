@@ -119,12 +119,17 @@ Out of scope
   through one contract; widening the canonical key set is a separate
   governance step that must update both the Rust ``CANONICAL_INSTALL_ENV_KEYS``
   const and :func:`list_canonical_keys` here.
-* User-bucket secrets (``user_secret_pairs`` / ``user_secret_known_keys``
-  in ``ProjectEnvSettings``). Those have a separate active-flag /
-  paused-state lifecycle managed by ``commands::project_env_settings::
-  resolve_user_secret_state`` in Rust; routing them through this
-  contract requires plumbing that active-flag gate into Python first.
-  The contract handles canonical (launcher-owned) keys only.
+* User-bucket secret VALUES (keychain-resident). The OS keychain is
+  Rust-owned; there is no Python keychain bridge yet. Phase 0.E
+  (2026-05-25) adds :func:`apply_user_secrets` which ROUTES the
+  byte layout through this module while accepting pre-resolved
+  (KEY, VALUE) pairs from the Rust caller (which queries the
+  keychain). The DB-side resolver
+  :func:`user_secret_known_keys_from_db` reads the strip set
+  (every KEY ever observed across the three buckets — per_project,
+  shared, global) so paused / deleted secrets actually leave the
+  surfaces. See the "User-secret writes (Phase 0.E)" section
+  below for the contract shape.
 
 Cross-OS rules (non-negotiable)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -177,6 +182,68 @@ regression-proof acceptance criterion of Phase 0.B and is tested by
 Divergences caught by the parity test must be fixed by changing the
 Python side (Rust is the source of truth for byte layout until the
 follow-up PR that flips production callers).
+
+User-secret writes (Phase 0.E, 2026-05-25)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Phase 0.B explicitly excluded ``user_secret_pairs`` /
+``user_secret_known_keys`` because their VALUE side lives in the OS
+keychain (Rust-owned; no Python bridge exists). Phase 0.E extends the
+contract to cover their WRITE side without bridging the keychain:
+
+  * The Rust caller queries the keychain via the existing
+    ``commands::project_env_settings::resolve_user_secret_state``
+    code path → produces ``(KEY, VALUE)`` pairs across the three
+    buckets (``per_project``, ``shared``, ``global``).
+  * The Rust caller serialises those pairs to JSON and invokes
+    ``python -m vco_lib.config_projection apply-user-secrets
+    --project-id <id> --pairs-json <file>``.
+  * Python reads the launcher DB to compute the STRIP set
+    (every KEY ever observed in ``secret_active_state`` across
+    the three buckets, regardless of active flag) via
+    :func:`user_secret_known_keys_from_db`. Pairs in the input AND
+    in the known-keys list are EMITTED; known-keys NOT in the
+    input are STRIPPED from the JSON env blocks (signal-to-remove).
+  * Python writes through the SAME atomic-write pipeline as the
+    canonical env, preserving byte-identical output with the Rust
+    writer (``build_claude_env_managed_block_with_user_secrets``
+    and ``merge_env_object_canonical_with_user_secrets``).
+
+The three lifecycle scenarios this contract supports:
+
+  1. **Fresh secret creation** — KEY appears in both ``user_secret_pairs``
+     (input) and the DB strip set (because ``set_secret_v2`` writes the
+     active-flag row before invoking the env-refresh hook). EMITTED to
+     every surface.
+  2. **Secret update (overwrite existing)** — same shape as creation;
+     the new VALUE replaces the old in the JSON env objects and the
+     ``.claude/env`` managed block is rebuilt from scratch.
+  3. **Secret deletion / pause** — KEY is in the DB strip set but
+     absent from ``user_secret_pairs`` (because either ``clear_secret_v2``
+     removed the keychain entry, or the active flag is 0, or the
+     keychain backend is unreachable). The key is REMOVED from the
+     JSON env blocks via the explicit strip pass, and is simply
+     absent from the rebuilt ``.claude/env`` managed block.
+
+Three reasons NOT to fully bridge the keychain into Python today:
+
+  * The OS keychain APIs (Linux Secret Service, macOS Keychain
+    Services, Windows Credential Manager) have well-tested Rust
+    bindings via the launcher's ``secrets`` crate; the Python
+    side would need a parallel implementation that handles the same
+    three backends + the soft-fail discipline (keychain unreachable
+    → empty pairs, not a crash).
+  * The active-flag gate uses the cross-launcher discovery walker
+    in ``db::secret_active::is_secret_active_cross_launcher`` —
+    a sibling-walking ``read_is_active_from_db_file`` over every
+    other launcher's DB. Re-implementing that defensively in Python
+    is doable but doubles the surface area for soft-fail bugs.
+  * Two implementations of the same security-sensitive lifecycle
+    is a worse outcome than one implementation that owns it.
+
+So the contract is asymmetric on purpose: VALUES stay Rust-owned;
+LAYOUT moves to Python (and is shared with the canonical writer's
+layout, which was the whole point of Phase 0.B).
 """
 
 from __future__ import annotations
@@ -318,6 +385,69 @@ class ProjectEnvBundle(TypedDict):
     canonical_env: dict[str, str]
     project_id: str
     project_root: Path
+
+
+class UserSecretBundle(TypedDict):
+    """Phase 0.E (2026-05-25) — input bundle for :func:`apply_user_secrets`.
+
+    The Rust caller resolves the keychain VALUES (via the existing
+    ``commands::project_env_settings::resolve_user_secret_state``)
+    and produces this bundle for the Python writer to consume.
+
+    ``user_secret_pairs`` is the ordered list of ``(KEY, VALUE)``
+    tuples to EMIT. Order matches the Rust resolver's bucket-precedence
+    rule (per-project bucket wins on collision; shared then global
+    fill the rest). The list is intentionally a list-of-tuples
+    rather than a dict so two pairs with the same KEY but different
+    VALUES (a Rust resolver bug) would be visibly malformed at the
+    JSON boundary rather than silently de-duplicated by ``json.load``.
+    The Python writer treats LAST-write-wins per-key when emitting
+    (matching the Rust behaviour: ``env_obj.insert(k, v)`` in
+    ``merge_env_object_canonical_with_user_secrets``).
+
+    ``user_secret_known_keys`` is the STRIP set — every KEY that has
+    ever had an active-flag row across the three buckets, regardless
+    of current active flag. The writer REMOVES any key in this list
+    that is NOT in ``user_secret_pairs`` from the JSON env blocks
+    (signal-to-remove semantics; the ``.claude/env`` BEGIN/END
+    replace handles strip implicitly via wholesale block rebuild).
+
+    ``project_id`` and ``project_root`` are carried alongside so
+    callers don't have to re-query the DB to know where to write.
+
+    Invariants enforced by the resolver, not by the dataclass:
+
+      * ``user_secret_known_keys`` is a superset of the keys in
+        ``user_secret_pairs`` (the strip set always carries every
+        active key — if it didn't, the EMIT for that key would not
+        survive a subsequent paused-secret strip pass).
+      * No key in ``user_secret_pairs`` is a canonical key (the
+        ``set_secret_v2`` GUI path doesn't let users pick canonical
+        names; defensive enforcement happens at the call site).
+
+    See also the module-level "User-secret writes (Phase 0.E)" doc
+    section.
+    """
+
+    user_secret_pairs: list[tuple[str, str]]
+    user_secret_known_keys: list[str]
+    project_id: str
+    project_root: Path
+
+
+# Sentinel project_id values used in the secret_active_state schema.
+# The launcher uses these literals to key shared / global secrets so
+# every project's resolver sees the same row. They MUST match the Rust
+# constants in launcher/src-tauri/src/secrets.rs (SENTINEL_SHARED /
+# SENTINEL_GLOBAL) — a drift here silently dis-routes the env-time
+# strip set across reboots.
+
+_USER_SECRET_SCOPE_PER_PROJECT = "per_project"
+_USER_SECRET_SCOPE_SHARED = "shared"
+_USER_SECRET_SCOPE_GLOBAL = "global"
+_USER_SECRET_PROJECT_ID_SHARED = "_user_shared_"
+_USER_SECRET_PROJECT_ID_GLOBAL = "_global_"
+_USER_SECRET_MODULE_ID = "user"
 
 
 @dataclass(frozen=True, slots=True)
@@ -739,6 +869,131 @@ def _fetch_diagram_access_list(
     return sorted({str(r["name"]) for r in cur.fetchall() if r["name"]})
 
 
+# ─── Phase 0.E user-secret strip-set resolver ───────────────────────────
+
+
+def _fetch_user_secret_known_keys(
+    conn: sqlite3.Connection, project_id: str
+) -> list[str]:
+    """Resolve the union of user-bucket secret KEYS across the three buckets.
+
+    Mirrors the Rust resolver's combined output:
+
+      * per-project bucket: ``(scope='per_project', project_id=<id>,
+        module_id='user')`` — see
+        ``db::secret_active::list_user_secret_keys_for_project``.
+      * shared bucket: ``(scope='shared', project_id='_user_shared_',
+        module_id='user')`` — see ``list_shared_user_secret_keys``.
+      * global bucket: ``(scope='global', project_id='_global_',
+        module_id='user')`` — see ``list_global_user_secret_keys``.
+
+    The union is what drives the STRIP set: any key here that is NOT
+    in the input ``user_secret_pairs`` is removed from the JSON env
+    blocks on the next write. The Rust resolver dedups across buckets
+    (a single KEY in multiple buckets appears once in the known-keys
+    list); we mirror that with a ``set`` + sort.
+
+    Order: ASCII-sorted (matches the Rust resolver's per-bucket
+    ``ORDER BY key ASC`` discipline, then de-duplicates across
+    buckets in the same alphabetical order).
+
+    Soft-fail: a missing ``secret_active_state`` table (the migration
+    007/009 boundary — a launcher.db that pre-dates the Phase 0.E
+    contract entirely) returns an empty list, matching the Rust
+    ``Vec::new()`` soft-fail. Same for the column-shape mismatch
+    where the migration ran partially (we don't probe schema; the
+    SELECT either succeeds or we treat it as "no keys observed").
+
+    Args:
+        conn: an open read-only sqlite3 connection.
+        project_id: the project's UUID (drives the per-project bucket
+            filter; sentinel rows for shared / global are always
+            read for every project).
+
+    Returns:
+        ASCII-sorted, de-duplicated list of KEY names. Empty list
+        when no rows exist OR the table is absent.
+
+    SQL uses parameterised ``?`` for ``project_id``; the bucket
+    discriminators are inlined string literals (no untrusted input).
+    """
+    cur = conn.cursor()
+    # Defensive: pre-migration-007 DBs lack the `secret_active_state`
+    # table entirely. Phase 0.D's test fixtures + any partial-install
+    # scenario where migration 007 hasn't run yet must still resolve
+    # without crashing.
+    try:
+        cur.execute(
+            "SELECT key FROM secret_active_state "
+            "WHERE module_id = ? AND ("
+            "  (scope = ? AND project_id = ?) OR "
+            "  (scope = ? AND project_id = ?) OR "
+            "  (scope = ? AND project_id = ?)"
+            ")",
+            (
+                _USER_SECRET_MODULE_ID,
+                _USER_SECRET_SCOPE_PER_PROJECT, project_id,
+                _USER_SECRET_SCOPE_SHARED, _USER_SECRET_PROJECT_ID_SHARED,
+                _USER_SECRET_SCOPE_GLOBAL, _USER_SECRET_PROJECT_ID_GLOBAL,
+            ),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+    rows = cur.fetchall()
+    # Dedup across buckets, sort for deterministic output. The Rust
+    # resolver's bucket-precedence rule only matters for VALUE
+    # collisions (per-project wins) — for the strip set, any one
+    # bucket carrying the key is enough.
+    return sorted({str(r["key"]) for r in rows if r["key"]})
+
+
+def user_secret_known_keys_from_db(
+    project_id: str,
+    *,
+    db_path: Path | None = None,
+) -> list[str]:
+    """Public API for the user-secret STRIP set lookup.
+
+    Reads the union of user-bucket secret KEYS observed in
+    ``secret_active_state`` across the three buckets (per-project,
+    shared, global) for the given project. Used by
+    :func:`apply_user_secrets` to drive the STRIP pass, and also
+    available to Rust subprocess callers that want to inspect the
+    set without applying.
+
+    Args:
+        project_id: The project's UUID.
+        db_path: Optional override of the launcher DB location.
+            Defaults to :func:`_resolve_launcher_db_path`. Tests
+            should pass an explicit path.
+
+    Returns:
+        ASCII-sorted, de-duplicated list of KEY names.
+
+    Raises:
+        DbUnreachable: the launcher DB is missing or unopenable.
+    """
+    if db_path is None:
+        db_path = _resolve_launcher_db_path()
+    try:
+        conn = _open_db_read_only(db_path)
+    except FileNotFoundError as exc:
+        raise DbUnreachable(str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        raise DbUnreachable(
+            f"cannot open launcher.db at {db_path}: {exc}"
+        ) from exc
+    try:
+        return _fetch_user_secret_known_keys(conn, project_id)
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
 # ─── Sanitization (mirrors Rust ``sanitize_kg_collection``) ─────────────
 #
 # Same rule as ``vco_lib.project_init.sanitize_for_weaviate_class``:
@@ -1042,6 +1297,7 @@ def apply_project_env(
     bundle: ProjectEnvBundle,
     *,
     surfaces: Iterable[str] | None = None,
+    user_secret_bundle: UserSecretBundle | None = None,
 ) -> dict[str, list[str]]:
     """Project ``bundle`` to the requested env surfaces.
 
@@ -1057,6 +1313,15 @@ def apply_project_env(
             useful for the diagrams flow where the VS Code extension's
             claude-code.env block is the only path to the embedded
             editor).
+        user_secret_bundle: Optional Phase 0.E user-secret payload.
+            When provided, user-secret pairs are EMITTED to the same
+            surfaces in the same write pass (atomic per surface),
+            and the strip set is applied to the JSON env blocks
+            before canonical updates. Production callers use
+            :func:`apply_user_secrets` instead of threading this
+            argument; this parameter exists so a single ``apply``
+            CLI invocation can write canonical + secrets in one
+            atomic-per-surface pass when both are stale.
 
     Returns:
         ``{surface_name: [keys_written, ...]}`` — a dict mapping each
@@ -1085,28 +1350,334 @@ def apply_project_env(
     env = bundle["canonical_env"]
     canonical_keys = list_canonical_keys()
 
+    # Phase 0.E: precompute the EMIT and STRIP sets from the optional
+    # user-secret bundle. STRIP is "known - emit" (paused / deleted
+    # keys that need to leave the JSON env blocks); EMIT is the
+    # active pairs that need to land in every surface.
+    us_pairs: list[tuple[str, str]] = []
+    us_strip_keys: list[str] = []
+    if user_secret_bundle is not None:
+        us_pairs = list(user_secret_bundle["user_secret_pairs"])
+        emit_set = {k for k, _ in us_pairs}
+        us_strip_keys = [
+            k for k in user_secret_bundle["user_secret_known_keys"]
+            if k not in emit_set
+        ]
+
     report: dict[str, list[str]] = {}
 
     if _SURFACE_CLAUDE_SETTINGS in surfaces_seq:
         path = project_root / ".claude" / "settings.json"
         keys = _write_json_env_block(
             path, env, canonical_keys, env_key="env",
+            user_secret_pairs=us_pairs,
+            user_secret_strip_keys=us_strip_keys,
         )
         report[_SURFACE_CLAUDE_SETTINGS] = keys
 
     if _SURFACE_CLAUDE_ENV in surfaces_seq:
         path = project_root / ".claude" / "env"
-        keys = _write_shell_env_managed_block(path, env)
+        keys = _write_shell_env_managed_block(
+            path, env, user_secret_pairs=us_pairs,
+        )
         report[_SURFACE_CLAUDE_ENV] = keys
 
     if _SURFACE_VSCODE_SETTINGS in surfaces_seq:
         path = project_root / ".vscode" / "settings.json"
         keys = _write_json_env_block(
             path, env, canonical_keys, env_key="claude-code.env",
+            user_secret_pairs=us_pairs,
+            user_secret_strip_keys=us_strip_keys,
         )
         report[_SURFACE_VSCODE_SETTINGS] = keys
 
     return report
+
+
+# ─── Phase 0.E: user-secret writer ──────────────────────────────────────
+
+
+def apply_user_secrets(
+    secret_bundle: UserSecretBundle,
+    *,
+    surfaces: Iterable[str] | None = None,
+) -> dict[str, dict[str, list[str]]]:
+    """Project ``secret_bundle`` to the requested env surfaces (Phase 0.E).
+
+    This is the user-secret sibling of :func:`apply_project_env`.
+    The Rust caller resolves the keychain VALUES (via the existing
+    ``commands::project_env_settings::resolve_user_secret_state``),
+    serialises them into a :class:`UserSecretBundle`, and invokes
+    this function — either in-process (Python tests) or via the CLI
+    ``python -m vco_lib.config_projection apply-user-secrets``.
+
+    Behaviour:
+
+      * For each requested JSON surface (settings.json /
+        vscode.settings.json):
+          - STRIP every key in ``user_secret_known_keys`` that is NOT
+            in ``user_secret_pairs`` from the existing ``env`` /
+            ``claude-code.env`` sub-block. This is how paused /
+            deleted secrets actually leave the surface.
+          - EMIT every (KEY, VALUE) in ``user_secret_pairs`` into the
+            sub-block. Order in the bundle is preserved insertion-wise.
+          - Existing canonical keys and user-added-by-hand keys are
+            PRESERVED (the writer does not touch them).
+      * For ``.claude/env``:
+          - Read the existing file (if any). The user-secret block
+            REBUILD is wholesale — there's no in-place key edit on the
+            shell surface; the BEGIN/END managed block is rewritten.
+          - If the file has a managed block, the user-secret pairs
+            land between the canonical exports (preserved) and the
+            END marker. If there's no managed block at all, the
+            entire managed block (including a placeholder empty
+            canonical section) is written.
+
+    The CALLER is responsible for resolving the strip set correctly.
+    If they pass an empty ``user_secret_known_keys`` list, no STRIP
+    pass runs — useful for test fixtures where the keychain state
+    is known to be fresh. Production callers SHOULD pass the result
+    of :func:`user_secret_known_keys_from_db` to drive the STRIP
+    pass off the launcher DB.
+
+    Why we re-read the canonical env from disk rather than passing it
+    in: this function is invoked by the secret-mutation hot path
+    (``set_secret_v2`` / ``clear_secret_v2`` → env-refresh hook); the
+    canonical env is already on disk from the last
+    :func:`apply_project_env` call. Re-reading is cheaper than
+    re-resolving from the DB on every secret mutation, and it
+    preserves whatever the canonical writer last produced byte-for-
+    byte (no risk of the user-secret writer accidentally regenerating
+    canonical bytes that drift from the Rust authority).
+
+    Returns a two-level audit report::
+
+        {
+          "claude_settings_json": {
+            "emitted": ["GITHUB_TOKEN", ...],
+            "stripped": ["OLD_PAUSED_KEY", ...],
+          },
+          ...
+        }
+
+    Raises:
+        ConfigProjectionError: an unknown surface was passed.
+
+    Cross-OS: same atomic-write discipline as
+    :func:`apply_project_env`. The tempfile lands in the target
+    directory; ``os.replace`` is invariant across POSIX and
+    Windows 10+.
+    """
+    if surfaces is None:
+        surfaces_seq: tuple[str, ...] = _DEFAULT_SURFACES
+    else:
+        surfaces_seq = tuple(surfaces)
+
+    for s in surfaces_seq:
+        if s not in _ALL_SURFACES:
+            raise ConfigProjectionError(
+                f"unknown surface {s!r}; valid: {sorted(_ALL_SURFACES)}"
+            )
+
+    project_root = secret_bundle["project_root"]
+    pairs: list[tuple[str, str]] = list(secret_bundle["user_secret_pairs"])
+    known: list[str] = list(secret_bundle["user_secret_known_keys"])
+    emit_set = {k for k, _ in pairs}
+    strip_keys = [k for k in known if k not in emit_set]
+
+    # User-secret keys aren't canonical, so the json writer's
+    # signal-to-remove path doesn't run for them — we drive STRIP
+    # explicitly via the strip_keys argument.
+    report: dict[str, dict[str, list[str]]] = {}
+
+    if _SURFACE_CLAUDE_SETTINGS in surfaces_seq:
+        path = project_root / ".claude" / "settings.json"
+        _, emitted, stripped = _user_secret_apply_json(
+            path, pairs, strip_keys, env_key="env",
+        )
+        report[_SURFACE_CLAUDE_SETTINGS] = {
+            "emitted": emitted, "stripped": stripped,
+        }
+
+    if _SURFACE_CLAUDE_ENV in surfaces_seq:
+        path = project_root / ".claude" / "env"
+        emitted = _user_secret_apply_claude_env(path, pairs)
+        report[_SURFACE_CLAUDE_ENV] = {
+            "emitted": emitted,
+            # .claude/env strip is implicit (BEGIN/END replace rebuilds
+            # the entire block); we surface the OBSERVED-removed list
+            # as the strip-set keys for parity with the JSON report.
+            "stripped": sorted(strip_keys),
+        }
+
+    if _SURFACE_VSCODE_SETTINGS in surfaces_seq:
+        path = project_root / ".vscode" / "settings.json"
+        _, emitted, stripped = _user_secret_apply_json(
+            path, pairs, strip_keys, env_key="claude-code.env",
+        )
+        report[_SURFACE_VSCODE_SETTINGS] = {
+            "emitted": emitted, "stripped": stripped,
+        }
+
+    return report
+
+
+def _user_secret_apply_json(
+    path: Path,
+    pairs: list[tuple[str, str]],
+    strip_keys: list[str],
+    *,
+    env_key: str,
+) -> tuple[bool, list[str], list[str]]:
+    """Apply user-secret EMIT/STRIP to a JSON env sub-block.
+
+    Surgical: only touches the user-secret keys. Canonical and user-
+    added-by-hand keys survive verbatim. The file is created (with
+    just the env sub-block) if it doesn't exist, mirroring the
+    canonical writer's "fresh file" semantics.
+
+    Returns:
+        Tuple of (file_existed, emitted_keys, stripped_keys). The
+        file_existed flag is for audit logging — useful to detect
+        "user-secret write created the file from scratch" which
+        usually means a canonical write hasn't run yet (a Rust-side
+        ordering bug worth surfacing).
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    file_existed = path.exists()
+    existing_root: Any = {}
+    if file_existed:
+        try:
+            raw = path.read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                existing_root = parsed
+            else:
+                existing_root = {}
+        except (OSError, json.JSONDecodeError):
+            existing_root = {}
+
+    env_block_raw = existing_root.get(env_key)
+    if not isinstance(env_block_raw, dict):
+        env_block: dict[str, Any] = {}
+    else:
+        env_block = dict(env_block_raw)
+
+    # STRIP first.
+    stripped: list[str] = []
+    for k in strip_keys:
+        if k in env_block:
+            del env_block[k]
+            stripped.append(k)
+
+    # EMIT (user-wins on hypothetical collision).
+    emitted: list[str] = []
+    for k, v in pairs:
+        env_block[k] = v
+        emitted.append(k)
+
+    existing_root[env_key] = env_block
+
+    serialised = json.dumps(existing_root, indent=2, ensure_ascii=False)
+    _atomic_write_text(path, serialised)
+
+    emitted.sort()
+    stripped.sort()
+    return file_existed, emitted, stripped
+
+
+def _user_secret_apply_claude_env(
+    path: Path,
+    pairs: list[tuple[str, str]],
+) -> list[str]:
+    """Apply user-secret EMIT/STRIP to ``.claude/env``.
+
+    Re-reads the existing managed block, extracts the canonical
+    section (everything before the user-secret section header OR
+    before END if no header), rebuilds with the new user-secret
+    pairs spliced in after canonical and before END. Lines outside
+    the BEGIN/END markers are preserved verbatim.
+
+    If the file doesn't exist OR has no managed block: writes a fresh
+    managed block with NO canonical content + the user-secret
+    section. The next :func:`apply_project_env` call will re-emit
+    canonical content; for the interim window the file has the
+    correct user-secret state but no canonical state. This matches
+    the Rust writer's behaviour when ``set_secret_v2`` runs against
+    a project that hasn't had ``write_project_env_files`` invoked
+    yet (rare; should only happen on first-secret-before-first-
+    refresh).
+
+    STRIP is implicit: the entire managed block is rebuilt; paused /
+    deleted secrets simply don't appear in the new pairs list.
+
+    Returns the sorted list of KEYS emitted.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    prior: Optional[str]
+    if path.exists():
+        try:
+            prior = path.read_text(encoding="utf-8")
+        except OSError:
+            prior = None
+    else:
+        prior = None
+
+    # Extract the canonical lines from the existing managed block (if
+    # any) so we can preserve them across user-secret-only writes.
+    # The canonical exports look like `export KEY="value"` — we
+    # capture every line between BEGIN and either the user-secret
+    # section header OR the END marker.
+    canonical_lines: list[str] = []
+    if prior is not None:
+        begin_idx = prior.find(CLAUDE_ENV_MANAGED_BEGIN)
+        if begin_idx != -1:
+            end_off = prior[begin_idx:].find(CLAUDE_ENV_MANAGED_END)
+            if end_off != -1:
+                block_text = prior[begin_idx:begin_idx + end_off]
+                # Split into lines; drop the BEGIN line (first one).
+                lines = block_text.splitlines()[1:]
+                user_secret_header = (
+                    "# user secrets (per-project; "
+                    "managed via launcher GUI Secrets panel)"
+                )
+                for line in lines:
+                    # Stop at the user-secret section header — everything
+                    # after it is the OLD user-secret block we're
+                    # rebuilding.
+                    if line == user_secret_header:
+                        # Drop the preceding blank line if there is one;
+                        # the rebuild re-emits it. The canonical exports
+                        # are everything before the blank line that
+                        # precedes the header.
+                        if canonical_lines and canonical_lines[-1] == "":
+                            canonical_lines.pop()
+                        break
+                    canonical_lines.append(line)
+
+    # Build the new managed block. We need to splice user-secret pairs
+    # between the canonical content and the END marker.
+    out: list[str] = [CLAUDE_ENV_MANAGED_BEGIN]
+    out.extend(canonical_lines)
+    if pairs:
+        out.append("")
+        out.append(
+            "# user secrets (per-project; managed via launcher GUI Secrets panel)"
+        )
+        for k, v in pairs:
+            escaped = v.replace('"', '\\"')
+            out.append(f'export {k}="{escaped}"')
+    out.append(CLAUDE_ENV_MANAGED_END)
+    managed = "\n".join(out) + "\n"
+
+    new_text = _merge_managed_block(prior, managed)
+    _atomic_write_text(path, new_text)
+
+    return sorted(k for k, _ in pairs)
 
 
 # ─── Surface writers ────────────────────────────────────────────────────
@@ -1118,6 +1689,8 @@ def _write_json_env_block(
     canonical_keys: set[str],
     *,
     env_key: str,
+    user_secret_pairs: Iterable[tuple[str, str]] | None = None,
+    user_secret_strip_keys: Iterable[str] | None = None,
 ) -> list[str]:
     """Write the canonical env into a JSON file's ``<env_key>`` sub-block.
 
@@ -1135,14 +1708,31 @@ def _write_json_env_block(
           - if absent from ``canonical_env``: delete ``env[key]`` if
             present (signal-to-remove semantics; supports "the launcher
             decided this project no longer has any peer KG access").
-      * Non-canonical keys (user-added) are PRESERVED untouched.
+      * Phase 0.E user-secret handling (mirrors Rust):
+          - STRIP first: ``user_secret_strip_keys`` are removed from
+            ``env_block`` BEFORE inserting active pairs. Run before
+            canonical so a same-tick toggle (active→inactive across
+            two writes) can't rely on residual state. The strip set
+            is by construction disjoint from the emit set (the resolver
+            computes ``strip = known - emit``), so removing-then-
+            inserting is safe.
+          - EMIT last: ``user_secret_pairs`` are inserted after the
+            canonical keys. A hypothetical KEY collision (which
+            ``set_secret_v2`` prevents at the GUI layer) resolves
+            user-wins, matching the Rust ordering at
+            ``merge_env_object_canonical_with_user_secrets`` step 3.
+      * Non-canonical, non-user-secret keys (user-added by hand
+        directly in the JSON) are PRESERVED untouched.
       * Write the result back with 2-space indent, no trailing newline,
         ``ensure_ascii=False`` (matching Rust's
         ``serde_json::to_string_pretty`` byte layout).
 
     Returns the sorted list of canonical keys whose value was set
     (those that were deleted are not listed — the audit consumer wants
-    to see what's NOW exported, not what was previously there).
+    to see what's NOW exported, not what was previously there). User-
+    secret keys are NOT in the returned list (audit reporting for
+    user secrets uses a separate report channel; see
+    :func:`apply_user_secrets`).
 
     Atomic write: writes to a tempfile in the same directory as ``path``,
     then ``os.replace``-s into place. This is atomic on POSIX (rename
@@ -1176,7 +1766,15 @@ def _write_json_env_block(
     else:
         env_block = dict(env_block_raw)  # defensive copy
 
-    # Apply canonical updates.
+    # Phase 0.E step 1: STRIP paused / removed user-secret keys.
+    # Matches Rust's `merge_env_object_canonical_with_user_secrets`
+    # step 1: remove BEFORE canonical / emit so a buggy resolver
+    # can't silently drop the active value.
+    if user_secret_strip_keys:
+        for k in user_secret_strip_keys:
+            env_block.pop(k, None)
+
+    # Phase 0.B step 2: canonical updates (overwrite + signal-to-remove).
     written_keys: list[str] = []
     for key in canonical_keys:
         if key in canonical_env:
@@ -1188,6 +1786,12 @@ def _write_json_env_block(
             # checkout" case where the env var should disappear.
             del env_block[key]
         # else: not in bundle, not in surface — nothing to do.
+
+    # Phase 0.E step 3: EMIT active user-secret pairs LAST so they
+    # win on a hypothetical KEY collision with a canonical key.
+    if user_secret_pairs:
+        for k, v in user_secret_pairs:
+            env_block[k] = v
 
     existing_root[env_key] = env_block
 
@@ -1208,6 +1812,8 @@ def _write_json_env_block(
 def _write_shell_env_managed_block(
     path: Path,
     canonical_env: Mapping[str, str],
+    *,
+    user_secret_pairs: Iterable[tuple[str, str]] | None = None,
 ) -> list[str]:
     """Write the canonical env between bracket markers in ``.claude/env``.
 
@@ -1227,12 +1833,24 @@ def _write_shell_env_managed_block(
     (insertion order of the bundle's dict, which the caller built from
     ``_CANONICAL_KEYS`` in :func:`project_env_from_db`).
 
+    Phase 0.E (2026-05-25): when ``user_secret_pairs`` is non-empty,
+    the user-secret exports land AFTER the canonical block, preceded
+    by a blank line + ``# user secrets (per-project; managed via
+    launcher GUI Secrets panel)`` section header — byte-identical to
+    Rust's ``build_claude_env_managed_block_with_user_secrets``.
+
+    STRIP for ``.claude/env`` is IMPLICIT: the entire BEGIN/END block
+    is replaced on every write, so a paused / removed user secret
+    simply doesn't appear in the new block — no explicit strip-set
+    plumbing needed (contrast with the JSON env writers, where the
+    deep-merge is additive).
+
     Atomic write: same tempfile + ``os.replace`` discipline as the JSON
     surfaces.
 
     Returns the sorted list of canonical keys written. Keys absent from
     ``canonical_env`` (the bundle decided to omit them) are simply not
-    rendered.
+    rendered. User-secret keys are NOT in the returned list.
     """
     parent = path.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -1246,23 +1864,31 @@ def _write_shell_env_managed_block(
     else:
         prior = None
 
-    managed = _build_managed_block(canonical_env)
+    managed = _build_managed_block(canonical_env, user_secret_pairs=user_secret_pairs)
     new_text = _merge_managed_block(prior, managed)
     _atomic_write_text(path, new_text)
 
     return sorted(canonical_env.keys())
 
 
-def _build_managed_block(canonical_env: Mapping[str, str]) -> str:
+def _build_managed_block(
+    canonical_env: Mapping[str, str],
+    *,
+    user_secret_pairs: Iterable[tuple[str, str]] | None = None,
+) -> str:
     """Render the managed block for ``.claude/env``.
 
     Format (byte-identical to Rust's
-    ``build_claude_env_managed_block_with_user_secrets``, modulo the
-    user-secrets section which is out-of-scope here):
+    ``build_claude_env_managed_block_with_user_secrets``):
 
       ``# vco-managed-begin\\n``
-      ``<header comments — 7 lines>\\n``
+      ``<header comments — 11 lines>\\n``
       ``export KEY1="value1"\\n``
+      ...
+      [optional, when user_secret_pairs is non-empty:]
+      ``\\n``
+      ``# user secrets (per-project; managed via launcher GUI Secrets panel)\\n``
+      ``export SECRET_KEY1="secret_value1"\\n``
       ...
       ``# vco-managed-end\\n``
 
@@ -1270,14 +1896,12 @@ def _build_managed_block(canonical_env: Mapping[str, str]) -> str:
     POSIX; legitimate on Windows + git-bash paths). The Rust writer
     only escapes ``"`` — we mirror that.
 
-    Note: in production, the user-secret pairs from the Rust resolver
-    land BETWEEN the canonical and END marker. This Python writer does
-    NOT emit them (user secrets stay Rust-owned for now); the END
-    marker comes directly after the canonical block. The next Rust
-    invocation will re-add the user-secret block by replacing
-    BEGIN→END wholesale. Until a project's grant matrix changes
-    OR config_projection grows a user-secret bridge, this hybrid is
-    consistent: whichever writer ran last owns the block content.
+    Phase 0.E (2026-05-25): user-secret exports land BETWEEN the
+    canonical block and the END marker, preceded by a blank line +
+    section header for diff readability. This block is byte-identical
+    to Rust's ``build_claude_env_managed_block_with_user_secrets``.
+    Paused / removed secrets are simply absent from this list (the
+    BEGIN/END replace strips them implicitly).
     """
     out: list[str] = [CLAUDE_ENV_MANAGED_BEGIN]
     out.append(
@@ -1312,6 +1936,21 @@ def _build_managed_block(canonical_env: Mapping[str, str]) -> str:
     for key, value in canonical_env.items():
         escaped = value.replace('"', '\\"')
         out.append(f'export {key}="{escaped}"')
+    # Phase 0.E user-secret section. Materialise the iterable first so we
+    # can branch on emptiness without consuming a one-shot iterator twice.
+    pairs_list: list[tuple[str, str]] = (
+        list(user_secret_pairs) if user_secret_pairs else []
+    )
+    if pairs_list:
+        # Blank line separator + section header. Byte-identical to Rust
+        # at projects_v2.rs L2429-2430.
+        out.append("")
+        out.append(
+            "# user secrets (per-project; managed via launcher GUI Secrets panel)"
+        )
+        for k, v in pairs_list:
+            escaped = v.replace('"', '\\"')
+            out.append(f'export {k}="{escaped}"')
     out.append(CLAUDE_ENV_MANAGED_END)
     # Trailing newline AFTER the final marker — matches Rust which does
     # `out.push('\n')` after CLAUDE_ENV_MANAGED_END.
@@ -1465,6 +2104,159 @@ def _cli_list_keys(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_apply_user_secrets(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.config_projection apply-user-secrets``.
+
+    Phase 0.E (2026-05-25). Rust callers spawn this verb to write
+    user-secret pairs into the env surfaces after a ``set_secret_v2``
+    / ``clear_secret_v2`` mutation. The keychain values are resolved
+    Rust-side (no Python keychain bridge) and passed in via
+    ``--pairs-json``; the strip set is resolved from the launcher DB
+    via :func:`user_secret_known_keys_from_db`.
+
+    Exit codes (parallel to ``apply``):
+        0 — success
+        2 — project_not_found
+        3 — db_unreachable
+        4 — apply_failed (surface write error)
+        5 — pairs_json_invalid (cannot parse the input)
+    """
+    # 1. Resolve project folder (we need this for the write target).
+    try:
+        project_folder = resolve_project_folder(
+            args.project_id,
+            db_path=Path(args.db_path) if args.db_path else None,
+        )
+    except LookupError as exc:
+        print(
+            json.dumps({"error": "project_not_found", "message": str(exc)}),
+            file=sys.stderr,
+        )
+        return 2
+    except DbUnreachable as exc:
+        print(
+            json.dumps({"error": "db_unreachable", "message": str(exc)}),
+            file=sys.stderr,
+        )
+        return 3
+
+    # 2. Resolve the strip set from the launcher DB.
+    try:
+        known_keys = user_secret_known_keys_from_db(
+            args.project_id,
+            db_path=Path(args.db_path) if args.db_path else None,
+        )
+    except DbUnreachable as exc:
+        print(
+            json.dumps({"error": "db_unreachable", "message": str(exc)}),
+            file=sys.stderr,
+        )
+        return 3
+
+    # 3. Parse the input pairs. The Rust caller writes a JSON file
+    # (rather than passing on argv) so very long secret values don't
+    # hit ARG_MAX on Linux. The file is a list of [KEY, VALUE]
+    # arrays so order is preserved (a JSON object would lose order
+    # on some parsers).
+    pairs: list[tuple[str, str]] = []
+    if args.pairs_json:
+        try:
+            raw = Path(args.pairs_json).read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                json.dumps({
+                    "error": "pairs_json_invalid",
+                    "message": f"could not read {args.pairs_json}: {exc}",
+                }),
+                file=sys.stderr,
+            )
+            return 5
+        if not isinstance(parsed, list):
+            print(
+                json.dumps({
+                    "error": "pairs_json_invalid",
+                    "message": "pairs_json must be a JSON array of [key, value] pairs",
+                }),
+                file=sys.stderr,
+            )
+            return 5
+        for entry in parsed:
+            if (
+                not isinstance(entry, (list, tuple))
+                or len(entry) != 2
+                or not isinstance(entry[0], str)
+                or not isinstance(entry[1], str)
+            ):
+                print(
+                    json.dumps({
+                        "error": "pairs_json_invalid",
+                        "message": "each pair must be a [string, string] array",
+                    }),
+                    file=sys.stderr,
+                )
+                return 5
+            pairs.append((entry[0], entry[1]))
+
+    secret_bundle: UserSecretBundle = {
+        "user_secret_pairs": pairs,
+        "user_secret_known_keys": known_keys,
+        "project_id": args.project_id,
+        "project_root": project_folder,
+    }
+
+    surfaces: Iterable[str] | None = None
+    if args.surfaces:
+        surfaces = tuple(args.surfaces.split(","))
+
+    try:
+        report = apply_user_secrets(secret_bundle, surfaces=surfaces)
+    except ConfigProjectionError as exc:
+        print(
+            json.dumps({"error": "apply_failed", "message": str(exc)}),
+            file=sys.stderr,
+        )
+        return 4
+
+    print(json.dumps({
+        "ok": True,
+        "report": report,
+        "project_id": args.project_id,
+        "project_root": str(project_folder),
+        "known_keys": known_keys,
+    }))
+    return 0
+
+
+def _cli_user_secret_known_keys(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.config_projection user-secret-known-keys
+    --project-id <id>``.
+
+    Print the STRIP set (every user-bucket KEY observed across the
+    three buckets) without applying. Useful for the Rust caller to
+    verify the bridge before invoking ``apply-user-secrets`` (e.g.
+    in CI parity checks).
+    """
+    try:
+        keys = user_secret_known_keys_from_db(
+            args.project_id,
+            db_path=Path(args.db_path) if args.db_path else None,
+        )
+    except DbUnreachable as exc:
+        print(
+            json.dumps({"error": "db_unreachable", "message": str(exc)}),
+            file=sys.stderr,
+        )
+        return 3
+
+    if args.json:
+        print(json.dumps(keys))
+    else:
+        for k in keys:
+            print(k)
+    return 0
+
+
 def _cli_from_db(args: argparse.Namespace) -> int:
     """``python -m vco_lib.config_projection from-db --project-id <id>``.
 
@@ -1545,6 +2337,39 @@ def _build_parser() -> argparse.ArgumentParser:
     p_from.add_argument("--orchestrator-root", default=None)
     p_from.set_defaults(handler=_cli_from_db)
 
+    # Phase 0.E (2026-05-25).
+    p_us_apply = sub.add_parser(
+        "apply-user-secrets",
+        help="write user-bucket secret pairs into the env surfaces (Phase 0.E)",
+    )
+    p_us_apply.add_argument("--project-id", required=True)
+    p_us_apply.add_argument(
+        "--db-path", default=None,
+        help="override launcher DB path (defaults to ~/.vct/launcher.db)",
+    )
+    p_us_apply.add_argument(
+        "--pairs-json", default=None,
+        help="path to a JSON file containing a list of [key, value] pairs. "
+             "Omit / empty file = treat input as empty (drives STRIP-only "
+             "behaviour, useful for purge flows).",
+    )
+    p_us_apply.add_argument(
+        "--surfaces", default=None,
+        help="comma-separated subset of "
+             "claude_settings_json,claude_env,vscode_settings_json "
+             "(default: claude_settings_json,claude_env)",
+    )
+    p_us_apply.set_defaults(handler=_cli_apply_user_secrets)
+
+    p_us_known = sub.add_parser(
+        "user-secret-known-keys",
+        help="print the STRIP set (every user-bucket KEY observed in DB)",
+    )
+    p_us_known.add_argument("--project-id", required=True)
+    p_us_known.add_argument("--db-path", default=None)
+    p_us_known.add_argument("--json", action="store_true")
+    p_us_known.set_defaults(handler=_cli_user_secret_known_keys)
+
     return p
 
 
@@ -1565,9 +2390,12 @@ __all__ = [
     "DbUnreachable",
     "ProjectEnvBundle",
     "ProjectNotFound",
+    "UserSecretBundle",
     "apply_project_env",
+    "apply_user_secrets",
     "list_canonical_keys",
     "list_registered_projects",
     "project_env_from_db",
     "resolve_project_folder",
+    "user_secret_known_keys_from_db",
 ]
