@@ -410,3 +410,52 @@ never authored by hand.
 
 Exit codes: `0` = all match, `1` = drift, `2` = project not found or DB
 unreadable, `3` = `--fix` failed or contract idempotency broken.
+
+### `vco verify-diagrams <project_slug_or_id>`
+
+End-to-end verifier for the Diagrams Integration feature. Runs 13
+focused checks covering: project row in launcher DB, `project_modules`
+seed row, migration 022 applied, MCP wrappers registered in
+`~/.claude.json`, hub allowlist HTTP route alive, env projection
+across the three surfaces, per-project Weaviate `<Project>_Diagrams`
+class present, `PreToolUse` + `PostToolUse` hooks registered, hook
+scripts on disk + executable, `vco_lib.diagram_indexer` /
+`vco_lib.diagram_paths` importable, CLAUDE.md diagrams section
+rendered.
+
+| Flag      | Behaviour                                                       |
+| --------- | --------------------------------------------------------------- |
+| `--json`  | Emit a single JSON envelope on stdout (machine-readable).        |
+| `--fix`   | Best-effort repair where possible (re-seed `project_modules` row, re-project env, create minimal Weaviate class). Logs and continues per-check on failure — unlike `verify-pins` which aborts on the first failure. |
+| `--all`   | Iterate every project registered in the launcher DB. Worst exit code across all projects wins. |
+| `--quick` | Skip the slow checks (Weaviate connectivity, hub HTTP probe). Useful in CI / pre-commit hooks. |
+
+Example output:
+
+```text
+$ vco verify-diagrams demo --quick
+verify-diagrams: demo (project_id=p-1)
+  folder: /home/me/projects/demo
+
+  [OK]   project_row — project 'demo' (id=p-1)
+  [OK]   project_modules_row — project_modules('diagrams', enabled=1) row present
+  [OK]   migration_022 — migration 22 applied + all 6 tables present
+  [OK]   mcp_wrappers — mermaid + excalidraw wrappers registered with correct module path
+  [SKIP] hub_allowlist — --quick: hub HTTP probe skipped
+  [FAIL] env_projection — 1 drift entries: DIAGRAMS_COLLECTION on .vscode/settings.json: expected 'Demo_Diagrams', got '<missing>'
+         > fix: vco verify-env-projection p-1 --fix
+  [SKIP] weaviate_diagrams_class — --quick: Weaviate connectivity check skipped
+  [OK]   pretooluse_hooks — both PreToolUse entries (Write|Edit + MCP matchers) present
+  [OK]   post_delete_hook — PostToolUse Bash entry → post-file-delete registered
+  [OK]   hook_scripts_on_disk — all 2 hook scripts present + executable
+  [OK]   indexer_importable — key functions resolvable
+  [OK]   path_validator — round-trip OK (good→None, bad→string)
+  [OK]   claude_md_section — diagrams section present
+
+Summary: 10 OK, 1 FAIL, 2 SKIP
+```
+
+Exit codes: `0` = all OK (or only SKIP/FIXED), `1` = at least one
+FAIL, `2` = environment problem (project not in launcher DB, DB
+unreadable), `3` = `--fix` ran but failed to repair at least one
+check.
