@@ -2,9 +2,10 @@
 # Copyright (c) 2026 VibeCoded Tools
 """vco_lib.cli — top-level CLI entry-points for the ``vco`` command.
 
-This package wires the ``vco`` script (registered via ``pyproject.toml``
-``[project.scripts]`` once packaging is added; until then, callable via
-``python -m vco_lib.cli``) to subcommand modules:
+This package wires the ``vco`` script (registered via the root
+``pyproject.toml`` ``[project.scripts]`` entry; also callable as
+``python -m vco_lib.cli`` for any environment where the console-script
+isn't on PATH) to subcommand modules:
 
 * :mod:`vco_lib.cli.verify` — Phase 0 acceptance commands
   (``verify-pins``, ``verify-env-projection``).

@@ -5,9 +5,12 @@
 Wires subcommand modules onto a single ``vco`` script so users can
 type ``vco verify-pins`` rather than ``python -m vco_lib.cli.verify ...``.
 
-Until packaging lands (``pyproject.toml`` ``[project.scripts]`` entry —
-see plan §3 Phase 0.C step 2), this is callable via
-``python -m vco_lib.cli`` and the optional ``scripts/vco`` shim wrapper.
+Distribution: the ``vco`` console-script is registered via
+``pyproject.toml`` ``[project.scripts] vco = "vco_lib.cli.__main__:main"``
+and lands on PATH automatically when the orchestrator's ``install.py``
+runs ``pip install -e .`` against ``.venv``. Pre-v0.2.34 installs
+shipped ``scripts/vco{,.ps1}`` shim wrappers as a stop-gap; those were
+removed once packaging landed. Manual fallback: ``python -m vco_lib.cli``.
 
 Subcommand modules contribute via :func:`add_subparsers(sub)` so adding
 a new one is a single-line registration here.
