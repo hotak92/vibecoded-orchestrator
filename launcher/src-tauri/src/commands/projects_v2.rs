@@ -2424,6 +2424,22 @@ pub struct EnsureEnvReport {
 /// This is the Rust mirror of `_ensure_env_template` in install.py;
 /// keep them in lockstep. The 'env_template_canonical_keys_match_python'
 /// integration test is the contract that enforces this.
+///
+/// env_template: legacy_caller_pending_migration
+///
+/// PHASE 0.D NOTE (2026-05-24): This function and `build_canonical_env_text`
+/// are the Rust direct writers of `<folder>/.env` and are intentionally
+/// allowlisted by `tests/test_config_projection_single_writer.py` during
+/// the Phase 0.D migration. The Python sibling `_ensure_env_template`
+/// has been migrated to delegate to `vco_lib.env_template.apply_env_template`;
+/// this Rust function will be migrated to subprocess-into-Python in a
+/// follow-up Phase 0.D Part 2 (matching the Phase 0.B Part 2 /
+/// `write_project_env_files` migration pattern). Until then, the
+/// legacy append-only `# added by vco YYYY-MM-DD` behaviour is preserved
+/// here and Python's `apply_env_template` block-replace contract runs
+/// in parallel against the same file (the two formats don't collide:
+/// the new BEGIN/END markers don't appear in legacy lines, and legacy
+/// lines sit outside the BEGIN/END markers Python writes).
 pub fn ensure_project_env_template(
     folder: &Path,
     settings: &ProjectEnvSettings,

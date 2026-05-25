@@ -13436,75 +13436,101 @@ def _parse_existing_env_keys(env_path: Path) -> set[str]:
 
 def _ensure_env_template(env_path: Path, project_name: str = "<project>",
                         project_root: str = "<project_root>") -> dict:
-    """Ensure `.env` exists and contains all canonical template keys.
+    """Ensure `.env` carries the canonical managed block.
 
-    Behaviour:
-      - .env missing → create from the canonical template (all optional
-        keys commented out, active keys filled with placeholders).
-      - .env exists → diff against canonical, append any missing keys
-        commented out, tagged with `# added by vco YYYY-MM-DD`.
-      - Idempotent: keys already present (commented or not) are skipped,
-        and lines already carrying the marker tag aren't re-considered.
+    PHASE 0.D MIGRATION (2026-05-24): This function used to implement
+    append-only "# added by vco YYYY-MM-DD" semantics in-line. It now
+    delegates to ``vco_lib.env_template.apply_env_template`` — the
+    single-writer contract for the per-project ``<project_root>/.env``
+    surface. See ``knowledge/concepts/config-projection-contract-2026-05-24.md``
+    (extended for Phase 0.D) for the rationale.
 
-    Preserves all existing values verbatim — never overwrites a
-    user-set value.
+    Behaviour after migration:
+      - .env missing → create with just the managed block (BEGIN/END markers
+        + canonical KEY=VALUE pairs derived from the orchestrator's resolved
+        defaults).
+      - .env exists with the BEGIN marker → in-place replace the managed
+        block. Lines outside markers preserved byte-for-byte.
+      - .env exists WITHOUT the BEGIN marker (legacy format from pre-Phase-
+        0.D vco installs, or hand-written file) → append the managed block
+        at EOF. Existing legacy "# added by vco YYYY-MM-DD" annotations stay
+        in place; the next invocation in-place replaces.
 
-    Returns a small report dict: {"action": "created"|"appended"|"noop",
-    "added_keys": [..], "env_path": str}.
+    The canonical keys delegated to ``apply_env_template`` are the
+    subset documented at :func:`vco_lib.env_template.list_canonical_env_template_keys`
+    — project identity, KG collections, service URLs, feature flags.
 
-    Used by:
-      - install.py Step 9 (_write_env_config integration)
-      - launcher's projects_v2::create_project_v2 (Rust mirror calls
-        Python via subprocess on lightweight re-installs; for the
-        normal create_project flow we have a dedicated Rust helper.)
+    Args:
+        env_path: Path to the ``.env`` file. The parent directory IS the
+            project_folder passed to apply_env_template.
+        project_name: Used to derive KG_COLLECTION / DEVELOPMENT_COLLECTION
+            when no per-launcher value is available (install.py's case —
+            the launcher's project_init runs later and re-projects via
+            apply_env_template directly).
+        project_root: Reserved for future use (the Phase 0.D apply_env_template
+            contract doesn't render orchestrator-root paths into ``.env``;
+            see the env_template docstring's EXCLUDE rationale).
+
+    Returns:
+        ``{"action": ..., "added_keys": [...], "env_path": str}`` for
+        API back-compat with the pre-migration caller surface.
     """
-    if not env_path.exists():
-        env_path.write_text(
-            _build_canonical_env_template_text(project_name, project_root),
-            encoding="utf-8",
-        )
-        return {
-            "action": "created",
-            "added_keys": [k for k, _, _ in _env_canonical_template(project_name, project_root)
-                           if k],
-            "env_path": str(env_path),
-        }
+    # Import here (not at module top) so the install.py module can be
+    # imported in environments where vco_lib isn't on sys.path yet
+    # (e.g. fresh first-install before the venv is fully populated).
+    from vco_lib.env_template import (
+        apply_env_template,
+        list_canonical_env_template_keys,
+    )
 
-    existing_keys = _parse_existing_env_keys(env_path)
-    missing: list[tuple[str, str | None, str]] = [
-        (k, default, comment)
-        for k, default, comment in _env_canonical_template(project_name, project_root)
-        if k and k not in existing_keys
-    ]
-    if not missing:
-        return {"action": "noop", "added_keys": [], "env_path": str(env_path)}
+    # Build the canonical key map. The legacy `_ensure_env_template`
+    # took `project_name` as an explicit arg and derived KG_COLLECTION
+    # / DEVELOPMENT_COLLECTION from it directly — we preserve that
+    # contract. Service URL ports come from environ ONLY (mirrors what
+    # `_write_env_config` already does in its lines[] build above).
+    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
+    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
 
-    # Append a marked block. Preserve trailing newline behaviour: if the
-    # file doesn't end with \n, add one before our block so we don't
-    # glue our header onto the user's last line.
-    today = _utc_iso_now()[:10]
-    existing_text = env_path.read_text(encoding="utf-8")
-    needs_leading_nl = (existing_text and not existing_text.endswith("\n"))
-    block_lines: list[str] = []
-    if needs_leading_nl:
-        block_lines.append("")  # joining will add a \n at start
-    block_lines.append("")
-    block_lines.append(f"{ENV_VCO_MARKER} {today}: appended missing canonical keys")
-    for key, default, comment in missing:
-        if default is None:
-            # Optional key — write the comment form (already starts with `#`).
-            line = comment if comment is not None else f"# {key}="
-        else:
-            line = f"{key}={default}"
-        block_lines.append(line)
-    block_lines.append("")  # trailing newline
+    sanitized = project_name if project_name != "<project>" else "Project"
+    keys = {
+        "PROJECT_NAME": project_name,
+        "CODE_GRAPH_PROJECT": sanitized,
+        # KG / DEVELOPMENT collections derived from the explicit
+        # project_name arg — matches the pre-Phase-0.D contract where
+        # `_ensure_env_template(env, project_name="Acme")` always
+        # produced `KG_COLLECTION=Acme_KnowledgeGraph`. Reading
+        # os.environ would leak the caller's shell env into the
+        # generated file (observed in tests where VCO_dev's
+        # KG_COLLECTION was active in the shell).
+        "KG_COLLECTION": f"{sanitized}_KnowledgeGraph",
+        "DEVELOPMENT_COLLECTION": f"{sanitized}_Development",
+        "SHARED_KG_COLLECTION": os.environ.get(
+            "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
+        ),
+        "SHARED_KG_WRITE_DISABLED": "false",
+        "SHARED_KG_OPT_OUT": "false",
+        "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
+        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
+        "WEAVIATE_PORT": weaviate_port,
+        "OLLAMA_URL": f"http://localhost:{ollama_port}",
+        "OLLAMA_PORT": ollama_port,
+        "CODE_EMBED_URL": f"http://localhost:{code_embed_port}",
+        "CODE_EMBED_PORT": code_embed_port,
+    }
+    # Filter to the canonical subset (defensive — keys is already
+    # constructed as the subset, but the contract source-of-truth is
+    # list_canonical_env_template_keys()).
+    allowed = list_canonical_env_template_keys()
+    keys = {k: v for k, v in keys.items() if k in allowed}
 
-    with env_path.open("a", encoding="utf-8") as f:
-        f.write("\n".join(block_lines))
+    pre_existed = env_path.exists()
+    project_folder = env_path.parent
+    report = apply_env_template(keys, project_folder=project_folder)
 
     return {
-        "action": "appended",
-        "added_keys": [k for k, _, _ in missing],
+        "action": "appended" if pre_existed else "created",
+        "added_keys": report["env"],
         "env_path": str(env_path),
     }
 
@@ -13631,17 +13657,29 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         "",
     ])
 
-    # Write (don't overwrite if exists). When the file IS already there,
-    # run the canonical-template append-merge so installs that pre-date
-    # the template (or third-party-provided .env files) pick up newer
-    # placeholder keys without losing the user's edits.
+    # env_template: legacy_caller_pending_migration
+    #
+    # PHASE 0.D NOTE (2026-05-24): the fresh-write branch below at the
+    # ``else`` arm is intentionally allowlisted by
+    # ``tests/test_config_projection_single_writer.py``. install.py
+    # writes a mix of canonical Phase 0.D keys AND non-canonical
+    # install-time-only keys (EMBEDDING_MODEL / EMBEDDING_DIMS /
+    # CODE_EMBED_BACKEND / EMBEDDING_PROVIDER / VCT_JOERN_AVAILABLE /
+    # VCT_TELEMETRY / banner comments / RL-section placeholders).
+    # Splitting "managed-block keys" from "install-time-only keys" so
+    # the install.py fresh-write fully routes through
+    # ``apply_env_template`` is a follow-up refactor scoped outside
+    # Phase 0.D's brief — the brief's literal directive was migrating
+    # ``_ensure_env_template`` (done above).
+    # The EXISTING-file branch DOES route through apply_env_template
+    # (via _ensure_env_template, now Phase 0.D-migrated).
     if env_file.exists():
         report = _ensure_env_template(env_file)
         if report["action"] == "appended":
-            print(f"already exists — appended {len(report['added_keys'])} canonical keys")
+            print(f"already exists — refreshed managed block ({len(report['added_keys'])} canonical keys)")
             _log_install_event(
                 "9/10", "ok",
-                f".env append-merged ({len(report['added_keys'])} new keys)",
+                f".env managed-block refreshed ({len(report['added_keys'])} keys)",
                 data={"env_file": str(env_file),
                       "added_keys": report["added_keys"]},
             )
