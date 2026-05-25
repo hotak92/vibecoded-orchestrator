@@ -31,7 +31,7 @@ from vco_lib.diagram_indexer import (
     ExcalidrawMetadata,
     MermaidMetadata,
     _MERMAID_KINDS,
-    _local_validate_scoped_path,
+    _validate_scoped_path,
     _upsert_row,
     humanize_filename,
     index_diagram,
@@ -255,21 +255,22 @@ class TestParseExcalidraw:
 
 
 # ---------------------------------------------------------------------------
-# _local_validate_scoped_path
+# _validate_scoped_path — delegates to vco_lib.diagram_paths (1.2 canonical).
+# Error-message regexes match 1.2's wording (see vco_lib/diagram_paths.py).
 # ---------------------------------------------------------------------------
 
 
-class TestLocalPathValidator:
+class TestScopedPathValidator:
     def test_valid_mermaid(self):
         p = Path(".claude/diagrams/gui/auth/login-form.mmd")
-        dtype, cat, name = _local_validate_scoped_path(p)
+        dtype, cat, name = _validate_scoped_path(p)
         assert dtype == "mermaid"
         assert cat == "gui/auth"
         assert name == "login-form"
 
     def test_valid_excalidraw(self):
         p = Path(".claude/diagrams/architecture/data-flow.excalidraw")
-        dtype, cat, name = _local_validate_scoped_path(p)
+        dtype, cat, name = _validate_scoped_path(p)
         assert dtype == "excalidraw"
         assert cat == "architecture"
         assert name == "data-flow"
@@ -277,32 +278,32 @@ class TestLocalPathValidator:
     def test_flat_rejected(self):
         p = Path(".claude/diagrams/flat.mmd")
         with pytest.raises(ValueError, match="flat"):
-            _local_validate_scoped_path(p)
+            _validate_scoped_path(p)
 
     def test_traversal_rejected(self):
         p = Path(".claude/diagrams/../../secrets.mmd")
-        with pytest.raises(ValueError, match="traversal|flat"):
-            _local_validate_scoped_path(p)
+        with pytest.raises(ValueError):
+            _validate_scoped_path(p)
 
     def test_no_anchor_rejected(self):
         p = Path("/tmp/diagrams/flat.mmd")
         with pytest.raises(ValueError, match="\\.claude/diagrams"):
-            _local_validate_scoped_path(p)
+            _validate_scoped_path(p)
 
     def test_bad_extension_rejected(self):
         p = Path(".claude/diagrams/gui/auth/login.txt")
-        with pytest.raises(ValueError, match="extension"):
-            _local_validate_scoped_path(p)
+        with pytest.raises(ValueError, match="extension|\\.mmd|\\.excalidraw"):
+            _validate_scoped_path(p)
 
     def test_camelcase_name_rejected(self):
         p = Path(".claude/diagrams/gui/LoginForm.mmd")
-        with pytest.raises(ValueError, match="kebab-case"):
-            _local_validate_scoped_path(p)
+        with pytest.raises(ValueError, match="kebab|lowercase"):
+            _validate_scoped_path(p)
 
     def test_underscore_name_rejected(self):
         p = Path(".claude/diagrams/gui/login_form.mmd")
-        with pytest.raises(ValueError, match="kebab-case"):
-            _local_validate_scoped_path(p)
+        with pytest.raises(ValueError, match="kebab|lowercase"):
+            _validate_scoped_path(p)
 
 
 # ---------------------------------------------------------------------------

@@ -14,9 +14,9 @@ That works only if every diagram save lands at:
 with kebab-case identifiers. We enforce that mechanically — no
 instruction-following required. Defense in depth: BOTH the wrapper MCP
 (``claude_mcp_servers/wrappers/mermaid_proxy.py``) AND the PreToolUse
-hook (Phase 1.5.A — sibling) call :func:`validate_scoped_path`. The
-wrapper catches MCP-routed saves; the hook catches direct ``Write``
-tool calls that bypass the MCP entirely.
+hook (``templates/hooks/pre-diagram-path-validation.{sh,ps1}``) call
+:func:`validate_scoped_path`. The wrapper catches MCP-routed saves; the
+hook catches direct ``Write`` tool calls that bypass the MCP entirely.
 
 Why a shared module (not duplicated inline)
 -------------------------------------------
@@ -281,10 +281,10 @@ def _format_error(
 def extract_category_tags(path: str) -> tuple[str, ...]:
     """Return the category segments of a valid scoped path as a tuple.
 
-    Used by ``vco_lib/diagram_indexer.py`` (sibling Phase 1.5.A) to
-    derive ``path_tags`` from ``category_path``. Returns an empty
-    tuple when the path doesn't match the scoped layout — callers
-    should validate first via :func:`validate_scoped_path`.
+    Used by ``vco_lib/diagram_indexer.py`` to derive ``path_tags`` from
+    ``category_path``. Returns an empty tuple when the path doesn't
+    match the scoped layout — callers should validate first via
+    :func:`validate_scoped_path`.
 
     Co-located here (not in the indexer) because the tag derivation
     is a direct consequence of the path rule; keeping them in the

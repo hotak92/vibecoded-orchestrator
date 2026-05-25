@@ -21,39 +21,20 @@ Failure handling (see `index_diagram` docstring):
   - Weaviate failure: DB + sidecar committed, row enqueued to
     `diagram_index_retry` (best-effort), warning logged, row returned.
 
-Stubs / cross-team dependencies (Phase 1.1 + 1.2 siblings):
-  - The `project_diagrams` table schema lives in launcher migration 021
-    (Phase 1.1). This module reads/writes against that schema; if the
-    table doesn't exist (e.g. sibling not yet merged) the DB write raises
-    a clear error.
-  - `vco_lib.diagram_paths.validate_scoped_path` is owned by Phase 1.2.
-    A local fallback copy lives in this worktree at
-    `vco_lib/diagram_paths.py` so this module imports cleanly during
-    parallel development; the integrator drops the local copy when the
-    sibling lands.
-  - The retry table `diagram_index_retry` ships as a Phase 1.1 addendum
-    (SQL in this file's module docstring, also in
-    `migrations_addendum/021_diagram_index_retry.sql`).
+Cross-module dependencies:
+  - `project_diagrams` + `diagram_index_retry` table schemas live in
+    launcher migration 022 (created in Phase 1.1; retry-queue folded in
+    from Phase 1.5.A). The module degrades gracefully when the DB is
+    absent or the schema hasn't been applied — sidecar + Weaviate still
+    happen, the SQLite UPSERT is skipped.
+  - Path validation delegates to `vco_lib.diagram_paths.validate_scoped_path`
+    (single source of truth for the scoped-path regex + error wording).
 
 CLI usage (called by the post-file-edit hook):
     python -m vco_lib.diagram_indexer index <file_path>
         Indexes a single file (resolves project_id from CWD, chat_id
         from CLAUDE_CODE_SESSION_ID env). Prints the resulting row as
         JSON. Exit 0 on success, non-zero on failure.
-
-Retry table SQL (to be folded into migration 021 by Phase 1.1 integrator):
-
-    CREATE TABLE IF NOT EXISTS diagram_index_retry (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id TEXT NOT NULL,
-        file_path TEXT NOT NULL,
-        error TEXT,
-        attempt_count INTEGER NOT NULL DEFAULT 0,
-        next_attempt_at INTEGER NOT NULL,
-        last_error_at INTEGER
-    );
-    CREATE INDEX IF NOT EXISTS idx_diagram_retry_next
-        ON diagram_index_retry(next_attempt_at);
 """
 from __future__ import annotations
 
@@ -404,102 +385,31 @@ def parse_excalidraw(scene_json: dict) -> ExcalidrawMetadata:
 
 
 # ---------------------------------------------------------------------------
-# Path validation (depends on sibling Phase 1.2 — local fallback)
+# Path validation — delegates to vco_lib.diagram_paths (single source of truth)
 # ---------------------------------------------------------------------------
 
 
 def _validate_scoped_path(file_path: Path) -> tuple[str, str, str]:
-    """Wrapper around `vco_lib.diagram_paths.validate_scoped_path`.
+    """Validate path via ``vco_lib.diagram_paths`` and return the parsed triple.
 
-    Phase 1.2's canonical API returns ``str | None`` (None = valid,
-    string = corrective error). This wrapper adapts it back to the
-    indexer's `(diagram_type, category_path, diagram_name)` triple by
-    re-parsing the (now-validated) path via ``_local_validate_scoped_path``.
-    The validation HAPPENS in 1.2's module (one regex, one error message);
-    the triple-extraction is mechanical.
+    The validation logic (regex, error wording, kind enforcement) lives in
+    ``vco_lib.diagram_paths.validate_scoped_path``; this wrapper just
+    extracts the ``(diagram_type, category_path, diagram_name)`` triple
+    from the now-known-good path.
 
-    Falls back to a local in-module implementation when the sibling
-    module isn't present yet (defensive — should not trigger post-merge).
-
-    Raises ValueError with a clear corrective message on violation.
+    Raises ``ValueError`` with the canonical corrective message on violation.
     """
-    try:
-        from vco_lib.diagram_paths import validate_scoped_path  # type: ignore
-    except ImportError:
-        return _local_validate_scoped_path(file_path)
+    from vco_lib.diagram_paths import validate_scoped_path, extract_category_tags
 
     err = validate_scoped_path(str(file_path))
     if err is not None:
         raise ValueError(err)
-    # Validation passed; extract triple via local parser (mechanical — the
-    # path is already known-good).
-    return _local_validate_scoped_path(file_path)
 
-
-def _local_validate_scoped_path(file_path: Path) -> tuple[str, str, str]:
-    """Local fallback when `vco_lib.diagram_paths` isn't available.
-
-    Mirrors the validator contract Phase 1.2 will own. When the sibling
-    module lands, the integrator removes this fallback (and the
-    try/except in `_validate_scoped_path`) — the canonical implementation
-    takes over.
-
-    Contract:
-      - path must contain `.claude/diagrams/` (anywhere in its parents).
-      - relative to that anchor, structure must be
-        `<category>/<name>.{mmd,excalidraw}` with at least one category
-        directory.
-      - name must match `[a-z0-9][a-z0-9-]*`.
-      - Path-traversal (`..`) is rejected.
-    """
-    parts = file_path.parts
-    try:
-        anchor_idx = max(
-            i for i, p in enumerate(parts[:-1])
-            if p == "diagrams" and i > 0 and parts[i - 1] == ".claude"
-        )
-    except ValueError:
-        raise ValueError(
-            f"Diagram path '{file_path}' must live under "
-            f".claude/diagrams/<category>/<name>.{{mmd,excalidraw}}. "
-            f"Example: .claude/diagrams/gui/auth/login-form.mmd"
-        )
-
-    rel_parts = parts[anchor_idx + 1:]
-    if len(rel_parts) < 2:
-        raise ValueError(
-            f"Diagram path '{file_path}' is flat — must include at "
-            f"least one category directory. "
-            f"Example: .claude/diagrams/gui/auth/login-form.mmd"
-        )
-
-    if any(p == ".." for p in rel_parts):
-        raise ValueError(
-            f"Diagram path '{file_path}' contains '..' traversal — "
-            f"refused for security."
-        )
-
-    name_with_ext = rel_parts[-1]
+    # Path is known-good; mechanical extraction.
     suffix = file_path.suffix.lower()
-    if suffix == ".mmd":
-        diagram_type = "mermaid"
-    elif suffix == ".excalidraw":
-        diagram_type = "excalidraw"
-    else:
-        raise ValueError(
-            f"Diagram path '{file_path}' has unsupported extension "
-            f"'{suffix}' — must be .mmd or .excalidraw."
-        )
-
-    diagram_name = name_with_ext[: -len(suffix)]
-    if not re.match(r"^[a-z0-9][a-z0-9-]*$", diagram_name):
-        raise ValueError(
-            f"Diagram name '{diagram_name}' must match "
-            f"[a-z0-9][a-z0-9-]* (lowercase-kebab-case). "
-            f"Example: 'login-form-v2', not 'LoginForm' or 'login_form'."
-        )
-
-    category_path = "/".join(rel_parts[:-1])
+    diagram_type = "mermaid" if suffix == ".mmd" else "excalidraw"
+    diagram_name = file_path.stem
+    category_path = "/".join(extract_category_tags(str(file_path)))
     return diagram_type, category_path, diagram_name
 
 

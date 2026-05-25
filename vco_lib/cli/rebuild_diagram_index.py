@@ -38,21 +38,12 @@ Cross-OS rules (see ``knowledge/concepts/cross-os-hook-portability.md``):
 * No ``/tmp`` literals; ``tempfile.gettempdir()`` if scratch is needed
   (none today).
 
-Phase coordination notes
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-* Phase 1.5.A ships ``vco_lib.diagram_indexer.index_diagram``. Until
-  it lands, the STUB in that module satisfies the contract: sidecar
-  writes are idempotent, Weaviate writes are no-ops (``wrote_weaviate``
-  always ``False``). The CLI reports "0 Weaviate writes" on re-run
-  under both the STUB and the real implementation.
-
-* Phase 0.B ships ``vco_lib.config_projection.resolve_project_folder``
-  and ``list_registered_projects``. They aren't on disk yet (Phase 0.B
-  Part 2 follow-up — see the plan's §8.2 open follow-ups). This module
-  imports them via lazy wrappers (mirrors ``vco_lib.cli.verify``);
-  tests monkey-patch the wrappers. The integration point — when 0.B
-  Part 2 merges — is the wrapper bodies below.
+Cross-module dependencies:
+  - ``vco_lib.diagram_indexer.index_diagram`` does the per-file work.
+  - ``vco_lib.config_projection.resolve_project_folder`` /
+    ``list_registered_projects`` are wrapped via lazy imports so tests can
+    monkey-patch them and so the CLI can run before Phase 0.B Part 2
+    finishes routing every caller through the projection contract.
 """
 from __future__ import annotations
 
@@ -118,31 +109,18 @@ def _list_registered_projects() -> Iterable[Mapping[str, str]]:
 
 
 def _index_diagram(file_path: Path, project_id: str, chat_id: Optional[str] = None) -> Any:
-    """Phase 1.5.A dependency wrapper.
+    """Indexer wrapper kept thin so tests can monkey-patch the call site.
 
-    Calls :func:`vco_lib.diagram_indexer.index_diagram`. Returns a
-    :class:`DiagramRow`-shaped object (we read ``.wrote_sidecar``,
-    ``.wrote_weaviate``, ``.sidecar_path``, ``.content_hash``,
-    ``.file_path``).
+    Returns a :class:`DiagramRow`-shaped object (we read ``.wrote_sidecar``
+    and ``.wrote_weaviate`` to count the report).
     """
-    # Phase 1.5.A dependency — STUB lives at vco_lib/diagram_indexer.py
-    # until the real implementation lands. The CLI reads the same
-    # attribute set from both.
-    from vco_lib.diagram_indexer import index_diagram  # noqa: WPS433 — local import
+    from vco_lib.diagram_indexer import index_diagram  # local import for monkey-patching
     return index_diagram(file_path, project_id, chat_id)
 
 
 def _drop_weaviate_diagram(content_hash: str, project_id: str) -> bool:
-    """Phase 1.5.A dependency wrapper for orphan-prune.
-
-    Best-effort: if the indexer module ships a ``drop_diagram_by_hash``
-    helper, call it; otherwise return ``False`` (the STUB never writes
-    to Weaviate, so there's nothing to drop). Tests stub this directly.
-    """
-    try:
-        from vco_lib.diagram_indexer import drop_diagram_by_hash  # type: ignore  # noqa: E501
-    except ImportError:
-        return False
+    """Orphan-prune wrapper. Best-effort — Weaviate side of orphan cleanup."""
+    from vco_lib.diagram_indexer import drop_diagram_by_hash
     try:
         return bool(drop_diagram_by_hash(content_hash, project_id))
     except Exception:  # pragma: no cover — best-effort cleanup
@@ -247,10 +225,9 @@ def _index_one(
     """Index a single diagram; updates ``report`` in place."""
     report.total += 1
     if dry_run:
-        # Dry-run: we still call the indexer with a dry-run shim — but
-        # the STUB has no dry-run mode. Instead, compare the file's
-        # current content hash to the sidecar's content_hash; if they
-        # match, "skipped" — otherwise "would_index".
+        # Dry-run: don't call the indexer (which would write); compare
+        # the file's current content hash to the sidecar's content_hash.
+        # Match → would-skip; mismatch → would-index.
         from vco_lib.diagram_indexer import _read_sidecar, _sha256_bytes  # noqa: WPS437,E501
         try:
             raw = file_path.read_bytes()
@@ -307,9 +284,8 @@ def _handle_orphans(
         # Diagram is gone → orphan sidecar.
         report.orphans.append(str(sidecar))
         if prune and not dry_run:
-            # Try to drop the Weaviate object first (best-effort,
-            # always succeeds on the STUB which doesn't write to
-            # Weaviate at all).
+            # Drop the Weaviate object first (best-effort; the indexer
+            # silently no-ops when Weaviate is unreachable / unconfigured).
             try:
                 content_hash = json.loads(sidecar.read_text(encoding="utf-8")).get("content_hash", "")
             except (OSError, ValueError):
