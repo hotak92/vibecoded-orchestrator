@@ -159,6 +159,17 @@ if [[ "$EDITED_FILE" == "$DIAGRAMS_DIR"/* ]] \
         ( "$_DIAG_VENV" -m vco_lib.diagram_indexer index "$EDITED_FILE" \
             >/dev/null 2>&1 || true ) &
 
+        # A6 wire-up (Phase 1 item 9 + §1.5.6): auto-snapshot the file
+        # before the next edit can land. Uses the same SQLite table
+        # (`diagram_snapshots`) the launcher's Tauri command writes,
+        # with trigger=`auto_pre_edit_save`. Throttle is shared with
+        # the indexer above (one snapshot per file per 60s); content
+        # dedup is enforced inside the CLI (UNIQUE constraint +
+        # explicit hash check). Soft-fail: snapshot failure must
+        # never block the user's edit, so we background + `|| true`.
+        ( "$_DIAG_VENV" -m vco_lib.diagram_indexer snapshot create \
+            "$EDITED_FILE" --quiet >/dev/null 2>&1 || true ) &
+
         # Live UI refresh in DiagramsTab is driven by the launcher's
         # frontend file-watcher (chokidar in launcher/src/lib/...) — NOT
         # a hub broadcast. The original Phase 1.5.A design called for a

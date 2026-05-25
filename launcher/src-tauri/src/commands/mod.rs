@@ -21,6 +21,11 @@ pub mod desktop_shortcut;
 pub mod diagrams_cmd;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;
+// C8 wire-up (2026-05-25): Tauri command `read_env_var` consumed by the
+// DiagramsTab Wayland fallback (read XDG_SESSION_TYPE). Secret-shaped
+// names are redacted to "" before reaching std::env::var; the FE never
+// sees credential-looking values.
+pub mod env_cmd;
 // v0.2.24 §A0 (2026-05-22): per-path 3-way merge for known
 // user-editable files during orchestrator-root updates. Sits between
 // `installer::{update_orchestrator, merge_orchestrator_with_upstream}`

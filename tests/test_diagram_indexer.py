@@ -715,3 +715,397 @@ class TestSidecarDict:
         assert d["_sidecar_schema_version"] == 1
         assert d["diagram_name"] == "name"
         assert d["created_at"] == 1000
+
+
+# ---------------------------------------------------------------------------
+# snapshot_diagram_file + `snapshot create` CLI subcommand (A6 wire-up)
+# ---------------------------------------------------------------------------
+#
+# The DB schema fixture above (`_PROJECT_DIAGRAMS_SCHEMA`) doesn't include
+# diagram_snapshots — we extend it locally here so the snapshot tests
+# don't depend on migration 022 being applied. Mirrors the
+# launcher-core SQL in `launcher/src-tauri/vct-launcher-core/src/db/
+# migrations/022_diagrams.sql` byte-for-byte.
+
+_SNAPSHOTS_SCHEMA = """
+CREATE TABLE diagram_snapshots (
+    id              INTEGER PRIMARY KEY,
+    diagram_id      INTEGER NOT NULL,
+    content_hash    TEXT NOT NULL,
+    content         BLOB NOT NULL,
+    created_at      INTEGER NOT NULL,
+    trigger         TEXT NOT NULL,
+    label           TEXT,
+    UNIQUE(diagram_id, content_hash)
+);
+"""
+
+
+def _add_snapshots_table(db_path: Path) -> None:
+    """Apply the diagram_snapshots schema fragment to an existing DB."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_SNAPSHOTS_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_diagram_row(
+    db_path: Path,
+    project_id: str,
+    diagram_name: str,
+    file_path: Path,
+    *,
+    category_path: str = "gui",
+    diagram_type: str = "mermaid",
+) -> int:
+    """Insert a minimal project_diagrams row (bypassing the indexer)
+    and return its rowid. Used by snapshot tests that need a
+    pre-existing diagram row to point at."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "INSERT INTO project_diagrams "
+            "(project_id, diagram_name, diagram_type, file_path, "
+            " category_path, enabled, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, 1000, 1000)",
+            (
+                project_id,
+                diagram_name,
+                diagram_type,
+                str(file_path.resolve()),
+                category_path,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def _count_snapshots(db_path: Path, diagram_id: int) -> int:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM diagram_snapshots WHERE diagram_id = ?",
+            (diagram_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _read_snapshot(db_path: Path, snapshot_id: int) -> dict:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT diagram_id, content_hash, content, trigger, label "
+            "FROM diagram_snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return {}
+    return {
+        "diagram_id": row[0],
+        "content_hash": row[1],
+        "content": row[2],
+        "trigger": row[3],
+        "label": row[4],
+    }
+
+
+class TestSnapshotDiagramFile:
+    def test_creates_snapshot_for_known_diagram(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        from vco_lib.diagram_indexer import (
+            snapshot_diagram_file,
+            _sha256_bytes,
+        )
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "snap-test.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        diagram_id = _insert_diagram_row(
+            db_path, "proj-test-uuid", "snap-test", f,
+        )
+
+        snapshot_id = snapshot_diagram_file(
+            f, "proj-test-uuid", db_path=db_path,
+        )
+        assert snapshot_id is not None
+        assert _count_snapshots(db_path, diagram_id) == 1
+
+        snap = _read_snapshot(db_path, snapshot_id)
+        assert snap["diagram_id"] == diagram_id
+        assert snap["trigger"] == "auto_pre_edit_save"
+        assert snap["label"] is None
+        # content stored as raw bytes; hash matches.
+        expected_hash = _sha256_bytes(f.read_bytes())
+        assert snap["content_hash"] == expected_hash
+        assert bytes(snap["content"]) == f.read_bytes()
+
+    def test_dedup_skips_when_latest_hash_matches(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        from vco_lib.diagram_indexer import snapshot_diagram_file
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "dedup.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        diagram_id = _insert_diagram_row(
+            db_path, "proj-test-uuid", "dedup", f,
+        )
+
+        snapshot_id_1 = snapshot_diagram_file(
+            f, "proj-test-uuid", db_path=db_path,
+        )
+        assert snapshot_id_1 is not None
+        # Second call with unchanged content → no-op (returns None).
+        snapshot_id_2 = snapshot_diagram_file(
+            f, "proj-test-uuid", db_path=db_path,
+        )
+        assert snapshot_id_2 is None
+        assert _count_snapshots(db_path, diagram_id) == 1
+
+    def test_dedup_does_not_block_changed_content(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        from vco_lib.diagram_indexer import snapshot_diagram_file
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "changing.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        diagram_id = _insert_diagram_row(
+            db_path, "proj-test-uuid", "changing", f,
+        )
+
+        s1 = snapshot_diagram_file(f, "proj-test-uuid", db_path=db_path)
+        assert s1 is not None
+
+        # Change the file → second snapshot must land (different hash).
+        f.write_text("flowchart TD\n  A --> C")
+        s2 = snapshot_diagram_file(f, "proj-test-uuid", db_path=db_path)
+        assert s2 is not None
+        assert s2 != s1
+        assert _count_snapshots(db_path, diagram_id) == 2
+
+    def test_no_diagram_row_returns_none(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        """If the indexer hasn't UPSERTed a project_diagrams row yet
+        (e.g. snapshot fires before indexer in a hook race), we soft-
+        skip rather than create a dangling snapshot."""
+        from vco_lib.diagram_indexer import snapshot_diagram_file
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "orphan.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        # No INSERT into project_diagrams.
+        result = snapshot_diagram_file(
+            f, "proj-test-uuid", db_path=db_path,
+        )
+        assert result is None
+
+    def test_missing_db_returns_none(
+        self, tmp_path: Path, diagrams_root: Path
+    ):
+        from vco_lib.diagram_indexer import snapshot_diagram_file
+
+        f = diagrams_root / "gui" / "nodbskip.mmd"
+        f.parent.mkdir(parents=True)
+        f.write_text("flowchart TD\n  A --> B")
+
+        nonexistent = tmp_path / "definitely-not-here.db"
+        result = snapshot_diagram_file(
+            f, "proj-test-uuid", db_path=nonexistent,
+        )
+        assert result is None
+
+    def test_missing_file_returns_none(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        from vco_lib.diagram_indexer import snapshot_diagram_file
+
+        _add_snapshots_table(db_path)
+        ghost = diagrams_root / "gui" / "ghost.mmd"
+        # Don't write the file.
+        result = snapshot_diagram_file(
+            ghost, "proj-test-uuid", db_path=db_path,
+        )
+        assert result is None
+
+    def test_custom_trigger_and_label_recorded(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        from vco_lib.diagram_indexer import snapshot_diagram_file
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "labelled.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+        diagram_id = _insert_diagram_row(
+            db_path, "proj-test-uuid", "labelled", f,
+        )
+        snapshot_id = snapshot_diagram_file(
+            f, "proj-test-uuid", db_path=db_path,
+            trigger="manual", label="pre-refactor",
+        )
+        assert snapshot_id is not None
+        snap = _read_snapshot(db_path, snapshot_id)
+        assert snap["trigger"] == "manual"
+        assert snap["label"] == "pre-refactor"
+        # Sanity: the row points at the right diagram.
+        assert snap["diagram_id"] == diagram_id
+
+
+class TestSnapshotCli:
+    """Exercise the `snapshot create` CLI subcommand against an
+    in-process call (not subprocess) so we keep the test cheap and
+    deterministic. End-to-end subprocess coverage is provided by the
+    post-file-edit hook test (test_post_file_edit_diagrams_branch.py)."""
+
+    def test_cli_creates_snapshot(self, db_path: Path, diagrams_root: Path):
+        from vco_lib.diagram_indexer import _cli
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "cli-snap.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+        diagram_id = _insert_diagram_row(
+            db_path, "proj-test-uuid", "cli-snap", f,
+        )
+
+        rc = _cli([
+            "snapshot", "create", str(f),
+            "--project-id", "proj-test-uuid",
+            "--db-path", str(db_path),
+            "--quiet",
+        ])
+        assert rc == 0
+        assert _count_snapshots(db_path, diagram_id) == 1
+
+    def test_cli_dedup_returns_zero_and_no_extra_row(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        from vco_lib.diagram_indexer import _cli
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "cli-dedup.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+        diagram_id = _insert_diagram_row(
+            db_path, "proj-test-uuid", "cli-dedup", f,
+        )
+
+        argv = [
+            "snapshot", "create", str(f),
+            "--project-id", "proj-test-uuid",
+            "--db-path", str(db_path),
+            "--quiet",
+        ]
+        # First call: insert. Second call: dedup no-op.
+        assert _cli(argv) == 0
+        assert _cli(argv) == 0
+        assert _count_snapshots(db_path, diagram_id) == 1
+
+    def test_cli_missing_project_id_returns_2(
+        self, db_path: Path, diagrams_root: Path, monkeypatch
+    ):
+        """When neither --project-id nor CWD-resolved project_id is
+        available, the CLI returns 2 (the unrecoverable code reserved
+        for project-id resolution failure)."""
+        from vco_lib.diagram_indexer import _cli
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "noproj.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+
+        # Force the CWD resolver to return None.
+        monkeypatch.setattr(
+            "vco_lib.diagram_indexer._resolve_project_id_from_cwd",
+            lambda: None,
+        )
+        rc = _cli([
+            "snapshot", "create", str(f),
+            "--db-path", str(db_path),
+            "--quiet",
+        ])
+        assert rc == 2
+
+    def test_cli_respects_custom_trigger(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        from vco_lib.diagram_indexer import _cli
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "trig.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+        _ = _insert_diagram_row(
+            db_path, "proj-test-uuid", "trig", f,
+        )
+        rc = _cli([
+            "snapshot", "create", str(f),
+            "--project-id", "proj-test-uuid",
+            "--db-path", str(db_path),
+            "--trigger", "auto_interval",
+            "--label", "interval-keepalive",
+            "--quiet",
+        ])
+        assert rc == 0
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT trigger, label FROM diagram_snapshots "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == ("auto_interval", "interval-keepalive")
+
+    def test_cli_rejects_invalid_trigger(
+        self, db_path: Path, diagrams_root: Path
+    ):
+        """argparse `choices=` should refuse an unknown trigger so we
+        never accidentally write garbage that the launcher's snapshot
+        UI filter dropdown won't recognise."""
+        from vco_lib.diagram_indexer import _cli
+
+        _add_snapshots_table(db_path)
+        cat = diagrams_root / "gui"
+        cat.mkdir(parents=True)
+        f = cat / "bad-trig.mmd"
+        f.write_text("flowchart TD\n  A --> B")
+        _insert_diagram_row(
+            db_path, "proj-test-uuid", "bad-trig", f,
+        )
+        with pytest.raises(SystemExit):
+            _cli([
+                "snapshot", "create", str(f),
+                "--project-id", "proj-test-uuid",
+                "--db-path", str(db_path),
+                "--trigger", "definitely-not-allowed",
+                "--quiet",
+            ])

@@ -1185,6 +1185,188 @@ def _resolve_project_id_from_cwd() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Auto-snapshot (Phase 1, item 9 — A6 wire-up)
+# ---------------------------------------------------------------------------
+#
+# When the post-file-edit hook fires on a `.mmd` / `.excalidraw` change,
+# we want to capture a version snapshot BEFORE the next edit lands. The
+# Tauri command `create_diagram_snapshot` exists for this but is only
+# reachable from JS — the hook runs in bash. Rather than couple the two
+# (the launcher might not be running when the hook fires), we go direct
+# to the same SQLite table (`diagram_snapshots`) that the Tauri command
+# writes.
+#
+# Contract (mirrors `create_diagram_snapshot` in
+# `launcher/src-tauri/src/commands/diagrams_cmd.rs`):
+#   * trigger is fixed to `'auto_pre_edit_save'`.
+#   * dedup is by `(diagram_id, content_hash)` — the table's UNIQUE
+#     constraint makes a repeat-content insert a no-op (we catch the
+#     IntegrityError and return False).
+#   * the snapshot's `content` BLOB stores the raw file bytes. The
+#     Rust side already documents the column as opaque (gzipped or
+#     raw — writer's choice); we go raw for now to keep this CLI a
+#     drop-in match for the Rust command's behaviour.
+#   * dispatch is soft-fail per the hook contract: a launcher-DB
+#     hiccup must NOT block the user's edit from completing.
+
+
+_SNAPSHOT_LOOKUP_SQL = """
+SELECT id FROM project_diagrams
+WHERE project_id = :project_id AND file_path = :file_path
+"""
+
+_SNAPSHOT_LATEST_HASH_SQL = """
+SELECT content_hash FROM diagram_snapshots
+WHERE diagram_id = :diagram_id
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+"""
+
+_SNAPSHOT_INSERT_SQL = """
+INSERT INTO diagram_snapshots
+    (diagram_id, content_hash, content, created_at, trigger, label)
+VALUES
+    (:diagram_id, :content_hash, :content, :created_at, :trigger, :label)
+"""
+
+
+def snapshot_diagram_file(
+    file_path: Path,
+    project_id: str,
+    *,
+    db_path: Optional[Path] = None,
+    trigger: str = "auto_pre_edit_save",
+    label: Optional[str] = None,
+) -> Optional[int]:
+    """Create a snapshot row for ``file_path`` in ``diagram_snapshots``.
+
+    Mirrors the Tauri command `create_diagram_snapshot` for the hook
+    path. Look-up by ``(project_id, file_path)`` against the resolved
+    absolute path — the indexer's UPSERT writes the same canonical form
+    so this match is exact.
+
+    Returns:
+        The new ``snapshot_id`` (int) on insert.
+        ``None`` on any of: file missing, no matching diagram row,
+        DB unavailable, dedup hit (latest snapshot hash matches), or
+        any SQLite error. All failure modes are soft (the hook should
+        never break the user's edit because the snapshot table is
+        temporarily unhappy).
+
+    Raises:
+        Never — the hook path is best-effort by design. Callers that
+        want hard failure should use ``create_diagram_snapshot`` via
+        the Tauri command.
+    """
+    abs_path = file_path.resolve()
+    if not abs_path.is_file():
+        logger.debug(
+            "snapshot_diagram_file: %s does not exist; skipping",
+            abs_path,
+        )
+        return None
+
+    if db_path is None:
+        state_dir = Path(
+            os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct")
+        )
+        db_path = state_dir / "launcher.db"
+    if not db_path.exists():
+        logger.debug(
+            "snapshot_diagram_file: launcher DB %s missing; skipping",
+            db_path,
+        )
+        return None
+
+    try:
+        content_bytes = abs_path.read_bytes()
+    except OSError as exc:
+        logger.warning(
+            "snapshot_diagram_file: read %s failed: %s; skipping",
+            abs_path, exc,
+        )
+        return None
+
+    content_hash = _sha256_bytes(content_bytes)
+    now_ms = int(time.time() * 1000)  # match Rust's `Utc::now().timestamp_millis()`
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            # 1. Resolve diagram_id by (project_id, file_path).
+            row = conn.execute(
+                _SNAPSHOT_LOOKUP_SQL,
+                {"project_id": project_id, "file_path": str(abs_path)},
+            ).fetchone()
+            if row is None:
+                logger.debug(
+                    "snapshot_diagram_file: no project_diagrams row for "
+                    "(project_id=%s, file_path=%s); skipping",
+                    project_id, abs_path,
+                )
+                return None
+            diagram_id = int(row[0])
+
+            # 2. Dedup: if the most recent snapshot has the same hash,
+            #    no insert needed. The table's UNIQUE(diagram_id,
+            #    content_hash) constraint would also reject the insert,
+            #    but checking up-front avoids the IntegrityError noise.
+            latest = conn.execute(
+                _SNAPSHOT_LATEST_HASH_SQL,
+                {"diagram_id": diagram_id},
+            ).fetchone()
+            if latest is not None and latest[0] == content_hash:
+                logger.debug(
+                    "snapshot_diagram_file: dedup hit for diagram_id=%d "
+                    "hash=%s; skipping",
+                    diagram_id, content_hash[:12],
+                )
+                return None
+
+            # 3. Insert. The UNIQUE constraint still races us in theory
+            #    (another writer between SELECT and INSERT) — we catch
+            #    that case and return None as a graceful dedup.
+            try:
+                cursor = conn.execute(
+                    _SNAPSHOT_INSERT_SQL,
+                    {
+                        "diagram_id": diagram_id,
+                        "content_hash": content_hash,
+                        "content": content_bytes,
+                        "created_at": now_ms,
+                        "trigger": trigger,
+                        "label": label,
+                    },
+                )
+                conn.commit()
+                snapshot_id = int(cursor.lastrowid)
+                logger.debug(
+                    "snapshot_diagram_file: inserted snapshot_id=%d "
+                    "diagram_id=%d trigger=%s bytes=%d",
+                    snapshot_id, diagram_id, trigger, len(content_bytes),
+                )
+                return snapshot_id
+            except sqlite3.IntegrityError as exc:
+                # UNIQUE(diagram_id, content_hash) — racing dedup. Same
+                # outcome as the manual check above: no-op.
+                logger.debug(
+                    "snapshot_diagram_file: UNIQUE conflict for diagram_id=%d "
+                    "(probably racing dedup): %s",
+                    diagram_id, exc,
+                )
+                return None
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning(
+            "snapshot_diagram_file: SQLite error against %s: %s; skipping",
+            db_path, exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1196,6 +1378,7 @@ def _cli(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # ── index ─────────────────────────────────────────────────────────
     p_index = sub.add_parser("index", help="Index one file.")
     p_index.add_argument("file_path", type=Path)
     p_index.add_argument(
@@ -1219,6 +1402,10 @@ def _cli(argv: list[str] | None = None) -> int:
              "Weaviate upsert if omitted.",
     )
 
+    # ── drop ──────────────────────────────────────────────────────────
+    # post-file-delete hook calls this to cascade SQLite + sidecar +
+    # Weaviate cleanup after a `rm` / `unlink` / `mv`. Idempotent —
+    # already-deleted is a successful outcome.
     p_drop = sub.add_parser(
         "drop",
         help="Cascade-delete a diagram across SQLite + sidecar + Weaviate.",
@@ -1237,8 +1424,58 @@ def _cli(argv: list[str] | None = None) -> int:
         help="Weaviate collection name.",
     )
 
+    # ── snapshot create ───────────────────────────────────────────────
+    # A6 wire-up: hook calls `snapshot create <file_path>` after the
+    # indexer to capture a versioned snapshot. Trigger is fixed to
+    # `auto_pre_edit_save` (the canonical value for hook-driven
+    # snapshots; mirrors the Rust constant `VALID_SNAPSHOT_TRIGGERS`).
+    # Soft-fail throughout — `--quiet` is on by default for the hook
+    # path; errors are logged but exit code stays 0 unless arg parsing
+    # itself fails.
+    p_snap = sub.add_parser(
+        "snapshot",
+        help="Snapshot operations (create one).",
+    )
+    snap_sub = p_snap.add_subparsers(dest="snap_cmd", required=True)
+    p_snap_create = snap_sub.add_parser(
+        "create",
+        help="Create an `auto_pre_edit_save` snapshot for a diagram file. "
+             "Dedupped by content hash; no-op if the most-recent snapshot "
+             "for the diagram already has the same hash.",
+    )
+    p_snap_create.add_argument("file_path", type=Path)
+    p_snap_create.add_argument(
+        "--project-id",
+        help="Project UUID. Resolved from CWD via vct-hub if omitted.",
+    )
+    p_snap_create.add_argument(
+        "--db-path",
+        type=Path,
+        help="Override launcher SQLite DB path "
+             "(default ${VCT_STATE_DIR:-$HOME/.vct}/launcher.db).",
+    )
+    p_snap_create.add_argument(
+        "--label",
+        default=None,
+        help="Optional human label stored in `diagram_snapshots.label`.",
+    )
+    p_snap_create.add_argument(
+        "--trigger",
+        default="auto_pre_edit_save",
+        choices=("manual", "auto_pre_edit_save", "auto_interval"),
+        help="Trigger string written to `diagram_snapshots.trigger`. "
+             "Mirrors the launcher's VALID_SNAPSHOT_TRIGGERS constant.",
+    )
+    p_snap_create.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress stdout / non-error stderr output (for hook use).",
+    )
+
     args = parser.parse_args(argv)
 
+    if args.cmd == "index":
+        return _cli_index(args)
     if args.cmd == "drop":
         project_id = args.project_id or _resolve_project_id_from_cwd()
         # project_id is optional for drop (file_path is functionally unique).
@@ -1249,13 +1486,16 @@ def _cli(argv: list[str] | None = None) -> int:
             diagrams_collection=args.diagrams_collection,
         )
         print(json.dumps(result, indent=2))
-        # Exit 0 if anything was removed OR if everything was already absent
-        # (idempotent — already-deleted is a successful outcome).
+        # Exit 0: idempotent — already-deleted is a successful outcome.
         return 0
+    if args.cmd == "snapshot":
+        if args.snap_cmd == "create":
+            return _cli_snapshot_create(args)
+        parser.error(f"unknown snapshot subcommand: {args.snap_cmd}")
+    parser.error(f"unknown command: {args.cmd}")  # pragma: no cover
 
-    if args.cmd != "index":  # pragma: no cover — argparse handles this
-        parser.error("unknown command")
 
+def _cli_index(args: argparse.Namespace) -> int:
     project_id = args.project_id or _resolve_project_id_from_cwd()
     if not project_id:
         print(
@@ -1286,6 +1526,44 @@ def _cli(argv: list[str] | None = None) -> int:
         return 4
 
     print(json.dumps(asdict(row), indent=2))
+    return 0
+
+
+def _cli_snapshot_create(args: argparse.Namespace) -> int:
+    """``snapshot create <file_path> [--project-id ...] [--label ...]``.
+
+    Soft-fail on everything that isn't an arg-parser error so the hook
+    can call us with `|| true` and never break the user's edit flow.
+    Exit codes:
+      0 — success OR dedup hit OR soft-failed for any reason.
+      2 — bad project_id resolution (truly unrecoverable: no project →
+          no diagram row → nothing to snapshot ever).
+    """
+    project_id = args.project_id or _resolve_project_id_from_cwd()
+    if not project_id:
+        if not args.quiet:
+            print(
+                "ERROR: could not resolve project_id (pass --project-id "
+                "or register the project with the launcher).",
+                file=sys.stderr,
+            )
+        return 2
+
+    snapshot_id = snapshot_diagram_file(
+        args.file_path,
+        project_id,
+        db_path=args.db_path,
+        trigger=args.trigger,
+        label=args.label,
+    )
+
+    if args.quiet:
+        return 0
+
+    if snapshot_id is None:
+        print(json.dumps({"snapshot_id": None, "reason": "noop"}))
+    else:
+        print(json.dumps({"snapshot_id": snapshot_id}))
     return 0
 
 

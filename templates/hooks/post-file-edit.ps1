@@ -166,6 +166,16 @@ if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) 
             Start-Process -FilePath $diagVenv `
                 -ArgumentList @('-m', 'vco_lib.diagram_indexer', 'index', $EditedFile) `
                 -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+
+            # A6 wire-up (Phase 1 item 9 + §1.5.6): auto-snapshot mirror
+            # of the .sh sibling. Same trigger (`auto_pre_edit_save`),
+            # same `--quiet` flag, same soft-fail discipline.
+            Start-Process -FilePath $diagVenv `
+                -ArgumentList @(
+                    '-m', 'vco_lib.diagram_indexer',
+                    'snapshot', 'create', $EditedFile, '--quiet'
+                ) `
+                -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
         }
 
         # Live UI refresh in DiagramsTab is driven by the launcher's
