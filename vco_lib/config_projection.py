@@ -560,13 +560,22 @@ def _fetch_diagram_access_list(
     legal writer of that env var.
     """
     cur = conn.cursor()
-    cur.execute(
-        "SELECT p.name FROM diagram_access da "
-        "JOIN projects p ON p.id = da.grantor_project_id "
-        "WHERE da.grantee_project_id = ? AND da.access_level = 'read' "
-        "ORDER BY p.name",
-        (project_id,),
-    )
+    # Defensive: pre-migration-022 DBs lack the `diagram_access` table.
+    # Phase 0.D's test fixtures + any partial-install scenario where
+    # migration 022 hasn't run yet must still resolve env without
+    # crashing. Empty list is the right "no grants" fallback semantically.
+    try:
+        cur.execute(
+            "SELECT p.name FROM diagram_access da "
+            "JOIN projects p ON p.id = da.grantor_project_id "
+            "WHERE da.grantee_project_id = ? AND da.access_level = 'read' "
+            "ORDER BY p.name",
+            (project_id,),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
     # Use a set for dedup, sort for deterministic output (matches the
     # ORDER BY in the SQL but defends against the case where two
     # grantors share a name — sort+dedup keeps the env var stable).
