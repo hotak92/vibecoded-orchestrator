@@ -506,6 +506,14 @@ def _persist_seen(session_id: str, additions: Iterable[str]) -> None:
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--session-id", default="", help="Per-session dedup key")
+    # v0.2.33 (SubagentStart): when the consuming subagent doesn't have
+    # the `Agent`/`Task` tool, suggesting AGENTS to it is pointless —
+    # it has no way to spawn one. The bash/ps1 wrapper checks the
+    # subagent's tool list and passes --skills-only when Agent/Task
+    # is absent. Default off → back-compat for the existing
+    # UserPromptSubmit wrapper, which always wants both groups.
+    p.add_argument("--skills-only", action="store_true",
+                   help="Suppress agent suggestions; emit only skills.")
     # Tolerate unknown args silently — the hook contract is "never block".
     args, _unknown = p.parse_known_args(argv)
     return args
@@ -521,7 +529,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     root = _project_root()
     try:
-        agents = collect_agents(root)
+        agents = collect_agents(root) if not args.skills_only else []
         skills = collect_skills(root)
     except Exception:
         return 0
