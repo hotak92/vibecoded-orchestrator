@@ -41,6 +41,13 @@ pub mod git_user_editable_merge;
 pub mod hub_proxy;
 pub mod installed_modules;
 pub mod installer;
+// v0.2.35 Agent M (2026-05-26): GUI-level preflight check for the install
+// pipeline. Runs in `ModuleCatalog.svelte::handleInstall` BEFORE the
+// `install_module_for_project` invoke, so the user sees an actionable
+// "Install Podman" modal instead of the cryptic "no container runtime
+// found" error that `installer_engine::detect_container_runtime` would
+// otherwise produce deep inside `run_install`.
+pub mod install_preflight;
 pub mod kg;
 pub mod kg_sync;
 pub mod kg_summary;

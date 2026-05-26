@@ -1106,6 +1106,14 @@ pub fn run() {
             commands::runtime_install::runtime_install_podman_linux,
             commands::runtime_install::runtime_open_install_url,
             commands::runtime_install::runtime_recheck,
+            // v0.2.35 Agent M (2026-05-26): GUI-level preflight that
+            // gates `install_module_for_project` on a usable container
+            // runtime being present right now. Distinct from the
+            // boot-time `runtime_recheck` path (which only fires inside
+            // the NoContainerRuntimeDialog modal triggered by the auto-
+            // start event); this one runs on EVERY install click so the
+            // gate is transactional, not boot-snapshot.
+            commands::install_preflight::check_container_runtime_available,
             // Projects v1 (legacy JSON-backed) was deleted 2026-04-28 — frontend
             // is 100% Svelte and uses projects_v2 exclusively. The file
             // commands/projects.rs and types CreateProjectRequest/
