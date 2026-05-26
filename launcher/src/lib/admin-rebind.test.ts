@@ -16,11 +16,12 @@ import {
 import type { AdminRebindResult } from './types/launcher';
 
 describe('shouldShowRebindButton', () => {
-  it('returns true for admin tier', () => {
+  it('returns true for admin tier (no last_error)', () => {
     expect(shouldShowRebindButton('admin')).toBe(true);
+    expect(shouldShowRebindButton('admin', null)).toBe(true);
   });
 
-  it('returns false for pro / mao / enterprise / free tiers', () => {
+  it('returns false for pro / mao / enterprise / free tiers with no error', () => {
     expect(shouldShowRebindButton('free')).toBe(false);
     expect(shouldShowRebindButton('pro')).toBe(false);
     expect(shouldShowRebindButton('mao')).toBe(false);
@@ -30,6 +31,7 @@ describe('shouldShowRebindButton', () => {
   it('returns false for null / undefined (no license cached yet)', () => {
     expect(shouldShowRebindButton(null)).toBe(false);
     expect(shouldShowRebindButton(undefined)).toBe(false);
+    expect(shouldShowRebindButton(null, null)).toBe(false);
   });
 
   it('returns false for unknown tier strings (defensive)', () => {
@@ -39,6 +41,51 @@ describe('shouldShowRebindButton', () => {
     expect(shouldShowRebindButton('superadmin')).toBe(false);
     expect(shouldShowRebindButton('')).toBe(false);
     expect(shouldShowRebindButton('Admin')).toBe(false); // wrong case
+  });
+
+  // v0.2.36 migration-recovery branch: existing admin Vault rows pinned
+  // to the old MAC-derived machine_id_hash will /validate-tier with
+  // machine_mismatch after Agent T's platform-stable hash lands. The
+  // server flips tier to 'free' and writes the error into
+  // tier_cache.last_error; the predicate must still surface the button
+  // so the user can unstick themselves.
+  it('returns true for free tier + server "machine_mismatch" error code', () => {
+    expect(shouldShowRebindButton('free', 'machine_mismatch')).toBe(true);
+  });
+
+  it('returns true for free tier + friendly "different machine" message', () => {
+    expect(
+      shouldShowRebindButton(
+        'free',
+        'Admin token is bound to a different machine.',
+      ),
+    ).toBe(true);
+  });
+
+  it('returns false for free tier + unrelated error', () => {
+    expect(shouldShowRebindButton('free', 'invalid_license_key')).toBe(false);
+    expect(shouldShowRebindButton('free', 'network')).toBe(false);
+    expect(shouldShowRebindButton('free', 'service_unavailable')).toBe(false);
+  });
+
+  it('returns true for pro tier + machine_mismatch (defensive show)', () => {
+    // Corner case: LS pro users can't in practice produce machine_mismatch
+    // (their UUIDs never hit Vault TOFU). If it ever surfaces, prefer
+    // showing the button — the rebind endpoint will reject with its own
+    // clear error (not_an_admin_token) rather than silently hiding an
+    // actionable affordance.
+    expect(shouldShowRebindButton('pro', 'machine_mismatch')).toBe(true);
+  });
+
+  it('returns false for free tier + empty/whitespace error', () => {
+    expect(shouldShowRebindButton('free', '')).toBe(false);
+    // Whitespace string does not contain 'machine' — predicate must reject.
+    expect(shouldShowRebindButton('free', '   ')).toBe(false);
+  });
+
+  it('case-insensitive substring match on "machine"', () => {
+    expect(shouldShowRebindButton('free', 'MACHINE_MISMATCH')).toBe(true);
+    expect(shouldShowRebindButton('free', 'Bound To A Different Machine')).toBe(true);
   });
 });
 

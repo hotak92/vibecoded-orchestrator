@@ -15,22 +15,49 @@
 import type { AdminRebindResult } from '$lib/types/launcher';
 
 /**
- * Whether to render the "Rebind to this machine" affordance for the
- * given orchestrator tier.
+ * Whether to render the "Rebind to this machine" affordance.
  *
- * Today: admin-tier ONLY. The Vault-admin machine binding (TOFU pattern
- * via `bind_vault_admin_machine` + explicit rebind via
+ * Visibility rules:
+ *   1. `tier === 'admin'` — happy path. Token validated, currently bound
+ *      to this machine; the button is an "if I move machines later, I
+ *      know where it lives" affordance.
+ *   2. `tier !== 'admin'` BUT `lastError` mentions "machine" — recovery
+ *      path. v0.2.36's platform-stable machine_id_hash migration (Agent
+ *      T) re-computes every host's hash from MachineGuid /
+ *      IOPlatformUUID / `/etc/machine-id` rather than MAC address.
+ *      Existing admin Vault rows pinned to the old MAC-derived hash
+ *      now /validate-tier with `error: "machine_mismatch"` →
+ *      server flips client to `tier='free'` server-side and writes
+ *      the human message into `tier_cache.last_error`. Without this
+ *      branch the rebind button stays hidden and the user is stuck.
+ *      Substring match on 'machine' captures both the server's error
+ *      code ("machine_mismatch") and the friendly message ("Admin
+ *      token is bound to a different machine.").
+ *
+ * Defensive note: in the corner case `tier === 'pro'` + machine error,
+ * we still show the button. LS pro users cannot in practice produce
+ * a machine_mismatch error (their UUIDs never hit Vault TOFU), so the
+ * branch is effectively unreachable for them; if it ever fires the
+ * rebind endpoint will reject with its own clear error
+ * (`not_an_admin_token`) which is preferable to silently hiding an
+ * actionable affordance.
+ *
+ * The Vault-admin machine binding (TOFU pattern via
+ * `bind_vault_admin_machine` + explicit rebind via
  * `rebind_vault_admin_machine`) is exclusive to the Vault-admin path.
  * LS-licensed users (pro / mao / enterprise) manage activations
  * through Lemon Squeezy's dashboard at vibecodedtools.it/account — no
- * launcher-side rebind needed.
- *
- * If we ever add LS-side machine rebind, the wire shape can evolve
- * (e.g. an enum of `'admin' | 'ls-activation'`); this helper stays
- * the single decision point.
+ * launcher-side rebind needed in the happy path.
  */
-export function shouldShowRebindButton(tier: string | null | undefined): boolean {
-  return tier === 'admin';
+export function shouldShowRebindButton(
+  tier: string | null | undefined,
+  lastError?: string | null,
+): boolean {
+  if (tier === 'admin') return true;
+  if (typeof lastError === 'string' && lastError.toLowerCase().includes('machine')) {
+    return true;
+  }
+  return false;
 }
 
 /**

@@ -192,7 +192,7 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 /// runs or it doesn't; "podman from 2018 that lacks compose" surfaces
 /// later when the compose-form probe fails.
 ///
-/// Timeout: 5s on Linux/macOS, 15s on Windows.
+/// Timeout: 5s on Linux, 15s on Windows + macOS.
 ///
 /// History:
 ///   - pre-2026-04-27: 2s, raised to 5s after disk I/O pressure on slower
@@ -203,12 +203,16 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 ///     modal despite Docker Desktop being healthy. The Hyper-V VM that
 ///     hosts Docker on Windows can take 3-10s to respond to `docker
 ///     --version` on cold cache; 5s is too tight as a worst-case ceiling.
-///     Linux/macOS still use 5s because the runtimes there are local
-///     processes with sub-second startup.
+///   - 2026-05-26 (v0.2.36 Agent U): same 15s ceiling extended to macOS.
+///     Docker Desktop for Mac runs inside HyperKit / Apple Virtualization
+///     Framework VMs with the same cold-cache + named-socket cost profile
+///     as the Hyper-V VM on Windows; real-world `docker --version` on
+///     Mac is 6-10s on cold start. Native Linux podman/docker remains
+///     a local process with sub-second startup, so Linux still uses 5s.
 async fn version_probe(binary: &PathBuf) -> bool {
-    #[cfg(windows)]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let timeout_secs = 15u64;
-    #[cfg(not(windows))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let timeout_secs = 5u64;
 
     let start = std::time::Instant::now();
@@ -283,7 +287,7 @@ async fn version_probe(binary: &PathBuf) -> bool {
 ///     validation — no extra grep needed because rootless podman has
 ///     no client/server split.
 ///
-/// Timeout: 5s on Linux/macOS, 15s on Windows.
+/// Timeout: 5s on Linux, 15s on Windows + macOS.
 ///
 /// History:
 ///   - originally 5s — `docker info` on a real Linux daemon answers in
@@ -293,16 +297,21 @@ async fn version_probe(binary: &PathBuf) -> bool {
 ///     even with Docker Desktop healthy. `docker info` on Windows queries
 ///     the Hyper-V VM via named pipe + gathers daemon metadata (images,
 ///     networks, plugins); cold-cache or VM-under-load this can take
-///     7-12s. 5s missed the window. Linux/macOS unchanged because the
-///     local daemon there is sub-second.
+///     7-12s. 5s missed the window.
+///   - 2026-05-26 (v0.2.36 Agent U): same 15s ceiling extended to macOS.
+///     Docker Desktop for Mac issues `docker info` against the HyperKit /
+///     Apple Virtualization Framework VM (socket-style transport with
+///     daemon-metadata gather); cold-cache profile matches Windows, and
+///     5s spuriously failed against healthy Docker Desktop installs.
+///     Native Linux daemons stay at 5s — local daemon, sub-second.
 ///
 /// Soft-fail: any error (timeout, spawn failure, non-zero exit)
 /// returns `false`, never panics. Caller (`resolve_runtime`) then
 /// falls through to the next candidate runtime.
 async fn daemon_usable_probe(binary: &PathBuf, runtime: ContainerRuntime) -> bool {
-    #[cfg(windows)]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let timeout_secs = 15u64;
-    #[cfg(not(windows))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let timeout_secs = 5u64;
 
     let start = std::time::Instant::now();
@@ -338,9 +347,10 @@ async fn daemon_usable_probe(binary: &PathBuf, runtime: ContainerRuntime) -> boo
         }
         Err(_) => {
             eprintln!(
-                "[runtime] daemon_usable_probe timeout for {} {} (5s)",
+                "[runtime] daemon_usable_probe timeout for {} {} (ceiling {}s)",
                 runtime.display_name(),
-                binary.display()
+                binary.display(),
+                timeout_secs
             );
             return false;
         }

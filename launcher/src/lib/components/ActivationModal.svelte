@@ -37,7 +37,14 @@
   // v0.2.36: admin-tier card gates the "Rebind to this machine" button.
   // The predicate lives in `$lib/admin-rebind` so the visibility logic
   // has a single test surface in `admin-rebind.test.ts`.
-  const showRebindButton = $derived(shouldShowRebindButton(tier));
+  //
+  // `cache?.last_error` feeds the migration-recovery branch: existing
+  // admins whose Vault row holds a MAC-derived machine_id_hash (pre
+  // v0.2.36) will /validate-tier with machine_mismatch after Agent T's
+  // platform-stable hash lands, flipping tier to 'free' server-side.
+  // The predicate then re-shows the rebind button so the user can
+  // unstick themselves without dropping to the CLI.
+  const showRebindButton = $derived(shouldShowRebindButton(tier, cache?.last_error));
   // v0.2.32 §D1: per-module license rows for the new section.
   const moduleLicenses = $derived(viewState.moduleLicenses ?? []);
 
