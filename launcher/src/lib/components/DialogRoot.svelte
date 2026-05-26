@@ -71,20 +71,57 @@
   // toggle, which guarantees the top layer is released and re-
   // acquired cleanly.
   let prevOpen = false;
+  // 2026-05-26 (fork-bomb fix Windows/WebView2): re-entry guard.
+  //
+  // Symptom on Windows: launching the freshly-built launcher with the
+  // OnboardingWizard auto-opening produced visible cascading windows so
+  // fast the user couldn't screenshot. Single Tauri process; the
+  // multiplication was the native <dialog> top-layer being torn down +
+  // re-created in a microtask loop.
+  //
+  // Root cause: this $effect reads `dialogEl.open`, which is a reactive
+  // property of the DOM element. On WebView2 (Chromium-based) the
+  // dialog's onclose handler fires synchronously during the showModal()
+  // call's microtask flush in certain race patterns (when the modal is
+  // mounted with open=true initial AND the consumer also has its own
+  // $effect chain feeding into `open`). The onclose handler sets
+  // `open = false`, which re-triggers this $effect, which sees
+  // wantOpen=true (the consumer's reactive `open` value at the *new*
+  // microtask) AND isOpen=false (we just closed) AND prevOpen=true and
+  // takes the third branch — close()+showModal() — which fires onclose
+  // again, etc. Infinite loop, each iteration painting a new dialog
+  // frame, hence "milioni di finestre" (Fabio, 2026-05-25).
+  //
+  // The guard: a non-reactive `inFlight` flag that suppresses re-entry
+  // while we're inside a showModal/close transition. Critically, we
+  // also OMIT the "defensive third branch" entirely — same-tick
+  // false→true toggles are handled by Svelte's effect batching
+  // (which collapses to the final value); the third branch was a
+  // workaround for a WebKitGTK Linux quirk (Bug B 2026-04-28) that
+  // does not apply on Windows WebView2, and on Windows it actively
+  // CAUSES the loop. We keep the guard cross-OS because re-entry is
+  // never desirable; on Linux this is a no-op vs the prior behavior
+  // (the false→true microtask path Bug B targeted no longer takes
+  // the third branch — it takes the first branch on a subsequent tick
+  // once Svelte's effect flush settles).
+  let inFlight = false;
   $effect(() => {
     if (!dialogEl) return;
+    if (inFlight) return;
     const wantOpen = open;
     const isOpen = dialogEl.open;
     if (wantOpen && !isOpen) {
+      inFlight = true;
       try { dialogEl.showModal(); } catch { /* already open */ }
+      inFlight = false;
     } else if (!wantOpen && isOpen) {
+      inFlight = true;
       dialogEl.close();
-    } else if (wantOpen && isOpen && prevOpen === false) {
-      // Defensive: same-tick false→true toggle that the effect
-      // missed. Cycle the top layer.
-      try { dialogEl.close(); } catch {}
-      try { dialogEl.showModal(); } catch {}
+      inFlight = false;
     }
+    // No third branch: see the long comment above. wantOpen===isOpen
+    // means there is nothing to do, and re-entering the close()+
+    // showModal() cycle is what triggers the Windows fork-bomb.
     prevOpen = wantOpen;
   });
 
