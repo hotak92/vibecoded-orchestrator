@@ -36,6 +36,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter, Manager, Runtime};
 use tokio::process::Command as TokioCommand;
+use vct_launcher_core::process::CommandExt as _;
 
 /// Refresh cadence for the daily background check. The user said "once a
 /// day" — we run a check every 24h after the previous successful check
@@ -313,7 +314,7 @@ fn walk_up_for_git(start: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 async fn git_available() -> bool {
-    TokioCommand::new("git")
+    TokioCommand::new("git").silent()
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -324,7 +325,7 @@ async fn git_available() -> bool {
 }
 
 async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let fut = TokioCommand::new("git")
+    let fut = TokioCommand::new("git").silent()
         .args(args)
         .current_dir(repo)
         .output();
@@ -387,7 +388,7 @@ const FETCH_RETRY_DELAYS_MS: [u64; 4] = [1, 5, 30, 120];
 /// hiccup at boot — symptom: badge never refreshes without restart.
 async fn fetch_upstream(repo: &Path) -> Result<(), String> {
     let try_once = || async {
-        let fetch = tokio::process::Command::new("git")
+        let fetch = tokio::process::Command::new("git").silent()
             .args(["fetch", "--quiet", VCO_UPSTREAM_REMOTE])
             .current_dir(repo)
             .output()
@@ -780,7 +781,7 @@ async fn finish_apply_after_pull<R: Runtime>(
         );
     }
 
-    std::process::Command::new(&exe)
+    std::process::Command::new(&exe).silent()
         .spawn()
         .map_err(|e| format!("failed to spawn new launcher: {}", e))?;
     // Programmatic shutdown: bypass the Quit confirmation dialog (the
@@ -977,7 +978,7 @@ async fn rebuild_cargo(repo: &Path) -> Result<(), String> {
         }
     }
 
-    let fut = TokioCommand::new("cargo")
+    let fut = TokioCommand::new("cargo").silent()
         .args(["build", "--release"])
         .current_dir(&dir)
         .output();
@@ -1001,7 +1002,7 @@ async fn rebuild_frontend(repo: &Path) -> Result<(), String> {
         repo.to_path_buf()
     };
 
-    let fut = TokioCommand::new("npm")
+    let fut = TokioCommand::new("npm").silent()
         .args(["run", "build"])
         .current_dir(&dir)
         .output();

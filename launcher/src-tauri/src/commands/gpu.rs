@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use vct_launcher_core::process::CommandExt as _;
 
 /// Result of the CDI-vs-driver drift check.
 ///
@@ -164,7 +165,7 @@ pub fn query_amd_gpu_present() -> bool {
     // Path 1: rocminfo (canonical). Set a tight feeling-out: if the
     // binary isn't on PATH, Command::new(...).output() returns Err and
     // we move on without spawning anything else.
-    if Command::new("rocminfo")
+    if Command::new("rocminfo").silent()
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -198,7 +199,7 @@ pub fn query_amd_gpu_present() -> bool {
 /// with a 3s timeout. Returns the version string (e.g. "595.58.03") or
 /// None if the command isn't on PATH or the call fails.
 fn query_nvidia_smi_driver() -> Option<String> {
-    let output = Command::new("nvidia-smi")
+    let output = Command::new("nvidia-smi").silent()
         .args(["--query-gpu=driver_version", "--format=csv,noheader"])
         // No native std::process::Command timeout. The launcher's UX
         // can absorb the worst-case ~5s; nvidia-smi normally returns

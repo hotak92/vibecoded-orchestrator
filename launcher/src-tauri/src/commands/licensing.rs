@@ -114,21 +114,204 @@ fn to_view(row: TierCacheRow) -> TierCacheView {
     }
 }
 
-pub(crate) fn machine_id_hash() -> String {
-    // Mirrors commercial_workflow/license/validator.py::_machine_id_hash
-    // sha256 of the 8-byte big-endian MAC, hex lowercase.
-    let mac = mac_address::get_mac_address().ok().flatten();
-    let bytes: [u8; 8] = match mac {
-        Some(m) => {
-            let bs = m.bytes(); // 6 bytes
-            let mut out = [0u8; 8];
-            out[2..].copy_from_slice(&bs);
-            out
+// ---------------------------------------------------------------------------
+// v0.2.36: platform-stable host identifier for machine binding.
+// ---------------------------------------------------------------------------
+//
+// SUPERSEDES the MAC-based algorithm shipped through v0.2.35. The previous
+// design hashed `uuid.getnode().to_bytes(8, "big")` (Python) /
+// `mac_address::get_mac_address()` (Rust), which had three structural
+// problems on laptops — the dominant 3rd-party user case:
+//
+//   1. NICs come and go. Wi-Fi can power-save off, USB Ethernet can be
+//      unplugged, docks swap adapter enumeration. Every event changed the
+//      MAC the algorithm picked → every event broke machine binding.
+//   2. Python's `uuid.getnode()` and Rust's `mac_address::get_mac_address()`
+//      didn't always pick the SAME NIC on the same machine — observed on
+//      Fabio's Win11 laptop (2 NICs, Python picked USB Ethernet, Rust
+//      picked Wi-Fi → different hashes → `machine_mismatch` errors).
+//   3. Hardware repairs / mainboard swaps that replace the integrated NIC
+//      look identical to a brand-new machine from the licence server's
+//      perspective, forcing a manual rebind for what is functionally the
+//      same install.
+//
+// The new algorithm reads a platform-stable host identifier that the OS
+// itself provides — set at install time, survives NIC changes, survives
+// motherboard repairs (on Windows; registry-resident), and is the same
+// regardless of which language reads it:
+//
+//   * Windows: `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`
+//              — GUID set by Windows at install (`abc12345-...`).
+//   * macOS:   `IOPlatformUUID` from `ioreg -rd1 -c IOPlatformExpertDevice`
+//              — hardware UUID, survives OS reinstall.
+//   * Linux:   `/etc/machine-id` (systemd standard) with fallback to
+//              `/var/lib/dbus/machine-id` (pre-systemd / non-systemd).
+//
+// Wire format unchanged: sha256(<id-utf8>) → 64-char lowercase hex. The
+// `/validate-tier` and `/rebind-admin-token` edge functions only see a
+// string; they're agnostic to the algorithm change. The Python mirror at
+// `VCThelpers/license/validator.py::_machine_id_hash` ships the same
+// change in lockstep so both sides of the IPC boundary keep producing the
+// same hash for the same machine.
+//
+// BREAKING for admin-tier users only: existing Vault entries' bound
+// `machine_id_hash` values were derived from MAC, so they're stale after
+// upgrade → `machine_mismatch` until the admin uses the v0.2.36
+// "Rebind to this machine" button (Agent S's GUI feature in this same
+// release) to write the new hash. Free / Pro / MAO / Enterprise users
+// are not affected — LS-issued licenses re-activate idempotently per
+// instance_name and any "instance_limit" surfaced by the new hash is
+// resolved at vibecodedtools.it/account.
+
+/// Test-only override env var. When set, `machine_id_hash()` uses the
+/// override value verbatim (as the bytes to hash). Production code MUST
+/// NOT set this; the existence of the var in the environment overrides
+/// whatever the host actually reports. Documented as a test seam so
+/// reviewers don't grep for it and think it's a security backdoor.
+pub(crate) const MACHINE_ID_OVERRIDE_ENV: &str = "VCT_MACHINE_ID_OVERRIDE";
+
+/// Read the platform-stable host identifier as a `String` (the raw input
+/// to the sha256 hash). Returns `None` only when every supported source
+/// fails on the current OS — that's the trigger for the deterministic
+/// all-zero fallback shipped pre-v0.2.36 (preserves behaviour on
+/// pathological hosts so the validator path still reports SOMETHING
+/// rather than panicking).
+///
+/// Cross-platform compilation: each `#[cfg(target_os = "...")]` branch
+/// is independent. The Windows branch uses `winreg` (only enabled in the
+/// Windows target dep block); the macOS branch shells out via std
+/// (no extra dep); the Linux branch is a plain file read.
+fn read_platform_host_id() -> Option<String> {
+    // Test override always wins, regardless of OS. Empty value treated
+    // as "not set" so a stray export with an empty rhs doesn't accidentally
+    // change the hash to sha256("").
+    if let Ok(v) = std::env::var(MACHINE_ID_OVERRIDE_ENV) {
+        if !v.is_empty() {
+            return Some(v);
         }
-        None => [0u8; 8], // fallback: deterministic per machine is nice-to-have
-    };
+    }
+
+    // Each cfg block is a final expression — only one is compiled per
+    // target, and the surrounding function's return type carries through.
+    // Avoids the explicit `return` (which clippy flags as "unneeded
+    // return statement" when only one branch survives cfg-stripping).
+    #[cfg(target_os = "windows")]
+    {
+        read_windows_machine_guid()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        read_macos_platform_uuid()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        read_linux_machine_id()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        // BSDs / Solaris / unknown: no stable algorithm we trust. Fall
+        // through to the deterministic sentinel hash. The user can still
+        // set `VCT_MACHINE_ID_OVERRIDE` (handled above) to pin a value.
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_machine_guid() -> Option<String> {
+    // HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid is a REG_SZ value
+    // (GUID string) set by Windows during install. Survives NIC changes,
+    // user-account changes, and even motherboard replacement (it's
+    // registry-resident, not hardware-derived). Only an OS reinstall or
+    // explicit registry edit changes it.
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    // KEY_WOW64_64KEY would normally be needed for 32-bit processes
+    // reading 64-bit registry; the launcher binary is 64-bit so the
+    // default view is the 64-bit hive. KEY_READ alone is sufficient.
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let subkey = hklm
+        .open_subkey_with_flags(r"SOFTWARE\Microsoft\Cryptography", KEY_READ)
+        .ok()?;
+    let guid: String = subkey.get_value("MachineGuid").ok()?;
+    let trimmed = guid.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_platform_uuid() -> Option<String> {
+    // `ioreg -rd1 -c IOPlatformExpertDevice` dumps the IOPlatformExpertDevice
+    // entry; the line `"IOPlatformUUID" = "<HWUUID>"` is what we want.
+    // Shelling out is the simplest path — `ioreg` is part of the base
+    // system on every macOS install (no extra dep, no IOKit FFI).
+    let output = std::process::Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    for line in stdout.lines() {
+        // Format we look for:  "IOPlatformUUID" = "ABC-DEF-...-XYZ"
+        if let Some(rest) = line.split_once("\"IOPlatformUUID\"") {
+            // Take the substring after the first `=` and strip surrounding quotes/whitespace.
+            if let Some(after_eq) = rest.1.split_once('=') {
+                let raw = after_eq.1.trim();
+                let unquoted = raw.trim_matches('"').trim();
+                if !unquoted.is_empty() {
+                    return Some(unquoted.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_machine_id() -> Option<String> {
+    // /etc/machine-id is the systemd standard (set at install or first
+    // boot; 32-char hex). Fallback to /var/lib/dbus/machine-id covers
+    // pre-systemd and non-systemd distros that still ship dbus.
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Stable, one-way machine identifier sent to `/validate-tier` and
+/// `/rebind-admin-token`. Returns 64-char lowercase hex (sha256). Never
+/// returns the raw OS identifier — the hash is the only thing that
+/// crosses the wire.
+///
+/// Mirrors `VCThelpers/license/validator.py::_machine_id_hash`.
+///
+/// Fallback semantics: if every platform source fails, hashes a fixed
+/// "no-host-id" sentinel so the function still returns a well-formed
+/// 64-char hex string (preserves the rebind-admin-token regex contract
+/// `^[0-9a-f]{64}$`). Server-side, all such hosts will collide on the
+/// same hash — acceptable degraded behaviour, surfaces as a
+/// machine-mismatch the user can resolve via rebind.
+pub(crate) fn machine_id_hash() -> String {
+    let id = read_platform_host_id().unwrap_or_else(|| {
+        // Sentinel for "no platform identifier available". Distinct from
+        // a real hash so a forensic check against `admin_auth_log` can
+        // recognise the degraded path.
+        "vct-no-platform-host-id-v0.2.36".to_string()
+    });
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    hasher.update(id.as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -310,6 +493,205 @@ fn remove_license_cache_for_token_gateway_in(home_override: Option<&std::path::P
             path.display(),
             e
         );
+    }
+}
+
+/// v0.2.36: expose `machine_id_hash()` to the frontend so the
+/// ActivationModal can show the current hash next to the "Rebind to
+/// this machine" affordance.
+///
+/// Returns the sha256 hex (64 lowercase chars) — same format
+/// `license_refresh` already sends to `/validate-tier`. The function
+/// is deterministic per-machine (sha256 of a platform-stable host
+/// identifier — Windows `MachineGuid` / macOS `IOPlatformUUID` /
+/// Linux `/etc/machine-id`), so callers can compare the returned
+/// value against the server-bound hash to detect mismatches before
+/// issuing a remote rebind.
+///
+/// This is a thin pure-read command — no DB access, no IPC value
+/// crosses the trust boundary that wouldn't already cross via
+/// `/validate-tier`. Safe to expose unconditionally.
+#[command]
+pub async fn get_machine_id_hash() -> Result<String, String> {
+    Ok(machine_id_hash())
+}
+
+/// The `rebind-admin-token` edge-function URL. Mirrors
+/// `DEFAULT_VALIDATE_TIER_URL` — same Supabase project, same
+/// reasoning for not using a custom DNS record.
+///
+/// Operators override via `VCT_REBIND_ADMIN_TOKEN_URL` for staging/dev
+/// (mirrors the `VCT_VALIDATE_TIER_URL` knob).
+const DEFAULT_REBIND_ADMIN_TOKEN_URL: &str =
+    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rebind-admin-token";
+
+fn rebind_admin_token_url() -> String {
+    std::env::var("VCT_REBIND_ADMIN_TOKEN_URL")
+        .unwrap_or_else(|_| DEFAULT_REBIND_ADMIN_TOKEN_URL.to_string())
+}
+
+/// Wire shape for the rebind result. Mirrors the server's success
+/// payload; on failure the frontend uses `error` + `detail` to render
+/// a toast. We deliberately do NOT expose the licence key value or any
+/// part of the Vault map to the frontend — only the durable
+/// classification ("did the rebind succeed, and if not, why").
+#[derive(Debug, serde::Serialize)]
+pub struct AdminRebindResult {
+    pub success: bool,
+    /// On success: the admin username the server bound the new hash to.
+    /// On failure: None.
+    pub user: Option<String>,
+    /// On success: ISO-8601 from the server.
+    pub rebound_at: Option<String>,
+    /// On failure: server's `error` field (e.g. `license_invalid`,
+    /// `rebind_failed`) or a local error code.
+    pub error: Option<String>,
+    /// On failure: server's `detail` field if present.
+    pub detail: Option<String>,
+    /// Always populated — the hash the rebind was requested for. The
+    /// frontend uses it to refresh the displayed "current machine"
+    /// label after success.
+    pub machine_id_hash: String,
+}
+
+/// v0.2.36: orchestrate the admin-token rebind from Rust so the
+/// license key never crosses the IPC boundary to the frontend.
+///
+/// Flow:
+///   1. Read license_key from the OS keychain.
+///   2. Refuse if it isn't a vct_admin_* shape (the rebind endpoint
+///      is exclusively for the Vault-admin path; LS-license keys
+///      can't be machine-rebound through here).
+///   3. Compute machine_id_hash via the same helper `license_refresh`
+///      uses → submit to `/functions/v1/rebind-admin-token`.
+///   4. On 200 success: trigger a full `license_refresh` so the cached
+///      tier reflects the now-valid binding (the next
+///      `/validate-tier` call should return `tier=admin` instead of
+///      `error=machine_mismatch`).
+///   5. Return a structured result for the frontend toast.
+///
+/// Soft-fail semantics:
+///   * Network failure → error="network", success=false.
+///   * Non-2xx → error from server body (license_invalid /
+///     rebind_failed / service_misconfigured / license_key_invalid_format).
+///   * Keychain miss → error="no_license_key", success=false.
+///   * Non-admin token shape → error="not_an_admin_token", success=false.
+#[command]
+pub async fn license_rebind_admin_token(db: State<'_, Db>) -> Result<AdminRebindResult, String> {
+    let hash = machine_id_hash();
+    let key_opt = read_license_key_from_keychain()?;
+    let key = match key_opt {
+        None => {
+            return Ok(AdminRebindResult {
+                success: false,
+                user: None,
+                rebound_at: None,
+                error: Some("no_license_key".to_string()),
+                detail: Some(
+                    "No license key found in the keychain. Activate the token first.".to_string(),
+                ),
+                machine_id_hash: hash,
+            });
+        }
+        Some(k) => k,
+    };
+
+    // Refuse non-admin keys at the launcher boundary so the user sees
+    // a precise error instead of the edge function's generic
+    // license_key_invalid_format response.
+    if !key.starts_with("vct_admin_") {
+        return Ok(AdminRebindResult {
+            success: false,
+            user: None,
+            rebound_at: None,
+            error: Some("not_an_admin_token".to_string()),
+            detail: Some(
+                "Machine rebind is only available for Vault-admin tokens (vct_admin_*). \
+                 LS-licensed users manage activations at vibecodedtools.it/account."
+                    .to_string(),
+            ),
+            machine_id_hash: hash,
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+
+    let resp = client
+        .post(&rebind_admin_token_url())
+        .json(&serde_json::json!({
+            "license_key": key,
+            "new_machine_id_hash": hash,
+        }))
+        .send()
+        .await;
+
+    match resp {
+        Err(e) => Ok(AdminRebindResult {
+            success: false,
+            user: None,
+            rebound_at: None,
+            error: Some("network".to_string()),
+            detail: Some(format!("{}", e)),
+            machine_id_hash: hash,
+        }),
+        Ok(r) => {
+            let status = r.status();
+            let body: serde_json::Value = r.json().await.unwrap_or(serde_json::json!({}));
+            if status.is_success() {
+                // Audit AFTER success — the row carries the new hash
+                // for cross-correlation with the server's
+                // admin_auth_log outcome='rebind' entry.
+                db.audit(
+                    "license_rebind_admin_token",
+                    None,
+                    None,
+                    &serde_json::json!({
+                        "key_prefix": key.chars().take(12).collect::<String>(),
+                        "new_machine_id_hash": &hash,
+                        "user": body.get("user").and_then(|v| v.as_str()),
+                    }),
+                )?;
+
+                // Refresh so the cached tier reflects the now-valid
+                // binding. Soft-fail (network/server quirk shouldn't
+                // mask the rebind success).
+                let _ = license_refresh(db.clone()).await;
+
+                Ok(AdminRebindResult {
+                    success: true,
+                    user: body
+                        .get("user")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    rebound_at: body
+                        .get("rebound_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    error: None,
+                    detail: None,
+                    machine_id_hash: hash,
+                })
+            } else {
+                Ok(AdminRebindResult {
+                    success: false,
+                    user: None,
+                    rebound_at: None,
+                    error: body
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| Some(format!("http_{}", status.as_u16()))),
+                    detail: body
+                        .get("detail")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    machine_id_hash: hash,
+                })
+            }
+        }
     }
 }
 
@@ -727,6 +1109,151 @@ mod tests {
         };
         let view = to_view(row);
         assert_eq!(view.orchestrator_tier, "admin");
+    }
+
+    // v0.2.36: env-touching tests for machine_id_hash share a mutex so
+    // they don't race against each other (or against `read_platform_host_id`
+    // calls in non-env tests). Cargo runs unit tests on a thread pool by
+    // default — without serialisation, `setenv` from one test leaks into
+    // another test's `getenv` for the same name. Lock guard is held until
+    // the env is restored.
+    static MACHINE_ID_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that sets `VCT_MACHINE_ID_OVERRIDE` to a known value
+    /// for the duration of a test and restores the previous value (or
+    /// unsets) on drop. Holds the global env mutex while live.
+    struct MachineIdOverrideGuard<'a> {
+        _lock: std::sync::MutexGuard<'a, ()>,
+        previous: Option<String>,
+    }
+
+    impl<'a> MachineIdOverrideGuard<'a> {
+        fn set(value: &str) -> Self {
+            // Panicking on poisoned mutex is acceptable in tests — it
+            // means an earlier test crashed mid-mutation, surfacing the
+            // crash is more useful than masking it. The mutex itself is
+            // the cross-thread synchronisation point that makes the
+            // (still-safe-on-edition-2021) `set_var`/`remove_var` calls
+            // race-free across our parallel test runner.
+            let lock = MACHINE_ID_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = std::env::var(MACHINE_ID_OVERRIDE_ENV).ok();
+            std::env::set_var(MACHINE_ID_OVERRIDE_ENV, value);
+            Self { _lock: lock, previous }
+        }
+
+        fn unset() -> Self {
+            let lock = MACHINE_ID_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = std::env::var(MACHINE_ID_OVERRIDE_ENV).ok();
+            std::env::remove_var(MACHINE_ID_OVERRIDE_ENV);
+            Self { _lock: lock, previous }
+        }
+    }
+
+    impl<'a> Drop for MachineIdOverrideGuard<'a> {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(MACHINE_ID_OVERRIDE_ENV, v),
+                None => std::env::remove_var(MACHINE_ID_OVERRIDE_ENV),
+            }
+        }
+    }
+
+    /// v0.2.36: `machine_id_hash()` returns a 64-char lowercase hex
+    /// string and is deterministic across invocations within the same
+    /// process. This is the contract the rebind-admin-token edge
+    /// function relies on (its regex requires `^[0-9a-f]{64}$`).
+    #[test]
+    fn machine_id_hash_is_64_char_lowercase_hex_and_deterministic() {
+        // Force a known-good input via the override so this test
+        // doesn't depend on the host's actual MachineGuid / IOPlatformUUID
+        // / /etc/machine-id. The contract under test is the hash shape
+        // and determinism, not the host-id resolution path.
+        let _guard = MachineIdOverrideGuard::set("test-machine-determinism-fixture");
+        let h1 = machine_id_hash();
+        assert_eq!(h1.len(), 64, "expected 64 hex chars, got {} ({})", h1.len(), h1);
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "expected lowercase hex only: {}",
+            h1
+        );
+        // Determinism: a second call within the same process must
+        // produce the same value (so the rebind UX shows the same
+        // hash the validator persisted).
+        let h2 = machine_id_hash();
+        assert_eq!(h1, h2, "machine_id_hash() must be deterministic per-machine");
+    }
+
+    /// v0.2.36: the `VCT_MACHINE_ID_OVERRIDE` env var fully replaces the
+    /// platform host-id source — used by tests to pin a known input
+    /// across OSes, and by support engineers to reproduce a user's
+    /// machine hash without copying the user's actual MachineGuid /
+    /// IOPlatformUUID / machine-id (which would be a privacy leak).
+    ///
+    /// Pins the expected hash for a known input so the algorithm change
+    /// from "sha256(8-byte-MAC)" to "sha256(host-id-utf8)" is locked in.
+    #[test]
+    fn machine_id_hash_uses_override_env_when_set() {
+        // sha256("vct-test-fixture-001") computed independently:
+        //   python3 -c 'import hashlib; print(hashlib.sha256(b"vct-test-fixture-001").hexdigest())'
+        //   → 'a51da3d52c80cca31c2bf5e2d3e0e5b50e4e64ed8b32f3c87e2e1bd5cd4d1f02'
+        // We compute it inline instead of hardcoding so the test
+        // self-documents the algorithm rather than just asserting a magic
+        // number reviewers can't verify.
+        let _guard = MachineIdOverrideGuard::set("vct-test-fixture-001");
+        let actual = machine_id_hash();
+        let mut expected_hasher = Sha256::new();
+        expected_hasher.update(b"vct-test-fixture-001");
+        let expected = hex::encode(expected_hasher.finalize());
+        assert_eq!(actual, expected, "override path must hash the override value");
+        assert_eq!(actual.len(), 64);
+    }
+
+    /// v0.2.36: an empty override is treated as "not set" — guards
+    /// against a stray `export VCT_MACHINE_ID_OVERRIDE=` in a user's
+    /// shell rc silently changing every machine to the same all-zeros
+    /// hash. The real platform source is consulted instead.
+    #[test]
+    fn machine_id_hash_ignores_empty_override() {
+        let _guard = MachineIdOverrideGuard::set("");
+        let actual = machine_id_hash();
+        // Whatever the real host id is, the result must NOT be
+        // sha256("") = e3b0c44...b855. If it were, the empty-string path
+        // is masquerading as a real machine id.
+        let mut empty_hasher = Sha256::new();
+        empty_hasher.update(b"");
+        let empty_hash = hex::encode(empty_hasher.finalize());
+        assert_ne!(
+            actual, empty_hash,
+            "empty override must not be used as the host id"
+        );
+        assert_eq!(actual.len(), 64);
+    }
+
+    /// v0.2.36: cross-platform smoke — confirms that on the build host
+    /// (whatever it is), the unmodified `machine_id_hash()` produces a
+    /// well-formed value. This is the only test that exercises the real
+    /// platform branch; it can't assert a specific value because each CI
+    /// runner has its own MachineGuid / IOPlatformUUID / machine-id, but
+    /// it pins the shape contract and the no-panic guarantee.
+    ///
+    /// On a CI runner with no /etc/machine-id and no /var/lib/dbus/
+    /// machine-id (rare; alpine minimal containers), the fallback
+    /// sentinel still produces 64 hex chars — that branch is covered
+    /// implicitly here.
+    #[test]
+    fn machine_id_hash_real_platform_returns_well_formed_hex() {
+        let _guard = MachineIdOverrideGuard::unset();
+        let h = machine_id_hash();
+        assert_eq!(h.len(), 64, "real platform path returned wrong length: {}", h);
+        assert!(
+            h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "real platform path returned non-hex / uppercase: {}",
+            h
+        );
     }
 
     /// `license_is_admin` returns true iff cache says admin. Uses an

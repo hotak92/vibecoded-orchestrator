@@ -41,6 +41,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
 
 use crate::services::runtime::{detect_runtime, invalidate_cache as invalidate_runtime_cache};
+use vct_launcher_core::process::CommandExt as _;
 
 /// Frontend event for streaming pkexec install progress. Matches the
 /// dialog's `listen('vct-runtime-install-progress', ...)` subscription.
@@ -163,7 +164,7 @@ pub async fn runtime_install_podman_linux(app: AppHandle) -> Result<(), String> 
         },
     );
 
-    let mut cmd = TokioCommand::new("pkexec");
+    let mut cmd = TokioCommand::new("pkexec").silent();
     // Wrap in /usr/bin/env so DEBIAN_FRONTEND survives pkexec's env strip.
     cmd.arg("/usr/bin/env");
     cmd.arg("DEBIAN_FRONTEND=noninteractive");

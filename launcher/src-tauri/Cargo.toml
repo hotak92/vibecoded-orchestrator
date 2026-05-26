@@ -9,7 +9,7 @@ members = ["vct-launcher-core", "vct-hub"]
 
 [package]
 name = "vct-launcher-temp"
-version = "0.2.35"
+version = "0.2.36"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -77,7 +77,9 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 # Safer subprocess spawning (tokenize strings to Vec<String>)
 shlex = "1"
 
-# Hashing for machine ID (sha256 of MAC matches Python validator.py)
+# Hashing for machine ID (sha256 of platform-stable host id, matches
+# Python validator.py — algorithm updated in v0.2.36 from MAC-based to
+# platform-stable; see commands/licensing.rs::machine_id_hash).
 sha2 = "0.11"
 
 # Regex for manifest validation patterns + PII scrub
@@ -86,8 +88,14 @@ regex = "1"
 # Platform hostname
 gethostname = "1"
 
-# MAC address for machine binding (matches commercial_workflow/license/validator.py)
-mac_address = "1"
+# v0.2.36: machine binding now reads platform-stable host identifiers
+# (Windows MachineGuid registry / macOS IOPlatformUUID via ioreg / Linux
+# /etc/machine-id). The MAC-based `mac_address` crate was removed from
+# the launcher binary because it produced unstable hashes on laptops
+# (Wi-Fi/Ethernet swaps changed the bound NIC). The Linux + macOS
+# branches use std only; Windows uses `winreg` (declared in the
+# cfg(windows) target deps block below). `hex` stays — same encoder
+# applied to the new sha256 input.
 hex = "0.4"
 
 # Bug 31: launcher.toml config (volume location, etc.)
@@ -178,8 +186,15 @@ libloading = "0.8"
 # transitive deps to crates that don't declare them. Adding it
 # directly with a `cfg(windows)` gate keeps Linux/macOS builds
 # lean (no compilation cost).
+#
+# v0.2.36: `winreg` reads HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+# in `commands/licensing.rs::machine_id_hash` for platform-stable machine
+# binding. Tiny dep (~15 KB compiled), already in our lockfile
+# transitively via Tauri's Windows path — promoting to a direct dep
+# follows the same pattern as `windows-sys` above.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+winreg = "0.55"
 
 # Release-profile privacy + size hardening (PR-4, 2026-05-06).
 #

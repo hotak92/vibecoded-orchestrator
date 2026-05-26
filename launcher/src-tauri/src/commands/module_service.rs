@@ -38,6 +38,7 @@ use tokio::process::Command;
 use crate::db::models::ProjectRow;
 use crate::db::Db;
 use crate::manifest::{ModuleManifest, PlaceholderCtx, PortMapping, VolumeMount};
+use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -66,26 +67,17 @@ pub const DEFAULT_RL_LATEST_VERSION_ENDPOINT: &str =
     "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-latest-version";
 
 /// Public machine-id helper used by `lib.rs::spawn_daily_weights_poll`
-/// license-reader closure (Step 24 commit b). Mirrors
-/// `commands::licensing::machine_id_hash` — sha256 of the 8-byte
-/// big-endian MAC, hex lowercase. Pulled out as a separate `pub fn` so
-/// the closure in lib.rs can construct the `(license_key, hash)` pair
-/// without a circular dependency on the licensing module.
+/// license-reader closure (Step 24 commit b). Thin wrapper around
+/// `commands::licensing::machine_id_hash` so the closure in lib.rs has
+/// a `pub fn` it can reach without depending on `pub(crate)` symbols
+/// across the commands tree.
+///
+/// v0.2.36: previously this was an inline duplicate of the MAC-based
+/// algorithm. Replaced with a delegation call so the platform-stable
+/// host identifier change in `licensing.rs` propagates here
+/// automatically — keeps the two call sites in lockstep.
 pub fn machine_id_hash_for_poll() -> String {
-    use sha2::{Digest, Sha256};
-    let mac = mac_address::get_mac_address().ok().flatten();
-    let bytes: [u8; 8] = match mac {
-        Some(m) => {
-            let bs = m.bytes();
-            let mut out = [0u8; 8];
-            out[2..].copy_from_slice(&bs);
-            out
-        }
-        None => [0u8; 8],
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+    crate::commands::licensing::machine_id_hash()
 }
 
 /// Default Ollama port used to resolve `{ollama_port}` in env values
@@ -401,7 +393,7 @@ pub fn build_podman_run_args(
 /// across module boundaries).
 async fn detect_container_runtime() -> Result<String, String> {
     for candidate in ["podman", "docker"] {
-        let probe = Command::new(candidate)
+        let probe = Command::new(candidate).silent()
             .args(["--version"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -479,7 +471,7 @@ pub async fn start_container_for_module(
     let podman = detect_container_runtime().await?;
 
     // Idempotency: force-remove any prior container with the same name.
-    let _ = Command::new(&podman)
+    let _ = Command::new(&podman).silent()
         .args(["rm", "-f", &container_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -503,7 +495,7 @@ pub async fn start_container_for_module(
 
     let args = build_podman_run_args(manifest, ctx, project, rl_port, &container_name, &image)?;
 
-    let mut cmd = Command::new(&podman);
+    let mut cmd = Command::new(&podman).silent();
     cmd.args(&args);
     cmd.env_clear();
     for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
@@ -603,14 +595,14 @@ fn allocate_random_rl_port() -> u16 {
 pub async fn stop_container_for_project(container_name: &str) -> Result<(), String> {
     let podman = detect_container_runtime().await?;
 
-    let _ = Command::new(&podman)
+    let _ = Command::new(&podman).silent()
         .args(["stop", "-t", "10", container_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await;
 
-    let _ = Command::new(&podman)
+    let _ = Command::new(&podman).silent()
         .args(["rm", container_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -624,7 +616,7 @@ pub async fn stop_container_for_project(container_name: &str) -> Result<(), Stri
 /// when the container doesn't exist OR is in any non-running state.
 pub async fn is_container_running(container_name: &str) -> Result<bool, String> {
     let podman = detect_container_runtime().await?;
-    let output = Command::new(&podman)
+    let output = Command::new(&podman).silent()
         .args(["inspect", "--format", "{{.State.Status}}", container_name])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

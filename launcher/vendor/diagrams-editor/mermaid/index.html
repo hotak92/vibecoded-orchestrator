@@ -1,0 +1,328 @@
+<!doctype html>
+<!--
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+Minimal self-hosted Mermaid visual editor. Served by the launcher's
+local diagrams-editor HTTP server (commands/diagrams_local_server.rs)
+when the user clicks "Draw Mermaid (visual)" in DiagramsTab.svelte.
+
+The page opens in the user's DEFAULT BROWSER, NOT in the Tauri WebView
+— that's the whole point of this v0.2.36 rework. Wayland + webkit2gtk
+has rendering bugs that mangle Mermaid output inside the WebView.
+
+The URL contract:
+    http://127.0.0.1:<port>/mermaid/?file=<rel_path>
+
+`<rel_path>` is the project-relative path of the .mmd file the launcher
+created or pre-existed (e.g. ".claude/diagrams/gui/auth/login.mmd").
+The page:
+    1. On load, fetches GET /file?path=<rel_path> to populate the editor.
+    2. Lets the user edit the textarea; preview re-renders on every change.
+    3. On "Save", POSTs the textarea content to /save?path=<rel_path>.
+    4. The launcher's existing filesystem watcher
+       (commands/diagram_watcher.rs) picks up the change and emits a
+       `diagram-changed` event into the DiagramsTab — which then auto-
+       registers the diagram if it isn't already registered (v0.2.36
+       auto-register-on-first-edit behaviour).
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>VCO — Mermaid editor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        --bg: #1e1e1e;
+        --fg: #e1e1e1;
+        --accent: #3b82f6;
+        --accent-hover: #2563eb;
+        --border: #3a3a3a;
+        --panel: #252525;
+        --error: #ef4444;
+        --success: #10b981;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 14px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 16px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        height: 48px;
+      }
+      header h1 {
+        font-size: 14px;
+        margin: 0;
+        font-weight: 600;
+      }
+      header .file-path {
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 12px;
+        color: #999;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      header button {
+        background: var(--accent);
+        color: white;
+        border: none;
+        padding: 6px 16px;
+        border-radius: 4px;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      header button:hover { background: var(--accent-hover); }
+      header button:disabled { opacity: 0.5; cursor: not-allowed; }
+      header .status {
+        font-size: 12px;
+        color: #999;
+        min-width: 120px;
+        text-align: right;
+      }
+      header .status.error { color: var(--error); }
+      header .status.success { color: var(--success); }
+      .split {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        height: calc(100% - 48px);
+        gap: 1px;
+        background: var(--border);
+      }
+      .pane {
+        background: var(--bg);
+        overflow: auto;
+        position: relative;
+      }
+      .pane-header {
+        position: sticky;
+        top: 0;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+        padding: 6px 12px;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: #999;
+        font-weight: 600;
+        z-index: 1;
+      }
+      textarea {
+        width: 100%;
+        height: calc(100% - 28px);
+        background: var(--bg);
+        color: var(--fg);
+        border: none;
+        outline: none;
+        padding: 12px;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 13px;
+        resize: none;
+        tab-size: 2;
+      }
+      #preview {
+        padding: 24px;
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        min-height: calc(100% - 28px);
+      }
+      #preview svg { max-width: 100%; height: auto; }
+      #preview .error {
+        color: var(--error);
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+        text-align: left;
+        max-width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Mermaid editor</h1>
+      <span id="filePath" class="file-path">—</span>
+      <span id="status" class="status">Loading…</span>
+      <button id="saveBtn" disabled>Save</button>
+    </header>
+    <div class="split">
+      <div class="pane">
+        <div class="pane-header">Source</div>
+        <textarea
+          id="src"
+          spellcheck="false"
+          autocorrect="off"
+          autocapitalize="off"
+          placeholder="flowchart TD&#10;  A[Start] --> B{Decision}&#10;  B -->|Yes| C[OK]&#10;  B -->|No| D[Stop]"
+        ></textarea>
+      </div>
+      <div class="pane">
+        <div class="pane-header">Preview</div>
+        <div id="preview"></div>
+      </div>
+    </div>
+
+    <script src="./mermaid.min.js"></script>
+    <script>
+      // ─── URL parsing ────────────────────────────────────────────
+      // `?file=<rel_path>` is the project-relative path; we forward it
+      // verbatim to the launcher's /file and /save endpoints. The
+      // launcher's local-server module re-validates the path against
+      // the project root (commands::diagrams_local_server::resolve_request_path).
+      const params = new URLSearchParams(window.location.search);
+      const filePath = params.get('file') || '';
+      const srcEl = document.getElementById('src');
+      const previewEl = document.getElementById('preview');
+      const saveBtn = document.getElementById('saveBtn');
+      const statusEl = document.getElementById('status');
+      const filePathEl = document.getElementById('filePath');
+      filePathEl.textContent = filePath || '(no file specified)';
+
+      // ─── Mermaid init ───────────────────────────────────────────
+      // `securityLevel: 'loose'` lets us render diagrams that include
+      // clickable links (the default 'strict' strips HTML and breaks
+      // some flowchart features). We're in the user's own browser
+      // serving from 127.0.0.1; the threat model is benign.
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: 'dark',
+        securityLevel: 'loose',
+        flowchart: { useMaxWidth: true },
+      });
+
+      let renderCounter = 0;
+      async function renderPreview() {
+        const src = srcEl.value.trim();
+        if (!src) {
+          previewEl.innerHTML = '<div style="color:#666;font-size:12px">(empty)</div>';
+          return;
+        }
+        renderCounter += 1;
+        const myCount = renderCounter;
+        try {
+          const id = `mermaid-render-${myCount}`;
+          const { svg } = await mermaid.render(id, src);
+          // Race-condition guard: if a newer render started while we
+          // were awaiting, drop this result.
+          if (myCount === renderCounter) {
+            previewEl.innerHTML = svg;
+          }
+        } catch (err) {
+          if (myCount === renderCounter) {
+            previewEl.innerHTML = `<pre class="error">${escapeHtml(
+              err.message || String(err),
+            )}</pre>`;
+          }
+        }
+      }
+
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&#039;');
+      }
+
+      // ─── Debounced re-render on edit ────────────────────────────
+      let renderTimer = null;
+      srcEl.addEventListener('input', () => {
+        if (renderTimer) clearTimeout(renderTimer);
+        renderTimer = setTimeout(renderPreview, 250);
+        // Mark unsaved.
+        markStatus('Modified', 'modified');
+        saveBtn.disabled = false;
+      });
+
+      function markStatus(text, kind) {
+        statusEl.textContent = text;
+        statusEl.className = 'status' + (kind ? ' ' + kind : '');
+      }
+
+      // ─── Load file content ──────────────────────────────────────
+      async function loadFile() {
+        if (!filePath) {
+          markStatus('No file', 'error');
+          return;
+        }
+        try {
+          const resp = await fetch(
+            '/file?path=' + encodeURIComponent(filePath),
+          );
+          if (!resp.ok) {
+            const txt = await resp.text();
+            // 404 with empty body = blank-new-file case; treat as empty.
+            if (resp.status === 404) {
+              srcEl.value = '';
+              markStatus('New file', 'success');
+              await renderPreview();
+              saveBtn.disabled = false;
+              return;
+            }
+            throw new Error(`GET /file failed (${resp.status}): ${txt}`);
+          }
+          srcEl.value = await resp.text();
+          markStatus('Loaded', 'success');
+          await renderPreview();
+          // Saved state — disable button until the next edit.
+          saveBtn.disabled = true;
+        } catch (err) {
+          console.error('[mermaid-editor] load failed:', err);
+          markStatus(`Load failed: ${err.message}`, 'error');
+        }
+      }
+
+      // ─── Save handler ───────────────────────────────────────────
+      saveBtn.addEventListener('click', async () => {
+        if (!filePath) {
+          markStatus('No file path', 'error');
+          return;
+        }
+        saveBtn.disabled = true;
+        markStatus('Saving…');
+        try {
+          const resp = await fetch(
+            '/save?path=' + encodeURIComponent(filePath),
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+              body: srcEl.value,
+            },
+          );
+          if (!resp.ok) {
+            const txt = await resp.text();
+            throw new Error(`POST /save failed (${resp.status}): ${txt}`);
+          }
+          markStatus('Saved', 'success');
+        } catch (err) {
+          console.error('[mermaid-editor] save failed:', err);
+          markStatus(`Save failed: ${err.message}`, 'error');
+          saveBtn.disabled = false;
+        }
+      });
+
+      // ─── Keyboard shortcut: Cmd/Ctrl+S ──────────────────────────
+      window.addEventListener('keydown', (e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+          e.preventDefault();
+          if (!saveBtn.disabled) saveBtn.click();
+        }
+      });
+
+      // ─── Boot ────────────────────────────────────────────────────
+      loadFile();
+    </script>
+  </body>
+</html>

@@ -9,6 +9,7 @@ use crate::services::adoption::{
     self, AdoptionMode, AdoptionState, ServiceAdoption,
 };
 use crate::services::runtime::{detect_runtime, invalidate_cache as invalidate_runtime_cache, RuntimeInfo};
+use vct_launcher_core::process::CommandExt as _;
 
 // ---------------------------------------------------------------------------
 // Shared-container lifecycle (Podman/Docker compose).
@@ -164,7 +165,7 @@ async fn detect_container_zombie(
     // 1. Get the container's main PID via podman inspect.
     let inspect = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        tokio::process::Command::new(runtime_binary)
+        tokio::process::Command::new(runtime_binary).silent()
             .args(["inspect", "--format", "{{.State.Pid}}", container_name])
             .output(),
     )
@@ -289,7 +290,7 @@ async fn run_stack_wrapper(subcommand: &str) -> Result<(), String> {
         // per-invocation; does not modify the user's persistent
         // policy). These flags match the Scheduled Task XML template
         // at templates/windows/claude-mcp-containers.task.xml.template.
-        let mut c = tokio::process::Command::new("powershell");
+        let mut c = tokio::process::Command::new("powershell").silent();
         c.args([
             "-NoProfile",
             "-ExecutionPolicy",
@@ -300,7 +301,7 @@ async fn run_stack_wrapper(subcommand: &str) -> Result<(), String> {
         ]);
         c
     } else {
-        let mut c = tokio::process::Command::new("bash");
+        let mut c = tokio::process::Command::new("bash").silent();
         c.arg(&wrapper).arg(subcommand);
         c
     };
@@ -444,7 +445,7 @@ pub async fn recover_zombie(container_name: String) -> Result<(), String> {
         .await
         .ok_or("No container runtime found; cannot recover zombie")?;
     // Step 1: force-remove the zombie record.
-    let rm_out = tokio::process::Command::new(&info.binary_path)
+    let rm_out = tokio::process::Command::new(&info.binary_path).silent()
         .args(["rm", "--force", &container_name])
         .output()
         .await
@@ -752,7 +753,7 @@ pub(crate) async fn control_adopted_container(
     // We don't go through `info.compose_command()` here — we want the
     // raw runtime binary, not compose. The first argv entry is the
     // action verb (start/stop/restart), the second is the container.
-    let mut cmd = tokio::process::Command::new(&info.binary_path);
+    let mut cmd = tokio::process::Command::new(&info.binary_path).silent();
     for a in argv.iter().skip(1) {
         cmd.arg(a);
     }
@@ -812,7 +813,7 @@ pub(crate) fn structured_err(kind: &str, msg: impl AsRef<str>) -> String {
 /// …). The inspect-not-found case is NORMAL — a user may have deleted
 /// the container we pinned.
 pub(crate) async fn container_exists(info: &RuntimeInfo, name: &str) -> Result<bool, String> {
-    let mut cmd = tokio::process::Command::new(&info.binary_path);
+    let mut cmd = tokio::process::Command::new(&info.binary_path).silent();
     cmd.args(["inspect", "--format", "{{.Id}}", name]);
     let out = cmd
         .output()
@@ -944,7 +945,7 @@ async fn find_container_for_service(
         format!("label=io.podman.compose.service={}", service),
     ];
     for label in &label_filters {
-        let mut cmd = tokio::process::Command::new(&info.binary_path);
+        let mut cmd = tokio::process::Command::new(&info.binary_path).silent();
         cmd.args([
             "ps",
             "-a",
@@ -968,7 +969,7 @@ async fn find_container_for_service(
 
     // Port-only fallback. List ALL containers, find one whose port
     // mapping matches.
-    let mut cmd = tokio::process::Command::new(&info.binary_path);
+    let mut cmd = tokio::process::Command::new(&info.binary_path).silent();
     cmd.args(["ps", "-a", "--format", "{{.Names}}\t{{.Ports}}"]);
     let out = cmd
         .output()

@@ -48,3 +48,14 @@ verify_jwt = false
 # 2026-05-26. Source-controlled so the next deploy re-applies it.
 [functions.rl-artifact-url]
 verify_jwt = false
+
+# v0.2.36: admin machine-rebind endpoint. Authenticates via the body's
+# `license_key` (vct_admin_*) — possession of the token is the auth
+# boundary, same model as validate-tier's Path A. The endpoint mutates
+# the Vault secret via a SECURITY DEFINER RPC and audit-logs the rebind
+# outcome. Without `verify_jwt = false`, the launcher would have to
+# obtain an anon key just to call this, defeating the point of a
+# self-serve recovery flow when the user's only credential is the
+# vct_admin_ token itself.
+[functions.rebind-admin-token]
+verify_jwt = false

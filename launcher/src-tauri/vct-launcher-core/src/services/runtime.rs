@@ -31,6 +31,45 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::process::Command as TokioCommand;
 
+/// Build a `tokio::process::Command` that does NOT flash a console window
+/// on Windows. Equivalent to `TokioCommand::new(bin)` on Linux/macOS.
+///
+/// Why this exists (2026-05-26 fork-bomb fix): runtime detection probes
+/// (`docker --version`, `docker info`, `podman --version`, `podman info`)
+/// spawn child subprocesses. On Windows, a child spawned from a
+/// `windows_subsystem = "windows"` parent (= our launcher) inherits the
+/// console allocation flag. Without `CREATE_NO_WINDOW` (0x08000000), each
+/// spawned child gets a NEW console allocated by `CreateProcessW`, which
+/// flashes a `conhost.exe` window for the child's lifetime. With the
+/// services::watcher polling every 30s, the version+daemon-usable probes
+/// running back-to-back AND the OnboardingWizard's preflight rerunning
+/// probes, the user sees a STREAM of console windows flashing on screen
+/// at startup, becoming visually indistinguishable from "milioni di
+/// finestre" cascading.
+///
+/// EnumWindows snapshot taken 2026-05-26 against the launcher proved
+/// this: 11 of the 15 launcher-owned visible windows were
+/// `CASCADIA_HOSTING_WINDOW_CLASS` (Windows Terminal hosting class)
+/// with titles like `C:\Windows\system32\where.exe`, `git.exe` — not
+/// dialog-based at all.
+///
+/// Pattern mirrors `launcher/src-tauri/src/commands/installer.rs:2491`
+/// (and 11 other places in the launcher) which already set this flag.
+/// This helper centralises the pattern for the `services/runtime.rs`
+/// hot path which the audit missed.
+fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
+    let mut cmd = TokioCommand::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW = 0x08000000 (winbase.h). Suppresses console
+        // allocation for the child. Mandatory on Windows for parent
+        // processes built with `windows_subsystem = "windows"`.
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
 /// Which container runtime the launcher will drive. Detected once per
 /// launcher session and cached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -96,7 +135,7 @@ impl RuntimeInfo {
     pub fn compose_command(&self) -> TokioCommand {
         match self.compose_form {
             ComposeForm::Subcommand => {
-                let mut cmd = TokioCommand::new(&self.binary_path);
+                let mut cmd = silent_command(&self.binary_path);
                 cmd.arg("compose");
                 cmd
             }
@@ -109,7 +148,7 @@ impl RuntimeInfo {
                 let standalone_name = format!("{}-compose", self.runtime.binary());
                 let resolved = which_on_path(&standalone_name)
                     .unwrap_or_else(|| PathBuf::from(&standalone_name));
-                TokioCommand::new(resolved)
+                silent_command(resolved)
             }
         }
     }
@@ -153,33 +192,66 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 /// runs or it doesn't; "podman from 2018 that lacks compose" surfaces
 /// later when the compose-form probe fails.
 ///
-/// Timeout 5s (was 2s pre-2026-04-27): `podman --version` itself is fast,
-/// but a freshly-spawned launcher process competing with `first-install`'s
-/// final container-restart phase has been observed to time out at 2s
-/// under disk I/O pressure on slower machines. A 5s ceiling is still well
-/// under any user-perceivable lag if the runtime is genuinely missing.
+/// Timeout: 5s on Linux, 15s on Windows + macOS.
+///
+/// History:
+///   - pre-2026-04-27: 2s, raised to 5s after disk I/O pressure on slower
+///     machines competing with first-install's final container-restart
+///     phase caused false negatives.
+///   - 2026-05-23: raised to 15s on Windows after a fresh-install launcher
+///     boot on Ombromanto (Win11) fired the "No container runtime found"
+///     modal despite Docker Desktop being healthy. The Hyper-V VM that
+///     hosts Docker on Windows can take 3-10s to respond to `docker
+///     --version` on cold cache; 5s is too tight as a worst-case ceiling.
+///   - 2026-05-26 (v0.2.36 Agent U): same 15s ceiling extended to macOS.
+///     Docker Desktop for Mac runs inside HyperKit / Apple Virtualization
+///     Framework VMs with the same cold-cache + named-socket cost profile
+///     as the Hyper-V VM on Windows; real-world `docker --version` on
+///     Mac is 6-10s on cold start. Native Linux podman/docker remains
+///     a local process with sub-second startup, so Linux still uses 5s.
 async fn version_probe(binary: &PathBuf) -> bool {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let timeout_secs = 15u64;
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let timeout_secs = 5u64;
+
+    let start = std::time::Instant::now();
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TokioCommand::new(binary).arg("--version").output(),
+        std::time::Duration::from_secs(timeout_secs),
+        silent_command(binary).arg("--version").output(),
     )
     .await;
+    let elapsed_ms = start.elapsed().as_millis();
     let ok = matches!(&result, Ok(Ok(out)) if out.status.success());
     if !ok {
         // Diagnostic log — runtime detection silently returning None has
         // surfaced as a launcher UX bug (firing the no-container modal
         // even when the user has Podman installed). When this fires the
         // user sees a misleading dialog; we want stderr breadcrumbs in
-        // the launcher log to prove cause without strace.
+        // the launcher log to prove cause without strace. Elapsed-time
+        // helps distinguish timeout-near-ceiling (raise the limit) from
+        // genuine missing-binary (spawn error in <50ms).
         eprintln!(
-            "[runtime] version_probe failed for {}: {:?}",
+            "[runtime] version_probe failed for {} after {}ms (ceiling {}s): {:?}",
             binary.display(),
+            elapsed_ms,
+            timeout_secs,
             match &result {
                 Err(_) => "timeout".to_string(),
                 Ok(Err(e)) => format!("spawn error: {}", e),
                 Ok(Ok(out)) => format!("non-zero exit {:?}", out.status.code()),
             }
         );
+    } else {
+        // Non-error path: log elapsed only when slow enough to be
+        // interesting (>1s). Quiet on the happy path.
+        if elapsed_ms > 1000 {
+            eprintln!(
+                "[runtime] version_probe ok for {} but slow: {}ms",
+                binary.display(),
+                elapsed_ms
+            );
+        }
     }
     ok
 }
@@ -215,19 +287,53 @@ async fn version_probe(binary: &PathBuf) -> bool {
 ///     validation — no extra grep needed because rootless podman has
 ///     no client/server split.
 ///
-/// 5s timeout — `docker info` can be slow when probing a Docker
-/// Desktop VM cold-cache, but a real daemon answers in <1s. 5s is
-/// well below user-perceivable lag.
+/// Timeout: 5s on Linux, 15s on Windows + macOS.
+///
+/// History:
+///   - originally 5s — `docker info` on a real Linux daemon answers in
+///     <1s, so 5s was a wide-enough ceiling.
+///   - 2026-05-23: raised to 15s on Windows after `daemon_usable_probe`
+///     spuriously failed in fresh-install testing on Ombromanto (Win11)
+///     even with Docker Desktop healthy. `docker info` on Windows queries
+///     the Hyper-V VM via named pipe + gathers daemon metadata (images,
+///     networks, plugins); cold-cache or VM-under-load this can take
+///     7-12s. 5s missed the window.
+///   - 2026-05-26 (v0.2.36 Agent U): same 15s ceiling extended to macOS.
+///     Docker Desktop for Mac issues `docker info` against the HyperKit /
+///     Apple Virtualization Framework VM (socket-style transport with
+///     daemon-metadata gather); cold-cache profile matches Windows, and
+///     5s spuriously failed against healthy Docker Desktop installs.
+///     Native Linux daemons stay at 5s — local daemon, sub-second.
 ///
 /// Soft-fail: any error (timeout, spawn failure, non-zero exit)
 /// returns `false`, never panics. Caller (`resolve_runtime`) then
 /// falls through to the next candidate runtime.
 async fn daemon_usable_probe(binary: &PathBuf, runtime: ContainerRuntime) -> bool {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let timeout_secs = 15u64;
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let timeout_secs = 5u64;
+
+    let start = std::time::Instant::now();
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        TokioCommand::new(binary).arg("info").output(),
+        std::time::Duration::from_secs(timeout_secs),
+        silent_command(binary).arg("info").output(),
     )
     .await;
+    let elapsed_ms = start.elapsed().as_millis();
+    // Diagnostic breadcrumb: ALWAYS log elapsed for `docker info`/`podman
+    // info` because this is the single most common source of "launcher
+    // says no runtime but I have it installed" reports. Slow-but-OK runs
+    // (1.5-7s) are interesting precursors to future timeout regressions.
+    if elapsed_ms > 1000 {
+        eprintln!(
+            "[runtime] daemon_usable_probe slow for {} {}: {}ms (ceiling {}s)",
+            runtime.display_name(),
+            binary.display(),
+            elapsed_ms,
+            timeout_secs
+        );
+    }
     let output = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -241,9 +347,10 @@ async fn daemon_usable_probe(binary: &PathBuf, runtime: ContainerRuntime) -> boo
         }
         Err(_) => {
             eprintln!(
-                "[runtime] daemon_usable_probe timeout for {} {} (5s)",
+                "[runtime] daemon_usable_probe timeout for {} {} (ceiling {}s)",
                 runtime.display_name(),
-                binary.display()
+                binary.display(),
+                timeout_secs
             );
             return false;
         }
@@ -298,7 +405,7 @@ async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Opt
     // Subcommand probe — `podman compose version` or `docker compose version`.
     let sub = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        TokioCommand::new(binary)
+        silent_command(binary)
             .args(["compose", "version"])
             .output(),
     )
@@ -330,7 +437,7 @@ async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Opt
     for path in &standalone_paths {
         let sa = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            TokioCommand::new(path).arg("--version").output(),
+            silent_command(path).arg("--version").output(),
         )
         .await;
         if let Ok(Ok(out)) = sa {
@@ -363,7 +470,7 @@ async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Opt
 async fn detect_podman_machine_needed(binary: &PathBuf) -> bool {
     let probe = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        TokioCommand::new(binary)
+        silent_command(binary)
             .args(["machine", "list", "--format", "{{.Running}}"])
             .output(),
     )

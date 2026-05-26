@@ -1,0 +1,211 @@
+<!doctype html>
+<!--
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+Excalidraw bridge page (v0.2.36 Agent R).
+
+Honest scope statement: in v0.2.36 we DO NOT ship a fully self-hosted
+Excalidraw SPA. The @excalidraw/excalidraw npm bundle ships as ES
+modules with bare imports (react, react-dom, jotai, @radix-ui/*, etc.)
+and making it run standalone without a bundler is several hours of
+build-system work that didn't fit a single-agent v0.2.36 slot.
+
+What this page does INSTEAD: it explains the v0.2.36 workflow — draw
+the diagram at excalidraw.com (the upstream-hosted editor), export it
+as a `.excalidraw` file, then drag the file into the launcher's
+DiagramsTab drop zone (Agent L's v0.2.35 work). The drop zone
+auto-registers the diagram + creates the file under
+`<project>/.claude/diagrams/<category>/<name>.excalidraw`.
+
+The full-vendored Excalidraw SPA is queued for v0.2.37. Tracked in
+the agent summary returned to the main chat.
+
+The URL contract (matches mermaid/index.html for symmetry):
+    http://127.0.0.1:<port>/excalidraw/?file=<rel_path>
+
+`<rel_path>` is informational on this page — we display it so the
+user knows which file the launcher pre-created for them.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>VCO — Excalidraw (v0.2.36 bridge)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        --bg: #1e1e1e;
+        --fg: #e1e1e1;
+        --accent: #3b82f6;
+        --accent-hover: #2563eb;
+        --border: #3a3a3a;
+        --panel: #252525;
+        --muted: #8a8a8a;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      header {
+        padding: 16px 32px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--border);
+      }
+      header h1 {
+        font-size: 18px;
+        margin: 0;
+        font-weight: 600;
+      }
+      header .subtitle {
+        font-size: 13px;
+        color: var(--muted);
+        margin-top: 4px;
+      }
+      main {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 32px;
+      }
+      .step {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 20px 24px;
+        margin-bottom: 16px;
+      }
+      .step .num {
+        display: inline-block;
+        background: var(--accent);
+        color: white;
+        width: 28px;
+        height: 28px;
+        line-height: 28px;
+        text-align: center;
+        border-radius: 50%;
+        font-weight: 600;
+        margin-right: 12px;
+      }
+      .step h2 {
+        font-size: 16px;
+        margin: 0 0 12px 0;
+        display: flex;
+        align-items: center;
+      }
+      .step p {
+        margin: 0 0 8px 0;
+        color: #c8c8c8;
+      }
+      .step a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      .step a:hover { text-decoration: underline; }
+      .step .btn {
+        display: inline-block;
+        background: var(--accent);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 4px;
+        text-decoration: none;
+        margin-top: 8px;
+        font-weight: 500;
+      }
+      .step .btn:hover {
+        background: var(--accent-hover);
+        text-decoration: none;
+      }
+      code, .filepath {
+        background: #2a2a2a;
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 12px;
+        color: #e8e8e8;
+      }
+      .filepath {
+        display: block;
+        padding: 8px 12px;
+        word-break: break-all;
+        margin-top: 8px;
+      }
+      .note {
+        background: rgba(59, 130, 246, 0.08);
+        border-left: 3px solid var(--accent);
+        padding: 12px 16px;
+        margin-top: 24px;
+        font-size: 13px;
+        color: #c8c8c8;
+      }
+      .note strong { color: var(--fg); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Excalidraw — external workflow</h1>
+      <div class="subtitle">
+        v0.2.36 ships a bridge to excalidraw.com. Fully self-hosted
+        Excalidraw is queued for v0.2.37.
+      </div>
+    </header>
+    <main>
+      <div class="step">
+        <h2><span class="num">1</span>Draw your diagram</h2>
+        <p>
+          Click below to open the upstream Excalidraw editor in a new
+          tab. The launcher created an empty file on disk for you at:
+        </p>
+        <code id="filePath" class="filepath">—</code>
+        <p>
+          <a class="btn" href="https://excalidraw.com" target="_blank" rel="noopener">
+            Open excalidraw.com →
+          </a>
+        </p>
+      </div>
+
+      <div class="step">
+        <h2><span class="num">2</span>Export as <code>.excalidraw</code></h2>
+        <p>
+          In excalidraw.com, use the menu (☰) → <strong>Save to…</strong>
+          → <strong>Excalidraw file (.excalidraw)</strong>. Choose a
+          temporary location like your Downloads folder.
+        </p>
+      </div>
+
+      <div class="step">
+        <h2><span class="num">3</span>Drag into the launcher</h2>
+        <p>
+          Return to the launcher window. In the Diagrams tab, drag the
+          exported <code>.excalidraw</code> file onto the drop zone
+          (the dashed-outline area in the diagrams list). The launcher
+          reads the file content, prompts you for a name + category,
+          and saves it into <code>.claude/diagrams/&lt;category&gt;/&lt;name&gt;.excalidraw</code>.
+        </p>
+        <p>
+          You can close this browser tab once the import is done.
+        </p>
+      </div>
+
+      <div class="note">
+        <strong>Why this round-trip?</strong> Excalidraw ships as a
+        React app with several runtime peer-dependencies (react, jotai,
+        radix-ui, etc.). Vendoring the full standalone build is queued
+        for a future release. Until then, the upstream-hosted editor +
+        drag-import is the pragmatic v0.2.36 workflow. The embedded
+        editor we used to ship (Excalidraw inside the Tauri WebView)
+        rendered as broken giant-icons garbage on Wayland + webkit2gtk,
+        so it was removed.
+      </div>
+    </main>
+
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const filePath = params.get('file') || '(no file specified)';
+      document.getElementById('filePath').textContent = filePath;
+    </script>
+  </body>
+</html>

@@ -52,6 +52,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::time::timeout;
 
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -253,7 +254,7 @@ async fn run_reanalysis_with_stream(
             .to_string()
     })?;
 
-    let mut cmd = tokio::process::Command::new(&python);
+    let mut cmd = tokio::process::Command::new(&python).silent();
     cmd.arg(&script)
         .arg(folder.as_os_str())
         .arg("--project")

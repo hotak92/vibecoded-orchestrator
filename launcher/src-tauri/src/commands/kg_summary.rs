@@ -54,6 +54,7 @@ use tauri::{command, AppHandle, Emitter, Manager, State};
 use crate::commands::project_env_settings::{self, ProjectEnvSettings};
 use crate::db::kg_summaries::{status as summary_status, KgSummaryRow};
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 const SUMMARY_EVENT: &str = "kg-summary-progress";
 
@@ -683,7 +684,7 @@ async fn invoke_summariser_once(
 ) -> NodeOutcome {
     use tokio::io::AsyncReadExt;
 
-    let mut cmd = tokio::process::Command::new(venv_python);
+    let mut cmd = tokio::process::Command::new(venv_python).silent();
     cmd.arg(script)
         .arg(md_file)
         // KG_PROJECT_ROOT scopes the summariser's `.node_formats.json`

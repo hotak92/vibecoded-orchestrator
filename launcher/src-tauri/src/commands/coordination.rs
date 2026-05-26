@@ -11,6 +11,7 @@ use tauri::{command, State};
 
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
+use vct_launcher_core::process::CommandExt as _;
 
 const MODULE_ID: &str = "vct-coordination";
 
@@ -283,7 +284,7 @@ pub async fn coordination_apply_schema(
         format!("{}/.venv/bin/python", install.install_path)
     };
 
-    let output = tokio::process::Command::new(&python)
+    let output = tokio::process::Command::new(&python).silent()
         .args(["setup.py", "--non-interactive"])
         .current_dir(&install.install_path)
         .env_clear()

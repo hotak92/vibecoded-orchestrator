@@ -336,6 +336,104 @@
     }
   }
 
+  // ─── v0.2.36 Agent R — vendored visual editor opener ────────────────
+  // Distinct from `startDrawing` (which opens the in-tab inline editor).
+  // `openVisualEditor` calls the backend's `open_diagrams_editor` Tauri
+  // command, which:
+  //   1. Creates an empty file under `.claude/diagrams/visual-draft/`
+  //      so the file watcher has a target.
+  //   2. Lazy-starts the local diagrams-editor HTTP server.
+  //   3. Opens the vendored Mermaid (or Excalidraw bridge) page in the
+  //      user's DEFAULT BROWSER — NOT in the Tauri WebView, which has
+  //      Wayland+webkit2gtk rendering bugs for both libraries.
+  //
+  // Auto-register on first non-blank save is handled by the existing
+  // `diagram-changed` event handler below — when an `edit` payload
+  // arrives for an UNREGISTERED file under `.claude/diagrams/`, we
+  // call `register_project_diagram` silently so the file appears in
+  // the registry without a second user action. See the watcher event
+  // handler in `subscribeToChanges` for the auto-register branch.
+  let openingVisualEditor = $state(false);
+  async function openVisualEditor(type: DiagramType) {
+    // Prompt the user for a name; the rest of the file shape is
+    // hard-coded to `.claude/diagrams/visual-draft/<name>.<ext>`. The
+    // user can re-organise via the normal "+ Add diagram" flow once
+    // the file is registered (or unregister + re-register elsewhere).
+    const raw = window.prompt(
+      `Name for the new ${type === 'mermaid' ? 'Mermaid' : 'Excalidraw'} diagram?\n` +
+        `(lowercase-kebab — e.g. "login-flow"; will be saved under .claude/diagrams/visual-draft/)`,
+    );
+    if (raw === null) return;
+    const name = raw.trim().toLowerCase();
+    if (!name) {
+      toast.error('Name cannot be empty');
+      return;
+    }
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+      toast.error('Name must be lowercase-kebab (regex [a-z0-9][a-z0-9-]*)');
+      return;
+    }
+    openingVisualEditor = true;
+    try {
+      const url = await invoke<string>('open_diagrams_editor', {
+        projectId,
+        diagramType: type,
+        name,
+      });
+      toast.info(`Opening ${type} editor in your default browser…`);
+      console.info('[diagrams] open_diagrams_editor →', url);
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      openingVisualEditor = false;
+    }
+  }
+
+  // Track which files we've already tried to auto-register so we don't
+  // hammer the backend on every save burst. Keys are the relative file
+  // path the watcher resolves; entries live for the component lifetime.
+  const autoRegisterTried = new Set<string>();
+
+  async function tryAutoRegister(diagramId: number, relPath: string | null) {
+    // The watcher emits `diagram_id: -1` when it can't resolve the
+    // path to a registered row — that's the auto-register signal.
+    if (diagramId !== -1) return;
+    if (!relPath) return;
+    if (autoRegisterTried.has(relPath)) return;
+    autoRegisterTried.add(relPath);
+
+    // Path shape: .claude/diagrams/<category-path>/<name>.<ext>
+    const m = relPath.match(/^\.claude\/diagrams\/(.+)\/([a-z0-9][a-z0-9-]*)\.(mmd|excalidraw)$/);
+    if (!m) {
+      console.warn('[diagrams] auto-register: skipping unsupported path shape:', relPath);
+      return;
+    }
+    const category = m[1];
+    const name = m[2];
+    const type: DiagramType = m[3] === 'mmd' ? 'mermaid' : 'excalidraw';
+    try {
+      await invoke('register_project_diagram', {
+        projectId,
+        req: {
+          diagram_name: name,
+          diagram_type: type,
+          file_path: relPath,
+          category_path: category,
+        },
+      });
+      toast.info(`Auto-registered ${name} (${type})`);
+      await load();
+    } catch (e) {
+      // Soft-fail: maybe the row already exists (race with a previous
+      // save event) — list_project_diagrams will reflect reality on
+      // the next refresh. Don't toast on UNIQUE constraint errors.
+      const msg = String(e);
+      if (!/unique|already exists/i.test(msg)) {
+        console.warn('[diagrams] auto-register failed:', e);
+      }
+    }
+  }
+
   async function register() {
     const name = newName.trim();
     const category = newCategoryPath.trim();
@@ -704,6 +802,12 @@
           if (payload.kind === 'create' || payload.kind === 'delete') {
             void load();
           } else if (payload.kind === 'edit') {
+            // v0.2.36 Agent R: auto-register-on-first-edit. The watcher
+            // sets `diagram_id: -1` when the file isn't in the registry;
+            // we call `register_project_diagram` silently to bring it
+            // under management. tryAutoRegister is a no-op when the
+            // file is already known or the path shape doesn't match.
+            void tryAutoRegister(payload.diagram_id, payload.file_path);
             void load();
             if (selected && payload.diagram_id === selected.id) {
               void renderPreview();
@@ -844,10 +948,15 @@
       <aside class="diagrams-list" aria-label="Project diagrams list">
         <!-- v0.2.35 Agent L: three creation affordances live here.
              "+ Add diagram" registers an externally-created file (legacy
-             v0.2.34 flow). "Draw new Mermaid" / "Draw new Excalidraw"
-             open the right-pane editor on an empty draft; the first
-             save auto-registers + writes via the existing Tauri
-             commands. -->
+             v0.2.34 flow). "Draw Mermaid (text)" / "Draw Mermaid (visual)"
+             / "Draw Excalidraw (visual)" each open a different editor:
+             - text: inline textarea + preview (still works; useful for
+               code-first users).
+             - visual: opens the vendored editor in the user's default
+               browser via the local diagrams-editor HTTP server
+               (v0.2.36 Agent R rework). Replaces the previously-broken
+               embedded Excalidraw editor that rendered as enormous
+               icons in the Tauri WebView on Wayland+webkit2gtk. -->
         <div class="diagrams-list-header">
           <button
             class="ps-btn-primary"
@@ -859,14 +968,23 @@
           <button
             class="ps-btn-secondary"
             onclick={() => startDrawing('mermaid')}
-            title="Draft a new Mermaid diagram inline; save auto-registers it."
+            title="Draft a new Mermaid diagram inline (textarea + live preview); save auto-registers it."
           >
-            Draw Mermaid
+            Draw Mermaid (text)
           </button>
           <button
             class="ps-btn-secondary"
-            onclick={() => startDrawing('excalidraw')}
-            title="Draft a new Excalidraw scene inline; save auto-registers it."
+            onclick={() => openVisualEditor('mermaid')}
+            disabled={openingVisualEditor}
+            title="Open a vendored Mermaid visual editor in your default browser. Save auto-registers it."
+          >
+            Draw Mermaid (visual)
+          </button>
+          <button
+            class="ps-btn-secondary"
+            onclick={() => openVisualEditor('excalidraw')}
+            disabled={openingVisualEditor}
+            title="Open the Excalidraw bridge page in your default browser (v0.2.36 ships a workflow page; full self-hosted editor is queued for v0.2.37)."
           >
             Draw Excalidraw
           </button>

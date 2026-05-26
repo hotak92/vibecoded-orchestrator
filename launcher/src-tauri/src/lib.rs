@@ -1350,6 +1350,13 @@ pub fn run() {
             commands::diagrams_cmd::write_text_file,
             commands::diagrams_cmd::resolve_project_path,
             commands::diagram_watcher::subscribe_to_diagram_changes,
+            // v0.2.36 Agent R — opens a vendored Mermaid/Excalidraw
+            // editor in the user's default browser via the launcher's
+            // local diagrams-editor HTTP server (lazy-started). Replaces
+            // the embedded Excalidraw editor (broken on Wayland +
+            // webkit2gtk) and ships a self-hosted visual Mermaid editor
+            // alongside the existing text-only one.
+            commands::diagrams_cmd::open_diagrams_editor,
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
@@ -1391,6 +1398,13 @@ pub fn run() {
             commands::licensing::license_refresh,
             commands::licensing::license_activate,
             commands::licensing::license_deactivate,
+            // v0.2.36: machine-id hash for the admin-rebind UX. Pure
+            // read-only command; same value `license_refresh` sends
+            // to `/validate-tier`.
+            commands::licensing::get_machine_id_hash,
+            // v0.2.36: orchestrate the admin-token machine rebind from
+            // Rust so the license key never crosses the IPC boundary.
+            commands::licensing::license_rebind_admin_token,
             // v0.2.32 §D1: per-module license rows for the dialog.
             commands::licensing::get_module_licenses,
             commands::licensing::module_license_refresh,

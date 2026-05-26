@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tauri::command;
+use vct_launcher_core::process::CommandExt as _;
 
 // ---------------------------------------------------------------------------
 // Strict legacy-volume allowlist
@@ -565,7 +566,7 @@ pub fn filter_legacy_volume_names<'a>(lines: impl IntoIterator<Item = &'a str>) 
 /// Inspect a single volume by name. Returns mountpoint + driver. On
 /// any failure returns empty strings (the FE renders "(unavailable)").
 async fn inspect_volume(runtime: &str, name: &str) -> (String, String) {
-    let out = tokio::process::Command::new(runtime)
+    let out = tokio::process::Command::new(runtime).silent()
         .args(["volume", "inspect", name])
         .output()
         .await;
@@ -617,7 +618,7 @@ async fn detect_legacy_volumes_inner() -> Vec<DetectedLegacyVolume> {
     };
 
     // List ALL volumes, filter through the allowlist + prefix.
-    let out = tokio::process::Command::new(&runtime)
+    let out = tokio::process::Command::new(&runtime).silent()
         .args(["volume", "ls", "--format", "{{.Name}}"])
         .output()
         .await;
@@ -710,7 +711,7 @@ fn emit_deferral(
          report.add_entry(entry)\n\
          report.write(folder)\n",
     );
-    let status = std::process::Command::new(py)
+    let status = std::process::Command::new(py).silent()
         .arg("-c")
         .arg(script)
         .status();

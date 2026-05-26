@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use vct_launcher_core::process::pid_is_alive;
+use vct_launcher_core::process::CommandExt as _;
 
 const HUB_PID_FILE: &str = "hub.pid";
 
@@ -97,7 +98,7 @@ pub fn stop() -> StopOutcome {
     let Some(bin) = crate::hub_launcher::find_hub_binary() else {
         return StopOutcome::BinaryNotFound;
     };
-    let result = Command::new(&bin)
+    let result = Command::new(&bin).silent()
         .arg("--stop")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

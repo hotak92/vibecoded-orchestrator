@@ -83,6 +83,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Runtime};
+use vct_launcher_core::process::CommandExt as _;
 
 /// Result of `get_launcher_restart_status`: presence + details of a
 /// `launcher_restart_required` or `launcher_binary_swap_failed_locked`
@@ -356,7 +357,7 @@ fn launcher_binary_relative_path() -> (&'static str, &'static str) {
 /// immediately afterward; the child must be in its own session/process
 /// group so the kernel doesn't tear it down with us.
 fn spawn_detached_launcher(exe: &Path) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = std::process::Command::new(exe).silent();
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
