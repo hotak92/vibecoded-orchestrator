@@ -31,6 +31,45 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use tokio::process::Command as TokioCommand;
 
+/// Build a `tokio::process::Command` that does NOT flash a console window
+/// on Windows. Equivalent to `TokioCommand::new(bin)` on Linux/macOS.
+///
+/// Why this exists (2026-05-26 fork-bomb fix): runtime detection probes
+/// (`docker --version`, `docker info`, `podman --version`, `podman info`)
+/// spawn child subprocesses. On Windows, a child spawned from a
+/// `windows_subsystem = "windows"` parent (= our launcher) inherits the
+/// console allocation flag. Without `CREATE_NO_WINDOW` (0x08000000), each
+/// spawned child gets a NEW console allocated by `CreateProcessW`, which
+/// flashes a `conhost.exe` window for the child's lifetime. With the
+/// services::watcher polling every 30s, the version+daemon-usable probes
+/// running back-to-back AND the OnboardingWizard's preflight rerunning
+/// probes, the user sees a STREAM of console windows flashing on screen
+/// at startup, becoming visually indistinguishable from "milioni di
+/// finestre" cascading.
+///
+/// EnumWindows snapshot taken 2026-05-26 against the launcher proved
+/// this: 11 of the 15 launcher-owned visible windows were
+/// `CASCADIA_HOSTING_WINDOW_CLASS` (Windows Terminal hosting class)
+/// with titles like `C:\Windows\system32\where.exe`, `git.exe` — not
+/// dialog-based at all.
+///
+/// Pattern mirrors `launcher/src-tauri/src/commands/installer.rs:2491`
+/// (and 11 other places in the launcher) which already set this flag.
+/// This helper centralises the pattern for the `services/runtime.rs`
+/// hot path which the audit missed.
+fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
+    let mut cmd = TokioCommand::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW = 0x08000000 (winbase.h). Suppresses console
+        // allocation for the child. Mandatory on Windows for parent
+        // processes built with `windows_subsystem = "windows"`.
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
 /// Which container runtime the launcher will drive. Detected once per
 /// launcher session and cached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -96,7 +135,7 @@ impl RuntimeInfo {
     pub fn compose_command(&self) -> TokioCommand {
         match self.compose_form {
             ComposeForm::Subcommand => {
-                let mut cmd = TokioCommand::new(&self.binary_path);
+                let mut cmd = silent_command(&self.binary_path);
                 cmd.arg("compose");
                 cmd
             }
@@ -109,7 +148,7 @@ impl RuntimeInfo {
                 let standalone_name = format!("{}-compose", self.runtime.binary());
                 let resolved = which_on_path(&standalone_name)
                     .unwrap_or_else(|| PathBuf::from(&standalone_name));
-                TokioCommand::new(resolved)
+                silent_command(resolved)
             }
         }
     }
@@ -175,7 +214,7 @@ async fn version_probe(binary: &PathBuf) -> bool {
     let start = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        TokioCommand::new(binary).arg("--version").output(),
+        silent_command(binary).arg("--version").output(),
     )
     .await;
     let elapsed_ms = start.elapsed().as_millis();
@@ -269,7 +308,7 @@ async fn daemon_usable_probe(binary: &PathBuf, runtime: ContainerRuntime) -> boo
     let start = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        TokioCommand::new(binary).arg("info").output(),
+        silent_command(binary).arg("info").output(),
     )
     .await;
     let elapsed_ms = start.elapsed().as_millis();
@@ -356,7 +395,7 @@ async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Opt
     // Subcommand probe — `podman compose version` or `docker compose version`.
     let sub = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        TokioCommand::new(binary)
+        silent_command(binary)
             .args(["compose", "version"])
             .output(),
     )
@@ -388,7 +427,7 @@ async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Opt
     for path in &standalone_paths {
         let sa = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            TokioCommand::new(path).arg("--version").output(),
+            silent_command(path).arg("--version").output(),
         )
         .await;
         if let Ok(Ok(out)) = sa {
@@ -421,7 +460,7 @@ async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Opt
 async fn detect_podman_machine_needed(binary: &PathBuf) -> bool {
     let probe = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        TokioCommand::new(binary)
+        silent_command(binary)
             .args(["machine", "list", "--format", "{{.Running}}"])
             .output(),
     )

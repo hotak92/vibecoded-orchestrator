@@ -177,12 +177,24 @@ pub fn ensure_hub_running() -> SpawnOutcome {
     //
     // We deliberately drop stdio so any noise from the child doesn't
     // pollute the launcher's logs. The hub writes its own log.
-    let result = Command::new(&bin)
-        .arg("--start-if-not-running")
+    //
+    // CREATE_NO_WINDOW (0x08000000) on Windows: without it the vct-hub
+    // child spawned from a `windows_subsystem = "windows"` parent
+    // allocates a fresh conhost.exe console that flashes on screen for
+    // the hub's ~100ms startup window. ensure_hub_running is called once
+    // at every launcher boot, so this is one of the visible-flash sources
+    // we audited 2026-05-26.
+    let mut cmd = Command::new(&bin);
+    cmd.arg("--start-if-not-running")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let result = cmd.status();
 
     match result {
         Ok(status) if status.success() => SpawnOutcome::Started,
