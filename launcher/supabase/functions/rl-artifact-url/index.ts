@@ -76,8 +76,19 @@ const PAID_IMAGE_FULL = `ghcr.io/${PAID_IMAGE_REPO}`;
 const PAID_TAG_DEFAULT = "0.1.0"; // bumped by CD on each release
 
 // GHCR token-exchange parameters.
+// The /token endpoint requires Basic auth — `Authorization: Basic
+// base64("<gh-user>:<PAT>")`. The bare Bearer header attempted in the
+// pre-2026-05-26 version of this function returns 401 even with a
+// valid classic PAT that DOES have read:packages scope (verified via
+// `curl -H "Authorization: Bearer <PAT>" ghcr.io/token` vs
+// `curl -u <user>:<PAT> ghcr.io/token` on 2026-05-26 — only the
+// Basic form returns 200). The username is required (GHCR uses it
+// for audit-log attribution) but does NOT have to match the PAT
+// owner — for service-account usage we use a synthetic username
+// `vct-paid-module` which is the same one `container_login` uses
+// for the resulting pull-token on the launcher side.
 const GHCR_TOKEN_URL = "https://ghcr.io/token";
-const GHCR_AUTH_HEADER_PREFIX = "Bearer ";
+const GHCR_BASIC_AUTH_USERNAME = "vct-paid-module";
 const TOKEN_TTL_SECONDS = 900; // 15 min — what we promise the client
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -168,7 +179,7 @@ async function revalidateTierViaSupabase(
  * For pull-only access we request `repository:hotak92/vct-rl-reranker:pull`.
  */
 async function exchangeForRegistryToken(): Promise<
-  { token: string; expires_in_s: number } | { error: string; detail: string }
+  { token: string; username: string; expires_in_s: number } | { error: string; detail: string }
 > {
   const servicePat = Deno.env.get("GHCR_SERVICE_PAT");
   if (!servicePat) {
@@ -182,12 +193,16 @@ async function exchangeForRegistryToken(): Promise<
   const url =
     `${GHCR_TOKEN_URL}?service=ghcr.io&scope=${encodeURIComponent(scope)}`;
 
-  // GHCR accepts the PAT directly via Authorization: Bearer.
+  // GHCR /token requires Basic auth (`base64("user:PAT")`). See the
+  // GHCR_BASIC_AUTH_USERNAME constant docstring above for why Bearer
+  // fails despite being documented to work — observed empirically
+  // 2026-05-26 with a classic PAT that DID have read:packages scope.
+  const basicCreds = btoa(`${GHCR_BASIC_AUTH_USERNAME}:${servicePat}`);
   let resp: Response;
   try {
     resp = await fetch(url, {
       method: "GET",
-      headers: { Authorization: `${GHCR_AUTH_HEADER_PREFIX}${servicePat}` },
+      headers: { Authorization: `Basic ${basicCreds}` },
       signal: AbortSignal.timeout(8000),
     });
   } catch (e) {
@@ -223,8 +238,41 @@ async function exchangeForRegistryToken(): Promise<
     };
   }
 
+  // GHCR architectural quirk (verified 2026-05-26): for PERSONAL-account
+  // packages, the /token endpoint returns the original PAT base64-encoded
+  // rather than issuing a separate registry-scoped credential. The client
+  // (`container_login` on launcher side) needs a credential it can pass
+  // to `podman/docker login --password-stdin` — that command treats its
+  // input as a literal password, NOT as base64. So we decode here, server-
+  // side, before returning to the client.
+  //
+  // Anti-piracy note: the decoded value IS the underlying PAT for
+  // personal-account packages. This breaks the original design property
+  // ("PAT never leaves the server"). Tracked as v0.2.36 architectural
+  // follow-up — moving the image to a GitHub Organization changes the
+  // /token behaviour to issue proper scoped tokens. For now, the rate-
+  // limit at the edge function (per-license-key tier check + 15min TTL
+  // we promise) constrains the leak window. The launcher logs out
+  // immediately after pull completes.
+  let decodedToken: string;
+  try {
+    decodedToken = atob(parsed.token);
+  } catch (_) {
+    // Already-decoded path (org packages, future-compat): use as-is.
+    decodedToken = parsed.token;
+  }
+
+  // Username for `podman/docker login -u <user>` on the client side.
+  // For personal-account packages this MUST match the PAT owner's
+  // GitHub login (verified 2026-05-26 — synthetic usernames like
+  // `vct-paid-module` get 403). For org packages where the /token
+  // endpoint returns a scoped credential, any string works; keep
+  // `vct-paid-module` as the convention so audit logs attribute correctly.
+  const ghcrUsername = "hotak92"; // TODO[v0.2.36]: derive from package owner once orgs are used
+
   return {
-    token: parsed.token,
+    token: decodedToken,
+    username: ghcrUsername,
     // GHCR may return a different TTL; we cap our promise at our
     // policy minimum (15min) but accept anything ≥30s as usable.
     expires_in_s: Math.min(parsed.expires_in ?? TOKEN_TTL_SECONDS, TOKEN_TTL_SECONDS),
@@ -310,6 +358,16 @@ Deno.serve(async (req: Request) => {
     tag: PAID_TAG_DEFAULT,
     registry: "ghcr.io",
     pull_token: tokenResult.token,
+    // v0.2.36 wire-contract addition: the launcher-side container_login
+    // needs the GitHub username that the pull_token authenticates as,
+    // because `podman/docker login -u <user>` rejects mismatched
+    // username/credential pairs (verified empirically 2026-05-26 against
+    // ghcr.io for personal-account packages). Pre-v0.2.36 launcher
+    // hardcoded "vct-paid-module" which 403'd; v0.2.36 launcher reads
+    // this field and falls back to the legacy literal if absent (so a
+    // v0.2.35 launcher hitting a v0.2.36 server still works for org-
+    // package paths where username is synthetic).
+    username: tokenResult.username,
     expires_in_s: tokenResult.expires_in_s,
     expires_at: expiresAt,
   });

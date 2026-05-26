@@ -458,13 +458,13 @@ async fn container_pull(
     // carries the actual cause (license_invalid / tier_insufficient /
     // network / etc.) so the user sees an actionable error instead of
     // the old "Phase 3A gateway not deployed" footer.
-    let (token, token_request_err): (Option<String>, Option<String>) = match request_pull_token(container).await {
+    let (token, token_username, token_request_err): (Option<String>, Option<String>, Option<String>) = match request_pull_token(container).await {
         Ok(tok) => {
             eprintln!(
                 "[installer_engine] container_pull[{}]: obtained pull token (expires_in={}s)",
                 module_id, tok.expires_in_s
             );
-            (Some(tok.pull_token), None)
+            (Some(tok.pull_token), tok.username, None)
         }
         Err(e) => {
             eprintln!(
@@ -472,7 +472,7 @@ async fn container_pull(
                  Falling back to anonymous pull — will succeed only if the image is public.",
                 module_id, e
             );
-            (None, Some(e))
+            (None, None, Some(e))
         }
     };
 
@@ -485,7 +485,15 @@ async fn container_pull(
         .clone()
         .unwrap_or_else(|| infer_registry_from_image(&container.image));
     if let Some(t) = token.as_deref() {
-        container_login(&runtime, &registry, t).await?;
+        // v0.2.36: server returns the GHCR username alongside the
+        // pull_token. For personal-account packages this MUST be the
+        // PAT owner's GitHub login (synthetic usernames get 403 from
+        // ghcr.io). Pre-v0.2.36 server response omitted this field —
+        // fall back to the historical `vct-paid-module` literal so
+        // mismatched-version client/server pairings still attempt
+        // a login (it'll fail with a clear error, not silently break).
+        let login_username = token_username.as_deref().unwrap_or("vct-paid-module");
+        container_login(&runtime, &registry, login_username, t).await?;
     }
 
     // ─── Step 3a (v0.2.35): probe primary tag, fall back to cpu if missing ─
@@ -787,6 +795,16 @@ where
 #[derive(Debug, serde::Deserialize)]
 struct PullTokenResponse {
     pub pull_token: String,
+    /// v0.2.36 wire-contract addition. The GitHub username that the
+    /// pull_token authenticates as — passed to `podman/docker login -u`.
+    /// For personal-account GHCR packages this MUST match the PAT
+    /// owner's GitHub login (empirically verified 2026-05-26: synthetic
+    /// usernames get 403 from ghcr.io). For org-package paths
+    /// (v0.2.36+) the server returns a synthetic username + a properly-
+    /// scoped registry token. Optional so a v0.2.36 launcher remains
+    /// compatible with the pre-v0.2.36 server response shape.
+    #[serde(default)]
+    pub username: Option<String>,
     #[serde(default)]
     pub expires_in_s: u64,
 }
@@ -953,13 +971,33 @@ pub(crate) async fn detect_container_runtime() -> Result<String, String> {
 
 /// `<runtime> login <registry> -u <username> --password-stdin` with the
 /// token piped to stdin. Stdin-feed avoids exposing the token in argv
-/// (where `ps` would see it). The username is irrelevant for GHCR PATs
-/// — the registry validates the token, not the username pairing.
-async fn container_login(runtime: &str, registry: &str, token: &str) -> Result<(), String> {
+/// (where `ps` would see it).
+///
+/// v0.2.36 (2026-05-26): the username is NO LONGER irrelevant. Empirical
+/// finding from dogfooding: ghcr.io's `/v2/token` endpoint, when called
+/// during `podman/docker login`, rejects mismatched username/credential
+/// pairs with `403 Forbidden — Requesting bearer token: invalid status
+/// code from registry`. For personal-account GHCR packages the username
+/// MUST be the PAT owner's GitHub login. The caller is responsible for
+/// passing the correct username — usually obtained from the
+/// `rl-artifact-url` response's `username` field (server-controlled, so
+/// even if we ever switch from personal-account to org packages, the
+/// client side stays the same).
+///
+/// Cross-runtime + cross-OS: `login` subcommand syntax is identical
+/// between podman and docker; `--password-stdin` works on Linux, macOS,
+/// and Windows for both. Verified manually 2026-05-26 with podman on
+/// Linux; documented to work the same way per docker CLI reference.
+async fn container_login(
+    runtime: &str,
+    registry: &str,
+    username: &str,
+    token: &str,
+) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
     let mut child = Command::new(runtime)
-        .args(["login", registry, "-u", "vct-paid-module", "--password-stdin"])
+        .args(["login", registry, "-u", username, "--password-stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

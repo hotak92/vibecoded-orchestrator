@@ -35,3 +35,16 @@ verify_jwt = false
 # catalog-read layer (catalog metadata is marketing-tile-equivalent).
 [functions.module-catalog]
 verify_jwt = false
+
+# v0.2.35 (2026-05-26): paid-module pull-token gateway. Authenticates
+# via the body's {license_key, machine_id_hash} pair (license_key is
+# either a Lemon Squeezy UUID or a `vct_admin_*` Vault token; both
+# shapes accepted by `validateRequestBody`). The function internally
+# does a server-to-server call to `/validate-tier` to re-confirm tier
+# ≥ pro BEFORE issuing a GHCR pull token, so the auth boundary is at
+# the body level (not JWT). Without `verify_jwt = false`, every
+# launcher install attempt hits `UNAUTHORIZED_NO_AUTH_HEADER` before
+# the function body even runs — discovered during v0.2.35 dogfooding
+# 2026-05-26. Source-controlled so the next deploy re-applies it.
+[functions.rl-artifact-url]
+verify_jwt = false
