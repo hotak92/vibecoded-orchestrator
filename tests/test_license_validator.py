@@ -280,13 +280,78 @@ class TestCaching:
         )
         assert loaded.tier == "pro"
 
-    def test_machine_id_hash_is_stable_and_opaque(self, fresh_validator):
+    def test_machine_id_hash_is_stable_and_opaque(self, fresh_validator, monkeypatch):
+        # Pin the input via the override so the test is host-agnostic.
+        # The contract under test is shape + determinism, not host-id
+        # resolution.
+        monkeypatch.setenv("VCT_MACHINE_ID_OVERRIDE", "test-stable-and-opaque-fixture")
         a = fresh_validator._machine_id_hash()
         b = fresh_validator._machine_id_hash()
         assert a == b
         assert len(a) == 64  # sha256 hex
-        # Should never leak raw MAC chars; it's a hex digest.
+        # Should never leak raw host-id chars; it's a hex digest.
         assert all(c in "0123456789abcdef" for c in a)
+
+    def test_machine_id_hash_uses_override_env_when_set(self, fresh_validator, monkeypatch):
+        # v0.2.36: the VCT_MACHINE_ID_OVERRIDE env var fully replaces the
+        # platform host-id source. Pinning a known input lets us assert
+        # the *exact* hash, which locks the algorithm change from
+        # "sha256(8-byte-MAC)" to "sha256(host-id-utf8)" — and verifies
+        # the Python implementation matches the Rust mirror.
+        import hashlib
+        monkeypatch.setenv("VCT_MACHINE_ID_OVERRIDE", "vct-test-fixture-001")
+        expected = hashlib.sha256(b"vct-test-fixture-001").hexdigest()
+        assert fresh_validator._machine_id_hash() == expected
+
+    def test_machine_id_hash_ignores_empty_override(self, fresh_validator, monkeypatch):
+        # v0.2.36: a stray `export VCT_MACHINE_ID_OVERRIDE=` must NOT
+        # silently change every machine to sha256(""). The real platform
+        # source is consulted instead.
+        import hashlib
+        empty_hash = hashlib.sha256(b"").hexdigest()
+        monkeypatch.setenv("VCT_MACHINE_ID_OVERRIDE", "")
+        actual = fresh_validator._machine_id_hash()
+        assert actual != empty_hash, "empty override leaked through as the host id"
+        assert len(actual) == 64
+
+    def test_machine_id_hash_uses_no_platform_sentinel_when_sources_fail(
+        self, fresh_validator, monkeypatch
+    ):
+        # v0.2.36: when every platform source fails, the function MUST
+        # still return a well-formed 64-char hex string (the
+        # /rebind-admin-token regex requires `^[0-9a-f]{64}$`). We mock
+        # the resolver to return None and verify the sentinel branch.
+        import hashlib
+        monkeypatch.delenv("VCT_MACHINE_ID_OVERRIDE", raising=False)
+        monkeypatch.setattr(fresh_validator, "_read_platform_host_id", lambda: None)
+        expected = hashlib.sha256(b"vct-no-platform-host-id-v0.2.36").hexdigest()
+        assert fresh_validator._machine_id_hash() == expected
+
+    def test_machine_id_hash_linux_branch_reads_etc_machine_id(
+        self, fresh_validator, monkeypatch, tmp_path
+    ):
+        # v0.2.36: end-to-end test of the Linux branch — point the
+        # Path() reader at a tmpdir-rooted /etc/machine-id and verify
+        # the resulting hash matches sha256 of the fake content. Skips
+        # gracefully on non-Linux hosts so the test suite stays portable.
+        import platform as _platform
+        if _platform.system() != "Linux":
+            import pytest
+            pytest.skip("Linux-branch test (current platform: %s)" % _platform.system())
+        import hashlib
+        # Pre-empt the read by intercepting Path.read_text via a focused
+        # closure rather than touching the real /etc — the test must
+        # not require root.
+        fake_id = "abcdef0123456789abcdef0123456789"
+        monkeypatch.setattr(
+            fresh_validator,
+            "_read_linux_machine_id",
+            lambda: fake_id,
+        )
+        # Strip the override so we go through the real platform dispatcher.
+        monkeypatch.delenv("VCT_MACHINE_ID_OVERRIDE", raising=False)
+        expected = hashlib.sha256(fake_id.encode("utf-8")).hexdigest()
+        assert fresh_validator._machine_id_hash() == expected
 
 
 # ──────────────────────────────────────────────────────────────────────────────

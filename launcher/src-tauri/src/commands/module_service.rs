@@ -67,26 +67,17 @@ pub const DEFAULT_RL_LATEST_VERSION_ENDPOINT: &str =
     "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-latest-version";
 
 /// Public machine-id helper used by `lib.rs::spawn_daily_weights_poll`
-/// license-reader closure (Step 24 commit b). Mirrors
-/// `commands::licensing::machine_id_hash` — sha256 of the 8-byte
-/// big-endian MAC, hex lowercase. Pulled out as a separate `pub fn` so
-/// the closure in lib.rs can construct the `(license_key, hash)` pair
-/// without a circular dependency on the licensing module.
+/// license-reader closure (Step 24 commit b). Thin wrapper around
+/// `commands::licensing::machine_id_hash` so the closure in lib.rs has
+/// a `pub fn` it can reach without depending on `pub(crate)` symbols
+/// across the commands tree.
+///
+/// v0.2.36: previously this was an inline duplicate of the MAC-based
+/// algorithm. Replaced with a delegation call so the platform-stable
+/// host identifier change in `licensing.rs` propagates here
+/// automatically — keeps the two call sites in lockstep.
 pub fn machine_id_hash_for_poll() -> String {
-    use sha2::{Digest, Sha256};
-    let mac = mac_address::get_mac_address().ok().flatten();
-    let bytes: [u8; 8] = match mac {
-        Some(m) => {
-            let bs = m.bytes();
-            let mut out = [0u8; 8];
-            out[2..].copy_from_slice(&bs);
-            out
-        }
-        None => [0u8; 8],
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+    crate::commands::licensing::machine_id_hash()
 }
 
 /// Default Ollama port used to resolve `{ollama_port}` in env values

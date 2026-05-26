@@ -5402,7 +5402,6 @@ dependencies = [
  "keyring",
  "libc",
  "libloading 0.8.9",
- "mac_address",
  "notify",
  "rand 0.9.4",
  "regex",
@@ -5425,6 +5424,7 @@ dependencies = [
  "uuid",
  "vct-launcher-core",
  "windows-sys 0.59.0",
+ "winreg",
 ]
 
 [[package]]

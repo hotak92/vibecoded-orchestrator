@@ -446,8 +446,11 @@ async fn container_pull(
     // v0.2.35 (Phase 3A): `request_pull_token` is now the canonical
     // paid-module auth path. It reads the license key from the OS
     // keychain (the same source `license_refresh` uses), computes the
-    // MAC-based machine_id_hash, and POSTs `{license_key, machine_id_hash}`
-    // to the manifest's `pull_token_endpoint` (e.g., `rl-artifact-url`).
+    // platform-stable machine_id_hash (Windows MachineGuid / macOS
+    // IOPlatformUUID / Linux /etc/machine-id — see
+    // `commands/licensing.rs::machine_id_hash`, switched from MAC-based
+    // in v0.2.36), and POSTs `{license_key, machine_id_hash}` to the
+    // manifest's `pull_token_endpoint` (e.g., `rl-artifact-url`).
     // The endpoint re-validates the license server-side and returns a
     // short-lived (≤15min) repository-scoped pull token.
     //
@@ -822,9 +825,12 @@ struct PullTokenResponse {
 ///
 /// The launcher serves the user's license key out of the OS keychain —
 /// the SAME source `license_refresh` uses for `/validate-tier`. The
-/// `machine_id_hash` is derived from the host's first non-loopback MAC
+/// `machine_id_hash` is derived from a platform-stable host identifier
+/// (Windows MachineGuid / macOS IOPlatformUUID / Linux /etc/machine-id)
 /// via `commands::licensing::machine_id_hash`, again matching the
 /// `validate-tier` call site so the server sees consistent bindings.
+/// The algorithm switched from MAC-based to platform-stable in v0.2.36
+/// — see commands/licensing.rs for the rationale.
 ///
 /// Returned errors are passed to the caller in user-readable form
 /// (NOT just propagated through `container_pull`'s misleading

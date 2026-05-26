@@ -42,8 +42,9 @@ import hashlib
 import json
 import logging
 import os
+import platform
+import subprocess
 import time
-import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Optional
@@ -119,14 +120,176 @@ class LicenseResult:
         return cls(**json.loads(raw))
 
 
-def _machine_id_hash() -> str:
-    """Stable, one-way hash of the machine's MAC address.
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.2.36: platform-stable machine identifier.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# SUPERSEDES the MAC-based `uuid.getnode()` design used through v0.2.35.
+# The previous algorithm hashed the 8-byte big-endian MAC address, which
+# had three structural problems on laptops (the dominant 3rd-party user
+# environment):
+#
+#   1. NICs come and go. Wi-Fi can power-save off, USB Ethernet can be
+#      unplugged, docks swap adapter enumeration. Every event changed the
+#      MAC the algorithm picked → every event broke machine binding.
+#   2. `uuid.getnode()` (Python) and `mac_address::get_mac_address()`
+#      (Rust) didn't always pick the SAME NIC on the same machine —
+#      observed on a Win11 laptop with 2 NICs (Python picked USB
+#      Ethernet, Rust picked Wi-Fi → different hashes → mismatch).
+#   3. Hardware repairs / mainboard swaps that replaced the integrated
+#      NIC looked identical to a brand-new machine, forcing manual
+#      rebind for what is functionally the same install.
+#
+# The new algorithm reads a platform-stable host identifier the OS itself
+# provides — set at install, survives NIC changes, survives motherboard
+# repairs (on Windows; registry-resident), language-agnostic:
+#
+#   * Windows: HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+#              (REG_SZ GUID set by Windows at install)
+#   * macOS:   IOPlatformUUID from `ioreg -rd1 -c IOPlatformExpertDevice`
+#   * Linux:   /etc/machine-id (systemd) → /var/lib/dbus/machine-id
+#              fallback for non-systemd / pre-systemd hosts
+#
+# Wire format unchanged: sha256(<id-utf8>) → 64-char lowercase hex. The
+# `/validate-tier` endpoint only sees the string, so this change is
+# transparent server-side. The Rust mirror at
+# `launcher/src-tauri/src/commands/licensing.rs::machine_id_hash` ships
+# the SAME algorithm so both sides of the IPC boundary keep producing
+# the same hash for the same machine.
+#
+# BREAKING for admin-tier users: existing Vault entries' bound
+# `machine_id_hash` values were derived from MAC, so they're stale after
+# upgrade → `machine_mismatch` until the admin uses the launcher's
+# "Rebind to this machine" button (Agent S, v0.2.36) to write the new
+# hash. Free / Pro / MAO / Enterprise users are not affected — LS
+# instance binding is idempotent per `instance_name`.
 
-    Never returns raw hardware identifiers. The hash is the only identifier
-    sent to the validation endpoint.
+# Test-only override env var. Setting this pins the input to a known
+# value across OSes — used by tests and by support engineers to
+# reproduce a user's hash without copying their actual platform host id
+# (which would be a privacy leak). Production code MUST NOT set this.
+_MACHINE_ID_OVERRIDE_ENV = "VCT_MACHINE_ID_OVERRIDE"
+
+
+def _read_linux_machine_id() -> Optional[str]:
+    """Read /etc/machine-id with /var/lib/dbus/machine-id fallback."""
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            data = Path(path).read_text().strip()
+            if data:
+                return data
+        except (OSError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def _read_macos_platform_uuid() -> Optional[str]:
+    """Read IOPlatformUUID by shelling out to `ioreg`.
+
+    `ioreg` is part of the macOS base system on every version we support;
+    shelling out avoids a PyObjC / ctypes IOKit binding. Timeout is short
+    because this is on the launcher hot path.
     """
-    node = uuid.getnode()
-    return hashlib.sha256(node.to_bytes(8, "big")).hexdigest()
+    try:
+        proc = subprocess.run(
+            ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        # Format we look for:  "IOPlatformUUID" = "ABC-DEF-...-XYZ"
+        if '"IOPlatformUUID"' not in line:
+            continue
+        # Split on `=`, strip whitespace and surrounding double-quotes.
+        parts = line.split("=", 1)
+        if len(parts) != 2:
+            continue
+        candidate = parts[1].strip().strip('"').strip()
+        if candidate:
+            return candidate
+    return None
+
+
+def _read_windows_machine_guid() -> Optional[str]:
+    """Read HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid.
+
+    REG_SZ value set by Windows at install (GUID string). Survives NIC
+    changes, user-account changes, and motherboard replacement (it's
+    registry-resident, not hardware-derived). Only an OS reinstall or
+    explicit registry edit changes it.
+    """
+    try:
+        import winreg  # stdlib on Windows; ImportError on other OSes.
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+            0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+    except OSError:
+        return None
+    if not isinstance(value, str):
+        return None
+    trimmed = value.strip()
+    return trimmed or None
+
+
+def _read_platform_host_id() -> Optional[str]:
+    """Return the raw platform-stable host identifier (or None on
+    pathological hosts).
+
+    Test override (`VCT_MACHINE_ID_OVERRIDE`) always wins — empty string
+    treated as "not set" so a stray `export VCT_MACHINE_ID_OVERRIDE=`
+    doesn't silently change every machine to sha256("").
+    """
+    override = os.environ.get(_MACHINE_ID_OVERRIDE_ENV, "")
+    if override:
+        return override
+
+    system = platform.system()
+    if system == "Windows":
+        return _read_windows_machine_guid()
+    if system == "Darwin":
+        return _read_macos_platform_uuid()
+    if system == "Linux":
+        return _read_linux_machine_id()
+    # BSDs / Solaris / unknown: no stable source we trust. Fall through
+    # to the sentinel hash in `_machine_id_hash`. The user can still set
+    # VCT_MACHINE_ID_OVERRIDE to pin a value if they need stable binding
+    # on an unsupported OS.
+    return None
+
+
+def _machine_id_hash() -> str:
+    """Stable, one-way hash of a platform-stable host identifier.
+
+    Never returns the raw host id — only the sha256 hex (64 lowercase
+    chars). This is the only identifier sent to the validation endpoint.
+    Mirrors `launcher/src-tauri/src/commands/licensing.rs::machine_id_hash`.
+
+    Fallback semantics: when every platform source fails, hashes a fixed
+    sentinel so callers always receive a well-formed 64-char hex string
+    (the `/rebind-admin-token` regex requires `^[0-9a-f]{64}$`).
+    Server-side, all such hosts collide on the same hash — acceptable
+    degraded behaviour, surfaces as a machine-mismatch the user can
+    resolve via the launcher's rebind button.
+    """
+    host_id = _read_platform_host_id()
+    if host_id is None:
+        # Same sentinel value the Rust side uses — keeps the two
+        # implementations agreeing on the "no platform id" branch.
+        host_id = "vct-no-platform-host-id-v0.2.36"
+    return hashlib.sha256(host_id.encode("utf-8")).hexdigest()
 
 
 def _write_status(message: str) -> None:
