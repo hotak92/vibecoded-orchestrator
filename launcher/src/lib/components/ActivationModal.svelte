@@ -16,16 +16,28 @@
   import { license, formatGrace } from '$lib/stores/license';
   import type { TierCacheView } from '$lib/types/launcher';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import {
+    friendlyRebindMessage,
+    shouldShowRebindButton,
+  } from '$lib/admin-rebind';
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
   let code = $state('');
   let confirmingDeactivate = $state(false);
+  // v0.2.36: transient toast for the admin-rebind affordance.
+  // Kept local to the modal (vs the global store error) so the
+  // success/error message stays scoped to the rebind interaction.
+  let rebindToast = $state<{ kind: 'success' | 'error'; message: string } | null>(null);
 
   const viewState = $derived($license);
   const cache = $derived<TierCacheView | null>(viewState.cache);
   const tier = $derived(cache?.orchestrator_tier ?? 'free');
   const hasLicense = $derived(tier !== 'free');
+  // v0.2.36: admin-tier card gates the "Rebind to this machine" button.
+  // The predicate lives in `$lib/admin-rebind` so the visibility logic
+  // has a single test surface in `admin-rebind.test.ts`.
+  const showRebindButton = $derived(shouldShowRebindButton(tier));
   // v0.2.32 §D1: per-module license rows for the new section.
   const moduleLicenses = $derived(viewState.moduleLicenses ?? []);
 
@@ -48,6 +60,24 @@
     confirmingDeactivate = false;
   }
 
+  /**
+   * v0.2.36: rebind the admin token to this machine.
+   *
+   * Closes the recovery gap surfaced in v0.2.35: when an admin
+   * reinstalls their OS or swaps laptop, /validate-tier returns
+   * `machine_mismatch` (TOFU binding still points at the old
+   * machine_id_hash). The Rust command orchestrates the rebind so
+   * the license_key never crosses the IPC boundary.
+   *
+   * Server-side errors surface verbatim ({error, detail}) to give
+   * the user enough info to triage without re-opening logs.
+   */
+  async function handleRebind() {
+    rebindToast = null;
+    const result = await license.rebindAdminToken();
+    rebindToast = friendlyRebindMessage(result);
+  }
+
   // v0.2.32 §D1: per-module refresh / deactivate handlers.
   async function refreshModule(moduleId: string) {
     await license.refreshModule(moduleId);
@@ -62,6 +92,7 @@
     license.clearError();
     code = '';
     confirmingDeactivate = false;
+    rebindToast = null;
   }
 
   function handleKeydown(e: KeyboardEvent) {
@@ -152,6 +183,22 @@
             >
               {viewState.loading ? 'Refreshing…' : 'Refresh'}
             </button>
+            {#if showRebindButton}
+              <!-- v0.2.36: admin-only "Rebind to this machine" affordance.
+                   Closes the recovery gap when the admin's OS reinstall
+                   leaves the Vault entry's machine_id_hash pinned to the
+                   old machine — /validate-tier returns machine_mismatch
+                   until the binding is updated. See the
+                   `rebind-admin-token` edge function. -->
+              <button
+                class="btn-3d btn-3d-ghost btn-3d-sm"
+                data-testid="rebind-admin-button"
+                onclick={handleRebind}
+                disabled={viewState.rebinding}
+              >
+                {viewState.rebinding ? 'Rebinding…' : 'Rebind to this machine'}
+              </button>
+            {/if}
             {#if !confirmingDeactivate}
               <button
                 class="btn-3d btn-3d-ghost btn-3d-sm danger"
@@ -167,6 +214,17 @@
                 Confirm deactivate
               </button>
             {/if}
+          </div>
+        {/if}
+
+        {#if rebindToast}
+          <div
+            class="msg"
+            class:msg-error={rebindToast.kind === 'error'}
+            class:msg-success={rebindToast.kind === 'success'}
+            role="status"
+          >
+            {rebindToast.message}
           </div>
         {/if}
 
@@ -359,6 +417,14 @@
     background: rgba(255, 79, 160, 0.1);
     border: 1px solid rgba(255, 79, 160, 0.25);
     color: var(--color-pink);
+  }
+
+  /* v0.2.36: success toast for the admin-rebind affordance. Reuses the
+     same teal accent the tier-card uses for the paid-license card. */
+  .msg-success {
+    background: rgba(0, 191, 166, 0.08);
+    border: 1px solid rgba(0, 191, 166, 0.25);
+    color: var(--color-text);
   }
 
   .spinner {

@@ -12,7 +12,7 @@
 
 import { writable } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
-import type { ModuleLicenseRow, TierCacheView } from '$lib/types/launcher';
+import type { AdminRebindResult, ModuleLicenseRow, TierCacheView } from '$lib/types/launcher';
 
 interface LicenseState {
   cache: TierCacheView | null;
@@ -23,6 +23,10 @@ interface LicenseState {
   moduleLicenses: ModuleLicenseRow[];
   loading: boolean;
   activating: boolean;
+  /** v0.2.36: in-flight indicator for the "Rebind to this machine"
+   *  affordance. Separate from `loading` so the orchestrator-tier
+   *  refresh spinner stays orthogonal to the rebind action. */
+  rebinding: boolean;
   error: string | null;
 }
 
@@ -31,6 +35,7 @@ const initial: LicenseState = {
   moduleLicenses: [],
   loading: false,
   activating: false,
+  rebinding: false,
   error: null,
 };
 
@@ -186,6 +191,60 @@ function createLicenseStore() {
           loading: false,
           error: e instanceof Error ? e.message : String(e),
         }));
+      }
+    },
+
+    /** v0.2.36: rebind the current admin token to this machine.
+     *
+     *  Calls the Rust `license_rebind_admin_token` command which:
+     *    1. reads the license key from the OS keychain (never crosses IPC);
+     *    2. computes the current machine_id_hash;
+     *    3. POSTs to `/functions/v1/rebind-admin-token`;
+     *    4. on success, refreshes the cached tier so /validate-tier
+     *       stops returning machine_mismatch.
+     *
+     *  Returns the wire result so the caller can render a precise toast
+     *  (success / specific failure code). On thrown IPC failure
+     *  (very rare — only if Tauri isn't available) the store falls back
+     *  to a synthesised `error: "ipc_unavailable"` result. */
+    async rebindAdminToken(): Promise<AdminRebindResult> {
+      if (!tauriAvailable()) {
+        return {
+          success: false,
+          user: null,
+          rebound_at: null,
+          error: 'ipc_unavailable',
+          detail: 'Tauri bridge not initialised; reload the launcher.',
+          machine_id_hash: '',
+        };
+      }
+      update((s) => ({ ...s, rebinding: true, error: null }));
+      try {
+        const result = await invoke<AdminRebindResult>('license_rebind_admin_token');
+        // Reload cache + module rows after a successful rebind so the
+        // dialog reflects the now-valid tier without a manual Refresh.
+        if (result.success) {
+          const cache = await invoke<TierCacheView>('license_get_tier');
+          const moduleLicenses = await fetchModuleLicensesSafe();
+          update((s) => ({ ...s, cache, moduleLicenses, rebinding: false }));
+        } else {
+          update((s) => ({ ...s, rebinding: false }));
+        }
+        return result;
+      } catch (e) {
+        update((s) => ({
+          ...s,
+          rebinding: false,
+          error: e instanceof Error ? e.message : String(e),
+        }));
+        return {
+          success: false,
+          user: null,
+          rebound_at: null,
+          error: 'ipc_failure',
+          detail: e instanceof Error ? e.message : String(e),
+          machine_id_hash: '',
+        };
       }
     },
 

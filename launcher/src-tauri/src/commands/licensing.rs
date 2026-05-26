@@ -313,6 +313,204 @@ fn remove_license_cache_for_token_gateway_in(home_override: Option<&std::path::P
     }
 }
 
+/// v0.2.36: expose `machine_id_hash()` to the frontend so the
+/// ActivationModal can show the current hash next to the "Rebind to
+/// this machine" affordance.
+///
+/// Returns the sha256 hex (64 lowercase chars) — same format
+/// `license_refresh` already sends to `/validate-tier`. The function
+/// is deterministic per-machine (sha256 of an 8-byte MAC-derived
+/// value), so callers can compare the returned value against the
+/// server-bound hash to detect mismatches before issuing a remote
+/// rebind.
+///
+/// This is a thin pure-read command — no DB access, no IPC value
+/// crosses the trust boundary that wouldn't already cross via
+/// `/validate-tier`. Safe to expose unconditionally.
+#[command]
+pub async fn get_machine_id_hash() -> Result<String, String> {
+    Ok(machine_id_hash())
+}
+
+/// The `rebind-admin-token` edge-function URL. Mirrors
+/// `DEFAULT_VALIDATE_TIER_URL` — same Supabase project, same
+/// reasoning for not using a custom DNS record.
+///
+/// Operators override via `VCT_REBIND_ADMIN_TOKEN_URL` for staging/dev
+/// (mirrors the `VCT_VALIDATE_TIER_URL` knob).
+const DEFAULT_REBIND_ADMIN_TOKEN_URL: &str =
+    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rebind-admin-token";
+
+fn rebind_admin_token_url() -> String {
+    std::env::var("VCT_REBIND_ADMIN_TOKEN_URL")
+        .unwrap_or_else(|_| DEFAULT_REBIND_ADMIN_TOKEN_URL.to_string())
+}
+
+/// Wire shape for the rebind result. Mirrors the server's success
+/// payload; on failure the frontend uses `error` + `detail` to render
+/// a toast. We deliberately do NOT expose the licence key value or any
+/// part of the Vault map to the frontend — only the durable
+/// classification ("did the rebind succeed, and if not, why").
+#[derive(Debug, serde::Serialize)]
+pub struct AdminRebindResult {
+    pub success: bool,
+    /// On success: the admin username the server bound the new hash to.
+    /// On failure: None.
+    pub user: Option<String>,
+    /// On success: ISO-8601 from the server.
+    pub rebound_at: Option<String>,
+    /// On failure: server's `error` field (e.g. `license_invalid`,
+    /// `rebind_failed`) or a local error code.
+    pub error: Option<String>,
+    /// On failure: server's `detail` field if present.
+    pub detail: Option<String>,
+    /// Always populated — the hash the rebind was requested for. The
+    /// frontend uses it to refresh the displayed "current machine"
+    /// label after success.
+    pub machine_id_hash: String,
+}
+
+/// v0.2.36: orchestrate the admin-token rebind from Rust so the
+/// license key never crosses the IPC boundary to the frontend.
+///
+/// Flow:
+///   1. Read license_key from the OS keychain.
+///   2. Refuse if it isn't a vct_admin_* shape (the rebind endpoint
+///      is exclusively for the Vault-admin path; LS-license keys
+///      can't be machine-rebound through here).
+///   3. Compute machine_id_hash via the same helper `license_refresh`
+///      uses → submit to `/functions/v1/rebind-admin-token`.
+///   4. On 200 success: trigger a full `license_refresh` so the cached
+///      tier reflects the now-valid binding (the next
+///      `/validate-tier` call should return `tier=admin` instead of
+///      `error=machine_mismatch`).
+///   5. Return a structured result for the frontend toast.
+///
+/// Soft-fail semantics:
+///   * Network failure → error="network", success=false.
+///   * Non-2xx → error from server body (license_invalid /
+///     rebind_failed / service_misconfigured / license_key_invalid_format).
+///   * Keychain miss → error="no_license_key", success=false.
+///   * Non-admin token shape → error="not_an_admin_token", success=false.
+#[command]
+pub async fn license_rebind_admin_token(db: State<'_, Db>) -> Result<AdminRebindResult, String> {
+    let hash = machine_id_hash();
+    let key_opt = read_license_key_from_keychain()?;
+    let key = match key_opt {
+        None => {
+            return Ok(AdminRebindResult {
+                success: false,
+                user: None,
+                rebound_at: None,
+                error: Some("no_license_key".to_string()),
+                detail: Some(
+                    "No license key found in the keychain. Activate the token first.".to_string(),
+                ),
+                machine_id_hash: hash,
+            });
+        }
+        Some(k) => k,
+    };
+
+    // Refuse non-admin keys at the launcher boundary so the user sees
+    // a precise error instead of the edge function's generic
+    // license_key_invalid_format response.
+    if !key.starts_with("vct_admin_") {
+        return Ok(AdminRebindResult {
+            success: false,
+            user: None,
+            rebound_at: None,
+            error: Some("not_an_admin_token".to_string()),
+            detail: Some(
+                "Machine rebind is only available for Vault-admin tokens (vct_admin_*). \
+                 LS-licensed users manage activations at vibecodedtools.it/account."
+                    .to_string(),
+            ),
+            machine_id_hash: hash,
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+
+    let resp = client
+        .post(&rebind_admin_token_url())
+        .json(&serde_json::json!({
+            "license_key": key,
+            "new_machine_id_hash": hash,
+        }))
+        .send()
+        .await;
+
+    match resp {
+        Err(e) => Ok(AdminRebindResult {
+            success: false,
+            user: None,
+            rebound_at: None,
+            error: Some("network".to_string()),
+            detail: Some(format!("{}", e)),
+            machine_id_hash: hash,
+        }),
+        Ok(r) => {
+            let status = r.status();
+            let body: serde_json::Value = r.json().await.unwrap_or(serde_json::json!({}));
+            if status.is_success() {
+                // Audit AFTER success — the row carries the new hash
+                // for cross-correlation with the server's
+                // admin_auth_log outcome='rebind' entry.
+                db.audit(
+                    "license_rebind_admin_token",
+                    None,
+                    None,
+                    &serde_json::json!({
+                        "key_prefix": key.chars().take(12).collect::<String>(),
+                        "new_machine_id_hash": &hash,
+                        "user": body.get("user").and_then(|v| v.as_str()),
+                    }),
+                )?;
+
+                // Refresh so the cached tier reflects the now-valid
+                // binding. Soft-fail (network/server quirk shouldn't
+                // mask the rebind success).
+                let _ = license_refresh(db.clone()).await;
+
+                Ok(AdminRebindResult {
+                    success: true,
+                    user: body
+                        .get("user")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    rebound_at: body
+                        .get("rebound_at")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    error: None,
+                    detail: None,
+                    machine_id_hash: hash,
+                })
+            } else {
+                Ok(AdminRebindResult {
+                    success: false,
+                    user: None,
+                    rebound_at: None,
+                    error: body
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| Some(format!("http_{}", status.as_u16()))),
+                    detail: body
+                        .get("detail")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    machine_id_hash: hash,
+                })
+            }
+        }
+    }
+}
+
 #[command]
 pub async fn license_get_tier(db: State<'_, Db>) -> Result<TierCacheView, String> {
     let row = db.get_tier_cache()?;
@@ -727,6 +925,26 @@ mod tests {
         };
         let view = to_view(row);
         assert_eq!(view.orchestrator_tier, "admin");
+    }
+
+    /// v0.2.36: `machine_id_hash()` returns a 64-char lowercase hex
+    /// string and is deterministic across invocations within the same
+    /// process. This is the contract the rebind-admin-token edge
+    /// function relies on (its regex requires `^[0-9a-f]{64}$`).
+    #[test]
+    fn machine_id_hash_is_64_char_lowercase_hex_and_deterministic() {
+        let h1 = machine_id_hash();
+        assert_eq!(h1.len(), 64, "expected 64 hex chars, got {} ({})", h1.len(), h1);
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "expected lowercase hex only: {}",
+            h1
+        );
+        // Determinism: a second call within the same process must
+        // produce the same value (so the rebind UX shows the same
+        // hash the validator persisted).
+        let h2 = machine_id_hash();
+        assert_eq!(h1, h2, "machine_id_hash() must be deterministic per-machine");
     }
 
     /// `license_is_admin` returns true iff cache says admin. Uses an

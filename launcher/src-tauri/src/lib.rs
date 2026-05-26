@@ -1398,6 +1398,13 @@ pub fn run() {
             commands::licensing::license_refresh,
             commands::licensing::license_activate,
             commands::licensing::license_deactivate,
+            // v0.2.36: machine-id hash for the admin-rebind UX. Pure
+            // read-only command; same value `license_refresh` sends
+            // to `/validate-tier`.
+            commands::licensing::get_machine_id_hash,
+            // v0.2.36: orchestrate the admin-token machine rebind from
+            // Rust so the license key never crosses the IPC boundary.
+            commands::licensing::license_rebind_admin_token,
             // v0.2.32 §D1: per-module license rows for the dialog.
             commands::licensing::get_module_licenses,
             commands::licensing::module_license_refresh,

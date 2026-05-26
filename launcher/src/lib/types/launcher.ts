@@ -248,6 +248,33 @@ export interface ModuleLicenseRow {
   activated_at: string | null;
 }
 
+/**
+ * v0.2.36: result shape for the admin-token machine-rebind command.
+ *
+ * Mirrors `launcher/src-tauri/src/commands/licensing.rs::AdminRebindResult`.
+ * The Rust side orchestrates the full rebind (read license key from
+ * keychain, compute machine_id_hash, POST to the edge function) so the
+ * frontend never touches the secret directly — the value never crosses
+ * the IPC boundary.
+ *
+ * On success: `success=true`, `user` and `rebound_at` populated.
+ * On failure: `success=false`, `error` and `detail` describe the cause
+ * (network failure, license_invalid, not_an_admin_token, no_license_key,
+ * rebind_failed, service_misconfigured, license_key_invalid_format,
+ * machine_id_hash_invalid_format).
+ *
+ * `machine_id_hash` is ALWAYS populated — useful for displaying the
+ * "current machine" label in the dialog regardless of outcome.
+ */
+export interface AdminRebindResult {
+  success: boolean;
+  user: string | null;
+  rebound_at: string | null;
+  error: string | null;
+  detail: string | null;
+  machine_id_hash: string;
+}
+
 export interface ModuleCatalogEntry {
   id: string;
   name: string;

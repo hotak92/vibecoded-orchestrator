@@ -439,6 +439,10 @@ export async function bindVaultAdminMachine(
  * Append a row to public.admin_auth_log via the standard PostgREST
  * insert path. Failure is non-blocking: the auth itself succeeds
  * regardless. Audit-log gaps are preferable to login failures.
+ *
+ * v0.2.36: `outcome` accepts `"rebind"` for the explicit machine-rebind
+ * path. The DB CHECK constraint is updated in
+ * `20260526_rebind_admin_machine.sql` to allow this value.
  */
 export async function appendAdminAuthLog(
   supabaseUrl: string,
@@ -446,7 +450,7 @@ export async function appendAdminAuthLog(
   row: {
     admin_user: string;
     machine_id_hash: string;
-    outcome: "success" | "expired" | "machine_mismatch";
+    outcome: "success" | "expired" | "machine_mismatch" | "rebind";
     ip_hash?: string | null;
     user_agent?: string | null;
   },
@@ -465,4 +469,96 @@ export async function appendAdminAuthLog(
   } catch (_) {
     /* non-blocking — silent failure */
   }
+}
+
+/**
+ * Rebind a Vault-token admin user's `machine_id_hash` to a new value
+ * via the public.rebind_vault_admin_machine() SECURITY DEFINER RPC.
+ *
+ * Unlike `bindVaultAdminMachine` (which is TOFU-only and refuses to
+ * touch a non-NULL binding), this helper ALWAYS overwrites the
+ * existing binding. The caller MUST have already authenticated the
+ * submitted `vct_admin_*` token to the named user via a constant-time
+ * compare against the Vault map — possession of the token is the
+ * authorization, validated by the edge function before this call.
+ *
+ * Returns true on successful rebind, false on:
+ *   - user not present in the Vault map (someone removed it concurrently)
+ *   - Vault secret missing
+ *   - any RPC / network failure
+ *
+ * Used by the `rebind-admin-token` edge function (v0.2.36).
+ */
+export async function rebindVaultAdminMachine(
+  supabaseUrl: string,
+  serviceRoleKey: string,
+  user: string,
+  machineHash: string,
+): Promise<boolean> {
+  try {
+    const url = `${supabaseUrl}/rest/v1/rpc/rebind_vault_admin_machine`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${serviceRoleKey}`,
+        "apikey": serviceRoleKey,
+      },
+      body: JSON.stringify({
+        p_user: user,
+        p_machine_id_hash: machineHash,
+      }),
+    });
+    if (!resp.ok) return false;
+    const body = await resp.text();
+    return body.trim() === "true";
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Locate the Vault admin user that owns a submitted `vct_admin_*`
+ * token. Pure function — same constant-time semantics as
+ * `lookupVaultAdminToken` but returns ONLY the username (no machine
+ * binding check, no expiry check). The caller decides what to do with
+ * the match (currently: the rebind-admin-token edge function uses it
+ * to authorize a rebind by token possession alone).
+ *
+ * Why this is safe to expose alongside `lookupVaultAdminToken`:
+ *   * Token comparison is constant-time → no timing oracle.
+ *   * Token must already have the `vct_admin_` prefix → cheap
+ *     short-circuit on misuse with LS UUID keys.
+ *   * Expired tokens still match. The rebind path explicitly does
+ *     NOT block on expiry — an admin reinstalling their OS after
+ *     their old token expired still wants the rebind path to work
+ *     (so they can then rotate the expires_at via SQL). Adding an
+ *     expiry check here would block the recovery path the function
+ *     exists to provide.
+ *
+ * Returns the username on match, null on miss (or unparseable vault JSON).
+ */
+export function lookupVaultAdminTokenUser(
+  submittedKey: string,
+  vaultJson: string | null | undefined,
+): string | null {
+  if (!submittedKey.startsWith("vct_admin_")) return null;
+  if (!vaultJson) return null;
+
+  let map: Record<string, VaultAdminTokenRecord>;
+  try {
+    const parsed = JSON.parse(vaultJson);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+    map = parsed;
+  } catch (_) {
+    return null;
+  }
+
+  for (const [user, record] of Object.entries(map)) {
+    if (!record || typeof record.token !== "string") continue;
+    if (constantTimeEq(submittedKey, record.token)) return user;
+  }
+  return null;
 }
