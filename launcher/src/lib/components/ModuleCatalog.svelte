@@ -18,7 +18,7 @@
   import { selectedProject, projects } from '$lib/stores/projects';
   import { license } from '$lib/stores/license';
   import { toast } from '$lib/stores/toast';
-  import type { ModuleCatalogEntry, ModuleInstallRow } from '$lib/types/launcher';
+  import type { ModuleCatalogEntry } from '$lib/types/launcher';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import DeprecationBanner from '$lib/components/DeprecationBanner.svelte';
   // v0.2.33 (Agent E, 2026-05-25):
@@ -29,6 +29,16 @@
   import ManifestParseErrorModal from '$lib/components/ManifestParseErrorModal.svelte';
   import L0StatusIndicator from '$lib/components/L0StatusIndicator.svelte';
   import DevAffordanceToast from '$lib/components/DevAffordanceToast.svelte';
+  // v0.2.35 (Agent J): per-status display contract for the tile.
+  // Replaces the previous inline gating (which conflated "row exists"
+  // with "module healthy" and left status='error'/'broken' rows stuck
+  // with only an Uninstall CTA — no retry path short of a full
+  // Uninstall-then-Install loop).
+  import {
+    resolveTileDisplay,
+    truncateLastError,
+    statusBadgeLabel,
+  } from '$lib/module-status-display';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -302,31 +312,22 @@
     }
   }
 
-  /**
-   * Best-effort semver comparison. Splits on '.', parses the leading integer
-   * of each segment (so "0.2.4-dev" → 0.2.4), and compares lexicographically.
-   * Returns true iff `a` is strictly less than `b`.
-   */
-  function semverLess(a: string, b: string): boolean {
-    const parse = (v: string): number[] =>
-      v.split('.').map((s) => {
-        const match = s.match(/^(\d+)/);
-        return match ? parseInt(match[1], 10) : 0;
-      });
-    const aa = parse(a);
-    const bb = parse(b);
-    for (let i = 0; i < Math.max(aa.length, bb.length); i++) {
-      const x = aa[i] ?? 0;
-      const y = bb[i] ?? 0;
-      if (x < y) return true;
-      if (x > y) return false;
-    }
-    return false;
-  }
+  // v0.2.35 (Agent J): `semverLess` + `hasUpdate` extracted into
+  // `$lib/module-status-display` (same comparison logic, re-exported
+  // as part of `resolveTileDisplay`'s `can_update` field). The
+  // refactor lets unit tests cover the full gating matrix without a
+  // Svelte runtime.
 
-  function hasUpdate(m: ModuleCatalogEntry, installRow: ModuleInstallRow | null): boolean {
-    if (!installRow?.module_version) return false;
-    return semverLess(installRow.module_version, m.version);
+  // v0.2.35 (Agent J): retry-install handler. Calls the SAME
+  // `install_module_for_project` Tauri command as the first-time
+  // install path — the v0.2.34 UPSERT contract (Agent A) means the
+  // existing error/broken row is overwritten rather than triggering
+  // a UNIQUE-constraint crash. Keeps `handleInstall`'s missing-secret
+  // detection so the retry path can also surface the Open-Secrets prompt
+  // if the previous failure was a secret omission and the user hasn't
+  // fixed it yet.
+  async function handleRetryInstall(m: ModuleCatalogEntry) {
+    await handleInstall(m);
   }
 
   /** Centralized tier display label. Capitalizes "pro"/"mao"/"enterprise"/"admin". */
@@ -536,10 +537,10 @@
   {:else}
     <div class="card-grid">
       {#each visible as m (m.id)}
-        {@const isInstalled = installed.has(m.id)}
         {@const installRow = getInstalledRow(m)}
         {@const color = colorFor(m.id)}
         {@const installing = mState.installingId === m.id}
+        {@const display = resolveTileDisplay(m, installRow, installing)}
         <div class="module-card glass-card" style:--accent="rgb({colorRgb(color)})">
           <div class="card-head">
             <div class="card-icon" style:background="rgba({colorRgb(color)}, 0.12)" style:border-color="rgba({colorRgb(color)}, 0.25)">
@@ -574,66 +575,116 @@
               Hosts: {m.compatibility_hosts.join(', ')}
             </p>
           {/if}
-          {#if installRow?.last_error}
+          {#if display.kind === 'errored'}
+            <!-- v0.2.35 (Agent J): error/broken tile — explicit
+                 "Reason: …" label with click-to-expand for long
+                 errors. The full `last_error` payload is still
+                 available via the `<details>` element so triage
+                 (especially in support / bug-report flows) doesn't
+                 require copy-pasting from launcher.db. -->
+            {@const truncated = truncateLastError(display.last_error)}
+            <div class="card-error card-error-labelled" data-testid="card-error-labelled">
+              <div class="card-error-head">
+                <span class="card-error-label">
+                  {statusBadgeLabel(display.status)}:
+                </span>
+                <span class="card-error-msg" data-testid="card-error-msg">
+                  {truncated.display || 'no details recorded'}
+                </span>
+              </div>
+              {#if truncated.truncated && display.last_error}
+                <details class="card-error-details">
+                  <summary>Show full error</summary>
+                  <pre class="card-error-full">{display.last_error}</pre>
+                </details>
+              {/if}
+            </div>
+          {:else if installRow?.last_error}
+            <!-- Historic last_error on a recovered row — kept
+                 unlabelled to match the pre-v0.2.35 behavior so we
+                 don't regress the happy path. The reconciler normally
+                 clears this on a successful subsequent install. -->
             <div class="card-error">
               {installRow.last_error}
             </div>
           {/if}
           <div class="card-footer">
-            {#if m.kind === 'bundled'}
+            {#if display.kind === 'bundled'}
               <!-- Bug 16: launcher itself — no Install/Uninstall -->
               <span class="status-badge status-badge-bundled">Bundled</span>
-            {:else if m.kind === 'subcomponent'}
+            {:else if display.kind === 'included'}
               <!-- Bug 16: KG / Code Graph — shipped with orchestrator -->
               <span class="status-badge status-badge-included"
-                >Included with {m.parent_id}</span
+                >Included with {display.parent_id}</span
               >
-              {#if m.cta_route}
+              {#if display.cta_route}
                 <button
                   class="btn-3d btn-3d-ghost btn-3d-sm"
-                  onclick={() => goto(m.cta_route)}
+                  onclick={() => goto(display.cta_route)}
                 >
                   → Open dashboard
                 </button>
               {/if}
-            {:else if m.kind === 'installed' || isInstalled}
+            {:else if display.kind === 'installed'}
               <!-- Installed: toggle + (optional Update) + Uninstall -->
               <label class="enabled-toggle">
                 <input
                   type="checkbox"
-                  checked={installRow?.enabled ?? true}
+                  checked={display.install_row.enabled}
                   onchange={(e) => handleToggleEnabled(m, (e.target as HTMLInputElement).checked)}
                   aria-label="Enable or disable {m.name}"
                 />
                 <span>Enabled</span>
               </label>
-              {#if installRow}
-                {#if hasUpdate(m, installRow)}
-                  <button
-                    class="btn-3d btn-3d-primary btn-3d-sm"
-                    onclick={() => handleUpdate(m)}
-                    disabled={installing}
-                    aria-label="Update {m.name} from version {installRow.module_version} to version {m.version}"
-                  >
-                    {#if installing}
-                      <span class="spinner-sm"></span>
-                      Updating…
-                    {:else}
-                      Update v{installRow.module_version} → v{m.version}
-                    {/if}
-                  </button>
-                {/if}
+              {#if display.can_update}
                 <button
-                  class="btn-3d btn-3d-ghost btn-3d-sm"
-                  onclick={() => handleUninstall(m)}
-                  aria-label="Uninstall {m.name}"
+                  class="btn-3d btn-3d-primary btn-3d-sm"
+                  onclick={() => handleUpdate(m)}
+                  disabled={installing}
+                  aria-label="Update {m.name} from version {display.install_row.module_version} to version {m.version}"
                 >
-                  Uninstall
+                  Update v{display.install_row.module_version} → v{m.version}
                 </button>
-              {:else}
-                <span class="status-badge status-badge-bundled">Installed</span>
               {/if}
-            {:else if m.license_required && !m.is_licensed}
+              <button
+                class="btn-3d btn-3d-ghost btn-3d-sm"
+                onclick={() => handleUninstall(m)}
+                aria-label="Uninstall {m.name}"
+                data-testid="btn-uninstall"
+              >
+                Uninstall
+              </button>
+            {:else if display.kind === 'errored'}
+              <!-- v0.2.35 (Agent J): retry + uninstall pair for
+                   status='error' (install pipeline failed) and
+                   status='broken' (reconciler found ~/.vct/modules/<id>
+                   missing on startup). Same Tauri command for both —
+                   `install_module_for_project` (UPSERT under v0.2.34
+                   Agent A's contract) overwrites the existing row. -->
+              <button
+                class="btn-3d btn-3d-primary btn-3d-sm"
+                onclick={() => handleRetryInstall(m)}
+                disabled={installing || !project}
+                aria-label="Retry installing {m.name}"
+                data-testid="btn-retry"
+              >
+                Retry install
+              </button>
+              <button
+                class="btn-3d btn-3d-ghost btn-3d-sm"
+                onclick={() => handleUninstall(m)}
+                aria-label="Uninstall {m.name}"
+                data-testid="btn-uninstall"
+              >
+                Uninstall
+              </button>
+            {:else if display.kind === 'installing'}
+              <!-- In-flight install/retry/update — spinner-only, no buttons. -->
+              <span class="status-badge status-badge-bundled">
+                <span class="spinner-sm" aria-hidden="true"></span>
+                Installing…
+              </span>
+            {:else if display.kind === 'available' && display.needs_license}
               <!-- Not installed + tier-required + unlicensed: activate, not "upgrade". -->
               <button
                 class="btn-3d btn-3d-secondary btn-3d-sm"
@@ -643,18 +694,15 @@
                 Activate license
               </button>
             {:else}
+              <!-- display.kind === 'available' && !needs_license -->
               <button
                 class="btn-3d btn-3d-primary btn-3d-sm"
                 onclick={() => handleInstall(m)}
                 disabled={installing || !project}
                 aria-label="Install {m.name}"
+                data-testid="btn-install"
               >
-                {#if installing}
-                  <span class="spinner-sm"></span>
-                  Installing…
-                {:else}
-                  Install
-                {/if}
+                Install
               </button>
             {/if}
           </div>
@@ -1002,6 +1050,55 @@
     border-radius: 8px;
     color: var(--color-pink);
     font-size: 10px;
+  }
+
+  /* v0.2.35 (Agent J): labelled variant for error/broken tiles. The
+     label tag ("Install failed:" / "Files missing:") goes in bold; the
+     message body stays inline so a short error reads as one line. */
+  .card-error-labelled {
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .card-error-head {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    flex-wrap: wrap;
+  }
+  .card-error-label {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-size: 10px;
+    flex-shrink: 0;
+  }
+  .card-error-msg {
+    word-break: break-word;
+    flex: 1;
+    min-width: 0;
+  }
+  .card-error-details {
+    margin-top: 6px;
+    font-size: 10px;
+  }
+  .card-error-details summary {
+    cursor: pointer;
+    color: var(--color-pink);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .card-error-full {
+    margin-top: 4px;
+    padding: 6px 8px;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 6px;
+    color: var(--color-text);
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 10px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow-y: auto;
   }
 
   .card-footer {

@@ -9,7 +9,14 @@
 
 export type ProjectHost = 'base' | 'mao' | 'orchestrator_root';
 
-export type ModuleStatus = 'installing' | 'installed' | 'running' | 'stopped' | 'error';
+// v0.2.35 (Agent J): added 'broken' to mirror the Rust enum
+// (vct-launcher-core/src/db/models.rs::ModuleStatus::Broken — surfaced by
+// the startup reconciler when ~/.vct/modules/<id>/ has gone missing).
+// Previously this TS type drifted from the Rust source: the launcher would
+// receive `"broken"` strings from `list_installed_modules` and silently
+// type-cast them to nothing actionable. Now the catalog tile renders a
+// distinct Retry-install + Uninstall pair for both error and broken rows.
+export type ModuleStatus = 'installing' | 'installed' | 'running' | 'stopped' | 'error' | 'broken';
 
 export type SecretScope = 'per_project' | 'shared' | 'global';
 
