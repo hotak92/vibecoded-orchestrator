@@ -38,6 +38,7 @@ use tokio::process::Command;
 use crate::db::models::ProjectRow;
 use crate::db::Db;
 use crate::manifest::{ModuleManifest, PlaceholderCtx, PortMapping, VolumeMount};
+use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -401,7 +402,7 @@ pub fn build_podman_run_args(
 /// across module boundaries).
 async fn detect_container_runtime() -> Result<String, String> {
     for candidate in ["podman", "docker"] {
-        let probe = Command::new(candidate)
+        let probe = Command::new(candidate).silent()
             .args(["--version"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -479,7 +480,7 @@ pub async fn start_container_for_module(
     let podman = detect_container_runtime().await?;
 
     // Idempotency: force-remove any prior container with the same name.
-    let _ = Command::new(&podman)
+    let _ = Command::new(&podman).silent()
         .args(["rm", "-f", &container_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -503,7 +504,7 @@ pub async fn start_container_for_module(
 
     let args = build_podman_run_args(manifest, ctx, project, rl_port, &container_name, &image)?;
 
-    let mut cmd = Command::new(&podman);
+    let mut cmd = Command::new(&podman).silent();
     cmd.args(&args);
     cmd.env_clear();
     for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
@@ -603,14 +604,14 @@ fn allocate_random_rl_port() -> u16 {
 pub async fn stop_container_for_project(container_name: &str) -> Result<(), String> {
     let podman = detect_container_runtime().await?;
 
-    let _ = Command::new(&podman)
+    let _ = Command::new(&podman).silent()
         .args(["stop", "-t", "10", container_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await;
 
-    let _ = Command::new(&podman)
+    let _ = Command::new(&podman).silent()
         .args(["rm", container_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -624,7 +625,7 @@ pub async fn stop_container_for_project(container_name: &str) -> Result<(), Stri
 /// when the container doesn't exist OR is in any non-running state.
 pub async fn is_container_running(container_name: &str) -> Result<bool, String> {
     let podman = detect_container_runtime().await?;
-    let output = Command::new(&podman)
+    let output = Command::new(&podman).silent()
         .args(["inspect", "--format", "{{.State.Status}}", container_name])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

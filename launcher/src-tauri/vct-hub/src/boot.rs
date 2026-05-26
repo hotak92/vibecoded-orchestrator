@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::lifecycle::LifecycleResult;
+use vct_launcher_core::process::CommandExt as _;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -478,7 +479,7 @@ mod linux {
         // `systemctl --user is-enabled vct-hub.service` exits 0 if
         // enabled, non-zero with stdout "disabled" / "linked" / "masked"
         // otherwise.
-        let out = Command::new("systemctl")
+        let out = Command::new("systemctl").silent()
             .args(["--user", "is-enabled", "vct-hub.service"])
             .output()
             .map_err(|_| BootError::ToolNotFound { tool: "systemctl" })?;
@@ -492,7 +493,7 @@ mod linux {
 
     fn check_systemctl_available() -> Result<(), BootError> {
         // First: is systemctl on PATH at all?
-        let probe = Command::new("systemctl").arg("--version").output();
+        let probe = Command::new("systemctl").silent().arg("--version").output();
         let ok = probe.as_ref().map(|o| o.status.success()).unwrap_or(false);
         if !ok {
             return Err(BootError::ToolNotFound { tool: "systemctl" });
@@ -506,7 +507,7 @@ mod linux {
         // exit code AND missing stdout. The "is-system-running"
         // command on a session bus returns text like "running" even
         // when degraded, so a zero-byte stdout is the smoke signal.
-        let user_probe = Command::new("systemctl")
+        let user_probe = Command::new("systemctl").silent()
             .args(["--user", "is-system-running"])
             .output();
         if let Ok(o) = user_probe {
@@ -523,7 +524,7 @@ mod linux {
     }
 
     fn run_systemctl(args: &[&str]) -> Result<(), BootError> {
-        let out = Command::new("systemctl")
+        let out = Command::new("systemctl").silent()
             .args(args)
             .output()
             .map_err(|_| BootError::ToolNotFound { tool: "systemctl" })?;
@@ -589,11 +590,11 @@ mod macos {
 
         // If the agent is already loaded, bootstrap fails. Bootout
         // first to make re-registration idempotent.
-        let _ = Command::new("launchctl")
+        let _ = Command::new("launchctl").silent()
             .args(["bootout", &label_target])
             .output();
 
-        let out = Command::new("launchctl")
+        let out = Command::new("launchctl").silent()
             .args([
                 "bootstrap",
                 &target,
@@ -608,7 +609,7 @@ mod macos {
             });
         }
         // Kickstart so the agent runs NOW, not only at next login.
-        let _ = Command::new("launchctl")
+        let _ = Command::new("launchctl").silent()
             .args(["kickstart", "-k", &label_target])
             .output();
         Ok(plist_path)
@@ -619,7 +620,7 @@ mod macos {
         let uid = unsafe { libc::getuid() };
         let label_target = format!("gui/{}/{}", uid, LABEL);
         // Tolerate failure here; "Boot-out failed: not loaded" is fine.
-        let _ = Command::new("launchctl")
+        let _ = Command::new("launchctl").silent()
             .args(["bootout", &label_target])
             .output();
         if plist_path.exists() {
@@ -638,7 +639,7 @@ mod macos {
         // `launchctl print <target>` exits 0 if loaded, non-zero
         // otherwise. We only care about the exit code; output is
         // verbose.
-        let out = Command::new("launchctl")
+        let out = Command::new("launchctl").silent()
             .args(["print", &label_target])
             .output()
             .map_err(|_| BootError::ToolNotFound { tool: "launchctl" })?;
@@ -660,7 +661,7 @@ mod macos {
     /// doc and the Step 7 codesign-pipeline followup gated for
     /// v0.2.21.1.
     fn warn_if_unsigned(bin: &Path) {
-        let out = Command::new("codesign")
+        let out = Command::new("codesign").silent()
             .args(["-dv", "--verbose=2"])
             .arg(bin)
             .output();
@@ -718,7 +719,7 @@ mod windows {
 
         // /Create /F overwrites any existing task with the same name
         // (idempotency).
-        let out = Command::new("schtasks")
+        let out = Command::new("schtasks").silent()
             .args(["/Create", "/TN", TASK_NAME, "/XML"])
             .arg(&xml_path)
             .arg("/F")
@@ -735,7 +736,7 @@ mod windows {
         // user sees the hub running. /I = run interactively as current
         // user. Failure tolerated (hub may already be running, started
         // by the launcher).
-        let _ = Command::new("schtasks")
+        let _ = Command::new("schtasks").silent()
             .args(["/Run", "/TN", TASK_NAME, "/I"])
             .output();
         Ok(xml_path)
@@ -743,7 +744,7 @@ mod windows {
 
     pub(super) fn unregister() -> Result<(), BootError> {
         // /F suppresses confirmation prompt.
-        let _ = Command::new("schtasks")
+        let _ = Command::new("schtasks").silent()
             .args(["/Delete", "/TN", TASK_NAME, "/F"])
             .output();
         // Best-effort: remove the shim + xml too.
@@ -758,7 +759,7 @@ mod windows {
 
     pub(super) fn status() -> Result<BootStatus, BootError> {
         // /Query exits 0 if the task exists, 1 otherwise.
-        let out = Command::new("schtasks")
+        let out = Command::new("schtasks").silent()
             .args(["/Query", "/TN", TASK_NAME])
             .output()
             .map_err(|_| BootError::ToolNotFound { tool: "schtasks" })?;
@@ -766,7 +767,7 @@ mod windows {
             return Ok(BootStatus::NotInstalled);
         }
         // Task exists. Use /V /FO LIST for parseable output.
-        let detail = Command::new("schtasks")
+        let detail = Command::new("schtasks").silent()
             .args(["/Query", "/TN", TASK_NAME, "/V", "/FO", "LIST"])
             .output()
             .map_err(|_| BootError::ToolNotFound { tool: "schtasks" })?;
@@ -780,7 +781,7 @@ mod windows {
         // invariant (the Microsoft.Management.Infrastructure CIM
         // class). If PowerShell is unavailable, defer to the schtasks
         // parse result.
-        if let Ok(ps) = Command::new("powershell")
+        if let Ok(ps) = Command::new("powershell").silent()
             .args([
                 "-NoProfile",
                 "-Command",
@@ -821,7 +822,7 @@ mod windows {
     /// username changes. We use whoami instead of the windows-rs FFI
     /// to keep vct-hub's dep surface lean.
     fn current_user_sid() -> Result<String, BootError> {
-        let out = Command::new("whoami")
+        let out = Command::new("whoami").silent()
             .args(["/user", "/fo", "list"])
             .output()
             .map_err(|_| BootError::ToolNotFound { tool: "whoami" })?;

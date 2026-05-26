@@ -10,6 +10,7 @@ use crate::secrets::{self, SecretScope};
 // uses, sourced from the core crate so the re-export visibility in
 // `lib.rs` (`pub(crate) use`) doesn't matter here.
 use vct_launcher_core::process::pid_is_alive;
+use vct_launcher_core::process::CommandExt as _;
 
 /// Upstream GitHub repo. Auto-update isn't fully wired yet — initial
 /// install is a local file copy from the launcher's bundled repo source
@@ -704,7 +705,7 @@ pub async fn get_installed_version(path: String) -> Result<String, String> {
         return Err("Not a git repository".to_string());
     }
 
-    let tag_output = tokio::process::Command::new("git")
+    let tag_output = tokio::process::Command::new("git").silent()
         .args(["describe", "--tags", "--abbrev=0"])
         .current_dir(&p)
         .output()
@@ -718,7 +719,7 @@ pub async fn get_installed_version(path: String) -> Result<String, String> {
         }
     }
 
-    let hash_output = tokio::process::Command::new("git")
+    let hash_output = tokio::process::Command::new("git").silent()
         .args(["rev-parse", "--short", "HEAD"])
         .current_dir(&p)
         .output()
@@ -815,7 +816,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                 e
             );
         } else {
-            let fetch = tokio::process::Command::new("git")
+            let fetch = tokio::process::Command::new("git").silent()
                 .args([
                     "fetch",
                     "--quiet",
@@ -838,7 +839,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                 // Detect the current branch so we know which upstream ref
                 // to compare against. Default to `main` on any error —
                 // matches the convention everywhere else in self_update.rs.
-                let branch_output = tokio::process::Command::new("git")
+                let branch_output = tokio::process::Command::new("git").silent()
                     .args(["rev-parse", "--abbrev-ref", "HEAD"])
                     .current_dir(&p)
                     .output()
@@ -862,7 +863,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
                 // only worked when tracking was configured against
                 // `origin/<branch>` — that conventional tracking config
                 // is exactly the foot-gun Design B is removing.
-                let revlist = tokio::process::Command::new("git")
+                let revlist = tokio::process::Command::new("git").silent()
                     .args([
                         "rev-list",
                         "--count",
@@ -1692,7 +1693,7 @@ pub async fn apply_hardware_reconfig(
     }
 
     let python_cmd = &system.python_cmd;
-    let mut cmd = tokio::process::Command::new(python_cmd);
+    let mut cmd = tokio::process::Command::new(python_cmd).silent();
     cmd.args(&argv)
         .current_dir(&install_path)
         .stdin(std::process::Stdio::null())
@@ -1977,7 +1978,7 @@ async fn detect_existing_volumes() -> Vec<ExistingVolume> {
         for name in ORCHESTRATOR_VOLUME_NAMES {
             // `volume inspect <name>` returns 0 with JSON if it exists,
             // non-zero if not. Read-only — never mutates state.
-            let out = tokio::process::Command::new(&runtime_path)
+            let out = tokio::process::Command::new(&runtime_path).silent()
                 .args(["volume", "inspect", name])
                 .output()
                 .await;
@@ -2420,7 +2421,7 @@ pub async fn install_orchestrator(
     }
 
     let python_cmd = &system.python_cmd;
-    let mut cmd = tokio::process::Command::new(python_cmd);
+    let mut cmd = tokio::process::Command::new(python_cmd).silent();
     cmd.args(&install_args)
         // Defense-in-depth: explicitly close stdin so install.py's input()
         // calls receive EOF instead of blocking indefinitely. The --quiet
@@ -2695,7 +2696,7 @@ async fn run_install_orchestrator_lightweight(
     );
 
     let python_cmd = &system.python_cmd;
-    let mut cmd = tokio::process::Command::new(python_cmd);
+    let mut cmd = tokio::process::Command::new(python_cmd).silent();
     cmd.args(&argv)
         .stdin(std::process::Stdio::null())
         .current_dir(&install_path);
@@ -3556,7 +3557,7 @@ pub async fn update_orchestrator<R: Runtime>(
     // <branch>` invocation below doesn't depend on upstream tracking
     // config (which would point at `origin/<branch>` on a fork). Default
     // to `main` on any error — matches the convention in self_update.rs.
-    let pull_branch_output = tokio::process::Command::new("git")
+    let pull_branch_output = tokio::process::Command::new("git").silent()
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(&install_path)
         .output()
@@ -3602,7 +3603,7 @@ pub async fn update_orchestrator<R: Runtime>(
     // `git show <sha>:<path>`; without a recent fetch the local refs
     // are stale and pre-merge sees no upstream changes.
     emit_progress(&window, "update", "Fetching upstream for pre-merge...", 7.0);
-    let fetch_for_premerge = tokio::process::Command::new("git")
+    let fetch_for_premerge = tokio::process::Command::new("git").silent()
         .args([
             "fetch",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
@@ -3685,7 +3686,7 @@ pub async fn update_orchestrator<R: Runtime>(
             &pull_branch,
         ]
     };
-    let pull = tokio::process::Command::new("git")
+    let pull = tokio::process::Command::new("git").silent()
         .args(pull_args)
         .current_dir(&install_path)
         .output()
@@ -3768,7 +3769,7 @@ pub async fn update_orchestrator<R: Runtime>(
     emit_progress(&window, "install", "Applying updates...", 40.0);
 
     let python_cmd = &system.python_cmd;
-    let mut cmd = tokio::process::Command::new(python_cmd);
+    let mut cmd = tokio::process::Command::new(python_cmd).silent();
     cmd.args(["install.py", "--update"])
         .stdin(std::process::Stdio::null())
         .current_dir(&install_path);
@@ -3871,7 +3872,7 @@ pub async fn update_orchestrator<R: Runtime>(
              fallback so the banner fires on next launcher start.",
             e,
         );
-        let mut fallback = tokio::process::Command::new(python_cmd);
+        let mut fallback = tokio::process::Command::new(python_cmd).silent();
         // Re-run --update without the auto-restart env. install.py's
         // update path is idempotent (git pull is already a no-op
         // post-success; seed step skips unchanged content per the
@@ -3997,7 +3998,7 @@ pub async fn update_orchestrator<R: Runtime>(
 /// Best-effort: read HEAD's full SHA. Returns None on any failure (offline,
 /// detached HEAD, corrupted repo). The frontend renders "—" in that slot.
 async fn read_head_sha(repo: &Path) -> Option<String> {
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args(["rev-parse", "HEAD"])
         .current_dir(repo)
         .output()
@@ -4019,7 +4020,7 @@ async fn read_head_sha(repo: &Path) -> Option<String> {
 /// caller may not have fetched recently — `ls-remote` always hits the
 /// network and reports the current upstream tip.
 async fn read_remote_sha(repo: &Path, branch: &str) -> Option<String> {
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args([
             "ls-remote",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
@@ -4067,7 +4068,7 @@ async fn collect_diverged_files(
     // Find the merge-base. If this fails (e.g. unrelated histories,
     // which shouldn't happen for any real VCO clone), fall back to the
     // pre-v0.2.27 behaviour rather than blocking the modal.
-    let merge_base = match tokio::process::Command::new("git")
+    let merge_base = match tokio::process::Command::new("git").silent()
         .args(["merge-base", "HEAD", &upstream_ref])
         .current_dir(repo)
         .output()
@@ -4087,7 +4088,7 @@ async fn collect_diverged_files(
     let run_diff = |spec: String| {
         let repo = repo.to_path_buf();
         async move {
-            let out = tokio::process::Command::new("git")
+            let out = tokio::process::Command::new("git").silent()
                 .args(["diff", "--name-only", &spec])
                 .current_dir(&repo)
                 .output()
@@ -4130,7 +4131,7 @@ async fn collect_diverged_files(
 /// unrelated histories — shouldn't happen for any real VCO clone but
 /// guard against it anyway).
 async fn legacy_collect_diverged_files(repo: &Path, branch: &str) -> Vec<String> {
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args([
             "diff",
             "--name-only",
@@ -4158,7 +4159,7 @@ async fn legacy_collect_diverged_files(repo: &Path, branch: &str) -> Vec<String>
 /// merge or rebase. `git diff --name-only --diff-filter=U` lists every
 /// path with unresolved merge markers.
 async fn collect_conflicted_files(repo: &Path) -> Vec<String> {
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args(["diff", "--name-only", "--diff-filter=U"])
         .current_dir(repo)
         .output()
@@ -4276,7 +4277,7 @@ fn is_merge_or_rebase_conflict(err: &str) -> bool {
 /// Mirrors the in-place logic in `update_orchestrator` so the two paths
 /// can't disagree.
 async fn resolve_pull_branch(install_path: &Path) -> String {
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(install_path)
         .output()
@@ -4364,7 +4365,7 @@ async fn run_pre_merge_user_editable(
     let mut merged_any = false;
     for outcome in &outcomes {
         if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
-            let status = tokio::process::Command::new("git")
+            let status = tokio::process::Command::new("git").silent()
                 .args(["add", "--"])
                 .arg(&outcome.path)
                 .current_dir(install_path)
@@ -4418,7 +4419,7 @@ async fn run_pre_merge_user_editable(
     if merged_any {
         let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
         let msg = format!("vco: pre-merge user-editable files via A0 ({})", ts);
-        let commit_result = tokio::process::Command::new("git")
+        let commit_result = tokio::process::Command::new("git").silent()
             .args([
                 "-c",
                 "user.name=VCO Orchestrator",
@@ -4452,13 +4453,13 @@ async fn run_pre_merge_user_editable(
                 );
                 for outcome in &outcomes {
                     if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
-                        let _ = tokio::process::Command::new("git")
+                        let _ = tokio::process::Command::new("git").silent()
                             .args(["restore", "--staged", "--"])
                             .arg(&outcome.path)
                             .current_dir(install_path)
                             .status()
                             .await;
-                        let _ = tokio::process::Command::new("git")
+                        let _ = tokio::process::Command::new("git").silent()
                             .args(["checkout", "--"])
                             .arg(&outcome.path)
                             .current_dir(install_path)
@@ -4537,7 +4538,7 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
     emit_progress(window, "install", "Applying updates...", 40.0);
 
     let python_cmd = &system.python_cmd;
-    let mut cmd = tokio::process::Command::new(python_cmd);
+    let mut cmd = tokio::process::Command::new(python_cmd).silent();
     cmd.args(["install.py", "--update"])
         .stdin(std::process::Stdio::null())
         .current_dir(install_path);
@@ -4598,7 +4599,7 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
              fallback so the banner fires on next launcher start.",
             e,
         );
-        let mut fallback = tokio::process::Command::new(python_cmd);
+        let mut fallback = tokio::process::Command::new(python_cmd).silent();
         fallback
             .args(["install.py", "--update"])
             .stdin(std::process::Stdio::null())
@@ -4718,7 +4719,7 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     // Best-effort: failures fall through to the bare pull which will
     // surface the original error via the existing B4 modal flow.
     emit_progress(&window, "update", "Fetching upstream for pre-merge...", 7.0);
-    let fetch_for_premerge = tokio::process::Command::new("git")
+    let fetch_for_premerge = tokio::process::Command::new("git").silent()
         .args([
             "fetch",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
@@ -4758,7 +4759,7 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     // --no-edit suppresses the editor for the merge commit message — a
     // Tauri subprocess has no controlling tty and would hang otherwise.
     emit_progress(&window, "update", "Merging upstream into local...", 10.0);
-    let pull = tokio::process::Command::new("git")
+    let pull = tokio::process::Command::new("git").silent()
         .args([
             "pull",
             "--no-rebase",
@@ -4896,7 +4897,7 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
     // --rebase` so a partial network failure doesn't leave us with a
     // half-applied rebase.
     emit_progress(&window, "update", "Fetching upstream for rebase...", 10.0);
-    let fetch = tokio::process::Command::new("git")
+    let fetch = tokio::process::Command::new("git").silent()
         .args([
             "fetch",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
@@ -4925,7 +4926,7 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         pull_branch
     );
-    let rebase = tokio::process::Command::new("git")
+    let rebase = tokio::process::Command::new("git").silent()
         .args(["rebase", &upstream_ref])
         .current_dir(&install_path)
         .output()
@@ -5016,7 +5017,7 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
     let mut last_err: Option<String> = None;
 
     if in_merge {
-        let out = tokio::process::Command::new("git")
+        let out = tokio::process::Command::new("git").silent()
             .args(["merge", "--abort"])
             .current_dir(&install_path)
             .output()
@@ -5031,7 +5032,7 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
     }
 
     if in_rebase {
-        let out = tokio::process::Command::new("git")
+        let out = tokio::process::Command::new("git").silent()
             .args(["rebase", "--abort"])
             .current_dir(&install_path)
             .output()
@@ -7049,7 +7050,7 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 /// Detects NVIDIA GPU + total VRAM (across all GPUs) in GB.
 /// Returns (has_gpu, first_gpu_name, total_vram_gb).
 async fn detect_nvidia_gpu() -> (bool, String, u64) {
-    let result = tokio::process::Command::new("nvidia-smi")
+    let result = tokio::process::Command::new("nvidia-smi").silent()
         .args([
             "--query-gpu=name,memory.total",
             "--format=csv,noheader,nounits",
@@ -7088,7 +7089,7 @@ async fn detect_nvidia_gpu() -> (bool, String, u64) {
 /// Detect AMD/ROCm GPU + VRAM. Returns (has_gpu, total_vram_gb).
 /// rocm-smi output varies by version; we try the simplest CSV form first.
 async fn detect_amd_gpu() -> (bool, u64) {
-    let result = tokio::process::Command::new("rocm-smi")
+    let result = tokio::process::Command::new("rocm-smi").silent()
         .args(["--showmeminfo", "vram", "--csv"])
         .output()
         .await;
@@ -7123,7 +7124,7 @@ async fn detect_runtime_version(cmd: &str) -> Option<String> {
     if !check_command_exists(cmd).await {
         return None;
     }
-    let out = tokio::process::Command::new(cmd)
+    let out = tokio::process::Command::new(cmd).silent()
         .arg("--version")
         .output()
         .await
@@ -7180,7 +7181,7 @@ fn detect_ram_gb_native() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn detect_ram_gb_native() -> Option<u64> {
-    let out = std::process::Command::new("sysctl")
+    let out = std::process::Command::new("sysctl").silent()
         .args(["-n", "hw.memsize"])
         .output()
         .ok()?;
@@ -7268,7 +7269,7 @@ async fn check_command_exists(cmd: &str) -> bool {
         }
         cmd_builder.output().await
     } else {
-        tokio::process::Command::new("which")
+        tokio::process::Command::new("which").silent()
             .arg(cmd)
             .output()
             .await
@@ -8310,7 +8311,7 @@ infrastructure
     /// resolves a real checkout, so the fallback path is exercised by
     /// the bundle-install case which doesn't need git.
     fn try_git_init(dir: &Path) -> bool {
-        let init = std::process::Command::new("git")
+        let init = std::process::Command::new("git").silent()
             .args(["init", "-q", "--initial-branch=main"])
             .current_dir(dir)
             .status();
@@ -8320,11 +8321,11 @@ infrastructure
         }
         // Local user.name/email so `git commit` doesn't blow up on
         // shards where git's global config isn't set.
-        let _ = std::process::Command::new("git")
+        let _ = std::process::Command::new("git").silent()
             .args(["config", "user.email", "test@example.com"])
             .current_dir(dir)
             .status();
-        let _ = std::process::Command::new("git")
+        let _ = std::process::Command::new("git").silent()
             .args(["config", "user.name", "test"])
             .current_dir(dir)
             .status();
@@ -8333,7 +8334,7 @@ infrastructure
 
     fn try_git_commit(dir: &Path, files: &[&str]) -> bool {
         for f in files {
-            let st = std::process::Command::new("git")
+            let st = std::process::Command::new("git").silent()
                 .args(["add", "--", f])
                 .current_dir(dir)
                 .status();
@@ -8341,7 +8342,7 @@ infrastructure
                 return false;
             }
         }
-        let st = std::process::Command::new("git")
+        let st = std::process::Command::new("git").silent()
             .args(["commit", "-q", "-m", "init"])
             .current_dir(dir)
             .status();
@@ -11494,11 +11495,11 @@ MemAvailable:   23456789 kB
                 // provably dead. Same pattern as
                 // vct_launcher_core::process::tests.
                 #[cfg(unix)]
-                let mut child = std::process::Command::new("true")
+                let mut child = std::process::Command::new("true").silent()
                     .spawn()
                     .expect("spawn true");
                 #[cfg(windows)]
-                let mut child = std::process::Command::new("cmd")
+                let mut child = std::process::Command::new("cmd").silent()
                     .args(["/c", "exit"])
                     .spawn()
                     .expect("spawn cmd /c exit");
@@ -12002,7 +12003,7 @@ MemAvailable:   23456789 kB
         /// Skip a test if `git --version` doesn't succeed.
         macro_rules! skip_if_no_git {
             () => {
-                if StdCommand::new("git")
+                if StdCommand::new("git").silent()
                     .arg("--version")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -12160,7 +12161,7 @@ MemAvailable:   23456789 kB
             let local = root.join("local");
 
             // Init the bare remote.
-            let status = StdCommand::new("git")
+            let status = StdCommand::new("git").silent()
                 .args(["init", "--bare", "--initial-branch=main"])
                 .arg(&remote)
                 .status()
@@ -12170,46 +12171,46 @@ MemAvailable:   23456789 kB
             // Init a seeding workdir, commit a base file, push to remote.
             let seed = root.join("seed");
             std::fs::create_dir_all(&seed).unwrap();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["init", "--initial-branch=main"])
                 .current_dir(&seed)
                 .status()
                 .unwrap()
                 .success());
             // Local config so commit succeeds even when global config is empty.
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["config", "user.email", "test@example.com"])
                 .current_dir(&seed)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["config", "user.name", "Test"])
                 .current_dir(&seed)
                 .status()
                 .unwrap()
                 .success());
             std::fs::write(seed.join("README.md"), "base\n").unwrap();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["add", "README.md"])
                 .current_dir(&seed)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["commit", "-m", "base"])
                 .current_dir(&seed)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["remote", "add", "origin"])
                 .arg(remote.to_str().unwrap())
                 .current_dir(&seed)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["push", "origin", "main"])
                 .current_dir(&seed)
                 .status()
@@ -12217,7 +12218,7 @@ MemAvailable:   23456789 kB
                 .success());
 
             // Clone the bare remote into the "local" workdir.
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["clone"])
                 .arg(remote.to_str().unwrap())
                 .arg(&local)
@@ -12225,13 +12226,13 @@ MemAvailable:   23456789 kB
                 .unwrap()
                 .success());
             // Local config in the clone.
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["config", "user.email", "test@example.com"])
                 .current_dir(&local)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["config", "user.name", "Test"])
                 .current_dir(&local)
                 .status()
@@ -12241,14 +12242,14 @@ MemAvailable:   23456789 kB
             // Add the canonical vco_upstream remote pointing at the bare
             // repo so the production code paths (which use vco_upstream,
             // not origin) work.
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["remote", "add", "vco_upstream"])
                 .arg(remote.to_str().unwrap())
                 .current_dir(&local)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["fetch", "vco_upstream"])
                 .current_dir(&local)
                 .status()
@@ -12259,19 +12260,19 @@ MemAvailable:   23456789 kB
             // "behind" (this gives the test a meaningful diff to detect).
             // Push the new commit via the seed workdir.
             std::fs::write(seed.join("UPSTREAM.md"), "upstream-only\n").unwrap();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["add", "UPSTREAM.md"])
                 .current_dir(&seed)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["commit", "-m", "upstream commit"])
                 .current_dir(&seed)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["push", "origin", "main"])
                 .current_dir(&seed)
                 .status()
@@ -12279,7 +12280,7 @@ MemAvailable:   23456789 kB
                 .success());
 
             // Re-fetch so vco_upstream/main reflects the new tip.
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["fetch", "vco_upstream"])
                 .current_dir(&local)
                 .status()
@@ -12292,13 +12293,13 @@ MemAvailable:   23456789 kB
         /// Add a local commit to the clone, so HEAD differs from vco_upstream/main.
         fn add_local_divergent_commit(local: &Path, file: &str, body: &str) {
             std::fs::write(local.join(file), body).unwrap();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["add", file])
                 .current_dir(local)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["commit", "-m", "local divergent"])
                 .current_dir(local)
                 .status()
@@ -12319,7 +12320,7 @@ MemAvailable:   23456789 kB
             // Attempt the same `git pull --ff-only` invocation
             // update_orchestrator runs. It must fail with a non-FF stderr
             // pattern that `is_non_fast_forward` recognizes.
-            let pull = tokio::process::Command::new("git")
+            let pull = tokio::process::Command::new("git").silent()
                 .args(["pull", "--ff-only", "vco_upstream", "main"])
                 .current_dir(&local)
                 .output()
@@ -12381,7 +12382,7 @@ MemAvailable:   23456789 kB
 
             // Run the same `git pull --no-rebase --no-edit vco_upstream main`
             // invocation merge_orchestrator_with_upstream uses.
-            let pull = tokio::process::Command::new("git")
+            let pull = tokio::process::Command::new("git").silent()
                 .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
                 .current_dir(&local)
                 .output()
@@ -12395,7 +12396,7 @@ MemAvailable:   23456789 kB
             );
 
             // Verify HEAD is now a merge commit (has two parents).
-            let parents = StdCommand::new("git")
+            let parents = StdCommand::new("git").silent()
                 .args(["rev-list", "--parents", "-n", "1", "HEAD"])
                 .current_dir(&local)
                 .output()
@@ -12437,13 +12438,13 @@ MemAvailable:   23456789 kB
             //
             // Step 1: modify locally + commit.
             std::fs::write(local.join("README.md"), "LOCAL VERSION\n").unwrap();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["add", "README.md"])
                 .current_dir(&local)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["commit", "-m", "local README change"])
                 .current_dir(&local)
                 .status()
@@ -12456,45 +12457,45 @@ MemAvailable:   23456789 kB
             let pusher = local.parent().unwrap().join("pusher");
             std::fs::create_dir_all(&pusher).unwrap();
             // Clone from the bare remote — same URL used in vco_upstream.
-            let remote_url = StdCommand::new("git")
+            let remote_url = StdCommand::new("git").silent()
                 .args(["remote", "get-url", "vco_upstream"])
                 .current_dir(&local)
                 .output()
                 .expect("get-url")
                 .stdout;
             let remote_url = String::from_utf8_lossy(&remote_url).trim().to_string();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["clone", &remote_url])
                 .arg(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["config", "user.email", "test@example.com"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["config", "user.name", "Test"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
             std::fs::write(pusher.join("README.md"), "UPSTREAM VERSION\n").unwrap();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["add", "README.md"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["commit", "-m", "upstream README change"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["push", "origin", "main"])
                 .current_dir(&pusher)
                 .status()
@@ -12503,7 +12504,7 @@ MemAvailable:   23456789 kB
 
             // Step 3: fetch vco_upstream in the local clone so it sees the
             // upstream README change.
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["fetch", "vco_upstream"])
                 .current_dir(&local)
                 .status()
@@ -12511,7 +12512,7 @@ MemAvailable:   23456789 kB
                 .success());
 
             // Step 4: attempt the merge — should fail with conflict.
-            let pull = tokio::process::Command::new("git")
+            let pull = tokio::process::Command::new("git").silent()
                 .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
                 .current_dir(&local)
                 .output()
@@ -12554,7 +12555,7 @@ MemAvailable:   23456789 kB
 
             // Cleanup: abort the merge so the tempdir can be removed
             // without lingering MERGE_HEAD state confusing the OS.
-            let _ = StdCommand::new("git")
+            let _ = StdCommand::new("git").silent()
                 .args(["merge", "--abort"])
                 .current_dir(&local)
                 .status();
@@ -12581,13 +12582,13 @@ MemAvailable:   23456789 kB
             // Set up overlapping changes (same scaffolding as the conflict
             // test).
             std::fs::write(local.join("README.md"), "LOCAL VERSION\n").unwrap();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["add", "README.md"])
                 .current_dir(&local)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["commit", "-m", "local README"])
                 .current_dir(&local)
                 .status()
@@ -12595,51 +12596,51 @@ MemAvailable:   23456789 kB
                 .success());
 
             let pusher = local.parent().unwrap().join("pusher2");
-            let remote_url = StdCommand::new("git")
+            let remote_url = StdCommand::new("git").silent()
                 .args(["remote", "get-url", "vco_upstream"])
                 .current_dir(&local)
                 .output()
                 .expect("get-url")
                 .stdout;
             let remote_url = String::from_utf8_lossy(&remote_url).trim().to_string();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["clone", &remote_url])
                 .arg(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["config", "user.email", "test@example.com"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["config", "user.name", "Test"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
             std::fs::write(pusher.join("README.md"), "UPSTREAM VERSION\n").unwrap();
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["add", "README.md"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["commit", "-m", "upstream README"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["push", "origin", "main"])
                 .current_dir(&pusher)
                 .status()
                 .unwrap()
                 .success());
-            assert!(StdCommand::new("git")
+            assert!(StdCommand::new("git").silent()
                 .args(["fetch", "vco_upstream"])
                 .current_dir(&local)
                 .status()
@@ -12647,7 +12648,7 @@ MemAvailable:   23456789 kB
                 .success());
 
             // Trigger the merge — expected to leave MERGE_HEAD.
-            let pull = StdCommand::new("git")
+            let pull = StdCommand::new("git").silent()
                 .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
                 .current_dir(&local)
                 .output()

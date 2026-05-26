@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::lockfile::{self, AcquireOutcome};
 use vct_launcher_core::process::pid_is_alive;
+use vct_launcher_core::process::CommandExt as _;
 
 /// Process-level outcome of a lifecycle action.
 #[derive(Debug)]
@@ -64,7 +65,7 @@ pub fn start_if_not_running() -> LifecycleResult {
     // child detaches from this console. We set them via the
     // `windows::process::CommandExt::creation_flags` extension that
     // ships with `std`.
-    let mut cmd = StdCommand::new(&exe);
+    let mut cmd = StdCommand::new(&exe).silent();
     cmd.arg("--foreground");
     // Drop stdio so the child doesn't inherit pipes that prevent
     // the parent's caller from completing (think: SessionStart hook

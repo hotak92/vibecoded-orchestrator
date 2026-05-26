@@ -19,6 +19,7 @@ use tauri::{command, AppHandle, Emitter, Manager, State};
 use crate::config::LocalConfig;
 use crate::db::code_graph_builds::{status as build_status, CodeGraphBuildRow};
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 /// Resolve the local Weaviate URL, mirroring the precedence rules in
 /// `commands::kg::weaviate_url`: env (`VCT_WEAVIATE_URL`, then legacy
@@ -1104,7 +1105,7 @@ async fn run_build_task(
 
     // 5. Run it. We capture stdout+stderr; they're combined into one
     //    log buffer (interleaving is fine for human debugging).
-    let mut cmd = tokio::process::Command::new(&script);
+    let mut cmd = tokio::process::Command::new(&script).silent();
     cmd.args(&args)
         // Don't inherit the launcher's working dir; the analyzer is
         // path-aware and we don't want it picking up an unrelated cwd.

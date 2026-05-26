@@ -50,6 +50,7 @@ use tauri::{command, AppHandle, State};
 use tokio::process::Command;
 
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 // ─── Wire types ──────────────────────────────────────────────────────────
 
@@ -199,7 +200,7 @@ fn build_script_command(project_folder: &PathBuf, name: &str) -> Result<Command,
         ));
     }
     let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("powershell");
+        let mut c = Command::new("powershell").silent();
         c.arg("-NoProfile")
             .arg("-ExecutionPolicy")
             .arg("Bypass")
@@ -207,7 +208,7 @@ fn build_script_command(project_folder: &PathBuf, name: &str) -> Result<Command,
             .arg(&path);
         c
     } else {
-        Command::new(&path)
+        Command::new(&path).silent()
     };
     cmd.current_dir(project_folder);
     Ok(cmd)

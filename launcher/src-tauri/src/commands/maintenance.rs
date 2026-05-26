@@ -68,6 +68,7 @@ use crate::mcp_registration::{
     register_default_orchestrator_mcps, user_claude_json, DEFAULT_CODE_EMBED_PORT,
     DEFAULT_GRPC_PORT, DEFAULT_OLLAMA_PORT, DEFAULT_WEAVIATE_PORT, ServicePorts,
 };
+use vct_launcher_core::process::CommandExt as _;
 
 /// Consent-token TTL for `run_schema_migrations`. Tokens issued by the
 /// FE expire after this window — long enough to cover a slow modal
@@ -643,7 +644,7 @@ fn run_migration_script(
         };
     }
     let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = std::process::Command::new("powershell.exe");
+        let mut c = std::process::Command::new("powershell.exe").silent();
         c.arg("-NoProfile")
             .arg("-ExecutionPolicy")
             .arg("Bypass")
@@ -651,7 +652,7 @@ fn run_migration_script(
             .arg(&script);
         c
     } else {
-        let mut c = std::process::Command::new("bash");
+        let mut c = std::process::Command::new("bash").silent();
         c.arg(&script);
         c
     };
@@ -1068,7 +1069,7 @@ struct ShellMaintRunner;
 
 impl MaintCommandRunner for ShellMaintRunner {
     fn pgrep(&self, pattern: &str) -> Result<String, String> {
-        let out = std::process::Command::new("pgrep")
+        let out = std::process::Command::new("pgrep").silent()
             .arg("-f")
             .arg(pattern)
             .output()
@@ -1087,7 +1088,7 @@ impl MaintCommandRunner for ShellMaintRunner {
     }
 
     fn kill_sighup(&self, pid: u32) -> Result<(), String> {
-        let out = std::process::Command::new("kill")
+        let out = std::process::Command::new("kill").silent()
             .arg("-HUP")
             .arg(pid.to_string())
             .output()

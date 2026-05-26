@@ -73,6 +73,7 @@
 use std::path::{Path, PathBuf};
 
 use globset::{GlobSet, GlobSetBuilder};
+use vct_launcher_core::process::CommandExt as _;
 
 /// Hardcoded allowlist of paths the orchestrator considers
 /// user-editable. Each entry is a `globset` pattern interpreted
@@ -171,7 +172,7 @@ pub(crate) async fn compute_base_sha(
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         upstream_branch,
     );
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args(["merge-base", "HEAD", &remote_ref])
         .current_dir(install_path)
         .output()
@@ -205,7 +206,7 @@ pub(crate) async fn compute_theirs_sha(
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         upstream_branch,
     );
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args(["rev-parse", &remote_ref])
         .current_dir(install_path)
         .output()
@@ -232,7 +233,7 @@ async fn list_diff_files(
     theirs: &str,
 ) -> Result<Vec<String>, String> {
     let spec = format!("{}...{}", base, theirs);
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args(["diff", "--name-only", &spec])
         .current_dir(install_path)
         .output()
@@ -266,7 +267,7 @@ async fn list_diff_files(
 /// SKIP the immediately-following `<old>` record (it's metadata, not
 /// a standalone status line). The same logic applies to copies (`C`).
 async fn list_locally_modified(install_path: &Path) -> Result<Vec<String>, String> {
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args(["status", "--porcelain", "-z"])
         .current_dir(install_path)
         .output()
@@ -337,7 +338,7 @@ async fn read_blob_at_rev(
     path: &str,
 ) -> Result<Option<Vec<u8>>, String> {
     let spec = format!("{}:{}", sha, path);
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args(["show", &spec])
         .current_dir(install_path)
         .output()
@@ -425,7 +426,7 @@ async fn do_3way_merge(
     // the long alias for the same flag and we pass both for clarity.
     // The labels (`-L`) make conflict markers more readable should the
     // caller ever write them to disk (we don't, but it helps debugging).
-    let out = tokio::process::Command::new("git")
+    let out = tokio::process::Command::new("git").silent()
         .args([
             "merge-file",
             "-p",
@@ -1577,7 +1578,7 @@ mod tests {
         let mut merged_any = false;
         for outcome in &outcomes {
             if matches!(outcome.kind, MergeOutcomeKind::Merged { .. }) {
-                let s = tokio::process::Command::new("git")
+                let s = tokio::process::Command::new("git").silent()
                     .args(["add", "--"])
                     .arg(&outcome.path)
                     .current_dir(local)
@@ -1591,7 +1592,7 @@ mod tests {
         if merged_any {
             // Match installer.rs' commit invocation: -c user.name, -c
             // user.email, --no-verify, fixed message.
-            let s = tokio::process::Command::new("git")
+            let s = tokio::process::Command::new("git").silent()
                 .args([
                     "-c",
                     "user.name=VCO Orchestrator",
@@ -1691,7 +1692,7 @@ mod tests {
 
         // git status must be clean (BLOCKER assertion: staged content
         // was committed, no pending dirty edits).
-        let status = StdCommand::new("git")
+        let status = StdCommand::new("git").silent()
             .args(["status", "--porcelain"])
             .current_dir(&local)
             .output()
@@ -1704,7 +1705,7 @@ mod tests {
 
         // The pre-merge commit must appear in the log with the
         // synthetic author + subject.
-        let log = StdCommand::new("git")
+        let log = StdCommand::new("git").silent()
             .args(["log", "--format=%an <%ae>%n%s", "-n", "5"])
             .current_dir(&local)
             .output()
@@ -1727,7 +1728,7 @@ mod tests {
         // "dirty working tree" (the original BLOCKER). The B4 modal
         // in installer.rs:3423 catches the non-FF case and offers
         // Merge/Rebase; that path is exercised below.
-        let ff_pull = StdCommand::new("git")
+        let ff_pull = StdCommand::new("git").silent()
             .args(["pull", "--ff-only", "vco_upstream", "main"])
             .current_dir(&local)
             .output()
@@ -1758,7 +1759,7 @@ mod tests {
         // Follow-up merge pull (the production fallback via the B4
         // modal → merge_orchestrator_with_upstream) must succeed and
         // land both edits.
-        let merge_pull = StdCommand::new("git")
+        let merge_pull = StdCommand::new("git").silent()
             .args([
                 "pull",
                 "--no-rebase",
@@ -1788,7 +1789,7 @@ mod tests {
         );
 
         // Working tree clean after merge.
-        let status = StdCommand::new("git")
+        let status = StdCommand::new("git").silent()
             .args(["status", "--porcelain"])
             .current_dir(&local)
             .output()
@@ -1851,7 +1852,7 @@ mod tests {
 
         // Non-FF merge pull (matches merge_orchestrator_with_upstream
         // invocation: --no-rebase --no-edit).
-        let pull = StdCommand::new("git")
+        let pull = StdCommand::new("git").silent()
             .args([
                 "pull",
                 "--no-rebase",
@@ -1883,7 +1884,7 @@ mod tests {
         );
 
         // git status must be clean.
-        let status = StdCommand::new("git")
+        let status = StdCommand::new("git").silent()
             .args(["status", "--porcelain"])
             .current_dir(&local)
             .output()
@@ -1943,7 +1944,7 @@ mod tests {
         // No synthetic commit should land — sidecar paths are not
         // staged. The git log head must still be the original seed
         // commit (only one commit; clone seed = HEAD).
-        let log_count = StdCommand::new("git")
+        let log_count = StdCommand::new("git").silent()
             .args(["rev-list", "--count", "HEAD"])
             .current_dir(&local)
             .output()
@@ -1960,7 +1961,7 @@ mod tests {
         // This is the expected behaviour; the B4 modal then surfaces
         // the conflict + the deferral entry (already on disk) tells
         // the user about the sidecar.
-        let pull = StdCommand::new("git")
+        let pull = StdCommand::new("git").silent()
             .args(["pull", "--ff-only", "vco_upstream", "main"])
             .current_dir(&local)
             .output()

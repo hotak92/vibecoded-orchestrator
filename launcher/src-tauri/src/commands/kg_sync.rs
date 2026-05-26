@@ -52,6 +52,7 @@ use crate::commands::installer::find_local_repo_root;
 use crate::commands::project_env_settings::{self, ProjectEnvSettings};
 use crate::db::kg_syncs::{status as sync_status, KgSyncRow};
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 const SYNC_EVENT: &str = "kg-sync-progress";
 
@@ -544,7 +545,7 @@ async fn run_subprocess(
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::sync::mpsc;
 
-    let mut cmd = tokio::process::Command::new(&program);
+    let mut cmd = tokio::process::Command::new(&program).silent();
     cmd.args(&base_args)
         .arg("--all")
         // KG_BASE_DIR + the project's own folder; sync_knowledge_graph.py

@@ -24,6 +24,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use vct_launcher_core::process::CommandExt as _;
 
 /// Refresh the per-user desktop shortcut(s) to point at the given launcher
 /// binary. Picks the highest-resolution icon shipped with `install_path`'s
@@ -127,7 +128,7 @@ fn refresh_linux(install_path: &Path, launcher_binary: &Path) -> Result<(), Stri
     // appears in the system menu without a re-login. Failure is
     // intentionally swallowed — the file is already written, which is
     // the contract.
-    let _ = std::process::Command::new("update-desktop-database")
+    let _ = std::process::Command::new("update-desktop-database").silent()
         .arg(&apps_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

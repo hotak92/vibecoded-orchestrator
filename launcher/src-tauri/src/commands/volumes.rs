@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use tauri::{command, AppHandle, Emitter};
 
 use super::installer::ExistingVolume;
+use vct_launcher_core::process::CommandExt as _;
 
 // ---------------------------------------------------------------------------
 // Migration progress event
@@ -819,7 +820,7 @@ pub async fn migrate_volumes(
     //    containers, leaves volumes intact.
     emit_phase(&app, MigratePhase::StoppingContainers, "Stopping containers");
     let compose_dir = orchestrator_root()?.join("infrastructure");
-    let compose_status = tokio::process::Command::new(&runtime)
+    let compose_status = tokio::process::Command::new(&runtime).silent()
         .args(["compose", "stop"])
         .current_dir(&compose_dir)
         .status()
@@ -863,7 +864,7 @@ pub async fn migrate_volumes(
                 e
             ));
         }
-        let cp_status = tokio::process::Command::new("cp")
+        let cp_status = tokio::process::Command::new("cp").silent()
             .args(["-a", &ev.mountpoint, dest.to_str().unwrap_or("")])
             .status()
             .await;
@@ -908,7 +909,7 @@ pub async fn migrate_volumes(
     // 4. compose up -d. If it fails, ditch the override + .env entry
     //    and restart with old volumes.
     emit_phase(&app, MigratePhase::StartingContainers, "Starting containers");
-    let up_status = tokio::process::Command::new(&runtime)
+    let up_status = tokio::process::Command::new(&runtime).silent()
         .args(["compose", "up", "-d"])
         .current_dir(&compose_dir)
         .status()
@@ -954,7 +955,7 @@ pub async fn migrate_volumes(
         if canonical.contains(&ev.name.as_str()) {
             continue;
         }
-        let _ = tokio::process::Command::new(&runtime)
+        let _ = tokio::process::Command::new(&runtime).silent()
             .args(["volume", "rm", &ev.name])
             .status()
             .await;
@@ -974,7 +975,7 @@ pub async fn migrate_volumes(
 /// effort — used during rollback so even if it fails the user knows
 /// what to do (run `podman-compose up -d` themselves).
 async fn restart_services_for_rollback(runtime: &str, compose_dir: &Path) -> Result<(), String> {
-    let status = tokio::process::Command::new(runtime)
+    let status = tokio::process::Command::new(runtime).silent()
         .args(["compose", "up", "-d"])
         .current_dir(compose_dir)
         .status()

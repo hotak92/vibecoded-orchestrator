@@ -19,6 +19,7 @@ use crate::db::kg_summaries::status as kg_summary_status;
 use crate::db::kg_syncs::status as kg_sync_status;
 use crate::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectView {
@@ -717,7 +718,7 @@ async fn run_bootstrap_collections(folder: &Path, project_name: &str) -> Vec<Str
     };
 
     let folder_str = folder.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -900,7 +901,7 @@ async fn run_install_bundle(folder: &Path) -> Vec<String> {
 
     let folder_str = folder.to_string_lossy().to_string();
     let orch_str = orch_root.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -1057,7 +1058,7 @@ pub(crate) async fn run_install_bundle_update_with_root(
 
     let folder_str = folder.to_string_lossy().to_string();
     let templates_str = templates_root.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -1233,7 +1234,7 @@ pub(crate) async fn run_migrate_dry_run(
     };
 
     let folder_str = folder.to_string_lossy().to_string();
-    let mut cmd = tokio::process::Command::new(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -1633,7 +1634,7 @@ fn apply_project_env_via_python(
             .to_string()
     })?;
 
-    let mut cmd = std::process::Command::new(&python);
+    let mut cmd = std::process::Command::new(&python).silent();
     cmd.arg("-m")
         .arg("vco_lib.config_projection")
         .arg("apply")
@@ -4279,7 +4280,7 @@ async fn drop_owned_collections(project_name: &str) -> (Vec<String>, Vec<String>
         }
     };
 
-    let mut cmd = tokio::process::Command::new(&system.python_cmd);
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
     cmd.args([
         "-m",
         "vco_lib.project_init",
@@ -4605,7 +4606,7 @@ fn which_on_path(cmd: &str) -> bool {
 }
 
 fn launch_in_vscode(folder: &str) -> Result<(), String> {
-    let mut cmd = std::process::Command::new("code");
+    let mut cmd = std::process::Command::new("code").silent();
     cmd.arg(folder);
     match cmd.spawn() {
         Ok(_) => Ok(()),
@@ -4651,7 +4652,7 @@ fn launch_in_terminal_with_cli(folder: &str) -> Result<(), String> {
     ];
 
     for (bin, args) in candidates {
-        let mut cmd = std::process::Command::new(bin);
+        let mut cmd = std::process::Command::new(bin).silent();
         for a in *args {
             cmd.arg(a);
         }
@@ -5405,7 +5406,7 @@ mod tests {
         // that ever changes, gate this with a Mutex or use std::process
         // env directly per-call.
         unsafe { std::env::set_var("PATH", ""); }
-        let res = std::process::Command::new("code").arg(".").spawn();
+        let res = std::process::Command::new("code").silent().arg(".").spawn();
         if let Some(p) = saved {
             unsafe { std::env::set_var("PATH", p); }
         } else {
@@ -6239,11 +6240,11 @@ mod tests {
     #[test]
     fn install_bundle_subprocess_writes_full_tree() {
         // Skip if no Python — CI without python3 shouldn't fail this test.
-        let py = if std::process::Command::new("python3").arg("--version")
+        let py = if std::process::Command::new("python3").silent().arg("--version")
             .output().map(|o| o.status.success()).unwrap_or(false)
         {
             "python3".to_string()
-        } else if std::process::Command::new("python").arg("--version")
+        } else if std::process::Command::new("python").silent().arg("--version")
             .output().map(|o| o.status.success()).unwrap_or(false)
         {
             "python".to_string()
@@ -6262,7 +6263,7 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         make_fake_orchestrator(&fake_orch);
 
-        let out = std::process::Command::new(&py)
+        let out = std::process::Command::new(&py).silent()
             .args([
                 "-m", "vco_lib.project_init",
                 "install-bundle",
@@ -6340,11 +6341,11 @@ mod tests {
     /// "create" actions on top of an unchanged orchestrator.
     #[test]
     fn install_bundle_subprocess_idempotent_on_second_run() {
-        let py = if std::process::Command::new("python3").arg("--version")
+        let py = if std::process::Command::new("python3").silent().arg("--version")
             .output().map(|o| o.status.success()).unwrap_or(false)
         {
             "python3".to_string()
-        } else if std::process::Command::new("python").arg("--version")
+        } else if std::process::Command::new("python").silent().arg("--version")
             .output().map(|o| o.status.success()).unwrap_or(false)
         {
             "python".to_string()
@@ -6363,7 +6364,7 @@ mod tests {
         make_fake_orchestrator(&fake_orch);
 
         // First run.
-        let out1 = std::process::Command::new(&py)
+        let out1 = std::process::Command::new(&py).silent()
             .args([
                 "-m", "vco_lib.project_init", "install-bundle",
                 "--folder", &proj.to_string_lossy(),
@@ -6376,7 +6377,7 @@ mod tests {
         assert!(out1.status.success());
 
         // Second run.
-        let out2 = std::process::Command::new(&py)
+        let out2 = std::process::Command::new(&py).silent()
             .args([
                 "-m", "vco_lib.project_init", "install-bundle",
                 "--folder", &proj.to_string_lossy(),
@@ -6430,11 +6431,11 @@ mod tests {
     /// host has podman installed.
     #[test]
     fn bootstrap_collections_soft_fails_to_deferral() {
-        let py = if std::process::Command::new("python3").arg("--version")
+        let py = if std::process::Command::new("python3").silent().arg("--version")
             .output().map(|o| o.status.success()).unwrap_or(false)
         {
             "python3".to_string()
-        } else if std::process::Command::new("python").arg("--version")
+        } else if std::process::Command::new("python").silent().arg("--version")
             .output().map(|o| o.status.success()).unwrap_or(false)
         {
             "python".to_string()
@@ -6451,7 +6452,7 @@ mod tests {
         // Per-test free port → no collision with parallel tests probing
         // the same Weaviate URL.
         let dead_url = format!("http://127.0.0.1:{}", unused_local_port());
-        let out = std::process::Command::new(&py)
+        let out = std::process::Command::new(&py).silent()
             .args([
                 "-m", "vco_lib.project_init",
                 "bootstrap-collections",
@@ -6493,11 +6494,11 @@ mod tests {
     /// Pick whichever python launcher works on this host. Mirrors the
     /// helper used by other PR 4 tests.
     fn pick_python() -> Option<String> {
-        if std::process::Command::new("python3").arg("--version")
+        if std::process::Command::new("python3").silent().arg("--version")
             .output().map(|o| o.status.success()).unwrap_or(false)
         {
             Some("python3".to_string())
-        } else if std::process::Command::new("python").arg("--version")
+        } else if std::process::Command::new("python").silent().arg("--version")
             .output().map(|o| o.status.success()).unwrap_or(false)
         {
             Some("python".to_string())
@@ -6533,7 +6534,7 @@ mod tests {
 
         // Seed a first-install (so we have a manifest + on-disk bundle
         // to "update" against).
-        let out_seed = std::process::Command::new(&py)
+        let out_seed = std::process::Command::new(&py).silent()
             .args([
                 "-m", "vco_lib.project_init", "install-bundle",
                 "--folder", &proj.to_string_lossy(),
@@ -6617,7 +6618,7 @@ mod tests {
         make_fake_orchestrator(&fake_orch);
 
         // Seed install.
-        let out_seed = std::process::Command::new(&py)
+        let out_seed = std::process::Command::new(&py).silent()
             .args([
                 "-m", "vco_lib.project_init", "install-bundle",
                 "--folder", &proj.to_string_lossy(),
@@ -6853,7 +6854,7 @@ mod tests {
         ).unwrap();
 
         // Step 1: seed the project via install-bundle (first install).
-        let out_seed = std::process::Command::new(&py)
+        let out_seed = std::process::Command::new(&py).silent()
             .args([
                 "-m", "vco_lib.project_init", "install-bundle",
                 "--folder", &proj.to_string_lossy(),
@@ -6941,7 +6942,7 @@ mod tests {
         // command spawns via run_install_bundle_update. We pass --force
         // so user-modified detection doesn't matter — the test cares
         // about toggle preservation, not user-modified semantics.
-        let out_upd = std::process::Command::new(&py)
+        let out_upd = std::process::Command::new(&py).silent()
             .args([
                 "-m", "vco_lib.project_init", "install-bundle",
                 "--folder", &proj.to_string_lossy(),
