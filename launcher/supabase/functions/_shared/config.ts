@@ -160,3 +160,81 @@ export function resolvePaidTagDefault(): string {
   }
   return PAID_TAG_DEFAULT_FALLBACK;
 }
+
+/** Result of validating a GHCR username string. */
+export type GhcrUsernameValidation =
+  | { ok: true; value: string }
+  | { ok: false; reason: "empty" | "whitespace_only" | "invalid_chars" };
+
+/**
+ * Validate that `raw` is a well-formed GitHub username.
+ *
+ * GitHub username rules (as of 2026): 1-39 chars, alphanumeric + hyphens,
+ * cannot start/end with hyphen, cannot have consecutive hyphens. We're
+ * defensive (reject anything outside `[A-Za-z0-9-]`) rather than enforcing
+ * the full rule — GitHub will reject malformed usernames at the login
+ * step with a clearer error than we could synthesise here.
+ */
+export function validateGhcrUsername(
+  raw: string | undefined,
+): GhcrUsernameValidation {
+  if (raw === undefined) {
+    return { ok: false, reason: "empty" };
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, reason: raw.length === 0 ? "empty" : "whitespace_only" };
+  }
+  if (!/^[A-Za-z0-9-]+$/.test(trimmed)) {
+    return { ok: false, reason: "invalid_chars" };
+  }
+  return { ok: true, value: trimmed };
+}
+
+/**
+ * Resolve the GHCR username that the launcher should use for
+ * `podman/docker login -u <user>`.
+ *
+ * Why this exists as a separate env var from `GHCR_PAID_IMAGE_REPO`:
+ * the per-module bot-user architecture (v0.2.36, see KG node
+ * `multi-module-paid-distribution-architecture`) decouples PACKAGE OWNER
+ * from CREDENTIAL OWNER. The package lives at `hotak92/vct-rl-reranker`
+ * (PAID_IMAGE_REPO), but the PAT minted to access it belongs to a
+ * dedicated bot user `vct-bot-rl` (USERNAME). The launcher's
+ * `podman login` MUST use the credential owner's username — using the
+ * package owner gets 403 from ghcr.io because the PAT's owner doesn't
+ * match the login identity.
+ *
+ * Resolution order:
+ *   1. `GHCR_USERNAME` env var (preferred — explicit, supports the
+ *      per-module bot-user pattern where credential owner differs
+ *      from package owner)
+ *   2. Owner half of `GHCR_PAID_IMAGE_REPO` (backwards-compat for the
+ *      v0.2.36-pre-bot-user-architecture deployment where the package
+ *      owner WAS the credential owner)
+ *
+ * The fallback exists so a deployment that doesn't set `GHCR_USERNAME`
+ * doesn't immediately break — it just behaves the way Agent W shipped
+ * (auto-derive). Once the bot-user architecture is fully rolled out
+ * per module, `GHCR_USERNAME` should always be explicitly set; the
+ * fallback is purely a safety net for in-flight migrations.
+ */
+export function resolveGhcrUsername(): string {
+  const raw = Deno.env.get("GHCR_USERNAME");
+  const result = validateGhcrUsername(raw);
+  if (result.ok) {
+    return result.value;
+  }
+  // Set-but-malformed: warn + fall through to derivation.
+  if (raw !== undefined) {
+    console.warn(
+      `[config] GHCR_USERNAME malformed (reason=${result.reason}, ` +
+        `raw=${JSON.stringify(raw).slice(0, 80)}); falling back to ` +
+        `owner-half of GHCR_PAID_IMAGE_REPO`,
+    );
+  }
+  // Unset OR malformed: fall back to deriving from PAID_IMAGE_REPO.
+  // `resolvePaidImageRepo` already validates the slash-shape, so
+  // split("/")[0] is safe.
+  return resolvePaidImageRepo().split("/")[0];
+}

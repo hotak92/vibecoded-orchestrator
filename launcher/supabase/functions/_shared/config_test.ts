@@ -21,8 +21,10 @@ import {
 import {
   PAID_IMAGE_REPO_DEFAULT,
   PAID_TAG_DEFAULT_FALLBACK,
+  resolveGhcrUsername,
   resolvePaidImageRepo,
   resolvePaidTagDefault,
+  validateGhcrUsername,
   validatePaidImageRepo,
   validatePaidTag,
 } from "./config.ts";
@@ -308,4 +310,163 @@ Deno.test("PAID_IMAGE_REPO_DEFAULT: locked to v0.2.35 personal-account value", (
 
 Deno.test("PAID_TAG_DEFAULT_FALLBACK: locked to v0.2.35 0.1.0", () => {
   assertEquals(PAID_TAG_DEFAULT_FALLBACK, "0.1.0");
+});
+
+// ─── validateGhcrUsername (pure) ─────────────────────────────────────────
+
+Deno.test("validateGhcrUsername: accepts canonical login", () => {
+  const r = validateGhcrUsername("vct-bot-rl");
+  assertEquals(r, { ok: true, value: "vct-bot-rl" });
+});
+
+Deno.test("validateGhcrUsername: accepts alphanumeric", () => {
+  const r = validateGhcrUsername("hotak92");
+  assertEquals(r, { ok: true, value: "hotak92" });
+});
+
+Deno.test("validateGhcrUsername: trims surrounding whitespace", () => {
+  const r = validateGhcrUsername("  vct-bot-rl  ");
+  assertEquals(r, { ok: true, value: "vct-bot-rl" });
+});
+
+Deno.test("validateGhcrUsername: rejects undefined", () => {
+  const r = validateGhcrUsername(undefined);
+  assertEquals(r, { ok: false, reason: "empty" });
+});
+
+Deno.test("validateGhcrUsername: rejects empty string", () => {
+  const r = validateGhcrUsername("");
+  assertEquals(r, { ok: false, reason: "empty" });
+});
+
+Deno.test("validateGhcrUsername: rejects whitespace-only", () => {
+  const r = validateGhcrUsername("   ");
+  assertEquals(r, { ok: false, reason: "whitespace_only" });
+});
+
+Deno.test("validateGhcrUsername: rejects slashes", () => {
+  const r = validateGhcrUsername("owner/image");
+  assertEquals(r, { ok: false, reason: "invalid_chars" });
+});
+
+Deno.test("validateGhcrUsername: rejects @ and dots", () => {
+  assertEquals(validateGhcrUsername("a@b").ok, false);
+  assertEquals(validateGhcrUsername("a.b").ok, false);
+});
+
+Deno.test("validateGhcrUsername: rejects spaces", () => {
+  const r = validateGhcrUsername("vct bot");
+  assertEquals(r, { ok: false, reason: "invalid_chars" });
+});
+
+// ─── resolveGhcrUsername (env-driven) ────────────────────────────────────
+
+function captureWarn(): { restore: () => void; messages: () => string[] } {
+  const original = globalThis.console.warn;
+  const captured: string[] = [];
+  globalThis.console.warn = (...args: unknown[]) => {
+    captured.push(args.map(String).join(" "));
+  };
+  return {
+    restore: () => {
+      globalThis.console.warn = original;
+    },
+    messages: () => captured,
+  };
+}
+
+Deno.test("resolveGhcrUsername: prefers GHCR_USERNAME when set", () => {
+  Deno.env.set("GHCR_USERNAME", "vct-bot-rl");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "hotak92/vct-rl-reranker");
+  try {
+    assertEquals(resolveGhcrUsername(), "vct-bot-rl");
+  } finally {
+    Deno.env.delete("GHCR_USERNAME");
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
+});
+
+Deno.test("resolveGhcrUsername: per-module bot scenario (username differs from package owner)", () => {
+  // The load-bearing v0.2.36 case: package lives at hotak92/vct-rl-reranker
+  // but the PAT belongs to vct-bot-rl. Login MUST use vct-bot-rl or GHCR
+  // returns 403.
+  Deno.env.set("GHCR_USERNAME", "vct-bot-rl");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "hotak92/vct-rl-reranker");
+  try {
+    const username = resolveGhcrUsername();
+    const repoOwner = "hotak92";
+    assertEquals(username, "vct-bot-rl");
+    assertEquals(username === repoOwner, false);
+  } finally {
+    Deno.env.delete("GHCR_USERNAME");
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
+});
+
+Deno.test("resolveGhcrUsername: falls back to owner-half when GHCR_USERNAME unset", () => {
+  Deno.env.delete("GHCR_USERNAME");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "myorg/my-image");
+  try {
+    assertEquals(resolveGhcrUsername(), "myorg");
+  } finally {
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
+});
+
+Deno.test("resolveGhcrUsername: backwards-compat with v0.2.35 default", () => {
+  // Both env vars unset → falls back to default repo "hotak92/vct-rl-reranker"
+  // → username = "hotak92". This is the pre-bot-user behaviour preserved
+  // for in-flight migrations.
+  Deno.env.delete("GHCR_USERNAME");
+  Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  assertEquals(resolveGhcrUsername(), "hotak92");
+});
+
+Deno.test("resolveGhcrUsername: warns + falls back on malformed value", () => {
+  const warn = captureWarn();
+  Deno.env.set("GHCR_USERNAME", "invalid user with spaces");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "owner/image");
+  try {
+    assertEquals(resolveGhcrUsername(), "owner");
+    const messages = warn.messages();
+    assertEquals(messages.length >= 1, true);
+    assertStringIncludes(messages[0], "GHCR_USERNAME malformed");
+    assertStringIncludes(messages[0], "invalid_chars");
+  } finally {
+    warn.restore();
+    Deno.env.delete("GHCR_USERNAME");
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
+});
+
+Deno.test("resolveGhcrUsername: silent fallback when GHCR_USERNAME unset (normal case)", () => {
+  const warn = captureWarn();
+  Deno.env.delete("GHCR_USERNAME");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "owner/image");
+  try {
+    assertEquals(resolveGhcrUsername(), "owner");
+    // Unset is normal; should NOT warn (warning is for fat-finger / typo).
+    assertEquals(warn.messages().length, 0);
+  } finally {
+    warn.restore();
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
+});
+
+Deno.test("resolveGhcrUsername: warns on empty-string explicit set", () => {
+  const warn = captureWarn();
+  Deno.env.set("GHCR_USERNAME", "");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "owner/image");
+  try {
+    assertEquals(resolveGhcrUsername(), "owner");
+    // Empty-string set is treated as unset (raw === "" → reason "empty"
+    // but raw !== undefined → warning fires). Implementation choice:
+    // explicit empty-string IS a fat-finger worth flagging, distinct
+    // from "never set the var at all".
+    assertEquals(warn.messages().length, 1);
+  } finally {
+    warn.restore();
+    Deno.env.delete("GHCR_USERNAME");
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
 });

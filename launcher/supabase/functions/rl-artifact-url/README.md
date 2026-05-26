@@ -49,6 +49,7 @@ The launcher never sees the long-lived service PAT — only short-lived
 |---|---|---|
 | `GHCR_PAID_IMAGE_REPO` | `hotak92/vct-rl-reranker` | Paid-image repo in `<owner>/<image>` form. Set this when migrating from the personal-account image to the org image (see "Org migration" below). Malformed values (no slash, whitespace-only, etc.) are logged via `console.warn` and the default applies. |
 | `GHCR_PAID_TAG_DEFAULT` | `0.1.0` | Fallback tag for the `tag` field in the response. The launcher's `resolve_variant_tag` is the actual source of truth — this default is advisory / used by callers that bypass the launcher logic. |
+| `GHCR_USERNAME` | owner-half of `GHCR_PAID_IMAGE_REPO` | GitHub login the launcher uses for `podman login -u <user>`. Must match the owner of `GHCR_SERVICE_PAT` (the credential owner), NOT necessarily the owner of the package. For the v0.2.36 per-module bot-user architecture, set to the bot user's login (e.g. `vct-bot-rl`) while `GHCR_PAID_IMAGE_REPO` stays at the package path (e.g. `hotak92/vct-rl-reranker`). When unset, falls back to the owner-half of `GHCR_PAID_IMAGE_REPO` (Agent W's original auto-derivation; correct only when package owner IS credential owner). |
 
 To deploy:
 ```bash
@@ -75,12 +76,47 @@ update — not a code redeploy:
 ```bash
 supabase secrets set \
   GHCR_PAID_IMAGE_REPO=vibecodedtools/vct-rl-reranker \
+  GHCR_USERNAME=vibecodedtools \
   --project-ref ovpdtijpdchzlxbojhsg
 ```
 
 That's all. No `index.ts` edit, no version bump, no launcher change. The
 launcher already reads `image` + `username` from the response and uses
-the org owner for `podman login -u <user>`.
+the resolved username for `podman login -u <user>`.
+
+## Per-module bot-user architecture (v0.2.36)
+
+A middle-ground alternative to org migration: keep the image under the
+personal account, but mint the `GHCR_SERVICE_PAT` from a **dedicated bot
+GitHub user** (e.g. `vct-bot-rl`) whose only access is collaborator-read
+on the paid-module package. This bounds the PAT-echo leak surface to
+exactly one package without requiring a GitHub Organization.
+
+Setup:
+1. Create `vct-bot-rl` GitHub user (regular sign-up + 2FA)
+2. Invite `vct-bot-rl` as **Read** collaborator on the paid-module
+   package (via Manage Access on `vct-rl-reranker`'s package settings)
+3. Mint a `read:packages`-only PAT from `vct-bot-rl`'s account
+4. Update Supabase secrets:
+
+```bash
+supabase secrets set \
+  GHCR_SERVICE_PAT='<vct-bot-rl-PAT>' \
+  GHCR_PAID_IMAGE_REPO=hotak92/vct-rl-reranker \
+  GHCR_USERNAME=vct-bot-rl \
+  --project-ref ovpdtijpdchzlxbojhsg
+```
+
+Key property: `GHCR_USERNAME` (`vct-bot-rl`) differs from the owner-half
+of `GHCR_PAID_IMAGE_REPO` (`hotak92`). The launcher's `podman login`
+uses `vct-bot-rl` — the credential owner — even though the image lives
+at a path owned by a different account. Without `GHCR_USERNAME` the
+auto-derivation would send `hotak92` and get 403 from ghcr.io.
+
+For each new paid module, repeat with a new bot user (e.g.
+`vct-bot-coord`, `vct-bot-telegram`) on a sibling edge function. See
+the KG node `multi-module-paid-distribution-architecture` for the full
+rationale and constraint analysis.
 
 ## Wire contract
 

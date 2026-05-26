@@ -38,6 +38,21 @@
 //                                 of truth for tag selection — this default
 //                                 is advisory / used by callers that bypass
 //                                 the launcher logic.
+//   GHCR_USERNAME               — GitHub login the launcher uses for
+//                                 `podman login -u <user>`. Must match the
+//                                 owner of `GHCR_SERVICE_PAT` (the credential
+//                                 owner), NOT necessarily the owner of the
+//                                 package (which lives in `GHCR_PAID_IMAGE_REPO`).
+//                                 For the v0.2.36 per-module bot-user
+//                                 architecture: set to the bot user's login
+//                                 (e.g. `vct-bot-rl`) while `GHCR_PAID_IMAGE_REPO`
+//                                 stays at the package path (e.g.
+//                                 `hotak92/vct-rl-reranker`). When unset:
+//                                 falls back to the owner-half of
+//                                 `GHCR_PAID_IMAGE_REPO` (Agent W's original
+//                                 auto-derivation; correct only when the
+//                                 package owner IS the credential owner —
+//                                 the v0.2.35-pre-bot-user state).
 //
 // The registry token is what the launcher actually feeds to `podman
 // login --password-stdin`. It carries:
@@ -87,6 +102,7 @@ import {
   type OrchestratorTier,
 } from "../_shared/variant_map.ts";
 import {
+  resolveGhcrUsername,
   resolvePaidImageRepo,
   resolvePaidTagDefault,
 } from "../_shared/config.ts";
@@ -322,13 +338,19 @@ async function exchangeForRegistryToken(): Promise<
   // `vct-paid-module` get 403). For org packages where the /token
   // endpoint returns a scoped credential, any string works.
   //
-  // Derive the owner from PAID_IMAGE_REPO (the part before the slash)
-  // so changing the env var also flips the username — eliminates the
-  // need to redeploy when migrating from personal `hotak92/...` to
-  // org `vibecodedtools/...`. The shape was already validated at
-  // module init (`validatePaidImageRepo` requires exactly one slash),
-  // so `split("/")[0]` is safe here.
-  const ghcrUsername = PAID_IMAGE_REPO.split("/")[0];
+  // v0.2.36: resolved via `resolveGhcrUsername()`, which reads the
+  // `GHCR_USERNAME` env var with a fallback to the owner-half of
+  // `GHCR_PAID_IMAGE_REPO`. Why the explicit env var beats pure
+  // auto-derivation: the per-module bot-user architecture
+  // (see KG `multi-module-paid-distribution-architecture`) decouples
+  // PACKAGE OWNER from CREDENTIAL OWNER — the image lives at
+  // `hotak92/vct-rl-reranker` but the PAT belongs to a dedicated bot
+  // user like `vct-bot-rl`. The launcher's `podman login` must use the
+  // credential owner; auto-deriving from the repo path would send the
+  // wrong username and get 403'd. The fallback preserves Agent W's
+  // shipped behaviour when GHCR_USERNAME is unset (transitional
+  // deployments where the package owner WAS the credential owner).
+  const ghcrUsername = resolveGhcrUsername();
 
   return {
     token: decodedToken,
