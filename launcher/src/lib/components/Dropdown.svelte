@@ -66,8 +66,16 @@
     if (opt.disabled) return;
     value = opt.value;
     onChange?.(opt.value);
-    close();
-    triggerEl?.focus();
+    // v0.2.35 Agent L fix (c): defer close to a microtask so the
+    // `value = opt.value` reactive cascade (and any parent `bind:value`
+    // propagation) settles before we toggle `open`. Without the defer,
+    // certain combinations of `bind:value` + parent effects + Svelte 5
+    // batching could end up with `open` remaining `true` after a pick.
+    // Dogfooded 2026-05-26 in DiagramsTab's "Add diagram" type selector.
+    queueMicrotask(() => {
+      close();
+      triggerEl?.focus();
+    });
   }
 
   function onKey(e: KeyboardEvent) {

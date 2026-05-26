@@ -25,6 +25,7 @@
   } from '$lib/types/project-state';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import ExcalidrawEditor from './ExcalidrawEditor.svelte';
+  import MermaidEditor from './MermaidEditor.svelte';
 
   // ─── Props ────────────────────────────────────────────────────────────
   let { projectId }: { projectId: string } = $props();
@@ -161,6 +162,179 @@
   let newName = $state('');
   let newCategoryPath = $state('');
   let adding = $state(false);
+
+  // ─── Draft state: "Draw new" inline editor (v0.2.35 Agent L) ─────────
+  // The DiagramsTab originally accepted only externally-created diagrams
+  // (the "+ Add diagram" modal registers a file path; the user creates
+  // the content elsewhere). v0.2.35 adds two affordances for creating
+  // diagrams directly from the launcher:
+  //   1. "Draw new Mermaid" → inline MermaidEditor (textarea + preview).
+  //   2. "Draw new Excalidraw" → embedded ExcalidrawEditor with empty
+  //      initial scene.
+  // The draft persists in component state until the user clicks "Save
+  // as new", at which point we prompt for name + category, then call
+  // register_project_diagram + write_text_file (both Tauri commands
+  // shipped by Agent D in v0.2.34).
+  //
+  // While drafting, the right pane is fully owned by the draft editor
+  // (the registered-diagram preview is hidden). Cancel discards the
+  // draft. Selecting a registered diagram cancels the draft.
+  let draftingType = $state<DiagramType | null>(null);
+  let draftMermaidSource = $state<string>('');
+  let draftExcalidrawSource = $state<string>('');
+  let showSaveDraftDialog = $state(false);
+  let draftSaveName = $state<string>('');
+  let draftSaveCategory = $state<string>('');
+  let savingDraft = $state(false);
+  // Drag-drop import zone state — single boolean for visual hover/active.
+  let dropZoneActive = $state(false);
+
+  function startDrawing(type: DiagramType) {
+    // Cancel any current selection so the right pane shows the draft.
+    selectedId = null;
+    draftingType = type;
+    if (type === 'mermaid') {
+      draftMermaidSource = '';
+    } else {
+      draftExcalidrawSource = '';
+    }
+  }
+
+  function cancelDraft() {
+    if (draftingType === null) return;
+    if (
+      (draftingType === 'mermaid' && draftMermaidSource.trim()) ||
+      (draftingType === 'excalidraw' && draftExcalidrawSource.trim())
+    ) {
+      if (!confirm('Discard the draft? Unsaved content will be lost.')) return;
+    }
+    draftingType = null;
+    draftMermaidSource = '';
+    draftExcalidrawSource = '';
+    showSaveDraftDialog = false;
+  }
+
+  function openSaveDraftDialog() {
+    if (!draftingType) return;
+    // Pre-fill with safe defaults the user can edit.
+    draftSaveName = '';
+    draftSaveCategory = '';
+    showSaveDraftDialog = true;
+  }
+
+  async function saveDraft() {
+    if (!draftingType) return;
+    const name = draftSaveName.trim();
+    const category = draftSaveCategory.trim();
+    if (!name) {
+      toast.error('Diagram name required');
+      return;
+    }
+    if (!category) {
+      toast.error('Category path required (e.g. gui/auth)');
+      return;
+    }
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
+      toast.error('Name must be lowercase-kebab (regex [a-z0-9][a-z0-9-]*)');
+      return;
+    }
+    if (!/^[a-z0-9][a-z0-9/-]*[a-z0-9]$/.test(category)) {
+      toast.error('Category path must be kebab segments separated by /');
+      return;
+    }
+    const ext = draftingType === 'mermaid' ? 'mmd' : 'excalidraw';
+    const filePath = `.claude/diagrams/${category}/${name}.${ext}`;
+    const contents =
+      draftingType === 'mermaid' ? draftMermaidSource : draftExcalidrawSource;
+    savingDraft = true;
+    try {
+      // 1. Register the diagram row (file_path is project-relative).
+      const row = await invoke<DiagramRow>('register_project_diagram', {
+        projectId,
+        req: {
+          diagram_name: name,
+          diagram_type: draftingType,
+          file_path: filePath,
+          category_path: category,
+        },
+      });
+      // 2. Resolve to absolute path + write contents atomically.
+      const absPath = await invoke<string>('resolve_project_path', {
+        projectId,
+        relPath: filePath,
+      });
+      await invoke('write_text_file', { path: absPath, contents });
+      toast.success(`Saved ${name}`);
+      // 3. Reset draft + reload list + select the new row.
+      draftingType = null;
+      draftMermaidSource = '';
+      draftExcalidrawSource = '';
+      showSaveDraftDialog = false;
+      await load();
+      selectedId = row.id;
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      savingDraft = false;
+    }
+  }
+
+  // ─── Drag-drop file import (v0.2.35 Agent L) ──────────────────────────
+  // The empty-state of the registry now exposes a drop zone — the user
+  // can drag a `.mmd` / `.excalidraw` file from their file manager onto
+  // it and the launcher (a) reads the file content, (b) infers the type
+  // from extension, (c) prompts for name + category, (d) calls the same
+  // register + write_text_file flow as `saveDraft` above.
+  //
+  // Why this is a soft-fail-only path: Tauri's webview exposes the
+  // browser `File` API on drop events, so we can read the dropped file
+  // entirely client-side. If the drop has multiple files we only accept
+  // the first; if the extension isn't recognised we toast an error.
+  //
+  // After reading, we stash the content into the draft slots and open
+  // the save dialog — so the drop flow funnels into the same persistence
+  // path as `saveDraft` (register + write_text_file). No extra commands.
+  function onDragOver(e: DragEvent) {
+    e.preventDefault();
+    dropZoneActive = true;
+  }
+  function onDragLeave(_e: DragEvent) {
+    dropZoneActive = false;
+  }
+  async function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dropZoneActive = false;
+    const files = e.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    const file = files[0];
+    const lower = file.name.toLowerCase();
+    let type: DiagramType | null = null;
+    if (lower.endsWith('.mmd')) type = 'mermaid';
+    else if (lower.endsWith('.excalidraw')) type = 'excalidraw';
+    else {
+      toast.error(
+        `Unsupported file type: ${file.name}. Drop a .mmd or .excalidraw file.`,
+      );
+      return;
+    }
+    try {
+      const text = await file.text();
+      // Pre-fill the save dialog with the file's basename (stripped of
+      // extension) — user can override before confirming.
+      const base = file.name.replace(/\.(mmd|excalidraw)$/i, '');
+      draftSaveName = base.toLowerCase().replace(/[^a-z0-9-]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+      draftSaveCategory = '';
+      showSaveDraftDialog = true;
+      // Stash the pending content into the draft slot so `saveDraft` can
+      // pick it up without rewriting the persistence path.
+      draftingType = type;
+      if (type === 'mermaid') draftMermaidSource = text;
+      else draftExcalidrawSource = text;
+    } catch (err) {
+      toast.error(err);
+    }
+  }
 
   async function register() {
     const name = newName.trim();
@@ -588,6 +762,15 @@
   $effect(() => {
     // Re-render preview + reload snapshots when the selection changes.
     if (selected) {
+      // v0.2.35 Agent L: selecting a registered diagram implicitly
+      // cancels any in-progress draft. We don't `confirm()` here
+      // because the parent's selection click is intentional UX (the
+      // user-explicit `cancelDraft` button covers the unsaved-warning
+      // path).
+      if (draftingType !== null) {
+        draftingType = null;
+        showSaveDraftDialog = false;
+      }
       void renderPreview();
       void loadSnapshots();
     } else {
@@ -659,6 +842,12 @@
     <div class="diagrams-split" class:dimmed={moduleToggling}>
       <!-- ─── Left pane: list + add ───────────────────────────────────── -->
       <aside class="diagrams-list" aria-label="Project diagrams list">
+        <!-- v0.2.35 Agent L: three creation affordances live here.
+             "+ Add diagram" registers an externally-created file (legacy
+             v0.2.34 flow). "Draw new Mermaid" / "Draw new Excalidraw"
+             open the right-pane editor on an empty draft; the first
+             save auto-registers + writes via the existing Tauri
+             commands. -->
         <div class="diagrams-list-header">
           <button
             class="ps-btn-primary"
@@ -666,6 +855,20 @@
             aria-expanded={showAdd}
           >
             {showAdd ? 'Cancel' : '+ Add diagram'}
+          </button>
+          <button
+            class="ps-btn-secondary"
+            onclick={() => startDrawing('mermaid')}
+            title="Draft a new Mermaid diagram inline; save auto-registers it."
+          >
+            Draw Mermaid
+          </button>
+          <button
+            class="ps-btn-secondary"
+            onclick={() => startDrawing('excalidraw')}
+            title="Draft a new Excalidraw scene inline; save auto-registers it."
+          >
+            Draw Excalidraw
           </button>
         </div>
 
@@ -711,10 +914,32 @@
         {#if loading}
           <p class="ps-loading">Loading…</p>
         {:else if diagrams.length === 0}
-          <p class="ps-empty">
-            No diagrams registered. Use <code>+ Add diagram</code> or save
-            via the Mermaid / Excalidraw MCPs.
-          </p>
+          <!-- v0.2.35 Agent L: empty-state drop zone. Drag a .mmd or
+               .excalidraw file from the file manager → reads content
+               client-side via the browser File API → opens the save
+               dialog pre-filled with the file's basename. Drag-drop
+               here is the third creation entry point (after "+ Add
+               diagram" and "Draw new"). -->
+          <div
+            class="diagrams-empty-state"
+            class:drop-active={dropZoneActive}
+            ondragover={onDragOver}
+            ondragleave={onDragLeave}
+            ondrop={onDrop}
+            role="region"
+            aria-label="Drop diagram files here to import"
+          >
+            <p class="ps-empty">
+              No diagrams registered. Use <code>+ Add diagram</code>,
+              <code>Draw Mermaid</code> / <code>Draw Excalidraw</code>,
+              or drop a <code>.mmd</code> / <code>.excalidraw</code> file here.
+            </p>
+            <p class="diagrams-drop-hint">
+              {dropZoneActive
+                ? 'Release to import…'
+                : 'Drop file to import'}
+            </p>
+          </div>
         {:else}
           <ul class="diagrams-rows" role="listbox" aria-label="Diagrams">
             {#each diagrams as d (d.id)}
@@ -780,7 +1005,98 @@
 
       <!-- ─── Right pane: preview + actions ───────────────────────────── -->
       <main class="diagrams-preview" aria-label="Diagram preview">
-        {#if !selected}
+        {#if draftingType !== null}
+          <!-- v0.2.35 Agent L: draft state. Right pane is owned by the
+               inline editor (MermaidEditor or ExcalidrawEditor) until
+               the user clicks "Save as new" (opens the name/category
+               dialog) or "Cancel" (discards the draft). -->
+          <div class="diagrams-preview-toolbar">
+            <strong>Drafting new {draftingType} diagram</strong>
+            <span class="ps-tag diagrams-tag-kind">draft</span>
+            <span class="diagrams-preview-spacer"></span>
+            <button
+              class="ps-btn-primary"
+              onclick={openSaveDraftDialog}
+              disabled={savingDraft}
+              title="Register this draft as a new project diagram and write the file."
+            >
+              Save as new
+            </button>
+            <button class="ps-btn-link" onclick={cancelDraft}>Cancel</button>
+          </div>
+          <div class="diagrams-preview-body">
+            {#if draftingType === 'mermaid'}
+              <MermaidEditor bind:source={draftMermaidSource} diagramName="draft" />
+            {:else if excalidrawWaylandFallback}
+              <div class="diagrams-excalidraw-placeholder">
+                <p>
+                  Embedded Excalidraw editor disabled on Wayland +
+                  webkit2gtk (known canvas latency / pointer issue).
+                </p>
+                <p class="ps-hint">
+                  See <code>docs/EXCALIDRAW_WAYLAND_TEST.md</code> for the
+                  test recipe and reproduction steps. Cancel the draft and
+                  use an external editor instead.
+                </p>
+              </div>
+            {:else}
+              <ExcalidrawEditor
+                diagramName="draft"
+                initialSceneJson={draftExcalidrawSource}
+                onSave={async (json) => {
+                  draftExcalidrawSource = json;
+                }}
+              />
+            {/if}
+          </div>
+
+          {#if showSaveDraftDialog}
+            <!-- Modal-ish inline dialog. Keeps the form local to the
+                 right pane rather than a global modal so the user can
+                 still see their draft while typing the name/category. -->
+            <div class="diagrams-save-dialog" role="dialog" aria-label="Save draft as new diagram">
+              <h4>Save draft as new diagram</h4>
+              <label class="ps-form-row">
+                <span>Name</span>
+                <input
+                  bind:value={draftSaveName}
+                  placeholder="login-form"
+                  aria-label="Diagram name"
+                />
+              </label>
+              <label class="ps-form-row">
+                <span>Category path</span>
+                <input
+                  bind:value={draftSaveCategory}
+                  placeholder="gui/auth"
+                  aria-label="Category path"
+                />
+              </label>
+              <p class="ps-hint">
+                Lowercase-kebab name; multi-level category path. File will
+                be written to
+                <code>
+                  .claude/diagrams/{draftSaveCategory || '<category>'}/{draftSaveName || '<name>'}.{draftingType === 'mermaid' ? 'mmd' : 'excalidraw'}
+                </code>.
+              </p>
+              <div class="diagrams-save-dialog-actions">
+                <button
+                  class="ps-btn-primary"
+                  onclick={saveDraft}
+                  disabled={savingDraft}
+                >
+                  {savingDraft ? 'Saving…' : 'Save'}
+                </button>
+                <button
+                  class="ps-btn-link"
+                  onclick={() => (showSaveDraftDialog = false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          {/if}
+        {:else if !selected}
           <p class="ps-empty">Select a diagram on the left to preview.</p>
         {:else}
           <div class="diagrams-preview-toolbar">
@@ -1093,4 +1409,71 @@
     background: rgba(255,255,255,0.08); color: #ccc;
   }
   .diagrams-tag-kind { background: rgba(123,95,255,0.15); color: #c4b3ff; }
+
+  /* ── v0.2.35 Agent L: Draw-new buttons + drop zone + save dialog ─── */
+  .diagrams-list-header {
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: flex-start;
+  }
+  .ps-btn-secondary {
+    background: rgba(123, 95, 255, 0.20);
+    border: 1px solid rgba(123, 95, 255, 0.40);
+    color: #c4b3ff;
+    padding: 4px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .ps-btn-secondary:hover {
+    background: rgba(123, 95, 255, 0.30);
+  }
+  .ps-btn-secondary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .diagrams-empty-state {
+    padding: 20px;
+    border: 2px dashed rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    transition: all 0.15s ease;
+    text-align: center;
+  }
+  .diagrams-empty-state.drop-active {
+    border-color: rgb(0, 191, 166);
+    background: rgba(0, 191, 166, 0.08);
+  }
+  .diagrams-drop-hint {
+    margin-top: 12px;
+    color: #888;
+    font-size: 11px;
+    font-style: italic;
+  }
+  .diagrams-empty-state.drop-active .diagrams-drop-hint {
+    color: rgb(0, 191, 166);
+    font-weight: 600;
+    font-style: normal;
+  }
+  .diagrams-save-dialog {
+    margin: 12px;
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid rgba(0, 191, 166, 0.40);
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .diagrams-save-dialog h4 {
+    margin: 0;
+    font-size: 13px;
+    color: #c4b3ff;
+  }
+  .diagrams-save-dialog-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 4px;
+  }
 </style>
