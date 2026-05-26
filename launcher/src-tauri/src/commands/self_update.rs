@@ -1092,6 +1092,164 @@ pub fn get_auto_check_enabled() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// v0.2.35 Agent K — running-version display + post-update binary-lag warning
+// ---------------------------------------------------------------------------
+//
+// Problem (dogfooded against v0.2.34 ship): the orchestrator's
+// "Update orchestrator" flow does a `git pull` then restarts into whatever
+// binary lives at `launcher/dist/<arch>/vct-launcher`. After tagging a
+// release on `main`, CI runs the `chore(binary): refresh vct-launcher +
+// vct-hub dist binaries for v0.X.Y` job ~5-10 minutes later. If the user
+// clicks Update during that window, the pull SHA carries the new source
+// tag but the binary on disk is still the PREVIOUS release's — they
+// silently restart into an older launcher with the old bugs, then run
+// install attempts against mismatched code.
+//
+// Mitigation has two layers:
+//
+//   1. Display the running launcher's compile-time CARGO_PKG_VERSION in
+//      the Updates panel alongside the latest source release tag. The
+//      Svelte page now renders:
+//        Running: v0.2.X | Latest source release: v0.2.Y
+//      so the user can SEE the lag even before they click anything.
+//
+//   2. After an update completes (i.e. on the post-restart boot), the
+//      page checks `running_version` vs `latest_source_tag`. If they
+//      don't match → render a dismissible banner telling the user the
+//      binary-publishing CI commit hadn't landed yet at update time,
+//      with a "click Update again in 5-10 min" hint.
+//
+// We deliberately DO NOT change the update flow itself
+// (`finish_apply_after_pull`). The binary-swap mechanism is correct;
+// we're adding observability on top.
+
+/// Return the launcher's compile-time `CARGO_PKG_VERSION`. The Svelte
+/// Updates panel renders this alongside the latest source release tag so
+/// the user can spot a binary-lag situation at a glance.
+///
+/// `CARGO_PKG_VERSION` is baked into the binary at compile time, so this
+/// reflects the binary actually executing — NOT the version string in
+/// `Cargo.toml` on disk (which may differ if the user pulled new source
+/// but hasn't restarted yet). Exactly the property we need for layer-2
+/// mismatch detection.
+///
+/// v0.2.35 Agent K. SPDX-License-Identifier: AGPL-3.0-or-later (inherited
+/// from the file header).
+#[command]
+pub fn get_launcher_running_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Return the most recent release tag visible to the launcher's enclosing
+/// git checkout. Uses `git describe --tags --abbrev=0` against the
+/// canonical upstream remote (so the answer reflects the PUBLIC release
+/// stream, not whatever a private fork's `origin` happens to hold).
+///
+/// Returns `Ok(Some(tag))` when a tag is found, `Ok(None)` when the repo
+/// has no tags yet (e.g. brand-new dev checkout), and `Err` when git
+/// itself isn't available or the launcher isn't running from a git
+/// checkout. The frontend treats `None` and `Err` the same way: hide the
+/// "Latest source release" line entirely rather than render confusing
+/// fallback text.
+///
+/// We DELIBERATELY do not hit the GitHub API here. Reasons:
+///   - The local checkout already has the tag info via `vco_upstream`'s
+///     refs (populated by every fetch the daily check runs). One extra
+///     network round-trip would just retrace ground we already covered.
+///   - GitHub API requires either rate-limit-tolerance or an auth token;
+///     the launcher already operates fine without either.
+///   - Privacy: a self-hosted enterprise mirror (`VCO_UPSTREAM_URL` env
+///     override) might not even speak the GitHub API.
+///
+/// v0.2.35 Agent K.
+#[command]
+pub async fn get_latest_source_release_tag() -> Result<Option<String>, String> {
+    if !git_available().await {
+        return Err("git not found on PATH".into());
+    }
+    let repo = find_launcher_repo_root()?;
+
+    // Make sure vco_upstream exists + fetch tags so we see the latest
+    // release even when a private-fork `origin` lags. Soft-fail: if the
+    // network is dead we still try to read whatever tags the local
+    // .git/refs/tags/ directory already has.
+    let _ = ensure_upstream_remote(&repo).await;
+    let _ = run_git(
+        &repo,
+        &["fetch", "--tags", "--quiet", VCO_UPSTREAM_REMOTE],
+    )
+    .await;
+
+    // `git describe --tags --abbrev=0` returns the closest reachable tag.
+    // On a clean release-tag head it's the tag itself; on a branch ahead
+    // of the last tag it's still the most recent tag in history, which
+    // is exactly what we want ("latest source release").
+    match run_git(&repo, &["describe", "--tags", "--abbrev=0"]).await {
+        Ok(tag) => {
+            let trimmed = tag.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Err(e) => {
+            // The most common failure mode is "no tags yet" — git emits
+            // "fatal: No names found, cannot describe anything." Treat
+            // that as Ok(None) rather than a hard error so the UI just
+            // hides the line.
+            if e.to_lowercase().contains("no names found") {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Compare a running launcher version (from `CARGO_PKG_VERSION`) with
+/// the latest source release tag. Returns `true` iff the two differ in a
+/// way that indicates the binary swap lagged the source tag — i.e. the
+/// user is running an OLDER binary than the latest tagged release.
+///
+/// Comparison rules (kept deliberately permissive — see tests):
+///   - Tag string is normalized by stripping a leading `v` if present
+///     (`v0.2.34` → `0.2.34`). `CARGO_PKG_VERSION` is bare.
+///   - Trailing whitespace stripped from both sides.
+///   - String equality after normalization is the success path. We do
+///     NOT do SemVer-aware comparison — the only producers of these
+///     strings are `Cargo.toml` and `git tag`, both of which we control,
+///     and a mismatch in either direction (running > latest, running <
+///     latest) deserves a warning. Strict equality keeps the test matrix
+///     small and avoids a SemVer dep.
+///   - Empty / whitespace-only `latest_tag` → returns `false` (no signal
+///     to warn on; the upstream might genuinely have no tags yet).
+///
+/// `pub` (not `pub(crate)`) so the test module can reach it without
+/// declaring a sibling, and so a future MCP-side caller could reuse it.
+pub fn running_version_lags_tag(running: &str, latest_tag: &str) -> bool {
+    let r = running.trim();
+    let t = latest_tag.trim().trim_start_matches('v');
+    if t.is_empty() || r.is_empty() {
+        return false;
+    }
+    r != t
+}
+
+/// Tauri-callable wrapper around `running_version_lags_tag`. The Svelte
+/// page mirrors the same logic client-side for snappy banner rendering,
+/// but exposing a server-side answer here lets a future caller (CLI
+/// subcommand, MCP query, an installer hook that wants to skip
+/// follow-up work when the binary is known-stale) reach the same
+/// decision without re-implementing the comparison.
+///
+/// v0.2.35 Agent K.
+#[command]
+pub fn check_running_version_lags_tag(running: String, latest_tag: String) -> bool {
+    running_version_lags_tag(&running, &latest_tag)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1569,5 +1727,70 @@ mod tests {
             !err.is_empty(),
             "error should be non-empty even when every attempt returned empty stderr"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // v0.2.35 Agent K — running-version display + binary-lag warning
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn version_lag_detects_no_warn_when_match() {
+        // The happy path: running binary matches the latest tag. Tag has
+        // the conventional `v` prefix; running version is bare. The
+        // normalize step strips the `v` and equality holds.
+        assert!(!running_version_lags_tag("0.2.34", "v0.2.34"));
+        // Without the prefix (defensive — if upstream switches conventions
+        // we still don't false-warn).
+        assert!(!running_version_lags_tag("0.2.34", "0.2.34"));
+    }
+
+    #[test]
+    fn version_lag_detects_warn_when_running_behind_tag() {
+        // The bug-of-the-day: user clicked Update right after v0.2.34 tag
+        // pushed but BEFORE CI's binary-refresh commit landed. They get
+        // the v0.2.33 binary while running on a v0.2.34 source tree.
+        assert!(running_version_lags_tag("0.2.33", "v0.2.34"));
+        // Also the inverse direction (dev box with a future binary):
+        // still flag it — drift in either direction is a UX surprise the
+        // user deserves to see.
+        assert!(running_version_lags_tag("0.2.35", "v0.2.34"));
+    }
+
+    #[test]
+    fn version_lag_empty_tag_returns_no_warn() {
+        // Upstream has no release tags yet (brand-new fork, etc.). We
+        // can't say anything meaningful so we don't warn.
+        assert!(!running_version_lags_tag("0.2.34", ""));
+        assert!(!running_version_lags_tag("0.2.34", "   "));
+        // Symmetric: running version unknown shouldn't false-warn either,
+        // though in practice CARGO_PKG_VERSION is never empty.
+        assert!(!running_version_lags_tag("", "v0.2.34"));
+    }
+
+    #[test]
+    fn version_lag_normalizes_whitespace_and_v_prefix() {
+        // Real-world stdout from `git describe` is trimmed by `run_git`,
+        // but be paranoid: a fork that emits trailing whitespace mustn't
+        // false-warn.
+        assert!(!running_version_lags_tag("0.2.34", " v0.2.34 "));
+        assert!(!running_version_lags_tag("  0.2.34  ", "v0.2.34"));
+    }
+
+    #[test]
+    fn get_launcher_running_version_returns_cargo_pkg_version() {
+        // Sanity check: the command returns a non-empty string that
+        // matches CARGO_PKG_VERSION. We can't assert the literal value
+        // (it bumps every release) — checking non-empty + dotted shape
+        // is enough to verify the wiring.
+        let v = get_launcher_running_version();
+        assert!(!v.is_empty(), "running version must not be empty");
+        assert!(
+            v.contains('.'),
+            "running version should look like a SemVer string, got: {}",
+            v
+        );
+        // And the SAME string the rest of the codebase uses — guard
+        // against accidental hard-coding.
+        assert_eq!(v, env!("CARGO_PKG_VERSION"));
     }
 }

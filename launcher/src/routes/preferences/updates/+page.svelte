@@ -47,7 +47,46 @@
   let userOwnedPaths = $state<string[]>([]);
   let autoCheckEnabled = $state(true);
 
+  // v0.2.35 Agent K — running-version display + binary-lag warning.
+  // `runningVersion` is the launcher's compile-time CARGO_PKG_VERSION
+  // (always populated when running in Tauri). `latestSourceTag` is the
+  // most recent release tag from `vco_upstream`, e.g. `v0.2.34` — or
+  // null when no tags exist / git failed. `binaryLagDismissed` tracks
+  // per-tag-version dismissal so the banner doesn't nag forever once
+  // the user has acknowledged it for a given mismatch.
+  let runningVersion = $state<string | null>(null);
+  let latestSourceTag = $state<string | null>(null);
+  let binaryLagDismissed = $state(false);
+
   let unlisten: (() => void) | null = null;
+
+  /**
+   * v0.2.35 Agent K — true iff the running binary's version differs
+   * from the latest source release tag (after normalising the tag's
+   * `v` prefix). Mirrors `running_version_lags_tag` in self_update.rs;
+   * keeping a Svelte-side clone so we can render the banner without an
+   * extra IPC round-trip.
+   */
+  function versionLagsTag(running: string | null, tag: string | null): boolean {
+    if (!running || !tag) return false;
+    const r = running.trim();
+    const t = tag.trim().replace(/^v/, '');
+    if (!r || !t) return false;
+    return r !== t;
+  }
+
+  // Reactive: should we show the post-update lag banner?
+  let showBinaryLagBanner = $derived(
+    !binaryLagDismissed &&
+      versionLagsTag(runningVersion, latestSourceTag)
+  );
+
+  /**
+   * localStorage key under which we record the LATEST tag the user has
+   * dismissed the banner for. Per-version so a future mismatch with a
+   * different tag re-shows the warning.
+   */
+  const DISMISS_KEY = 'vct.updates.binary-lag-dismissed-tag';
 
   /**
    * Parse the error returned by `apply_launcher_update`. The backend
@@ -89,6 +128,60 @@
       if (auto !== null) autoCheckEnabled = auto;
     } catch (e) {
       console.warn('[updates] loadCached skipped:', e);
+    }
+
+    // v0.2.35 Agent K — load the running launcher version (always
+    // available — compile-time CARGO_PKG_VERSION) and the latest
+    // source release tag (network/git op, soft-fails to null). These
+    // are independent of the cached-status block above so a stale-cache
+    // case still renders the version line correctly.
+    try {
+      const rv = await invoke<string>('get_launcher_running_version');
+      if (rv) runningVersion = rv;
+    } catch (e) {
+      console.warn('[updates] get_launcher_running_version skipped:', e);
+    }
+    try {
+      const tag = await invoke<string | null>('get_latest_source_release_tag');
+      latestSourceTag = tag ?? null;
+    } catch (e) {
+      // No-git or no-tags is the common path; warn quietly so the
+      // banner just stays hidden rather than producing an error toast
+      // the user has no action for.
+      console.warn('[updates] get_latest_source_release_tag skipped:', e);
+      latestSourceTag = null;
+    }
+
+    // Apply per-tag dismissal. If the user previously dismissed the
+    // banner for the SAME tag we're showing now, keep it hidden;
+    // otherwise reset so a freshly-detected lag pops back up.
+    try {
+      const dismissedFor = localStorage.getItem(DISMISS_KEY);
+      binaryLagDismissed =
+        dismissedFor !== null &&
+        latestSourceTag !== null &&
+        dismissedFor === latestSourceTag;
+    } catch {
+      // localStorage can throw in restricted browsers; just default
+      // to "not dismissed" — the user can dismiss again if needed.
+      binaryLagDismissed = false;
+    }
+  }
+
+  /**
+   * v0.2.35 Agent K — record per-tag dismissal so the banner stays
+   * hidden until the next mismatch arises (typically a new release
+   * tag, possibly with the same CI-lag situation).
+   */
+  function dismissBinaryLagBanner() {
+    binaryLagDismissed = true;
+    try {
+      if (latestSourceTag) {
+        localStorage.setItem(DISMISS_KEY, latestSourceTag);
+      }
+    } catch {
+      // localStorage unavailable — fine, the in-memory flag still
+      // hides it for this session.
     }
   }
 
@@ -202,6 +295,61 @@
   <main class="upd-main">
     <section class="upd-status">
       <h2>Status</h2>
+
+      <!--
+        v0.2.35 Agent K — running-version display.
+        Always visible (when we have data) so the user can spot a
+        binary-lag situation at a glance without clicking anything.
+        Sits above the "available / up to date / error" banner so the
+        eye lands on it first when the page opens.
+      -->
+      {#if runningVersion}
+        <p class="upd-version-line">
+          <span class="upd-version-label">Running:</span>
+          <code>v{runningVersion}</code>
+          {#if latestSourceTag}
+            <span class="upd-version-sep">|</span>
+            <span class="upd-version-label">Latest source release:</span>
+            <code>{latestSourceTag}</code>
+          {/if}
+        </p>
+      {/if}
+
+      <!--
+        v0.2.35 Agent K — post-update binary-lag banner.
+        Lights up when `running_version` (compile-time CARGO_PKG_VERSION
+        of the launcher we're inside) doesn't match the latest source
+        release tag. Almost always means: user clicked "Update orchestrator"
+        right after a tag pushed but BEFORE CI's `chore(binary):` commit
+        landed, so the binary on disk is the previous release's.
+        Dismissible per-tag via localStorage so it doesn't nag once
+        acknowledged for a given mismatch.
+      -->
+      {#if showBinaryLagBanner}
+        <div class="upd-banner upd-banner-binary-lag">
+          <div class="upd-banner-binary-lag-text">
+            <strong>⚠ Binary is older than the latest source release</strong>
+            <span>
+              You're running <code>v{runningVersion}</code>, but the latest
+              source release is <code>{latestSourceTag}</code>. The
+              orchestrator's release CI publishes the matching binary
+              ~5-10 minutes after the source tag — if you updated during
+              that window, the launcher pulled the previous release's
+              binary. Click <strong>Update now</strong> again in
+              5-10 minutes to pick up the matching <code>{latestSourceTag}</code>
+              binary.
+            </span>
+          </div>
+          <button
+            class="upd-banner-dismiss"
+            onclick={dismissBinaryLagBanner}
+            aria-label="Dismiss binary-lag warning"
+            title="Dismiss for this version"
+          >
+            ×
+          </button>
+        </div>
+      {/if}
 
       {#if status?.error}
         <div class="upd-error">
@@ -394,4 +542,16 @@
   .upd-modal-hint { color: #888 !important; font-size: 11px !important; }
   .upd-modal code { background: rgba(255,255,255,0.06); padding: 1px 4px; border-radius: 3px; font-size: 11px; }
   .upd-modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
+  /* v0.2.35 Agent K — running-version display + binary-lag banner */
+  .upd-version-line { font-size: 12px; color: #ccc; margin: 0 0 12px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .upd-version-label { color: #888; }
+  .upd-version-sep { color: #555; }
+  .upd-version-line code { background: rgba(255,255,255,0.06); padding: 1px 6px; border-radius: 3px; font-size: 11px; color: #e8e8ee; }
+
+  .upd-banner-binary-lag { background: rgba(220, 130, 50, 0.12); border: 1px solid rgba(220, 130, 50, 0.45); align-items: flex-start; justify-content: space-between; flex-direction: row; padding: 10px 12px; }
+  .upd-banner-binary-lag-text { display: flex; flex-direction: column; gap: 6px; line-height: 1.5; }
+  .upd-banner-binary-lag-text code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; font-size: 11px; }
+  .upd-banner-dismiss { background: transparent; border: none; color: #ccc; font-size: 16px; line-height: 1; padding: 2px 6px; cursor: pointer; border-radius: 3px; }
+  .upd-banner-dismiss:hover { background: rgba(255,255,255,0.08); color: #fff; }
 </style>

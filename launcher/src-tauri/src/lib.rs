@@ -1666,6 +1666,17 @@ pub fn run() {
             commands::self_update::get_cached_update_status,
             commands::self_update::set_auto_check_enabled,
             commands::self_update::get_auto_check_enabled,
+            // v0.2.35 (Agent K): running-version display + post-update
+            // binary-lag warning. After "Update orchestrator" pulls the
+            // source tag for v0.X.Y but the matching `chore(binary):`
+            // commit hasn't landed yet from CI, the restarted launcher
+            // is the PREVIOUS release's binary. Surfaces a dismissible
+            // banner so the user knows to click Update again in
+            // 5-10 minutes. See `running_version_lags_tag` in
+            // self_update.rs for the comparison rules.
+            commands::self_update::get_launcher_running_version,
+            commands::self_update::get_latest_source_release_tag,
+            commands::self_update::check_running_version_lags_tag,
             // v0.2.15 (Agent D): launcher self-restart after binary swap.
             // Invoked by the green "Restart now" banner the FE renders for
             // `launcher_restart_required` deferral entries emitted by
