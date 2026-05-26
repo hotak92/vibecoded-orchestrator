@@ -280,6 +280,38 @@
       return iso;
     }
   }
+
+  // v0.2.35 (a11y, Agent O): keyboard support for the custom modals on
+  // this page. The two confirm/resync modals were rolled by hand (not
+  // via DialogRoot's native <dialog>), so they lacked native Escape
+  // handling. Wire Escape → close on the modal containers. Also handle
+  // focus restoration: when a modal opens we autofocus its first
+  // actionable button so the keyboard user can act immediately and so
+  // SR users land inside the dialog.
+  function onConfirmApplyKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && !applying) {
+      e.preventDefault();
+      confirmingApply = false;
+    }
+    e.stopPropagation();
+  }
+  function onResyncKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && !resyncing) {
+      e.preventDefault();
+      nonFastForward = null;
+    }
+    e.stopPropagation();
+  }
+  function autofocusFirstButton(el: HTMLDivElement) {
+    // After the modal mounts, move keyboard focus into the dialog so
+    // it lands on the first interactive control (typically the Cancel
+    // button — same position the native <dialog> would default to via
+    // showModal()'s focus trap).
+    queueMicrotask(() => {
+      const btn = el.querySelector<HTMLButtonElement>('button');
+      btn?.focus();
+    });
+  }
 </script>
 
 <svelte:head>
@@ -425,10 +457,26 @@
     </section>
   </main>
 
+  <!-- v0.2.35 (a11y, Agent O): the two custom modals below were rolled
+       by hand (not via DialogRoot's native <dialog>), so they lacked:
+       (1) aria-labelledby pointing at the heading,
+       (2) keyboard Escape handling,
+       (3) initial focus management when opening.
+       Each is fixed surgically below — see autofocusFirstButton + the
+       per-modal keydown handlers added in the script block. -->
   {#if confirmingApply}
     <div class="upd-modal-backdrop" role="presentation" onclick={() => (confirmingApply = false)}>
-      <div class="upd-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-        <h3>Update launcher?</h3>
+      <div
+        class="upd-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="upd-confirm-apply-heading"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={onConfirmApplyKeydown}
+        use:autofocusFirstButton
+      >
+        <h3 id="upd-confirm-apply-heading">Update launcher?</h3>
         <p>
           This will pull the latest changes from <code>{status?.branch || 'main'}</code>,
           rebuild the launcher, and restart it. Any unsaved work in the launcher window
@@ -454,8 +502,17 @@
         if (!resyncing) nonFastForward = null;
       }}
     >
-      <div class="upd-modal" role="dialog" aria-modal="true" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-        <h3>Local clone diverged from upstream</h3>
+      <div
+        class="upd-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="upd-resync-heading"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={onResyncKeydown}
+        use:autofocusFirstButton
+      >
+        <h3 id="upd-resync-heading">Local clone diverged from upstream</h3>
         <p>
           Your local copy can't fast-forward to the latest version because history
           has diverged (likely because we rewrote git history on 2026-05-06 to remove

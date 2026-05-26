@@ -522,11 +522,18 @@
     />
   </div>
 
-  <div class="filters">
+  <!-- v0.2.35 (a11y, Agent O): the filter pills are toggle buttons whose
+       "active" state was previously color-only. Adding aria-pressed makes
+       the toggle state programmatically queryable; screen readers
+       announce "pressed" / "not pressed" along with the label so users
+       know which filter is active without relying on visual styling. -->
+  <div class="filters" role="group" aria-label="Catalog filters">
     {#each ['all', 'free', 'pro', 'installed'] as f}
       <button
+        type="button"
         class="filter-pill"
         class:active={filter === f}
+        aria-pressed={filter === f}
         onclick={() => (filter = f as Filter)}
       >
         {f.charAt(0).toUpperCase() + f.slice(1)}
