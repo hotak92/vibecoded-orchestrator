@@ -115,6 +115,13 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
 
 /// Frontend payload for the `diagram-changed` Tauri event. Mirrors
 /// `launcher/src/lib/types/project-state.ts::DiagramChangedPayload`.
+///
+/// v0.2.36 (Agent R) added `file_path` — the TS type was already
+/// declaring it (an earlier sibling agent's expectation that wasn't
+/// landed) but the Rust payload was missing it. The auto-register-
+/// on-first-edit flow needs the project-relative path so the frontend
+/// can call `register_project_diagram` without going through a second
+/// IPC round-trip.
 #[derive(Debug, Clone, Serialize)]
 struct DiagramChangedPayload {
     project_id: String,
@@ -123,6 +130,13 @@ struct DiagramChangedPayload {
     /// (e.g. external edit of a not-yet-registered file); the frontend
     /// will reload its diagram list and re-resolve.
     diagram_id: i64,
+    /// Project-relative path of the changed file (e.g.
+    /// `.claude/diagrams/visual-draft/login-flow.mmd`). The frontend
+    /// uses this for the auto-register-on-first-edit flow when
+    /// `diagram_id == -1`. Empty string when the path doesn't resolve
+    /// inside the project folder (defensive — shouldn't happen since
+    /// the watcher's root is the project's `.claude/diagrams/`).
+    file_path: String,
     /// One of `create` | `edit` | `delete`. The `snapshot` kind is fired
     /// by the snapshot Tauri commands, not by this watcher.
     kind: &'static str,
@@ -286,9 +300,11 @@ fn spawn_debounce_task<R: Runtime + 'static>(app: AppHandle<R>) {
             }
             for (project_id, abs_path, slot) in ready {
                 let diagram_id = resolve_diagram_id(&app, &project_id, &abs_path);
+                let file_path = resolve_rel_path(&app, &project_id, &abs_path);
                 let payload = DiagramChangedPayload {
                     project_id: project_id.clone(),
                     diagram_id,
+                    file_path,
                     kind: slot.kind.as_str(),
                 };
                 if let Err(e) = app.emit("diagram-changed", &payload) {
@@ -320,6 +336,35 @@ fn collect_ready_events() -> Vec<(String, PathBuf, DebounceSlot)> {
         }
     }
     out
+}
+
+/// Resolve the project-relative form of `abs_path` so the frontend
+/// can use it for the auto-register-on-first-edit flow. Returns an
+/// empty string when:
+///   - the Db is unavailable (rare; only during teardown),
+///   - the project row vanished,
+///   - `abs_path` doesn't lie under the project folder (defensive —
+///     shouldn't happen since the watcher's root is `<project>/
+///     .claude/diagrams/`, but a race with project rename could
+///     in theory put us in that state).
+///
+/// The relative path is normalised to forward slashes so the
+/// frontend's regex (`/^\.claude\/diagrams\/.../`) works on Windows
+/// where the OS-native separator would be `\`.
+fn resolve_rel_path<R: Runtime>(app: &AppHandle<R>, project_id: &str, abs_path: &Path) -> String {
+    let Some(db) = app.try_state::<Db>() else {
+        return String::new();
+    };
+    let folder = match db.get_project(project_id) {
+        Ok(Some(p)) => PathBuf::from(p.folder_path),
+        _ => return String::new(),
+    };
+    let folder_canon = dunce::canonicalize(&folder).unwrap_or(folder);
+    let abs_canon = dunce::canonicalize(abs_path).unwrap_or_else(|_| abs_path.to_path_buf());
+    match abs_canon.strip_prefix(&folder_canon) {
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+        Err(_) => String::new(),
+    }
 }
 
 /// Resolve `diagram_id` from an absolute path. Looks up the

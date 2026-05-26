@@ -19,6 +19,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use serde::Deserialize;
@@ -999,6 +1000,139 @@ fn sibling_tmp_path(path: &Path) -> PathBuf {
     tmp
 }
 
+// ─── v0.2.36 Agent R — vendored editor opener ──────────────────────────
+//
+// Replaces the embedded Excalidraw editor (broken on Wayland+webkit2gtk)
+// and adds a visual Mermaid editor alongside the existing text editor.
+// The flow is:
+//
+//   1. Ensure the file exists on disk (create empty if absent) — gives
+//      the user something for the watcher to react to on first save.
+//   2. Lazily start the diagrams-local HTTP server on a free port at
+//      127.0.0.1 (idempotent).
+//   3. Open `http://127.0.0.1:<port>/<editor>/?file=<rel_path>` in the
+//      user's DEFAULT BROWSER via tauri-plugin-opener::open_url.
+//   4. The editor's JS fetches `/file?path=...`, lets the user edit,
+//      and POSTs back to `/save?path=...` on Save. The existing
+//      file-watcher (commands::diagram_watcher) picks up the change
+//      and pushes a `diagram-changed` event — the DiagramsTab handles
+//      auto-registration there.
+//
+// Soft-fail throughout — every error is converted to a `String` and
+// surfaced as a toast in the UI. The file watcher remains the source
+// of truth for "did the editor actually save something" — we don't
+// hold the editor session open or track its progress.
+
+#[command]
+pub async fn open_diagrams_editor(
+    project_id: String,
+    diagram_type: String,
+    name: String,
+    db: State<'_, Db>,
+) -> Result<String, String> {
+    // 1. Validate inputs at the boundary so we fail fast with a clear
+    //    error rather than relying on the local-server's path guard.
+    if !matches!(diagram_type.as_str(), "mermaid" | "excalidraw") {
+        return Err(format!(
+            "open_diagrams_editor: diagram_type must be \"mermaid\" or \"excalidraw\" (got \"{}\")",
+            diagram_type,
+        ));
+    }
+    if name.is_empty() {
+        return Err("open_diagrams_editor: name must be non-empty".to_string());
+    }
+    // Lowercase-kebab guard mirrors the registration check used elsewhere
+    // in this module. Keeps the path stable for both the legacy register
+    // flow and the new auto-register-on-first-save path.
+    let name_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*$")
+        .map_err(|e| format!("regex compile: {}", e))?;
+    if !name_re.is_match(&name) {
+        return Err(format!(
+            "open_diagrams_editor: name must be lowercase-kebab (got \"{}\")",
+            name,
+        ));
+    }
+
+    // 2. Resolve the project folder and the destination file path.
+    let project_folder = lookup_project_folder(&db, &project_id)?;
+    let ext = if diagram_type == "mermaid" { "mmd" } else { "excalidraw" };
+    // Default category for "Draw new (visual)" diagrams. The user can
+    // re-organise via the existing registration UI once the file is
+    // registered; this just picks a sensible starting folder.
+    let rel_path = format!(".claude/diagrams/visual-draft/{}.{}", name, ext);
+    let abs_path = project_folder.join(&rel_path);
+
+    // 3. Create an empty file on disk so the editor has a target to
+    //    GET /file against (returns 404 with empty body otherwise; the
+    //    editor's JS handles that, but creating the file lets the
+    //    watcher see the first save as `edit` rather than `create`,
+    //    which is cleaner UX for the auto-register path).
+    if !abs_path.exists() {
+        write_file_atomic(&abs_path, b"")?;
+    }
+
+    // 4. Spin up the local server (idempotent — first call only) and
+    //    grab its port. We open a fresh Db handle for the server (WAL
+    //    mode keeps it consistent with the main launcher connection).
+    //    Soft-fail: a Db::open failure here means the server can't
+    //    answer /file or /save, so we surface a clear error.
+    let server_db = Arc::new(
+        crate::db::Db::open()
+            .map_err(|e| format!("open_diagrams_editor: open server-side Db: {}", e))?,
+    );
+    let vendor_root = crate::commands::diagrams_local_server::resolve_vendor_root()?;
+    let port = crate::commands::diagrams_local_server::ensure_started(server_db, vendor_root)
+        .await
+        .map_err(|e| format!("open_diagrams_editor: ensure_started: {}", e))?;
+
+    // 5. Build the URL and hand it to the OS opener.
+    //    URL-encode the rel_path so any slashes / special chars survive
+    //    the query-string round trip. urlencoding::encode is a tiny
+    //    dep — we don't pull it in. Manual encoding (only paths + ASCII)
+    //    keeps the dependency footprint flat.
+    let encoded = encode_query_value(&rel_path);
+    let editor_path = if diagram_type == "mermaid" {
+        "mermaid"
+    } else {
+        "excalidraw"
+    };
+    let url = format!(
+        "http://127.0.0.1:{}/{}/?file={}",
+        port, editor_path, encoded,
+    );
+
+    tauri_plugin_opener::open_url(&url, None::<&str>)
+        .map_err(|e| format!("open_diagrams_editor: open_url({}): {}", url, e))?;
+
+    Ok(url)
+}
+
+/// Minimal URL-encoder for query-string values. Encodes the printable
+/// ASCII subset that's unsafe in a query value (`&`, `=`, ` `, `#`,
+/// `?`, `+`) plus all bytes outside `[A-Za-z0-9_.~-/]`. We don't pull
+/// in `urlencoding` / `percent-encoding` because this is the only spot
+/// in the launcher that needs the encoder.
+///
+/// `/` is left unencoded so the editor URL stays readable; the launcher
+/// local-server treats `?path=` verbatim, so an unencoded `/` is fine.
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let safe = b.is_ascii_alphanumeric()
+            || b == b'_'
+            || b == b'.'
+            || b == b'~'
+            || b == b'-'
+            || b == b'/';
+        if safe {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 //
 // We can't construct `tauri::State` in unit tests (it requires a running
@@ -1416,6 +1550,25 @@ mod tests {
     // through the #[command] macros is covered by the launcher's
     // integration tests + the hub-side tests in
     // `mcp_tool_grants_api.rs`.
+
+    #[test]
+    fn encode_query_value_preserves_slashes_and_encodes_unsafe_chars() {
+        // The launcher local-server treats the path verbatim; we keep
+        // `/` unencoded so the URL stays readable in browser history.
+        assert_eq!(
+            encode_query_value(".claude/diagrams/g/x.mmd"),
+            ".claude/diagrams/g/x.mmd",
+        );
+        // Unsafe chars get percent-encoded.
+        assert_eq!(encode_query_value("a b&c=d#e"), "a%20b%26c%3Dd%23e");
+        // Unicode bytes get percent-encoded byte-by-byte.
+        assert_eq!(encode_query_value("café"), "caf%C3%A9");
+        // Already-safe ASCII alnum + - _ . ~ pass through.
+        assert_eq!(
+            encode_query_value("abc-XYZ_123.foo~bar"),
+            "abc-XYZ_123.foo~bar",
+        );
+    }
 
     #[test]
     fn fallback_default_allowlist_returns_mermaid_set() {

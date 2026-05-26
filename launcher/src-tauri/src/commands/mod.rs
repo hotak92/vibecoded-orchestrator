@@ -26,6 +26,12 @@ pub mod diagrams_cmd;
 // per-command shape. See
 // `.claude/context/plans/diagrams-frontend-wiring-handoff-2026-05-25.md`.
 pub mod diagram_watcher;
+// v0.2.36 Agent R — local HTTP server that serves the vendored
+// Mermaid/Excalidraw editors at 127.0.0.1:<free-port>. Lazy-started
+// on the first `open_diagrams_editor` Tauri command. Replaces the
+// embedded Excalidraw editor (broken on Wayland+webkit2gtk) and adds
+// a visual Mermaid editor alongside the existing text-only one.
+pub mod diagrams_local_server;
 pub mod embedding_catalog;
 pub mod embedding_enrichment;
 // C8 wire-up (2026-05-25): Tauri command `read_env_var` consumed by the
