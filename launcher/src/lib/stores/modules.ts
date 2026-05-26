@@ -14,6 +14,7 @@
 
 import { writable, derived } from 'svelte/store';
 import { invoke, listen, tauriAvailable } from '$lib/tauri';
+import { toast } from '$lib/stores/toast';
 import type {
   CatalogResponse,
   DevAffordanceHint,
@@ -24,6 +25,26 @@ import type {
   ModuleInstallCompleteEvent,
   ModuleStatusView,
 } from '$lib/types/launcher';
+
+/**
+ * v0.2.35 (Agent N): subset of the InstallProgress payload the Rust
+ * `installer_engine` emits on `module://install-progress`. We only
+ * consume the variant-fallback stage here; the rest of the progress
+ * channel is unused today (see the legacy comment above — install is
+ * modelled as a single async call).
+ *
+ * Shape mirrors `InstallStage` (snake_case via serde rename) — the only
+ * stage this store reacts to is `variant_fallback`.
+ */
+interface ModuleInstallProgressEvent {
+  project_id: string;
+  module_id: string;
+  stage: string;
+  step_index: number;
+  step_total: number;
+  percent: number;
+  message: string;
+}
 
 interface ModulesState {
   catalog: ModuleCatalogEntry[];
@@ -55,6 +76,24 @@ function createModulesStore() {
   if (tauriAvailable()) {
     listen<ModuleInstallCompleteEvent>('module://install-complete', () => {
       update((s) => ({ ...s, installingId: null }));
+    });
+
+    // v0.2.35 (Agent N): surface a toast when the install's chosen
+    // GPU variant wasn't available on the registry and the backend
+    // silently fell back to the cpu variant. The install continues
+    // normally — this is purely informational so the user understands
+    // why their CUDA variant didn't land.
+    //
+    // Non-blocking by design: pre-v0.2.35 the same scenario produced a
+    // cryptic `denied`/404 hard-fail with no way to act. The fallback
+    // now Just Works for the common case (publisher hasn't built
+    // `-cuda` for this release yet) and the toast tells the user what
+    // happened. If they want the cuda variant they can re-install once
+    // the publisher ships it.
+    listen<ModuleInstallProgressEvent>('module://install-progress', (e) => {
+      if (e.payload.stage === 'variant_fallback') {
+        toast.info(e.payload.message);
+      }
     });
   }
 
