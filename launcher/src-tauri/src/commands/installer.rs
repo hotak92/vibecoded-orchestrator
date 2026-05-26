@@ -7252,11 +7252,21 @@ pub fn snap_to_common_ram_gb(meminfo_kb: u64) -> u64 {
 }
 
 async fn check_command_exists(cmd: &str) -> bool {
+    // CREATE_NO_WINDOW (0x08000000) on Windows: `where` spawned from a
+    // GUI-subsystem parent flashes a conhost.exe console for its
+    // ~200ms lifetime. detect_system() calls this 3 times concurrently
+    // for {claude,git,node} at boot, and check_command_exists also has
+    // other callers (~9 visible console flashes per launcher start
+    // observed via EnumWindows snapshot, 2026-05-26). Suppress.
     let check = if cfg!(windows) {
-        tokio::process::Command::new("where")
-            .arg(cmd)
-            .output()
-            .await
+        let mut cmd_builder = tokio::process::Command::new("where");
+        cmd_builder.arg(cmd);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd_builder.creation_flags(0x0800_0000);
+        }
+        cmd_builder.output().await
     } else {
         tokio::process::Command::new("which")
             .arg(cmd)
