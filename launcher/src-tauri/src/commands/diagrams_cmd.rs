@@ -27,6 +27,7 @@ use tauri::{command, State};
 use crate::db::diagrams::{AccessRow, DiagramRow, ModuleRow, SnapshotRow, ToolGrant};
 use crate::db::mcp_tool_defaults::McpToolDefault;
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 // ─── Read commands ──────────────────────────────────────────────────────
 
@@ -553,7 +554,7 @@ fn spawn_re_render_claude_md(db: &Db, project_id: &str) {
     let project_id_str = project_id.to_string();
     let project_name = project.name.clone();
     let folder_str = folder.to_string_lossy().into_owned();
-    let spawn_result = std::process::Command::new(&python)
+    let spawn_result = std::process::Command::new(&python).silent()
         .arg("-m")
         .arg("vco_lib.project_init")
         .arg("re-render-claude-md")

@@ -5,6 +5,70 @@
 //! need to ask "is this PID still alive?". Identical semantics in
 //! either context.
 
+/// Extension trait that adds `.silent()` to both `std::process::Command`
+/// and `tokio::process::Command`. On Windows, calling `.silent()` sets
+/// the `CREATE_NO_WINDOW` (0x08000000) flag on the child so that
+/// spawning a subprocess from a GUI-subsystem parent (the launcher,
+/// built with `windows_subsystem = "windows"`) does NOT allocate a
+/// new conhost.exe console window for the child. On Linux/macOS the
+/// call is a no-op.
+///
+/// History: prior to v0.2.34's audit on 2026-05-26, 208 of the 221
+/// `Command::new` call sites in the launcher omitted the flag. Each
+/// missing site flashes a conhost console on Windows for the duration
+/// of the subprocess (typically 50-500ms per `where`, `docker`, `git`,
+/// `python`, etc.). With launcher boot invoking 11+ such subprocesses
+/// concurrently (detect_system, hub_launcher, runtime probes,
+/// install-health probes, embedding-catalog probes, ...) the user
+/// sees a "fork bomb" of console windows cascading on screen.
+/// Centralising the fix on a chainable method makes the call-site
+/// edit a one-line append (`.silent()`) and avoids the indent-style
+/// inconsistencies of inlining 208 `#[cfg(windows)]` blocks.
+///
+/// Usage:
+/// ```ignore
+/// use vct_launcher_core::process::CommandExt;
+/// std::process::Command::new("git")
+///     .silent()
+///     .arg("status")
+///     .output()?;
+/// ```
+/// Implementation detail: takes `self` by value and returns it so that
+/// `Command::new(x).silent()` works as a fluent expression (the produced
+/// temporary chains forward instead of needing a `let mut binding`).
+/// Existing patterns that use a separate `let mut cmd = Command::new(x);
+/// cmd.silent();` also work because `Command` implements no Deref to
+/// the borrow form -- the call signature is unambiguous on a fresh
+/// owned value.
+pub trait CommandExt: Sized {
+    fn silent(self) -> Self;
+}
+
+impl CommandExt for std::process::Command {
+    fn silent(mut self) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            self.creation_flags(0x0800_0000);
+        }
+        self
+    }
+}
+
+impl CommandExt for tokio::process::Command {
+    fn silent(mut self) -> Self {
+        #[cfg(windows)]
+        {
+            // tokio::process::Command on Windows wraps std::process::Command
+            // and exposes the same `creation_flags` method via the same
+            // CommandExt trait from std::os::windows::process.
+            use std::os::windows::process::CommandExt as _;
+            self.creation_flags(0x0800_0000);
+        }
+        self
+    }
+}
+
 /// Check whether a given PID is still alive.
 ///
 /// Cross-OS: `kill(pid, 0)` on POSIX (signal 0 means "validate the

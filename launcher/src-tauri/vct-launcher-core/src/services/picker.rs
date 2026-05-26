@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::services::runtime::RuntimeInfo;
+use crate::process::CommandExt as _;
 
 /// HTTP timeout for each fullness probe. Kept short — a candidate that
 /// can't answer in 3s is a candidate that isn't fully up, and ranking
@@ -245,7 +246,7 @@ pub(crate) fn row_matches_service(row: &PsRow, service: &str, canonical_port: u1
 
 /// Run `<runtime> ps -a --format <PS_FORMAT>` and return parsed rows.
 async fn list_all_containers(runtime: &RuntimeInfo) -> Result<Vec<PsRow>, String> {
-    let mut cmd = tokio::process::Command::new(&runtime.binary_path);
+    let mut cmd = tokio::process::Command::new(&runtime.binary_path).silent();
     cmd.args(["ps", "-a", "--format", PS_FORMAT]);
     let out = cmd
         .output()
@@ -274,7 +275,7 @@ async fn list_all_containers(runtime: &RuntimeInfo) -> Result<Vec<PsRow>, String
 /// Returns 0 on any error (soft-fail: a missing restart count must NOT
 /// block enumeration).
 async fn inspect_restart_count(runtime: &RuntimeInfo, name: &str) -> u32 {
-    let mut cmd = tokio::process::Command::new(&runtime.binary_path);
+    let mut cmd = tokio::process::Command::new(&runtime.binary_path).silent();
     cmd.args([
         "inspect",
         "--format",
@@ -294,7 +295,7 @@ async fn inspect_restart_count(runtime: &RuntimeInfo, name: &str) -> u32 {
 /// Read the health-check state via `<runtime> inspect`. Returns `None`
 /// when the container has no health check or inspection fails (soft).
 async fn inspect_health(runtime: &RuntimeInfo, name: &str) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(&runtime.binary_path);
+    let mut cmd = tokio::process::Command::new(&runtime.binary_path).silent();
     cmd.args([
         "inspect",
         "--format",

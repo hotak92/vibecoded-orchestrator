@@ -56,6 +56,7 @@
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use vct_launcher_core::manifest::ModuleManifest;
+use vct_launcher_core::process::CommandExt as _;
 
 const CONTAINER_MANIFEST_PATH: &str = "/app/vct-module.json";
 
@@ -105,7 +106,7 @@ pub async fn extract_manifest_from_image(
     // Step 2: create the throw-away container. `create` doesn't run
     // the container — it just materialises the filesystem layer so
     // `cp` can read out of it.
-    let create_out = Command::new(runtime)
+    let create_out = Command::new(runtime).silent()
         .args(["create", image_ref])
         .output()
         .await
@@ -148,7 +149,7 @@ pub async fn extract_manifest_from_image(
     let cp_dst = tmp_path
         .to_str()
         .ok_or_else(|| format!("tmp path not utf8: {}", tmp_path.display()))?;
-    let cp_out = Command::new(runtime)
+    let cp_out = Command::new(runtime).silent()
         .args(["cp", &cp_src, cp_dst])
         .output()
         .await
@@ -292,7 +293,7 @@ impl Drop for ContainerCleanup {
             }
         }
 
-        let _ = std::process::Command::new(&self.runtime)
+        let _ = std::process::Command::new(&self.runtime).silent()
             .args(["rm", &self.cid])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

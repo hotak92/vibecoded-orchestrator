@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::process::Command;
 
 use crate::manifest::{CommandSpec, InstallMethod, ModuleManifest, PlaceholderCtx};
+use vct_launcher_core::process::CommandExt as _;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -421,7 +422,7 @@ async fn container_pull(
         container_login(&runtime, &registry, t).await?;
     }
 
-    let pull_status = Command::new(&runtime)
+    let pull_status = Command::new(&runtime).silent()
         .args(["pull", &image_ref])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -436,7 +437,7 @@ async fn container_pull(
             .registry
             .clone()
             .unwrap_or_else(|| infer_registry_from_image(&container.image));
-        let _ = Command::new(&runtime)
+        let _ = Command::new(&runtime).silent()
             .args(["logout", &registry])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -542,7 +543,7 @@ async fn request_pull_token(
 /// so the image reference resolves to a known-good local copy.
 pub(crate) async fn detect_container_runtime() -> Result<String, String> {
     for candidate in ["podman", "docker"] {
-        let probe = Command::new(candidate)
+        let probe = Command::new(candidate).silent()
             .args(["--version"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -562,7 +563,7 @@ pub(crate) async fn detect_container_runtime() -> Result<String, String> {
 async fn container_login(runtime: &str, registry: &str, token: &str) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
 
-    let mut child = Command::new(runtime)
+    let mut child = Command::new(runtime).silent()
         .args(["login", registry, "-u", "vct-paid-module", "--password-stdin"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -614,7 +615,7 @@ async fn git_clone(source: &str, git_ref: &str, dest: &Path) -> Result<(), Strin
             .map_err(|e| format!("create parent {}: {}", parent.display(), e))?;
     }
 
-    let status = Command::new("git")
+    let status = Command::new("git").silent()
         .args(["clone", "--depth", "1", "--branch", git_ref, source])
         .arg(dest)
         .stdout(Stdio::piped())
@@ -661,7 +662,7 @@ async fn run_post_install_command(
         });
     let cwd = PathBuf::from(&cwd_str);
 
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(program).silent();
     cmd.args(args);
     cmd.current_dir(&cwd);
     // Scrubbed env: only pass through PATH, HOME, USER, and platform essentials.
@@ -1110,7 +1111,7 @@ async fn refetch_artifact(
                 // Existing checkout — git pull preserves any user-edited
                 // gitignored files (e.g. local config under the install
                 // dir).
-                let status = Command::new("git")
+                let status = Command::new("git").silent()
                     .args(["-C"])
                     .arg(install_dir)
                     .args(["pull", "--ff-only"])

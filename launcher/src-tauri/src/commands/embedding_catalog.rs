@@ -61,6 +61,7 @@ use tauri::{command, State};
 use tokio::time::timeout;
 
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -253,7 +254,7 @@ async fn run_discover(
     let python = resolve_python_for_vco_lib()
         .ok_or_else(|| "no python interpreter found for vco_lib".to_string())?;
 
-    let mut cmd = tokio::process::Command::new(&python);
+    let mut cmd = tokio::process::Command::new(&python).silent();
     cmd.arg("-m")
         .arg("vco_lib.embedding_service")
         .arg("discover")
