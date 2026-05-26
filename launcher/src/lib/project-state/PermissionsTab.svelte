@@ -119,6 +119,20 @@
   };
   let mcpToolGroups = $state<McpToolsGroup[]>([]);
 
+  // v0.2.35 Agent L fix (a): atomic MCPs (weaviate-kg / search / playwright)
+  // ship no `tool_allowlist` — they're on/off-only, not per-tool gated. The
+  // generic MCP Tools section rendered an empty "No tools exposed" placeholder
+  // for them which looked like a bug. We now filter atomic MCPs out of the
+  // per-tool section entirely (they remain in the MCP servers toggle table
+  // above).
+  //
+  // The frontend mirrors the Rust-side `fallback_default_allowlist` in
+  // `launcher/src-tauri/src/commands/diagrams_cmd.rs` — see the integration
+  // test `fallback_default_allowlist_matches_hub_constants` for the sync
+  // contract with `vct-hub`. If new wrapper MCPs ship with default tool
+  // allowlists, add their IDs here.
+  const PER_TOOL_CAPABLE_MCPS = new Set(['mermaid', 'excalidraw']);
+
   async function loadMcpToolGroups() {
     // Reuse the same MCP list that drives the per-server toggle table
     // above. Derive a thin Info[] from `mcpRows` once it's loaded.
@@ -126,18 +140,22 @@
       mcpToolGroups = [];
       return;
     }
-    mcpToolGroups = mcpRows.map((row) => ({
-      info: {
-        mcp_name: row.id,
-        project_enabled: row.project_enabled,
-        explicit: row.explicit,
-      },
-      expanded: false,
-      loading: false,
-      loaded: false,
-      customized: false,
-      tools: [],
-    }));
+    // Filter to per-tool-capable MCPs only (fix (a) above). Atomic MCPs
+    // still appear in the MCP servers section above with on/off toggles.
+    mcpToolGroups = mcpRows
+      .filter((row) => PER_TOOL_CAPABLE_MCPS.has(row.id))
+      .map((row) => ({
+        info: {
+          mcp_name: row.id,
+          project_enabled: row.project_enabled,
+          explicit: row.explicit,
+        },
+        expanded: false,
+        loading: false,
+        loaded: false,
+        customized: false,
+        tools: [],
+      }));
   }
 
   async function expandMcpToolGroup(group: McpToolsGroup) {
@@ -369,7 +387,11 @@
     {#if mcpLoading}
       <p class="ps-empty">Loading MCP tools…</p>
     {:else if mcpToolGroups.length === 0}
-      <p class="ps-empty">No MCP servers — nothing to scope.</p>
+      <p class="ps-empty">
+        No per-tool-gated MCPs registered. Atomic MCPs (e.g.
+        <code>weaviate-kg</code>, <code>search</code>, <code>playwright</code>)
+        are controlled by the on/off toggle above.
+      </p>
     {:else}
       <ul class="ps-mcp-tool-groups">
         {#each mcpToolGroups as group (group.info.mcp_name)}
