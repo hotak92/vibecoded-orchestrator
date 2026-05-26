@@ -42,9 +42,23 @@ fn validate_tier_url() -> String {
     std::env::var("VCT_VALIDATE_TIER_URL").unwrap_or_else(|_| DEFAULT_VALIDATE_TIER_URL.to_string())
 }
 
-const LICENSE_MODULE_ID: &str = "licensing";
-const LICENSE_KEY_NAME: &str = "VIBECODED_LICENSE_KEY";
+pub(crate) const LICENSE_MODULE_ID: &str = "licensing";
+pub(crate) const LICENSE_KEY_NAME: &str = "VIBECODED_LICENSE_KEY";
 const GRACE_PERIOD_MS: i64 = 3 * 24 * 3600 * 1000;
+
+/// Read the currently-activated license key from the OS keychain.
+/// Returns `Ok(Some(key))` when present, `Ok(None)` when the user has
+/// not activated (free tier), and `Err` on keychain access failure.
+///
+/// Shared between `license_refresh` (this module) and
+/// `installer_engine::request_pull_token` (Phase 3A pull-token flow,
+/// v0.2.35) so both call sites agree on the canonical credential
+/// location. Previously `request_pull_token` read
+/// `~/.vibecoded/license_cache.json` and POSTed its body verbatim —
+/// that body has no `license_key` field, the keychain does.
+pub(crate) fn read_license_key_from_keychain() -> Result<Option<String>, String> {
+    secrets::get(SecretScope::Global, LICENSE_MODULE_ID, LICENSE_KEY_NAME)
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct TierCacheView {
@@ -100,7 +114,7 @@ fn to_view(row: TierCacheRow) -> TierCacheView {
     }
 }
 
-fn machine_id_hash() -> String {
+pub(crate) fn machine_id_hash() -> String {
     // Mirrors commercial_workflow/license/validator.py::_machine_id_hash
     // sha256 of the 8-byte big-endian MAC, hex lowercase.
     let mac = mac_address::get_mac_address().ok().flatten();

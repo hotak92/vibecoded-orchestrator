@@ -383,29 +383,37 @@ async fn container_pull(
 
     // ─── Step 1: try to obtain a pull token from the signed-URL gateway ─
     //
-    // For v0 (Phase 1B) this is a stub: we attempt the POST but treat ANY
-    // failure (network, 404, 401, body-parse) as "gateway not available,
-    // fall through to anonymous pull". Once Phase 3A lands the Supabase
-    // edge function, missing-token will become a hard error (registry is
-    // private, anonymous pull will 401 anyway — better to fail at the
-    // gateway-call site with a clear "your Pro license could not issue
-    // a pull token" message).
-    let token: Option<String> = match request_pull_token(container).await {
+    // v0.2.35 (Phase 3A): `request_pull_token` is now the canonical
+    // paid-module auth path. It reads the license key from the OS
+    // keychain (the same source `license_refresh` uses), computes the
+    // MAC-based machine_id_hash, and POSTs `{license_key, machine_id_hash}`
+    // to the manifest's `pull_token_endpoint` (e.g., `rl-artifact-url`).
+    // The endpoint re-validates the license server-side and returns a
+    // short-lived (≤15min) repository-scoped pull token.
+    //
+    // On Err we still fall through to anonymous pull, because the
+    // legacy "image is public during the launch window" scenario is
+    // still valid for free-tier publishers AND for the dev/test image
+    // variants that haven't been flipped to private yet. The 401 path
+    // is now diagnostic — the Err message from request_pull_token
+    // carries the actual cause (license_invalid / tier_insufficient /
+    // network / etc.) so the user sees an actionable error instead of
+    // the old "Phase 3A gateway not deployed" footer.
+    let (token, token_request_err): (Option<String>, Option<String>) = match request_pull_token(container).await {
         Ok(tok) => {
             eprintln!(
                 "[installer_engine] container_pull[{}]: obtained pull token (expires_in={}s)",
                 module_id, tok.expires_in_s
             );
-            Some(tok.pull_token)
+            (Some(tok.pull_token), None)
         }
         Err(e) => {
             eprintln!(
-                "[installer_engine] container_pull[{}]: pull-token gateway unavailable ({}). \
-                 Falling back to anonymous pull — will succeed only if the image is public, \
-                 401 if private. Phase 3A will turn this into a hard error.",
+                "[installer_engine] container_pull[{}]: pull-token gateway returned: {}. \
+                 Falling back to anonymous pull — will succeed only if the image is public.",
                 module_id, e
             );
-            None
+            (None, Some(e))
         }
     };
 
@@ -451,10 +459,18 @@ async fn container_pull(
             pull_status.code().unwrap_or(-1),
             image_ref,
             if token.is_none() {
-                " — likely because no pull token was obtained from the signed-URL gateway \
-                 (Phase 3A) and the image is private (registry returns 401 for anonymous pulls)."
+                // v0.2.35: the request_pull_token error is now the
+                // authoritative reason for the 401. Quote it verbatim
+                // so the user sees the actual cause (e.g. "your license
+                // has expired") instead of the pre-v0.2.35 generic
+                // "Phase 3A gateway not deployed" footer that masked
+                // every real failure mode.
+                match token_request_err.as_deref() {
+                    Some(reason) => format!(" — license check failed: {}", reason),
+                    None => " — and the pull-token gateway returned no error detail (this is unexpected; please report)".to_string(),
+                }
             } else {
-                ""
+                String::new()
             }
         ));
     }
@@ -469,67 +485,141 @@ struct PullTokenResponse {
     pub expires_in_s: u64,
 }
 
-/// POST validated-tier JWT to the manifest's `pull_token_endpoint`.
+/// Request a short-lived registry pull token from the manifest's
+/// `pull_token_endpoint` (Phase 3A, v0.2.35).
 ///
-/// Today: stub. Returns Err if the JWT-from-license-cache helper isn't
-/// available or the endpoint returns non-200. Phase 3A makes this the
-/// canonical paid-module auth path; until then, container_pull falls
-/// through to anonymous pull on Err.
+/// Wire contract (matches `launcher/supabase/functions/rl-artifact-url`):
+///   Request:  `{ "license_key": "<UUID-or-vct_admin_*>", "machine_id_hash": "<sha256 hex>" }`
+///   Response: `{ "image", "tag", "registry", "pull_token", "expires_in_s", "expires_at" }`
+///
+/// The launcher serves the user's license key out of the OS keychain —
+/// the SAME source `license_refresh` uses for `/validate-tier`. The
+/// `machine_id_hash` is derived from the host's first non-loopback MAC
+/// via `commands::licensing::machine_id_hash`, again matching the
+/// `validate-tier` call site so the server sees consistent bindings.
+///
+/// Returned errors are passed to the caller in user-readable form
+/// (NOT just propagated through `container_pull`'s misleading
+/// "Phase 3A gateway not deployed" footer text — that footer remains
+/// only for the truly-anonymous-pull case where this function returned
+/// `Err` BEFORE even reaching the server). The container_pull error
+/// formatter inspects the structured error variant in v0.2.35.
+///
+/// Pre-v0.2.35 behaviour (the stub): POSTed `~/.vibecoded/license_cache.json`
+/// body verbatim — that body has no `license_key` field, server returned
+/// 400 invalid-shape, every paid-module install fell through to anonymous
+/// pull and 401'd on the private registry.
 async fn request_pull_token(
     container: &crate::manifest::ContainerInstallBlock,
 ) -> Result<PullTokenResponse, String> {
-    // TODO[Phase 3A]: read the validated-tier JWT from ~/.vibecoded/license_cache.json
-    // (populated by VCThelpers/license/validator.py after /validate-tier success).
-    // For now, treat the absence of that file as "gateway unavailable" — keeps
-    // dev flow working with anonymous pulls.
-    let cache_path = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".vibecoded/license_cache.json"))
-        .ok_or("cannot resolve ~/.vibecoded/license_cache.json")?;
+    // 1. License key from keychain.
+    let license_key = crate::commands::licensing::read_license_key_from_keychain()
+        .map_err(|e| format!("keychain read failed: {}", e))?
+        .ok_or_else(|| {
+            "no license activated — open Settings → License → Activate to enter your key".to_string()
+        })?;
 
-    if !cache_path.exists() {
-        return Err(format!(
-            "license cache absent ({}); skipping token request",
-            cache_path.display()
-        ));
-    }
+    // 2. Machine ID hash — sha256 of 8-byte big-endian MAC. Same algorithm
+    // `license_refresh` uses, so the server sees a consistent binding
+    // when comparing pull-time vs activation-time machine identity.
+    let machine_hash = crate::commands::licensing::machine_id_hash();
 
-    let body = tokio::fs::read_to_string(&cache_path)
-        .await
-        .map_err(|e| format!("read license cache: {}", e))?;
-
-    // POST the cache body verbatim (the cache is opaque to us; the edge
-    // function validates the JWT inside). 15s timeout — short enough to
-    // not block install flow on a stuck gateway.
+    // 3. HTTP client. 15s timeout — long enough to absorb a slow GHCR
+    // token-exchange roundtrip on the server side; short enough to not
+    // hang the install UI.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("build http client: {}", e))?;
 
+    let method = container
+        .pull_token_method
+        .parse::<reqwest::Method>()
+        .unwrap_or(reqwest::Method::POST);
+
     let resp = client
-        .request(
-            container.pull_token_method.parse().unwrap_or(reqwest::Method::POST),
-            &container.pull_token_endpoint,
-        )
-        .header("Content-Type", "application/json")
-        .body(body)
+        .request(method, &container.pull_token_endpoint)
+        .json(&serde_json::json!({
+            "license_key": license_key,
+            "machine_id_hash": machine_hash,
+        }))
         .send()
         .await
         .map_err(|e| format!("POST {}: {}", container.pull_token_endpoint, e))?;
 
-    if !resp.status().is_success() {
-        return Err(format!(
-            "pull-token gateway returned {}: {}",
-            resp.status(),
-            container.pull_token_endpoint
-        ));
+    let status = resp.status();
+    if status.is_success() {
+        let parsed: PullTokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse pull-token response: {}", e))?;
+        return Ok(parsed);
     }
 
-    let parsed: PullTokenResponse = resp
+    let body: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("parse pull-token response: {}", e))?;
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Err(format_pull_token_error(status.as_u16(), &body))
+}
 
-    Ok(parsed)
+/// Map a non-2xx `rl-artifact-url` response into a user-actionable string.
+///
+/// Lifted to a free function so the test module can exercise every
+/// error-code/HTTP-status pairing without spinning up an HTTP server.
+/// The error body shape is `{ error: <code>, detail?: <string>,
+/// required_tier?: <string>, got?: <string> }` per the edge function
+/// at `launcher/supabase/functions/rl-artifact-url/index.ts`.
+pub(crate) fn format_pull_token_error(status: u16, body: &serde_json::Value) -> String {
+    let code = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_error");
+    let detail = body
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match (status, code) {
+        (400, _) => format!(
+            "pull-token gateway rejected the request shape ({}). \
+             This is a launcher bug — please report it. detail={}",
+            code, detail
+        ),
+        (401, "license_invalid") => {
+            "your license key is invalid or has been revoked. \
+             Open Settings → License → Refresh; if the problem persists, \
+             contact support."
+                .to_string()
+        }
+        (401, "license_expired") => {
+            "your license has expired. Renew on the dashboard, then \
+             open Settings → License → Refresh."
+                .to_string()
+        }
+        (401, "tier_insufficient") => {
+            let required = body
+                .get("required_tier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pro");
+            let got = body.get("got").and_then(|v| v.as_str()).unwrap_or("free");
+            format!(
+                "this module requires the {} tier; your license validates as {}. \
+                 Upgrade on the dashboard, then open Settings → License → Refresh.",
+                required, got
+            )
+        }
+        (401, _) => format!(
+            "license check failed at the pull-token gateway: {} ({})",
+            code, detail
+        ),
+        (500, _) => format!(
+            "pull-token gateway is temporarily unavailable ({}). \
+             Try again in a few minutes; if it persists, check Services tab.",
+            detail
+        ),
+        (s, c) => format!("pull-token gateway returned HTTP {}: {} ({})", s, c, detail),
+    }
 }
 
 /// Detect which container runtime to use. Prefers podman (matches the
@@ -1606,5 +1696,172 @@ mod tests {
         assert_eq!(json["stage"], "migrate", "stage must serialize as snake_case 'migrate'");
         assert_eq!(json["step_index"], 3);
         assert_eq!(json["step_total"], 5);
+    }
+
+    // ─── v0.2.35 Phase 3A: pull-token error formatting ─────────────────
+    //
+    // The `format_pull_token_error` helper is the lifted, pure-function
+    // version of the error-mapping logic inside `request_pull_token`.
+    // Tests pin every (HTTP status, error code) pairing the edge function
+    // at `launcher/supabase/functions/rl-artifact-url/index.ts` can return,
+    // so a future server-side rename / status-code drift fails loudly here
+    // BEFORE shipping.
+
+    #[test]
+    fn pull_token_error_400_is_actionable_for_launcher_bug() {
+        // Server rejected our request shape — almost always a launcher
+        // regression (e.g. a renamed body field). User sees a "report it"
+        // message rather than a cryptic 400.
+        let body = serde_json::json!({
+            "error": "license_key_invalid_format",
+            "detail": "expected UUID"
+        });
+        let msg = format_pull_token_error(400, &body);
+        assert!(
+            msg.contains("launcher bug"),
+            "400 must flag this as a launcher bug; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("license_key_invalid_format"),
+            "400 must surface the server's error code; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("expected UUID"),
+            "400 must surface the server's detail; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn pull_token_error_401_license_invalid_directs_user_to_refresh() {
+        let body = serde_json::json!({ "error": "license_invalid", "detail": "" });
+        let msg = format_pull_token_error(401, &body);
+        assert!(
+            msg.contains("invalid"),
+            "license_invalid message must say so; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Settings → License → Refresh"),
+            "license_invalid must point to the Settings recovery path; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn pull_token_error_401_license_expired_says_expired() {
+        let body = serde_json::json!({ "error": "license_expired", "detail": "" });
+        let msg = format_pull_token_error(401, &body);
+        assert!(
+            msg.contains("expired"),
+            "license_expired message must use the word; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Renew"),
+            "license_expired must point to renewal; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn pull_token_error_401_tier_insufficient_names_both_tiers() {
+        let body = serde_json::json!({
+            "error": "tier_insufficient",
+            "required_tier": "pro",
+            "got": "free"
+        });
+        let msg = format_pull_token_error(401, &body);
+        assert!(
+            msg.contains("pro"),
+            "must name required tier; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("free"),
+            "must name actual tier; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Upgrade"),
+            "must suggest upgrade path; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn pull_token_error_401_unknown_code_falls_through_with_detail() {
+        // Forward-compat: if the edge function adds a new 401 error code
+        // (e.g. "machine_mismatch"), we still surface SOMETHING usable
+        // instead of crashing or producing an empty message.
+        let body = serde_json::json!({
+            "error": "machine_mismatch",
+            "detail": "rebind on the dashboard"
+        });
+        let msg = format_pull_token_error(401, &body);
+        assert!(
+            msg.contains("machine_mismatch"),
+            "unknown 401 code must still surface the code; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("rebind on the dashboard"),
+            "unknown 401 code must still surface the detail; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn pull_token_error_500_suggests_retry_later() {
+        let body = serde_json::json!({
+            "error": "registry_token_exchange_failed",
+            "detail": "ghcr 502"
+        });
+        let msg = format_pull_token_error(500, &body);
+        assert!(
+            msg.contains("unavailable") || msg.contains("Try again"),
+            "500 must signal transience; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("ghcr 502"),
+            "500 must surface the underlying detail; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn pull_token_error_unexpected_status_quotes_the_status_code() {
+        // 418 (a stand-in for "weird status the server shouldn't return")
+        // must still produce a parseable error string for support triage.
+        let body = serde_json::json!({ "error": "teapot", "detail": "I'm short and stout" });
+        let msg = format_pull_token_error(418, &body);
+        assert!(
+            msg.contains("418"),
+            "unexpected status must quote the status code; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("teapot"),
+            "unexpected status must surface the error code; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn pull_token_error_empty_body_does_not_panic() {
+        // The edge function might return an empty body on some failure
+        // modes (e.g. proxy timeout). Defensive: the helper must produce
+        // a non-empty error string regardless.
+        let body = serde_json::json!({});
+        let msg = format_pull_token_error(503, &body);
+        assert!(!msg.is_empty(), "empty body must still produce a message");
+        assert!(
+            msg.contains("503"),
+            "empty body still quotes the status; got: {}",
+            msg
+        );
     }
 }
