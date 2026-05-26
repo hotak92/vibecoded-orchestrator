@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.36] — 2026-05-26
+
+A **post-v0.2.35-dogfooding follow-up release** — closes the launcher-side fragility surfaces uncovered while attempting first end-to-end paid-module installs against the v0.2.35 binary on real customer hardware (Fabio's Windows laptop) + a server-side architectural shift to per-module GitHub bot users for paid-module distribution. 7 agents (P/R/S/T/U/W + integration tree work).
+
+### BREAKING — admin-tier only
+
+- **`machine_id_hash` algorithm switched from MAC-based to platform-stable host ID** (Agent T): Windows `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`, macOS `IOPlatformUUID` via `ioreg`, Linux `/etc/machine-id` (fallback `/var/lib/dbus/machine-id`). Old algorithm hashed the first 6 bytes of a non-loopback MAC; on laptops with multiple NICs (Wi-Fi + USB Ethernet) Python and Rust could pick different MACs → different hashes → `machine_mismatch` 401 from `validate-tier`. Platform host IDs survive NIC changes. Mirror implementation on Python side. Sentinel fallback `vct-no-platform-host-id-v0.2.36` if all sources fail (testable via `VCT_MACHINE_ID_OVERRIDE` env var). **Migration**: admin-tier users with an existing `vct_admin_*` Vault token must click "Rebind to this machine" once after updating — the new GUI button (Agent S) calls the new `rebind-admin-token` edge function to update the Vault entry's bound `machine_id_hash` to the v0.2.36 value. Pro/MAO/free tiers unaffected (they don't use TOFU machine binding). (`commands/licensing.rs::machine_id_hash`, `VCThelpers/license/validator.py::_machine_id_hash`)
+
+### Added — paid-module distribution (server-side)
+
+- **Per-module GitHub bot-user architecture** for paid-module distribution. Each paid module gets a dedicated GitHub user account whose only access is collaborator-read on that module's package. Leaked `GHCR_SERVICE_PAT` bounded blast radius = exactly one module, not "every private package the PAT owner can access" (the v0.2.35 structural concern). The Supabase function deploys with `GHCR_PAID_IMAGE_REPO=hotak92/vct-rl-reranker` + `GHCR_USERNAME=vct-bot-rl` — package owner and credential owner are now decoupled identities. Customer-facing flow unchanged.
+- **`GHCR_PAID_IMAGE_REPO` + `GHCR_PAID_TAG_DEFAULT` env-driven** (Agent W): `rl-artifact-url` reads paid-image repo address from env rather than hardcoded `hotak92/vct-rl-reranker`. Migration to a different image (org migration, bot-user pattern) is now a one-line `supabase secrets set` rather than code redeploy. Pure validators + runtime resolvers in new `_shared/config.ts` (162 LoC) with 34 Deno tests. Backwards-compat: unset = v0.2.35 default applies silently. (`launcher/supabase/functions/_shared/config.ts`, `rl-artifact-url/index.ts`)
+- **`GHCR_USERNAME` override**: the launcher's `podman login -u <user>` username is now configurable separately from the repo owner. Resolves via `GHCR_USERNAME` env var with fallback to the owner-half of `GHCR_PAID_IMAGE_REPO` (Agent W's auto-derivation, preserved for backwards compat). Required for the per-bot-user architecture where credential owner (`vct-bot-rl`) differs from package owner (`hotak92`). 15 new Deno tests cover the resolution order + warning behaviour on malformed values. (`launcher/supabase/functions/_shared/config.ts::resolveGhcrUsername`)
+
+### Added — admin token rebind GUI (Agent S)
+
+- **`AdminRebindButton` in ActivationModal** when an admin license validates against a different machine than the one stored in the Vault. Calls the new `rebind-admin-token` Supabase edge function which updates the Vault entry's `machine_id_hash` via a `rebind_vault_admin_machine` SECURITY DEFINER RPC. License key never crosses the Svelte IPC boundary — Rust reads it from the OS keychain and orchestrates the call. Audit log: `admin_auth_log.outcome` CHECK constraint extended to include `'rebind'`. 16 new vitest unit tests.
+- **Predicate `shouldShowRebindButton(tier, lastError?)`** (Agent U follow-up): also returns true when the last `/validate-tier` error contains `"machine"` — covers the v0.2.36 algorithm-migration recovery case where `validate-tier` returns `tier='free'` + a `machine_mismatch` error (the user's old MAC-based hash no longer matches the platform-stable hash). Pre-Agent-U fix the button was hidden in this state → user stuck. 6 vitest tests pin the predicate behaviour.
+
+### Added — Mermaid + Excalidraw vendored visual editors (Agent R)
+
+- **`open_diagrams_editor` Tauri command** launches a local axum HTTP server on port 22000–22020 that serves a vendored Mermaid editor (textarea + live SVG preview, no external deps) at `127.0.0.1:<port>/mermaid`. Excalidraw ships a "bridge page" pointing at excalidraw.com (full SPA deferred to v0.2.37+ once embedded React playback proves out in Tauri WebView). DiagramsTab "Draw (visual)" buttons next to each registered diagram open the relevant editor in the user's default browser. Auto-register-on-first-edit if the file isn't in the registry yet.
+
+### Fixed — Windows + cross-OS hardening (Agent P, cherry-picked from Fabio)
+
+- **`check_install_health` venv-migration alignment**: pre-v0.2.36 the launcher's first-run health check failed on Fabio's Windows because it expected the old `vibecodedtools/.venv` layout; `install.py` had moved to `.venv/<project>/`. Now reads from the canonical post-migration path.
+- **Windows runtime-probe timeouts raised to 15s** (Fabio observation): podman/docker first-call probe on Windows can exceed 5s (Docker Desktop VM cold-start). 5s on Linux unchanged; **macOS extended to 15s as well** (Agent U finding: Mac Docker Desktop also runs in VM, same cold-cache profile).
+- **DialogRoot fork-bomb on Windows**: removed the WebKitGTK-only third branch + added re-entry guard. The third branch fired on Windows because the WebKitGTK check returned non-false on Windows WebView2; without the guard it recursed itself open.
+- **Windows console-flash suppression**: `CommandExt::silent()` trait with `#[cfg(windows)]` `creation_flags(0x0800_0000)` (CREATE_NO_WINDOW). No-op on Linux/macOS. Applied via a repo-wide 218-site script-driven sweep covering every `Command::new(...)` in the launcher + hub. The earlier console-flash WAS the root cause of Fabio's "launcher GUI fork-bomb on Windows" report — each subprocess flashed a console window, and on slow Windows hardware the launcher's repeated probes appeared as a flickering proliferation of console windows.
+- KG node `knowledge/concepts/cross-os-hook-portability.md` updated with the `silent()` pattern.
+
+### Internal
+
+- 7 agents (P/R/S/T/U/V/W) ran in parallel worktrees on `/tmp/vco-wt-v0236-*/`. V was an investigation agent (no code changes — report at `.claude/context/plans/ghcr-registry-denied-investigation-2026-05-26.md`); all others landed code. Single trivial Phase-3A vs CREATE_NO_WINDOW sweep cherry-pick conflict at Agent P merge, resolved preserving Phase 3A's `token_username` field.
+- **GHCR registry-denied investigation**: package access list was empty due to a GitHub UI quirk (inheritance toggle off briefly mid-session, then re-enabled). Restored via Manage Access on the package settings page.
+- Rust workspace: 1690 lib tests pass + 3 pre-existing baseline failures in `hub_launcher::tests::*` (10 ignored). svelte-check 0/0 across 866 files. vitest 40/40. Python 36/36 license validator.
+
 ## [0.2.35] — 2026-05-26
 
 A **3rd-party-user-journey-driven release.** v0.2.34 closed the install-pipeline bugs found by dogfooding the RL Reranker v0.2.7 install up to the `podman pull` step. v0.2.35 closes the chain from `podman pull` through to a working installed module for a paid Pro-tier customer accessing the launcher GUI for the first time — no terminal, no SQL editing, no manual `podman login`, no JSON file inspection. 7 agents (Phase-3A + J/K/L/M/N + O a11y).
