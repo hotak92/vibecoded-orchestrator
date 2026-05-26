@@ -39,6 +39,11 @@
     truncateLastError,
     statusBadgeLabel,
   } from '$lib/module-status-display';
+  // v0.2.35 Agent M (2026-05-26): preflight modal shown when the
+  // install-pipeline preflight (`check_container_runtime_available`)
+  // returns `available: false`. Runs on every Install click — see the
+  // handleInstall flow below for the gating logic.
+  import InstallPreflightRuntimeModal from '$lib/components/InstallPreflightRuntimeModal.svelte';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -46,6 +51,22 @@
   let search = $state('');
   let openActivation = $state(false);
   let openSecretsPrompt = $state<ModuleCatalogEntry | null>(null);
+
+  // v0.2.35 Agent M (2026-05-26): preflight modal state. Opens when a
+  // user clicks Install and the container-runtime preflight returns
+  // `available: false`. The `pendingInstallModule` is the module that
+  // would be installed once the runtime becomes available; the modal's
+  // "Detect again with success" path resumes the install against this
+  // module without the user having to re-click the catalog button.
+  interface PreflightRuntimeAvailability {
+    available: boolean;
+    detected: string | null;
+    platform: string;
+    install_url: string | null;
+  }
+  let preflightModalOpen = $state(false);
+  let preflightAvailability = $state<PreflightRuntimeAvailability | null>(null);
+  let pendingInstallModule = $state<ModuleCatalogEntry | null>(null);
   // v0.2.33 (Agent E, L9): modal open state for the parse-error
   // detail view. Closed by default; opened from the banner click.
   let parseErrorModalOpen = $state(false);
@@ -274,6 +295,46 @@
       onOpenActivation();
       return;
     }
+
+    // v0.2.35 Agent M (2026-05-26): container-runtime preflight. Runs on
+    // EVERY install click (not gated behind a "first-time" flag) so that
+    // a user who uninstalls their runtime mid-session gets an actionable
+    // modal instead of the cryptic "no container runtime found" error
+    // from `installer_engine::detect_container_runtime` deep inside
+    // `run_install`. The preflight command never returns Err — failures
+    // surface as `available: false` so the modal renders rather than
+    // a generic error toast.
+    try {
+      const availability = await invoke<PreflightRuntimeAvailability>(
+        'check_container_runtime_available',
+      );
+      if (!availability.available) {
+        // Open modal + remember the module so "Detect again → available"
+        // can resume the install without a second click. We deliberately
+        // do NOT call `modules.install` here — the install only starts
+        // once the user dismisses the modal via the Proceed path.
+        preflightAvailability = availability;
+        pendingInstallModule = m;
+        preflightModalOpen = true;
+        return;
+      }
+    } catch (e) {
+      // The Rust command's contract is "never Err", but the IPC
+      // transport itself could fail (Tauri unavailable in dev browser
+      // mode). Fall through to the install attempt — `install_module_
+      // for_project` will surface its own error if the runtime really
+      // is missing.
+      console.warn('[ModuleCatalog] preflight runtime check failed, proceeding without gate:', e);
+    }
+
+    await runInstall(m);
+  }
+
+  // Extracted from `handleInstall` so the preflight modal's "Detect
+  // again → available" success path can call back into the install flow
+  // without re-triggering the runtime preflight (we just confirmed it).
+  async function runInstall(m: ModuleCatalogEntry) {
+    if (!project) return;
     try {
       await modules.install(project.id, m.id);
     } catch (e) {
@@ -286,6 +347,28 @@
         alert(`Install failed: ${msg}`);
       }
     }
+  }
+
+  // v0.2.35 Agent M (2026-05-26): preflight modal callbacks.
+  //
+  // onProceed fires after a successful "Detect again" inside the modal
+  // (the modal has already updated its own `available` state to true).
+  // Resume the install against the originally-clicked module.
+  //
+  // onCancel fires for the Cancel button, the Escape key, or a backdrop
+  // click. Discard the pending module — the user has explicitly aborted.
+  function handlePreflightProceed() {
+    const m = pendingInstallModule;
+    pendingInstallModule = null;
+    preflightAvailability = null;
+    if (m) {
+      void runInstall(m);
+    }
+  }
+
+  function handlePreflightCancel() {
+    pendingInstallModule = null;
+    preflightAvailability = null;
   }
 
   async function handleUninstall(m: ModuleCatalogEntry) {
@@ -740,6 +823,18 @@
 <DevAffordanceToast
   hint={mState.devAffordanceHint}
   onDismiss={dismissDevHint}
+/>
+
+<!-- v0.2.35 Agent M (2026-05-26): install-pipeline preflight modal.
+     Renders when `handleInstall` calls `check_container_runtime_available`
+     and gets `available: false`. The modal owns its own "Detect again"
+     retry loop; only the "available now" branch calls back into the
+     install flow via `handlePreflightProceed`. -->
+<InstallPreflightRuntimeModal
+  bind:open={preflightModalOpen}
+  availability={preflightAvailability}
+  onProceed={handlePreflightProceed}
+  onCancel={handlePreflightCancel}
 />
 
 <!-- Missing-secret prompt — Bug 26: native <dialog> top-layer via DialogRoot. -->
