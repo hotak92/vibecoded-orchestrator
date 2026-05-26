@@ -7,10 +7,43 @@
 // function re-validates the tier, then exchanges a long-lived
 // service-account PAT for a short-lived registry-scoped token.
 //
+// ─── Runtime env-var contract ────────────────────────────────────────────────
+//
+// Required (function returns 500 / `Service misconfigured` if missing):
+//   SUPABASE_URL                — auto-set by Supabase runtime; used for
+//                                 the server-to-server `/validate-tier` call
+//   SUPABASE_SERVICE_ROLE_KEY   — auto-set by Supabase runtime; service-role
+//                                 credential for the inter-function call
+//   GHCR_SERVICE_PAT            — manually set via `supabase secrets set`;
+//                                 long-lived GitHub PAT scoped to
+//                                 `read:packages` on the paid image repo.
+//                                 Rotate quarterly. Function returns 500 /
+//                                 `registry_token_exchange_failed` if missing.
+//
+// Optional (function falls back to safe defaults if unset/malformed,
+// emitting a `console.warn` so on-call can spot the fat-finger in
+// `supabase functions logs`):
+//   GHCR_PAID_IMAGE_REPO        — paid-image repo address in `<owner>/<image>`
+//                                 form. Default: `hotak92/vct-rl-reranker`
+//                                 (the v0.2.35-shipped personal-account
+//                                 image). When migrating to a GitHub Org
+//                                 for proper scoped /token credentials,
+//                                 set this secret rather than redeploying
+//                                 the function. Malformed values (no slash,
+//                                 whitespace-only, invalid chars) are logged
+//                                 and the default applies.
+//   GHCR_PAID_TAG_DEFAULT       — fallback tag for the `tag` field in the
+//                                 response. Default: `0.1.0`. The launcher's
+//                                 `resolve_variant_tag` is the actual source
+//                                 of truth for tag selection — this default
+//                                 is advisory / used by callers that bypass
+//                                 the launcher logic.
+//
 // The registry token is what the launcher actually feeds to `podman
 // login --password-stdin`. It carries:
-//   - scope=repository:hotak92/vct-rl-reranker:pull (READ-ONLY pull,
-//     no push, no other repos)
+//   - scope=repository:${PAID_IMAGE_REPO}:pull (READ-ONLY pull,
+//     no push, no other repos) — PAID_IMAGE_REPO resolved from env
+//     (default `hotak92/vct-rl-reranker`; see env-var contract below)
 //   - 15-minute TTL (or whatever GHCR returns — typically 5-30 min)
 //
 // Why GHCR's token-exchange instead of returning the service-account
@@ -54,6 +87,10 @@ import {
   type OrchestratorTier,
 } from "../_shared/variant_map.ts";
 import {
+  resolvePaidImageRepo,
+  resolvePaidTagDefault,
+} from "../_shared/config.ts";
+import {
   REQUIRED_TIER,
   type RequestBody,
   tierMeetsRequirement,
@@ -68,12 +105,27 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// Paid-module manifest pins. Kept here (rather than in the manifest body
-// the client sent) so a malicious client can't request a token for a
-// different image. The function only ever issues tokens for THIS image.
-const PAID_IMAGE_REPO = "hotak92/vct-rl-reranker";
+// Paid-module manifest pins. Kept on the server (rather than in the
+// manifest body the client sent) so a malicious client can't request a
+// token for a different image. The function only ever issues tokens for
+// THIS image — sourced from `GHCR_PAID_IMAGE_REPO` (v0.2.36+) with a
+// fallback to the v0.2.35 personal-account default. Resolved ONCE at
+// module init: env-driven, but no per-request env reads (Deno re-uses
+// the module across requests, env stays stable for the function's
+// lifetime — when the env value changes, the function is redeployed).
+//
+// Why env-driven: the medium-term anti-piracy follow-up is moving the
+// image from a personal account (where GHCR's /token endpoint returns
+// the original PAT base64-encoded rather than a proper scoped credential
+// — see exchangeForRegistryToken doc) to a GitHub Organization where
+// /token issues real scoped tokens. When that migration happens, we want
+// it to be a Supabase secret update, not a code redeploy:
+//   supabase secrets set GHCR_PAID_IMAGE_REPO=vibecodedtools/vct-rl-reranker
+// (and re-run `supabase functions deploy rl-artifact-url` only to pick
+// up the new env, which is automatic on the next cold start).
+const PAID_IMAGE_REPO = resolvePaidImageRepo();
 const PAID_IMAGE_FULL = `ghcr.io/${PAID_IMAGE_REPO}`;
-const PAID_TAG_DEFAULT = "0.1.0"; // bumped by CD on each release
+const PAID_TAG_DEFAULT = resolvePaidTagDefault();
 
 // GHCR token-exchange parameters.
 // The /token endpoint requires Basic auth — `Authorization: Basic
@@ -176,7 +228,9 @@ async function revalidateTierViaSupabase(
  *
  * Scope syntax per the Docker registry v2 spec:
  *   repository:<owner>/<image>:<actions>
- * For pull-only access we request `repository:hotak92/vct-rl-reranker:pull`.
+ * For pull-only access we request `repository:${PAID_IMAGE_REPO}:pull`
+ * — with PAID_IMAGE_REPO resolved at module init from the env var (see
+ * top-of-file env-var contract block).
  */
 async function exchangeForRegistryToken(): Promise<
   { token: string; username: string; expires_in_s: number } | { error: string; detail: string }
@@ -266,9 +320,15 @@ async function exchangeForRegistryToken(): Promise<
   // For personal-account packages this MUST match the PAT owner's
   // GitHub login (verified 2026-05-26 — synthetic usernames like
   // `vct-paid-module` get 403). For org packages where the /token
-  // endpoint returns a scoped credential, any string works; keep
-  // `vct-paid-module` as the convention so audit logs attribute correctly.
-  const ghcrUsername = "hotak92"; // TODO[v0.2.36]: derive from package owner once orgs are used
+  // endpoint returns a scoped credential, any string works.
+  //
+  // Derive the owner from PAID_IMAGE_REPO (the part before the slash)
+  // so changing the env var also flips the username — eliminates the
+  // need to redeploy when migrating from personal `hotak92/...` to
+  // org `vibecodedtools/...`. The shape was already validated at
+  // module init (`validatePaidImageRepo` requires exactly one slash),
+  // so `split("/")[0]` is safe here.
+  const ghcrUsername = PAID_IMAGE_REPO.split("/")[0];
 
   return {
     token: decodedToken,

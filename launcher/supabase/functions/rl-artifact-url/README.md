@@ -41,7 +41,14 @@ The launcher never sees the long-lived service PAT — only short-lived
 |---|---|
 | `SUPABASE_URL` | Auto-set by Supabase runtime; used to call `/validate-tier` server-to-server |
 | `SUPABASE_SERVICE_ROLE_KEY` | Auto-set by Supabase runtime; authorizes the inter-function call |
-| `GHCR_SERVICE_PAT` | **Manually set.** A GitHub fine-grained PAT scoped to `read:packages` on `hotak92/vct-rl-reranker`. Long-lived (90 days typical); rotate quarterly. NEVER the launcher's pull token — that's what this function GENERATES from this PAT. |
+| `GHCR_SERVICE_PAT` | **Manually set.** A GitHub fine-grained PAT scoped to `read:packages` on the paid-image repo. Long-lived (90 days typical); rotate quarterly. NEVER the launcher's pull token — that's what this function GENERATES from this PAT. |
+
+## Optional env vars (v0.2.36+)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GHCR_PAID_IMAGE_REPO` | `hotak92/vct-rl-reranker` | Paid-image repo in `<owner>/<image>` form. Set this when migrating from the personal-account image to the org image (see "Org migration" below). Malformed values (no slash, whitespace-only, etc.) are logged via `console.warn` and the default applies. |
+| `GHCR_PAID_TAG_DEFAULT` | `0.1.0` | Fallback tag for the `tag` field in the response. The launcher's `resolve_variant_tag` is the actual source of truth — this default is advisory / used by callers that bypass the launcher logic. |
 
 To deploy:
 ```bash
@@ -49,6 +56,31 @@ cd launcher/supabase
 supabase secrets set GHCR_SERVICE_PAT='<your-fine-grained-PAT>'
 supabase functions deploy rl-artifact-url
 ```
+
+## Org migration (v0.2.36 architectural follow-up)
+
+The v0.2.35-shipped default points at a **personal-account** image
+(`hotak92/vct-rl-reranker`). GHCR's `/token` endpoint has a known quirk for
+personal-account packages: it returns the original PAT base64-encoded
+rather than issuing a separate scoped credential (see
+`exchangeForRegistryToken` doc in `index.ts`). This means the decoded
+pull_token returned to the client IS the underlying PAT — breaking the
+original design property that "the PAT never leaves the server".
+
+Moving the image to a **GitHub Organization** (e.g., `vibecodedtools/`)
+changes the `/token` behaviour to issue proper repository-scoped tokens.
+When that migration happens, it should be a one-line Supabase secret
+update — not a code redeploy:
+
+```bash
+supabase secrets set \
+  GHCR_PAID_IMAGE_REPO=vibecodedtools/vct-rl-reranker \
+  --project-ref ovpdtijpdchzlxbojhsg
+```
+
+That's all. No `index.ts` edit, no version bump, no launcher change. The
+launcher already reads `image` + `username` from the response and uses
+the org owner for `podman login -u <user>`.
 
 ## Wire contract
 
@@ -127,13 +159,22 @@ token request. The 3-day grace exists for offline operation of
 ```bash
 deno test --no-check \
   launcher/supabase/functions/rl-artifact-url/validation_test.ts
+
+# Config layer (v0.2.36+) — requires --allow-env for Deno.env.set/delete:
+deno test --no-check --allow-env \
+  launcher/supabase/functions/_shared/config_test.ts
 ```
 
-23 tests cover the validation helpers + tier comparison + token
-preview deterministic hashing. The integration path (full request
-through `/validate-tier` round-trip + `/token` exchange) is exercised
-by manual `curl` against the deployed function — automated integration
-tests would require a Supabase project mock and are deferred.
+23 tests in `validation_test.ts` cover the validation helpers + tier
+comparison + token preview deterministic hashing. 34 tests in
+`_shared/config_test.ts` cover env-driven paid-image-repo / paid-tag
+resolution + the malformed-value fallback + `console.warn` capture +
+default-value tripwires.
+
+The integration path (full request through `/validate-tier` round-trip
++ `/token` exchange) is exercised by manual `curl` against the deployed
+function — automated integration tests would require a Supabase project
+mock and are deferred.
 
 ## Related
 
