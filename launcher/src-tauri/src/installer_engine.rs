@@ -38,6 +38,16 @@ pub enum InstallStage {
     /// either confuses the user when extraction is the slow / failing
     /// step.
     ExtractingManifest,
+    /// v0.2.35 (Agent N): emitted by `container_pull` when the
+    /// `resolve_variant_tag`-chosen tag (e.g. `0.2.7-cuda`) is missing
+    /// from the registry and the launcher silently falls back to the
+    /// `-cpu` variant. Pre-v0.2.35 the user got a cryptic `denied`/404
+    /// from `podman pull` with no way to act; now the GUI can render a
+    /// non-blocking "CUDA variant unavailable; installing CPU variant
+    /// instead" toast keyed off this stage. The `message` field carries
+    /// the requested-vs-actual tag pair (e.g. "requested 0.2.7-cuda,
+    /// installing 0.2.7-cpu").
+    VariantFallback,
     Done,
     /// v0.2.31 (#27): emitted via `report_error` before an error return.
     /// Pre-v0.2.31 errors propagated as `Result::Err` but the progress
@@ -208,7 +218,47 @@ async fn run_install_inner(
             // single-tag flow (just the version, no suffix).
             let tag = resolve_variant_tag(manifest, &base_tag, gpu_mode);
 
-            container_pull(container, &tag, &manifest.id).await?;
+            // v0.2.35 (Agent N): compute the CPU-fallback tag UP FRONT.
+            // `container_pull` probes the registry for `tag` and falls
+            // back to the cpu variant if missing (covers publishers who
+            // shipped `-cpu` but haven't built `-cuda`/`-rocm` for this
+            // release yet). If `tag` is already the cpu variant, or the
+            // manifest declares no variants, the fallback is None.
+            let fallback = cpu_fallback_tag(manifest, &base_tag, gpu_mode);
+            let actual_tag = container_pull(
+                container,
+                &tag,
+                fallback.as_deref(),
+                &manifest.id,
+            )
+            .await?;
+
+            // v0.2.35 (Agent N): emit a non-blocking progress event when
+            // the registry rejected the chosen variant and we silently
+            // pulled the cpu fallback. The GUI consumes this stage as a
+            // toast/inline message — install proceeds normally with the
+            // fallback tag, but the user sees WHY their CUDA variant
+            // wasn't installed.
+            if actual_tag != tag {
+                emit_progress(
+                    app,
+                    project_id,
+                    &manifest.id,
+                    InstallStage::VariantFallback,
+                    step_index,
+                    total_steps,
+                    &format!(
+                        "Requested variant {} not available on the registry; installing {} instead",
+                        tag, actual_tag
+                    ),
+                );
+            }
+            // Use the actually-pulled tag for downstream operations
+            // (manifest extraction). Without this, an upgrade from
+            // cuda→cpu would try to `docker cp` from the cuda image
+            // (which was never pulled), surfacing as a confusing
+            // image-not-found error.
+            let tag = actual_tag;
 
             // For container modules, install_dir is metadata-only — a
             // marker directory we use to track installed state. Create
@@ -374,13 +424,22 @@ async fn run_install_inner(
 ///
 /// Runtime detection: prefers `podman` (rootless, matches the rest of
 /// VCO's container stack). Falls back to `docker` if podman is missing.
+///
+/// v0.2.35 (Agent N): after login + before pull, probe the chosen tag's
+/// existence on the registry via `<runtime> manifest inspect`. If the
+/// probe says "missing" and `fallback_tag` is `Some`, probe the fallback;
+/// pull whichever exists. The returned `String` is the tag actually
+/// pulled — callers compare against the originally-requested tag to
+/// detect a fallback happened (so they can emit a UI event / log).
+/// When both probes fail OR `fallback_tag` is `None`, hard-fail with a
+/// "variant not available" error rather than firing a doomed pull that
+/// would 404 with a cryptic `denied` message.
 async fn container_pull(
     container: &crate::manifest::ContainerInstallBlock,
     tag: &str,
+    fallback_tag: Option<&str>,
     module_id: &str,
-) -> Result<(), String> {
-    let image_ref = format!("{}:{}", container.image, tag);
-
+) -> Result<String, String> {
     // ─── Step 1: try to obtain a pull token from the signed-URL gateway ─
     //
     // v0.2.35 (Phase 3A): `request_pull_token` is now the canonical
@@ -420,15 +479,65 @@ async fn container_pull(
     // ─── Step 2: pick container runtime (podman preferred, docker fallback) ─
     let runtime = detect_container_runtime().await?;
 
-    // ─── Step 3: login (if token), pull, logout ─────────────────────────
+    // ─── Step 3: login (if token), then probe + pull + logout ──────────
+    let registry = container
+        .registry
+        .clone()
+        .unwrap_or_else(|| infer_registry_from_image(&container.image));
     if let Some(t) = token.as_deref() {
-        let registry = container
-            .registry
-            .clone()
-            .unwrap_or_else(|| infer_registry_from_image(&container.image));
         container_login(&runtime, &registry, t).await?;
     }
 
+    // ─── Step 3a (v0.2.35): probe primary tag, fall back to cpu if missing ─
+    //
+    // The probe is a `manifest inspect` call — it issues a HEAD-equivalent
+    // request to the registry without downloading layers. Cheap, scoped
+    // to the same auth context as the upcoming pull, and lets us decide
+    // FROM the registry's authoritative answer whether the chosen
+    // variant exists. Pre-v0.2.35 the launcher fired the pull blind and
+    // surfaced a cryptic `denied` error on miss; now the user gets a
+    // structured fallback (or a clear "no variant available" hard-fail
+    // when even the CPU fallback is missing).
+    //
+    // The decision tree itself lives in `decide_variant_to_pull` — a
+    // pure helper that takes a probe-closure and the candidate tags so
+    // unit tests can exercise every branch (primary-hit /
+    // primary-miss-fallback-hit / both-miss / probe-error-degrades) by
+    // injecting a fake probe instead of needing a live registry.
+    let runtime_for_probe = runtime.clone();
+    let decision = decide_variant_to_pull(
+        &container.image,
+        tag,
+        fallback_tag,
+        module_id,
+        |probe_image, probe_tag| {
+            let runtime = runtime_for_probe.clone();
+            async move {
+                probe_image_tag_exists(&probe_image, &probe_tag, &runtime).await
+            }
+        },
+    )
+    .await;
+
+    let resolved_tag: String = match decision {
+        Ok(t) => t,
+        Err(decision_err) => {
+            // Hard-fail the install BEFORE issuing the doomed pull.
+            // Always logout so we don't leak the token in the runtime's
+            // auth.json (mirrors the post-pull logout path).
+            if token.is_some() {
+                let _ = Command::new(&runtime)
+                    .args(["logout", &registry])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await;
+            }
+            return Err(decision_err);
+        }
+    };
+
+    let image_ref = format!("{}:{}", container.image, resolved_tag);
     let pull_status = Command::new(&runtime)
         .args(["pull", &image_ref])
         .stdout(Stdio::piped())
@@ -440,10 +549,6 @@ async fn container_pull(
     // Always logout if we logged in (even on pull failure) so the token
     // doesn't linger in the runtime's auth.json.
     if token.is_some() {
-        let registry = container
-            .registry
-            .clone()
-            .unwrap_or_else(|| infer_registry_from_image(&container.image));
         let _ = Command::new(&runtime)
             .args(["logout", &registry])
             .stdout(Stdio::null())
@@ -475,7 +580,208 @@ async fn container_pull(
         ));
     }
 
-    Ok(())
+    Ok(resolved_tag)
+}
+
+/// v0.2.35 (Agent N): probe whether `<image>:<tag>` exists on the
+/// registry using `<runtime> manifest inspect`.
+///
+/// Returns:
+///   - `Ok(true)`: tag exists; the registry returned a manifest.
+///   - `Ok(false)`: tag is missing on the registry. Distinguished from
+///     transport errors by inspecting stderr: `manifest inspect` exits
+///     non-zero with a `manifest unknown` / `not found` / `name unknown`
+///     / `MANIFEST_UNKNOWN` substring in stderr when the tag genuinely
+///     doesn't exist. Other non-zero exits (auth failure, network) bubble
+///     up as `Err` so the caller can decide whether to fall through to a
+///     blind pull (probe-flaky path) or hard-fail.
+///   - `Err(msg)`: probe couldn't run (no runtime / spawn error / probe
+///     subcommand unsupported by older `docker` versions without the
+///     `experimental` flag enabled). Callers should treat this as
+///     "probe inconclusive" and degrade gracefully — NOT as "tag
+///     missing", since false-negatives would prevent valid pulls.
+///
+/// Auth context: the caller must have run `container_login` BEFORE
+/// invoking this for a private registry — `manifest inspect` honours
+/// the runtime's auth.json the same way `pull` does, so the same login
+/// token covers both calls.
+///
+/// Runtime support:
+///   - Podman: `podman manifest inspect` is built-in (all supported
+///     versions).
+///   - Docker: requires v23+ for the unflagged path; older versions need
+///     `experimental: true` in the daemon config. v25+ is mainstream as
+///     of 2026, so the probe is reliable; on older docker the probe
+///     errors and the caller falls through to the blind-pull path.
+///
+/// Rate-limit consideration (GHCR): the manifest endpoint is the same
+/// one `pull` uses for its initial manifest fetch, so an inspect-then-pull
+/// sequence costs 1 extra round-trip per install attempt. GHCR's
+/// unauthenticated rate limits are 60/hour/IP; the AUTHENTICATED rate is
+/// 5000/hour — and the launcher is always authenticated by the time the
+/// probe runs (Step 3 above runs after `container_login`). At one install
+/// per minute the probe contributes 60 inspects/hour, well under cap.
+pub(crate) async fn probe_image_tag_exists(
+    image: &str,
+    tag: &str,
+    runtime: &str,
+) -> Result<bool, String> {
+    let image_ref = format!("{}:{}", image, tag);
+    let output = Command::new(runtime)
+        .args(["manifest", "inspect", &image_ref])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("spawn {} manifest inspect: {}", runtime, e))?;
+
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    // Non-zero exit: inspect stderr to distinguish "tag missing" from
+    // "transport / auth / unsupported-subcommand" errors. Registry
+    // signals for genuine 404s are stable across docker + podman + GHCR:
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let lower = stderr.to_lowercase();
+    let signals_missing = lower.contains("manifest unknown")
+        || lower.contains("manifest_unknown")
+        || lower.contains("name unknown")
+        || lower.contains("name_unknown")
+        || lower.contains("not found")
+        || lower.contains("denied")
+        // GHCR returns 403 `denied` for non-existent private tags when
+        // the token is repo-scoped — treat it as "missing" so the
+        // fallback path engages. Public-image case is covered by the
+        // "manifest unknown" / "not found" strings above.
+        || lower.contains("no such manifest");
+
+    if signals_missing {
+        Ok(false)
+    } else {
+        Err(format!(
+            "{} manifest inspect {} failed (exit {}): {}",
+            runtime,
+            image_ref,
+            output.status.code().unwrap_or(-1),
+            stderr.chars().take(500).collect::<String>(),
+        ))
+    }
+}
+
+/// v0.2.35 (Agent N): pick the `-cpu` fallback variant tag for a given
+/// primary `tag`. The CPU variant is the always-available baseline per
+/// `runtime_hints.gpu_image_variants` design — manifests are required to
+/// declare it when they declare any variant block.
+///
+/// Returns `None` when:
+///   - The manifest has no `gpu_image_variants` block (legacy single-tag
+///     module; no fallback possible by design).
+///   - The chosen GPU mode is ALREADY Cpu (the variant we'd "fall back
+///     to" IS the primary; the fallback wouldn't help).
+pub(crate) fn cpu_fallback_tag(
+    manifest: &ModuleManifest,
+    base_tag: &str,
+    gpu_mode: crate::commands::gpu_policy::GpuMode,
+) -> Option<String> {
+    use crate::commands::gpu_policy::GpuMode;
+    let variants = manifest.runtime.gpu_image_variants.as_ref()?;
+    // CPU/Metal already route to the cpu variant; fallback == primary,
+    // no point probing twice.
+    if matches!(gpu_mode, GpuMode::Cpu | GpuMode::Metal) {
+        return None;
+    }
+    Some(variants.cpu.replace("{version}", base_tag))
+}
+
+/// v0.2.35 (Agent N): pure decision helper — given a probe closure and
+/// the candidate tags, decide which tag to actually pull.
+///
+/// The closure-injection pattern lets unit tests exercise the entire
+/// decision tree (primary hit / primary miss + fallback hit / both miss
+/// / probe error) without needing a live container runtime or registry.
+/// Production callers pass a closure that wraps [`probe_image_tag_exists`];
+/// tests pass closures that return canned probe results.
+///
+/// Decision tree:
+///   1. Probe `tag` (primary).
+///      - Ok(true)  → pull `tag`.
+///      - Ok(false) → step 2.
+///      - Err(_)    → degrade to blind pull; return `tag` (legacy
+///                    behaviour preserved so a flaky/unsupported probe
+///                    doesn't block valid installs).
+///   2. If `fallback_tag` is Some(`fb`) and `fb != tag`:
+///      - Probe `fb`.
+///        - Ok(true)  → pull `fb` (fallback engaged).
+///        - Ok(false) → hard-fail: "no variant available on the registry".
+///        - Err(e)    → hard-fail surfacing the probe error.
+///   3. If `fallback_tag` is None (or == primary): hard-fail with the
+///      "variant_not_found, no fallback declared" message.
+///
+/// The hard-fail cases return `Err(message)` — callers MUST log out
+/// before propagating to avoid leaking the auth token in `auth.json`.
+pub(crate) async fn decide_variant_to_pull<F, Fut>(
+    image: &str,
+    tag: &str,
+    fallback_tag: Option<&str>,
+    module_id: &str,
+    probe: F,
+) -> Result<String, String>
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, String>>,
+{
+    match probe(image.to_string(), tag.to_string()).await {
+        Ok(true) => Ok(tag.to_string()),
+        Ok(false) => {
+            eprintln!(
+                "[installer_engine] container_pull[{}]: variant {}:{} not found on registry; \
+                 will try fallback if available",
+                module_id, image, tag
+            );
+            match fallback_tag {
+                Some(fb) if fb != tag => match probe(image.to_string(), fb.to_string()).await {
+                    Ok(true) => {
+                        eprintln!(
+                            "[installer_engine] container_pull[{}]: falling back to {}:{}",
+                            module_id, image, fb
+                        );
+                        Ok(fb.to_string())
+                    }
+                    Ok(false) => Err(format!(
+                        "no variant of {} is available on the registry \
+                         (probed {}:{} and fallback {}:{}, neither found). \
+                         The module publisher hasn't built a compatible variant \
+                         for this release yet — try again later or contact \
+                         the publisher.",
+                        image, image, tag, image, fb
+                    )),
+                    Err(probe_err) => Err(format!(
+                        "variant {}:{} missing on registry; fallback {}:{} probe failed: {}",
+                        image, tag, image, fb, probe_err
+                    )),
+                },
+                _ => Err(format!(
+                    "variant_not_found: {}:{} is not available on the registry, \
+                     and no fallback variant was declared in the manifest.",
+                    image, tag
+                )),
+            }
+        }
+        Err(probe_err) => {
+            // Probe inconclusive (network, runtime error, unsupported
+            // subcommand). Degrade to the legacy blind-pull behaviour
+            // — the pull itself will surface a proper error if the tag
+            // doesn't exist. False-negatives from a flaky probe MUST
+            // NOT prevent valid installs.
+            eprintln!(
+                "[installer_engine] container_pull[{}]: probe failed for {}:{}: {}. \
+                 Falling through to blind pull (legacy behaviour).",
+                module_id, image, tag, probe_err
+            );
+            Ok(tag.to_string())
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1015,7 +1321,7 @@ async fn run_upgrade_inner(
                 app, project_id, &manifest.id, InstallStage::Clone, 0, 1,
                 "Fetching updated source (legacy fallback)",
             );
-            refetch_artifact(manifest, &install_dir, gpu_mode).await?;
+            let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode).await?;
             // v0.2.33 (Agent C, L0b): re-extract the manifest after a
             // re-pull. The upgrade flow may have brought in a new
             // image version whose manifest differs from the previous
@@ -1023,7 +1329,15 @@ async fn run_upgrade_inner(
             // need the fresh file. Atomic write with .bak rollback
             // preserves the v0.2.7 manifest if the v0.2.8 extract
             // fails (architecture review §J4 G-b).
-            extract_manifest_after_refetch(app, project_id, manifest, gpu_mode, 0, 1).await?;
+            //
+            // v0.2.35 (Agent N): thread `pulled_tag` through so the
+            // post-pull extractor uses the tag that was actually
+            // pulled (matters when a cuda→cpu variant fallback happened
+            // inside refetch_artifact).
+            extract_manifest_after_refetch(
+                app, project_id, manifest, gpu_mode, pulled_tag.as_deref(), 0, 1,
+            )
+            .await?;
             emit_progress(
                 app, project_id, &manifest.id, InstallStage::Done, 1, 1,
                 "Update complete (legacy fallback)",
@@ -1064,14 +1378,19 @@ async fn run_upgrade_inner(
         step_index, total_steps, "Fetching updated source",
     );
     step_index += 1;
-    refetch_artifact(manifest, &install_dir, gpu_mode).await?;
+    let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode).await?;
 
     // v0.2.33 (Agent C, L0b): re-extract the manifest after the
     // upgrade re-pull. See the legacy-fallback comment above for
     // the rationale. .bak rollback restores the previous version's
     // manifest on extract failure.
+    //
+    // v0.2.35 (Agent N): thread `pulled_tag` so the post-pull extractor
+    // uses the tag that was actually pulled (matters for variant
+    // fallback — see refetch_artifact's docstring).
     extract_manifest_after_refetch(
-        app, project_id, manifest, gpu_mode, step_index, total_steps,
+        app, project_id, manifest, gpu_mode,
+        pulled_tag.as_deref(), step_index, total_steps,
     )
     .await?;
 
@@ -1188,11 +1507,18 @@ async fn run_upgrade_inner(
 ///     wipe + re-clone (handles user-corrupted dirs gracefully).
 ///   - `ContainerPull`: `podman pull` the resolved variant tag.
 ///   - `Local`: no-op (user has already updated by hand).
+///
+/// v0.2.35 (Agent N): returns `Some(actual_tag)` when the install
+/// method was `ContainerPull` so `extract_manifest_after_refetch` can
+/// use the SAME tag that was pulled (avoids the cuda→cpu fallback case
+/// where the post-pull manifest extractor would otherwise try to
+/// `docker cp` from a never-pulled `0.2.7-cuda` reference). Returns
+/// `None` for `GitClone` / `Local` (no image tag involved).
 async fn refetch_artifact(
     manifest: &ModuleManifest,
     install_dir: &Path,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     match manifest.install.method {
         InstallMethod::GitClone => {
             let git_dir = install_dir.join(".git");
@@ -1264,10 +1590,25 @@ async fn refetch_artifact(
                     .unwrap_or_else(|| "latest".to_string())
             };
             let tag = resolve_variant_tag(manifest, &base_tag, gpu_mode);
-            container_pull(container, &tag, &manifest.id).await?;
+            // v0.2.35 (Agent N): same probe-and-fallback contract as
+            // run_install_inner. No InstallStage::VariantFallback event
+            // emitted here — refetch_artifact has no AppHandle and the
+            // outer `extract_manifest_after_refetch` consumes the
+            // returned tag instead. Update path doesn't surface the
+            // fallback to the GUI today; logs in container_pull record
+            // it for diagnostics.
+            let fallback = cpu_fallback_tag(manifest, &base_tag, gpu_mode);
+            let actual_tag = container_pull(
+                container,
+                &tag,
+                fallback.as_deref(),
+                &manifest.id,
+            )
+            .await?;
+            return Ok(Some(actual_tag));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// v0.2.33 (Agent C, L0b): for `ContainerPull` modules, extract the
@@ -1278,11 +1619,20 @@ async fn refetch_artifact(
 ///
 /// Shared between the run_upgrade legacy-fallback path and the
 /// upgrade-block path to keep the extract policy identical for both.
+///
+/// v0.2.35 (Agent N): accepts an optional `pulled_tag` override. When
+/// `refetch_artifact` reports the actually-pulled tag (which may differ
+/// from `resolve_variant_tag`'s preferred tag because of the cuda→cpu
+/// fallback path), this function uses that tag for `docker cp`. Without
+/// the override, an upgrade that fell back to the cpu variant would
+/// extract from a non-existent local image and surface a confusing
+/// "image not found" error.
 async fn extract_manifest_after_refetch(
     app: &AppHandle,
     project_id: &str,
     manifest: &ModuleManifest,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
+    pulled_tag: Option<&str>,
     step_index: u32,
     total_steps: u32,
 ) -> Result<(), String> {
@@ -1303,7 +1653,9 @@ async fn extract_manifest_after_refetch(
             .clone()
             .unwrap_or_else(|| "latest".to_string())
     };
-    let tag = resolve_variant_tag(manifest, &base_tag, gpu_mode);
+    let tag = pulled_tag
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| resolve_variant_tag(manifest, &base_tag, gpu_mode));
     let image_ref = format!("{}:{}", container.image, tag);
     let runtime = detect_container_runtime().await?;
     emit_progress(
@@ -1616,6 +1968,8 @@ mod tests {
                 manifest_for_local_install(&install_dir.display().to_string());
             let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu).await;
             assert!(res.is_ok(), "local refetch must succeed when dir exists: {:?}", res);
+            // v0.2.35 (Agent N): Local refetch returns None (no tag involved).
+            assert_eq!(res.unwrap(), None, "Local refetch must return None — no tag involved");
             assert!(sentinel.exists(), "Local refetch must not touch user files");
             let body = tokio::fs::read(&sentinel).await.unwrap();
             assert_eq!(&body, b"keep", "Local refetch must not modify files");
@@ -1863,5 +2217,386 @@ mod tests {
             "empty body still quotes the status; got: {}",
             msg
         );
+    }
+
+    // ─── v0.2.35 (Agent N): image variant fallback ──────────────────────
+    //
+    // The decision logic lives in `decide_variant_to_pull` — a pure helper
+    // that takes a probe closure. These tests inject fake probe results
+    // covering each branch of the decision tree:
+    //   1. Primary tag exists → pull it.
+    //   2. Primary missing, fallback exists → pull fallback.
+    //   3. Both missing → hard-fail with "no variant available".
+    //   4. No fallback declared, primary missing → hard-fail variant_not_found.
+    //   5. Probe errors → degrade to blind pull (legacy behaviour).
+    //   6. cpu_fallback_tag returns None when manifest has no variants /
+    //      or gpu_mode is already Cpu (no point falling back to itself).
+    //   7. probe_image_tag_exists itself is integration-only (#[ignore]):
+    //      it spawns a real `manifest inspect` and requires a runtime on PATH.
+    //
+    // The closure-injection pattern (suggested by spec; mirrors Agent C's
+    // `bust_cache_if_launcher_version_changed_with_db` style) means we
+    // never need a live registry to exercise the decision branches — the
+    // entire fallback logic is exercised with deterministic inputs.
+
+    /// Helper: build a probe closure that returns canned answers keyed by
+    /// `(image, tag)`. Any tag not in the map returns `Ok(false)` (missing).
+    fn canned_probe(
+        answers: std::collections::HashMap<(String, String), Result<bool, String>>,
+    ) -> impl Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>>>>
+    {
+        // Wrap in Arc so the closure can be Fn (called multiple times).
+        let answers = std::sync::Arc::new(answers);
+        move |image: String, tag: String| {
+            let answers = answers.clone();
+            Box::pin(async move {
+                match answers.get(&(image.clone(), tag.clone())) {
+                    Some(Ok(v)) => Ok(*v),
+                    Some(Err(e)) => Err(e.clone()),
+                    None => Ok(false),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn decide_variant_returns_primary_when_primary_exists() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let mut answers = std::collections::HashMap::new();
+            answers.insert(
+                ("ghcr.io/test/img".into(), "0.2.7-cuda".into()),
+                Ok(true),
+            );
+            let probe = canned_probe(answers);
+            let res = decide_variant_to_pull(
+                "ghcr.io/test/img",
+                "0.2.7-cuda",
+                Some("0.2.7-cpu"),
+                "vct-test",
+                probe,
+            )
+            .await;
+            assert_eq!(
+                res.unwrap(),
+                "0.2.7-cuda",
+                "primary-hit path must pull the primary tag"
+            );
+        });
+    }
+
+    #[test]
+    fn decide_variant_falls_back_to_cpu_when_primary_missing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let mut answers = std::collections::HashMap::new();
+            // cuda missing, cpu present — the headline fallback case.
+            answers.insert(
+                ("ghcr.io/test/img".into(), "0.2.7-cuda".into()),
+                Ok(false),
+            );
+            answers.insert(
+                ("ghcr.io/test/img".into(), "0.2.7-cpu".into()),
+                Ok(true),
+            );
+            let probe = canned_probe(answers);
+            let res = decide_variant_to_pull(
+                "ghcr.io/test/img",
+                "0.2.7-cuda",
+                Some("0.2.7-cpu"),
+                "vct-test",
+                probe,
+            )
+            .await;
+            assert_eq!(
+                res.unwrap(),
+                "0.2.7-cpu",
+                "fallback path must pull the cpu variant"
+            );
+        });
+    }
+
+    #[test]
+    fn decide_variant_hard_fails_when_both_variants_missing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let mut answers = std::collections::HashMap::new();
+            answers.insert(
+                ("ghcr.io/test/img".into(), "0.2.7-cuda".into()),
+                Ok(false),
+            );
+            answers.insert(
+                ("ghcr.io/test/img".into(), "0.2.7-cpu".into()),
+                Ok(false),
+            );
+            let probe = canned_probe(answers);
+            let res = decide_variant_to_pull(
+                "ghcr.io/test/img",
+                "0.2.7-cuda",
+                Some("0.2.7-cpu"),
+                "vct-test",
+                probe,
+            )
+            .await;
+            let err = res.expect_err("both-missing must hard-fail");
+            assert!(
+                err.contains("no variant"),
+                "error must say 'no variant available'; got: {}",
+                err
+            );
+            assert!(
+                err.contains("0.2.7-cuda"),
+                "error must name primary tag; got: {}",
+                err
+            );
+            assert!(
+                err.contains("0.2.7-cpu"),
+                "error must name fallback tag; got: {}",
+                err
+            );
+        });
+    }
+
+    #[test]
+    fn decide_variant_hard_fails_when_no_fallback_declared() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let mut answers = std::collections::HashMap::new();
+            answers.insert(
+                ("ghcr.io/test/img".into(), "0.2.7".into()),
+                Ok(false),
+            );
+            let probe = canned_probe(answers);
+            let res = decide_variant_to_pull(
+                "ghcr.io/test/img",
+                "0.2.7",
+                None, // legacy manifest, no variants block.
+                "vct-test",
+                probe,
+            )
+            .await;
+            let err = res.expect_err("no-fallback must hard-fail");
+            assert!(
+                err.contains("variant_not_found"),
+                "error must use the variant_not_found code; got: {}",
+                err
+            );
+        });
+    }
+
+    #[test]
+    fn decide_variant_degrades_to_blind_pull_on_probe_error() {
+        // Probe errored (e.g. `manifest inspect` unsupported on this
+        // runtime version). Don't block the install — let the pull try
+        // its hand, the registry will surface the real error if any.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let mut answers = std::collections::HashMap::new();
+            answers.insert(
+                ("ghcr.io/test/img".into(), "0.2.7-cuda".into()),
+                Err("podman: manifest subcommand unsupported".into()),
+            );
+            let probe = canned_probe(answers);
+            let res = decide_variant_to_pull(
+                "ghcr.io/test/img",
+                "0.2.7-cuda",
+                Some("0.2.7-cpu"),
+                "vct-test",
+                probe,
+            )
+            .await;
+            assert_eq!(
+                res.unwrap(),
+                "0.2.7-cuda",
+                "probe error must degrade to blind pull of primary"
+            );
+        });
+    }
+
+    #[test]
+    fn decide_variant_handles_fallback_equal_to_primary() {
+        // Defensive: if a manifest somehow declares the cpu fallback ==
+        // the chosen primary (e.g. GpuMode::Cpu picks the cpu variant,
+        // then `cpu_fallback_tag` is asked for "what's the fallback?"
+        // and answers with the same string), the decision helper should
+        // hard-fail with the no-fallback message rather than infinite-
+        // looping on the same probe.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let mut answers = std::collections::HashMap::new();
+            answers.insert(
+                ("ghcr.io/test/img".into(), "0.2.7-cpu".into()),
+                Ok(false),
+            );
+            let probe = canned_probe(answers);
+            let res = decide_variant_to_pull(
+                "ghcr.io/test/img",
+                "0.2.7-cpu",
+                Some("0.2.7-cpu"), // intentionally same as primary
+                "vct-test",
+                probe,
+            )
+            .await;
+            let err = res.expect_err("primary==fallback miss must hard-fail");
+            assert!(
+                err.contains("variant_not_found"),
+                "error must say variant_not_found; got: {}",
+                err
+            );
+        });
+    }
+
+    #[test]
+    fn cpu_fallback_tag_returns_none_when_no_variants_declared() {
+        // Legacy single-tag module (no gpu_image_variants block) — no
+        // fallback possible. The chosen GpuMode is irrelevant.
+        let m = manifest_with_variants(None);
+        assert_eq!(cpu_fallback_tag(&m, "0.2.7", GpuMode::Cuda), None);
+        assert_eq!(cpu_fallback_tag(&m, "0.2.7", GpuMode::Cpu), None);
+        assert_eq!(cpu_fallback_tag(&m, "0.2.7", GpuMode::Rocm), None);
+    }
+
+    #[test]
+    fn cpu_fallback_tag_returns_none_when_already_cpu_mode() {
+        // GpuMode::Cpu and Metal already pick the cpu variant via
+        // resolve_variant_tag. Probing it twice would be wasted work.
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        }));
+        assert_eq!(cpu_fallback_tag(&m, "0.2.7", GpuMode::Cpu), None);
+        assert_eq!(cpu_fallback_tag(&m, "0.2.7", GpuMode::Metal), None);
+    }
+
+    #[test]
+    fn cpu_fallback_tag_substitutes_version_template() {
+        // For Cuda / Rocm callers, the fallback is the cpu variant with
+        // `{version}` replaced by the base tag. Mirrors the same
+        // template-substitution `resolve_variant_tag` performs.
+        let m = manifest_with_variants(Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        }));
+        assert_eq!(
+            cpu_fallback_tag(&m, "0.2.7", GpuMode::Cuda),
+            Some("0.2.7-cpu".to_string()),
+        );
+        assert_eq!(
+            cpu_fallback_tag(&m, "0.2.7", GpuMode::Rocm),
+            Some("0.2.7-cpu".to_string()),
+        );
+    }
+
+    #[test]
+    fn install_progress_payload_serializes_variant_fallback_stage() {
+        // Pin the JSON wire contract for the new VariantFallback stage.
+        // The GUI keys off the snake_case string "variant_fallback" to
+        // route the event to a non-blocking toast — a rename would
+        // silently break that surfacing.
+        let payload = InstallProgress {
+            project_id: "p1".to_string(),
+            module_id: "vct-rl-reranker".to_string(),
+            stage: InstallStage::VariantFallback,
+            step_index: 1,
+            step_total: 5,
+            percent: 20,
+            message:
+                "Requested variant 0.2.7-cuda not available on the registry; installing 0.2.7-cpu instead"
+                    .to_string(),
+        };
+        let json = serde_json::to_value(&payload).expect("serialize InstallProgress");
+        assert_eq!(
+            json["stage"], "variant_fallback",
+            "stage must serialize as snake_case 'variant_fallback'"
+        );
+        let msg = json["message"].as_str().unwrap();
+        assert!(
+            msg.contains("0.2.7-cuda") && msg.contains("0.2.7-cpu"),
+            "fallback message must name both requested + actual tags; got: {}",
+            msg
+        );
+    }
+
+    // ─── probe_image_tag_exists (env-conditional) ───────────────────────
+    //
+    // Spawns a real `manifest inspect` against `library/hello-world` —
+    // requires podman or docker on PATH AND outbound network to
+    // registry-1.docker.io. Skipped by default; run with
+    // `cargo test --lib -- --ignored probe_image_tag_exists` when
+    // verifying probe behaviour against the real registry.
+
+    #[test]
+    #[ignore = "requires podman/docker on PATH and outbound network"]
+    fn probe_image_tag_exists_returns_true_for_known_public_image() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            // Resolve runtime up-front; skip if neither podman nor docker.
+            let runtime = match detect_container_runtime().await {
+                Ok(r) => r,
+                Err(_) => {
+                    eprintln!("skipping: no container runtime on PATH");
+                    return;
+                }
+            };
+            let exists = probe_image_tag_exists("docker.io/library/hello-world", "latest", &runtime)
+                .await
+                .expect("probe must not error on a public image");
+            assert!(exists, "hello-world:latest must exist on docker.io");
+        });
+    }
+
+    #[test]
+    #[ignore = "requires podman/docker on PATH and outbound network"]
+    fn probe_image_tag_exists_returns_false_for_unknown_tag() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            let runtime = match detect_container_runtime().await {
+                Ok(r) => r,
+                Err(_) => {
+                    eprintln!("skipping: no container runtime on PATH");
+                    return;
+                }
+            };
+            // Tag with a sentinel UUID-shaped suffix — will never exist.
+            let exists = probe_image_tag_exists(
+                "docker.io/library/hello-world",
+                "vct-probe-test-00000000-0000-0000-0000-000000000000",
+                &runtime,
+            )
+            .await;
+            // Result MUST be Ok(false) — not Err. Treating
+            // "manifest unknown" as Err would block valid installs.
+            assert!(
+                matches!(exists, Ok(false)),
+                "missing tag must produce Ok(false); got: {:?}",
+                exists,
+            );
+        });
     }
 }
