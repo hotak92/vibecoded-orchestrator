@@ -29,6 +29,8 @@
     closeOnBackdrop = true,
     closeOnEscape = true,
     width = '560px',
+    ariaLabelledBy,
+    ariaLabel,
     header,
     body,
     footer,
@@ -38,6 +40,15 @@
     closeOnBackdrop?: boolean;
     closeOnEscape?: boolean;
     width?: string;
+    // v0.2.35 (a11y sweep, Agent O): allow callers to wire the dialog's
+    // accessible name. WCAG 2.4.6 — interactive components need an
+    // accessible name; for native <dialog>, that's normally the first
+    // heading in the dialog, but assistive tech only reliably picks it
+    // up via aria-labelledby (or aria-label as a fallback). Without it,
+    // some screen readers announce "dialog" with no title context on
+    // open.
+    ariaLabelledBy?: string;
+    ariaLabel?: string;
     header?: Snippet;
     body?: Snippet;
     footer?: Snippet;
@@ -157,6 +168,8 @@
   oncancel={onCancel}
   onclick={onDialogClick}
   style:--dialog-width={width}
+  aria-labelledby={ariaLabelledBy}
+  aria-label={ariaLabel}
 >
   <div class="dialog-content" role="document">
     {#if header}

@@ -49,6 +49,22 @@
   const selected = $derived(options.find((o) => o.value === value));
   const label = $derived(selected?.label ?? placeholder);
 
+  // v0.2.35 (a11y, Agent O): stable per-instance prefix for option IDs so
+  // aria-activedescendant on the listbox can point at the currently
+  // highlighted option. The combobox/listbox WAI-ARIA pattern requires
+  // this — without it, arrow-key nav through the menu is invisible to
+  // screen readers (the focus stays on the trigger button; only
+  // aria-activedescendant tells AT which option is conceptually focused).
+  // Math.random keeps multiple Dropdown instances on the same page
+  // unique without forcing the caller to provide an `id` prop.
+  const instanceId = `dd-${Math.random().toString(36).slice(2, 10)}`;
+  function optionId(idx: number): string {
+    return `${instanceId}-opt-${idx}`;
+  }
+  const activeDescendant = $derived(
+    open && options[highlighted] ? optionId(highlighted) : undefined,
+  );
+
   function toggle() {
     if (disabled) return;
     open = !open;
@@ -120,14 +136,23 @@
 </script>
 
 <div class="dropdown {classes}" class:open class:disabled>
+  <!-- v0.2.35 (a11y, Agent O): role="combobox" is required for the
+       aria-activedescendant pattern to be valid on a <button>. ARIA APG
+       Combobox With Listbox Popup pattern (1.2) treats this as the
+       canonical combination — without it, svelte-check (and axe) flag
+       aria-activedescendant on an implicit-role="button" as
+       unsupported. Visual styling and click behavior are unchanged. -->
   <button
     type="button"
     class="dropdown-trigger"
+    role="combobox"
     onclick={toggle}
     onkeydown={onKey}
     aria-haspopup="listbox"
     aria-expanded={open}
     aria-label={ariaLabel}
+    aria-activedescendant={activeDescendant}
+    aria-controls={open ? `${instanceId}-menu` : undefined}
     {id}
     {disabled}
     bind:this={triggerEl}
@@ -151,7 +176,12 @@
   </button>
 
   {#if open}
-    <ul class="dropdown-menu" role="listbox" bind:this={menuEl}>
+    <ul
+      class="dropdown-menu"
+      role="listbox"
+      id="{instanceId}-menu"
+      bind:this={menuEl}
+    >
       {#each options as opt, i (String(opt.value))}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <li
@@ -161,6 +191,7 @@
           class:disabled={opt.disabled}
           role="option"
           aria-selected={opt.value === value}
+          id={optionId(i)}
           onclick={() => pick(opt)}
           onmouseenter={() => (highlighted = i)}
         >

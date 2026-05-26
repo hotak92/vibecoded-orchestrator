@@ -127,7 +127,16 @@
 </script>
 
 {#if open}
-  <DialogRoot bind:open onClose={cancel} width="600px">
+  <!-- v0.2.35 (a11y, Agent O): wire `aria-labelledby` to the heading id
+       so screen readers announce "No container runtime detected" when
+       the dialog opens. The native <dialog> + showModal() handles focus
+       trap and Escape; the labelledby fills WCAG 2.4.6 (accessible name). -->
+  <DialogRoot
+    bind:open
+    onClose={cancel}
+    width="600px"
+    ariaLabelledBy="install-preflight-runtime-title"
+  >
     {#snippet header()}
       <h2 id="install-preflight-runtime-title">No container runtime detected</h2>
     {/snippet}
@@ -144,15 +153,23 @@
         come back here and click "Detect again".
       </p>
 
-      {#if lastRedetectMessage}
-        <p
-          class="redetect-status"
-          class:success={current?.available}
-          class:error={current?.available === false && lastRedetectMessage.toLowerCase().includes('still')}
-        >
-          {lastRedetectMessage}
-        </p>
-      {/if}
+      <!-- v0.2.35 (a11y, Agent O): role="status" + aria-live="polite" so
+           the "Still no container runtime detected" / "Detected podman —
+           proceeding…" message is announced to screen readers without
+           interrupting current speech (vs assertive). Placed as a
+           wrapper region so the polite live area exists from the first
+           paint; the inner paragraph is conditionally rendered. -->
+      <div class="redetect-status-region" role="status" aria-live="polite">
+        {#if lastRedetectMessage}
+          <p
+            class="redetect-status"
+            class:success={current?.available}
+            class:error={current?.available === false && lastRedetectMessage.toLowerCase().includes('still')}
+          >
+            {lastRedetectMessage}
+          </p>
+        {/if}
+      </div>
     {/snippet}
     {#snippet footer()}
       <div class="footer-actions">
@@ -177,9 +194,17 @@
           class="primary"
           onclick={openInstallPage}
           disabled={redetecting || !installUrl}
+          aria-describedby="install-podman-external-hint"
         >
           Install Podman
         </button>
+        <!-- v0.2.35 (a11y, Agent O): visually-hidden text announces that
+             "Install Podman" opens an external URL in the OS browser
+             rather than performing the install in-app. Screen readers
+             read the aria-describedby description after the button name. -->
+        <span id="install-podman-external-hint" class="sr-only">
+          Opens the canonical Podman install page in your browser.
+        </span>
       </div>
     {/snippet}
   </DialogRoot>
@@ -249,5 +274,24 @@
   button:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+  /* v0.2.35 (a11y, Agent O): WCAG-standard visually-hidden helper for
+     screen-reader-only descriptive text. Mirrors the .sr-only pattern
+     used elsewhere in the launcher (see route +layout if added later). */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  /* The redetect status region is purely a live-area container; no
+     visual chrome of its own (the inner <p> carries the styling). */
+  .redetect-status-region {
+    min-height: 0;
   }
 </style>

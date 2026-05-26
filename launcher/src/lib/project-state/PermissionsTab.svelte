@@ -351,12 +351,21 @@
                 {/if}
               </td>
               <td>
+                <!-- v0.2.35 (a11y, Agent O): the <label> wraps the
+                     checkbox but contains only the cosmetic slider span,
+                     so SR users get no accessible name from the visible
+                     content. Adding aria-label on the input gives screen
+                     readers a concrete control name ("Enable / Disable
+                     <server> for this project"). The title attribute is
+                     a fallback for sighted users (hover tooltip), not a
+                     reliable a11y name source. -->
                 <label class="ps-toggle" title={row.project_enabled ? 'Click to disable this MCP server for this project.' : 'Click to enable this MCP server for this project.'}>
                   <input
                     type="checkbox"
                     checked={row.project_enabled}
                     disabled={!row.enabled}
                     onchange={() => toggleMcp(row)}
+                    aria-label="{row.project_enabled ? 'Disable' : 'Enable'} MCP server {row.name} for this project"
                   />
                   <span class="ps-toggle-slider"></span>
                 </label>

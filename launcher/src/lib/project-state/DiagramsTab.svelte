@@ -873,7 +873,18 @@
         </div>
 
         {#if showAdd}
-          <div class="ps-form" role="dialog" aria-label="Add diagram">
+          <!-- v0.2.35 (a11y, Agent O): inline form was role="dialog" but
+               it's an in-place expandable form, NOT a modal dialog. SR
+               users get a misleading "dialog" announcement otherwise.
+               role="group" with aria-labelledby pointing to a labelling
+               heading correctly communicates "this is a grouped form
+               control set" without the modal semantics. -->
+          <div
+            class="ps-form"
+            role="group"
+            aria-labelledby="add-diagram-form-heading"
+          >
+            <h5 id="add-diagram-form-heading" class="sr-only">Add diagram form</h5>
             <label class="ps-form-row">
               <span>Type</span>
               <Dropdown options={TYPE_OPTIONS} bind:value={newType} />
@@ -920,6 +931,11 @@
                dialog pre-filled with the file's basename. Drag-drop
                here is the third creation entry point (after "+ Add
                diagram" and "Draw new"). -->
+          <!-- v0.2.35 (a11y, Agent O): drop zone announces dragover/leave
+               state via aria-live so SR users hear the "Release to
+               import…" prompt when a draggable enters the zone. Polite
+               so it doesn't interrupt; the visual border change already
+               serves sighted users. -->
           <div
             class="diagrams-empty-state"
             class:drop-active={dropZoneActive}
@@ -934,19 +950,29 @@
               <code>Draw Mermaid</code> / <code>Draw Excalidraw</code>,
               or drop a <code>.mmd</code> / <code>.excalidraw</code> file here.
             </p>
-            <p class="diagrams-drop-hint">
+            <p class="diagrams-drop-hint" aria-live="polite">
               {dropZoneActive
                 ? 'Release to import…'
                 : 'Drop file to import'}
             </p>
           </div>
         {:else}
+          <!-- v0.2.35 (a11y, Agent O): listbox semantics require direct
+               role="option" children. The <li> wrappers exist for
+               layout (they pair the row activator with a toggle + delete
+               button); marking them role="none" tells AT to skip the
+               list wrapper and treat the inner role="option" button as
+               the option itself. The sibling toggle/delete buttons stay
+               focusable via Tab even though they aren't options
+               (assistive tech handles this via the standard listbox
+               pattern + tabindex). -->
           <ul class="diagrams-rows" role="listbox" aria-label="Diagrams">
             {#each diagrams as d (d.id)}
               <li
                 class="diagrams-row-wrapper"
                 class:active={selectedId === d.id}
                 class:disabled-row={!d.enabled}
+                role="none"
               >
                 <!-- Row activator: clicking selects the diagram. The
                      enabled-toggle + delete button are siblings (not
@@ -1051,11 +1077,14 @@
           </div>
 
           {#if showSaveDraftDialog}
-            <!-- Modal-ish inline dialog. Keeps the form local to the
-                 right pane rather than a global modal so the user can
-                 still see their draft while typing the name/category. -->
-            <div class="diagrams-save-dialog" role="dialog" aria-label="Save draft as new diagram">
-              <h4>Save draft as new diagram</h4>
+            <!-- v0.2.35 (a11y, Agent O): "Modal-ish" inline form, not a
+                 true modal — focus isn't trapped, backdrop doesn't
+                 block. role="dialog" was misleading; switched to
+                 role="group" with aria-labelledby pointing to the
+                 visible heading so SR users get the same name without
+                 the false-modal announcement. -->
+            <div class="diagrams-save-dialog" role="group" aria-labelledby="save-draft-heading">
+              <h4 id="save-draft-heading">Save draft as new diagram</h4>
               <label class="ps-form-row">
                 <span>Name</span>
                 <input
@@ -1139,7 +1168,11 @@
           <div class="diagrams-preview-body">
             {#if selected.diagram_type === 'mermaid'}
               {#if previewError}
-                <pre class="diagrams-preview-error">{previewError}</pre>
+                <!-- v0.2.35 (a11y, Agent O): render errors are async,
+                     not user-triggered — role="alert" interrupts and
+                     announces immediately so SR users hear about syntax
+                     errors as they type. -->
+                <pre class="diagrams-preview-error" role="alert">{previewError}</pre>
               {:else if previewSvg}
                 <!-- Mermaid output is trusted: rendered with
                      securityLevel='strict' which sanitises user input
@@ -1475,5 +1508,20 @@
     gap: 8px;
     justify-content: flex-end;
     margin-top: 4px;
+  }
+
+  /* v0.2.35 (a11y, Agent O): visually-hidden heading used for the
+     role="group" form labelling pattern. Standard WCAG hide-from-sighted
+     /show-to-AT helper. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 </style>

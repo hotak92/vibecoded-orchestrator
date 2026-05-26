@@ -101,19 +101,32 @@
     <label class="mermaid-editor-label" for="mermaid-source">
       Mermaid source
     </label>
+    <!-- v0.2.35 (a11y, Agent O): the visible <label for="mermaid-source">
+         already provides the accessible name; redundant aria-label
+         dropped. spellcheck=false because mermaid source is code, not
+         prose. -->
     <textarea
       id="mermaid-source"
       class="mermaid-editor-textarea"
       bind:value={source}
       placeholder={'flowchart TD\n  A[Start] --> B{Decision}\n  B -->|Yes| C[Action]\n  B -->|No| D[Other]'}
       spellcheck="false"
-      aria-label="Mermaid source code"
     ></textarea>
   </div>
-  <div class="mermaid-editor-pane mermaid-editor-preview">
-    <span class="mermaid-editor-label" aria-hidden="true">Live preview</span>
+  <!-- v0.2.35 (a11y, Agent O): preview pane wrapped as role="region" with
+       a visible label that's also the accessible name (no aria-hidden on
+       the label). Adds aria-live="polite" so SR users hear updates as
+       the diagram re-renders. Error path uses role="alert" to interrupt
+       and announce render failures immediately. -->
+  <div
+    class="mermaid-editor-pane mermaid-editor-preview"
+    role="region"
+    aria-labelledby="mermaid-preview-label"
+    aria-live="polite"
+  >
+    <span id="mermaid-preview-label" class="mermaid-editor-label">Live preview</span>
     {#if previewError}
-      <pre class="mermaid-editor-error">{previewError}</pre>
+      <pre class="mermaid-editor-error" role="alert">{previewError}</pre>
     {:else if previewSvg}
       <!-- securityLevel='strict' sanitises Mermaid output; safe to inject. -->
       <div class="mermaid-editor-svg-host">
