@@ -31,7 +31,7 @@ status: active
 - `.claude/context/plans/install-adaptation-audit-2026-05-06.md` — adaptation-of-existing-projects edge cases.
 - `.claude/context/plans/container-install-and-collections-audit-2026-05-16.md` — Weaviate-side install/seed flow.
 - `.claude/context/plans/v0.2.34-install-path-audit-2026-05-25.md` — post-pull module install bugs (mostly addressed in v0.2.34/v0.2.35).
-- `/home/martino/Desktop/instambul_map/.claude/context/INSTALL-GAPS-2026-05-27.md` — five concrete gaps observed during fresh project bootstrap.
+- `<project-folder>/.claude/context/INSTALL-GAPS-2026-05-27.md` — five concrete gaps observed during fresh project bootstrap on a non-orchestrator project (path redacted; original report lives in the affected project's own context directory).
 
 ## Surface-by-surface analysis
 
