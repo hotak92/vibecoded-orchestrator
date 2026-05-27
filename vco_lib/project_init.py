@@ -5849,7 +5849,18 @@ def install_project_bundle(
     # a warning, not a fatal install-bundle failure.
     if not dry_run:
         try:
-            backfill = _apply_canonical_env_via_config_projection(folder)
+            # v0.2.37 (Gap 6a): thread orchestrator_root through to the
+            # env-projection step so `.claude/env` carries
+            # VCT_ORCHESTRATOR_ROOT / VCT_INFRASTRUCTURE_DIR / VCT_INSTALL_ROOT
+            # exports. Without these, KG-sync / code-graph wrappers in a
+            # fresh OSS install (no launcher running) fail with
+            # "claude_mcp_servers/ not found" because they need an
+            # absolute pointer to the orchestrator clone. The launcher
+            # was the only previous emitter of VCT_INSTALL_ROOT — direct
+            # CLI invocations had no way to reach the analyzer venv.
+            backfill = _apply_canonical_env_via_config_projection(
+                folder, orchestrator_root=orchestrator_root,
+            )
             result["backfill_code_graph_project"] = backfill
             result["backfill_kg_collection"] = backfill  # same data
             _log("4.bundle.backfill", "ok",
@@ -6318,7 +6329,11 @@ def _smart_merge_for_bundle(user: dict, template: dict) -> dict:
     return out
 
 
-def _apply_canonical_env_via_config_projection(folder: Path) -> dict:
+def _apply_canonical_env_via_config_projection(
+    folder: Path,
+    *,
+    orchestrator_root: Optional[Path] = None,
+) -> dict:
     """Phase 0.B Part 2 (2026-05-25): project the FULL canonical env
     into a project's `.claude/settings.json::env` + `.claude/env` via
     the single-writer contract.
@@ -6330,6 +6345,14 @@ def _apply_canonical_env_via_config_projection(folder: Path) -> dict:
       - launcher.db is missing (pre-launcher-boot / corrupt install).
       - The folder isn't registered in `projects` (race with create flow,
         or post-unregister).
+
+    Args:
+        folder: project root (must already exist).
+        orchestrator_root: v0.2.37 (Gap 6a) — when set, the env bundle
+            carries VCT_ORCHESTRATOR_ROOT / VCT_INFRASTRUCTURE_DIR
+            exports so direct CLI users (no launcher) can locate the
+            orchestrator clone from `.claude/env`. Forwarded to
+            `project_env_from_db` which is the canonical emit site.
 
     Returns:
         Same shape as the legacy backfill helpers' return dict for
@@ -6418,7 +6441,10 @@ def _apply_canonical_env_via_config_projection(folder: Path) -> dict:
             DbUnreachable,
             ProjectNotFound,
         )
-        bundle = project_env_from_db(project_id)
+        bundle = project_env_from_db(
+            project_id,
+            orchestrator_root=orchestrator_root,
+        )
         report = apply_project_env(bundle)
     except DbUnreachable:
         result["action"] = "db_unreachable"
