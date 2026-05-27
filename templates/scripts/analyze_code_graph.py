@@ -4509,7 +4509,16 @@ def main():
             )
 
     if not project_name:
-        project_name = args.project or repo_path.name
+        # v0.2.37 (Gap 6e): honor $CODE_GRAPH_PROJECT env var BEFORE
+        # falling back to the repo dir name. The launcher and hooks
+        # already export this key (see `.claude/env` + `.claude/settings.json
+        # ::env`); without this check, code-graph collections diverge from
+        # the KG collection prefix on direct CLI invocations (the analyzer
+        # would silently write to a Weaviate class whose name reflects the
+        # cwd basename rather than the launcher-resolved project name).
+        # Order: --from-resolver > --project > $CODE_GRAPH_PROJECT > repo_path.name.
+        env_project = os.environ.get("CODE_GRAPH_PROJECT", "").strip()
+        project_name = args.project or env_project or repo_path.name
 
     if args.verbose:
         print(f"📂 Repository: {repo_path}")

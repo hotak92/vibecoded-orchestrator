@@ -3,22 +3,73 @@
 # Usage: code-graph-query search "query"
 #        code-graph-query similar "full.function.name"
 #        code-graph-query structure dependencies "path/to/module.py"
+#
+# v0.2.37 (Gap 6b + 6c): backports the validate-has-weaviate-client pattern
+# from `code-graph-analyze` AND sets PYTHONPATH so `query_code_graph.py`
+# can import the `claude_mcp_servers` package (parity with the
+# `sync_knowledge_graph.py` helper, which uses `_resolve_mcp_servers_dir()`
+# but `query_code_graph.py` requires `claude_mcp_servers` on PYTHONPATH).
+#
+# Bug history:
+#   - 2026-05-27 (instambul_map dogfooding): query_code_graph.py crashed
+#     with `ModuleNotFoundError: No module named 'weaviate_mcp'` because
+#     the wrapper activated a venv but never put claude_mcp_servers/ on
+#     PYTHONPATH. The launcher exports VCT_ORCHESTRATOR_ROOT for this
+#     purpose; the OSS install path didn't have it. Alternative
+#     considered + rejected: install weaviate_mcp as a package via
+#     pyproject.toml. That's bigger scope; ship the env-var workaround
+#     for v0.2.37, queue the package-ification for later.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Probe canonical .venv locations. install-root/.venv is the OSS install
-# layout; claude_mcp_servers/.venv is the legacy private-Claude-orch
-# path. Hardcoding only the legacy one broke real OSS installs.
+# Validate a venv has the code-graph-query deps installed.
+venv_has_code_graph_deps() {
+    local v="$1"
+    local py=""
+    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
+    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
+    else return 1
+    fi
+    "$py" -c "import weaviate" 2>/dev/null
+}
+
+CANDIDATES=(
+    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
+    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
+    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
+    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
+)
+
 VENV_PATH=""
-for _c in "$SCRIPT_DIR/../../.venv" "$SCRIPT_DIR/../../claude_mcp_servers/.venv"; do
-    if [ -x "$_c/bin/python" ] || [ -x "$_c/bin/python3" ]; then
-        VENV_PATH="$_c"
+for c in "${CANDIDATES[@]}"; do
+    [ -z "$c" ] && continue
+    [ "$c" = "/.venv" ] && continue
+    [ "$c" = "/claude_mcp_servers/.venv" ] && continue
+    if venv_has_code_graph_deps "$c"; then
+        VENV_PATH="$c"
         break
     fi
 done
 
 if [ -n "$VENV_PATH" ]; then
     source "$VENV_PATH/bin/activate"
+fi
+
+# Resolve the orchestrator root for PYTHONPATH. Prefer
+# $VCT_ORCHESTRATOR_ROOT (canonical, written into .claude/env by
+# install-bundle as of v0.2.37 Gap 6a), fall back to $VCT_INSTALL_ROOT
+# (legacy alias), then to script-relative paths.
+ORCH_ROOT=""
+if [ -n "${VCT_ORCHESTRATOR_ROOT:-}" ] && [ -d "${VCT_ORCHESTRATOR_ROOT}/claude_mcp_servers" ]; then
+    ORCH_ROOT="${VCT_ORCHESTRATOR_ROOT}"
+elif [ -n "${VCT_INSTALL_ROOT:-}" ] && [ -d "${VCT_INSTALL_ROOT}/claude_mcp_servers" ]; then
+    ORCH_ROOT="${VCT_INSTALL_ROOT}"
+elif [ -d "$SCRIPT_DIR/../../claude_mcp_servers" ]; then
+    ORCH_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+fi
+
+if [ -n "$ORCH_ROOT" ]; then
+    export PYTHONPATH="$ORCH_ROOT/claude_mcp_servers:${PYTHONPATH:-}"
 fi
 
 # Run the Python script

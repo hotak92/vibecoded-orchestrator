@@ -1,13 +1,36 @@
 #!/bin/bash
-# Wrapper script for search_knowledge.py with automatic venv activation
+# Wrapper script for search_knowledge.py with automatic venv activation.
+#
+# v0.2.37 (Gap 6b): backports the validate-has-weaviate-client pattern
+# from `code-graph-analyze`. See `kg-sync` for the full rationale.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Validate a venv has the KG-search deps installed.
+venv_has_kg_deps() {
+    local v="$1"
+    local py=""
+    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
+    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
+    else return 1
+    fi
+    "$py" -c "import weaviate" 2>/dev/null
+}
+
+CANDIDATES=(
+    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
+    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
+    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
+    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
+)
 
 VENV_PATH=""
-for _c in "$PROJECT_ROOT/.venv" "$PROJECT_ROOT/claude_mcp_servers/.venv"; do
-    if [ -x "$_c/bin/python" ] || [ -x "$_c/bin/python3" ]; then
-        VENV_PATH="$_c"
+for c in "${CANDIDATES[@]}"; do
+    [ -z "$c" ] && continue
+    [ "$c" = "/.venv" ] && continue
+    [ "$c" = "/claude_mcp_servers/.venv" ] && continue
+    if venv_has_kg_deps "$c"; then
+        VENV_PATH="$c"
         break
     fi
 done

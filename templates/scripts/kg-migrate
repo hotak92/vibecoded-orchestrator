@@ -8,19 +8,46 @@
 #   .claude/scripts/kg-migrate --fix                # Apply automatic fixes
 #   .claude/scripts/kg-migrate --interactive        # Interactive mode with prompts
 #   .claude/scripts/kg-migrate --file <path>        # Check/fix single file
+#
+# v0.2.37 (Gap 6b): backports the validate-has-weaviate-client pattern
+# from `code-graph-analyze`. See `kg-sync` for the full rationale.
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Probe canonical .venv locations (OSS install-root first, legacy second).
-for _c in "$PROJECT_ROOT/.venv" "$PROJECT_ROOT/claude_mcp_servers/.venv"; do
-    if [ -f "$_c/bin/activate" ]; then
-        source "$_c/bin/activate"
+# Validate a venv has the KG-migrate deps installed.
+venv_has_kg_deps() {
+    local v="$1"
+    local py=""
+    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
+    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
+    else return 1
+    fi
+    "$py" -c "import weaviate" 2>/dev/null
+}
+
+CANDIDATES=(
+    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
+    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
+    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
+    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
+)
+
+VENV_PATH=""
+for c in "${CANDIDATES[@]}"; do
+    [ -z "$c" ] && continue
+    [ "$c" = "/.venv" ] && continue
+    [ "$c" = "/claude_mcp_servers/.venv" ] && continue
+    if venv_has_kg_deps "$c"; then
+        VENV_PATH="$c"
         break
     fi
 done
+
+if [ -n "$VENV_PATH" ]; then
+    source "$VENV_PATH/bin/activate"
+fi
 
 # Run migration script
 exec python "$SCRIPT_DIR/migrate_to_vocabulary.py" "$@"
