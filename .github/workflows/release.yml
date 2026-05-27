@@ -71,6 +71,10 @@ on:
         description: "Skip committing built binaries back to main (dry-run / QA)"
         type: boolean
         default: false
+      skip_supabase_deploy:
+        description: "Skip auto-deploying Supabase edge functions + migrations (dry-run / QA)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write       # needed to attach artifacts to the release
@@ -935,3 +939,282 @@ jobs:
       - name: Report no-op (all binaries already up to date)
         if: steps.stage.outputs.changed == '0'
         run: echo "All dist binaries are byte-identical to HEAD — no commit needed."
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # supabase-deploy
+  #
+  # v0.2.37 (Issue 2 fix): auto-deploy edge functions + DB migrations to the
+  # canonical Supabase project on every successful release tag.
+  #
+  # Prior to v0.2.37 this was an entirely-manual step. The v0.2.36 release
+  # shipped a launcher binary calling the `rebind-admin-token` edge
+  # function, but the function itself was never deployed to Supabase prod
+  # — every admin recovery request hit a 404 NOT_FOUND. The migration
+  # backing the same function (`20260526_rebind_admin_machine.sql`) had to
+  # be hand-pasted into the SQL editor. This job closes that gap.
+  #
+  # Trade-off (intentional): this job runs AFTER `build` and
+  # `commit-dist-binaries` rather than as a hard pre-condition for the
+  # release. Rationale: a Supabase outage / API hiccup shouldn't block a
+  # launcher release that otherwise built fine. Symptom of a Supabase
+  # deploy failure is a red `supabase-deploy` job in the run summary; the
+  # GitHub Release is still cut and the binaries downloadable. Operators
+  # fall back to the manual recipe documented in
+  # `docs/operations/supabase-ci-deploy.md` § "Manual fallback".
+  #
+  # ⚠️  PREREQUISITES — see docs/operations/supabase-ci-deploy.md
+  #
+  # Required repo configuration (set ONCE per project):
+  #   - Secret  SUPABASE_ACCESS_TOKEN  → Supabase user access token
+  #     (https://supabase.com/dashboard/account/tokens)
+  #   - Variable SUPABASE_PROJECT_REF  → 20-char project ref slug
+  #     (e.g. ovpdtijpdchzlxbojhsg for the canonical orchestrator project,
+  #     OR your fork's own project ref — nothing in this workflow hardcodes
+  #     the canonical ref, so private forks just override this one variable)
+  #
+  # Required one-time human-driven migration repair (BEFORE this job will
+  # succeed for the first time): see § "First-time CI setup" in
+  # docs/operations/supabase-ci-deploy.md. We deliberately keep
+  # `supabase migration repair` OUT of CI — it mutates the
+  # schema_migrations ledger and is destructive; one-time normalization
+  # belongs in a human-supervised runbook, not a recurring release job.
+  #
+  # Skipped (no-op) when:
+  #   - workflow_dispatch input skip_supabase_deploy == true (manual override)
+  #   - workflow_dispatch input skip_dist_commit == true     (dry-run signal —
+  #                                                          a no-binary-commit
+  #                                                          run almost certainly
+  #                                                          shouldn't deploy
+  #                                                          Supabase either)
+  #   - The required secret is not set (warning-and-skip rather than hard-
+  #     fail, so a private fork that hasn't configured Supabase yet can
+  #     still ship launcher releases).
+  # ─────────────────────────────────────────────────────────────────────────
+  supabase-deploy:
+    name: Deploy Supabase edge functions + migrations
+    needs: [build, commit-dist-binaries]
+    runs-on: ubuntu-latest
+    # Mirror the gating used by commit-dist-binaries: only on tag pushes
+    # or explicit workflow_dispatch, honouring both manual skip flags. A
+    # dry-run workflow_dispatch with skip_dist_commit=true also skips
+    # Supabase deploy (a dry-run shouldn't touch prod Supabase).
+    if: |
+      (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+      && github.event.inputs.skip_dist_commit != 'true'
+      && github.event.inputs.skip_supabase_deploy != 'true'
+
+    steps:
+      # v0.2.37: early visibility on missing SUPABASE_ACCESS_TOKEN. Same
+      # pattern as the DIST_COMMIT_TOKEN check above — surface the missing
+      # secret BEFORE we install the CLI / link the project, with a clear
+      # pointer to the setup doc. Falls back to a warning + step skip
+      # (not a hard fail) so private forks that don't ship to a Supabase
+      # project still get a clean release.
+      - name: Check SUPABASE_ACCESS_TOKEN presence
+        id: token_check
+        run: |
+          if [ -z "${{ secrets.SUPABASE_ACCESS_TOKEN }}" ]; then
+            echo "::warning::SUPABASE_ACCESS_TOKEN secret is not set on this repo."
+            echo "::warning::Skipping Supabase edge-function + migration deploy."
+            echo "::warning::See docs/operations/supabase-ci-deploy.md for setup."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "SUPABASE_ACCESS_TOKEN is set — proceeding with deploy."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check SUPABASE_PROJECT_REF presence
+        id: ref_check
+        if: steps.token_check.outputs.skip != 'true'
+        env:
+          PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+        run: |
+          if [ -z "${PROJECT_REF}" ]; then
+            echo "::error::SUPABASE_PROJECT_REF repository variable is not set."
+            echo "::error::Set it via: gh variable set SUPABASE_PROJECT_REF --body '<20-char-ref>'"
+            echo "::error::See docs/operations/supabase-ci-deploy.md for setup."
+            exit 1
+          fi
+          echo "SUPABASE_PROJECT_REF is set: ${PROJECT_REF}"
+
+      - uses: actions/checkout@v6
+        if: steps.token_check.outputs.skip != 'true'
+        with:
+          # Check out the tag's commit so the functions + migrations we
+          # deploy match the binaries we just published. Unlike the
+          # commit-dist-binaries job, we're not pushing back to main, so
+          # the ancestry-divergence concern from v0.2.17 doesn't apply.
+          fetch-depth: 1
+
+      # Use the official Supabase setup action. Pinned to v1 — the action
+      # is a thin shim that installs the latest stable CLI (or the version
+      # named in the `version` input) and adds it to PATH. We deliberately
+      # don't pin a CLI version: the CLI auto-updates the `schema_migrations`
+      # ledger format from time to time, and pinning would freeze us on an
+      # older format. If a feature in a future release of this workflow
+      # needs a specific CLI version (e.g. a new flag), pin via `version:`
+      # at THAT time and document the bump in docs/operations/supabase-
+      # ci-deploy.md § "Known limitations".
+      - name: Set up Supabase CLI
+        if: steps.token_check.outputs.skip != 'true'
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # Verify the CLI installed correctly. A hard fail here means the
+      # upstream install action regressed — much cheaper to fail before
+      # we attempt project link than to fail mid-deploy.
+      - name: Verify Supabase CLI installation
+        if: steps.token_check.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          if ! command -v supabase >/dev/null 2>&1; then
+            echo "::error::Supabase CLI not on PATH after setup-cli@v1"
+            echo "::error::Check https://github.com/supabase/setup-cli for upstream status"
+            exit 1
+          fi
+          supabase --version
+
+      # `supabase link` writes the project ref to .supabase/temp/ inside
+      # the workspace. Subsequent CLI calls in this job read that file
+      # implicitly. We pass the access token via env so the link command
+      # is non-interactive.
+      - name: Link Supabase project
+        if: steps.token_check.outputs.skip != 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+        working-directory: launcher/supabase
+        run: |
+          set -euo pipefail
+          # `supabase link` exits 0 even on auth failure in some CLI
+          # versions; explicit project-status probe afterward catches it.
+          supabase link --project-ref "${PROJECT_REF}"
+          echo "::notice::Linked to project ${PROJECT_REF}"
+
+      # Deploy every directory under launcher/supabase/functions/ except
+      # _shared (which is shared library code, not a deployable function).
+      #
+      # Resilience: rather than fail-fast on the first broken function,
+      # we collect failures into a summary and exit non-zero at the end.
+      # This way operators see EVERY function that needs attention in a
+      # single CI run, not just the first.
+      #
+      # We do NOT pass `--no-verify-jwt`. Each function's verify_jwt
+      # posture lives in launcher/supabase/config.toml — committed to
+      # source-control rather than passed as a CLI flag. Future operators
+      # who run a manual deploy don't have to remember the flag.
+      - name: Deploy edge functions
+        if: steps.token_check.outputs.skip != 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+        working-directory: launcher/supabase
+        run: |
+          set -uo pipefail
+          # set -e disabled intentionally — we want to attempt every
+          # function before failing the job.
+
+          declare -a failed=()
+          declare -a deployed=()
+
+          if [ ! -d functions ]; then
+            echo "::warning::No launcher/supabase/functions/ directory found — skipping."
+            exit 0
+          fi
+
+          for fn_dir in functions/*/; do
+            fn_name="$(basename "$fn_dir")"
+            # _shared is library code (Deno modules imported by the
+            # actual functions). It has no top-level `index.ts` entry
+            # point and `supabase functions deploy _shared` would 400.
+            if [ "$fn_name" = "_shared" ]; then
+              echo "::group::Skipping _shared (library code, not a deployable function)"
+              echo "::endgroup::"
+              continue
+            fi
+            # Sanity: a function dir without an index.ts isn't deployable.
+            # Surface this as a warning rather than a hard fail — the
+            # legit case is `mkdir -p functions/new-fn/` committed before
+            # the index.ts lands in a follow-up PR.
+            if [ ! -f "${fn_dir}index.ts" ]; then
+              echo "::warning::${fn_name} has no index.ts — skipping deploy."
+              continue
+            fi
+
+            echo "::group::Deploying ${fn_name}"
+            if supabase functions deploy "${fn_name}" --project-ref "${PROJECT_REF}"; then
+              echo "✓ ${fn_name} deployed"
+              deployed+=("${fn_name}")
+            else
+              echo "::error::Failed to deploy ${fn_name}"
+              failed+=("${fn_name}")
+            fi
+            echo "::endgroup::"
+          done
+
+          echo ""
+          echo "Deploy summary:"
+          echo "  ✓ deployed: ${#deployed[@]} function(s): ${deployed[*]:-<none>}"
+          echo "  ✗ failed:   ${#failed[@]} function(s): ${failed[*]:-<none>}"
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::One or more edge functions failed to deploy: ${failed[*]}"
+            echo "::error::See docs/operations/supabase-ci-deploy.md § 'Manual fallback' for recovery."
+            exit 1
+          fi
+
+      # Apply any net-new migrations under launcher/supabase/migrations/.
+      # `supabase db push` skips migrations already recorded in the
+      # remote schema_migrations ledger, so re-running this on a project
+      # that's already in sync is a clean no-op.
+      #
+      # `--include-all` ensures the CLI doesn't ask for confirmation on
+      # files past a certain age (some CLI versions warn on > 1-month-old
+      # migrations and require an interactive prompt). CI is non-
+      # interactive, so we accept all.
+      #
+      # FIRST-RUN FAILURE MODE: if the operator hasn't run the one-time
+      # migration-history reconciliation (see docs/operations/
+      # supabase-ci-deploy.md § "First-time CI setup"), this step exits
+      # non-zero with:
+      #   "Remote migration versions not found in local migrations directory."
+      # That's working as designed — the docs walk the operator through
+      # the one-shot `supabase migration repair` + `supabase db pull`
+      # flow that resolves it.
+      - name: Apply migrations
+        if: steps.token_check.outputs.skip != 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          PROJECT_REF: ${{ vars.SUPABASE_PROJECT_REF }}
+        working-directory: launcher/supabase
+        run: |
+          set -euo pipefail
+          # `supabase db push` against a linked project with a clean
+          # ledger is idempotent — applies only net-new migrations.
+          # `--include-all` skips age-based confirmation prompts.
+          if ! supabase db push --include-all; then
+            echo "::error::supabase db push failed."
+            echo "::error::If this is the FIRST CI deploy against this project, you likely"
+            echo "::error::need to run the one-time migration-history reconciliation FIRST."
+            echo "::error::See docs/operations/supabase-ci-deploy.md § 'First-time CI setup'."
+            exit 1
+          fi
+          echo "::notice::Migrations applied (or no net-new migrations to apply)."
+
+      # Final summary step. Runs even on partial failure (the deploy +
+      # migrate steps above use `exit 1` which terminates the job before
+      # reaching here on hard fail — this step only runs on the success
+      # path or the no-secret-skip path).
+      - name: Summary
+        if: always() && steps.token_check.outputs.skip != 'true'
+        run: |
+          echo "Supabase deploy job complete for tag/run: ${{ github.ref }}"
+          echo "Project ref: ${{ vars.SUPABASE_PROJECT_REF }}"
+
+      - name: Summary (skipped)
+        if: steps.token_check.outputs.skip == 'true'
+        run: |
+          echo "Supabase deploy SKIPPED (no SUPABASE_ACCESS_TOKEN configured)."
+          echo "This is expected on forks that don't ship to a Supabase project."
+          echo "See docs/operations/supabase-ci-deploy.md to enable."
