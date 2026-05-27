@@ -5,6 +5,53 @@ Supabase edge function that issues short-lived GHCR pull tokens for the
 `installer_engine::container_pull` (in `launcher/src-tauri/src/installer_engine.rs`)
 before each `podman pull` / `docker pull` of the private image.
 
+## ⚠️ Supabase has TWO independent "secrets" systems — get this right or nothing works
+
+Before configuring this function, internalize the following. **Confusing
+these two systems cost ~3 hours of production debugging on 2026-05-27**
+and the symptom (edge function returns `service_misconfigured` while the
+dashboard shows the secret is "set") is genuinely opaque.
+
+Supabase stores secrets in two unrelated places:
+
+| System | Where it lives | Who reads it | What belongs here |
+|---|---|---|---|
+| **Vault** | Project → Integrations → Vault → Secrets | SQL functions, via `supabase.vault.decrypted_secrets` | The `vct_admin_tokens` JSON map (read by `validate-tier`'s SQL `lookupVaultAdminToken` constant-time compare). **Nothing else from this edge function.** |
+| **Edge Function Secrets** | Project → Edge Functions → Secrets, or `supabase secrets set ...` CLI | Edge functions, via `Deno.env.get()` | `GHCR_USERNAME`, `GHCR_PAID_IMAGE_REPO`, `GHCR_PAID_TAG_DEFAULT`, `GHCR_SERVICE_PAT` — every variable this README documents in the "Required" / "Optional" tables below. |
+
+These two systems do **NOT** read from each other. A value placed in
+Vault is invisible to `Deno.env.get()`. A value placed in Edge Function
+Secrets is invisible to `supabase.vault.decrypted_secrets`.
+
+The Supabase dashboard does not warn you when you set a secret in the
+wrong system — both systems happily accept and persist your value, and
+the dashboard cheerfully shows it as "set". The edge function logs will
+report `service_misconfigured` (env var missing) even though, to you,
+the secret is right there in the dashboard.
+
+### Verifying that secrets are in the right system
+
+After configuring (or when debugging a `service_misconfigured` error),
+run:
+
+```bash
+# Lists Edge Function Secrets only — the things `Deno.env.get()` can see.
+supabase secrets list --project-ref <your-project-ref> | grep -E 'GHCR_|SERVICE_PAT'
+```
+
+**Every GHCR-related variable this README requires MUST appear in this
+list.** If a variable appears in the dashboard Vault UI but not in
+`supabase secrets list`, it is in the wrong system — re-set it via
+`supabase secrets set` (or via the Edge Functions → Secrets dashboard
+pane, which is a distinct UI from the Vault pane).
+
+Vault values are not listable via the CLI; to verify the
+`vct_admin_tokens` Vault entry is present, query
+`select name from vault.secrets where name = 'vct_admin_tokens';`
+from the Supabase SQL editor (the function that reads it lives in
+[`launcher/supabase/functions/validate-tier/index.ts`](../validate-tier/index.ts) —
+search for `lookupVaultAdminToken`).
+
 ## Architecture (locked decisions 2026-05-16)
 
 ```
@@ -93,30 +140,146 @@ on the paid-module package. This bounds the PAT-echo leak surface to
 exactly one package without requiring a GitHub Organization.
 
 Setup:
-1. Create `vct-bot-rl` GitHub user (regular sign-up + 2FA)
-2. Invite `vct-bot-rl` as **Read** collaborator on the paid-module
-   package (via Manage Access on `vct-rl-reranker`'s package settings)
-3. Mint a `read:packages`-only PAT from `vct-bot-rl`'s account
-4. Update Supabase secrets:
+1. Create `<your-bot-user>` GitHub user (regular sign-up + 2FA).
+2. Invite `<your-bot-user>` as a **Read** collaborator on the paid-module
+   repo — AND on the package itself (see "Package ACL vs Repo ACL"
+   below; doing only the repo half is a common footgun that returns
+   `denied` from `podman pull` even though every other check passes).
+3. Mint a `read:packages`-only PAT from `<your-bot-user>`'s account.
+4. Update Supabase secrets (replace `<your-supabase-project-ref>` with
+   the ref from your Supabase project dashboard URL):
 
 ```bash
 supabase secrets set \
-  GHCR_SERVICE_PAT='<vct-bot-rl-PAT>' \
-  GHCR_PAID_IMAGE_REPO=hotak92/vct-rl-reranker \
-  GHCR_USERNAME=vct-bot-rl \
-  --project-ref ovpdtijpdchzlxbojhsg
+  GHCR_SERVICE_PAT='ghp_xxxxxxxxxx' \
+  GHCR_PAID_IMAGE_REPO=<your-package-owner>/vct-rl-reranker \
+  GHCR_USERNAME=<your-bot-user> \
+  --project-ref <your-supabase-project-ref>
 ```
 
-Key property: `GHCR_USERNAME` (`vct-bot-rl`) differs from the owner-half
-of `GHCR_PAID_IMAGE_REPO` (`hotak92`). The launcher's `podman login`
-uses `vct-bot-rl` — the credential owner — even though the image lives
-at a path owned by a different account. Without `GHCR_USERNAME` the
-auto-derivation would send `hotak92` and get 403 from ghcr.io.
+Key property: `GHCR_USERNAME` (`<your-bot-user>`) differs from the
+owner-half of `GHCR_PAID_IMAGE_REPO` (`<your-package-owner>`). The
+launcher's `podman login` uses `<your-bot-user>` — the credential owner
+— even though the image lives at a path owned by a different account.
+Without `GHCR_USERNAME` the auto-derivation would send
+`<your-package-owner>` and get 403 from ghcr.io.
 
 For each new paid module, repeat with a new bot user (e.g.
-`vct-bot-coord`, `vct-bot-telegram`) on a sibling edge function. See
-the KG node `multi-module-paid-distribution-architecture` for the full
-rationale and constraint analysis.
+`<your-bot-user>-coord`, `<your-bot-user>-telegram`) on a sibling edge
+function. See the KG node `multi-module-paid-distribution-architecture`
+for the full rationale and constraint analysis, plus the scaling note
+in "Scaling beyond one paid module" below.
+
+### Package ACL vs Repo ACL — a critical gotcha
+
+GHCR packages have **two independent access lists**:
+
+1. **Repo collaborators** — `https://github.com/<owner>/<repo>/settings/access`
+2. **Package's own Manage Access** —
+   `https://github.com/users/<owner>/packages/container/<package>/settings`
+
+When a package is first published from a repo, GitHub sets it to
+**Inherit access from source repository** — the package ACL mirrors
+repo collaborators automatically, and adding a user to the repo is
+enough.
+
+However, if that "Inherit access" toggle is ever turned OFF (which
+typically happens while debugging a different access issue, then never
+turned back on), the package falls back to its **own curated ACL**.
+That curated list is initially empty. From that moment on, **adding a
+user as a repo collaborator is no longer sufficient** — the user must
+also be added to the package's own Manage Access list.
+
+Symptom when this is wrong:
+
+- `gh api /repos/<your-package-owner>/<repo>/collaborators` shows the bot
+  with `pull: true` ✓
+- `curl -u "<your-bot-user>:$PAT" \
+  https://api.github.com/users/<your-package-owner>/packages/container/<package>`
+  returns **"Package not found"** (404) ✗
+- `podman login ghcr.io -u <your-bot-user> -p $PAT` succeeds (the PAT is
+  valid; auth works) ✓
+- `podman pull ghcr.io/<your-package-owner>/<package>:<tag>` returns
+  **`denied`** ✗
+
+The `podman pull` failure is the production symptom — `denied` here
+specifically means "you authenticated, but the package's ACL does not
+list you", which is distinct from "PAT invalid" or "image not found".
+
+#### Diagnostic snippet
+
+Run this as the operator (the human who owns `<your-bot-user>`'s PAT) to
+verify both ACLs in one go:
+
+```bash
+OWNER=<your-package-owner>
+REPO=<your-paid-module-repo>           # e.g. vct-rl-reranker
+PACKAGE=<your-package-name>            # usually same as REPO
+BOT=<your-bot-user>
+PAT=ghp_xxxxxxxxxx                     # bot's read:packages PAT
+
+# 1. Is the bot a repo collaborator? (Inherits-access path)
+gh api "/repos/$OWNER/$REPO/collaborators/$BOT" \
+  2>/dev/null && echo "✓ repo collaborator" || echo "✗ NOT a repo collaborator"
+
+# 2. Can the bot see the package via its OWN ACL? (Curated path)
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -u "$BOT:$PAT" \
+  "https://api.github.com/users/$OWNER/packages/container/$PACKAGE"
+# 200 = bot can see the package. 404 = bot is not on the package ACL
+# (regardless of repo collaboration).
+```
+
+If step 1 passes but step 2 returns 404, you are hitting the
+package-ACL gotcha. Fix:
+
+1. Sign in to GitHub as `<your-package-owner>`.
+2. Navigate to
+   `https://github.com/users/<your-package-owner>/packages/container/<package>/settings`.
+3. Scroll to **Manage Access**.
+4. Click **Add user**, search for `<your-bot-user>`, set role to
+   **Read**, and confirm the invitation.
+5. Sign in as `<your-bot-user>` (or open the invitation email) and
+   accept.
+6. Re-run the curl in step 2 — it should now return 200.
+7. Retry `podman pull` — it should now succeed.
+
+You can leave "Inherit access from source repository" off; explicitly
+listing the bot on the package ACL is the more robust configuration
+for the per-bot-user pattern (it makes the access surface auditable
+package-by-package rather than tangled with the repo's collaborator
+list, which tends to grow contributors over time).
+
+### Scaling beyond one paid module — GitHub ToS constraint
+
+The per-bot-user pattern works cleanly for **one** paid module today,
+but it does not scale to many. GitHub's Terms of Service permit a human
+to operate **one** machine account in addition to their Personal
+Account. Running `<your-bot-user>-rl`, `<your-bot-user>-coord`,
+`<your-bot-user>-telegram`, etc. — one bot per paid module — is
+technically a ToS violation past the first bot, and GitHub may suspend
+the accounts (which would simultaneously break every paid-module
+install across every customer).
+
+Long-term, the two viable paths are:
+
+- **Migrate to a GitHub Organization** (e.g.
+  `https://github.com/<your-org>/`). Organizations have no
+  machine-account limit, and packages owned by an org get proper
+  scoped tokens from GHCR's `/token` endpoint instead of the
+  PAT-echo behaviour that personal-account packages have (see
+  "Org migration" earlier in this README). One org-scoped service
+  PAT, or one bot member of the org, covers all paid modules.
+- **Move artifact distribution off GHCR entirely.** The Lemon Squeezy
+  hosted file feature can serve signed artifact URLs directly,
+  bypassing the GHCR ACL system; the long-term plan in the Lemon
+  Squeezy spec already contemplates this path.
+
+This README does not propose which path to take — that's a separate
+architecture decision tracked in the orchestrator's roadmap. The point
+of this section is to make sure operators reading the per-module
+bot-user setup *know* the pattern has a ceiling at 1 module so they
+plan accordingly.
 
 ## Wire contract
 
