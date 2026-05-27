@@ -18,6 +18,7 @@
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import {
     friendlyRebindMessage,
+    hasActiveLicense,
     shouldShowRebindButton,
   } from '$lib/admin-rebind';
 
@@ -33,7 +34,6 @@
   const viewState = $derived($license);
   const cache = $derived<TierCacheView | null>(viewState.cache);
   const tier = $derived(cache?.orchestrator_tier ?? 'free');
-  const hasLicense = $derived(tier !== 'free');
   // v0.2.36: admin-tier card gates the "Rebind to this machine" button.
   // The predicate lives in `$lib/admin-rebind` so the visibility logic
   // has a single test surface in `admin-rebind.test.ts`.
@@ -45,6 +45,16 @@
   // The predicate then re-shows the rebind button so the user can
   // unstick themselves without dropping to the CLI.
   const showRebindButton = $derived(shouldShowRebindButton(tier, cache?.last_error));
+  // v0.2.37 (Bug 1): `hasLicense` previously was `tier !== 'free'`. That
+  // collapsed two distinct states into one: (a) genuinely free (no key
+  // activated → show activation input) and (b) admin's machine_id_hash
+  // drifted (key IS activated but server rejected binding → tier flips
+  // to 'free' server-side with last_error: machine_mismatch). Pre-fix,
+  // state (b) hid the Refresh/Rebind/Deactivate buttons inside the
+  // `{:else}` branch, leaving the user stuck with only the activation
+  // input. The `hasActiveLicense` helper centralises the predicate so
+  // both the modal and `admin-rebind.test.ts` exercise the same logic.
+  const hasLicense = $derived(hasActiveLicense(tier, cache?.last_error));
   // v0.2.32 §D1: per-module license rows for the new section.
   const moduleLicenses = $derived(viewState.moduleLicenses ?? []);
 
