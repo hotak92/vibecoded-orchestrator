@@ -28,46 +28,79 @@ const ORCHESTRATOR_REPO: &str = "https://github.com/hotak92/vibecoded-orchestrat
 /// installed somewhere else, e.g. `/home/x/Desktop/PROGETTI/VCO_dev`).
 pub(crate) const APP_STATE_KEY_INSTALL_PATH: &str = "launcher.install_path";
 
-/// v0.2.23.1 helper (2026-05-21): synchronous resolver for the install
-/// root, used by non-Tauri-command code paths (e.g. `manifest_scan_paths`
-/// in module_gui.rs) that need to discover the orchestrator clone root
-/// without going through the async `get_known_install_path` command.
+/// v0.2.37 canonical resolver (2026-05-27): single source of truth for
+/// the orchestrator clone root. Supersedes the previous parallel
+/// resolvers `find_local_repo_root` (uncached walk-up only) and
+/// `resolve_install_root_sync` (DB-cached + walk-up via `install.py +
+/// CLAUDE.md` markers only).
 ///
-/// Same two-strategy resolution as the async sibling:
+/// The two pre-v0.2.37 resolvers diverged in TWO ways:
+///   * Caching: only `resolve_install_root_sync` consulted the DB
+///     cache + wrote back on hit. `find_local_repo_root` was stateless,
+///     which bit `ProjectEnvSettings::populate` when `current_exe()`
+///     was far from the clone (e.g. binary installed at `~/bin/`,
+///     clone at `~/dev/vco/`) — populate returned `None` →
+///     `VCT_ORCHESTRATOR_ROOT` was OMITTED from `.claude/env`.
+///   * Marker pattern: `find_local_repo_root` looked for
+///     `vct-module.json` (the orchestrator clone's own manifest);
+///     `resolve_install_root_sync` looked for `install.py + CLAUDE.md`
+///     (the install-root files). These identify the same artifact — an
+///     orchestrator clone — by different signals, but a binary launched
+///     from a partial checkout might match one but not the other.
+///
+/// This canonical resolver accepts BOTH marker patterns at every level
+/// of the walk: a directory is an orchestrator root if it contains
+/// EITHER `vct-module.json` OR (`install.py` + `CLAUDE.md`).
+///
+/// Strategy order:
 ///   1. Read `launcher.install_path` from `app_state`. Validate the
-///      cached path still passes `check_install_status`; fall through
-///      if stale.
-///   2. Walk up from `current_exe()` looking for `install.py + CLAUDE.md`
-///      markers (`walk_for_install_markers`). On a hit, write back to
-///      app_state so future calls take the cached path.
+///      cached path still passes `check_install_status` (which gates on
+///      `install.py + CLAUDE.md`); fall through if stale.
+///   2. Walk up from `current_exe()` looking for EITHER marker pattern.
+///      On a hit, write back to app_state so future calls take the
+///      cached path.
 ///
 /// Returns `None` when no install is discoverable. Callers should treat
 /// `None` as "scan the empty set" — never panic or return a phantom path.
 ///
 /// **No hardcoded paths in the binary**: the resolution is fully
 /// runtime-derived (DB OR exe location). No `env!("CARGO_MANIFEST_DIR")`
-/// fallback — that macro leaks the build-host's absolute path and is
-/// wrong on shipped binaries (build-time != runtime). Discipline shared
-/// with `self_update.rs:280` + `find_local_repo_root` (privacy notes
-/// from 2026-05-06).
-pub(crate) fn resolve_install_root_sync(db: &Db) -> Option<PathBuf> {
+/// or `option_env!("VCT_REPO_ROOT")` fallback — those leak the
+/// build-host's absolute path and are wrong on shipped binaries
+/// (build-time != runtime). Privacy discipline established 2026-05-06.
+pub(crate) fn resolve_orchestrator_root(db: &Db) -> Option<PathBuf> {
     // Strategy 1: cached path from app_state.
     if let Ok(Some(cached)) = db.app_state_get(APP_STATE_KEY_INSTALL_PATH) {
         if !cached.is_empty() && check_install_status(cached.clone()) {
             return Some(PathBuf::from(cached));
         }
     }
-    // Strategy 2: walk up from current_exe() looking for install markers.
-    let found = walk_for_install_markers()?;
+    // Strategy 2: walk up from current_exe() honoring BOTH marker
+    // patterns (vct-module.json OR install.py+CLAUDE.md).
+    let found = walk_for_orchestrator_root()?;
     // Sticky cache — future calls take the cached path.
     let s = found.to_string_lossy().to_string();
     if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &s) {
         eprintln!(
-            "[vct] resolve_install_root_sync: failed to cache install_path: {}",
+            "[vct] resolve_orchestrator_root: failed to cache install_path: {}",
             e
         );
     }
     Some(found)
+}
+
+/// DEPRECATED v0.2.37 shim — kept so existing call sites compile. New
+/// code MUST call `resolve_orchestrator_root(db)` directly to benefit
+/// from the DB cache (the writeback fix that closed the
+/// `.claude/env` omission bug). This shim retains the old name +
+/// signature for callers that genuinely don't have a `Db` handle in
+/// scope; it does ONLY the walk-up step (no DB read, no writeback).
+///
+/// Privacy discipline survives: still no `env!("CARGO_MANIFEST_DIR")`,
+/// still no `option_env!("VCT_REPO_ROOT")` (both would leak the
+/// build-host's path into shipped binaries).
+pub(crate) fn resolve_install_root_sync(db: &Db) -> Option<PathBuf> {
+    resolve_orchestrator_root(db)
 }
 
 /// app_state key for the last-detected hardware snapshot. Populated on
@@ -1202,10 +1235,30 @@ pub fn detect_existing_install_root() -> Option<String> {
 /// files), no manifest gating — a dev clone with no `state/install-manifest.json`
 /// is still a valid install root for launcher-discovery purposes.
 pub(crate) fn walk_for_install_markers() -> Option<PathBuf> {
+    walk_for_orchestrator_root()
+}
+
+/// v0.2.37 canonical walk-up: returns the nearest ancestor of
+/// `current_exe()` that looks like an orchestrator clone root. A
+/// directory qualifies if it contains EITHER:
+///   * `vct-module.json` (the orchestrator clone's manifest — the
+///     marker `find_local_repo_root` used pre-v0.2.37), OR
+///   * `install.py` + `CLAUDE.md` (the install-root files — the
+///     marker `walk_for_install_markers` used pre-v0.2.37).
+///
+/// Both patterns identify the same artifact. Accepting either lets a
+/// binary launched from a partial checkout (release zip missing one of
+/// the markers, dev clone without a generated state file, etc.) still
+/// discover its root.
+///
+/// Walks up to 8 ancestor levels — covers Tauri release bundle, dev
+/// `cargo run`, and macOS .app bundle layouts without per-platform
+/// branching.
+pub(crate) fn walk_for_orchestrator_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut current = exe.parent()?.to_path_buf();
     for _ in 0..8 {
-        if current.join("install.py").is_file() && current.join("CLAUDE.md").is_file() {
+        if looks_like_orchestrator_root(&current) {
             return Some(current);
         }
         if !current.pop() {
@@ -1213,6 +1266,16 @@ pub(crate) fn walk_for_install_markers() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Predicate for "is this directory an orchestrator clone root?".
+/// Pure function — no I/O beyond two `is_file` probes per call.
+///
+/// Accepts EITHER marker pattern. See `walk_for_orchestrator_root`
+/// for the privacy/cross-layout rationale.
+pub(crate) fn looks_like_orchestrator_root(dir: &Path) -> bool {
+    dir.join("vct-module.json").is_file()
+        || (dir.join("install.py").is_file() && dir.join("CLAUDE.md").is_file())
 }
 
 /// FE entry point — see module-level Bug A comment for the contract.
@@ -5171,48 +5234,37 @@ pub async fn apply_pending_install(
 // access, no GitHub PAT required, no `git clone`.
 // ---------------------------------------------------------------------------
 
-/// Locate the orchestrator repo root (the folder containing
-/// `vct-module.json`). Tries three strategies in order:
+/// DEPRECATED v0.2.37 shim — prefer `resolve_orchestrator_root(db)`.
 ///
-/// 1. Build-time `VCT_REPO_ROOT` env var (set by the bundler when the
-///    binary is shipped with the repo embedded next to it).
-/// 2. Walk up from the running binary's directory.
+/// Locate the orchestrator clone root by walking up from
+/// `current_exe()`. Accepts EITHER marker pattern (`vct-module.json` OR
+/// `install.py + CLAUDE.md`) via the canonical `walk_for_orchestrator_root`
+/// helper.
 ///
-/// Privacy note (2026-05-06): an earlier version added a Strategy 3
-/// fallback using `env!("CARGO_MANIFEST_DIR")`. That macro embeds the
-/// build-host's absolute manifest path as a string literal, which
-/// `--remap-path-prefix` does NOT rewrite — every release shipped from
-/// a dev box leaked the developer's username and on-disk layout. The
-/// fallback was unreachable on healthy release builds (Strategy 2 always
-/// succeeds when the binary lives under the clone), so removing it is
-/// pure privacy improvement.
+/// This shim exists for call sites that genuinely don't have a `Db`
+/// handle in scope (e.g. free functions in helper modules,
+/// volumes-only paths, early-init code). It does ONLY the walk-up step
+/// — no DB cache read, no writeback. New code that DOES have `db`
+/// available MUST use `resolve_orchestrator_root(db)` instead, so the
+/// DB cache stays warm and `ProjectEnvSettings::populate` can emit
+/// `VCT_ORCHESTRATOR_ROOT` even when the binary lives outside the
+/// clone (the bug that hit instambul_map pre-v0.2.37).
+///
+/// Privacy note (2026-05-06): no `env!("CARGO_MANIFEST_DIR")` or
+/// `option_env!("VCT_REPO_ROOT")` fallback. Both bake the build-host's
+/// absolute path into shipped binaries — `--remap-path-prefix` does
+/// NOT rewrite string literals. The shim is runtime-walk-only. The
+/// option_env Strategy 1 that lived here pre-v0.2.37 was unreachable
+/// on healthy release builds anyway (Strategy 2 always succeeded when
+/// the binary lived under the clone), so removing it is pure privacy
+/// + simplicity improvement.
 pub fn find_local_repo_root() -> Result<PathBuf, String> {
-    // Strategy 1: build-time env var
-    if let Some(p) = option_env!("VCT_REPO_ROOT") {
-        let candidate = PathBuf::from(p);
-        if candidate.join("vct-module.json").exists() {
-            return Ok(candidate);
-        }
-    }
-
-    // Strategy 2: walk up from the running binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut current = parent.to_path_buf();
-            for _ in 0..10 {
-                if current.join("vct-module.json").exists() {
-                    return Ok(current);
-                }
-                if !current.pop() {
-                    break;
-                }
-            }
-        }
-    }
-
-    Err("Could not locate orchestrator repo root containing vct-module.json. \
-         Set VCT_REPO_ROOT or run from a checkout."
-        .to_string())
+    walk_for_orchestrator_root().ok_or_else(|| {
+        "Could not locate orchestrator clone root (no ancestor of \
+         current_exe() contains vct-module.json or install.py+CLAUDE.md). \
+         Run from a checkout or set launcher.install_path in app_state."
+            .to_string()
+    })
 }
 
 /// Synchronous recursive copy. Symlinks are resolved (file content
