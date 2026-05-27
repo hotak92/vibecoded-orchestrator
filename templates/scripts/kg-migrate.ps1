@@ -1,16 +1,12 @@
-# PowerShell wrapper for sync_knowledge_graph.py (Windows equivalent of kg-sync)
-# Usage: .\kg-sync.ps1 FILE
-#        .\kg-sync.ps1 --all
+# PowerShell wrapper for migrate_to_vocabulary.py (Windows equivalent of kg-migrate)
+# Usage: .\kg-migrate.ps1 --check
+#        .\kg-migrate.ps1 --fix
+#        .\kg-migrate.ps1 --interactive
+#        .\kg-migrate.ps1 --file <path>
 #
-# v0.2.37 (Gap 6b): backports the validate-has-weaviate-client pattern
-# from the bash sibling. Pre-v0.2.37 this script only probed
-# `$ProjectRoot\.venv` + `$ProjectRoot\claude_mcp_servers\.venv`, both
-# absent in a fresh OSS install where the bundle lands in a user
-# project that has its own (unrelated) `.venv`. The canonical
-# venv-with-weaviate lives at `$env:VCT_INSTALL_ROOT\.venv` (launcher-
-# provided) or at orch-clone-relative paths. Validate each candidate
-# has `weaviate` importable before activating to avoid picking up an
-# unrelated project venv.
+# v0.2.37 (Gap 6b): Windows sibling of the bash kg-migrate (which used
+# to be POSIX-only). Backports the validate-has-weaviate-client pattern
+# from the bash sibling. See `kg-sync.ps1` for the full rationale.
 
 $ErrorActionPreference = "Stop"
 
@@ -24,7 +20,6 @@ function Test-VenvHasKgDeps {
     return ($LASTEXITCODE -eq 0)
 }
 
-# Candidate venv python locations, canonical-first.
 $Candidates = @(
     $(if ($env:VCT_INSTALL_ROOT) { Join-Path $env:VCT_INSTALL_ROOT ".venv\Scripts\python.exe" }),
     $(if ($env:VCT_INSTALL_ROOT) { Join-Path $env:VCT_INSTALL_ROOT "claude_mcp_servers\.venv\Scripts\python.exe" }),
@@ -49,5 +44,5 @@ if (-not $VenvPython) {
     exit 1
 }
 
-& $VenvPython (Join-Path $ScriptDir "sync_knowledge_graph.py") @args
+& $VenvPython (Join-Path $ScriptDir "migrate_to_vocabulary.py") @args
 exit $LASTEXITCODE

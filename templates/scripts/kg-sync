@@ -1,16 +1,50 @@
 #!/bin/bash
-# Wrapper script for sync_knowledge_graph.py with automatic venv activation
+# Wrapper script for sync_knowledge_graph.py with automatic venv activation.
+#
+# v0.2.37 (Gap 6b): backports the validate-has-weaviate-client pattern
+# from `code-graph-analyze`. Pre-v0.2.37 this wrapper only probed
+# `$PROJECT_ROOT/.venv` + `$PROJECT_ROOT/claude_mcp_servers/.venv`, both
+# of which are absent in a fresh OSS install where the bundle lands in a
+# user project that has its own (unrelated) `.venv`. The canonical
+# venv-with-weaviate-client lives in `$VCT_INSTALL_ROOT/.venv` (set by
+# the launcher) or at script-relative paths inside the orchestrator
+# clone. We also validate each candidate has `weaviate` importable so an
+# unrelated project venv at SCRIPT_DIR/../../.venv doesn't get picked up
+# by accident.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Probe canonical .venv locations. install-root/.venv (OSS) takes
-# precedence; claude_mcp_servers/.venv kept as fallback for legacy
-# private-Claude-orch installs.
+# Validate a venv has the KG-sync deps installed.
+# Without this gate, an unrelated venv (e.g. the project's own venv at
+# SCRIPT_DIR/../../.venv post bundle install) would be activated and
+# sync_knowledge_graph would crash with `ModuleNotFoundError: weaviate`.
+venv_has_kg_deps() {
+    local v="$1"
+    local py=""
+    if [ -x "$v/bin/python" ]; then py="$v/bin/python"
+    elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
+    else return 1
+    fi
+    "$py" -c "import weaviate" 2>/dev/null
+}
+
+# Probe candidate venvs. Launcher-provided $VCT_INSTALL_ROOT canonical
+# install-root takes precedence; script-relative paths are fallbacks for
+# direct CLI use inside the orchestrator clone.
+CANDIDATES=(
+    "${VCT_INSTALL_ROOT:-}/.venv"                      # launcher-provided install root (canonical)
+    "${VCT_INSTALL_ROOT:-}/claude_mcp_servers/.venv"   # launcher-provided legacy path
+    "$SCRIPT_DIR/../../.venv"                          # vco OSS install root (script in orch clone)
+    "$SCRIPT_DIR/../../claude_mcp_servers/.venv"       # legacy Claude orch (script in orch clone)
+)
+
 VENV_PATH=""
-for _c in "$PROJECT_ROOT/.venv" "$PROJECT_ROOT/claude_mcp_servers/.venv"; do
-    if [ -x "$_c/bin/python" ] || [ -x "$_c/bin/python3" ]; then
-        VENV_PATH="$_c"
+for c in "${CANDIDATES[@]}"; do
+    [ -z "$c" ] && continue
+    [ "$c" = "/.venv" ] && continue                    # empty VCT_INSTALL_ROOT → skip
+    [ "$c" = "/claude_mcp_servers/.venv" ] && continue
+    if venv_has_kg_deps "$c"; then
+        VENV_PATH="$c"
         break
     fi
 done

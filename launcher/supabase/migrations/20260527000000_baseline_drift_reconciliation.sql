@@ -1,0 +1,106 @@
+-- 20260527000000_baseline_drift_reconciliation.sql
+--
+-- v0.2.37 (Issue 3): baseline-drift reconciliation marker.
+--
+-- This migration is a deliberate NO-OP. Its purpose is to document — in
+-- the repo's migration history — a one-time reconciliation operators
+-- must run before the CI-driven `supabase db push` step (introduced in
+-- the same release; see `.github/workflows/release.yml` `supabase-deploy`
+-- job and `docs/operations/supabase-ci-deploy.md`) can succeed.
+--
+-- =====================================================================
+-- WHY THIS EXISTS
+-- =====================================================================
+--
+-- Through v0.2.36 every database schema change was applied to the
+-- canonical Supabase project via the SQL editor (or an older `supabase`
+-- CLI flow that doesn't write to `launcher/supabase/migrations/`). The
+-- `supabase_migrations.schema_migrations` table on the remote therefore
+-- contains 8 migration version IDs that have NO counterpart file in
+-- this repo:
+--
+--   20260418000000
+--   20260418000001
+--   20260418000002
+--   20260418000003
+--   20260425
+--   20260427000000
+--   20260429
+--   20260509000000
+--
+-- Running `supabase db push` from a fresh checkout of this repo against
+-- the canonical project fails with:
+--
+--   Remote migration versions not found in local migrations directory.
+--   ...
+--   supabase migration repair --status reverted 20260418000000 \
+--     20260418000001 20260418000002 20260418000003 20260425 \
+--     20260427000000 20260429 20260509000000
+--   supabase db pull
+--
+-- The DDL those 8 IDs encode IS present in the production schema (they
+-- ran successfully when applied via the SQL editor). The drift is
+-- purely bookkeeping in the `schema_migrations` ledger — the remote
+-- schema and the local migration files are NOT inconsistent.
+--
+-- =====================================================================
+-- ONE-TIME OPERATOR RUNBOOK (BEFORE CI DEPLOY WORKS)
+-- =====================================================================
+--
+-- Run ONCE per Supabase project (the canonical project + any private
+-- fork that has the same legacy drift):
+--
+--   # 1. Tell the CLI to forget the 8 orphan version IDs. `reverted`
+--   #    removes them from the head-of-history pointer without trying
+--   #    to roll back any DDL (which would fail — there's no down
+--   #    script for these legacy IDs).
+--   cd launcher/supabase
+--   supabase link --project-ref <SUPABASE_PROJECT_REF>
+--   supabase migration repair --status reverted \
+--     20260418000000 20260418000001 20260418000002 20260418000003 \
+--     20260425 20260427000000 20260429 20260509000000
+--
+--   # 2. Pull the current remote schema as a baseline migration. This
+--   #    writes a new `<timestamp>_remote_schema.sql` into
+--   #    launcher/supabase/migrations/ capturing everything the 8
+--   #    orphan IDs actually did.
+--   supabase db pull
+--
+--   # 3. Commit the generated baseline + repair record. After this
+--   #    one-shot, future `supabase db push` runs (including the CI
+--   #    deploy job) operate on a clean history.
+--   git add launcher/supabase/migrations/
+--   git commit -m "chore(supabase): baseline drift reconciliation \
+--     (one-time, post-v0.2.37)"
+--
+-- =====================================================================
+-- WHY THIS IS A DOC-DRIVEN REPAIR (NOT SELF-HEALING CI)
+-- =====================================================================
+--
+-- `supabase migration repair` mutates the project's
+-- `schema_migrations` ledger. We deliberately keep that step out of CI
+-- because:
+--
+--   * It's a one-time normalization — once reconciled, the issue is
+--     gone forever and there's no reason to keep destructive ledger-
+--     mutation code in every release run.
+--   * The current ledger state should be auditable by a human before
+--     the repair runs (forks may have their own legacy drift; their
+--     operator must inspect before blanket-applying our list).
+--   * `supabase db pull` writes a new committed file. CI committing
+--     migration files back to `main` overlaps awkwardly with the
+--     existing `commit-dist-binaries` job — we'd need a second
+--     branch-protection bypass token, and the failure modes are
+--     uglier than just having the operator run the steps once.
+--
+-- See docs/operations/supabase-ci-deploy.md §"First-time CI setup" for
+-- the operator-facing version of this runbook.
+
+-- Intentional no-op: this file's purpose is the comment block above.
+-- The SELECT statement gives `supabase db push` something to execute
+-- (an empty .sql file would otherwise be flagged as malformed by some
+-- CLI versions) without touching any schema.
+do $$
+begin
+  raise notice 'v0.2.37 baseline-drift reconciliation marker — no DDL';
+end $$;

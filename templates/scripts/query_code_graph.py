@@ -44,8 +44,25 @@ except ImportError:
 # lives at .claude/scripts/query_code_graph.py and the MCP module at
 # claude_mcp_servers/weaviate_mcp/server.py — derive the project root
 # from this file's location so the layout works without hardcoded paths.
+#
+# v0.2.37 (Gap 6c): when this script ships into a 3rd-party project
+# via install-bundle, parents[2] resolves to the USER PROJECT root,
+# which has no `claude_mcp_servers/` directory. Honor
+# $VCT_ORCHESTRATOR_ROOT (set by install-bundle's .claude/env writer)
+# and $VCT_INSTALL_ROOT (legacy alias) before falling back to the
+# script-relative location. Mirrors sync_knowledge_graph.py's
+# `_resolve_mcp_servers_dir()` pattern.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_MCP_SERVERS_PATH = _PROJECT_ROOT / "claude_mcp_servers"
+_MCP_SERVERS_PATH: Optional[Path] = None
+for _env_var in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT"):
+    _env_root = os.environ.get(_env_var, "").strip()
+    if _env_root:
+        _candidate = Path(_env_root) / "claude_mcp_servers"
+        if _candidate.is_dir():
+            _MCP_SERVERS_PATH = _candidate
+            break
+if _MCP_SERVERS_PATH is None:
+    _MCP_SERVERS_PATH = _PROJECT_ROOT / "claude_mcp_servers"
 if str(_MCP_SERVERS_PATH) not in sys.path:
     sys.path.insert(0, str(_MCP_SERVERS_PATH))
 

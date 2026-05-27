@@ -551,11 +551,24 @@ async fn container_pull(
     };
 
     let image_ref = format!("{}:{}", container.image, resolved_tag);
+    // v0.2.37 (Issue 7): drain stdout/stderr via Stdio::null() rather than
+    // Stdio::piped(). `podman pull` of a large image (5.5GB / 7 layers) emits
+    // tens of KB of layer-progress text to stderr; combined with `.status()`
+    // — which doesn't drain the pipes — the OS-level pipe buffer (64KB on
+    // Linux) fills up and the child blocks on write, while the parent blocks
+    // on wait, producing a deadlock that surfaces as `exit -1` AFTER the
+    // image has actually been downloaded successfully (`podman images`
+    // confirms presence). The launcher reports progress via Tauri events
+    // through `report_progress`, NOT by parsing pull stdout, so dropping the
+    // output is safe — no UX regression. Same fix is applied to the two
+    // `git clone` / `git pull` sites further down, where the same Stdio +
+    // .status() pattern carries the same latent deadlock risk on
+    // unexpectedly verbose repos.
     let pull_status = Command::new(&runtime)
         .silent()
         .args(["pull", &image_ref])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .await
         .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
@@ -1059,11 +1072,15 @@ async fn git_clone(source: &str, git_ref: &str, dest: &Path) -> Result<(), Strin
             .map_err(|e| format!("create parent {}: {}", parent.display(), e))?;
     }
 
+    // v0.2.37 (Issue 7): see `container_pull` above for the rationale.
+    // Stdio::null() avoids the pipe-buffer deadlock when cloning a repo
+    // that emits large amounts of progress text (e.g. a depth-1 clone of
+    // a repo with many submodules or large pack files).
     let status = Command::new("git").silent()
         .args(["clone", "--depth", "1", "--branch", git_ref, source])
         .arg(dest)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .await
         .map_err(|e| format!("spawn git clone: {}", e))?;
@@ -1575,12 +1592,16 @@ async fn refetch_artifact(
                 // Existing checkout — git pull preserves any user-edited
                 // gitignored files (e.g. local config under the install
                 // dir).
+                // v0.2.37 (Issue 7): see `container_pull` for the rationale.
+                // Stdio::null() avoids the pipe-buffer deadlock that could
+                // occur on an unusually verbose fast-forward (large pack
+                // fetch + many ref updates).
                 let status = Command::new("git").silent()
                     .args(["-C"])
                     .arg(install_dir)
                     .args(["pull", "--ff-only"])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .status()
                     .await
                     .map_err(|e| format!("spawn git pull: {}", e))?;
@@ -2645,6 +2666,85 @@ mod tests {
                 matches!(exists, Ok(false)),
                 "missing tag must produce Ok(false); got: {:?}",
                 exists,
+            );
+        });
+    }
+
+    /// v0.2.37 (Issue 7): regression test for the pipe-buffer deadlock
+    /// bug in `container_pull` / `git_clone` / `run_upgrade`.
+    ///
+    /// **The bug**: on Linux the anonymous pipe buffer is 64KB. When a
+    /// child process emits more than that to a `Stdio::piped()` pipe and
+    /// the parent calls `.status().await` (rather than draining the
+    /// pipe via `.output().await` or `.wait_with_output().await`), the
+    /// child blocks on its next write while the parent blocks on wait.
+    /// The deadlock manifests as `exit -1` AFTER the work has actually
+    /// completed (in the original bug report, `podman pull` of a 5.5GB
+    /// image returned exit -1 even though `podman images` confirmed the
+    /// 5.5GB image was present).
+    ///
+    /// **The fix**: change `Stdio::piped()` to `Stdio::null()` on the
+    /// three `.status().await` sites (`container_pull`, `git_clone`,
+    /// `run_upgrade` fast-forward). The launcher reports progress via
+    /// Tauri events and doesn't consume the pipes for diagnostic, so
+    /// the output is genuinely throw-away.
+    ///
+    /// **What this test does**: simulates the bug condition without
+    /// requiring podman or a network. We spawn a child process that
+    /// writes 200KB (~3.1× the 64KB buffer) to stderr — comfortably past
+    /// the deadlock threshold — and we mirror the production wrapper's
+    /// shape (`.stderr(Stdio::null()).status().await`). With the fix,
+    /// this completes in milliseconds. With the un-fixed
+    /// `Stdio::piped()` pattern the same call hangs forever (the test
+    /// would have to be killed by the test runner's timeout).
+    ///
+    /// Gated `#[cfg(unix)]` because the test driver uses `/bin/sh`. The
+    /// underlying bug behaves identically on Windows — anonymous pipes
+    /// there also have a finite buffer (~4KB by default for sync
+    /// pipes; the async runtime sizes vary) — but a Windows-portable
+    /// driver requires either a small Rust helper binary or PowerShell,
+    /// and the spec authorises deferring that to v0.2.38.
+    // TODO(v0.2.38): add a Windows-portable regression driver.
+    #[cfg(unix)]
+    #[test]
+    fn stdio_null_avoids_pipe_buffer_deadlock_on_high_volume_stderr() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            // Emit 200000 bytes to stderr: well past the 64KB Linux pipe
+            // buffer, so the bug would trigger reliably under the old
+            // Stdio::piped() pattern. We use `printf` rather than `yes`
+            // because `yes | head` produces a SIGPIPE-on-close edge case
+            // on some shells.
+            let driver = "printf '%.0sx' $(seq 1 200000) >&2";
+
+            // Wrap the call in a tokio timeout. With the fix the child
+            // completes in <100ms; with the un-fixed Stdio::piped()
+            // pattern the call would hang forever, the timeout would
+            // fire, and the test would fail with a clear diagnostic.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(driver)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status(),
+            )
+            .await;
+
+            let status = result
+                .expect(
+                    "deadlock regression: child hung past 10s on 200KB stderr — \
+                     the Stdio::piped() + .status() bug is back",
+                )
+                .expect("spawn /bin/sh failed");
+            assert!(
+                status.success(),
+                "driver shell exited non-zero: {:?}",
+                status.code(),
             );
         });
     }

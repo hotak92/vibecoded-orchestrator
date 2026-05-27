@@ -61,6 +61,38 @@ export function shouldShowRebindButton(
 }
 
 /**
+ * v0.2.37 (Bug 1): "Does the user have an active orchestrator-tier license?"
+ *
+ * Mirrors the `hasLicense` `$derived` in `ActivationModal.svelte`. Exported
+ * as a pure helper so the gating logic can be exercised in vitest without
+ * standing up `@testing-library/svelte` (the launcher's vitest config is
+ * node-only — see `vitest.config.ts`).
+ *
+ * Returns `true` when:
+ *   - tier is anything other than 'free' (happy path: pro / mao / admin / etc),
+ *     OR
+ *   - the rebind affordance should be shown (recovery path: tier flipped to
+ *     'free' server-side because of `machine_mismatch`, but the user DOES
+ *     have a license activated).
+ *
+ * Why both branches: pre-v0.2.37 the modal used the bare `tier !== 'free'`
+ * predicate and hid the Refresh/Rebind/Deactivate buttons in the recovery
+ * case — the user saw only the activation input, with no path forward.
+ *
+ * Keeping this in sync with the Svelte `$derived`: this helper IS the
+ * predicate; the component just imports + binds it.
+ */
+export function hasActiveLicense(
+  tier: string | null | undefined,
+  lastError?: string | null,
+): boolean {
+  if (tier !== 'free' && tier !== null && tier !== undefined) {
+    return true;
+  }
+  return shouldShowRebindButton(tier, lastError);
+}
+
+/**
  * Map an `AdminRebindResult` to the toast message the dialog renders.
  * Success returns a positive confirmation; failure maps the server's
  * `error` code to a user-readable message, falling back to the raw

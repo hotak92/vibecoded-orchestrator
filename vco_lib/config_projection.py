@@ -319,6 +319,13 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "CODE_EMBED_PORT",
     "VCT_ORCHESTRATOR_ROOT",
     "VCT_INFRASTRUCTURE_DIR",
+    # v0.2.37 (Gap 6a): legacy alias for VCT_ORCHESTRATOR_ROOT consumed
+    # by the templates/scripts/code-graph-analyze venv-fallback (probes
+    # ``$VCT_INSTALL_ROOT/.venv``). Pre-v0.2.37 only the launcher
+    # exported this key; direct CLI invocations in a fresh OSS install
+    # had no way to reach the analyzer venv. Emitted alongside
+    # VCT_ORCHESTRATOR_ROOT when orchestrator_root is set; same value.
+    "VCT_INSTALL_ROOT",
     "VCT_KG_ACCESS_LIST",
     "VCT_CODE_GRAPH_ACCESS_LIST",
     # Diagrams cross-project visibility (v0.2.34, A7). Previously the MCP
@@ -1246,6 +1253,12 @@ def project_env_from_db(
             "VCT_INFRASTRUCTURE_DIR",
             str(orchestrator_root / "infrastructure"),
         )
+        # v0.2.37 (Gap 6a): legacy alias for VCT_ORCHESTRATOR_ROOT —
+        # consumed by `templates/scripts/code-graph-analyze` (probes
+        # ``$VCT_INSTALL_ROOT/.venv`` before script-relative paths).
+        # Same value; the legacy alias kept until the wrappers fully
+        # migrate to VCT_ORCHESTRATOR_ROOT.
+        _set("VCT_INSTALL_ROOT", str(orchestrator_root))
 
     if kg_access:
         _set("VCT_KG_ACCESS_LIST", ",".join(kg_access))

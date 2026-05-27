@@ -175,6 +175,7 @@ def test_template_keys_excludes_known_runtime_concerns() -> None:
         "VCT_CODE_GRAPH_ACCESS_LIST",   # per-session grant snapshot
         "VCT_ORCHESTRATOR_ROOT",        # launcher-install-local path
         "VCT_INFRASTRUCTURE_DIR",       # launcher-install-local path
+        "VCT_INSTALL_ROOT",             # launcher-install-local path (v0.2.37 alias)
         "GITHUB_TOKEN",                 # secret; keychain-owned
     }
     leaked = keys & excluded_by_design

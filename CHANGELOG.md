@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.37] — 2026-05-27
+
+A **multi-axis hotfix release** — closes 7 distinct user-visible regressions discovered during v0.2.36 dogfooding (1 fresh-install of `instambul_map` exposed 5 install-bundle gaps; 1 fresh-3rd-party admin install exposed 2 launcher-side state bugs). 7 parallel Opus agents (V37-A/B/C/D/E/F/G) on isolated worktrees + per-branch diff review during integration.
+
+### Fixed — paid-module install pipeline (BLOCKER series)
+
+- **`container_pull` deadlock on Stdio::piped() with large images** (Agent V37-A, Issue 7): the launcher's `podman/docker pull` invocation in `installer_engine.rs::container_pull` used `Stdio::piped()` on stdout + stderr but never drained the pipes. For images >~64KB of stdout (any image with ≥3 layers), the pipe buffer filled mid-pull, child blocked writing, parent's `.await` returned `success() == false` even though the image successfully downloaded. Symptom: install fails with `podman pull failed (exit -1)` but `podman images` shows the image present at full size. Fix: `Stdio::null()` on stdout + stderr (progress goes via Tauri events, not by parsing podman's stdout). Same fix applied to `git clone --depth 1` (source-method install) and `git pull --ff-only` (run_upgrade). Regression test exercises a controlled subprocess emitting >200KB stdout to verify no deadlock.
+
+- **ActivationModal hides Refresh + Rebind buttons when admin's `machine_id_hash` drifted** (Agent V37-B, Issue 1): when `/validate-tier` returns `tier='free' + error='machine_mismatch'` (the v0.2.36 algorithm-migration recovery case), the modal collapsed into its "no license activated" branch and showed ONLY the activation input field. The rebind button (Agent S's v0.2.36 work) and Refresh button were both in the `{:else}` branch and unreachable. Fix: introduce `hasActiveLicense(tier, lastError)` predicate that returns true when the rebind-relevant error state is set, so the action-buttons branch renders. 8 new vitest tests pin the predicate behaviour (`launcher/src/lib/admin-rebind.ts`, `ActivationModal.svelte`).
+
+- **`rl-artifact-url` GHCR token-exchange used hardcoded `vct-paid-module` username instead of env-driven** (Agent V37-B, Issue 4a): backport of the 2026-05-27 in-place Supabase hotfix into the repo. The Basic-auth header to GHCR's `/token` endpoint at line 270 used the legacy `GHCR_BASIC_AUTH_USERNAME` constant ("vct-paid-module"). GHCR validates that the Basic-auth username matches the PAT owner for personal-account packages — synthetic literals get 403 DENIED. Replaced with `resolveGhcrUsername()` (the v0.2.36 env-driven resolver, already used for the response field). The diagnostic `console.error([rl-artifact-url DIAG] ...)` line + `// touched <timestamp>` comment from the 2026-05-27 forced-redeploy cycle were removed. Dead `GHCR_BASIC_AUTH_USERNAME` const deleted. 3 new Deno tests pin the Basic-auth header round-trip.
+
+### Fixed — install-bundle bootstrap gaps (`instambul_map` dogfood findings)
+
+- **`.claude/env` missing `VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR` / `VCT_INSTALL_ROOT` exports** (Agent V37-C Gap 6a + Agent V37-E Finding F1 + F6): two complementary fixes for the root cause that broke every freshly-installed project's wrapper scripts. (1) Agent V37-C threaded `orchestrator_root` through `vco_lib.project_init.install_project_bundle` → `_apply_canonical_env_via_config_projection` → `project_env_from_db` on the Python side. (2) Agent V37-E added `--orchestrator-root <path>` to the Rust `apply_project_env_via_python` subprocess call (sourced from `app_state["launcher.install_path"]` → `find_local_repo_root` fallback). (3) Agent V37-E also fixed `update_project_v2` to invoke `apply_project_env_via_python` after `run_install_bundle_update` so existing projects backfill the env keys on every bundle update — closes the staleness gap that left SD15-shaped long-lived projects missing keys added by later launcher versions.
+
+- **`kg-sync` / `kg-migrate` / `kg-search` / `kg-info` / `code-graph-query` wrappers had no venv fallback** (Agent V37-C Gap 6b): the 5 sibling wrappers only probed `$PROJECT_ROOT/.venv` / `$PROJECT_ROOT/claude_mcp_servers/.venv` and failed with `weaviate-client not installed` when neither existed. `code-graph-analyze` (the canonical wrapper) already had the correct fallback to `$VCT_INSTALL_ROOT/.venv` with `weaviate-client` import validation. Backported the canonical pattern to all 5 siblings (sh + ps1 — also created new `kg-migrate.ps1` for Windows parity, previously missing).
+
+- **`code-graph-query` wrapper didn't set `PYTHONPATH` to include `claude_mcp_servers/`** (Agent V37-C Gap 6c): `query_code_graph.py` requires `weaviate_mcp` on PYTHONPATH but the wrapper never set it. Mirrored `sync_knowledge_graph.py::_resolve_mcp_servers_dir()` defence-in-depth pattern (env-var-first, in-tree fallback) in both `query_code_graph.py` and the `code-graph-query` wrapper (sh + ps1).
+
+- **`sync_knowledge_graph.py::ensure_collection_exists` additive migration missing chunking props** (Agent V37-C Gap 6d): the fresh-create schema lists `chunk_num` / `total_chunks` / `source_node_id`, but the additive-migrate path for pre-chunking collections didn't add them. Every pre-chunking KG collection failed sync with `no such prop with name 'chunk_num' found in class '...'`. Fix: extend the additive prop loop to include the 3 chunking props. Verified against a real legacy `VCODev_KnowledgeGraph` collection during smoke testing.
+
+- **`analyze_code_graph.py` ignored `$CODE_GRAPH_PROJECT` env var** (Agent V37-C Gap 6e): when neither `--from-resolver` nor `--project` was passed, the analyzer fell back to repo dir name — diverging from the KG collection prefix set via `.claude/env`. Result: code-graph collections named after the directory (e.g. `Instambul_map_*`) instead of the configured project (`Instambul1860_*`). Fix: 3-step fallback order — `--from-resolver` > `--project` > `$CODE_GRAPH_PROJECT` > repo-dir-derived name.
+
+### Added — release-discipline automation
+
+- **CI Supabase deploy automation** (Agent V37-G, Issue 2): new `supabase-deploy` job in `.github/workflows/release.yml` runs after the binary build + dist-commit jobs. On every `v*.*.*` tag push, the job authenticates to Supabase via `SUPABASE_ACCESS_TOKEN` secret + `SUPABASE_PROJECT_REF` variable, deploys every edge function in `launcher/supabase/functions/*/`, and runs `supabase db push` for any net-new migrations. Closes the v0.2.36 release-discipline gap where the `rebind-admin-token` edge function shipped in the launcher binary but was never deployed to Supabase (404 NOT_FOUND for every customer install). Gracefully degrades when the secret is unset (private-fork friendly). Adds `docs/operations/supabase-ci-deploy.md` (213 lines) with full operator setup + manual fallback runbook.
+
+- **Supabase migration drift baseline** (Agent V37-G, Issue 3): new no-op marker migration `20260527000000_baseline_drift_reconciliation.sql` documents 8 legacy migration IDs that exist on the remote DB but not in the repo (a historical artifact of pre-CI manual SQL-editor applies). Includes a one-time reconciliation runbook in the SQL header + the operator doc. Future `supabase db push` calls work cleanly after the one-time `supabase migration repair --status reverted ...` + `supabase db pull` baseline pull.
+
+### Refactored — orchestrator-root resolver consolidation
+
+- **Single canonical `resolve_orchestrator_root(db)` resolver** (Agent V37-E): merged the two parallel resolvers (`find_local_repo_root` walking `vct-module.json`, `resolve_install_root_sync` walking `install.py + CLAUDE.md`) into a single canonical fn accepting BOTH marker patterns. DB cache → walk-up fallback → sticky writeback (best traits of both). Both legacy fns kept as deprecated shims so the ~30 existing call sites compile unchanged. `option_env!("VCT_REPO_ROOT")` removed entirely (privacy: was unreachable on release builds; risk: leaked build-host paths if shipped). `ProjectEnvSettings::populate` switched to the DB-cached resolver — survives binary moves where the previous uncached resolver would fall through to None and silently omit `VCT_ORCHESTRATOR_ROOT` from the env files.
+
+### Added — install-time DB seeding
+
+- **`install.py` seeds `<install>/.vct/install_path_seed.txt`** (Agent V37-E): on first install OR lightweight reinstall, install.py writes the resolved install path to a seed file. Launcher boot consumes via new `consume_install_path_seed_if_present` (in `lib.rs`) which writes the value to `app_state["launcher.install_path"]` and deletes the seed. Closes the chicken-and-egg gap where install.py finished but launcher.db didn't know the install path until the first launcher boot's walk-up resolver happened to succeed.
+
+- **`refresh_all_projects_env_with_db` Tauri command + boot hook** (Agent V37-E, F1 Step 4): after the install-path-seed consumer runs at boot, the launcher re-applies `apply_project_env_via_python` for every project in launcher.db. Legacy SD15-shaped projects with stale `.claude/env` self-heal on the first boot post-upgrade — no manual operator action.
+
+### Documentation
+
+- **Admin license recovery walkthrough** (Agent V37-D): new `docs/guides/admin-license-recovery.md` (193 lines) — end-to-end walkthrough for the 3 scenarios that trigger admin token rebind (OS reinstall / new laptop / pre-v0.2.36 upgrade). Launcher GUI flow with v0.2.37 visible-button fix called out + curl fallback with per-OS sha256 one-liners (Linux/macOS shell, Windows PowerShell).
+
+- **Supabase Vault vs Edge Function Secrets warning** + **Package ACL vs Repo ACL gotcha** (Agent V37-D): two new sections in `launcher/supabase/functions/rl-artifact-url/README.md` documenting the load-bearing gotchas discovered during 2026-05-27 dogfooding (each cost ~hour of debugging on a clean operator). Plus a "Scaling beyond one paid module" callout noting GitHub's 1-machine-account ToS limit (the per-bot-user pattern scales to 1 module; multi-module distribution will need org migration OR Lemon Squeezy file hosting — see KG spec in VCO_dev).
+
+- **Install/update flow audit** (Agent V37-F): new `docs/audits/install-update-audit-2026-05-27.md` (340 lines) — comprehensive read-only audit identifying 15 install/update flow gaps across the 5 surfaces (`install.py`, `vco_lib.project_init install-bundle`, launcher self-update, GitHub Release CI, Supabase migrations + edge function deploys). 10 fixes in this release; 5 architectural items deferred to v0.2.38+.
+
+### Internal
+
+- 7 agents on isolated `/tmp/vco-wt-v0237-*/` worktrees + per-branch diff review during integration (caught 1 KG-discipline violation: V37-F's audit was force-added to gitignored `.claude/context/`; moved to `docs/audits/` for posterity. Also caught + redacted 1 absolute path leak in the audit body).
+- Gate baseline (delta vs v0.2.36): vct-launcher-temp 1156 passed (+17 new), vct-hub 191 passed + 5 pre-existing env baseline, vct-launcher-core 343 passed, svelte-check 0/0 across 866 files, vitest 48/48 (+8 new), pytest 2784 passed (+16 new) + 12 pre-existing env baseline. Total net delta: +41 new passing tests; zero new regressions.
+
 ## [0.2.36] — 2026-05-26
 
 A **post-v0.2.35-dogfooding follow-up release** — closes the launcher-side fragility surfaces uncovered while attempting first end-to-end paid-module installs against the v0.2.35 binary on real customer hardware (Fabio's Windows laptop) + a server-side architectural shift to per-module GitHub bot users for paid-module distribution. 7 agents (P/R/S/T/U/W + integration tree work).

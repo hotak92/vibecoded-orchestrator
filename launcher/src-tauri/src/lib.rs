@@ -508,6 +508,75 @@ pub fn run() {
                 }
             }
 
+            // v0.2.37 (Agent V37-E, 2026-05-27): consume the
+            // install_path seed file that install.py may have written
+            // alongside the orchestrator clone (see
+            // `install.py::_seed_launcher_install_path` for the
+            // companion writer). If `app_state['launcher.install_path']`
+            // is unset AND a seed exists, write the seed value to
+            // app_state and delete the seed file.
+            //
+            // Why this exists: the launcher's canonical
+            // `resolve_orchestrator_root` resolver walks up from
+            // `current_exe()` looking for orchestrator-root markers
+            // (`vct-module.json` OR `install.py+CLAUDE.md`). That walk
+            // FAILS when the launcher binary lives outside the clone
+            // (e.g. PATH-installed wrapper at `~/bin/vct-launcher`
+            // pointing at a clone in `~/dev/`). `ProjectEnvSettings::populate`
+            // then returns `orchestrator_root=None` and
+            // `VCT_ORCHESTRATOR_ROOT` is OMITTED from `.claude/env` —
+            // exactly the bug that hit instambul_map / SD15 pre-v0.2.37.
+            //
+            // install.py knows the install path with certainty (it's
+            // PROJECT_ROOT), so it records it out-of-band; this hook
+            // promotes the recorded value into the DB on the next
+            // launcher boot, where the resolver picks it up via its
+            // Strategy 1 (DB cache) before ever needing the walk-up.
+            //
+            // SECOND ACTION on seed-consume: bulk-refresh every
+            // project's `.claude/env` + `.claude/settings.json`. Existing
+            // projects created BEFORE this release have stale env files
+            // missing `VCT_ORCHESTRATOR_ROOT` (the pre-v0.2.37 uncached
+            // resolver returned None silently). Now that the DB cache
+            // is warm, re-running the project env writer picks up the
+            // correct value and patches the surfaces without any user
+            // action. We tie the bulk refresh to a successful seed
+            // consume so this isn't a per-boot cost — only once per
+            // install/update boundary.
+            //
+            // Soft-fail throughout: any error here MUST NOT block boot.
+            // The walk-up resolver remains a working fallback for the
+            // common case (binary inside the clone).
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    let consumed = consume_install_path_seed_if_present(db.inner());
+                    if consumed {
+                        let report = commands::projects_v2::
+                            refresh_all_projects_env_with_db(db.inner());
+                        if !report.refreshed.is_empty()
+                            || !report.refreshed_with_warnings.is_empty()
+                            || !report.failed.is_empty()
+                        {
+                            eprintln!(
+                                "[vct] install-boundary env refresh: \
+                                 refreshed={} with_warnings={} failed={} skipped={}",
+                                report.refreshed.len(),
+                                report.refreshed_with_warnings.len(),
+                                report.failed.len(),
+                                report.skipped.len(),
+                            );
+                            for (name, err) in &report.failed {
+                                eprintln!(
+                                    "[vct]   env refresh failed for {}: {}",
+                                    name, err
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // P1-B (2026-05-08): one-shot migration of plaintext MCP-server
             // secret settings from `~/.vct/orchestrator.json` into the OS
             // keychain. Self-gated by an `app_state` flag — runs at most
@@ -1135,6 +1204,11 @@ pub fn run() {
             // 3 surfaces. Auto-invoked by access-matrix setters; FE may
             // also call directly after bulk edits.
             commands::projects_v2::refresh_project_env,
+            // v0.2.37 (Agent V37-E): bulk refresh for the install/update
+            // boundary — re-renders `.claude/env` + `.claude/settings.json`
+            // for every project so the canonical orchestrator-root
+            // resolver's newly-warm DB cache propagates everywhere.
+            commands::projects_v2::refresh_all_projects_env,
             commands::projects_v2::switch_project_host_v2,
             commands::projects_v2::delete_project_v2,
             commands::projects_v2::launch_project_in_editor,
@@ -1771,6 +1845,163 @@ fn sweep_stale_binary_siblings(dist_dir: &std::path::Path) {
     }
 }
 
+/// v0.2.37 (Agent V37-E, 2026-05-27): seed-file consumer for
+/// `app_state['launcher.install_path']`. Companion to
+/// `install.py::_seed_launcher_install_path`.
+///
+/// Behaviour:
+///   1. If `app_state['launcher.install_path']` is already set AND
+///      passes `check_install_status`, do nothing. The cache is warm;
+///      the seed (if any) is stale.
+///   2. If unset OR stale, look for
+///      `<exe-parent-walk-up>/.vct/install_path_seed.txt`. The walk
+///      uses the same algorithm as `walk_for_orchestrator_root` so
+///      this hook works whether the launcher binary is inside the
+///      clone or in a sibling `dist/` folder.
+///   3. If the seed file exists and points at a directory that passes
+///      `check_install_status`, write the value to app_state and
+///      delete the seed file.
+///
+/// Returns `true` iff the install_path was just promoted from a seed
+/// file into `app_state` (signals "fresh install/update boundary" to
+/// the caller — the boot hook uses this to gate the per-project env
+/// refresh). Returns `false` when the DB cache was already warm OR
+/// when no seed was found OR when the seed was invalid.
+///
+/// Soft-fail throughout: any error MUST NOT block launcher boot. The
+/// `resolve_orchestrator_root` walk-up resolver remains the fallback.
+///
+/// Idempotent: deleting the seed after consumption prevents a stale
+/// seed from overriding a user's manual GUI choice on subsequent boots.
+fn consume_install_path_seed_if_present(db: &db::Db) -> bool {
+    use commands::installer::APP_STATE_KEY_INSTALL_PATH;
+
+    // Step 1: is app_state already warm with a VALID install path?
+    if let Ok(Some(cached)) = db.app_state_get(APP_STATE_KEY_INSTALL_PATH) {
+        if !cached.is_empty()
+            && commands::installer::check_install_status(cached.clone())
+        {
+            // DB cache is warm + valid. If a stale seed exists, clean
+            // it up so the next install.py write isn't shadowed by
+            // an out-of-date one — but only if it disagrees with the
+            // cache (matching seeds are a no-op).
+            return false;
+        }
+    }
+
+    // Step 2: locate a seed file. The seed lives at
+    // `<install_root>/.vct/install_path_seed.txt`. We walk up from
+    // current_exe() the same way the canonical resolver does, but
+    // looking for the seed file instead of the orchestrator markers.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let start = match exe.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return false,
+    };
+    let seed_path = match locate_install_path_seed(&start) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    process_install_path_seed(db, &seed_path)
+}
+
+/// v0.2.37 (Agent V37-E): pure helper — walks up from `start` looking
+/// for `<level>/.vct/install_path_seed.txt`. Returns the first match
+/// (deepest-first), or None. Bounded to 8 ancestor levels to mirror
+/// `walk_for_orchestrator_root`.
+///
+/// Factored out of `consume_install_path_seed_if_present` so unit
+/// tests can drive it deterministically without depending on
+/// `current_exe()`'s real location.
+fn locate_install_path_seed(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = start.to_path_buf();
+    for _ in 0..8 {
+        let candidate = current.join(".vct").join("install_path_seed.txt");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// v0.2.37 (Agent V37-E): pure helper — read seed file, validate via
+/// `check_install_status`, promote to `app_state['launcher.install_path']`,
+/// delete on success. Soft-fail throughout: returns `true` iff the
+/// app_state was just updated (i.e. install/update boundary signal),
+/// `false` otherwise.
+///
+/// Factored out so unit tests can drive the read+validate+promote
+/// path with arbitrary seed paths.
+fn process_install_path_seed(db: &db::Db, seed_path: &std::path::Path) -> bool {
+    use commands::installer::APP_STATE_KEY_INSTALL_PATH;
+
+    let raw = match std::fs::read_to_string(seed_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[vct] install-path seed at {} unreadable: {} \
+                 (falling back to walk-up resolver)",
+                seed_path.display(),
+                e
+            );
+            return false;
+        }
+    };
+    let install_path = raw.trim().to_string();
+    if install_path.is_empty() {
+        // Empty seed — drop it so we don't keep re-reading it.
+        let _ = std::fs::remove_file(seed_path);
+        return false;
+    }
+    if !commands::installer::check_install_status(install_path.clone()) {
+        eprintln!(
+            "[vct] install-path seed at {} points at {} which does \
+             not pass check_install_status — leaving DB unchanged. \
+             The seed file will be retried on the next launcher boot.",
+            seed_path.display(),
+            install_path,
+        );
+        // Don't delete: the install may be in progress / on a
+        // momentarily-unmounted drive. install.py rewrites the seed
+        // anyway on its next run.
+        return false;
+    }
+
+    // Promote: write the seed value into app_state.
+    if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &install_path) {
+        eprintln!(
+            "[vct] install-path seed: could not write {} to app_state: {} \
+             (seed file left in place; will retry next boot)",
+            install_path, e,
+        );
+        return false;
+    }
+    eprintln!(
+        "[vct] install-path seed: promoted {} to app_state from {}",
+        install_path,
+        seed_path.display(),
+    );
+
+    // Delete the seed file so it doesn't shadow a future GUI override.
+    if let Err(e) = std::fs::remove_file(seed_path) {
+        eprintln!(
+            "[vct] install-path seed: app_state updated but seed file \
+             {} could not be removed: {} \
+             (next boot will see the cache warm and skip the seed)",
+            seed_path.display(),
+            e,
+        );
+    }
+    true
+}
+
 fn load_projects_from_disk() -> HashMap<String, types::Project> {
     let path = paths::vct_root_dir().join("projects.json");
 
@@ -1901,5 +2132,192 @@ mod boot_sweep_tests {
         let nonexistent = std::path::PathBuf::from("/tmp/vct-test-nonexistent-sweep-target");
         // No assertions; success = function returns without panicking.
         sweep_stale_binary_siblings(&nonexistent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.37 (Agent V37-E, 2026-05-27) — install_path_seed consumer tests
+// ---------------------------------------------------------------------------
+//
+// Companion to `install.py::_seed_launcher_install_path`. The seed file
+// is the out-of-band channel that primes the launcher's DB cache for
+// the canonical orchestrator-root resolver, closing the
+// "binary-outside-clone" gap that produced the SD15 / instambul_map
+// "missing VCT_ORCHESTRATOR_ROOT" bug.
+
+#[cfg(test)]
+mod install_path_seed_tests {
+    use super::*;
+
+    /// Build a directory tree that passes `check_install_status`:
+    /// install.py + CLAUDE.md + state/install-manifest.json with
+    /// `installed:true`. The seed file points to THIS directory.
+    fn fake_install_with_seed(seed_content: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-v0237-seed-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(tmp.join(".vct")).unwrap();
+        fs::create_dir_all(tmp.join("state")).unwrap();
+        fs::write(tmp.join("install.py"), "# stub\n").unwrap();
+        fs::write(tmp.join("CLAUDE.md"), "# stub\n").unwrap();
+        fs::write(
+            tmp.join("state/install-manifest.json"),
+            "{\"installed\":true}\n",
+        )
+        .unwrap();
+        let seed = tmp.join(".vct").join("install_path_seed.txt");
+        fs::write(&seed, seed_content).unwrap();
+        (tmp, seed)
+    }
+
+    /// Happy path — seed file → app_state, seed deleted, returns true.
+    #[test]
+    fn process_install_path_seed_promotes_valid_path_and_deletes_seed() {
+        let db = db::Db::open_in_memory().expect("in-memory db");
+        let (install_dir, seed) =
+            fake_install_with_seed(&format!("{}\n", "TMPDIR_PLACEHOLDER"));
+        // Rewrite seed content with the actual path now that we have it.
+        std::fs::write(&seed, format!("{}\n", install_dir.to_string_lossy()))
+            .unwrap();
+
+        let consumed = process_install_path_seed(&db, &seed);
+        assert!(consumed, "valid seed must be consumed (returns true)");
+
+        // app_state was written with the install path.
+        let cached = db
+            .app_state_get(commands::installer::APP_STATE_KEY_INSTALL_PATH)
+            .expect("app_state read")
+            .expect("app_state value set");
+        assert_eq!(cached, install_dir.to_string_lossy().to_string());
+
+        // Seed file was deleted (idempotency — next boot is a no-op).
+        assert!(
+            !seed.is_file(),
+            "consumed seed file must be deleted, but {} still exists",
+            seed.display()
+        );
+
+        std::fs::remove_dir_all(&install_dir).ok();
+    }
+
+    /// Seed contents point at a directory that doesn't pass
+    /// `check_install_status` (e.g. partial / in-progress install).
+    /// Must NOT promote, must NOT delete the seed (so it can be retried
+    /// on next boot).
+    #[test]
+    fn process_install_path_seed_skips_invalid_path_and_preserves_seed() {
+        let db = db::Db::open_in_memory().expect("in-memory db");
+        let bogus = std::env::temp_dir().join(format!(
+            "vct-v0237-no-such-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // Create the seed file in a tempdir, contents point at a
+        // directory that doesn't exist.
+        let seed_dir = std::env::temp_dir().join(format!(
+            "vct-v0237-seed-only-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        let seed = seed_dir.join("install_path_seed.txt");
+        std::fs::write(&seed, format!("{}\n", bogus.to_string_lossy())).unwrap();
+
+        let consumed = process_install_path_seed(&db, &seed);
+        assert!(!consumed, "invalid seed must NOT be consumed");
+
+        // app_state unchanged.
+        let cached = db
+            .app_state_get(commands::installer::APP_STATE_KEY_INSTALL_PATH)
+            .expect("app_state read");
+        assert_eq!(cached, None, "invalid seed must NOT touch app_state");
+
+        // Seed file preserved for retry.
+        assert!(
+            seed.is_file(),
+            "invalid seed must be preserved for next-boot retry, \
+             but {} was deleted",
+            seed.display()
+        );
+
+        std::fs::remove_dir_all(&seed_dir).ok();
+    }
+
+    /// Empty seed file is deleted (defensive — never re-read garbage).
+    #[test]
+    fn process_install_path_seed_drops_empty_seed() {
+        let db = db::Db::open_in_memory().expect("in-memory db");
+        let dir = std::env::temp_dir().join(format!(
+            "vct-v0237-empty-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let seed = dir.join("seed.txt");
+        std::fs::write(&seed, "").unwrap();
+
+        let consumed = process_install_path_seed(&db, &seed);
+        assert!(!consumed, "empty seed → returns false");
+        assert!(
+            !seed.is_file(),
+            "empty seed must be cleaned up (no point retrying garbage)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `locate_install_path_seed` finds a seed in `start/.vct/`.
+    #[test]
+    fn locate_install_path_seed_finds_at_start() {
+        let dir = std::env::temp_dir().join(format!(
+            "vct-v0237-locate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(dir.join(".vct")).unwrap();
+        let seed = dir.join(".vct").join("install_path_seed.txt");
+        std::fs::write(&seed, "/some/path\n").unwrap();
+
+        let found = locate_install_path_seed(&dir);
+        assert_eq!(found.as_deref(), Some(seed.as_path()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `locate_install_path_seed` walks up to find a seed in an
+    /// ancestor's `.vct/`.
+    #[test]
+    fn locate_install_path_seed_walks_up_to_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "vct-v0237-locate-ancestor-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let nested = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join(".vct")).unwrap();
+        let seed = root.join(".vct").join("install_path_seed.txt");
+        std::fs::write(&seed, "/some/path\n").unwrap();
+
+        let found = locate_install_path_seed(&nested);
+        assert_eq!(
+            found.as_deref(),
+            Some(seed.as_path()),
+            "walk-up must find seed in ancestor"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `locate_install_path_seed` returns None when no seed is reachable.
+    #[test]
+    fn locate_install_path_seed_returns_none_when_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "vct-v0237-no-seed-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let found = locate_install_path_seed(&dir);
+        assert_eq!(found, None);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
