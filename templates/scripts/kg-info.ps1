@@ -1,28 +1,43 @@
-﻿# PowerShell wrapper for get_node_info.py (Windows equivalent of kg-info)
+# PowerShell wrapper for get_node_info.py (Windows equivalent of kg-info)
 # Usage: .\kg-info.ps1 info "Node Title"
 #        .\kg-info.ps1 connections "Node Title"
+#
+# v0.2.37 (Gap 6b): backports the validate-has-weaviate-client pattern
+# from the bash sibling. See `kg-sync.ps1` for the full rationale.
 
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Resolve-Path (Join-Path $ScriptDir "..\..")
 
-# Probe canonical .venv locations in priority order — see kg-search.ps1
-# for rationale (OSS install root takes precedence over the legacy
-# claude_mcp_servers/.venv layout).
-$VenvPython = $null
-foreach ($candidate in @(
+function Test-VenvHasKgDeps {
+    param([string]$PythonExe)
+    if (-not (Test-Path $PythonExe)) { return $false }
+    & $PythonExe -c "import weaviate" 2>$null
+    return ($LASTEXITCODE -eq 0)
+}
+
+$Candidates = @(
+    $(if ($env:VCT_INSTALL_ROOT) { Join-Path $env:VCT_INSTALL_ROOT ".venv\Scripts\python.exe" }),
+    $(if ($env:VCT_INSTALL_ROOT) { Join-Path $env:VCT_INSTALL_ROOT "claude_mcp_servers\.venv\Scripts\python.exe" }),
     (Join-Path $ProjectRoot ".venv\Scripts\python.exe"),
     (Join-Path $ProjectRoot "claude_mcp_servers\.venv\Scripts\python.exe")
-)) {
-    if (Test-Path $candidate) { $VenvPython = $candidate; break }
+)
+
+$VenvPython = $null
+foreach ($cand in $Candidates) {
+    if ($cand -and (Test-Path $cand) -and (Test-VenvHasKgDeps $cand)) {
+        $VenvPython = $cand
+        break
+    }
 }
 
 if (-not $VenvPython) {
-    Write-Host "ERROR: venv not found. Probed:" -ForegroundColor Red
-    Write-Host "  $ProjectRoot\.venv\Scripts\python.exe" -ForegroundColor Red
-    Write-Host "  $ProjectRoot\claude_mcp_servers\.venv\Scripts\python.exe" -ForegroundColor Red
-    Write-Host "Run install.ps1 first." -ForegroundColor Red
+    Write-Host "ERROR: no venv with weaviate-client installed. Probed:" -ForegroundColor Red
+    foreach ($cand in $Candidates) {
+        if ($cand) { Write-Host "  - $cand" -ForegroundColor Red }
+    }
+    Write-Host "Run install.ps1 first, or set VCT_INSTALL_ROOT to point at an installed orchestrator clone." -ForegroundColor Red
     exit 1
 }
 
