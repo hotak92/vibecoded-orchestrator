@@ -1545,6 +1545,12 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         _check_search_mcp_env_obsolete(_lightweight_deferral)
     _materialize_boot_service(PROJECT_ROOT, None, args,
                               deferral_report=_lightweight_deferral)
+    # v0.2.37: seed the launcher's install_path resolver on lightweight
+    # too — the lightweight path is exactly what `--lightweight-old-path`
+    # uses to relocate an install, so this is the canonical moment to
+    # refresh the seed. See `_seed_launcher_install_path` for the
+    # full rationale.
+    _seed_launcher_install_path(PROJECT_ROOT, _lightweight_deferral)
     # Best-effort: persist the deferral report. Mirrors the folder
     # resolution used by the full install path (line ~2169).
     try:
@@ -3126,6 +3132,30 @@ def main() -> int:
     # final write happens at line ~2181 below).
     _materialize_boot_service(PROJECT_ROOT, sysinfo, args,
                               deferral_report=_deferral_report)
+
+    # v0.2.37 (2026-05-27): seed the launcher's install_path resolver
+    # before next boot. The launcher's canonical
+    # `resolve_orchestrator_root` resolver reads
+    # `app_state['launcher.install_path']` first, then falls back to
+    # walking up from `current_exe()`. The walk-up FAILS when the
+    # launcher binary lives outside the clone (e.g. `~/bin/`,
+    # PATH-installed wrapper, etc.), which historically caused
+    # `ProjectEnvSettings::populate` to omit `VCT_ORCHESTRATOR_ROOT`
+    # from `.claude/env` — see the instambul_map / SD15 incident.
+    #
+    # Approach: write the install_path to a seed file at
+    # `<install>/.vct/install_path_seed.txt`. On first launcher boot
+    # the launcher's setup hook reads the seed (if present),
+    # writes it to `app_state['launcher.install_path']`, and deletes
+    # the seed file. This avoids Python-side SQLite schema knowledge
+    # (the launcher.db schema is owned by the Rust launcher; we don't
+    # want install.py touching it directly).
+    #
+    # Soft-fail by design: a failed seed write leaves the launcher to
+    # fall back to its walk-up resolver, which still works in the
+    # common case (binary lives inside the clone). The seed is purely
+    # an out-of-band hint for the binary-outside-clone case.
+    _seed_launcher_install_path(PROJECT_ROOT, _deferral_report)
 
     # v0.2.6 Bug C1: invoke the desktop-icon step so direct `python install.py`
     # runs get an icon too. first-install.sh-wrapped runs already trigger
@@ -8779,6 +8809,107 @@ def _read_git_rev() -> tuple[str | None, str | None]:
         return (commit, branch)
     # Detached HEAD — head_content is the commit hash itself.
     return (head_content, None)
+
+
+def _seed_launcher_install_path(install_path: Path,
+                                deferral_report: "DeferralReport") -> None:
+    """v0.2.37 — write `<install>/.vct/install_path_seed.txt` so the
+    launcher's first boot can populate `app_state['launcher.install_path']`
+    without depending on a successful `current_exe()` walk-up.
+
+    The launcher's canonical resolver
+    (`installer::resolve_orchestrator_root`) walks up from the running
+    binary looking for `vct-module.json` or `install.py + CLAUDE.md`. The
+    walk fails when the binary is far from the clone (e.g. PATH-installed
+    wrapper at `~/bin/vct-launcher` pointing at a clone in `~/dev/`).
+    `ProjectEnvSettings::populate` then returns `orchestrator_root=None`
+    and `VCT_ORCHESTRATOR_ROOT` is OMITTED from `.claude/env` — which
+    bit the instambul_map / SD15 user.
+
+    Seeding the resolver out-of-band closes this gap: install.py knows
+    where it's running, so it just records the absolute path. On first
+    launcher boot the launcher's setup hook reads + consumes the seed
+    file (writes to `app_state['launcher.install_path']`, then unlinks
+    the seed).
+
+    Idempotent: if a seed already exists with the same path, this is a
+    no-op. If it exists with a different path, we overwrite (the most
+    recent install wins — which matches the rest of install.py's
+    "this is where the install is now" semantics).
+
+    Soft-fail throughout: any OSError is downgraded to a deferral entry.
+    The launcher's walk-up resolver remains a working fallback for the
+    common case (binary inside the clone).
+    """
+    seed_dir = install_path / ".vct"
+    seed_file = seed_dir / "install_path_seed.txt"
+    payload = str(install_path.resolve())
+    try:
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        # Idempotency: skip the write if the existing seed already
+        # records the same path (avoids needless file churn on
+        # successive `install.py --update` runs).
+        if seed_file.is_file():
+            try:
+                existing = seed_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                existing = ""
+            if existing == payload:
+                _log_install_event(
+                    "seed_install_path", "ok",
+                    "seed already current; skipped",
+                )
+                return
+        seed_file.write_text(payload + "\n", encoding="utf-8")
+        try:
+            os.chmod(seed_file, 0o600)
+        except OSError:
+            # chmod is best-effort on Windows / non-POSIX filesystems;
+            # the seed content isn't a secret — it's a path the user
+            # already controls — so a failed chmod is not a security
+            # issue.
+            pass
+        _log_install_event(
+            "seed_install_path", "ok",
+            f"wrote install path seed at {seed_file}",
+        )
+    except OSError as exc:
+        # Non-fatal: the launcher's walk-up resolver remains in play.
+        # The deferral entry lets a user with the binary-outside-clone
+        # layout know they may need to set the path manually.
+        _log_install_event(
+            "seed_install_path", "warn",
+            f"could not write seed file: {exc}",
+        )
+        try:
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="launcher_install_path_seed_unavailable",
+                    title="Launcher install-path seed not written",
+                    detected=(
+                        f"install.py could not write the install-path "
+                        f"seed file at {seed_file} (OSError: {exc})."
+                    ),
+                    why_deferred=(
+                        "The launcher will fall back to its walk-up "
+                        "resolver. If the launcher binary lives OUTSIDE "
+                        "this clone (e.g. PATH-installed wrapper at "
+                        "~/bin/), .claude/env may be missing "
+                        "VCT_ORCHESTRATOR_ROOT until you set the install "
+                        "path explicitly via the launcher GUI."
+                    ),
+                    command_to_apply=(
+                        "# Open the launcher GUI → Settings → set the "
+                        "install path manually, OR run with sufficient "
+                        "permissions to write to "
+                        f"{seed_dir}"
+                    ),
+                    severity="info",
+                )
+            )
+        except Exception:  # noqa: BLE001
+            # DeferralReport API drift — log only.
+            pass
 
 
 def _run_desktop_icon_step(args: argparse.Namespace) -> None:

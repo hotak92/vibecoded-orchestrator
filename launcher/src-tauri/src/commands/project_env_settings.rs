@@ -32,7 +32,7 @@
 
 use std::path::PathBuf;
 
-use crate::commands::installer::find_local_repo_root;
+use crate::commands::installer::resolve_orchestrator_root;
 use crate::commands::projects_v2::{get_shared_kg_write_disabled, sanitize_kg_collection};
 use crate::db::Db;
 use crate::services::adoption::{self, AdoptionMode};
@@ -196,13 +196,18 @@ pub struct ProjectEnvSettings {
     pub project_name: String,
 
     /// Orchestrator clone root (PR-2 portability, 2026-05-06). `Some` when
-    /// `find_local_repo_root()` succeeds at populate time; `None` falls
-    /// through to the older behaviour where `VCT_ORCHESTRATOR_ROOT` /
-    /// `VCT_INFRASTRUCTURE_DIR` are simply omitted from `.claude/env` (the
-    /// in-tree hooks have a fallback resolution path). Routed via the
+    /// `resolve_orchestrator_root(db)` succeeds at populate time; `None`
+    /// falls through to the older behaviour where `VCT_ORCHESTRATOR_ROOT`
+    /// / `VCT_INFRASTRUCTURE_DIR` are simply omitted from `.claude/env`
+    /// (the in-tree hooks have a fallback resolution path). Routed via the
     /// settings struct so PR-2's value flows through PR-3's plumbing
-    /// rather than being a side-channel `find_local_repo_root()` call
-    /// inside the writer body.
+    /// rather than being a side-channel resolver call inside the writer
+    /// body.
+    ///
+    /// v0.2.37: switched from uncached `find_local_repo_root().ok()` to
+    /// the canonical DB-cached `resolve_orchestrator_root(db)` resolver,
+    /// so populate emits the orchestrator root even when `current_exe()`
+    /// is far from the clone (binary in `~/bin/`, clone in `~/dev/`).
     pub orchestrator_root: Option<PathBuf>,
 
     /// Multi-source KG access list (P1-D, 2026-05-08). Sorted, deduped list
@@ -630,7 +635,20 @@ pub fn populate(
         // (None) so a launcher running outside a git checkout still
         // produces a usable `.claude/env` (the bundled hooks' in-tree
         // fallback path takes over).
-        orchestrator_root: find_local_repo_root().ok(),
+        //
+        // v0.2.37: was `find_local_repo_root().ok()` — the uncached
+        // walk-up resolver. That bit instambul_map: when the launcher
+        // binary lived at `~/bin/vct-launcher` and the clone at
+        // `~/dev/vco/`, the walk-up returned None and
+        // `VCT_ORCHESTRATOR_ROOT` was OMITTED from `.claude/env`
+        // (per the omit-on-None semantic in
+        // `write_project_env_files`). The canonical
+        // `resolve_orchestrator_root(db)` checks the DB cache first
+        // (`app_state['launcher.install_path']`, seeded at install
+        // time by install.py + on the first launcher boot that hits
+        // the walk-up), so populate succeeds even when
+        // `current_exe()` is far from the clone.
+        orchestrator_root: resolve_orchestrator_root(db),
         kg_access_list,
         code_graph_access_list,
         github_token,

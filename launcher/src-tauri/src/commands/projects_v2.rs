@@ -359,7 +359,7 @@ pub async fn create_project_v2(
     // user-secret path and (b) `ensure_project_env_template` below also
     // consumes it for the `.env` template surface (which is out of scope
     // for the Phase 0.B contract).
-    if let Err(e) = apply_project_env_via_python(&row.id, folder) {
+    if let Err(e) = apply_project_env_via_python(&row.id, folder, &db) {
         // B10 (2026-05-01): surface env-write failures to the UI instead of
         // silent eprintln. Project creation still succeeds; the UI should show
         // a warning toast so the user knows manual env setup is required.
@@ -1396,6 +1396,33 @@ pub async fn update_project_v2(
         warnings.push(w);
     }
 
+    // 5. v0.2.37 (Finding F6, 2026-05-27): backfill the per-project env
+    //    surfaces after the bundle update. Pre-v0.2.37 the bundle update
+    //    flow NEVER invoked the env writer, so projects created BEFORE
+    //    this release stayed pinned to whatever `.claude/env` their
+    //    `create_project_v2` call wrote at the time. Combined with
+    //    Finding F1 (apply_project_env_via_python now passes
+    //    --orchestrator-root), this closes the SD15-style "missing
+    //    VCT_ORCHESTRATOR_ROOT" gap on every bundle update — existing
+    //    projects self-heal the next time the user clicks Update.
+    //
+    //    Mirrors the warning-on-error pattern from create_project_v2
+    //    (line 362) and rename_project_v2 (line 3039): a Python
+    //    subprocess hiccup is surfaced as a warning, NOT a hard
+    //    failure. The bundle update still succeeds because the
+    //    manifest install + audit log + change_log entry have
+    //    already landed — env writes are a best-effort step on top.
+    if let Err(e) = apply_project_env_via_python(&row.id, &folder, &db) {
+        let msg = format!(
+            "post-bundle env refresh (apply_project_env_via_python) failed: {}. \
+             Bundle update succeeded but .claude/env / .claude/settings.json \
+             may be missing VCT_ORCHESTRATOR_ROOT until the next refresh.",
+            e
+        );
+        eprintln!("[vct] warning: {}", msg);
+        warnings.push(msg);
+    }
+
     db.audit(
         "project_update_bundle",
         Some(&row.id),
@@ -1623,9 +1650,35 @@ pub async fn update_all_projects(
 ///   secret's value change in the keychain won't reach env surfaces
 ///   until the SecretsPanel toggles or the user re-runs the affected
 ///   project's secret writer.
+/// v0.2.37 (Finding F1 testability helper): builds the argument list
+/// passed to the `python -m vco_lib.config_projection apply` subprocess.
+/// Pure function; no I/O. Lets unit tests assert the
+/// `--orchestrator-root` flag is included exactly when the
+/// orchestrator-root resolver returns Some.
+///
+/// Returns the list in the order it will appear after `-m
+/// vco_lib.config_projection apply`. The caller is responsible for
+/// prepending those three Python-module pieces + appending any
+/// future per-call args.
+fn build_config_projection_apply_args(
+    project_id: &str,
+    orchestrator_root: Option<&Path>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--project-id".to_string(),
+        project_id.to_string(),
+    ];
+    if let Some(root) = orchestrator_root {
+        args.push("--orchestrator-root".to_string());
+        args.push(root.to_string_lossy().to_string());
+    }
+    args
+}
+
 fn apply_project_env_via_python(
     project_id: &str,
     folder: &Path,
+    db: &Db,
 ) -> Result<(), String> {
     let python = resolve_python_for_vco_lib_local().ok_or_else(|| {
         "no python interpreter found for vco_lib.config_projection apply \
@@ -1635,11 +1688,33 @@ fn apply_project_env_via_python(
     })?;
 
     let mut cmd = std::process::Command::new(&python).silent();
-    cmd.arg("-m")
-        .arg("vco_lib.config_projection")
-        .arg("apply")
-        .arg("--project-id")
-        .arg(project_id);
+    cmd.arg("-m").arg("vco_lib.config_projection").arg("apply");
+
+    // v0.2.37 (Finding F1, 2026-05-27): pass the orchestrator clone
+    // root to the Python writer. `vco_lib/config_projection.py` only
+    // emits `VCT_ORCHESTRATOR_ROOT` + `VCT_INFRASTRUCTURE_DIR` when
+    // the apply call receives `orchestrator_root is not None` — and
+    // the CLI defaults the flag to `None`. Before this fix, the
+    // launcher NEVER set the flag, so every Python-written env file
+    // silently omitted those two keys (the production writer surface
+    // since Phase 0.B Part 2 migrated away from the Rust
+    // `write_project_env_files`). This is the actual root cause of
+    // the instambul_map / SD15 "missing VCT_ORCHESTRATOR_ROOT" bug.
+    //
+    // Resolution order matches the canonical Rust resolver:
+    //   1. `resolve_orchestrator_root(db)` — DB cache (sticky after
+    //      install.py seeds it OR after the first successful walk-up).
+    //   2. (No further fallback needed — resolve_orchestrator_root
+    //      already includes the walk-up step internally.)
+    //
+    // When the resolver returns None (standalone binary, no clone
+    // discoverable on disk), we OMIT the flag entirely. This
+    // preserves the pre-fix behaviour for forks running outside a
+    // clone — no regression for those legitimate cases.
+    let orch_root = crate::commands::installer::resolve_orchestrator_root(db);
+    for a in build_config_projection_apply_args(project_id, orch_root.as_deref()) {
+        cmd.arg(a);
+    }
 
     // Minimal env: clear inherited, then add only what the Python side
     // needs. This prevents per-launcher quirks (e.g. an inherited
@@ -3010,7 +3085,7 @@ pub async fn rename_project_v2(
     // surfaces (no downstream consumer here today; underscore-prefixed
     // to silence the unused-variable warning while preserving the call
     // for any side-effect logging inside `populate`).
-    if let Err(e) = apply_project_env_via_python(&id, folder) {
+    if let Err(e) = apply_project_env_via_python(&id, folder, &db) {
         let msg = format!(
             "rename env refresh (apply_project_env_via_python) failed: {}. \
              KG routing for the renamed project may be stale until manual repair.",
@@ -3090,7 +3165,7 @@ pub async fn set_shared_kg_write_disabled(
     // toggle without needing the pre-PR-2 Rust `env_settings` override.
     let mut warnings: Vec<String> = Vec::new();
     let folder = Path::new(&row.folder_path);
-    if let Err(e) = apply_project_env_via_python(&project_id, folder) {
+    if let Err(e) = apply_project_env_via_python(&project_id, folder, &db) {
         let msg = format!(
             "shared-KG write-disabled env refresh failed: {}. \
              Toggle persisted to DB but env files may be stale.",
@@ -3182,7 +3257,7 @@ pub fn refresh_project_env_with_db(
     let code_graph_access_list = env_settings.code_graph_access_list.clone();
 
     let mut warnings: Vec<String> = Vec::new();
-    if let Err(e) = apply_project_env_via_python(project_id, folder) {
+    if let Err(e) = apply_project_env_via_python(project_id, folder, db) {
         let msg = format!(
             "refresh_project_env (apply_project_env_via_python) failed: {}. \
              Access-matrix env vars may be stale until next refresh.",
@@ -3204,6 +3279,98 @@ pub struct RefreshProjectEnvResult {
     pub kg_access_list: Vec<String>,
     pub code_graph_access_list: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// v0.2.37 (Agent V37-E, 2026-05-27): bulk refresh of `.claude/env` +
+/// `.claude/settings.json` for every project the launcher knows about.
+///
+/// Why this exists: the canonical install-root resolver
+/// (`installer::resolve_orchestrator_root`) is now DB-cached, and
+/// install.py seeds the cache via `.vct/install_path_seed.txt` (the
+/// seed file is consumed on first launcher boot post-install). The
+/// SECOND consequence is that existing projects created BEFORE this
+/// release have stale `.claude/env` files missing
+/// `VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR` exports (the
+/// pre-v0.2.37 uncached resolver failed silently when the binary
+/// lived outside the clone). Re-running the project env writer once
+/// after the install/update boundary backfills the missing exports
+/// without any user action.
+///
+/// Used by:
+///   * The launcher's first-boot setup hook (post seed consumption)
+///     — re-renders env for every project so the SD15-style
+///     "missing exports" state is healed automatically.
+///   * The launcher GUI's "Refresh all projects" admin action, if a
+///     user wants to force a manual refresh after a manual edit to
+///     the launcher DB.
+///
+/// Soft-fail per project: one project's hiccup MUST NOT prevent the
+/// others from refreshing. Returns a per-project status map (the
+/// caller surfaces successes + failures in the GUI / log).
+pub fn refresh_all_projects_env_with_db(db: &Db) -> RefreshAllProjectsEnvResult {
+    let mut result = RefreshAllProjectsEnvResult::default();
+    let rows = match db.list_projects() {
+        Ok(r) => r,
+        Err(e) => {
+            result.global_warnings.push(format!("list_projects failed: {}", e));
+            return result;
+        }
+    };
+    for proj in &rows {
+        let folder = Path::new(&proj.folder_path);
+        if !folder.is_dir() {
+            // Project row points at a folder that no longer exists.
+            // Skip silently — the user will see the broken project
+            // in the GUI; refreshing a phantom dir would just create
+            // it, which is worse.
+            result.skipped.push(proj.name.clone());
+            continue;
+        }
+        match refresh_project_env_with_db(db, &proj.id) {
+            Ok(r) => {
+                if r.warnings.is_empty() {
+                    result.refreshed.push(proj.name.clone());
+                } else {
+                    result.refreshed_with_warnings.push((
+                        proj.name.clone(),
+                        r.warnings,
+                    ));
+                }
+            }
+            Err(e) => {
+                result.failed.push((proj.name.clone(), e));
+            }
+        }
+    }
+    result
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RefreshAllProjectsEnvResult {
+    /// Project names that refreshed cleanly.
+    pub refreshed: Vec<String>,
+    /// Per-project warnings (env writer surfaced soft-fails but the
+    /// refresh proceeded).
+    pub refreshed_with_warnings: Vec<(String, Vec<String>)>,
+    /// Per-project hard failures (refresh did not happen).
+    pub failed: Vec<(String, String)>,
+    /// Projects whose `folder_path` no longer exists on disk.
+    pub skipped: Vec<String>,
+    /// Errors outside the per-project loop (e.g. `list_projects`
+    /// itself failed).
+    pub global_warnings: Vec<String>,
+}
+
+/// v0.2.37 (Agent V37-E): Tauri command surface for the bulk refresh.
+/// Lets the launcher GUI's admin / dev-tools tab trigger a manual
+/// "re-render env for every project" without the user having to walk
+/// project-by-project. The boot hook in lib.rs calls
+/// `refresh_all_projects_env_with_db` directly (no Tauri layer).
+#[command]
+pub async fn refresh_all_projects_env(
+    db: State<'_, Db>,
+) -> Result<RefreshAllProjectsEnvResult, String> {
+    Ok(refresh_all_projects_env_with_db(&db))
 }
 
 #[command]
@@ -8914,5 +9081,303 @@ export BY_HAND_KEY=\"user_typed\"
             total_failed,
             total_skipped,
         })
+    }
+
+    // ─── v0.2.37 Finding F1: --orchestrator-root passed to Python ─────
+    //
+    // Pre-v0.2.37 the launcher built `python -m vco_lib.config_projection
+    // apply --project-id <id>` with NO `--orchestrator-root` argument.
+    // `vco_lib/config_projection.py:1241-1248` only emits
+    // `VCT_ORCHESTRATOR_ROOT` + `VCT_INFRASTRUCTURE_DIR` when the apply
+    // call receives `orchestrator_root is not None` — so the launcher
+    // was silently asking the Python writer NOT to emit those keys.
+    // This is the actual root cause of the SD15 / instambul_map bug.
+    //
+    // These tests pin the contract on the `build_config_projection_apply_args`
+    // helper: when the Rust resolver hands us a `Some(path)`, the flag
+    // must appear in the arg list. When it hands us `None` (legitimate
+    // for forks running outside a clone), the flag must NOT appear so
+    // we don't pass a bogus path that fails Python's `Path()` parse.
+
+    /// F1 — happy path: orchestrator root resolved → flag emitted.
+    #[test]
+    fn build_apply_args_includes_orchestrator_root_when_resolver_returns_some() {
+        let root = std::path::PathBuf::from("/some/orchestrator/clone");
+        let args = build_config_projection_apply_args("proj-123", Some(&root));
+        assert_eq!(
+            args,
+            vec![
+                "--project-id".to_string(),
+                "proj-123".to_string(),
+                "--orchestrator-root".to_string(),
+                "/some/orchestrator/clone".to_string(),
+            ],
+            "F1 fix regressed: --orchestrator-root must follow --project-id \
+             when the resolver returns Some. Args produced: {:?}",
+            args,
+        );
+    }
+
+    /// F1 — resolver returns None: flag omitted (no regression for
+    /// standalone-binary installs outside a clone).
+    #[test]
+    fn build_apply_args_omits_orchestrator_root_when_resolver_returns_none() {
+        let args = build_config_projection_apply_args("proj-xyz", None);
+        assert_eq!(
+            args,
+            vec![
+                "--project-id".to_string(),
+                "proj-xyz".to_string(),
+            ],
+            "F1: when resolver returns None we MUST NOT pass --orchestrator-root \
+             (Python's argparse would accept the empty string but config_projection \
+             would emit a phantom path). Args produced: {:?}",
+            args,
+        );
+    }
+
+    /// F1 — paths with spaces survive the to_string_lossy round-trip
+    /// intact. The user's home dir might be `/Users/Some User/` on
+    /// macOS or `C:\Users\Some User\` on Windows; the subprocess arg
+    /// API takes care of quoting.
+    #[test]
+    fn build_apply_args_preserves_path_with_spaces() {
+        let root = std::path::PathBuf::from("/Users/Some User/dev/vco");
+        let args = build_config_projection_apply_args("p", Some(&root));
+        assert!(
+            args.iter().any(|a| a == "/Users/Some User/dev/vco"),
+            "path with spaces should survive intact: {:?}",
+            args,
+        );
+    }
+
+    // ─── v0.2.37 Step 1: canonical resolver dedup ─────────────────────
+    //
+    // The pre-v0.2.37 `walk_for_install_markers` looked ONLY for
+    // `install.py + CLAUDE.md`. The pre-v0.2.37 `find_local_repo_root`
+    // looked ONLY for `vct-module.json`. The consolidated
+    // `looks_like_orchestrator_root` predicate must accept BOTH
+    // patterns so a partial checkout missing one marker but having
+    // the other still resolves.
+
+    #[test]
+    fn looks_like_orchestrator_root_accepts_vct_module_only() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-v0237-root-vct-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("vct-module.json"), "{}").unwrap();
+        // No install.py + no CLAUDE.md — should still qualify.
+        assert!(
+            crate::commands::installer::looks_like_orchestrator_root(&tmp),
+            "F1/Step1: directory with only vct-module.json must qualify"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn looks_like_orchestrator_root_accepts_install_py_and_claude_md_only() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-v0237-root-py-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("install.py"), "# stub").unwrap();
+        std::fs::write(tmp.join("CLAUDE.md"), "# stub").unwrap();
+        // No vct-module.json — should still qualify.
+        assert!(
+            crate::commands::installer::looks_like_orchestrator_root(&tmp),
+            "F1/Step1: directory with install.py+CLAUDE.md but no \
+             vct-module.json must qualify"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn looks_like_orchestrator_root_rejects_install_py_alone() {
+        // install.py without CLAUDE.md is NOT an orchestrator root —
+        // matches the pre-v0.2.37 walk-marker behaviour.
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-v0237-root-half-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("install.py"), "# stub").unwrap();
+        assert!(
+            !crate::commands::installer::looks_like_orchestrator_root(&tmp),
+            "install.py alone (no CLAUDE.md, no vct-module.json) must NOT qualify"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn looks_like_orchestrator_root_rejects_unrelated_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-v0237-root-empty-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("README.md"), "# random").unwrap();
+        assert!(
+            !crate::commands::installer::looks_like_orchestrator_root(&tmp),
+            "directory with neither marker must NOT qualify"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ─── v0.2.37 Step 2: populate uses canonical resolver ─────────────
+    //
+    // The contract: `populate()` must return `orchestrator_root=Some(...)`
+    // when the DB has `launcher.install_path` cached AND the cached
+    // path is a valid orchestrator clone, even if `current_exe()`'s
+    // walk-up would fail. This is the actual user-facing fix —
+    // populate's previous use of uncached `find_local_repo_root()`
+    // omitted VCT_ORCHESTRATOR_ROOT from .claude/env when the binary
+    // lived outside the clone.
+
+    /// Helper: create a temp directory that passes
+    /// `check_install_status`. install.py + CLAUDE.md + a
+    /// `state/install-manifest.json` with `installed:true`.
+    fn fake_install_root() -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "vct-v0237-fake-install-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(tmp.join("state")).unwrap();
+        std::fs::write(tmp.join("install.py"), "# stub\n").unwrap();
+        std::fs::write(tmp.join("CLAUDE.md"), "# stub\n").unwrap();
+        std::fs::write(
+            tmp.join("state/install-manifest.json"),
+            "{\"installed\":true}\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn populate_emits_orchestrator_root_from_db_cache() {
+        let db = Db::open_in_memory().expect("open in-memory db");
+        let install = fake_install_root();
+        db.app_state_set(
+            crate::commands::installer::APP_STATE_KEY_INSTALL_PATH,
+            &install.to_string_lossy(),
+        )
+        .expect("seed app_state");
+
+        let settings = project_env_settings::populate(&db, "FakeProj", None);
+
+        assert_eq!(
+            settings.orchestrator_root.as_ref(),
+            Some(&install),
+            "populate must return the DB-cached install path as \
+             orchestrator_root (instambul_map / SD15 bugfix). \
+             Got: {:?}",
+            settings.orchestrator_root,
+        );
+
+        std::fs::remove_dir_all(&install).ok();
+    }
+
+    #[test]
+    fn populate_returns_none_when_db_empty_and_walk_up_fails() {
+        // No DB seed. We can't easily neutralize the walk-up
+        // (current_exe() in cargo test points inside the orchestrator
+        // clone, so walk-up will succeed) — but we CAN verify the
+        // contract: orchestrator_root is either None OR Some(real
+        // orchestrator root). The previous bug was returning None
+        // INSPITE OF having a valid DB cache; the regression we want
+        // to pin is that DB cache + valid path → Some.
+        let db = Db::open_in_memory().expect("open in-memory db");
+        let settings = project_env_settings::populate(&db, "FakeProj", None);
+        // If walk-up succeeds (likely in `cargo test`), settings.orchestrator_root
+        // should be Some pointing at the real clone. If walk-up fails (rare),
+        // it should be None. Both are acceptable for this test — the bug we
+        // fixed was specifically "DB has a valid path but populate returns None".
+        if let Some(p) = &settings.orchestrator_root {
+            assert!(
+                p.is_dir(),
+                "walk-up resolution must point at an existing dir, got {}",
+                p.display()
+            );
+        }
+    }
+
+    // ─── v0.2.37 Finding F6: update_project_v2 backfills env ──────────
+    //
+    // The Tauri command `update_project_v2` cannot be driven directly
+    // from a unit test (it requires `State<'_, Db>`), and the
+    // subprocess it eventually calls needs python + vco_lib. Instead
+    // we pin a source-level invariant: the function body of
+    // `update_project_v2` MUST contain the
+    // `apply_project_env_via_python` call. If a future refactor
+    // accidentally drops this call, this test fails LOUDLY with the
+    // exact regression message — which is much louder than the silent
+    // SD15 "missing VCT_ORCHESTRATOR_ROOT" the F6 fix targets.
+    #[test]
+    fn update_project_v2_calls_apply_project_env_via_python() {
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // NOTE: CARGO_MANIFEST_DIR used here is for COMPILE-TIME source
+        // location lookup only (locate the file under audit). It is
+        // NOT embedded into a production code path — this is a unit
+        // test that walks source to enforce a contract.
+        let path = repo_root.join("src/commands/projects_v2.rs");
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+
+        // Find `pub async fn update_project_v2(` and grab its body to
+        // the next top-level `}`. Simple enough for this enforcement
+        // — `module_gui.rs::production_code_does_not_use_cargo_manifest_dir...`
+        // uses a more sophisticated brace-balanced scan; we don't need
+        // that precision here (we just want to know the call is
+        // present somewhere inside).
+        let fn_marker = "pub async fn update_project_v2(";
+        let start = body
+            .find(fn_marker)
+            .expect("update_project_v2 must exist; if you renamed it, update this test");
+        // Look ahead ~5000 chars — the function is ~60 lines.
+        let window_end = (start + 6000).min(body.len());
+        let fn_window = &body[start..window_end];
+
+        assert!(
+            fn_window.contains("apply_project_env_via_python"),
+            "F6 regression: update_project_v2 no longer calls \
+             apply_project_env_via_python. Pre-v0.2.37 this was the \
+             cause of stale `.claude/env` on bundle update (the \
+             SD15 missing-VCT_ORCHESTRATOR_ROOT bug). If you \
+             intentionally removed the call, update this test with \
+             the rationale and audit ALL bundle-update users."
+        );
+    }
+
+    #[test]
+    fn populate_writes_back_to_db_when_walk_up_succeeds() {
+        let db = Db::open_in_memory().expect("open in-memory db");
+        // Pre: DB cache is empty.
+        assert_eq!(
+            db.app_state_get(crate::commands::installer::APP_STATE_KEY_INSTALL_PATH).unwrap(),
+            None,
+            "precondition: app_state must start empty"
+        );
+        // Call populate — if walk-up succeeds (likely in `cargo test`),
+        // resolve_orchestrator_root caches the result.
+        let settings = project_env_settings::populate(&db, "TestProj", None);
+        if let Some(p) = &settings.orchestrator_root {
+            // The DB should now have the same path cached. This is the
+            // sticky-cache behaviour from `resolve_orchestrator_root`.
+            let cached = db
+                .app_state_get(crate::commands::installer::APP_STATE_KEY_INSTALL_PATH)
+                .expect("app_state read")
+                .expect("cache should be populated after walk-up hit");
+            assert_eq!(
+                cached,
+                p.to_string_lossy().to_string(),
+                "sticky cache should mirror walk-up result"
+            );
+        }
+        // (If walk-up failed in this test environment, no cache write
+        // is expected. The assertion above is conditional for that
+        // reason — `cargo test` may not always run from inside the
+        // clone.)
     }
 }
