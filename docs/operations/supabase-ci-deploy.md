@@ -56,6 +56,82 @@ Configure these on the repo (once per project — both the canonical orchestrato
 
 ---
 
+## First-time CI setup — one-time migration-history reconciliation
+
+This step is REQUIRED once per Supabase project before the `apply-migrations` step of the CI job will succeed. Run it from a maintainer workstation with the Supabase CLI installed locally.
+
+### Background
+
+Through v0.2.36, schema changes were applied directly via the Supabase SQL editor (or with an older CLI that didn't write to `launcher/supabase/migrations/`). The remote `schema_migrations` ledger contains 8 version IDs with no counterpart file in the repo:
+
+```
+20260418000000  20260418000001  20260418000002  20260418000003
+20260425        20260427000000  20260429        20260509000000
+```
+
+The DDL those IDs encode IS already present in the production schema — they ran successfully when applied via the SQL editor. The drift is purely in the ledger.
+
+`supabase db push` from a fresh checkout fails until this is resolved:
+
+```
+Remote migration versions not found in local migrations directory.
+```
+
+The marker migration `launcher/supabase/migrations/20260527000000_baseline_drift_reconciliation.sql` (committed in this same release) documents the situation in the repo but does NOT auto-repair anything — `supabase migration repair` is destructive and we keep it out of CI by design (see the rationale captured in that file's header comment).
+
+### Runbook
+
+```bash
+# 1. Install + log in to the Supabase CLI locally (one time).
+#    Or via `brew install supabase/tap/supabase` if you prefer.
+npm i -g supabase
+supabase login
+
+# 2. Link this checkout to the project you're reconciling.
+cd <repo-root>/launcher/supabase
+supabase link --project-ref <SUPABASE_PROJECT_REF>
+
+# 3. Mark the 8 orphan version IDs as `reverted` in the remote ledger.
+#    `reverted` removes them from the head-of-history pointer WITHOUT
+#    running any down-script (there isn't one — the legacy DDL stays in
+#    place). Roughly: "stop tracking these as outstanding; their
+#    schema effects are already in the database".
+supabase migration repair --status reverted \
+  20260418000000 20260418000001 20260418000002 20260418000003 \
+  20260425        20260427000000 20260429        20260509000000
+
+# 4. Snapshot the current remote schema as a baseline migration. This
+#    writes a new file like `20260527XXXXXX_remote_schema.sql` capturing
+#    every table/column/policy currently in production.
+supabase db pull
+
+# 5. Commit the baseline + your repair to the repo.
+git add launcher/supabase/migrations/
+git commit -m "chore(supabase): baseline drift reconciliation (one-time, post-v0.2.37)"
+git push origin main
+```
+
+After step 5, every future `supabase db push` (including the CI deploy job) starts from a clean ledger and applies only NEW migrations.
+
+### Verifying the reconciliation worked
+
+```bash
+cd launcher/supabase
+supabase db push --dry-run
+```
+
+Expected output: either `No new migrations to apply.` (if the working tree is in sync) or a list of net-new migration filenames (the ones added between reconciliation and now). The output should NOT contain `Remote migration versions not found`.
+
+### Why this is a doc-driven repair and not self-healing CI
+
+`supabase migration repair` mutates the remote `schema_migrations` ledger and is destructive in the sense that it cannot be cleanly reversed afterwards. Three reasons it stays a one-time human-supervised step rather than an automatic CI behaviour:
+
+* It's a one-time normalization — once reconciled, the issue is gone forever and there's no reason to keep destructive ledger-mutation code in every release run.
+* The current ledger state should be auditable by a human before the repair runs. Private forks may have their own legacy drift; their operator must inspect before blanket-applying our list.
+* `supabase db pull` writes a new committed file. CI committing migration files back to `main` would overlap awkwardly with the existing `commit-dist-binaries` job — we'd need a second branch-protection bypass token, and the failure modes are uglier than just having the operator run the steps once.
+
+---
+
 ## Verifying a CI deploy succeeded
 
 After a tag push, navigate to the run summary:
@@ -132,5 +208,6 @@ Nothing in the workflow file knows the canonical Supabase project ref — it's l
 ## Reference
 
 * `.github/workflows/release.yml` — workflow source (`supabase-deploy` job).
+* `launcher/supabase/migrations/20260527000000_baseline_drift_reconciliation.sql` — the marker migration that documents the legacy drift inside the migration directory itself.
 * `launcher/supabase/config.toml` — per-function `verify_jwt` overrides (committed-to-source-control auth posture).
 * `docs/MAINTAINER_GUIDE.md` — broader release-pipeline secrets (DIST_COMMIT_TOKEN, etc.).
