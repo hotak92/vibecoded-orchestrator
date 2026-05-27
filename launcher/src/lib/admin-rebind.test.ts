@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   friendlyRebindMessage,
+  hasActiveLicense,
   shouldShowRebindButton,
 } from './admin-rebind';
 import type { AdminRebindResult } from './types/launcher';
@@ -196,5 +197,79 @@ describe('friendlyRebindMessage', () => {
     expect(friendlyRebindMessage(makeResult({ error: 'ipc_failure' })).message).toMatch(
       /tauri ipc/i,
     );
+  });
+});
+
+// v0.2.37 (Bug 1): `hasActiveLicense` is the `$derived` predicate the
+// ActivationModal uses to decide which branch (activation input vs
+// Refresh/Rebind/Deactivate buttons) to render. Pre-v0.2.37 the modal
+// used the bare `tier !== 'free'` check, which collapsed two distinct
+// states — see the helper's docstring for the regression context.
+//
+// These tests pin the predicate's behaviour against representative
+// states (genuine free, happy-path paid tiers, recovery-mode free)
+// so a future tier-string addition or rebind-predicate tweak doesn't
+// silently re-introduce the regression. Since the launcher's vitest
+// config is node-only (no @testing-library/svelte, no jsdom), we test
+// the pure helper directly rather than rendering the component.
+describe('hasActiveLicense (modal gating predicate)', () => {
+  it('returns false for genuinely free user (no error)', () => {
+    // Pre-fix and post-fix agree: show activation input.
+    expect(hasActiveLicense('free')).toBe(false);
+    expect(hasActiveLicense('free', null)).toBe(false);
+    expect(hasActiveLicense('free', undefined)).toBe(false);
+    expect(hasActiveLicense('free', '')).toBe(false);
+  });
+
+  it('returns false when license store is empty (null/undefined tier)', () => {
+    expect(hasActiveLicense(null)).toBe(false);
+    expect(hasActiveLicense(undefined)).toBe(false);
+    expect(hasActiveLicense(null, null)).toBe(false);
+  });
+
+  it('returns true for paid tiers (pro / mao / enterprise / admin)', () => {
+    expect(hasActiveLicense('pro')).toBe(true);
+    expect(hasActiveLicense('mao')).toBe(true);
+    expect(hasActiveLicense('enterprise')).toBe(true);
+    expect(hasActiveLicense('admin')).toBe(true);
+  });
+
+  // The load-bearing regression case: admin's machine_id_hash drifts
+  // (OS reinstall, laptop swap, v0.2.35→v0.2.36 hash-algo migration).
+  // /validate-tier flips tier to 'free' server-side and writes
+  // last_error: machine_mismatch. Pre-fix this gave the user ONLY the
+  // activation input — the Rebind button was hidden in the `{:else}`
+  // branch. Post-fix the predicate returns true so the action buttons
+  // render and the user can self-recover.
+  it('returns true for free tier + machine_mismatch error (Bug 1 regression)', () => {
+    expect(hasActiveLicense('free', 'machine_mismatch')).toBe(true);
+  });
+
+  it('returns true for free tier + friendly "different machine" message', () => {
+    expect(
+      hasActiveLicense('free', 'Admin token is bound to a different machine.'),
+    ).toBe(true);
+  });
+
+  it('returns true for free tier + case-insensitive machine error', () => {
+    expect(hasActiveLicense('free', 'MACHINE_MISMATCH')).toBe(true);
+    expect(hasActiveLicense('free', 'Bound To A Different Machine')).toBe(true);
+  });
+
+  // Unrelated errors keep the user in the "no license" branch (we
+  // can't recover via rebind if the issue is network / invalid key /
+  // service down — the right affordance is still the activation input).
+  it('returns false for free tier + unrelated error', () => {
+    expect(hasActiveLicense('free', 'invalid_license_key')).toBe(false);
+    expect(hasActiveLicense('free', 'network')).toBe(false);
+    expect(hasActiveLicense('free', 'service_unavailable')).toBe(false);
+  });
+
+  it('stays true for paid tiers even with errors (last_error is informational)', () => {
+    // A pro user with a stale last_error from a prior failed refresh
+    // shouldn't suddenly see the activation input — they still have a
+    // valid license, the action buttons are correct.
+    expect(hasActiveLicense('pro', 'network')).toBe(true);
+    expect(hasActiveLicense('admin', 'machine_mismatch')).toBe(true);
   });
 });

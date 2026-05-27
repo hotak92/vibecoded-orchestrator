@@ -38,17 +38,23 @@
 //                                 of truth for tag selection — this default
 //                                 is advisory / used by callers that bypass
 //                                 the launcher logic.
-//   GHCR_USERNAME               — GitHub login the launcher uses for
-//                                 `podman login -u <user>`. Must match the
-//                                 owner of `GHCR_SERVICE_PAT` (the credential
-//                                 owner), NOT necessarily the owner of the
-//                                 package (which lives in `GHCR_PAID_IMAGE_REPO`).
-//                                 For the v0.2.36 per-module bot-user
-//                                 architecture: set to the bot user's login
-//                                 (e.g. `vct-bot-rl`) while `GHCR_PAID_IMAGE_REPO`
-//                                 stays at the package path (e.g.
-//                                 `hotak92/vct-rl-reranker`). When unset:
-//                                 falls back to the owner-half of
+//   GHCR_USERNAME               — GitHub login the credential owner uses.
+//                                 Used in TWO places (v0.2.37+, was one in
+//                                 v0.2.36): (1) the Basic-auth header on the
+//                                 server-side /token exchange — GHCR returns
+//                                 403 if the username doesn't match the PAT
+//                                 owner for personal-account packages; (2)
+//                                 the response `username` field the launcher
+//                                 passes to `podman login -u <user>`. Must
+//                                 match the owner of `GHCR_SERVICE_PAT` (the
+//                                 credential owner), NOT necessarily the
+//                                 owner of the package (which lives in
+//                                 `GHCR_PAID_IMAGE_REPO`). For the v0.2.36
+//                                 per-module bot-user architecture: set to
+//                                 the bot user's login (e.g. `vct-bot-rl`)
+//                                 while `GHCR_PAID_IMAGE_REPO` stays at the
+//                                 package path (e.g. `hotak92/vct-rl-reranker`).
+//                                 When unset: falls back to the owner-half of
 //                                 `GHCR_PAID_IMAGE_REPO` (Agent W's original
 //                                 auto-derivation; correct only when the
 //                                 package owner IS the credential owner —
@@ -150,13 +156,18 @@ const PAID_TAG_DEFAULT = resolvePaidTagDefault();
 // valid classic PAT that DOES have read:packages scope (verified via
 // `curl -H "Authorization: Bearer <PAT>" ghcr.io/token` vs
 // `curl -u <user>:<PAT> ghcr.io/token` on 2026-05-26 — only the
-// Basic form returns 200). The username is required (GHCR uses it
-// for audit-log attribution) but does NOT have to match the PAT
-// owner — for service-account usage we use a synthetic username
-// `vct-paid-module` which is the same one `container_login` uses
-// for the resulting pull-token on the launcher side.
+// Basic form returns 200).
+//
+// v0.2.37 (Issue 4a): the Basic-auth username MUST be the credential
+// owner's GitHub login (verified 2026-05-27: GHCR returns 403 when the
+// username doesn't match the PAT owner for personal-account packages).
+// Pre-v0.2.37 we used a synthetic literal `vct-paid-module` here, which
+// 403'd against `hotak92`'s PAT once the per-module bot-user
+// architecture moved the credential owner away from the package owner.
+// `resolveGhcrUsername()` reads `GHCR_USERNAME` (preferred) with a
+// fallback to the owner-half of `GHCR_PAID_IMAGE_REPO` — the same
+// resolver used for the response `username` field below.
 const GHCR_TOKEN_URL = "https://ghcr.io/token";
-const GHCR_BASIC_AUTH_USERNAME = "vct-paid-module";
 const TOKEN_TTL_SECONDS = 900; // 15 min — what we promise the client
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -263,11 +274,17 @@ async function exchangeForRegistryToken(): Promise<
   const url =
     `${GHCR_TOKEN_URL}?service=ghcr.io&scope=${encodeURIComponent(scope)}`;
 
-  // GHCR /token requires Basic auth (`base64("user:PAT")`). See the
-  // GHCR_BASIC_AUTH_USERNAME constant docstring above for why Bearer
+  // GHCR /token requires Basic auth (`base64("user:PAT")`). Bearer
   // fails despite being documented to work — observed empirically
   // 2026-05-26 with a classic PAT that DID have read:packages scope.
-  const basicCreds = btoa(`${GHCR_BASIC_AUTH_USERNAME}:${servicePat}`);
+  //
+  // v0.2.37 (Issue 4a): the username MUST be the credential owner's
+  // GitHub login (e.g. `vct-bot-rl` for the per-module bot-user
+  // architecture). Using a synthetic literal here gets 403 from GHCR
+  // for personal-account packages (verified 2026-05-27). Same
+  // resolver used for the response `username` field below — both
+  // call sites read the same env var so they cannot drift.
+  const basicCreds = btoa(`${resolveGhcrUsername()}:${servicePat}`);
   let resp: Response;
   try {
     resp = await fetch(url, {
@@ -334,9 +351,15 @@ async function exchangeForRegistryToken(): Promise<
 
   // Username for `podman/docker login -u <user>` on the client side.
   // For personal-account packages this MUST match the PAT owner's
-  // GitHub login (verified 2026-05-26 — synthetic usernames like
-  // `vct-paid-module` get 403). For org packages where the /token
-  // endpoint returns a scoped credential, any string works.
+  // GitHub login (verified 2026-05-26 — synthetic usernames like the
+  // legacy `vct-paid-module` literal get 403). For org packages where
+  // the /token endpoint returns a scoped credential, any string works.
+  //
+  // v0.2.37 (Issue 4a): SAME resolver is now used above for the
+  // server-side /token Basic-auth username (was a hardcoded literal
+  // pre-v0.2.37). Sharing the resolver means the two call sites can't
+  // drift — both read `GHCR_USERNAME` with the same fallback. See the
+  // top-of-file env-var contract for the resolution order.
   //
   // v0.2.36: resolved via `resolveGhcrUsername()`, which reads the
   // `GHCR_USERNAME` env var with a fallback to the owner-half of
