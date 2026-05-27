@@ -741,6 +741,26 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                             Property(name=prop_name, data_type=prop_type)
                         )
 
+                # v0.2.37 (Gap 6d): chunking props for legacy collections.
+                # Pre-chunking-era collections (created before chunk-aware
+                # sync) lack these three properties. Every sync then fails
+                # with "no such prop with name 'chunk_num'" because the
+                # writer ALWAYS sets chunk_num/total_chunks/source_node_id
+                # (see sync_node — even unchunked nodes write chunk_num=1,
+                # total_chunks=1). Patch them additively here so the next
+                # sync pass succeeds without manual schema migration.
+                chunking_props = {
+                    'chunk_num': DataType.INT,
+                    'total_chunks': DataType.INT,
+                    'source_node_id': DataType.TEXT,
+                }
+                for prop_name, prop_type in chunking_props.items():
+                    if prop_name not in existing_props:
+                        print(f"  Adding property: {prop_name}")
+                        collection.config.add_property(
+                            Property(name=prop_name, data_type=prop_type)
+                        )
+
                 # Add typed_links property if missing
                 if 'typed_links' not in existing_props:
                     print(f"  Adding property: typed_links (nested objects)")
