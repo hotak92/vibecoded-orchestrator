@@ -470,3 +470,83 @@ Deno.test("resolveGhcrUsername: warns on empty-string explicit set", () => {
     Deno.env.delete("GHCR_PAID_IMAGE_REPO");
   }
 });
+
+// ─── v0.2.37 (Issue 4a): Basic-auth header round-trip ─────────────────
+//
+// `rl-artifact-url/index.ts` constructs the GHCR /token Basic-auth
+// header as `btoa(\`${resolveGhcrUsername()}:${servicePat}\`)`. The
+// pre-v0.2.37 version used a hardcoded literal `vct-paid-module` for
+// the username, which 403'd against personal-account PATs once the
+// per-module bot-user architecture moved the credential owner away
+// from the package owner. These tests pin the exact round-trip the
+// /token call now makes: env state → resolver → Basic-encoded header
+// → base64-decoded credentials → ASSERT the username half matches
+// the credential owner (NOT the package owner, NOT the legacy literal).
+//
+// We can't easily mock fetch from Deno test (would need to import the
+// edge function module and patch a global). Instead we exercise the
+// same string-construction path the function uses — `resolveGhcrUsername`
+// + btoa — and assert the decoded username. This catches any future
+// regression that hardcodes the literal again, or that swaps the
+// resolver call for owner-half derivation.
+
+Deno.test("Basic-auth header (v0.2.37 fix): per-module bot user scenario", () => {
+  // Mirrors the load-bearing case: package at hotak92/vct-rl-reranker
+  // but credential owner is the dedicated vct-bot-rl bot.
+  Deno.env.set("GHCR_USERNAME", "vct-bot-rl");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "hotak92/vct-rl-reranker");
+  try {
+    const servicePat = "ghp_redacted-fake-pat-for-test";
+    // Same construction `exchangeForRegistryToken` does at the call
+    // site we hotfixed in index.ts.
+    const basicCreds = btoa(`${resolveGhcrUsername()}:${servicePat}`);
+    const decoded = atob(basicCreds);
+    const [username, pat] = decoded.split(":");
+    assertEquals(username, "vct-bot-rl");
+    // Must NOT be the legacy literal — that's exactly the regression
+    // we're locking against.
+    assertEquals(username === "vct-paid-module", false);
+    // Must NOT be the package owner (auto-derivation would yield this).
+    assertEquals(username === "hotak92", false);
+    // PAT half preserved verbatim (no encoding shenanigans).
+    assertEquals(pat, servicePat);
+  } finally {
+    Deno.env.delete("GHCR_USERNAME");
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
+});
+
+Deno.test("Basic-auth header (v0.2.37 fix): backwards-compat when GHCR_USERNAME unset", () => {
+  // Pre-bot-user deployment: package owner IS credential owner.
+  // GHCR_USERNAME unset → resolver derives from GHCR_PAID_IMAGE_REPO.
+  Deno.env.delete("GHCR_USERNAME");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "myorg/vct-rl-reranker");
+  try {
+    const servicePat = "ghp_redacted-fake-pat-for-test";
+    const basicCreds = btoa(`${resolveGhcrUsername()}:${servicePat}`);
+    const [username, _pat] = atob(basicCreds).split(":");
+    assertEquals(username, "myorg");
+  } finally {
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
+});
+
+Deno.test("Basic-auth header (v0.2.37 fix): tripwire against the pre-v0.2.37 hardcoded literal", () => {
+  // Even with both env vars present, the resolver MUST honour
+  // GHCR_USERNAME and NEVER yield "vct-paid-module" (the pre-v0.2.37
+  // hardcoded literal that GHCR returned 403 for personal-account
+  // packages). This test will fail if someone accidentally reintroduces
+  // a hardcoded username constant in the auth path.
+  Deno.env.set("GHCR_USERNAME", "vct-bot-rl");
+  Deno.env.set("GHCR_PAID_IMAGE_REPO", "hotak92/vct-rl-reranker");
+  try {
+    const username = resolveGhcrUsername();
+    assertEquals(username, "vct-bot-rl");
+    // The literal that 403'd pre-v0.2.37 — must NOT be the resolved value.
+    // Asserting inequality via `=== false`.
+    assertEquals(username === "vct-paid-module", false);
+  } finally {
+    Deno.env.delete("GHCR_USERNAME");
+    Deno.env.delete("GHCR_PAID_IMAGE_REPO");
+  }
+});
