@@ -689,6 +689,59 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
     return result
 
 
+# v0.2.38 A4: Canonical scalar-property registry for KG collections.
+#
+# BOTH the fresh-create path AND the additive-migrate path inside
+# `ensure_collection_exists` must stay in sync. Previously they were
+# independent inline dicts — V37-C Gap 6d found that chunking props
+# (chunk_num / total_chunks / source_node_id) existed in the create
+# branch but not the migrate branch, causing "no such prop" failures
+# on legacy collections. Hoisting into ONE constant here guarantees
+# the two paths can never diverge again.
+#
+# Mapping: prop_name → DataType sentinel.  DataType is a lazy import
+# inside ensure_collection_exists so we use string sentinels at the
+# module level and resolve them at runtime (avoids importing weaviate
+# at parse-time for scripts that only need the constant for inspection,
+# e.g. unit tests).
+#
+# String sentinels match DataType attribute names: "TEXT", "INT",
+# "DATE", "TEXT_ARRAY".  Non-scalar props (typed_links OBJECT_ARRAY,
+# linksTo cross-reference) are handled separately because they require
+# nested_properties / ReferenceProperty which can't be expressed as
+# a simple name→DataType mapping.
+_KG_NODE_SCALAR_PROPERTIES: dict[str, str] = {
+    # Core identity
+    "title":           "TEXT",
+    "content":         "TEXT",
+    "file_path":       "TEXT",
+    "node_type":       "TEXT",
+    # Multi-value arrays (TEXT_ARRAY is still a "scalar" Weaviate primitive)
+    "tags":            "TEXT_ARRAY",
+    "links":           "TEXT_ARRAY",
+    # External links (RDF-inspired; stored as JSON text since Weaviate OBJECT
+    # requires nested properties)
+    "external_links":  "TEXT",
+    # Legacy filesystem timestamps (back-compat)
+    "created_at":      "DATE",
+    "updated_at":      "DATE",
+    # Canonical temporal metadata (from frontmatter, PR-24 2026-05-16)
+    "created":         "DATE",
+    "updated":         "DATE",
+    "valid_from":      "DATE",
+    "valid_until":     "DATE",
+    # v0.2.17: status + content-hash for embed-skip on re-sync
+    "status":          "TEXT",
+    "content_hash":    "TEXT",
+    # v0.2.37 Gap 6d: chunking props — MUST be present in both fresh-create
+    # and additive-migrate paths to avoid "no such prop 'chunk_num'" failures
+    # on legacy collections.  Validated by test_kg_schema_consistency.py.
+    "chunk_num":       "INT",
+    "total_chunks":    "INT",
+    "source_node_id":  "TEXT",
+}
+
+
 def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
     """
     Ensure the project's KG_COLLECTION (env-resolved, fallback "KnowledgeGraph")
@@ -700,6 +753,9 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
     legacy 3-slot config if the import fails (one-off script runs outside
     the orchestrator clone). Mirrors `ensure_dev_collection_exists`.
 
+    Scalar properties sourced from `_KG_NODE_SCALAR_PROPERTIES` (v0.2.38 A4)
+    so fresh-create and additive-migrate paths cannot diverge.
+
     Args:
         server: Weaviate MCP server instance
 
@@ -709,52 +765,35 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
     try:
         from weaviate.classes.config import Configure, Property, DataType
 
+        # Resolve DataType values from the module-level string sentinels.
+        # Done once per call so tests can inspect _KG_NODE_SCALAR_PROPERTIES
+        # without importing weaviate.
+        _dt_map: dict[str, object] = {
+            "TEXT":       DataType.TEXT,
+            "INT":        DataType.INT,
+            "DATE":       DataType.DATE,
+            "TEXT_ARRAY": DataType.TEXT_ARRAY,
+        }
+        _scalar_props: dict[str, object] = {
+            name: _dt_map[sentinel]
+            for name, sentinel in _KG_NODE_SCALAR_PROPERTIES.items()
+        }
+
         if server.client.collections.exists(COLLECTION_NAME):
             print(f"✓ Collection '{COLLECTION_NAME}' exists")
 
-            # Check if temporal properties and references exist, add them if missing
+            # Additive-migrate path: add any scalar prop missing from an
+            # existing collection (temporal + chunking + hash).  Uses the
+            # same canonical list as the fresh-create path below — A4
+            # invariant enforced by test_kg_schema_consistency.py.
             try:
                 collection = server.client.collections.get(COLLECTION_NAME)
                 config = collection.config.get()
                 existing_props = {prop.name for prop in config.properties}
                 existing_refs = {ref.name for ref in (config.references or [])}
 
-                # Define temporal properties
-                temporal_props = {
-                    'created': DataType.DATE,
-                    'updated': DataType.DATE,
-                    'valid_from': DataType.DATE,
-                    'valid_until': DataType.DATE,
-                    'status': DataType.TEXT,
-                    # v0.2.17 (plan 0.2): content-hash for embed-skip on
-                    # re-sync. SHA-256 over (frontmatter-minus-updated +
-                    # body). Empty string until migrated; sync_node only
-                    # uses it to skip re-embed when stored AND non-empty.
-                    'content_hash': DataType.TEXT,
-                }
-
-                # Add missing properties
-                for prop_name, prop_type in temporal_props.items():
-                    if prop_name not in existing_props:
-                        print(f"  Adding property: {prop_name}")
-                        collection.config.add_property(
-                            Property(name=prop_name, data_type=prop_type)
-                        )
-
-                # v0.2.37 (Gap 6d): chunking props for legacy collections.
-                # Pre-chunking-era collections (created before chunk-aware
-                # sync) lack these three properties. Every sync then fails
-                # with "no such prop with name 'chunk_num'" because the
-                # writer ALWAYS sets chunk_num/total_chunks/source_node_id
-                # (see sync_node — even unchunked nodes write chunk_num=1,
-                # total_chunks=1). Patch them additively here so the next
-                # sync pass succeeds without manual schema migration.
-                chunking_props = {
-                    'chunk_num': DataType.INT,
-                    'total_chunks': DataType.INT,
-                    'source_node_id': DataType.TEXT,
-                }
-                for prop_name, prop_type in chunking_props.items():
+                # Add every scalar prop that's missing.
+                for prop_name, prop_type in _scalar_props.items():
                     if prop_name not in existing_props:
                         print(f"  Adding property: {prop_name}")
                         collection.config.add_property(
@@ -830,18 +869,22 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                 Configure.NamedVectors.none(name="openai_embed"),    # optional
             ]
 
-        # Create collection with proper schema (supports chunking + temporal + typed links)
+        # Fresh-create path: build Property list from the canonical scalar
+        # registry (_KG_NODE_SCALAR_PROPERTIES) so this path and the
+        # additive-migrate path above are always identical in coverage.
+        # Non-scalar props (typed_links, content_hash note, etc.) are
+        # appended inline below.
+        scalar_property_list = [
+            Property(name=name, data_type=dt)
+            for name, dt in _scalar_props.items()
+        ]
+
         server.client.collections.create(
             name=COLLECTION_NAME,
             description="Claude knowledge graph nodes with semantic search (chunked for large files)",
-            properties=[
-                Property(name="title", data_type=DataType.TEXT),
-                Property(name="content", data_type=DataType.TEXT),
-                Property(name="file_path", data_type=DataType.TEXT),
-                Property(name="node_type", data_type=DataType.TEXT),
-                Property(name="tags", data_type=DataType.TEXT_ARRAY),
-                Property(name="links", data_type=DataType.TEXT_ARRAY),
-                # NEW: Typed relationships as JSON objects
+            properties=scalar_property_list + [
+                # Typed relationships as JSON objects (non-scalar — needs
+                # nested_properties, cannot be expressed in the scalar registry)
                 Property(
                     name="typed_links",
                     data_type=DataType.OBJECT_ARRAY,
@@ -850,34 +893,6 @@ def ensure_collection_exists(server: WeaviateMCPServer) -> bool:
                         Property(name="target_title", data_type=DataType.TEXT)
                     ]
                 ),
-                # External links (RDF-inspired: DBpedia, official docs, GitHub, etc.)
-                # Stored as JSON text since Weaviate OBJECT requires nested properties
-                Property(name="external_links", data_type=DataType.TEXT),
-                Property(name="created_at", data_type=DataType.DATE),
-                Property(name="updated_at", data_type=DataType.DATE),
-                # Temporal metadata (from frontmatter)
-                Property(name="created", data_type=DataType.DATE),
-                Property(name="updated", data_type=DataType.DATE),
-                Property(name="valid_from", data_type=DataType.DATE),
-                Property(name="valid_until", data_type=DataType.DATE),
-                Property(name="status", data_type=DataType.TEXT),
-                # Chunking support
-                Property(name="chunk_num", data_type=DataType.INT),
-                Property(name="total_chunks", data_type=DataType.INT),
-                Property(name="source_node_id", data_type=DataType.TEXT),
-                # v0.2.17 (plan 0.2): SHA-256 over the source file
-                # (frontmatter-minus-updated + body, via
-                # `_content_signature_excluding_updated`). Compared
-                # against the stored value in `sync_node` to skip the
-                # delete-then-re-embed pipeline when content is
-                # unchanged. Saves ~5/sec Ollama embed calls + the
-                # delete+insert Weaviate roundtrips for every re-sync
-                # pass. Empty string on objects predating this property
-                # (existing-collection migration adds the property but
-                # doesn't backfill values) — those re-embed on next
-                # touch and then get a non-empty hash, which the run
-                # AFTER that one will then skip.
-                Property(name="content_hash", data_type=DataType.TEXT),
             ],
             # Named vectors must match `vco_lib.weaviate_schema.KG_NAMED_VECTORS`
             # (the canonical v0.2.18 catalog). Without these the collection
