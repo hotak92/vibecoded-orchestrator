@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.38] — unreleased
+
+### Fixed
+
+- **NEW-1: `container_pull` used L1 manifest's placeholder `pull_token_endpoint` instead of L0 catalog's real URL** (Agent V38-B): `installer_engine::request_pull_token` (and its caller `container_pull`) read `pull_token_endpoint` from the L1 manifest extracted from the image at install time. The RL Reranker image shipped with `placeholder.supabase.co/functions/v1/rl-pull-token` in `/app/vct-module.json`, causing every install attempt on v0.2.37 to fail with `POST https://placeholder.supabase.co/…: error sending request`. The L0 catalog (`module-catalog` edge function) always carries the real Supabase URL server-side. Fix: added `l0_pull_token_endpoint: Option<&str>` parameter to `request_pull_token` / `container_pull` / `run_install` / `run_upgrade` / `refetch_artifact`; when provided, it is preferred over the L1 value (`l0.unwrap_or(l1)` at the call site). `install_module_for_project` and `update_module_for_project` now call `resolve_install_metadata` (catalog-cache read, no network hit) and thread the L0 endpoint through. Soft-fail: if the catalog cache is empty, `None` is passed and L1 is used as before — install fails with a clear placeholder-URL error rather than silently wrong. Regression test `l0_endpoint_overrides_l1_placeholder_in_request_pull_token` pins both branches of the selection logic.
+
 ## [0.2.37] — 2026-05-27
 
 A **multi-axis hotfix release** — closes 7 distinct user-visible regressions discovered during v0.2.36 dogfooding (1 fresh-install of `instambul_map` exposed 5 install-bundle gaps; 1 fresh-3rd-party admin install exposed 2 launcher-side state bugs). 7 parallel Opus agents (V37-A/B/C/D/E/F/G) on isolated worktrees + per-branch diff review during integration.

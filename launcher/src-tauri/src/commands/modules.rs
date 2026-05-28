@@ -1376,7 +1376,17 @@ pub async fn install_module_for_project(
             .map(|snap| snap.gpu_mode_decided)
             .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
 
-    match installer_engine::run_install(&app, &manifest, &ctx, &project_id, gpu_mode, &db).await {
+    // NEW-1 (2026-05-28): read the L0 catalog's pull_token_endpoint so
+    // installer_engine can prefer it over the L1 manifest's value.
+    // Soft-fail: if the catalog cache is empty (user never opened Modules tab)
+    // fall back to None — the L1 value is used as before. The ContainerPull
+    // method may then fail with a placeholder URL, but the user gets a clear
+    // error rather than a silent wrong-URL 403.
+    let l0_pull_token_endpoint: Option<String> = resolve_install_metadata(&db, &module_id)
+        .ok()
+        .map(|l0| l0.install.container.pull_token_endpoint);
+
+    match installer_engine::run_install(&app, &manifest, &ctx, &project_id, gpu_mode, &db, l0_pull_token_endpoint.as_deref()).await {
         Ok(resolved_dir) => {
             db.set_module_status(&project_id, &module_id, ModuleStatus::Installed, None)?;
             db.audit(
@@ -1564,6 +1574,11 @@ pub async fn update_module_for_project(
             .map(|snap| snap.gpu_mode_decided)
             .unwrap_or(crate::commands::gpu_policy::GpuMode::Cpu);
 
+    // NEW-1 (2026-05-28): same L0 override as install_module_for_project.
+    let l0_pull_token_endpoint: Option<String> = resolve_install_metadata(&db, &module_id)
+        .ok()
+        .map(|l0| l0.install.container.pull_token_endpoint);
+
     match installer_engine::run_upgrade(
         &app,
         &manifest,
@@ -1572,6 +1587,7 @@ pub async fn update_module_for_project(
         &project_id,
         gpu_mode,
         &db,
+        l0_pull_token_endpoint.as_deref(),
     )
     .await
     {

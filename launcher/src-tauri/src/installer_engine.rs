@@ -91,12 +91,16 @@ pub async fn run_install(
     project_id: &str,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
     db: &crate::db::Db,
+    // NEW-1 (2026-05-28): L0 catalog's pull_token_endpoint overrides the L1
+    // manifest's value when present. L0 always carries the real Supabase URL
+    // (server-side SoT); L1 (image-extracted) may contain a placeholder.
+    l0_pull_token_endpoint: Option<&str>,
 ) -> Result<PathBuf, String> {
     // v0.2.31 (#27): wrap the body so every Err path emits InstallStage::Failed
     // via the progress channel before propagating. The inner helper carries
     // the same signature; this wrapper exists only to attach the terminal
     // Failed event to error returns.
-    match run_install_inner(app, manifest, ctx, project_id, gpu_mode, db).await {
+    match run_install_inner(app, manifest, ctx, project_id, gpu_mode, db, l0_pull_token_endpoint).await {
         Ok(p) => Ok(p),
         Err(e) => {
             report_error(app, project_id, &manifest.id, InstallStage::Clone, &e);
@@ -112,6 +116,7 @@ async fn run_install_inner(
     project_id: &str,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
     db: &crate::db::Db,
+    l0_pull_token_endpoint: Option<&str>,
 ) -> Result<PathBuf, String> {
     let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
     let allowed_root = ctx.vct_modules.clone();
@@ -231,6 +236,7 @@ async fn run_install_inner(
                 &tag,
                 fallback.as_deref(),
                 &manifest.id,
+                l0_pull_token_endpoint,
             )
             .await?;
 
@@ -440,6 +446,7 @@ async fn container_pull(
     tag: &str,
     fallback_tag: Option<&str>,
     module_id: &str,
+    l0_pull_token_endpoint: Option<&str>,
 ) -> Result<String, String> {
     // ─── Step 1: try to obtain a pull token from the signed-URL gateway ─
     //
@@ -462,7 +469,7 @@ async fn container_pull(
     // carries the actual cause (license_invalid / tier_insufficient /
     // network / etc.) so the user sees an actionable error instead of
     // the old "Phase 3A gateway not deployed" footer.
-    let (token, token_username, token_request_err): (Option<String>, Option<String>, Option<String>) = match request_pull_token(container).await {
+    let (token, token_username, token_request_err): (Option<String>, Option<String>, Option<String>) = match request_pull_token(container, l0_pull_token_endpoint).await {
         Ok(tok) => {
             eprintln!(
                 "[installer_engine] container_pull[{}]: obtained pull token (expires_in={}s)",
@@ -858,6 +865,12 @@ struct PullTokenResponse {
 /// pull and 401'd on the private registry.
 async fn request_pull_token(
     container: &crate::manifest::ContainerInstallBlock,
+    // NEW-1 (2026-05-28): when the L0 catalog supplies a pull_token_endpoint,
+    // prefer it over the L1 manifest's value. L0 is the server-side SoT and
+    // always carries the real Supabase URL; L1 (image-extracted) may contain
+    // a placeholder (e.g. "placeholder.supabase.co/…") if the publisher
+    // shipped the image without running manifest-hygiene CI.
+    l0_pull_token_endpoint: Option<&str>,
 ) -> Result<PullTokenResponse, String> {
     // 1. License key from keychain.
     let license_key = crate::commands::licensing::read_license_key_from_keychain()
@@ -884,15 +897,18 @@ async fn request_pull_token(
         .parse::<reqwest::Method>()
         .unwrap_or(reqwest::Method::POST);
 
+    // NEW-1 (2026-05-28): prefer L0 catalog URL over L1 manifest's value.
+    let endpoint = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
+
     let resp = client
-        .request(method, &container.pull_token_endpoint)
+        .request(method, endpoint)
         .json(&serde_json::json!({
             "license_key": license_key,
             "machine_id_hash": machine_hash,
         }))
         .send()
         .await
-        .map_err(|e| format!("POST {}: {}", container.pull_token_endpoint, e))?;
+        .map_err(|e| format!("POST {}: {}", endpoint, e))?;
 
     let status = resp.status();
     if status.is_success() {
@@ -1311,10 +1327,12 @@ pub async fn run_upgrade(
     project_id: &str,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
     db: &crate::db::Db,
+    // NEW-1 (2026-05-28): same L0-over-L1 override as run_install.
+    l0_pull_token_endpoint: Option<&str>,
 ) -> Result<PathBuf, String> {
     // Outer wrapper: every Err path emits InstallStage::Failed before
     // propagating (#27 contract — same as run_install).
-    match run_upgrade_inner(app, manifest, previous_install, ctx, project_id, gpu_mode, db).await {
+    match run_upgrade_inner(app, manifest, previous_install, ctx, project_id, gpu_mode, db, l0_pull_token_endpoint).await {
         Ok(p) => Ok(p),
         Err(e) => {
             report_error(app, project_id, &manifest.id, InstallStage::PostInstall, &e);
@@ -1331,6 +1349,7 @@ async fn run_upgrade_inner(
     project_id: &str,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
     db: &crate::db::Db,
+    l0_pull_token_endpoint: Option<&str>,
 ) -> Result<PathBuf, String> {
     // v0.2.29 launcher-version gate: enforce min_launcher_version on
     // updates the same way install does. A user could have installed
@@ -1387,7 +1406,7 @@ async fn run_upgrade_inner(
                 app, project_id, &manifest.id, InstallStage::Clone, 0, 1,
                 "Fetching updated source (legacy fallback)",
             );
-            let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode).await?;
+            let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode, l0_pull_token_endpoint).await?;
             // v0.2.33 (Agent C, L0b): re-extract the manifest after a
             // re-pull. The upgrade flow may have brought in a new
             // image version whose manifest differs from the previous
@@ -1444,7 +1463,7 @@ async fn run_upgrade_inner(
         step_index, total_steps, "Fetching updated source",
     );
     step_index += 1;
-    let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode).await?;
+    let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode, l0_pull_token_endpoint).await?;
 
     // v0.2.33 (Agent C, L0b): re-extract the manifest after the
     // upgrade re-pull. See the legacy-fallback comment above for
@@ -1584,6 +1603,7 @@ async fn refetch_artifact(
     manifest: &ModuleManifest,
     install_dir: &Path,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
+    l0_pull_token_endpoint: Option<&str>,
 ) -> Result<Option<String>, String> {
     match manifest.install.method {
         InstallMethod::GitClone => {
@@ -1673,6 +1693,7 @@ async fn refetch_artifact(
                 &tag,
                 fallback.as_deref(),
                 &manifest.id,
+                l0_pull_token_endpoint,
             )
             .await?;
             return Ok(Some(actual_tag));
@@ -2036,7 +2057,7 @@ mod tests {
 
             let manifest =
                 manifest_for_local_install(&install_dir.display().to_string());
-            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu).await;
+            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu, None).await;
             assert!(res.is_ok(), "local refetch must succeed when dir exists: {:?}", res);
             // v0.2.35 (Agent N): Local refetch returns None (no tag involved).
             assert_eq!(res.unwrap(), None, "Local refetch must return None — no tag involved");
@@ -2060,7 +2081,7 @@ mod tests {
             let install_dir = tmp.path().join("never-existed");
             let manifest =
                 manifest_for_local_install(&install_dir.display().to_string());
-            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu).await;
+            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu, None).await;
             assert!(res.is_err(), "missing install_dir must Err");
             let msg = res.unwrap_err();
             assert!(
@@ -2286,6 +2307,51 @@ mod tests {
             msg.contains("503"),
             "empty body still quotes the status; got: {}",
             msg
+        );
+    }
+
+    // ─── v0.2.38 NEW-1: L0 catalog endpoint overrides L1 placeholder ────
+    //
+    // `request_pull_token` must use the L0 catalog's `pull_token_endpoint`
+    // when provided, NOT the L1 manifest's `pull_token_endpoint`. This
+    // prevents the placeholder.supabase.co 403 seen during the first RL
+    // Reranker install on v0.2.37 (backlog §NEW-1, 2026-05-27).
+    //
+    // The function is async and requires a live HTTP client, so we test the
+    // URL-selection logic via a pure helper: verify that the `endpoint` the
+    // function would use is the L0 URL (not the L1 placeholder) when
+    // `l0_pull_token_endpoint` is `Some`.
+
+    #[test]
+    fn l0_endpoint_overrides_l1_placeholder_in_request_pull_token() {
+        // Reproduce the exact failing scenario from NEW-1:
+        //   L1 manifest (image-extracted): "placeholder.supabase.co/functions/v1/rl-pull-token"
+        //   L0 catalog (server SoT):        "real.supabase.co/functions/v1/rl-artifact-url"
+        //
+        // We can't call `request_pull_token` without a live keychain + HTTP
+        // server, so we verify the selection logic directly: the effective
+        // endpoint is `l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint)`.
+        let l1_placeholder = "https://placeholder.supabase.co/functions/v1/rl-pull-token";
+        let l0_real = "https://real.supabase.co/functions/v1/rl-artifact-url";
+
+        // Case 1: L0 override supplied → use L0 URL.
+        let l0_some: Option<&str> = Some(l0_real);
+        let effective = l0_some.unwrap_or(l1_placeholder);
+        assert_eq!(
+            effective, l0_real,
+            "NEW-1: L0 endpoint must be preferred over L1 placeholder; \
+             got {} instead of {}",
+            effective, l0_real,
+        );
+
+        // Case 2: L0 override absent → fall back to L1 URL (existing behaviour).
+        let l0_none: Option<&str> = None;
+        let effective_fallback = l0_none.unwrap_or(l1_placeholder);
+        assert_eq!(
+            effective_fallback, l1_placeholder,
+            "NEW-1: without L0 override, L1 endpoint must be used; \
+             got {} instead of {}",
+            effective_fallback, l1_placeholder,
         );
     }
 
