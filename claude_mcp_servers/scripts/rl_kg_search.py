@@ -140,9 +140,17 @@ async def main():
         # below self-collection results even when their score is higher.
         all_formatted.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
-        # RL rerank (calls RL server, falls back to Weaviate order)
+        # RL rerank (calls RL server, falls back to Weaviate order).
+        # NEW-8 (2026-05-28): pass query embedding so the local telemetry
+        # writer records it for offline training. Pre-fix, every retrieval
+        # event under cohorts orchestrator-root/VibeCoded*/VCODev (758
+        # events since 2026-05-20) was written without query_emb because
+        # this kwarg was missing.
         task_id = f"pre_edit_{uuid.uuid4().hex[:8]}"
-        results = await _rl_cache_and_rerank(task_id, args.query, all_formatted, args.limit)
+        results = await _rl_cache_and_rerank(
+            task_id, args.query, all_formatted, args.limit,
+            query_emb=vector,
+        )
         for r in results:
             if "score" not in r:
                 d = r.get("distance")
