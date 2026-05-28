@@ -523,6 +523,68 @@ enum PipeLine {
 /// Run the kg-sync subprocess, stream stdout+stderr line-by-line for live
 /// progress events, and parse the summary lines for the final counts.
 ///
+/// Build the environment variable pairs for the kg-sync subprocess.
+///
+/// Extracted as a pure helper so the env-building logic can be unit-tested
+/// without spawning a real process.
+///
+/// Returns a `Vec` of `(&'static str, OsString)` pairs ready to feed into
+/// `Command::env`.  `orchestrator_root` is `Some` when the launcher has a
+/// configured install root; when `None` the two root vars are omitted.
+fn build_kg_sync_env(
+    env_settings: &ProjectEnvSettings,
+    project_folder: &std::path::Path,
+    orchestrator_root: Option<&std::path::Path>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let mut pairs: Vec<(&'static str, std::ffi::OsString)> = vec![
+        ("KG_BASE_DIR", project_folder.as_os_str().to_owned()),
+        (
+            "PROJECT_NAME",
+            std::ffi::OsString::from(&env_settings.project_name),
+        ),
+        (
+            "KG_COLLECTION",
+            std::ffi::OsString::from(&env_settings.kg_collection),
+        ),
+        (
+            "DEVELOPMENT_COLLECTION",
+            std::ffi::OsString::from(&env_settings.dev_collection),
+        ),
+        (
+            "SHARED_KG_COLLECTION",
+            std::ffi::OsString::from(&env_settings.shared_kg_collection),
+        ),
+        (
+            "WEAVIATE_URL",
+            std::ffi::OsString::from(&env_settings.weaviate_url),
+        ),
+        (
+            "OLLAMA_URL",
+            std::ffi::OsString::from(&env_settings.ollama_url),
+        ),
+        (
+            "ACTIVE_EMBEDDING",
+            std::ffi::OsString::from(&env_settings.active_embedding),
+        ),
+    ];
+
+    if let Some(root) = orchestrator_root {
+        pairs.push(("VCT_ORCHESTRATOR_ROOT", root.as_os_str().to_owned()));
+        // NEW-15 (2026-05-28): also pass VCT_INSTALL_ROOT so the kg-sync
+        // wrapper's first venv-candidate (`${VCT_INSTALL_ROOT}/.venv`) is
+        // populated. Without this, projects without a project-local
+        // `.venv` (e.g. anything installed via the launcher's install-
+        // bundle flow since v0.2.36) fall through to SCRIPT_DIR-relative
+        // candidates that don't exist, then to system python with no
+        // `weaviate` → `ModuleNotFoundError: No module named 'weaviate'`.
+        // Symptom: KG sync: failed on the project's Identity tab.
+        // codegraph.rs:1117 already does this; this is the sibling.
+        pairs.push(("VCT_INSTALL_ROOT", root.as_os_str().to_owned()));
+    }
+
+    pairs
+}
+
 /// Concurrent drain (Bug-3 v0.2.x, 2026-05-12): stdout and stderr are
 /// read by two `tokio::spawn` tasks feeding a shared `mpsc::channel`.
 /// The main loop awaits messages, tagged with their origin pipe, and
@@ -548,16 +610,6 @@ async fn run_subprocess(
     let mut cmd = tokio::process::Command::new(&program).silent();
     cmd.args(&base_args)
         .arg("--all")
-        // KG_BASE_DIR + the project's own folder; sync_knowledge_graph.py
-        // resolves knowledge/ and docs/ relative to one of these.
-        .env("KG_BASE_DIR", project_folder.as_os_str())
-        .env("PROJECT_NAME", &env_settings.project_name)
-        .env("KG_COLLECTION", &env_settings.kg_collection)
-        .env("DEVELOPMENT_COLLECTION", &env_settings.dev_collection)
-        .env("SHARED_KG_COLLECTION", &env_settings.shared_kg_collection)
-        .env("WEAVIATE_URL", &env_settings.weaviate_url)
-        .env("OLLAMA_URL", &env_settings.ollama_url)
-        .env("ACTIVE_EMBEDDING", &env_settings.active_embedding)
         // Don't inherit the launcher's working dir; pin to a neutral path.
         // The kg-sync wrapper resolves its own paths relative to its
         // installed location, so cwd doesn't matter for correctness — but
@@ -568,8 +620,8 @@ async fn run_subprocess(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    if let Some(root) = orchestrator_root {
-        cmd.env("VCT_ORCHESTRATOR_ROOT", root.as_os_str());
+    for (key, val) in build_kg_sync_env(env_settings, project_folder, orchestrator_root) {
+        cmd.env(key, val);
     }
 
     #[cfg(windows)]
@@ -1760,5 +1812,68 @@ mod tests {
         let _ = h_err.await;
         let exit = child.wait().await.expect("wait");
         assert!(!exit.success(), "killed subprocess must report failure");
+    }
+
+    // NEW-15 (2026-05-28): regression — kg_sync subprocess must receive VCT_INSTALL_ROOT.
+    //
+    // Before the fix, `run_subprocess` only set `VCT_ORCHESTRATOR_ROOT` when
+    // `orchestrator_root` was `Some`. `VCT_INSTALL_ROOT` was never set.  The
+    // kg-sync wrapper tries `${VCT_INSTALL_ROOT}/.venv` as its first venv
+    // candidate; without this env var the wrapper falls through to
+    // SCRIPT_DIR-relative candidates that don't exist on launcher-bundle-
+    // installed projects, landing on system python which has no `weaviate`
+    // package → `ModuleNotFoundError: No module named 'weaviate'` / "KG sync:
+    // failed" shown in the Identity tab.
+    #[test]
+    fn build_kg_sync_env_includes_vct_install_root_when_orchestrator_root_set() {
+        use crate::commands::project_env_settings::ProjectEnvSettings;
+        use std::path::Path;
+
+        let env_settings = ProjectEnvSettings::with_defaults("TestProject");
+        let project_folder = Path::new("/tmp/my-project");
+        let orchestrator_root = Path::new("/home/user/vco");
+
+        let pairs = build_kg_sync_env(&env_settings, project_folder, Some(orchestrator_root));
+
+        let find = |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+        };
+
+        let orch_root = find("VCT_ORCHESTRATOR_ROOT")
+            .expect("VCT_ORCHESTRATOR_ROOT must be present when orchestrator_root is Some");
+        let install_root = find("VCT_INSTALL_ROOT")
+            .expect("VCT_INSTALL_ROOT must be present when orchestrator_root is Some");
+
+        assert_eq!(
+            orch_root,
+            orchestrator_root.as_os_str(),
+            "VCT_ORCHESTRATOR_ROOT must equal orchestrator_root"
+        );
+        assert_eq!(
+            install_root,
+            orchestrator_root.as_os_str(),
+            "VCT_INSTALL_ROOT must equal orchestrator_root (NEW-15 regression)"
+        );
+    }
+
+    #[test]
+    fn build_kg_sync_env_omits_root_vars_when_orchestrator_root_absent() {
+        use crate::commands::project_env_settings::ProjectEnvSettings;
+        use std::path::Path;
+
+        let env_settings = ProjectEnvSettings::with_defaults("TestProject");
+        let pairs = build_kg_sync_env(&env_settings, Path::new("/tmp/p"), None);
+
+        assert!(
+            pairs.iter().all(|(k, _)| *k != "VCT_ORCHESTRATOR_ROOT"),
+            "VCT_ORCHESTRATOR_ROOT must be absent when orchestrator_root is None"
+        );
+        assert!(
+            pairs.iter().all(|(k, _)| *k != "VCT_INSTALL_ROOT"),
+            "VCT_INSTALL_ROOT must be absent when orchestrator_root is None"
+        );
     }
 }
