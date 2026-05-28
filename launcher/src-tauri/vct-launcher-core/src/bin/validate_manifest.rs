@@ -42,7 +42,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use vct_launcher_core::manifest::ModuleManifest;
+use vct_launcher_core::manifest::{ModuleManifest, WarningSeverity};
 
 fn print_usage() {
     eprintln!(
@@ -90,9 +90,32 @@ fn main() -> ExitCode {
     let mut ok = 0usize;
     for path in &paths {
         match validate_one(path) {
-            Ok(()) => {
-                println!("[OK]   {}", path.display());
-                ok += 1;
+            Ok(warnings) => {
+                // NEW-3.D (2026-05-28): print deprecation warnings even on
+                // parse-OK manifests. Exit 0 for deprecations only (backward
+                // compatible with existing RL Reranker manifests). Exit 1 only
+                // when Error-severity warnings are present.
+                let has_errors = warnings.iter()
+                    .any(|w| w.severity == WarningSeverity::Error);
+                if has_errors {
+                    // Error-severity: print + count as failure.
+                    for w in &warnings {
+                        let prefix = match w.severity {
+                            WarningSeverity::Error       => "[error]",
+                            WarningSeverity::Deprecation => "[deprecation]",
+                        };
+                        println!("{} {}: {}: {}", prefix, path.display(), w.field, w.message);
+                    }
+                    eprintln!("[FAIL] {}: manifest contract validation failed", path.display());
+                    errors += 1;
+                } else {
+                    // No errors. Print any deprecation warnings, then OK.
+                    for w in &warnings {
+                        println!("[deprecation] {}: {}: {}", path.display(), w.field, w.message);
+                    }
+                    println!("[OK]   {}", path.display());
+                    ok += 1;
+                }
             }
             Err(msg) => {
                 eprintln!("[FAIL] {}: {}", path.display(), msg);
@@ -116,14 +139,22 @@ fn main() -> ExitCode {
              this launcher version doesn't know about, the launcher itself needs\n\
              to be updated first. Lenient mode (VCT_LAUNCHER_STRICT_MANIFEST=0)\n\
              would render the unknown kind as a placeholder at runtime, but CI\n\
-             intentionally runs strict so the gap is caught at PR time."
+             intentionally runs strict so the gap is caught at PR time.\n\
+             \n\
+             For manifest contract errors (missing install.container.image etc.),\n\
+             see the [error] lines above and update the module manifest."
         );
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-fn validate_one(path: &PathBuf) -> Result<(), String> {
+// NEW-3.D (2026-05-28): returns Ok(warnings) on parse success, Err(msg) on
+// parse failure. Warnings from validate_for_container_start are non-fatal
+// at the parse level — the caller decides whether to block on Error severity.
+fn validate_one(path: &PathBuf) -> Result<Vec<vct_launcher_core::manifest::ManifestWarning>, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read error: {}", e))?;
-    ModuleManifest::from_json(&raw).map(|_| ()).map_err(|e| e)
+    let manifest = ModuleManifest::from_json(&raw)?;
+    let warnings = manifest.validate_for_container_start();
+    Ok(warnings)
 }

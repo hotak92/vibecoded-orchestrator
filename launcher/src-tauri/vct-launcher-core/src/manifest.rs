@@ -1928,6 +1928,123 @@ impl ModuleManifest {
     pub fn is_compatible_with_host(&self, host: &str) -> bool {
         self.compatibility.hosts.iter().any(|h| h == host)
     }
+
+    /// NEW-3.D (2026-05-28): validate that a `service`/`container` runtime
+    /// module has the fields needed for the launcher's container start path.
+    /// Returns a Vec of [`ManifestWarning`]s (empty = fully valid).
+    ///
+    /// Only applies to manifests with `install.method == ContainerPull` AND
+    /// `runtime.type ∈ {"container", "service"}`. All other modules return
+    /// an empty Vec immediately.
+    ///
+    /// Warnings divide into two severity levels:
+    /// - `Error` — field is required with no sensible default (e.g. missing
+    ///   `install.container.image`). Callers SHOULD block the install.
+    /// - `Deprecation` — field is missing but can be synthesized. Callers
+    ///   SHOULD log + audit and continue. Publishers should declare the field
+    ///   explicitly to silence the warning.
+    pub fn validate_for_container_start(&self) -> Vec<ManifestWarning> {
+        let mut warnings = Vec::new();
+
+        // Only meaningful for container-pull + container/service runtime.
+        if self.install.method != InstallMethod::ContainerPull {
+            return warnings;
+        }
+        if !matches!(self.runtime.r#type.as_str(), "container" | "service") {
+            return warnings;
+        }
+
+        // Hard error: install.container block must be present and have a non-empty image.
+        let image_ok = self.install.container.as_ref()
+            .map(|c| !c.image.is_empty())
+            .unwrap_or(false);
+        if !image_ok {
+            warnings.push(ManifestWarning::error(
+                "install.container.image",
+                "required for container_pull modules — no image to pull",
+            ));
+        }
+
+        // Deprecation: container_name_template missing but synthesizable.
+        if self.runtime.container_name_template.is_none() {
+            warnings.push(ManifestWarning::deprecation(
+                "runtime.container_name_template",
+                "missing; launcher will synthesize as '{module_id}-{project_slug}'. \
+                 Declare explicitly to silence this warning.",
+            ));
+        }
+
+        // Deprecation: image_ref missing but synthesizable from install.container.
+        if self.runtime.image_ref.is_none() {
+            warnings.push(ManifestWarning::deprecation(
+                "runtime.image_ref",
+                "missing; launcher will synthesize from install.container.image + version. \
+                 Declare explicitly to silence this warning.",
+            ));
+        }
+
+        // Deprecation: raw runtime.args with no structured ports — likely -p flags
+        // that the supervisor won't pick up correctly.
+        if self.runtime.ports.is_empty() && !self.runtime.args.is_empty() {
+            let has_p_flag = self.runtime.args.iter().any(|a| a == "-p" || a.starts_with("-p"));
+            if has_p_flag {
+                warnings.push(ManifestWarning::deprecation(
+                    "runtime.ports",
+                    "raw -p flag detected in runtime.args but runtime.ports is empty. \
+                     Declare runtime.ports for structured port forwarding.",
+                ));
+            }
+        }
+
+        warnings
+    }
+}
+
+/// Severity of a [`ManifestWarning`] emitted by
+/// [`ModuleManifest::validate_for_container_start`].
+///
+/// `Error` warnings indicate a field with no sensible default — callers
+/// should block the install. `Deprecation` warnings indicate a field that
+/// will be synthesized at start time but should be declared explicitly by
+/// the publisher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarningSeverity {
+    /// Field is required and has no sensible default. Callers should block.
+    Error,
+    /// Field is optional-but-recommended; a default will be synthesized.
+    Deprecation,
+}
+
+/// A single validation warning from [`ModuleManifest::validate_for_container_start`].
+#[derive(Debug, Clone)]
+pub struct ManifestWarning {
+    /// Dotted field path (e.g. `"runtime.container_name_template"`).
+    pub field: String,
+    /// Human-readable explanation, including the synthesized default when
+    /// applicable.
+    pub message: String,
+    /// Whether this warning should block the install or just be logged.
+    pub severity: WarningSeverity,
+}
+
+impl ManifestWarning {
+    /// Construct a `Deprecation`-severity warning.
+    pub fn deprecation(field: &str, message: &str) -> Self {
+        Self {
+            field: field.to_owned(),
+            message: message.to_owned(),
+            severity: WarningSeverity::Deprecation,
+        }
+    }
+
+    /// Construct an `Error`-severity warning.
+    pub fn error(field: &str, message: &str) -> Self {
+        Self {
+            field: field.to_owned(),
+            message: message.to_owned(),
+            severity: WarningSeverity::Error,
+        }
+    }
 }
 
 /// v0.2.31: validate a `DbBlock` from a parsed manifest.

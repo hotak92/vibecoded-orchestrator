@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.39] — unreleased
+
+### Added
+
+- **NEW-3.D: install-time manifest contract validator for container-distributed modules** (Agent V39-NEW3.D): `ModuleManifest::validate_for_container_start()` in `vct-launcher-core/src/manifest.rs` checks that `container_pull` + `service`/`container` runtime manifests declare `install.container.image` (Error), `runtime.container_name_template` (Deprecation), and `runtime.image_ref` (Deprecation). `ManifestWarning` + `WarningSeverity` types carry field path + message + severity. Wired into `install_module_for_project` in `modules.rs` BEFORE `set_module_status(Installed)`: Error warnings block with `set_module_status(Error)` + a clear `Err` return; Deprecation warnings log to `eprintln` + `db.audit("module_install_manifest_deprecation")` and continue. CI validator binary (`validate-manifest`) extended to call `validate_for_container_start()` and print `[deprecation]`/`[error]` prefixed lines — exits non-zero only on Error severity (RL Reranker v0.2.7 manifest emits 3 deprecation warnings + 0 errors, exit 0: backward compatible). 7 integration tests in `vct-launcher-core/tests/manifest_ci_gate.rs` cover: passes-fully-valid, deprecation-for-missing-container_name_template, deprecation-for-missing-image_ref, error-for-missing-image, skips-non-container-pull, skips-cli-runtime, rl-reranker-v027-emits-deprecations-not-errors.
+
 ## [0.2.38] — 2026-05-28
 
 A **comprehensive paid-module + install-pipeline + telemetry + KG-hygiene release** — closes 14 distinct items (8 fixes + 4 features + 2 CI gates) across two parallel agent fanouts, with audit-before-fanout discipline applied. Fixes 4 production regressions from v0.2.36/0.2.37 (RL Reranker install failure, MCP project misidentification, query_emb missing from telemetry, kg-sync VCT_INSTALL_ROOT plumbing) + ships the AGPL-side training corpus loader + adds 2 CI prevention gates. All fixes propagate via existing `install.py --update` + launcher self-update flows; no operator action required.
