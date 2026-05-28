@@ -25,7 +25,15 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # Use a fresh event loop per call so the test isn't sensitive to
+    # asyncio policy state polluted by earlier tests in the suite (the
+    # deprecated `get_event_loop()` raises when the default loop is
+    # closed by an earlier test on Python 3.12+).
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ---------------------------------------------------------------------------
