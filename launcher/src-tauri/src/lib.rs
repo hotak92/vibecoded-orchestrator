@@ -837,6 +837,52 @@ pub fn run() {
                 }
             }
 
+            // NEW-12 (2026-05-28): init-time migration of legacy shared-KG
+            // collection names in `kg_collection_access`.
+            //
+            // Pre-v0.2.12 installs may carry `VibeCodedTools_KnowledgeGraph`
+            // rows; v0.2.12–v0.2.22 installs may carry the lowercase-c
+            // `VibecodedOrchestrator_KnowledgeGraph`. Both are silently
+            // rewritten to `VibeCodedOrchestrator_KnowledgeGraph` here.
+            //
+            // Dedup-then-rename: if BOTH legacy and canonical rows exist
+            // for the same project_id, the legacy duplicate is deleted and
+            // only the canonical row is kept. Idempotent — a second boot
+            // with no legacy rows is a no-op. Soft-fail: a DB error is
+            // logged and never blocks boot.
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    let canonical =
+                        commands::project_env_settings::DEFAULT_SHARED_KG_COLLECTION;
+                    match db.migrate_legacy_shared_kg_collection_names(canonical) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            eprintln!(
+                                "[vct] migrate-shared-kg: renamed {} \
+                                 legacy row(s) → '{}'",
+                                n, canonical
+                            );
+                            let _ = db.audit(
+                                "kg_collection_access_legacy_migrated",
+                                None,
+                                None,
+                                &serde_json::json!({
+                                    "canonical": canonical,
+                                    "renamed_count": n,
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] migrate-shared-kg warning (non-fatal): {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             // v0.2.21 Step 6: bring up the detached vct-hub binary if
             // it isn't already running. `ensure_hub_running` is best-
             // effort — a missing binary or failed spawn drops the
