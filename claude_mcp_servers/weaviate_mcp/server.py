@@ -4231,6 +4231,24 @@ async def _hybrid_search_body(
 
     fetch_limit = limit * _RL_OVERFETCH
 
+    # NEW-8 hotfix (2026-05-28 post-merge): capture the query vector once at
+    # the top of hybrid_search so we can pass it to `_rl_cache_and_rerank`
+    # for `query_emb=...`. Without this, the call at line ~4360 raises
+    # `NameError: name 'query_vector' is not defined` at runtime — the
+    # V38-MCP NEW-8 fix added `query_emb=query_vector` here mirroring the
+    # `_semantic_graph_search_body` pattern but forgot that hybrid_search's
+    # body never had `query_vector` in scope. None on the Weaviate-vectoriser
+    # path (no raw vectors returned); the writer handles None gracefully.
+    query_vector: list[float] | None = None
+    if EMBEDDING_SOURCE != "weaviate":
+        try:
+            _vec, _ = await _get_search_vector(query)
+            query_vector = _vec
+        except Exception as exc:
+            # Best-effort capture — vector unavailable means downstream
+            # log_retrieval omits the field, but search itself proceeds.
+            logger.debug("hybrid_search: query_vector capture failed (%s); proceeding without query_emb", exc)
+
     # Determine all collections to search: self + shared + peers (from
     # VCT_KG_ACCESS_LIST, P1-D 2026-05-08) + DEVELOPMENT_COLLECTION when
     # configured + DIAGRAMS_COLLECTION (+ diagram-access peers) when
