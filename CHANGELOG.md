@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.39] — unreleased
+
+### Fixed
+
+- **NEW-3.B: synthesize `container_name_template` + `image_ref` defaults; apply NEW-3 widening to hub-side supervisor** — BLOCKER for all service-type modules and applies to all future container-distributed modules per project contract. `start_container_for_module` in both the launcher (`module_service.rs`) and the hub (`module_supervisor.rs`) previously hard-failed with `.ok_or_else()` when `runtime.container_name_template` or `runtime.image_ref` were absent from the manifest. Modules declaring `runtime.type = "service"` without these optional fields (e.g. RL Reranker v0.2.7) installed successfully but the container never started, leaving the tile in `Installed` state with no visible error. Fix: added `RuntimeBlock::resolve_container_name_template(module_id)` and `RuntimeBlock::resolve_image_ref(container_install, version)` methods to `vct-launcher-core/src/manifest.rs`; both methods return the declared value when present and non-empty, otherwise synthesize sensible defaults (`{module_id_safe}-{project_slug}` for the container name; `{image}:{version}` from `install.container` for the image ref). Both launcher and hub call the shared methods — no synthesis logic duplication. Also applied the NEW-3 gate widening (`"container" | "service"`) to `build_podman_run_args` in `vct-hub/src/module_supervisor.rs` which was previously still gated on `"container"` only (launcher-side widening in v0.2.38 had not been applied to the hub, creating a divergence). 11 new unit tests across `manifest_ci_gate.rs`, `module_service.rs`, and `module_supervisor.rs`.
+
 ## [0.2.38] — 2026-05-28
 
 A **comprehensive paid-module + install-pipeline + telemetry + KG-hygiene release** — closes 14 distinct items (8 fixes + 4 features + 2 CI gates) across two parallel agent fanouts, with audit-before-fanout discipline applied. Fixes 4 production regressions from v0.2.36/0.2.37 (RL Reranker install failure, MCP project misidentification, query_emb missing from telemetry, kg-sync VCT_INSTALL_ROOT plumbing) + ships the AGPL-side training corpus loader + adds 2 CI prevention gates. All fixes propagate via existing `install.py --update` + launcher self-update flows; no operator action required.

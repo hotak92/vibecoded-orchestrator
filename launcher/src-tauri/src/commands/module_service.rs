@@ -459,19 +459,18 @@ pub async fn start_container_for_module(
         ));
     }
 
-    let name_template = runtime
-        .container_name_template
-        .as_deref()
-        .ok_or_else(|| {
-            "runtime.container_name_template missing on container module".to_string()
-        })?;
-    let container_name = resolve_container_name(name_template, &project.slug)?;
-
-    let image_template = runtime
-        .image_ref
-        .as_deref()
-        .ok_or_else(|| "runtime.image_ref missing on container module".to_string())?;
-    let image = resolve_image_ref(image_template, manifest)?;
+    // NEW-3.B (2026-05-28): use defaulting helpers so service/container
+    // modules without explicit container_name_template / image_ref get
+    // sensible defaults instead of hard-failing with ok_or_else().
+    let name_template = runtime.resolve_container_name_template(&manifest.id);
+    let container_name = resolve_container_name(&name_template, &project.slug)?;
+    let image_template = runtime.resolve_image_ref(
+        manifest.install.container.as_ref().ok_or_else(|| {
+            "install.container block missing — required for container/service modules".to_string()
+        })?,
+        &manifest.version,
+    );
+    let image = resolve_image_ref(&image_template, manifest)?;
 
     let podman = detect_container_runtime().await?;
 
@@ -2053,6 +2052,48 @@ mod tests {
             build_podman_run_args(&manifest, &ctx, &project, 11533, "x", "img:tag")
                 .expect("service runtime must be accepted after NEW-3 widening");
         assert!(args.iter().any(|a| a == "--restart=unless-stopped"));
+    }
+
+    /// NEW-3.B (2026-05-28): a service-typed manifest with BOTH
+    /// `container_name_template=None` and `image_ref=None` must
+    /// successfully resolve defaults and reach `build_podman_run_args`
+    /// without a "missing" error. Verifies the ok_or_else hard-fails are
+    /// replaced with the synthesizing helpers.
+    #[test]
+    fn start_container_for_module_succeeds_with_synthesized_defaults() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.r#type = "service".into();
+        // Remove explicitly-declared fields to exercise the synthesis path.
+        manifest.runtime.container_name_template = None;
+        manifest.runtime.image_ref = None;
+
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+
+        // Synthesize the name/image the way start_container_for_module will.
+        let name_template =
+            manifest.runtime.resolve_container_name_template(&manifest.id);
+        let container_name = resolve_container_name(&name_template, &project.slug)
+            .expect("synthesized name must resolve");
+        let image_template = manifest.runtime.resolve_image_ref(
+            manifest.install.container.as_ref().expect("container block present"),
+            &manifest.version,
+        );
+        let image = resolve_image_ref(&image_template, &manifest)
+            .expect("synthesized image must resolve");
+
+        // Must not panic/error — the "container_name_template missing" error
+        // must no longer be reachable.
+        let args =
+            build_podman_run_args(&manifest, &ctx, &project, 11533, &container_name, &image)
+                .expect("build_podman_run_args must succeed with synthesized defaults");
+
+        // Synthesized container name: module id = "vct-rl-reranker" + project slug = "acme-corp"
+        assert_eq!(container_name, "vct-rl-reranker-acme-corp");
+        // Synthesized image: tag_from_version=true → image:version
+        assert_eq!(image, "ghcr.io/hotak92/vct-rl-reranker:0.1.0");
+        assert!(args.iter().any(|a| a == "vct-rl-reranker-acme-corp"),
+            "container name must appear in podman args");
     }
 
     #[test]

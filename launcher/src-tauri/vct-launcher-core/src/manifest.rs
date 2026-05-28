@@ -1650,6 +1650,91 @@ pub struct RuntimeBlock {
     pub gpu_image_variants: Option<GpuImageVariants>,
 }
 
+/// NEW-3.B (2026-05-28): Defaulting helpers for container-runtime fields.
+///
+/// `container_name_template` and `image_ref` are `Option<String>` on the
+/// wire but the launcher's start logic requires them. Rather than
+/// hard-failing at start time when they're absent (old behaviour), these
+/// methods synthesize sensible defaults — making `service`/`container`
+/// modules installable without forcing publishers to declare every
+/// structured field. The caller still passes the synthesized string
+/// through the existing `resolve_container_name` / `resolve_image_ref`
+/// free functions so placeholder substitution is unchanged.
+impl RuntimeBlock {
+    /// Returns the manifest's declared `container_name_template` when
+    /// present, else synthesizes a sensible default.
+    ///
+    /// Default form: `{module_id_safe}-{project_slug}` where
+    /// `module_id_safe` is the module_id with non-alphanumeric chars
+    /// collapsed to `-`.
+    pub fn resolve_container_name_template(&self, module_id: &str) -> String {
+        // NEW-3.B (2026-05-28): use declared value when non-empty.
+        if let Some(t) = self.container_name_template.as_deref() {
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+        // Synthesize: replace non-alphanumeric with '-', collapse runs of
+        // '-', then append "-{project_slug}" (the placeholder is resolved
+        // later by resolve_container_name in module_service.rs).
+        let safe_id: String = module_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let safe_id = safe_id
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        format!("{}-{{project_slug}}", safe_id)
+    }
+
+    /// Returns the manifest's declared `image_ref` when present, else
+    /// synthesizes from the `install.container` block.
+    ///
+    /// Caller passes the resolved `ContainerInstallBlock` so this method
+    /// stays a pure function on `RuntimeBlock`.
+    ///
+    /// Default form: `{image}:{tag}` where `tag` is:
+    /// - `module_version` when `tag_from_version` is true
+    /// - `container_install.tag_from_version == false` → uses `install.r#ref`
+    ///   (callers that need `install.r#ref` should call the free-function
+    ///   `resolve_image_ref` on the resulting template string instead; here
+    ///   we synthesize the canonical template that the free function handles)
+    ///
+    /// Concretely: when `tag_from_version` is true we return
+    /// `"{install.container.image}:{version}"` filled with the actual
+    /// version; when false we return the template
+    /// `"{install.container.image}:{install.container.tag}"` so the
+    /// caller's existing `resolve_image_ref` free function can substitute
+    /// the tag from `install.r#ref`.
+    pub fn resolve_image_ref(
+        &self,
+        container_install: &ContainerInstallBlock,
+        module_version: &str,
+    ) -> String {
+        // NEW-3.B (2026-05-28): use declared value when non-empty.
+        if let Some(t) = self.image_ref.as_deref() {
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+        // Synthesize: produce the canonical template that resolve_image_ref
+        // (the free function) already knows how to substitute.
+        if container_install.tag_from_version {
+            // Embed the version directly — avoids a second round-trip through
+            // the template substitution path.
+            format!("{}:{}", container_install.image, module_version)
+        } else {
+            // Return the standard template; the free function will substitute
+            // {install.container.tag} from install.r#ref or "latest".
+            format!(
+                "{{install.container.image}}:{{install.container.tag}}"
+            )
+        }
+    }
+}
+
 /// Per-GPU-mode image tag variants. Each variant ships as a separate
 /// OCI image tag (e.g. `:0.1.0-cpu`, `:0.1.0-cuda`, `:0.1.0-rocm`)
 /// because PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive at
