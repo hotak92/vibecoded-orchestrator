@@ -194,12 +194,18 @@ def _try_resolve_project_config():
         return _resolved_project_config
     if not _HAS_PROJECT_CONFIG or _resolve_project_config is None:
         return None
-    # Project root: the directory containing claude_mcp_servers/. The
-    # MCP is always launched from inside a project's tree; this matches
-    # the existing CLAUDE_PROJECT_DIR / cwd assumptions throughout the
-    # module.
     try:
-        _project_root = Path(__file__).resolve().parent.parent.parent
+        # NEW-6 (2026-05-28): prefer CLAUDE_PROJECT_DIR over Path(__file__)
+        # so MCP subprocesses launched against different workspaces resolve
+        # to different projects. Pre-fix: every project's MCP resolved to
+        # whichever workspace server.py physically lives in (the global
+        # ~/.claude.json registration's path), causing telemetry mislabeling
+        # and wrong KG collection routing for any non-VCO_dev project.
+        _workspace = os.environ.get('CLAUDE_PROJECT_DIR', '')
+        if _workspace and Path(_workspace).is_dir():
+            _project_root = Path(_workspace).resolve()
+        else:
+            _project_root = Path(__file__).resolve().parent.parent.parent
         _resolved_project_config = _resolve_project_config(_project_root)
         return _resolved_project_config
     except Exception:
@@ -3289,6 +3295,7 @@ async def _rl_cache_and_rerank(
     *,
     failure_mode: str | None = None,
     failed_collections: list[str] | None = None,
+    query_emb: list[float] | None = None,
 ) -> list[dict]:
     """
     Rerank nodes via rl_server and spawn a background monitor for online training.
@@ -3421,6 +3428,7 @@ async def _rl_cache_and_rerank(
                 session_id=os.getenv("CLAUDE_SESSION_ID", ""),
                 failure_mode=failure_mode,
                 failed_collections=failed_collections,
+                query_emb=query_emb,
             )
     except Exception as exc:
         logger.debug("RL telemetry log_retrieval failed (%s); continuing", exc)
@@ -3788,6 +3796,7 @@ async def _semantic_graph_search_body(
         task_id, query, all_formatted, limit,
         failure_mode=_partial_failure_mode,
         failed_collections=failed_collections_schema or None,
+        query_emb=query_vector,
     )
     for r in primary_results:
         if "score" not in r:
@@ -4348,6 +4357,7 @@ async def _hybrid_search_body(
         task_id, query, all_results, limit,
         failure_mode=_partial_failure_mode,
         failed_collections=failed_collections_schema or None,
+        query_emb=query_vector,
     )
 
     # Ensure score survives the RL hop too (RL server returns its own dicts; if
