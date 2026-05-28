@@ -1404,6 +1404,48 @@ pub async fn install_module_for_project(
 
     match installer_engine::run_install(&app, &manifest, &ctx, &project_id, gpu_mode, &db, l0_pull_token_endpoint.as_deref()).await {
         Ok(resolved_dir) => {
+            // NEW-3.D (2026-05-28): validate manifest contract for container modules
+            // before marking the row as Installed. Error-severity warnings (e.g.
+            // missing install.container.image) block the install with a clear message
+            // and set status=Error so the GUI shows the failure. Deprecation-severity
+            // warnings (e.g. missing container_name_template) are logged + audited
+            // and do NOT block — backward compatible with existing RL Reranker manifests.
+            {
+                use crate::manifest::{WarningSeverity};
+                let warnings = manifest.validate_for_container_start();
+                let errors: Vec<_> = warnings.iter()
+                    .filter(|w| w.severity == WarningSeverity::Error)
+                    .collect();
+                if !errors.is_empty() {
+                    let error_summary = errors.iter()
+                        .map(|w| format!("{}: {}", w.field, w.message))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let msg = format!("manifest validation failed: {}", error_summary);
+                    db.set_module_status(
+                        &project_id,
+                        &module_id,
+                        ModuleStatus::Error,
+                        Some(msg.clone()),
+                    )?;
+                    return Err(format!("Install rejected for module {}: {}", module_id, msg));
+                }
+                for w in warnings.iter().filter(|w| w.severity == WarningSeverity::Deprecation) {
+                    eprintln!(
+                        "[install] manifest deprecation for {}: {}: {}",
+                        module_id, w.field, w.message
+                    );
+                    let _ = db.audit(
+                        "module_install_manifest_deprecation",
+                        Some(&project_id),
+                        Some(&module_id),
+                        &serde_json::json!({
+                            "field": w.field,
+                            "message": w.message,
+                        }),
+                    );
+                }
+            }
             db.set_module_status(&project_id, &module_id, ModuleStatus::Installed, None)?;
             db.audit(
                 "module_install_done",

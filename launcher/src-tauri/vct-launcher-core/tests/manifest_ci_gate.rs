@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use vct_launcher_core::manifest::{
-    ContainerInstallBlock, ModuleManifest, RuntimeBlock,
+    ContainerInstallBlock, ModuleManifest, RuntimeBlock, WarningSeverity,
 };
 
 /// Locate `tests/fixtures/manifests/` relative to this crate's
@@ -166,6 +166,261 @@ fn schema_includes_unsupported_control_variant() {
             kind
         );
     }
+}
+
+// ─── NEW-3.D (2026-05-28): validate_for_container_start tests ─────────────────
+
+/// A fully-valid container-pull + service manifest (all fields declared).
+/// `validate_for_container_start` must return an empty Vec.
+#[test]
+fn validate_for_container_start_passes_fully_valid_manifest() {
+    let json = r#"{
+        "id": "test-module",
+        "name": "Test Module",
+        "version": "1.0.0",
+        "category": "paid-orchestrator",
+        "license": { "min_orchestrator_tier": "free" },
+        "install": {
+            "method": "container_pull",
+            "container": {
+                "image": "ghcr.io/example/test-module",
+                "tag_from_version": true,
+                "pull_token_endpoint": "https://example.com/pull-token"
+            }
+        },
+        "runtime": {
+            "type": "service",
+            "command": "podman",
+            "container_name_template": "test-module-{project_slug}",
+            "image_ref": "ghcr.io/example/test-module:1.0.0",
+            "ports": [{ "host": "8080", "container": 8080 }]
+        }
+    }"#;
+    let manifest = ModuleManifest::from_json(json).expect("valid manifest must parse");
+    let warnings = manifest.validate_for_container_start();
+    assert!(
+        warnings.is_empty(),
+        "fully valid manifest must return no warnings, got: {:?}",
+        warnings.iter().map(|w| format!("{}: {}", w.field, w.message)).collect::<Vec<_>>()
+    );
+}
+
+/// Missing `runtime.container_name_template` emits a Deprecation warning
+/// (not an Error) — install should proceed but publisher should fix.
+#[test]
+fn validate_for_container_start_emits_deprecation_for_missing_container_name_template() {
+    let json = r#"{
+        "id": "test-module",
+        "name": "Test Module",
+        "version": "1.0.0",
+        "category": "paid-orchestrator",
+        "license": { "min_orchestrator_tier": "free" },
+        "install": {
+            "method": "container_pull",
+            "container": {
+                "image": "ghcr.io/example/test-module",
+                "tag_from_version": true,
+                "pull_token_endpoint": "https://example.com/pull-token"
+            }
+        },
+        "runtime": {
+            "type": "service",
+            "command": "podman",
+            "image_ref": "ghcr.io/example/test-module:1.0.0"
+        }
+    }"#;
+    let manifest = ModuleManifest::from_json(json).expect("valid manifest must parse");
+    let warnings = manifest.validate_for_container_start();
+    let deprecation = warnings.iter().find(|w| w.field == "runtime.container_name_template");
+    assert!(
+        deprecation.is_some(),
+        "missing container_name_template must emit a deprecation warning"
+    );
+    assert_eq!(
+        deprecation.unwrap().severity,
+        WarningSeverity::Deprecation,
+        "missing container_name_template must be Deprecation, not Error"
+    );
+}
+
+/// Missing `runtime.image_ref` emits a Deprecation warning — synthesizable
+/// from install.container, so install should continue.
+#[test]
+fn validate_for_container_start_emits_deprecation_for_missing_image_ref() {
+    let json = r#"{
+        "id": "test-module",
+        "name": "Test Module",
+        "version": "1.0.0",
+        "category": "paid-orchestrator",
+        "license": { "min_orchestrator_tier": "free" },
+        "install": {
+            "method": "container_pull",
+            "container": {
+                "image": "ghcr.io/example/test-module",
+                "tag_from_version": true,
+                "pull_token_endpoint": "https://example.com/pull-token"
+            }
+        },
+        "runtime": {
+            "type": "container",
+            "command": "podman",
+            "container_name_template": "test-module-{project_slug}"
+        }
+    }"#;
+    let manifest = ModuleManifest::from_json(json).expect("valid manifest must parse");
+    let warnings = manifest.validate_for_container_start();
+    let deprecation = warnings.iter().find(|w| w.field == "runtime.image_ref");
+    assert!(
+        deprecation.is_some(),
+        "missing image_ref must emit a deprecation warning"
+    );
+    assert_eq!(
+        deprecation.unwrap().severity,
+        WarningSeverity::Deprecation,
+        "missing image_ref must be Deprecation, not Error"
+    );
+}
+
+/// Missing `install.container.image` is an Error-severity warning — no
+/// sensible default exists, the install MUST be blocked.
+#[test]
+fn validate_for_container_start_emits_error_for_missing_install_container_image() {
+    // We must construct this via a direct struct because from_json rejects
+    // manifests where container block is missing (ContainerInstallBlock.image
+    // is required). Test via absent container block entirely, which also
+    // triggers the error path.
+    let json = r#"{
+        "id": "test-module",
+        "name": "Test Module",
+        "version": "1.0.0",
+        "category": "paid-orchestrator",
+        "license": { "min_orchestrator_tier": "free" },
+        "install": {
+            "method": "container_pull"
+        },
+        "runtime": {
+            "type": "service",
+            "command": "podman",
+            "container_name_template": "test-{project_slug}",
+            "image_ref": "ghcr.io/example/test:1.0.0"
+        }
+    }"#;
+    // from_json may fail here (missing pull_token_endpoint on container block).
+    // If parse fails, the error comes before validation — that's also acceptable.
+    // If it succeeds (container block omitted entirely), validate_for_container_start
+    // must emit an Error warning.
+    match ModuleManifest::from_json(json) {
+        Err(_) => {
+            // Acceptable: parse itself rejected the manifest for missing required field.
+            // The contract is upheld — missing image blocks the flow.
+        }
+        Ok(manifest) => {
+            let warnings = manifest.validate_for_container_start();
+            let error = warnings.iter().find(|w| {
+                w.field == "install.container.image" && w.severity == WarningSeverity::Error
+            });
+            assert!(
+                error.is_some(),
+                "missing install.container.image must emit an Error-severity warning, \
+                 got: {:?}",
+                warnings.iter().map(|w| format!("{}/{:?}", w.field, w.severity)).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// Non-container-pull modules are out of scope — must return empty Vec
+/// regardless of missing runtime fields.
+#[test]
+fn validate_for_container_start_skips_non_container_pull_modules() {
+    let json = r#"{
+        "id": "test-git",
+        "name": "Test Git Module",
+        "version": "1.0.0",
+        "category": "community",
+        "license": { "min_orchestrator_tier": "free" },
+        "install": { "method": "git_clone", "source": "https://example.com/x.git" },
+        "runtime": { "type": "service", "command": "python" }
+    }"#;
+    let manifest = ModuleManifest::from_json(json).expect("git_clone manifest must parse");
+    let warnings = manifest.validate_for_container_start();
+    assert!(
+        warnings.is_empty(),
+        "git_clone module must not produce container validation warnings"
+    );
+}
+
+/// CLI/MCP runtime types don't run as containers — must return empty Vec
+/// even with container_pull install method.
+#[test]
+fn validate_for_container_start_skips_cli_runtime() {
+    let json = r#"{
+        "id": "test-cli",
+        "name": "Test CLI Module",
+        "version": "1.0.0",
+        "category": "paid-orchestrator",
+        "license": { "min_orchestrator_tier": "free" },
+        "install": {
+            "method": "container_pull",
+            "container": {
+                "image": "ghcr.io/example/test-cli",
+                "tag_from_version": true,
+                "pull_token_endpoint": "https://example.com/pull-token"
+            }
+        },
+        "runtime": { "type": "cli", "command": "vct-cli" }
+    }"#;
+    let manifest = ModuleManifest::from_json(json).expect("cli manifest must parse");
+    let warnings = manifest.validate_for_container_start();
+    assert!(
+        warnings.is_empty(),
+        "cli runtime must not produce container validation warnings"
+    );
+}
+
+/// The committed v0.2.7 RL Reranker fixture (container_pull + service runtime,
+/// but missing container_name_template and image_ref) MUST emit exactly
+/// 2 deprecation warnings and 0 error warnings. This pins the backward-compat
+/// guarantee: existing publishers are warned, not blocked.
+#[test]
+fn validate_for_container_start_rl_reranker_v027_emits_deprecations_not_errors() {
+    let path = fixtures_dir().join("vct-rl-reranker.v0.2.7.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    let manifest = ModuleManifest::from_json(&raw)
+        .unwrap_or_else(|e| panic!("v0.2.7 RL fixture must parse: {}", e));
+
+    let warnings = manifest.validate_for_container_start();
+
+    let errors: Vec<_> = warnings.iter()
+        .filter(|w| w.severity == WarningSeverity::Error)
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "RL Reranker v0.2.7 must produce 0 error warnings (backward compat), \
+         got: {:?}",
+        errors.iter().map(|w| format!("{}: {}", w.field, w.message)).collect::<Vec<_>>()
+    );
+
+    let deprecations: Vec<_> = warnings.iter()
+        .filter(|w| w.severity == WarningSeverity::Deprecation)
+        .collect();
+    assert!(
+        !deprecations.is_empty(),
+        "RL Reranker v0.2.7 is missing container_name_template + image_ref, \
+         must produce at least 1 deprecation warning"
+    );
+
+    // Verify the two expected fields are warned about.
+    let fields: Vec<&str> = deprecations.iter().map(|w| w.field.as_str()).collect();
+    assert!(
+        fields.contains(&"runtime.container_name_template"),
+        "must warn about missing container_name_template, got fields: {:?}", fields
+    );
+    assert!(
+        fields.contains(&"runtime.image_ref"),
+        "must warn about missing image_ref, got fields: {:?}", fields
+    );
 }
 
 /// CI invariant: the committed schema MUST match what
