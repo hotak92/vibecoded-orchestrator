@@ -328,9 +328,12 @@ pub fn build_podman_run_args(
     image: &str,
 ) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
-    if runtime.r#type != "container" {
+    // NEW-3 (2026-05-28): widened from `"container"`-only to also admit
+    // `"service"` — both types declare a long-running daemon backed by a
+    // container. `"cli"` / `"mcp_stdio"` / `"mcp_http"` have no podman args.
+    if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
-            "build_podman_run_args: runtime.type must be 'container', got '{}'",
+            "build_podman_run_args: runtime.type must be 'container' or 'service', got '{}'",
             runtime.r#type
         ));
     }
@@ -447,7 +450,9 @@ pub async fn start_container_for_module(
     rl_port: u16,
 ) -> Result<String, String> {
     let runtime = &manifest.runtime;
-    if runtime.r#type != "container" {
+    // NEW-3 (2026-05-28): widened from `"container"`-only to also admit
+    // `"service"` — both types are long-running daemons that podman manages.
+    if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
             "start_container_for_module called for non-container runtime '{}'",
             runtime.r#type
@@ -715,6 +720,32 @@ pub async fn restart_rl_container(
     let ctx = PlaceholderCtx::new(RL_RERANKER_MODULE_ID);
     let _ = start_container_for_module(&manifest, &ctx, &project, rl_port).await?;
     Ok(())
+}
+
+/// NEW-3 (2026-05-28): generic "Start" Tauri command for any installed
+/// module whose `module_installs.container_name` is NULL (i.e. the
+/// post-install auto-start was skipped because `runtime.type` was not
+/// admitted by the old `== "container"` gate). Also serves as a manual
+/// "Start" affordance for service-type modules.
+///
+/// The Svelte tile renders a "Start" button when
+/// `status='installed' AND container_name=NULL AND runtime_type ∈
+/// {container, service}`. Clicking it invokes this command.
+#[tauri::command]
+pub async fn start_module_container(
+    project_id: String,
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<String, String> {
+    let project = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+
+    let manifest = crate::commands::modules::find_manifest_for_resume(&db, &module_id)
+        .ok_or_else(|| format!("manifest for {} not in catalog", module_id))?;
+
+    let container_name = start_container_after_install(&manifest, &project, &db).await?;
+    Ok(container_name)
 }
 
 // ─── Hub proxy helpers (Step 24 commit b) ───────────────────────────────
@@ -2006,6 +2037,22 @@ mod tests {
             build_podman_run_args(&manifest, &ctx, &project, 11533, "x", "img:tag")
                 .expect_err("must reject non-container runtime");
         assert!(err.contains("container"));
+    }
+
+    /// NEW-3 (2026-05-28): `runtime.type = "service"` must succeed in
+    /// `build_podman_run_args` after the gate widening. Mirrors
+    /// `build_podman_run_args_uses_unless_stopped_when_auto_restart_true`
+    /// but with `type = "service"` to guard against future regressions.
+    #[test]
+    fn build_podman_run_args_accepts_service_runtime_type() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.r#type = "service".into();
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args =
+            build_podman_run_args(&manifest, &ctx, &project, 11533, "x", "img:tag")
+                .expect("service runtime must be accepted after NEW-3 widening");
+        assert!(args.iter().any(|a| a == "--restart=unless-stopped"));
     }
 
     #[test]

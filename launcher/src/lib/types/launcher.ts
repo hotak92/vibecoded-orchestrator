@@ -47,6 +47,13 @@ export interface ModuleInstallRow {
   installed_at: number;
   last_started_at: number | null;
   last_error: string | null;
+  /**
+   * NEW-3 (2026-05-28): resolved container name, populated by the hub
+   * supervisor after `podman run -d --name <name>` succeeds. `null` /
+   * missing for non-container modules and for container/service modules
+   * whose start path hasn't run yet.
+   */
+  container_name?: string | null;
 }
 
 export interface SwitchHostResult {
@@ -342,6 +349,12 @@ export interface ModuleCatalogEntry {
    * shows a "No longer available in catalog" warning badge.
    */
   catalog_warning?: string;
+  /**
+   * NEW-3 (2026-05-28): the module's `runtime.type` as declared in its
+   * manifest. `"container"` or `"service"` for long-running daemon
+   * modules. Empty/absent for builtins and L0-only entries.
+   */
+  runtime_type?: string;
 }
 
 /**

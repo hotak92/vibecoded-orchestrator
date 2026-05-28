@@ -428,6 +428,37 @@
     }
   }
 
+  // NEW-3 (2026-05-28): "Start" affordance for service/container modules
+  // whose container_name is NULL after install. Invokes the generic
+  // `start_module_container` Tauri command which calls
+  // `start_container_after_install` (already used by the Phase-1E
+  // auto-start path — just wasn't reachable for `runtime.type="service"`
+  // before the gate widening).
+  let startingModuleId = $state<string | null>(null);
+
+  async function handleStartContainer(m: ModuleCatalogEntry) {
+    if (!project) {
+      alert('Select a project from the menu bar first.');
+      return;
+    }
+    startingModuleId = m.id;
+    try {
+      await invoke('start_module_container', {
+        projectId: project.id,
+        moduleId: m.id,
+      });
+      await modules.loadInstalled(project.id);
+    } catch (e) {
+      alert(`Start failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      startingModuleId = null;
+    }
+  }
+
+  function isLongRunningRuntime(runtimeType: string | undefined): boolean {
+    return runtimeType === 'container' || runtimeType === 'service';
+  }
+
   function getInstalledRow(m: ModuleCatalogEntry) {
     return mState.installed.find((r) => r.module_id === m.id) ?? null;
   }
@@ -716,7 +747,7 @@
                 </button>
               {/if}
             {:else if display.kind === 'installed'}
-              <!-- Installed: toggle + (optional Update) + Uninstall -->
+              <!-- Installed: toggle + (optional Update) + (optional Start) + Uninstall -->
               <label class="enabled-toggle">
                 <input
                   type="checkbox"
@@ -734,6 +765,22 @@
                   aria-label="Update {m.name} from version {display.install_row.module_version} to version {m.version}"
                 >
                   Update v{display.install_row.module_version} → v{m.version}
+                </button>
+              {/if}
+              <!-- NEW-3 (2026-05-28): "Start" button — defence-in-depth for
+                   service/container modules whose container was never created
+                   (e.g. because the old gate excluded runtime.type="service").
+                   Condition: no container_name recorded AND runtime is a
+                   long-running type. -->
+              {#if !display.install_row.container_name && isLongRunningRuntime(m.runtime_type)}
+                <button
+                  class="btn-3d btn-3d-primary btn-3d-sm"
+                  onclick={() => handleStartContainer(m)}
+                  disabled={startingModuleId === m.id || !project}
+                  aria-label="Start {m.name} container"
+                  data-testid="btn-start-container"
+                >
+                  {startingModuleId === m.id ? 'Starting…' : 'Start'}
                 </button>
               {/if}
               <button

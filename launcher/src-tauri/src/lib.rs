@@ -1260,6 +1260,9 @@ pub fn run() {
             // (Phase 4B scaffolding). Wired commands:
             commands::module_service::rl_is_container_running,
             commands::module_service::restart_rl_container,
+            // NEW-3 (2026-05-28): generic start for service/container modules
+            // whose container_name is NULL (auto-start was skipped).
+            commands::module_service::start_module_container,
             commands::module_service::check_for_weights_update_now,
             commands::module_service::apply_weights_update,
             commands::module_service::get_rl_dashboard_state,
