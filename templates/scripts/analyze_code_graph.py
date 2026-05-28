@@ -197,10 +197,19 @@ def _sanitize_collection_prefix(name: str) -> str:
 def _collection_name(base: str, project_name: str) -> str:
     """Return per-project collection name, e.g. 'MyProject_CodeModule'.
 
-    Falls back to bare base name if project_name is empty.
+    Raises SystemExit when project_name is empty to prevent silent writes to bare
+    class names (e.g. 'CodeFunction') that cause multi-project data collision.
     """
     if not project_name:
-        return base
+        # NEW-10 (2026-05-28): refuse bare class name — multiple unrelated projects
+        # piling into a single bare 'CodeFunction'/'CodeClass'/etc. collection is
+        # a data-hygiene hazard that is hard to recover from (requires manual cleanup).
+        raise SystemExit(
+            f"analyze_code_graph: --project is required (or set CODE_GRAPH_PROJECT "
+            f"in env). Refusing to write to bare class name '{base}' — would cause "
+            f"multi-project data collision. See knowledge/concepts/parallel-pr-"
+            f"coordination-gotchas-2026-05-10.md §1c."
+        )
     prefix = _sanitize_collection_prefix(project_name)
     return f"{prefix}_{base}"
 
