@@ -189,7 +189,9 @@ pub fn build_podman_run_args(
     image: &str,
 ) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
-    if runtime.r#type != "container" {
+    // NEW-3.B (2026-05-28): aligned with launcher-side widening — accept
+    // both "container" and "service" runtime types.
+    if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
             "build_podman_run_args: runtime.type must be 'container', got '{}'",
             runtime.r#type
@@ -288,26 +290,28 @@ pub async fn start_container_for_module(
     rl_port: u16,
 ) -> Result<String, String> {
     let runtime = &manifest.runtime;
-    if runtime.r#type != "container" {
+    // NEW-3.B (2026-05-28): aligned with launcher-side widening from NEW-3
+    // (v0.2.38) — accept both "container" and "service" runtime types here.
+    // The hub was previously gated on "container" only, creating a divergence.
+    if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
             "start_container_for_module called for non-container runtime '{}'",
             runtime.r#type
         ));
     }
 
-    let name_template = runtime
-        .container_name_template
-        .as_deref()
-        .ok_or_else(|| {
-            "runtime.container_name_template missing on container module".to_string()
-        })?;
-    let container_name = resolve_container_name(name_template, &project.slug)?;
-
-    let image_template = runtime
-        .image_ref
-        .as_deref()
-        .ok_or_else(|| "runtime.image_ref missing on container module".to_string())?;
-    let image = resolve_image_ref(image_template, manifest)?;
+    // NEW-3.B (2026-05-28): use defaulting helpers so service/container
+    // modules without explicit container_name_template / image_ref get
+    // sensible defaults instead of hard-failing with ok_or_else().
+    let name_template = runtime.resolve_container_name_template(&manifest.id);
+    let container_name = resolve_container_name(&name_template, &project.slug)?;
+    let image_template = runtime.resolve_image_ref(
+        manifest.install.container.as_ref().ok_or_else(|| {
+            "install.container block missing — required for container/service modules".to_string()
+        })?,
+        &manifest.version,
+    );
+    let image = resolve_image_ref(&image_template, manifest)?;
 
     let podman = detect_container_runtime().await?;
 
@@ -829,5 +833,68 @@ mod tests {
             // Should return without panicking.
             resume_containers_on_startup(&db, resolver).await;
         });
+    }
+
+    // ─── NEW-3.B (2026-05-28): hub-side synthesized defaults ─────────────
+
+    /// NEW-3.B: `runtime.type = "service"` must now pass the gate in
+    /// `start_container_for_module` on the hub side. Mirrors the launcher-side
+    /// `build_podman_run_args_accepts_service_runtime_type` test.
+    #[test]
+    fn hub_start_container_accepts_service_runtime_type() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.r#type = "service".into();
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        // `build_podman_run_args` is the synchronous gate we can test
+        // without spawning podman — it validates runtime type and resolves
+        // args. If the type gate still rejected "service", this would error.
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.1.0",
+        )
+        .expect("service runtime must be accepted by hub after NEW-3.B");
+        assert_eq!(args[0], "run");
+    }
+
+    /// NEW-3.B: manifest with `container_name_template=None` and
+    /// `image_ref=None` synthesizes sensible defaults and reaches
+    /// `build_podman_run_args` without a hard-fail "missing" error.
+    #[test]
+    fn hub_start_container_succeeds_with_synthesized_defaults() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.r#type = "service".into();
+        // Remove explicitly-declared fields to exercise the synthesis path.
+        manifest.runtime.container_name_template = None;
+        manifest.runtime.image_ref = None;
+
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+
+        // Synthesize the way start_container_for_module now does.
+        let name_template =
+            manifest.runtime.resolve_container_name_template(&manifest.id);
+        let container_name = resolve_container_name(&name_template, &project.slug)
+            .expect("synthesized name must resolve");
+        let image_template = manifest.runtime.resolve_image_ref(
+            manifest.install.container.as_ref().expect("container block present"),
+            &manifest.version,
+        );
+        let image = resolve_image_ref(&image_template, &manifest)
+            .expect("synthesized image must resolve");
+
+        assert_eq!(container_name, "vct-rl-reranker-acme-corp",
+            "synthesized container name must match module-id + project-slug");
+        assert_eq!(image, "ghcr.io/hotak92/vct-rl-reranker:0.1.0",
+            "synthesized image must use install.container.image + manifest.version");
+
+        let args =
+            build_podman_run_args(&manifest, &ctx, &project, 11533, &container_name, &image)
+                .expect("build_podman_run_args must succeed with synthesized defaults");
+        assert!(args.iter().any(|a| a == "vct-rl-reranker-acme-corp"));
     }
 }

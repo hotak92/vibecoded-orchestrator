@@ -16,9 +16,12 @@
 //! fallback doesn't mask schema errors. See
 //! `vct_launcher_core::manifest::set_strict_manifest_for_test`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
-use vct_launcher_core::manifest::ModuleManifest;
+use vct_launcher_core::manifest::{
+    ContainerInstallBlock, ModuleManifest, RuntimeBlock,
+};
 
 /// Locate `tests/fixtures/manifests/` relative to this crate's
 /// `CARGO_MANIFEST_DIR`. Stable across `cargo test` invocations from
@@ -199,4 +202,143 @@ fn exported_schema_matches_committed_copy() {
             generated_lines,
         );
     }
+}
+
+// ─── NEW-3.B (2026-05-28): RuntimeBlock::resolve_container_name_template ──
+
+fn make_runtime_block_minimal() -> RuntimeBlock {
+    RuntimeBlock {
+        r#type: "service".into(),
+        command: "".into(),
+        args: vec![],
+        platform_command: HashMap::new(),
+        cwd: None,
+        env_from_secrets: vec![],
+        env_from_settings: vec![],
+        env_fixed: HashMap::new(),
+        health_check: None,
+        auto_restart: false,
+        log_file: None,
+        min_gpu_vram_gb: None,
+        gpu_optional: false,
+        gpu_image_variants: None,
+        log_path_template: None,
+        container_name_template: None,
+        image_ref: None,
+        ports: vec![],
+        env_derived: HashMap::new(),
+        volumes: vec![],
+    }
+}
+
+fn make_container_install_block(tag_from_version: bool, _tag_ref: Option<&str>) -> ContainerInstallBlock {
+    ContainerInstallBlock {
+        image: "ghcr.io/example/my-module".into(),
+        tag_from_version,
+        registry: None,
+        pull_token_endpoint: "https://example.invalid/token".into(),
+        pull_token_method: "POST".into(),
+        rotate_weights: false,
+        rotate_weights_endpoint: None,
+    }
+}
+
+/// Declared `container_name_template` passes through unchanged.
+#[test]
+fn resolve_container_name_template_uses_declared_value() {
+    let mut rt = make_runtime_block_minimal();
+    rt.container_name_template = Some("my-svc-{project_slug}".into());
+    let result = rt.resolve_container_name_template("ignored-module-id");
+    assert_eq!(result, "my-svc-{project_slug}");
+}
+
+/// Missing (`None`) `container_name_template` synthesizes
+/// `{sanitized-module-id}-{project_slug}`.
+#[test]
+fn resolve_container_name_template_synthesizes_when_none() {
+    let rt = make_runtime_block_minimal(); // container_name_template = None
+    let result = rt.resolve_container_name_template("vct-rl-reranker");
+    assert_eq!(result, "vct-rl-reranker-{project_slug}");
+}
+
+/// Empty string `container_name_template` is treated as missing and
+/// synthesizes the default.
+#[test]
+fn resolve_container_name_template_synthesizes_when_empty() {
+    let mut rt = make_runtime_block_minimal();
+    rt.container_name_template = Some("".into());
+    let result = rt.resolve_container_name_template("vct-rl-reranker");
+    assert_eq!(result, "vct-rl-reranker-{project_slug}");
+}
+
+/// Module IDs with special chars get non-alphanumeric chars collapsed to
+/// single `-` runs and leading/trailing dashes trimmed.
+#[test]
+fn resolve_container_name_template_sanitizes_module_id_dots() {
+    let rt = make_runtime_block_minimal();
+    // dots replaced with '-', no double-dashes
+    let result = rt.resolve_container_name_template("my.mod");
+    assert_eq!(result, "my-mod-{project_slug}");
+}
+
+#[test]
+fn resolve_container_name_template_sanitizes_module_id_underscores() {
+    let rt = make_runtime_block_minimal();
+    let result = rt.resolve_container_name_template("my_mod");
+    assert_eq!(result, "my-mod-{project_slug}");
+}
+
+#[test]
+fn resolve_container_name_template_collapses_repeated_separators() {
+    let rt = make_runtime_block_minimal();
+    // "a..b" → "a-b" (two dots become one dash)
+    let result = rt.resolve_container_name_template("a..b");
+    assert_eq!(result, "a-b-{project_slug}");
+}
+
+// ─── NEW-3.B (2026-05-28): RuntimeBlock::resolve_image_ref ────────────────
+
+/// Declared `image_ref` passes through unchanged.
+#[test]
+fn resolve_image_ref_uses_declared_value() {
+    let mut rt = make_runtime_block_minimal();
+    rt.image_ref = Some("ghcr.io/example/my-module:pinned-tag".into());
+    let cib = make_container_install_block(true, None);
+    let result = rt.resolve_image_ref(&cib, "1.2.3");
+    assert_eq!(result, "ghcr.io/example/my-module:pinned-tag");
+}
+
+/// Missing `image_ref` + `tag_from_version=true` synthesizes
+/// `{image}:{version}` as a fully-resolved string.
+#[test]
+fn resolve_image_ref_synthesizes_with_tag_from_version_true() {
+    let rt = make_runtime_block_minimal(); // image_ref = None
+    let cib = make_container_install_block(true, None);
+    let result = rt.resolve_image_ref(&cib, "0.2.7");
+    assert_eq!(result, "ghcr.io/example/my-module:0.2.7");
+}
+
+/// Missing `image_ref` + `tag_from_version=false` synthesizes the
+/// `{install.container.image}:{install.container.tag}` template string
+/// (the free-function `resolve_image_ref` will substitute it).
+#[test]
+fn resolve_image_ref_synthesizes_template_when_tag_from_version_false() {
+    let rt = make_runtime_block_minimal(); // image_ref = None
+    let cib = make_container_install_block(false, None);
+    let result = rt.resolve_image_ref(&cib, "0.2.7");
+    // Must be the exact template string the free-function can substitute.
+    assert_eq!(
+        result,
+        "{install.container.image}:{install.container.tag}"
+    );
+}
+
+/// Empty `image_ref` is treated as missing and synthesizes the default.
+#[test]
+fn resolve_image_ref_synthesizes_when_empty() {
+    let mut rt = make_runtime_block_minimal();
+    rt.image_ref = Some("".into());
+    let cib = make_container_install_block(true, None);
+    let result = rt.resolve_image_ref(&cib, "1.0.0");
+    assert_eq!(result, "ghcr.io/example/my-module:1.0.0");
 }
