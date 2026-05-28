@@ -1576,6 +1576,70 @@ def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple
     return False, ""
 
 
+# NEW-11 (2026-05-28): normalize typed_links to list-of-objects before any
+# Weaviate insert.  Pre-canonicalization writers emitted list-of-strings in
+# "relation::target" form; Weaviate's gRPC serializer cannot pack
+# []interface{} and raises "creating primitive value for typed_links: proto:
+# invalid type: []interface {}" which crashes the whole iterator.
+#
+# Canonical shape: [{"relation_type": str, "target_title": str}, ...]
+#
+# Three cases handled:
+#   • list-of-objects with correct keys  → returned unchanged
+#   • list-of-strings ("rel::target")    → parsed and converted
+#   • anything else (single str, None…)  → warning logged, field dropped
+def _normalize_typed_links(typed_links: object, context: str = "") -> list:
+    """Return typed_links in the canonical list-of-objects shape.
+
+    Args:
+        typed_links: raw value from node_data (any type coming from disk).
+        context: description of the node being written (for warning messages).
+
+    Returns:
+        list of {"relation_type": str, "target_title": str} dicts (may be empty).
+    """
+    if not typed_links:
+        # None, [], empty string — treat as empty; no warning needed
+        return []
+
+    if not isinstance(typed_links, list):
+        print(
+            f"   ⚠ typed_links: unexpected type {type(typed_links).__name__!r} "
+            f"for {context!r} — dropping field to avoid gRPC crash"
+        )
+        return []
+
+    normalized: list = []
+    for item in typed_links:
+        if isinstance(item, dict):
+            # Canonical shape — validate required keys are present
+            if "relation_type" in item and "target_title" in item:
+                normalized.append(item)
+            else:
+                print(
+                    f"   ⚠ typed_links item missing required keys {list(item.keys())!r} "
+                    f"for {context!r} — skipping item"
+                )
+        elif isinstance(item, str):
+            # Legacy "relation::target" string form — parse and convert
+            if "::" in item:
+                relation, _, target = item.partition("::")
+                normalized.append({"relation_type": relation.strip(), "target_title": target.strip()})
+            else:
+                # Plain string with no separator — treat as relatedTo
+                print(
+                    f"   ⚠ typed_links string {item!r} has no '::' separator "
+                    f"for {context!r} — storing as relatedTo"
+                )
+                normalized.append({"relation_type": "relatedTo", "target_title": item.strip()})
+        else:
+            print(
+                f"   ⚠ typed_links item type {type(item).__name__!r} unexpected "
+                f"for {context!r} — skipping item"
+            )
+    return normalized
+
+
 def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
     """
     Sync a single knowledge node to Weaviate (with chunking support)
@@ -1765,7 +1829,12 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "node_type": node_data["node_type"],
                 "tags": node_data["tags"],
                 "links": node_data["links"],
-                "typed_links": node_data["typed_links"],  # Typed relationships
+                # NEW-11 (2026-05-28): guard against legacy list-of-strings form
+                # that crashes Weaviate gRPC serialiser with "invalid type:
+                # []interface {}".  Canonical shape: list-of-objects.
+                "typed_links": _normalize_typed_links(
+                    node_data["typed_links"], context=node_data.get("title", "")
+                ),
                 "external_links": node_data["external_links"],  # External links (RDF)
                 "created_at": node_data["created_at"],
                 "updated_at": node_data["updated_at"],
@@ -1865,7 +1934,10 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                     "node_type": node_data["node_type"],
                     "tags": node_data["tags"],
                     "links": node_data["links"],
-                    "typed_links": node_data["typed_links"],  # Typed relationships
+                    # NEW-11 (2026-05-28): same guard as single-chunk path above.
+                    "typed_links": _normalize_typed_links(
+                        node_data["typed_links"], context=node_data.get("title", "")
+                    ),
                     "external_links": node_data["external_links"],  # External links (RDF)
                     "created_at": node_data["created_at"],
                     "updated_at": node_data["updated_at"],
