@@ -232,6 +232,36 @@ impl Db {
         Ok(())
     }
 
+    /// NEW-3.C (2026-05-28): write an error message to `module_installs.last_error`
+    /// WITHOUT touching `status`. Used when `start_container_after_install` fails
+    /// post-install so the GUI tile can render a clear failure state even though
+    /// `status` stays `'installed'` (the install itself succeeded; only the
+    /// container start failed — the user can retry via Restart).
+    ///
+    /// Pass `None` to clear the field (e.g. on a subsequent successful start).
+    pub fn set_module_last_error(
+        &self,
+        project_id: &str,
+        module_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs SET last_error = ?1
+                  WHERE project_id = ?2 AND module_id = ?3",
+                params![error, project_id, module_id],
+            )
+            .map_err(|e| format!("set_module_last_error: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "module_install not found for project={} module={}",
+                project_id, module_id
+            ));
+        }
+        Ok(())
+    }
+
     pub fn set_module_enabled(
         &self,
         project_id: &str,
@@ -633,5 +663,94 @@ mod tests {
             1,
             "project B holds 1 module",
         );
+    }
+
+    // ─── NEW-3.C (2026-05-28): set_module_last_error tests ───────────────────
+    //
+    // These tests verify that `set_module_last_error` writes and clears
+    // `last_error` without touching `status`, mirroring the install-time
+    // container-start failure path in `modules.rs:1450–1471`.
+
+    /// Verify that `set_module_last_error` persists an error string to
+    /// `module_installs.last_error` while leaving `status` unchanged.
+    #[test]
+    fn db_set_module_last_error_persists_error() {
+        let (db, pid) = open_db_with_project();
+        db.insert_module_install(
+            "install-id-lasterror-1",
+            &pid,
+            "vct-rl-reranker",
+            "0.2.7",
+            "/home/test/.vct/modules/vct-rl-reranker",
+        )
+        .expect("insert");
+        // Flip to Installed (mimics the successful install step before
+        // the container start is attempted).
+        db.set_module_status(&pid, "vct-rl-reranker", ModuleStatus::Installed, None)
+            .expect("set installed");
+
+        // Simulate container-start failure.
+        db.set_module_last_error(
+            &pid,
+            "vct-rl-reranker",
+            Some("podman: image not found"),
+        )
+        .expect("set_module_last_error must succeed");
+
+        let row = db
+            .get_module_install(&pid, "vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        // Error is visible.
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("podman: image not found"),
+            "last_error must be written by set_module_last_error",
+        );
+        // Status must NOT have changed — install succeeded, only start failed.
+        assert_eq!(
+            row.status,
+            ModuleStatus::Installed,
+            "status must remain Installed after set_module_last_error",
+        );
+    }
+
+    /// Verify that passing `None` to `set_module_last_error` clears the
+    /// field — models the "user retries, container starts successfully"
+    /// flow where `last_error` should be wiped.
+    #[test]
+    fn db_set_module_last_error_to_none_clears_field() {
+        let (db, pid) = open_db_with_project();
+        db.insert_module_install(
+            "install-id-lasterror-2",
+            &pid,
+            "vct-rl-reranker",
+            "0.2.7",
+            "/home/test/.vct/modules/vct-rl-reranker",
+        )
+        .expect("insert");
+        db.set_module_status(&pid, "vct-rl-reranker", ModuleStatus::Installed, None)
+            .expect("set installed");
+
+        // Write then clear.
+        db.set_module_last_error(
+            &pid,
+            "vct-rl-reranker",
+            Some("temporary failure"),
+        )
+        .expect("write error");
+        db.set_module_last_error(&pid, "vct-rl-reranker", None)
+            .expect("clear error");
+
+        let row = db
+            .get_module_install(&pid, "vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.last_error.is_none(),
+            "last_error must be NULL after set_module_last_error(None)",
+        );
+        // Status must remain Installed throughout.
+        assert_eq!(row.status, ModuleStatus::Installed);
     }
 }

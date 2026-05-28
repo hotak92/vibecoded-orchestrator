@@ -1453,6 +1453,18 @@ pub async fn install_module_for_project(
                             "[module_service] start_container_after_install failed (install row stays installed): {}",
                             e
                         );
+                        // NEW-3.C (2026-05-28): persist the error to
+                        // module_installs.last_error so the GUI tile renders a
+                        // clear failure state instead of "installed but no
+                        // container" silent-fail. Status intentionally stays
+                        // 'installed' — the install succeeded; only the
+                        // post-install container start failed. The user can
+                        // retry via Restart from the dashboard.
+                        let _ = db.set_module_last_error(
+                            &project_id,
+                            &module_id,
+                            Some(&e),
+                        );
                         let _ = app.emit(
                             "module://container-start-failed",
                             serde_json::json!({
