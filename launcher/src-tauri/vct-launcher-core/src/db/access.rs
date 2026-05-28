@@ -66,6 +66,98 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect: {}", e))
     }
+
+    /// Init-time migration: rewrite legacy shared-KG collection names in
+    /// `kg_collection_access` to the current canonical name.
+    ///
+    /// Two legacy names are handled:
+    /// * `VibeCodedTools_KnowledgeGraph` — pre-v0.2.12 PR-26 rename
+    /// * `VibecodedOrchestrator_KnowledgeGraph` — v0.2.12–v0.2.22
+    ///   lowercase-c default
+    ///
+    /// For each legacy name the operation is:
+    /// 1. DELETE rows where BOTH the legacy name AND the canonical name
+    ///    already exist for the same `project_id` (dedup — the canonical
+    ///    row wins and the legacy duplicate is dropped).
+    /// 2. UPDATE the remaining legacy rows to the canonical name.
+    ///
+    /// Returns the total number of rows renamed across both legacy names.
+    /// Idempotent: a second call with no legacy rows is a no-op returning 0.
+    ///
+    /// Soft-fail contract: any DB error is returned to the caller; the
+    /// caller (launcher `setup()`) logs and continues — a migration hiccup
+    /// MUST NOT block launcher boot.
+    ///
+    /// // NEW-12 (2026-05-28): init-time migration for legacy shared-KG names
+    pub fn migrate_legacy_shared_kg_collection_names(
+        &self,
+        canonical: &str,
+    ) -> Result<usize, String> {
+        // Pre-v0.2.12 name (PR-26 rename). Mirrors
+        // `launcher::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION`.
+        const LEGACY_TOOLS: &str = "VibeCodedTools_KnowledgeGraph";
+        // v0.2.12–v0.2.22 lowercase-c name. Mirrors
+        // `launcher::commands::project_env_settings::LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C`.
+        const LEGACY_LOWERCASE_C: &str = "VibecodedOrchestrator_KnowledgeGraph";
+
+        let mut total_renamed: usize = 0;
+
+        for legacy in &[LEGACY_TOOLS, LEGACY_LOWERCASE_C] {
+            if *legacy == canonical {
+                // Safety guard: never rename a name to itself.
+                continue;
+            }
+
+            let guard = self.lock();
+
+            // Step 1: delete duplicate legacy rows where the canonical row
+            // already exists for the same project_id.
+            let deleted = guard
+                .execute(
+                    "DELETE FROM kg_collection_access
+                      WHERE collection_name = ?1
+                        AND project_id IN (
+                              SELECT project_id FROM kg_collection_access
+                              WHERE collection_name = ?2
+                            )",
+                    params![legacy, canonical],
+                )
+                .map_err(|e| {
+                    format!(
+                        "migrate_legacy_shared_kg: dedup-delete ({} → {}): {}",
+                        legacy, canonical, e
+                    )
+                })?;
+
+            // Step 2: rename the remaining legacy rows.
+            let renamed = guard
+                .execute(
+                    "UPDATE kg_collection_access
+                        SET collection_name = ?1
+                      WHERE collection_name = ?2",
+                    params![canonical, legacy],
+                )
+                .map_err(|e| {
+                    format!(
+                        "migrate_legacy_shared_kg: rename ({} → {}): {}",
+                        legacy, canonical, e
+                    )
+                })?;
+
+            if deleted > 0 || renamed > 0 {
+                eprintln!(
+                    "[vct] migrate-shared-kg: \
+                     legacy='{}' canonical='{}' \
+                     dedup_deleted={} renamed={}",
+                    legacy, canonical, deleted, renamed
+                );
+            }
+
+            total_renamed += renamed;
+        }
+
+        Ok(total_renamed)
+    }
 }
 
 // ─── Codegraph access ────────────────────────────────────────────────────
@@ -406,5 +498,147 @@ mod audit_tests {
             .unwrap();
         assert_eq!(by_search.len(), 1);
         assert_eq!(by_search[0].operation, "license_activate");
+    }
+}
+
+// ─── Tests: migrate_legacy_shared_kg_collection_names (NEW-12) ───────────
+
+#[cfg(test)]
+mod migrate_shared_kg_tests {
+    use crate::db::Db;
+
+    const CANONICAL: &str = "VibeCodedOrchestrator_KnowledgeGraph";
+    const LEGACY_TOOLS: &str = "VibeCodedTools_KnowledgeGraph";
+    const LEGACY_LOWERCASE_C: &str = "VibecodedOrchestrator_KnowledgeGraph";
+
+    /// Helper: seed a project row and an access row.
+    /// `folder_path` is derived from `project_id` so every project gets a
+    /// unique path — the `projects` table has a UNIQUE constraint on
+    /// `folder_path`, so reusing the same path for two projects would cause
+    /// the second `INSERT OR IGNORE` to silently skip, leaving the FK
+    /// reference broken.
+    fn seed(db: &Db, project_id: &str, collection: &str, level: &str) {
+        let now = 1_700_000_000_000_i64;
+        let folder = format!("/tmp/test/{}", project_id);
+        let guard = db.lock();
+        guard.execute(
+            "INSERT OR IGNORE INTO projects \
+             (id, name, folder_path, host, created_at, updated_at, slug) \
+             VALUES (?1, ?2, ?3, 'base', ?4, ?4, ?1)",
+            rusqlite::params![project_id, project_id, folder, now],
+        ).unwrap_or_else(|e| panic!("seed project {}: {}", project_id, e));
+        drop(guard);
+        db.kg_set_access(project_id, collection, level).unwrap();
+    }
+
+    /// Helper: count rows for a given (project_id, collection_name) pair.
+    fn count(db: &Db, project_id: &str, collection: &str) -> i64 {
+        let guard = db.lock();
+        guard
+            .query_row(
+                "SELECT COUNT(*) FROM kg_collection_access \
+                  WHERE project_id = ?1 AND collection_name = ?2",
+                rusqlite::params![project_id, collection],
+                |r| r.get(0),
+            )
+            .unwrap_or(0)
+    }
+
+    /// Case 1: a lone legacy `VibeCodedTools_KnowledgeGraph` row gets renamed
+    /// to the canonical name.
+    #[test]
+    fn legacy_tools_row_alone_gets_renamed() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", LEGACY_TOOLS, "read");
+
+        let renamed = db
+            .migrate_legacy_shared_kg_collection_names(CANONICAL)
+            .unwrap();
+        assert_eq!(renamed, 1, "expected 1 rename");
+
+        assert_eq!(count(&db, "p1", LEGACY_TOOLS), 0, "legacy row must be gone");
+        assert_eq!(count(&db, "p1", CANONICAL), 1, "canonical row must exist");
+    }
+
+    /// Case 1b: the lowercase-c legacy name also gets renamed.
+    #[test]
+    fn legacy_lowercase_c_row_alone_gets_renamed() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", LEGACY_LOWERCASE_C, "write");
+
+        let renamed = db
+            .migrate_legacy_shared_kg_collection_names(CANONICAL)
+            .unwrap();
+        assert_eq!(renamed, 1);
+
+        assert_eq!(count(&db, "p1", LEGACY_LOWERCASE_C), 0, "legacy_lowercase_c row must be gone");
+        assert_eq!(count(&db, "p1", CANONICAL), 1, "canonical row must exist");
+    }
+
+    /// Case 2: when BOTH a legacy row AND a canonical row exist for the SAME
+    /// project_id, the legacy duplicate is deleted (no uniqueness violation)
+    /// and only the canonical row survives.
+    #[test]
+    fn legacy_plus_canonical_same_project_deduped() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", LEGACY_TOOLS, "read");
+        seed(&db, "p1", CANONICAL, "write");
+
+        // Pre-condition: both rows present.
+        assert_eq!(count(&db, "p1", LEGACY_TOOLS), 1);
+        assert_eq!(count(&db, "p1", CANONICAL), 1);
+
+        let renamed = db
+            .migrate_legacy_shared_kg_collection_names(CANONICAL)
+            .unwrap();
+        // The dedup-delete path fires; the rename step has 0 remaining rows.
+        assert_eq!(renamed, 0, "legacy dup was deleted, not renamed");
+
+        assert_eq!(count(&db, "p1", LEGACY_TOOLS), 0, "legacy dup must be gone");
+        assert_eq!(count(&db, "p1", CANONICAL), 1, "canonical row must survive");
+    }
+
+    /// Case 3: only the canonical row exists — no-op, returns 0.
+    #[test]
+    fn only_canonical_row_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", CANONICAL, "read");
+
+        let renamed = db
+            .migrate_legacy_shared_kg_collection_names(CANONICAL)
+            .unwrap();
+        assert_eq!(renamed, 0);
+
+        assert_eq!(count(&db, "p1", CANONICAL), 1, "canonical row must be untouched");
+    }
+
+    /// Case 4: no rows at all — no-op, returns 0.
+    #[test]
+    fn empty_table_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+
+        let renamed = db
+            .migrate_legacy_shared_kg_collection_names(CANONICAL)
+            .unwrap();
+        assert_eq!(renamed, 0);
+    }
+
+    /// Idempotency: calling migrate twice on the same DB must not error and
+    /// the second call must return 0 (all legacy rows already renamed).
+    #[test]
+    fn idempotent_second_call_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "p1", LEGACY_TOOLS, "read");
+        seed(&db, "p2", LEGACY_LOWERCASE_C, "write");
+
+        let first = db
+            .migrate_legacy_shared_kg_collection_names(CANONICAL)
+            .unwrap();
+        assert_eq!(first, 2);
+
+        let second = db
+            .migrate_legacy_shared_kg_collection_names(CANONICAL)
+            .unwrap();
+        assert_eq!(second, 0, "second call must be a no-op");
     }
 }
