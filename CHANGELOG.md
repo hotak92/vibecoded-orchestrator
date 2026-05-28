@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.38] — unreleased
+## [0.2.38] — 2026-05-28
+
+A **comprehensive paid-module + install-pipeline + telemetry + KG-hygiene release** — closes 14 distinct items (8 fixes + 4 features + 2 CI gates) across two parallel agent fanouts, with audit-before-fanout discipline applied. Fixes 4 production regressions from v0.2.36/0.2.37 (RL Reranker install failure, MCP project misidentification, query_emb missing from telemetry, kg-sync VCT_INSTALL_ROOT plumbing) + ships the AGPL-side training corpus loader + adds 2 CI prevention gates. All fixes propagate via existing `install.py --update` + launcher self-update flows; no operator action required.
 
 ### Added
 
