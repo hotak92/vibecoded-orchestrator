@@ -310,12 +310,18 @@ class AgentMdInstallSubstitutesTests(unittest.TestCase):
 # Scripts that historically did
 #     sys.path.insert(0, .../claude_mcp_servers)
 # and have been retro-fitted to consult VCT_ORCHESTRATOR_ROOT.
+#
+# v0.2.38 A1: detect_duplicates.py uses the `weaviate` client directly
+# (no `weaviate_mcp.*` imports) so its claude_mcp_servers/ sys.path entry
+# was vestigial. A1 dropped it when introducing the pip-installable
+# weaviate_mcp package; the script no longer needs to consult
+# VCT_ORCHESTRATOR_ROOT for that purpose. Removed from this list so the
+# contract reflects reality.
 PR2_REWIRED_SCRIPTS = [
     "sync_knowledge_graph.py",
     "search_knowledge.py",
     "analyze_code_graph.py",
     "process_documents.py",
-    "detect_duplicates.py",
     "maintain_knowledge_graph.py",
     "generate-kg-summary.py",
 ]
