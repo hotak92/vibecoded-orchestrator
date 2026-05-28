@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# pyproject.toml — packaging for the `weaviate_mcp` sub-package.
+#
+# After `pip install -e claude_mcp_servers/` (which install.py runs
+# automatically after the root requirements.txt install), all consumer
+# scripts can `from weaviate_mcp.chunking import Chunker` or
+# `from weaviate_mcp.server import hybrid_search` without sys.path hacks.
+#
+# install.py handles the invocation; users don't run this directly.
+
+[build-system]
+requires = ["hatchling >= 1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "weaviate-mcp"
+version = "0.2.38"
+description = "Weaviate MCP server for the VibeCoded Orchestrator — semantic KG + code-graph search"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+authors = [
+    { name = "Martino Cesaratto", email = "martino.cesaratto@gmail.com" },
+]
+keywords = ["mcp", "weaviate", "knowledge-graph", "claude-code", "orchestrator"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Runtime deps shared with the root requirements.txt.
+# Versions are kept in sync with the root file; install.py installs the root
+# requirements.txt first, then `pip install -e .` here (no re-download
+# since the packages are already present in the venv).
+dependencies = [
+    "mcp>=1.27.0",
+    "weaviate-client>=4.21.0",
+    "aiohttp>=3.13.5",
+    "httpx>=0.28.1",
+    "pydantic>=2.13.3",
+    "pyyaml>=6.0.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["weaviate_mcp"]

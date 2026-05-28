@@ -381,22 +381,18 @@ SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
-# Smart code truncation — import from weaviate_mcp package.
-# PR-2 portability (2026-05-06): orchestrator clone resolved via
-# $VCT_ORCHESTRATOR_ROOT (.claude/env) with in-tree fallback. Falls back
-# to naive char-based truncation if the module is unavailable (CPU-only
-# user projects without the venv). Pure utility import (no service
-# runtime); see PR-2 design notes.
+# weaviate_mcp is pip-installed as an editable package by install.py
+# (A1, v0.2.38) — no sys.path entry needed for weaviate_mcp.code_truncation.
+# vco_lib (EmbeddingService) still needs its parent on sys.path because
+# vco_lib is not yet a standalone package.
+# Resolution order:
+#   1. $VCT_ORCHESTRATOR_ROOT (set by .claude/env)
+#   2. <in-tree> fallback — claude_mcp_servers/../ relative to this script
 _env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-if _env_root and (Path(_env_root) / "claude_mcp_servers").is_dir():
-    _mcp_dir = Path(_env_root) / "claude_mcp_servers"
+if _env_root and Path(_env_root).is_dir():
+    _vco_lib_parent = Path(_env_root)
 else:
-    _mcp_dir = Path(__file__).resolve().parent.parent.parent / "claude_mcp_servers"
-if str(_mcp_dir) not in sys.path:
-    sys.path.insert(0, str(_mcp_dir))
-# v0.2.18: vco_lib (EmbeddingService) lives next to claude_mcp_servers in
-# the orchestrator clone. Put its parent on sys.path too.
-_vco_lib_parent = _mcp_dir.parent
+    _vco_lib_parent = Path(__file__).resolve().parent.parent.parent
 if str(_vco_lib_parent) not in sys.path:
     sys.path.insert(0, str(_vco_lib_parent))
 # VCO-REWIRE-END: orchestrator-root-resolution
