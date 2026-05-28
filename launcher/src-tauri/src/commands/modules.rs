@@ -119,6 +119,12 @@ pub struct ModuleCatalogEntry {
     /// for the common case (entry IS in L0, or entry is a builtin).
     #[serde(default)]
     pub catalog_warning: String,
+    /// NEW-3 (2026-05-28): the module's `runtime.type` as declared in its
+    /// manifest. Populated from `from_manifest`; empty string for L0-only
+    /// entries and builtins. The Svelte tile uses this to decide whether to
+    /// render a "Start" button when `container_name = NULL`.
+    #[serde(default)]
+    pub runtime_type: String,
 }
 
 impl ModuleCatalogEntry {
@@ -148,6 +154,9 @@ impl ModuleCatalogEntry {
             deprecation_eol_date: String::new(),
             deprecation_migration_url: String::new(),
             catalog_warning: String::new(),
+            // NEW-3 (2026-05-28): expose runtime type so the tile can gate
+            // the "Start" button on container/service modules.
+            runtime_type: m.runtime.r#type.clone(),
         }
     }
 
@@ -189,6 +198,9 @@ impl ModuleCatalogEntry {
             deprecation_eol_date: l0.deprecation_eol_date.clone(),
             deprecation_migration_url: l0.deprecation_migration_url.clone(),
             catalog_warning: String::new(),
+            // L0 catalog records don't carry runtime metadata; the
+            // installed manifest path fills this in when available.
+            runtime_type: String::new(),
         }
     }
 }
@@ -322,6 +334,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         deprecation_eol_date: String::new(),
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
+        runtime_type: String::new(),
     });
 
     // 2. Orchestrator core + 3-4. its sub-components, sourced from
@@ -376,6 +389,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         deprecation_eol_date: String::new(),
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
+        runtime_type: String::new(),
     });
 
     for comp in components {
@@ -407,6 +421,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
             deprecation_eol_date: String::new(),
             deprecation_migration_url: String::new(),
             catalog_warning: String::new(),
+            runtime_type: String::new(),
         });
     }
 
@@ -833,6 +848,7 @@ fn synthetic_legacy_entry(legacy: &InstalledLegacyEntry) -> ModuleCatalogEntry {
         deprecation_eol_date: String::new(),
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
+        runtime_type: String::new(),
     }
 }
 
@@ -1415,9 +1431,14 @@ pub async fn install_module_for_project(
             // dashboard. Surfaces the error via audit + a non-blocking
             // toast event so the failure mode is visible without
             // rolling back the install.
+            // NEW-3 (2026-05-28): widened from `== "container"` to also
+            // admit `"service"` — both types declare a long-running
+            // daemon that should auto-start after install. `"cli"` /
+            // `"mcp_stdio"` / `"mcp_http"` are deliberately excluded
+            // (invoked on-demand, not persisted as containers).
             let resolved_container_name = if manifest.install.method
                 == crate::manifest::InstallMethod::ContainerPull
-                && manifest.runtime.r#type == "container"
+                && matches!(manifest.runtime.r#type.as_str(), "container" | "service")
             {
                 match crate::commands::module_service::start_container_after_install(
                     &manifest,
