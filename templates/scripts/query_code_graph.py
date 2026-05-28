@@ -52,6 +52,11 @@ except ImportError:
 # and $VCT_INSTALL_ROOT (legacy alias) before falling back to the
 # script-relative location. Mirrors sync_knowledge_graph.py's
 # `_resolve_mcp_servers_dir()` pattern.
+# A1 (v0.2.38): weaviate_mcp is pip-installed as an editable package by
+# install.py, so `from weaviate_mcp.server import ...` works without a
+# sys.path entry.  _MCP_SERVERS_PATH is still resolved for the `scripts/`
+# subdirectory (used below by kg_access.py via the P1-D block) and for the
+# fallback error message.
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _MCP_SERVERS_PATH: Optional[Path] = None
 for _env_var in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT"):
@@ -63,8 +68,6 @@ for _env_var in ("VCT_ORCHESTRATOR_ROOT", "VCT_INSTALL_ROOT"):
             break
 if _MCP_SERVERS_PATH is None:
     _MCP_SERVERS_PATH = _PROJECT_ROOT / "claude_mcp_servers"
-if str(_MCP_SERVERS_PATH) not in sys.path:
-    sys.path.insert(0, str(_MCP_SERVERS_PATH))
 
 try:
     from weaviate_mcp.server import (
@@ -77,7 +80,8 @@ except ImportError as exc:  # pragma: no cover — surface a clear error
     print(
         f"Error: could not import weaviate_mcp.server rank-tier helper: {exc}\n"
         f"  Expected module at: {_MCP_SERVERS_PATH}/weaviate_mcp/server.py\n"
-        "  This script requires the MCP server module for shared rendering.",
+        "  Ensure install.py has run (pip install -e claude_mcp_servers/) or set\n"
+        "  VCT_ORCHESTRATOR_ROOT to the orchestrator clone root.",
         file=sys.stderr,
     )
     sys.exit(1)

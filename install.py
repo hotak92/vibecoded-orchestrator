@@ -5781,6 +5781,52 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     print("OK")
     _log_install_event("4/10", "ok", "vco CLI editable install completed")
 
+    # A1 (v0.2.38): pip-install weaviate_mcp as an editable package so all
+    # consumer scripts can `from weaviate_mcp.chunking import Chunker` (etc.)
+    # without sys.path hacks.  Runs AFTER the root `pip install -e .` so the
+    # venv already has all shared deps (mcp, weaviate-client, aiohttp, …) and
+    # hatchling can satisfy them without a network hit.
+    #
+    # Gated on the sub-package's pyproject.toml so older clones (pre-0.2.38)
+    # or exotic paths that strip that file don't fail loudly — they just keep
+    # using sys.path-based resolution.
+    mcp_pyproject = PROJECT_ROOT / "claude_mcp_servers" / "pyproject.toml"
+    if not mcp_pyproject.exists():
+        _log_install_event(
+            "4/10", "skip",
+            "claude_mcp_servers/pyproject.toml missing; skipping weaviate_mcp editable install",
+            data={"mcp_pyproject_path": str(mcp_pyproject)},
+        )
+        return
+
+    print("[4/10] Installing weaviate_mcp (editable) ... ", end="", flush=True)
+    _log_install_event("4/10", "start", "pip install -e claude_mcp_servers/ (weaviate_mcp)")
+    mcp_editable_result = subprocess.run(
+        [str(venv_python), "-m", "pip", "install", "-e",
+         str(PROJECT_ROOT / "claude_mcp_servers")],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True, text=True,
+    )
+    if mcp_editable_result.returncode != 0:
+        print("FAIL")
+        for line in (mcp_editable_result.stderr or "").strip().splitlines()[-15:]:
+            print(f"    {line}")
+        print()
+        print("  The orchestrator install completed, but weaviate_mcp is not pip-installed.")
+        print("  Consumer scripts fall back to sys.path resolution automatically.")
+        _log_install_event(
+            "4/10", "warn",
+            f"weaviate_mcp editable install failed (exit {mcp_editable_result.returncode}); "
+            "sys.path fallback will be used",
+            data={"exit_code": mcp_editable_result.returncode,
+                  "stderr_tail": (mcp_editable_result.stderr or "")
+                                 .strip()[-400:]},
+        )
+        # Soft-fail: don't kill the whole install — sys.path fallbacks still work.
+        return
+    print("OK")
+    _log_install_event("4/10", "ok", "weaviate_mcp editable install completed")
+
 
 # ---------------------------------------------------------------------------
 # Step 5b: Materialize orchestrator-self .claude/ from templates
