@@ -5454,6 +5454,8 @@ def install_project_bundle(
     update_mode: bool = False,
     force: bool = False,
     dry_run: bool = False,
+    write_env: bool = False,
+    project_name: Optional[str] = None,
     log_event: Optional[Callable[..., None]] = None,
 ) -> dict:
     """Install (or update) the per-project Claude bundle in `folder`.
@@ -5468,6 +5470,13 @@ def install_project_bundle(
         force: in update mode, treat user-modified files as overwritable
             (still respects the no-changes "noop" case).
         dry_run: enumerate + classify but make no filesystem mutations.
+        write_env: A2 (2026-05-28) — when True, write `.claude/env` +
+            `.claude/settings.json env` using launcher.db when available,
+            falling back to a default bundle derived from `--orchestrator-root`
+            + project-name (folder basename or `project_name`).  Makes
+            ``install-bundle`` standalone-usable without a running launcher.
+        project_name: raw project name for env derivation (overrides folder
+            basename when ``write_env`` is True and launcher.db is absent).
         log_event: optional forensic logger.
 
     Returns a JSON-serialisable dict:
@@ -5861,6 +5870,27 @@ def install_project_bundle(
             backfill = _apply_canonical_env_via_config_projection(
                 folder, orchestrator_root=orchestrator_root,
             )
+            # A2 (2026-05-28): when the DB-sourced projection was skipped
+            # (launcher.db absent / project not registered) and the caller
+            # explicitly requested env emission via --write-env, fall back
+            # to the standalone bundle derived from orchestrator_root +
+            # project-name.  This makes `install-bundle` fully functional
+            # for OSS-developer / fork-integrator workflows that don't run
+            # through the launcher.
+            if write_env and backfill["action"] in ("db_unreachable", "not_registered"):
+                standalone = _apply_standalone_env(
+                    folder,
+                    orchestrator_root=orchestrator_root,
+                    project_name=project_name,
+                )
+                _log("4.bundle.standalone_env", "ok",
+                     f"standalone_env_apply: {standalone['action']}",
+                     data=standalone)
+                result["standalone_env"] = standalone
+                if standalone["action"] == "applied":
+                    # Surface standalone write in the top-level result so
+                    # the CLI human-readable output picks it up.
+                    backfill = standalone
             result["backfill_code_graph_project"] = backfill
             result["backfill_kg_collection"] = backfill  # same data
             _log("4.bundle.backfill", "ok",
@@ -6463,6 +6493,102 @@ def _apply_canonical_env_via_config_projection(
     result["action"] = "applied"
     result["added_keys"] = sorted(keys_written)
     result["resolved_values"] = dict(bundle["canonical_env"])
+    return result
+
+
+def _apply_standalone_env(
+    folder: Path,
+    orchestrator_root: Optional[Path],
+    project_name: Optional[str],
+) -> dict:
+    """A2 (2026-05-28): write env surfaces from --orchestrator-root alone.
+
+    Used when ``--write-env`` is passed but launcher.db is absent (or the
+    project is not registered in it).  Constructs a :class:`ProjectEnvBundle`
+    from the folder-basename + orchestrator_root without any DB access, then
+    delegates to :func:`~vco_lib.config_projection.apply_project_env`.
+
+    This is the standalone / fork-integrator path that makes ``install-bundle``
+    fully functional without a running launcher.
+
+    Args:
+        folder: target project root (must exist).
+        orchestrator_root: path to the orchestrator clone.  ``VCT_ORCHESTRATOR_ROOT``
+            is only emitted when this is non-None.
+        project_name: raw project name override.  Defaults to ``folder.name``.
+
+    Returns:
+        Same shape as :func:`_apply_canonical_env_via_config_projection`::
+
+            {"action": str, "added_keys": [str, ...], "path": str,
+             "resolved_values": {key: value, ...}}
+
+        Actions:
+            - ``"applied"``: env written.
+            - ``"apply_failed:<ExceptionName>:<message>"``: write error.
+    """
+    from vco_lib.config_projection import apply_project_env, ProjectEnvBundle
+
+    settings_file = folder / ".claude" / "settings.json"
+    result: dict = {
+        "action": "missing",
+        "added_keys": [],
+        "path": str(settings_file),
+        "resolved_values": {},
+    }
+
+    raw_name = project_name or folder.name or "Project"
+    sanitized = sanitize_for_weaviate_class(raw_name)
+
+    kg_collection = f"{sanitized}_KnowledgeGraph"
+    dev_collection = f"{sanitized}_Development"
+    diagrams_collection = f"{sanitized}_Diagrams"
+    shared_kg = "VibeCodedOrchestrator_KnowledgeGraph"
+
+    env: dict[str, str] = {
+        "PROJECT_NAME": raw_name,
+        "CODE_GRAPH_PROJECT": sanitized,
+        "KG_COLLECTION": kg_collection,
+        "DEVELOPMENT_COLLECTION": dev_collection,
+        "DIAGRAMS_COLLECTION": diagrams_collection,
+        "SHARED_KG_COLLECTION": shared_kg,
+        "SHARED_KG_WRITE_DISABLED": "false",
+        "SHARED_KG_OPT_OUT": "false",
+        "ACTIVE_EMBEDDING": "qwen3",
+        "WEAVIATE_URL": "http://localhost:8081",
+        "WEAVIATE_PORT": "8081",
+        "OLLAMA_URL": "http://localhost:11435",
+        "OLLAMA_PORT": "11435",
+        "CODE_EMBED_URL": "http://localhost:11440",
+        "CODE_EMBED_PORT": "11440",
+    }
+
+    if orchestrator_root is not None:
+        orch = Path(orchestrator_root).resolve()
+        env["VCT_ORCHESTRATOR_ROOT"] = str(orch)
+        env["VCT_INFRASTRUCTURE_DIR"] = str(orch / "infrastructure")
+        # v0.2.37 Gap 6a legacy alias consumed by code-graph-analyze wrapper
+        env["VCT_INSTALL_ROOT"] = str(orch)
+
+    bundle: ProjectEnvBundle = {
+        "canonical_env": env,
+        "project_id": "",      # no DB row — sentinel empty string
+        "project_root": folder.resolve(),
+    }
+
+    try:
+        report = apply_project_env(bundle)
+    except Exception as e:
+        result["action"] = f"apply_failed:{type(e).__name__}:{e}"
+        return result
+
+    keys_written: set[str] = set()
+    for _surface, keys in report.items():
+        keys_written.update(keys)
+
+    result["action"] = "applied"
+    result["added_keys"] = sorted(keys_written)
+    result["resolved_values"] = dict(env)
     return result
 
 
@@ -7841,6 +7967,8 @@ def _cmd_install_bundle(args: argparse.Namespace) -> int:
         update_mode=bool(args.update),
         force=bool(args.force),
         dry_run=bool(args.dry_run),
+        write_env=bool(getattr(args, "write_env", False)),
+        project_name=getattr(args, "project_name", None) or None,
     )
     if args.json:
         print(json.dumps(result))
@@ -8259,6 +8387,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--project-folder", default=None,
         help="Alias / explicit form of --folder (kept for symmetry with "
              "bootstrap-collections). If both are given they must match.",
+    )
+    p_bundle.add_argument(
+        "--write-env", action="store_true", dest="write_env",
+        help=(
+            "A2 (v0.2.38): write .claude/env + .claude/settings.json env "
+            "block after copying bundle files.  Uses launcher.db when "
+            "available; falls back to a default bundle derived from "
+            "--orchestrator-root and --project-name (or folder basename) "
+            "when the launcher is absent.  Makes install-bundle standalone-"
+            "usable for OSS-developer / fork-integrator workflows."
+        ),
+    )
+    p_bundle.add_argument(
+        "--project-name", default=None, dest="project_name",
+        help=(
+            "Raw project display name used for KG_COLLECTION / "
+            "CODE_GRAPH_PROJECT derivation when --write-env is set and "
+            "the launcher DB is absent.  Defaults to the folder basename."
+        ),
     )
     p_bundle.add_argument(
         "--json", action="store_true",
