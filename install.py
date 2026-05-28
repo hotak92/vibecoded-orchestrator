@@ -2787,6 +2787,28 @@ def main() -> int:
         _write_env_config(embed_config, args, joern_available=joern_available)
     else:
         print("[skip] .env configuration (preserved during update)")
+        # A3 (2026-05-28): reconcile any canonical env keys added since the
+        # user's original install. Additive-only: user-set values preserved,
+        # only missing keys are appended.
+        _env_file = PROJECT_ROOT / ".env"
+        _reconcile_result = _reconcile_env_keys(_env_file)
+        if _reconcile_result["action"] == "appended":
+            _added_keys = _reconcile_result["added"]
+            print(
+                f"  .env: added {len(_added_keys)} new env key(s): "
+                + ", ".join(_added_keys)
+            )
+            _log_install_event(
+                "9/10", "info",
+                f"_reconcile_env_keys: added {len(_added_keys)} key(s)",
+                data={"added": _added_keys, "env_file": str(_env_file)},
+            )
+        elif _reconcile_result["action"] == "noop":
+            _log_install_event(
+                "9/10", "info",
+                "_reconcile_env_keys: no missing keys (noop)",
+                data={"env_file": str(_env_file)},
+            )
 
     # Step 9: Configure Claude Code settings (skip on update)
     if mode == "install":
@@ -13875,6 +13897,114 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
                   "telemetry_on": telemetry_enabled,
                   "joern_available": joern_available},
         )
+
+
+def _reconcile_env_keys(env_path: Path) -> dict:
+    """Append canonical env keys missing from an existing .env file.
+
+    # A3 (2026-05-28): install.py --update skips _write_env_config to
+    # preserve user values, so keys added in newer orchestrator versions
+    # (e.g. DIAGRAMS_COLLECTION added between v0.2.10 and v0.2.34) were
+    # silently absent. This function closes that gap with an additive-only
+    # write: parse existing keys, compare against the canonical list from
+    # vco_lib.env_template, append each missing key with its default value
+    # and a comment marker. User-set values are NEVER overwritten.
+
+    Args:
+        env_path: Path to the project's ``.env`` file. No-op if the file
+            does not exist (fresh install wrote it; nothing to reconcile).
+
+    Returns:
+        ``{"added": [keys...], "action": "appended"|"noop"|"skipped"}``
+    """
+    if not env_path.is_file():
+        return {"added": [], "action": "skipped"}
+
+    from vco_lib.env_template import list_canonical_env_template_keys
+
+    canonical_keys = list_canonical_env_template_keys()
+    existing_keys = _parse_existing_env_keys(env_path)
+    missing = [k for k in canonical_keys if k not in existing_keys]
+    if not missing:
+        return {"added": [], "action": "noop"}
+
+    # Build a default-value map from the legacy canonical template
+    # (same source _ensure_env_template uses so defaults are consistent).
+    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
+    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
+    sanitized = os.environ.get("PROJECT_NAME", "Project")
+    defaults: dict[str, str] = {
+        "PROJECT_NAME": sanitized,
+        "CODE_GRAPH_PROJECT": sanitized,
+        "KG_COLLECTION": f"{sanitized}_KnowledgeGraph",
+        "DEVELOPMENT_COLLECTION": f"{sanitized}_Development",
+        "SHARED_KG_COLLECTION": os.environ.get(
+            "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
+        ),
+        "SHARED_KG_WRITE_DISABLED": "false",
+        "SHARED_KG_OPT_OUT": "false",
+        "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
+        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
+        "WEAVIATE_PORT": weaviate_port,
+        "OLLAMA_URL": f"http://localhost:{ollama_port}",
+        "OLLAMA_PORT": ollama_port,
+        "CODE_EMBED_URL": f"http://localhost:{code_embed_port}",
+        "CODE_EMBED_PORT": code_embed_port,
+    }
+
+    date_str = _utc_iso_now()[:10]
+    append_lines: list[str] = [
+        "",
+        f"# --- Added by install.py --update on {date_str} ---",
+    ]
+    added: list[str] = []
+    for key in missing:
+        default = defaults.get(key, "")
+        append_lines.append(
+            f"# Added by install.py --update on {date_str}"
+        )
+        append_lines.append(f"{key}={default}")
+        added.append(key)
+
+    try:
+        existing_text = env_path.read_text(encoding="utf-8")
+        new_text = existing_text
+        if not existing_text.endswith("\n"):
+            new_text += "\n"
+        new_text += "\n".join(append_lines) + "\n"
+        # Atomic write — same pattern as _atomic_write_text in env_template.
+        import tempfile
+        parent = env_path.parent
+        fd, tmp_path_str = tempfile.mkstemp(
+            prefix=env_path.name + ".",
+            suffix=".tmp",
+            dir=str(parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(new_text)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_path_str, str(env_path))
+        except Exception:
+            try:
+                Path(tmp_path_str).unlink()
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        _log_install_event(
+            "9/10", "warn",
+            f"_reconcile_env_keys: write failed: {exc}",
+            data={"env_path": str(env_path), "error": str(exc)},
+        )
+        return {"added": [], "action": "skipped"}
+
+    return {"added": added, "action": "appended"}
 
 
 # ---------------------------------------------------------------------------
