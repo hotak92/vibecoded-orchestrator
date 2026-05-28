@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.39] — unreleased
+
+### Fixed
+
+- **NEW-3.C: surface container-start failure to `module_installs.last_error`** (Agent V39-NEW3.C): when `start_container_after_install` fails post-install, the error was previously swallowed — `eprintln` + an unlistened Tauri event + audit log only. The GUI tile showed `status='installed'` with no error message, making the failure invisible. `Db::set_module_last_error` (new targeted DB helper) now writes the failure reason to `module_installs.last_error` without touching `status` (install succeeded; only the post-install container start failed — user can retry via Restart). Two unit tests added to `vct-launcher-core/src/db/modules.rs`: `db_set_module_last_error_persists_error` and `db_set_module_last_error_to_none_clears_field`. All 1176 lib tests pass.
+
 ## [0.2.38] — 2026-05-28
 
 A **comprehensive paid-module + install-pipeline + telemetry + KG-hygiene release** — closes 14 distinct items (8 fixes + 4 features + 2 CI gates) across two parallel agent fanouts, with audit-before-fanout discipline applied. Fixes 4 production regressions from v0.2.36/0.2.37 (RL Reranker install failure, MCP project misidentification, query_emb missing from telemetry, kg-sync VCT_INSTALL_ROOT plumbing) + ships the AGPL-side training corpus loader + adds 2 CI prevention gates. All fixes propagate via existing `install.py --update` + launcher self-update flows; no operator action required.
