@@ -133,6 +133,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module-shipped MCP tool allowlist defaults: module_mcp_tool_defaults table populated from vct-module.json::mcp_registration.tool_allowlist at install time, read by hub /mcp-tool-grants route (v0.2.34 Agent E — Phase 4 generalisation)",
         sql: include_str!("migrations/023_module_mcp_tool_defaults.sql"),
     },
+    Migration {
+        version: 24,
+        description: "license_keys + license_key_validations: per-paid-module license keys (L1, v0.2.40). Each paid module owns its own row keyed by module_id; reserved '__orchestrator__' slot preserves the legacy single-key behaviour. tier_cache stays the EFFECTIVE projection.",
+        sql: include_str!("migrations/024_license_keys.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

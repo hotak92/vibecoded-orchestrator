@@ -29,6 +29,20 @@ interface UIState {
   showInstallWizard: boolean;
   showMcpDashboard: boolean;
   showOnboarding: boolean;
+  // v0.2.40 L1: multi-key licensing modal.
+  //
+  // NAMING NOTE (Agent L1, 2026-05-30): the flag is named
+  // `showLicenseManager` — NOT `showLicense`, `showModal`,
+  // `showKeyManager` or any short variant. Pre-push collision audit A3
+  // (`.claude/context/reviews/v0240-pre-push-2026-05-30/discovery-A3-fabio-branch-collision-audit.md`)
+  // identified that Fabio's parallel branch (orchestrator-update-progress
+  // modal) is likely to add `showOrchestratorUpdateProgress` to this
+  // same UIState interface in a future PR. The `showLicenseManager`
+  // name was reserved by the A3 audit guidance to keep rebase
+  // friction-free: distinct enough that there's no substring-match
+  // ambiguity, distinct enough that grep/sed across the codebase won't
+  // hit both flags.
+  showLicenseManager: boolean;
   // Cross-component trigger for ProjectSelector's "Create project" modal.
   // Set by routes that don't render their own form (e.g. /projects list
   // page's "+ Add Project" button) so the modal opens from the globally-
@@ -52,6 +66,7 @@ function createUIStore() {
     showOnboarding: false,
     onboardingForced: false,
     showCreateProject: false,
+    showLicenseManager: false,
   });
 
   return {
@@ -114,6 +129,14 @@ function createUIStore() {
       update((s) => ({ ...s, showCreateProject: true })),
     closeCreateProject: () =>
       update((s) => ({ ...s, showCreateProject: false })),
+    // v0.2.40 L1: per-paid-module license manager. Opens a modal that
+    // lists every paid module's key with input + Validate + status
+    // badge. See `LicenseManagerModal.svelte` for the UX shape and
+    // `stores/moduleLicenseKeys.ts` for the data flow.
+    openLicenseManager: () =>
+      update((s) => ({ ...s, showLicenseManager: true })),
+    closeLicenseManager: () =>
+      update((s) => ({ ...s, showLicenseManager: false })),
   };
 }
 

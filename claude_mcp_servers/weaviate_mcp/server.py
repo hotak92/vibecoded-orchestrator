@@ -3485,7 +3485,15 @@ async def _rl_cache_and_rerank(
     _rl_enabled = True
     try:
         from VCThelpers.license import feature_enabled
-        if not feature_enabled("rl_retrieval"):
+        # v0.2.40 L1 — multi-key licensing: passing `module_id` lets
+        # `feature_enabled` consult the per-module overlay in
+        # `~/.vibecoded/license_cache.json`. So a user on orchestrator
+        # tier=free who explicitly activated a `vct-rl-reranker` license
+        # key still gets RL retrieval. Pre-L1 behaviour (no per-module
+        # key) is preserved: the function short-circuits on the legacy
+        # tier check first, so a Pro/MAO user never reaches the overlay
+        # check.
+        if not feature_enabled("rl_retrieval", module_id="vct-rl-reranker"):
             logger.debug("RL retrieval gated off for current tier — using Weaviate order")
             _rl_enabled = False
     except ImportError:

@@ -567,15 +567,83 @@ def is_admin() -> bool:
     return get_tier() == "admin"
 
 
-def feature_enabled(feature: str) -> bool:
+def feature_enabled(feature: str, module_id: Optional[str] = None) -> bool:
     """Return True if `feature` is available on the current tier.
 
     Unknown features default to True (fail-open for features not yet gated).
+
+    v0.2.40 L1 — multi-key licensing: pass `module_id=` to gate on
+    PER-MODULE entitlements (e.g. the user activated a `vct-rl-reranker`
+    key independently of the orchestrator tier). When `module_id` is
+    set, the function:
+
+      1. Returns True immediately if the orchestrator tier already
+         covers the feature (legacy behaviour — a Pro-tier user
+         doesn't need a per-module RL key).
+      2. Otherwise, consults the cached `module_licenses` overlay from
+         `~/.vibecoded/license_cache.json` (mirror of the launcher's
+         `tier_cache.module_licenses` SQLite column) and returns True
+         if that module has a non-empty `tier` entry.
+
+    Falling back to True for "unknown feature, no module_id" preserves
+    fail-open semantics for code paths that ask about features the
+    validator doesn't know about yet.
     """
     min_tier = TIER_FEATURES.get(feature)
     if min_tier is None:
         return True
-    return require_tier(min_tier)
+    # Step 1: legacy tier-only path. Orchestrator tier wins.
+    if require_tier(min_tier):
+        return True
+    # Step 2: per-module overlay (only when caller passed module_id).
+    if module_id is not None:
+        return is_module_licensed(module_id)
+    return False
+
+
+def is_module_licensed(module_id: str) -> bool:
+    """Return True if `module_id` has a non-empty per-module entitlement
+    in the cached `module_licenses` overlay.
+
+    v0.2.40 L1 — pure read from `~/.vibecoded/license_cache.json` (the
+    Phase 3A token gateway's cache file, also written by the launcher's
+    `license_refresh` flow when the server returns a `module_licenses`
+    payload AND now by `validate_module_license` per-module).
+
+    Returns False on any failure (file missing, JSON malformed, no
+    `module_licenses` field, no matching entry, entry has no `tier`
+    field). Never raises — feature-gate callers cannot afford a
+    `feature_enabled` call to crash startup.
+
+    Distinct from `require_tier(min_tier)`: this checks an INDEPENDENT
+    per-module entitlement granted by the user activating a paid
+    module's specific license key. A user can have orchestrator
+    tier=free + a paid RL Reranker key → `is_module_licensed(
+    "vct-rl-reranker")` returns True, but `require_tier("pro")` returns
+    False.
+    """
+    if not module_id:
+        return False
+    try:
+        if not CACHE_FILE.exists():
+            return False
+        raw = CACHE_FILE.read_text()
+    except OSError:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    overlay = parsed.get("module_licenses")
+    if not isinstance(overlay, dict):
+        return False
+    entry = overlay.get(module_id)
+    if not isinstance(entry, dict):
+        return False
+    tier = entry.get("tier")
+    return isinstance(tier, str) and tier not in ("", "free")
 
 
 def license_status() -> dict:

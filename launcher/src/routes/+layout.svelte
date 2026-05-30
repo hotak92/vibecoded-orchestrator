@@ -20,6 +20,15 @@
   // to /preferences via goto(). The Secrets sub-tab dropped entirely
   // because it duplicated /preferences/secrets.
   import ActivationModal from '$lib/components/ActivationModal.svelte';
+  // v0.2.40 L1: per-paid-module license manager modal. Opened via
+  // `ui.openLicenseManager()`. Mount + close pattern mirrors
+  // `InstallWizard` (the wiring guide we sent Fabio). Namespacing
+  // discipline per the A3 collision audit: the store flag is
+  // `showLicenseManager` (NOT `showLicense` / `showModal`) so Fabio's
+  // parallel orchestrator-update-progress branch doesn't collide on
+  // rebase. See `.claude/context/reviews/v0240-pre-push-2026-05-30
+  // /discovery-A3-fabio-branch-collision-audit.md`.
+  import LicenseManagerModal from '$lib/components/LicenseManagerModal.svelte';
   import InstallWizard from '$lib/components/InstallWizard.svelte';
   import McpDashboard from '$lib/components/McpDashboard.svelte';
   import OnboardingWizard from '$lib/components/OnboardingWizard.svelte';
@@ -260,6 +269,15 @@
       force={uiState.onboardingForced}
       onClose={() => ui.closeOnboarding()}
     />
+  {/if}
+
+  <!-- v0.2.40 L1: per-paid-module license manager. Opened via
+       `ui.openLicenseManager()`. The flag name is `showLicenseManager`
+       per the A3 collision-audit guidance (avoids overlap with Fabio's
+       in-progress orchestrator-update-progress modal flag). Same
+       open/close shape as InstallWizard above. -->
+  {#if uiState.showLicenseManager}
+    <LicenseManagerModal onClose={() => ui.closeLicenseManager()} />
   {/if}
   <ChangelogModal bind:open={showChangelog} />
   <ExternalServicesDialog />

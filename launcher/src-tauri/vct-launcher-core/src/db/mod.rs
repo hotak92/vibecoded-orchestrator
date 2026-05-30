@@ -55,6 +55,12 @@ pub mod diagrams;
 // time from manifest.mcp_registration.tool_allowlist; read by the hub's
 // /mcp-tool-grants route to compose per-project allowlists.
 pub mod mcp_tool_defaults;
+// Migration 024 — per-paid-module license keys (v0.2.40 L1). The raw
+// key value stays in the OS keychain; this table only holds the SOURCE-
+// of-input metadata (prefix for display, keychain coordinates, last
+// validation outcome). Effective tier still projects through
+// `tier_cache.module_licenses` — `tier.rs` stays unchanged.
+pub mod license_keys;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
