@@ -1,4 +1,4 @@
-//! Per-paid-module license keys (v0.2.40 L1).
+//! Per-paid-module license keys (v0.2.40 L1, L1.M migration).
 //!
 //! Source-of-truth side of the multi-key licensing model: each paid
 //! module (RL Reranker, MAO, future agent packs) owns one row keyed by
@@ -14,9 +14,46 @@
 //!   service = "vct.global.licensing"
 //!   username = <keychain_username column>
 //!
-//! For new per-module rows the username is `license_key__<module_id>`;
-//! for migrated legacy rows it's the constant `VIBECODED_LICENSE_KEY`
-//! so the existing keychain entry is reused without rewriting.
+//! Every row — including the reserved orchestrator slot — uses the
+//! canonical username pattern `license_key__<module_id>` (so the
+//! orchestrator slot lives at `license_key____orchestrator__`).
+//!
+//! ## Discovery for downstream consumers
+//!
+//! Orchestrator projects, hooks, MCPs, and helper scripts that need to
+//! discover license keys should use the helpers exposed by this module
+//! rather than hardcoding strings:
+//!
+//!   * `license_keychain_service()` → returns `"vct.global.licensing"`
+//!     (the keychain service name; this is the value
+//!     `commands::licensing::LICENSE_MODULE_ID` resolves to when used
+//!     as the secret's `module_id` argument in `secrets::get/set`).
+//!   * `keychain_username_for(module_id)` → returns the canonical
+//!     username for the given module (e.g. `"license_key__vct-rl-reranker"`,
+//!     or `"license_key____orchestrator__"` for the reserved root slot).
+//!   * `ORCHESTRATOR_MODULE_ID` → the reserved module-id sentinel
+//!     (`"__orchestrator__"`) for the root orchestrator-tier key.
+//!
+//! All orchestrator projects, hooks, MCPs that need to discover
+//! license keys should use `keychain_username_for(module_id)` from
+//! this module rather than hardcoded strings — this keeps consumers
+//! resilient to future username-shape changes.
+//!
+//! ## Legacy username migration (v0.2.40 L1.M)
+//!
+//! Pre-L1 launcher (v0.2.39 and earlier) stored the single orchestrator
+//! key at username `"VIBECODED_LICENSE_KEY"`. L1 (initial v0.2.40
+//! landing) kept that constant as `keychain_username_for(ORCHESTRATOR_…)`'s
+//! return value to preserve downgrade compatibility. L1.M (per user
+//! directive 2026-05-30: "no reason a user will ever downgrade")
+//! switches to the canonical `license_key____orchestrator__` username.
+//! `commands::licensing::ensure_legacy_orchestrator_row_migrated`
+//! handles the one-time migration at launcher boot: READ the value
+//! from the legacy username → WRITE it to the canonical username →
+//! DELETE the legacy entry. Write-before-delete order ensures no data
+//! loss on partial failure. `LEGACY_KEYCHAIN_USERNAME` is retained as
+//! a constant ONLY for the migration helper to read from; production
+//! call sites use `keychain_username_for(ORCHESTRATOR_MODULE_ID)`.
 //!
 //! Why this is a separate table from `tier_cache`
 //!   `tier_cache` has the `id INTEGER PRIMARY KEY CHECK (id = 1)`
@@ -41,23 +78,41 @@ use super::Db;
 /// special module_id so existing installs upgrade cleanly.
 pub const ORCHESTRATOR_MODULE_ID: &str = "__orchestrator__";
 
-/// Legacy keychain username (single-key model). When a row is created
-/// by the v0.2.40 migration path, `keychain_username` carries this
-/// value so the existing OS keychain entry is reused without a
-/// one-time rewrite.
+/// Legacy keychain username (single-key model, pre-v0.2.40-L1.M).
+///
+/// L1.M (v0.2.40): retained ONLY so the one-time migration helper
+/// `commands::licensing::ensure_legacy_orchestrator_row_migrated` can
+/// READ from this username before rewriting to the canonical
+/// `license_key____orchestrator__` (and DELETING this entry). New
+/// production code MUST NOT reference this constant — use
+/// `keychain_username_for(ORCHESTRATOR_MODULE_ID)` instead, which
+/// returns the canonical username.
 pub const LEGACY_KEYCHAIN_USERNAME: &str = "VIBECODED_LICENSE_KEY";
 
-/// Compose the per-module keychain username for new per-module rows.
-/// Legacy single-key rows stay on `LEGACY_KEYCHAIN_USERNAME`.
+/// Canonical keychain service name used by every license-key keychain
+/// entry. Returned as a `&'static str` so consumers (orchestrator
+/// projects, hooks, MCPs) can use it directly as the secret's service
+/// argument without allocating. Mirrors the value
+/// `commands::licensing::LICENSE_MODULE_ID` carries (kept in sync as a
+/// single source of truth for downstream discoverability).
+pub fn license_keychain_service() -> &'static str {
+    "vct.global.licensing"
+}
+
+/// Compose the canonical per-module keychain username for every
+/// license-key entry. Every module — including the reserved
+/// orchestrator slot — uses the `license_key__<module_id>` pattern;
+/// the orchestrator slot resolves to `license_key____orchestrator__`
+/// (the double underscore comes from the reserved `__orchestrator__`
+/// module-id sentinel concatenated with the `license_key__` prefix).
+///
+/// L1.M (v0.2.40): SUPERSEDES the v0.2.40-L1 behaviour where the
+/// orchestrator slot returned `LEGACY_KEYCHAIN_USERNAME` for downgrade
+/// compatibility. The migration helper
+/// `commands::licensing::ensure_legacy_orchestrator_row_migrated`
+/// owns the one-time legacy-to-canonical rewrite at launcher boot.
 pub fn keychain_username_for(module_id: &str) -> String {
-    if module_id == ORCHESTRATOR_MODULE_ID {
-        // Promotion path: when the user explicitly re-activates the
-        // orchestrator key through the new GUI, we WRITE to the legacy
-        // username so a downgrade to a pre-L1 launcher still finds it.
-        LEGACY_KEYCHAIN_USERNAME.to_string()
-    } else {
-        format!("license_key__{}", module_id)
-    }
+    format!("license_key__{}", module_id)
 }
 
 /// In-memory row shape for `license_keys`. The raw key VALUE is never
@@ -410,8 +465,14 @@ mod tests {
         let db = Db::open_in_memory().expect("in-memory");
         db.upsert_license_key("vct-rl-reranker", "AAA", "license_key__vct-rl-reranker")
             .expect("upsert A");
-        db.upsert_license_key(ORCHESTRATOR_MODULE_ID, "ORC", LEGACY_KEYCHAIN_USERNAME)
-            .expect("upsert root");
+        // Use the canonical username for the orchestrator slot (L1.M:
+        // SUPERSEDES the v0.2.40-L1 LEGACY_KEYCHAIN_USERNAME path).
+        db.upsert_license_key(
+            ORCHESTRATOR_MODULE_ID,
+            "ORC",
+            &keychain_username_for(ORCHESTRATOR_MODULE_ID),
+        )
+        .expect("upsert root");
         let rows = db.list_license_keys().expect("list");
         // '__orchestrator__' < 'vct-rl-reranker' in ASCII, so it sorts first.
         assert_eq!(rows[0].module_id, ORCHESTRATOR_MODULE_ID);
@@ -443,18 +504,38 @@ mod tests {
     }
 
     #[test]
-    fn keychain_username_for_orchestrator_returns_legacy_constant() {
-        // Promotion path: rewriting the orchestrator slot keeps the
-        // legacy keychain entry so downgrades to pre-L1 launcher still
-        // find it under 'VIBECODED_LICENSE_KEY'.
+    fn keychain_username_for_orchestrator_uses_canonical_format() {
+        // L1.M (v0.2.40): SUPERSEDES the v0.2.40-L1 contract where the
+        // orchestrator slot returned LEGACY_KEYCHAIN_USERNAME. Per user
+        // directive 2026-05-30: no downgrade lane is needed, so the
+        // orchestrator slot uses the same `license_key__<module_id>`
+        // pattern as every other module.
         assert_eq!(
             keychain_username_for(ORCHESTRATOR_MODULE_ID),
-            LEGACY_KEYCHAIN_USERNAME
+            "license_key____orchestrator__"
         );
         assert_eq!(
             keychain_username_for("vct-rl-reranker"),
             "license_key__vct-rl-reranker"
         );
+        // Guard against future drift: every callable produces the
+        // canonical shape (no special-case for the orchestrator slot).
+        assert!(
+            keychain_username_for(ORCHESTRATOR_MODULE_ID).starts_with("license_key__"),
+            "orchestrator username must use canonical `license_key__` prefix"
+        );
+    }
+
+    #[test]
+    fn license_keychain_service_returns_canonical_value() {
+        // Discovery contract for orchestrator projects, hooks, MCPs:
+        // the keychain service for every license-key entry is fixed at
+        // "vct.global.licensing". Mirrors the value
+        // `commands::licensing::LICENSE_MODULE_ID` carries, which is
+        // the secret's `module_id` argument in `secrets::get/set` calls
+        // (the secrets layer composes it into a service string per
+        // `SecretScope::service_name`).
+        assert_eq!(license_keychain_service(), "vct.global.licensing");
     }
 
     #[test]

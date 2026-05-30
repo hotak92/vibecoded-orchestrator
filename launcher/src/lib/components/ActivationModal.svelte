@@ -3,7 +3,8 @@
   //
   // Flow:
   //   1. license.load() on mount → reads cached tier from launcher.db
-  //   2. activate() → secrets::set(VIBECODED_LICENSE_KEY) + license_refresh()
+  //   2. activate() → secrets::set(license_key____orchestrator__) + license_refresh()
+  //      (canonical per L1.M v0.2.40; was VIBECODED_LICENSE_KEY pre-L1.M)
   //   3. refresh() → POST /validate-tier with current key
   //   4. deactivate() → secrets::delete + tier_cache→free
   //

@@ -29,9 +29,10 @@
   // ─── Module identity (legacy) ────────────────────────────────────
   //  The keychain key shape includes a module_id segment for backward
   //  compat with pre-existing entries (e.g. the seeded
-  //  `licensing/VIBECODED_LICENSE_KEY` global entry). New entries
-  //  added through this panel default to module_id="user". The UI
-  //  does NOT surface module_id to the user — it is an
+  //  `licensing/license_key____orchestrator__` global entry, canonical
+  //  per L1.M v0.2.40; was `licensing/VIBECODED_LICENSE_KEY` pre-L1.M).
+  //  New entries added through this panel default to module_id="user".
+  //  The UI does NOT surface module_id to the user — it is an
   //  implementation detail for v0.1.x. Listing entries flattens the
   //  visual grouping and keys solely by KEY name.
 
@@ -101,12 +102,20 @@
   // Seed the store with the orchestrator-tier license key so users
   // always see "is the orchestrator license keychain entry set?". Other
   // module-specific keys come from manifests / "Add secret" form.
+  //
+  // L1.M (v0.2.40): the canonical per-module username is
+  // `license_key____orchestrator__` (was `VIBECODED_LICENSE_KEY`
+  // pre-L1.M). The Rust-side migration helper
+  // `ensure_legacy_orchestrator_row_migrated` rewrites any existing
+  // keychain entry on first launcher boot. The seeded registry entry
+  // here must use the canonical key so the GUI reflects the post-
+  // migration state.
   function seedKnownKeys() {
     secrets.register({
       project_id: '_global_',
       module_id: 'licensing',
       scope: 'global',
-      key: 'VIBECODED_LICENSE_KEY',
+      key: 'license_key____orchestrator__',
       sensitive: true,
     });
   }

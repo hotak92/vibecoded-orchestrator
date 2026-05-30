@@ -181,7 +181,8 @@ function createSecretsStore() {
      * flow). Existing entries are updated with the latest is_set /
      * is_active / has_saved_value / shadow status from the backend.
      *
-     * Module-bucket entries (e.g. licensing's VIBECODED_LICENSE_KEY)
+     * Module-bucket entries (e.g. licensing's license_key____orchestrator__,
+     * canonical per L1.M v0.2.40; was VIBECODED_LICENSE_KEY pre-L1.M)
      * are NOT enumerated — this command targets only the user emit
      * bucket the SecretsPanel writes to. The SecretsPanel still seeds
      * the licensing global key separately via `register()`.

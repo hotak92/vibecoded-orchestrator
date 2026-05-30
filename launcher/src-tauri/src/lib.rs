@@ -1165,10 +1165,18 @@ pub fn run() {
             crate::commands::module_service::spawn_daily_weights_poll(
                 app.handle().clone(),
                 || {
+                    // L1.M (v0.2.40): canonical per-module username (was the
+                    // legacy `VIBECODED_LICENSE_KEY`). Uses `keychain_username_for`
+                    // helper as the single source of truth for the username
+                    // shape — automatically picks up future changes.
+                    let username =
+                        vct_launcher_core::db::license_keys::keychain_username_for(
+                            vct_launcher_core::db::license_keys::ORCHESTRATOR_MODULE_ID,
+                        );
                     let key = match crate::secrets::get(
                         crate::secrets::SecretScope::Global,
                         "licensing",
-                        "VIBECODED_LICENSE_KEY",
+                        &username,
                     ) {
                         Ok(Some(k)) if !k.trim().is_empty() => k,
                         _ => return None,
