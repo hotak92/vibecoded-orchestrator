@@ -35,6 +35,9 @@ on:
       - "vco_lib/config_projection.py"
       - "templates/**"
       - ".github/workflows/installer-smoke.yml"
+      # v0.2.40 X1: macOS best-effort smoke triggers
+      - "launcher/src-tauri/vct-hub/templates/**"
+      - "docs/macos-install.md"
   pull_request:
     paths:
       - "install.py"
@@ -42,6 +45,9 @@ on:
       - "vco_lib/config_projection.py"
       - "templates/**"
       - ".github/workflows/installer-smoke.yml"
+      # v0.2.40 X1: macOS best-effort smoke triggers
+      - "launcher/src-tauri/vct-hub/templates/**"
+      - "docs/macos-install.md"
   workflow_dispatch: {}
 
 permissions:
@@ -359,3 +365,153 @@ jobs:
           client.close()
           PYEOF
           echo "✓ Weaviate schema assertions complete"
+
+  # ------------------------------------------------------------------ #
+  # Job 3: macOS best-effort smoke (v0.2.40 X1)                        #
+  #                                                                    #
+  # Verifies the macOS-specific support pieces parse + install cleanly #
+  # on a real macos-latest runner WITHOUT triggering a full Tauri      #
+  # launcher build (which costs ~10-15 min and is already exercised    #
+  # by the release.yml matrix on every tag).                           #
+  #                                                                    #
+  # What this catches:                                                 #
+  #   - launchctl plist template doesn't parse after placeholder       #
+  #     substitution (would surface at user manual-install time, not   #
+  #     here, without this gate).                                      #
+  #   - canonical plist (rendered by `vct-hub --register-boot`)        #
+  #     doesn't parse — would surface at first --register-boot         #
+  #     attempt on a real Mac.                                         #
+  #   - codesign tooling isn't on the macos-latest runner (unlikely    #
+  #     but would silently regress release.yml's ad-hoc-sign step).    #
+  #   - docs/macos-install.md links a referenced template path that    #
+  #     no longer exists.                                              #
+  #                                                                    #
+  # What this deliberately doesn't do:                                 #
+  #   - Full Tauri launcher build (heavyweight; release.yml owns it).  #
+  #   - Actually launch the .app / verify Gatekeeper bypass (GUI      #
+  #     runner constraints — `osascript` open dialog isn't            #
+  #     interactive in CI).                                            #
+  # ------------------------------------------------------------------ #
+  macos-smoke:
+    name: macOS best-effort smoke (v0.2.40 X1)
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Assertion M1: codesign + plutil are available on the runner.
+      # If either tool disappears from the runner image, the X1 ad-hoc
+      # codesign step in release.yml would silently regress. Fail loudly
+      # here so the regression is caught at PR time, not release time.
+      - name: Assert codesign + plutil tooling available
+        run: |
+          set -euo pipefail
+          for tool in codesign plutil; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Required tool $tool not on PATH on macos-latest"
+              exit 1
+            fi
+          done
+          codesign --version || true
+          plutil -help 2>&1 | head -3 || true
+          echo "✓ Assertion M1 PASS: codesign + plutil available"
+
+      # Assertion M2: the manual-fallback plist template parses after
+      # placeholder substitution. We sub with fake but well-formed paths
+      # and run `plutil -lint` which is strict about plist XML validity.
+      - name: Assert templates/scripts/launchctl-plist.template parses
+        run: |
+          set -euo pipefail
+          src="templates/scripts/launchctl-plist.template"
+          if [ ! -f "$src" ]; then
+            echo "::error::Expected manual-fallback template at $src (v0.2.40 X1 deliverable)"
+            exit 1
+          fi
+          tmp="$(mktemp -d)/com.vibecodedtools.vct-hub.plist"
+          sed -e "s|__VCT_HUB_BIN__|/usr/local/bin/vct-hub|g" \
+              -e "s|__VCT_STATE_DIR__|/tmp/vct-smoke-state|g" \
+              "$src" > "$tmp"
+          plutil -lint "$tmp"
+          echo "✓ Assertion M2 PASS: $src parses as valid plist after substitution"
+
+      # Assertion M3: the canonical plist template (rendered by
+      # `vct-hub --register-boot`) also parses. Same substitution, same
+      # plutil check — catches accidental edits to the canonical
+      # template that would break the launcher-driven install path.
+      - name: Assert canonical vct-hub plist template parses
+        run: |
+          set -euo pipefail
+          src="launcher/src-tauri/vct-hub/templates/com.vibecodedtools.vct-hub.plist.template"
+          if [ ! -f "$src" ]; then
+            echo "::error::Expected canonical plist template at $src"
+            exit 1
+          fi
+          tmp="$(mktemp -d)/com.vibecodedtools.vct-hub.plist"
+          sed -e "s|__VCT_HUB_BIN__|/usr/local/bin/vct-hub|g" \
+              -e "s|__VCT_STATE_DIR__|/tmp/vct-smoke-state|g" \
+              "$src" > "$tmp"
+          plutil -lint "$tmp"
+          echo "✓ Assertion M3 PASS: canonical plist template parses after substitution"
+
+      # Assertion M4: ad-hoc codesign tooling works end-to-end against
+      # a tiny test binary. If `codesign --sign -` regresses on a runner
+      # image bump (or hardened-runtime defaults change), the release
+      # would ship an unsigned binary silently — this assertion fails
+      # loudly instead.
+      - name: Assert ad-hoc codesign + verify round-trip succeeds
+        run: |
+          set -euo pipefail
+          # Build a minimal Mach-O via clang — `/bin/echo` is a system
+          # binary so we can't sign it (Apple owns the entitlements).
+          # Build our own.
+          tmp="$(mktemp -d)"
+          cat > "$tmp/hello.c" <<'CEOF'
+          #include <stdio.h>
+          int main(void) { puts("hello from x1 smoke"); return 0; }
+          CEOF
+          clang -O0 -o "$tmp/hello" "$tmp/hello.c"
+          codesign --force --deep --sign - "$tmp/hello"
+          codesign --verify --verbose=2 "$tmp/hello"
+          # The verify output should include "valid on disk" — check it.
+          out="$(codesign --verify --verbose=2 "$tmp/hello" 2>&1 || true)"
+          echo "$out"
+          if echo "$out" | grep -q "valid on disk"; then
+            echo "✓ Assertion M4 PASS: ad-hoc codesign + verify works on macos-latest"
+          else
+            echo "::error::Assertion M4 FAIL: codesign verify output unexpected"
+            exit 1
+          fi
+
+      # Assertion M5: docs/macos-install.md references paths that exist.
+      # Avoids drift between the doc's "see X for the canonical Y" links
+      # and the actual on-disk paths.
+      - name: Assert docs/macos-install.md references resolve
+        run: |
+          set -euo pipefail
+          doc="docs/macos-install.md"
+          if [ ! -f "$doc" ]; then
+            echo "::error::Expected $doc (v0.2.40 X1 deliverable)"
+            exit 1
+          fi
+          # Paths the doc claims exist — verify each one.
+          referenced_paths=(
+            "templates/scripts/launchctl-plist.template"
+            "launcher/src-tauri/vct-hub/templates/com.vibecodedtools.vct-hub.plist.template"
+            "launcher/src-tauri/vct-hub/templates/vct-hub.service.template"
+            "launcher/src-tauri/vct-hub/templates/vct-hub-task.xml.template"
+            "launcher/src-tauri/vct-hub/src/boot.rs"
+            "scripts/build-bundled-launcher.sh"
+            ".github/workflows/release.yml"
+          )
+          missing_count=0
+          for p in "${referenced_paths[@]}"; do
+            if [ ! -e "$p" ]; then
+              echo "::error::docs/macos-install.md references $p but it doesn't exist"
+              missing_count=$((missing_count + 1))
+            fi
+          done
+          if [ "$missing_count" -gt 0 ]; then
+            exit 1
+          fi
+          echo "✓ Assertion M5 PASS: all ${#referenced_paths[@]} doc-referenced paths exist"

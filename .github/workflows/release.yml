@@ -36,11 +36,16 @@
 # Revisit if user demand surfaces — cross-compile path:
 # `--target x86_64-apple-darwin` from the arm64 runner.
 #
-# macOS UNSIGNED — Apple Developer ID + notarization deferred
-# (Tier-2 alpha, see QuickStart). First-launch users will see a
-# Gatekeeper "unidentified developer" dialog; right-click → Open
-# bypasses it. README + QuickStart already disclose this. Code
-# signing tracked separately for v0.2.x.
+# macOS BEST-EFFORT (v0.2.40) — Apple Developer ID + notarization
+# deferred until credentials are provisioned. We DO ship ad-hoc
+# codesigning (`codesign --force --deep --sign -`) so the binaries
+# have a valid signature for the local machine — Gatekeeper still
+# warns on first launch ("not signed by an identified developer")
+# because ad-hoc signing has no trust anchor in Apple's PKI, but
+# the binary runs cleanly after the user's one-time right-click →
+# Open bypass. See docs/macos-install.md for the user-facing first-
+# launch flow. Full Developer ID + notarization remain tracked for
+# the v0.2.x follow-up patch.
 #
 # Build is driven by `bash scripts/build-bundled-launcher.sh` — the
 # SAME script maintainers run locally. It does:
@@ -159,6 +164,47 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
         run: bash scripts/build-bundled-launcher.sh
 
+      # v0.2.40 X1: ad-hoc codesign on macOS. `codesign --sign -` (the
+      # literal hyphen identity) attaches a valid Mach-O signature with
+      # NO trust anchor in Apple's PKI — Gatekeeper still warns on the
+      # FIRST launch ("can't be verified by Apple"), but the binary
+      # gains structural integrity guarantees + DYLD doesn't refuse to
+      # load mixed-arch deps on hardened runtimes. Critically: ad-hoc
+      # signing is the difference between "binary runs after right-
+      # click → Open" (signed, even if unidentified) and "binary won't
+      # run at all under SIP-hardened policies on M-series Macs"
+      # (unsigned). `--force` overwrites any pre-existing ad-hoc sig
+      # from a developer-local build; `--deep` recurses into any
+      # embedded frameworks/dylibs Tauri might have stamped in.
+      #
+      # tauri build runs with --no-bundle, so the artifact is the raw
+      # Mach-O at launcher/dist/<target>/vct-launcher (NOT a .app).
+      # We sign that raw binary directly. We also sign vct-hub, since
+      # both ship to users.
+      #
+      # Full Developer ID + notarization deferred — see the header
+      # comment and docs/macos-install.md.
+      - name: Ad-hoc codesign macOS binaries (no Developer ID)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="launcher/dist/${{ matrix.target }}"
+          for bin in vct-launcher vct-hub; do
+            path="$dist/$bin"
+            if [ ! -f "$path" ]; then
+              echo "::error::Expected binary not found for ad-hoc sign: $path"
+              ls -la "$dist" || true
+              exit 1
+            fi
+            echo "[ad-hoc-sign] $path"
+            codesign --force --deep --sign - "$path"
+            # Verify the signature is well-formed. `codesign --verify`
+            # exits 0 only when the signature parses correctly; doesn't
+            # validate against any CA (impossible for ad-hoc).
+            codesign --verify --verbose=2 "$path"
+          done
+
       # v0.2.21+: vct-hub is a sibling binary built from the same Cargo
       # workspace and staged into the same launcher/dist/<arch>/ directory
       # by scripts/build-bundled-launcher.sh. Expose its platform-specific
@@ -226,8 +272,12 @@ jobs:
           stage="$dist/_release"
           mkdir -p "$stage"
           hub_bin="${{ steps.hub_meta.outputs.binary }}"
+          # v0.2.40 X1: macos-x64 axis dropped — GitHub-runner constraint
+          # (no actions/runner-images label produces Intel macs anymore
+          # after macos-13 deprecation 2025-12-04, confirmed by user
+          # 2026-05-30). Only macos-arm64 (Apple Silicon) ships.
           case "${{ matrix.target }}" in
-            macos-arm64|macos-x64)
+            macos-arm64)
               cp "$dist/${{ matrix.binary }}" "$stage/vct-launcher-${{ matrix.target }}-experimental"
               cp "$dist/${{ matrix.binary }}.metadata.json" "$stage/vct-launcher-${{ matrix.target }}-experimental.metadata.json"
               # v0.2.21+: vct-hub gets the same -experimental suffix on

@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  templates/scripts/launchctl-plist.template
+
+  v0.2.40 (X1: macOS best-effort support)
+
+  macOS LaunchAgent template for vct-hub auto-start. Parity with the
+  systemd-user template (Linux) and the Scheduled Task template
+  (Windows). See docs/macos-install.md for the user-facing install
+  recipe; see this comment for the placeholder contract.
+
+  PREFERRED INSTALL PATH (launcher-driven, recommended): use
+  `vct-hub` with the register-boot subcommand. The binary renders the
+  canonical template under launcher/src-tauri/vct-hub/templates/ and
+  writes it to ~/Library/LaunchAgents/com.vibecodedtools.vct-hub.plist
+  via `launchctl bootstrap`. No user editing required; the binary
+  fills in the placeholders from its own runtime state at registration
+  time. See docs/macos-install.md.
+
+  THIS FILE IS A FALLBACK for users who want to inspect or customize
+  the plist manually OR who can't run the launcher-driven path (no
+  launcher, permissions issues, etc.).
+
+  Manual install steps:
+
+    1. Substitute the placeholders below with your real values:
+       __VCT_HUB_BIN__   absolute path to the `vct-hub` binary
+                            (typically /usr/local/bin/vct-hub or
+                             ~/.vct/bin/vct-hub).
+       __VCT_STATE_DIR__ absolute path to your VCT state directory
+                            (default: $HOME/.vct).
+
+    2. Copy the substituted file to:
+       ~/Library/LaunchAgents/com.vibecodedtools.vct-hub.plist
+
+    3. Load it via launchctl bootstrap and kickstart.
+
+    4. Verify with launchctl print.
+
+  See docs/macos-install.md section "Auto-start (vct-hub LaunchAgent)"
+  for the full troubleshooting and uninstall recipe.
+
+  PLACEHOLDER CONVENTION: __SCREAMING_SNAKE__ matches the canonical
+  templates under launcher/src-tauri/vct-hub/templates/. Other template
+  surfaces in this repo use {{DOUBLE_BRACE}} (see
+  templates/launchd/com.vibecodedtools.claude-mcp-containers.plist.template)
+  but those are rendered by a different code path (install.py for the
+  containers stack vs. vct-hub::boot::macos for the hub itself).
+
+  XML note: the canonical XML 1.0 spec forbids the two-hyphen sequence
+  inside comments. Keep CLI flag references like the register-boot
+  subcommand expressed without leading hyphens in this comment block;
+  the actual ProgramArguments value below uses the real flag string.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vibecodedtools.vct-hub</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__VCT_HUB_BIN__</string>
+        <string>--foreground</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep alive only on abnormal exit; SuccessfulExit=false means
+         "restart if the process exits with a non-zero status OR is signalled."
+         We do NOT use a bare KeepAlive=true because that would restart even
+         on a clean vct-hub stop subcommand. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Throttle restart attempts to avoid restart storms. macOS default is 10s. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Pin state dir so dev installs don't contaminate prod state on boot. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VCT_STATE_DIR</key>
+        <string>__VCT_STATE_DIR__</string>
+        <!-- Provide a baseline PATH; LaunchAgents do not inherit the user's
+             shell PATH, so podman/docker invocations from the supervisor
+             would otherwise fail with "command not found". -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/opt/podman/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Log streams. Without these the user has no record of crashes. -->
+    <key>StandardOutPath</key>
+    <string>__VCT_STATE_DIR__/logs/vct-hub.launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>__VCT_STATE_DIR__/logs/vct-hub.launchd.err</string>
+
+    <!-- Run as the logged-in user (not root). LaunchAgent by definition. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
