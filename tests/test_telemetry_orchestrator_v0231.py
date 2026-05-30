@@ -276,9 +276,14 @@ class RLTelemetryWriterEmbeddingFieldsTest(unittest.TestCase):
     """Fix 2: writer construction never ships blank embedding_source."""
 
     def setUp(self):
-        # Force fresh singleton each test.
+        # Force fresh writer cache each test.
+        # v0.2.40 F2: writer is now keyed by (project, embedding_source);
+        # call _reset_rl_telemetry_writers() to drop all cached writers.
+        # (Legacy `_rl_telemetry_writer_instance = None` kept for back-compat
+        # with any external test that still references the tombstone.)
         import claude_mcp_servers.weaviate_mcp.server as srv
         srv._rl_telemetry_writer_instance = None
+        srv._reset_rl_telemetry_writers()
         self._srv = srv
 
     def test_writer_construction_falls_back_to_env_when_service_fails(self):
