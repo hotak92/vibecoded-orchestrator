@@ -410,7 +410,7 @@ const TEMPORAL_PROPS: &[&str] = &["created", "updated", "valid_from", "valid_unt
 ///
 /// v0.2.23 B1 (2026-05-21): flipped from lowercase-c "Vibecoded" to
 /// capital-C "VibeCoded" to match the brand spelling. See
-/// `commands/project_env_settings.rs::DEFAULT_SHARED_KG_COLLECTION` for
+/// `commands/project_env_settings.rs::LAST_RESORT_SHARED_KG_COLLECTION` for
 /// the source-of-truth constant.
 const DEFAULT_SHARED_KG_CLASS: &str = "VibeCodedOrchestrator_KnowledgeGraph";
 

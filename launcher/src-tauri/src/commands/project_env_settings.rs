@@ -67,13 +67,39 @@ pub const DEFAULT_OLLAMA_PORT: u16 = 11435;
 pub const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
 pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
 
-/// Canonical shared-KG class name. Must stay in lockstep with:
+/// Canonical shared-KG class name — LAST-RESORT FALLBACK.
+///
+/// **v0.2.40 W40-C rename** (was `DEFAULT_SHARED_KG_COLLECTION`): renamed
+/// to `LAST_RESORT_*` so call sites that bypass the DB-read chain become
+/// audit-able via `grep LAST_RESORT_SHARED_KG_COLLECTION`. The const
+/// value is unchanged; the rename is purely a discipline signal that
+/// this value is the END of the resolution chain, not the first choice.
+///
+/// **Resolution chain** (highest to lowest, all roads end here only if
+/// every higher-priority source is empty):
+///
+///   1. `app_state[shared_kg.collection_name]` — explicit GUI override.
+///   2. `resolve_shared_kg_from_orchestrator_root(db)` — reads
+///      `project_kg_bindings(slug='orchestrator-root', role='primary').
+///      collection_name`. This is the SOURCE OF TRUTH for the shared-KG
+///      name on every machine where the orchestrator-root project is
+///      registered (which is every machine that has run the launcher
+///      at least once).
+///   3. `LAST_RESORT_SHARED_KG_COLLECTION` (this const). Only fires on
+///      a totally-fresh-fresh first boot before any project is created,
+///      OR in tests with an empty in-memory DB. In production, callers
+///      should essentially never see this value.
+///
+/// Must stay in lockstep with:
 ///   * `vco_lib/project_init.py::_SHARED_KG_NAME`
 ///   * `claude_mcp_servers/weaviate_mcp/server.py::_SHARED_KG_DEFAULT`
 ///   * `scripts/migrate-shared-kg-schema.{sh,ps1}` defaults
+///
 /// Cross-language invariant test
-/// `tests/test_shared_kg_constant_consistency.py` pins these together so any
-/// drift fails CI loudly.
+/// `tests/test_shared_kg_constant_consistency.py` pins these together so
+/// any drift fails CI loudly. The test parses this `.rs` file by const
+/// name; renaming required updating the test in lockstep (which v0.2.40
+/// W40-C did).
 ///
 /// v0.2.23 B1 (2026-05-21): casing flipped from lowercase-c "Vibecoded"
 /// (the v0.2.12–v0.2.22 default) back to capital-C "VibeCoded" to match
@@ -82,7 +108,7 @@ pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
 /// in `install.py::_self_heal_kg_bindings_on_update` ensure existing
 /// installs with the lowercase-c class are adopted in place — no rename,
 /// no data loss, no re-embedding.
-pub const DEFAULT_SHARED_KG_COLLECTION: &str = "VibeCodedOrchestrator_KnowledgeGraph";
+pub const LAST_RESORT_SHARED_KG_COLLECTION: &str = "VibeCodedOrchestrator_KnowledgeGraph";
 
 /// Legacy shared-KG class name (pre-v0.2.12 PR-26 rename). Used ONLY by
 /// migration-detection paths (e.g., `commands::kg::list_kg_collections`
@@ -111,7 +137,7 @@ pub const LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C: &str =
 /// Recognises:
 /// * `canonical` (case-insensitive) — the active canonical shared-KG name
 ///   for this install. Production call sites pass
-///   [`DEFAULT_SHARED_KG_COLLECTION`]; tests and white-label forks may pass
+///   [`LAST_RESORT_SHARED_KG_COLLECTION`]; tests and white-label forks may pass
 ///   a different value (e.g. `"AcmeOrchestrator_KnowledgeGraph"`).
 /// * [`LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C`] — the v0.2.12–v0.2.22
 ///   lowercase-c default. Always recognised so pre-v0.2.23-B1 installs are
@@ -328,7 +354,7 @@ impl ProjectEnvSettings {
             container_runtime: None,
             kg_collection: format!("{}_KnowledgeGraph", kg_basename),
             dev_collection: format!("{}_Development", kg_basename),
-            shared_kg_collection: DEFAULT_SHARED_KG_COLLECTION.to_string(),
+            shared_kg_collection: LAST_RESORT_SHARED_KG_COLLECTION.to_string(),
             shared_kg_write_disabled: false,
             cpu_only: true,
             use_gpu: false,
@@ -529,7 +555,7 @@ pub fn populate(
     //             detected. This makes every project on the machine
     //             derive the shared KG from the same source of truth:
     //             the Orchestrator Project itself.
-    // Priority 3: `DEFAULT_SHARED_KG_COLLECTION` const fallback. Kept
+    // Priority 3: `LAST_RESORT_SHARED_KG_COLLECTION` const fallback. Kept
     //             for two scenarios:
     //               (a) standalone-binary install (no clone → no row
     //                   → no binding);
@@ -537,7 +563,7 @@ pub fn populate(
     //
     // Explicit empty string (`SHARED_KG_COLLECTION=""`) handling: a
     // user who has explicitly set `app_state[shared_kg.collection_name]`
-    // to "" gets back DEFAULT_SHARED_KG_COLLECTION here. That's fine —
+    // to "" gets back LAST_RESORT_SHARED_KG_COLLECTION here. That's fine —
     // the per-project gate `SHARED_KG_WRITE_DISABLED` (resolved below)
     // is the right knob for "opt out of shared KG writes". Forcing
     // SHARED_KG_COLLECTION to be empty would break the read path too,
@@ -549,7 +575,7 @@ pub fn populate(
         .flatten()
         .filter(|s| !s.is_empty())
         .or_else(|| resolve_shared_kg_from_orchestrator_root(db))
-        .unwrap_or_else(|| DEFAULT_SHARED_KG_COLLECTION.to_string());
+        .unwrap_or_else(|| LAST_RESORT_SHARED_KG_COLLECTION.to_string());
 
     let shared_kg_write_disabled = match project_id {
         Some(pid) => get_shared_kg_write_disabled(db, pid).unwrap_or(false),
@@ -925,7 +951,7 @@ fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)
 ///     and a non-empty `collection_name`.
 ///
 /// Returns `None` (so the caller falls through to
-/// `DEFAULT_SHARED_KG_COLLECTION`) when:
+/// `LAST_RESORT_SHARED_KG_COLLECTION`) when:
 ///   - the row doesn't exist (standalone-binary install — no clone),
 ///   - the binding isn't seeded yet (rare — happens between
 ///     migration-013 run and the first `ensure_orchestrator_root` call),
@@ -1186,7 +1212,7 @@ mod tests {
         // projects row + no primary binding. Caller must get the const.
         let db = Db::open_in_memory().unwrap();
         let s = populate(&db, "Acme", None);
-        assert_eq!(s.shared_kg_collection, DEFAULT_SHARED_KG_COLLECTION);
+        assert_eq!(s.shared_kg_collection, LAST_RESORT_SHARED_KG_COLLECTION);
     }
 
     #[test]
@@ -1208,7 +1234,7 @@ mod tests {
         .unwrap();
         // No binding set.
         let s = populate(&db, "Acme", None);
-        assert_eq!(s.shared_kg_collection, DEFAULT_SHARED_KG_COLLECTION);
+        assert_eq!(s.shared_kg_collection, LAST_RESORT_SHARED_KG_COLLECTION);
     }
 
     #[test]
@@ -1236,7 +1262,7 @@ mod tests {
         )
         .unwrap();
         let s = populate(&db, "Acme", None);
-        assert_eq!(s.shared_kg_collection, DEFAULT_SHARED_KG_COLLECTION);
+        assert_eq!(s.shared_kg_collection, LAST_RESORT_SHARED_KG_COLLECTION);
     }
 
     // ─── is_shared_kg_class_name unit tests (B4) ────────────────────────
@@ -1251,7 +1277,7 @@ mod tests {
     fn is_shared_kg_class_name_recognises_canonical_casing() {
         assert!(is_shared_kg_class_name(
             "VibeCodedOrchestrator_KnowledgeGraph",
-            DEFAULT_SHARED_KG_COLLECTION,
+            LAST_RESORT_SHARED_KG_COLLECTION,
         ));
     }
 
@@ -1261,7 +1287,7 @@ mod tests {
         // fix in maintenance.rs that this helper consolidates).
         assert!(is_shared_kg_class_name(
             "vibecodedorchestrator_knowledgegraph",
-            DEFAULT_SHARED_KG_COLLECTION,
+            LAST_RESORT_SHARED_KG_COLLECTION,
         ));
     }
 
@@ -1272,7 +1298,7 @@ mod tests {
         // be picked up even on a white-label fork.
         assert!(is_shared_kg_class_name(
             LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C,
-            DEFAULT_SHARED_KG_COLLECTION,
+            LAST_RESORT_SHARED_KG_COLLECTION,
         ));
         // Custom canonical → legacy still recognised.
         assert!(is_shared_kg_class_name(
@@ -1286,12 +1312,12 @@ mod tests {
         // `VibeCodedTools_KnowledgeGraph` — pre-v0.2.12 PR-26 default.
         assert!(is_shared_kg_class_name(
             LEGACY_SHARED_KG_COLLECTION,
-            DEFAULT_SHARED_KG_COLLECTION,
+            LAST_RESORT_SHARED_KG_COLLECTION,
         ));
         // Case-folded legacy → still detected.
         assert!(is_shared_kg_class_name(
             "vibecodedtools_knowledgegraph",
-            DEFAULT_SHARED_KG_COLLECTION,
+            LAST_RESORT_SHARED_KG_COLLECTION,
         ));
     }
 
@@ -1299,7 +1325,7 @@ mod tests {
     fn is_shared_kg_class_name_rejects_random_kg_collection() {
         assert!(!is_shared_kg_class_name(
             "RandomProject_KnowledgeGraph",
-            DEFAULT_SHARED_KG_COLLECTION,
+            LAST_RESORT_SHARED_KG_COLLECTION,
         ));
     }
 
@@ -1307,7 +1333,7 @@ mod tests {
     fn is_shared_kg_class_name_rejects_development_collection() {
         assert!(!is_shared_kg_class_name(
             "MyProject_Development",
-            DEFAULT_SHARED_KG_COLLECTION,
+            LAST_RESORT_SHARED_KG_COLLECTION,
         ));
     }
 

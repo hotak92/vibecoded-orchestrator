@@ -1311,6 +1311,89 @@ def _log_collection_resolution() -> None:
 _log_collection_resolution()
 
 
+# ─── v0.2.40 W40-C: warn when SHARED_KG_COLLECTION names a missing class ───
+#
+# The MCP subprocess cannot read launcher.db (no SQLite + no filesystem-
+# canonical-DB-path resolution in this scope) so it stays env-only for
+# SHARED_KG_COLLECTION resolution (Priority-5 fallback per the design doc).
+# What we CAN do is surface misconfig: if the env value names a Weaviate
+# class that doesn't exist, the user has a stale env (typical after a
+# launcher.db rebind to a new prefix without an env regen) or a flat-out
+# wrong value.
+#
+# Loud-but-soft: emit a structured WARNING via the existing logger. Don't
+# crash, don't change behaviour — the existing search-time failures
+# (`every configured collection schema-failed`) ALREADY surface the issue
+# loudly, but at search-time, after the user has tried 3-4 hybrid_searches
+# and lost trust. Surfacing the problem on first connect means the user
+# sees the misconfig in the MCP log immediately on session start
+# (effectively, on the first MCP tool call that touches Weaviate).
+#
+# Invocation: deferred to first successful `get_weaviate_client()` call
+# (guarded by `_shared_kg_probe_done`) rather than module-load time, so
+# (a) a slow / cold Weaviate doesn't block MCP startup, and (b) we don't
+# fire before the global `weaviate_client` is populated. One-shot per
+# process lifetime.
+def _warn_if_shared_kg_class_missing() -> None:
+    """Probe Weaviate for SHARED_KG_COLLECTION; warn if absent.
+
+    v0.2.40 W40-C: diagnostic-only. The MCP cannot self-heal (no
+    launcher.db access from a subprocess that doesn't know where the
+    DB lives) but it can flag the misconfig so the user understands
+    why cross-project search returns empty.
+
+    Called from `get_weaviate_client()` immediately after the first
+    successful connect, behind a one-shot guard (`_shared_kg_probe_done`)
+    so it runs once per process lifetime.
+
+    Behaviour:
+      * SHARED_KG_COLLECTION empty / unset → skip (legitimate no-shared
+        configuration).
+      * SHARED_KG_COLLECTION set, class exists in Weaviate → skip
+        (happy path, no log noise).
+      * SHARED_KG_COLLECTION set, class absent → emit a structured
+        warning with the env-var name + the resolved source.
+      * Weaviate unreachable / schema probe transient error → skip
+        silently (the search-time error path surfaces the problem;
+        doubling up here is noise).
+    """
+    if not SHARED_KG_COLLECTION or not SHARED_KG_COLLECTION.strip():
+        return
+    # Use the already-cached client (caller is `get_weaviate_client`
+    # after the connect succeeded). Avoid re-entering `get_weaviate_client`
+    # which would recurse into this probe.
+    global weaviate_client
+    client = weaviate_client
+    if client is None:
+        # Defensive: should not happen because the caller just set it,
+        # but a concurrent close/reset could race. Skip silently.
+        return
+    try:
+        if client.collections.exists(SHARED_KG_COLLECTION):
+            return
+    except Exception:
+        # Schema probe failed for transient reasons (gRPC blip, etc.).
+        # Don't escalate — the next real query will retry and surface
+        # any persistent failure mode through the proper error path.
+        return
+
+    logger.warning(
+        "weaviate-kg: SHARED_KG_COLLECTION=%r but no such class exists "
+        "in Weaviate. Set SHARED_KG_COLLECTION env to the actual class "
+        "name in .claude/settings.json `env`, or re-run launcher boot "
+        "to trigger auto-adoption / env regen. Cross-project search "
+        "will return empty until this is resolved. (Source: %s)",
+        SHARED_KG_COLLECTION,
+        _SHARED_KG_COLLECTION_SOURCE,
+    )
+
+
+# NOTE: The probe is invoked at module-end (after `get_weaviate_client`
+# is defined) — not here — because the probe depends on the
+# `get_weaviate_client` symbol which is declared further down. See the
+# call site near the end of the module-load block.
+
+
 # ─── Multi-source access matrix (P1-D, 2026-05-08) ─────────────────────────
 #
 # The launcher's GUI access matrix is propagated into env vars that the MCP
@@ -1795,6 +1878,9 @@ class WeaviateAuthError(Exception):
         self.user_msg = user_msg or msg
 
 
+_shared_kg_probe_done: bool = False
+
+
 def get_weaviate_client():
     """Get or create Weaviate client.
 
@@ -1802,7 +1888,7 @@ def get_weaviate_client():
     user_msg pointing at the most likely root causes (port-binding
     desync, container down, healthcheck flap).
     """
-    global weaviate_client
+    global weaviate_client, _shared_kg_probe_done
     if weaviate_client is None:
         http_host = WEAVIATE_URL.replace("http://", "").replace("https://", "").split(":")[0]
         http_port = int(WEAVIATE_URL.split(":")[-1]) if ":" in WEAVIATE_URL else 8081
@@ -1823,6 +1909,22 @@ def get_weaviate_client():
             weaviate_client = None
             raise WeaviateUnreachable(str(exc), _build_unreachable_hint(exc)) from exc
         logger.info(f"✓ Connected to Weaviate at {WEAVIATE_URL}")
+
+        # v0.2.40 W40-C: one-shot diagnostic — on first successful
+        # Weaviate connect, probe SHARED_KG_COLLECTION existence and
+        # surface a structured WARNING if the env value points at a
+        # missing class. Deferred to here (rather than module-load
+        # time) because `get_weaviate_client` may not be ready at
+        # module-import time on cold-start machines. Guarded by a
+        # one-shot flag so we don't re-probe on every call.
+        if not _shared_kg_probe_done:
+            _shared_kg_probe_done = True
+            try:
+                _warn_if_shared_kg_class_missing()
+            except Exception:
+                # Diagnostic — never let it interfere with the
+                # caller's real work.
+                pass
     return weaviate_client
 
 

@@ -361,7 +361,7 @@ fn ensure_orchestrator_root_state_populated(
 ///
 /// Soft-fail: any error here logs to stderr but does NOT propagate.
 /// The Orchestrator Project row insert succeeded; missing KG binding
-/// only means the shared KG falls back to `DEFAULT_SHARED_KG_COLLECTION`
+/// only means the shared KG falls back to `LAST_RESORT_SHARED_KG_COLLECTION`
 /// const for now.
 fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
     let collection_name = format!(
@@ -441,7 +441,7 @@ fn ensure_orchestrator_root_kg_binding(db: &Db, root_id: &str) {
         Err(e) => {
             // Don't propagate — the binding seed is a Priority-2
             // optimization; without it the shared KG resolution
-            // falls back to DEFAULT_SHARED_KG_COLLECTION.
+            // falls back to LAST_RESORT_SHARED_KG_COLLECTION.
             eprintln!(
                 "[vct] WARN: ensure_orchestrator_root_kg_binding failed (non-fatal): {}",
                 e

@@ -10,7 +10,10 @@ lockstep across the four surfaces that carry the literal:
               ``vco_lib/project_init.py::_LEGACY_SHARED_KG_NAME_LOWERCASE_C``
                   (v0.2.12–v0.2.22)
   * Rust    — ``launcher/src-tauri/src/commands/project_env_settings.rs``
-              ``DEFAULT_SHARED_KG_COLLECTION``
+              ``LAST_RESORT_SHARED_KG_COLLECTION`` (renamed from
+                  ``DEFAULT_SHARED_KG_COLLECTION`` in v0.2.40 W40-C; value
+                  unchanged — rename is purely an audit-discipline signal
+                  that this value is the END of the resolution chain)
               ``LEGACY_SHARED_KG_COLLECTION`` (pre-v0.2.12)
               ``LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C`` (v0.2.12–v0.2.22)
 
@@ -176,13 +179,20 @@ class RustConstantsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.constants = _parse_rust_constants()
 
-    def test_default_shared_kg_collection_present(self):
+    def test_last_resort_shared_kg_collection_present(self):
+        # v0.2.40 W40-C (2026-05-30): const renamed from
+        # `DEFAULT_SHARED_KG_COLLECTION` to `LAST_RESORT_SHARED_KG_COLLECTION`
+        # to signal that this value is the END of the resolution chain
+        # (DB-read → app_state override → const), not the first choice.
+        # The value is unchanged; only the name moved to make fallback-only
+        # call sites greppable.
         self.assertIn(
-            "DEFAULT_SHARED_KG_COLLECTION",
+            "LAST_RESORT_SHARED_KG_COLLECTION",
             self.constants,
-            f"Expected `pub const DEFAULT_SHARED_KG_COLLECTION: &str = ...` "
+            f"Expected `pub const LAST_RESORT_SHARED_KG_COLLECTION: &str = ...` "
             f"in {RUST_CONSTS_FILE.relative_to(REPO_ROOT)} — the constant "
-            "was removed or renamed.",
+            "was removed or renamed. (v0.2.40 W40-C renamed the prior "
+            "`DEFAULT_SHARED_KG_COLLECTION` to `LAST_RESORT_*`.)",
         )
 
     def test_legacy_shared_kg_collection_present(self):
@@ -205,11 +215,13 @@ class RustConstantsTests(unittest.TestCase):
             "commands::kg + the binding-row self-heal rely on it.",
         )
 
-    def test_rust_default_matches_canonical(self):
+    def test_rust_last_resort_matches_canonical(self):
+        # v0.2.40 W40-C: name change from DEFAULT_* → LAST_RESORT_*; value
+        # unchanged.
         self.assertEqual(
-            self.constants.get("DEFAULT_SHARED_KG_COLLECTION"),
+            self.constants.get("LAST_RESORT_SHARED_KG_COLLECTION"),
             CANONICAL_SHARED_KG_NAME,
-            "Rust DEFAULT_SHARED_KG_COLLECTION drifted from "
+            "Rust LAST_RESORT_SHARED_KG_COLLECTION drifted from "
             f"{CANONICAL_SHARED_KG_NAME!r}",
         )
 
@@ -236,11 +248,16 @@ class CrossLanguageInvariantTests(unittest.TestCase):
     """The headline invariant: Python + Rust must agree byte-for-byte."""
 
     def test_python_and_rust_canonical_match(self):
+        # v0.2.40 W40-C: Rust const renamed `DEFAULT_*` → `LAST_RESORT_*`.
+        # The value invariant still holds: Python's _SHARED_KG_NAME and
+        # Rust's LAST_RESORT_SHARED_KG_COLLECTION must agree byte-for-byte
+        # so fresh installs converge on the same fallback name across
+        # surfaces.
         rust = _parse_rust_constants()
         self.assertEqual(
             project_init._SHARED_KG_NAME,
-            rust.get("DEFAULT_SHARED_KG_COLLECTION"),
-            "Python `_SHARED_KG_NAME` and Rust `DEFAULT_SHARED_KG_COLLECTION` "
+            rust.get("LAST_RESORT_SHARED_KG_COLLECTION"),
+            "Python `_SHARED_KG_NAME` and Rust `LAST_RESORT_SHARED_KG_COLLECTION` "
             "diverged — fresh installs / fresh projects without picker "
             "interaction will pick up different defaults on different "
             "surfaces. Sync them and re-run the test.",
