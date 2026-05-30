@@ -3176,6 +3176,16 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
 # ----------------------------------------------------------------------
 
 _rl_client_instance = None  # type: ignore[var-annotated]
+# v0.2.40 F2: re-key telemetry writers on (project, embedding_source) so
+# mid-session env changes (ACTIVE_EMBEDDING flip, PROJECT_NAME re-resolution
+# from launcher.db adopt) produce a writer tagged with the CURRENT env
+# rather than freezing first-call values for the MCP subprocess lifetime.
+# Pre-fix this was a single Optional[RLTelemetryWriter] singleton.
+_rl_telemetry_writers: dict = {}  # type: ignore[var-annotated]
+# Kept as None-valued shim for back-compat: tests / external code that
+# directly reset srv._rl_telemetry_writer_instance = None still work
+# (the factory now consults the dict, so the legacy global is a tombstone
+# read-only sentinel — kept to avoid AttributeError in older callers).
 _rl_telemetry_writer_instance = None  # type: ignore[var-annotated]
 
 
@@ -3305,18 +3315,24 @@ def _cosine(a, b) -> float:
 
 
 def _get_rl_telemetry_writer():
-    """Lazy-build one ``RLTelemetryWriter`` per process."""
-    global _rl_telemetry_writer_instance
-    if _rl_telemetry_writer_instance is not None:
-        return _rl_telemetry_writer_instance
+    """Lazy-build one ``RLTelemetryWriter`` per ``(project, embedding_source)`` tuple.
+
+    v0.2.40 F2: was a single-instance singleton; mid-session env changes
+    (ACTIVE_EMBEDDING flip qwen3→arctic2, PROJECT_NAME re-resolution from
+    launcher.db adopt) would silently contaminate the offline training
+    corpus because the writer froze its tags at first call. Now cached
+    by ``(project, embedding_source)`` so each distinct env tuple gets
+    its own writer with correct tags. All cached writers share the
+    process and are eligible for shutdown reset via
+    ``_reset_rl_telemetry_writers()``.
+    """
     try:
         from claude_mcp_servers.rl_client import RLTelemetryWriter
     except Exception as exc:
         logger.debug("RLTelemetryWriter import failed (%s); telemetry disabled", exc)
         return None
 
-    # Derive the embedding source short id from EmbeddingService when
-    # available. Falls back to ACTIVE_EMBEDDING env (qwen3 default).
+    # ---- step 1: derive the embedding triple (source/model/dim) ----
     #
     # v0.2.31 telemetry audit fix (Item 2.2 — was 31% blank rows): when
     # EmbeddingService probe fails AND module-level constants happen to
@@ -3326,12 +3342,27 @@ def _get_rl_telemetry_writer():
     # the writer-construction site too, in addition to the module-level
     # constants — defence-in-depth so the writer never ships blank
     # embedding_{source,model} into the JSONL.
+    #
+    # v0.2.40 F2: env reads happen on every call (not just on cache
+    # miss) so a mid-session ACTIVE_EMBEDDING flip produces a NEW key
+    # and constructs a NEW writer rather than returning the stale one.
+    # `ACTIVE_EMBEDDING` (module constant) and `os.getenv(...)` are
+    # both consulted; module-constant first matches pre-F2 priority,
+    # but the env fallback now picks up runtime changes.
     emb_source = ACTIVE_EMBEDDING or os.getenv("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
+    # If the env was changed at runtime, prefer the live value over the
+    # frozen module constant. (Empty/unset env → fall through to constant.)
+    _live_active = os.getenv("ACTIVE_EMBEDDING")
+    if _live_active:
+        emb_source = _live_active
     emb_model = (
         EMBEDDING_MODEL
         or os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
         or "qwen3-embedding:0.6b"
     )
+    _live_model = os.getenv("EMBEDDING_MODEL")
+    if _live_model:
+        emb_model = _live_model
     emb_dim = _embedding_dim_for(emb_model)
     try:
         from vco_lib.embedding_service import EmbeddingService
@@ -3344,6 +3375,9 @@ def _get_rl_telemetry_writer():
             svc.close()
     except Exception as exc:
         logger.debug("EmbeddingService probe for telemetry failed (%s); using env defaults", exc)
+
+    # ---- step 2: derive the project tag ----
+    #
     # v0.2.21 Step 18: prefer the hub-resolved project slug/display name,
     # falling back to PROJECT_NAME / KG_COLLECTION env (historical
     # precedence) when the hub is unreachable.
@@ -3380,13 +3414,34 @@ def _get_rl_telemetry_writer():
                 project = sanitize_for_weaviate_class(raw_name)
             except Exception:
                 project = raw_name
-    _rl_telemetry_writer_instance = RLTelemetryWriter(
+
+    # ---- step 3: look up / construct the writer for this key ----
+    key = (project, emb_source)
+    writer = _rl_telemetry_writers.get(key)
+    if writer is not None:
+        return writer
+    writer = RLTelemetryWriter(
         project=project,
         embedding_source=emb_source,
         embedding_dim=emb_dim,
         embedding_model=emb_model,
     )
-    return _rl_telemetry_writer_instance
+    _rl_telemetry_writers[key] = writer
+    return writer
+
+
+def _reset_rl_telemetry_writers() -> None:
+    """Test/shutdown helper: drop all cached telemetry writers.
+
+    v0.2.40 F2: the writer cache is per-process and per-(project, embedding)
+    tuple. ``RLTelemetryWriter`` holds no persistent file handles or
+    network sockets — its underlying ``RLDataLogger`` opens+closes the
+    JSONL on every write via context manager — so clearing the dict is
+    sufficient teardown. This helper exists so test fixtures can isolate
+    state between tests and so any future shutdown hook has a single
+    canonical reset path.
+    """
+    _rl_telemetry_writers.clear()
 
 
 async def _rl_cache_and_rerank(
