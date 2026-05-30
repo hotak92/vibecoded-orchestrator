@@ -111,6 +111,13 @@ class RLUpdateRequest(BaseModel):
     Note the plural ``task_ids`` — the server batches updates for
     multiple retrieval events that all reference the same agent
     output (e.g. one chat turn that emitted two KG searches).
+
+    ``embedding_source`` / ``active_embedding`` mirror the
+    ``CacheNodesRequest`` shape (v0.2.40 F1) so the server can pin the
+    training signal to the embedding source that produced the original
+    retrieval candidates. Both fields are optional for backward-compat
+    with older clients; new clients always set them from the constructor
+    ``active_embedding`` tag.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -118,6 +125,8 @@ class RLUpdateRequest(BaseModel):
     task_ids: List[str]
     agent_output: str
     task_type: Optional[str] = None
+    embedding_source: Optional[str] = None
+    active_embedding: Optional[str] = None
 
 
 class RLUpdateResponse(BaseModel):

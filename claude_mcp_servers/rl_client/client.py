@@ -305,6 +305,16 @@ class RLClient:
         payload = {
             "task_ids": list(task_ids),
             "agent_output": agent_output,
+            # v0.2.40 F1 — silent-correctness fix: mirror the cache_nodes
+            # contract so the server can verify the training signal came
+            # from the same embedding source that produced the original
+            # retrieval candidates. Without this, an arctic2-sourced
+            # /rl_update would silently train the qwen3-tagged network
+            # (or vice versa). The server's RLUpdateRequest accepts the
+            # field as an extra (ConfigDict(extra="allow")), so older
+            # servers tolerate it; newer ones gate on it.
+            "embedding_source": self.active_embedding,
+            "active_embedding": self.active_embedding,
         }
         if task_type:
             payload["task_type"] = task_type

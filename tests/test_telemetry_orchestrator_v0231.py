@@ -107,6 +107,171 @@ class RLClientCacheNodesSessionIdTest(unittest.TestCase):
         self.assertEqual(captured["json"]["session_id"], "")
 
 
+class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
+    """v0.2.40 F1: RLClient.rl_update plumbs active_embedding into POST body.
+
+    Mirrors the existing ``cache_nodes`` contract (which already carries
+    both ``embedding_source`` and ``active_embedding``). Without this,
+    training signals from a mismatched embedding source (e.g. arctic2
+    events training a qwen3 NN) could silently corrupt the wrong neural
+    network. Per multi-Opus pre-push review highest-risk silent-
+    correctness gap #1.
+    """
+
+    def test_active_embedding_threaded_into_payload(self):
+        from claude_mcp_servers.rl_client.client import RLClient
+
+        captured = {}
+
+        class _FakeResp:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"ok": True, "scheduled": 1}
+
+        class _FakeClient:
+            async def post(self, url, json=None, timeout=None):
+                captured["url"] = url
+                captured["json"] = json
+                return _FakeResp()
+            async def get(self, url, timeout=None):
+                return _FakeResp()
+            async def aclose(self):
+                pass
+
+        rl = RLClient(
+            text_dim=1024,
+            active_embedding="qwen3",
+            base_url="http://127.0.0.1:0",
+            client=_FakeClient(),
+        )
+        result = _run(rl.rl_update(
+            task_ids=["task-xyz"],
+            agent_output="Claude's answer text",
+        ))
+        self.assertTrue(result.ok)
+        # The /rl_update endpoint must be hit, not /cache_nodes.
+        self.assertTrue(captured["url"].endswith("/rl_update"))
+        # Both fields present — mirror of the cache_nodes payload shape.
+        self.assertIn("active_embedding", captured["json"])
+        self.assertEqual(captured["json"]["active_embedding"], "qwen3")
+        self.assertIn("embedding_source", captured["json"])
+        self.assertEqual(captured["json"]["embedding_source"], "qwen3")
+
+    def test_active_embedding_override_honored(self):
+        """Constructor-level override (e.g. arctic2) flows into rl_update."""
+        from claude_mcp_servers.rl_client.client import RLClient
+
+        captured = {}
+
+        class _FakeResp:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"ok": True}
+
+        class _FakeClient:
+            async def post(self, url, json=None, timeout=None):
+                captured["json"] = json
+                return _FakeResp()
+            async def get(self, url, timeout=None):
+                return _FakeResp()
+            async def aclose(self):
+                pass
+
+        rl = RLClient(
+            text_dim=1024,
+            active_embedding="arctic2",
+            base_url="http://127.0.0.1:0",
+            client=_FakeClient(),
+        )
+        _run(rl.rl_update(
+            task_ids=["task-arctic"],
+            agent_output="answer",
+        ))
+        self.assertEqual(captured["json"]["active_embedding"], "arctic2")
+        self.assertEqual(captured["json"]["embedding_source"], "arctic2")
+
+    def test_active_embedding_defaults_to_qwen3_when_unset(self):
+        """Backward-compat: constructor without explicit active_embedding
+        falls back to the canonical 'qwen3' default (matches the existing
+        ``RLClient.__init__`` contract — see ``self.active_embedding =
+        str(active_embedding or 'qwen3')``)."""
+        from claude_mcp_servers.rl_client.client import RLClient
+
+        captured = {}
+
+        class _FakeResp:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"ok": True}
+
+        class _FakeClient:
+            async def post(self, url, json=None, timeout=None):
+                captured["json"] = json
+                return _FakeResp()
+            async def get(self, url, timeout=None):
+                return _FakeResp()
+            async def aclose(self):
+                pass
+
+        # No active_embedding arg → defaults to "qwen3" per constructor.
+        rl = RLClient(base_url="http://127.0.0.1:0", client=_FakeClient())
+        _run(rl.rl_update(
+            task_ids=["t"],
+            agent_output="answer",
+        ))
+        # Default must still be present (NOT omitted) — the server uses
+        # this to pin the training signal source; an absent field would
+        # require the server to guess.
+        self.assertIn("active_embedding", captured["json"])
+        self.assertEqual(captured["json"]["active_embedding"], "qwen3")
+        self.assertIn("embedding_source", captured["json"])
+        self.assertEqual(captured["json"]["embedding_source"], "qwen3")
+
+    def test_payload_preserves_existing_fields(self):
+        """The new fields must coexist with task_ids/agent_output/task_type;
+        adding active_embedding must not displace any prior contract."""
+        from claude_mcp_servers.rl_client.client import RLClient
+
+        captured = {}
+
+        class _FakeResp:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"ok": True}
+
+        class _FakeClient:
+            async def post(self, url, json=None, timeout=None):
+                captured["json"] = json
+                return _FakeResp()
+            async def get(self, url, timeout=None):
+                return _FakeResp()
+            async def aclose(self):
+                pass
+
+        rl = RLClient(
+            active_embedding="qwen3",
+            base_url="http://127.0.0.1:0",
+            client=_FakeClient(),
+        )
+        _run(rl.rl_update(
+            task_ids=["t1", "t2"],
+            agent_output="full answer",
+            task_type="mcp_interactive",
+        ))
+        body = captured["json"]
+        # Pre-existing contract fields untouched.
+        self.assertEqual(body["task_ids"], ["t1", "t2"])
+        self.assertEqual(body["agent_output"], "full answer")
+        self.assertEqual(body["task_type"], "mcp_interactive")
+        # New fields added.
+        self.assertEqual(body["active_embedding"], "qwen3")
+        self.assertEqual(body["embedding_source"], "qwen3")
+
+
 class RLTelemetryWriterEmbeddingFieldsTest(unittest.TestCase):
     """Fix 2: writer construction never ships blank embedding_source."""
 
