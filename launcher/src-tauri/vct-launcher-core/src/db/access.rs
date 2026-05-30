@@ -2,8 +2,37 @@
 
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
+use serde_json::Value as JsonValue;
 
 use super::Db;
+
+// ─── W40-B (v0.2.40): boot-time KG binding adoption types ────────────────
+
+/// Outcome counts from `adopt_populated_collections_at_boot`. Returned to
+/// the launcher boot path so the init block can log a one-line summary.
+///
+/// Field semantics:
+///   * `adopted` — number of `project_kg_bindings` rows whose
+///     `collection_name` was rewritten to an unambiguous Weaviate
+///     candidate (exactly one populated class matched the binding's
+///     suffix).
+///   * `deferred` — number of rows where multiple populated candidates
+///     existed; we did NOT pick (preserves user intent), and a warning
+///     was logged naming the alternatives so the user can resolve
+///     manually via the launcher GUI's "Manage shared KG collection"
+///     picker.
+///   * `no_change` — rows where the advertised collection already
+///     exists in Weaviate (the common happy path) OR a case-sibling
+///     exists (the existing case-insensitive self-heal handles those)
+///     OR no populated candidate matched (preserves user intent on a
+///     genuinely-missing collection — they'll re-create it on demand).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AdoptionReport {
+    pub adopted: usize,
+    pub deferred: usize,
+    pub no_change: usize,
+}
 
 // ─── KG collection access ────────────────────────────────────────────────
 
@@ -158,6 +187,390 @@ impl Db {
 
         Ok(total_renamed)
     }
+
+    /// W40-B (v0.2.40): cross-prefix self-heal for `project_kg_bindings`
+    /// at launcher boot.
+    ///
+    /// Background: the existing case-insensitive self-heal
+    /// (`migrate_legacy_shared_kg_collection_names` above, plus
+    /// `install.py::_self_heal_kg_bindings_on_update`) covers casing
+    /// flips (`VibecodedOrchestrator_*` → `VibeCodedOrchestrator_*`)
+    /// and legacy-name flips (`VibeCodedTools_*` → `VibeCodedOrchestrator_*`).
+    /// It does NOT handle the case where a `project_kg_bindings` row
+    /// names a collection that doesn't exist in Weaviate AND has no
+    /// case-sibling AND a different-prefix collection with the same
+    /// suffix (`*_KnowledgeGraph`) DOES exist with populated rows.
+    ///
+    /// VCO_dev's broken state (the canonical fixture this targets):
+    /// ```text
+    /// project_kg_bindings (orchestrator-root):
+    ///   primary  = VCODev_KnowledgeGraph                     (manual_override:v0.2.29-cleanup)
+    ///   shared   = VibeCodedOrchestrator_KnowledgeGraph      (manual_override:v0.2.28-recovery)
+    /// Weaviate:
+    ///   VCODev_KnowledgeGraph                                1033 rows  ← actual data
+    ///   VibeCodedOrchestrator_KnowledgeGraph                 missing    ← what shared advertises
+    /// ```
+    /// The advertised collection doesn't exist; the populated one
+    /// matches the same suffix. Auto-adopt is safe because there's
+    /// exactly one populated `*_KnowledgeGraph` candidate.
+    ///
+    /// Algorithm:
+    /// 1. Fetch Weaviate schema → set of existing class names
+    ///    (`/v1/schema`).
+    /// 2. For each row in `project_kg_bindings`:
+    ///    a. If `collection_name` exists → `no_change`.
+    ///    b. If `collection_name.to_lowercase()` matches an existing
+    ///    class (case-sibling) → `no_change` (the case-insensitive
+    ///    self-heal owns this scenario; we never compete with it).
+    ///    c. Otherwise: derive the suffix from the binding's name
+    ///    (`_KnowledgeGraph`). Enumerate populated classes with
+    ///    the same suffix via GraphQL aggregate count. If exactly
+    ///    one has `count > 0`, `UPDATE` the binding's
+    ///    `collection_name` + set `config_json` to
+    ///    `{"manual_override":"v0.2.40-prefix-adopt"}`. If
+    ///    multiple, log a structured warning naming the
+    ///    alternatives and `defer`. If zero, `no_change`.
+    ///
+    /// Idempotency: second call after a successful adoption no-ops
+    /// because the new `collection_name` now exists in step 2a.
+    ///
+    /// Soft-fail contract:
+    ///   * Weaviate unreachable → return `Err(...)`. The caller
+    ///     (launcher boot) logs the error and continues. Boot MUST
+    ///     NOT be blocked by a missing Weaviate.
+    ///   * Per-row probe failures (GraphQL parse error, etc.) are
+    ///     logged and treated as "no populated candidate"; we err on
+    ///     the side of NOT rewriting a binding the user may have
+    ///     intentionally set.
+    ///   * DB errors after a successful probe ARE returned (the row
+    ///     write is the load-bearing step; a failure there leaves the
+    ///     binding stale and we want the caller to know).
+    ///
+    /// Tags every adopted row with `manual_override=v0.2.40-prefix-adopt`
+    /// in `config_json` so the env-backfill path (`vco_lib/project_init.py
+    /// ::_align_env_with_db_bindings`) trusts the new value next time
+    /// `populate()` runs. Matches the sentinel discipline established
+    /// in v0.2.28-recovery + v0.2.29-cleanup.
+    ///
+    /// Position in the boot sequence: called AFTER
+    /// `migrate_legacy_shared_kg_collection_names` so the canonical
+    /// name is finalized first; the case-insensitive self-heal (in
+    /// install.py / W40-A's branch) covers the casing gap; THIS
+    /// function only fires on the residue (full-prefix divergence).
+    ///
+    /// // W40-B (v0.2.40, 2026-05-30): cross-prefix adoption
+    pub async fn adopt_populated_collections_at_boot(
+        &self,
+        weaviate_url: &str,
+    ) -> Result<AdoptionReport, String> {
+        // ── Step 1: probe Weaviate schema ────────────────────────────
+        //
+        // Single GET /v1/schema. Failure → return Err so the caller can
+        // log; don't probe per-row with no schema context.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("adopt_populated: reqwest client: {}", e))?;
+
+        let schema_url = format!("{}/v1/schema", weaviate_url.trim_end_matches('/'));
+        let resp = client
+            .get(&schema_url)
+            .send()
+            .await
+            .map_err(|e| format!("adopt_populated: GET {}: {}", schema_url, e))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "adopt_populated: {} returned status {}",
+                schema_url,
+                resp.status().as_u16()
+            ));
+        }
+        let schema: JsonValue = resp
+            .json()
+            .await
+            .map_err(|e| format!("adopt_populated: parse {}: {}", schema_url, e))?;
+
+        let existing: Vec<String> = schema
+            .get("classes")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        c.get("class").and_then(|v| v.as_str()).map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let existing_set: std::collections::HashSet<&str> =
+            existing.iter().map(String::as_str).collect();
+        let existing_by_lower: std::collections::HashMap<String, &str> = existing
+            .iter()
+            .map(|n| (n.to_lowercase(), n.as_str()))
+            .collect();
+
+        // ── Step 2: collect candidate rows from the DB ───────────────
+        //
+        // Read every project_kg_bindings row. We don't filter at the
+        // SQL layer because the set is tiny (≤ 3-5 rows per project ×
+        // ~10 projects in worst case) and we want the probe → adopt
+        // decision to happen in one pass.
+        struct BindingRow {
+            project_id: String,
+            role: String,
+            collection_name: String,
+        }
+
+        let rows: Vec<BindingRow> = {
+            let guard = self.lock();
+            let mut stmt = guard
+                .prepare(
+                    "SELECT project_id, role, collection_name \
+                     FROM project_kg_bindings",
+                )
+                .map_err(|e| format!("adopt_populated: prepare: {}", e))?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok(BindingRow {
+                        project_id: r.get(0)?,
+                        role: r.get(1)?,
+                        collection_name: r.get(2)?,
+                    })
+                })
+                .map_err(|e| format!("adopt_populated: query: {}", e))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("adopt_populated: collect: {}", e))?
+        };
+
+        let mut report = AdoptionReport::default();
+
+        // ── Step 3: per-row decision ─────────────────────────────────
+        for row in &rows {
+            // 3a — advertised collection exists → nothing to do.
+            if existing_set.contains(row.collection_name.as_str()) {
+                report.no_change += 1;
+                continue;
+            }
+
+            // 3b — case-sibling exists → defer to the case-insensitive
+            // self-heal in install.py / `_self_heal_kg_bindings_on_update`.
+            // We never compete with that path; it'll get this row on the
+            // next `install.py --update`.
+            if existing_by_lower.contains_key(&row.collection_name.to_lowercase()) {
+                report.no_change += 1;
+                continue;
+            }
+
+            // 3c — derive suffix; we only know how to adopt for the
+            // two known suffixes (`_KnowledgeGraph`, `_Development`).
+            // Anything else is treated as user intent we don't
+            // understand; preserve the row.
+            let suffix = match suffix_of(&row.collection_name) {
+                Some(s) => s,
+                None => {
+                    report.no_change += 1;
+                    continue;
+                }
+            };
+
+            // Enumerate populated same-suffix candidates.
+            let candidates = collect_candidates(&existing, suffix);
+            if candidates.is_empty() {
+                report.no_change += 1;
+                continue;
+            }
+
+            // Aggregate-count each candidate. Soft-fail per-candidate:
+            // a count probe error → treat as 0 (don't auto-adopt on
+            // ambiguous information).
+            let mut populated: Vec<(String, u64)> = Vec::new();
+            for cand in &candidates {
+                let count = fetch_class_count(&client, weaviate_url, cand)
+                    .await
+                    .unwrap_or(0);
+                if count > 0 {
+                    populated.push((cand.clone(), count));
+                }
+            }
+
+            match populated.len() {
+                0 => {
+                    // No populated candidate — preserve user intent.
+                    // They probably set this binding ahead of populating
+                    // the collection (or just renamed it intentionally).
+                    report.no_change += 1;
+                }
+                1 => {
+                    // Unambiguous adoption candidate. Rewrite the row.
+                    let (new_name, count) = &populated[0];
+                    if let Err(e) = self.update_binding_for_adoption(
+                        &row.project_id,
+                        &row.role,
+                        new_name,
+                    ) {
+                        // DB write failure is propagated — caller logs
+                        // and the next boot will retry.
+                        return Err(format!(
+                            "adopt_populated: rewrite project_id={} role={} \
+                             {} → {} failed: {}",
+                            row.project_id, row.role,
+                            row.collection_name, new_name, e
+                        ));
+                    }
+                    eprintln!(
+                        "[vct] adopt-populated: project_id={} role={} \
+                         {} → {} (rows={})",
+                        row.project_id, row.role,
+                        row.collection_name, new_name, count
+                    );
+                    report.adopted += 1;
+                }
+                _ => {
+                    // Multiple populated candidates — defer. Log the
+                    // alternatives so the user can pick via the
+                    // launcher GUI's "Manage shared KG collection"
+                    // picker. Do NOT auto-pick the highest-row-count
+                    // one: the user may legitimately want either, and
+                    // a silent pick from the launcher's boot path is
+                    // exactly the surprise we want to avoid.
+                    let alts: Vec<String> = populated
+                        .iter()
+                        .map(|(n, c)| format!("{} ({} rows)", n, c))
+                        .collect();
+                    eprintln!(
+                        "[vct] adopt-populated DEFER: project_id={} role={} \
+                         advertised='{}' multiple populated candidates: [{}]",
+                        row.project_id, row.role,
+                        row.collection_name,
+                        alts.join(", ")
+                    );
+                    report.deferred += 1;
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Helper for `adopt_populated_collections_at_boot`: update a
+    /// `project_kg_bindings` row's `collection_name` AND tag its
+    /// `config_json` with the v0.2.40 prefix-adopt sentinel.
+    ///
+    /// The sentinel matters: `vco_lib/project_init.py::_align_env_with_db_bindings`
+    /// uses the presence of a `manual_override` key to know it should
+    /// CORRECT a stale env file rather than preserve user edits. So
+    /// the boot-time write must declare itself in the same sentinel
+    /// channel that v0.2.28-recovery / v0.2.29-cleanup use; otherwise
+    /// the env file would silently lag behind the DB.
+    ///
+    /// We preserve any other keys in `config_json` by reading the
+    /// existing JSON, merging in the sentinel, and re-serializing.
+    /// (Today nothing else lives there, but future fields could; the
+    /// merge is the safe shape.)
+    fn update_binding_for_adoption(
+        &self,
+        project_id: &str,
+        role: &str,
+        new_collection: &str,
+    ) -> Result<(), String> {
+        let now = Utc::now().timestamp_millis();
+        let guard = self.lock();
+
+        // Read existing config_json so we don't clobber unrelated keys.
+        let existing_cfg: String = guard
+            .query_row(
+                "SELECT config_json FROM project_kg_bindings \
+                  WHERE project_id = ?1 AND role = ?2",
+                params![project_id, role],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| "{}".to_string());
+
+        let mut cfg: JsonValue =
+            serde_json::from_str(&existing_cfg).unwrap_or(JsonValue::Object(serde_json::Map::new()));
+        if !cfg.is_object() {
+            cfg = JsonValue::Object(serde_json::Map::new());
+        }
+        if let Some(obj) = cfg.as_object_mut() {
+            obj.insert(
+                "manual_override".to_string(),
+                JsonValue::String("v0.2.40-prefix-adopt".to_string()),
+            );
+        }
+        let cfg_s = serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string());
+
+        guard
+            .execute(
+                "UPDATE project_kg_bindings \
+                    SET collection_name = ?1, \
+                        config_json = ?2, \
+                        updated_at = ?3 \
+                  WHERE project_id = ?4 AND role = ?5",
+                params![new_collection, cfg_s, now, project_id, role],
+            )
+            .map_err(|e| format!("update: {}", e))?;
+        Ok(())
+    }
+}
+
+/// Extract the recognized suffix from a binding collection name. We
+/// only know how to adopt across known suffixes; anything else (a user
+/// pointing a binding at a custom-named class) is preserved as-is.
+///
+/// Returns the suffix INCLUDING the leading underscore so callers can
+/// build candidate names directly via `format!("{prefix}{suffix}")`.
+fn suffix_of(name: &str) -> Option<&'static str> {
+    const SUFFIXES: &[&str] = &["_KnowledgeGraph", "_Development"];
+    for s in SUFFIXES {
+        if name.ends_with(s) {
+            return Some(*s);
+        }
+    }
+    None
+}
+
+/// Collect classes in `existing` that share the given suffix. Used by
+/// `adopt_populated_collections_at_boot` to enumerate adoption candidates.
+fn collect_candidates(existing: &[String], suffix: &str) -> Vec<String> {
+    existing
+        .iter()
+        .filter(|n| n.ends_with(suffix))
+        .cloned()
+        .collect()
+}
+
+/// Aggregate-count a Weaviate class via GraphQL. Mirrors the
+/// implementation in `launcher::commands::kg::fetch_class_count` but
+/// lives in the core crate where the boot-time self-heal also needs
+/// it. Returns 0 when the class is missing / the query errors /
+/// parsing fails — the caller decides whether 0 → "no populated
+/// candidate".
+async fn fetch_class_count(
+    client: &reqwest::Client,
+    weaviate_url: &str,
+    class: &str,
+) -> Result<u64, String> {
+    let url = format!("{}/v1/graphql", weaviate_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "query": format!(
+            "{{ Aggregate {{ {class} {{ meta {{ count }} }} }} }}",
+            class = class
+        )
+    });
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("graphql: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("graphql status {}", resp.status().as_u16()));
+    }
+    let v: JsonValue = resp.json().await.map_err(|e| format!("parse: {}", e))?;
+    Ok(v.pointer(&format!("/data/Aggregate/{}/0/meta/count", class))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0))
 }
 
 // ─── Codegraph access ────────────────────────────────────────────────────
@@ -640,5 +1053,421 @@ mod migrate_shared_kg_tests {
             .migrate_legacy_shared_kg_collection_names(CANONICAL)
             .unwrap();
         assert_eq!(second, 0, "second call must be a no-op");
+    }
+}
+
+// ─── Tests: adopt_populated_collections_at_boot (W40-B / v0.2.40) ─────────
+
+#[cfg(test)]
+mod adopt_populated_tests {
+    use super::AdoptionReport;
+    use crate::db::Db;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    /// Tiny mock Weaviate server. Spawns a synchronous TCP listener on
+    /// an ephemeral port that responds to:
+    ///   * `GET /v1/schema` → JSON with a `classes` array.
+    ///   * `POST /v1/graphql` (an Aggregate query) → JSON with a count
+    ///     for the requested class.
+    ///
+    /// Why a hand-rolled server and not an external mock crate: the
+    /// `vct-launcher-core` crate has no test-dependency budget (see
+    /// the `[dev-dependencies]` rationale in Cargo.toml's comments —
+    /// any feature-gated dep risks tauri-build environment issues).
+    /// A 40-line TCP echo loop is cheaper than adding `httpmock`.
+    ///
+    /// The server runs until the test drops the handle (the listener
+    /// goes out of scope and the accept loop returns).
+    struct MockWeaviate {
+        url: String,
+        _handle: thread::JoinHandle<()>,
+    }
+
+    impl MockWeaviate {
+        /// Spawn a mock server. `classes` is the list of class names
+        /// served by `/v1/schema`. `counts` maps each class to a row
+        /// count served by GraphQL Aggregate.
+        ///
+        /// The server handles a bounded number of requests (16) then
+        /// quietly exits. Tests need at most: 1 schema fetch + N count
+        /// probes, where N is the candidate count — well under 16.
+        fn spawn(classes: Vec<String>, counts: HashMap<String, u64>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+            let port = listener.local_addr().unwrap().port();
+            let url = format!("http://127.0.0.1:{}", port);
+
+            let classes_arc = Arc::new(classes);
+            let counts_arc = Arc::new(Mutex::new(counts));
+
+            let handle = thread::spawn(move || {
+                listener.set_nonblocking(false).ok();
+                for (i, stream) in listener.incoming().enumerate() {
+                    if i >= 16 {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    let mut buf = [0u8; 8192];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+                    let body = if req.starts_with("GET /v1/schema") {
+                        serde_json::json!({
+                            "classes": classes_arc
+                                .iter()
+                                .map(|c| serde_json::json!({"class": c}))
+                                .collect::<Vec<_>>()
+                        })
+                        .to_string()
+                    } else if req.contains("POST /v1/graphql") {
+                        // Extract the class name from the GraphQL query.
+                        // Body starts after the blank line; the query has
+                        // shape `{ Aggregate { ClassName { meta {...} } } }`.
+                        // Crude but sufficient for the test fixture.
+                        let class = req
+                            .split("Aggregate")
+                            .nth(1)
+                            .and_then(|s| s.split('{').nth(1))
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default();
+                        let count = counts_arc
+                            .lock()
+                            .unwrap()
+                            .get(&class)
+                            .copied()
+                            .unwrap_or(0);
+                        serde_json::json!({
+                            "data": {
+                                "Aggregate": {
+                                    class: [
+                                        { "meta": { "count": count } }
+                                    ]
+                                }
+                            }
+                        })
+                        .to_string()
+                    } else {
+                        "{}".to_string()
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+
+            Self { url, _handle: handle }
+        }
+    }
+
+    /// Seed a project + a `project_kg_bindings` row.
+    fn seed_binding(
+        db: &Db,
+        project_id: &str,
+        role: &str,
+        collection: &str,
+        config: serde_json::Value,
+    ) {
+        let now = 1_700_000_000_000_i64;
+        let folder = format!("/tmp/test-w40b/{}", project_id);
+        {
+            let guard = db.lock();
+            guard.execute(
+                "INSERT OR IGNORE INTO projects \
+                 (id, name, folder_path, host, created_at, updated_at, slug) \
+                 VALUES (?1, ?2, ?3, 'base', ?4, ?4, ?1)",
+                rusqlite::params![project_id, project_id, folder, now],
+            ).unwrap_or_else(|e| panic!("seed project {}: {}", project_id, e));
+        }
+        db.set_project_kg_binding(
+            project_id,
+            role,
+            collection,
+            None,
+            None,
+            None,
+            None,
+            &config,
+        )
+        .expect("seed binding");
+    }
+
+    /// Helper: read a single binding back out.
+    fn read_binding(
+        db: &Db,
+        project_id: &str,
+        role: &str,
+    ) -> (String, serde_json::Value) {
+        let bindings = db.list_project_kg_bindings(project_id).unwrap();
+        let b = bindings
+            .into_iter()
+            .find(|b| b.role == role)
+            .unwrap_or_else(|| panic!("binding {}/{} missing", project_id, role));
+        (b.collection_name, b.config)
+    }
+
+    /// T1 — Fresh install shape: binding's `collection_name` is present
+    /// in Weaviate. No adoption needed, report `no_change=1`.
+    #[tokio::test]
+    async fn t1_existing_collection_is_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        seed_binding(
+            &db,
+            "p1",
+            "primary",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            json!({}),
+        );
+
+        let mock = MockWeaviate::spawn(
+            vec!["VibeCodedOrchestrator_KnowledgeGraph".to_string()],
+            HashMap::from([(
+                "VibeCodedOrchestrator_KnowledgeGraph".to_string(),
+                42_u64,
+            )]),
+        );
+
+        let report = db
+            .adopt_populated_collections_at_boot(&mock.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            AdoptionReport { adopted: 0, deferred: 0, no_change: 1 }
+        );
+
+        // Binding unchanged.
+        let (name, _cfg) = read_binding(&db, "p1", "primary");
+        assert_eq!(name, "VibeCodedOrchestrator_KnowledgeGraph");
+    }
+
+    /// T2 — VCO_dev's broken shape: binding names a missing class, but
+    /// a populated same-suffix candidate (different prefix) exists.
+    /// Auto-adopt; binding's config_json gains
+    /// `manual_override:v0.2.40-prefix-adopt`.
+    #[tokio::test]
+    async fn t2_vco_dev_shape_single_populated_candidate_adopted() {
+        let db = Db::open_in_memory().unwrap();
+        seed_binding(
+            &db,
+            "p1",
+            "shared",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            json!({"manual_override": "v0.2.28-recovery"}),
+        );
+
+        // Weaviate has VCODev_KnowledgeGraph (1033 rows). Advertised
+        // VibeCodedOrchestrator_KnowledgeGraph is missing entirely.
+        let mock = MockWeaviate::spawn(
+            vec!["VCODev_KnowledgeGraph".to_string()],
+            HashMap::from([("VCODev_KnowledgeGraph".to_string(), 1033_u64)]),
+        );
+
+        let report = db
+            .adopt_populated_collections_at_boot(&mock.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            AdoptionReport { adopted: 1, deferred: 0, no_change: 0 }
+        );
+
+        // Binding rebound to VCODev_KnowledgeGraph; sentinel updated.
+        let (name, cfg) = read_binding(&db, "p1", "shared");
+        assert_eq!(name, "VCODev_KnowledgeGraph");
+        assert_eq!(
+            cfg.get("manual_override").and_then(|v| v.as_str()),
+            Some("v0.2.40-prefix-adopt"),
+            "sentinel must reflect the boot-time prefix adoption \
+             (overrides the prior v0.2.28-recovery on this row)"
+        );
+    }
+
+    /// T3 — Two populated candidates → don't auto-pick; defer.
+    /// Binding remains unchanged so the user can resolve via the GUI.
+    #[tokio::test]
+    async fn t3_multiple_populated_candidates_defer() {
+        let db = Db::open_in_memory().unwrap();
+        seed_binding(
+            &db,
+            "p1",
+            "shared",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            json!({}),
+        );
+
+        let mock = MockWeaviate::spawn(
+            vec![
+                "VCODev_KnowledgeGraph".to_string(),
+                "AcmeOrch_KnowledgeGraph".to_string(),
+            ],
+            HashMap::from([
+                ("VCODev_KnowledgeGraph".to_string(), 500_u64),
+                ("AcmeOrch_KnowledgeGraph".to_string(), 200_u64),
+            ]),
+        );
+
+        let report = db
+            .adopt_populated_collections_at_boot(&mock.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            AdoptionReport { adopted: 0, deferred: 1, no_change: 0 }
+        );
+
+        // Binding intact — we never auto-pick on ambiguity.
+        let (name, _cfg) = read_binding(&db, "p1", "shared");
+        assert_eq!(name, "VibeCodedOrchestrator_KnowledgeGraph");
+    }
+
+    /// T4 — Zero populated candidates → no-op. The user's
+    /// not-yet-populated binding is preserved (they may be about to
+    /// run a seed).
+    #[tokio::test]
+    async fn t4_no_populated_candidates_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        seed_binding(
+            &db,
+            "p1",
+            "primary",
+            "BrandNew_KnowledgeGraph",
+            json!({}),
+        );
+
+        // Weaviate has a same-suffix class but it's empty (count=0).
+        let mock = MockWeaviate::spawn(
+            vec!["OtherProject_KnowledgeGraph".to_string()],
+            HashMap::from([("OtherProject_KnowledgeGraph".to_string(), 0_u64)]),
+        );
+
+        let report = db
+            .adopt_populated_collections_at_boot(&mock.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            AdoptionReport { adopted: 0, deferred: 0, no_change: 1 }
+        );
+
+        // Binding intact.
+        let (name, _cfg) = read_binding(&db, "p1", "primary");
+        assert_eq!(name, "BrandNew_KnowledgeGraph");
+    }
+
+    /// T5 — Idempotency: after a successful T2-shape adoption, running
+    /// again no-ops (the binding's new collection_name now exists in
+    /// Weaviate, so step 2a short-circuits).
+    #[tokio::test]
+    async fn t5_idempotent_after_adoption() {
+        let db = Db::open_in_memory().unwrap();
+        seed_binding(
+            &db,
+            "p1",
+            "shared",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            json!({}),
+        );
+
+        // First server: missing advertised, populated candidate.
+        let mock1 = MockWeaviate::spawn(
+            vec!["VCODev_KnowledgeGraph".to_string()],
+            HashMap::from([("VCODev_KnowledgeGraph".to_string(), 1033_u64)]),
+        );
+        let first = db
+            .adopt_populated_collections_at_boot(&mock1.url)
+            .await
+            .unwrap();
+        assert_eq!(first.adopted, 1);
+
+        // Second server: binding now points at the existing class.
+        // (We use a fresh mock because the first listener has finite
+        // accept budget; the test fixture isn't a long-running server.)
+        let mock2 = MockWeaviate::spawn(
+            vec!["VCODev_KnowledgeGraph".to_string()],
+            HashMap::from([("VCODev_KnowledgeGraph".to_string(), 1033_u64)]),
+        );
+        let second = db
+            .adopt_populated_collections_at_boot(&mock2.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            AdoptionReport { adopted: 0, deferred: 0, no_change: 1 },
+            "second call must be a no-op"
+        );
+    }
+
+    /// T6 — Case-sibling handling. A binding whose case-different
+    /// sibling exists on disk MUST be left alone (the case-insensitive
+    /// self-heal owns that scenario; we never compete with it). Without
+    /// this guard, W40-B would steal cases from the install.py path and
+    /// rewrite via the prefix-adopt sentinel instead of the proper
+    /// case-rebind sentinel.
+    #[tokio::test]
+    async fn t6_case_sibling_is_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        // Binding names capital-C; Weaviate has lowercase-c (case-sibling).
+        seed_binding(
+            &db,
+            "p1",
+            "shared",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            json!({}),
+        );
+
+        let mock = MockWeaviate::spawn(
+            vec!["VibecodedOrchestrator_KnowledgeGraph".to_string()],
+            HashMap::from([(
+                "VibecodedOrchestrator_KnowledgeGraph".to_string(),
+                10_u64,
+            )]),
+        );
+
+        let report = db
+            .adopt_populated_collections_at_boot(&mock.url)
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            AdoptionReport { adopted: 0, deferred: 0, no_change: 1 },
+            "case-sibling must be deferred to the case-insensitive heal"
+        );
+
+        // Binding untouched.
+        let (name, _cfg) = read_binding(&db, "p1", "shared");
+        assert_eq!(name, "VibeCodedOrchestrator_KnowledgeGraph");
+    }
+
+    /// T7 — Weaviate unreachable → Err. Caller (launcher boot) logs
+    /// and continues; boot is NOT blocked.
+    #[tokio::test]
+    async fn t7_weaviate_unreachable_returns_err() {
+        let db = Db::open_in_memory().unwrap();
+        seed_binding(
+            &db,
+            "p1",
+            "primary",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            json!({}),
+        );
+
+        // Bind+drop a listener to grab an unused port; nothing will
+        // listen on it for the call.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let dead_url = format!("http://127.0.0.1:{}", port);
+
+        let result = db.adopt_populated_collections_at_boot(&dead_url).await;
+        assert!(result.is_err(), "expected Err on unreachable Weaviate, got {:?}", result);
     }
 }

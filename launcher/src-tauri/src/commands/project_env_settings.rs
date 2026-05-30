@@ -973,6 +973,73 @@ fn resolve_shared_kg_from_orchestrator_root(db: &Db) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// W40-B (v0.2.40): decide whether a project's env files need
+/// regeneration based on binding-row freshness vs env-file mtime.
+///
+/// Returns `true` iff the most recent `updated_at` across the
+/// project's KG + codegraph binding rows is strictly newer than the
+/// env file's modification time. Used by the launcher boot path to
+/// auto-refresh per-project `.claude/settings.json` + `.claude/env`
+/// after a binding has been adopted to a different collection name
+/// (the `adopt_populated_collections_at_boot` self-heal in
+/// `vct-launcher-core`).
+///
+/// Soft-fail contract:
+///   * No bindings for the project → `false` (nothing to compare).
+///   * Env file missing → `false`. Caller should NOT trigger a
+///     refresh on a project that's never had env files written —
+///     the regular create-project / populate path owns that. The
+///     boot regen is strictly a "stale env" healer, not a first-time
+///     creator.
+///   * mtime unreadable → `false`. Better to skip a refresh than
+///     to spam regeneration on every boot for a project whose
+///     filesystem timestamps are flaky.
+///
+/// Performance: 1 SQLite read (bounded set of binding rows per
+/// project) + 1 `metadata()` call. Bounded; safe to call once per
+/// project at boot.
+pub fn should_regenerate_env_for_project(
+    db: &Db,
+    project_id: &str,
+    env_file_path: &std::path::Path,
+) -> bool {
+    // Collect the latest binding update timestamp from KG + codegraph.
+    let kg_bindings = match db.list_project_kg_bindings(project_id) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let codegraph = db.get_project_codegraph_binding(project_id).ok().flatten();
+
+    let mut db_max_ms: Option<i64> = None;
+    for b in &kg_bindings {
+        db_max_ms = Some(db_max_ms.map_or(b.updated_at, |m| m.max(b.updated_at)));
+    }
+    if let Some(cb) = &codegraph {
+        db_max_ms = Some(db_max_ms.map_or(cb.updated_at, |m| m.max(cb.updated_at)));
+    }
+    let Some(db_max_ms) = db_max_ms else {
+        // No bindings at all — nothing has been written that the env
+        // could be lagging behind.
+        return false;
+    };
+
+    let meta = match std::fs::metadata(env_file_path) {
+        Ok(m) => m,
+        Err(_) => return false, // env file missing or unreadable
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    // Convert env-file mtime to epoch milliseconds for comparison.
+    let env_ms = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(_) => return false, // mtime before UNIX epoch — improbable, skip
+    };
+
+    db_max_ms > env_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1355,5 +1422,107 @@ mod tests {
             "OtherTool_KnowledgeGraph",
             "AcmeOrchestrator_KnowledgeGraph",
         ));
+    }
+
+    // ─── W40-B (v0.2.40): should_regenerate_env_for_project ──────────
+
+    /// Seed a project + a primary KG binding with `updated_at = now`.
+    fn seed_project_with_kg_binding(db: &Db, project_id: &str, folder: &str) {
+        use crate::db::models::ProjectHost;
+        db.insert_project(
+            project_id,
+            project_id,
+            folder,
+            ProjectHost::Base,
+            project_id,
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            project_id,
+            "primary",
+            "VCODev_KnowledgeGraph",
+            None, None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    }
+
+    /// T8: DB binding `updated_at` is NEWER than the env file mtime →
+    /// regen needed (boot-time adoption just rewrote the binding;
+    /// env file is now stale).
+    #[test]
+    fn should_regen_returns_true_when_binding_newer_than_env_file() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("env");
+        // Write the env file FIRST so its mtime is older than the
+        // upcoming binding write.
+        let mut f = std::fs::File::create(&env_path).unwrap();
+        writeln!(f, "KG_COLLECTION=OldName").unwrap();
+        drop(f);
+
+        // Sleep just enough so the binding's updated_at (set to
+        // chrono::now() inside set_project_kg_binding) is strictly
+        // greater than the env file mtime.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let db = Db::open_in_memory().unwrap();
+        seed_project_with_kg_binding(&db, "p-stale", tmp.path().to_str().unwrap());
+
+        assert!(
+            should_regenerate_env_for_project(&db, "p-stale", &env_path),
+            "expected true: binding is newer than env file"
+        );
+    }
+
+    /// T9: env file is NEWER than the binding → no regen.
+    #[test]
+    fn should_regen_returns_false_when_env_file_newer_than_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("env");
+
+        let db = Db::open_in_memory().unwrap();
+        seed_project_with_kg_binding(&db, "p-fresh", tmp.path().to_str().unwrap());
+
+        // Now write the env file LATER. Ensures the env mtime > binding.updated_at.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&env_path, b"KG_COLLECTION=CurrentName").unwrap();
+
+        assert!(
+            !should_regenerate_env_for_project(&db, "p-fresh", &env_path),
+            "expected false: env file is newer than binding"
+        );
+    }
+
+    /// T10: env file missing → false (don't regen on a project that
+    /// has never had env files; the regular populate path owns that).
+    #[test]
+    fn should_regen_returns_false_when_env_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("nonexistent-env");
+
+        let db = Db::open_in_memory().unwrap();
+        seed_project_with_kg_binding(&db, "p-nofile", tmp.path().to_str().unwrap());
+
+        assert!(
+            !should_regenerate_env_for_project(&db, "p-nofile", &env_path),
+            "expected false: env file missing, refresh path not appropriate"
+        );
+    }
+
+    /// Edge: no bindings at all → false (nothing to compare against).
+    #[test]
+    fn should_regen_returns_false_when_no_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_path = tmp.path().join("env");
+        std::fs::write(&env_path, b"KG_COLLECTION=X").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        // Note: project not inserted; list_project_kg_bindings returns
+        // empty for unknown project_id.
+        assert!(
+            !should_regenerate_env_for_project(&db, "ghost", &env_path),
+            "expected false: no binding rows → nothing to regenerate against"
+        );
     }
 }
