@@ -259,6 +259,14 @@ class RLDataLogger:
                          offline trainer can reconstruct the same analog
                          advantage rewards without the original agent output.
         """
+        # v0.2.40 F3: stamp the embedding triple
+        # (embedding_source, embedding_dim, embedding_model) on every
+        # citation event so it is self-contained. The offline RL
+        # training pipeline pairs retrieval events with citation
+        # events via shared embedding-triple keys; if the retrieval
+        # event is dropped at training_loader steps 4/6 (filter or
+        # alias-map miss), the citation event would otherwise orphan
+        # silently with no anchor. Mirrors the retrieval-event shape.
         record: dict[str, Any] = {
             "event": "citation",
             "schema_version": self.SCHEMA_VERSION,
@@ -266,6 +274,9 @@ class RLDataLogger:
             "project": self._project,
             "task_id": task_id,
             "task_type": task_type,
+            "embedding_source": self._embedding_source,
+            "embedding_dim": self._embedding_dim,
+            "embedding_model": self._embedding_model,
             "citations": {
                 title: (bool(cited) if cited is not None else None)
                 for title, cited in citations.items()
