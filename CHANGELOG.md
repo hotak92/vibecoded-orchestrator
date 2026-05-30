@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.40] — unreleased
+
+### Fixed
+
+- **W40-A: `install.py --update` cross-prefix self-heal** (Agent W40-A): when a `project_kg_bindings` row's `collection_name` doesn't exist in Weaviate AND has no case-sibling, the v0.2.23 case-insensitive self-heal explicitly left the row alone (preserving the "genuine missing-class" contract). v0.2.40 adds a SECOND pass to `_self_heal_kg_bindings_on_update`: probe Weaviate for `*_KnowledgeGraph` / `*_Development` classes with non-zero row count via GraphQL Aggregate; auto-adopt when exactly one candidate exists (tagged `manual_override=v0.2.40-prefix-adopt` in `config_json` so downstream env-backfill picks it up on the next `populate()`). Closes the v0.2.29-cleanup stale-shared-binding case where VCO_dev's `VCODev_KnowledgeGraph` (populated, 1033 rows) wasn't reached by the case-insensitive sweep targeting `VibeCodedOrchestrator_KnowledgeGraph` (never created). Multi-candidate ambiguity → emits `multi_candidate_prefix_adopt` deferral entry (warning severity) with per-candidate row counts and copy-paste SQL — refuses to guess. Zero candidates → no-op (legitimate missing-class state, preserved). Transient Weaviate Aggregate errors per-candidate are treated as "unknown count" and skipped (never auto-adopt blindly). Pre-existing config_json keys preserved during adoption; only `manual_override` is set/updated. Idempotent: a second run finds the adopted class in the schema and short-circuits. 11 new tests in `tests/test_self_heal_cross_prefix_adopt.py` (T1–T9 + 2 helper-direct tests) + 2 regression guards in `tests/test_install_self_heal_kg_bindings.py` pin the contract that a pure case-rebind does NOT acquire the v0.2.40 sentinel.
+
 ## [0.2.39] — 2026-05-28
 
 ### Added
