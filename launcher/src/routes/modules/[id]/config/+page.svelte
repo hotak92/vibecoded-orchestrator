@@ -17,6 +17,13 @@
   import { page } from '$app/stores';
   import { invoke, tauriAvailable } from '$lib/tauri';
   import ModuleConfigTab from '$lib/components/ModuleConfigTab.svelte';
+  // v0.2.40 H2: re-wire the orphan dashboard widget. Mounted only for
+  // the RL Reranker module — other modules show only the generic
+  // schema-rendered config tab. See `RlRerankerStatusPanel.svelte`.
+  import RlRerankerStatusPanel from '$lib/components/RlRerankerStatusPanel.svelte';
+  import { selectedProject } from '$lib/stores/projects';
+
+  const RL_MODULE_ID = 'vct-rl-reranker';
 
   // The renderer (ModuleConfigTab.svelte) owns the canonical ConfigTab
   // type. We type the wire response as `unknown` here and hand it to
@@ -36,6 +43,10 @@
   }
 
   const moduleId = $derived($page.params.id ?? '');
+  // v0.2.40 H2: status panel binds to the globally selected project.
+  // Renders placeholders ("—") when no project is picked yet.
+  const activeProjectId = $derived($selectedProject?.id ?? '');
+  const showStatusPanel = $derived(moduleId === RL_MODULE_ID);
 
   let configTab = $state<ConfigTab | null>(null);
   let loadError = $state<string | null>(null);
@@ -72,6 +83,13 @@
       <p>{loadError}</p>
     </div>
   {:else if configTab}
+    {#if showStatusPanel}
+      <!-- v0.2.40 H2: dashboard widget + flag-state summary above the
+           schema-rendered controls. Re-wires the v0.2.31 orphan widget. -->
+      <div class="status-panel-wrapper">
+        <RlRerankerStatusPanel projectId={activeProjectId} />
+      </div>
+    {/if}
     <ModuleConfigTab configTab={configTab} {moduleId} />
   {/if}
 </div>
@@ -103,5 +121,13 @@
     margin: 0;
     font-size: 13px;
     color: var(--color-text);
+  }
+  /* v0.2.40 H2: keeps the status panel padded the same as the tab body
+     beneath it. ModuleConfigTab.svelte has its own .tab padding so we
+     can't share — we mirror the 24px gutter instead. */
+  .status-panel-wrapper {
+    padding: 24px 24px 0 24px;
+    max-width: 920px;
+    margin: 0 auto;
   }
 </style>

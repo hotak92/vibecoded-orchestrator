@@ -148,6 +148,56 @@ pub async fn set_rl_global_training_source_flag(
     set_bool_flag(&db, &project_id, "rl_global_training_source_flag", value)
 }
 
+// ─── Per-project flag getters (v0.2.40 H2) ───────────────────────────────
+//
+// Counterparts to the three setters above. v0.2.31 Agent J built the
+// `RlRerankerDashboardWidget` but it never had a path to load the
+// persisted flag state on mount — the renderer-driven `get_module_setting`
+// path is fine for the schema-driven config tab, but the widget wraps
+// the three flags into a single status summary and is cheaper to read
+// via dedicated getters (no JSON deserialisation, typed bool returns,
+// missing-row = false default baked in).
+//
+// Default for any missing row is `false`, matching `get_bool_flag`'s
+// semantics. Rejects empty `project_id` (caller bug, not a soft-fail).
+
+/// Read back the persisted "Use global model (read-only)" flag.
+#[command]
+pub async fn get_rl_use_global(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    if project_id.is_empty() {
+        return Err("get_rl_use_global: project_id required".into());
+    }
+    get_bool_flag(&db, &project_id, "rl_use_global")
+}
+
+/// Read back the persisted "Disable online training for this project" flag.
+#[command]
+pub async fn get_rl_online_training_disabled(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    if project_id.is_empty() {
+        return Err("get_rl_online_training_disabled: project_id required".into());
+    }
+    get_bool_flag(&db, &project_id, "rl_online_training_disabled")
+}
+
+/// Read back the persisted "Use this project's data to train the
+/// global model" flag.
+#[command]
+pub async fn get_rl_global_training_source_flag(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    if project_id.is_empty() {
+        return Err("get_rl_global_training_source_flag: project_id required".into());
+    }
+    get_bool_flag(&db, &project_id, "rl_global_training_source_flag")
+}
+
 // ─── Reset / retrain (STUBS for Stream 2) ───────────────────────────────
 
 /// "Reset to global model" — re-forks this project's local model from
@@ -245,6 +295,38 @@ mod tests {
         let p = &ids[0];
         assert!(!get_bool_flag(&db, p, "rl_use_global").unwrap());
         assert!(!get_bool_flag(&db, p, "nonexistent_key").unwrap());
+    }
+
+    /// v0.2.40 H2: the three getter command bodies (`get_rl_use_global`,
+    /// `get_rl_online_training_disabled`, `get_rl_global_training_source_flag`)
+    /// round-trip through `module_settings` via the same `get_bool_flag` /
+    /// `set_bool_flag` helpers the setters use. Verifies the wire shape
+    /// the dashboard widget reads.
+    ///
+    /// Default for a missing row is `false` (not an error) — the widget
+    /// renders a "off" status for never-configured projects rather than
+    /// blanking out the panel.
+    #[test]
+    fn getters_round_trip_with_setters_and_default_to_false() {
+        let (db, ids) = open_db_with_projects(1);
+        let p = &ids[0];
+
+        // Missing rows ⇒ all three getters return false (matches the
+        // widget's "fresh install, no opt-in" copy).
+        assert!(!get_bool_flag(&db, p, "rl_use_global").unwrap());
+        assert!(!get_bool_flag(&db, p, "rl_online_training_disabled").unwrap());
+        assert!(!get_bool_flag(&db, p, "rl_global_training_source_flag").unwrap());
+
+        // Set the three flags via the setter helper, then read back via
+        // the same helper the new commands wrap. Independent rows ⇒
+        // independent readback (no cross-talk).
+        set_bool_flag(&db, p, "rl_use_global", true).unwrap();
+        set_bool_flag(&db, p, "rl_global_training_source_flag", true).unwrap();
+        // rl_online_training_disabled left false on purpose.
+
+        assert!(get_bool_flag(&db, p, "rl_use_global").unwrap());
+        assert!(!get_bool_flag(&db, p, "rl_online_training_disabled").unwrap());
+        assert!(get_bool_flag(&db, p, "rl_global_training_source_flag").unwrap());
     }
 
     /// `list_rl_global_training_source_projects` returns only projects
