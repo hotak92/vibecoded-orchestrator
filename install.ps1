@@ -97,6 +97,101 @@ $nonInteractiveMode = $NonInteractive -or $Quiet -or `
     ($env:VCT_NON_INTERACTIVE -ne $null -and $env:VCT_NON_INTERACTIVE -ne "")
 
 # ---------------------------------------------------------------------------
+# WebView2 Runtime check (Windows-only)
+#
+# The Tauri launcher GUI links dynamically against Microsoft Edge WebView2
+# Runtime. On Windows 10 1903+ and Windows 11 it's pre-installed via the
+# Evergreen channel, but older Windows 10 SKUs (or images where Edge updates
+# were disabled by group policy) ship without it. When absent, the launcher
+# .exe LAUNCHES but opens a black/blank window with no error — confusing
+# silent failure for new users.
+#
+# Probe the well-known registry keys first; if absent, try `winget install`
+# silently, falling back to a human-readable URL hint. Runs only on Windows
+# (no-op on Linux/macOS — install.sh handles those platforms and they don't
+# use WebView2).
+#
+# How to test:
+#   1. Uninstall the WebView2 Runtime: Settings > Apps > Microsoft Edge
+#      WebView2 Runtime > Uninstall. (Or: winget uninstall
+#      Microsoft.EdgeWebView2Runtime.)
+#   2. Run install.ps1; verify it offers the winget install path (or URL
+#      hint if winget is absent).
+#   3. Re-run install.ps1; verify it skips the check silently (Test- returns
+#      $true on the first registry key).
+# ---------------------------------------------------------------------------
+function Test-WebView2Installed {
+    # GUID is the stable product ID for Microsoft Edge WebView2 Runtime.
+    # Sources: per-machine x64 install (WOW6432Node), per-machine native,
+    # and per-user install. Any one of the three counts as "installed".
+    $guid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+    $keys = @(
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$guid",
+        "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid",
+        "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid"
+    )
+    foreach ($k in $keys) {
+        if (Test-Path $k) { return $true }
+    }
+    return $false
+}
+
+function Install-WebView2Runtime {
+    Write-Host "Microsoft Edge WebView2 Runtime not detected." -ForegroundColor Yellow
+    $winget = Get-Command "winget" -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host "Detected winget. Will run:"
+        Write-Host "  winget install Microsoft.EdgeWebView2Runtime --silent --accept-package-agreements --accept-source-agreements"
+        # Skip the confirm prompt in non-interactive mode (CI / -Quiet /
+        # VCT_NON_INTERACTIVE / -NonInteractive). Prompt-Yes is defined
+        # later in the file so we inline a Read-Host here instead.
+        $proceed = $nonInteractiveMode
+        if (-not $proceed) {
+            $reply = Read-Host "Install WebView2 Runtime now? [Y/n]"
+            $proceed = [string]::IsNullOrWhiteSpace($reply) -or ($reply -match '^[Yy]')
+        }
+        if ($proceed) {
+            & winget install Microsoft.EdgeWebView2Runtime --silent --accept-package-agreements --accept-source-agreements
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "WebView2 Runtime installed successfully."
+                return $true
+            }
+            Write-Host "winget install failed (exit $LASTEXITCODE). Falling back to URL hint." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "winget not found." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  WebView2 Runtime is REQUIRED by the launcher GUI on Windows." -ForegroundColor Yellow
+    Write-Host "  Without it, the launcher opens a black/blank window."
+    Write-Host "  Install manually from:"
+    Write-Host "    https://developer.microsoft.com/microsoft-edge/webview2/"
+    Write-Host ""
+    Write-Host "  Re-run install.ps1 (or first-install.bat) after installation."
+    return $false
+}
+
+if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+    if (-not (Test-WebView2Installed)) {
+        $installed = Install-WebView2Runtime
+        if (-not $installed) {
+            if ($nonInteractiveMode) {
+                # Non-interactive: don't block the install — WebView2 is
+                # only needed for the GUI launcher, not the CLI/MCP stack.
+                # The user can install it manually before first GUI launch.
+                Write-Host "Continuing install (WebView2 needed only for launcher GUI; install before first GUI launch)." -ForegroundColor Yellow
+            } else {
+                $resp = Read-Host "Continue install without WebView2 Runtime? Launcher GUI will not work until installed. [y/N]"
+                if ($resp -notmatch '^[Yy]') {
+                    Write-Host "Aborting. Install WebView2 Runtime and re-run." -ForegroundColor Red
+                    exit 1
+                }
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Python detection
 # ---------------------------------------------------------------------------
 function Find-Python {
