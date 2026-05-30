@@ -392,6 +392,110 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         ids = [e.condition_id for e in report.entries]
         self.assertNotIn("kg_binding_self_healed", ids)
 
+    # ── v0.2.40 W40-A regression guards ───────────────────────────────
+    # These guard the existing case-insensitive path against the
+    # second-pass cross-prefix logic added in v0.2.40. Even when the
+    # second pass IS available, a row that has a case-different sibling
+    # in Weaviate must still go through pass 1 (case-rebind) — the
+    # config_json must NOT acquire the `v0.2.40-prefix-adopt` sentinel,
+    # because no prefix change happened.
+
+    def test_v0240_case_rebind_does_not_set_prefix_adopt_sentinel(self):
+        """A case-only rebind must NOT mark config_json with the v0.2.40
+        sentinel — that sentinel is reserved for cross-prefix adoption,
+        which signals to env-backfill that the prefix CHANGED. A pure
+        case-flip already had `manual_override` semantics (or none) and
+        should preserve them.
+        """
+        # Seed with a config_json carrying a prior sentinel.
+        db_path = self._db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(_PROJECT_KG_BINDINGS_DDL)
+            now = int(time.time() * 1000)
+            conn.execute(
+                "INSERT INTO project_kg_bindings "
+                "(project_id, role, collection_name, embedding_model, "
+                "embedding_dim, kg_dir_path, weaviate_url, config_json, "
+                "updated_at) VALUES "
+                "(?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)",
+                (
+                    "p1", "shared",
+                    "VibecodedOrchestrator_KnowledgeGraph",  # lowercase c
+                    json.dumps({"manual_override": "v0.2.28-recovery"}),
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        # Weaviate holds the canonical capital-C sibling.
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        # Pass-1 rebound the row.
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cur = conn.execute(
+                "SELECT collection_name, config_json "
+                "FROM project_kg_bindings WHERE project_id = ? AND role = ?",
+                ("p1", "shared"),
+            )
+            coll, cfg_str = cur.fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(coll, "VibeCodedOrchestrator_KnowledgeGraph")
+        cfg = json.loads(cfg_str)
+        # The original sentinel is preserved — pass-1 doesn't touch
+        # config_json at all (only collection_name + updated_at).
+        self.assertEqual(
+            cfg.get("manual_override"), "v0.2.28-recovery",
+            "case-only rebind must NOT change manual_override sentinel",
+        )
+        self.assertNotEqual(
+            cfg.get("manual_override"), "v0.2.40-prefix-adopt",
+            "v0.2.40 sentinel must NOT be applied on a pure case-rebind",
+        )
+
+    def test_v0240_pass2_does_not_re_adopt_a_just_case_rebound_row(self):
+        """If pass-1 just rebound a row from lowercase-c to capital-C,
+        pass-2 must see the row's new value already in
+        ``existing_classes`` and short-circuit. No double-modification.
+        """
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared",
+                   "VibecodedOrchestrator_KnowledgeGraph")],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        bindings = _read_bindings(self._db_path)
+        # Pass-1 result. Pass-2 must NOT have changed anything further.
+        self.assertEqual(
+            bindings,
+            [("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+        )
+        # Only ONE deferral entry (the case-rebind summary). No
+        # multi-candidate deferral, no second adoption recorded.
+        ids = [e.condition_id for e in report.entries]
+        self.assertEqual(
+            ids.count("kg_binding_self_healed"), 1,
+            "case-rebind must produce exactly one summary entry",
+        )
+        self.assertNotIn("multi_candidate_prefix_adopt", ids)
+
 
 _KG_COLLECTION_ACCESS_DDL = """
 CREATE TABLE kg_collection_access (

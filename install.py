@@ -8261,6 +8261,84 @@ def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
 _KG_ACCESS_RANK: dict[str, int] = {"none": 0, "read": 1, "write": 2}
 
 
+# v0.2.40 cross-prefix self-heal — suffixes considered when probing
+# Weaviate for a populated sibling under a different prefix. Mirrors the
+# `vco_lib.project_init._KG_SUFFIXES` constant so the two sides stay in
+# sync; duplicated here to avoid a cross-module import inside install.py
+# (which is imported very early in the install flow, before vco_lib's
+# heavier modules are guaranteed to be importable).
+_KG_BINDING_PREFIX_ADOPT_SUFFIXES: tuple[str, ...] = (
+    "_KnowledgeGraph",
+    "_Development",
+)
+
+
+def _count_weaviate_class_objects(
+    weaviate_url: str, class_name: str,
+) -> "Optional[int]":
+    """Count objects in ``class_name`` via Weaviate's GraphQL Aggregate.
+
+    Returns:
+        int  — object count when the request succeeds (0 for empty class).
+        None — Weaviate unreachable, malformed response, or HTTP error.
+               Callers MUST treat ``None`` as "unknown" (not zero) so a
+               transient network blip cannot cause a populated collection
+               to look empty and miss adoption.
+
+    Soft-fails throughout: never raises into the caller. Used by the
+    v0.2.40 cross-prefix self-heal to identify which ``*_KnowledgeGraph``
+    / ``*_Development`` candidate class actually holds data.
+    """
+    base = (weaviate_url or "http://localhost:8081").rstrip("/")
+    # GraphQL injection guard: class_name comes from Weaviate's own
+    # schema endpoint (we filter from existing_classes), so it's already
+    # safe. But validate the shape anyway to fail-closed if a future
+    # caller passes user input.
+    if not class_name or not class_name.replace("_", "").isalnum():
+        return None
+    query = (
+        "{ Aggregate { "
+        f"{class_name} {{ meta {{ count }} }}"
+        " } }"
+    )
+    try:
+        data = json.dumps({"query": query}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/v1/graphql",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
+            req, timeout=10,
+        )
+    except Exception:
+        return None
+    try:
+        status = resp.getcode()
+    except Exception:
+        status = 0
+    if status != 200:
+        return None
+    try:
+        payload = json.loads(resp.read())
+    except Exception:
+        return None
+    try:
+        agg = payload.get("data", {}).get("Aggregate", {}) or {}
+        rows = agg.get(class_name) or []
+        if not rows:
+            # Aggregate returns empty list for missing class.
+            return 0
+        meta = rows[0].get("meta") or {}
+        count = meta.get("count")
+        if isinstance(count, int):
+            return count
+    except Exception:
+        return None
+    return None
+
+
 def _rebind_collection_names_to_on_disk_casing(
     cur: "sqlite3.Cursor",
     *,
@@ -8356,6 +8434,165 @@ def _rebind_collection_names_to_on_disk_casing(
             )
 
     return rebinds
+
+
+def _prefix_adopt_kg_bindings_pass(
+    cur: "sqlite3.Cursor",
+    *,
+    existing_classes: "set[str]",
+    existing_by_lower: "dict[str, str]",
+    weaviate_url: str,
+) -> "dict[str, list]":
+    """v0.2.40 — second-pass cross-prefix adoption for ``project_kg_bindings``.
+
+    The case-insensitive first pass (see ``_rebind_collection_names_to_on_disk_casing``)
+    handles rows whose ``collection_name`` differs only in casing from a
+    live Weaviate class. This second pass handles a different shape: a
+    row whose ``collection_name`` is GENUINELY MISSING from Weaviate
+    (and has no case-sibling), but where Weaviate holds a populated
+    class under a *different prefix* but the *same suffix*.
+
+    Algorithm (per binding row left un-aligned by pass 1):
+      1. Skip rows whose ``collection_name`` is already in
+         ``existing_classes`` (exact match — nothing to do).
+      2. Skip rows whose ``collection_name.lower()`` is in
+         ``existing_by_lower`` (pass 1 would have rebound this; if it
+         didn't, the row is already canonical for some other reason —
+         leave it alone).
+      3. Determine the suffix (``_KnowledgeGraph`` or ``_Development``).
+         Rows whose advertised name doesn't end in a known suffix are
+         skipped — we don't second-guess arbitrary user-set names.
+      4. Probe ``existing_classes`` for every class ending in that
+         suffix; query Weaviate Aggregate for row counts; filter to
+         candidates with ``row_count > 0``.
+      5. Decision:
+           * Exactly one candidate     → UPDATE the binding row, tag
+                                          ``manual_override:v0.2.40-prefix-adopt``.
+           * Multiple populated → record for ``multi_candidate_prefix_adopt``
+                                          deferral; DO NOT modify the row.
+           * Zero candidates    → no-op (legitimate missing-class state,
+                                          preserved from prior behaviour).
+
+    Idempotency: a second run finds the adopted ``collection_name`` in
+    ``existing_classes`` (step 1) and short-circuits at the per-row
+    skip. Multi-candidate deferrals re-emit (the SQL the user runs is
+    deterministic; emitting the same entry twice is harmless and gives
+    the user current row counts).
+
+    Returns a dict with two keys:
+        adopts:           list of (project_id, role, old_name, new_name, row_count)
+        multi_candidates: list of (project_id, role, old_name, [(cand, count), ...])
+
+    Soft-fails on Weaviate errors per candidate: when row-count probing
+    returns ``None`` for a candidate, that candidate is treated as
+    "unknown" and skipped (never adopted blindly). When ALL candidates
+    probe ``None``, the row is left un-aligned (the next run will retry).
+    """
+    adopts: list[tuple[str, str, str, str, int]] = []
+    multi_candidates: list[tuple[str, str, str, list[tuple[str, int]]]] = []
+
+    cur.execute(
+        "SELECT project_id, role, collection_name, config_json "
+        "FROM project_kg_bindings"
+    )
+    rows = cur.fetchall()
+
+    # Group existing classes by suffix once — we'll consult per row.
+    classes_by_suffix: dict[str, list[str]] = {
+        s: [] for s in _KG_BINDING_PREFIX_ADOPT_SUFFIXES
+    }
+    for cls in existing_classes:
+        for suffix in _KG_BINDING_PREFIX_ADOPT_SUFFIXES:
+            if cls.endswith(suffix):
+                classes_by_suffix[suffix].append(cls)
+                break
+
+    # Cache row-counts so we don't re-probe Weaviate twice for the same
+    # class when multiple binding rows map to the same suffix.
+    count_cache: dict[str, "Optional[int]"] = {}
+
+    def _count(name: str) -> "Optional[int]":
+        if name not in count_cache:
+            count_cache[name] = _count_weaviate_class_objects(
+                weaviate_url, name,
+            )
+        return count_cache[name]
+
+    for row in rows:
+        proj_id, role, coll_name, config_json = row
+        if not coll_name:
+            continue
+        # Pass-1 already aligned exact-match and case-sibling rows.
+        if coll_name in existing_classes:
+            continue
+        if coll_name.lower() in existing_by_lower:
+            # Defensive: pass-1 should have rebound this. If it didn't,
+            # leave the row alone — pass-1 owns that case.
+            continue
+
+        # Determine the suffix the row's name ends in. Unknown suffix
+        # → skip (we don't probe arbitrary prefixes; the user might
+        # have a custom convention we shouldn't second-guess).
+        suffix: "Optional[str]" = None
+        for s in _KG_BINDING_PREFIX_ADOPT_SUFFIXES:
+            if coll_name.endswith(s):
+                suffix = s
+                break
+        if suffix is None:
+            continue
+
+        # Find all populated candidate classes matching the suffix.
+        candidates: list[tuple[str, int]] = []
+        for cand in classes_by_suffix.get(suffix, []):
+            if cand == coll_name:
+                # Won't happen (we already filtered exact-match above),
+                # but keep the guard defensively.
+                continue
+            cnt = _count(cand)
+            if cnt is None:
+                # Weaviate transient error or malformed response — skip
+                # this candidate. Never auto-adopt with unknown count.
+                continue
+            if cnt > 0:
+                candidates.append((cand, cnt))
+
+        if not candidates:
+            # No populated sibling under this suffix. Legitimate
+            # missing-class state — preserve the existing contract
+            # (orphan-prune sync recreates lazily; user picks via the
+            # launcher's Shared KG picker).
+            continue
+
+        if len(candidates) == 1:
+            # Exactly one populated sibling — auto-adopt.
+            cand_name, cand_count = candidates[0]
+            # Build the new config_json with the v0.2.40 sentinel.
+            # Preserve other config_json keys so we don't clobber
+            # user/launcher state in there.
+            try:
+                cfg = json.loads(config_json) if config_json else {}
+                if not isinstance(cfg, dict):
+                    cfg = {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                cfg = {}
+            cfg["manual_override"] = "v0.2.40-prefix-adopt"
+            new_config = json.dumps(cfg)
+
+            cur.execute(
+                "UPDATE project_kg_bindings "
+                "SET collection_name = ?, config_json = ?, updated_at = ? "
+                "WHERE project_id = ? AND role = ?",
+                (cand_name, new_config, int(time.time() * 1000), proj_id, role),
+            )
+            adopts.append((proj_id, role, coll_name, cand_name, cand_count))
+        else:
+            # Multiple populated candidates — refuse to guess.
+            # Sort by row count descending so the deferral's listing
+            # leads with the most populated candidate.
+            candidates.sort(key=lambda c: c[1], reverse=True)
+            multi_candidates.append((proj_id, role, coll_name, candidates))
+
+    return {"adopts": adopts, "multi_candidates": multi_candidates}
 
 
 def _self_heal_kg_bindings_on_update(
@@ -8455,6 +8692,11 @@ def _self_heal_kg_bindings_on_update(
     # helper exists to fix data, not schema.
     rebinds: list[tuple[str, str, str, str]] = []  # (proj_id, role, old, new)
     access_rebinds: list[tuple[str, str, str]] = []  # (proj_id, old, new)
+    # v0.2.40 cross-prefix adoption (second pass) — see _prefix_adopt_kg_bindings_pass.
+    # adopts:           (project_id, role, old_name, new_name, row_count)
+    # multi_candidates: (project_id, role, old_name, [(cand_name, row_count), ...])
+    prefix_adopts: list[tuple[str, str, str, str, int]] = []
+    prefix_multi_candidates: list[tuple[str, str, str, list[tuple[str, int]]]] = []
     try:
         conn = sqlite3.connect(str(db_path), timeout=5.0)
         try:
@@ -8579,6 +8821,47 @@ def _self_heal_kg_bindings_on_update(
                 if "no such table" not in str(oe).lower():
                     raise
 
+            # ── 3. v0.2.40 cross-prefix adoption (SECOND PASS) ─────────
+            # The case-insensitive sweep above handles the casing-flip
+            # scenarios (lowercase-c → capital-C, etc.). It explicitly
+            # leaves rows alone when the advertised `collection_name`
+            # doesn't exist in Weaviate AND has no case-different
+            # sibling — the "genuine missing-class" branch.
+            #
+            # v0.2.40 covers a different breakage shape: when a
+            # `manual_override` cleanup (e.g. v0.2.29) updated the
+            # PRIMARY binding to a custom prefix (e.g. `VCODev_*`)
+            # but left the SHARED binding pointing at the canonical
+            # release-default prefix (`VibeCodedOrchestrator_*`), the
+            # advertised shared collection never gets populated and
+            # the actual data lives under the per-project prefix.
+            #
+            # Probe Weaviate for *_KnowledgeGraph / *_Development
+            # classes with non-zero row count. Exactly ONE candidate
+            # → auto-adopt (tag `manual_override:v0.2.40-prefix-adopt`
+            # in config_json so downstream env-backfill picks it up).
+            # Multiple candidates with rows → emit
+            # `multi_candidate_prefix_adopt` deferral and DO NOT pick.
+            # Zero candidates → no-op (legitimate missing-class state,
+            # preserves the existing contract for true missing rows).
+            try:
+                prefix_outcomes = _prefix_adopt_kg_bindings_pass(
+                    cur,
+                    existing_classes=existing_classes,
+                    existing_by_lower=existing_by_lower,
+                    weaviate_url=weaviate_url,
+                )
+                prefix_adopts.extend(prefix_outcomes["adopts"])
+                prefix_multi_candidates.extend(
+                    prefix_outcomes["multi_candidates"]
+                )
+            except sqlite3.OperationalError as oe:
+                # Already-handled `no such table` from the first pass;
+                # if we got here that table exists. Re-raise other
+                # operational errors — they're real corruption signals.
+                if "no such table" not in str(oe).lower():
+                    raise
+
             conn.commit()
         finally:
             conn.close()
@@ -8616,91 +8899,203 @@ def _self_heal_kg_bindings_on_update(
         )
         return
 
-    if not rebinds and not access_rebinds:
+    if (
+        not rebinds
+        and not access_rebinds
+        and not prefix_adopts
+        and not prefix_multi_candidates
+    ):
         _log_install_event(
             "7e/10", "ok",
             "no case-mismatched KG bindings or access rows; self-heal no-op",
         )
         return
 
-    # Emit ONE deferral entry summarising every rebind so the user has
-    # an audit trail. severity=info because nothing is broken — we just
-    # corrected a misalignment that would otherwise route writes to a
-    # nonexistent class.
-    rebind_lines = "\n".join(
-        f"  * project_id={pid} role={role}: `{old}` → `{new}`"
-        for (pid, role, old, new) in rebinds
-    )
-    access_rebind_lines = "\n".join(
-        f"  * project_id={pid}: `{old}` → `{new}`"
-        for (pid, old, new) in access_rebinds
-    )
+    # Emit deferral entries. Case-rebinds + prefix-adopts share an
+    # informational `kg_binding_self_healed` entry because both are
+    # auto-applied metadata fixes (the target class exists in Weaviate
+    # before we point the binding at it). Multi-candidate prefix
+    # situations get a SEPARATE `multi_candidate_prefix_adopt` entry
+    # with warning severity — they require user input.
     binding_count = len(rebinds)
     access_count = len(access_rebinds)
-    title_parts = []
-    if binding_count:
-        title_parts.append(f"{binding_count} binding(s)")
-    if access_count:
-        title_parts.append(f"{access_count} access row(s)")
-    title = (
-        f"Self-healed {' + '.join(title_parts)} of case-mismatched KG "
-        "metadata in launcher.db"
-    )
-    detected_parts = []
-    if binding_count:
-        detected_parts.append(
-            f"Found {binding_count} `project_kg_bindings` row(s) whose "
-            f"`collection_name` differed only in casing from a class that "
-            f"exists in Weaviate at {weaviate_url}.\n\n"
-            f"Rebound binding rows:\n{rebind_lines}"
+    prefix_adopt_count = len(prefix_adopts)
+    if rebinds or access_rebinds or prefix_adopts:
+        rebind_lines = "\n".join(
+            f"  * project_id={pid} role={role}: `{old}` → `{new}`"
+            for (pid, role, old, new) in rebinds
         )
-    if access_count:
-        detected_parts.append(
-            f"Found {access_count} `kg_collection_access` row(s) whose "
-            f"`collection_name` differed only in casing from a class that "
-            f"exists in Weaviate (sibling rows to the binding rebinds). "
-            f"These were updated in place to keep the launcher GUI's "
-            f"per-project Identity tab access matrix pointing at the live "
-            f"class. Rows annotated `(deduped)` were merged with a pre-"
-            f"existing canonical-casing row at equal-or-higher privilege.\n\n"
-            f"Rebound access rows:\n{access_rebind_lines}"
+        access_rebind_lines = "\n".join(
+            f"  * project_id={pid}: `{old}` → `{new}`"
+            for (pid, old, new) in access_rebinds
         )
-    detected = "\n\n".join(detected_parts) + "\n\nNo data was touched."
+        prefix_adopt_lines = "\n".join(
+            f"  * project_id={pid} role={role}: `{old}` → `{new}` "
+            f"(adopted populated class with {cnt} object(s))"
+            for (pid, role, old, new, cnt) in prefix_adopts
+        )
+        title_parts = []
+        if binding_count:
+            title_parts.append(f"{binding_count} case-rebound binding(s)")
+        if access_count:
+            title_parts.append(f"{access_count} access row(s)")
+        if prefix_adopt_count:
+            title_parts.append(
+                f"{prefix_adopt_count} cross-prefix adopted binding(s)"
+            )
+        title = (
+            f"Self-healed {' + '.join(title_parts)} in launcher.db KG metadata"
+        )
+        detected_parts = []
+        if binding_count:
+            detected_parts.append(
+                f"Found {binding_count} `project_kg_bindings` row(s) whose "
+                f"`collection_name` differed only in casing from a class that "
+                f"exists in Weaviate at {weaviate_url}.\n\n"
+                f"Rebound binding rows:\n{rebind_lines}"
+            )
+        if access_count:
+            detected_parts.append(
+                f"Found {access_count} `kg_collection_access` row(s) whose "
+                f"`collection_name` differed only in casing from a class that "
+                f"exists in Weaviate (sibling rows to the binding rebinds). "
+                f"These were updated in place to keep the launcher GUI's "
+                f"per-project Identity tab access matrix pointing at the live "
+                f"class. Rows annotated `(deduped)` were merged with a pre-"
+                f"existing canonical-casing row at equal-or-higher privilege.\n\n"
+                f"Rebound access rows:\n{access_rebind_lines}"
+            )
+        if prefix_adopt_count:
+            detected_parts.append(
+                f"Found {prefix_adopt_count} `project_kg_bindings` row(s) "
+                f"whose advertised `collection_name` does not exist in "
+                f"Weaviate, but a SINGLE populated class under a different "
+                f"prefix matches the same suffix "
+                f"(`_KnowledgeGraph` / `_Development`). Auto-adopted the "
+                f"populated class and tagged `config_json` with "
+                f"`manual_override: v0.2.40-prefix-adopt` so downstream "
+                f"env-backfill picks up the new collection name on the next "
+                f"`populate()` call.\n\n"
+                f"Adopted bindings:\n{prefix_adopt_lines}"
+            )
+        detected = "\n\n".join(detected_parts) + "\n\nNo data was touched."
 
-    deferral_report.add_entry(
-        DeferralEntry(
-            condition_id="kg_binding_self_healed",
-            title=title,
-            detected=detected,
-            why_deferred=(
-                "This is an informational entry — the heal was applied "
-                "automatically (it's a metadata fix, not a destructive "
-                "operation, since the target class already exists in "
-                "Weaviate). The launcher.db row(s) now match the actual "
-                "Weaviate class casing, so writes/reads route to the live "
-                "class instead of a nonexistent case-variant.\n\n"
-                "Background: install.py v0.2.23 B1 (2026-05-21) flipped the "
-                "canonical shared-KG class name from `VibecodedOrchestrator_"
-                "KnowledgeGraph` (lowercase c) to `VibeCodedOrchestrator_"
-                "KnowledgeGraph` (capital C, matching the brand spelling). "
-                "Case-insensitive adoption in `_ensure_collections` keeps "
-                "the on-disk casing unchanged; this helper aligns the "
-                "launcher.db `project_kg_bindings` AND `kg_collection_access` "
-                "rows with that on-disk casing."
-            ),
-            command_to_apply=(
-                "No action required — the heal already ran. If you want to "
-                "verify the rebound rows, open the launcher and check the "
-                "Shared KG collection name on each affected project's "
-                "Settings → Identity tab."
-            ),
-            severity="info",
-            kg_node_refs=[],
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="kg_binding_self_healed",
+                title=title,
+                detected=detected,
+                why_deferred=(
+                    "This is an informational entry — the heal was applied "
+                    "automatically (it's a metadata fix, not a destructive "
+                    "operation, since the target class already exists in "
+                    "Weaviate). The launcher.db row(s) now match the actual "
+                    "Weaviate class names so writes/reads route to the live "
+                    "class instead of a nonexistent variant.\n\n"
+                    "Background: install.py v0.2.23 B1 (2026-05-21) flipped "
+                    "the canonical shared-KG class name from "
+                    "`VibecodedOrchestrator_KnowledgeGraph` (lowercase c) "
+                    "to `VibeCodedOrchestrator_KnowledgeGraph` (capital C, "
+                    "matching the brand spelling). Case-insensitive adoption "
+                    "in `_ensure_collections` keeps the on-disk casing "
+                    "unchanged; this helper aligns the launcher.db "
+                    "`project_kg_bindings` AND `kg_collection_access` rows "
+                    "with that on-disk casing.\n\n"
+                    "install.py v0.2.40 (2026-05-30) added a second pass: "
+                    "when a binding row's `collection_name` is genuinely "
+                    "missing AND has no case-sibling, probe for "
+                    "`*_KnowledgeGraph` / `*_Development` classes with "
+                    "non-zero row count; auto-adopt when exactly one matches "
+                    "(typical post-`v0.2.29-cleanup` shape where the user "
+                    "rebound the PRIMARY binding to a custom prefix like "
+                    "`VCODev_*` but left the SHARED binding pointing at the "
+                    "release-default canonical name)."
+                ),
+                command_to_apply=(
+                    "No action required — the heal already ran. If you want "
+                    "to verify the rebound rows, open the launcher and check "
+                    "the Shared KG collection name on each affected project's "
+                    "Settings → Identity tab."
+                ),
+                severity="info",
+                kg_node_refs=[],
+            )
         )
-    )
+
+    if prefix_multi_candidates:
+        # User intent is genuinely ambiguous — surface the candidates
+        # with row counts and the explicit SQL to pick one.
+        multi_lines = []
+        for (pid, role, old_name, cands) in prefix_multi_candidates:
+            cand_listing = "\n".join(
+                f"      - `{name}` ({cnt} object(s))"
+                for (name, cnt) in cands
+            )
+            multi_lines.append(
+                f"  * project_id={pid} role={role}: advertised "
+                f"`{old_name}` is missing; candidates with rows:\n"
+                f"{cand_listing}"
+            )
+        multi_block = "\n".join(multi_lines)
+        # Build a copy-paste SQL stanza per candidate-row for the user.
+        sql_lines: list[str] = []
+        for (pid, role, _old, cands) in prefix_multi_candidates:
+            for (cand_name, _cnt) in cands:
+                sql_lines.append(
+                    f"UPDATE project_kg_bindings SET collection_name = "
+                    f"'{cand_name}', config_json = "
+                    f"'{{\"manual_override\":\"v0.2.40-prefix-adopt\"}}', "
+                    f"updated_at = strftime('%s','now') * 1000 "
+                    f"WHERE project_id = '{pid}' AND role = '{role}';"
+                )
+        sql_block = "\n".join(sql_lines)
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="multi_candidate_prefix_adopt",
+                title=(
+                    f"Multiple populated KG collections match advertised "
+                    f"`collection_name` suffix — manual choice required "
+                    f"({len(prefix_multi_candidates)} row(s) ambiguous)"
+                ),
+                detected=(
+                    f"For the following `project_kg_bindings` row(s), the "
+                    f"advertised `collection_name` does not exist in "
+                    f"Weaviate AND more than one populated class shares "
+                    f"the suffix (`_KnowledgeGraph` / `_Development`). "
+                    f"The cross-prefix self-heal refuses to guess.\n\n"
+                    f"{multi_block}"
+                ),
+                why_deferred=(
+                    "Auto-adoption with multiple non-empty candidates "
+                    "would risk pointing the binding at the wrong data. "
+                    "Pick the collection that matches your intent and "
+                    "apply the SQL below directly against launcher.db "
+                    "(see `command_to_apply`). If neither matches, "
+                    "rename one in Weaviate first (out of scope for "
+                    "install.py)."
+                ),
+                command_to_apply=(
+                    f"# Pick ONE of the following lines per "
+                    f"(project_id, role) tuple and run it against your "
+                    f"launcher.db (default: ~/.vct/launcher.db).\n"
+                    f"# Then re-run `python install.py --update` to "
+                    f"propagate the new binding into .claude/env / "
+                    f".claude/settings.json on next launcher boot.\n"
+                    f"{sql_block}"
+                ),
+                severity="warning",
+                kg_node_refs=[],
+            )
+        )
+
     _log_install_event(
         "7e/10", "ok",
-        f"self-healed {binding_count} binding(s) + {access_count} access row(s)",
+        (
+            f"self-healed {binding_count} case-binding(s) + "
+            f"{access_count} access row(s) + "
+            f"{prefix_adopt_count} prefix-adopt(s); "
+            f"{len(prefix_multi_candidates)} ambiguous row(s) deferred"
+        ),
         data={
             "rebinds": [
                 {"project_id": pid, "role": role,
@@ -8713,6 +9108,22 @@ def _self_heal_kg_bindings_on_update(
                  "old_collection_name": old,
                  "new_collection_name": new}
                 for (pid, old, new) in access_rebinds
+            ],
+            "prefix_adopts": [
+                {"project_id": pid, "role": role,
+                 "old_collection_name": old,
+                 "new_collection_name": new,
+                 "adopted_row_count": cnt}
+                for (pid, role, old, new, cnt) in prefix_adopts
+            ],
+            "multi_candidates": [
+                {"project_id": pid, "role": role,
+                 "old_collection_name": old,
+                 "candidates": [
+                     {"name": name, "row_count": cnt}
+                     for (name, cnt) in cands
+                 ]}
+                for (pid, role, old, cands) in prefix_multi_candidates
             ],
         },
     )
