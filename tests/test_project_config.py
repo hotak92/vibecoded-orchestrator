@@ -688,5 +688,85 @@ class ResolveClaudeSessionDirTest(_ResolverTestBase):
         self.assertEqual(cfg.claude_session_dir, "")
 
 
+# ─── v0.2.40 R2: RL Reranker flag exposure ─────────────────────────────
+
+
+class ResolveRlFlagsTest(_ResolverTestBase):
+    """v0.2.40 R2 — RL Reranker per-project flags travel through the
+    resolver end-to-end.
+
+    Until v0.2.40 the three GUI checkboxes (``rl_use_global``,
+    ``rl_online_training_disabled``, ``rl_global_training_source_flag``)
+    wrote to ``module_settings`` but the RL container had no readback
+    path — flipping a checkbox had zero runtime effect. v0.2.40+ hubs
+    expose the values via ``GET /api/v1/projects/{id}/config`` and the
+    Python ``ProjectConfig`` parser surfaces them on the dataclass.
+    """
+
+    def test_resolve_propagates_rl_flags_from_hub_body(self) -> None:
+        # Canonical happy path: hub emits explicit values; parser
+        # surfaces them as the dataclass booleans. Three flags with
+        # distinct values (T/F/T) demonstrates each is read
+        # independently rather than from a single shared key.
+        body = {
+            **FULL_BODY,
+            "rl_use_global": True,
+            "rl_online_training_disabled": False,
+            "rl_global_training_source_flag": True,
+        }
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertIs(cfg.rl_use_global, True)
+        self.assertIs(cfg.rl_online_training_disabled, False)
+        self.assertIs(cfg.rl_global_training_source_flag, True)
+
+    def test_resolve_back_fills_false_when_hub_omits_rl_flags(self) -> None:
+        # Backward-compat guard: a pre-v0.2.40 hub paired with a
+        # v0.2.40+ client doesn't emit the RL flag fields. The parser
+        # must back-fill ``False`` for all three rather than crashing
+        # (matches the Rust handler's ``unwrap_or(false)`` contract on
+        # absent ``module_settings`` rows).
+        body_old = {
+            k: v
+            for k, v in FULL_BODY.items()
+            if k
+            not in {
+                "rl_use_global",
+                "rl_online_training_disabled",
+                "rl_global_training_source_flag",
+            }
+        }
+        # FULL_BODY at the top of this file doesn't ship the RL keys
+        # yet; the dict-comp above is a no-op on the missing-keys case
+        # but stays defensive in case FULL_BODY grows them later.
+        self.session.get.return_value = _make_response(200, body_old)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertIs(cfg.rl_use_global, False)
+        self.assertIs(cfg.rl_online_training_disabled, False)
+        self.assertIs(cfg.rl_global_training_source_flag, False)
+
+    def test_resolve_handles_non_bool_truthy_values_via_bool_coercion(
+        self,
+    ) -> None:
+        # Defensive: if a non-conforming hub ever emits truthy non-bool
+        # values (e.g. ``1`` instead of ``True``), the parser must
+        # normalise them via ``bool(...)`` so downstream consumers can
+        # rely on the dataclass type annotation. Mirrors the
+        # ``bool(body["shared_kg_write_disabled"])`` pattern used for
+        # the older flag at line 735 of project_config.py.
+        body = {
+            **FULL_BODY,
+            "rl_use_global": 1,
+            "rl_online_training_disabled": 0,
+            "rl_global_training_source_flag": "yes",
+        }
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertIs(cfg.rl_use_global, True)
+        self.assertIs(cfg.rl_online_training_disabled, False)
+        # Non-empty string is truthy in Python — bool("yes") == True.
+        self.assertIs(cfg.rl_global_training_source_flag, True)
+
+
 if __name__ == "__main__":
     unittest.main()
