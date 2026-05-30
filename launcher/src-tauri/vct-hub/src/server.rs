@@ -19,7 +19,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use super::{
     api, auth, cli_api, config_api, db, lifecycle_api, mcp_tool_grants_api, module_db_api,
-    module_supervisor, modules_api, project_state_api, weaviate_probe,
+    modules_api, project_state_api, weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -163,39 +163,19 @@ pub async fn start_hub_server() -> Result<u16, String> {
         }
     });
 
-    // v0.2.21 Stream B / Step 24 commit b: per-project module
-    // container resume sweep. Spawned detached so it doesn't block the
-    // listener; soft-fails per row. Reads `module_installs.container_
-    // name` and restarts any non-running container via
-    // `module_supervisor::start_container_for_module`. Manifest lookup
-    // is stubbed (returns None for every id) for this step — the
-    // launcher continues to own the resume sweep in parallel via its
-    // own Tauri startup hook in `commands::module_service::resume_
-    // containers_on_startup`. Phase 3+ wires a hub-side catalog
-    // resolver and cuts the launcher hook over to be a no-op.
-    let resume_db = match vct_launcher_core::db::Db::open() {
-        Ok(d) => Some(std::sync::Arc::new(d)),
-        Err(e) => {
-            eprintln!(
-                "[vct-hub] module_supervisor: cannot open launcher.db for resume ({}); skipping",
-                e
-            );
-            None
-        }
-    };
-    if let Some(db) = resume_db {
-        tokio::spawn(async move {
-            // Manifest resolver stub: returns None for every id. Hub
-            // side has no catalog scanner yet (Phase 3+). The
-            // resume_containers_on_startup function logs + skips when
-            // the resolver returns None, which is the safe default —
-            // the launcher's own startup hook will still run and pick
-            // up the manifest from the catalog scan.
-            let resolver: module_supervisor::ManifestResolver =
-                Box::new(|_id: &str| None);
-            module_supervisor::resume_containers_on_startup(&db, resolver).await;
-        });
-    }
+    // v0.2.40 F4 (2026-05-30): the hub-side resume-containers sweep
+    // that lived here was a dead stub — its manifest resolver was
+    // hardcoded `Box::new(|_id| None)`, so the `resume_containers_on_
+    // startup` loop in `module_supervisor` skipped every row. The
+    // launcher-side path at `commands::module_service::resume_
+    // containers_on_startup` (invoked from `lib.rs::setup()`) is what
+    // actually keeps containers alive on boot. Phase 3+ would wire a
+    // hub-side catalog resolver and cut the launcher hook over to a
+    // no-op; until that work lands the stub here masqueraded as live
+    // coverage. Removed per multi-Opus pre-push review highest-risk
+    // gap #4. `module_supervisor::resume_containers_on_startup` and
+    // its `ManifestResolver` type remain in place for that Phase 3+
+    // wiring (tests in `module_supervisor.rs` still exercise them).
 
     println!("[vct-hub] API server running on http://127.0.0.1:{}", actual_port);
     Ok(actual_port)
