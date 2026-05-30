@@ -1518,6 +1518,13 @@ pub fn run() {
             commands::rl_settings::set_rl_use_global,
             commands::rl_settings::set_rl_online_training_disabled,
             commands::rl_settings::set_rl_global_training_source_flag,
+            // v0.2.40 H2: getter counterparts to the three setters above.
+            // Back the `RlRerankerDashboardWidget` rewire — the widget
+            // surfaces the persisted flags as a compact status panel in
+            // the RL module's config tab.
+            commands::rl_settings::get_rl_use_global,
+            commands::rl_settings::get_rl_online_training_disabled,
+            commands::rl_settings::get_rl_global_training_source_flag,
             commands::rl_settings::list_rl_global_training_source_projects,
             // v0.2.26 (2026-05-22): generic declarative HTTP-action
             // dispatcher. Single Tauri command that executes any
