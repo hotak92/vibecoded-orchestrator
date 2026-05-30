@@ -1826,11 +1826,16 @@ def _dir_size_human(path: str) -> str:
 def _vct_state_dir() -> Path:
     """Resolve `~/.vct/` honouring VCT_STATE_DIR (mirrors the Rust path
     resolver in `launcher/src-tauri/src/paths.rs::vct_root_dir`). The
-    Python fallback writes storage.toml directly into this directory."""
-    custom = os.environ.get("VCT_STATE_DIR", "").strip()
-    if custom:
-        return Path(custom)
-    return Path.home() / ".vct"
+    Python fallback writes storage.toml directly into this directory.
+
+    Thin wrapper around :func:`vco_lib.paths.vct_root_dir` — kept as a
+    module-local symbol so existing call sites (`_write_storage_toml_direct`)
+    don't have to import the helper. v0.2.40 F5 consolidation pointed all
+    inline ``~/.vct`` reconstructions at the canonical resolver so future
+    cross-OS convention changes (macOS / Windows) need a single fix-point.
+    """
+    from vco_lib.paths import vct_root_dir
+    return vct_root_dir()
 
 
 def _write_storage_toml_direct(choice: dict) -> Path:
@@ -7344,13 +7349,11 @@ def _resolve_project_id_by_folder(folder: Path) -> str | None:
     returns None — the caller treats this as "no-op, don't backfill".
 
     Honours `$VCT_STATE_DIR` so the launcher's per-launcher state
-    isolation works (multi-launcher dev setups).
+    isolation works (multi-launcher dev setups) — delegates to
+    `vco_lib.paths.launcher_db_path` (canonical resolver, v0.2.40 F5).
     """
-    state_dir = os.environ.get("VCT_STATE_DIR", "").strip()
-    if state_dir:
-        db_path = Path(state_dir) / "launcher.db"
-    else:
-        db_path = Path.home() / ".vct" / "launcher.db"
+    from vco_lib.paths import launcher_db_path
+    db_path = launcher_db_path()
     if not db_path.is_file():
         return None
     try:
