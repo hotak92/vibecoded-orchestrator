@@ -70,7 +70,8 @@ fn scope_from_manifest<'a>(scope: &str, project_id: &'a str) -> SecretScope<'a> 
 /// whose entries auto-emit into ONE specific project's env surfaces.
 ///
 /// Module-owned secrets (`scope='per_project'`, `module_id != 'user'` —
-/// e.g. licensing's `VIBECODED_LICENSE_KEY` global, or any future
+/// e.g. licensing's `license_key____orchestrator__` global (canonical
+/// per L1.M v0.2.40; was `VIBECODED_LICENSE_KEY` pre-L1.M), or any future
 /// MCP-server module declaring `secrets[]` in its manifest) are
 /// resolved separately by the hub `project_env` endpoint and
 /// already reach subprocesses via that path. They are NOT in scope

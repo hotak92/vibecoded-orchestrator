@@ -21,7 +21,9 @@
 //!
 //! 1. Resolve the license key from the OS keychain (same scope the
 //!    licensing module uses — `SecretScope::Global` /
-//!    `licensing` / `VIBECODED_LICENSE_KEY`). No license ⇒ refuse.
+//!    `licensing` / canonical `license_key____orchestrator__` per
+//!    L1.M v0.2.40; was the legacy `VIBECODED_LICENSE_KEY` pre-L1.M).
+//!    No license ⇒ refuse.
 //! 2. POST to the Supabase edge `rl-latest-weights` with
 //!    `{license_key, machine_id_hash, embedding_source}` and the
 //!    license key in the `Authorization: Bearer` header (the edge
@@ -379,12 +381,18 @@ fn create_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// always 401).
 fn resolve_license_key() -> Result<String, String> {
     // Same scope used by `commands::licensing` — keep them in sync if
-    // either changes (the launcher exposes only one license key per
-    // user, not per-module).
+    // either changes. L1.M (v0.2.40): canonical per-module username
+    // (was the legacy `VIBECODED_LICENSE_KEY`). The keychain_username_for
+    // helper is the single source of truth for the username shape; this
+    // call site picks up the canonical value automatically.
+    let username =
+        vct_launcher_core::db::license_keys::keychain_username_for(
+            vct_launcher_core::db::license_keys::ORCHESTRATOR_MODULE_ID,
+        );
     let key_opt = crate::secrets::get(
         crate::secrets::SecretScope::Global,
         "licensing",
-        "VIBECODED_LICENSE_KEY",
+        &username,
     )
     .map_err(|e| format!("read license keychain: {}", e))?;
 
