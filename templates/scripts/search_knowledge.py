@@ -504,13 +504,27 @@ def search_knowledge(
         # Log usage
         if HAS_LOGGER:
             duration_ms = (time.time() - start_time) * 1000
+            # v0.2.40 H1: stamp the resolved project name on the
+            # tool_usage.jsonl row so per-event metadata matches the
+            # KG / code-graph project identifier. Pre-fix the entry's
+            # ``project`` field always fell back to the logger's
+            # ``"claude-orchestrator"`` default, regardless of which
+            # workspace the script ran in. Resolution is best-effort
+            # via the canonical helper in ``vco_lib.paths`` — None
+            # preserves the historic default downstream.
+            try:
+                from vco_lib.paths import resolve_project_name as _resolve_project_name
+                _project = _resolve_project_name()
+            except Exception:
+                _project = None
             ToolUsageLogger.log_kg_search(
                 query=query,
                 result_count=result_count,
                 duration_ms=duration_ms,
                 success=error_msg is None,
                 error=error_msg,
-                filters=filter_dict if 'filter_dict' in locals() else None
+                filters=filter_dict if 'filter_dict' in locals() else None,
+                project=_project,
             )
 
 
