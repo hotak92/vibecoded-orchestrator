@@ -171,6 +171,61 @@ impl Db {
             .map_err(|e| format!("collect list_containers: {}", e))
     }
 
+    /// v0.2.40 (NEW-3.E): list every `status='installed'` install row,
+    /// REGARDLESS of whether `container_name` is set. Returns the same
+    /// `(project_id, module_id, container_name)` triple shape as
+    /// `list_module_installs_with_containers`, but `container_name` is
+    /// `Option<String>` because rows whose install-time container start
+    /// failed (or never ran — pre-NEW-3.B installs) have NULL here.
+    ///
+    /// Sibling of `list_module_installs_with_containers`. The two queries
+    /// are intentionally distinct:
+    ///
+    ///   * `list_module_installs_with_containers` — narrow, used by
+    ///     callers that only care about KNOWN running containers (e.g.
+    ///     uninstall enumeration).
+    ///   * `list_module_installs_needing_start` — broad, used by the
+    ///     resume-on-boot sweep in
+    ///     `vct-hub::module_supervisor::resume_containers_on_startup`,
+    ///     which must consider BOTH:
+    ///     (a) rows with a known container_name (existing path:
+    ///     probe + restart),
+    ///     (b) rows whose install-time auto-start failed BEFORE
+    ///     NEW-3.B's default synthesis was available (newly
+    ///     covered: synthesize defaults + start via
+    ///     `start_container_after_install`).
+    ///
+    /// Filters `status='installed'` only (excludes `'error'`,
+    ///` 'installing'`, `'broken'`). Caller is responsible for the
+    /// runtime-type gate (`runtime.type ∈ {container, service}` AND
+    /// `install.method = container_pull`) by loading each row's
+    /// manifest — `list_module_installs_with_status` already follows
+    /// that pattern, and the manifest must be loaded per-row anyway
+    /// to call `start_container_after_install`.
+    pub fn list_module_installs_needing_start(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT project_id, module_id, container_name
+                   FROM module_installs
+                  WHERE status = 'installed'",
+            )
+            .map_err(|e| format!("prepare list_module_installs_needing_start: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| format!("query list_module_installs_needing_start: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_module_installs_needing_start: {}", e))
+    }
+
     /// v0.2.31 (#20-Fix-3): update the `module_version` + bump `installed_at`
     /// on an existing module_install row. Called by `update_module_for_project`
     /// after a successful in-place upgrade so the catalog UI reflects the new
@@ -752,5 +807,121 @@ mod tests {
         );
         // Status must remain Installed throughout.
         assert_eq!(row.status, ModuleStatus::Installed);
+    }
+
+    /// v0.2.40 (NEW-3.E): `list_module_installs_needing_start` must
+    /// return BOTH `status='installed'` rows with non-NULL
+    /// `container_name` AND rows with NULL `container_name`. This is the
+    /// behaviour difference vs `list_module_installs_with_containers`
+    /// (which filters to non-NULL only) — the resume-on-boot sweep
+    /// needs to consider NULL-container rows because that's the
+    /// failure-mode this branch fixes (install-time start failed →
+    /// container_name was never persisted).
+    #[test]
+    fn db_list_module_installs_needing_start_returns_null_container_rows() {
+        let (db, pid) = open_db_with_project();
+
+        // Row A: status=installed, container_name=NULL (the v0.2.40
+        // failure-mode case — install-time start hadn't run or failed
+        // before NEW-3.B synthesis).
+        db.insert_module_install(
+            "install-a-null",
+            &pid,
+            "module-null",
+            "0.1.0",
+            "/tmp/install-a",
+        )
+        .expect("insert A");
+        db.set_module_status(&pid, "module-null", ModuleStatus::Installed, None)
+            .expect("set A installed");
+
+        // Row B: status=installed, container_name=SET (the existing
+        // path — already-resolved container, supervisor will probe + restart).
+        db.insert_module_install(
+            "install-b-named",
+            &pid,
+            "module-named",
+            "0.1.0",
+            "/tmp/install-b",
+        )
+        .expect("insert B");
+        db.set_module_status(&pid, "module-named", ModuleStatus::Installed, None)
+            .expect("set B installed");
+        db.set_module_container_name(&pid, "module-named", "named-container")
+            .expect("set container_name");
+
+        // Row C: status=error — must be EXCLUDED (only `installed` rows
+        // are resumable; `error` rows require user action).
+        db.insert_module_install(
+            "install-c-err",
+            &pid,
+            "module-err",
+            "0.1.0",
+            "/tmp/install-c",
+        )
+        .expect("insert C");
+        db.set_module_status(
+            &pid,
+            "module-err",
+            ModuleStatus::Error,
+            Some("oops".into()),
+        )
+        .expect("set C error");
+
+        // Row D: status=installing — must be EXCLUDED (still in
+        // install pipeline; resume sweep mustn't interfere).
+        db.insert_module_install(
+            "install-d-inst",
+            &pid,
+            "module-installing",
+            "0.1.0",
+            "/tmp/install-d",
+        )
+        .expect("insert D");
+        // Status stays 'installing' (set by insert_module_install).
+
+        let rows = db
+            .list_module_installs_needing_start()
+            .expect("query must succeed");
+
+        // A and B in, C and D out.
+        let module_ids: Vec<&str> = rows.iter().map(|(_, m, _)| m.as_str()).collect();
+        assert!(
+            module_ids.contains(&"module-null"),
+            "NULL-container installed row must be returned (the v0.2.40 bug-fix case): rows={:?}",
+            rows
+        );
+        assert!(
+            module_ids.contains(&"module-named"),
+            "SET-container installed row must also be returned (existing path): rows={:?}",
+            rows
+        );
+        assert!(
+            !module_ids.contains(&"module-err"),
+            "error-status row must be EXCLUDED: rows={:?}",
+            rows
+        );
+        assert!(
+            !module_ids.contains(&"module-installing"),
+            "installing-status row must be EXCLUDED: rows={:?}",
+            rows
+        );
+
+        // Verify the NULL/Some shape of the container_name column.
+        for (_, module_id, container_name) in &rows {
+            if module_id == "module-null" {
+                assert!(
+                    container_name.is_none(),
+                    "module-null row must surface container_name=None, got {:?}",
+                    container_name
+                );
+            } else if module_id == "module-named" {
+                assert_eq!(
+                    container_name.as_deref(),
+                    Some("named-container"),
+                    "module-named row must surface its persisted container_name"
+                );
+            }
+        }
     }
 }
