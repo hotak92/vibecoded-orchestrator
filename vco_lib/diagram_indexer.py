@@ -520,10 +520,8 @@ def drop_diagram_by_path(
 
     # Layer 1: SQLite
     if db_path is None:
-        state_dir = Path(
-            os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct")
-        )
-        db_path = state_dir / "launcher.db"
+        from vco_lib.paths import launcher_db_path
+        db_path = launcher_db_path()
     if db_path.exists():
         try:
             conn = sqlite3.connect(str(db_path))
@@ -1106,10 +1104,8 @@ def index_diagram(
     # like `vco rebuild-diagram-index` against a project folder without a
     # launcher-managed DB; sidecar + Weaviate still happen).
     if db_path is None:
-        state_dir = Path(
-            os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct")
-        )
-        db_path = state_dir / "launcher.db"
+        from vco_lib.paths import launcher_db_path
+        db_path = launcher_db_path()
     db_available = False
     if db_path.exists():
         try:
@@ -1329,10 +1325,8 @@ def snapshot_diagram_file(
         return None
 
     if db_path is None:
-        state_dir = Path(
-            os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct")
-        )
-        db_path = state_dir / "launcher.db"
+        from vco_lib.paths import launcher_db_path
+        db_path = launcher_db_path()
     if not db_path.exists():
         logger.debug(
             "snapshot_diagram_file: launcher DB %s missing; skipping",

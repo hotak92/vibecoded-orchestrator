@@ -3788,16 +3788,20 @@ _DEFAULT_ACTIVE_MODULES: frozenset[str] = frozenset({"diagrams"})
 def _launcher_db_path() -> Path:
     """Return the path to the launcher SQLite DB.
 
-    Same resolution rule as ``vco_lib.paths.vct_root_dir`` /
-    ``templates/scripts/generate-kg-summary.py``:
+    Thin wrapper around :func:`vco_lib.paths.launcher_db_path` — kept as a
+    module-local symbol so existing callers (and any external imports of
+    ``vco_lib.project_init._launcher_db_path``) keep working. v0.2.40 F5
+    consolidation pointed every inline ``~/.vct`` reconstruction at the
+    canonical resolver so future cross-OS convention changes (macOS /
+    Windows) need a single fix-point.
+
+    Resolution rules inherit from ``vct_root_dir``:
 
       1. ``$VCT_STATE_DIR/launcher.db`` if the env var is set.
       2. ``~/.vct/launcher.db`` otherwise.
     """
-    custom = os.environ.get("VCT_STATE_DIR", "").strip()
-    if custom:
-        return Path(custom) / "launcher.db"
-    return Path.home() / ".vct" / "launcher.db"
+    from vco_lib.paths import launcher_db_path as _canonical
+    return _canonical()
 
 
 def resolve_active_modules(
@@ -6408,12 +6412,10 @@ def _apply_canonical_env_via_config_projection(
     }
 
     # Resolve project_id from folder path. The lookup mirrors
-    # `_read_kg_binding_override`'s soft-fail pattern.
-    state_dir = os.environ.get("VCT_STATE_DIR", "").strip()
-    if state_dir:
-        db_path = Path(state_dir) / "launcher.db"
-    else:
-        db_path = Path.home() / ".vct" / "launcher.db"
+    # `_read_kg_binding_override`'s soft-fail pattern. Path resolution
+    # delegated to `vco_lib.paths.launcher_db_path` (v0.2.40 F5).
+    from vco_lib.paths import launcher_db_path
+    db_path = launcher_db_path()
     if not db_path.is_file():
         result["action"] = "db_unreachable"
         return result
@@ -6805,11 +6807,9 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
 
     out: dict = {"collection_prefix": None, "has_manual_override": False}
 
-    state_dir_env = _os.environ.get("VCT_STATE_DIR", "").strip()
-    if state_dir_env:
-        db_path = Path(state_dir_env) / "launcher.db"
-    else:
-        db_path = Path.home() / ".vct" / "launcher.db"
+    # Path resolution delegated to `vco_lib.paths.launcher_db_path` (v0.2.40 F5).
+    from vco_lib.paths import launcher_db_path
+    db_path = launcher_db_path()
 
     if not db_path.is_file():
         return out
@@ -6911,11 +6911,9 @@ def _read_kg_binding_override(folder: Path) -> dict:
         "shared_has_manual_override": False,
     }
 
-    state_dir_env = _os.environ.get("VCT_STATE_DIR", "").strip()
-    if state_dir_env:
-        db_path = Path(state_dir_env) / "launcher.db"
-    else:
-        db_path = Path.home() / ".vct" / "launcher.db"
+    # Path resolution delegated to `vco_lib.paths.launcher_db_path` (v0.2.40 F5).
+    from vco_lib.paths import launcher_db_path
+    db_path = launcher_db_path()
 
     if not db_path.is_file():
         return out
@@ -7015,15 +7013,12 @@ def _read_kg_collection_from_launcher_db(folder: Path) -> dict:
 
     out: dict = {}
 
-    # DB path resolution — mirror install.py._discover_app_state_db_path
-    # rather than calling it (avoid the install.py → project_init →
-    # install.py reverse-import which doesn't exist today but would
-    # bite the test fixtures).
-    state_dir_env = _os.environ.get("VCT_STATE_DIR", "").strip()
-    if state_dir_env:
-        db_path = Path(state_dir_env) / "launcher.db"
-    else:
-        db_path = Path.home() / ".vct" / "launcher.db"
+    # DB path resolution — delegated to `vco_lib.paths.launcher_db_path`
+    # (v0.2.40 F5). The canonical resolver also honours `$VCT_STATE_DIR`
+    # so multi-launcher dev setups continue to work, and mirrors
+    # install.py._discover_app_state_db_path.
+    from vco_lib.paths import launcher_db_path
+    db_path = launcher_db_path()
 
     if not db_path.is_file():
         return out
