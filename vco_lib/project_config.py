@@ -323,6 +323,34 @@ class ProjectConfig:
     #: the canonical name directly. Additive (declared last so callers
     #: that construct ``ProjectConfig`` positionally don't break).
     diagrams_collection: str = ""
+    #: v0.2.40 R2 — RL Reranker per-project flags. Until v0.2.40 the
+    #: three GUI checkboxes (``set_rl_use_global`` /
+    #: ``set_rl_online_training_disabled`` /
+    #: ``set_rl_global_training_source_flag`` in
+    #: ``launcher/src-tauri/src/commands/rl_settings.rs``) wrote into
+    #: ``module_settings`` but had no readback path; the RL container
+    #: never saw them. v0.2.40+ hubs expose them through the resolver
+    #: so the container can fetch its project's flag state on every
+    #: config refresh.
+    #:
+    #: Semantics (mirror the Rust ``ProjectConfigResponse``):
+    #:
+    #: * ``rl_use_global`` — read-only global mode (events DO NOT
+    #:   update the local model when true).
+    #: * ``rl_online_training_disabled`` — freezes the local model
+    #:   AND marks new events as log-only.
+    #: * ``rl_global_training_source_flag`` — opts this project's
+    #:   data into the global model's retraining corpus.
+    #:
+    #: Pre-v0.2.40 hubs paired with v0.2.40+ clients omit the fields;
+    #: the parser back-fills with ``False`` so old hubs don't crash
+    #: new clients. Default ``False`` also matches the GUI's pre-
+    #: unchecked checkbox state and the setter helper's
+    #: ``unwrap_or(false)`` contract. Declared last to keep the
+    #: frozen-dataclass init signature backward-compat.
+    rl_use_global: bool = False
+    rl_online_training_disabled: bool = False
+    rl_global_training_source_flag: bool = False
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -739,6 +767,19 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             claude_session_dir=str(body.get("claude_session_dir", "")),
             retrieval_tuning=retrieval_tuning,
             schema_version=schema_version,
+            # v0.2.40 R2 additive RL Reranker flags — pre-v0.2.40 hubs
+            # omit these; default `False` for back-compat and matches
+            # the Rust handler's `unwrap_or(false)` contract on absent
+            # rows. Each `.get(..., False)` is independent — old hubs
+            # paired with new clients see all three as False; new hubs
+            # paired with old clients have the fields silently ignored.
+            rl_use_global=bool(body.get("rl_use_global", False)),
+            rl_online_training_disabled=bool(
+                body.get("rl_online_training_disabled", False)
+            ),
+            rl_global_training_source_flag=bool(
+                body.get("rl_global_training_source_flag", False)
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(

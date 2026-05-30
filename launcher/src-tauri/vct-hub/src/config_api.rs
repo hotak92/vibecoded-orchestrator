@@ -250,6 +250,41 @@ struct ProjectConfigResponse {
     ollama_url: String,
     grpc_port: u16,
     shared_kg_write_disabled: bool,
+    /// v0.2.40 R2 — RL Reranker per-project flags exposed for the
+    /// in-container reader. Until v0.2.40 these three booleans were
+    /// SETTER-only: the GUI checkboxes wrote them into
+    /// ``module_settings`` (module_id = ``"vct-rl-reranker"``) but the
+    /// RL container had no readback path, so flipping them produced no
+    /// runtime effect. Exposing them through the resolver closes the
+    /// loop — the container fetches the project's config on refresh
+    /// and respects these three values. Per multi-Opus pre-push review
+    /// (item 3, ``00-synthesis.md``).
+    ///
+    /// Semantics (mirror the docstrings on the setter commands in
+    /// ``launcher/src-tauri/src/commands/rl_settings.rs``):
+    ///
+    /// * ``rl_use_global`` — "read-only global mode". When ``true``,
+    ///   online training events from this project DO NOT update its
+    ///   local model.
+    /// * ``rl_online_training_disabled`` — freezes the local model AND
+    ///   marks new events as log-only. Independent of
+    ///   ``rl_use_global``.
+    /// * ``rl_global_training_source_flag`` — opts this project's data
+    ///   INTO the global model's retraining corpus.
+    ///
+    /// Default (missing row): ``false`` for all three. Matches the
+    /// canonical default in :func:`get_bool_flag` (``rl_settings.rs``
+    /// line 101: ``unwrap_or(false)``) — the GUI ships its checkboxes
+    /// pre-unchecked, so an absent row must read back the same way the
+    /// setters would write it on a fresh first-toggle.
+    ///
+    /// Additive field — pre-v0.2.40 Python clients see unknown fields
+    /// and ignore them (the parser back-fills with ``false`` for
+    /// pre-v0.2.40 hubs paired with v0.2.40+ clients). ``schema_version``
+    /// stays at 1 because the field is defaultable client-side.
+    rl_use_global: bool,
+    rl_online_training_disabled: bool,
+    rl_global_training_source_flag: bool,
     /// v0.2.31 — absolute path to Claude Code's per-workspace session-
     /// transcript directory (``~/.claude/projects/<slug>/``). The
     /// launcher computes this once from ``projects.folder_path`` using
@@ -392,6 +427,41 @@ async fn project_config(
     let shared_kg_write_disabled = h
         .0
         .get_setting(&project.id, "orchestrator-core", "shared_kg_write_disabled")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 7b. RL Reranker per-project flags (v0.2.40 R2 — module_settings →
+    // vct-rl-reranker). Same shape as the orchestrator-core read above;
+    // module_id is "vct-rl-reranker" — the canonical id used by the
+    // setter commands in launcher/src-tauri/src/commands/rl_settings.rs.
+    // Default false on missing rows: matches the GUI's pre-unchecked
+    // checkboxes and the setter helper's `unwrap_or(false)` contract.
+    //
+    // We deliberately read all three flags from the same module_id
+    // (``vct-rl-reranker``) rather than from ``orchestrator-core`` —
+    // they're RL-module-specific. Even though `vct-rl-reranker` is a
+    // paid module that may not be installed on every project, reading
+    // the absent rows simply returns the `false` default, which is the
+    // correct semantic: "RL is not in special-mode for this project".
+    let rl_use_global = h
+        .0
+        .get_setting(&project.id, "vct-rl-reranker", "rl_use_global")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let rl_online_training_disabled = h
+        .0
+        .get_setting(&project.id, "vct-rl-reranker", "rl_online_training_disabled")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let rl_global_training_source_flag = h
+        .0
+        .get_setting(&project.id, "vct-rl-reranker", "rl_global_training_source_flag")
         .ok()
         .flatten()
         .and_then(|v| v.as_bool())
@@ -573,6 +643,9 @@ async fn project_config(
         ollama_url,
         grpc_port,
         shared_kg_write_disabled,
+        rl_use_global,
+        rl_online_training_disabled,
+        rl_global_training_source_flag,
         claude_session_dir,
         retrieval_tuning,
     };
@@ -1948,6 +2021,142 @@ kg_tier_full = 0.8
         );
         assert_eq!(
             body.get("shared_kg_write_disabled").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    /// v0.2.40 R2 — RL flag exposure (defaults branch).
+    ///
+    /// A project with no rows in ``module_settings`` for the
+    /// ``vct-rl-reranker`` module must read back all three flags as
+    /// ``false``. This mirrors :func:`get_bool_flag` in
+    /// ``launcher/src-tauri/src/commands/rl_settings.rs`` (line 101):
+    /// the setter's getter uses ``unwrap_or(false)`` on a missing
+    /// row, and the hub's response surface MUST agree with that
+    /// contract — otherwise the in-container reader would see a
+    /// different default than the launcher's own admin code.
+    #[tokio::test]
+    async fn config_emits_rl_flag_defaults_when_module_settings_empty() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-defaults", "myproject");
+
+        let resp = reqwest::get(format!("{}/projects/p-rl-defaults/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        // All three flags present and false (no DB rows → unwrap_or(false)).
+        assert_eq!(
+            body.get("rl_use_global").and_then(|v| v.as_bool()),
+            Some(false),
+            "rl_use_global default must be false; body={}",
+            body,
+        );
+        assert_eq!(
+            body.get("rl_online_training_disabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "rl_online_training_disabled default must be false; body={}",
+            body,
+        );
+        assert_eq!(
+            body.get("rl_global_training_source_flag").and_then(|v| v.as_bool()),
+            Some(false),
+            "rl_global_training_source_flag default must be false; body={}",
+            body,
+        );
+    }
+
+    /// v0.2.40 R2 — RL flag exposure (set → fetch round-trip).
+    ///
+    /// Writing each flag via ``set_setting`` under
+    /// ``module_id = "vct-rl-reranker"`` (the exact path the GUI
+    /// setter commands take — see ``rl_settings.rs::set_bool_flag``)
+    /// must surface that value in the resolver response. Each flag
+    /// lives at its own row, so independent writes do not collide.
+    /// This is the core regression guard: without this assertion, a
+    /// rename of the canonical key strings ("rl_use_global" etc.)
+    /// would silently break the contract between the launcher's
+    /// setters and the hub's reader.
+    #[tokio::test]
+    async fn config_emits_rl_flags_from_module_settings() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-set", "myproject");
+
+        // Mirror the GUI setter path exactly: module_id is the literal
+        // "vct-rl-reranker" string, keys are the canonical names. Two
+        // flags true + one false demonstrates per-row independence.
+        h.0.set_setting(
+            "p-rl-set",
+            "vct-rl-reranker",
+            "rl_use_global",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+        h.0.set_setting(
+            "p-rl-set",
+            "vct-rl-reranker",
+            "rl_online_training_disabled",
+            &serde_json::Value::Bool(false),
+        )
+        .unwrap();
+        h.0.set_setting(
+            "p-rl-set",
+            "vct-rl-reranker",
+            "rl_global_training_source_flag",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-rl-set/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        assert_eq!(
+            body.get("rl_use_global").and_then(|v| v.as_bool()),
+            Some(true),
+        );
+        assert_eq!(
+            body.get("rl_online_training_disabled").and_then(|v| v.as_bool()),
+            Some(false),
+        );
+        assert_eq!(
+            body.get("rl_global_training_source_flag").and_then(|v| v.as_bool()),
+            Some(true),
+        );
+    }
+
+    /// v0.2.40 R2 — single-field filter access on the new RL flags.
+    /// The ``?key=`` filter operates on top-level fields by serde, so
+    /// the additive RL flags fall out of the generic path automatically
+    /// — but pin the contract anyway so a future struct refactor that
+    /// nests them (don't!) would surface here loudly.
+    #[tokio::test]
+    async fn config_key_filter_returns_rl_use_global() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-key", "myproject");
+        h.0.set_setting(
+            "p-rl-key",
+            "vct-rl-reranker",
+            "rl_use_global",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-rl-key/config?key=rl_use_global",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let obj = body.as_object().expect("object");
+        assert_eq!(obj.len(), 1);
+        assert_eq!(
+            obj.get("rl_use_global").and_then(|v| v.as_bool()),
             Some(true)
         );
     }

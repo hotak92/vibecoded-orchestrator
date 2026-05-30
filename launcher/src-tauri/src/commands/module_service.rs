@@ -557,6 +557,19 @@ pub async fn start_container_after_install(
     let ctx = PlaceholderCtx::new(&manifest.id);
     let container_name = start_container_for_module(manifest, &ctx, project, rl_port).await?;
     db.set_module_container_name(&project.id, &manifest.id, &container_name)?;
+    // TODO(paid-modules, v0.2.40 R2): the RL container should fetch
+    // `rl_use_global` / `rl_online_training_disabled` /
+    // `rl_global_training_source_flag` from
+    // `GET /api/v1/projects/{id}/config` on a refresh cadence (e.g. at
+    // startup AND on a periodic re-poll, so a runtime checkbox toggle
+    // takes effect without a container restart). The hub side ships the
+    // fields in v0.2.40 (see `launcher/src-tauri/vct-hub/src/config_api.rs`
+    // `ProjectConfigResponse::rl_*`); the container-side consumer lives
+    // in the paid-modules tree (`vct-rl-reranker` source) which is not
+    // co-located with this clone. Closing this loop is tracked as item 3
+    // of the v0.2.40 pre-push multi-Opus review synthesis (see
+    // `discovery-A2-dashboard-widget-archaeology.md` F9 for the
+    // verification recipe).
     Ok(container_name)
 }
 
