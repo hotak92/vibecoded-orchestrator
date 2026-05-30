@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.40] — unreleased
+
+### Fixed
+
+- **W40-B: launcher boot adopts populated Weaviate collections to `project_kg_bindings` rows whose `collection_name` doesn't exist (cross-prefix)** (Agent V40-W40-B): mirrors `install.py --update`'s W40-A self-heal at LAUNCHER BOOT so users who never re-run `install.py` still get fixed at next launcher start. New `Db::adopt_populated_collections_at_boot` in `vct-launcher-core/src/db/access.rs` probes Weaviate via `/v1/schema` + GraphQL Aggregate count for `*_KnowledgeGraph` / `*_Development` classes when a binding row's `collection_name` doesn't exist on-disk and has no case-sibling (NEW-12 / case-insensitive heal owns that path). Auto-adopts on an unambiguous single populated candidate; defers (logs a structured warning naming alternatives) on multi-candidate; no-ops on zero. Adopted rows are tagged `manual_override=v0.2.40-prefix-adopt` in `config_json` so the env-backfill path (`_align_env_with_db_bindings`) trusts the new value next time `populate()` runs. Wired into the boot init block in `lib.rs` immediately after `migrate_legacy_shared_kg_collection_names` (NEW-12 from v0.2.38). Plus: new `should_regenerate_env_for_project` helper in `project_env_settings.rs` (compares max `project_kg_bindings.updated_at` vs env file mtime) drives a per-project env regen at boot via `refresh_project_env_with_db`, so post-adoption env values realign with the DB without manual re-trigger. 11 new tests: 7 in `vct-launcher-core` access tests (existing-collection no-op, VCO_dev-shape single-candidate adoption, multi-candidate defer, zero-candidate no-op, idempotency after adoption, case-sibling preserved for case-insensitive heal, Weaviate-unreachable returns Err) + 4 in `project_env_settings` tests (binding-newer-than-env true, env-newer-than-binding false, env-file-missing false, no-bindings false). Tests use a 40-line synchronous TCP mock in lieu of an external mock crate.
+
 ## [0.2.39] — 2026-05-28
 
 ### Added

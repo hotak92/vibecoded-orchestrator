@@ -883,6 +883,158 @@ pub fn run() {
                 }
             }
 
+            // W40-B (v0.2.40, 2026-05-30): cross-prefix KG binding
+            // adoption + env regen-on-stale.
+            //
+            // Mirrors `install.py` W40-A's `_self_heal_kg_bindings_on_update`
+            // cross-prefix extension at LAUNCHER BOOT, so users who
+            // never re-run `install.py --update` still get healed on
+            // the next launcher start.
+            //
+            // For each `project_kg_bindings` row whose `collection_name`
+            // doesn't exist in Weaviate AND has no case-sibling
+            // (NEW-12 / case-insensitive heal owns that path), probe
+            // Weaviate for same-suffix classes (`*_KnowledgeGraph`)
+            // with `row_count > 0`. Auto-adopt on a single populated
+            // candidate; defer with a warning on multiple; no-op on
+            // zero. Adopted rows are tagged
+            // `manual_override=v0.2.40-prefix-adopt` in `config_json`
+            // so the env-backfill path (`_align_env_with_db_bindings`
+            // in `vco_lib/project_init.py`) trusts the new value on
+            // the next `populate()`.
+            //
+            // After adoption: regenerate every project's env files
+            // whose binding `updated_at` is newer than the env file's
+            // mtime. Without this, the env files keep advertising the
+            // pre-adoption name and the MCP subprocess still talks to
+            // the missing collection.
+            //
+            // Position: AFTER NEW-12 so the canonical name is
+            // finalized before we look at "still-missing" rows.
+            //
+            // Soft-fail throughout: Weaviate unreachable → log + skip
+            // (boot continues; install.py --update or the next launch
+            // will retry). Per-project env regen errors are logged
+            // and never block other projects.
+            //
+            // Async needed because the function does HTTP probes;
+            // wrap in `tauri::async_runtime::block_on` so the
+            // synchronous setup closure isn't restructured.
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    // Weaviate URL: honour env override (matches the
+                    // contract in the rest of the launcher), default
+                    // to canonical localhost:8081.
+                    let weaviate_url = std::env::var("WEAVIATE_URL")
+                        .unwrap_or_else(|_| {
+                            "http://localhost:8081".to_string()
+                        });
+
+                    // `block_on` keeps the &Db borrow valid throughout
+                    // the call (the async fn doesn't hold the DB lock
+                    // across .await boundaries — verified by the
+                    // function's contract docstring).
+                    let adopt_report =
+                        tauri::async_runtime::block_on(
+                            db.inner().adopt_populated_collections_at_boot(
+                                &weaviate_url,
+                            ),
+                        );
+
+                    match adopt_report {
+                        Ok(report) => {
+                            if report.adopted > 0 || report.deferred > 0 {
+                                eprintln!(
+                                    "[vct] adopt-populated: \
+                                     adopted={} deferred={} no_change={}",
+                                    report.adopted,
+                                    report.deferred,
+                                    report.no_change,
+                                );
+                                let _ = db.audit(
+                                    "kg_binding_prefix_adopted_at_boot",
+                                    None,
+                                    None,
+                                    &serde_json::json!({
+                                        "adopted": report.adopted,
+                                        "deferred": report.deferred,
+                                        "no_change": report.no_change,
+                                        "weaviate_url": weaviate_url,
+                                    }),
+                                );
+                            }
+
+                            // Env regen-on-stale: for each project
+                            // whose binding updated_at is newer than
+                            // the env file mtime, re-render env files.
+                            // We trigger this regardless of whether
+                            // THIS boot's adopt step rewrote any
+                            // binding — a binding could have been
+                            // touched by a prior boot, the GUI, or
+                            // install.py --update without the env
+                            // files being regenerated yet.
+                            if let Ok(projects) = db.list_projects() {
+                                let mut regened = 0usize;
+                                for proj in &projects {
+                                    let folder = std::path::Path::new(
+                                        &proj.folder_path,
+                                    );
+                                    if !folder.is_dir() {
+                                        continue;
+                                    }
+                                    let env_path =
+                                        folder.join(".claude").join("env");
+                                    if !commands::project_env_settings::
+                                        should_regenerate_env_for_project(
+                                            db.inner(),
+                                            &proj.id,
+                                            &env_path,
+                                        )
+                                    {
+                                        continue;
+                                    }
+                                    match commands::projects_v2::
+                                        refresh_project_env_with_db(
+                                            db.inner(), &proj.id,
+                                        )
+                                    {
+                                        Ok(_) => {
+                                            regened += 1;
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[vct] adopt-populated env \
+                                                 regen failed for {}: {}",
+                                                proj.name, e
+                                            );
+                                        }
+                                    }
+                                }
+                                if regened > 0 {
+                                    eprintln!(
+                                        "[vct] adopt-populated: env \
+                                         regenerated for {} project(s) \
+                                         (binding newer than env file)",
+                                        regened
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Weaviate unreachable / schema fetch
+                            // failed — the prefix-adopt step is best-
+                            // effort; install.py --update is the
+                            // canonical recovery path.
+                            eprintln!(
+                                "[vct] adopt-populated warning (non-fatal): {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             // v0.2.21 Step 6: bring up the detached vct-hub binary if
             // it isn't already running. `ensure_hub_running` is best-
             // effort — a missing binary or failed spawn drops the
