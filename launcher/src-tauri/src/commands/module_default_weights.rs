@@ -160,6 +160,217 @@ pub fn weights_file_path(module_id: &str, embedding_source: &str, version: &str)
     ))
 }
 
+// ─── v0.2.40 R3: weights-staging unification ────────────────────────────
+//
+// Background. Until v0.2.40 the two weights-staging paths drifted apart:
+//
+//   * `module_weights_dir` (THIS module) stages downloads globally at
+//     `<vct_root>/modules/<module_id>/weights/<source>-<version>.pt`.
+//   * `module_service::download_weights` (the daily-poll path) writes at
+//     `<vct_root>/data/<module_id>/<project_slug>/state/rl_model_<source>_<version>.pt`
+//     — and that is also where the container's bind mount lives
+//     (`{VCT_DATA}/<module_id>/<project_slug>/state` → `/data/state`,
+//     declared in the RL Reranker's runtime.volumes block).
+//
+// Net effect: "Download default weights" succeeded on disk but the .pt
+// never reached the running container — the bind-mount looked at a
+// completely different directory. Multi-Opus pre-push review item 4.
+//
+// Strategy A (this patch). Keep the global download path as the source of
+// truth (it's where the .pt actually lives) and surface it into the
+// per-project bind mount via a symlink named with the container's
+// expected naming convention (`rl_model_<source>_<version>.pt`). The
+// container then loads weights through its existing path-resolution code
+// without any container-side change.
+//
+// Override / diverge UX. If the per-project mount slot already contains a
+// regular file (not a symlink), we treat that as a deliberate user
+// override and leave it alone — re-running "Download default weights"
+// must NOT clobber a hand-placed override. Symlinks get refreshed
+// freely (they are launcher-managed mirrors).
+//
+// Reset UX. The companion `reset_weights_to_global` helper removes any
+// override (file or symlink) and re-points the slot at the global file
+// — i.e. "use global". Currently called from tests + (future) a Tauri
+// reset_to_global command; the helper is the smallest surface needed
+// for the brief.
+//
+// Windows fallback. `std::os::unix::fs::symlink` is unix-only; on Windows
+// the symlink call uses `std::os::windows::fs::symlink_file` which
+// requires either elevated privileges or Developer Mode. If the symlink
+// fails (insufficient permission), we fall back to a plain `fs::copy`
+// so the container still gets the weights — the copy is a one-shot;
+// the next download replaces it (the symlink-replacement detection
+// treats a copy the same as a real file for override-protection
+// purposes, so on Windows the user re-downloads explicitly rather
+// than getting symlink-style transparent updates).
+
+/// Resolve the per-project bind-mount directory the RL container reads
+/// weights from. Mirrors the host path declared in the RL Reranker
+/// manifest's `runtime.volumes`: `{VCT_DATA}/<module_id>/<project_slug>/state`
+/// → `/data/state` (mode rw). Mkdir is the caller's responsibility.
+pub fn container_weights_mount_dir(module_id: &str, project_slug: &str) -> PathBuf {
+    crate::paths::vct_root_dir()
+        .join("data")
+        .join(sanitize_path_component(module_id))
+        .join(sanitize_path_component(project_slug))
+        .join("state")
+}
+
+/// Resolve the filename inside the bind-mount that the RL container's
+/// `/rotate_weights` handler loads. Matches `module_service::container_weights_path`'s
+/// `rl_model_<source>_<version>.pt` shape — duplicated rather than
+/// re-exported so this module stays self-contained.
+pub fn project_mount_weights_filename(embedding_source: &str, version: &str) -> String {
+    format!(
+        "rl_model_{}_{}.pt",
+        sanitize_path_component(embedding_source),
+        sanitize_path_component(version),
+    )
+}
+
+/// Full path of the project-mount slot the launcher manages for a given
+/// (module, project, source, version).
+pub fn project_mount_weights_path(
+    module_id: &str,
+    project_slug: &str,
+    embedding_source: &str,
+    version: &str,
+) -> PathBuf {
+    container_weights_mount_dir(module_id, project_slug)
+        .join(project_mount_weights_filename(embedding_source, version))
+}
+
+/// Create the symlink (or fallback copy) from the per-project bind-mount
+/// slot to the global download. Returns the symlink/copy path.
+///
+/// Behaviour matrix at the target slot:
+///   * Nothing there → create symlink (or copy on symlink failure).
+///   * Symlink there → remove + re-create (refresh global pointer).
+///   * Regular file there → LEAVE UNTOUCHED (user override). Returns the
+///     existing path; the caller can detect via `path.symlink_metadata`
+///     if it cares, but the contract is "do not clobber".
+///
+/// Soft-fail on the underlying filesystem op: callers (the download
+/// command) treat link failure as non-fatal — the .pt is still on disk
+/// globally and a future bundle re-link can pick it up.
+pub async fn link_global_into_project_mount(
+    module_id: &str,
+    project_slug: &str,
+    embedding_source: &str,
+    version: &str,
+    global_path: &Path,
+) -> Result<PathBuf, String> {
+    let mount_dir = container_weights_mount_dir(module_id, project_slug);
+    tokio::fs::create_dir_all(&mount_dir)
+        .await
+        .map_err(|e| format!("mkdir bind-mount dir {}: {}", mount_dir.display(), e))?;
+
+    let target = project_mount_weights_path(module_id, project_slug, embedding_source, version);
+
+    // Override protection: if a real (non-symlink) file already sits in
+    // the slot, the user has deliberately placed it there. Don't touch.
+    match tokio::fs::symlink_metadata(&target).await {
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            // User override (regular file or copy) — preserve.
+            return Ok(target);
+        }
+        Ok(_) => {
+            // Existing symlink — remove so we can refresh.
+            if let Err(e) = tokio::fs::remove_file(&target).await {
+                return Err(format!(
+                    "remove stale symlink {}: {}",
+                    target.display(),
+                    e
+                ));
+            }
+        }
+        Err(_) => {
+            // Nothing there — proceed.
+        }
+    }
+
+    // Try platform-native symlink first.
+    let symlink_res = create_symlink(global_path, &target);
+
+    if let Err(symlink_err) = symlink_res {
+        // Soft-fall back to copy (Windows without Developer Mode,
+        // restricted filesystems, etc.). Log so the developer sees
+        // it but don't fail — the container still gets the weights.
+        eprintln!(
+            "[module_default_weights] symlink {} -> {} failed ({}); falling back to copy",
+            target.display(),
+            global_path.display(),
+            symlink_err
+        );
+        tokio::fs::copy(global_path, &target).await.map_err(|e| {
+            format!(
+                "copy fallback {} -> {} failed: {}",
+                global_path.display(),
+                target.display(),
+                e
+            )
+        })?;
+    }
+
+    Ok(target)
+}
+
+/// Reset the per-project mount slot back to "use global" — remove any
+/// override (real file or symlink) and re-point at the latest global
+/// `.pt`. Idempotent: re-creating a symlink to the same target is a no-op.
+///
+/// `global_path` is the source-of-truth `.pt` the symlink should point
+/// at. Typically the caller resolves this from the last successful
+/// `module_download_default_weights_inner` call (or by inspecting
+/// `module_weights_dir(module_id)`).
+pub async fn reset_weights_to_global(
+    module_id: &str,
+    project_slug: &str,
+    embedding_source: &str,
+    version: &str,
+    global_path: &Path,
+) -> Result<PathBuf, String> {
+    let target = project_mount_weights_path(module_id, project_slug, embedding_source, version);
+
+    // Remove any existing entry (file OR symlink) — reset wipes both.
+    match tokio::fs::symlink_metadata(&target).await {
+        Ok(_) => {
+            tokio::fs::remove_file(&target)
+                .await
+                .map_err(|e| format!("remove {}: {}", target.display(), e))?;
+        }
+        Err(_) => {
+            // Nothing to remove — fine.
+        }
+    }
+
+    // Re-link to global.
+    link_global_into_project_mount(module_id, project_slug, embedding_source, version, global_path)
+        .await
+}
+
+/// Platform-specific symlink wrapper. Unix uses `std::os::unix::fs::symlink`;
+/// Windows uses `symlink_file`. Both return `io::Error` on failure; the
+/// caller catches that to apply the copy fallback.
+fn create_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, dst)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(src, dst)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink not supported on this platform",
+        ))
+    }
+}
+
 // ─── License + endpoint helpers ─────────────────────────────────────────
 
 /// Read the user's license key from the OS keychain. Returns `Err` on
@@ -539,6 +750,50 @@ pub async fn module_download_default_weights_inner(
     let local_path =
         download_to_module_dir(&module_id, &embedding_source, &response).await?;
 
+    // 2.5. v0.2.40 R3: surface the global download into the per-project
+    // bind-mount so the running RL container actually sees it. Before
+    // this step, `<vct_root>/modules/<module>/weights/<source>-<version>.pt`
+    // existed but the container's bind mount looked at a different
+    // directory entirely (`<vct_root>/data/<module>/<slug>/state/...`).
+    //
+    // Soft-fail: a link failure does not invalidate the download — the
+    // .pt is on disk globally and the next install/run cycle can pick
+    // it up. We just log + continue so the hub-upsert + result return
+    // still happen.
+    let project_slug = match db.get_project(&project_id) {
+        Ok(Some(row)) => Some(row.slug),
+        Ok(None) => {
+            eprintln!(
+                "[module_default_weights] project {} not found — skipping bind-mount link",
+                project_id
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "[module_default_weights] db.get_project({}) failed: {} — skipping bind-mount link",
+                project_id, e
+            );
+            None
+        }
+    };
+    if let Some(slug) = project_slug.as_deref() {
+        if let Err(e) = link_global_into_project_mount(
+            &module_id,
+            slug,
+            &embedding_source,
+            &response.version,
+            &local_path,
+        )
+        .await
+        {
+            eprintln!(
+                "[module_default_weights] bind-mount link failed (non-fatal): {}",
+                e
+            );
+        }
+    }
+
     // 3. Best-effort hub upsert. Logged but not propagated.
     if let Err(e) = upsert_global_weight_row(
         db,
@@ -875,5 +1130,244 @@ mod tests {
             Some(v) => std::env::set_var("VCT_RL_LATEST_WEIGHTS_URL", v),
             None => std::env::remove_var("VCT_RL_LATEST_WEIGHTS_URL"),
         }
+    }
+
+    // ─── v0.2.40 R3: staging-unify helper tests ─────────────────────────
+
+    #[test]
+    fn container_weights_mount_dir_matches_rl_runtime_volume_shape() {
+        // Pin the path shape: `<vct_root>/data/<module>/<slug>/state`
+        // must equal the `{VCT_DATA}/vct-rl-reranker/{project_slug}/state`
+        // host volume declared in the RL Reranker manifest fixture
+        // (see module_service.rs make_manifest's runtime.volumes block).
+        // If these drift the container will never see the .pt again.
+        let p = container_weights_mount_dir("vct-rl-reranker", "acme-corp");
+        let suffix: Vec<String> = p
+            .iter()
+            .rev()
+            .take(4)
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        // Reversed: [state, acme-corp, vct-rl-reranker, data]
+        assert_eq!(suffix[0], "state");
+        assert_eq!(suffix[1], "acme-corp");
+        assert_eq!(suffix[2], "vct-rl-reranker");
+        assert_eq!(suffix[3], "data");
+    }
+
+    #[test]
+    fn project_mount_filename_matches_container_weights_path_shape() {
+        // Pin the filename: `rl_model_<source>_<version>.pt` is what
+        // `module_service::container_weights_path` resolves to inside the
+        // container. The launcher MUST publish the symlink under that
+        // exact name or the container's path-resolution won't find it.
+        assert_eq!(
+            project_mount_weights_filename("qwen3", "v3"),
+            "rl_model_qwen3_v3.pt"
+        );
+        // Hostile components get sanitised.
+        assert_eq!(
+            project_mount_weights_filename("../bad", "v3/../x"),
+            "rl_model_.._bad_v3_.._x.pt"
+        );
+    }
+
+    /// T1: After "download default weights" the container's expected
+    /// bind-mount path contains the .pt (reachable through the symlink).
+    #[cfg(unix)] // symlink fallback to copy on Windows tested separately.
+    #[tokio::test]
+    async fn t1_link_global_makes_pt_visible_at_container_mount() {
+        let tmp = tempfile::tempdir().expect("mkdtemp");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        // Simulate a successful global download: write a .pt at the
+        // module_weights_dir path.
+        let global = weights_file_path("vct-rl-reranker", "qwen3", "v42");
+        tokio::fs::create_dir_all(global.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&global, b"fake-weights-bytes")
+            .await
+            .unwrap();
+
+        // Act: link into the per-project bind-mount.
+        let linked = link_global_into_project_mount(
+            "vct-rl-reranker",
+            "acme-corp",
+            "qwen3",
+            "v42",
+            &global,
+        )
+        .await
+        .expect("link must succeed on unix");
+
+        // Assert: the symlink is at the container-expected location with
+        // the container-expected filename.
+        assert_eq!(
+            linked,
+            project_mount_weights_path("vct-rl-reranker", "acme-corp", "qwen3", "v42"),
+        );
+        let fname = linked.file_name().unwrap().to_string_lossy();
+        assert_eq!(fname, "rl_model_qwen3_v42.pt");
+
+        // Assert: it IS a symlink, not a copy.
+        let meta = tokio::fs::symlink_metadata(&linked).await.unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "expected a symlink, got {:?}",
+            meta.file_type()
+        );
+
+        // Assert: reading through the symlink gives the global content.
+        let bytes = tokio::fs::read(&linked).await.unwrap();
+        assert_eq!(bytes, b"fake-weights-bytes");
+
+        std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    /// T2: A per-project override (user replaces the symlink with a real
+    /// file) MUST survive a re-link. The launcher does not clobber
+    /// user-placed files.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t2_override_real_file_survives_relink() {
+        let tmp = tempfile::tempdir().expect("mkdtemp");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        // Global download.
+        let global = weights_file_path("vct-rl-reranker", "qwen3", "v1");
+        tokio::fs::create_dir_all(global.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&global, b"global-v1").await.unwrap();
+
+        let mount = project_mount_weights_path("vct-rl-reranker", "acme-corp", "qwen3", "v1");
+
+        // User places an override (regular file, NOT a symlink) at the
+        // mount slot — simulates "diverge" workflow.
+        tokio::fs::create_dir_all(mount.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&mount, b"USER-OVERRIDE")
+            .await
+            .unwrap();
+
+        // Act: re-link (simulates re-running "Download default weights").
+        let result = link_global_into_project_mount(
+            "vct-rl-reranker",
+            "acme-corp",
+            "qwen3",
+            "v1",
+            &global,
+        )
+        .await
+        .expect("re-link must succeed");
+        assert_eq!(result, mount);
+
+        // Assert: the override is preserved verbatim.
+        let bytes = tokio::fs::read(&mount).await.unwrap();
+        assert_eq!(
+            bytes, b"USER-OVERRIDE",
+            "real-file override must NOT be clobbered by re-link"
+        );
+
+        // Assert: still NOT a symlink.
+        let meta = tokio::fs::symlink_metadata(&mount).await.unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "override should stay a real file"
+        );
+
+        std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    /// T3: "Reset to latest released weights" wipes any override (real
+    /// file OR stale symlink) and re-points the slot at the global file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t3_reset_wipes_override_and_relinks_to_global() {
+        let tmp = tempfile::tempdir().expect("mkdtemp");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        // Global download.
+        let global = weights_file_path("vct-rl-reranker", "qwen3", "v2");
+        tokio::fs::create_dir_all(global.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&global, b"global-v2-content").await.unwrap();
+
+        let mount = project_mount_weights_path("vct-rl-reranker", "acme-corp", "qwen3", "v2");
+
+        // Place an override.
+        tokio::fs::create_dir_all(mount.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&mount, b"USER-OVERRIDE-WILL-BE-WIPED")
+            .await
+            .unwrap();
+
+        // Act: reset.
+        let linked = reset_weights_to_global(
+            "vct-rl-reranker",
+            "acme-corp",
+            "qwen3",
+            "v2",
+            &global,
+        )
+        .await
+        .expect("reset must succeed");
+
+        // Assert: slot is a symlink again.
+        let meta = tokio::fs::symlink_metadata(&linked).await.unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "post-reset slot must be a symlink, got {:?}",
+            meta.file_type()
+        );
+
+        // Assert: reading through resolves to the global content.
+        let bytes = tokio::fs::read(&linked).await.unwrap();
+        assert_eq!(bytes, b"global-v2-content");
+
+        std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    /// Edge case: refreshing an existing managed symlink. The first
+    /// link points at one .pt; a second link to the same slot for a
+    /// new version cleanly removes + re-creates.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relink_refreshes_existing_symlink() {
+        let tmp = tempfile::tempdir().expect("mkdtemp");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        // Two distinct global files (same source, different versions).
+        let g1 = weights_file_path("vct-rl-reranker", "qwen3", "v1");
+        let g2 = weights_file_path("vct-rl-reranker", "qwen3", "v1");
+        tokio::fs::create_dir_all(g1.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&g1, b"first").await.unwrap();
+
+        // First link.
+        link_global_into_project_mount("vct-rl-reranker", "acme-corp", "qwen3", "v1", &g1)
+            .await
+            .expect("first link");
+
+        // Re-write global with new content (same path — simulates an
+        // atomic-rename promote that the next download would do).
+        tokio::fs::write(&g2, b"updated").await.unwrap();
+
+        // Second link to same slot — should remove existing symlink and
+        // recreate (no "file exists" error).
+        let target =
+            link_global_into_project_mount("vct-rl-reranker", "acme-corp", "qwen3", "v1", &g2)
+                .await
+                .expect("re-link must succeed without 'file exists'");
+
+        let bytes = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(bytes, b"updated");
+
+        std::env::remove_var("VCT_STATE_DIR");
     }
 }
