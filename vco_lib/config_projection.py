@@ -758,6 +758,109 @@ def _fetch_kg_bindings(
     return {str(r["role"]): str(r["collection_name"]) for r in cur.fetchall()}
 
 
+# ─── Shared-KG default resolver (v0.2.40 W40-C) ──────────────────────────
+
+
+# Last-resort fallback for SHARED_KG_COLLECTION when launcher.db is
+# unreachable, the orchestrator-root project row is absent, or its primary
+# KG binding is empty. The value matches the Rust
+# `LAST_RESORT_SHARED_KG_COLLECTION` const + the
+# `vco_lib.project_init._SHARED_KG_NAME`; cross-language drift is pinned
+# by ``tests/test_shared_kg_constant_consistency.py``.
+#
+# In production, this value should essentially never be observed —
+# every machine that has run the launcher at least once has an
+# `orchestrator-root` project row with a primary KG binding, and the
+# Priority-2 resolver below returns that name. The const fires only on
+# a totally-fresh-fresh first boot, or in tests with an empty / missing
+# launcher.db.
+_LAST_RESORT_SHARED_KG_NAME = "VibeCodedOrchestrator_KnowledgeGraph"
+
+
+def _resolve_shared_kg_default_from_launcher_db(
+    db_path: Path | None = None,
+) -> str:
+    """Return the shared-KG class name from the orchestrator-root binding.
+
+    v0.2.40 W40-C: Python mirror of the Rust
+    `resolve_shared_kg_from_orchestrator_root` resolver
+    (``launcher/src-tauri/src/commands/project_env_settings.rs``).
+
+    Reads ``project_kg_bindings`` for the project whose slug is
+    ``orchestrator-root`` and role is ``primary``, returning that row's
+    ``collection_name``. This is the SOURCE OF TRUTH for the shared-KG
+    name on every machine that has run the launcher at least once
+    (the launcher seeds the orchestrator-root row on first boot via
+    ``ensure_orchestrator_root_kg_binding``).
+
+    Soft-fail on EVERY error path — launcher.db missing, file
+    unreadable, query fails, row absent, ``collection_name`` empty —
+    returns :data:`_LAST_RESORT_SHARED_KG_NAME` (the bundled canonical
+    name). Never raises.
+
+    The intent: callers passing ``shared_kg_default=None`` to
+    :func:`project_env_from_db` get the DB-driven name when possible,
+    and the bundled const when not. The bundled const stays accurate
+    for fresh installs but never overrides a real binding.
+
+    Args:
+        db_path: Optional override of the launcher DB location. Defaults
+            to :func:`_resolve_launcher_db_path`. Tests should pass an
+            explicit path.
+
+    Returns:
+        A non-empty Weaviate class name string. Never an empty string;
+        never raises.
+    """
+    if db_path is None:
+        try:
+            db_path = _resolve_launcher_db_path()
+        except Exception:
+            return _LAST_RESORT_SHARED_KG_NAME
+
+    # Soft-fail: any error path returns the last-resort const.
+    try:
+        if not db_path.is_file():
+            return _LAST_RESORT_SHARED_KG_NAME
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=5.0
+        )
+        try:
+            conn.row_factory = sqlite3.Row
+            # Look up the orchestrator-root project by slug.
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id FROM projects WHERE slug = ?",
+                ("orchestrator-root",),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return _LAST_RESORT_SHARED_KG_NAME
+            root_id = str(row["id"])
+
+            # Read its primary KG binding (matches the Rust resolver
+            # which reads `role='primary'`, not `role='shared'` — the
+            # orchestrator-root's primary KG IS what every other
+            # project's shared-KG resolves to).
+            cur.execute(
+                "SELECT collection_name FROM project_kg_bindings "
+                "WHERE project_id = ? AND role = ?",
+                (root_id, "primary"),
+            )
+            brow = cur.fetchone()
+            if brow is None:
+                return _LAST_RESORT_SHARED_KG_NAME
+            name = str(brow["collection_name"]).strip()
+            if not name:
+                return _LAST_RESORT_SHARED_KG_NAME
+            return name
+        finally:
+            conn.close()
+    except Exception:
+        # sqlite3.OperationalError, PermissionError, anything — fall back.
+        return _LAST_RESORT_SHARED_KG_NAME
+
+
 def _fetch_kg_access_list(
     conn: sqlite3.Connection,
     project_id: str,
@@ -1051,7 +1154,7 @@ def project_env_from_db(
     weaviate_url_override: str | None = None,
     ollama_url_override: str | None = None,
     active_embedding_override: str | None = None,
-    shared_kg_default: str = "VibeCodedOrchestrator_KnowledgeGraph",
+    shared_kg_default: str | None = None,
     weaviate_port_default: int = 8081,
     ollama_port_default: int = 11435,
     code_embed_port_default: int = 11440,
@@ -1094,10 +1197,24 @@ def project_env_from_db(
         active_embedding_override: Pin ACTIVE_EMBEDDING; otherwise read
             from ``module_settings`` (orchestrator-core /
             active_embedding), defaulting to "qwen3".
-        shared_kg_default: Fallback SHARED_KG_COLLECTION if the
-            ``shared`` KG binding row is absent. Matches the Rust
-            ``DEFAULT_SHARED_KG_COLLECTION`` constant
-            (``"VibeCodedOrchestrator_KnowledgeGraph"``).
+        shared_kg_default: Fallback SHARED_KG_COLLECTION when the
+            project's ``shared`` KG binding row is absent.
+
+            **v0.2.40 W40-C**: when ``None`` (the new default), the
+            resolver consults the launcher's
+            ``project_kg_bindings(slug='orchestrator-root',
+            role='primary').collection_name`` and uses that value as
+            the fallback. This makes future shared-KG name flips
+            propagate automatically rather than getting silently
+            stranded behind a stale const.
+
+            Soft-fail: launcher.db unreachable / orchestrator-root row
+            absent / binding empty → falls back to the bundled const
+            (``"VibeCodedOrchestrator_KnowledgeGraph"`` — matches the
+            Rust ``LAST_RESORT_SHARED_KG_COLLECTION`` constant).
+
+            Explicit string overrides (CLI tests, white-label installs)
+            still win and skip the DB-read.
         weaviate_port_default: Port to use when constructing
             ``WEAVIATE_URL`` (and as ``WEAVIATE_PORT``). Default 8081.
         ollama_port_default: Port for OLLAMA_URL / OLLAMA_PORT. Default
@@ -1141,7 +1258,19 @@ def project_env_from_db(
         kg_collection = kg_bindings.get(
             "primary", f"{sanitized}_KnowledgeGraph"
         )
-        shared_kg = kg_bindings.get("shared", shared_kg_default)
+        # v0.2.40 W40-C: when `shared_kg_default` was not provided by
+        # the caller (the new default), resolve from launcher.db's
+        # orchestrator-root primary binding rather than a stale const.
+        # Soft-fail returns the bundled
+        # `_LAST_RESORT_SHARED_KG_NAME` const when the DB is
+        # unreachable / no orchestrator-root row / binding empty.
+        if shared_kg_default is None:
+            resolved_default = _resolve_shared_kg_default_from_launcher_db(
+                db_path=db_path,
+            )
+        else:
+            resolved_default = shared_kg_default
+        shared_kg = kg_bindings.get("shared", resolved_default)
         dev_collection = kg_bindings.get(
             "archive", f"{sanitized}_Development"
         )

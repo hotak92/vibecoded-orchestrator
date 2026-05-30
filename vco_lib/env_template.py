@@ -318,7 +318,7 @@ def project_env_template_from_db(
     weaviate_url_override: str | None = None,
     ollama_url_override: str | None = None,
     active_embedding_override: str | None = None,
-    shared_kg_default: str = "VibeCodedOrchestrator_KnowledgeGraph",
+    shared_kg_default: str | None = None,
     weaviate_port_default: int = 8081,
     ollama_port_default: int = 11435,
     code_embed_port_default: int = 11440,
@@ -342,7 +342,12 @@ def project_env_template_from_db(
             Same shape and semantics as ``project_env_from_db``.
         shared_kg_default / weaviate_port_default / ollama_port_default /
         code_embed_port_default: Same shape and semantics as
-            ``project_env_from_db``.
+            ``project_env_from_db``. **v0.2.40 W40-C**: ``shared_kg_default``
+            now defaults to ``None``, which triggers a DB-read from
+            ``project_kg_bindings(slug='orchestrator-root',
+            role='primary')`` for the fallback name. Soft-fall back to
+            the bundled const if launcher.db is unreachable / row
+            absent. Explicit string overrides still bypass the DB-read.
         orchestrator_root: Forwarded; even though ``VCT_ORCHESTRATOR_ROOT``
             / ``VCT_INFRASTRUCTURE_DIR`` are NOT in the ``.env`` template
             subset, accepting this arg keeps the CLI surface symmetric

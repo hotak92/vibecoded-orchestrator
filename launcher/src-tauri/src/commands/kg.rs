@@ -180,7 +180,7 @@ pub async fn kg_list_collections(
         // heuristic for whatever the user happens to have around.
         let is_shared = crate::commands::project_env_settings::is_shared_kg_class_name(
             &name,
-            crate::commands::project_env_settings::DEFAULT_SHARED_KG_COLLECTION,
+            crate::commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION,
         )
             || name == "sharedVCT"
             || name.to_lowercase().contains("shared");

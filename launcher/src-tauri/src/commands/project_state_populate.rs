@@ -39,7 +39,7 @@ use std::path::Path;
 
 use serde_json::Value as JsonValue;
 
-use crate::commands::project_env_settings::DEFAULT_SHARED_KG_COLLECTION;
+use crate::commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION;
 use crate::commands::projects_v2::sanitize_kg_collection;
 use crate::db::project_mcp_servers::{is_bundled_mcp, is_default_disabled_mcp};
 use crate::db::project_state::{resolve_kind_paths, AgentOrSkill};
@@ -141,7 +141,7 @@ fn populate_kg_collection_access(
     let dev_collection = format!("{}_Development", pascal);
     // Single source of truth — see project_env_settings.rs. Renamed from
     // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E.
-    let shared_collection = DEFAULT_SHARED_KG_COLLECTION;
+    let shared_collection = LAST_RESORT_SHARED_KG_COLLECTION;
 
     // Project's OWN primary KG: write access by default. The project's
     // hooks + MCP server need to write to this — the .claude/env carries
@@ -694,7 +694,7 @@ fn populate_kg_bindings(
     let primary_collection = format!("{}_KnowledgeGraph", pascal);
     // Single source of truth — see project_env_settings.rs. Renamed from
     // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E.
-    let shared_collection = DEFAULT_SHARED_KG_COLLECTION;
+    let shared_collection = LAST_RESORT_SHARED_KG_COLLECTION;
     let weaviate_url = "http://localhost:8081";
     let embedding_model = "qwen3-embedding:0.6b";
     let embedding_dim: i64 = 1024;

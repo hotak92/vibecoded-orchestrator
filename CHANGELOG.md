@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.40] — unreleased
+
+### Changed
+
+- **W40-C: hardcoded `DEFAULT_SHARED_KG_COLLECTION` fallbacks now read from launcher.db first** (Agent W40-C). Hardcoded fallback sites for `SHARED_KG_COLLECTION` in `vco_lib/config_projection.py` and `vco_lib/env_template.py` now consult `launcher.db project_kg_bindings(slug='orchestrator-root', role='primary').collection_name` before falling back to the bundled const. The Rust const in `launcher/src-tauri/src/commands/project_env_settings.rs` is renamed from `DEFAULT_SHARED_KG_COLLECTION` to `LAST_RESORT_SHARED_KG_COLLECTION` (value unchanged at `"VibeCodedOrchestrator_KnowledgeGraph"`) — the rename is purely an audit-discipline signal so call sites that bypass the DB-read chain become greppable. Python adds a parallel `_LAST_RESORT_SHARED_KG_NAME` const + a `_resolve_shared_kg_default_from_launcher_db()` helper with soft-fail behaviour (DB missing / unreadable / orchestrator-root row absent / binding empty → falls back to the const). `claude_mcp_servers/weaviate_mcp/server.py` stays env-only for `SHARED_KG_COLLECTION` resolution (the MCP subprocess cannot read launcher.db) but gains a startup probe via the first `get_weaviate_client()` call: when `SHARED_KG_COLLECTION` names a Weaviate class that doesn't exist, the MCP emits a structured `WARNING` log line ("SHARED_KG_COLLECTION='X' but no such class exists in Weaviate; set the env var in `.claude/settings.json env` or re-run launcher boot"). Prevents future canonical-name flips (v0.2.12 PR-26, v0.2.23 B1, future) from silently stranding users behind stale const-derived values when their launcher.db binding has the right answer. Cross-language invariant test `tests/test_shared_kg_constant_consistency.py` updated to track the new Rust const name; new `tests/test_env_template_resolve_shared.py` pins all three branches of the soft-fall-through chain. No behaviour change for fresh installs (the const value is unchanged); existing installs whose launcher.db binding is correct but whose env files are stale will pick up the right name on the next env regen.
+
 ## [0.2.39] — 2026-05-28
 
 ### Added

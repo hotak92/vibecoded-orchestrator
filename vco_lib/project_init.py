@@ -1587,7 +1587,10 @@ _migrate_collections = migrate_collections
 # Canonical shared-KG class name. Must stay in lockstep with:
 #   * `derive_project_collection_names()` above (which returns this value
 #     as `shared_kg_collection`),
-#   * `launcher/src-tauri/src/commands/project_env_settings.rs::DEFAULT_SHARED_KG_COLLECTION`,
+#   * `launcher/src-tauri/src/commands/project_env_settings.rs::LAST_RESORT_SHARED_KG_COLLECTION`
+#     (renamed from `DEFAULT_SHARED_KG_COLLECTION` in v0.2.40 W40-C —
+#     value unchanged, the rename signals "last-resort fallback" rather
+#     than "first-choice default" since DB-read takes precedence),
 #   * `claude_mcp_servers/weaviate_mcp/server.py::_SHARED_KG_DEFAULT`,
 #   * `scripts/migrate-shared-kg-schema.{sh,ps1}` defaults.
 # The cross-language invariant test `tests/test_shared_kg_constant_consistency.py`

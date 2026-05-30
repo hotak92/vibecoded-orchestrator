@@ -854,7 +854,7 @@ pub fn run() {
                 use tauri::Manager;
                 if let Some(db) = app.try_state::<db::Db>() {
                     let canonical =
-                        commands::project_env_settings::DEFAULT_SHARED_KG_COLLECTION;
+                        commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION;
                     match db.migrate_legacy_shared_kg_collection_names(canonical) {
                         Ok(0) => {}
                         Ok(n) => {
