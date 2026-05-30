@@ -295,13 +295,23 @@ class RLTelemetryWriter:
         citations: Dict[str, Optional[bool]],
         cosine_sims: Optional[Dict[str, float]],
     ) -> Dict[str, Any]:
-        """Build the queue-bound payload for a citation event."""
+        """Build the queue-bound payload for a citation event.
+
+        v0.2.40 F3: includes the full embedding triple
+        (embedding_source, embedding_dim, embedding_model) — mirrors
+        the local JSONL citation shape and the retrieval-event shape.
+        Lets the offline RL pipeline anchor the citation event by its
+        own embedding triple if the paired retrieval event was dropped
+        at training_loader steps 4/6.
+        """
         payload: Dict[str, Any] = {
             "schema_version": RLDataLogger.SCHEMA_VERSION,
             "project": self._project,
             "task_id": task_id,
             "task_type": task_type,
             "embedding_source": self._embedding_source,
+            "embedding_dim": self._embedding_dim,
+            "embedding_model": self._embedding_model,
             "citations": {
                 title: (bool(cited) if cited is not None else None)
                 for title, cited in citations.items()
