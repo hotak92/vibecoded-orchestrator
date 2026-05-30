@@ -144,6 +144,30 @@ def _missing_props_only() -> dict:
     return sch
 
 
+def _at_target_diagrams() -> dict:
+    """A Diagrams collection schema at the current target shape.
+
+    Mirrors ``diagrams_class_definition`` so the migrate dispatcher
+    returns 'noop' when fed this fixture as the actual schema.
+    """
+    return {
+        "class": "Foo_Diagrams",
+        "vectorConfig": dict(_TARGET_VEC_CONFIG),
+        "invertedIndexConfig": {"indexNullState": True},
+        "properties": [
+            {"name": "title",                   "dataType": ["text"]},
+            {"name": "content",                 "dataType": ["text"]},
+            {"name": "path_tags",               "dataType": ["text[]"]},
+            {"name": "diagram_kind",            "dataType": ["text"]},
+            {"name": "chat_id",                 "dataType": ["text"]},
+            {"name": "linked_session_summary",  "dataType": ["text"]},
+            {"name": "file_path",               "dataType": ["text"]},
+            {"name": "created_at",              "dataType": ["int"]},
+            {"name": "updated_at",              "dataType": ["int"]},
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # SchemaDelta + classify_action
 # ---------------------------------------------------------------------------
@@ -256,12 +280,18 @@ class MigrateDispatchUnitTests(unittest.TestCase):
     correct downstream helper called."""
 
     def setUp(self):
-        # Set env so migrate_collections sees both env keys.
+        # Set env so migrate_collections sees all three env keys (KG + Dev +
+        # Diagrams). Diagrams support was added in fix/a1-indexing-pipeline
+        # (2026-05-25); tests that don't supply a Foo_Diagrams fetcher entry
+        # must include it so the real-env DIAGRAMS_COLLECTION value doesn't
+        # leak in and produce a spurious third collection.
         self._env_backup = {
-            k: os.environ.get(k) for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION")
+            k: os.environ.get(k)
+            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION", "DIAGRAMS_COLLECTION")
         }
         os.environ["KG_COLLECTION"] = "Foo_KnowledgeGraph"
         os.environ["DEVELOPMENT_COLLECTION"] = "Foo_Development"
+        os.environ["DIAGRAMS_COLLECTION"] = "Foo_Diagrams"
         self.args = argparse.Namespace(force_rebuild=False)
 
     def tearDown(self):
@@ -278,6 +308,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph":  _missing_index_null_state_only(),
             "Foo_Development":     _at_target_dev(),
+            "Foo_Diagrams":        _at_target_diagrams(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_create_class") as cmock, \
@@ -292,6 +323,7 @@ class MigrateDispatchUnitTests(unittest.TestCase):
         self.assertEqual(actions, {
             "Foo_KnowledgeGraph": "copy",
             "Foo_Development":    "noop",
+            "Foo_Diagrams":       "noop",
         })
         # No Weaviate mutation calls.
         cmock.assert_not_called()
@@ -348,15 +380,16 @@ class MigrateDispatchUnitTests(unittest.TestCase):
 
     def test_create_called_for_not_present(self):
         fetcher = self._fetcher_returning({
-            # KG missing entirely; Dev present at target.
+            # KG missing entirely; Dev + Diagrams present at target.
             "Foo_Development":     _at_target_dev(),
+            "Foo_Diagrams":        _at_target_diagrams(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_create_class") as cmock:
             result = project_init.migrate_collections(
                 self.args, dry_run=False, schema_fetcher=fetcher,
             )
-        # Exactly 1 _create_class for the missing KG.
+        # Exactly 1 _create_class for the missing KG; Dev + Diagrams are noop.
         self.assertEqual(cmock.call_count, 1)
         kg_plan = next(p for p in result["plan"]
                        if p["collection"] == "Foo_KnowledgeGraph")
@@ -365,9 +398,10 @@ class MigrateDispatchUnitTests(unittest.TestCase):
 
     def test_force_rebuild_flag_overrides_smart_path(self):
         fetcher = self._fetcher_returning({
-            # Both at-target — would normally noop.
+            # All three at-target — would normally noop.
             "Foo_KnowledgeGraph": _at_target(),
             "Foo_Development":    _at_target_dev(),
+            "Foo_Diagrams":       _at_target_diagrams(),
         })
         args = argparse.Namespace(force_rebuild=True)
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
@@ -377,9 +411,9 @@ class MigrateDispatchUnitTests(unittest.TestCase):
             result = project_init.migrate_collections(
                 args, dry_run=False, schema_fetcher=fetcher,
             )
-        # Both should be classified rebuild → 2 deletes (skip recreate;
+        # All three should be classified rebuild → 3 deletes (skip recreate;
         # caller's _ensure_collections handles that).
-        self.assertEqual(dmock.call_count, 2)
+        self.assertEqual(dmock.call_count, 3)
         actions = {p["action"] for p in result["plan"]}
         self.assertEqual(actions, {"rebuild"})
 
@@ -409,14 +443,15 @@ class MigrateDispatchUnitTests(unittest.TestCase):
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph": _at_target(),
             "Foo_Development":    _at_target_dev(),
+            "Foo_Diagrams":       _at_target_diagrams(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging",
                                return_value="dropped") as drop_mock:
             project_init.migrate_collections(
                 self.args, dry_run=True, schema_fetcher=fetcher,
             )
-        # Called once per env-configured collection (2: KG + Dev).
-        self.assertEqual(drop_mock.call_count, 2)
+        # Called once per env-configured collection (3: KG + Dev + Diagrams).
+        self.assertEqual(drop_mock.call_count, 3)
         # Each call passes the target schema definition for recovery use.
         for call in drop_mock.call_args_list:
             self.assertIn("target_def", call.kwargs)
