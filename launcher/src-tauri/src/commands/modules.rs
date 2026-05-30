@@ -1489,7 +1489,79 @@ pub async fn install_module_for_project(
                 )
                 .await
                 {
-                    Ok(name) => Some(name),
+                    Ok(name) => {
+                        // v0.2.40 R5: first-install auto-download of
+                        // default weights. After the container starts
+                        // for the RL Reranker, trigger a one-shot
+                        // weights download so the project doesn't run
+                        // on baked-in qwen3-only weights for up to 24h
+                        // until the user manually clicks "Download
+                        // default weights" or the daily poll fires.
+                        //
+                        // Gates:
+                        //   - module_id == RL_RERANKER_MODULE_ID — the
+                        //     only module today that ships weights.
+                        //     Future modules with weights will need
+                        //     this gate widened (likely manifest-driven
+                        //     `runtime.weights_provider != None`); for
+                        //     v0.2.40 the explicit id-check is the
+                        //     narrowest correct scope.
+                        //   - `is_module_licensed` — paid-tier only.
+                        //     The manifest "Download default weights"
+                        //     button is already hidden for free-tier
+                        //     per `module_default_weights.rs:50-54`,
+                        //     so the auto-trigger mirrors that policy.
+                        //     Note: `is_module_licensed` was already
+                        //     checked above (line 1341) as the install
+                        //     gate, but we re-check here defensively
+                        //     in case the tier rotated mid-install.
+                        //
+                        // Detached spawn: the download is 50-500 MB
+                        // and can take minutes on a slow connection.
+                        // We emit `module://install-complete` BELOW
+                        // (after this match), and the user-visible
+                        // install is declared done at that point. The
+                        // weights download streams in the background.
+                        //
+                        // Soft-fail throughout: every error path in
+                        // `apply_default_weights_after_install` is
+                        // logged + recorded as
+                        // `module_settings.weights_download_deferred=
+                        // true` (per-(project,module)) so the GUI
+                        // tile can render "click Download default
+                        // weights to refresh". The install row stays
+                        // installed; the container is already running.
+                        //
+                        // Depends on (R4): the Supabase edge function
+                        // `rl-latest-weights` must be deployed for
+                        // this to succeed end-to-end. If R4 hasn't
+                        // shipped, the download soft-fails with a
+                        // clear 404 message and the deferred-flag is
+                        // set. See multi-Opus pre-push review item 5.
+                        if module_id == crate::commands::module_service::RL_RERANKER_MODULE_ID
+                            && is_module_licensed(&manifest, &db)
+                        {
+                            let app_clone = app.clone();
+                            let project_id_clone = project_id.clone();
+                            let module_id_clone = module_id.clone();
+                            tauri::async_runtime::spawn(async move {
+                                use tauri::Manager;
+                                let db_state: tauri::State<'_, Db> = app_clone.state();
+                                let db_ref: &Db = db_state.inner();
+                                // soft-fail wrapper internally; we
+                                // discard the Result either way.
+                                let _ = crate::commands::module_default_weights::
+                                    apply_default_weights_after_install(
+                                        &module_id_clone,
+                                        &project_id_clone,
+                                        db_ref,
+                                        &app_clone,
+                                    )
+                                    .await;
+                            });
+                        }
+                        Some(name)
+                    }
                     Err(e) => {
                         eprintln!(
                             "[module_service] start_container_after_install failed (install row stays installed): {}",

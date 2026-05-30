@@ -871,6 +871,204 @@ pub async fn module_get_runtime_value_inner(
     }
 }
 
+// ─── v0.2.40 R5: first-install auto-trigger ─────────────────────────────
+//
+// After `start_container_after_install` succeeds for the RL Reranker,
+// trigger a one-shot default-weights download so the container doesn't
+// run on the (likely qwen3-only) weights baked into the image until
+// the user manually clicks "Download default weights" or the daily
+// poll fires (~24h). "Just works" UX for paid-tier users.
+//
+// Soft-fail discipline: this function NEVER propagates errors that
+// would block the install pipeline. Failure modes (license missing,
+// Supabase function unavailable, network timeout) are logged and
+// recorded in `module_settings.weights_download_deferred=true` so the
+// GUI tile can render "click Download default weights to refresh".
+// Free-tier callers are filtered out at the call site (R5 is gated on
+// `is_module_licensed` before invoking this helper).
+
+/// `module_settings.setting_key` used to mark that the first-install
+/// auto-download did not complete (license missing, edge function 404,
+/// network failure, etc.). The GUI reads this to render a "click
+/// Download default weights to refresh" hint on the module tile.
+///
+/// Cleared on a subsequent successful download (either auto-retry or
+/// the user clicking the manual button). Stored as JSON `true` /
+/// absence-of-row; the renderer treats both `false` and missing as
+/// "no defer".
+pub const WEIGHTS_DOWNLOAD_DEFERRED_KEY: &str = "weights_download_deferred";
+
+/// Record the deferred-flag + audit entry for a failed first-install
+/// auto-download. Extracted into a pure-Db helper so unit tests can
+/// drive it without standing up an `AppHandle` (the keychain +
+/// network paths in `module_download_default_weights_inner` are not
+/// reachable in a `cargo test --lib` context).
+///
+/// Idempotent: safe to call on every error-path retry.
+pub(crate) fn mark_weights_download_deferred(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+    embedding_source: &str,
+    error: &str,
+) {
+    // Set the deferred-flag setting. Soft-fail on the set itself —
+    // if the DB write errors (extremely unlikely), logging is all we
+    // can do; the GUI tile will not show the "click to refresh" hint
+    // but the install otherwise succeeded.
+    if let Err(set_err) =
+        db.set_setting(project_id, module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY,
+            &serde_json::Value::Bool(true))
+    {
+        eprintln!(
+            "[module_default_weights] R5: failed to mark deferred flag \
+             (best-effort, non-fatal): {}",
+            set_err
+        );
+    }
+
+    let _ = db.audit(
+        "module_default_weights_auto_download_deferred",
+        Some(project_id),
+        Some(module_id),
+        &serde_json::json!({
+            "embedding_source": embedding_source,
+            "error": error,
+        }),
+    );
+}
+
+/// Clear a previously-set deferred-flag after a successful download.
+/// Pure-Db helper, sibling to `mark_weights_download_deferred`.
+/// Idempotent: rows that don't exist produce a silent success.
+pub(crate) fn clear_weights_download_deferred(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+) {
+    let _ = db.delete_setting(project_id, module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY);
+}
+
+/// Trigger a one-shot default-weights download after first install.
+///
+/// Soft-fails: every error path sets the
+/// `WEIGHTS_DOWNLOAD_DEFERRED_KEY` setting on `(project_id, module_id)`
+/// and returns Ok(()) — the caller should NOT use this function's
+/// return value to gate any user-visible behaviour. The return is
+/// `Result<(), String>` purely so internal `?` plumbing stays
+/// consistent; the err path is squashed into Ok() before returning.
+///
+/// Tier-gate: the call site MUST filter on `is_module_licensed`
+/// before invoking. Free-tier users skip the trigger silently (the
+/// manifest button is hidden for them per the existing pattern at
+/// `module_default_weights.rs:50-54`).
+///
+/// Embedding source: read via `module_service::read_active_embedding_source`
+/// with fallback to `module_service::DEFAULT_EMBEDDING_SOURCE`
+/// (currently `"qwen3"`). Matches the daily-poller path
+/// (`module_service.rs:862`).
+pub async fn apply_default_weights_after_install(
+    module_id: &str,
+    project_id: &str,
+    db: &Db,
+    app: &AppHandle,
+) -> Result<(), String> {
+    // 1. Resolve embedding source from the project's `.claude/env`.
+    let project = match db.get_project(project_id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            // Project vanished between install and post-install — unusual
+            // but possible if the user uninstalled the project mid-flight.
+            // Nothing to defer onto; just log + return.
+            eprintln!(
+                "[module_default_weights] R5 auto-trigger: project {} not found; \
+                 skipping default-weights download",
+                project_id
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!(
+                "[module_default_weights] R5 auto-trigger: get_project failed: {}; \
+                 skipping default-weights download",
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    let embedding_source =
+        crate::commands::module_service::read_active_embedding_source(&project)
+            .unwrap_or_else(|| {
+                crate::commands::module_service::DEFAULT_EMBEDDING_SOURCE.to_string()
+            });
+
+    // 2. Reuse the manual-download path (no duplication). This is the
+    // same function the GUI's "Download default weights" button calls
+    // via the chained_action dispatcher (`module_dispatch.rs:244-252`).
+    let result = module_download_default_weights_inner(
+        module_id.to_string(),
+        project_id.to_string(),
+        embedding_source.clone(),
+        db,
+        app,
+    )
+    .await;
+
+    match result {
+        Ok(downloaded) => {
+            eprintln!(
+                "[module_default_weights] R5 auto-trigger: downloaded {} ({}) \
+                 for project {}",
+                downloaded.local_path, downloaded.version, project_id
+            );
+
+            // Best-effort: clear any stale deferred-flag from a prior
+            // failed attempt. Idempotent.
+            clear_weights_download_deferred(db, project_id, module_id);
+
+            let _ = db.audit(
+                "module_default_weights_auto_downloaded",
+                Some(project_id),
+                Some(module_id),
+                &serde_json::json!({
+                    "embedding_source": embedding_source,
+                    "version": downloaded.version,
+                    "local_path": downloaded.local_path,
+                }),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Soft-fail path: log, set deferred-flag, audit, continue.
+            // The install row stays installed; the container is already
+            // running; the user can re-trigger via the manifest button.
+            //
+            // Common failure modes we expect to land here:
+            //   - "no license key configured" (race: license rotated
+            //     between install-gate check and post-install spawn).
+            //   - "rl-latest-weights returned 404" (R4's Supabase edge
+            //     function not yet deployed in this environment).
+            //   - "rl-latest-weights returned 5xx" (transient server
+            //     error or rate-limit).
+            //   - "POST ...: connection timed out" (network blip).
+            eprintln!(
+                "[module_default_weights] R5 auto-trigger soft-fail for \
+                 project {} module {}: {}",
+                project_id, module_id, e
+            );
+
+            mark_weights_download_deferred(db, project_id, module_id, &embedding_source, &e);
+
+            // Return Ok — the install pipeline must NOT fail when the
+            // weights download soft-fails. The container is running
+            // with its baked-in weights; the user can re-trigger via
+            // the manifest button.
+            Ok(())
+        }
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1119,6 +1317,181 @@ mod tests {
         assert!(!target.exists(), "tmp file must not have been promoted");
 
         std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    // ─── v0.2.40 R5: first-install auto-trigger tests ───────────────────
+    //
+    // Scope: unit tests for the pure-Db helpers (`mark_*` / `clear_*`)
+    // and the const pin. The full `apply_default_weights_after_install`
+    // function takes `&AppHandle` and exercises the keychain +
+    // network paths in `module_download_default_weights_inner`, which
+    // can't be reached from a `cargo test --lib` context (no
+    // AppHandle, no keychain license, no Supabase endpoint). The
+    // contract those paths follow is already tested by the existing
+    // `module_download_default_weights_returns_local_path_and_version`
+    // test above. What R5 adds on top is the deferred-flag bookkeeping
+    // — tested here.
+
+    fn open_db_with_project() -> (Db, String, String) {
+        use crate::db::models::ProjectHost;
+        let db = Db::open_in_memory().expect("in-memory db");
+        let project_id = uuid::Uuid::new_v4().to_string();
+        db.insert_project(
+            &project_id,
+            "R5 Test Project",
+            "/tmp/r5-test",
+            ProjectHost::Base,
+            &format!("r5-test-{}", &project_id[..8]),
+        )
+        .expect("insert project");
+        let module_id = "vct-rl-reranker".to_string();
+        (db, project_id, module_id)
+    }
+
+    /// Pin the setting-key constant. The renderer (JS side) reads this
+    /// key from `module_settings` to render the "click Download default
+    /// weights to refresh" hint on the module tile. Changing the key
+    /// silently would break the GUI hint without a compiler warning.
+    #[test]
+    fn weights_download_deferred_key_is_stable() {
+        assert_eq!(WEIGHTS_DOWNLOAD_DEFERRED_KEY, "weights_download_deferred");
+    }
+
+    /// `mark_weights_download_deferred` writes `true` to the
+    /// `(project_id, module_id, "weights_download_deferred")` row in
+    /// module_settings. The GUI tile reads this row to decide whether
+    /// to render the "click to refresh" hint.
+    #[test]
+    fn mark_weights_download_deferred_sets_setting_to_true() {
+        let (db, project_id, module_id) = open_db_with_project();
+
+        mark_weights_download_deferred(
+            &db,
+            &project_id,
+            &module_id,
+            "qwen3",
+            "rl-latest-weights returned 404: function not deployed",
+        );
+
+        let value = db
+            .get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY)
+            .expect("get_setting must not error")
+            .expect("deferred-flag row must exist after mark_*");
+        assert_eq!(value, serde_json::Value::Bool(true));
+    }
+
+    /// `clear_weights_download_deferred` removes the row, returning the
+    /// project to the "no defer" state. Idempotent: calling it when the
+    /// row doesn't exist must produce a silent success.
+    #[test]
+    fn clear_weights_download_deferred_removes_setting() {
+        let (db, project_id, module_id) = open_db_with_project();
+
+        // Pre-condition: row exists.
+        mark_weights_download_deferred(
+            &db,
+            &project_id,
+            &module_id,
+            "qwen3",
+            "test failure",
+        );
+        assert!(
+            db.get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY)
+                .unwrap()
+                .is_some(),
+            "deferred-flag row must exist before clear_*"
+        );
+
+        clear_weights_download_deferred(&db, &project_id, &module_id);
+
+        let after = db
+            .get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY)
+            .expect("get_setting must not error after clear");
+        assert!(
+            after.is_none(),
+            "deferred-flag row must be removed by clear_*"
+        );
+    }
+
+    /// `clear_weights_download_deferred` on a fresh project (no row to
+    /// clear) is a no-op that doesn't panic. The success path of the
+    /// auto-trigger calls clear_* defensively even on first install,
+    /// where no prior deferred-flag exists; that path must not error.
+    #[test]
+    fn clear_weights_download_deferred_is_idempotent_when_absent() {
+        let (db, project_id, module_id) = open_db_with_project();
+        // No prior mark_* call.
+        clear_weights_download_deferred(&db, &project_id, &module_id);
+        // No panic, no error — test passes by reaching this point.
+        let after = db
+            .get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY)
+            .expect("get_setting after no-op clear must not error");
+        assert!(after.is_none());
+    }
+
+    /// Audit log: `mark_weights_download_deferred` records an audit
+    /// entry with operation `module_default_weights_auto_download_deferred`
+    /// so post-incident debugging can find every failed first-install
+    /// auto-download in the audit log.
+    #[test]
+    fn mark_weights_download_deferred_records_audit_entry() {
+        let (db, project_id, module_id) = open_db_with_project();
+
+        mark_weights_download_deferred(
+            &db,
+            &project_id,
+            &module_id,
+            "qwen3",
+            "rl-latest-weights returned 404",
+        );
+
+        // Verify by reading the audit table directly. audit_list
+        // signature: (project_id, actor, since_ms, until_ms, search,
+        // limit). We filter by project_id only and search the recent
+        // 100 rows for the deferred-operation row.
+        let entries = db
+            .audit_list(Some(&project_id), None, None, None, None, 100)
+            .expect("audit_list must work");
+        let deferred_entry = entries
+            .iter()
+            .find(|e| e.operation == "module_default_weights_auto_download_deferred");
+        assert!(
+            deferred_entry.is_some(),
+            "expected audit entry with operation \
+             'module_default_weights_auto_download_deferred'; got operations: {:?}",
+            entries.iter().map(|e| &e.operation).collect::<Vec<_>>()
+        );
+        // The detail payload includes the embedding source + error so
+        // post-incident grep can find "all projects whose qwen3 weights
+        // download deferred with a 404 error", etc.
+        let detail = &deferred_entry.unwrap().detail;
+        assert!(
+            detail.contains("qwen3"),
+            "audit detail must include embedding_source: {}",
+            detail
+        );
+        assert!(
+            detail.contains("404"),
+            "audit detail must include error message: {}",
+            detail
+        );
+    }
+
+    /// Round-trip: mark, then clear, then mark again. Catches any
+    /// stale-row issues from the SQL upsert path.
+    #[test]
+    fn mark_clear_mark_round_trip() {
+        let (db, project_id, module_id) = open_db_with_project();
+
+        mark_weights_download_deferred(&db, &project_id, &module_id, "qwen3", "err1");
+        clear_weights_download_deferred(&db, &project_id, &module_id);
+        mark_weights_download_deferred(&db, &project_id, &module_id, "arctic", "err2");
+
+        let value = db
+            .get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY)
+            .expect("get_setting")
+            .expect("final mark must leave row present");
+        assert_eq!(value, serde_json::Value::Bool(true));
     }
 
     #[test]
