@@ -98,6 +98,8 @@ state/
 .claude/logs/*.log
 .claude/logs/*.jsonl
 .claude/logs/.last_reviewed_commit
+# kg-info / kg-search CLI telemetry (per-machine, created at script invocation)
+claude_mcp_servers/weaviate_mcp/*_tool_usage.jsonl
 .claude/cron-jobs.json
 .claude/worktrees/
 # Hook ephemeral state (per-session dedup, etc.)
