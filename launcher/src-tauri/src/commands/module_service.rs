@@ -37,7 +37,7 @@ use tokio::process::Command;
 
 use crate::db::models::ProjectRow;
 use crate::db::Db;
-use crate::manifest::{ModuleManifest, PlaceholderCtx, PortMapping, VolumeMount};
+use crate::manifest::{InstallMethod, ModuleManifest, PlaceholderCtx, PortMapping, VolumeMount};
 use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ──────────────────────────────────────────────────────────
@@ -1560,28 +1560,127 @@ async fn parse_recent_event_stats_from_path(path: &Path) -> (u32, f32) {
 
 // ─── Startup hook + daily poller (scaffolding) ──────────────────────────
 
-/// Iterate every install row where `container_name IS NOT NULL` and
-/// probe each container's running state. Restart those that aren't
-/// running. Soft-fail per row. Called from `lib.rs::setup()`.
+/// Iterate every `status='installed'` install row and ensure its
+/// container is running. Soft-fail per row. Called from
+/// `lib.rs::setup()` at launcher boot.
+///
+/// v0.2.40 (R1): mirror of W40-D's hub-side
+/// `vct-hub::module_supervisor::resume_containers_on_startup`
+/// generalization. Two-bug fix over the pre-v0.2.40 launcher
+/// implementation:
+///
+///   1. **Iterates ALL `status='installed'` rows**, not only rows with
+///      a non-NULL `container_name`. Modules whose install-time
+///      auto-start failed (pre-v0.2.39 NEW-3.B's default synthesis) left
+///      rows with `container_name=NULL`. The pre-v0.2.40 resume loop
+///      iterated only non-NULL rows → those modules never got a second
+///      chance to start. Now `list_module_installs_needing_start`
+///      returns all `installed` rows; NULL-container rows route through
+///      `start_container_after_install` (the NEW-3.B synthesis path).
+///
+///   2. **Generalises beyond RL Reranker.** Prior code had a hardcoded
+///      `if module_id != RL_RERANKER_MODULE_ID { continue; }` gate that
+///      blocked any other container-distributed module. Replaced with
+///      the same manifest-driven gate `start_container_for_module`
+///      already uses (`install.method = ContainerPull` AND
+///      `runtime.type ∈ {container, service}`). This is the canonical
+///      "long-running daemon under hub supervision" signal — `cli` /
+///      `mcp_stdio` / `mcp_http` runtime types are deliberately
+///      excluded (on-demand invocations, not persistent containers).
+///
+/// Per-row branches:
+///
+///   * `container_name = Some(name)` AND running → no-op.
+///   * `container_name = Some(name)` AND not running → existing path:
+///     `start_container_for_module` (the manifest's defaulting helpers
+///     re-resolve the same name for `(module_id, project_slug)`).
+///   * `container_name = None` → R1 path:
+///     `start_container_after_install` (synthesises defaults via
+///     NEW-3.B helpers AND persists the resolved name back to the DB
+///     row so subsequent resumes pick the existing-path branch).
+///
+/// Soft-fail discipline: any per-row error logs and the loop continues
+/// to the next row — one broken module must not block the rest of the
+/// resume sweep. The NULL-container branch additionally surfaces the
+/// failure to `module_installs.last_error` via NEW-3.C's
+/// `set_module_last_error` so the GUI tile renders a clear failure
+/// state; status stays `'installed'` (the install succeeded; only the
+/// post-boot container start failed). The named-container existing
+/// branch logs only — matches W40-D's discipline (the hub is the
+/// single-writer for that row's container_name + last_error;
+/// double-writing from both surfaces would race).
 pub async fn resume_containers_on_startup(db: &Db) {
-    let containers = match db.list_module_installs_with_containers() {
+    // Production path delegates manifest resolution to the on-disk
+    // catalog via `find_manifest_for_resume`. Tests use the
+    // `_with_resolver` variant directly with an in-memory map.
+    resume_containers_on_startup_with_resolver(db, |id| {
+        crate::commands::modules::find_manifest_for_resume(db, id)
+    })
+    .await;
+}
+
+/// Test-friendly variant: same logic as `resume_containers_on_startup`
+/// but the manifest resolver is injected. Pure-Rust callers can
+/// provide a closure over an in-memory map; production goes through
+/// `find_manifest_for_resume` (= the on-disk catalog). Soft-fail
+/// discipline is identical between both surfaces.
+///
+/// Kept `pub(crate)` rather than `pub` because no caller outside the
+/// crate has a reason to pass a custom resolver — the only legitimate
+/// in-crate caller is the test module below; the production wrapper
+/// above is the documented entry point.
+pub(crate) async fn resume_containers_on_startup_with_resolver<F>(db: &Db, resolve_manifest: F)
+where
+    F: Fn(&str) -> Option<ModuleManifest>,
+{
+    let rows = match db.list_module_installs_needing_start() {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[module_service] resume_containers_on_startup list failed: {}", e);
+            eprintln!(
+                "[module_service] resume_containers_on_startup list failed: {}",
+                e
+            );
             return;
         }
     };
-    for (project_id, module_id, container_name) in containers {
-        let running = is_container_running(&container_name).await.unwrap_or(false);
-        if running {
+    for (project_id, module_id, container_name_opt) in rows {
+        // Load the manifest first — both the runtime-type gate AND the
+        // restart paths need it. Failure here is "module installed
+        // from a catalog that's no longer on disk" — skip noisily.
+        let manifest = match resolve_manifest(&module_id) {
+            Some(m) => m,
+            None => {
+                eprintln!(
+                    "[module_service] resume: manifest for {} not in catalog, skipping",
+                    module_id
+                );
+                continue;
+            }
+        };
+
+        // Runtime-type gate: mirrors the install-time auto-start gate
+        // in `modules.rs` (NEW-3 widening, v0.2.38) AND W40-D's
+        // hub-side gate. Only container_pull-installed modules
+        // declaring a long-running (`container` | `service`) runtime
+        // are auto-resumed. Older / non-container modules (git_clone,
+        // local) and on-demand runtime types are excluded.
+        let is_container_distributed = manifest.install.method == InstallMethod::ContainerPull
+            && matches!(manifest.runtime.r#type.as_str(), "container" | "service");
+        if !is_container_distributed {
             continue;
         }
-        // Not running — try to restart via the standard path.
-        if module_id != RL_RERANKER_MODULE_ID {
-            // We only know how to restart the RL reranker for now; any
-            // future container module would need its own resolver here.
-            continue;
+
+        // Existing path: known container_name → probe + restart if not
+        // running. Skip the work entirely when the container is
+        // already up.
+        if let Some(ref container_name) = container_name_opt {
+            let running = is_container_running(container_name).await.unwrap_or(false);
+            if running {
+                continue;
+            }
         }
+
+        // Resolve the project row once for both branches below.
         let project = match db.get_project(&project_id) {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -1596,29 +1695,60 @@ pub async fn resume_containers_on_startup(db: &Db) {
                 continue;
             }
         };
-        let manifest = match crate::commands::modules::find_manifest_for_resume(db, &module_id) {
-            Some(m) => m,
+
+        match container_name_opt {
+            Some(_container_name) => {
+                // Existing path: name was previously resolved + persisted;
+                // restart with the manifest. `start_container_for_module`
+                // re-resolves from the manifest (via NEW-3.B defaulting
+                // helpers if needed), producing the same name for the
+                // same `(module_id, project_slug)` pair.
+                let rl_port = match ensure_project_rl_port(db, &project) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "[module_service] resume: ensure_rl_port({}): {}",
+                            project_id, e
+                        );
+                        continue;
+                    }
+                };
+                let ctx = PlaceholderCtx::new(&module_id);
+                if let Err(e) =
+                    start_container_for_module(&manifest, &ctx, &project, rl_port).await
+                {
+                    eprintln!(
+                        "[module_service] resume: start_container_for_module({}, {}): {}",
+                        project_id, module_id, e
+                    );
+                }
+            }
             None => {
-                eprintln!(
-                    "[module_service] resume: manifest for {} not in catalog",
-                    module_id
-                );
-                continue;
+                // v0.2.40 R1 path (mirror of W40-D): container_name=NULL
+                // means install-time auto-start either failed or never ran
+                // (e.g. install predates v0.2.39 NEW-3.B's defaulting
+                // helpers). Route through `start_container_after_install`
+                // — same path install-time auto-start uses post-v0.2.39.
+                // This both starts the container AND persists the
+                // resolved container_name back to the DB row so the
+                // existing-path branch picks it up on subsequent
+                // resumes.
+                if let Err(e) =
+                    start_container_after_install(&manifest, &project, db).await
+                {
+                    eprintln!(
+                        "[module_service] resume: start_container_after_install({}, {}): {}",
+                        project_id, module_id, e
+                    );
+                    // NEW-3.C surface: write to last_error so the GUI
+                    // tile can render a clear failure state. Status
+                    // intentionally stays 'installed' (the install
+                    // succeeded; only the post-boot container start
+                    // failed). Soft-fail: ignore the DB write error here
+                    // too — it's already a degraded path.
+                    let _ = db.set_module_last_error(&project_id, &module_id, Some(&e));
+                }
             }
-        };
-        let rl_port = match ensure_project_rl_port(db, &project) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[module_service] resume: ensure_rl_port({}): {}", project_id, e);
-                continue;
-            }
-        };
-        let ctx = PlaceholderCtx::new(&module_id);
-        if let Err(e) = start_container_for_module(&manifest, &ctx, &project, rl_port).await {
-            eprintln!(
-                "[module_service] resume: start_container_for_module({}): {}",
-                project_id, e
-            );
         }
     }
 }
@@ -2463,5 +2593,313 @@ mod tests {
         assert_eq!(resolved, "qwen3");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── R1 (v0.2.40): resume_containers_on_startup gate behaviour ─────
+    //
+    // Mirrors W40-D's hub-side 4-branch test set. Real podman is NOT
+    // available in the test environment, so tests assert on observable
+    // side-effects: (a) which module_ids the resolver was asked to
+    // resolve (the resolver runs BEFORE the runtime-type gate, so it's
+    // an accurate witness of "what rows the sweep visited"), and (b)
+    // for NULL-container rows that pass the gate, the soft-fail path
+    // from a real-podman invocation writes to
+    // `module_installs.last_error` (the NEW-3.C surfacing path).
+    //
+    // Test scaffolding uses the `_with_resolver` variant so the
+    // manifest is injected from an in-memory map (no on-disk catalog
+    // needed).
+
+    use crate::db::models::ModuleStatus;
+    use std::sync::{Arc, Mutex};
+
+    /// Build an in-memory Db pre-populated with a single base-host project.
+    fn open_db_with_resume_project() -> (Db, String) {
+        use rusqlite::params;
+        let db = Db::open_in_memory().expect("DB");
+        let pid = "proj-rs".to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES (?1, 'rs', '/tmp/rs', 'base', 'rs-slug', ?2, ?2)",
+                    params!["proj-rs", now],
+                )
+                .expect("insert resume project");
+        }
+        (db, pid)
+    }
+
+    /// Manifest with the supplied runtime type + install method.
+    /// Reuses `make_manifest`'s container block so the synthesis
+    /// helpers (resolve_container_name_template / resolve_image_ref)
+    /// have everything they need.
+    fn make_manifest_for_gate(runtime_type: &str, method: InstallMethod) -> ModuleManifest {
+        let mut m = make_manifest(true, true);
+        m.runtime.r#type = runtime_type.into();
+        m.install.method = method;
+        m
+    }
+
+    /// Track which module_ids the resolver was asked to resolve.
+    /// Returns the resolver + the visited-id log so tests can assert
+    /// on it.
+    fn tracking_resolver(
+        manifests: HashMap<String, ModuleManifest>,
+    ) -> (
+        impl Fn(&str) -> Option<ModuleManifest>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let visited = Arc::new(Mutex::new(Vec::<String>::new()));
+        let visited_clone = Arc::clone(&visited);
+        let resolver = move |id: &str| {
+            visited_clone.lock().unwrap().push(id.to_string());
+            manifests.get(id).cloned()
+        };
+        (resolver, visited)
+    }
+
+    /// T1: a `status='installed'` row with `container_name=NULL` AND a
+    /// manifest declaring `runtime.type='service'` + `install.method=
+    /// ContainerPull` PASSES the gate — resolver is invoked AND the
+    /// resume routes through `start_container_after_install`, which
+    /// fails (no real podman in tests) and surfaces the error to
+    /// `module_installs.last_error` via NEW-3.C's set_module_last_error.
+    /// This is the failure mode this branch fixes — pre-v0.2.40 the row
+    /// was skipped entirely because the RL_RERANKER_MODULE_ID-only gate
+    /// blocked any non-RL module from reaching the restart path, AND
+    /// `list_module_installs_with_containers` excluded NULL-container
+    /// rows in the first place.
+    #[tokio::test]
+    async fn resume_null_container_service_routes_through_start_after_install() {
+        let (db, pid) = open_db_with_resume_project();
+
+        // Insert the row — install completed but auto-start never
+        // wrote a container_name (the v0.2.40 bug case).
+        db.insert_module_install(
+            "install-id-t1",
+            &pid,
+            "some-future-service",
+            "0.2.0",
+            "/tmp/some-future-service",
+        )
+        .expect("insert");
+        db.set_module_status(&pid, "some-future-service", ModuleStatus::Installed, None)
+            .expect("set installed");
+
+        let row_before = db
+            .get_module_install(&pid, "some-future-service")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row_before.container_name.is_none(),
+            "precondition: container_name must be NULL"
+        );
+        assert!(
+            row_before.last_error.is_none(),
+            "precondition: last_error must be NULL"
+        );
+
+        // service-runtime + ContainerPull → passes the gate.
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "some-future-service".to_string(),
+            make_manifest_for_gate("service", InstallMethod::ContainerPull),
+        );
+        let (resolver, visited) = tracking_resolver(manifests);
+
+        resume_containers_on_startup_with_resolver(&db, resolver).await;
+
+        // Resolver was invoked for our row.
+        let visited_ids = visited.lock().unwrap().clone();
+        assert!(
+            visited_ids.contains(&"some-future-service".to_string()),
+            "resume must call resolver for the NULL-container row, visited={:?}",
+            visited_ids
+        );
+
+        // After the gate passed, start_container_after_install was
+        // called and failed (no real podman). NEW-3.C path wrote
+        // last_error.
+        let row_after = db
+            .get_module_install(&pid, "some-future-service")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row_after.last_error.is_some(),
+            "last_error must be set after start_container_after_install fails (NEW-3.C surface), row={:?}",
+            row_after
+        );
+        // Status must remain Installed — the install itself succeeded;
+        // only the post-boot start failed.
+        assert_eq!(
+            row_after.status,
+            ModuleStatus::Installed,
+            "status must remain Installed after resume-start failure"
+        );
+    }
+
+    /// T2/T3 (existing path): a `status='installed'` row with a
+    /// pre-persisted `container_name` + a service-type ContainerPull
+    /// manifest passes the gate and reaches the "named container"
+    /// branch. The probe (`is_container_running`) returns false because
+    /// no real podman runtime is present in tests, which routes to
+    /// `start_container_for_module` (also no-op-fails without podman).
+    /// Critically: `last_error` is NOT written in this branch — the
+    /// existing path's failure handling is `eprintln!` only, NOT
+    /// `set_module_last_error`. This pins the divergence between the
+    /// two branches so the test catches an accidental cross-wire.
+    ///
+    /// Conflates T2 (already-running, no-op) and T3 (not-running,
+    /// restart) because both converge on "no last_error write" without
+    /// real podman; the discriminator between them requires a real
+    /// container runtime which is out of scope for unit tests.
+    #[tokio::test]
+    async fn resume_named_container_row_uses_existing_path_no_lasterror() {
+        let (db, pid) = open_db_with_resume_project();
+
+        db.insert_module_install(
+            "install-id-t23",
+            &pid,
+            "some-future-service",
+            "0.2.0",
+            "/tmp/some-future-service",
+        )
+        .expect("insert");
+        db.set_module_status(&pid, "some-future-service", ModuleStatus::Installed, None)
+            .expect("set installed");
+        // Pre-populate container_name (the existing path's
+        // precondition).
+        db.set_module_container_name(&pid, "some-future-service", "some-future-service-rs-slug")
+            .expect("set container_name");
+
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "some-future-service".to_string(),
+            make_manifest_for_gate("service", InstallMethod::ContainerPull),
+        );
+        let (resolver, visited) = tracking_resolver(manifests);
+
+        resume_containers_on_startup_with_resolver(&db, resolver).await;
+
+        // Resolver was called.
+        assert!(visited
+            .lock()
+            .unwrap()
+            .contains(&"some-future-service".to_string()));
+
+        // Existing-path's failure handler is eprintln-only — must NOT
+        // call set_module_last_error. This pins that the R1 refactor
+        // didn't cross-wire the named-container branch into the
+        // NULL-container branch's NEW-3.C surfacing.
+        let row_after = db
+            .get_module_install(&pid, "some-future-service")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row_after.last_error.is_none(),
+            "named-container existing-path failure must NOT write last_error (only the NULL-container R1 branch does), row={:?}",
+            row_after
+        );
+        // container_name must remain set (we didn't overwrite it).
+        assert_eq!(
+            row_after.container_name.as_deref(),
+            Some("some-future-service-rs-slug"),
+            "container_name must remain set"
+        );
+    }
+
+    /// T4 (gate): a `status='installed'` row whose manifest declares a
+    /// non-`container_pull` install method (e.g. GitClone) is SKIPPED
+    /// before any container-start attempt. Resolver is invoked (called
+    /// before the gate check), but no `last_error` is written and
+    /// `start_container_*` is not reached.
+    #[tokio::test]
+    async fn resume_non_container_pull_row_skipped_by_gate() {
+        let (db, pid) = open_db_with_resume_project();
+
+        db.insert_module_install(
+            "install-id-t4",
+            &pid,
+            "git-installed-module",
+            "0.1.0",
+            "/tmp/git-installed-module",
+        )
+        .expect("insert");
+        db.set_module_status(&pid, "git-installed-module", ModuleStatus::Installed, None)
+            .expect("set installed");
+
+        // service runtime but GitClone install — the gate must reject
+        // this row (resume-on-boot is for container_pull modules only).
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "git-installed-module".to_string(),
+            make_manifest_for_gate("service", InstallMethod::GitClone),
+        );
+        let (resolver, visited) = tracking_resolver(manifests);
+
+        resume_containers_on_startup_with_resolver(&db, resolver).await;
+
+        // Resolver WAS invoked (it runs before the gate).
+        let visited_ids = visited.lock().unwrap().clone();
+        assert!(
+            visited_ids.contains(&"git-installed-module".to_string()),
+            "resolver must be invoked even for rows the gate rejects, visited={:?}",
+            visited_ids
+        );
+
+        // No last_error — gate rejected, no podman invocation, no
+        // failure path reached.
+        let row_after = db
+            .get_module_install(&pid, "git-installed-module")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row_after.last_error.is_none(),
+            "non-container_pull row must NOT trigger start path (no last_error), row={:?}",
+            row_after
+        );
+    }
+
+    /// T4-variant (gate): runtime.type='cli' rejected even when
+    /// install.method=ContainerPull. The gate accepts only `container`
+    /// | `service`. Protects against a future schema where a
+    /// container-pull-distributed CLI tool's manifest leaks into the
+    /// resume sweep.
+    #[tokio::test]
+    async fn resume_cli_runtime_skipped_by_gate() {
+        let (db, pid) = open_db_with_resume_project();
+        db.insert_module_install(
+            "install-id-cli",
+            &pid,
+            "cli-only-module",
+            "0.1.0",
+            "/tmp/cli-only-module",
+        )
+        .expect("insert");
+        db.set_module_status(&pid, "cli-only-module", ModuleStatus::Installed, None)
+            .expect("set installed");
+
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "cli-only-module".to_string(),
+            make_manifest_for_gate("cli", InstallMethod::ContainerPull),
+        );
+        let (resolver, _visited) = tracking_resolver(manifests);
+
+        resume_containers_on_startup_with_resolver(&db, resolver).await;
+
+        // Gate rejected → no last_error write.
+        let row_after = db
+            .get_module_install(&pid, "cli-only-module")
+            .unwrap()
+            .unwrap();
+        assert!(
+            row_after.last_error.is_none(),
+            "cli-runtime row must NOT trigger start path, row={:?}",
+            row_after
+        );
     }
 }
