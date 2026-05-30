@@ -1684,6 +1684,20 @@ pub fn run() {
             commands::licensing::get_module_licenses,
             commands::licensing::module_license_refresh,
             commands::licensing::module_license_deactivate,
+            // v0.2.40 L1: multi-key licensing model — per-paid-module
+            // license keys. Each paid module owns its own row keyed by
+            // module_id; the reserved '__orchestrator__' slot covers the
+            // legacy single-key root tier. The legacy
+            // license_activate/license_deactivate path stays in place
+            // for the orchestrator-tier ActivationModal; new per-module
+            // UX flows through the License Manager modal go through
+            // these commands.
+            commands::licensing::list_license_keys,
+            commands::licensing::get_module_license_key_status,
+            commands::licensing::set_module_license_key,
+            commands::licensing::clear_module_license_key,
+            commands::licensing::validate_module_license,
+            commands::licensing::list_module_license_validations,
             // KG dashboard
             commands::kg::kg_list_collections,
             commands::kg::codegraph_list_projects,

@@ -1063,6 +1063,593 @@ pub async fn module_license_deactivate(
 }
 
 // ---------------------------------------------------------------------------
+// v0.2.40 L1: per-paid-module license keys.
+// ---------------------------------------------------------------------------
+//
+// Surface for the multi-key licensing model: each paid module
+// (RL Reranker, MAO, future agent packs) owns its own license key,
+// keyed by `module_id`. The reserved `module_id = "__orchestrator__"`
+// slot identifies the legacy single-key root tier (the v0.2.39 and
+// earlier model).
+//
+// Storage split:
+//   * Raw key VALUE         → OS keychain at (service='vct.global.licensing',
+//                              username='license_key__<module_id>' or
+//                              'VIBECODED_LICENSE_KEY' for the legacy slot).
+//   * Per-module metadata   → SQLite `license_keys` (prefix, keychain
+//                              coordinates, last validation outcome).
+//   * Effective projection  → SQLite `tier_cache.module_licenses` JSON
+//                              (already present, written by the legacy
+//                              `license_refresh` path AND now by
+//                              `validate_module_license`).
+//
+// Backward compatibility:
+//   * The legacy keychain entry at username='VIBECODED_LICENSE_KEY' is
+//     NOT deleted on migration. On first call to `list_license_keys`
+//     after the v0.2.40 upgrade, if no `license_keys` row exists AND
+//     the legacy keychain entry is present, we synthesise a virtual
+//     `__orchestrator__` row pointing at the legacy username (the row
+//     is also INSERTED so subsequent calls don't need the synthesis
+//     branch). This preserves the v0.2.39 single-key UX while making
+//     the per-module dialog functional immediately.
+//   * The existing `license_get_tier`, `license_activate`,
+//     `license_deactivate` commands are kept as-is — they continue to
+//     manage the orchestrator-tier root key for orchestration-tier
+//     UX flows (the legacy ActivationModal). New per-module flows go
+//     through `set_module_license_key` / `validate_module_license` /
+//     `clear_module_license_key`.
+
+use vct_launcher_core::db::license_keys::{
+    keychain_username_for, key_prefix_of, LicenseKeyRow, LicenseKeyValidationRow,
+    LEGACY_KEYCHAIN_USERNAME, ORCHESTRATOR_MODULE_ID,
+};
+
+/// Wire-shape returned by `list_license_keys` / `get_module_license_key_status`.
+/// Mirrors `vct_launcher_core::db::license_keys::LicenseKeyRow` but uses
+/// `redacted_key` (a display-only field) instead of exposing keychain
+/// coordinates to the frontend — the raw key never crosses the IPC
+/// boundary, and the keychain username is launcher-internal plumbing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LicenseKeySummary {
+    /// Module manifest id, or `__orchestrator__` for the root tier key.
+    pub module_id: String,
+    /// Display name for the GUI. Looked up from the module catalog;
+    /// falls back to `module_id` (or a friendly label for the reserved
+    /// orchestrator slot).
+    pub display_name: String,
+    /// Always-safe display: first 12 chars of the key followed by an
+    /// ellipsis. Never the full key. The GUI uses this to confirm
+    /// "yes, the key I just pasted is the one persisted" without ever
+    /// receiving the secret value back.
+    pub redacted_key: String,
+    /// Last successful validation's server-returned tier.
+    pub tier: Option<String>,
+    /// Unix ms of the last validation attempt.
+    pub validated_at: Option<i64>,
+    /// Human-readable error from the last validation attempt.
+    pub last_validation_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+fn display_name_for(db: &Db, module_id: &str) -> String {
+    if module_id == ORCHESTRATOR_MODULE_ID {
+        return "Orchestrator tier (root)".to_string();
+    }
+    lookup_module_display_name(db, module_id).unwrap_or_else(|| module_id.to_string())
+}
+
+fn to_summary(db: &Db, row: LicenseKeyRow) -> LicenseKeySummary {
+    let display_name = display_name_for(db, &row.module_id);
+    let redacted_key = if row.key_prefix.is_empty() {
+        "(not stored)".to_string()
+    } else {
+        format!("{}…", row.key_prefix)
+    };
+    LicenseKeySummary {
+        module_id: row.module_id,
+        display_name,
+        redacted_key,
+        tier: row.tier,
+        validated_at: row.validated_at,
+        last_validation_error: row.last_validation_error,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+/// Synthesise the legacy `__orchestrator__` row when the keychain still
+/// holds the v0.2.39-shape entry but no `license_keys` row exists yet.
+/// Called from `list_license_keys` on every invocation; idempotent (only
+/// inserts when the row is missing AND the legacy keychain entry is
+/// present, so a user who explicitly cleared the orchestrator key
+/// doesn't get it silently reinstated).
+fn ensure_legacy_orchestrator_row_migrated(db: &Db) -> Result<(), String> {
+    if db.get_license_key(ORCHESTRATOR_MODULE_ID)?.is_some() {
+        return Ok(());
+    }
+    // No row yet — check the legacy keychain slot.
+    let legacy_key = match secrets::get(
+        SecretScope::Global,
+        LICENSE_MODULE_ID,
+        LEGACY_KEYCHAIN_USERNAME,
+    )? {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+    // Found the legacy entry: project it into the new table. We DO NOT
+    // copy the value to a new keychain username — the legacy username
+    // is what `keychain_username_for(ORCHESTRATOR_MODULE_ID)` returns,
+    // so future per-module reads will find it where it already lives.
+    let prefix = key_prefix_of(&legacy_key);
+    db.upsert_license_key(ORCHESTRATOR_MODULE_ID, &prefix, LEGACY_KEYCHAIN_USERNAME)?;
+
+    // Mirror the cached tier from `tier_cache` so the GUI shows
+    // "Active: pro (validated <date>)" immediately instead of "(never
+    // validated)". `license_refresh` would discover the same state on
+    // its next run, but a freshly-upgraded user opening the License
+    // Manager modal should see a sensible row right away.
+    let tier_row = db.get_tier_cache()?;
+    if tier_row.orchestrator_tier != "free" {
+        db.record_license_key_validation(
+            ORCHESTRATOR_MODULE_ID,
+            Some(&tier_row.orchestrator_tier),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// v0.2.40 L1: list every per-paid-module license key plus the root
+/// orchestrator slot. Synthesises the legacy `__orchestrator__` row on
+/// the first call after upgrade (idempotent — only when the keychain
+/// has the legacy entry and no row exists).
+#[command]
+pub async fn list_license_keys(db: State<'_, Db>) -> Result<Vec<LicenseKeySummary>, String> {
+    let db_ref: &Db = &db;
+    // Best-effort: if synthesis errors (transient keyring failure), we
+    // still want to render whatever rows already exist. Log + continue.
+    if let Err(e) = ensure_legacy_orchestrator_row_migrated(db_ref) {
+        eprintln!(
+            "[licensing] legacy orchestrator-row migration soft-failed: {} \
+             — list_license_keys returning current rows only",
+            e
+        );
+    }
+    let rows = db.list_license_keys()?;
+    Ok(rows.into_iter().map(|r| to_summary(db_ref, r)).collect())
+}
+
+/// v0.2.40 L1: read a single per-module summary. Useful for the GUI's
+/// per-module sub-page; returns `None` when no key has been activated
+/// for that module.
+#[command]
+pub async fn get_module_license_key_status(
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<Option<LicenseKeySummary>, String> {
+    let db_ref: &Db = &db;
+    if module_id == ORCHESTRATOR_MODULE_ID {
+        // Pick up the legacy slot if we haven't migrated yet.
+        let _ = ensure_legacy_orchestrator_row_migrated(db_ref);
+    }
+    let row = db.get_license_key(&module_id)?;
+    Ok(row.map(|r| to_summary(db_ref, r)))
+}
+
+/// v0.2.40 L1: activate or rotate the license key for one paid module.
+///
+/// Persists to the OS keychain at (service='vct.global.licensing',
+/// username=keychain_username_for(module_id)) and writes the metadata
+/// row in `license_keys`. Does NOT immediately validate the key against
+/// the server — call `validate_module_license` next (the GUI runs them
+/// back-to-back via the License Manager modal's "Save & Validate"
+/// button). Keeping them separate also lets headless / scripted
+/// activation persist the key without paying the network round-trip
+/// when the caller already knows offline-grace will cover the next
+/// validation pass.
+///
+/// The raw key NEVER leaves this function: the value goes into the OS
+/// keychain via the existing `secrets::set` helper (which handles the
+/// rate-limit + retry-with-backoff plumbing in
+/// `vct-launcher-core/secrets.rs`); only the redacted prefix lives in
+/// SQLite.
+#[command]
+pub async fn set_module_license_key(
+    module_id: String,
+    license_key: String,
+    db: State<'_, Db>,
+) -> Result<LicenseKeySummary, String> {
+    if module_id.trim().is_empty() {
+        return Err("module_id cannot be empty".into());
+    }
+    let trimmed_key = license_key.trim().to_string();
+    if trimmed_key.is_empty() {
+        return Err("license key cannot be empty".into());
+    }
+    let username = keychain_username_for(&module_id);
+    // 1. Write the raw value to the keychain FIRST. If the SQL row
+    //    upsert fails afterwards, the keychain is the source of truth —
+    //    `list_license_keys` will re-sync the row on next call via the
+    //    synthesis path.
+    secrets::set(
+        SecretScope::Global,
+        LICENSE_MODULE_ID,
+        &username,
+        &trimmed_key,
+    )?;
+    // 2. Upsert metadata row. Rotation clears stale validation state
+    //    (handled inside `upsert_license_key`).
+    let prefix = key_prefix_of(&trimmed_key);
+    db.upsert_license_key(&module_id, &prefix, &username)?;
+    // 3. Audit (no raw key value crosses the audit boundary).
+    db.audit(
+        "set_module_license_key",
+        None,
+        Some(&module_id),
+        &serde_json::json!({
+            "module_id": &module_id,
+            "key_prefix": &prefix,
+            "keychain_username": &username,
+        }),
+    )?;
+
+    // Return the freshly-stored row's summary so the GUI can render the
+    // updated state without a follow-up `get_module_license_key_status`
+    // round-trip.
+    let db_ref: &Db = &db;
+    let row = db
+        .get_license_key(&module_id)?
+        .ok_or_else(|| format!("license_keys row missing after upsert: {}", module_id))?;
+    Ok(to_summary(db_ref, row))
+}
+
+/// v0.2.40 L1: clear the per-module license key. Removes the keychain
+/// entry, drops the metadata row + validation history, and clears the
+/// matching `tier_cache.module_licenses` entry (so feature gates
+/// re-check). The orchestrator-root slot can be cleared too — that
+/// degrades the user back to free tier the same way the legacy
+/// `license_deactivate` did. Idempotent: calling on an absent module
+/// is a no-op.
+#[command]
+pub async fn clear_module_license_key(
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    if module_id.trim().is_empty() {
+        return Err("module_id cannot be empty".into());
+    }
+    // Resolve the keychain username from the row (if present) so we
+    // delete the exact entry — including the legacy
+    // 'VIBECODED_LICENSE_KEY' for migrated orchestrator rows.
+    let existing = db.get_license_key(&module_id)?;
+    let username = existing
+        .as_ref()
+        .map(|r| r.keychain_username.clone())
+        .unwrap_or_else(|| keychain_username_for(&module_id));
+    // Best-effort keychain delete; missing entry is fine.
+    let _ = secrets::delete(SecretScope::Global, LICENSE_MODULE_ID, &username);
+    // Drop the SQL row + audit history.
+    db.delete_license_key(&module_id)?;
+    // Clear the per-module entry in `tier_cache.module_licenses` so
+    // `is_module_licensed_v2`'s overlay check no longer reports this
+    // module as licensed.
+    let row = db.get_tier_cache()?;
+    let mut map = row
+        .module_licenses
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let removed = map.remove(&module_id).is_some();
+    db.set_tier_cache(
+        &row.orchestrator_tier,
+        &serde_json::Value::Object(map),
+        row.last_error.as_deref(),
+    )?;
+    // If we cleared the orchestrator slot, downgrade the cache to
+    // 'free' the same way `license_deactivate` does. We do NOT touch
+    // `~/.vibecoded/license_cache.json` here — `license_refresh` is
+    // the canonical owner of that file. The next refresh will rewrite
+    // it correctly based on the now-cleared keychain.
+    if module_id == ORCHESTRATOR_MODULE_ID {
+        db.set_tier_cache("free", &serde_json::json!({}), None)?;
+    }
+    db.audit(
+        "clear_module_license_key",
+        None,
+        Some(&module_id),
+        &serde_json::json!({
+            "module_id": &module_id,
+            "tier_cache_entry_removed": removed,
+        }),
+    )?;
+    Ok(())
+}
+
+/// Wire shape for `validate_module_license`. Reports the outcome of
+/// the per-module validation round-trip so the GUI can render a
+/// precise status badge (Active / Expired / Invalid / Network failure
+/// / etc.). Soft-fail throughout — the legacy single-key
+/// `license_refresh` already establishes the cached-tier grace-period
+/// pattern; we mirror it here for per-module keys.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModuleLicenseValidationResult {
+    pub module_id: String,
+    /// The server's verdict ("pro" / "mao" / "enterprise" / "free" /
+    /// "free-on-error"). `free-on-error` is the client-only synthetic
+    /// value emitted when network failure prevented a definitive
+    /// answer AND the cached tier_cache entry is also absent.
+    pub tier: String,
+    /// True iff the server returned `valid=true`.
+    pub valid: bool,
+    /// Server-returned expiry (ISO-8601), if any.
+    pub expires_at: Option<String>,
+    /// HTTP status code from the server (0 = network failure / no
+    /// response received).
+    pub http_status: i64,
+    /// Human-readable error message; None on success.
+    pub error: Option<String>,
+    /// True iff the response was satisfied from `tier_cache` because
+    /// the server was unreachable. The GUI uses this to render a
+    /// "(cached)" badge.
+    pub stale: bool,
+}
+
+/// v0.2.40 L1: validate ONE per-module license key against
+/// `/validate-tier`. Reads the raw key from the keychain (via the
+/// metadata row's `keychain_username`), POSTs to the edge function,
+/// updates `tier_cache.module_licenses[module_id]` + the `license_keys`
+/// row's `tier` / `validated_at` / `last_validation_error` columns.
+/// Appends an entry to `license_key_validations` for the per-module
+/// audit timeline.
+///
+/// Soft-fail: a network failure or 5xx leaves the cached tier in
+/// place and surfaces `stale=true` so the GUI shows a warning rather
+/// than dropping the user to free tier.
+#[command]
+pub async fn validate_module_license(
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<ModuleLicenseValidationResult, String> {
+    if module_id.trim().is_empty() {
+        return Err("module_id cannot be empty".into());
+    }
+    let row = db
+        .get_license_key(&module_id)?
+        .ok_or_else(|| format!("no license key set for module: {}", module_id))?;
+    // Refuse to validate the orchestrator root slot through this code
+    // path — the legacy `license_refresh` already owns it (it knows
+    // about machine_id binding, license_cache.json, the rebind-admin
+    // flow, etc.). Telling users to use the Orchestrator tab for the
+    // root key keeps the contract clear.
+    if module_id == ORCHESTRATOR_MODULE_ID {
+        // Convenience: run a full refresh so the GUI's per-module
+        // refresh button still works for the root row.
+        let _view = license_refresh(db.clone()).await?;
+        let refreshed = db.get_license_key(ORCHESTRATOR_MODULE_ID)?;
+        let tier_cache = db.get_tier_cache()?;
+        return Ok(ModuleLicenseValidationResult {
+            module_id,
+            tier: tier_cache.orchestrator_tier.clone(),
+            valid: tier_cache.orchestrator_tier != "free",
+            expires_at: None,
+            http_status: 200,
+            error: refreshed.as_ref().and_then(|r| r.last_validation_error.clone()),
+            stale: tier_cache.last_error.is_some(),
+        });
+    }
+
+    // Per-module key path: read the raw value from the keychain.
+    let key_opt = secrets::get(SecretScope::Global, LICENSE_MODULE_ID, &row.keychain_username)?;
+    let key = match key_opt {
+        Some(k) => k,
+        None => {
+            let err = "keychain entry missing — re-add the key".to_string();
+            db.record_license_key_validation(&module_id, None, Some(&err))?;
+            db.append_license_key_validation(&module_id, None, 0, Some(&err))?;
+            db.trim_license_key_validations(&module_id, 50)?;
+            return Ok(ModuleLicenseValidationResult {
+                module_id,
+                tier: "free-on-error".to_string(),
+                valid: false,
+                expires_at: None,
+                http_status: 0,
+                error: Some(err),
+                stale: false,
+            });
+        }
+    };
+
+    let hash = machine_id_hash();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    let resp = client
+        .post(&validate_tier_url())
+        .json(&serde_json::json!({
+            "license_key": key,
+            "machine_id_hash": hash,
+            "module_id": &module_id,
+        }))
+        .send()
+        .await;
+
+    // Audit FIRST so the round-trip outcome is durable even if the
+    // SQL update fails afterwards.
+    db.audit(
+        "validate_module_license",
+        None,
+        Some(&module_id),
+        &serde_json::json!({ "module_id": &module_id }),
+    )?;
+
+    match resp {
+        Err(e) => {
+            // Network failure: keep cached tier entry, mark as stale.
+            let err_str = format!("network: {}", e);
+            db.record_license_key_validation(&module_id, row.tier.as_deref(), Some(&err_str))?;
+            db.append_license_key_validation(&module_id, row.tier.as_deref(), 0, Some(&err_str))?;
+            db.trim_license_key_validations(&module_id, 50)?;
+            // Tier_cache entry stays untouched (cached overlay rides
+            // through the network blip).
+            let cached_tier = row
+                .tier
+                .clone()
+                .unwrap_or_else(|| "free-on-error".to_string());
+            Ok(ModuleLicenseValidationResult {
+                module_id,
+                tier: cached_tier,
+                valid: row.tier.is_some(),
+                expires_at: None,
+                http_status: 0,
+                error: Some(err_str),
+                stale: true,
+            })
+        }
+        Ok(r) => {
+            let status = r.status();
+            let http_status = status.as_u16() as i64;
+            let body: serde_json::Value = r.json().await.unwrap_or(serde_json::json!({}));
+            if status.is_success() {
+                let tier = body
+                    .get("tier")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("free")
+                    .to_string();
+                let valid = body.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
+                let expires_at = body
+                    .get("expires_at")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let err = if !valid {
+                    body.get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            body.get("message").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        })
+                } else {
+                    None
+                };
+                // Persist per-module row state.
+                db.record_license_key_validation(
+                    &module_id,
+                    if valid { Some(&tier) } else { None },
+                    err.as_deref(),
+                )?;
+                db.append_license_key_validation(
+                    &module_id,
+                    if valid { Some(&tier) } else { None },
+                    http_status,
+                    err.as_deref(),
+                )?;
+                db.trim_license_key_validations(&module_id, 50)?;
+                // Update the tier_cache overlay so `is_module_licensed_v2`
+                // picks up (or drops) this module's entry.
+                let mut tier_row = db.get_tier_cache()?;
+                let mut map = tier_row
+                    .module_licenses
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                if valid {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert(
+                        "tier".to_string(),
+                        serde_json::Value::String(tier.clone()),
+                    );
+                    if let Some(ref ea) = expires_at {
+                        entry.insert(
+                            "expires_at".to_string(),
+                            serde_json::Value::String(ea.clone()),
+                        );
+                    }
+                    entry.insert(
+                        "source".to_string(),
+                        serde_json::Value::String("per-module".to_string()),
+                    );
+                    entry.insert(
+                        "activated_at".to_string(),
+                        serde_json::Value::Number(
+                            chrono::Utc::now().timestamp_millis().into(),
+                        ),
+                    );
+                    map.insert(module_id.clone(), serde_json::Value::Object(entry));
+                } else {
+                    map.remove(&module_id);
+                }
+                tier_row.module_licenses = serde_json::Value::Object(map);
+                db.set_tier_cache(
+                    &tier_row.orchestrator_tier,
+                    &tier_row.module_licenses,
+                    tier_row.last_error.as_deref(),
+                )?;
+
+                Ok(ModuleLicenseValidationResult {
+                    module_id,
+                    tier,
+                    valid,
+                    expires_at,
+                    http_status,
+                    error: err,
+                    stale: false,
+                })
+            } else {
+                let msg = body
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("validation failed")
+                    .to_string();
+                let formatted = format!("status {}: {}", status, msg);
+                db.record_license_key_validation(&module_id, None, Some(&formatted))?;
+                db.append_license_key_validation(&module_id, None, http_status, Some(&formatted))?;
+                db.trim_license_key_validations(&module_id, 50)?;
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    // Definitive invalid: drop the per-module overlay
+                    // entry so feature gates re-check.
+                    let mut tier_row = db.get_tier_cache()?;
+                    let mut map = tier_row
+                        .module_licenses
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default();
+                    map.remove(&module_id);
+                    tier_row.module_licenses = serde_json::Value::Object(map);
+                    db.set_tier_cache(
+                        &tier_row.orchestrator_tier,
+                        &tier_row.module_licenses,
+                        tier_row.last_error.as_deref(),
+                    )?;
+                }
+                Ok(ModuleLicenseValidationResult {
+                    module_id,
+                    tier: "free-on-error".to_string(),
+                    valid: false,
+                    expires_at: None,
+                    http_status,
+                    error: Some(formatted),
+                    stale: status.as_u16() >= 500, // 5xx → cached state still rides through
+                })
+            }
+        }
+    }
+}
+
+/// v0.2.40 L1: list the most recent per-module validation outcomes
+/// for the GUI's timeline view. Capped at `limit` rows; defaults to
+/// the 10 most-recent if not specified.
+#[command]
+pub async fn list_module_license_validations(
+    module_id: String,
+    limit: Option<i64>,
+    db: State<'_, Db>,
+) -> Result<Vec<LicenseKeyValidationRow>, String> {
+    let limit = limit.unwrap_or(10).clamp(1, 100);
+    db.recent_license_key_validations(&module_id, limit)
+}
+
+// ---------------------------------------------------------------------------
 // Bug 33: admin tier passthrough tests.
 // ---------------------------------------------------------------------------
 
@@ -1801,5 +2388,162 @@ mod tests {
         let after_map = after.module_licenses.as_object().unwrap();
         assert!(!after_map.contains_key("vct-rl-reranker"));
         assert!(after_map.contains_key("vct-other"));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.40 L1: multi-key licensing — per-paid-module key storage.
+    //
+    // The Tauri commands themselves can't be invoked from unit tests
+    // without a full AppHandle, but the underlying DB ops + the
+    // `to_summary` projection + the `ensure_legacy_orchestrator_row_migrated`
+    // SQL behaviour are all testable directly. Tests that depend on
+    // the OS keychain are gated behind `#[ignore]` (we don't want a
+    // hung gnome-keyring on a CI runner to fail the suite).
+    // -----------------------------------------------------------------
+
+    /// L1 contract T1: per-module rows are independent. Setting tier
+    /// for module A must not touch module B's row.
+    #[test]
+    fn license_keys_per_module_rows_are_independent() {
+        let db = Db::open_in_memory().expect("in-memory");
+        db.upsert_license_key("vct-rl-reranker", "AAA", "license_key__vct-rl-reranker")
+            .unwrap();
+        db.upsert_license_key("vct-mao", "BBB", "license_key__vct-mao").unwrap();
+        // Validate only module A — B's row stays untouched.
+        db.record_license_key_validation("vct-rl-reranker", Some("pro"), None).unwrap();
+        let a = db.get_license_key("vct-rl-reranker").unwrap().unwrap();
+        let b = db.get_license_key("vct-mao").unwrap().unwrap();
+        assert_eq!(a.tier.as_deref(), Some("pro"));
+        assert!(b.tier.is_none(), "validating A must not touch B's tier");
+    }
+
+    /// L1 contract T2: tier_cache.module_licenses entries are written
+    /// per-module by `validate_module_license`'s server-side branch.
+    /// We exercise the persistence the command performs after a
+    /// successful server response without actually hitting the HTTP
+    /// layer — pins the projection logic.
+    #[test]
+    fn validate_module_license_writes_per_module_overlay_entry() {
+        let db = Db::open_in_memory().expect("in-memory");
+        db.set_tier_cache("free", &serde_json::json!({}), None).unwrap();
+
+        // Simulate the success branch's write to `tier_cache.module_licenses`.
+        let module_id = "vct-rl-reranker";
+        let mut row = db.get_tier_cache().unwrap();
+        let mut map = row.module_licenses.as_object().cloned().unwrap_or_default();
+        let mut entry = serde_json::Map::new();
+        entry.insert("tier".into(), serde_json::json!("pro"));
+        entry.insert("source".into(), serde_json::json!("per-module"));
+        entry.insert("activated_at".into(), serde_json::json!(1_700_000_000_000_i64));
+        map.insert(module_id.into(), serde_json::Value::Object(entry));
+        row.module_licenses = serde_json::Value::Object(map);
+        db.set_tier_cache(
+            &row.orchestrator_tier,
+            &row.module_licenses,
+            row.last_error.as_deref(),
+        )
+        .unwrap();
+
+        // is_module_licensed_v2 should now report this module as licensed
+        // via the per-module overlay branch, even though orchestrator_tier
+        // is still 'free'.
+        let after = db.get_tier_cache().unwrap();
+        assert_eq!(after.orchestrator_tier, "free");
+        let overlay = after
+            .module_licenses
+            .as_object()
+            .unwrap()
+            .get(module_id)
+            .expect("per-module entry present");
+        assert_eq!(overlay.get("tier").unwrap(), "pro");
+        assert_eq!(overlay.get("source").unwrap(), "per-module");
+    }
+
+    /// L1 contract T3: clearing module A's overlay leaves module B untouched.
+    /// Mirrors the SQL pathway `clear_module_license_key` walks.
+    #[test]
+    fn clear_module_license_key_overlay_pathway_leaves_siblings() {
+        let db = Db::open_in_memory().expect("in-memory");
+        let seeded = serde_json::json!({
+            "vct-rl-reranker": { "tier": "pro", "source": "per-module" },
+            "vct-mao": { "tier": "mao", "source": "per-module" }
+        });
+        db.set_tier_cache("free", &seeded, None).unwrap();
+
+        // Reproduce the overlay-removal step of clear_module_license_key.
+        let row = db.get_tier_cache().unwrap();
+        let mut map = row.module_licenses.as_object().cloned().unwrap_or_default();
+        let removed = map.remove("vct-rl-reranker").is_some();
+        assert!(removed);
+        db.set_tier_cache(
+            &row.orchestrator_tier,
+            &serde_json::Value::Object(map),
+            row.last_error.as_deref(),
+        )
+        .unwrap();
+
+        let after = db.get_tier_cache().unwrap();
+        let map = after.module_licenses.as_object().unwrap();
+        assert!(!map.contains_key("vct-rl-reranker"));
+        assert!(map.contains_key("vct-mao"), "sibling overlay must survive");
+    }
+
+    /// Display-name helper: the reserved __orchestrator__ slot renders
+    /// as a human-readable label, not the underscored sentinel.
+    #[test]
+    fn display_name_for_orchestrator_slot_is_human_readable() {
+        let db = Db::open_in_memory().expect("in-memory");
+        let name = display_name_for(&db, ORCHESTRATOR_MODULE_ID);
+        assert_eq!(name, "Orchestrator tier (root)");
+        // Per-module without a catalog hit falls back to module_id.
+        let name = display_name_for(&db, "vct-some-future-module");
+        assert_eq!(name, "vct-some-future-module");
+    }
+
+    /// `to_summary` redacts the key and returns the structural shape
+    /// the frontend expects.
+    #[test]
+    fn to_summary_redacts_key_and_renders_orchestrator_slot() {
+        let db = Db::open_in_memory().expect("in-memory");
+        let row = LicenseKeyRow {
+            module_id: ORCHESTRATOR_MODULE_ID.to_string(),
+            key_prefix: "vct_pro_abc".to_string(),
+            keychain_username: LEGACY_KEYCHAIN_USERNAME.to_string(),
+            tier: Some("pro".to_string()),
+            validated_at: Some(1_700_000_000_000),
+            last_validation_error: None,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        };
+        let s = to_summary(&db, row);
+        assert_eq!(s.module_id, ORCHESTRATOR_MODULE_ID);
+        assert_eq!(s.display_name, "Orchestrator tier (root)");
+        assert!(s.redacted_key.starts_with("vct_pro_abc"));
+        // Never the full key — redacted form ends with the ellipsis sentinel.
+        assert!(s.redacted_key.ends_with('…'));
+        assert_eq!(s.tier.as_deref(), Some("pro"));
+    }
+
+    /// The legacy synthesis path is idempotent — calling it twice
+    /// with no keychain entry is a no-op (no row created). With the
+    /// keychain entry present a row is created on the first call;
+    /// the second call short-circuits because the row exists.
+    /// Keychain-touching parts are gated; here we exercise just the
+    /// "no row, no keychain" idempotency branch.
+    #[test]
+    fn ensure_legacy_migration_is_idempotent_when_no_legacy_keychain_entry() {
+        let db = Db::open_in_memory().expect("in-memory");
+        // First call: no row, no keychain entry → no row created.
+        // (We deliberately don't write anything to the keychain; the
+        // helper is best-effort and only synthesises a row when the
+        // legacy entry exists.)
+        let _ = ensure_legacy_orchestrator_row_migrated(&db);
+        assert!(
+            db.get_license_key(ORCHESTRATOR_MODULE_ID).unwrap().is_none(),
+            "no row should exist without a legacy keychain entry"
+        );
+        // Idempotent second call — still no row.
+        let _ = ensure_legacy_orchestrator_row_migrated(&db);
+        assert!(db.get_license_key(ORCHESTRATOR_MODULE_ID).unwrap().is_none());
     }
 }

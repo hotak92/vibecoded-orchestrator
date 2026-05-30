@@ -282,6 +282,65 @@ export interface AdminRebindResult {
   machine_id_hash: string;
 }
 
+/**
+ * v0.2.40 L1: per-paid-module license key summary surface.
+ *
+ * Each paid module (RL Reranker, MAO, etc.) owns a row keyed by
+ * `module_id`. The reserved value `'__orchestrator__'` identifies the
+ * legacy single-key root tier (preserves v0.2.39 single-key UX after
+ * upgrade). The raw key value NEVER crosses the IPC boundary —
+ * `redacted_key` is the display-only "ends in ..." label.
+ *
+ * Mirrors `launcher/src-tauri/src/commands/licensing.rs::LicenseKeySummary`.
+ */
+export interface LicenseKeySummary {
+  module_id: string;
+  display_name: string;
+  redacted_key: string;
+  tier: string | null;
+  validated_at: number | null;
+  last_validation_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/**
+ * v0.2.40 L1: outcome of a per-module validation round-trip.
+ *
+ * The Rust `validate_module_license` command soft-fails on network
+ * errors and surfaces `stale=true` so the GUI can render a warning
+ * badge rather than dropping the user to free tier on a transient
+ * blip. `tier='free-on-error'` is a client-only synthetic value used
+ * when no cached tier exists either.
+ *
+ * Mirrors `launcher/src-tauri/src/commands/licensing.rs::ModuleLicenseValidationResult`.
+ */
+export interface ModuleLicenseValidationResult {
+  module_id: string;
+  tier: string;
+  valid: boolean;
+  expires_at: string | null;
+  http_status: number;
+  error: string | null;
+  stale: boolean;
+}
+
+/**
+ * v0.2.40 L1: append-only validation timeline entry.
+ *
+ * Mirrors `vct_launcher_core::db::license_keys::LicenseKeyValidationRow`.
+ * Used by the License Manager modal to show a per-module "last N
+ * validations" history without round-tripping to the keychain.
+ */
+export interface LicenseKeyValidationRow {
+  id: number;
+  module_id: string;
+  validated_at: number;
+  tier: string | null;
+  http_status: number;
+  error_message: string | null;
+}
+
 export interface ModuleCatalogEntry {
   id: string;
   name: string;
