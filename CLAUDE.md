@@ -318,7 +318,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 - **URL**: `http://127.0.0.1:7700` (default; configurable via `VCT_HUB_PORT`)
 - **Purpose**: Detached background service that resolves per-project configuration (KG collection, codegraph prefix, embedding model, secrets) for hooks, MCPs, and scripts. Started by `install.py`'s post-install step, by the `session-start-ensure-hub.sh` Claude Code hook on every session, and by the launcher GUI. Outlives the launcher GUI (close the GUI; hooks/MCPs/scripts still reach the hub).
 - **Lockfile**: `<vct_root_dir>/hub.pid` — single-instance per user. CLI: `vct-hub --start-if-not-running` / `--stop` / `--status` / `--register-boot` / `--unregister-boot` / `--boot-status` / `--foreground`.
-- **Auth**: bearer token at `<vct_root_dir>/hub.token` (regenerated every startup, mode 0o600). Required on every `/api/v1/*` route except `/health`.
+- **Auth**: bearer token at `<vct_root_dir>/hub.token` (regenerated every startup, mode 0o600). Required on every `/api/v1/*` route except `/api/v1/health` (liveness probe — no auth).
 - **Key endpoints**:
   - `GET /api/v1/projects/{id-or-slug}/config` — resolver for KG collection / codegraph prefix / embedding model / access-matrix lists.
   - `GET /api/v1/projects/{id}/env` — secrets resolver.

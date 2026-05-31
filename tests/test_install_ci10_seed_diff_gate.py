@@ -408,5 +408,105 @@ class ContentHashHelpersTest(unittest.TestCase):
         os.environ.pop("VCT_STATE_DIR", None)
 
 
+# ─── V0243-0: orchestrator-root shared-KG seed skip ──────────────────────────
+
+
+class OrchestratorRootSharedKgSkipTest(unittest.TestCase):
+    """V0243-0: _seed_weaviate_shared_kg_only skips when orchestrator-root
+    install has per-project KG == shared KG (same collection = double sync).
+    """
+
+    def _make_db(self, tmp: str) -> Path:
+        db_path = Path(tmp) / "launcher.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS app_state "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL);"
+        )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_skip_when_shared_kg_equals_per_project_kg(self):
+        """shared_kg == kg_collection on orchestrator-root → skip sync, upsert app_state."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["VCT_STATE_DIR"] = tmp
+            db_path = self._make_db(tmp)
+
+            captured_subprocess: list = []
+
+            def _fake_run(cmd, **kwargs):
+                captured_subprocess.append(list(cmd))
+                class _R:
+                    returncode = 0
+                return _R()
+
+            collection = "VCODev_KnowledgeGraph"
+
+            # Stub _is_orchestrator_root_install → True and subprocess.run.
+            with mock.patch.object(install, "_is_orchestrator_root_install", return_value=True), \
+                 mock.patch.object(install, "_discover_app_state_db_path", return_value=db_path), \
+                 mock.patch("subprocess.run", side_effect=_fake_run):
+                errors = install._seed_weaviate_shared_kg_only(
+                    args=argparse.Namespace(),
+                    venv_py=Path("/fake/python"),
+                    sync_kg=Path(tmp) / "sync_kg.py",
+                    weaviate_url="http://localhost:8081",
+                    current_shared_kg=collection,
+                    current_kg_collection=collection,
+                )
+
+            # No subprocess.run calls (sync was skipped).
+            sync_calls = [c for c in captured_subprocess if "sync_knowledge_graph" in " ".join(c)]
+            self.assertEqual(sync_calls, [], "sync must NOT run when shared==per-project KG")
+
+            # No errors returned.
+            self.assertEqual(errors, [])
+
+            # app_state key written.
+            stored = install._read_app_state_key(
+                install._APP_STATE_KEY_LAST_SHARED_KG_COLLECTION
+            )
+            self.assertEqual(stored, collection, "app_state key must be upserted to collection name")
+
+        os.environ.pop("VCT_STATE_DIR", None)
+
+    def test_no_skip_when_shared_kg_differs_from_per_project_kg(self):
+        """shared_kg != kg_collection → skip logic must NOT fire (sync still runs)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["VCT_STATE_DIR"] = tmp
+            db_path = self._make_db(tmp)
+
+            # Write a minimal sync_kg stub so sync_kg.exists() is True.
+            sync_kg = Path(tmp) / "sync_knowledge_graph.py"
+            sync_kg.write_text("# stub\n")
+
+            captured_subprocess: list = []
+
+            def _fake_run(cmd, **kwargs):
+                captured_subprocess.append(list(cmd))
+                class _R:
+                    returncode = 0
+                return _R()
+
+            with mock.patch.object(install, "_is_orchestrator_root_install", return_value=True), \
+                 mock.patch.object(install, "_discover_app_state_db_path", return_value=db_path), \
+                 mock.patch("subprocess.run", side_effect=_fake_run):
+                errors = install._seed_weaviate_shared_kg_only(
+                    args=argparse.Namespace(),
+                    venv_py=Path("/fake/python"),
+                    sync_kg=sync_kg,
+                    weaviate_url="http://localhost:8081",
+                    current_shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
+                    current_kg_collection="VCODev_KnowledgeGraph",
+                )
+
+            # subprocess.run MUST have been called (shared != per-project).
+            sync_calls = [c for c in captured_subprocess if str(sync_kg) in " ".join(c)]
+            self.assertTrue(len(sync_calls) >= 1, "sync must run when shared != per-project KG")
+
+        os.environ.pop("VCT_STATE_DIR", None)
+
+
 if __name__ == "__main__":
     unittest.main()

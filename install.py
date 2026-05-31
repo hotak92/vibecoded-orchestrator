@@ -2488,6 +2488,13 @@ def main() -> int:
             "--skip-materialize-claude-dir set; .claude/ left untouched",
         )
 
+    # V0243-5: emit VCT_ORCHESTRATOR_ROOT + VCT_INFRASTRUCTURE_DIR + KG_BASE_DIR
+    # to .claude/env managed block. Done unconditionally on orchestrator-root
+    # installs so the 3 portability keys are always present regardless of
+    # whether launcher.db exists yet (pre-first-boot fresh installs).
+    if _is_orchestrator_root_install():
+        _emit_orchestrator_root_env_keys(PROJECT_ROOT)
+
     # Step 6: Container services (restart on update to pick up config changes)
     if not args.no_containers:
         if not sysinfo.container_cmd:
@@ -2796,6 +2803,10 @@ def main() -> int:
             # in Weaviate by a different casing). Emits an informational
             # deferral entry per heal so the user sees what we changed.
             _self_heal_kg_bindings_on_update(_deferral_report)
+            # V0243-13: on orchestrator-root, emit deferred-action entries
+            # for known schema drift that requires explicit consent to fix.
+            if _is_orchestrator_root_install():
+                _emit_orchestrator_root_schema_deferrals(_deferral_report)
     else:
         print("\n[skip] Container services (--no-containers)")
         print("[skip] Weaviate seeding (--no-containers)")
@@ -5843,6 +5854,153 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     return result
 
 
+def _prune_stale_kg_rows(
+    collection_name: str,
+    weaviate_url: str,
+    *,
+    dry_run: bool | None = None,
+) -> None:
+    """V0243-6: delete Weaviate objects whose ``file_path`` has no matching
+    on-disk Markdown file in ``knowledge/**/*.md``.
+
+    Called from the full-sync branch of ``_seed_weaviate`` after a successful
+    ``sync_knowledge_graph.py --all``.  The sync upserts every on-disk file
+    but never deletes rows for files that were removed from disk — this step
+    closes that gap.
+
+    Args:
+        collection_name: The Weaviate collection to prune (``KG_COLLECTION``).
+        weaviate_url: Base URL of the Weaviate instance.
+        dry_run: When True, print the stale count but do NOT delete.
+                 When False, batch-delete all stale rows via the Weaviate
+                 ``/v1/batch/objects`` endpoint.
+                 When None (default): False for orchestrator-root installs
+                 (``_is_orchestrator_root_install()``), True otherwise.
+
+    Soft-fail throughout: any error is logged but never raises into the caller.
+    """
+    if dry_run is None:
+        dry_run = not _is_orchestrator_root_install()
+
+    knowledge_root = PROJECT_ROOT / "knowledge"
+    on_disk = _compute_on_disk_content_hashes(knowledge_root)
+    # Build normalised path set covering both absolute and relative forms.
+    on_disk_paths: set[str] = set(on_disk.keys())
+    on_disk_rel: set[str] = set()
+    for p in on_disk_paths:
+        try:
+            on_disk_rel.add(str(Path(p).relative_to(PROJECT_ROOT)))
+        except ValueError:
+            pass
+    all_on_disk = on_disk_paths | on_disk_rel
+
+    # Fetch all stored (uuid, file_path) pairs from Weaviate.
+    stored: list[tuple[str, str]] = []  # (uuid, file_path)
+    try:
+        base = (weaviate_url or "http://localhost:8081").rstrip("/")
+        # Use a generous limit; orchestrator KGs are typically <200 nodes.
+        gql_query = (
+            "{ Get { "
+            f"{collection_name}(limit: 2000, "
+            f"where: {{path: [\"file_path\"], operator: Like, valueText: \"%\"}}) "
+            f"{{ _additional {{ id }} file_path }} }}"
+        )
+        import json as _json
+        import urllib.request as _ur
+        data = _json.dumps({"query": gql_query}).encode()
+        req = _ur.Request(
+            f"{base}/v1/graphql",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=15) as resp:  # noqa: S310
+            body = _json.loads(resp.read())
+        objects = (
+            body.get("data", {})
+            .get("Get", {})
+            .get(collection_name, [])
+        ) or []
+        for obj in objects:
+            uid = (obj.get("_additional") or {}).get("id") or ""
+            fp = (obj.get("file_path") or "").strip()
+            if uid and fp:
+                stored.append((uid, fp))
+    except Exception as exc:
+        _log_install_event(
+            "7c/10", "warn",
+            f"V0243-6: could not fetch stored file_paths for prune check: {exc}",
+            data={"collection": collection_name, "error": str(exc)[:200]},
+        )
+        return
+
+    stale_uuids: list[str] = []
+    for uid, fp in stored:
+        if fp not in all_on_disk:
+            stale_uuids.append(uid)
+
+    if not stale_uuids:
+        _log_install_event(
+            "7c/10", "ok",
+            f"V0243-6: prune check: no stale rows in {collection_name!r} "
+            f"({len(stored)} rows, all match on-disk)",
+            data={"collection": collection_name, "stored": len(stored), "stale": 0},
+        )
+        return
+
+    print(
+        f"  V0243-6: {len(stale_uuids)} stale KG row(s) found "
+        f"(file deleted from disk) in {collection_name!r}"
+    )
+    _log_install_event(
+        "7c/10", "info",
+        f"V0243-6: prune: {len(stale_uuids)} stale row(s) in {collection_name!r}",
+        data={"collection": collection_name, "stale": len(stale_uuids),
+              "dry_run": dry_run},
+    )
+
+    if dry_run:
+        print(f"  (dry-run: {len(stale_uuids)} row(s) would be deleted)")
+        return
+
+    # Batch-delete via Weaviate v1 batch/objects endpoint.
+    try:
+        base = (weaviate_url or "http://localhost:8081").rstrip("/")
+        delete_body = _json.dumps({
+            "match": {
+                "class": collection_name,
+                "where": {
+                    "path": ["id"],
+                    "operator": "ContainsAny",
+                    "valueText": stale_uuids,
+                },
+            },
+            "output": "minimal",
+            "dryRun": False,
+        }).encode()
+        req = _ur.Request(
+            f"{base}/v1/batch/objects",
+            data=delete_body,
+            headers={"Content-Type": "application/json"},
+            method="DELETE",
+        )
+        with _ur.urlopen(req, timeout=30) as resp:  # noqa: S310
+            result_body = _json.loads(resp.read())
+        deleted_count = (result_body.get("results") or {}).get("successful", 0)
+        print(f"  V0243-6: pruned {deleted_count} stale row(s)")
+        _log_install_event(
+            "7c/10", "ok",
+            f"V0243-6: pruned {deleted_count} stale row(s) from {collection_name!r}",
+            data={"collection": collection_name, "deleted": deleted_count},
+        )
+    except Exception as exc:
+        _log_install_event(
+            "7c/10", "warn",
+            f"V0243-6: batch delete failed for {collection_name!r}: {exc}",
+            data={"collection": collection_name, "error": str(exc)[:200]},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step 4: Virtual environment
 # ---------------------------------------------------------------------------
@@ -6259,6 +6417,167 @@ def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
             f"materialized {copied_hooks} hooks + {copied_scripts} scripts",
             data={"copied_hooks": copied_hooks,
                   "copied_scripts": copied_scripts},
+        )
+
+    # V0243-4: on orchestrator-root installs, refresh .vco-manifest.json
+    # with current shipped-file SHA256s + bump vco_version. Only runs after
+    # templates have been copied (so hashes reflect the latest on-disk state).
+    if _is_orchestrator_root_install():
+        _refresh_orchestrator_self_vco_manifest(install_root)
+
+
+def _refresh_orchestrator_self_vco_manifest(install_root: Path) -> None:
+    """V0243-4: rewrite `<install_root>/.claude/.vco-manifest.json` with
+    current shipped-file SHA256 hashes + bump `vco_version` to the current
+    HEAD commit from ``_read_git_rev()[0]``.
+
+    Only called from the orchestrator-root install path (after templates are
+    copied by ``_materialize_orchestrator_self_claude_dir``).  Per-project
+    installs have their manifest written by
+    ``vco_lib.project_init.install_project_bundle``.
+
+    The manifest tracks every file that install.py copies from
+    ``templates/`` to ``.claude/`` — hooks, scripts, and the rendered
+    settings.json.  Agents and skills are NOT included because their
+    source-of-truth is ``templates/{agents,skills}/`` and they are written
+    by the per-project bundle path, not by the orchestrator-self path.
+
+    Soft-fail throughout: any OSError is logged but does not abort the
+    install.  A missing or stale manifest is only a cosmetic issue (the
+    launcher's bundle-update flow will notice the drift on the next
+    per-project update pass).
+    """
+    import hashlib as _hashlib
+    import datetime as _dt
+
+    claude_dir = install_root / ".claude"
+    manifest_path = claude_dir / ".vco-manifest.json"
+
+    # Collect shipped files that were just materialised.
+    file_entries: dict[str, dict] = {}
+    templates_dir = install_root / "templates"
+
+    def _sha256_file(p: Path) -> str:
+        h = _hashlib.sha256()
+        try:
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+        except OSError:
+            return ""
+        return h.hexdigest()
+
+    # Hooks (top-level files only — _lib/ sub-tree handled below).
+    hooks_src = templates_dir / "hooks"
+    hooks_dst = claude_dir / "hooks"
+    if hooks_src.is_dir():
+        for src in hooks_src.iterdir():
+            if not src.is_file():
+                continue
+            dst = hooks_dst / src.name
+            rel = str(Path(".claude") / "hooks" / src.name)
+            src_rel = str(src.relative_to(install_root))
+            file_entries[rel] = {
+                "sha256": _sha256_file(dst if dst.exists() else src),
+                "source": src_rel,
+            }
+        # _lib/ subdirectory.
+        lib_src = hooks_src / "_lib"
+        lib_dst = hooks_dst / "_lib"
+        if lib_src.is_dir():
+            for src in lib_src.iterdir():
+                if not src.is_file():
+                    continue
+                dst = lib_dst / src.name
+                rel = str(Path(".claude") / "hooks" / "_lib" / src.name)
+                src_rel = str(src.relative_to(install_root))
+                file_entries[rel] = {
+                    "sha256": _sha256_file(dst if dst.exists() else src),
+                    "source": src_rel,
+                }
+
+    # Scripts.
+    scripts_src = templates_dir / "scripts"
+    scripts_dst = claude_dir / "scripts"
+    if scripts_src.is_dir():
+        for src in scripts_src.iterdir():
+            if not src.is_file():
+                continue
+            dst = scripts_dst / src.name
+            rel = str(Path(".claude") / "scripts" / src.name)
+            src_rel = str(src.relative_to(install_root))
+            file_entries[rel] = {
+                "sha256": _sha256_file(dst if dst.exists() else src),
+                "source": src_rel,
+            }
+
+    # settings.json (rendered from template — hash the on-disk result).
+    settings_dst = claude_dir / "settings.json"
+    if platform.system() == "Windows":
+        settings_src_name = "settings.json.windows.template"
+    else:
+        settings_src_name = "settings.json.linux.template"
+    settings_src = templates_dir / settings_src_name
+    if settings_src.is_file():
+        rel = str(Path(".claude") / "settings.json")
+        file_entries[rel] = {
+            "sha256": _sha256_file(
+                settings_dst if settings_dst.exists() else settings_src
+            ),
+            "source": str(settings_src.relative_to(install_root)),
+        }
+
+    # Determine vco_version.
+    commit, _ = _read_git_rev()
+    vco_version = commit or "unknown"
+
+    now_str = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Read existing manifest to preserve preserved_files section.
+    existing: dict = {}
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+
+    manifest_payload = {
+        "schema_version": 2,
+        "vco_version": vco_version,
+        "installed_at": existing.get("installed_at", now_str),
+        "updated_at": now_str,
+        "files": file_entries,
+        "preserved_files": existing.get("preserved_files", {}),
+    }
+
+    try:
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        payload_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n")
+        # Atomic write via tempfile + replace.
+        import tempfile as _tf
+        fd, tmp_path = _tf.mkstemp(
+            dir=str(claude_dir), suffix=".tmp", prefix=".vco-manifest-",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload_bytes)
+            os.replace(tmp_path, str(manifest_path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        _log_install_event(
+            "4b/10", "ok",
+            f"V0243-4: refreshed .vco-manifest.json "
+            f"({len(file_entries)} files, vco_version={vco_version!r})",
+            data={"file_count": len(file_entries), "vco_version": vco_version},
+        )
+    except OSError as exc:
+        _log_install_event(
+            "4b/10", "warn",
+            f"V0243-4: could not write .vco-manifest.json: {exc}",
         )
 
 
@@ -7548,6 +7867,61 @@ def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
     return result
 
 
+def _emit_orchestrator_root_env_keys(install_root: Path) -> None:
+    """V0243-5: write VCT_ORCHESTRATOR_ROOT, VCT_INFRASTRUCTURE_DIR, and
+    KG_BASE_DIR into ``<install_root>/.claude/env`` managed block.
+
+    These three portability keys are load-bearing for every hook and MCP
+    that references the orchestrator root at runtime.  They were previously
+    emitted only via ``apply_project_env`` (which requires launcher.db with
+    a registered project row), leaving fresh installs — where the launcher
+    has never started — without these keys until the first launcher boot.
+
+    This helper writes the 3 keys directly, bypassing the DB requirement.
+    It merges into the managed block via
+    ``vco_lib.config_projection._write_shell_env_managed_block`` (same
+    mechanism the launcher uses) so a subsequent ``apply_project_env`` call
+    that writes the full canonical set will overwrite these 3 keys in-place
+    without duplication.
+
+    Soft-fail: any error is logged but never raises.
+    """
+    try:
+        from vco_lib.config_projection import _write_shell_env_managed_block
+    except ImportError:
+        # vco_lib not yet on sys.path on a very early fresh install; skip —
+        # the launcher's first-boot env-projection will fill the gap.
+        _log_install_event(
+            "4b/10", "skip",
+            "V0243-5: vco_lib.config_projection not importable; "
+            "orchestrator-root env keys deferred to launcher boot",
+        )
+        return
+
+    infra_dir = install_root / "infrastructure"
+    keys: dict[str, str] = {
+        "VCT_ORCHESTRATOR_ROOT": str(install_root.resolve()),
+        "VCT_INFRASTRUCTURE_DIR": str(infra_dir.resolve()),
+        "KG_BASE_DIR": str(install_root.resolve()),
+    }
+
+    claude_env_path = install_root / ".claude" / "env"
+    try:
+        written = _write_shell_env_managed_block(claude_env_path, keys)
+        _log_install_event(
+            "4b/10", "ok",
+            f"V0243-5: emitted orchestrator-root env keys to .claude/env: "
+            f"{', '.join(written)}",
+            data={"keys": written, "path": str(claude_env_path)},
+        )
+    except Exception as exc:
+        _log_install_event(
+            "4b/10", "warn",
+            f"V0243-5: could not write orchestrator-root env keys to "
+            f".claude/env: {exc}",
+        )
+
+
 def _resolve_project_id_by_folder(folder: Path) -> str | None:
     """Look up the project_id for a given folder_path in launcher.db.
 
@@ -8092,6 +8466,24 @@ def _rebuild_collections(args: argparse.Namespace) -> None:
     _project_init.rebuild_collections(args, log_event=_log_install_event)
 
 
+def _is_orchestrator_root_install() -> bool:
+    """Return True iff PROJECT_ROOT is an orchestrator clone (not a per-project install).
+
+    Detection: PROJECT_ROOT contains ALL THREE of:
+      - vct-module.json  (orchestrator identity marker)
+      - install.py       (orchestrator entry-point)
+      - vco_lib/         (orchestrator library package)
+
+    Per-project installs have `.vco-manifest.json` and no install.py.
+    Orchestrator self-installs have all three markers above.  Never raises.
+    """
+    return (
+        (PROJECT_ROOT / "vct-module.json").is_file()
+        and (PROJECT_ROOT / "install.py").is_file()
+        and (PROJECT_ROOT / "vco_lib").is_dir()
+    )
+
+
 def _seed_weaviate_shared_kg_only(
     *,
     args: "argparse.Namespace",
@@ -8099,12 +8491,19 @@ def _seed_weaviate_shared_kg_only(
     sync_kg: "Path",
     weaviate_url: str,
     current_shared_kg: str,
+    current_kg_collection: str = "",
 ) -> "list[str]":
     """Run the shared-KG seed step only (no per-project KG sync).
 
     v0.2.42 CI-10: extracted from ``_seed_weaviate`` so the diff-gate
     skip path can still run the shared KG seed without the full per-project
     sync. Returns a list of error strings (empty = success).
+
+    v0.2.43 V0243-0: on orchestrator-root installs where
+    ``current_shared_kg == current_kg_collection`` (the per-project KG IS
+    the shared KG — typical when both env vars point at the same collection),
+    skip the shared seed to avoid a redundant double-sync and record the
+    skip in ``app_state.last_installed_shared_kg_collection``.
     """
     seed_errors: list[str] = []
     shared_write_disabled = (
@@ -8116,6 +8515,23 @@ def _seed_weaviate_shared_kg_only(
         return seed_errors
     if not current_shared_kg:
         print("  → shared KG seed: skipped (SHARED_KG_COLLECTION empty)")
+        return seed_errors
+
+    # V0243-0: orchestrator-root self-install where per-project KG == shared KG.
+    # Running kg-sync twice against the same collection would be wasteful;
+    # record the collection as synced and return early.
+    if (
+        _is_orchestrator_root_install()
+        and current_kg_collection
+        and current_shared_kg == current_kg_collection
+    ):
+        print(
+            f"  → shared KG seed: skipping — orchestrator-root install, "
+            f"per-project KG '{current_kg_collection}' IS the shared KG"
+        )
+        _write_app_state_key(
+            _APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_kg_collection
+        )
         return seed_errors
     if not sync_kg.exists():
         return seed_errors
@@ -8321,6 +8737,7 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
                     sync_kg=sync_kg,
                     weaviate_url=weaviate_url,
                     current_shared_kg=current_shared_kg,
+                    current_kg_collection=current_kg_collection,
                 )
                 _log_install_event("7c/10", "ok", "CI-10: diff-gate skip complete")
                 return
@@ -8340,6 +8757,17 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
             )
 
     seed_errors: list[str] = []
+
+    # V0243-10: on the full-sync branch, record the on-disk file count as the
+    # upper-bound nodes_synced BEFORE subprocess.run so the stat is captured
+    # even on non-zero exit.  (Previously _nodes_synced was left at 0 for
+    # full-sync runs, recording 0/0 in last_kg_sync_stats.)
+    if _sync_all and current_kg_collection:
+        _knowledge_root_for_count = PROJECT_ROOT / "knowledge"
+        _full_sync_count = len(
+            _compute_on_disk_content_hashes(_knowledge_root_for_count)
+        )
+        _nodes_synced = _full_sync_count
 
     # `sync_knowledge_graph.py` now handles both KG (knowledge/) and dev
     # docs (docs/) ingest paths — it routes by the file's location.
@@ -8392,6 +8820,13 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
             json.dumps({"nodes_synced": _nodes_synced or 0, "nodes_skipped": _nodes_skipped}),
         )
 
+    # V0243-6: prune stale KG rows after full-sync (orchestrator-root only).
+    # Runs only when _sync_all=True so it fires after a complete re-seed
+    # (not after a partial diff-only sync, where orphan detection would
+    # produce false positives for files we deliberately skipped).
+    if not seed_errors and _sync_all and current_kg_collection:
+        _prune_stale_kg_rows(current_kg_collection, weaviate_url)
+
     # 3. Cross-project shared KG seed (Step 7d).
     #
     # Re-runs sync_knowledge_graph.py against the SHARED collection so
@@ -8417,6 +8852,7 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         sync_kg=sync_kg,
         weaviate_url=weaviate_url,
         current_shared_kg=current_shared_kg,
+        current_kg_collection=current_kg_collection,
     )
     seed_errors.extend(shared_errors)
 
@@ -8669,6 +9105,155 @@ def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
         data={"legacy_class": legacy_name,
               "canonical_present": canonical_present},
     )
+
+
+def _emit_orchestrator_root_schema_deferrals(
+    deferral_report: "DeferralReport",
+) -> None:
+    """V0243-13: emit UPDATE_DEFERRED.md entries for known orchestrator-root
+    schema drift items that require explicit user consent to fix.
+
+    Currently covers two items:
+
+    (a) **Orphan VibeCodedOrchestrator_Development collection** — the
+        orchestrator's own Development collection has no callers and 0 rows.
+        It was created by early install.py versions before the "docs/" sync
+        moved exclusively into per-project Development collections. Dropping
+        it is non-destructive (0 rows) but we still require explicit consent.
+
+    (b) **linksTo property drift** — old shared-KG collections may carry a
+        stale ``linksTo`` property (array of object refs) whose schema has
+        drifted from the current ``typed_links``/``links`` property contract.
+        Fixing requires a schema PATCH or collection recreate; emitting a
+        deferral so the user can run the migration script at a chosen time.
+
+    Both deferrals are severity="info" and idempotent (re-emitting the same
+    ``condition_id`` on successive ``--update`` runs is harmless — the
+    deferral-report writer deduplicates by ``condition_id``).
+
+    Soft-fail throughout: any error is logged but never raises.
+    """
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+
+    # Fetch current schema to probe both conditions.
+    try:
+        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
+            f"{weaviate_url}/v1/schema", timeout=5,
+        )
+        schema = json.loads(resp.read())
+        classes_list = schema.get("classes", [])
+    except Exception:
+        # Weaviate unreachable — skip silently.
+        return
+
+    class_map: dict[str, dict] = {
+        c.get("class", ""): c
+        for c in classes_list
+        if isinstance(c, dict) and c.get("class")
+    }
+
+    # ── (a) Orphan VibeCodedOrchestrator_Development ──────────────────────
+    orphan_dev = "VibeCodedOrchestrator_Development"
+    if orphan_dev in class_map:
+        # Only emit if the collection appears to have 0 or very few rows.
+        row_count = _count_weaviate_class_objects(weaviate_url, orphan_dev)
+        if row_count is not None and row_count == 0:
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="orphan_orchestrator_development_collection",
+                    title=(
+                        f"Orphan Weaviate collection `{orphan_dev}` "
+                        f"has 0 rows and no callers"
+                    ),
+                    detected=(
+                        f"The Weaviate collection `{orphan_dev}` exists at "
+                        f"{weaviate_url} with 0 stored objects.  It was "
+                        f"created by older install.py versions and is no "
+                        f"longer populated (all docs/ sync now targets "
+                        f"per-project Development collections).  Dropping "
+                        f"it is safe."
+                    ),
+                    why_deferred=(
+                        "DROP is a destructive Weaviate operation even when "
+                        "the collection is empty — it cannot be undone without "
+                        "a full re-seed.  User consent required."
+                    ),
+                    command_to_apply=(
+                        f"# Delete the orphan collection via the Weaviate REST API:\n"
+                        f"curl -X DELETE "
+                        f"{weaviate_url}/v1/schema/{orphan_dev}\n"
+                        f"# Or open the Weaviate console at {weaviate_url} "
+                        f"and delete the class from the Schema tab."
+                    ),
+                    severity="info",
+                    kg_node_refs=[],
+                )
+            )
+            _log_install_event(
+                "7e/10", "info",
+                f"V0243-13(a): orphan {orphan_dev!r} deferral emitted (0 rows)",
+            )
+
+    # ── (b) linksTo property drift ─────────────────────────────────────────
+    shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
+    _links_to_drift_classes: list[str] = []
+    for class_name, class_def in class_map.items():
+        # Only check KG-shaped collections (shared KG + per-project KG).
+        if not class_name.endswith("_KnowledgeGraph"):
+            continue
+        props = class_def.get("properties") or []
+        prop_names = {p.get("name", "") for p in props if isinstance(p, dict)}
+        # Stale schema has "linksTo" but lacks the current "typed_links" property.
+        if "linksTo" in prop_names and "typed_links" not in prop_names:
+            _links_to_drift_classes.append(class_name)
+
+    if _links_to_drift_classes:
+        classes_str = ", ".join(f"`{c}`" for c in sorted(_links_to_drift_classes))
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="links_to_property_schema_drift",
+                title=(
+                    f"KG collection(s) have stale `linksTo` property "
+                    f"(missing `typed_links`): {classes_str}"
+                ),
+                detected=(
+                    f"The following Weaviate collection(s) carry a stale "
+                    f"`linksTo` array-of-object-refs property introduced by "
+                    f"an older orchestrator version: {classes_str}.  The "
+                    f"current schema uses `typed_links` (text property) and "
+                    f"`links` (text array).  KG search still works but "
+                    f"graph-traversal features (`semantic_graph_search`) "
+                    f"cannot resolve wiki-links on these collections."
+                ),
+                why_deferred=(
+                    "Fixing requires either a Weaviate schema PATCH (add "
+                    "`typed_links` + `links` properties additively) or a "
+                    "full DROP + recreate + re-seed (if the schema is too "
+                    "old to accept the additive patch).  Both operations "
+                    "require manual consent."
+                ),
+                command_to_apply=(
+                    "# Option 1 — additive PATCH (preserves existing data):\n"
+                    "python install.py --update  "
+                    "# run migrate-shared-kg-schema.sh if it detects the gap\n"
+                    "# Option 2 — full recreate + re-seed:\n"
+                    "python -m vco_lib.project_init migrate-collections "
+                    f"--name <collection>  "
+                    "# opens a consent prompt, then re-syncs"
+                ),
+                severity="info",
+                kg_node_refs=[],
+            )
+        )
+        _log_install_event(
+            "7e/10", "info",
+            f"V0243-13(b): linksTo drift deferral emitted for "
+            f"{len(_links_to_drift_classes)} collection(s)",
+            data={"classes": _links_to_drift_classes},
+        )
 
 
 # Privilege rank for `kg_collection_access.access_level`. Higher wins when
@@ -9505,6 +10090,91 @@ def _self_heal_kg_bindings_on_update(
                 # operational errors — they're real corruption signals.
                 if "no such table" not in str(oe).lower():
                     raise
+
+            # ── 4. V0243-9: kg_collection_access parity self-heal ─────────
+            #
+            # For every row in project_kg_bindings that lacks a matching
+            # kg_collection_access row, INSERT-OR-IGNORE the canonical
+            # access-level:
+            #   role="primary"  → access_level="write"
+            #   role="shared"   → access_level="read"
+            #   role="archive"  → access_level="read"  (Development)
+            #
+            # Also backfill the matching _Development collection row:
+            # for each primary KG binding whose collection ends in
+            # "_KnowledgeGraph", derive the sibling "_Development"
+            # collection name and INSERT-OR-IGNORE a "write" row (the
+            # project owns its Development collection too).
+            #
+            # INSERT-OR-IGNORE is safe: the PK is (project_id,
+            # collection_name).  We never lower an existing privilege.
+            _parity_inserts = 0
+            try:
+                # Read all existing kg_collection_access rows for lookup.
+                cur.execute(
+                    "SELECT project_id, collection_name, access_level "
+                    "FROM kg_collection_access"
+                )
+                existing_access: set[tuple[str, str]] = {
+                    (r[0], r[1]) for r in cur.fetchall()
+                }
+                # Read all project_kg_bindings rows.
+                cur.execute(
+                    "SELECT project_id, role, collection_name "
+                    "FROM project_kg_bindings"
+                )
+                binding_rows = cur.fetchall()
+
+                _ROLE_LEVEL = {"primary": "write", "shared": "read", "archive": "read"}
+                now_ms = int(time.time() * 1000)
+
+                for proj_id, role, coll_name in binding_rows:
+                    if not coll_name:
+                        continue
+                    level = _ROLE_LEVEL.get(role, "read")
+                    if (proj_id, coll_name) not in existing_access:
+                        cur.execute(
+                            "INSERT OR IGNORE INTO kg_collection_access "
+                            "(project_id, collection_name, access_level, "
+                            " granted_at, updated_at) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (proj_id, coll_name, level, now_ms, now_ms),
+                        )
+                        if cur.rowcount:
+                            existing_access.add((proj_id, coll_name))
+                            _parity_inserts += 1
+
+                    # Backfill the sibling _Development collection for primary
+                    # bindings.
+                    if role == "primary" and coll_name.endswith("_KnowledgeGraph"):
+                        dev_name = coll_name[:-len("_KnowledgeGraph")] + "_Development"
+                        if (proj_id, dev_name) not in existing_access:
+                            cur.execute(
+                                "INSERT OR IGNORE INTO kg_collection_access "
+                                "(project_id, collection_name, access_level, "
+                                " granted_at, updated_at) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (proj_id, dev_name, "write", now_ms, now_ms),
+                            )
+                            if cur.rowcount:
+                                existing_access.add((proj_id, dev_name))
+                                _parity_inserts += 1
+
+                if _parity_inserts:
+                    _log_install_event(
+                        "7e/10", "ok",
+                        f"V0243-9: inserted {_parity_inserts} missing "
+                        f"kg_collection_access row(s) (parity self-heal)",
+                        data={"inserts": _parity_inserts},
+                    )
+            except sqlite3.OperationalError as oe:
+                if "no such table" not in str(oe).lower():
+                    raise
+                # kg_collection_access table absent — older schema; skip.
+                _log_install_event(
+                    "7e/10", "skip",
+                    "V0243-9: kg_collection_access absent; parity self-heal skipped",
+                )
 
             conn.commit()
         finally:
@@ -12478,24 +13148,44 @@ def _delete_vct_hub_cutover_sentinel() -> None:
 
 
 def _probe_vct_hub_health(timeout: float = 0.5) -> bool:
-    """Probe ``http://localhost:<hub.port>/health``. Returns True when
+    """Probe ``http://localhost:<hub.port>/api/v1/health``. Returns True when
     the hub responds with status<400, False otherwise.
 
     Reads the hub port from ``vct_root_dir()/hub.port`` (written by
     vct-hub on startup). Soft-fail on every error (file missing, port
     unparseable, connection refused, timeout).
+
+    v0.2.43 V0243-1: corrected endpoint from ``/health`` to
+    ``/api/v1/health`` (the hub's actual health route; ``/health`` 404s
+    on all vct-hub versions shipped since v0.2.21). This endpoint
+    intentionally requires NO auth header — the probe runs before the
+    hub token file is readable.
+
+    On a successful probe, any pre-existing ``~/.vct/v0.2.21-cutover.flag``
+    is unlinked (cleanup of a stale migration sentinel that an interrupted
+    v0.2.21 install may have left behind).
     """
     try:
         from vco_lib.paths import vct_root_dir
-        port_file = vct_root_dir() / "hub.port"
+        root = vct_root_dir()
+        port_file = root / "hub.port"
         if not port_file.is_file():
             return False
         port_raw = port_file.read_text(encoding="utf-8").strip()
         if not port_raw.isdigit():
             return False
-        url = f"http://127.0.0.1:{port_raw}/health"
+        url = f"http://127.0.0.1:{port_raw}/api/v1/health"
         resp = urllib.request.urlopen(url, timeout=timeout)
-        return resp.status < 400
+        healthy = resp.status < 400
+        if healthy:
+            # V0243-1: unlink stale v0.2.21-cutover.flag when hub is up.
+            legacy_flag = root / "v0.2.21-cutover.flag"
+            try:
+                if legacy_flag.is_file():
+                    legacy_flag.unlink()
+            except OSError:
+                pass  # Best-effort; not critical.
+        return healthy
     except Exception:
         return False
 
@@ -15771,27 +16461,40 @@ def _query_installed_npm_version(package: str,
                                  *, timeout: int = 60) -> str | None:
     """Return the version of a globally-installed npm package, or None.
 
-    Runs `npm view -g <package> version`. Returns None when:
-      - npm is not on PATH (cached miss);
-      - the package is not installed;
-      - the subprocess errors out / times out.
+    v0.2.43 V0243-11: uses ``npm ls -g --json --depth=0 <package>`` and
+    parses ``dependencies[package].version``.  Mirrors the pattern used
+    by :func:`_installed_npm_integrity` (same command, different field).
 
-    The result is the cleaned `stdout` (`npm view` prints just the
-    version string when querying a single field).
+    The previous implementation used ``npm view -g <package> version``
+    which queries the REGISTRY (network round-trip, returns the latest
+    published version — NOT the locally-installed version).  The local
+    ``npm ls`` approach is offline, faster, and returns the correct
+    installed version even when the registry version is newer.
+
+    Returns None when:
+      - npm is not on PATH (``_NPM_PATH`` is None);
+      - the package is not installed globally (absent from ``dependencies``);
+      - the subprocess errors out / times out.
     """
     if _NPM_PATH is None:
         return None
     try:
         result = subprocess.run(
-            [_NPM_PATH, "view", "-g", package, "version"],
+            [_NPM_PATH, "ls", "-g", "--json", "--depth=0", package],
             capture_output=True, text=True, timeout=timeout,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
-    if result.returncode != 0:
+    if not result.stdout.strip():
         return None
-    # `npm view foo version` prints e.g. "1.6.3\n" — strip.
-    return result.stdout.strip() or None
+    try:
+        parsed = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return None
+    # ``npm ls --json`` shape: {"dependencies": {"<pkg>": {"version": "..."}}}
+    deps = parsed.get("dependencies") or {}
+    entry = deps.get(package) or {}
+    return (entry.get("version") or "").strip() or None
 
 
 def _installed_npm_integrity(package: str, *, timeout: int = 60) -> str | None:
