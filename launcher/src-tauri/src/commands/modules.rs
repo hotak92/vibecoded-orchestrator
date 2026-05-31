@@ -1464,6 +1464,63 @@ pub async fn install_module_for_project(
             // (defaults can be reconciled again on next install/update).
             reconcile_module_tool_allowlist(&manifest, &module_id, &db);
 
+            // v0.2.43 V0243-17: post-install assertion — if the manifest
+            // declares mcp_registration.tool_allowlist, at least 1 row
+            // MUST be present in module_mcp_tool_defaults after reconcile.
+            // Log forensic evidence either way so failures are traceable
+            // even when `reconcile_module_tool_allowlist` soft-failed
+            // silently (it only eprintln!s, it does not return Err).
+            if let Some(mcp_reg) = manifest.mcp_registration.as_ref() {
+                if let Some(allowlist) = mcp_reg.tool_allowlist.as_ref() {
+                    if !allowlist.is_empty() {
+                        match db.list_mcp_tool_defaults(&mcp_reg.mcp_name) {
+                            Ok(defaults) if !defaults.is_empty() => {
+                                eprintln!(
+                                    "[v0.2.43/V0243-17] {} (mcp={}): tool_allowlist \
+                                     declares {} tool(s); {} row(s) confirmed in \
+                                     module_mcp_tool_defaults",
+                                    module_id,
+                                    mcp_reg.mcp_name,
+                                    allowlist.len(),
+                                    defaults.len(),
+                                );
+                            }
+                            Ok(_empty) => {
+                                // Zero rows despite a non-empty allowlist — reconcile
+                                // soft-failed. Audit the anomaly for later forensics;
+                                // do NOT fail the install (rows can be reconciled on
+                                // next update / restart).
+                                eprintln!(
+                                    "[v0.2.43/V0243-17] WARN: {} (mcp={}): tool_allowlist \
+                                     has {} tool(s) but module_mcp_tool_defaults has 0 rows \
+                                     — reconcile_module_tool_allowlist may have soft-failed. \
+                                     Hub will fall back to hardcoded defaults until next \
+                                     reconcile.",
+                                    module_id, mcp_reg.mcp_name, allowlist.len(),
+                                );
+                                let _ = db.audit(
+                                    "module_mcp_tool_defaults_empty_after_install",
+                                    Some(&project_id),
+                                    Some(&module_id),
+                                    &serde_json::json!({
+                                        "mcp_name": mcp_reg.mcp_name,
+                                        "expected_tool_count": allowlist.len(),
+                                        "actual_row_count": 0,
+                                    }),
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[v0.2.43/V0243-17] {} (mcp={}): list_mcp_tool_defaults \
+                                     query failed: {}",
+                                    module_id, mcp_reg.mcp_name, e,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Phase 1E: per-project container lifecycle. For
             // container_pull modules we resolve `runtime.container_name_
             // template`, allocate an `rl_port` if not yet set, and
@@ -1784,6 +1841,49 @@ pub async fn update_module_for_project(
             // delete-then-insert inside a transaction so the rows
             // match the new manifest.
             reconcile_module_tool_allowlist(&manifest, &module_id, &db);
+            // v0.2.43 V0243-17: same post-reconcile forensic assertion as
+            // the install path (see above). Log anomalies but never block.
+            if let Some(mcp_reg) = manifest.mcp_registration.as_ref() {
+                if let Some(allowlist) = mcp_reg.tool_allowlist.as_ref() {
+                    if !allowlist.is_empty() {
+                        match db.list_mcp_tool_defaults(&mcp_reg.mcp_name) {
+                            Ok(defaults) if !defaults.is_empty() => {
+                                eprintln!(
+                                    "[v0.2.43/V0243-17] update: {} (mcp={}): {} row(s) in \
+                                     module_mcp_tool_defaults (expected >= 1 for {} tool(s))",
+                                    module_id, mcp_reg.mcp_name,
+                                    defaults.len(), allowlist.len(),
+                                );
+                            }
+                            Ok(_) => {
+                                eprintln!(
+                                    "[v0.2.43/V0243-17] WARN: update: {} (mcp={}): \
+                                     tool_allowlist non-empty but 0 rows in \
+                                     module_mcp_tool_defaults after reconcile",
+                                    module_id, mcp_reg.mcp_name,
+                                );
+                                let _ = db.audit(
+                                    "module_mcp_tool_defaults_empty_after_update",
+                                    Some(&project_id),
+                                    Some(&module_id),
+                                    &serde_json::json!({
+                                        "mcp_name": mcp_reg.mcp_name,
+                                        "expected_tool_count": allowlist.len(),
+                                        "actual_row_count": 0,
+                                    }),
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[v0.2.43/V0243-17] update: {} (mcp={}): \
+                                     list_mcp_tool_defaults failed: {}",
+                                    module_id, mcp_reg.mcp_name, e,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             let _ = app.emit(
                 "module://install-complete",
                 serde_json::json!({
