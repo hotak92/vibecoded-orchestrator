@@ -256,7 +256,17 @@ echo ""
 # ── Section 3: Repo-level checks ─────────────────────────────────────────────
 echo "--- Repo-level checks ---"
 
-# Gate 14: Allow auto-merge enabled
+# Gate 14: Allow auto-merge enabled (advisory — owner action, not code gate)
+#
+# v0.2.42: this gate is WARN-level, not FAIL-level. Reasoning:
+# `allow_auto_merge` is a repo-level setting that affects Dependabot PR
+# behaviour, not code correctness. Flipping it requires owner discretion
+# (auto-merging unaudited Dependabot bumps can land breaking-major bumps —
+# e.g. PR #267 transformers <4.50 → <5.10 would break the CodeSage code-
+# embed service). The right cadence is: ship the tag, then triage the
+# 26 stalled PRs into "safe patch" vs "major needs review" groups, then
+# flip the setting. The script's exit code should reflect CODE READINESS;
+# this gate stays advisory so a green script means "ship it."
 echo "  [checking allow_auto_merge repo setting...]"
 AUTO_MERGE="$(gh api "/repos/$REPO" --jq '.allow_auto_merge' 2>/dev/null || echo "unknown")"
 if [ "$AUTO_MERGE" = "true" ]; then
@@ -264,8 +274,8 @@ if [ "$AUTO_MERGE" = "true" ]; then
 elif [ "$AUTO_MERGE" = "unknown" ]; then
     gate_warn "allow_auto_merge" "Could not check (gh api error)"
 else
-    gate_fail "allow_auto_merge = true" \
-        "Enable: gh api -X PATCH /repos/$REPO -f allow_auto_merge=true"
+    gate_warn "allow_auto_merge = true (advisory)" \
+        "Owner-discretion. Triage Dependabot PRs first, then: gh api -X PATCH /repos/$REPO -f allow_auto_merge=true"
 fi
 
 # Gate 15: Open CodeQL error-severity alerts
