@@ -5850,6 +5850,153 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     return result
 
 
+def _prune_stale_kg_rows(
+    collection_name: str,
+    weaviate_url: str,
+    *,
+    dry_run: bool | None = None,
+) -> None:
+    """V0243-6: delete Weaviate objects whose ``file_path`` has no matching
+    on-disk Markdown file in ``knowledge/**/*.md``.
+
+    Called from the full-sync branch of ``_seed_weaviate`` after a successful
+    ``sync_knowledge_graph.py --all``.  The sync upserts every on-disk file
+    but never deletes rows for files that were removed from disk — this step
+    closes that gap.
+
+    Args:
+        collection_name: The Weaviate collection to prune (``KG_COLLECTION``).
+        weaviate_url: Base URL of the Weaviate instance.
+        dry_run: When True, print the stale count but do NOT delete.
+                 When False, batch-delete all stale rows via the Weaviate
+                 ``/v1/batch/objects`` endpoint.
+                 When None (default): False for orchestrator-root installs
+                 (``_is_orchestrator_root_install()``), True otherwise.
+
+    Soft-fail throughout: any error is logged but never raises into the caller.
+    """
+    if dry_run is None:
+        dry_run = not _is_orchestrator_root_install()
+
+    knowledge_root = PROJECT_ROOT / "knowledge"
+    on_disk = _compute_on_disk_content_hashes(knowledge_root)
+    # Build normalised path set covering both absolute and relative forms.
+    on_disk_paths: set[str] = set(on_disk.keys())
+    on_disk_rel: set[str] = set()
+    for p in on_disk_paths:
+        try:
+            on_disk_rel.add(str(Path(p).relative_to(PROJECT_ROOT)))
+        except ValueError:
+            pass
+    all_on_disk = on_disk_paths | on_disk_rel
+
+    # Fetch all stored (uuid, file_path) pairs from Weaviate.
+    stored: list[tuple[str, str]] = []  # (uuid, file_path)
+    try:
+        base = (weaviate_url or "http://localhost:8081").rstrip("/")
+        # Use a generous limit; orchestrator KGs are typically <200 nodes.
+        gql_query = (
+            "{ Get { "
+            f"{collection_name}(limit: 2000, "
+            f"where: {{path: [\"file_path\"], operator: Like, valueText: \"%\"}}) "
+            f"{{ _additional {{ id }} file_path }} }}"
+        )
+        import json as _json
+        import urllib.request as _ur
+        data = _json.dumps({"query": gql_query}).encode()
+        req = _ur.Request(
+            f"{base}/v1/graphql",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=15) as resp:  # noqa: S310
+            body = _json.loads(resp.read())
+        objects = (
+            body.get("data", {})
+            .get("Get", {})
+            .get(collection_name, [])
+        ) or []
+        for obj in objects:
+            uid = (obj.get("_additional") or {}).get("id") or ""
+            fp = (obj.get("file_path") or "").strip()
+            if uid and fp:
+                stored.append((uid, fp))
+    except Exception as exc:
+        _log_install_event(
+            "7c/10", "warn",
+            f"V0243-6: could not fetch stored file_paths for prune check: {exc}",
+            data={"collection": collection_name, "error": str(exc)[:200]},
+        )
+        return
+
+    stale_uuids: list[str] = []
+    for uid, fp in stored:
+        if fp not in all_on_disk:
+            stale_uuids.append(uid)
+
+    if not stale_uuids:
+        _log_install_event(
+            "7c/10", "ok",
+            f"V0243-6: prune check: no stale rows in {collection_name!r} "
+            f"({len(stored)} rows, all match on-disk)",
+            data={"collection": collection_name, "stored": len(stored), "stale": 0},
+        )
+        return
+
+    print(
+        f"  V0243-6: {len(stale_uuids)} stale KG row(s) found "
+        f"(file deleted from disk) in {collection_name!r}"
+    )
+    _log_install_event(
+        "7c/10", "info",
+        f"V0243-6: prune: {len(stale_uuids)} stale row(s) in {collection_name!r}",
+        data={"collection": collection_name, "stale": len(stale_uuids),
+              "dry_run": dry_run},
+    )
+
+    if dry_run:
+        print(f"  (dry-run: {len(stale_uuids)} row(s) would be deleted)")
+        return
+
+    # Batch-delete via Weaviate v1 batch/objects endpoint.
+    try:
+        base = (weaviate_url or "http://localhost:8081").rstrip("/")
+        delete_body = _json.dumps({
+            "match": {
+                "class": collection_name,
+                "where": {
+                    "path": ["id"],
+                    "operator": "ContainsAny",
+                    "valueText": stale_uuids,
+                },
+            },
+            "output": "minimal",
+            "dryRun": False,
+        }).encode()
+        req = _ur.Request(
+            f"{base}/v1/batch/objects",
+            data=delete_body,
+            headers={"Content-Type": "application/json"},
+            method="DELETE",
+        )
+        with _ur.urlopen(req, timeout=30) as resp:  # noqa: S310
+            result_body = _json.loads(resp.read())
+        deleted_count = (result_body.get("results") or {}).get("successful", 0)
+        print(f"  V0243-6: pruned {deleted_count} stale row(s)")
+        _log_install_event(
+            "7c/10", "ok",
+            f"V0243-6: pruned {deleted_count} stale row(s) from {collection_name!r}",
+            data={"collection": collection_name, "deleted": deleted_count},
+        )
+    except Exception as exc:
+        _log_install_event(
+            "7c/10", "warn",
+            f"V0243-6: batch delete failed for {collection_name!r}: {exc}",
+            data={"collection": collection_name, "error": str(exc)[:200]},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Step 4: Virtual environment
 # ---------------------------------------------------------------------------
@@ -8607,6 +8754,17 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
 
     seed_errors: list[str] = []
 
+    # V0243-10: on the full-sync branch, record the on-disk file count as the
+    # upper-bound nodes_synced BEFORE subprocess.run so the stat is captured
+    # even on non-zero exit.  (Previously _nodes_synced was left at 0 for
+    # full-sync runs, recording 0/0 in last_kg_sync_stats.)
+    if _sync_all and current_kg_collection:
+        _knowledge_root_for_count = PROJECT_ROOT / "knowledge"
+        _full_sync_count = len(
+            _compute_on_disk_content_hashes(_knowledge_root_for_count)
+        )
+        _nodes_synced = _full_sync_count
+
     # `sync_knowledge_graph.py` now handles both KG (knowledge/) and dev
     # docs (docs/) ingest paths — it routes by the file's location.
     # Old upload_docs.py was retired 2026-04-30 (audit cleanup); the
@@ -8657,6 +8815,13 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
             _APP_STATE_KEY_LAST_KG_SYNC_STATS,
             json.dumps({"nodes_synced": _nodes_synced or 0, "nodes_skipped": _nodes_skipped}),
         )
+
+    # V0243-6: prune stale KG rows after full-sync (orchestrator-root only).
+    # Runs only when _sync_all=True so it fires after a complete re-seed
+    # (not after a partial diff-only sync, where orphan detection would
+    # produce false positives for files we deliberately skipped).
+    if not seed_errors and _sync_all and current_kg_collection:
+        _prune_stale_kg_rows(current_kg_collection, weaviate_url)
 
     # 3. Cross-project shared KG seed (Step 7d).
     #
