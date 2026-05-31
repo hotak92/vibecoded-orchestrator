@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI-1**: Re-targeted installer-smoke F1 assertions from install-root `.env` to per-project `.claude/env`. `VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR` are deliberately excluded from `.env` per `vco_lib/env_template.py:71-91`; the correct assertion target is `$PROJECT_DIR/.claude/env` written by `--write-env`. Both Job 1 (ubuntu) and Job 4 (windows/macos) updated.
+- **CI-2**: Replaced `pip install -e ".[dev]"` with `pip install -e ".[mcp]"` at 3 sites in `installer-smoke.yml`; removed `|| true` swallows so packaging regressions surface; added `client.close()` before `sys.exit(1)` in the weaviate-bootstrap step to suppress Con004 ResourceWarning.
+- **CI-3**: Added `actions/cache@v4` for pip across all three installer-smoke jobs; bumped `install-smoke-no-container` `timeout-minutes` from 20 to 30 (Windows cold-runner installs can take 18-22 min).
+- **CI-3-nohub**: Added `--no-hub` flag to `install.py` argparse; when set, Step 8 (vct-hub deployment + start) is skipped with a descriptive note referencing the session-start-ensure-hub auto-start fallback. Passed `--no-hub` in the installer-smoke no-container job (windows-latest + macos-latest).
+- **CI-5**: Bumped `actions/checkout@v4` → `@v6` and `actions/setup-python@v5` → `@v6` at all 4+3 sites in `installer-smoke.yml`.
+- **CI-7**: Added `launcher/dist/**` to `ci.yml` `paths-ignore` (push + pull_request) so the release binary-refresh commit no longer triggers the full CI matrix.
+- **CI-9**: Added `timeout-minutes: 12` to `manifest-validate.yml` `validate-manifests` job to prevent runaway Rust compilations from burning unbounded CI minutes.
+
 ## [0.2.41] — 2026-05-31
 
 ### Fixed
