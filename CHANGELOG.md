@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### UX
 
 - **UX-1 (paid-modules-agnostic gating)**: introduced `moduleIsActive(moduleId, installed)` and `moduleIsInstalled(moduleId, installed)` pure helpers (`launcher/src/lib/module-active-gate.ts`) as the single gate for all paid-module-specific UI. RL Reranker status panel + RT-4 Reset button now visible only when the module container is running; License Manager shows rows only for installed modules. 16 unit tests covering all status transitions. ([W6])
-- **RT-4 (Reset to global weights button)**: wired the Tauri command `reset_weights_to_global` (registered by W3) to a "Reset to global weights" button on the RL Reranker module config tab. Button is gated by `moduleIsActive` (visible only when container is running). ([W6])
+- **RT-4 (Reset to global weights button)**: wired the Tauri command `module_reset_weights_to_global` (registered by RT-4) to a "Reset to global weights" button on the RL Reranker module config tab. Button is gated by `moduleIsActive` (visible only when container is running) and hidden when `weights_last_version` is absent (nothing to reset to). On success, surfaces the version string in an inline status message ("Reset to qwen3 v3"). Stale `TODO (W6)` comments removed from `module_default_weights.rs`. ([W6], corrected D3)
 
 ## [0.2.41] — 2026-05-31
 
