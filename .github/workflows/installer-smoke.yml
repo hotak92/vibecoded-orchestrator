@@ -86,6 +86,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      # v0.2.42 CI-3: pip cache — saves ~2-4 min on repeated runs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-smoke-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-smoke-
+
       # Install orchestrator Python deps into CI venv. We skip container
       # and model setup entirely — install.py --no-containers --skip-models
       # does the venv/package work only.
@@ -286,6 +294,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # v0.2.42 CI-3: pip cache.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-smoke-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-smoke-
 
       - name: Install Python deps
         run: |
@@ -550,7 +566,9 @@ jobs:
             wrapper_ext: ""
             kind: macos
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # v0.2.42 CI-3: raised from 20 → 30 min. Windows pip install on cold
+    # runner images (no cache) + install.py venv bootstrap can take 18-22 min.
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -561,6 +579,17 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # v0.2.42 CI-3: pip cache — saves ~3-5 min on repeated windows-latest runs.
+      # Both Linux and Windows cache paths included; macOS uses ~/.cache/pip too.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/AppData/Local/pip/Cache
+          key: ${{ runner.os }}-pip-smoke-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-smoke-
 
       - name: Install Python deps
         run: |
