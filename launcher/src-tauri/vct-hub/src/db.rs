@@ -25,7 +25,9 @@ pub fn open_db() -> SqlResult<Db> {
     }
 
     let conn = Connection::open(&path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    // busy_timeout=5000 matches install.py's sqlite3.connect(..., timeout=5.0)
+    // so hub and Python scripts wait up to 5 s rather than failing immediately.
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
     migrate(&conn)?;
     Ok(Arc::new(Mutex::new(conn)))
 }

@@ -94,6 +94,11 @@ impl Db {
             .map_err(|e| format!("set synchronous: {}", e))?;
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| format!("enable FK: {}", e))?;
+        // Match install.py's sqlite3.connect(..., timeout=5.0) so both sides
+        // wait up to 5 s before raising SQLITE_BUSY rather than failing
+        // immediately when the launcher and a Python install script contend.
+        conn.pragma_update(None, "busy_timeout", 5000)
+            .map_err(|e| format!("set busy_timeout: {}", e))?;
 
         migrations::apply(&conn)?;
 
