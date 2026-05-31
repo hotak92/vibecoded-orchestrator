@@ -2314,6 +2314,19 @@ def main() -> int:
                              "you manage ~/.claude.json mcpServers entries "
                              "outside the installer (multi-stack adoption, "
                              "containerised deployment, etc.).")
+    # v0.2.42 CI-3-nohub: skip Step 8 (vct-hub deploy + start).
+    # Verified auto-start fallback: templates/hooks/session-start-ensure-hub.sh
+    # (and its .ps1 sibling) run on every Claude Code SessionStart and invoke
+    # `vct-hub --start-if-not-running`, so the hub comes up on the user's next
+    # Claude Code session even when skipped here.
+    parser.add_argument("--no-hub", action="store_true", default=False,
+                        help="v0.2.42: skip Step 8 (vct-hub deployment + start). "
+                             "Useful in CI environments without a vct-hub binary "
+                             "on PATH (no GitHub release download, no cargo build). "
+                             "With --update + --no-hub: any already-running hub is "
+                             "left untouched; only the launch step is skipped. "
+                             "Hub auto-starts on next launcher open or first Claude "
+                             "Code session start (session-start-ensure-hub hook).")
     args = parser.parse_args()
 
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
@@ -3136,7 +3149,23 @@ def main() -> int:
     # Boot auto-start (8d): NOT registered here — user opts in via
     # launcher GUI Preferences (Step 13). install-time default is
     # conservative.
-    if not getattr(args, "skip_mcp_registration", False):
+    #
+    # --no-hub (v0.2.42 CI-3-nohub): skip Step 8 entirely when requested.
+    # Intended for CI environments (no vct-hub binary on PATH, no network
+    # download, no cargo) and headless installs where spawning a background
+    # service is undesirable. With --update + --no-hub: any already-running
+    # hub is left untouched; only the launch step is skipped (no kill, no
+    # sentinel manipulation). Auto-start fallback verified: the hook at
+    # templates/hooks/session-start-ensure-hub.sh (and its .ps1 sibling)
+    # fires on every Claude Code SessionStart and invokes
+    # `vct-hub --start-if-not-running`, so the hub comes up on the user's
+    # next Claude Code session without manual intervention.
+    if getattr(args, "no_hub", False):
+        print("[8/10] Skipping vct-hub start (--no-hub). "
+              "Hub will auto-start when the launcher is next opened, "
+              "or when the first Claude Code session starts in any "
+              "installed project (via session-start-ensure-hub hook).")
+    elif not getattr(args, "skip_mcp_registration", False):
         try:
             _deploy_and_start_vct_hub(
                 PROJECT_ROOT,

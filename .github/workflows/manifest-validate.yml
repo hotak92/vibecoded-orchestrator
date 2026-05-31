@@ -90,6 +90,11 @@ jobs:
   validate-manifests:
     name: Validate paid-module manifests (strict mode)
     runs-on: ubuntu-latest
+    # CI-9 (v0.2.42): explicit timeout prevents runaway Rust compilations
+    # from burning unbounded CI minutes. The job typically finishes in 4-6 min
+    # (cached) or 8-10 min (cold); 12 min gives headroom without leaving
+    # it unbounded.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

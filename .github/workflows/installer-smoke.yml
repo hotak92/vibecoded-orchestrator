@@ -80,11 +80,19 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # v0.2.42 CI-3: pip cache — saves ~2-4 min on repeated runs.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-smoke-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-smoke-
 
       # Install orchestrator Python deps into CI venv. We skip container
       # and model setup entirely — install.py --no-containers --skip-models
@@ -96,9 +104,11 @@ jobs:
           # the venv-setup phase without error.  We only need the Python
           # side; Rust/npm/containers are out of scope.
           pip install -r requirements.txt 2>/dev/null || true
-          # vco_lib itself (editable, so imports resolve from the checkout)
-          pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true
-          # Ensure weaviate-client is available for the wrapper --help assertions
+          # vco_lib itself (editable, so imports resolve from the checkout).
+          # [mcp] extras pull weaviate-client, pyyaml, and mcp SDK together.
+          # No || true: packaging regressions must surface, not be silenced.
+          pip install -e ".[mcp]"
+          # weaviate-client included in [mcp]; kept explicit as belt-and-suspenders.
           pip install weaviate-client 2>/dev/null || true
 
       # Step 1: Run install.py against a fresh temporary directory.
@@ -130,9 +140,15 @@ jobs:
       # Step 2: Run install-bundle into a fresh project directory.
       #
       # This exercises the per-project bundle path (agents/skills/hooks/
-      # scripts/settings copied into project .claude/). Finding F7 from
-      # the audit identified that standalone install-bundle leaves no .claude/env
-      # — this step verifies what IS written and asserts it.
+      # scripts/settings copied into project .claude/).
+      #
+      # --write-env: emit per-project .claude/env carrying VCT_ORCHESTRATOR_ROOT
+      # and VCT_INFRASTRUCTURE_DIR (the A2 path, 2026-05-28). These keys are
+      # EXCLUDED from install-root .env by design — see vco_lib/env_template.py
+      # lines 71-91: they are launcher-installation-local paths that the launcher
+      # refreshes via the three Phase 0.B surfaces; .env is NOT one of them.
+      # CLI users keep these in their shell rc. --write-env is the CI-reachable
+      # path to assert them without a running launcher.
       - name: Run install-bundle into tmp project dir
         run: |
           set -euo pipefail
@@ -141,55 +157,56 @@ jobs:
           python -m vco_lib.project_init install-bundle \
             --folder "$PROJECT_DIR" \
             --orchestrator-root "$INSTALL_ROOT" \
+            --write-env \
             || {
               echo "::warning::install-bundle exited non-zero; continuing assertions"
             }
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      # Assertions 1-3: .claude/env contains expected orchestrator-root keys.
+      # Assertions 1-3: per-project .claude/env carries orchestrator-root keys.
       #
-      # Finding F1 from the audit: fresh projects' .claude/env was missing
-      # VCT_ORCHESTRATOR_ROOT / VCT_INFRASTRUCTURE_DIR. These assertions
-      # verify the install pipeline writes them (or fail clearly if it doesn't).
-      #
-      # Note: standalone install-bundle (without launcher) may NOT write
-      # .claude/env — this is a known gap (Finding F7, deferred to A2).
-      # The assertions here check the install.py-generated root .env instead,
-      # which is the reachable path in CI. The install-bundle assertions
-      # check what CAN be verified without the launcher.
-      - name: Assert install.py root env contains orchestrator-root keys
+      # CI-1 (v0.2.42 W1): re-targeted from install-root .env → per-project
+      # .claude/env. Rationale: VCT_ORCHESTRATOR_ROOT / VCT_INFRASTRUCTURE_DIR
+      # are DELIBERATELY EXCLUDED from install-root .env per vco_lib/env_template.py
+      # lines 71-91 (launcher-local paths; the launcher refreshes the three
+      # Phase 0.B surfaces; .env is NOT one of them; CLI users keep these in
+      # their shell rc). The correct assertion target is $PROJECT_DIR/.claude/env,
+      # which --write-env (above) writes via the A2 path.
+      - name: Assert per-project .claude/env contains orchestrator-root keys
         run: |
           set -euo pipefail
+          PROJECT_ENV="$PROJECT_DIR/.claude/env"
+          if [ ! -f "$PROJECT_ENV" ]; then
+            echo "::error::per-project .claude/env not written by install-bundle --write-env at $PROJECT_ENV"
+            exit 1
+          fi
+          echo "Contents of per-project .claude/env (first 40 lines):"
+          head -40 "$PROJECT_ENV"
+
+          # Assertion 1: VCT_ORCHESTRATOR_ROOT present in per-project .claude/env
+          if grep -q "VCT_ORCHESTRATOR_ROOT" "$PROJECT_ENV"; then
+            echo "✓ Assertion 1 PASS: VCT_ORCHESTRATOR_ROOT found in .claude/env"
+          else
+            echo "::error::Assertion 1 FAIL: VCT_ORCHESTRATOR_ROOT missing from .claude/env (CI-1 / Finding F1)"
+            exit 1
+          fi
+
+          # Assertion 2: VCT_INFRASTRUCTURE_DIR present in per-project .claude/env
+          if grep -q "VCT_INFRASTRUCTURE_DIR" "$PROJECT_ENV"; then
+            echo "✓ Assertion 2 PASS: VCT_INFRASTRUCTURE_DIR found in .claude/env"
+          else
+            echo "::error::Assertion 2 FAIL: VCT_INFRASTRUCTURE_DIR missing from .claude/env (CI-1 / Finding F1)"
+            exit 1
+          fi
+
+          # Assertion 3: install-root .env present (sanity check only;
+          # we do NOT assert orchestrator-root keys there — they don't
+          # belong in .env per vco_lib/env_template.py:71-91).
           ROOT_ENV="$INSTALL_ROOT/.env"
-          if [ ! -f "$ROOT_ENV" ]; then
-            echo "::error::.env not written by install.py at $ROOT_ENV"
-            exit 1
-          fi
-          echo "Contents of root .env (first 40 lines):"
-          head -40 "$ROOT_ENV"
-
-          # Assertion 1: VCT_ORCHESTRATOR_ROOT present in root .env
-          if grep -q "VCT_ORCHESTRATOR_ROOT" "$ROOT_ENV"; then
-            echo "✓ Assertion 1 PASS: VCT_ORCHESTRATOR_ROOT found in root .env"
+          if [ -f "$ROOT_ENV" ]; then
+            echo "✓ Assertion 3 PASS: install-root .env present"
           else
-            echo "::error::Assertion 1 FAIL: VCT_ORCHESTRATOR_ROOT missing from root .env (Finding F1)"
-            exit 1
-          fi
-
-          # Assertion 2: VCT_INFRASTRUCTURE_DIR present in root .env
-          if grep -q "VCT_INFRASTRUCTURE_DIR" "$ROOT_ENV"; then
-            echo "✓ Assertion 2 PASS: VCT_INFRASTRUCTURE_DIR found in root .env"
-          else
-            echo "::error::Assertion 2 FAIL: VCT_INFRASTRUCTURE_DIR missing from root .env (Finding F1)"
-            exit 1
-          fi
-
-          # Assertion 3: VCT_INSTALL_ROOT present in root .env
-          if grep -q "VCT_INSTALL_ROOT" "$ROOT_ENV"; then
-            echo "✓ Assertion 3 PASS: VCT_INSTALL_ROOT found in root .env"
-          else
-            echo "::warning::Assertion 3 WARN: VCT_INSTALL_ROOT missing from root .env (may be written differently)"
-            # Not a hard failure — install.py may write it as VCT_ORCHESTRATOR_ROOT
+            echo "::warning::Assertion 3 WARN: install-root .env missing entirely (install.py may have exited early)"
           fi
 
       # Assertion 4: kg-sync --help exits 0 from the install root.
@@ -272,17 +289,28 @@ jobs:
           --health-retries 12
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # v0.2.42 CI-3: pip cache.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-smoke-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-smoke-
 
       - name: Install Python deps
         run: |
           pip install --upgrade pip
+          # [mcp] extras include weaviate-client, pyyaml, mcp SDK.
+          # No || true: packaging regressions must surface.
+          pip install -e ".[mcp]"
+          # weaviate-client included in [mcp]; kept explicit for clarity.
           pip install weaviate-client
-          pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true
 
       # Assertion 6: Weaviate /v1/.well-known/ready responds.
       #
@@ -372,9 +400,10 @@ jobs:
           missing = required_props - present
           if missing:
               print(f"FAIL: missing props on bootstrapped schema: {sorted(missing)}", file=sys.stderr)
+              client.close()  # Con004: close before exit to suppress ResourceWarning
               sys.exit(1)
           print(f"✓ Assertion 6b PASS: all 5 chunking/temporal props present: {sorted(required_props)}")
-          client.close()
+          client.close()  # Con004: explicit close suppresses ResourceWarning on GC
           PYEOF
           echo "✓ Weaviate schema assertions complete"
 
@@ -392,7 +421,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Assertion M1: codesign + plutil are available on the runner.
       # If either tool disappears from the runner image, the X1 ad-hoc
@@ -537,23 +566,39 @@ jobs:
             wrapper_ext: ""
             kind: macos
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    # v0.2.42 CI-3: raised from 20 → 30 min. Windows pip install on cold
+    # runner images (no cache) + install.py venv bootstrap can take 18-22 min.
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # v0.2.42 CI-3: pip cache — saves ~3-5 min on repeated windows-latest runs.
+      # Both Linux and Windows cache paths included; macOS uses ~/.cache/pip too.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/AppData/Local/pip/Cache
+          key: ${{ runner.os }}-pip-smoke-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-smoke-
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt 2>/dev/null || true
-          pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true
+          # [mcp] extras pull weaviate-client, pyyaml, mcp SDK.
+          # No || true: packaging regressions must surface.
+          pip install -e ".[mcp]"
+          # weaviate-client included in [mcp]; kept explicit as belt-and-suspenders.
           pip install weaviate-client 2>/dev/null || true
 
       # Run install.py with no containers + no models. This exercises:
@@ -563,6 +608,15 @@ jobs:
       #   - Cross-OS path handling in vco_lib.config_projection / env_template
       #     (the actual content of the F5 path-consolidation review item —
       #     a Windows branch in vct_root_dir resolver is a follow-up.)
+      #
+      # --no-hub (CI-3-nohub, v0.2.42): skip Step 8 (vct-hub deployment +
+      # start). GitHub-hosted Windows + macOS runners don't have a pre-built
+      # vct-hub binary on PATH, no GitHub release download is available from
+      # inside the CI sandbox, and no `cargo build` is available without the
+      # Rust toolchain step. --no-hub leaves any already-running hub untouched;
+      # only the launch step is skipped. Auto-start fallback: hub starts when
+      # the launcher is next opened, or when the first Claude Code session
+      # begins in any installed project (session-start-ensure-hub hook).
       - name: Run install.py (no containers, no models)
         env:
           VCO_CI_FIXTURE: "1"
@@ -575,11 +629,13 @@ jobs:
           # on Windows and macOS bash alike.
           cp -r . "$INSTALL_ROOT/"
           cd "$INSTALL_ROOT"
-          python install.py --no-containers --skip-models || {
+          python install.py --no-containers --skip-models --no-hub || {
             echo "::warning::install.py exited non-zero on ${{ matrix.kind }}; continuing to check what was written"
           }
           echo "INSTALL_ROOT=$INSTALL_ROOT" >> "$GITHUB_ENV"
 
+      # --write-env: emit per-project .claude/env (same as Job 1 above).
+      # See the Job 1 install-bundle comment for full rationale.
       - name: Run install-bundle into tmp project dir
         run: |
           set -euo pipefail
@@ -588,34 +644,36 @@ jobs:
           python -m vco_lib.project_init install-bundle \
             --folder "$PROJECT_DIR" \
             --orchestrator-root "$INSTALL_ROOT" \
+            --write-env \
             || {
               echo "::warning::install-bundle exited non-zero on ${{ matrix.kind }}; continuing assertions"
             }
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
-      # Assertion X2-1: .env materialized + carries orchestrator-root keys.
+      # Assertion X2-1: per-project .claude/env carries orchestrator-root keys.
       #
-      # Same canonical check as Assertions 1-2 in install-smoke (Linux),
-      # repeated cross-OS so the F1 regression (missing VCT_ORCHESTRATOR_ROOT
-      # / VCT_INFRASTRUCTURE_DIR) can't slip past on Windows or macOS.
-      - name: Assert install.py root env contains orchestrator-root keys
+      # CI-1 (v0.2.42 W1): re-targeted from install-root .env → per-project
+      # .claude/env. VCT_ORCHESTRATOR_ROOT / VCT_INFRASTRUCTURE_DIR are
+      # DELIBERATELY EXCLUDED from install-root .env per vco_lib/env_template.py
+      # lines 71-91. The correct assertion target is $PROJECT_DIR/.claude/env.
+      - name: Assert per-project .claude/env contains orchestrator-root keys
         run: |
           set -euo pipefail
-          ROOT_ENV="$INSTALL_ROOT/.env"
-          if [ ! -f "$ROOT_ENV" ]; then
-            echo "::error::.env not written by install.py at $ROOT_ENV (${{ matrix.kind }})"
+          PROJECT_ENV="$PROJECT_DIR/.claude/env"
+          if [ ! -f "$PROJECT_ENV" ]; then
+            echo "::error::per-project .claude/env not written at $PROJECT_ENV (${{ matrix.kind }})"
             exit 1
           fi
-          if grep -q "VCT_ORCHESTRATOR_ROOT" "$ROOT_ENV"; then
-            echo "✓ X2-1 PASS (${{ matrix.kind }}): VCT_ORCHESTRATOR_ROOT in root .env"
+          if grep -q "VCT_ORCHESTRATOR_ROOT" "$PROJECT_ENV"; then
+            echo "✓ X2-1 PASS (${{ matrix.kind }}): VCT_ORCHESTRATOR_ROOT in .claude/env"
           else
-            echo "::error::X2-1 FAIL (${{ matrix.kind }}): VCT_ORCHESTRATOR_ROOT missing (Finding F1)"
+            echo "::error::X2-1 FAIL (${{ matrix.kind }}): VCT_ORCHESTRATOR_ROOT missing from .claude/env (CI-1 / Finding F1)"
             exit 1
           fi
-          if grep -q "VCT_INFRASTRUCTURE_DIR" "$ROOT_ENV"; then
-            echo "✓ X2-1b PASS (${{ matrix.kind }}): VCT_INFRASTRUCTURE_DIR in root .env"
+          if grep -q "VCT_INFRASTRUCTURE_DIR" "$PROJECT_ENV"; then
+            echo "✓ X2-1b PASS (${{ matrix.kind }}): VCT_INFRASTRUCTURE_DIR in .claude/env"
           else
-            echo "::error::X2-1b FAIL (${{ matrix.kind }}): VCT_INFRASTRUCTURE_DIR missing (Finding F1)"
+            echo "::error::X2-1b FAIL (${{ matrix.kind }}): VCT_INFRASTRUCTURE_DIR missing from .claude/env (CI-1 / Finding F1)"
             exit 1
           fi
 
