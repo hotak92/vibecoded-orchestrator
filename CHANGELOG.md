@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CI-11 / V0243-7 (dist-binary freshness gate)**: added Gate 3 to `pre-release-gate` in `release.yml`. On a tag push, asserts that `launcher/dist/` changed since the previous tag. Catches the v0.2.42 regression class where a hotfix retag skipped `commit-dist-binaries` (PAT 403), leaving main with the v0.2.41 binary under a v0.2.42 tag. Gate skips gracefully (notice, not error) when no previous tag exists (first-ever release) or when triggered as `workflow_dispatch`. ~35 LoC added to `release.yml`.
+
 ## [0.2.42] — 2026-05-31
 
 47 commits across 11 worktree-isolated agent branches (W1-W8 fanout + D1-D3 deferral closers) plus a cargo-warning cleanup. Headline themes: (a) v0.2.40's silent-contamination guards are now AIRTIGHT (RT-1 closes the RLClient singleton hole F1 left open), (b) the long-broken `Installer Smoke Test` workflow turns green for the first time since v0.2.38 (W1 + W7), (c) launcher-side prep for the next vct-rl-reranker container iteration (L1.M multi-key licensing GUI gating, R3-R5 weights pipeline polish, W8 pull-token gateway end-to-end working), (d) **new discipline**: nothing deferred to v0.2.43. Every audit finding closed in-tag.
