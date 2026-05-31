@@ -10091,6 +10091,91 @@ def _self_heal_kg_bindings_on_update(
                 if "no such table" not in str(oe).lower():
                     raise
 
+            # ── 4. V0243-9: kg_collection_access parity self-heal ─────────
+            #
+            # For every row in project_kg_bindings that lacks a matching
+            # kg_collection_access row, INSERT-OR-IGNORE the canonical
+            # access-level:
+            #   role="primary"  → access_level="write"
+            #   role="shared"   → access_level="read"
+            #   role="archive"  → access_level="read"  (Development)
+            #
+            # Also backfill the matching _Development collection row:
+            # for each primary KG binding whose collection ends in
+            # "_KnowledgeGraph", derive the sibling "_Development"
+            # collection name and INSERT-OR-IGNORE a "write" row (the
+            # project owns its Development collection too).
+            #
+            # INSERT-OR-IGNORE is safe: the PK is (project_id,
+            # collection_name).  We never lower an existing privilege.
+            _parity_inserts = 0
+            try:
+                # Read all existing kg_collection_access rows for lookup.
+                cur.execute(
+                    "SELECT project_id, collection_name, access_level "
+                    "FROM kg_collection_access"
+                )
+                existing_access: set[tuple[str, str]] = {
+                    (r[0], r[1]) for r in cur.fetchall()
+                }
+                # Read all project_kg_bindings rows.
+                cur.execute(
+                    "SELECT project_id, role, collection_name "
+                    "FROM project_kg_bindings"
+                )
+                binding_rows = cur.fetchall()
+
+                _ROLE_LEVEL = {"primary": "write", "shared": "read", "archive": "read"}
+                now_ms = int(time.time() * 1000)
+
+                for proj_id, role, coll_name in binding_rows:
+                    if not coll_name:
+                        continue
+                    level = _ROLE_LEVEL.get(role, "read")
+                    if (proj_id, coll_name) not in existing_access:
+                        cur.execute(
+                            "INSERT OR IGNORE INTO kg_collection_access "
+                            "(project_id, collection_name, access_level, "
+                            " granted_at, updated_at) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (proj_id, coll_name, level, now_ms, now_ms),
+                        )
+                        if cur.rowcount:
+                            existing_access.add((proj_id, coll_name))
+                            _parity_inserts += 1
+
+                    # Backfill the sibling _Development collection for primary
+                    # bindings.
+                    if role == "primary" and coll_name.endswith("_KnowledgeGraph"):
+                        dev_name = coll_name[:-len("_KnowledgeGraph")] + "_Development"
+                        if (proj_id, dev_name) not in existing_access:
+                            cur.execute(
+                                "INSERT OR IGNORE INTO kg_collection_access "
+                                "(project_id, collection_name, access_level, "
+                                " granted_at, updated_at) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (proj_id, dev_name, "write", now_ms, now_ms),
+                            )
+                            if cur.rowcount:
+                                existing_access.add((proj_id, dev_name))
+                                _parity_inserts += 1
+
+                if _parity_inserts:
+                    _log_install_event(
+                        "7e/10", "ok",
+                        f"V0243-9: inserted {_parity_inserts} missing "
+                        f"kg_collection_access row(s) (parity self-heal)",
+                        data={"inserts": _parity_inserts},
+                    )
+            except sqlite3.OperationalError as oe:
+                if "no such table" not in str(oe).lower():
+                    raise
+                # kg_collection_access table absent — older schema; skip.
+                _log_install_event(
+                    "7e/10", "skip",
+                    "V0243-9: kg_collection_access absent; parity self-heal skipped",
+                )
+
             conn.commit()
         finally:
             conn.close()
