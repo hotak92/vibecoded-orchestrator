@@ -6261,6 +6261,167 @@ def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
                   "copied_scripts": copied_scripts},
         )
 
+    # V0243-4: on orchestrator-root installs, refresh .vco-manifest.json
+    # with current shipped-file SHA256s + bump vco_version. Only runs after
+    # templates have been copied (so hashes reflect the latest on-disk state).
+    if _is_orchestrator_root_install():
+        _refresh_orchestrator_self_vco_manifest(install_root)
+
+
+def _refresh_orchestrator_self_vco_manifest(install_root: Path) -> None:
+    """V0243-4: rewrite `<install_root>/.claude/.vco-manifest.json` with
+    current shipped-file SHA256 hashes + bump `vco_version` to the current
+    HEAD commit from ``_read_git_rev()[0]``.
+
+    Only called from the orchestrator-root install path (after templates are
+    copied by ``_materialize_orchestrator_self_claude_dir``).  Per-project
+    installs have their manifest written by
+    ``vco_lib.project_init.install_project_bundle``.
+
+    The manifest tracks every file that install.py copies from
+    ``templates/`` to ``.claude/`` — hooks, scripts, and the rendered
+    settings.json.  Agents and skills are NOT included because their
+    source-of-truth is ``templates/{agents,skills}/`` and they are written
+    by the per-project bundle path, not by the orchestrator-self path.
+
+    Soft-fail throughout: any OSError is logged but does not abort the
+    install.  A missing or stale manifest is only a cosmetic issue (the
+    launcher's bundle-update flow will notice the drift on the next
+    per-project update pass).
+    """
+    import hashlib as _hashlib
+    import datetime as _dt
+
+    claude_dir = install_root / ".claude"
+    manifest_path = claude_dir / ".vco-manifest.json"
+
+    # Collect shipped files that were just materialised.
+    file_entries: dict[str, dict] = {}
+    templates_dir = install_root / "templates"
+
+    def _sha256_file(p: Path) -> str:
+        h = _hashlib.sha256()
+        try:
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    h.update(chunk)
+        except OSError:
+            return ""
+        return h.hexdigest()
+
+    # Hooks (top-level files only — _lib/ sub-tree handled below).
+    hooks_src = templates_dir / "hooks"
+    hooks_dst = claude_dir / "hooks"
+    if hooks_src.is_dir():
+        for src in hooks_src.iterdir():
+            if not src.is_file():
+                continue
+            dst = hooks_dst / src.name
+            rel = str(Path(".claude") / "hooks" / src.name)
+            src_rel = str(src.relative_to(install_root))
+            file_entries[rel] = {
+                "sha256": _sha256_file(dst if dst.exists() else src),
+                "source": src_rel,
+            }
+        # _lib/ subdirectory.
+        lib_src = hooks_src / "_lib"
+        lib_dst = hooks_dst / "_lib"
+        if lib_src.is_dir():
+            for src in lib_src.iterdir():
+                if not src.is_file():
+                    continue
+                dst = lib_dst / src.name
+                rel = str(Path(".claude") / "hooks" / "_lib" / src.name)
+                src_rel = str(src.relative_to(install_root))
+                file_entries[rel] = {
+                    "sha256": _sha256_file(dst if dst.exists() else src),
+                    "source": src_rel,
+                }
+
+    # Scripts.
+    scripts_src = templates_dir / "scripts"
+    scripts_dst = claude_dir / "scripts"
+    if scripts_src.is_dir():
+        for src in scripts_src.iterdir():
+            if not src.is_file():
+                continue
+            dst = scripts_dst / src.name
+            rel = str(Path(".claude") / "scripts" / src.name)
+            src_rel = str(src.relative_to(install_root))
+            file_entries[rel] = {
+                "sha256": _sha256_file(dst if dst.exists() else src),
+                "source": src_rel,
+            }
+
+    # settings.json (rendered from template — hash the on-disk result).
+    settings_dst = claude_dir / "settings.json"
+    if platform.system() == "Windows":
+        settings_src_name = "settings.json.windows.template"
+    else:
+        settings_src_name = "settings.json.linux.template"
+    settings_src = templates_dir / settings_src_name
+    if settings_src.is_file():
+        rel = str(Path(".claude") / "settings.json")
+        file_entries[rel] = {
+            "sha256": _sha256_file(
+                settings_dst if settings_dst.exists() else settings_src
+            ),
+            "source": str(settings_src.relative_to(install_root)),
+        }
+
+    # Determine vco_version.
+    commit, _ = _read_git_rev()
+    vco_version = commit or "unknown"
+
+    now_str = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Read existing manifest to preserve preserved_files section.
+    existing: dict = {}
+    if manifest_path.is_file():
+        try:
+            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+
+    manifest_payload = {
+        "schema_version": 2,
+        "vco_version": vco_version,
+        "installed_at": existing.get("installed_at", now_str),
+        "updated_at": now_str,
+        "files": file_entries,
+        "preserved_files": existing.get("preserved_files", {}),
+    }
+
+    try:
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        payload_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n")
+        # Atomic write via tempfile + replace.
+        import tempfile as _tf
+        fd, tmp_path = _tf.mkstemp(
+            dir=str(claude_dir), suffix=".tmp", prefix=".vco-manifest-",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload_bytes)
+            os.replace(tmp_path, str(manifest_path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        _log_install_event(
+            "4b/10", "ok",
+            f"V0243-4: refreshed .vco-manifest.json "
+            f"({len(file_entries)} files, vco_version={vco_version!r})",
+            data={"file_count": len(file_entries), "vco_version": vco_version},
+        )
+    except OSError as exc:
+        _log_install_event(
+            "4b/10", "warn",
+            f"V0243-4: could not write .vco-manifest.json: {exc}",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step 6: Container services
