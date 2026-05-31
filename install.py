@@ -16223,27 +16223,40 @@ def _query_installed_npm_version(package: str,
                                  *, timeout: int = 60) -> str | None:
     """Return the version of a globally-installed npm package, or None.
 
-    Runs `npm view -g <package> version`. Returns None when:
-      - npm is not on PATH (cached miss);
-      - the package is not installed;
-      - the subprocess errors out / times out.
+    v0.2.43 V0243-11: uses ``npm ls -g --json --depth=0 <package>`` and
+    parses ``dependencies[package].version``.  Mirrors the pattern used
+    by :func:`_installed_npm_integrity` (same command, different field).
 
-    The result is the cleaned `stdout` (`npm view` prints just the
-    version string when querying a single field).
+    The previous implementation used ``npm view -g <package> version``
+    which queries the REGISTRY (network round-trip, returns the latest
+    published version — NOT the locally-installed version).  The local
+    ``npm ls`` approach is offline, faster, and returns the correct
+    installed version even when the registry version is newer.
+
+    Returns None when:
+      - npm is not on PATH (``_NPM_PATH`` is None);
+      - the package is not installed globally (absent from ``dependencies``);
+      - the subprocess errors out / times out.
     """
     if _NPM_PATH is None:
         return None
     try:
         result = subprocess.run(
-            [_NPM_PATH, "view", "-g", package, "version"],
+            [_NPM_PATH, "ls", "-g", "--json", "--depth=0", package],
             capture_output=True, text=True, timeout=timeout,
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
-    if result.returncode != 0:
+    if not result.stdout.strip():
         return None
-    # `npm view foo version` prints e.g. "1.6.3\n" — strip.
-    return result.stdout.strip() or None
+    try:
+        parsed = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return None
+    # ``npm ls --json`` shape: {"dependencies": {"<pkg>": {"version": "..."}}}
+    deps = parsed.get("dependencies") or {}
+    entry = deps.get(package) or {}
+    return (entry.get("version") or "").strip() or None
 
 
 def _installed_npm_integrity(package: str, *, timeout: int = 60) -> str | None:
