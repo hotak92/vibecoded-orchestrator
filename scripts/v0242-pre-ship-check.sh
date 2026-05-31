@@ -106,11 +106,36 @@ else
 fi
 
 # Gate 3: pytest
+#
+# Resolve the Python interpreter that actually has pytest installed.
+# `$PYTEST` env var wins; otherwise we probe a few canonical venvs.
+# Falling back to bare `python3 -m pytest` is intentional (it surfaces
+# a clear "pytest not installed" failure if the user hasn't set up
+# a venv yet).
 echo "  [running pytest tests/ ...]"
-if python3 -m pytest tests/ -q --tb=no > /tmp/w7-pytest.log 2>&1; then
+_PYTEST_PY=""
+if [ -n "${PYTEST:-}" ]; then
+    _PYTEST_PY="$PYTEST"
+elif [ -x ".venv/bin/python" ]; then
+    _PYTEST_PY=".venv/bin/python"
+elif [ -x ".venv/bin/python3" ]; then
+    _PYTEST_PY=".venv/bin/python3"
+elif [ -x "claude_mcp_servers/.venv/bin/python" ]; then
+    _PYTEST_PY="claude_mcp_servers/.venv/bin/python"
+elif command -v pytest >/dev/null 2>&1; then
+    _PYTEST_PY=""  # use bare `pytest`
+else
+    _PYTEST_PY="python3"
+fi
+if [ -n "$_PYTEST_PY" ]; then
+    _PYTEST_CMD=("$_PYTEST_PY" -m pytest)
+else
+    _PYTEST_CMD=(pytest)
+fi
+if "${_PYTEST_CMD[@]}" tests/ -q --tb=no > /tmp/w7-pytest.log 2>&1; then
     gate_pass "pytest tests/"
 else
-    gate_fail "pytest tests/" "See /tmp/w7-pytest.log"
+    gate_fail "pytest tests/" "See /tmp/w7-pytest.log (cmd: ${_PYTEST_CMD[*]})"
 fi
 
 # Gate 4: npm test (svelte-check)
