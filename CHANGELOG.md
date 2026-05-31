@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **D1 (module deprecation poll)**: wired the long-standing `#[allow(dead_code)]` scaffold `module_update_poll` to a real HTTP poller and 24h cron timer. `spawn_deprecation_poll` runs 30s after launcher boot then every 24h thereafter; it fetches the L0 module catalog (same `module-catalog` Supabase edge function as the Modules page) and for every `status='installed'` (project × module) pair applies the catalog's `deprecated` / `deprecation_message` / `deprecation_eol_date` / `deprecation_migration_url` fields via the existing three-layer soft-fail path (`apply_deprecation_state_impl`). Poll timestamps persisted to `app_state` under `module_deprecation_poll.last_at` / `module_deprecation_poll.last_status`. Removed `#[allow(dead_code)]`. 3 new unit tests. ([D1])
+
 ### Tests
 
 - W5-TEST3: added `cfg(any(test, debug_assertions))` thread-local mock keychain seam in `vct-launcher-core/src/secrets.rs`; un-ignored 2 L1.M keychain tests (`migrate_does_not_error_on_clean_install`, `migrate_full_flow_legacy_to_canonical`) + replaced 1 silent-pass test with 3 hermetic mock-backed siblings (`mock_empty_no_op`, `mock_seeded_migrate_succeeds`, `mock_idempotent_double_call`). All formerly-ignored tests now run on CI without D-Bus.
