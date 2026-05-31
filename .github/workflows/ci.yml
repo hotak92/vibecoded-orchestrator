@@ -79,6 +79,12 @@ on:
       - '.github/PULL_REQUEST_TEMPLATE.md'
       - '.github/FUNDING.yml'
       - '.github/CODEOWNERS'
+      # CI-7 (v0.2.42): the release.yml binary-refresh commit touches only
+      # launcher/dist/ — no source code changed, no test value in running CI.
+      # Adding the path here is cleaner than appending [skip ci] to every
+      # release binary-commit message (which would require touching release.yml
+      # and is harder to audit).
+      - 'launcher/dist/**'
   pull_request:
     paths-ignore:
       - 'knowledge/**'
@@ -98,6 +104,8 @@ on:
       - '.github/PULL_REQUEST_TEMPLATE.md'
       - '.github/FUNDING.yml'
       - '.github/CODEOWNERS'
+      # CI-7 (v0.2.42): binary-dist-only changes don't need CI.
+      - 'launcher/dist/**'
 
 permissions:
   contents: read
