@@ -45,7 +45,13 @@ pub trait CommandExt: Sized {
 }
 
 impl CommandExt for std::process::Command {
-    fn silent(self) -> Self {
+    // v0.2.42: `mut self` is REQUIRED on Windows because `creation_flags`
+    // takes `&mut self`. The earlier cargo-fix pass stripped `mut` because
+    // it ran on Linux where the cfg(windows) branch is inactive → unused_mut
+    // warning. The Windows build then failed with E0596. Restored `mut` +
+    // `#[allow(unused_mut)]` to silence the Linux warning cleanly.
+    #[allow(unused_mut)]
+    fn silent(mut self) -> Self {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt as _;
@@ -56,7 +62,9 @@ impl CommandExt for std::process::Command {
 }
 
 impl CommandExt for tokio::process::Command {
-    fn silent(self) -> Self {
+    // Same v0.2.42 mut-on-Windows requirement as above.
+    #[allow(unused_mut)]
+    fn silent(mut self) -> Self {
         #[cfg(windows)]
         {
             // tokio::process::Command on Windows wraps std::process::Command

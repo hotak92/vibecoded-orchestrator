@@ -57,8 +57,15 @@ use tokio::process::Command as TokioCommand;
 /// (and 11 other places in the launcher) which already set this flag.
 /// This helper centralises the pattern for the `services/runtime.rs`
 /// hot path which the audit missed.
+///
+/// v0.2.42: `mut cmd` is REQUIRED on Windows because `creation_flags`
+/// takes `&mut self`. cargo-fix on Linux stripped `mut` (the cfg(windows)
+/// branch is inactive there → unused_mut warning), breaking the Windows
+/// build with E0596. Restored `mut` + `#[allow(unused_mut)]` to silence
+/// the Linux warning cleanly.
+#[allow(unused_mut)]
 fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
-    let cmd = TokioCommand::new(program);
+    let mut cmd = TokioCommand::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
