@@ -58,7 +58,7 @@ use tokio::process::Command as TokioCommand;
 /// This helper centralises the pattern for the `services/runtime.rs`
 /// hot path which the audit missed.
 fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> TokioCommand {
-    let mut cmd = TokioCommand::new(program);
+    let cmd = TokioCommand::new(program);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

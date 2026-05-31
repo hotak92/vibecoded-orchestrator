@@ -45,7 +45,7 @@ pub trait CommandExt: Sized {
 }
 
 impl CommandExt for std::process::Command {
-    fn silent(mut self) -> Self {
+    fn silent(self) -> Self {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt as _;
@@ -56,7 +56,7 @@ impl CommandExt for std::process::Command {
 }
 
 impl CommandExt for tokio::process::Command {
-    fn silent(mut self) -> Self {
+    fn silent(self) -> Self {
         #[cfg(windows)]
         {
             // tokio::process::Command on Windows wraps std::process::Command

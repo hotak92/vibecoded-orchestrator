@@ -371,6 +371,12 @@ pub async fn mark_module_deprecation_seen(
 /// per-module throttling. The shape of the function will not change when
 /// the rest is filled in (poller's `apply_deprecation_state_impl` call
 /// stays identical).
+///
+/// v0.2.42: function remains an intentional scaffold pending HTTP+cron
+/// wiring (separate feature, not a v0.2.42 deferred fix). `#[allow(dead_code)]`
+/// silences the warning until a `#[tauri::command]` wrapper or cron task
+/// invokes it. Pinned by `module_update_poll_forwards_to_apply` test below.
+#[allow(dead_code)]
 pub fn module_update_poll(
     db: &Db,
     project_id: &str,
