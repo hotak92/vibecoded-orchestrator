@@ -350,7 +350,16 @@ jobs:
           python - <<'PYEOF'
           import os
           import sys
-          sys.path.insert(0, os.environ.get("VCT_ORCHESTRATOR_ROOT", "."))
+          _root = os.environ.get("VCT_ORCHESTRATOR_ROOT", ".")
+          sys.path.insert(0, _root)
+          # v0.2.42 (post-W1-CI2 fix): sync_knowledge_graph.py imports
+          # `weaviate_mcp.chunking` (TokenCounter + Chunker). The
+          # `weaviate_mcp` package lives one level deeper at
+          # `<root>/claude_mcp_servers/weaviate_mcp/`, so
+          # `claude_mcp_servers/` must also be on sys.path or the import
+          # fails with ModuleNotFoundError. Mirrors how vct-hub spawns
+          # the MCP subprocess with PYTHONPATH=<root>/claude_mcp_servers.
+          sys.path.insert(0, os.path.join(_root, "claude_mcp_servers"))
 
           import weaviate
 
