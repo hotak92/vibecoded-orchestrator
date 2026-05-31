@@ -892,6 +892,21 @@ pub async fn module_download_default_weights_inner(
         );
     }
 
+    // v0.2.42 RT-4: persist (source, version) so `module_reset_weights_to_global`
+    // can derive the global path without requiring the caller to pass them.
+    // Best-effort: failure is non-fatal — reset is an optional UX convenience.
+    let _ = db.set_setting(
+        &project_id, &module_id, WEIGHTS_LAST_EMBEDDING_SOURCE_KEY,
+        &serde_json::Value::String(embedding_source.clone()),
+    );
+    let _ = db.set_setting(
+        &project_id, &module_id, WEIGHTS_LAST_VERSION_KEY,
+        &serde_json::Value::String(response.version.clone()),
+    );
+    // v0.2.42 RT-3: on a successful manual download, clear any stale deferred
+    // flag so the cooldown resets and R5 doesn't skip the next install cycle.
+    clear_weights_download_deferred(db, &project_id, &module_id);
+
     Ok(DownloadDefaultWeightsResult {
         local_path: local_path.to_string_lossy().to_string(),
         version: response.version,
@@ -952,6 +967,123 @@ pub async fn module_get_runtime_value_inner(
     }
 }
 
+// ─── v0.2.42 RT-4: reset_weights_to_global Tauri command ────────────────
+//
+// Wraps `reset_weights_to_global` (the inner async helper at line ~385)
+// as a Tauri IPC command. The pre-existing inner function is pure logic;
+// this module adds the Tauri shim + the "derive source/version from DB"
+// discovery step so the GUI only needs `(module_id, project_id)`.
+//
+// TODO (W6): bind a "Reset to global defaults" button in the RL Reranker
+// module tile that calls `invoke("module_reset_weights_to_global", {
+//   module_id: module.id, project_id: current_project_id })`.
+// The call site: `module.reset_weights_to_global` on the Tauri side
+// maps to `module_reset_weights_to_global` in the handler below.
+
+/// Tauri-command return value for the reset operation.
+///
+/// `local_path` is the absolute path of the symlink/copy that now
+/// points at the global .pt. `version` + `embedding_source` echo the
+/// settings that were stored from the last successful download (so the
+/// renderer can display "reset to qwen3 v3").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetWeightsResult {
+    pub local_path: String,
+    pub embedding_source: String,
+    pub version: String,
+}
+
+/// v0.2.42 RT-4: Reset the per-project weights mount slot back to the
+/// globally-downloaded default `.pt`.
+///
+/// Derives `embedding_source` + `version` from the
+/// `WEIGHTS_LAST_EMBEDDING_SOURCE_KEY` / `WEIGHTS_LAST_VERSION_KEY`
+/// settings written by the last successful download. If either is
+/// absent (no download has succeeded yet), the command errors with a
+/// clear message so the renderer can prompt the user to download first.
+///
+/// The underlying `reset_weights_to_global` helper (lines ~385+)
+/// removes any user override (regular file or symlink) and re-points
+/// the slot at the global file — "use global".
+///
+/// TODO (W6): wire a "Reset to global defaults" button in the module
+/// tile's settings panel that invokes this command. The button should
+/// be hidden when `WEIGHTS_LAST_VERSION_KEY` is absent (nothing to
+/// reset to) and should surface `ResetWeightsResult.version` in the
+/// tile's success toast so users know which version they reverted to.
+#[command]
+pub async fn module_reset_weights_to_global(
+    module_id: String,
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<ResetWeightsResult, String> {
+    if module_id.trim().is_empty() {
+        return Err("module_id required".to_string());
+    }
+    if project_id.trim().is_empty() {
+        return Err("project_id required".to_string());
+    }
+
+    let db = db.inner();
+
+    // Derive source + version from the last successful download.
+    let embedding_source = match db.get_setting(&project_id, &module_id, WEIGHTS_LAST_EMBEDDING_SOURCE_KEY)? {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s,
+        _ => return Err(
+            "no successful weights download recorded yet — \
+             download default weights first, then reset to global".to_string()
+        ),
+    };
+    let version = match db.get_setting(&project_id, &module_id, WEIGHTS_LAST_VERSION_KEY)? {
+        Some(serde_json::Value::String(v)) if !v.is_empty() => v,
+        _ => return Err(
+            "no successful weights version recorded yet — \
+             download default weights first, then reset to global".to_string()
+        ),
+    };
+
+    let global_path = weights_file_path(&module_id, &embedding_source, &version);
+    if !global_path.exists() {
+        return Err(format!(
+            "global weights file not found at {} — \
+             re-download default weights first",
+            global_path.display()
+        ));
+    }
+
+    // Look up the project slug for the bind-mount path.
+    let project = db
+        .get_project(&project_id)
+        .map_err(|e| format!("get project: {}", e))?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+
+    let local_path = reset_weights_to_global(
+        &module_id,
+        &project.slug,
+        &embedding_source,
+        &version,
+        &global_path,
+    )
+    .await?;
+
+    let _ = db.audit(
+        "module_reset_weights_to_global",
+        Some(&project_id),
+        Some(&module_id),
+        &serde_json::json!({
+            "embedding_source": &embedding_source,
+            "version": &version,
+            "local_path": local_path.to_string_lossy(),
+        }),
+    );
+
+    Ok(ResetWeightsResult {
+        local_path: local_path.to_string_lossy().to_string(),
+        embedding_source,
+        version,
+    })
+}
+
 // ─── v0.2.40 R5: first-install auto-trigger ─────────────────────────────
 //
 // After `start_container_after_install` succeeds for the RL Reranker,
@@ -990,6 +1122,18 @@ pub const WEIGHTS_DOWNLOAD_DEFERRED_KEY: &str = "weights_download_deferred";
 ///
 /// Cleared alongside `WEIGHTS_DOWNLOAD_DEFERRED_KEY` on success.
 pub const WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY: &str = "weights_download_last_failed_at";
+
+/// v0.2.42 RT-4: `module_settings` key that records the embedding_source
+/// of the last successful default-weights download. Used by the
+/// `module_reset_weights_to_global` Tauri command to derive the correct
+/// source without requiring the GUI to pass it explicitly.
+pub const WEIGHTS_LAST_EMBEDDING_SOURCE_KEY: &str = "weights_last_embedding_source";
+
+/// v0.2.42 RT-4: `module_settings` key that records the version string
+/// (e.g. `"v3"` or `"2026-05-24"`) of the last successful default-weights
+/// download. Used by `module_reset_weights_to_global` to reconstruct the
+/// global file path.
+pub const WEIGHTS_LAST_VERSION_KEY: &str = "weights_last_version";
 
 /// 24-hour cooldown duration in milliseconds. When the deferred flag
 /// is set and the last failure was recorded within this window, the R5
@@ -1208,6 +1352,18 @@ pub async fn apply_default_weights_after_install(
             // Best-effort: clear any stale deferred-flag from a prior
             // failed attempt. Idempotent.
             clear_weights_download_deferred(db, project_id, module_id);
+
+            // v0.2.42 RT-4: persist (source, version) so
+            // `module_reset_weights_to_global` can derive the global
+            // path without requiring the caller to pass them explicitly.
+            let _ = db.set_setting(
+                project_id, module_id, WEIGHTS_LAST_EMBEDDING_SOURCE_KEY,
+                &serde_json::Value::String(embedding_source.clone()),
+            );
+            let _ = db.set_setting(
+                project_id, module_id, WEIGHTS_LAST_VERSION_KEY,
+                &serde_json::Value::String(downloaded.version.clone()),
+            );
 
             let _ = db.audit(
                 "module_default_weights_auto_downloaded",
