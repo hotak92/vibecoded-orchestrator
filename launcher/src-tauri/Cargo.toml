@@ -75,7 +75,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
 # Safer subprocess spawning (tokenize strings to Vec<String>)
-shlex = "1"
+shlex = "2"
 
 # Hashing for machine ID (sha256 of platform-stable host id, matches
 # Python validator.py — algorithm updated in v0.2.36 from MAC-based to
