@@ -96,9 +96,11 @@ jobs:
           # the venv-setup phase without error.  We only need the Python
           # side; Rust/npm/containers are out of scope.
           pip install -r requirements.txt 2>/dev/null || true
-          # vco_lib itself (editable, so imports resolve from the checkout)
-          pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true
-          # Ensure weaviate-client is available for the wrapper --help assertions
+          # vco_lib itself (editable, so imports resolve from the checkout).
+          # [mcp] extras pull weaviate-client, pyyaml, and mcp SDK together.
+          # No || true: packaging regressions must surface, not be silenced.
+          pip install -e ".[mcp]"
+          # weaviate-client included in [mcp]; kept explicit as belt-and-suspenders.
           pip install weaviate-client 2>/dev/null || true
 
       # Step 1: Run install.py against a fresh temporary directory.
@@ -281,8 +283,11 @@ jobs:
       - name: Install Python deps
         run: |
           pip install --upgrade pip
+          # [mcp] extras include weaviate-client, pyyaml, mcp SDK.
+          # No || true: packaging regressions must surface.
+          pip install -e ".[mcp]"
+          # weaviate-client included in [mcp]; kept explicit for clarity.
           pip install weaviate-client
-          pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true
 
       # Assertion 6: Weaviate /v1/.well-known/ready responds.
       #
@@ -372,9 +377,10 @@ jobs:
           missing = required_props - present
           if missing:
               print(f"FAIL: missing props on bootstrapped schema: {sorted(missing)}", file=sys.stderr)
+              client.close()  # Con004: close before exit to suppress ResourceWarning
               sys.exit(1)
           print(f"✓ Assertion 6b PASS: all 5 chunking/temporal props present: {sorted(required_props)}")
-          client.close()
+          client.close()  # Con004: explicit close suppresses ResourceWarning on GC
           PYEOF
           echo "✓ Weaviate schema assertions complete"
 
@@ -553,7 +559,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt 2>/dev/null || true
-          pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true
+          # [mcp] extras pull weaviate-client, pyyaml, mcp SDK.
+          # No || true: packaging regressions must surface.
+          pip install -e ".[mcp]"
+          # weaviate-client included in [mcp]; kept explicit as belt-and-suspenders.
           pip install weaviate-client 2>/dev/null || true
 
       # Run install.py with no containers + no models. This exercises:
