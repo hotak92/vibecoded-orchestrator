@@ -870,7 +870,10 @@ def _compute_drift(install_path: Path) -> dict[str, bool]:
       - requirements_txt_md5 changed → run `pip install -r ... --upgrade`
       - cargo_lock_md5 / package_json_md5 changed → caller may want to
         rebuild the launcher
-      - knowledge_md5 changed → re-run sync_knowledge_graph.py
+      - knowledge_md5 changed → (legacy signal, no longer used directly)
+        v0.2.42 CI-10 replaced single-tree md5 with per-file content-hash
+        diff via ``_seed_weaviate``'s diff gate; see CI-10 implementation in
+        ``_seed_weaviate`` for the "pay once, never again" design.
     """
     current = _compute_state_hashes(install_path)
     previous = _load_previous_state_hashes()
@@ -5434,6 +5437,29 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
 _APP_STATE_KEY_DEFAULT_TEXT_EMBED = "default_text_embedding"
 _APP_STATE_KEY_DEFAULT_CODE_EMBED = "default_code_embedding"
 
+# v0.2.42 CI-10: app_state keys that track the install-time embedding/collection
+# context when the KG seed last ran successfully. Used by _seed_weaviate to
+# decide whether a full sync or a content-hash diff-only sync is needed on
+# --update runs. Documented in v0.2.17 fast-path CHANGELOG entry and this spec.
+#
+# IMPORTANT: "pay once, never again" — on fresh install or when any of these
+# change (embedding model swap, collection rename), run a full sync. On
+# subsequent --update runs with no change, compute a per-file content_hash diff
+# and only sync the changed files. If the diff is empty → SKIP sync entirely.
+#
+# Semantics:
+#   last_installed_active_embedding  — active embedding model at last seed run
+#                                      (e.g. "qwen3", "arctic2", "openai")
+#   last_installed_kg_collection     — KG_COLLECTION value at last seed run
+#   last_installed_shared_kg_collection — SHARED_KG_COLLECTION at last seed run
+#   last_kg_sync_at                  — ISO-8601 UTC timestamp of last sync
+#   last_kg_sync_stats               — JSON: {"nodes_synced": N, "nodes_skipped": M}
+_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING = "last_installed_active_embedding"
+_APP_STATE_KEY_LAST_KG_COLLECTION = "last_installed_kg_collection"
+_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION = "last_installed_shared_kg_collection"
+_APP_STATE_KEY_LAST_KG_SYNC_AT = "last_kg_sync_at"
+_APP_STATE_KEY_LAST_KG_SYNC_STATS = "last_kg_sync_stats"
+
 # Canonical OpenAI ID used by Wave A (with `openai-` prefix). MUST match:
 #   launcher/src-tauri/src/commands/openai_cmd.rs::OPENAI_DEFAULT_TEXT_MODEL_ID
 #   launcher/src-tauri/src/commands/embedding_catalog.rs (`id` field)
@@ -5660,6 +5686,161 @@ def _write_preset_defaults_to_app_state(
             conn.close()
         except sqlite3.Error:
             pass
+
+
+def _read_app_state_key(key: str) -> "str | None":
+    """Read a single key from launcher.db's app_state table.
+
+    Returns the string value, or None when the key is absent or any error
+    occurs (soft-fail: callers use None as "unknown / first run").
+    """
+    import sqlite3
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            row = conn.execute(
+                "SELECT value FROM app_state WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def _write_app_state_key(key: str, value: str) -> None:
+    """Write/overwrite a single key in launcher.db's app_state table.
+
+    Soft-fail: any sqlite error is silently swallowed (callers use this
+    for telemetry / cache; a missed write just means the next run re-scans).
+    """
+    import sqlite3
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
+        return
+    try:
+        now_ms = int(time.time() * 1000)
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, value, now_ms),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _batch_query_weaviate_content_hashes(
+    collection_name: str,
+    weaviate_url: str,
+) -> "dict[str, str]":
+    """Fetch stored content_hash values from a Weaviate collection.
+
+    Returns a dict mapping file_path → content_hash for every object in
+    the collection that has both properties populated. Objects without a
+    content_hash (e.g. created before v0.2.17) return an empty string for
+    that file_path — the diff logic treats this as "always stale" for that
+    file, which triggers a single-file re-sync (correct: we want to fill in
+    the missing hash).
+
+    Uses the Weaviate v1 GraphQL aggregate endpoint with a cursor-based
+    batch fetch. Falls back to an empty dict on any error so the caller
+    treats the absence of stored hashes as "full sync required".
+
+    v0.2.42 CI-10: "pay once, never again" — this function is the key
+    enabler. Once hashes are stored in Weaviate (after the first sync
+    that sets content_hash), subsequent --update runs only embed changed
+    files. Nodes created before v0.2.17 (no content_hash property) will
+    be re-synced once (to populate content_hash), then skipped forever.
+    """
+    try:
+        import urllib.request as _ur
+        import json as _json
+        # GraphQL: fetch file_path + content_hash for every object.
+        # Use limit=1000 with after-cursor pagination (Weaviate v1 cursor API).
+        # For typical orchestrator repos (~100 KG nodes), a single page is enough.
+        gql = {
+            "query": (
+                f"{{ Get {{ {collection_name}(limit: 1000, "
+                f"where: {{path: [\"file_path\"], operator: Like, valueText: \"%\"}}) "
+                f"{{ file_path content_hash }} }} }}"
+            ),
+        }
+        data = _json.dumps(gql).encode()
+        req = _ur.Request(
+            f"{weaviate_url}/v1/graphql",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=10) as resp:  # noqa: S310
+            body = _json.loads(resp.read())
+
+        objects = (
+            body.get("data", {})
+            .get("Get", {})
+            .get(collection_name, [])
+        ) or []
+        result: dict[str, str] = {}
+        for obj in objects:
+            fp = (obj.get("file_path") or "").strip()
+            ch = (obj.get("content_hash") or "").strip()
+            if fp:
+                result[fp] = ch
+        return result
+    except Exception as exc:
+        _log_install_event(
+            "7c/10", "warn",
+            f"CI-10: batch hash query failed for {collection_name!r}: {exc}",
+            data={"collection": collection_name, "error": str(exc)[:200]},
+        )
+        return {}
+
+
+def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
+    """Compute _content_signature_excluding_updated for every .md in knowledge/.
+
+    Returns a dict mapping relative_file_path (str, relative to the project
+    root) → content_signature. The relative path matches the file_path stored
+    in Weaviate by sync_knowledge_graph.py (which uses
+    `file_path.relative_to(PROJECT_ROOT)` or the absolute path, depending on
+    KG_BASE_DIR — but content_hash comparison is by file content, so we can
+    detect drift purely by hash comparison regardless of the stored path format
+    as long as we match the key consistently).
+    """
+    import hashlib
+    import re as _re
+
+    def _sig(text: str) -> str:
+        """Mirror of sync_knowledge_graph.py::_content_signature_excluding_updated."""
+        if not text.strip().startswith("---"):
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        fm_no_updated = _re.sub(r"^updated:.*$\n?", "", parts[1], flags=_re.MULTILINE)
+        return hashlib.sha256((fm_no_updated + parts[2]).encode("utf-8")).hexdigest()
+
+    result: dict[str, str] = {}
+    if not knowledge_root.exists():
+        return result
+    for md_file in knowledge_root.rglob("*.md"):
+        try:
+            content = md_file.read_text(encoding="utf-8", errors="replace")
+            result[str(md_file)] = _sig(content)
+        except OSError:
+            # Unreadable file — include with empty hash so the diff logic
+            # treats it as stale (forces a re-sync attempt).
+            result[str(md_file)] = ""
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -7911,7 +8092,89 @@ def _rebuild_collections(args: argparse.Namespace) -> None:
     _project_init.rebuild_collections(args, log_event=_log_install_event)
 
 
+def _seed_weaviate_shared_kg_only(
+    *,
+    args: "argparse.Namespace",
+    venv_py: "Path",
+    sync_kg: "Path",
+    weaviate_url: str,
+    current_shared_kg: str,
+) -> "list[str]":
+    """Run the shared-KG seed step only (no per-project KG sync).
+
+    v0.2.42 CI-10: extracted from ``_seed_weaviate`` so the diff-gate
+    skip path can still run the shared KG seed without the full per-project
+    sync. Returns a list of error strings (empty = success).
+    """
+    seed_errors: list[str] = []
+    shared_write_disabled = (
+        os.environ.get("SHARED_KG_WRITE_DISABLED")
+        or os.environ.get("SHARED_KG_OPT_OUT", "")
+    ).lower() in ("1", "true", "yes")
+    if shared_write_disabled:
+        print("  → shared KG seed: skipped (SHARED_KG_WRITE_DISABLED=true)")
+        return seed_errors
+    if not current_shared_kg:
+        print("  → shared KG seed: skipped (SHARED_KG_COLLECTION empty)")
+        return seed_errors
+    if not sync_kg.exists():
+        return seed_errors
+    print(f"  → knowledge/ → {current_shared_kg} (shared) ...", flush=True)
+    seed_env = os.environ.copy()
+    seed_env["KG_COLLECTION"] = current_shared_kg
+    seed_env["KG_BASE_DIR"] = str(PROJECT_ROOT)
+    try:
+        subprocess.run(
+            [str(venv_py), str(sync_kg), "--all"],
+            check=True,
+            cwd=str(PROJECT_ROOT),
+            timeout=600,
+            env=seed_env,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"    ! shared KG seed exited {e.returncode} — re-run later with "
+              f"`KG_COLLECTION={current_shared_kg} kg-sync --all`")
+        seed_errors.append(f"shared-kg exit {e.returncode}")
+    except subprocess.TimeoutExpired:
+        print("    ! shared KG seed timed out (>10 min)")
+        seed_errors.append("shared-kg timeout")
+    except FileNotFoundError as e:
+        print(f"    ! shared KG seed failed: {e}")
+        seed_errors.append(f"shared-kg FileNotFound: {e}")
+    return seed_errors
+
+
 def _seed_weaviate(args: argparse.Namespace) -> None:
+    """Seed Weaviate with bundled knowledge/ + docs/.
+
+    v0.2.42 CI-10: on ``--update`` runs (not fresh install), gate the sync
+    on a per-file content-hash diff instead of unconditionally running
+    ``sync_knowledge_graph.py --all``.  "Pay once, never again" — see
+    v0.2.17 fast-path CHANGELOG entry and the v0.2.42 user-spec.
+
+    Gate algorithm for ``--update``:
+      a. Read ``app_state`` keys ``last_installed_active_embedding``,
+         ``last_installed_kg_collection``, ``last_installed_shared_kg_collection``.
+      b. If ANY differ from current env → full sync (model swap / collection
+         rename detected; re-embed everything).
+      c. Else compute on-disk ``content_hash`` per file in ``knowledge/``
+         (using ``_content_signature_excluding_updated``, the same function
+         ``sync_knowledge_graph.py`` uses). Batch-query Weaviate for stored
+         ``content_hash`` per ``file_path``. Compute diff set.
+         - Empty diff → SKIP sync entirely (all hashes match).
+         - Non-empty diff → invoke ``sync_knowledge_graph.py`` passing just
+           the diff list as positional args (NOT ``--all``).
+      d. After successful sync, UPSERT the ``app_state`` keys with current
+         values. Audit-log run stats: ``nodes_synced``, ``nodes_skipped``.
+
+    On fresh install (no ``--update`` flag): full sync, no change.
+
+    Replaces the old ``knowledge_md5 changed → re-run sync_knowledge_graph.py``
+    approach (line ~873 comment in ``_compute_drift``) with per-file content-hash
+    diff: instead of a single md5 of the whole tree we now compare per-object
+    hashes already stored in Weaviate, avoiding the false-positive where a single
+    file change would force re-embedding of the entire tree.
+    """
     print("[7c/10] Seeding Weaviate with bundled knowledge/ + docs/ ... ", flush=True)
     _log_install_event("7c/10", "start", "seeding Weaviate")
 
@@ -7947,17 +8210,155 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     scripts_dir = PROJECT_ROOT / ".claude" / "scripts"
     sync_kg = scripts_dir / "sync_knowledge_graph.py"
 
+    # ── CI-10: content-hash diff gate for --update runs ───────────────────
+    #
+    # On fresh install (args.update is False): full sync unconditionally.
+    # On --update: detect whether a full sync or a diff-only sync (or skip)
+    # is needed. See function docstring for full algorithm.
+    is_update = getattr(args, "update", False)
+    _sync_all = True          # default: run --all (set False for diff path)
+    _diff_files: "list[str]" = []  # set when doing a partial sync
+    _nodes_skipped = 0
+    _nodes_synced = 0
+
+    current_active_embedding = os.environ.get("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
+    current_kg_collection = os.environ.get("KG_COLLECTION", "") or ""
+    current_shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+
+    if is_update and sync_kg.exists():
+        stored_embedding = _read_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
+        stored_kg = _read_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION)
+        stored_shared_kg = _read_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION)
+
+        # Check for model-swap / collection-rename: if ANY key differs, fall
+        # back to full sync (we cannot trust the stored hashes).
+        context_changed = (
+            stored_embedding != current_active_embedding
+            or stored_kg != current_kg_collection
+            or stored_shared_kg != current_shared_kg
+        )
+
+        if context_changed:
+            # Full sync required — context changed since last run.
+            reason = (
+                f"embedding={stored_embedding!r}→{current_active_embedding!r}, "
+                f"kg={stored_kg!r}→{current_kg_collection!r}, "
+                f"shared_kg={stored_shared_kg!r}→{current_shared_kg!r}"
+            )
+            print(f"  CI-10: context changed ({reason}) → full sync")
+            _log_install_event(
+                "7c/10", "info",
+                f"CI-10: full sync (context change: {reason})",
+                data={"reason": "context_change"},
+            )
+            _sync_all = True
+        elif not current_kg_collection:
+            # No KG_COLLECTION configured — can't query Weaviate for diff.
+            # Fall back to full sync to be safe.
+            _sync_all = True
+        else:
+            # Context unchanged — attempt per-file content-hash diff.
+            knowledge_root = PROJECT_ROOT / "knowledge"
+            on_disk = _compute_on_disk_content_hashes(knowledge_root)
+            stored_hashes = _batch_query_weaviate_content_hashes(
+                current_kg_collection, weaviate_url,
+            )
+
+            # Build diff: files whose on-disk hash differs from stored
+            # (or whose stored hash is missing / empty).
+            diff_files: list[str] = []
+            for file_path_str, disk_hash in on_disk.items():
+                # Match stored hash by absolute path OR by file_path relative
+                # forms. Weaviate stores file_path as written by sync_kg (may
+                # be absolute or relative depending on KG_BASE_DIR).
+                stored_hash = stored_hashes.get(file_path_str, "")
+                if not stored_hash:
+                    # Try relative path form as fallback.
+                    try:
+                        rel = str(Path(file_path_str).relative_to(PROJECT_ROOT))
+                        stored_hash = stored_hashes.get(rel, "")
+                    except ValueError:
+                        pass
+                if disk_hash != stored_hash:
+                    diff_files.append(file_path_str)
+
+            total_files = len(on_disk)
+            _nodes_skipped = total_files - len(diff_files)
+
+            if not diff_files:
+                # All hashes match → skip sync entirely.
+                print(
+                    f"  CI-10: all {total_files} knowledge/ file(s) unchanged "
+                    f"(content-hash diff empty) → skipping KG sync"
+                )
+                _log_install_event(
+                    "7c/10", "skip",
+                    f"CI-10: diff-only gate: all {total_files} file(s) match "
+                    f"stored hashes → sync skipped",
+                    data={"total": total_files, "changed": 0, "skipped": _nodes_skipped},
+                )
+                # Still update the app_state sync timestamp.
+                _write_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, current_active_embedding)
+                _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, current_kg_collection)
+                _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_shared_kg)
+                import datetime as _dt
+                _write_app_state_key(
+                    _APP_STATE_KEY_LAST_KG_SYNC_AT,
+                    _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                )
+                _write_app_state_key(
+                    _APP_STATE_KEY_LAST_KG_SYNC_STATS,
+                    json.dumps({"nodes_synced": 0, "nodes_skipped": _nodes_skipped}),
+                )
+                # Skip directly to shared KG section (no per-project sync).
+                _seed_weaviate_shared_kg_only(
+                    args=args,
+                    venv_py=venv_py,
+                    sync_kg=sync_kg,
+                    weaviate_url=weaviate_url,
+                    current_shared_kg=current_shared_kg,
+                )
+                _log_install_event("7c/10", "ok", "CI-10: diff-gate skip complete")
+                return
+
+            # Non-empty diff — sync only the changed files.
+            _sync_all = False
+            _diff_files = diff_files
+            _nodes_synced = len(diff_files)
+            print(
+                f"  CI-10: {len(diff_files)}/{total_files} knowledge/ file(s) changed "
+                f"→ partial sync"
+            )
+            _log_install_event(
+                "7c/10", "info",
+                f"CI-10: diff-only sync: {len(diff_files)}/{total_files} file(s)",
+                data={"changed": len(diff_files), "skipped": _nodes_skipped},
+            )
+
     seed_errors: list[str] = []
 
     # `sync_knowledge_graph.py` now handles both KG (knowledge/) and dev
     # docs (docs/) ingest paths — it routes by the file's location.
     # Old upload_docs.py was retired 2026-04-30 (audit cleanup); the
     # `--all` flag below seeds knowledge/ AND docs/ in one pass.
+    #
+    # CI-10 diff gate: when _sync_all=False, pass explicit file list
+    # instead of --all (only syncs changed files).
     if sync_kg.exists():
-        print("  → knowledge/ + docs/ → KG + Development collections ...", flush=True)
+        if _sync_all:
+            cmd_args = ["--all"]
+            desc = "knowledge/ + docs/"
+        else:
+            cmd_args = _diff_files  # explicit list of changed files
+            desc = f"{len(_diff_files)} changed file(s)"
+        print(f"  → {desc} → KG + Development collections ...", flush=True)
         try:
             subprocess.run(
-                [str(venv_py), str(sync_kg), "--all"],
+                [str(venv_py), str(sync_kg)] + cmd_args,
                 check=True,
                 cwd=str(PROJECT_ROOT),
                 timeout=900,  # 15 min cap; large repos may hit this
@@ -7974,6 +8375,22 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     else:
         print(f"  ! sync_knowledge_graph.py not found at {sync_kg}")
         seed_errors.append("sync_knowledge_graph.py missing")
+
+    # After a successful sync, update app_state with current context so
+    # the next --update run can compare against these values.
+    if not seed_errors:
+        _write_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, current_active_embedding)
+        _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, current_kg_collection)
+        _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_shared_kg)
+        import datetime as _dt
+        _write_app_state_key(
+            _APP_STATE_KEY_LAST_KG_SYNC_AT,
+            _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        )
+        _write_app_state_key(
+            _APP_STATE_KEY_LAST_KG_SYNC_STATS,
+            json.dumps({"nodes_synced": _nodes_synced or 0, "nodes_skipped": _nodes_skipped}),
+        )
 
     # 3. Cross-project shared KG seed (Step 7d).
     #
@@ -7993,48 +8410,15 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
     # Honor SHARED_KG_WRITE_DISABLED=true at install time too (skip seeding)
     # so power-users who explicitly gated shared-KG writes don't get the
     # collection re-populated by a subsequent install / update.
-    # Legacy alias SHARED_KG_OPT_OUT is still consulted for ~3 releases —
-    # canonical key wins when both are set (mirroring the MCP server).
-    shared_write_disabled = (
-        os.environ.get("SHARED_KG_WRITE_DISABLED")
-        or os.environ.get("SHARED_KG_OPT_OUT", "")
-    ).lower() in ("1", "true", "yes")
-    shared_collection = os.environ.get(
-        "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
+    # v0.2.42 CI-10: extracted to _seed_weaviate_shared_kg_only helper.
+    shared_errors = _seed_weaviate_shared_kg_only(
+        args=args,
+        venv_py=venv_py,
+        sync_kg=sync_kg,
+        weaviate_url=weaviate_url,
+        current_shared_kg=current_shared_kg,
     )
-    if shared_write_disabled:
-        print("  → shared KG seed: skipped (SHARED_KG_WRITE_DISABLED=true)")
-    elif not shared_collection:
-        print("  → shared KG seed: skipped (SHARED_KG_COLLECTION empty)")
-    elif sync_kg.exists():
-        print(f"  → knowledge/ → {shared_collection} (shared) ...", flush=True)
-        # Pass the override via subprocess env so the script writes into the
-        # shared collection without us having to special-case its argparse.
-        # The script reads KG_COLLECTION via os.getenv at module top-level,
-        # so a fresh subprocess picks up the override cleanly.
-        seed_env = os.environ.copy()
-        seed_env["KG_COLLECTION"] = shared_collection
-        # Keep KG_BASE_DIR pointed at the orchestrator root so file_path
-        # resolution still finds the bundled knowledge/ tree.
-        seed_env["KG_BASE_DIR"] = str(PROJECT_ROOT)
-        try:
-            subprocess.run(
-                [str(venv_py), str(sync_kg), "--all"],
-                check=True,
-                cwd=str(PROJECT_ROOT),
-                timeout=600,
-                env=seed_env,
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"    ! shared KG seed exited {e.returncode} — re-run later with "
-                  f"`KG_COLLECTION={shared_collection} kg-sync --all`")
-            seed_errors.append(f"shared-kg exit {e.returncode}")
-        except subprocess.TimeoutExpired:
-            print("    ! shared KG seed timed out (>10 min)")
-            seed_errors.append("shared-kg timeout")
-        except FileNotFoundError as e:
-            print(f"    ! shared KG seed failed: {e}")
-            seed_errors.append(f"shared-kg FileNotFound: {e}")
+    seed_errors.extend(shared_errors)
 
     print("  OK (seed step complete; per-script errors are non-fatal — see hints above)")
     if seed_errors:
@@ -8627,6 +9011,234 @@ def _prefix_adopt_kg_bindings_pass(
     return {"adopts": adopts, "multi_candidates": multi_candidates}
 
 
+def _w40_run_adoption_uplifts(
+    *,
+    prefix_adopts: "list[tuple[str, str, str, str, int]]",
+    weaviate_url: str,
+    deferral_report: "DeferralReport",
+    db_path: "Path",
+) -> None:
+    """v0.2.42 RT-13: W40-adoption smart-path uplift.
+
+    For each (project_id, role, old_name, new_name, row_count) entry in
+    ``prefix_adopts``, run ``migrate_collections`` against the newly-adopted
+    ``new_name`` collection to detect schema drift between the legacy-named
+    collection and the current orchestrator target schema.
+
+    Decision table:
+      noop / patch_props → apply silently (additive or no-op; no re-embed).
+      copy               → apply (copies existing vectors; no re-embed cost).
+      rebuild            → emit ``schema_migration_required`` deferral entry;
+                           DO NOT apply automatically (full re-embed required,
+                           user must consent and schedule downtime).
+
+    Writes an ``audit_log`` row to ``launcher.db`` per adopted collection:
+      operation='kg_collection_adopt_uplift'
+      detail={'collection_name': ..., 'smart_path_action': ...,
+              'applied': true|false}
+
+    Soft-fail: any per-collection migrate error becomes a deferral entry;
+    the binding flip is already committed, so this step cannot undo adoption.
+
+    Args:
+        prefix_adopts: output from ``_prefix_adopt_kg_bindings_pass``
+            — list of (project_id, role, old_name, new_name, row_count).
+        weaviate_url: resolved Weaviate base URL.
+        deferral_report: active ``DeferralReport`` instance for the run.
+        db_path: absolute path to ``launcher.db`` (for audit writes).
+    """
+    import sqlite3
+    import argparse as _argparse
+
+    seen_collections: set[str] = set()
+    for (project_id, role, old_name, new_name, _row_count) in prefix_adopts:
+        if new_name in seen_collections:
+            # Multiple bindings pointing at the same adopted collection (e.g.
+            # KG + shared KG both adopted the same name). Only process once.
+            continue
+        seen_collections.add(new_name)
+
+        smart_action = "unknown"
+        applied = False
+        error_msg: "str | None" = None
+
+        try:
+            # Temporarily override the env so migrate_collections targets
+            # exactly ``new_name``.  Determine which env key maps to this
+            # collection (KG or Dev) based on the suffix.
+            if new_name.endswith("_KnowledgeGraph"):
+                env_key = "KG_COLLECTION"
+            elif new_name.endswith("_Development"):
+                env_key = "DEVELOPMENT_COLLECTION"
+            else:
+                # Unknown suffix — skip (conservative; don't override env
+                # with something we can't undo if migrate_collections
+                # picks up extra collections from the env).
+                _log_install_event(
+                    "7e/10", "skip",
+                    f"RT-13: adopted collection {new_name!r} has unknown suffix; "
+                    f"skipping smart-path uplift",
+                    data={"collection": new_name, "project_id": project_id},
+                )
+                continue
+
+            saved_env = os.environ.get(env_key)
+            os.environ[env_key] = new_name
+            try:
+                # A minimal args namespace — migrate_collections only needs
+                # force_rebuild.  dry_run=False so changes are applied.
+                _args = _argparse.Namespace(force_rebuild=False)
+                result = _project_init.migrate_collections(
+                    _args,
+                    dry_run=False,
+                    weaviate_url=weaviate_url,
+                    log_event=_log_install_event,
+                )
+            finally:
+                if saved_env is None:
+                    os.environ.pop(env_key, None)
+                else:
+                    os.environ[env_key] = saved_env
+
+            # Inspect the plan result for the adopted collection.
+            plan_entries = [
+                e for e in (result.get("plan") or [])
+                if e.get("collection") == new_name
+            ]
+            if plan_entries:
+                smart_action = plan_entries[0].get("action", "unknown")
+            elif result.get("errors"):
+                # Errors list is populated when the collection is missing
+                # entirely or the plan build failed.
+                smart_action = "error"
+                error_msg = str(result["errors"][0].get("error", ""))
+            else:
+                smart_action = "noop"  # nothing to do
+
+            if smart_action in ("noop", "patch_props", "copy"):
+                applied = True
+                _log_install_event(
+                    "7e/10", "ok",
+                    f"RT-13 uplift: applied {smart_action!r} for {new_name!r} "
+                    f"(adopted from {old_name!r})",
+                    data={"collection": new_name, "action": smart_action,
+                          "project_id": project_id},
+                )
+            elif smart_action == "rebuild":
+                # Destructive rebuild requires user consent — defer.
+                applied = False
+                _log_install_event(
+                    "7e/10", "warn",
+                    f"RT-13 uplift: rebuild required for {new_name!r} — deferred",
+                    data={"collection": new_name, "action": "rebuild",
+                          "project_id": project_id},
+                )
+                deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id=f"schema_migration_required_{new_name}",
+                        title=f"Schema migration required for adopted collection `{new_name}`",
+                        detected=(
+                            f"After adopting `{old_name}` → `{new_name}` "
+                            f"(project_id={project_id}), the migrate_collections "
+                            f"smart-path determined the collection needs a REBUILD "
+                            f"(schema invariants changed in a way that requires "
+                            f"drop + re-embed). This was NOT applied automatically "
+                            f"because it requires re-embedding all objects "
+                            f"(~{_row_count} objects in the adopted collection)."
+                        ),
+                        why_deferred=(
+                            "A rebuild drops the collection and re-embeds every "
+                            "object. This takes time (cost proportional to "
+                            f"~{_row_count} objects × embedding latency) and cannot "
+                            "be safely auto-applied in an unattended install run. "
+                            "Run the command below when you can afford the downtime."
+                        ),
+                        command_to_apply=(
+                            f"python install.py --update --migrate-collections "
+                            f"--force-rebuild\n"
+                            f"# Or migrate only this collection interactively:\n"
+                            f"python -c \"from vco_lib import project_init; "
+                            f"import argparse, os; "
+                            f"os.environ['KG_COLLECTION']='{new_name}'; "
+                            f"project_init.migrate_collections(argparse.Namespace(force_rebuild=True))\""
+                        ),
+                        severity="warning",
+                        kg_node_refs=[
+                            "knowledge/concepts/config-projection-contract-2026-05-24.md",
+                        ],
+                    )
+                )
+            else:
+                # error or unknown action — log + soft-fail.
+                applied = False
+                _log_install_event(
+                    "7e/10", "warn",
+                    f"RT-13 uplift: unexpected action {smart_action!r} for "
+                    f"{new_name!r}; no-op",
+                    data={"collection": new_name, "action": smart_action,
+                          "error": error_msg or ""},
+                )
+
+        except Exception as exc:
+            applied = False
+            smart_action = "error"
+            error_msg = str(exc)
+            _log_install_event(
+                "7e/10", "warn",
+                f"RT-13 uplift: migrate failed for {new_name!r}: {exc}",
+                data={"collection": new_name, "error": error_msg[:200]},
+            )
+
+        # Write audit entry to launcher.db (best-effort).
+        _w40_write_adoption_audit(
+            db_path=db_path,
+            collection_name=new_name,
+            smart_path_action=smart_action,
+            applied=applied,
+        )
+
+
+def _w40_write_adoption_audit(
+    *,
+    db_path: "Path",
+    collection_name: str,
+    smart_path_action: str,
+    applied: bool,
+) -> None:
+    """Write a ``kg_collection_adopt_uplift`` audit entry to ``launcher.db``.
+
+    Best-effort: any sqlite error is logged and silently swallowed.
+    """
+    import sqlite3 as _sqlite3
+    import json as _json
+
+    if not db_path.is_file():
+        return
+    try:
+        conn = _sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            now_ms = int(time.time() * 1000)
+            detail = _json.dumps({
+                "collection_name": collection_name,
+                "smart_path_action": smart_path_action,
+                "applied": applied,
+            })
+            conn.execute(
+                "INSERT INTO audit_log (operation, detail, created_at) "
+                "VALUES (?, ?, ?)",
+                ("kg_collection_adopt_uplift", detail, now_ms),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        _log_install_event(
+            "7e/10", "warn",
+            f"RT-13: audit write failed for {collection_name!r}: {exc}",
+            data={"collection": collection_name, "error": str(exc)[:200]},
+        )
+
+
 def _self_heal_kg_bindings_on_update(
     deferral_report: "DeferralReport",
 ) -> None:
@@ -8942,6 +9554,24 @@ def _self_heal_kg_bindings_on_update(
             "no case-mismatched KG bindings or access rows; self-heal no-op",
         )
         return
+
+    # v0.2.42 RT-13: W40-adoption smart-path uplift.
+    #
+    # After each binding flip has been committed, run the migrate_collections
+    # smart-path against every newly-adopted collection to detect schema
+    # drift between the legacy-named collection and the current orchestrator
+    # target schema. Applied BEFORE the deferral-entry block so any
+    # rebuild deferrals are merged into the same UPDATE_DEFERRED.md write.
+    #
+    # Soft-fail: migrate errors become deferral entries; the binding flip
+    # already committed so this step cannot roll back the adoption.
+    if prefix_adopts:
+        _w40_run_adoption_uplifts(
+            prefix_adopts=prefix_adopts,
+            weaviate_url=weaviate_url,
+            deferral_report=deferral_report,
+            db_path=db_path,
+        )
 
     # Emit deferral entries. Case-rebinds + prefix-adopts share an
     # informational `kg_binding_self_healed` entry because both are

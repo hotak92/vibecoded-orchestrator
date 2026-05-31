@@ -1544,10 +1544,33 @@ pub async fn install_module_for_project(
                             let app_clone = app.clone();
                             let project_id_clone = project_id.clone();
                             let module_id_clone = module_id.clone();
+                            let manifest_clone = manifest.clone();
                             tauri::async_runtime::spawn(async move {
                                 use tauri::Manager;
                                 let db_state: tauri::State<'_, Db> = app_clone.state();
                                 let db_ref: &Db = db_state.inner();
+                                // v0.2.42 RT-6: re-check license INSIDE the
+                                // detached spawn, not just at spawn-gate time.
+                                // A user can deactivate their license between
+                                // the outer `is_module_licensed` check (which
+                                // runs synchronously before the spawn) and the
+                                // actual download attempt (which runs in this
+                                // background task, potentially seconds later).
+                                // Without this check the auto-trigger would
+                                // proceed for a de-licensed user and then set
+                                // `weights_download_deferred=true` on failure —
+                                // polluting the module tile's state with a
+                                // misleading "download pending" hint for a
+                                // user who chose the free tier.
+                                if !is_module_licensed(&manifest_clone, db_ref) {
+                                    eprintln!(
+                                        "[module_default_weights] R5 auto-trigger: \
+                                         skipping (license revoked between install-gate \
+                                         and spawn) for module {} project {}",
+                                        module_id_clone, project_id_clone
+                                    );
+                                    return;
+                                }
                                 // soft-fail wrapper internally; we
                                 // discard the Result either way.
                                 let _ = crate::commands::module_default_weights::

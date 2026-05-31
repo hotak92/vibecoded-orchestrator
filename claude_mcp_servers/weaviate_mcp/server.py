@@ -3175,7 +3175,14 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
 # allocate_rl_port flow) are read at first use, not at import time.
 # ----------------------------------------------------------------------
 
-_rl_client_instance = None  # type: ignore[var-annotated]
+# v0.2.42 RT-1: re-key RLClient singleton on active_embedding so a
+# mid-session ACTIVE_EMBEDDING flip (e.g. user switches from qwen3 to
+# arctic2 via the launcher's embedding dropdown) produces a client whose
+# `active_embedding` attribute matches the current env value rather than
+# freezing the value read at import time (which was ACTIVE_EMBEDDING, a
+# module-level constant).  Pre-fix this was a bare None — replacing with
+# a dict keyed by embedding name mirrors F2's telemetry-writer fix.
+_rl_client_instances: dict = {}  # type: ignore[var-annotated]
 # v0.2.40 F2: re-key telemetry writers on (project, embedding_source) so
 # mid-session env changes (ACTIVE_EMBEDDING flip, PROJECT_NAME re-resolution
 # from launcher.db adopt) produce a writer tagged with the CURRENT env
@@ -3187,19 +3194,34 @@ _rl_telemetry_writers: dict = {}  # type: ignore[var-annotated]
 # (the factory now consults the dict, so the legacy global is a tombstone
 # read-only sentinel — kept to avoid AttributeError in older callers).
 _rl_telemetry_writer_instance = None  # type: ignore[var-annotated]
+# Legacy alias kept so external code that holds a reference to
+# `srv._rl_client_instance` (e.g. older test shims) still resolves a
+# value rather than raising AttributeError.  The dict is the live
+# storage; this is a read-only tombstone.
+_rl_client_instance = None  # type: ignore[var-annotated]
 
 
 def _get_rl_client():
-    """Lazy-build one ``RLClient`` per process.
+    """Lazy-build one ``RLClient`` per active embedding per process.
+
+    v0.2.42 RT-1: keyed by the *current* ``ACTIVE_EMBEDDING`` env value
+    rather than a bare singleton.  A mid-session flip (user switches
+    embedding model via the launcher) yields a fresh client whose
+    ``active_embedding`` attribute matches the new value — the old
+    client stays in the dict as a tombstone for any in-flight requests
+    but is never returned to new callers.
 
     Reads ``RL_SERVER_URL`` / ``RL_SERVER_PORT`` at first call via
     ``rl_client.client._resolve_base_url``. When neither is set,
     the client lives in "disabled mode" and every call returns the
     no-rerank fallback without touching the network.
     """
-    global _rl_client_instance
-    if _rl_client_instance is not None:
-        return _rl_client_instance
+    # Re-read the env value on every call so a flip is caught immediately.
+    current_embedding = os.getenv("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
+
+    if current_embedding in _rl_client_instances:
+        return _rl_client_instances[current_embedding]
+
     try:
         from claude_mcp_servers.rl_client import RLClient
     except Exception as exc:
@@ -3218,11 +3240,12 @@ def _get_rl_client():
             svc.close()
     except Exception as exc:
         logger.debug("EmbeddingService probe failed (%s); using default text_dim=%d", exc, text_dim)
-    _rl_client_instance = RLClient(
+    client = RLClient(
         text_dim=text_dim,
-        active_embedding=ACTIVE_EMBEDDING,
+        active_embedding=current_embedding,
     )
-    return _rl_client_instance
+    _rl_client_instances[current_embedding] = client
+    return client
 
 
 def _embedding_dim_for(model: str) -> int:

@@ -125,6 +125,62 @@ pub struct DownloadDefaultWeightsResult {
     pub version: String,
 }
 
+/// v0.2.42 RT-3: structured error for Supabase 400 `unsupported_embedding_source`.
+///
+/// The edge function (`rl-latest-weights` and `rl-latest-version`) returns this
+/// body when the requested `embedding_source` has no matching row in
+/// `paid_module_releases`:
+///
+/// ```json
+/// {"error": "unsupported_embedding_source",
+///  "supported_embedding_sources": ["qwen3", "arctic2"]}
+/// ```
+///
+/// Pre-fix the client rendered only a raw 200-char text preview, which
+/// hid the actionable hint (the supported list). Now the caller receives
+/// a typed value that surfaces both the unsupported source and the
+/// available alternatives — the GUI tile can render
+/// "not available for <source>; try: qwen3, arctic2" instead of a
+/// cryptic JSON snippet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnsupportedEmbeddingSourceError {
+    /// The embedding source the caller requested.
+    pub requested_source: String,
+    /// The sources the server currently supports for this module.
+    pub supported_sources: Vec<String>,
+}
+
+impl std::fmt::Display for UnsupportedEmbeddingSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.supported_sources.is_empty() {
+            write!(
+                f,
+                "embedding source '{}' is not supported by the server \
+                 (no alternatives available yet)",
+                self.requested_source,
+            )
+        } else {
+            write!(
+                f,
+                "embedding source '{}' is not supported; \
+                 available sources: {}",
+                self.requested_source,
+                self.supported_sources.join(", "),
+            )
+        }
+    }
+}
+
+/// Deserialise shape of the Supabase 400 `unsupported_embedding_source` body.
+/// Only used internally by `fetch_signed_download_url`.
+#[derive(Debug, Deserialize)]
+struct SupabaseErrorBody {
+    #[serde(default)]
+    error: String,
+    #[serde(default, rename = "supported_embedding_sources")]
+    supported: Vec<String>,
+}
+
 // ─── Path helpers ───────────────────────────────────────────────────────
 
 /// Replace `[^A-Za-z0-9._-]` with `_` so a hostile string can never
@@ -201,11 +257,39 @@ pub fn weights_file_path(module_id: &str, embedding_source: &str, version: &str)
 // the symlink call uses `std::os::windows::fs::symlink_file` which
 // requires either elevated privileges or Developer Mode. If the symlink
 // fails (insufficient permission), we fall back to a plain `fs::copy`
-// so the container still gets the weights — the copy is a one-shot;
-// the next download replaces it (the symlink-replacement detection
-// treats a copy the same as a real file for override-protection
-// purposes, so on Windows the user re-downloads explicitly rather
-// than getting symlink-style transparent updates).
+// so the container still gets the weights.
+//
+// v0.2.42 RT-5 override-protection fix. Before this patch, the copy
+// fallback produced a regular file that the override-protection logic
+// (the `meta.file_type().is_symlink()` check in
+// `link_global_into_project_mount`) treated as a user-placed override —
+// so subsequent calls to "Download default weights" silently skipped the
+// slot, leaving the container on the first-downloaded version forever.
+//
+// Fix: when the copy fallback is taken, write a sibling `.vct-managed`
+// marker file next to the `.pt`. Override-protection checks for this
+// marker: if present, the slot is orchestrator-managed (replaceable);
+// only a regular file WITHOUT a marker is treated as a user override.
+//
+// On a re-link the old copy + marker are removed and the new copy (or
+// symlink on systems where symlink is now available) replaces them.
+// The user can still place a hand-crafted override by deleting the
+// marker file (or never having a copy at all).
+
+/// v0.2.42 RT-5: sibling marker file that signals "this weights file was
+/// placed here by the orchestrator (copy fallback) and is safe to
+/// replace on the next download". Without this marker, override-protection
+/// treats a regular `.pt` file as a deliberate user override and skips it.
+///
+/// Naming convention: `<weights_file>.vct-managed` — sibling of the `.pt`,
+/// same stem + `.vct-managed` extension. Created by the `fs::copy` fallback
+/// path; deleted alongside the file on re-link.
+pub fn managed_marker_path(weights_path: &Path) -> PathBuf {
+    let mut p = weights_path.to_path_buf();
+    let stem = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+    p.set_file_name(format!("{}.vct-managed", stem));
+    p
+}
 
 /// Resolve the per-project bind-mount directory the RL container reads
 /// weights from. Mirrors the host path declared in the RL Reranker
@@ -271,11 +355,28 @@ pub async fn link_global_into_project_mount(
     let target = project_mount_weights_path(module_id, project_slug, embedding_source, version);
 
     // Override protection: if a real (non-symlink) file already sits in
-    // the slot, the user has deliberately placed it there. Don't touch.
+    // the slot, check whether it is orchestrator-managed (`.vct-managed`
+    // marker present, written by the copy fallback path) or a deliberate
+    // user override. Only user overrides are preserved.
+    //
+    // v0.2.42 RT-5: pre-fix this block treated ALL regular files as user
+    // overrides, so a copy-fallback `.pt` was never refreshed on subsequent
+    // downloads — the container silently ran on the first-downloaded version
+    // forever on Windows systems where symlinks require Developer Mode.
+    let marker = managed_marker_path(&target);
     match tokio::fs::symlink_metadata(&target).await {
         Ok(meta) if !meta.file_type().is_symlink() => {
-            // User override (regular file or copy) — preserve.
-            return Ok(target);
+            // Regular file in the slot. Check the marker.
+            let is_managed = tokio::fs::metadata(&marker).await.is_ok();
+            if is_managed {
+                // Orchestrator-managed copy: remove + marker so we can refresh.
+                let _ = tokio::fs::remove_file(&target).await;
+                let _ = tokio::fs::remove_file(&marker).await;
+                // Fall through to the link/copy path below.
+            } else {
+                // No marker → genuine user override — preserve.
+                return Ok(target);
+            }
         }
         Ok(_) => {
             // Existing symlink — remove so we can refresh.
@@ -286,6 +387,9 @@ pub async fn link_global_into_project_mount(
                     e
                 ));
             }
+            // Clean up any stale marker file left from a prior copy-then-
+            // symlink transition (defensive; should be absent but harmless).
+            let _ = tokio::fs::remove_file(&marker).await;
         }
         Err(_) => {
             // Nothing there — proceed.
@@ -299,6 +403,12 @@ pub async fn link_global_into_project_mount(
         // Soft-fall back to copy (Windows without Developer Mode,
         // restricted filesystems, etc.). Log so the developer sees
         // it but don't fail — the container still gets the weights.
+        //
+        // v0.2.42 RT-5: write a `.vct-managed` marker file alongside
+        // the copy so future override-protection passes recognise this
+        // as an orchestrator-managed file (replaceable) rather than a
+        // user override. Without the marker, subsequent "Download default
+        // weights" calls silently skip the slot.
         eprintln!(
             "[module_default_weights] symlink {} -> {} failed ({}); falling back to copy",
             target.display(),
@@ -313,6 +423,17 @@ pub async fn link_global_into_project_mount(
                 e
             )
         })?;
+        // Write the marker (best-effort: a missing marker just means the
+        // copy will be treated as a user override on the NEXT call, which
+        // is the pre-fix behaviour — not great but not worse than before).
+        if let Err(marker_err) = tokio::fs::write(&marker, b"vct-managed").await {
+            eprintln!(
+                "[module_default_weights] warning: failed to write .vct-managed marker \
+                 {} ({}); copy will be treated as user override on next update",
+                marker.display(),
+                marker_err
+            );
+        }
     }
 
     Ok(target)
@@ -449,6 +570,23 @@ pub async fn fetch_signed_download_url(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
+        // v0.2.42 RT-3: parse 400 `unsupported_embedding_source` into a
+        // structured error so callers can surface actionable guidance
+        // ("try: qwen3, arctic2") rather than a raw JSON snippet.
+        if status.as_u16() == 400 {
+            if let Ok(err_body) = serde_json::from_str::<SupabaseErrorBody>(&body_text) {
+                if err_body.error == "unsupported_embedding_source" {
+                    let structured = UnsupportedEmbeddingSourceError {
+                        requested_source: embedding_source.to_string(),
+                        supported_sources: err_body.supported,
+                    };
+                    return Err(format!(
+                        "unsupported_embedding_source: {}",
+                        structured,
+                    ));
+                }
+            }
+        }
         let preview = body_text.chars().take(200).collect::<String>();
         return Err(format!("rl-latest-weights returned {}: {}", status, preview));
     }
@@ -819,6 +957,21 @@ pub async fn module_download_default_weights_inner(
         );
     }
 
+    // v0.2.42 RT-4: persist (source, version) so `module_reset_weights_to_global`
+    // can derive the global path without requiring the caller to pass them.
+    // Best-effort: failure is non-fatal — reset is an optional UX convenience.
+    let _ = db.set_setting(
+        &project_id, &module_id, WEIGHTS_LAST_EMBEDDING_SOURCE_KEY,
+        &serde_json::Value::String(embedding_source.clone()),
+    );
+    let _ = db.set_setting(
+        &project_id, &module_id, WEIGHTS_LAST_VERSION_KEY,
+        &serde_json::Value::String(response.version.clone()),
+    );
+    // v0.2.42 RT-3: on a successful manual download, clear any stale deferred
+    // flag so the cooldown resets and R5 doesn't skip the next install cycle.
+    clear_weights_download_deferred(db, &project_id, &module_id);
+
     Ok(DownloadDefaultWeightsResult {
         local_path: local_path.to_string_lossy().to_string(),
         version: response.version,
@@ -879,6 +1032,123 @@ pub async fn module_get_runtime_value_inner(
     }
 }
 
+// ─── v0.2.42 RT-4: reset_weights_to_global Tauri command ────────────────
+//
+// Wraps `reset_weights_to_global` (the inner async helper at line ~385)
+// as a Tauri IPC command. The pre-existing inner function is pure logic;
+// this module adds the Tauri shim + the "derive source/version from DB"
+// discovery step so the GUI only needs `(module_id, project_id)`.
+//
+// TODO (W6): bind a "Reset to global defaults" button in the RL Reranker
+// module tile that calls `invoke("module_reset_weights_to_global", {
+//   module_id: module.id, project_id: current_project_id })`.
+// The call site: `module.reset_weights_to_global` on the Tauri side
+// maps to `module_reset_weights_to_global` in the handler below.
+
+/// Tauri-command return value for the reset operation.
+///
+/// `local_path` is the absolute path of the symlink/copy that now
+/// points at the global .pt. `version` + `embedding_source` echo the
+/// settings that were stored from the last successful download (so the
+/// renderer can display "reset to qwen3 v3").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetWeightsResult {
+    pub local_path: String,
+    pub embedding_source: String,
+    pub version: String,
+}
+
+/// v0.2.42 RT-4: Reset the per-project weights mount slot back to the
+/// globally-downloaded default `.pt`.
+///
+/// Derives `embedding_source` + `version` from the
+/// `WEIGHTS_LAST_EMBEDDING_SOURCE_KEY` / `WEIGHTS_LAST_VERSION_KEY`
+/// settings written by the last successful download. If either is
+/// absent (no download has succeeded yet), the command errors with a
+/// clear message so the renderer can prompt the user to download first.
+///
+/// The underlying `reset_weights_to_global` helper (lines ~385+)
+/// removes any user override (regular file or symlink) and re-points
+/// the slot at the global file — "use global".
+///
+/// TODO (W6): wire a "Reset to global defaults" button in the module
+/// tile's settings panel that invokes this command. The button should
+/// be hidden when `WEIGHTS_LAST_VERSION_KEY` is absent (nothing to
+/// reset to) and should surface `ResetWeightsResult.version` in the
+/// tile's success toast so users know which version they reverted to.
+#[command]
+pub async fn module_reset_weights_to_global(
+    module_id: String,
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<ResetWeightsResult, String> {
+    if module_id.trim().is_empty() {
+        return Err("module_id required".to_string());
+    }
+    if project_id.trim().is_empty() {
+        return Err("project_id required".to_string());
+    }
+
+    let db = db.inner();
+
+    // Derive source + version from the last successful download.
+    let embedding_source = match db.get_setting(&project_id, &module_id, WEIGHTS_LAST_EMBEDDING_SOURCE_KEY)? {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s,
+        _ => return Err(
+            "no successful weights download recorded yet — \
+             download default weights first, then reset to global".to_string()
+        ),
+    };
+    let version = match db.get_setting(&project_id, &module_id, WEIGHTS_LAST_VERSION_KEY)? {
+        Some(serde_json::Value::String(v)) if !v.is_empty() => v,
+        _ => return Err(
+            "no successful weights version recorded yet — \
+             download default weights first, then reset to global".to_string()
+        ),
+    };
+
+    let global_path = weights_file_path(&module_id, &embedding_source, &version);
+    if !global_path.exists() {
+        return Err(format!(
+            "global weights file not found at {} — \
+             re-download default weights first",
+            global_path.display()
+        ));
+    }
+
+    // Look up the project slug for the bind-mount path.
+    let project = db
+        .get_project(&project_id)
+        .map_err(|e| format!("get project: {}", e))?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+
+    let local_path = reset_weights_to_global(
+        &module_id,
+        &project.slug,
+        &embedding_source,
+        &version,
+        &global_path,
+    )
+    .await?;
+
+    let _ = db.audit(
+        "module_reset_weights_to_global",
+        Some(&project_id),
+        Some(&module_id),
+        &serde_json::json!({
+            "embedding_source": &embedding_source,
+            "version": &version,
+            "local_path": local_path.to_string_lossy(),
+        }),
+    );
+
+    Ok(ResetWeightsResult {
+        local_path: local_path.to_string_lossy().to_string(),
+        embedding_source,
+        version,
+    })
+}
+
 // ─── v0.2.40 R5: first-install auto-trigger ─────────────────────────────
 //
 // After `start_container_after_install` succeeds for the RL Reranker,
@@ -905,6 +1175,83 @@ pub async fn module_get_runtime_value_inner(
 /// absence-of-row; the renderer treats both `false` and missing as
 /// "no defer".
 pub const WEIGHTS_DOWNLOAD_DEFERRED_KEY: &str = "weights_download_deferred";
+
+/// v0.2.42 RT-3: `module_settings.setting_key` used to record the
+/// Unix-millisecond timestamp of the last failed first-install auto-
+/// download. Combined with `WEIGHTS_DOWNLOAD_DEFERRED_KEY` to gate
+/// the R5 daily poll: when the deferred flag is set AND the last
+/// failure was < 24 hours ago, skip the poll to avoid hammering the
+/// Supabase edge function repeatedly for a known-stale configuration
+/// (e.g. `unsupported_embedding_source` — won't resolve without user
+/// action, so polling every 24h is wasteful).
+///
+/// Cleared alongside `WEIGHTS_DOWNLOAD_DEFERRED_KEY` on success.
+pub const WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY: &str = "weights_download_last_failed_at";
+
+/// v0.2.42 RT-4: `module_settings` key that records the embedding_source
+/// of the last successful default-weights download. Used by the
+/// `module_reset_weights_to_global` Tauri command to derive the correct
+/// source without requiring the GUI to pass it explicitly.
+pub const WEIGHTS_LAST_EMBEDDING_SOURCE_KEY: &str = "weights_last_embedding_source";
+
+/// v0.2.42 RT-4: `module_settings` key that records the version string
+/// (e.g. `"v3"` or `"2026-05-24"`) of the last successful default-weights
+/// download. Used by `module_reset_weights_to_global` to reconstruct the
+/// global file path.
+pub const WEIGHTS_LAST_VERSION_KEY: &str = "weights_last_version";
+
+/// 24-hour cooldown duration in milliseconds. When the deferred flag
+/// is set and the last failure was recorded within this window, the R5
+/// auto-trigger skips polling to avoid repeated edge-function calls
+/// for a configuration that requires user action to fix.
+const WEIGHTS_DOWNLOAD_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000; // 24 h
+
+/// v0.2.42 RT-3: return `true` when the R5 auto-trigger should skip
+/// the download attempt because a recent failure was recorded within
+/// the 24-hour cooldown window.
+///
+/// Logic:
+/// 1. If `WEIGHTS_DOWNLOAD_DEFERRED_KEY` is NOT set → not in defer
+///    state → never skip (let the first-install trigger proceed).
+/// 2. If `WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY` is absent → no
+///    timestamp recorded → skip (conservative: assume deferred
+///    recently; the user can clear via the manual "Download" button).
+/// 3. If `now - last_failed_at < 24h` → within cooldown → skip.
+/// 4. Otherwise → cooldown expired → allow retry.
+///
+/// Soft-fail: DB errors are treated as "do not skip" (let the
+/// download attempt run; it will fail and re-record the timestamp).
+pub(crate) fn should_skip_r5_poll(
+    db: &crate::db::Db,
+    project_id: &str,
+    module_id: &str,
+) -> bool {
+    // Step 1: check deferred flag.
+    let deferred = match db.get_setting(project_id, module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY) {
+        Ok(Some(serde_json::Value::Bool(true))) => true,
+        _ => false,
+    };
+    if !deferred {
+        return false;
+    }
+    // Steps 2–4: check timestamp.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match db.get_setting(project_id, module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY) {
+        Ok(Some(serde_json::Value::Number(n))) => {
+            if let Some(ts) = n.as_i64() {
+                // Within cooldown window → skip.
+                now_ms - ts < WEIGHTS_DOWNLOAD_COOLDOWN_MS
+            } else {
+                // Malformed timestamp → conservative skip.
+                true
+            }
+        }
+        // No timestamp row or non-numeric value → conservative skip.
+        Ok(_) => true,
+        // DB error → don't skip (let it try).
+        Err(_) => false,
+    }
+}
 
 /// Record the deferred-flag + audit entry for a failed first-install
 /// auto-download. Extracted into a pure-Db helper so unit tests can
@@ -935,6 +1282,18 @@ pub(crate) fn mark_weights_download_deferred(
         );
     }
 
+    // v0.2.42 RT-3: record failure timestamp for the 24-hour cooldown
+    // gate. `should_skip_r5_poll` reads this to avoid hammering the
+    // edge function for a configuration that requires user action
+    // (e.g. `unsupported_embedding_source`).
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let _ = db.set_setting(
+        project_id,
+        module_id,
+        WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY,
+        &serde_json::Value::Number(now_ms.into()),
+    );
+
     let _ = db.audit(
         "module_default_weights_auto_download_deferred",
         Some(project_id),
@@ -949,12 +1308,16 @@ pub(crate) fn mark_weights_download_deferred(
 /// Clear a previously-set deferred-flag after a successful download.
 /// Pure-Db helper, sibling to `mark_weights_download_deferred`.
 /// Idempotent: rows that don't exist produce a silent success.
+///
+/// v0.2.42 RT-3: also clears `WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY`
+/// so the 24-hour cooldown resets on success (next poll starts fresh).
 pub(crate) fn clear_weights_download_deferred(
     db: &Db,
     project_id: &str,
     module_id: &str,
 ) {
     let _ = db.delete_setting(project_id, module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY);
+    let _ = db.delete_setting(project_id, module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY);
 }
 
 /// Trigger a one-shot default-weights download after first install.
@@ -1011,6 +1374,26 @@ pub async fn apply_default_weights_after_install(
                 crate::commands::module_service::DEFAULT_EMBEDDING_SOURCE.to_string()
             });
 
+    // v0.2.42 RT-3: 24-hour cooldown gate. If the deferred flag is set
+    // and the last failure was recorded within the last 24 hours, skip
+    // this auto-trigger. This prevents repeated Supabase edge calls for
+    // configurations that require user action (e.g.
+    // `unsupported_embedding_source` — a new embedding source hasn't
+    // been released yet; no point retrying every install cycle).
+    //
+    // The user can always force a retry via the "Download default weights"
+    // button on the module tile, which calls the manual path directly
+    // (bypassing this gate). On success that path calls
+    // `clear_weights_download_deferred`, resetting the cooldown.
+    if should_skip_r5_poll(db, project_id, module_id) {
+        eprintln!(
+            "[module_default_weights] R5 auto-trigger: skipping (deferred + \
+             within 24-hour cooldown) for project {} module {}",
+            project_id, module_id
+        );
+        return Ok(());
+    }
+
     // 2. Reuse the manual-download path (no duplication). This is the
     // same function the GUI's "Download default weights" button calls
     // via the chained_action dispatcher (`module_dispatch.rs:244-252`).
@@ -1034,6 +1417,18 @@ pub async fn apply_default_weights_after_install(
             // Best-effort: clear any stale deferred-flag from a prior
             // failed attempt. Idempotent.
             clear_weights_download_deferred(db, project_id, module_id);
+
+            // v0.2.42 RT-4: persist (source, version) so
+            // `module_reset_weights_to_global` can derive the global
+            // path without requiring the caller to pass them explicitly.
+            let _ = db.set_setting(
+                project_id, module_id, WEIGHTS_LAST_EMBEDDING_SOURCE_KEY,
+                &serde_json::Value::String(embedding_source.clone()),
+            );
+            let _ = db.set_setting(
+                project_id, module_id, WEIGHTS_LAST_VERSION_KEY,
+                &serde_json::Value::String(downloaded.version.clone()),
+            );
 
             let _ = db.audit(
                 "module_default_weights_auto_downloaded",
@@ -1060,6 +1455,8 @@ pub async fn apply_default_weights_after_install(
             //   - "rl-latest-weights returned 5xx" (transient server
             //     error or rate-limit).
             //   - "POST ...: connection timed out" (network blip).
+            //   - "unsupported_embedding_source: ..." (v0.2.42 RT-3,
+            //     structured error; includes list of alternatives).
             eprintln!(
                 "[module_default_weights] R5 auto-trigger soft-fail for \
                  project {} module {}: {}",
@@ -1067,6 +1464,13 @@ pub async fn apply_default_weights_after_install(
             );
 
             mark_weights_download_deferred(db, project_id, module_id, &embedding_source, &e);
+
+            // v0.2.42 RT-3: surface the error to `module_installs.last_error`
+            // so the GUI tile can render a human-readable failure reason
+            // (especially useful for `unsupported_embedding_source` which
+            // includes the list of supported alternatives). Best-effort:
+            // failure here is non-fatal — the deferred flag is already set.
+            let _ = db.set_module_last_error(project_id, module_id, Some(&e));
 
             // Return Ok — the install pipeline must NOT fail when the
             // weights download soft-fails. The container is running
@@ -1748,6 +2152,287 @@ mod tests {
 
         let bytes = tokio::fs::read(&target).await.unwrap();
         assert_eq!(bytes, b"updated");
+
+        std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    // ─── v0.2.42 RT-3: unsupported_embedding_source UX + cooldown ─────────
+
+    /// `UnsupportedEmbeddingSourceError::fmt` produces a message that
+    /// contains both the requested source and the supported alternatives.
+    #[test]
+    fn unsupported_embedding_source_error_display_includes_supported_list() {
+        let err = UnsupportedEmbeddingSourceError {
+            requested_source: "matryoshka".to_string(),
+            supported_sources: vec!["qwen3".to_string(), "arctic2".to_string()],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("matryoshka"), "must mention requested source: {}", msg);
+        assert!(msg.contains("qwen3"), "must list supported: {}", msg);
+        assert!(msg.contains("arctic2"), "must list supported: {}", msg);
+    }
+
+    /// When the supported list is empty the message stays coherent (no panic,
+    /// no "available sources: " with nothing after the colon).
+    #[test]
+    fn unsupported_embedding_source_error_display_handles_empty_supported_list() {
+        let err = UnsupportedEmbeddingSourceError {
+            requested_source: "experimental".to_string(),
+            supported_sources: vec![],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("experimental"), "must mention requested source");
+        assert!(!msg.is_empty());
+    }
+
+    /// `mark_weights_download_deferred` now also writes the
+    /// `WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY` timestamp row so
+    /// `should_skip_r5_poll` can compute the 24-hour window.
+    #[test]
+    fn mark_deferred_writes_last_failed_at_timestamp() {
+        let (db, project_id, module_id) = open_db_with_project();
+        let before_ms = chrono::Utc::now().timestamp_millis();
+
+        mark_weights_download_deferred(
+            &db, &project_id, &module_id, "matryoshka",
+            "unsupported_embedding_source: matryoshka is not supported; available sources: qwen3",
+        );
+
+        let ts_value = db
+            .get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY)
+            .expect("get_setting must not error")
+            .expect("timestamp row must exist after mark_*");
+
+        let ts_ms = ts_value.as_i64().expect("timestamp must be a JSON number");
+        let after_ms = chrono::Utc::now().timestamp_millis();
+        assert!(ts_ms >= before_ms, "timestamp must be >= before_ms");
+        assert!(ts_ms <= after_ms, "timestamp must be <= after_ms");
+    }
+
+    /// `clear_weights_download_deferred` must also remove the
+    /// `WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY` row so the cooldown resets.
+    #[test]
+    fn clear_deferred_also_clears_last_failed_at() {
+        let (db, project_id, module_id) = open_db_with_project();
+
+        mark_weights_download_deferred(&db, &project_id, &module_id, "qwen3", "err");
+        // Pre-condition: both rows exist.
+        assert!(
+            db.get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY)
+                .unwrap()
+                .is_some(),
+            "last_failed_at row must exist before clear"
+        );
+
+        clear_weights_download_deferred(&db, &project_id, &module_id);
+
+        assert!(
+            db.get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY)
+                .unwrap()
+                .is_none(),
+            "last_failed_at row must be removed by clear_*"
+        );
+    }
+
+    /// `should_skip_r5_poll` returns false when no deferred flag is set
+    /// (fresh project, never failed).
+    #[test]
+    fn should_skip_r5_poll_returns_false_when_not_deferred() {
+        let (db, project_id, module_id) = open_db_with_project();
+        // No mark_* call — deferred flag absent.
+        assert!(
+            !should_skip_r5_poll(&db, &project_id, &module_id),
+            "must not skip when no deferred flag"
+        );
+    }
+
+    /// `should_skip_r5_poll` returns true when deferred flag is set
+    /// and the failure timestamp is within the 24-hour window (i.e. now).
+    #[test]
+    fn should_skip_r5_poll_returns_true_within_cooldown() {
+        let (db, project_id, module_id) = open_db_with_project();
+        mark_weights_download_deferred(&db, &project_id, &module_id, "qwen3", "network error");
+        // Timestamp was just written — well within 24h.
+        assert!(
+            should_skip_r5_poll(&db, &project_id, &module_id),
+            "must skip within 24-hour cooldown"
+        );
+    }
+
+    /// `should_skip_r5_poll` returns false when the failure timestamp is
+    /// older than 24 hours (cooldown expired → allow retry).
+    #[test]
+    fn should_skip_r5_poll_returns_false_when_cooldown_expired() {
+        let (db, project_id, module_id) = open_db_with_project();
+        // Deferred flag set but timestamp is 25h in the past.
+        let _ = db.set_setting(
+            &project_id, &module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY,
+            &serde_json::Value::Bool(true),
+        );
+        let old_ts = chrono::Utc::now().timestamp_millis() - (25 * 60 * 60 * 1000_i64);
+        let _ = db.set_setting(
+            &project_id, &module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY,
+            &serde_json::Value::Number(old_ts.into()),
+        );
+        assert!(
+            !should_skip_r5_poll(&db, &project_id, &module_id),
+            "must allow retry once cooldown has expired"
+        );
+    }
+
+    /// Integration test: `fetch_signed_download_url` receiving a mocked
+    /// Supabase 400 `unsupported_embedding_source` body returns a
+    /// structured error message that includes the requested source and
+    /// the supported list.
+    #[tokio::test]
+    async fn fetch_signed_download_url_structures_unsupported_embedding_source_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let error_body = serde_json::json!({
+            "error": "unsupported_embedding_source",
+            "supported_embedding_sources": ["qwen3", "arctic2"],
+        })
+        .to_string();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = error_body.clone();
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let endpoint = format!("http://127.0.0.1:{}/rl-latest-weights", port);
+        let result = fetch_signed_download_url(
+            &endpoint, "fake-key", "deadbeef", "matryoshka", "vct-rl-reranker",
+        )
+        .await;
+
+        let err = result.expect_err("must error on 400 unsupported_embedding_source");
+        // Must start with the structured prefix.
+        assert!(
+            err.starts_with("unsupported_embedding_source:"),
+            "error must have structured prefix: {}",
+            err
+        );
+        // Must contain the requested source.
+        assert!(err.contains("matryoshka"), "error must name the bad source: {}", err);
+        // Must contain at least one supported source.
+        assert!(
+            err.contains("qwen3") || err.contains("arctic2"),
+            "error must list supported sources: {}",
+            err
+        );
+    }
+
+    // ─── v0.2.42 RT-5: .vct-managed marker for copy fallback ─────────────
+
+    /// `managed_marker_path` returns a sibling file with `.vct-managed`
+    /// appended to the filename.
+    #[test]
+    fn managed_marker_path_is_sibling_with_vct_managed_suffix() {
+        let weights = PathBuf::from("/some/dir/rl_model_qwen3_v3.pt");
+        let marker = managed_marker_path(&weights);
+        assert_eq!(
+            marker,
+            PathBuf::from("/some/dir/rl_model_qwen3_v3.pt.vct-managed"),
+        );
+        // Same parent directory.
+        assert_eq!(marker.parent(), weights.parent());
+    }
+
+    /// On platforms where symlinks work (Unix), a copy produced by a prior
+    /// fallback that has a `.vct-managed` marker is replaced by a symlink
+    /// on the next link call. The marker is cleaned up.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_copy_is_replaced_by_symlink_on_relink() {
+        let tmp = tempfile::tempdir().expect("mkdtemp");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        let global = weights_file_path("vct-rl-reranker", "qwen3", "v5");
+        tokio::fs::create_dir_all(global.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&global, b"updated-weights").await.unwrap();
+
+        let target = project_mount_weights_path("vct-rl-reranker", "proj", "qwen3", "v5");
+        tokio::fs::create_dir_all(target.parent().unwrap()).await.unwrap();
+
+        // Simulate a prior copy-fallback: write the .pt + the marker.
+        tokio::fs::write(&target, b"old-copy-content").await.unwrap();
+        let marker = managed_marker_path(&target);
+        tokio::fs::write(&marker, b"vct-managed").await.unwrap();
+
+        // Act: re-link (symlink should now succeed on Unix).
+        let linked = link_global_into_project_mount(
+            "vct-rl-reranker", "proj", "qwen3", "v5", &global,
+        )
+        .await
+        .expect("re-link must succeed");
+
+        // The old copy and marker must be gone.
+        assert!(!marker.exists(), ".vct-managed marker must be cleaned up");
+
+        // The slot must now be a symlink to the global file.
+        let meta = tokio::fs::symlink_metadata(&linked).await.unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "slot must be a symlink after re-link on Unix"
+        );
+
+        // Content through the symlink must be the global's content.
+        let bytes = tokio::fs::read(&linked).await.unwrap();
+        assert_eq!(bytes, b"updated-weights");
+
+        std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    /// A regular file WITHOUT a `.vct-managed` marker is treated as a user
+    /// override and preserved on re-link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_override_without_marker_is_preserved() {
+        let tmp = tempfile::tempdir().expect("mkdtemp");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        let global = weights_file_path("vct-rl-reranker", "qwen3", "v7");
+        tokio::fs::create_dir_all(global.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&global, b"global-content").await.unwrap();
+
+        let target = project_mount_weights_path("vct-rl-reranker", "proj2", "qwen3", "v7");
+        tokio::fs::create_dir_all(target.parent().unwrap()).await.unwrap();
+
+        // Simulate a user override: regular file, NO marker.
+        tokio::fs::write(&target, b"user-custom-weights").await.unwrap();
+
+        // Act: attempt to link.
+        let result = link_global_into_project_mount(
+            "vct-rl-reranker", "proj2", "qwen3", "v7", &global,
+        )
+        .await
+        .expect("must return Ok (user override path)");
+
+        // The override content must be intact.
+        let bytes = tokio::fs::read(&result).await.unwrap();
+        assert_eq!(
+            bytes, b"user-custom-weights",
+            "user override file must not be touched"
+        );
+
+        // Must NOT be a symlink — it's the user's regular file.
+        let meta = tokio::fs::symlink_metadata(&result).await.unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "user override must remain a regular file"
+        );
 
         std::env::remove_var("VCT_STATE_DIR");
     }

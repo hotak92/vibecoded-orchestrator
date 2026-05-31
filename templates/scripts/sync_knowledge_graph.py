@@ -2046,8 +2046,9 @@ def main():
     """
     if len(sys.argv) < 2:
         print("Usage: sync_knowledge_graph.py <file_path>")
-        print("       sync_knowledge_graph.py --all       (knowledge/ + docs/)")
-        print("       sync_knowledge_graph.py --all-docs  (docs/ only)")
+        print("       sync_knowledge_graph.py --all              (knowledge/ + docs/)")
+        print("       sync_knowledge_graph.py --all-docs         (docs/ only)")
+        print("       sync_knowledge_graph.py <f1> <f2> ...      (explicit file list)")
         sys.exit(1)
 
     embedding_service = None
@@ -2097,29 +2098,43 @@ def main():
             doc_success, doc_fail = sync_all_docs(server)
             print(f"📊 Docs: {doc_success} succeeded, {doc_fail} failed")
             sys.exit(0 if doc_fail == 0 else 1)
-        else:
-            file_path = Path(sys.argv[1]).resolve()
+        elif len(sys.argv) > 2 or (len(sys.argv) == 2 and not sys.argv[1].startswith("--")):
+            # v0.2.42 CI-10: accept a list of file paths as positional args.
+            # When multiple files are given, sync only those files rather than
+            # the full tree — used by install.py's content-hash diff gate to
+            # sync only the files that changed since the last install.
+            # Single-file path (the original behaviour) also falls through here
+            # when it has no `--` prefix.
+            file_paths = [Path(p).resolve() for p in sys.argv[1:]]
+            success_count = 0
+            fail_count = 0
+            for file_path in file_paths:
+                try:
+                    file_path.relative_to(KNOWLEDGE_ROOT)
+                    in_knowledge = True
+                except ValueError:
+                    in_knowledge = False
+                try:
+                    file_path.relative_to(DOCS_ROOT)
+                    in_docs = True
+                except ValueError:
+                    in_docs = False
 
-            # Route by path
-            try:
-                file_path.relative_to(KNOWLEDGE_ROOT)
-                in_knowledge = True
-            except ValueError:
-                in_knowledge = False
-            try:
-                file_path.relative_to(DOCS_ROOT)
-                in_docs = True
-            except ValueError:
-                in_docs = False
+                if in_knowledge:
+                    ok = sync_node(server, file_path)
+                elif in_docs:
+                    ok = sync_doc(server, file_path)
+                else:
+                    print(f"ℹ️  {file_path}: not in knowledge/ or docs/ — skipping")
+                    continue
+                if ok:
+                    success_count += 1
+                else:
+                    fail_count += 1
 
-            if in_knowledge:
-                success = sync_node(server, file_path)
-            elif in_docs:
-                success = sync_doc(server, file_path)
-            else:
-                print(f"ℹ️  File not in knowledge/ or docs/ directory, skipping")
-                sys.exit(0)
-            sys.exit(0 if success else 1)
+            if len(file_paths) > 1:
+                print(f"📊 List: {success_count} succeeded, {fail_count} failed")
+            sys.exit(0 if fail_count == 0 else 1)
 
     except Exception as e:
         print(f"❌ Fatal error: {e}")

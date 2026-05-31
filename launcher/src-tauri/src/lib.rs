@@ -1492,6 +1492,11 @@ pub fn run() {
             // multi_select's options list.
             commands::module_default_weights::module_download_default_weights,
             commands::module_default_weights::module_get_runtime_value,
+            // v0.2.42 RT-4: reset the per-project bind-mount slot back to
+            // the globally-downloaded default weights. Derives (source, version)
+            // from module_settings written by the last successful download.
+            // TODO (W6): bind "Reset to global defaults" button in module tile.
+            commands::module_default_weights::module_reset_weights_to_global,
             // Stream 2 (2026-05-19): module-contributed GUI tabs +
             // generic per-control state. `get_module_nav_items` feeds the
             // Sidebar's module nav group; the get/set setting pair is the
