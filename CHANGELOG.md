@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **W8: pull-token gateway end-to-end (`RL_ARTIFACT_URL_DEFAULT_ENDPOINT` fallback)** — Closes the root cause of `unable to retrieve auth token: invalid username/password: unauthorized` seen in v0.2.41 dogfooding. Root cause: the L0 catalog bucket has the real Supabase URL (`ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url`) but the synthesized L1 manifest carries the test-fixture placeholder `"https://example/pull-token"`. When the L0 catalog cache is absent or stale, `request_pull_token` fell back to the L1 placeholder, which is unreachable, causing a connection error that silently fell through to an anonymous GHCR pull → 401. Fix: added `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` const + `resolve_pull_token_endpoint()` helper in `installer_engine.rs` that replaces empty strings and the placeholder with the hardcoded real Supabase URL before the HTTP call. The live `rl-artifact-url` edge function is verified healthy (returns structured 401 `license_invalid` for invalid keys, NOT 404 or network error). 9 new unit tests pin the substitution logic, the combined L0/L1 flow, and 3 additional structured gateway error cases (`machine_mismatch`, `registry_token_exchange_failed`, `Service misconfigured`). Logout discipline confirmed correct: `podman logout` fires in all three exit paths of `container_pull` (login-failed-early is unreachable, decide_variant_to_pull error, and post-pull).
+
 ## [0.2.41] — 2026-05-31
 
 ### Fixed

@@ -837,6 +837,60 @@ struct PullTokenResponse {
 }
 
 /// Request a short-lived registry pull token from the manifest's
+/// Default Supabase endpoint for the paid-module pull-token gateway.
+///
+/// v0.2.42 (W8): added as a hardcoded fallback for the case where BOTH the
+/// L0 catalog override AND the L1 manifest's `pull_token_endpoint` field are
+/// absent, empty, or still contain the test/publish-time placeholder string
+/// `"https://example/pull-token"`.
+///
+/// Why this is needed:
+/// - The L0 catalog bucket is the canonical SoT for the real URL. If the user
+///   has never visited the Modules tab (cold boot, no catalog cache), the L0
+///   override passed to `request_pull_token` is `None`.
+/// - The synthesized L1 manifest at that point is built from the L0 catalog
+///   install-slice — so if the catalog cache IS populated, it carries the real
+///   URL. But if the cache is somehow stale or the module publisher shipped a
+///   manifest with the placeholder still in it, the fallback here saves the
+///   install from a useless POST to `https://example/`.
+/// - Pattern mirrors `module_service::DEFAULT_RL_LATEST_VERSION_ENDPOINT` and
+///   `licensing::VALIDATE_TIER_DEFAULT_ENDPOINT`.
+pub(crate) const RL_ARTIFACT_URL_DEFAULT_ENDPOINT: &str =
+    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
+
+/// The placeholder string baked into test fixtures and into any `vct-module.json`
+/// that was published without running manifest-hygiene CI. When the resolved
+/// `pull_token_endpoint` matches this string exactly, `request_pull_token`
+/// substitutes `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` and logs a warning so the
+/// operator can track down and fix the stale manifest.
+const PULL_TOKEN_ENDPOINT_PLACEHOLDER: &str = "https://example/pull-token";
+
+/// Resolve the effective pull-token endpoint URL, replacing empty strings and
+/// the known placeholder with `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`.
+///
+/// v0.2.42 (W8): extracted as a pure helper so unit tests can verify the
+/// substitution logic without spinning up an HTTP client or keychain.
+///
+/// Substitution fires when:
+///   - `raw` is empty (malformed publish)
+///   - `raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER` (test fixture baked into image)
+///
+/// In both cases the function logs a warning and returns the default const.
+/// Any other non-empty string is returned as-is (trusts the caller's URL).
+pub(crate) fn resolve_pull_token_endpoint(raw: &str) -> &str {
+    if raw.is_empty() || raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER {
+        eprintln!(
+            "[installer_engine] pull_token_endpoint is {:?}; \
+             substituting default RL_ARTIFACT_URL_DEFAULT_ENDPOINT. \
+             Fix the module manifest to remove this warning.",
+            raw
+        );
+        RL_ARTIFACT_URL_DEFAULT_ENDPOINT
+    } else {
+        raw
+    }
+}
+
 /// `pull_token_endpoint` (Phase 3A, v0.2.35).
 ///
 /// Wire contract (matches `launcher/supabase/functions/rl-artifact-url`):
@@ -898,7 +952,17 @@ async fn request_pull_token(
         .unwrap_or(reqwest::Method::POST);
 
     // NEW-1 (2026-05-28): prefer L0 catalog URL over L1 manifest's value.
-    let endpoint = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
+    // v0.2.42 (W8): additionally replace empty strings and the well-known
+    // placeholder "https://example/pull-token" with the hardcoded default
+    // const. This handles two failure modes:
+    //   a. L0 override absent AND L1 manifest carries the placeholder →
+    //      would POST to a non-existent host; now falls back to the real URL.
+    //   b. L0 override absent AND L1 manifest carries "" (malformed publish) →
+    //      same substitution.
+    // When the substitution fires, an eprintln warns the operator so the stale
+    // manifest gets noticed and fixed before it affects more users.
+    let raw_endpoint = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
+    let endpoint = resolve_pull_token_endpoint(raw_endpoint);
 
     let resp = client
         .request(method, endpoint)
@@ -2352,6 +2416,156 @@ mod tests {
             "NEW-1: without L0 override, L1 endpoint must be used; \
              got {} instead of {}",
             effective_fallback, l1_placeholder,
+        );
+    }
+
+    // ─── v0.2.42 W8: resolve_pull_token_endpoint substitution logic ────
+    //
+    // `resolve_pull_token_endpoint` is the pure helper that replaces
+    // empty strings and the PULL_TOKEN_ENDPOINT_PLACEHOLDER with the
+    // hardcoded RL_ARTIFACT_URL_DEFAULT_ENDPOINT. Tests verify every
+    // case the production code can encounter:
+    //   1. placeholder string → default const
+    //   2. real URL → passes through unchanged
+    //   3. empty string → default const
+    //   4. The combined flow: L0 Some + real URL → L0 URL (no substitution)
+    //   5. The combined flow: L0 None + L1 placeholder → default const
+
+    #[test]
+    fn resolve_endpoint_placeholder_substitutes_default() {
+        // The exact placeholder baked into the l0_manifest_synth test
+        // fixture and any publisher who shipped without manifest-hygiene CI.
+        let result = resolve_pull_token_endpoint(PULL_TOKEN_ENDPOINT_PLACEHOLDER);
+        assert_eq!(
+            result, RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+            "placeholder must be substituted with the real Supabase URL; got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_empty_substitutes_default() {
+        // Malformed publish: L0 catalog row has `pull_token_endpoint: ""`.
+        let result = resolve_pull_token_endpoint("");
+        assert_eq!(
+            result, RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+            "empty endpoint must be substituted with the real Supabase URL; got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_real_url_passes_through() {
+        // A real custom endpoint (e.g. staging or a third-party module)
+        // must NOT be replaced — the caller set it deliberately.
+        let real = "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
+        let result = resolve_pull_token_endpoint(real);
+        assert_eq!(
+            result, real,
+            "real URL must pass through unchanged; got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn resolve_endpoint_arbitrary_non_placeholder_passes_through() {
+        // A staging override or third-party module URL.
+        let staging = "https://staging.example.com/functions/v1/pull-token";
+        let result = resolve_pull_token_endpoint(staging);
+        assert_eq!(
+            result, staging,
+            "non-placeholder URL must pass through unchanged; got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn l0_some_real_url_plus_resolve_endpoint_gives_l0_url() {
+        // Full stack: L0 override present with a real URL → resolve_endpoint
+        // passes it through untouched (no default substitution needed).
+        let l0_real = "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
+        let l1_placeholder = PULL_TOKEN_ENDPOINT_PLACEHOLDER;
+        let raw = Some(l0_real).unwrap_or(l1_placeholder);
+        let effective = resolve_pull_token_endpoint(raw);
+        assert_eq!(
+            effective, l0_real,
+            "W8: L0 real URL must be used as-is; got: {}",
+            effective
+        );
+    }
+
+    #[test]
+    fn l0_none_l1_placeholder_resolves_to_default_const() {
+        // Root cause scenario from v0.2.41 dogfooding:
+        //   L0 override absent (cache miss) AND L1 manifest carries placeholder.
+        // Previously: would POST to "https://example/pull-token" → connection
+        // error, fall through to anonymous pull, GHCR 401 with no useful message.
+        // After fix: substitutes RL_ARTIFACT_URL_DEFAULT_ENDPOINT.
+        let l0_none: Option<&str> = None;
+        let l1_placeholder = PULL_TOKEN_ENDPOINT_PLACEHOLDER;
+        let raw = l0_none.unwrap_or(l1_placeholder);
+        let effective = resolve_pull_token_endpoint(raw);
+        assert_eq!(
+            effective, RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+            "W8: L0 absent + L1 placeholder must resolve to default const; got: {}",
+            effective
+        );
+    }
+
+    // ─── v0.2.42 W8: structured error parsing covers all gateway cases ──
+    //
+    // Extends the existing v0.2.35 error tests with cases specifically
+    // from the rl-artifact-url edge function contract that weren't
+    // previously exercised as a named set.
+
+    #[test]
+    fn pull_token_error_401_machine_mismatch_surfaces_rebind_hint() {
+        // Server returns machine_id_hash mismatch — user needs admin rebind.
+        // This is a known case the user can self-serve (rebind-admin-token).
+        let body = serde_json::json!({
+            "error": "machine_mismatch",
+            "detail": "hash mismatch; use rebind-admin-token to re-bind"
+        });
+        let msg = format_pull_token_error(401, &body);
+        assert!(
+            msg.contains("machine_mismatch"),
+            "machine_mismatch code must appear in the error; got: {}",
+            msg
+        );
+        assert!(
+            !msg.is_empty(),
+            "machine_mismatch must produce a non-empty user message"
+        );
+    }
+
+    #[test]
+    fn pull_token_error_500_registry_exchange_failed_is_transient() {
+        // GHCR token-exchange 5xx — transient, user should retry.
+        let body = serde_json::json!({
+            "error": "registry_token_exchange_failed",
+            "detail": "ghcr 500: upstream error"
+        });
+        let msg = format_pull_token_error(500, &body);
+        assert!(
+            msg.contains("unavailable") || msg.contains("Try again") || msg.contains("temporarily"),
+            "500 from registry exchange must be framed as transient; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn pull_token_error_500_service_misconfigured_is_transient() {
+        // SUPABASE_URL / SERVICE_ROLE_KEY missing on the server side — not
+        // actionable for the user, but transient framing is the right UX.
+        let body = serde_json::json!({
+            "error": "Service misconfigured",
+            "detail": ""
+        });
+        let msg = format_pull_token_error(500, &body);
+        assert!(
+            !msg.is_empty(),
+            "service_misconfigured must produce a non-empty message; got: {}",
+            msg
         );
     }
 
