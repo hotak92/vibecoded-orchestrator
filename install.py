@@ -2488,6 +2488,13 @@ def main() -> int:
             "--skip-materialize-claude-dir set; .claude/ left untouched",
         )
 
+    # V0243-5: emit VCT_ORCHESTRATOR_ROOT + VCT_INFRASTRUCTURE_DIR + KG_BASE_DIR
+    # to .claude/env managed block. Done unconditionally on orchestrator-root
+    # installs so the 3 portability keys are always present regardless of
+    # whether launcher.db exists yet (pre-first-boot fresh installs).
+    if _is_orchestrator_root_install():
+        _emit_orchestrator_root_env_keys(PROJECT_ROOT)
+
     # Step 6: Container services (restart on update to pick up config changes)
     if not args.no_containers:
         if not sysinfo.container_cmd:
@@ -7707,6 +7714,61 @@ def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
     result["action"] = "applied"
     result["added_keys"] = sorted(keys_written)
     return result
+
+
+def _emit_orchestrator_root_env_keys(install_root: Path) -> None:
+    """V0243-5: write VCT_ORCHESTRATOR_ROOT, VCT_INFRASTRUCTURE_DIR, and
+    KG_BASE_DIR into ``<install_root>/.claude/env`` managed block.
+
+    These three portability keys are load-bearing for every hook and MCP
+    that references the orchestrator root at runtime.  They were previously
+    emitted only via ``apply_project_env`` (which requires launcher.db with
+    a registered project row), leaving fresh installs — where the launcher
+    has never started — without these keys until the first launcher boot.
+
+    This helper writes the 3 keys directly, bypassing the DB requirement.
+    It merges into the managed block via
+    ``vco_lib.config_projection._write_shell_env_managed_block`` (same
+    mechanism the launcher uses) so a subsequent ``apply_project_env`` call
+    that writes the full canonical set will overwrite these 3 keys in-place
+    without duplication.
+
+    Soft-fail: any error is logged but never raises.
+    """
+    try:
+        from vco_lib.config_projection import _write_shell_env_managed_block
+    except ImportError:
+        # vco_lib not yet on sys.path on a very early fresh install; skip —
+        # the launcher's first-boot env-projection will fill the gap.
+        _log_install_event(
+            "4b/10", "skip",
+            "V0243-5: vco_lib.config_projection not importable; "
+            "orchestrator-root env keys deferred to launcher boot",
+        )
+        return
+
+    infra_dir = install_root / "infrastructure"
+    keys: dict[str, str] = {
+        "VCT_ORCHESTRATOR_ROOT": str(install_root.resolve()),
+        "VCT_INFRASTRUCTURE_DIR": str(infra_dir.resolve()),
+        "KG_BASE_DIR": str(install_root.resolve()),
+    }
+
+    claude_env_path = install_root / ".claude" / "env"
+    try:
+        written = _write_shell_env_managed_block(claude_env_path, keys)
+        _log_install_event(
+            "4b/10", "ok",
+            f"V0243-5: emitted orchestrator-root env keys to .claude/env: "
+            f"{', '.join(written)}",
+            data={"keys": written, "path": str(claude_env_path)},
+        )
+    except Exception as exc:
+        _log_install_event(
+            "4b/10", "warn",
+            f"V0243-5: could not write orchestrator-root env keys to "
+            f".claude/env: {exc}",
+        )
 
 
 def _resolve_project_id_by_folder(folder: Path) -> str | None:
