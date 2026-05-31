@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **RT-1: RLClient singleton re-keyed on active_embedding for mid-session flip** (`claude_mcp_servers/weaviate_mcp/server.py`). `_get_rl_client()` was a bare None singleton that froze `ACTIVE_EMBEDDING` at first call. Now keyed by `os.getenv("ACTIVE_EMBEDDING")` so a mid-session flip produces a fresh `RLClient` with the correct `active_embedding` attribute. Mirrors the F2 telemetry-writer dict pattern.
+- **RT-3: structured `unsupported_embedding_source` error UX + 24h cooldown gate** (`launcher/src-tauri/src/commands/module_default_weights.rs`). `fetch_signed_download_url` now parses Supabase 400 body and surfaces a typed `UnsupportedEmbeddingSourceError` with supported-sources list. `mark_weights_download_deferred` records a `weights_download_last_failed_at` timestamp; `should_skip_r5_poll` gates the R5 auto-trigger with a 24-hour cooldown window. Errors surfaced to `module_installs.last_error`.
+- **RT-4: `module_reset_weights_to_global` Tauri command + `lib.rs` registration** (`launcher/src-tauri/src/commands/module_default_weights.rs`, `lib.rs`). Registers the previously-unused inner helper as a Tauri IPC command. Derives `embedding_source` + `version` from `module_settings` keys written by each successful download. TODO comment marks the W6 Svelte button wiring point.
+- **RT-5: `.vct-managed` marker prevents Windows `fs::copy` stale-redownload sentinel** (`launcher/src-tauri/src/commands/module_default_weights.rs`). Copy fallback now writes a sibling `.vct-managed` marker file. Override-protection checks the marker before treating a regular `.pt` file as a user override — orchestrator-managed copies are now replaceable on subsequent downloads.
+- **RT-6: re-check `is_module_licensed` inside R5 detached spawn** (`launcher/src-tauri/src/commands/modules.rs`). Second license validation inside `tauri::async_runtime::spawn` guards against the race where a user deactivates their subscription between the outer spawn-gate check and the actual download attempt. On re-check failure: log + early return (no deferred flag set).
+- **RT-13: W40-adoption smart-path uplift** (`install.py`). After `_self_heal_kg_bindings_on_update` persists a binding flip, runs `migrate_collections` smart-path per adopted collection. `noop`/`patch_props`/`copy` applied silently; `rebuild` emits `schema_migration_required` deferral (not auto-applied). Writes `audit_log` row with `operation='kg_collection_adopt_uplift'` per collection.
+- **CI-10: content-hash diff-only sync gate on `--update`** (`install.py`, `templates/scripts/sync_knowledge_graph.py`). On `--update`: reads `last_installed_{active_embedding,kg_collection,shared_kg_collection}` from `app_state`; context change → full sync; otherwise computes per-file `content_hash` diff vs Weaviate-stored hashes; empty diff → skip sync entirely; non-empty diff → sync only changed files. Extends `sync_knowledge_graph.py` to accept file-path positional args. "Pay once, never again."
+
 ## [0.2.41] — 2026-05-31
 
 ### Fixed
