@@ -5,8 +5,8 @@ tags: [saas, landing-page, conversion, marketing, copy, founder, ux, mid-level-a
 created: 2026-05-19T00:00:00Z
 updated: 2026-05-19T00:00:00Z
 valid_from: 2026-05-19T00:00:00Z
-valid_until: null
-status: active
+valid_until: 2026-05-22T00:00:00Z
+status: archived
 ---
 
 # Landing Page Conversion Audit Framework

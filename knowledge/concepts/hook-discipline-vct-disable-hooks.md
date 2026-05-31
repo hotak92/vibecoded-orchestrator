@@ -3,7 +3,7 @@ title: Hook Discipline — VCT_DISABLE_HOOKS Escape Hatch
 type: concept
 tags: [hooks, debugging, ci, security, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-05-22T00:00:00Z
 status: active
 ---
 
@@ -23,6 +23,10 @@ fi
 ```
 
 Coverage: every shell hook in the orchestrator. Verified in CI by `pytest tests/test_hooks_disable_guard.py` which greps each hook for the guard and asserts presence. Adding a new hook without the guard fails CI.
+
+**Coverage history (2026-05-08)**: All 23 hooks have the guard. `verify-container-ports.sh` guard implemented in commit 5b95685 (last hook to be added).
+
+**Pre-fork audit item #12 enforcement (2026-05-08)**: New CI gate `check_hook_set_directives.py` enforces that any hook using `set -e` MUST also enable `pipefail` (i.e., `set -euo pipefail`). This caught 7 violations across hooks that didn't have both directives. The CI gate ensures no new hooks violate this pattern.
 
 ## How it works
 

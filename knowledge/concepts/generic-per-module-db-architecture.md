@@ -129,6 +129,58 @@ The column is kept in place for v0.2.26 — removing it would break older `vct-h
 
 The `get_project_rl_port` helper in `db/projects.rs` retains its signature throughout this transition so callers don't churn. The implementation is already module-id-generic underneath.
 
+## v0.2.31 — module-shipped SQL migrations (the substrate evolves)
+
+The pattern this node originally documented (launcher-owned generic tables consumed by modules) extends in v0.2.31 to: **modules ship their own SQL** alongside their manifest; the launcher applies the migrations idempotently at install/update time and exposes hub endpoints for module-side reads/writes.
+
+### Manifest declaration
+
+`vct-module.json::db` block (optional; absent = no module-owned tables):
+```jsonc
+"db": {
+  "migrations_dir": "db/",   // relative to module repo root
+  "namespace": "rl"           // every table created must start with "rl_"
+}
+```
+
+### Apply pipeline (launcher-side, v0.2.31)
+
+1. At install/update, launcher reads `manifest.db`, scans `db/[0-9]+_*.sql` files sorted by name.
+2. For each: compute SHA256, check against `module_db_migrations` table (launcher schema, NEW in v0.2.31).
+3. Matching SHA → skip (idempotent).
+4. Different SHA on same `(module_id, filename)` → REFUSE (mutation forbidden; ship a new `00N+1` file instead).
+5. Unseen → execute SQL inside a transaction; on success, INSERT row.
+
+Namespace enforcement: launcher parses each `CREATE TABLE` statement, asserts the table name starts with `{namespace}_`. ALTER TABLE on non-namespaced tables is refused. FK clauses referencing launcher-owned tables (e.g. `projects.id`) are allowed.
+
+### Hub endpoints for module-side reads/writes
+
+REST under `/api/v1/modules/{module_id}/db/projects/{project_id}/rows/{table}` — 5 verbs (GET row, GET list, POST upsert, PATCH partial, DELETE). Bearer-token auth via `VCT_MODULE_TOKEN` env (per-install shared secret in v0.2.31; JWT in v0.2.32+). Token refresh via `POST /api/v1/modules/{module_id}/token/refresh`. `?fields=col1,col2` projection on GET for cheap dashboard reads.
+
+### vct-rl-reranker as first consumer (paid-module v0.2.6 → v0.2.7)
+
+| SQL file | Table | What |
+|---|---|---|
+| `db/0001_rl_state.sql` | `rl_state` | Live state cache mirroring `/state_summary` endpoint (dynamic_types, marker_present, sidecar_dir_present, model_loaded, arch_version, emb_dim, active_embedding) |
+| `db/0002_rl_weights_state.sql` | `rl_weights_state` | Per-(project, embedding_source) active checkpoint metadata. Replaces the launcher's legacy `module_weights_state` (which was dropped in v0.2.31 migration 020 — zero production users existed; no backfill needed). |
+| `db/0003_rl_weights_state_add_weights_version.sql` (v0.2.7) | ALTER `rl_weights_state` | Adds `weights_version` (semver) + `embedding_source` columns. |
+| `db/0004_rl_global_weights_available.sql` (v0.2.7) | `rl_global_weights_available` | Per-embedding-source cache of latest shipped weights (download_url + sha256 + local_downloaded + polled_at). Launcher-owned writes (JWT stays out of container). |
+
+**Container is sole writer** for the runtime state tables (`rl_state`, `rl_weights_state`). Launcher is sole writer for the discovery table (`rl_global_weights_available`) — keeps the license JWT out of the container's trust boundary.
+
+**Decision artefacts**:
+- Spec: `.claude/context/plans/rl-module-launcher-db-tables-spec-2026-05-23.md`
+- Shared plan: `.claude/context/plans/FINAL-v0.2.31-shared-plan-2026-05-23.md`
+- v0.2.31 ship details: `.claude/context/plans/v0.2.31-plan-2026-05-23.md`
+- v0.2.7 manifest redesign: `paid-modules/vct-rl-reranker/vct-module.json` (worktree, uncommitted as of 2026-05-24)
+
+### Operational lessons from v0.2.31's first consumer
+
+1. **Migration numbering is per-module-namespace, not global.** RL ships `0001`, `0002`, `0003`, `0004`. If MAO later ships its own `db/0001_*.sql`, it lives in MAO's namespace; the `module_db_migrations` table key is `(module_id, filename)` so no collision.
+2. **Cleanup of the OLD pattern's RL-specific column (`projects.rl_port`)** is deferred to whenever any production install has a populated launcher.db column to drop safely. Pre-v0.2.31 the table was a launcher-side artifact; post-v0.2.31 the RL module's `rl_state` covers the same data + more.
+3. **No backward-compat ever needed for paid-module v0.2.5 → v0.2.6 transition** because zero production users existed on v0.2.5. This shaped the v0.2.31 ship sequence (migration 020 just DROPs old `module_weights_state`; no backfill helper, no double-write feature flag).
+4. **Composite-key UPSERTs in the hub endpoints** use `f"{project_id}:{embedding_source}"` as the URL-path key. Hub parses back into two-column PK on write. Pattern generalizes to any composite-key table; documented in the hub endpoints spec.
+
 ## Related
 
 - [[buildsOn::Module-Contributed GUI Tabs Framework]] — the declarative-action dispatcher is the consumer that made the generic table architecture urgent. The dispatcher's `module_dispatch_action` calls `db.get_module_port` on every dispatch.

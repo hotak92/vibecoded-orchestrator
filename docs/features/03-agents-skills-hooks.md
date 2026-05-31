@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 29 bundled agents, 28 skills, and 23 hooks (22 wired in default `.claude/settings.json`, 1 available but not wired). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 45 bundled agents, 52 skills, and 28 hooks (most wired in default `.claude/settings.json`; some available but not wired). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -8,7 +8,7 @@ For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-
 
 ## Bundled Agents (`templates/agents/free/`)
 
-Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 29 agents below split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / migrate / bootstrap).
+Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 45 agents below split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / migrate / bootstrap).
 
 ### `coder` (Sonnet, `isolation: worktree`)
 Writes code from a spec, following patterns from the KG. Runs in git worktree isolation by default.

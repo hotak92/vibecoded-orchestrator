@@ -270,6 +270,35 @@ When Phase 0.D's tests landed, `test_cli_from_db_happy` crashed with `sqlite3.Op
 
 The lesson is sibling to the wiring-audit one: same-release features can break each other's test fixtures even when individual branches pass. Defensive table-existence checks for any new cross-feature query are cheap insurance.
 
+## Production bug — `apply_project_env_via_python` silently omits `--orchestrator-root` (2026-05-27, v0.2.37 Finding F1)
+
+Discovered during v0.2.37 audit (`/tmp/vco-wt-v0237-V37-F/.claude/context/install-update-audit-2026-05-27.md`). The Rust caller `launcher/src-tauri/src/commands/projects_v2.rs::apply_project_env_via_python` (around line 1626) builds the Python subprocess command for `vco_lib.config_projection apply` and passes `--project-id` but **NEVER** passes `--orchestrator-root`.
+
+Downstream consequence: `config_projection.py::_cli_apply` (lines 2065-2067) sees `args.orchestrator_root is None` → constructs `EnvBundle` with `orchestrator_root=None` → the `VCT_ORCHESTRATOR_ROOT` and `VCT_INFRASTRUCTURE_DIR` exports are omitted from BOTH surfaces (`.claude/env` AND `.claude/settings.json` env block). The omission is silent — neither writer logs a warning when these keys are absent.
+
+Affected users: ALL launcher v0.2.x users since the Phase 0.B Part 2 migration to Python writer (2026-05-25). Every project created via `create_project_v2` or refreshed via `rename_project_v2` ships without the portability keys. Every bundled script that needs `claude_mcp_servers/` then dies with `RuntimeError: claude_mcp_servers/ not found`.
+
+Compounded by `update_project_v2` (projects_v2.rs:1352-1423) which does NOT call `apply_project_env_via_python` at all — so existing projects never recover even after the upstream fix lands.
+
+The Rust-side `write_project_env_files` correctly handles the omit-on-None semantic (projects_v2.rs:2033-2040) AND has tests for it (lines 4904-5099) — but **it's no longer the production writer** (see projects_v2.rs:3008 comment). The tests passed; the production code path silently regressed because of unrelated migration churn.
+
+**Fix for v0.2.37**:
+- `apply_project_env_via_python` resolves orchestrator-root from `app_state["launcher.install_path"]` (canonical, DB-cached) → falls back to `find_local_repo_root()` → omits the flag if both fail. Passes `--orchestrator-root <path>` to the subprocess.
+- `update_project_v2` calls `apply_project_env_via_python` after `run_install_bundle_update` to backfill env keys for existing projects on every bundle update.
+
+**Lessons for this single-writer contract**:
+
+1. **Single-writer pattern needs end-to-end caller contracts, not just writer contracts**. The "every surface write flows through `apply_project_env`" rule was honored. But the inputs the writer used were silently truncated by callers. Future single-writer migrations must include a contract test that exercises EVERY production caller and asserts the full `EnvBundle` shape reaches the writer.
+
+2. **Test-passing != production-correct when the wrong function is tested**. `write_project_env_files`'s tests at lines 4904-5099 verified the correct omit-on-None behavior — but the function had been demoted from production. The KG node for that test suite should carry a `valid_until` once a writer migrates, OR the tests should explicitly assert "this is the production writer" by deferring to a SoT pointer.
+
+3. **Wrapper-script failures with cryptic stderr are the canary for env-projection bugs**. The instambul_map symptom `claude_mcp_servers/ not found` looked like a wrapper bug. It WAS upstream — but the wrappers' error message didn't surface the env-projection failure. v0.2.38 should add a single boot-time check ("VCT_ORCHESTRATOR_ROOT empty + claude_mcp_servers/ resolvable in inferred root? You probably have a v0.2.37 pre-fix env-projection regression; run `python -m vco_lib.config_projection apply --project-id ... --orchestrator-root ...`") in the wrapper templates so the diagnosis surface is fewer-hops-away from the symptom.
+
+Sibling node (Issue 6 from v0.2.37 backlog): scripts/wrapper-level fixes belong in their own KG node once they land — `pre-install-catalog-architecture-l0-endpoint.md` and `launcher-paid-modules-schema.md` may need a cross-link.
+
+[[relatedTo::Multi-Module Paid Distribution — Per-Bot-User Architecture]] (same release, sibling lesson)
+[[supersedes::write_project_env_files as production writer]] (the demoted function — its test suite needs `valid_until` markers in a follow-up release)
+
 ## See also
 
 * `.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md`

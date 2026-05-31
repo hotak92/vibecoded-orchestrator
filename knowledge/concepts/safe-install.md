@@ -98,8 +98,42 @@ Compose container names are namespaced (`vco_weaviate`, `vco_ollama`) for collis
 - `~/.vct/services.toml` — runtime adoption lock
 - `tests/test_install_shared_containers.py` — 12+ tests covering probe / decision / TOML round-trip
 
+## Lesson: probe choice for "is Weaviate usable?" — `/v1/meta` not `/v1/.well-known/ready` (added 2026-05-06)
+
+The launcher's "shared services detected" panel and the in-process
+`services_already_running()` guard both probe Weaviate to decide
+"adopt" vs "alt-port" vs "fresh install". Until 2026-05-06 they used
+`/v1/.well-known/ready` — Weaviate's strict readiness gate.
+
+**The bug**: `/v1/.well-known/ready` can return 503 during legitimate
+operation (write-readiness gating, post-recovery, disk-pressure checks)
+even when Weaviate is fully usable for queries. `hybrid_search` /
+`/v1/graphql` / `/v1/meta` all answer correctly while
+`/well-known/ready` is still 503. Result: the install wizard reports
+"Weaviate not running" → user clicks Custom path or fresh-install →
+existing volumes get bypassed.
+
+Confirmed twice (2026-05-05 evening + 2026-05-06 14:00) — both times
+the false-negative was misdiagnosed as "Podman rootlessport stall under
+disk pressure," with destructive recovery (force-remove + recreate
+container). Real bug was the probe URL choice; recoveries were unnecessary.
+
+**Fix**: `/v1/meta` at all 5 launcher detection sites
+(`commands/lifecycle.rs::canonical_services` + `services_already_running`,
+`tray.rs::probe_services`, `commands/volumes.rs::wait_until_healthy`,
+`hub/cli_api.rs` services-running check). PR
+`fix/launcher-detection-correctness` (#141, commit `c94602b`).
+
+**`/v1/meta` semantics**: returns 200 with version + module list as soon
+as the HTTP server can answer. Strictly weaker signal than "ready for
+writes" (which is what `.well-known/ready` checks) — for the install-time
+adopt-vs-not question, the weaker signal is correct.
+
 ## See also
 
 - `docs/GETTING_STARTED.md` "Coexisting with other Weaviate or Ollama installs"
 - [[Cross-OS Hook Portability]]
+- [[buildsOn::Launcher Container Lifecycle]]
+- [[relatedTo::Shared Knowledge Graph Cross-Project]]
+- [[relatedTo::vct-infrastructure-bugs-2026-05-05]]
 - [[uses::Podman]]

@@ -3,13 +3,24 @@ title: Cross-OS Hook Portability
 type: concept
 tags: [hooks, cross-os, portability, podman, bash, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-05-22T00:00:00Z
 status: active
 ---
 
 # Cross-OS Hook Portability
 
 vibecoded-orchestrator's `.claude/hooks/*.sh` and `install.py` ship to Linux, macOS, and Windows-via-Git-Bash. Several hardcoded assumptions had to be replaced to make the same scripts portable across all three.
+
+## Phase evolution
+
+**Phase 1 (2026-04-27)** — `.sh` only, "Windows-via-Git-Bash" model. Five hardening fixes (TMPDIR, os.pathsep, podman-first, `bash -n`, shutil.which). Implemented across vco commits `ac30e5b`, `98f962f`, `b897a4e`.
+
+**Phase 2 (2026-04-30)** — sub-portability fixes inside the `.sh` hooks. Audit (`.claude/context/vco-os-portability-audit-2026-04-30.md`) found 20 remaining issues. Landed via PRs:
+- vco #81 — agent/skill prompts no longer parrot `sudo apt-get`/`systemctl`/`brew install` literally; three-OS framing instead.
+- vco #82 — Rust test fixtures + `install.py` chmod use `cfg!(windows)` / `platform.system()` guards. Tightened `0o755 → 0o700` for owner-only temp files (CWE-732).
+- vco #83 — `.sh` hooks lose `notify-send`, `stat -c %Y`, `/dev/tcp`, hardcoded `python3`. Shared `_lib/find-python.sh` resolves `python3 || python || py`. Cross-OS `notify.py` (Linux notify-send / macOS osascript / Windows BurntToast → NotifyIcon fallback).
+
+**Phase 3 (2026-04-30, in flight at time of writing)** — full `.sh ↔ .ps1` parity. Every portable hook gets a PowerShell sibling; install.py installs only the OS-active set; two `settings.json.{linux,windows}.template` files. Linux-only exemptions (instinct pipeline) marked with `# OS-EXEMPT-PARITY: <reason>` headers. CI parity gate from PR #84 enforces drift prevention. See [[Hook OS-Parity CI Gate — .sh / .ps1 Synchronization]].
 
 ## What it is
 
@@ -124,6 +135,64 @@ Apple ships **bash 3.2** as the system default (`/bin/bash`) for GPLv3-licensing
 1. macOS is explicitly Tier-2 in KNOWN_ISSUES.md — we shouldn't add NEW bash-4 dependencies without an explicit reason.
 2. The SEEN_NODES_FILE was already on disk; the in-memory hash was a redundant cache layer.
 3. `grep -Fxq` is fixed-string (no regex compile per call), and the lookup count is bounded by the cache replay batch size (~10-20 blocks typically).
+
+## Bash shebang portability: #!/usr/bin/env bash
+
+Before (commit 1b9a138):
+```bash
+#!/bin/bash
+```
+
+After:
+```bash
+#!/usr/bin/env bash
+```
+
+**Why this matters on macOS**: `/bin/bash` may not exist on recent macOS systems without explicit Bash installation. Homebrew, MacPorts, and other package managers install Bash to `/usr/local/bin/bash` or `/opt/homebrew/bin/bash` (on Apple Silicon). The `#!/usr/bin/env bash` pattern respects the user's `PATH` and locates whichever bash version is active in their shell environment.
+
+**Applied to**: All 24 hooks in `.claude/hooks/*.sh` via commit `1b9a138` (pre-fork audit item #5).
+
+Enables hooks to execute cross-platform without hardcoding bash location assumptions.
+
+## Compose-overlay split: Docker vs Podman (Phase 4, 2026-05-01)
+
+GPU device-passthrough syntax differs between Docker and Podman even though both read `docker-compose.yml`. We ship four overlays:
+
+```
+infrastructure/
+  docker-compose.yml             # base, engine-agnostic
+  docker-compose.gpu.yml         # NVIDIA, Docker syntax
+  docker-compose.amd-rocm.yml    # AMD ROCm, Docker syntax
+  podman-compose.gpu.yml         # NVIDIA, Podman syntax (CDI form)
+  podman-compose.amd-rocm.yml    # AMD ROCm, Podman syntax (keep-groups)
+```
+
+NVIDIA differences:
+- **Docker** reads `deploy.resources.reservations.devices: [{driver: nvidia, ...}]`. Works with Container Toolkit ≥ 1.14.
+- **Podman** canonically uses CDI form `devices: [nvidia.com/gpu=all]`. Podman ≥ 4.6 ALSO reads the Docker block, but only when a CDI spec exists. **DO NOT write `/etc/cdi/nvidia.yaml` manually** (this was the old advice and it's now actively harmful). NVIDIA Container Toolkit ≥ 1.18.0 ships `nvidia-cdi-refresh.path` + `.service` systemd units that auto-write `/var/run/cdi/nvidia.yaml` on every driver install/upgrade. A manual `/etc/cdi/nvidia.yaml` SHADOWS the auto-refreshed spec because Podman reads `/etc/cdi/` before `/var/run/cdi/`, and the manual file goes stale on the next driver upgrade — every GPU container then fails with `runc: failed to fulfil mount request: ... libEGL_nvidia.so.<old-version>: no such file`. Bit Claude Orch 2026-05-07; root-cause forensics in `freeze-investigation-2026-05-07*`. Verify auto-refresh active: `systemctl is-enabled nvidia-cdi-refresh.path` (must say `enabled`). Docker on Linux doesn't use CDI at all (still uses `--gpus` runtime hook).
+
+ROCm differences:
+- **Docker** uses `group_add: [video, render]` + user-on-host group membership.
+- **Podman** rootless uses `group_add: [keep-groups]` — Podman-specific magic that preserves host supplementary groups inside the container without numeric-GID lookup.
+
+`install.py` picks the right overlay via `sysinfo.container_cmd`. For Podman + NVIDIA, `_ensure_nvidia_cdi_spec_for_podman()` runs the `nvidia-ctk` generator (sudo) BEFORE compose-up. Non-fatal on failure: install prints the Container Toolkit URL and continues; compose-up surfaces the real error if CDI didn't get set up.
+
+**Takeaway**: don't assume compose syntax is engine-agnostic. Device passthrough, group handling, and CDI integration all diverge.
+
+## When .sh fixes don't need a .ps1 sibling change (the parity-gate escape valve)
+
+The drift gate flags any `.sh` edit without a matching `.ps1` edit as suspicious. The right response is rarely a cosmetic .ps1 touch — most cross-OS bash fixes catch the .sh sibling up to behavior the .ps1 already had via PowerShell-native equivalents:
+
+| Bash gap | Cross-OS-correct PowerShell equivalent (already in the .ps1) |
+|---|---|
+| `python3 -c "import json,sys; ..."` | `ConvertFrom-Json` (native, no Python invocation) |
+| `md5sum` | `[System.Security.Cryptography.MD5]::Create()` (.NET) |
+| `stat -c %Y` | `(Get-Item $f).LastWriteTime` (.NET) |
+| Path probe `bin/python` only | `Test-Path` against `Scripts\python.exe` (Windows-native) |
+
+For each of these, the `.sh` correction is real (md5sum is GNU-only, python3 is missing on Windows, stat -c needs `-f %m` on macOS). The `.ps1` was already correct. Mark the .sh with `# OS-EXEMPT-PARITY: <one-line rationale>` in the first 5 lines explaining which PowerShell-native path made the .ps1 already cross-OS-correct, and the parity gate passes.
+
+**Anti-pattern**: writing a cosmetic .ps1 comment (`# parity-touch ...`) just to satisfy the gate. That hides the real reason the change was asymmetric and rots into noise.
 
 ## Why it matters
 

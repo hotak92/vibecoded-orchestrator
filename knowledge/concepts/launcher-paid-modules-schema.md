@@ -1,14 +1,20 @@
 ---
 title: Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
 type: concept
-tags: [launcher, supabase, schema, paid-modules, licensing, commercial, VCT-Launcher]
+tags: [launcher, supabase, schema, paid-modules, licensing, commercial, VCT-Launcher, partially-superseded]
 created: 2026-04-23T16:20:00Z
-updated: 2026-05-16T14:15:54Z
+updated: 2026-05-26T00:00:00Z
 status: active
-implementation: "VCT-Launcher Supabase project: migration 004_paid_modules.sql applied 2026-04-22 evening. Applied artifacts verified: profiles.paid_modules column + GIN index + trigger + upsert_paid_module()/remove_paid_module() RPCs + active_paid_modules view."
+implementation: "Original migration 004_paid_modules.sql lives in the `pb992/VCT-Launcher` private Supabase project (Fabio's earlier exploration). Production project for the launcher is `ovpdtijpdchzlxbojhsg` (the orchestrator's Supabase). The launcher-side mirror of per-module entitlements is `tier_cache.module_licenses` (read via `is_module_licensed_v2`)."
 ---
 
 # Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
+
+⚠️ **Partially-superseded** (2026-05-26): the `profiles.paid_modules` JSONB column described below was designed in the pre-v0.2.33 architecture, intended to be read by a single `validate-module` endpoint at runtime. v0.2.33+ uses a three-endpoint design instead (`validate-tier` + `rl-artifact-url` + `module-catalog`) and the source-of-truth for per-module entitlements lives in `tier_cache.module_licenses` on the launcher side, with server-authoritative checks at `rl-artifact-url` via its server-to-server call to `validate-tier`. The `profiles.paid_modules` column shape is still RELEVANT for org-side persistence of which modules a user owns (especially when Lemon Squeezy webhooks fire post-purchase) once Path B (LS-variant licensing) ships, but the launcher-side runtime flow has evolved away from this single-endpoint design.
+
+See [[Pre-install catalog architecture — L0 public endpoint + post-install on-disk manifest]] for the current install-time gate + [[Server-Side Admin License Validation]] for the production deployment status. See [[validate-module Supabase Edge Function]] for the superseded single-endpoint design and the migration path away from it.
+
+## Original design (preserved below — superseded for runtime flow)
 
 Supabase-side infrastructure for tracking which paid modules a user has activated. Extends the existing `profiles` table (from `002_orchestrator_tier.sql`) with a JSONB column + service-role helper functions + a view. Consumed by the `lemon-squeezy-webhook` edge function (on purchase) and by the forthcoming `validate-module` edge function (on runtime activation).
 

@@ -11,6 +11,7 @@ tags:
   - mid-level-architecture
 created: 2026-05-19T00:00:00Z
 updated: 2026-05-19T00:00:00Z
+valid_until: 2026-06-30T00:00:00Z
 status: active
 ---
 

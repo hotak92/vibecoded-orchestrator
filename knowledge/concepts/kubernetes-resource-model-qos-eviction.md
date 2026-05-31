@@ -5,8 +5,8 @@ tags: [kubernetes, infrastructure, devops, SRE, containerization, mid-level-arch
 created: 2026-05-19T00:00:00Z
 updated: 2026-05-19T00:00:00Z
 valid_from: 2026-05-19T00:00:00Z
-valid_until: null
-status: active
+valid_until: 2026-05-22T00:00:00Z
+status: archived
 ---
 
 # Kubernetes Resource Model — Requests, Limits, QoS Classes, and Eviction

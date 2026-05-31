@@ -3,11 +3,15 @@ title: "Claude Code CLI - Headless & Scripted Usage"
 type: tool
 tags: [tool, AI, claude-code, CLI, headless, scripting, session-management, orchestration, low-level-implementation]
 created: 2026-02-18T00:00:00Z
-updated: 2026-04-05T14:34:48Z
+updated: 2026-05-22T00:00:00Z
+valid_until: 2026-08-31T00:00:00Z
 status: active
 ---
 
 # Claude Code CLI - Headless & Scripted Usage
+
+> **Verified 2026-05-22**: The subscription-vs-API-key distinction below still holds — `claude -p` runs against the active claude.ai login when present; the Agent SDK still requires `ANTHROPIC_API_KEY`. Confirmed against the CLAUDE.md "Claude Code Auth" canonical note. Re-verify quarterly as Anthropic's auth model evolves.
+
 
 Claude Code CLI (`claude`) supports non-interactive/programmatic use via the `-p` flag. When used with a Claude Max subscription, it runs entirely on the subscription (no per-token API billing). The Agent SDK, by contrast, requires an API key and charges per token.
 
