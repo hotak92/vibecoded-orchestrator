@@ -1,11 +1,11 @@
 {
-  "source_sha": "6ce2c91a5ae614c66f156191a205a6b9f563e288",
-  "source_short_sha": "6ce2c91",
-  "source_hash": "711e7cb409bfa63861d0388e383b1082144ba5b3",
-  "built_at": "2026-05-31T13:17:31Z",
-  "launcher_version": "0.2.41",
+  "source_sha": "e7baaf4ae17173a8501b37fd0853421fed2f02c2",
+  "source_short_sha": "e7baaf4",
+  "source_hash": "eb0e1c09148f825cf3cbe362c918642db8dff302",
+  "built_at": "2026-05-31T20:38:10Z",
+  "launcher_version": "0.2.42",
   "host_target": "windows-x64",
   "binary_name": "vct-hub.exe",
-  "binary_size_bytes": 9067008,
+  "binary_size_bytes": 9047040,
   "tier": "stable"
 }
