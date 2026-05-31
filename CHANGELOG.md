@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **RT-2: atomic `tier_cache` RMW helper** (`Db::with_tier_cache_mut`) prevents torn writes when a timer-driven `license_refresh` and a user-initiated `validate_module_license` race to update `tier_cache` concurrently. All four call sites that previously did `get_tier_cache` → mutate → `set_tier_cache` across separate lock acquisitions are replaced with the atomic helper.
+- **RT-7: SQL-first ordering in `set_module_license_key`** — writes the SQL row with a `(pending)` sentinel prefix before the OS keychain write. A keychain failure no longer leaves an orphan keychain entry with no traceable SQL row; instead a `(pending)` row is visible to `list_license_keys` with a clear diagnostic.
+- **RT-9: `validate_module_license` audit-log written before keychain read** — the `audit_log` entry is now the first write in the per-module key path, so every user click on Re-validate is recorded including the keychain-missing early return that previously short-circuited before the audit call.
+- **RT-10: orchestrator-slot `validate_module_license` forwards `tier_cache.last_error`** — admin-mismatch and network errors written to `tier_cache.last_error` by `license_refresh` are now forwarded through the `error` field of `ModuleLicenseValidationResult` when the per-row `last_validation_error` is absent.
+- **RT-12: SQL-first ordering in `clear_module_license_key`** — the SQL row is deleted before the keychain entry so `list_license_keys` hides the entry immediately. Consistent with RT-7's SQL-first pattern; also applies `with_tier_cache_mut` to the tier_cache overlay removal.
+
 ## [0.2.41] — 2026-05-31
 
 ### Fixed
