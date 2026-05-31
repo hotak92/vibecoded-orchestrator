@@ -61,16 +61,82 @@ pub struct ReconcileReport {
     pub broken: Vec<String>,
 }
 
+/// v0.2.43 V0243-12: return true when the on-disk manifest at `path`
+/// declares `install.method == "container_pull"`. Reads and parses the
+/// JSON file; any error (missing, malformed) returns false so the caller
+/// falls through to the existing healthy/broken path without crashing.
+fn manifest_indicates_container_pull(manifest_path: &std::path::Path) -> bool {
+    let raw = match std::fs::read_to_string(manifest_path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // Avoid deserializing the full manifest — just check the install.method
+    // field via a lightweight JSON value parse.
+    let val: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    val.pointer("/install/method")
+        .and_then(|v| v.as_str())
+        .map(|m| m == "container_pull")
+        .unwrap_or(false)
+}
+
+/// v0.2.43 V0243-12: return true when `last_error` matches the failure
+/// patterns for a pull that failed at the credential / registry layer.
+/// These indicate a hard-broken state (registry auth failure, not a
+/// transient network blip) that warrants a `broken` status flip so the
+/// GUI can render a Reinstall CTA.
+///
+/// Patterns (case-insensitive substring):
+///   - "pull fail"      — generic `podman pull` failure log
+///   - "unauthorized"   — GHCR HTTP 401 (anonymous pull rejected)
+///   - "retrieve auth"  — Docker credential helper error
+fn last_error_indicates_pull_failure(last_error: &str) -> bool {
+    let lower = last_error.to_lowercase();
+    lower.contains("pull fail")
+        || lower.contains("unauthorized")
+        || lower.contains("retrieve auth")
+}
+
 /// Walk every `module_installs` row with `status='installed'`. For
-/// each, verify that `~/.vct/modules/<module_id>/vct-module.json`
+/// each, verify that `<vct_root>/modules/<module_id>/vct-module.json`
 /// exists. When it doesn't, flip the row's status to `'broken'`.
 ///
 /// Soft-fail throughout: per-row errors log to stderr + skip, top-
 /// level DB errors return an empty report so the launcher boots.
+///
+/// `vct_root_override` is only used by unit tests to avoid touching
+/// `VCT_STATE_DIR` (which is process-wide and racy under `cargo test
+/// --jobs N`). Production callers pass `None` and the function
+/// resolves the root via `crate::paths::vct_root_dir()`.
 pub fn reconcile_installed_modules(db: &Db) -> ReconcileReport {
+    reconcile_installed_modules_inner(db, None)
+}
+
+#[doc(hidden)]
+#[cfg(test)]
+pub(crate) fn reconcile_installed_modules_for_test(
+    db: &Db,
+    vct_root: &std::path::Path,
+) -> ReconcileReport {
+    reconcile_installed_modules_inner(db, Some(vct_root))
+}
+
+fn reconcile_installed_modules_inner(
+    db: &Db,
+    vct_root_override: Option<&std::path::Path>,
+) -> ReconcileReport {
     let mut report = ReconcileReport::default();
 
-    let vct_root = crate::paths::vct_root_dir();
+    let vct_root_buf;
+    let vct_root = match vct_root_override {
+        Some(r) => r,
+        None => {
+            vct_root_buf = crate::paths::vct_root_dir();
+            &vct_root_buf
+        }
+    };
 
     let installs = match db.list_module_installs_with_status("installed") {
         Ok(rows) => rows,
@@ -87,6 +153,42 @@ pub fn reconcile_installed_modules(db: &Db) -> ReconcileReport {
             .join("vct-module.json");
 
         if manifest_path.is_file() {
+            // v0.2.43 V0243-12: even when the manifest is present, check
+            // whether a container_pull module is stuck in a pull-failure
+            // state (container_name IS NULL AND last_error indicates a
+            // hard auth/registry failure). These rows have status='installed'
+            // but will never auto-recover — surface them as broken so the
+            // GUI can show a Reinstall CTA.
+            let is_container_pull = manifest_indicates_container_pull(&manifest_path);
+            if is_container_pull
+                && row.container_name.is_none()
+                && row.last_error
+                    .as_deref()
+                    .map(last_error_indicates_pull_failure)
+                    .unwrap_or(false)
+            {
+                eprintln!(
+                    "[reconciler] V0243-12: {} ({}): container_pull, \
+                     container_name=NULL, last_error indicates pull failure \
+                     ({:?}); marking status=broken",
+                    row.module_id,
+                    row.project_id,
+                    row.last_error.as_deref().unwrap_or(""),
+                );
+                match db.set_module_install_status(&row.id, "broken") {
+                    Ok(()) => {
+                        report.broken.push(row.module_id.clone());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[reconciler] failed to mark {} broken (pull-fail): {}",
+                            row.module_id, e
+                        );
+                    }
+                }
+                continue;
+            }
+
             report.healthy += 1;
             continue;
         }
@@ -135,10 +237,11 @@ mod tests {
     use uuid::Uuid;
     use vct_launcher_core::db::models::ProjectHost;
 
-    /// Set up an isolated VCT_STATE_DIR + in-memory Db pair with one
-    /// project row that subsequent inserts can FK against.
+    /// Set up an in-memory Db pair with one project row that subsequent
+    /// inserts can FK against. Does NOT touch VCT_STATE_DIR — tests use
+    /// `reconcile_installed_modules_for_test(db, tmp.path())` to pass the
+    /// vct root directly, avoiding process-wide env races.
     fn seed_env(tmp: &tempfile::TempDir) -> (Db, String) {
-        std::env::set_var("VCT_STATE_DIR", tmp.path());
         let db = Db::open_in_memory().expect("open in-memory db");
         let project_id = Uuid::new_v4().to_string();
         db.insert_project(
@@ -189,7 +292,7 @@ mod tests {
         let install_id = insert_installed(&db, &project_id, "vct-missing-mod");
         // Intentionally do NOT place a manifest on disk.
 
-        let report = reconcile_installed_modules(&db);
+        let report = reconcile_installed_modules_for_test(&db, tmp.path());
 
         assert_eq!(report.healthy, 0);
         assert_eq!(report.broken, vec!["vct-missing-mod".to_string()]);
@@ -205,8 +308,6 @@ mod tests {
             "row {} must be marked broken",
             install_id
         );
-
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     #[test]
@@ -216,7 +317,7 @@ mod tests {
         let _install_id = insert_installed(&db, &project_id, "vct-healthy-mod");
         place_manifest_on_disk(tmp.path(), "vct-healthy-mod");
 
-        let report = reconcile_installed_modules(&db);
+        let report = reconcile_installed_modules_for_test(&db, tmp.path());
 
         assert_eq!(report.healthy, 1);
         assert!(report.broken.is_empty());
@@ -231,8 +332,6 @@ mod tests {
             vct_launcher_core::db::models::ModuleStatus::Installed,
             "healthy row must remain installed"
         );
-
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     #[test]
@@ -243,12 +342,10 @@ mod tests {
         let _b_id = insert_installed(&db, &project_id, "vct-broken-mod");
         place_manifest_on_disk(tmp.path(), "vct-healthy-mod");
 
-        let report = reconcile_installed_modules(&db);
+        let report = reconcile_installed_modules_for_test(&db, tmp.path());
 
         assert_eq!(report.healthy, 1);
         assert_eq!(report.broken, vec!["vct-broken-mod".to_string()]);
-
-        std::env::remove_var("VCT_STATE_DIR");
     }
 
     #[test]
@@ -257,12 +354,66 @@ mod tests {
         let (db, _project_id) = seed_env(&tmp);
 
         // No module_installs rows seeded.
-        let report = reconcile_installed_modules(&db);
+        let report = reconcile_installed_modules_for_test(&db, tmp.path());
 
         assert_eq!(report.healthy, 0);
         assert!(report.broken.is_empty());
+    }
 
-        std::env::remove_var("VCT_STATE_DIR");
+    // ----------------------------------------------------------------
+    // v0.2.43 V0243-12: container_pull pull-failure broken detection.
+    // ----------------------------------------------------------------
+
+    /// Helper: place a `vct-module.json` on disk with `install.method=container_pull`.
+    fn place_container_pull_manifest(vct_root: &std::path::Path, module_id: &str) {
+        let dir = vct_root.join("modules").join(module_id);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let manifest = r#"{"id":"x","install":{"method":"container_pull","install_dir":"{VCT_MODULES}"}}"#;
+        std::fs::write(dir.join("vct-module.json"), manifest).expect("write manifest");
+    }
+
+    /// V0243-12 T1: container_pull row with container_name=NULL and a
+    /// pull-failure error must be flipped to broken.
+    #[test]
+    fn reconcile_marks_container_pull_with_pull_error_as_broken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project_id) = seed_env(&tmp);
+        insert_installed(&db, &project_id, "vct-pull-fail-mod");
+        // Place a container_pull manifest.
+        place_container_pull_manifest(tmp.path(), "vct-pull-fail-mod");
+        // Set last_error to a pull-failure string; container_name stays NULL.
+        db.set_module_status(
+            &project_id,
+            "vct-pull-fail-mod",
+            vct_launcher_core::db::models::ModuleStatus::Installed,
+            Some("podman pull failed: unauthorized: authentication required".to_string()),
+        ).expect("set last_error");
+
+        let report = reconcile_installed_modules_for_test(&db, tmp.path());
+
+        assert_eq!(report.healthy, 0);
+        assert_eq!(report.broken, vec!["vct-pull-fail-mod".to_string()]);
+    }
+
+    /// V0243-12 T2: container_pull row with a non-failure last_error stays healthy.
+    #[test]
+    fn reconcile_keeps_container_pull_with_benign_error_healthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project_id) = seed_env(&tmp);
+        insert_installed(&db, &project_id, "vct-benign-mod");
+        place_container_pull_manifest(tmp.path(), "vct-benign-mod");
+        // A benign / unrelated error string (e.g. a port bind warning).
+        db.set_module_status(
+            &project_id,
+            "vct-benign-mod",
+            vct_launcher_core::db::models::ModuleStatus::Installed,
+            Some("port 11441 in use; retrying".to_string()),
+        ).expect("set last_error");
+
+        let report = reconcile_installed_modules_for_test(&db, tmp.path());
+
+        assert_eq!(report.healthy, 1, "benign-error row must be healthy");
+        assert!(report.broken.is_empty());
     }
 
     #[test]
@@ -285,7 +436,7 @@ mod tests {
         .expect("insert");
         // Don't flip to installed; status stays 'installing'.
 
-        let report = reconcile_installed_modules(&db);
+        let report = reconcile_installed_modules_for_test(&db, tmp.path());
 
         assert_eq!(report.healthy, 0);
         assert!(
@@ -303,7 +454,5 @@ mod tests {
             row.status,
             vct_launcher_core::db::models::ModuleStatus::Installing,
         );
-
-        std::env::remove_var("VCT_STATE_DIR");
     }
 }
