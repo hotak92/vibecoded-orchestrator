@@ -110,6 +110,19 @@
 
   async function handleResetWeights() {
     if (!tauriAvailable() || !activeProjectId) return;
+    // v0.2.42 P5-P3-1: confirm before resetting — this discards any
+    // project-specific fine-tuning AND any uploaded override file at
+    // the per-project bind-mount slot. Matches the destructive-action
+    // pattern used by LicenseManagerModal (window.confirm before
+    // clearing a license key).
+    const confirmed = window.confirm(
+      'Reset weights to the current global model?\n\n' +
+        'This will discard any project-specific fine-tuning AND any uploaded ' +
+        'override file at this project\'s weights slot. The global download is ' +
+        'preserved and will be re-symlinked into this project.\n\n' +
+        'This cannot be undone.',
+    );
+    if (!confirmed) return;
     resettingWeights = true;
     resetWeightsError = null;
     resetWeightsSuccess = null;

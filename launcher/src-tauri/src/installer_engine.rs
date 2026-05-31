@@ -858,27 +858,73 @@ struct PullTokenResponse {
 pub(crate) const RL_ARTIFACT_URL_DEFAULT_ENDPOINT: &str =
     "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
 
-/// The placeholder string baked into test fixtures and into any `vct-module.json`
+/// Placeholder strings baked into test fixtures and into any `vct-module.json`
 /// that was published without running manifest-hygiene CI. When the resolved
-/// `pull_token_endpoint` matches this string exactly, `request_pull_token`
+/// `pull_token_endpoint` matches one of these patterns, `request_pull_token`
 /// substitutes `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` and logs a warning so the
 /// operator can track down and fix the stale manifest.
+///
+/// v0.2.42 P3-P1-1: widened from a single literal to a small family of
+/// obvious placeholders. The detection (see `is_pull_token_placeholder`)
+/// matches the bare RFC-2606 reserved hosts + the historical `example`
+/// fixture form, but NOT arbitrary subdomains (e.g. `staging.example.com`
+/// is a legitimate user-controlled URL that must pass through unchanged).
 const PULL_TOKEN_ENDPOINT_PLACEHOLDER: &str = "https://example/pull-token";
 
-/// Resolve the effective pull-token endpoint URL, replacing empty strings and
-/// the known placeholder with `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`.
+/// Returns true if `raw` matches one of the known placeholder URL shapes
+/// that must be substituted with the default const. Pure function.
 ///
-/// v0.2.42 (W8): extracted as a pure helper so unit tests can verify the
-/// substitution logic without spinning up an HTTP client or keychain.
+/// Detection rules (any one matches → placeholder):
+///   1. Exact match against `PULL_TOKEN_ENDPOINT_PLACEHOLDER` (back-compat).
+///   2. URL has `example` as the bare host (the historical fixture form,
+///      no TLD).
+///   3. URL host is EXACTLY one of the RFC-2606 reserved hosts:
+///      `example.com`, `example.net`, `example.org`, `example.invalid`,
+///      `example.test`.
+///
+/// NOT a placeholder: subdomains of any of the above (e.g. `staging.example.com`).
+/// Those are legitimate user-controlled hostnames — a staging Supabase tenant
+/// or a third-party module's gateway. Treating them as placeholders would
+/// silently route their traffic to `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`, which
+/// is wrong.
+fn is_pull_token_placeholder(raw: &str) -> bool {
+    if raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER {
+        return true;
+    }
+    let host_start = if let Some(rest) = raw.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        rest
+    } else {
+        return false;
+    };
+    let host = host_start.split('/').next().unwrap_or("");
+    let host_no_port = host.split(':').next().unwrap_or("");
+    matches!(
+        host_no_port,
+        "example"
+            | "example.com"
+            | "example.net"
+            | "example.org"
+            | "example.invalid"
+            | "example.test"
+    )
+}
+
+/// Resolve the effective pull-token endpoint URL, replacing empty strings and
+/// the known placeholder family with `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`.
+///
+/// v0.2.42 (W8 + P3-P1-1): extracted as a pure helper so unit tests can verify
+/// the substitution logic without spinning up an HTTP client or keychain.
 ///
 /// Substitution fires when:
 ///   - `raw` is empty (malformed publish)
-///   - `raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER` (test fixture baked into image)
+///   - `raw` is a known placeholder shape (see `is_pull_token_placeholder`)
 ///
 /// In both cases the function logs a warning and returns the default const.
 /// Any other non-empty string is returned as-is (trusts the caller's URL).
 pub(crate) fn resolve_pull_token_endpoint(raw: &str) -> &str {
-    if raw.is_empty() || raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER {
+    if raw.is_empty() || is_pull_token_placeholder(raw) {
         eprintln!(
             "[installer_engine] pull_token_endpoint is {:?}; \
              substituting default RL_ARTIFACT_URL_DEFAULT_ENDPOINT. \
@@ -2469,7 +2515,10 @@ mod tests {
 
     #[test]
     fn resolve_endpoint_arbitrary_non_placeholder_passes_through() {
-        // A staging override or third-party module URL.
+        // A staging override or third-party module URL. Subdomains of
+        // `example.com` are NOT placeholders — they're legitimate
+        // user-controlled hostnames (could be a staging tenant or a
+        // third-party gateway).
         let staging = "https://staging.example.com/functions/v1/pull-token";
         let result = resolve_pull_token_endpoint(staging);
         assert_eq!(
@@ -2477,6 +2526,51 @@ mod tests {
             "non-placeholder URL must pass through unchanged; got: {}",
             result
         );
+    }
+
+    // v0.2.42 P3-P1-1: widened placeholder detection covers RFC-2606 reserved
+    // bare hosts. These are obvious "I forgot to set the URL" markers, NOT
+    // legitimate endpoints. Substituting them with the default const is the
+    // best the launcher can do without blocking the install entirely.
+    #[test]
+    fn resolve_endpoint_rfc2606_hosts_substitute_default() {
+        for placeholder in [
+            "https://example.com/pull-token",
+            "https://example.org/functions/v1/rl-artifact-url",
+            "https://example.net/x",
+            "https://example.invalid/anything",
+            "https://example.test/",
+            // Port suffix on the host: still a placeholder.
+            "https://example.com:443/pull-token",
+            // http:// scheme is also caught.
+            "http://example.com/pull-token",
+        ] {
+            let result = resolve_pull_token_endpoint(placeholder);
+            assert_eq!(
+                result, RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+                "expected {:?} to be detected as a placeholder; got: {}",
+                placeholder, result
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_endpoint_example_subdomains_pass_through() {
+        // Subdomains of RFC-2606 reserved hosts are NOT placeholders.
+        // A staging Supabase tenant or a third-party gateway might
+        // legitimately live at e.g. `staging.example.com`.
+        for legitimate in [
+            "https://staging.example.com/functions/v1/pull-token",
+            "https://api.example.org/v1/tokens",
+            "https://my-tenant.example.net/pull",
+        ] {
+            let result = resolve_pull_token_endpoint(legitimate);
+            assert_eq!(
+                result, legitimate,
+                "expected {:?} to pass through (subdomain, not bare); got: {}",
+                legitimate, result
+            );
+        }
     }
 
     #[test]

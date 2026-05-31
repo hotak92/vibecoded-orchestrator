@@ -288,6 +288,14 @@ jobs:
       # hit running the script on a fresh Ubuntu box. `build-essential`,
       # `curl`, `wget`, `file` are required by Tauri's bundler chain even
       # under --no-bundle (file is used for ELF detection).
+      #
+      # v0.2.42 P4-P2-2: libdbus-1-dev + pkg-config listed EXPLICITLY.
+      # vct-launcher-core's `keyring` dep links against libdbus-1 on Linux
+      # via the sync-secret-service feature. Historically libgtk-3-dev
+      # transitively pulled libdbus-1-dev on Ubuntu 24.04 via the Debian
+      # dep chain, but this is fragile — a future GTK packaging change
+      # could break the build without warning. Explicit listing is cheap
+      # insurance.
       - name: Install Tauri Linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -299,6 +307,8 @@ jobs:
             librsvg2-dev \
             libsoup-3.0-dev \
             libjavascriptcoregtk-4.1-dev \
+            libdbus-1-dev \
+            pkg-config \
             build-essential \
             curl \
             wget \
