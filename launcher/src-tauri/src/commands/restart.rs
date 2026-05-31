@@ -281,6 +281,24 @@ fn clear_restart_deferral(install_root: &Path) -> Result<(), String> {
         .any(|line| line.starts_with("## ") && !line.starts_with("## VCO Update"));
 
     if !has_any_entry {
+        // v0.2.43 V0243-8: preserve stub files. When the frontmatter
+        // declares `stub: true` this file is a test fixture or a
+        // synthetic placeholder that must survive the clear operation.
+        // Deleting it would cause the next launcher boot to lose the
+        // stub entry and re-render the restart banner spuriously.
+        if frontmatter_has_stub_flag(&updated) {
+            eprintln!(
+                "[restart] UPDATE_DEFERRED.md at {} has stub:true — \
+                 preserving file rather than unlinking (no real entries remain)",
+                target.display(),
+            );
+            // Write the stripped content so the launcher_restart_required
+            // section is gone, but the stub file itself stays on disk.
+            std::fs::write(&target, updated)
+                .map_err(|e| format!("write (stub preserve) {}: {}", target.display(), e))?;
+            return Ok(());
+        }
+
         // Sweep the file. Strip the CLAUDE.md reminder block too — keep
         // parity with the Python writer. We do not modify CLAUDE.md
         // from Rust here; the next install.py run will strip the block
@@ -324,6 +342,38 @@ fn strip_section(content: &str, condition_id: &str) -> String {
     }
     prefix.push_str(suffix);
     prefix
+}
+
+/// v0.2.43 V0243-8: return true when the YAML frontmatter of a deferral
+/// document contains `stub: true`.
+///
+/// The frontmatter is the `---`-delimited block at the top of the file.
+/// We look for a line matching `stub: true` (with optional surrounding
+/// whitespace) within that block only — not in section bodies. This
+/// guards against pathological manifests where a section body happens to
+/// contain the string.
+///
+/// Returns false when the file has no frontmatter, the frontmatter does
+/// not contain the stub key, or the value is anything other than `true`.
+fn frontmatter_has_stub_flag(content: &str) -> bool {
+    // Frontmatter is bracketed by two `---` lines. The leading `---` must
+    // be at position 0 (very start of the file); the closing `---` ends
+    // the block.
+    if !content.starts_with("---") {
+        return false;
+    }
+    // Find the closing delimiter. Skip the opening `---`.
+    let after_open = &content[3..];
+    let close_pos = after_open.find("\n---")
+        .map(|i| 3 + i + 1) // absolute start of `---\n` in `content`
+        .unwrap_or(0);
+    if close_pos == 0 {
+        return false; // no closing delimiter found
+    }
+    let frontmatter = &content[3..close_pos]; // between the two `---` markers
+    frontmatter
+        .lines()
+        .any(|line| matches!(line.trim(), "stub: true" | "stub:true"))
 }
 
 /// Resolve the dist binary path under `install_root` for the current OS.
@@ -523,6 +573,75 @@ condition_ids: [launcher_restart_required]
         let tmp = tempfile::tempdir().expect("tempdir");
         // No file created — must not error.
         clear_restart_deferral(tmp.path()).expect("missing-file must be Ok");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.43 V0243-8: stub-protect tests.
+    // -----------------------------------------------------------------
+
+    /// V0243-8 T1: a file with `stub: true` in its frontmatter is NOT
+    /// deleted even when no real entries remain after stripping.
+    #[test]
+    fn clear_restart_deferral_preserves_stub_file_when_only_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dot_claude = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&dot_claude).expect("mkdir");
+        let target = dot_claude.join("UPDATE_DEFERRED.md");
+        // Frontmatter with stub: true
+        let stub_content = "\
+---
+condition_ids: [launcher_restart_required]
+stub: true
+---
+
+# VCO Update Deferred
+
+## launcher_restart_required (info)
+
+**Title**: foo
+
+---
+";
+        std::fs::write(&target, stub_content).expect("write");
+
+        clear_restart_deferral(tmp.path()).expect("clear");
+
+        // File must NOT be deleted because stub: true.
+        assert!(target.exists(), "stub file must be preserved, not deleted");
+        let after = std::fs::read_to_string(&target).expect("read after");
+        // The launcher_restart_required section must have been stripped.
+        assert!(!after.contains("## launcher_restart_required"),
+                "section must still be removed from stub file");
+    }
+
+    /// V0243-8 T2: `frontmatter_has_stub_flag` returns true for stub files.
+    #[test]
+    fn frontmatter_has_stub_flag_returns_true_for_stub_files() {
+        let stub = "---\ncondition_ids: [x]\nstub: true\n---\n\n# body";
+        assert!(frontmatter_has_stub_flag(stub));
+    }
+
+    /// V0243-8 T3: `frontmatter_has_stub_flag` returns false for normal files.
+    #[test]
+    fn frontmatter_has_stub_flag_returns_false_for_normal_files() {
+        let normal = "---\ncondition_ids: [x]\n---\n\n# body";
+        assert!(!frontmatter_has_stub_flag(normal));
+    }
+
+    /// V0243-8 T4: normal file (no stub flag) is still deleted when empty.
+    #[test]
+    fn clear_restart_deferral_deletes_non_stub_empty_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dot_claude = tmp.path().join(".claude").join("context");
+        std::fs::create_dir_all(&dot_claude).expect("mkdir");
+        let target = dot_claude.join("UPDATE_DEFERRED.md");
+        std::fs::write(
+            &target,
+            "---\ncondition_ids: [launcher_restart_required]\n---\n\n# VCO Update Deferred\n\n## launcher_restart_required (info)\n\n**Title**: foo\n\n---\n",
+        ).expect("write");
+
+        clear_restart_deferral(tmp.path()).expect("clear");
+        assert!(!target.exists(), "non-stub empty file must be deleted");
     }
 
     #[test]
