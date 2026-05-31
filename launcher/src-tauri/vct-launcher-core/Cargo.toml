@@ -84,7 +84,7 @@ dunce = "1"
 
 # System info (CPU/RAM) — used by detect_system, which lives in launcher today
 # but its data types may move to core. Keep here as shared infrastructure.
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # tempfile for tests + intentional use in core (volumes module path probes)
 tempfile = "3"
