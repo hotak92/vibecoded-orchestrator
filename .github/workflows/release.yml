@@ -230,12 +230,76 @@ jobs:
           ./target/debug/validate-manifest "${fixtures[@]}" && \
             echo "::notice::Gate 2b PASS: all test-fixture manifests valid in strict mode"
 
+      # ── Gate 3: dist-binary freshness check (V0243-7) ─────────────────────
+      #
+      # Asserts that `launcher/dist/` has changed since the previous release
+      # tag. This catches the v0.2.42 regression class: a hotfix retag
+      # (Windows-mut) was pushed, the Release workflow built fresh binaries,
+      # but `commit-dist-binaries` failed silently (PAT 403) — so main still
+      # carried the v0.2.41 binary while the tag said v0.2.42.  The next
+      # release (v0.2.43) then had to ship a manual chore(binary) catch-up
+      # commit before the tag was cut.
+      #
+      # Gate logic:
+      #   1. Find the most recent tag BEFORE the tag being pushed
+      #      (git describe --tags --abbrev=0 HEAD~1 or `git tag --sort=-creatordate`).
+      #   2. Assert that `git diff <prev_tag>..HEAD -- launcher/dist/` is non-empty.
+      #
+      # Exceptions (both skip the gate with a notice, not an error):
+      #   - No previous tag exists yet (first-ever tag on the repo).
+      #   - Triggered as workflow_dispatch without a tag (dry-run mode).
+      #
+      # IMPORTANT: this gate runs against the tag commit as checked out by
+      # `actions/checkout@v6` above (the default ref for a tag push).  If
+      # `commit-dist-binaries` from the PREVIOUS release failed and no manual
+      # catch-up commit was made, the diff will be empty and this gate will
+      # fail — exactly the intended behaviour.  Fix: commit the missing
+      # binaries manually (see docs/MAINTAINER_GUIDE.md § "Manual binary
+      # commit recipe"), then retag.
+      - name: Gate 3 — dist-binary freshness since previous tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+
+          # Fetch all tags so `git describe` can find the previous one.
+          git fetch --tags --quiet
+
+          current_tag="${GITHUB_REF#refs/tags/}"
+
+          # Find the most recent tag that predates the current one.
+          # `git tag --sort=-creatordate` lists newest-first; skip the current tag.
+          prev_tag="$(git tag --sort=-creatordate \
+            | grep -v "^${current_tag}$" \
+            | head -1 || true)"
+
+          if [ -z "$prev_tag" ]; then
+            echo "::notice::Gate 3 SKIP — no previous tag found (first release). Skipping dist-freshness check."
+            exit 0
+          fi
+
+          echo "Checking launcher/dist/ diff between ${prev_tag} and HEAD (${current_tag})"
+
+          dist_diff="$(git diff "${prev_tag}..HEAD" -- launcher/dist/ || true)"
+
+          if [ -z "$dist_diff" ]; then
+            echo "::error::PRE-RELEASE GATE FAIL (V0243-7): launcher/dist/ is UNCHANGED since ${prev_tag}."
+            echo "::error::This means the dist binaries were NOT refreshed since the previous release."
+            echo "::error::The commit-dist-binaries job from the previous release likely failed (PAT 403 / branch-protection)."
+            echo "::error::Fix: manually commit updated launcher/dist/ binaries to main (see docs/MAINTAINER_GUIDE.md"
+            echo "::error::§ 'Manual binary commit recipe'), then retag."
+            exit 1
+          fi
+
+          changed_count="$(echo "$dist_diff" | grep -c '^diff --git' || true)"
+          echo "::notice::Gate 3 PASS: launcher/dist/ has ${changed_count} changed file(s) since ${prev_tag}."
+
       - name: Gate summary
         if: success()
         run: |
           echo "::notice::All pre-release gates PASSED for ${{ github.ref }}"
           echo "  Gate 1: install.py smoke — PASS"
           echo "  Gate 2: manifest-validate strict — PASS"
+          echo "  Gate 3: dist-binary freshness — PASS (or SKIPPED for first release / workflow_dispatch)"
           echo "Proceeding to build matrix."
 
   build:
