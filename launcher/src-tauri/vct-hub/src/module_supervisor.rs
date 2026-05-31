@@ -55,20 +55,6 @@ use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
-/// Module ID we recognise as RL-reranker for the resume-by-default path.
-///
-/// v0.2.40 (NEW-3.E): no longer used as a gate inside
-/// `resume_containers_on_startup` — the resume path now generalises to
-/// any container_pull-installed module declaring a `service`/`container`
-/// runtime (see the function's doc-comment for the rationale). Kept
-/// because (a) it's `pub`, (b) the launcher-side
-/// `commands/module_service.rs` still owns its own copy and special-
-/// cases the RL reranker for fine-tune polling / weights rotation, and
-/// (c) leaving it in place avoids cascading rename-cleanup in v0.2.40.
-/// Queued for v0.2.41 cleanup if it stays dead in the hub crate.
-#[allow(dead_code)]
-pub const RL_RERANKER_MODULE_ID: &str = "vct-rl-reranker";
-
 /// Fixed RL port for the orchestrator-root project.
 pub const ORCHESTRATOR_ROOT_RL_PORT: u16 = 11442;
 
@@ -498,7 +484,7 @@ pub type ManifestResolver = Box<dyn Fn(&str) -> Option<ModuleManifest> + Send + 
 ///      synthesis path.
 ///
 ///   2. **Generalises beyond RL Reranker.** Prior code had a hardcoded
-///      `if module_id != RL_RERANKER_MODULE_ID { continue; }` gate
+///      `if module_id != "vct-rl-reranker" { continue; }` gate
 ///      that blocked the restart path for any other future
 ///      container-distributed module. The gate is replaced with the
 ///      same manifest-driven gate that install-time auto-start uses

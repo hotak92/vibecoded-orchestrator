@@ -106,3 +106,8 @@ libc = "0.2"
 # Windows-specific (pid_is_alive uses OpenProcess + CloseHandle)
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+# v0.2.42 W4-TEST-7: serial_test allows daemon_usable_probe_* tests to run
+# serially (they spawn subprocess fakes and flake under parallelism).
+[dev-dependencies]
+serial_test = "3"

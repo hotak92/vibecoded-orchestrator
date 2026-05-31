@@ -82,7 +82,7 @@ def _get_normalizer():
         _MOD = _import_sync_kg()
     fn = getattr(_MOD, "_normalize_typed_links", None)
     if fn is None:
-        pytest.skip("_normalize_typed_links not importable in this test env")
+        pytest.fail("_normalize_typed_links missing from sync_knowledge_graph — CI env regression (shipped function must always be present)")
     return fn
 
 

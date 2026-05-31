@@ -1277,12 +1277,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_collections_endpoint_returns_only_orchestrator_shaped() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, _h) = spawn_test_hub().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -1337,12 +1334,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_rejects_invalid_collection_name() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         // Need a project row + at least one valid grant so we get past
         // ACL gating BEFORE the validity check fires. Actually, the
@@ -1381,12 +1375,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_returns_403_on_missing_grant() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         let pid = uuid::Uuid::new_v4().to_string();
         h.0.insert_project(
@@ -1401,10 +1392,7 @@ mod cli_kg_integration_tests {
         // Pick a real orchestrator-shaped collection but DON'T grant it.
         let wclient = weaviate_client().unwrap();
         let cols = detect_orchestrator_kg_collections(&wclient).await.unwrap();
-        if cols.is_empty() {
-            eprintln!("skipping: no orchestrator collections to test against");
-            return;
-        }
+        assert!(!cols.is_empty(), "no orchestrator collections found on dev Weaviate — test requires at least one");
         let target = &cols[0];
 
         let client = reqwest::Client::new();
@@ -1422,12 +1410,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_with_auto_detect_returns_collections_searched() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
@@ -1463,21 +1448,15 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_with_explicit_collections_skips_auto_detect() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
         let wclient = weaviate_client().unwrap();
         let cols = detect_orchestrator_kg_collections(&wclient).await.unwrap();
-        if cols.is_empty() {
-            eprintln!("skipping: no orchestrator collections");
-            return;
-        }
+        assert!(!cols.is_empty(), "no orchestrator collections found on dev Weaviate — test requires at least one");
         let target = &cols[0];
 
         let client = reqwest::Client::new();
@@ -1506,12 +1485,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_audit_row_is_written_with_truncated_query() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
@@ -1545,12 +1521,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_handles_quote_in_query_safely() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
@@ -1740,12 +1713,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn codegraph_collections_endpoint_returns_canonical_set() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, _h) = spawn_test_hub().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -1774,12 +1744,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn codegraph_search_scope_code_excludes_api_and_interaction() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         let pid = uuid::Uuid::new_v4().to_string();
         h.0.insert_project(
@@ -1827,12 +1794,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn codegraph_search_scope_interaction_keeps_only_api_and_interaction() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         let pid = uuid::Uuid::new_v4().to_string();
         h.0.insert_project(
@@ -1895,12 +1859,9 @@ mod cli_kg_integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires local Weaviate at localhost:8081"]
     async fn codegraph_search_audit_row_uses_cli_codegraph_search_op() {
         let _env_guard = lock_real_weaviate();
-        if !weaviate_reachable().await {
-            eprintln!("skipping: localhost:8081 unreachable");
-            return;
-        }
         let (base, h) = spawn_test_hub().await;
         let pid = uuid::Uuid::new_v4().to_string();
         h.0.insert_project(

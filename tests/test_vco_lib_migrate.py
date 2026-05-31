@@ -522,7 +522,17 @@ class CliMigrateCommandTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+try:
+    import weaviate as _weaviate_mod  # noqa: F401
+    _WEAVIATE_AVAILABLE = True
+except ImportError:
+    _WEAVIATE_AVAILABLE = False
+
+
 def _weaviate_reachable() -> bool:
+    """Return True only if the weaviate package is importable AND the server responds."""
+    if not _WEAVIATE_AVAILABLE:
+        return False
     url = os.environ.get("WEAVIATE_URL", "http://localhost:8081")
     try:
         req = urllib.request.Request(f"{url.rstrip('/')}/v1/.well-known/ready")
@@ -535,8 +545,10 @@ def _weaviate_reachable() -> bool:
 _LIVE_TEST_COLLECTION_NAME = "VctMigrateTest"
 
 
-@unittest.skipUnless(_weaviate_reachable(),
-                     "Weaviate not reachable on localhost:8081")
+@unittest.skipUnless(
+    _weaviate_reachable(),
+    "Weaviate not reachable on localhost:8081 or weaviate package not installed",
+)
 class LiveMigrateIntegrationTest(unittest.TestCase):
     """Real Weaviate round-trip:
       1. Create VctMigrateTest_KnowledgeGraph with OLD schema (missing

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -39,6 +40,107 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib.cli import rebuild_diagram_index as rdi  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# DB schemas that satisfy diagram_indexer._upsert_row's FK
+# ---------------------------------------------------------------------------
+
+# Minimal schema: only id + name in projects (used by autouse fixture for
+# tests that interact via 'demo-project' only).
+_DIAGRAM_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    id   TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_diagrams (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id             TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    diagram_name           TEXT    NOT NULL,
+    diagram_type           TEXT    NOT NULL CHECK(diagram_type IN ('mermaid','excalidraw')),
+    file_path              TEXT    NOT NULL,
+    category_path          TEXT    NOT NULL,
+    enabled                INTEGER NOT NULL DEFAULT 1,
+    inferred_title         TEXT,
+    diagram_kind           TEXT,
+    content_text           TEXT,
+    node_count             INTEGER,
+    edge_count             INTEGER,
+    chat_id                TEXT,
+    linked_session_summary TEXT,
+    config_json            TEXT,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    UNIQUE(project_id, diagram_name)
+);
+"""
+
+# Extended schema: includes folder_path + slug columns used by config_projection
+# when listing projects for the --all path.
+_FULL_PROJECTS_DIAGRAM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    folder_path TEXT NOT NULL DEFAULT '',
+    slug        TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS project_diagrams (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id             TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    diagram_name           TEXT    NOT NULL,
+    diagram_type           TEXT    NOT NULL CHECK(diagram_type IN ('mermaid','excalidraw')),
+    file_path              TEXT    NOT NULL,
+    category_path          TEXT    NOT NULL,
+    enabled                INTEGER NOT NULL DEFAULT 1,
+    inferred_title         TEXT,
+    diagram_kind           TEXT,
+    content_text           TEXT,
+    node_count             INTEGER,
+    edge_count             INTEGER,
+    chat_id                TEXT,
+    linked_session_summary TEXT,
+    config_json            TEXT,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    UNIQUE(project_id, diagram_name)
+);
+"""
+
+
+@pytest.fixture(autouse=True)
+def isolated_vct_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect VCT_STATE_DIR to a per-test tmp dir and seed launcher.db.
+
+    TEST-1 (v0.2.42 W4): Without this fixture, _upsert_row in
+    diagram_indexer calls launcher_db_path() which defaults to
+    ~/.vct/launcher.db. On a dev box with a populated DB the FK
+    constraint on project_diagrams.project_id fails because
+    "demo-project" doesn't exist there.
+
+    This fixture:
+      1. Sets VCT_STATE_DIR so launcher_db_path() → <tmp>/launcher.db.
+      2. Creates that DB with the minimal projects + project_diagrams schema.
+      3. Pre-seeds a 'demo-project' row so the FK is satisfiable.
+    """
+    state_dir = tmp_path / "vct-state"
+    state_dir.mkdir(parents=True)
+    monkeypatch.setenv("VCT_STATE_DIR", str(state_dir))
+
+    db_path = state_dir / "launcher.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_DIAGRAM_DB_SCHEMA)
+        conn.execute(
+            "INSERT OR IGNORE INTO projects (id, name) VALUES (?, ?)",
+            ("demo-project", "Demo Project"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return state_dir
 
 
 # ---------------------------------------------------------------------------
@@ -263,13 +365,11 @@ def test_all_iterates_projects(monkeypatch, tmp_path, capsys):
     _write_mermaid(p2_folder / ".claude" / "diagrams" / "arch" / "b.mmd")
 
     # Seed a real launcher DB with the schema config_projection reads.
-    import sqlite3
+    # Also set VCT_STATE_DIR so diagram_indexer._upsert_row's launcher_db_path()
+    # resolves to the same file (overrides the autouse fixture's vct-state dir).
     db = tmp_path / "launcher.db"
     conn = sqlite3.connect(str(db))
-    conn.execute(
-        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
-        "folder_path TEXT NOT NULL, slug TEXT NOT NULL)"
-    )
+    conn.executescript(_FULL_PROJECTS_DIAGRAM_SCHEMA)
     conn.execute(
         "INSERT INTO projects (id, name, folder_path, slug) VALUES (?,?,?,?)",
         ("p1", "AlphaProj", str(p1_folder), "p1"),
@@ -280,6 +380,7 @@ def test_all_iterates_projects(monkeypatch, tmp_path, capsys):
     )
     conn.commit()
     conn.close()
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
 
     # Pin the launcher-DB resolver inside config_projection so both
     # helpers transparently read our tmp DB.
@@ -309,13 +410,9 @@ def test_all_iterates_projects_deterministic_order(monkeypatch, tmp_path, capsys
         _write_mermaid(f / ".claude" / "diagrams" / "gui" / "x.mmd")
         folders[slug] = f
 
-    import sqlite3
     db = tmp_path / "launcher.db"
     conn = sqlite3.connect(str(db))
-    conn.execute(
-        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
-        "folder_path TEXT NOT NULL, slug TEXT NOT NULL)"
-    )
+    conn.executescript(_FULL_PROJECTS_DIAGRAM_SCHEMA)
     # Insert in NON-alphabetical order; helper must sort by name.
     for slug, name in (("zulu", "Zulu"), ("alpha", "Alpha"), ("mike", "Mike")):
         conn.execute(
@@ -324,6 +421,7 @@ def test_all_iterates_projects_deterministic_order(monkeypatch, tmp_path, capsys
         )
     conn.commit()
     conn.close()
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
 
     from vco_lib import config_projection as cp
     monkeypatch.setattr(cp, "_resolve_launcher_db_path", lambda: db)

@@ -108,147 +108,33 @@ class DeriveOrchestratorProjectNameTests(unittest.TestCase):
             self.assertEqual(result, "MyFancyOrch")
 
 
-@unittest.skip(
-    "Phase 0.B Part 2 (2026-05-25): "
-    "`install._backfill_code_graph_project_env` now delegates to "
-    "`vco_lib.config_projection.apply_project_env`, which projects "
-    "the FULL canonical env from launcher.db rather than the legacy "
-    "two-key add-only-missing-keys contract. New behavioral contract "
-    "covered by `tests/test_config_projection_subprocess.py` (CLI/"
-    "in-process parity) and `tests/test_config_projection.py` "
-    "(apply_project_env semantics). Pre-Phase-0.B legacy behaviors "
-    "(add-only-missing-keys, file-existence noop, user-value "
-    "preservation for canonical keys) are intentional regressions: "
-    "the DB is now the source of truth and canonical keys are always "
-    "OVERWRITTEN with the DB-resolved value."
-)
-class BackfillCodeGraphProjectEnvTests(unittest.TestCase):
-    """`_backfill_code_graph_project_env` — idempotent fill-in of two
-    missing keys in `.claude/settings.json::env`.
 
-    Contract:
-      - Missing settings file → action="missing" (no-op).
-      - File unparseable → action="unparseable" (no-op, preserves user file).
-      - Both keys present → action="noop".
-      - Missing `env` block → creates it with both keys.
-      - One or both keys missing → action="backfilled", added_keys lists
-        the keys that were just written.
+class LegacyBackfillRemovedTest(unittest.TestCase):
+    """TEST-5 sentinel (v0.2.42 W4): verify the legacy add-only-missing-keys
+    implementation is gone and the function delegates to apply_project_env.
+
+    BackfillCodeGraphProjectEnvTests was deleted in v0.2.42 W4 because
+    Phase 0.B Part 2 (2026-05-25) replaced the two-key add-only contract
+    with full canonical env projection via apply_project_env. The new
+    behavioral contract is covered by test_config_projection.py and
+    test_config_projection_subprocess.py.
     """
 
-    def _write_settings(self, td: Path, env_block: dict | None) -> Path:
-        f = td / ".claude" / "settings.json"
-        f.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict = {"permissions": {"allow": []}}
-        if env_block is not None:
-            payload["env"] = env_block
-        f.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        return f
+    def test_legacy_backfill_attribute_does_not_exist(self):
+        """install._legacy_backfill should not exist (never did; but a
+        regression adding it would signal the wrong migration path)."""
+        self.assertFalse(
+            callable(getattr(install, "_legacy_backfill", None)),
+            "_legacy_backfill attribute must not exist on install module",
+        )
 
-    def test_missing_file_is_noop(self):
-        with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / ".claude" / "settings.json"
-            result = install._backfill_code_graph_project_env(f)
-            self.assertEqual(result["action"], "missing")
-            self.assertEqual(result["added_keys"], [])
-
-    def test_unparseable_file_is_noop(self):
-        with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "settings.json"
-            f.write_text("not json {{}}", encoding="utf-8")
-            result = install._backfill_code_graph_project_env(f)
-            self.assertEqual(result["action"], "unparseable")
-            self.assertEqual(result["added_keys"], [])
-
-    def test_both_keys_already_present_is_noop(self):
-        with tempfile.TemporaryDirectory() as td:
-            f = self._write_settings(
-                Path(td),
-                {"PROJECT_NAME": "Foo", "CODE_GRAPH_PROJECT": "Foo",
-                 "KG_COLLECTION": "Foo_KnowledgeGraph"},
-            )
-            result = install._backfill_code_graph_project_env(f)
-            self.assertEqual(result["action"], "noop")
-            self.assertEqual(result["added_keys"], [])
-            # User-set values preserved verbatim.
-            data = json.loads(f.read_text(encoding="utf-8"))
-            self.assertEqual(data["env"]["PROJECT_NAME"], "Foo")
-            self.assertEqual(data["env"]["CODE_GRAPH_PROJECT"], "Foo")
-
-    def test_missing_env_block_creates_it(self):
-        with tempfile.TemporaryDirectory() as td:
-            f = self._write_settings(Path(td), None)  # No env block.
-            result = install._backfill_code_graph_project_env(f)
-            self.assertEqual(result["action"], "backfilled")
-            self.assertEqual(sorted(result["added_keys"]),
-                             ["CODE_GRAPH_PROJECT", "PROJECT_NAME"])
-            data = json.loads(f.read_text(encoding="utf-8"))
-            self.assertIn("env", data)
-            self.assertIn("PROJECT_NAME", data["env"])
-            self.assertIn("CODE_GRAPH_PROJECT", data["env"])
-
-    def test_both_keys_missing_fills_both(self):
-        with tempfile.TemporaryDirectory() as td:
-            f = self._write_settings(
-                Path(td), {"BASH_ENV": "/some/path"},
-            )
-            result = install._backfill_code_graph_project_env(f)
-            self.assertEqual(result["action"], "backfilled")
-            self.assertEqual(sorted(result["added_keys"]),
-                             ["CODE_GRAPH_PROJECT", "PROJECT_NAME"])
-            data = json.loads(f.read_text(encoding="utf-8"))
-            # Existing user-set key preserved.
-            self.assertEqual(data["env"]["BASH_ENV"], "/some/path")
-
-    def test_only_project_name_missing_fills_one(self):
-        with tempfile.TemporaryDirectory() as td:
-            f = self._write_settings(
-                Path(td),
-                {"CODE_GRAPH_PROJECT": "Foo"},
-            )
-            result = install._backfill_code_graph_project_env(f)
-            self.assertEqual(result["action"], "backfilled")
-            self.assertEqual(result["added_keys"], ["PROJECT_NAME"])
-            data = json.loads(f.read_text(encoding="utf-8"))
-            # User value preserved on the already-present key.
-            self.assertEqual(data["env"]["CODE_GRAPH_PROJECT"], "Foo")
-
-    def test_only_code_graph_project_missing_fills_one(self):
-        with tempfile.TemporaryDirectory() as td:
-            f = self._write_settings(
-                Path(td),
-                {"PROJECT_NAME": "Foo"},
-            )
-            result = install._backfill_code_graph_project_env(f)
-            self.assertEqual(result["action"], "backfilled")
-            self.assertEqual(result["added_keys"], ["CODE_GRAPH_PROJECT"])
-            data = json.loads(f.read_text(encoding="utf-8"))
-            self.assertEqual(data["env"]["PROJECT_NAME"], "Foo")
-
-    def test_idempotent_under_repeat_invocation(self):
-        # Running the backfill twice in a row must produce noop on the
-        # second call (every key already present after the first).
-        with tempfile.TemporaryDirectory() as td:
-            f = self._write_settings(Path(td), {})
-            first = install._backfill_code_graph_project_env(f)
-            second = install._backfill_code_graph_project_env(f)
-            self.assertEqual(first["action"], "backfilled")
-            self.assertEqual(second["action"], "noop")
-            self.assertEqual(second["added_keys"], [])
-
-    def test_user_set_value_never_overwritten(self):
-        # Critical safety: backfill MUST NOT touch existing values, even
-        # if they look "wrong" (e.g. user pinned a custom basename).
-        with tempfile.TemporaryDirectory() as td:
-            f = self._write_settings(
-                Path(td),
-                {"PROJECT_NAME": "UserCustomName",
-                 "CODE_GRAPH_PROJECT": "AnotherCustomName"},
-            )
-            result = install._backfill_code_graph_project_env(f)
-            self.assertEqual(result["action"], "noop")
-            data = json.loads(f.read_text(encoding="utf-8"))
-            self.assertEqual(data["env"]["PROJECT_NAME"], "UserCustomName")
-            self.assertEqual(data["env"]["CODE_GRAPH_PROJECT"], "AnotherCustomName")
+    def test_backfill_function_still_callable(self):
+        """_backfill_code_graph_project_env must remain callable for
+        callers that haven't updated their import yet (soft-deprecation)."""
+        self.assertTrue(
+            callable(install._backfill_code_graph_project_env),
+            "_backfill_code_graph_project_env should still be callable",
+        )
 
 
 class BackfillInProjectTests(unittest.TestCase):

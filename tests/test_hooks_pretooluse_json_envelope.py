@@ -131,7 +131,7 @@ def test_sh_pretooluse_hook_uses_json_envelope(hook_dir: Path, name: str) -> Non
     10000-char truncation cap.
     """
     if not hook_dir.is_dir():
-        pytest.skip(f"hook dir not present: {hook_dir}")
+        pytest.fail(f"hook dir missing from repo (CI env regression): {hook_dir}")
     path = _hook_path(hook_dir, name, "sh")
     if not path.exists():
         pytest.fail(f"expected hook missing: {path}")
@@ -173,7 +173,7 @@ def test_ps1_pretooluse_hook_uses_json_envelope(hook_dir: Path, name: str) -> No
     expected encoder (PowerShell stdlib).
     """
     if not hook_dir.is_dir():
-        pytest.skip(f"hook dir not present: {hook_dir}")
+        pytest.fail(f"hook dir missing from repo (CI env regression): {hook_dir}")
     path = _hook_path(hook_dir, name, "ps1")
     if not path.exists():
         pytest.fail(f"expected hook missing: {path}")
@@ -225,10 +225,10 @@ def test_pre_edit_context_inject_no_unwrapped_get_content(hook_dir: Path) -> Non
     statement before ``exit 0``.
     """
     if not hook_dir.is_dir():
-        pytest.skip(f"hook dir not present: {hook_dir}")
+        pytest.fail(f"hook dir missing from repo (CI env regression): {hook_dir}")
     path = hook_dir / "pre-edit-context-inject.ps1"
     if not path.exists():
-        pytest.skip(f"hook not present: {path}")
+        pytest.fail(f"expected hook file missing from repo (CI env regression): {path}")
 
     text = path.read_text()
     # The buggy form was:
@@ -268,10 +268,10 @@ def test_pre_edit_context_inject_no_unwrapped_write_output(hook_dir: Path) -> No
     gun for a regression.
     """
     if not hook_dir.is_dir():
-        pytest.skip(f"hook dir not present: {hook_dir}")
+        pytest.fail(f"hook dir missing from repo (CI env regression): {hook_dir}")
     path = hook_dir / "pre-edit-context-inject.ps1"
     if not path.exists():
-        pytest.skip(f"hook not present: {path}")
+        pytest.fail(f"expected hook file missing from repo (CI env regression): {path}")
 
     text = path.read_text()
     bad_pattern = re.compile(r"^\s*Write-Output\s+\$outStr\b", re.MULTILINE)

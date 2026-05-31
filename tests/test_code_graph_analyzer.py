@@ -31,12 +31,12 @@ def _load_analyzer_module() -> types.ModuleType:
         "_new10_analyze_code_graph", str(_ANALYZER_PATH)
     )
     if spec is None or spec.loader is None:
-        pytest.skip(f"Cannot load analyzer module from {_ANALYZER_PATH}")
+        pytest.fail(f"Analyzer module file missing from repo — CI env regression: {_ANALYZER_PATH}")
     mod = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
     except SystemExit:
-        pytest.skip("weaviate-client unavailable — analyzer cannot be loaded")
+        pytest.fail("weaviate-client package not installed — CI env regression (required dependency missing)")
     return mod
 
 

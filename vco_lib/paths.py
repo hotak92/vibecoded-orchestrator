@@ -23,9 +23,12 @@ admin-license token).
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def vct_root_dir() -> Path:
@@ -113,8 +116,10 @@ def resolve_project_name(cwd: Optional[Path] = None) -> Optional[str]:
         cfg = _vco_resolve(cwd)
         if cfg.code_graph_project:
             return cfg.code_graph_project
-    except Exception:  # noqa: BLE001 — hub may be down; fall through to env
-        pass
+    except Exception as e:  # noqa: BLE001 — hub may be down; fall through to env
+        logger.warning(
+            "resolve_project_name: hub-resolver failed: %s; falling back to env", e
+        )
     env_cg = os.environ.get("CODE_GRAPH_PROJECT", "").strip()
     if env_cg:
         return env_cg

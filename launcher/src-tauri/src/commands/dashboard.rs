@@ -907,11 +907,8 @@ mod tests {
     /// Skipped when the OS keychain backend is unavailable (CI containers,
     /// headless build hosts).
     #[test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn test_update_mcp_setting_secret_routes_to_keychain_not_json() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let (home, _guard) = setup_temp_env();
 
         // Seed a config that includes a custom MCP with a Secret-typed key.
@@ -1094,11 +1091,8 @@ mod tests {
     /// removed). We inject a synthetic custom MCP with a Secret setting to
     /// exercise the migration sweep — the sweep logic is unchanged.
     #[test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn test_first_run_migrates_plaintext_secrets_to_keychain() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let (home, _guard) = setup_temp_env();
 
         // Seed orchestrator.json with a plaintext Secret value (the
