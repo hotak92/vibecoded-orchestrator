@@ -787,11 +787,12 @@ pub async fn license_refresh(db: State<'_, Db>) -> Result<TierCacheView, String>
     match resp {
         Err(e) => {
             // Network failure: keep cache, update error. Client uses grace window.
-            db.set_tier_cache(
-                &db.get_tier_cache()?.orchestrator_tier,
-                &db.get_tier_cache()?.module_licenses,
-                Some(&format!("network: {}", e)),
-            )?;
+            // RT-2 (v0.2.42): atomic RMW so a concurrent validate_module_license
+            // can't tear the module_licenses overlay while we update last_error.
+            let err_str = format!("network: {}", e);
+            db.with_tier_cache_mut(|row| {
+                row.last_error = Some(err_str.clone());
+            })?;
             Ok(to_view(db.get_tier_cache()?))
         }
         Ok(r) => {
@@ -884,11 +885,12 @@ pub async fn license_refresh(db: State<'_, Db>) -> Result<TierCacheView, String>
                     // file too so the gateway can't authenticate.
                     remove_license_cache_for_token_gateway();
                 } else {
-                    db.set_tier_cache(
-                        &db.get_tier_cache()?.orchestrator_tier,
-                        &db.get_tier_cache()?.module_licenses,
-                        Some(&err),
-                    )?;
+                    // RT-2 (v0.2.42): atomic RMW preserves existing tier +
+                    // module_licenses while stamping the new error.
+                    let err_owned = err.clone();
+                    db.with_tier_cache_mut(|row| {
+                        row.last_error = Some(err_owned.clone());
+                    })?;
                     // 5xx / 4xx-other: leave the JSON cache untouched so
                     // the user keeps their in-grace-period authority.
                 }
@@ -1708,46 +1710,47 @@ pub async fn validate_module_license(
                     err.as_deref(),
                 )?;
                 db.trim_license_key_validations(&module_id, 50)?;
-                // Update the tier_cache overlay so `is_module_licensed_v2`
-                // picks up (or drops) this module's entry.
-                let mut tier_row = db.get_tier_cache()?;
-                let mut map = tier_row
-                    .module_licenses
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default();
-                if valid {
-                    let mut entry = serde_json::Map::new();
-                    entry.insert(
-                        "tier".to_string(),
-                        serde_json::Value::String(tier.clone()),
-                    );
-                    if let Some(ref ea) = expires_at {
-                        entry.insert(
-                            "expires_at".to_string(),
-                            serde_json::Value::String(ea.clone()),
-                        );
-                    }
-                    entry.insert(
-                        "source".to_string(),
-                        serde_json::Value::String("per-module".to_string()),
-                    );
-                    entry.insert(
-                        "activated_at".to_string(),
-                        serde_json::Value::Number(
-                            chrono::Utc::now().timestamp_millis().into(),
-                        ),
-                    );
-                    map.insert(module_id.clone(), serde_json::Value::Object(entry));
-                } else {
-                    map.remove(&module_id);
+                // RT-2 (v0.2.42): atomic RMW so a concurrent license_refresh
+                // (timer) can't overwrite this module's overlay entry while we
+                // are updating it. All three operations — read, mutate, write —
+                // run under a single lock acquisition inside with_tier_cache_mut.
+                {
+                    let mid = module_id.clone();
+                    let tier_copy = tier.clone();
+                    let expires_copy = expires_at.clone();
+                    db.with_tier_cache_mut(|row| {
+                        let map = row
+                            .module_licenses
+                            .as_object_mut()
+                            .expect("module_licenses is always a JSON object");
+                        if valid {
+                            let mut entry = serde_json::Map::new();
+                            entry.insert(
+                                "tier".to_string(),
+                                serde_json::Value::String(tier_copy.clone()),
+                            );
+                            if let Some(ref ea) = expires_copy {
+                                entry.insert(
+                                    "expires_at".to_string(),
+                                    serde_json::Value::String(ea.clone()),
+                                );
+                            }
+                            entry.insert(
+                                "source".to_string(),
+                                serde_json::Value::String("per-module".to_string()),
+                            );
+                            entry.insert(
+                                "activated_at".to_string(),
+                                serde_json::Value::Number(
+                                    chrono::Utc::now().timestamp_millis().into(),
+                                ),
+                            );
+                            map.insert(mid.clone(), serde_json::Value::Object(entry));
+                        } else {
+                            map.remove(&mid);
+                        }
+                    })?;
                 }
-                tier_row.module_licenses = serde_json::Value::Object(map);
-                db.set_tier_cache(
-                    &tier_row.orchestrator_tier,
-                    &tier_row.module_licenses,
-                    tier_row.last_error.as_deref(),
-                )?;
 
                 Ok(ModuleLicenseValidationResult {
                     module_id,
@@ -1769,21 +1772,17 @@ pub async fn validate_module_license(
                 db.append_license_key_validation(&module_id, None, http_status, Some(&formatted))?;
                 db.trim_license_key_validations(&module_id, 50)?;
                 if status == reqwest::StatusCode::UNAUTHORIZED {
-                    // Definitive invalid: drop the per-module overlay
-                    // entry so feature gates re-check.
-                    let mut tier_row = db.get_tier_cache()?;
-                    let mut map = tier_row
-                        .module_licenses
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default();
-                    map.remove(&module_id);
-                    tier_row.module_licenses = serde_json::Value::Object(map);
-                    db.set_tier_cache(
-                        &tier_row.orchestrator_tier,
-                        &tier_row.module_licenses,
-                        tier_row.last_error.as_deref(),
-                    )?;
+                    // Definitive invalid: drop the per-module overlay entry
+                    // so feature gates re-check.
+                    // RT-2 (v0.2.42): atomic RMW prevents a race with a
+                    // concurrent license_refresh from restoring the entry.
+                    let mid = module_id.clone();
+                    db.with_tier_cache_mut(|row| {
+                        row.module_licenses
+                            .as_object_mut()
+                            .expect("module_licenses is always a JSON object")
+                            .remove(&mid);
+                    })?;
                 }
                 Ok(ModuleLicenseValidationResult {
                     module_id,
