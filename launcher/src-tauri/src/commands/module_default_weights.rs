@@ -125,6 +125,62 @@ pub struct DownloadDefaultWeightsResult {
     pub version: String,
 }
 
+/// v0.2.42 RT-3: structured error for Supabase 400 `unsupported_embedding_source`.
+///
+/// The edge function (`rl-latest-weights` and `rl-latest-version`) returns this
+/// body when the requested `embedding_source` has no matching row in
+/// `paid_module_releases`:
+///
+/// ```json
+/// {"error": "unsupported_embedding_source",
+///  "supported_embedding_sources": ["qwen3", "arctic2"]}
+/// ```
+///
+/// Pre-fix the client rendered only a raw 200-char text preview, which
+/// hid the actionable hint (the supported list). Now the caller receives
+/// a typed value that surfaces both the unsupported source and the
+/// available alternatives — the GUI tile can render
+/// "not available for <source>; try: qwen3, arctic2" instead of a
+/// cryptic JSON snippet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnsupportedEmbeddingSourceError {
+    /// The embedding source the caller requested.
+    pub requested_source: String,
+    /// The sources the server currently supports for this module.
+    pub supported_sources: Vec<String>,
+}
+
+impl std::fmt::Display for UnsupportedEmbeddingSourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.supported_sources.is_empty() {
+            write!(
+                f,
+                "embedding source '{}' is not supported by the server \
+                 (no alternatives available yet)",
+                self.requested_source,
+            )
+        } else {
+            write!(
+                f,
+                "embedding source '{}' is not supported; \
+                 available sources: {}",
+                self.requested_source,
+                self.supported_sources.join(", "),
+            )
+        }
+    }
+}
+
+/// Deserialise shape of the Supabase 400 `unsupported_embedding_source` body.
+/// Only used internally by `fetch_signed_download_url`.
+#[derive(Debug, Deserialize)]
+struct SupabaseErrorBody {
+    #[serde(default)]
+    error: String,
+    #[serde(default, rename = "supported_embedding_sources")]
+    supported: Vec<String>,
+}
+
 // ─── Path helpers ───────────────────────────────────────────────────────
 
 /// Replace `[^A-Za-z0-9._-]` with `_` so a hostile string can never
@@ -449,6 +505,23 @@ pub async fn fetch_signed_download_url(
     let status = resp.status();
     if !status.is_success() {
         let body_text = resp.text().await.unwrap_or_default();
+        // v0.2.42 RT-3: parse 400 `unsupported_embedding_source` into a
+        // structured error so callers can surface actionable guidance
+        // ("try: qwen3, arctic2") rather than a raw JSON snippet.
+        if status.as_u16() == 400 {
+            if let Ok(err_body) = serde_json::from_str::<SupabaseErrorBody>(&body_text) {
+                if err_body.error == "unsupported_embedding_source" {
+                    let structured = UnsupportedEmbeddingSourceError {
+                        requested_source: embedding_source.to_string(),
+                        supported_sources: err_body.supported,
+                    };
+                    return Err(format!(
+                        "unsupported_embedding_source: {}",
+                        structured,
+                    ));
+                }
+            }
+        }
         let preview = body_text.chars().take(200).collect::<String>();
         return Err(format!("rl-latest-weights returned {}: {}", status, preview));
     }
@@ -906,6 +979,71 @@ pub async fn module_get_runtime_value_inner(
 /// "no defer".
 pub const WEIGHTS_DOWNLOAD_DEFERRED_KEY: &str = "weights_download_deferred";
 
+/// v0.2.42 RT-3: `module_settings.setting_key` used to record the
+/// Unix-millisecond timestamp of the last failed first-install auto-
+/// download. Combined with `WEIGHTS_DOWNLOAD_DEFERRED_KEY` to gate
+/// the R5 daily poll: when the deferred flag is set AND the last
+/// failure was < 24 hours ago, skip the poll to avoid hammering the
+/// Supabase edge function repeatedly for a known-stale configuration
+/// (e.g. `unsupported_embedding_source` — won't resolve without user
+/// action, so polling every 24h is wasteful).
+///
+/// Cleared alongside `WEIGHTS_DOWNLOAD_DEFERRED_KEY` on success.
+pub const WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY: &str = "weights_download_last_failed_at";
+
+/// 24-hour cooldown duration in milliseconds. When the deferred flag
+/// is set and the last failure was recorded within this window, the R5
+/// auto-trigger skips polling to avoid repeated edge-function calls
+/// for a configuration that requires user action to fix.
+const WEIGHTS_DOWNLOAD_COOLDOWN_MS: i64 = 24 * 60 * 60 * 1000; // 24 h
+
+/// v0.2.42 RT-3: return `true` when the R5 auto-trigger should skip
+/// the download attempt because a recent failure was recorded within
+/// the 24-hour cooldown window.
+///
+/// Logic:
+/// 1. If `WEIGHTS_DOWNLOAD_DEFERRED_KEY` is NOT set → not in defer
+///    state → never skip (let the first-install trigger proceed).
+/// 2. If `WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY` is absent → no
+///    timestamp recorded → skip (conservative: assume deferred
+///    recently; the user can clear via the manual "Download" button).
+/// 3. If `now - last_failed_at < 24h` → within cooldown → skip.
+/// 4. Otherwise → cooldown expired → allow retry.
+///
+/// Soft-fail: DB errors are treated as "do not skip" (let the
+/// download attempt run; it will fail and re-record the timestamp).
+pub(crate) fn should_skip_r5_poll(
+    db: &crate::db::Db,
+    project_id: &str,
+    module_id: &str,
+) -> bool {
+    // Step 1: check deferred flag.
+    let deferred = match db.get_setting(project_id, module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY) {
+        Ok(Some(serde_json::Value::Bool(true))) => true,
+        _ => false,
+    };
+    if !deferred {
+        return false;
+    }
+    // Steps 2–4: check timestamp.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match db.get_setting(project_id, module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY) {
+        Ok(Some(serde_json::Value::Number(n))) => {
+            if let Some(ts) = n.as_i64() {
+                // Within cooldown window → skip.
+                now_ms - ts < WEIGHTS_DOWNLOAD_COOLDOWN_MS
+            } else {
+                // Malformed timestamp → conservative skip.
+                true
+            }
+        }
+        // No timestamp row or non-numeric value → conservative skip.
+        Ok(_) => true,
+        // DB error → don't skip (let it try).
+        Err(_) => false,
+    }
+}
+
 /// Record the deferred-flag + audit entry for a failed first-install
 /// auto-download. Extracted into a pure-Db helper so unit tests can
 /// drive it without standing up an `AppHandle` (the keychain +
@@ -935,6 +1073,18 @@ pub(crate) fn mark_weights_download_deferred(
         );
     }
 
+    // v0.2.42 RT-3: record failure timestamp for the 24-hour cooldown
+    // gate. `should_skip_r5_poll` reads this to avoid hammering the
+    // edge function for a configuration that requires user action
+    // (e.g. `unsupported_embedding_source`).
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let _ = db.set_setting(
+        project_id,
+        module_id,
+        WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY,
+        &serde_json::Value::Number(now_ms.into()),
+    );
+
     let _ = db.audit(
         "module_default_weights_auto_download_deferred",
         Some(project_id),
@@ -949,12 +1099,16 @@ pub(crate) fn mark_weights_download_deferred(
 /// Clear a previously-set deferred-flag after a successful download.
 /// Pure-Db helper, sibling to `mark_weights_download_deferred`.
 /// Idempotent: rows that don't exist produce a silent success.
+///
+/// v0.2.42 RT-3: also clears `WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY`
+/// so the 24-hour cooldown resets on success (next poll starts fresh).
 pub(crate) fn clear_weights_download_deferred(
     db: &Db,
     project_id: &str,
     module_id: &str,
 ) {
     let _ = db.delete_setting(project_id, module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY);
+    let _ = db.delete_setting(project_id, module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY);
 }
 
 /// Trigger a one-shot default-weights download after first install.
@@ -1011,6 +1165,26 @@ pub async fn apply_default_weights_after_install(
                 crate::commands::module_service::DEFAULT_EMBEDDING_SOURCE.to_string()
             });
 
+    // v0.2.42 RT-3: 24-hour cooldown gate. If the deferred flag is set
+    // and the last failure was recorded within the last 24 hours, skip
+    // this auto-trigger. This prevents repeated Supabase edge calls for
+    // configurations that require user action (e.g.
+    // `unsupported_embedding_source` — a new embedding source hasn't
+    // been released yet; no point retrying every install cycle).
+    //
+    // The user can always force a retry via the "Download default weights"
+    // button on the module tile, which calls the manual path directly
+    // (bypassing this gate). On success that path calls
+    // `clear_weights_download_deferred`, resetting the cooldown.
+    if should_skip_r5_poll(db, project_id, module_id) {
+        eprintln!(
+            "[module_default_weights] R5 auto-trigger: skipping (deferred + \
+             within 24-hour cooldown) for project {} module {}",
+            project_id, module_id
+        );
+        return Ok(());
+    }
+
     // 2. Reuse the manual-download path (no duplication). This is the
     // same function the GUI's "Download default weights" button calls
     // via the chained_action dispatcher (`module_dispatch.rs:244-252`).
@@ -1060,6 +1234,8 @@ pub async fn apply_default_weights_after_install(
             //   - "rl-latest-weights returned 5xx" (transient server
             //     error or rate-limit).
             //   - "POST ...: connection timed out" (network blip).
+            //   - "unsupported_embedding_source: ..." (v0.2.42 RT-3,
+            //     structured error; includes list of alternatives).
             eprintln!(
                 "[module_default_weights] R5 auto-trigger soft-fail for \
                  project {} module {}: {}",
@@ -1067,6 +1243,13 @@ pub async fn apply_default_weights_after_install(
             );
 
             mark_weights_download_deferred(db, project_id, module_id, &embedding_source, &e);
+
+            // v0.2.42 RT-3: surface the error to `module_installs.last_error`
+            // so the GUI tile can render a human-readable failure reason
+            // (especially useful for `unsupported_embedding_source` which
+            // includes the list of supported alternatives). Best-effort:
+            // failure here is non-fatal — the deferred flag is already set.
+            let _ = db.set_module_last_error(project_id, module_id, Some(&e));
 
             // Return Ok — the install pipeline must NOT fail when the
             // weights download soft-fails. The container is running
@@ -1750,5 +1933,183 @@ mod tests {
         assert_eq!(bytes, b"updated");
 
         std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    // ─── v0.2.42 RT-3: unsupported_embedding_source UX + cooldown ─────────
+
+    /// `UnsupportedEmbeddingSourceError::fmt` produces a message that
+    /// contains both the requested source and the supported alternatives.
+    #[test]
+    fn unsupported_embedding_source_error_display_includes_supported_list() {
+        let err = UnsupportedEmbeddingSourceError {
+            requested_source: "matryoshka".to_string(),
+            supported_sources: vec!["qwen3".to_string(), "arctic2".to_string()],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("matryoshka"), "must mention requested source: {}", msg);
+        assert!(msg.contains("qwen3"), "must list supported: {}", msg);
+        assert!(msg.contains("arctic2"), "must list supported: {}", msg);
+    }
+
+    /// When the supported list is empty the message stays coherent (no panic,
+    /// no "available sources: " with nothing after the colon).
+    #[test]
+    fn unsupported_embedding_source_error_display_handles_empty_supported_list() {
+        let err = UnsupportedEmbeddingSourceError {
+            requested_source: "experimental".to_string(),
+            supported_sources: vec![],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("experimental"), "must mention requested source");
+        assert!(!msg.is_empty());
+    }
+
+    /// `mark_weights_download_deferred` now also writes the
+    /// `WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY` timestamp row so
+    /// `should_skip_r5_poll` can compute the 24-hour window.
+    #[test]
+    fn mark_deferred_writes_last_failed_at_timestamp() {
+        let (db, project_id, module_id) = open_db_with_project();
+        let before_ms = chrono::Utc::now().timestamp_millis();
+
+        mark_weights_download_deferred(
+            &db, &project_id, &module_id, "matryoshka",
+            "unsupported_embedding_source: matryoshka is not supported; available sources: qwen3",
+        );
+
+        let ts_value = db
+            .get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY)
+            .expect("get_setting must not error")
+            .expect("timestamp row must exist after mark_*");
+
+        let ts_ms = ts_value.as_i64().expect("timestamp must be a JSON number");
+        let after_ms = chrono::Utc::now().timestamp_millis();
+        assert!(ts_ms >= before_ms, "timestamp must be >= before_ms");
+        assert!(ts_ms <= after_ms, "timestamp must be <= after_ms");
+    }
+
+    /// `clear_weights_download_deferred` must also remove the
+    /// `WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY` row so the cooldown resets.
+    #[test]
+    fn clear_deferred_also_clears_last_failed_at() {
+        let (db, project_id, module_id) = open_db_with_project();
+
+        mark_weights_download_deferred(&db, &project_id, &module_id, "qwen3", "err");
+        // Pre-condition: both rows exist.
+        assert!(
+            db.get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY)
+                .unwrap()
+                .is_some(),
+            "last_failed_at row must exist before clear"
+        );
+
+        clear_weights_download_deferred(&db, &project_id, &module_id);
+
+        assert!(
+            db.get_setting(&project_id, &module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY)
+                .unwrap()
+                .is_none(),
+            "last_failed_at row must be removed by clear_*"
+        );
+    }
+
+    /// `should_skip_r5_poll` returns false when no deferred flag is set
+    /// (fresh project, never failed).
+    #[test]
+    fn should_skip_r5_poll_returns_false_when_not_deferred() {
+        let (db, project_id, module_id) = open_db_with_project();
+        // No mark_* call — deferred flag absent.
+        assert!(
+            !should_skip_r5_poll(&db, &project_id, &module_id),
+            "must not skip when no deferred flag"
+        );
+    }
+
+    /// `should_skip_r5_poll` returns true when deferred flag is set
+    /// and the failure timestamp is within the 24-hour window (i.e. now).
+    #[test]
+    fn should_skip_r5_poll_returns_true_within_cooldown() {
+        let (db, project_id, module_id) = open_db_with_project();
+        mark_weights_download_deferred(&db, &project_id, &module_id, "qwen3", "network error");
+        // Timestamp was just written — well within 24h.
+        assert!(
+            should_skip_r5_poll(&db, &project_id, &module_id),
+            "must skip within 24-hour cooldown"
+        );
+    }
+
+    /// `should_skip_r5_poll` returns false when the failure timestamp is
+    /// older than 24 hours (cooldown expired → allow retry).
+    #[test]
+    fn should_skip_r5_poll_returns_false_when_cooldown_expired() {
+        let (db, project_id, module_id) = open_db_with_project();
+        // Deferred flag set but timestamp is 25h in the past.
+        let _ = db.set_setting(
+            &project_id, &module_id, WEIGHTS_DOWNLOAD_DEFERRED_KEY,
+            &serde_json::Value::Bool(true),
+        );
+        let old_ts = chrono::Utc::now().timestamp_millis() - (25 * 60 * 60 * 1000_i64);
+        let _ = db.set_setting(
+            &project_id, &module_id, WEIGHTS_DOWNLOAD_LAST_FAILED_AT_KEY,
+            &serde_json::Value::Number(old_ts.into()),
+        );
+        assert!(
+            !should_skip_r5_poll(&db, &project_id, &module_id),
+            "must allow retry once cooldown has expired"
+        );
+    }
+
+    /// Integration test: `fetch_signed_download_url` receiving a mocked
+    /// Supabase 400 `unsupported_embedding_source` body returns a
+    /// structured error message that includes the requested source and
+    /// the supported list.
+    #[tokio::test]
+    async fn fetch_signed_download_url_structures_unsupported_embedding_source_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let error_body = serde_json::json!({
+            "error": "unsupported_embedding_source",
+            "supported_embedding_sources": ["qwen3", "arctic2"],
+        })
+        .to_string();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let body = error_body.clone();
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let endpoint = format!("http://127.0.0.1:{}/rl-latest-weights", port);
+        let result = fetch_signed_download_url(
+            &endpoint, "fake-key", "deadbeef", "matryoshka", "vct-rl-reranker",
+        )
+        .await;
+
+        let err = result.expect_err("must error on 400 unsupported_embedding_source");
+        // Must start with the structured prefix.
+        assert!(
+            err.starts_with("unsupported_embedding_source:"),
+            "error must have structured prefix: {}",
+            err
+        );
+        // Must contain the requested source.
+        assert!(err.contains("matryoshka"), "error must name the bad source: {}", err);
+        // Must contain at least one supported source.
+        assert!(
+            err.contains("qwen3") || err.contains("arctic2"),
+            "error must list supported sources: {}",
+            err
+        );
     }
 }
