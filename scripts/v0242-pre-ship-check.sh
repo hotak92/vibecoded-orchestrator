@@ -113,6 +113,19 @@ fi
 # a clear "pytest not installed" failure if the user hasn't set up
 # a venv yet).
 echo "  [running pytest tests/ ...]"
+#
+# Resolve a Python interpreter that has pytest installed. Probe order:
+#  1. $PYTEST env override (explicit user choice).
+#  2. ./.venv/bin/python (or python3)            — created by install.py
+#  3. ./claude_mcp_servers/.venv/bin/python       — legacy venv path
+#  4. ../VCO_dev/.venv/bin/python                 — dev-machine sibling
+#                                                   private fork (lets
+#                                                   the script work when
+#                                                   run from a freshly
+#                                                   git-cloned public repo
+#                                                   on the same machine).
+#  5. `pytest` on PATH if no venv probe matched.
+#  6. Bare `python3` (will fail clearly if pytest missing).
 _PYTEST_PY=""
 if [ -n "${PYTEST:-}" ]; then
     _PYTEST_PY="$PYTEST"
@@ -122,6 +135,8 @@ elif [ -x ".venv/bin/python3" ]; then
     _PYTEST_PY=".venv/bin/python3"
 elif [ -x "claude_mcp_servers/.venv/bin/python" ]; then
     _PYTEST_PY="claude_mcp_servers/.venv/bin/python"
+elif [ -x "../VCO_dev/.venv/bin/python" ]; then
+    _PYTEST_PY="../VCO_dev/.venv/bin/python"
 elif command -v pytest >/dev/null 2>&1; then
     _PYTEST_PY=""  # use bare `pytest`
 else
