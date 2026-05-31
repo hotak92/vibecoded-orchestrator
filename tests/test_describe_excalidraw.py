@@ -41,14 +41,14 @@ def describe_excalidraw():
         sys.path.insert(0, str(path.parent))
         spec = importlib.util.spec_from_file_location("weaviate_mcp_server", path)
         if spec is None or spec.loader is None:
-            pytest.skip("weaviate_mcp.server cannot be imported on this host")
+            pytest.fail("weaviate_mcp/server.py file missing or unloadable — CI env regression (shipped module must be present)")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)  # type: ignore[union-attr]
     except Exception as exc:
-        pytest.skip(f"weaviate_mcp.server cannot be imported: {exc}")
+        pytest.fail(f"weaviate_mcp.server import failed — CI env regression (shipped module must be importable): {exc}")
     fn = getattr(module, "describe_excalidraw", None)
     if fn is None:
-        pytest.skip("describe_excalidraw not present on weaviate_mcp.server")
+        pytest.fail("describe_excalidraw missing from weaviate_mcp.server — CI env regression (shipped function must be present)")
     # FastMCP decorates the function — unwrap to the original.
     inner = getattr(fn, "fn", None) or getattr(fn, "__wrapped__", None) or fn
     return inner

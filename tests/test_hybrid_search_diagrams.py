@@ -71,7 +71,7 @@ def fresh_server(monkeypatch) -> Iterator:
         try:
             return importlib.import_module("weaviate_mcp.server")
         except Exception as exc:
-            pytest.skip(f"weaviate_mcp.server cannot be imported: {exc}")
+            pytest.fail(f"weaviate_mcp.server import failed — CI env regression (shipped module must be importable): {exc}")
 
     yield _do_import
 
