@@ -2799,7 +2799,13 @@ mod tests {
     /// present (we'd then migrate BRANCH 2). Instead we assert the
     /// MIGRATION DOES NOT ERROR — covers the legitimate clean-install
     /// branch (no panic, soft-fail discipline preserved).
+    ///
+    /// `#[ignore]` because the migration helper calls `secrets::get`
+    /// which fails on CI Ubuntu runners (no D-Bus secret-service
+    /// session). Run via `cargo test --lib ... -- --ignored` in an
+    /// environment with a host keychain. v0.2.41 CI-gate hotfix.
     #[tokio::test]
+    #[ignore = "touches host OS keychain via secrets::get — opt-in via --ignored"]
     async fn migrate_does_not_error_on_clean_install() {
         let db = Db::open_in_memory().expect("in-memory");
         // No seeded row. Whether the host keychain has the legacy

@@ -358,9 +358,15 @@ class MigrateDispatchUnitTests(unittest.TestCase):
         self.assertEqual(result["errors"], [])
 
     def test_patch_props_calls_post_property_per_missing_prop(self):
+        # v0.2.41 CI-gate hotfix: include Foo_Diagrams at-target so the
+        # Diagrams branch classifies as noop. Without this entry the
+        # fetcher returns None → migrate falls into the "create" path
+        # and calls a real urlopen (CI has no Weaviate). Mirrors the
+        # fetcher shape of every other test in this class.
         fetcher = self._fetcher_returning({
             "Foo_KnowledgeGraph":  _missing_props_only(),
             "Foo_Development":     _at_target_dev(),
+            "Foo_Diagrams":        _at_target_diagrams(),
         })
         with mock.patch.object(project_init, "_recover_or_drop_orphan_staging", return_value="none"), \
              mock.patch.object(project_init, "_post_property") as pmock, \

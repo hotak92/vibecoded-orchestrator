@@ -26,7 +26,12 @@
   let { onClose }: { onClose: () => void } = $props();
 
   let open = $state(true);
-  const state = $derived($moduleLicenseKeys);
+  // v0.2.41 CI-gate hotfix: renamed from `state` to `summary` because
+  // svelte-check resolved `$state<...>` (the rune) as an auto-subscribe
+  // to a store named `state`, producing 6 false-positive type errors at
+  // every `$state<Generic>(...)` site below. Renaming the derived-store
+  // alias removes the symbol collision.
+  const summary = $derived($moduleLicenseKeys);
 
   // Per-row key inputs. Keyed by module_id so each row has its own
   // independent textbox state. Initialised lazily on first render.
@@ -91,7 +96,7 @@
   }
 
   async function onClear(moduleId: string) {
-    const row = state.keys.find((k) => k.module_id === moduleId);
+    const row = summary.keys.find((k) => k.module_id === moduleId);
     if (!row) return;
     const label = row.display_name;
     // Confirm before destroying the key. Using native confirm() because
@@ -116,7 +121,7 @@
   });
 
   function rowBusy(row: LicenseKeySummary): boolean {
-    return state.busyModuleId === row.module_id;
+    return summary.busyModuleId === row.module_id;
   }
 </script>
 
@@ -137,18 +142,18 @@
   {/snippet}
 
   {#snippet body()}
-    {#if state.loading && state.keys.length === 0}
+    {#if summary.loading && summary.keys.length === 0}
       <p class="loading">Loading license keys…</p>
-    {:else if state.keys.length === 0}
+    {:else if summary.keys.length === 0}
       <p class="empty">
         No paid-module license keys yet. Activate one through the
         Orchestrator tier dialog, or paste a key below once you have one.
       </p>
     {/if}
 
-    {#if state.error}
+    {#if summary.error}
       <div class="error" role="alert">
-        {state.error}
+        {summary.error}
         <button class="link" onclick={() => moduleLicenseKeys.clearError()}
           >Dismiss</button
         >
@@ -156,7 +161,7 @@
     {/if}
 
     <ul class="key-list">
-      {#each state.keys as row (row.module_id)}
+      {#each summary.keys as row (row.module_id)}
         {@const badge = statusBadge(row)}
         {@const lastResult = lastResults[row.module_id]}
         <li class="key-row">
