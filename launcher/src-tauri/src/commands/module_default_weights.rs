@@ -257,11 +257,39 @@ pub fn weights_file_path(module_id: &str, embedding_source: &str, version: &str)
 // the symlink call uses `std::os::windows::fs::symlink_file` which
 // requires either elevated privileges or Developer Mode. If the symlink
 // fails (insufficient permission), we fall back to a plain `fs::copy`
-// so the container still gets the weights — the copy is a one-shot;
-// the next download replaces it (the symlink-replacement detection
-// treats a copy the same as a real file for override-protection
-// purposes, so on Windows the user re-downloads explicitly rather
-// than getting symlink-style transparent updates).
+// so the container still gets the weights.
+//
+// v0.2.42 RT-5 override-protection fix. Before this patch, the copy
+// fallback produced a regular file that the override-protection logic
+// (the `meta.file_type().is_symlink()` check in
+// `link_global_into_project_mount`) treated as a user-placed override —
+// so subsequent calls to "Download default weights" silently skipped the
+// slot, leaving the container on the first-downloaded version forever.
+//
+// Fix: when the copy fallback is taken, write a sibling `.vct-managed`
+// marker file next to the `.pt`. Override-protection checks for this
+// marker: if present, the slot is orchestrator-managed (replaceable);
+// only a regular file WITHOUT a marker is treated as a user override.
+//
+// On a re-link the old copy + marker are removed and the new copy (or
+// symlink on systems where symlink is now available) replaces them.
+// The user can still place a hand-crafted override by deleting the
+// marker file (or never having a copy at all).
+
+/// v0.2.42 RT-5: sibling marker file that signals "this weights file was
+/// placed here by the orchestrator (copy fallback) and is safe to
+/// replace on the next download". Without this marker, override-protection
+/// treats a regular `.pt` file as a deliberate user override and skips it.
+///
+/// Naming convention: `<weights_file>.vct-managed` — sibling of the `.pt`,
+/// same stem + `.vct-managed` extension. Created by the `fs::copy` fallback
+/// path; deleted alongside the file on re-link.
+pub fn managed_marker_path(weights_path: &Path) -> PathBuf {
+    let mut p = weights_path.to_path_buf();
+    let stem = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+    p.set_file_name(format!("{}.vct-managed", stem));
+    p
+}
 
 /// Resolve the per-project bind-mount directory the RL container reads
 /// weights from. Mirrors the host path declared in the RL Reranker
@@ -327,11 +355,28 @@ pub async fn link_global_into_project_mount(
     let target = project_mount_weights_path(module_id, project_slug, embedding_source, version);
 
     // Override protection: if a real (non-symlink) file already sits in
-    // the slot, the user has deliberately placed it there. Don't touch.
+    // the slot, check whether it is orchestrator-managed (`.vct-managed`
+    // marker present, written by the copy fallback path) or a deliberate
+    // user override. Only user overrides are preserved.
+    //
+    // v0.2.42 RT-5: pre-fix this block treated ALL regular files as user
+    // overrides, so a copy-fallback `.pt` was never refreshed on subsequent
+    // downloads — the container silently ran on the first-downloaded version
+    // forever on Windows systems where symlinks require Developer Mode.
+    let marker = managed_marker_path(&target);
     match tokio::fs::symlink_metadata(&target).await {
         Ok(meta) if !meta.file_type().is_symlink() => {
-            // User override (regular file or copy) — preserve.
-            return Ok(target);
+            // Regular file in the slot. Check the marker.
+            let is_managed = tokio::fs::metadata(&marker).await.is_ok();
+            if is_managed {
+                // Orchestrator-managed copy: remove + marker so we can refresh.
+                let _ = tokio::fs::remove_file(&target).await;
+                let _ = tokio::fs::remove_file(&marker).await;
+                // Fall through to the link/copy path below.
+            } else {
+                // No marker → genuine user override — preserve.
+                return Ok(target);
+            }
         }
         Ok(_) => {
             // Existing symlink — remove so we can refresh.
@@ -342,6 +387,9 @@ pub async fn link_global_into_project_mount(
                     e
                 ));
             }
+            // Clean up any stale marker file left from a prior copy-then-
+            // symlink transition (defensive; should be absent but harmless).
+            let _ = tokio::fs::remove_file(&marker).await;
         }
         Err(_) => {
             // Nothing there — proceed.
@@ -355,6 +403,12 @@ pub async fn link_global_into_project_mount(
         // Soft-fall back to copy (Windows without Developer Mode,
         // restricted filesystems, etc.). Log so the developer sees
         // it but don't fail — the container still gets the weights.
+        //
+        // v0.2.42 RT-5: write a `.vct-managed` marker file alongside
+        // the copy so future override-protection passes recognise this
+        // as an orchestrator-managed file (replaceable) rather than a
+        // user override. Without the marker, subsequent "Download default
+        // weights" calls silently skip the slot.
         eprintln!(
             "[module_default_weights] symlink {} -> {} failed ({}); falling back to copy",
             target.display(),
@@ -369,6 +423,17 @@ pub async fn link_global_into_project_mount(
                 e
             )
         })?;
+        // Write the marker (best-effort: a missing marker just means the
+        // copy will be treated as a user override on the NEXT call, which
+        // is the pre-fix behaviour — not great but not worse than before).
+        if let Err(marker_err) = tokio::fs::write(&marker, b"vct-managed").await {
+            eprintln!(
+                "[module_default_weights] warning: failed to write .vct-managed marker \
+                 {} ({}); copy will be treated as user override on next update",
+                marker.display(),
+                marker_err
+            );
+        }
     }
 
     Ok(target)
@@ -2267,5 +2332,108 @@ mod tests {
             "error must list supported sources: {}",
             err
         );
+    }
+
+    // ─── v0.2.42 RT-5: .vct-managed marker for copy fallback ─────────────
+
+    /// `managed_marker_path` returns a sibling file with `.vct-managed`
+    /// appended to the filename.
+    #[test]
+    fn managed_marker_path_is_sibling_with_vct_managed_suffix() {
+        let weights = PathBuf::from("/some/dir/rl_model_qwen3_v3.pt");
+        let marker = managed_marker_path(&weights);
+        assert_eq!(
+            marker,
+            PathBuf::from("/some/dir/rl_model_qwen3_v3.pt.vct-managed"),
+        );
+        // Same parent directory.
+        assert_eq!(marker.parent(), weights.parent());
+    }
+
+    /// On platforms where symlinks work (Unix), a copy produced by a prior
+    /// fallback that has a `.vct-managed` marker is replaced by a symlink
+    /// on the next link call. The marker is cleaned up.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_copy_is_replaced_by_symlink_on_relink() {
+        let tmp = tempfile::tempdir().expect("mkdtemp");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        let global = weights_file_path("vct-rl-reranker", "qwen3", "v5");
+        tokio::fs::create_dir_all(global.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&global, b"updated-weights").await.unwrap();
+
+        let target = project_mount_weights_path("vct-rl-reranker", "proj", "qwen3", "v5");
+        tokio::fs::create_dir_all(target.parent().unwrap()).await.unwrap();
+
+        // Simulate a prior copy-fallback: write the .pt + the marker.
+        tokio::fs::write(&target, b"old-copy-content").await.unwrap();
+        let marker = managed_marker_path(&target);
+        tokio::fs::write(&marker, b"vct-managed").await.unwrap();
+
+        // Act: re-link (symlink should now succeed on Unix).
+        let linked = link_global_into_project_mount(
+            "vct-rl-reranker", "proj", "qwen3", "v5", &global,
+        )
+        .await
+        .expect("re-link must succeed");
+
+        // The old copy and marker must be gone.
+        assert!(!marker.exists(), ".vct-managed marker must be cleaned up");
+
+        // The slot must now be a symlink to the global file.
+        let meta = tokio::fs::symlink_metadata(&linked).await.unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "slot must be a symlink after re-link on Unix"
+        );
+
+        // Content through the symlink must be the global's content.
+        let bytes = tokio::fs::read(&linked).await.unwrap();
+        assert_eq!(bytes, b"updated-weights");
+
+        std::env::remove_var("VCT_STATE_DIR");
+    }
+
+    /// A regular file WITHOUT a `.vct-managed` marker is treated as a user
+    /// override and preserved on re-link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_override_without_marker_is_preserved() {
+        let tmp = tempfile::tempdir().expect("mkdtemp");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        let global = weights_file_path("vct-rl-reranker", "qwen3", "v7");
+        tokio::fs::create_dir_all(global.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&global, b"global-content").await.unwrap();
+
+        let target = project_mount_weights_path("vct-rl-reranker", "proj2", "qwen3", "v7");
+        tokio::fs::create_dir_all(target.parent().unwrap()).await.unwrap();
+
+        // Simulate a user override: regular file, NO marker.
+        tokio::fs::write(&target, b"user-custom-weights").await.unwrap();
+
+        // Act: attempt to link.
+        let result = link_global_into_project_mount(
+            "vct-rl-reranker", "proj2", "qwen3", "v7", &global,
+        )
+        .await
+        .expect("must return Ok (user override path)");
+
+        // The override content must be intact.
+        let bytes = tokio::fs::read(&result).await.unwrap();
+        assert_eq!(
+            bytes, b"user-custom-weights",
+            "user override file must not be touched"
+        );
+
+        // Must NOT be a symlink — it's the user's regular file.
+        let meta = tokio::fs::symlink_metadata(&result).await.unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "user override must remain a regular file"
+        );
+
+        std::env::remove_var("VCT_STATE_DIR");
     }
 }
