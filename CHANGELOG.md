@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.43] — 2026-05-31
+
+20 items across 4 worktree-isolated agent branches (A install.py / B launcher Rust / C Weaviate cleanup / D CI + housekeeping). Headline themes: (a) orchestrator-root install hardening — manifest refresh, portability env keys written pre-launcher-boot, stale KG row pruning, hub probe URL fixed after multi-tag regression; (b) KG schema migration safety — additive named-vector UNION strategy ensures pre-v0.2.18 collections gain all 5 slots without re-embedding, plus lowercase-collection cleanup deferrals; (c) launcher resilience — license_keys legacy-file self-heal, container_pull broken-detection, post-install MCP tool defaults assertion; (d) release pipeline — Gate 3 closes the v0.2.42 retag class where launcher/dist/ could silently regress under a new tag.
+
 ### Added
 
 - **V0243-3 (license_keys startup self-heal)**: if `license_keys` count=0 AND `~/.vct/license.key` exists non-empty, launcher startup now backfills the `__orchestrator__` row and writes the key to the OS keychain (`source=legacy_backfill_v0243`). Called from `lib.rs::setup()` after the module reconciler; hermetic 3-test suite covers empty-table insertion, no-op when table already populated, and no-op when file is absent.

@@ -88,13 +88,13 @@ cd "$REPO_ROOT"
 # ── Section 1: Local build gates ─────────────────────────────────────────────
 echo "--- Local build gates ---"
 
-# Gate 1: Cargo.toml version matches expected v0.2.42
+# Gate 1: Cargo.toml version matches expected v0.2.43
 CARGO_VER="$(grep -m1 '^version = ' launcher/src-tauri/Cargo.toml \
     | sed -E 's/^version *= *"([^"]+)".*/\1/')"
-if [ "$CARGO_VER" = "0.2.42" ]; then
-    gate_pass "Cargo.toml version = 0.2.42"
+if [ "$CARGO_VER" = "0.2.43" ]; then
+    gate_pass "Cargo.toml version = 0.2.43"
 else
-    gate_fail "Cargo.toml version = 0.2.42" "Found: $CARGO_VER (bump before tagging)"
+    gate_fail "Cargo.toml version = 0.2.43" "Found: $CARGO_VER (bump before tagging)"
 fi
 
 # Gate 2: cargo test --lib (unit tests)
@@ -291,13 +291,13 @@ else
         "Found $ALERT_COUNT open error-severity alerts — triage before release"
 fi
 
-# Gate 16: CHANGELOG has v0.2.42 entry
-# Match the Keep-a-Changelog heading shape: `## [0.2.42] — 2026-05-31`.
+# Gate 16: CHANGELOG has v0.2.43 entry
+# Match the Keep-a-Changelog heading shape: `## [0.2.43] — 2026-05-31`.
 # Allow optional `v` prefix and optional surrounding brackets for flexibility.
-if grep -qE '^## \[?v?0\.2\.42\]?' CHANGELOG.md 2>/dev/null; then
-    gate_pass "CHANGELOG.md has v0.2.42 section"
+if grep -qE '^## \[?v?0\.2\.43\]?' CHANGELOG.md 2>/dev/null; then
+    gate_pass "CHANGELOG.md has v0.2.43 section"
 else
-    gate_fail "CHANGELOG.md has v0.2.42 section" \
+    gate_fail "CHANGELOG.md has v0.2.43 section" \
         "Add release notes before tagging"
 fi
 
@@ -342,9 +342,9 @@ if [ "${#failures[@]}" -gt 0 ]; then
         printf "  ${RED}*${RESET} %s\n" "$f"
     done
     echo ""
-    echo "Fix all failed gates before tagging v0.2.42."
+    echo "Fix all failed gates before tagging v0.2.43."
     exit 1
 fi
 
-echo "All gates PASSED. Safe to tag v0.2.42."
+echo "All gates PASSED. Safe to tag v0.2.43."
 exit 0
