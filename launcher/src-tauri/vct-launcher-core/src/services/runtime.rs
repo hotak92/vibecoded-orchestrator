@@ -606,6 +606,7 @@ async fn resolve_runtime() -> Option<RuntimeInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn binary_names_match_runtimes() {
@@ -682,7 +683,7 @@ mod tests {
     // belt-and-suspenders.
 
     #[tokio::test]
-    #[ignore = "subprocess-stress flakes the parallel suite; run explicitly with --ignored"]
+    #[serial]
     async fn daemon_usable_probe_docker_cases() {
         let dir = tempfile::tempdir().unwrap();
         // (script_name, stdout, exit_code, expected_usable, label)
@@ -717,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "subprocess-stress flakes the parallel suite; run explicitly with --ignored"]
+    #[serial]
     async fn daemon_usable_probe_podman_cases() {
         let dir = tempfile::tempdir().unwrap();
         let cases: Vec<(&str, &str, i32, bool, &str)> = vec![
@@ -744,7 +745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "subprocess-stress flakes the parallel suite; run explicitly with --ignored"]
+    #[serial]
     async fn daemon_usable_probe_spawn_failure_returns_false() {
         // Path to a binary that doesn't exist — must soft-fail, not panic.
         let bogus = PathBuf::from("/nonexistent/path/to/docker");
