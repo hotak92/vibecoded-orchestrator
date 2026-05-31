@@ -22,8 +22,13 @@
   // schema-rendered config tab. See `RlRerankerStatusPanel.svelte`.
   import RlRerankerStatusPanel from '$lib/components/RlRerankerStatusPanel.svelte';
   import { selectedProject } from '$lib/stores/projects';
+  import { modules } from '$lib/stores/modules';
+  // v0.2.42 W6 (UX-1): paid-modules-agnostic gate. The status panel +
+  // Reset button are only shown when the RL module is both installed AND
+  // its container is running.
+  import { moduleIsActive, RL_RERANKER_MODULE_ID } from '$lib/module-active-gate';
 
-  const RL_MODULE_ID = 'vct-rl-reranker';
+  const RL_MODULE_ID = RL_RERANKER_MODULE_ID;
 
   // The renderer (ModuleConfigTab.svelte) owns the canonical ConfigTab
   // type. We type the wire response as `unknown` here and hand it to
@@ -46,11 +51,37 @@
   // v0.2.40 H2: status panel binds to the globally selected project.
   // Renders placeholders ("—") when no project is picked yet.
   const activeProjectId = $derived($selectedProject?.id ?? '');
-  const showStatusPanel = $derived(moduleId === RL_MODULE_ID);
+
+  // v0.2.42 W6 (UX-1): show RL-specific UI only when the module is
+  // both installed AND its container is actively running. This keeps
+  // the launcher agnostic about paid modules — Store/Modules tabs stay
+  // fully browsable, but operational controls are hidden when the module
+  // isn't running (no inference available, flags have no effect).
+  const rlIsActive = $derived(moduleIsActive(RL_MODULE_ID, $modules.installed));
+  const showStatusPanel = $derived(moduleId === RL_MODULE_ID && rlIsActive);
 
   let configTab = $state<ConfigTab | null>(null);
   let loadError = $state<string | null>(null);
   let loading = $state<boolean>(true);
+
+  // v0.2.42 RT-4: "Reset to global weights" button state.
+  // Wires the Tauri command registered by W3 (`reset_weights_to_global`).
+  // Button is only rendered when the RL module is active (rlIsActive gate).
+  let resettingWeights = $state(false);
+  let resetWeightsError = $state<string | null>(null);
+
+  async function handleResetWeights() {
+    if (!tauriAvailable() || !activeProjectId) return;
+    resettingWeights = true;
+    resetWeightsError = null;
+    try {
+      await invoke('reset_weights_to_global', { projectId: activeProjectId });
+    } catch (e) {
+      resetWeightsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      resettingWeights = false;
+    }
+  }
 
   onMount(async () => {
     if (!tauriAvailable()) {
@@ -85,9 +116,26 @@
   {:else if configTab}
     {#if showStatusPanel}
       <!-- v0.2.40 H2: dashboard widget + flag-state summary above the
-           schema-rendered controls. Re-wires the v0.2.31 orphan widget. -->
+           schema-rendered controls. Re-wires the v0.2.31 orphan widget.
+           v0.2.42 W6 (UX-1): only rendered when RL module is running. -->
       <div class="status-panel-wrapper">
         <RlRerankerStatusPanel projectId={activeProjectId} />
+
+        <!-- v0.2.42 RT-4: Reset to global weights. Calls the Tauri command
+             registered by W3. Gated by rlIsActive (same gate as this block). -->
+        <div class="weights-reset-row">
+          <button
+            class="weights-reset-btn"
+            disabled={resettingWeights}
+            title="Discard project-specific fine-tuning and revert to the current global weights model."
+            onclick={() => void handleResetWeights()}
+          >
+            {resettingWeights ? 'Resetting…' : 'Reset to global weights'}
+          </button>
+          {#if resetWeightsError}
+            <p class="weights-reset-error" role="alert">{resetWeightsError}</p>
+          {/if}
+        </div>
       </div>
     {/if}
     <ModuleConfigTab configTab={configTab} {moduleId} />
@@ -109,7 +157,7 @@
     max-width: 560px;
     padding: 20px 24px;
     border-radius: 10px;
-    border: 1px solid rgba(231, 76, 60, 0.30);
+    border: 1px solid rgba(231, 76, 60, 0.3);
     background: rgba(231, 76, 60, 0.06);
     color: #e74c3c;
   }
@@ -129,5 +177,40 @@
     padding: 24px 24px 0 24px;
     max-width: 920px;
     margin: 0 auto;
+  }
+
+  /* v0.2.42 RT-4: Reset weights row sits below the status panel. */
+  .weights-reset-row {
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .weights-reset-btn {
+    align-self: flex-start;
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--color-border, #2a2f3a);
+    background: var(--color-bg, #11141c);
+    color: var(--color-fg, #e8edf6);
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .weights-reset-btn:hover:not(:disabled) {
+    border-color: var(--color-teal, #00bfa6);
+    color: var(--color-teal, #00bfa6);
+  }
+
+  .weights-reset-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .weights-reset-error {
+    margin: 0;
+    font-size: 12px;
+    color: #ff8a8a;
   }
 </style>

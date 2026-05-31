@@ -300,7 +300,12 @@ async def health():
             "inference_busy": _get_lock().locked(),
         }
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        # Log the full error internally; return only a generic message in the
+        # response body to avoid leaking internal details (stack traces, model
+        # paths, etc.) through the health endpoint. This service is
+        # localhost-only, but defence-in-depth still applies.
+        logger.error("Health check failed: %s", e)
+        return {"status": "error", "error": "health check failed — see server logs"}
 
 
 @app.on_event("startup")

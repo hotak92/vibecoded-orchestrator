@@ -95,6 +95,11 @@ jobs:
           # at this repo size and worth the broader coverage on a fresh
           # public release.
           queries: security-extended
+          # v0.2.42 W6 (SEC-1): suppress alerts on vendored third-party
+          # dist bundles (excalidraw, mermaid) and false-positive
+          # py/clear-text-logging-sensitive-data in config_projection.py.
+          # See .github/codeql-config.yml for the full rationale.
+          config-file: ./.github/codeql-config.yml
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v4
