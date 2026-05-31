@@ -9,9 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.42] — 2026-05-31
 
+47 commits across 11 worktree-isolated agent branches (W1-W8 fanout + D1-D3 deferral closers) plus a cargo-warning cleanup. Headline themes: (a) v0.2.40's silent-contamination guards are now AIRTIGHT (RT-1 closes the RLClient singleton hole F1 left open), (b) the long-broken `Installer Smoke Test` workflow turns green for the first time since v0.2.38 (W1 + W7), (c) launcher-side prep for the next vct-rl-reranker container iteration (L1.M multi-key licensing GUI gating, R3-R5 weights pipeline polish, W8 pull-token gateway end-to-end working), (d) **new discipline**: nothing deferred to v0.2.43. Every audit finding closed in-tag.
+
 ### Fixed
 
-- **D1 (module deprecation poll)**: wired the long-standing `#[allow(dead_code)]` scaffold `module_update_poll` to a real HTTP poller and 24h cron timer. `spawn_deprecation_poll` runs 30s after launcher boot then every 24h thereafter; it fetches the L0 module catalog (same `module-catalog` Supabase edge function as the Modules page) and for every `status='installed'` (project × module) pair applies the catalog's `deprecated` / `deprecation_message` / `deprecation_eol_date` / `deprecation_migration_url` fields via the existing three-layer soft-fail path (`apply_deprecation_state_impl`). Poll timestamps persisted to `app_state` under `module_deprecation_poll.last_at` / `module_deprecation_poll.last_status`. Removed `#[allow(dead_code)]`. 3 new unit tests. ([D1])
+- **CI-1 (installer-smoke F1 assertions)** (W1): re-targeted from install-root `.env` to per-project `.claude/env`. `VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR` are deliberately excluded from `.env` per `vco_lib/env_template.py:71-91`; the correct assertion target is `$PROJECT_DIR/.claude/env` written by `--write-env`. Both Job 1 (ubuntu) and Job 4 (windows/macos) updated.
+- **CI-2 (pyyaml in installer-smoke)** (W1): replaced `pip install -e ".[dev]"` with `pip install -e ".[mcp]"` at 3 sites; removed `|| true` swallows so packaging regressions surface; added `client.close()` before `sys.exit(1)` in the weaviate-bootstrap step to suppress Con004 ResourceWarning.
+- **CI-3 (windows install-smoke timeout + pip cache)** (W1): added `actions/cache@v4` for pip across all three installer-smoke jobs; bumped `install-smoke-no-container` `timeout-minutes` from 20 to 30.
+- **CI-3-nohub (install.py --no-hub flag)** (W1): added `--no-hub` flag to `install.py` argparse; when set, Step 8 (vct-hub deployment + start) is skipped with a descriptive note referencing the session-start-ensure-hub auto-start fallback. Passed `--no-hub` in the installer-smoke no-container job (windows-latest + macos-latest).
+- **CI-5 (Node 20 deprecation)** (W1): bumped `actions/checkout@v4` → `@v6` and `actions/setup-python@v5` → `@v6` at all 4+3 sites in `installer-smoke.yml`.
+- **CI-6 (release pipeline hard-gate)** (W7): added `pre-release-gate` job to `release.yml` that runs `installer-smoke` + `manifest-validate` BEFORE `build`. If either gate is red → `build` never starts → no binaries published. Closes the v0.2.40/v0.2.41 footgun where binaries shipped while smoke was red. ~100 LoC added.
+- **CI-7 (release commit triggers duplicate CI)** (W1): added `launcher/dist/**` to `ci.yml` `paths-ignore` (push + pull_request) so the release binary-refresh commit no longer triggers the full CI matrix.
+- **CI-8 (step22 ubuntu cargo build failure)** (W7): root cause was `vct-hub`'s `keyring` dep linking against `libdbus-1` via `sync-secret-service` on Linux. Added `apt install libdbus-1-dev pkg-config` step gated on `runner.os == 'Linux'` before `cargo build`. Also added `Report matrix cell outcome` step so multi-cell failures name which OS/runtime cell failed.
+- **CI-9 (manifest-validate unbounded build)** (W1): added `timeout-minutes: 12` to `manifest-validate.yml` `validate-manifests` job to prevent runaway Rust compilations from burning unbounded CI minutes.
+- **CI-10 (content-hash diff-only sync gate on `install.py --update`)** (W3): `_seed_weaviate` no longer runs `kg-sync --all` unconditionally on `--update`. Reads `last_installed_{active_embedding,kg_collection,shared_kg_collection}` from `launcher.db app_state`. Context change (model swap / collection rename) → full sync. Otherwise: computes per-file `content_hash`, batch-queries Weaviate for stored hashes, computes diff, syncs ONLY changed files. Empty diff → skip entirely. `sync_knowledge_graph.py` extended to accept file-path positional args. "Pay once, never again." 10 new unit tests.
+- **RT-1 (RLClient singleton freeze)** (W3): `_get_rl_client()` in `claude_mcp_servers/weaviate_mcp/server.py` was a bare None singleton that froze `ACTIVE_EMBEDDING` at first call. Mid-session `ACTIVE_EMBEDDING` flip would still send the OLD value in `/rl_update` payloads → arctic2-sourced signals could silently train the qwen3-tagged NN. Now keyed by `os.getenv("ACTIVE_EMBEDDING")` so a flip produces a fresh `RLClient` with correct tag. Completes v0.2.40 F1 (which only fixed `client.py`'s constructor, not the orchestrator-side singleton).
+- **RT-2 (atomic tier_cache RMW)** (W2): introduced `Db::with_tier_cache_mut<F>` in `vct-launcher-core/src/db/tier.rs` — single-lock helper that reads, runs closure, validates tier, writes back atomically. Replaced 4 torn-write call sites in `licensing.rs`. Prevents torn writes when timer-driven `license_refresh` and user-initiated `validate_module_license` race.
+- **RT-3 (`unsupported_embedding_source` error UX + 24h cooldown)** (W3): `fetch_signed_download_url` in `commands/module_default_weights.rs` now parses Supabase 400 `{error:"unsupported_embedding_source", supported_embedding_sources:[...]}` into a typed error. GUI surfaces the supported list. R5 daily poll: 24h cooldown gate on `weights_download_last_failed_at` timestamp prevents spam-retry until a sane backoff has elapsed.
+- **RT-4 (Reset to global weights Tauri command + GUI button)** (W3 + D3): registered `module_reset_weights_to_global` in `lib.rs`; derives `embedding_source` + `version` from `module_settings` keys written by each successful download. Svelte button on RL Reranker module config tab (D3 fixed 4 functional defects from W6's initial wiring: wrong command name, missing `module_id` param, no success toast, no visibility gate when `weights_last_version` is absent). Button gated by `moduleIsActive`.
+- **RT-5 (`.vct-managed` marker for Windows fs::copy fallback)** (W3): on Windows without Developer Mode, the symlink fallback path writes a sibling `.vct-managed` marker file. Override-protection checks marker before treating a regular `.pt` file as a user override — orchestrator-managed copies are now replaceable on subsequent downloads (was: stuck-on-first-version forever).
+- **RT-6 (license re-check inside R5 detached spawn)** (W3): second `is_module_licensed` check inside `tauri::async_runtime::spawn` guards against the race where a user deactivates between install-time license gate and the actual download attempt.
+- **RT-7 (`set_module_license_key` SQL-first ordering)** (W2): writes the SQL row with a `(pending)` sentinel prefix BEFORE the OS keychain write. Keychain failure no longer leaves an orphan keychain entry with no traceable SQL row.
+- **RT-8 (PRAGMA busy_timeout=5000)** (W4): added to both `Db::open()` (vct-launcher-core) and vct-hub's `open_db()` to match `install.py`'s `sqlite3.connect(..., timeout=5.0)`. Prevents SQLITE_BUSY failures when the launcher and a Python install script contend on the same DB file.
+- **RT-9 (`validate_module_license` audit-log ordering)** (W2): `db.audit_log_insert` for the validation attempt is now written BEFORE the `secrets::get` call. Every user click on Re-validate is recorded in the audit trail.
+- **RT-10 (orchestrator-slot validate forwards tier_cache.last_error)** (W2): when `module_id == ORCHESTRATOR_MODULE_ID`, the `error` field of `ModuleLicenseValidationResult` now uses `per_row_error.or(tier_cache.last_error)` — admin-mismatch and network errors written by `license_refresh` are forwarded through.
+- **RT-11 (`resolve_project_name` hub-failure visibility)** (W4): `vco_lib/paths.py::resolve_project_name` now logs a `WARNING` instead of silently swallowing hub-resolver failures.
+- **RT-12 (`clear_module_license_key` SQL-first ordering)** (W2): SQL delete first → keychain delete second. `list_license_keys` hides the entry immediately.
+- **RT-13 (W40-adoption smart-path uplift)** (W3): after `_self_heal_kg_bindings_on_update` persists a binding flip, runs `migrate_collections` smart-path against the adopted collection. `noop`/`patch_props`/`copy` applied silently (no re-embed). `rebuild` emits `schema_migration_required` deferral (user opts in via launcher GUI "Migrate" button, NOT auto-applied). Audit-log entry written. 7 new tests.
+- **D1 (module deprecation poll)**: wired the long-standing `#[allow(dead_code)]` scaffold `module_update_poll` to a real HTTP poller and 24h cron timer. `spawn_deprecation_poll` runs 30s after launcher boot then every 24h thereafter; it fetches the L0 module catalog (same `module-catalog` Supabase edge function as the Modules page) and for every `status='installed'` (project × module) pair applies the catalog's `deprecated` / `deprecation_message` / `deprecation_eol_date` / `deprecation_migration_url` fields via the existing three-layer soft-fail path. Poll timestamps persisted to `app_state`. Removed `#[allow(dead_code)]`. 3 new unit tests.
+- **W8 (pull-token gateway placeholder substitution — closes the GHCR `unauthorized` install error)**: root cause was a cascading placeholder. `request_pull_token` resolved its endpoint as `l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint)`; when the L0 catalog cache was stale, the L1 manifest's placeholder `"https://example/pull-token"` was used. DNS lookup of `example` failed, error silently swallowed, fell through to anonymous GHCR pull → ghcr.io 401. Fix: added `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` and `PULL_TOKEN_ENDPOINT_PLACEHOLDER` constants; `resolve_pull_token_endpoint()` substitutes the default when manifest is empty or matches the placeholder. 9 new unit tests. Live `rl-artifact-url` Supabase function + L0 catalog bucket verified healthy — no Supabase redeploy needed. End users no longer need to manually `podman login ghcr.io`.
+- **MF-1 (pre-ship-check Gate 16 regex)**: `scripts/v0242-pre-ship-check.sh:245` was checking for `## v0.2.42` heading shape, but CHANGELOG uses Keep-a-Changelog `## [0.2.42] — 2026-05-31`. Widened regex to `^## \[?v?0\.2\.42\]?`.
+- **MF-4 (License Manager visibility for broken/error states)**: `launcher/src/lib/module-active-gate.ts::moduleIsInstalled` now returns true for `status='broken'` and `status='error'` in addition to `installed`/`running`/`stopped`. A user with a paid license whose container failed to start still needs access to the License Manager modal to manage / re-validate / remove their key. The license is server-side state; container state is orthogonal.
 
 ### Tests
 
@@ -34,8 +62,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### UX
 
-- **UX-1 (paid-modules-agnostic gating)**: introduced `moduleIsActive(moduleId, installed)` and `moduleIsInstalled(moduleId, installed)` pure helpers (`launcher/src/lib/module-active-gate.ts`) as the single gate for all paid-module-specific UI. RL Reranker status panel + RT-4 Reset button now visible only when the module container is running; License Manager shows rows only for installed modules. 16 unit tests covering all status transitions. ([W6])
-- **RT-4 (Reset to global weights button)**: wired the Tauri command `module_reset_weights_to_global` (registered by RT-4) to a "Reset to global weights" button on the RL Reranker module config tab. Button is gated by `moduleIsActive` (visible only when container is running) and hidden when `weights_last_version` is absent (nothing to reset to). On success, surfaces the version string in an inline status message ("Reset to qwen3 v3"). Stale `TODO (W6)` comments removed from `module_default_weights.rs`. ([W6], corrected D3)
+- **UX-1 (paid-modules-agnostic gating)** (W6 + MF-4): introduced `moduleIsActive(moduleId, installed)` and `moduleIsInstalled(moduleId, installed)` pure helpers (`launcher/src/lib/module-active-gate.ts`) as the single gate for all paid-module-specific UI. RL Reranker status panel + RT-4 Reset button visible only when the module container is running; License Manager shows rows for installed modules including `broken`/`error` states (MF-4 fix — paying users with broken containers still need key management). 16 unit tests covering all status transitions.
+
+### Internal / Cleanup
+
+- **CLEAN-1**: deleted dead `pub const RL_RERANKER_MODULE_ID` (hub-side, `vct-hub/src/module_supervisor.rs`) — zero callers since v0.2.40 NEW-3.E generalised the gate. Removes the `#[allow(dead_code)]` annotation too (~12 LoC).
+- **Cargo warning cleanup**: silenced 4 pre-existing cargo warnings (3× `unused_mut` in `vct-launcher-core/src/{process,services/runtime}.rs` via `cargo fix`; `module_update_poll` `#[allow(dead_code)]` removed since D1 wires it).
+- **Discipline rule** (private VCO_dev CLAUDE.md): codified "no release with deferred fixes" rule after v0.2.41 retrospective. Triggered by v0.2.41 shipping with `Installer Smoke Test` still red. Rule: every tag must close ALL known red gates / queued-for-next-release items.
+
+### Release / Ops
+
+- **Pre-ship verification script** (W7): new `scripts/v0242-pre-ship-check.sh` (executable). 18 gates across three sections: local build gates (cargo test --lib, pytest, npm check/test/audit, manifest-validate strict, check-no-secrets, dist binaries present, Cargo.toml version), GitHub CI last-run status gates (5 workflows via `gh run list`), and repo-level checks (allow_auto_merge, CodeQL error alerts = 0, CHANGELOG entry, clean working tree, release.yml has pre-release-gate). Exit 0 = all pass; exit 1 = listed failures. **Run this before every tag push.**
+- **Branch-protection apply script** (W7): new `scripts/apply-branch-protection-v0.2.42.sh` (executable). One-shot script the repo owner runs ONCE after tagging to (a) flip `allow_auto_merge=true` at repo level (unblocks 26 stalled Dependabot PRs), and (b) add 8 new required status check contexts to ruleset 15644739 (paid-module manifests strict, hook .sh/.ps1 parity, set -e + pipefail, managed-paths cross-language, launcher binary leak-check, macOS smoke, install.py + install-bundle smoke, Weaviate bootstrap smoke). Excludes Windows install.py smoke until that surface stabilises. Run with `DRY_RUN=1` to preview before applying.
+
+### Ops follow-up (owner-action required, post-tag)
+
+These are one-shot owner actions, NOT v0.2.42 code changes. Done ONCE after the tag lands:
+
+1. **Enable repo-level auto-merge** (closes 26 stalled Dependabot PRs):
+   ```bash
+   gh api -X PATCH /repos/hotak92/vibecoded-orchestrator -f allow_auto_merge=true
+   ```
+2. **Apply branch-protection additions**:
+   ```bash
+   bash scripts/apply-branch-protection-v0.2.42.sh   # or DRY_RUN=1 first
+   ```
+3. **Verify pre-ship gate is green BEFORE the tag push**:
+   ```bash
+   bash scripts/v0242-pre-ship-check.sh
+   ```
 
 ## [0.2.41] — 2026-05-31
 

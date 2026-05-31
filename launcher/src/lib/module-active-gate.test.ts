@@ -105,12 +105,16 @@ describe('moduleIsInstalled', () => {
     expect(moduleIsInstalled(RL_ID, [makeRow(RL_ID, 'stopped')])).toBe(true);
   });
 
-  it('status=error → NOT installed (install failed)', () => {
-    expect(moduleIsInstalled(RL_ID, [makeRow(RL_ID, 'error')])).toBe(false);
+  // v0.2.42 MF-4: 'error' and 'broken' DO count as installed for License
+  // Manager visibility. A user with a paid key whose container failed to
+  // start still needs to see + manage their license row. The license is
+  // server-side state; container state is orthogonal.
+  it('status=error → installed (paid user needs License Manager even when container errored)', () => {
+    expect(moduleIsInstalled(RL_ID, [makeRow(RL_ID, 'error')])).toBe(true);
   });
 
-  it('status=broken → NOT installed', () => {
-    expect(moduleIsInstalled(RL_ID, [makeRow(RL_ID, 'broken')])).toBe(false);
+  it('status=broken → installed (paid user needs License Manager even when container is broken)', () => {
+    expect(moduleIsInstalled(RL_ID, [makeRow(RL_ID, 'broken')])).toBe(true);
   });
 
   it('status=installing → NOT installed (in-progress)', () => {

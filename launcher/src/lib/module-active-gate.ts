@@ -44,12 +44,22 @@ export function moduleIsActive(
 }
 
 /**
- * Returns true when the module has any install row with a non-error status.
- * Use this for License Manager row visibility (show license row only for
- * modules that are actually installed, regardless of container state).
+ * Returns true when the module has any install row in a state where the
+ * user has already paid + installed and license-management surfaces should
+ * remain visible.
  *
- * Statuses treated as "installed": 'installed' | 'running' | 'stopped'.
- * Statuses NOT treated as installed: 'installing' | 'error' | 'broken'.
+ * Statuses treated as "installed": 'installed' | 'running' | 'stopped'
+ *   | 'broken' | 'error'.
+ *
+ * v0.2.42 MF-4 (2026-05-31): 'broken' and 'error' ARE included. Rationale:
+ * a user with a paid license whose container failed to start still needs
+ * access to the License Manager modal to manage, re-validate, or remove
+ * their key. Hiding the row orphans them from key management at the
+ * worst possible time (when something already went wrong). The license
+ * itself is server-side state, not container state — they're orthogonal.
+ *
+ * Statuses NOT treated as installed: 'installing' (in-flight; no row to
+ * manage yet; the post-install completion will flip the status).
  */
 export function moduleIsInstalled(
   moduleId: string,
@@ -57,7 +67,13 @@ export function moduleIsInstalled(
 ): boolean {
   const row = installed.find((r) => r.module_id === moduleId);
   if (!row) return false;
-  return row.status === 'installed' || row.status === 'running' || row.status === 'stopped';
+  return (
+    row.status === 'installed' ||
+    row.status === 'running' ||
+    row.status === 'stopped' ||
+    row.status === 'broken' ||
+    row.status === 'error'
+  );
 }
 
 /** The stable module ID for the RL Reranker paid module. */

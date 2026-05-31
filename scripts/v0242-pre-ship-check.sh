@@ -242,7 +242,9 @@ else
 fi
 
 # Gate 16: CHANGELOG has v0.2.42 entry
-if grep -q "## v0.2.42" CHANGELOG.md 2>/dev/null; then
+# Match the Keep-a-Changelog heading shape: `## [0.2.42] — 2026-05-31`.
+# Allow optional `v` prefix and optional surrounding brackets for flexibility.
+if grep -qE '^## \[?v?0\.2\.42\]?' CHANGELOG.md 2>/dev/null; then
     gate_pass "CHANGELOG.md has v0.2.42 section"
 else
     gate_fail "CHANGELOG.md has v0.2.42 section" \
