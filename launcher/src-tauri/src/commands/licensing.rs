@@ -1508,30 +1508,37 @@ pub async fn clear_module_license_key(
         .as_ref()
         .map(|r| r.keychain_username.clone())
         .unwrap_or_else(|| keychain_username_for(&module_id));
+    // RT-12 (v0.2.42): SQL-first ordering — delete the DB row BEFORE the
+    // keychain entry so `list_license_keys` hides the entry immediately.
+    // Previously the keychain delete came first; if the SQL delete
+    // subsequently failed, the keychain entry was gone but the row was
+    // still visible (the inverse of what users expect). The new ordering:
+    //   1. Delete SQL row + validation history  ← list_license_keys sees
+    //                                              the entry gone immediately
+    //   2. Best-effort keychain delete          ← fails silently if missing
+    //
+    // Consistent with RT-7's SQL-first pattern for set_module_license_key.
+    db.delete_license_key(&module_id)?;
     // Best-effort keychain delete; missing entry is fine.
     let _ = secrets::delete(SecretScope::Global, LICENSE_MODULE_ID, &username);
-    // Drop the SQL row + audit history.
-    db.delete_license_key(&module_id)?;
     // Clear the per-module entry in `tier_cache.module_licenses` so
     // `is_module_licensed_v2`'s overlay check no longer reports this
-    // module as licensed.
-    let row = db.get_tier_cache()?;
-    let mut map = row
-        .module_licenses
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    let removed = map.remove(&module_id).is_some();
-    db.set_tier_cache(
-        &row.orchestrator_tier,
-        &serde_json::Value::Object(map),
-        row.last_error.as_deref(),
-    )?;
-    // If we cleared the orchestrator slot, downgrade the cache to
-    // 'free' the same way `license_deactivate` does. We do NOT touch
-    // `~/.vibecoded/license_cache.json` here — `license_refresh` is
-    // the canonical owner of that file. The next refresh will rewrite
-    // it correctly based on the now-cleared keychain.
+    // module as licensed. RT-2: use with_tier_cache_mut for atomic RMW.
+    let removed = existing.is_some(); // proxy: did a row exist before we deleted it?
+    {
+        let mid = module_id.clone();
+        db.with_tier_cache_mut(|row| {
+            row.module_licenses
+                .as_object_mut()
+                .expect("module_licenses is always a JSON object")
+                .remove(&mid);
+        })?;
+    }
+    // If we cleared the orchestrator slot, downgrade the cache to 'free'
+    // the same way `license_deactivate` does. We do NOT touch
+    // `~/.vibecoded/license_cache.json` here — `license_refresh` is the
+    // canonical owner of that file. The next refresh will rewrite it
+    // correctly based on the now-cleared keychain.
     if module_id == ORCHESTRATOR_MODULE_ID {
         db.set_tier_cache("free", &serde_json::json!({}), None)?;
     }
