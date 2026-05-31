@@ -271,6 +271,63 @@ class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
         self.assertEqual(body["active_embedding"], "qwen3")
         self.assertEqual(body["embedding_source"], "qwen3")
 
+    def test_get_rl_client_re_keys_on_mid_session_embedding_flip(self):
+        """v0.2.42 RT-1: _get_rl_client() returns a new RLClient instance
+        whose active_embedding matches the *current* ACTIVE_EMBEDDING env
+        value, not the value read at import time.
+
+        Pre-fix: _rl_client_instance was a bare None-or-RLClient singleton;
+        the first call froze ACTIVE_EMBEDDING=qwen3 for the entire process
+        lifetime even if the user later flipped to arctic2 via the launcher.
+        Post-fix: the dict _rl_client_instances[embedding] is keyed on the
+        current env value, so a flip yields a fresh client.
+        """
+        import os
+        import claude_mcp_servers.weaviate_mcp.server as srv
+
+        # Clear the instance cache so this test starts clean.
+        srv._rl_client_instances.clear()
+
+        try:
+            # Phase 1: first call with qwen3.
+            os.environ["ACTIVE_EMBEDDING"] = "qwen3"
+            client_qwen3 = srv._get_rl_client()
+            if client_qwen3 is None:
+                self.skipTest("RLClient import not available in this env")
+
+            self.assertEqual(
+                getattr(client_qwen3, "active_embedding", None),
+                "qwen3",
+                "First client must carry active_embedding=qwen3",
+            )
+            self.assertIn("qwen3", srv._rl_client_instances)
+
+            # Phase 2: mid-session flip to arctic2.
+            os.environ["ACTIVE_EMBEDDING"] = "arctic2"
+            client_arctic = srv._get_rl_client()
+            self.assertIsNotNone(client_arctic)
+            self.assertEqual(
+                getattr(client_arctic, "active_embedding", None),
+                "arctic2",
+                "Second client must carry active_embedding=arctic2",
+            )
+
+            # The two clients must be distinct objects.
+            self.assertIsNot(
+                client_qwen3,
+                client_arctic,
+                "Mid-session flip must produce a distinct RLClient, not reuse the old one",
+            )
+
+            # Both entries survive in the dict (tombstone pattern).
+            self.assertIn("qwen3", srv._rl_client_instances)
+            self.assertIn("arctic2", srv._rl_client_instances)
+
+        finally:
+            # Restore original env state so we don't leak into adjacent tests.
+            os.environ.pop("ACTIVE_EMBEDDING", None)
+            srv._rl_client_instances.clear()
+
 
 class RLTelemetryWriterEmbeddingFieldsTest(unittest.TestCase):
     """Fix 2: writer construction never ships blank embedding_source."""
