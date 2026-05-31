@@ -64,18 +64,61 @@
   let loadError = $state<string | null>(null);
   let loading = $state<boolean>(true);
 
-  // v0.2.42 RT-4: "Reset to global weights" button state.
-  // Wires the Tauri command registered by W3 (`reset_weights_to_global`).
-  // Button is only rendered when the RL module is active (rlIsActive gate).
+  // v0.2.42 RT-4 / D3: "Reset to global weights" button state.
+  // Wires `module_reset_weights_to_global` (registered in v0.2.42 RT-4).
+  // Button is only rendered when the RL module is active (rlIsActive gate)
+  // AND a prior successful download exists (weights_last_version not null).
   let resettingWeights = $state(false);
   let resetWeightsError = $state<string | null>(null);
+  // Success message: shows the version that was reset to.
+  let resetWeightsSuccess = $state<string | null>(null);
+  // Whether a prior weights download has been recorded for this project.
+  // Null = not yet checked; false = no download on record; string = version.
+  let weightsLastVersion = $state<string | null | undefined>(undefined);
+
+  interface ResetWeightsResult {
+    local_path: string;
+    embedding_source: string;
+    version: string;
+  }
+
+  // Load whether a prior download exists so we can hide the button when
+  // there's nothing to reset to (matches the spec in the TODO comments).
+  async function loadWeightsLastVersion() {
+    if (!tauriAvailable() || !activeProjectId || moduleId !== RL_MODULE_ID) {
+      weightsLastVersion = null;
+      return;
+    }
+    try {
+      const val = await invoke<string | null>('get_module_setting', {
+        moduleId,
+        controlId: 'weights_last_version',
+        projectId: activeProjectId,
+      });
+      weightsLastVersion = typeof val === 'string' && val.length > 0 ? val : null;
+    } catch {
+      // Soft-fail: if the read errors, default to showing the button
+      // (the command itself will surface a clear error if nothing is recorded).
+      weightsLastVersion = null;
+    }
+  }
+
+  // Re-check whenever active project or module changes.
+  $effect(() => {
+    void loadWeightsLastVersion();
+  });
 
   async function handleResetWeights() {
     if (!tauriAvailable() || !activeProjectId) return;
     resettingWeights = true;
     resetWeightsError = null;
+    resetWeightsSuccess = null;
     try {
-      await invoke('reset_weights_to_global', { projectId: activeProjectId });
+      const result = await invoke<ResetWeightsResult>('module_reset_weights_to_global', {
+        moduleId,
+        projectId: activeProjectId,
+      });
+      resetWeightsSuccess = `Reset to ${result.embedding_source} v${result.version}`;
     } catch (e) {
       resetWeightsError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -121,21 +164,28 @@
       <div class="status-panel-wrapper">
         <RlRerankerStatusPanel projectId={activeProjectId} />
 
-        <!-- v0.2.42 RT-4: Reset to global weights. Calls the Tauri command
-             registered by W3. Gated by rlIsActive (same gate as this block). -->
-        <div class="weights-reset-row">
-          <button
-            class="weights-reset-btn"
-            disabled={resettingWeights}
-            title="Discard project-specific fine-tuning and revert to the current global weights model."
-            onclick={() => void handleResetWeights()}
-          >
-            {resettingWeights ? 'Resetting…' : 'Reset to global weights'}
-          </button>
-          {#if resetWeightsError}
-            <p class="weights-reset-error" role="alert">{resetWeightsError}</p>
-          {/if}
-        </div>
+        <!-- v0.2.42 RT-4 / D3: Reset to global weights. Calls
+             `module_reset_weights_to_global`. Hidden when no prior download
+             has been recorded (weightsLastVersion null = nothing to reset to).
+             Surfaces the version in a success message on completion. -->
+        {#if weightsLastVersion !== null}
+          <div class="weights-reset-row">
+            <button
+              class="weights-reset-btn"
+              disabled={resettingWeights}
+              title="Discard project-specific fine-tuning and revert to the current global weights model."
+              onclick={() => void handleResetWeights()}
+            >
+              {resettingWeights ? 'Resetting…' : 'Reset to global weights'}
+            </button>
+            {#if resetWeightsSuccess}
+              <p class="weights-reset-success" role="status">{resetWeightsSuccess}</p>
+            {/if}
+            {#if resetWeightsError}
+              <p class="weights-reset-error" role="alert">{resetWeightsError}</p>
+            {/if}
+          </div>
+        {/if}
       </div>
     {/if}
     <ModuleConfigTab configTab={configTab} {moduleId} />
@@ -206,6 +256,12 @@
   .weights-reset-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  .weights-reset-success {
+    margin: 0;
+    font-size: 12px;
+    color: var(--color-teal, #00bfa6);
   }
 
   .weights-reset-error {

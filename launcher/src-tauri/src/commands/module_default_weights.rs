@@ -1039,11 +1039,8 @@ pub async fn module_get_runtime_value_inner(
 // this module adds the Tauri shim + the "derive source/version from DB"
 // discovery step so the GUI only needs `(module_id, project_id)`.
 //
-// TODO (W6): bind a "Reset to global defaults" button in the RL Reranker
-// module tile that calls `invoke("module_reset_weights_to_global", {
-//   module_id: module.id, project_id: current_project_id })`.
-// The call site: `module.reset_weights_to_global` on the Tauri side
-// maps to `module_reset_weights_to_global` in the handler below.
+// Wired in v0.2.42 D3 — see
+// launcher/src/routes/modules/[id]/config/+page.svelte::handleResetWeights.
 
 /// Tauri-command return value for the reset operation.
 ///
@@ -1071,11 +1068,10 @@ pub struct ResetWeightsResult {
 /// removes any user override (regular file or symlink) and re-points
 /// the slot at the global file — "use global".
 ///
-/// TODO (W6): wire a "Reset to global defaults" button in the module
-/// tile's settings panel that invokes this command. The button should
-/// be hidden when `WEIGHTS_LAST_VERSION_KEY` is absent (nothing to
-/// reset to) and should surface `ResetWeightsResult.version` in the
-/// tile's success toast so users know which version they reverted to.
+/// UI wired in v0.2.42 D3: the button in the module config tab is hidden
+/// when `WEIGHTS_LAST_VERSION_KEY` is absent and surfaces
+/// `ResetWeightsResult.version` in a success message on completion.
+/// See launcher/src/routes/modules/[id]/config/+page.svelte::handleResetWeights.
 #[command]
 pub async fn module_reset_weights_to_global(
     module_id: String,
