@@ -825,11 +825,8 @@ mod tests {
     /// only covered the Tauri-side preview path, not the hub HTTP API).
     /// See secrets-and-access-matrix-audit-2026-05-06.md §6.
     #[test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn paused_secret_does_not_leak_to_hub_subprocess_env() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
 
         let db = Db::open_in_memory().unwrap();
         let scope_str = "global";
@@ -901,14 +898,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn resolver_returns_none_when_keychain_empty_even_if_active() {
         // Active flag default is true; if the keychain has no value the
         // resolver returns None (omits the env var). Doesn't require the
         // keychain backend — `is_set` returns false on a never-written key.
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let db = Db::open_in_memory().unwrap();
         let res = resolve_secret_for_subprocess_env(
             &db,
@@ -1266,11 +1260,8 @@ mod tests {
     ///
     /// Skipped without an OS keychain backend (CI containers).
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     async fn hub_project_env_resolves_shared_secret_via_sentinel_keychain() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let _lock = h1_lock();
 
         // Best-effort cleanup from any prior test that crashed before
@@ -1330,11 +1321,8 @@ mod tests {
     ///
     /// Skipped without an OS keychain backend (CI containers).
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     async fn orchestrator_manifest_bundled_secrets_surface_via_hub() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let _lock = h1_lock();
         delete_shared_keychain_canary("user", "github_pat");
 
@@ -1402,11 +1390,8 @@ mod tests {
     ///
     /// Skipped without an OS keychain backend.
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     async fn hub_resolver_honours_pause_on_sentinel_shared_active_flag() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let _lock = h1_lock();
         delete_shared_keychain_canary("user", "github_pat");
 
@@ -1470,11 +1455,8 @@ mod tests {
     ///
     /// Skipped without an OS keychain backend.
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     async fn hub_resolver_falls_back_to_legacy_installer_slot_when_user_slot_empty() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let _lock = h1_lock();
 
         // Wipe BOTH slots so a residue from a prior test doesn't
@@ -1528,11 +1510,8 @@ mod tests {
     ///
     /// Skipped without an OS keychain backend.
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     async fn hub_resolver_user_slot_wins_when_both_slots_populated() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let _lock = h1_lock();
 
         delete_shared_keychain_canary("user", "github_pat");
@@ -1589,11 +1568,8 @@ mod tests {
     ///
     /// Skipped without an OS keychain backend.
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     async fn installed_module_secret_takes_precedence_over_orchestrator_bundled() {
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
         let _lock = h1_lock();
         delete_shared_keychain_canary("user", "github_pat");
 

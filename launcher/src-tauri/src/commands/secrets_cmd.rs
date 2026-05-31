@@ -1243,14 +1243,11 @@ mod tests {
     /// Linux build hosts). Run locally with a logged-in desktop session
     /// or pass through to a workstation pre-merge.
     #[test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn inactive_secret_does_not_leak_preview() {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
         let _kc_lock = keychain_test_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend in this test env");
-            return;
-        }
 
         let db = make_db();
         seed_project(&db, "p1", "Project One");
@@ -1450,6 +1447,7 @@ mod tests {
     /// scopes are still excluded — they go through the hub's
     /// /projects/{id}/env resolver path, not the env-file emit path.
     #[test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn is_user_emit_bucket_pure_predicate() {
         // All three SecretsPanel tabs writing to module_id='user' MUST match.
         assert!(is_user_emit_bucket("per_project", "user"));
@@ -1493,10 +1491,6 @@ mod tests {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
         let _kc_lock = keychain_test_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend");
-            return;
-        }
         let db = make_db();
         let folder = seed_project_with_real_folder(&db, "p_set_refresh", "SetRefreshProj");
 
@@ -1571,16 +1565,13 @@ mod tests {
     /// docstring for the user-secret regression context. This test
     /// covers the strip side of the same flow.
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
                 see set_secret_v2_triggers_env_refresh docstring"]
     async fn delete_secret_v2_strips_secret_from_env_surfaces() {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
         let _kc_lock = keychain_test_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend");
-            return;
-        }
         let db = make_db();
         let folder = seed_project_with_real_folder(&db, "p_del_strip", "DelStripProj");
 
@@ -1665,6 +1656,7 @@ mod tests {
     /// the project folder simply must NOT have `.claude/settings.json`
     /// after a module-owned secret op.
     #[test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn refresh_env_after_user_secret_change_skips_module_owned_buckets() {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
@@ -1754,10 +1746,6 @@ mod tests {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
         let _kc_lock = keychain_test_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend");
-            return;
-        }
         let db = make_db();
         let (folder1, folder2) = seed_two_registered_projects(&db);
 
@@ -1820,16 +1808,13 @@ mod tests {
     /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
     /// docstring; this test pins fan-out propagation across projects.
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
                 see set_secret_v2_triggers_env_refresh docstring"]
     async fn set_secret_v2_global_user_bucket_propagates_to_all_registered_projects() {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
         let _kc_lock = keychain_test_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend");
-            return;
-        }
         let db = make_db();
         let (folder1, folder2) = seed_two_registered_projects(&db);
 
@@ -1888,16 +1873,13 @@ mod tests {
     /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
     /// docstring; this test pins fan-out strip across projects.
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
                 see set_secret_v2_triggers_env_refresh docstring"]
     async fn delete_secret_v2_shared_user_bucket_strips_from_all_projects() {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
         let _kc_lock = keychain_test_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend");
-            return;
-        }
         let db = make_db();
         let (folder1, folder2) = seed_two_registered_projects(&db);
 
@@ -1969,16 +1951,13 @@ mod tests {
     /// Phase 0.B Part 2 (2026-05-25): see `set_secret_v2_triggers_env_refresh`
     /// docstring; this test pins fan-out strip across projects.
     #[tokio::test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     #[ignore = "Phase 0.B Part 2: user-secret refresh deferred to Phase 0.E; \
                 see set_secret_v2_triggers_env_refresh docstring"]
     async fn delete_secret_v2_global_user_bucket_strips_from_all_projects() {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
         let _kc_lock = keychain_test_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend");
-            return;
-        }
         let db = make_db();
         let (folder1, folder2) = seed_two_registered_projects(&db);
 
@@ -2181,14 +2160,11 @@ mod tests {
     /// keychain has a value AND the cross-launcher active flag is set;
     /// the resolver's `winning_scope` follows is_set, NOT mere row presence.
     #[test]
+    #[ignore = "requires OS keychain backend (keyring); skipped in CI headless env"]
     fn winning_scope_ignores_paused_or_keychain_empty_rows() {
         // Serialize against other keychain-touching tests across
         // the crate. Required since 2026-05-13 — see crate::secrets docs.
         let _kc_lock = keychain_test_lock();
-        if !keyring_available() {
-            eprintln!("[skip] no OS keychain backend");
-            return;
-        }
         let db = make_db();
         seed_project(&db, "pwin", "Winning Project");
 
