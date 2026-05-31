@@ -2803,6 +2803,10 @@ def main() -> int:
             # in Weaviate by a different casing). Emits an informational
             # deferral entry per heal so the user sees what we changed.
             _self_heal_kg_bindings_on_update(_deferral_report)
+            # V0243-13: on orchestrator-root, emit deferred-action entries
+            # for known schema drift that requires explicit consent to fix.
+            if _is_orchestrator_root_install():
+                _emit_orchestrator_root_schema_deferrals(_deferral_report)
     else:
         print("\n[skip] Container services (--no-containers)")
         print("[skip] Weaviate seeding (--no-containers)")
@@ -9101,6 +9105,155 @@ def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
         data={"legacy_class": legacy_name,
               "canonical_present": canonical_present},
     )
+
+
+def _emit_orchestrator_root_schema_deferrals(
+    deferral_report: "DeferralReport",
+) -> None:
+    """V0243-13: emit UPDATE_DEFERRED.md entries for known orchestrator-root
+    schema drift items that require explicit user consent to fix.
+
+    Currently covers two items:
+
+    (a) **Orphan VibeCodedOrchestrator_Development collection** — the
+        orchestrator's own Development collection has no callers and 0 rows.
+        It was created by early install.py versions before the "docs/" sync
+        moved exclusively into per-project Development collections. Dropping
+        it is non-destructive (0 rows) but we still require explicit consent.
+
+    (b) **linksTo property drift** — old shared-KG collections may carry a
+        stale ``linksTo`` property (array of object refs) whose schema has
+        drifted from the current ``typed_links``/``links`` property contract.
+        Fixing requires a schema PATCH or collection recreate; emitting a
+        deferral so the user can run the migration script at a chosen time.
+
+    Both deferrals are severity="info" and idempotent (re-emitting the same
+    ``condition_id`` on successive ``--update`` runs is harmless — the
+    deferral-report writer deduplicates by ``condition_id``).
+
+    Soft-fail throughout: any error is logged but never raises.
+    """
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+
+    # Fetch current schema to probe both conditions.
+    try:
+        resp = urllib.request.urlopen(  # noqa: S310 (localhost only)
+            f"{weaviate_url}/v1/schema", timeout=5,
+        )
+        schema = json.loads(resp.read())
+        classes_list = schema.get("classes", [])
+    except Exception:
+        # Weaviate unreachable — skip silently.
+        return
+
+    class_map: dict[str, dict] = {
+        c.get("class", ""): c
+        for c in classes_list
+        if isinstance(c, dict) and c.get("class")
+    }
+
+    # ── (a) Orphan VibeCodedOrchestrator_Development ──────────────────────
+    orphan_dev = "VibeCodedOrchestrator_Development"
+    if orphan_dev in class_map:
+        # Only emit if the collection appears to have 0 or very few rows.
+        row_count = _count_weaviate_class_objects(weaviate_url, orphan_dev)
+        if row_count is not None and row_count == 0:
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="orphan_orchestrator_development_collection",
+                    title=(
+                        f"Orphan Weaviate collection `{orphan_dev}` "
+                        f"has 0 rows and no callers"
+                    ),
+                    detected=(
+                        f"The Weaviate collection `{orphan_dev}` exists at "
+                        f"{weaviate_url} with 0 stored objects.  It was "
+                        f"created by older install.py versions and is no "
+                        f"longer populated (all docs/ sync now targets "
+                        f"per-project Development collections).  Dropping "
+                        f"it is safe."
+                    ),
+                    why_deferred=(
+                        "DROP is a destructive Weaviate operation even when "
+                        "the collection is empty — it cannot be undone without "
+                        "a full re-seed.  User consent required."
+                    ),
+                    command_to_apply=(
+                        f"# Delete the orphan collection via the Weaviate REST API:\n"
+                        f"curl -X DELETE "
+                        f"{weaviate_url}/v1/schema/{orphan_dev}\n"
+                        f"# Or open the Weaviate console at {weaviate_url} "
+                        f"and delete the class from the Schema tab."
+                    ),
+                    severity="info",
+                    kg_node_refs=[],
+                )
+            )
+            _log_install_event(
+                "7e/10", "info",
+                f"V0243-13(a): orphan {orphan_dev!r} deferral emitted (0 rows)",
+            )
+
+    # ── (b) linksTo property drift ─────────────────────────────────────────
+    shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
+    _links_to_drift_classes: list[str] = []
+    for class_name, class_def in class_map.items():
+        # Only check KG-shaped collections (shared KG + per-project KG).
+        if not class_name.endswith("_KnowledgeGraph"):
+            continue
+        props = class_def.get("properties") or []
+        prop_names = {p.get("name", "") for p in props if isinstance(p, dict)}
+        # Stale schema has "linksTo" but lacks the current "typed_links" property.
+        if "linksTo" in prop_names and "typed_links" not in prop_names:
+            _links_to_drift_classes.append(class_name)
+
+    if _links_to_drift_classes:
+        classes_str = ", ".join(f"`{c}`" for c in sorted(_links_to_drift_classes))
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="links_to_property_schema_drift",
+                title=(
+                    f"KG collection(s) have stale `linksTo` property "
+                    f"(missing `typed_links`): {classes_str}"
+                ),
+                detected=(
+                    f"The following Weaviate collection(s) carry a stale "
+                    f"`linksTo` array-of-object-refs property introduced by "
+                    f"an older orchestrator version: {classes_str}.  The "
+                    f"current schema uses `typed_links` (text property) and "
+                    f"`links` (text array).  KG search still works but "
+                    f"graph-traversal features (`semantic_graph_search`) "
+                    f"cannot resolve wiki-links on these collections."
+                ),
+                why_deferred=(
+                    "Fixing requires either a Weaviate schema PATCH (add "
+                    "`typed_links` + `links` properties additively) or a "
+                    "full DROP + recreate + re-seed (if the schema is too "
+                    "old to accept the additive patch).  Both operations "
+                    "require manual consent."
+                ),
+                command_to_apply=(
+                    "# Option 1 — additive PATCH (preserves existing data):\n"
+                    "python install.py --update  "
+                    "# run migrate-shared-kg-schema.sh if it detects the gap\n"
+                    "# Option 2 — full recreate + re-seed:\n"
+                    "python -m vco_lib.project_init migrate-collections "
+                    f"--name <collection>  "
+                    "# opens a consent prompt, then re-syncs"
+                ),
+                severity="info",
+                kg_node_refs=[],
+            )
+        )
+        _log_install_event(
+            "7e/10", "info",
+            f"V0243-13(b): linksTo drift deferral emitted for "
+            f"{len(_links_to_drift_classes)} collection(s)",
+            data={"classes": _links_to_drift_classes},
+        )
 
 
 # Privilege rank for `kg_collection_access.access_level`. Higher wins when
