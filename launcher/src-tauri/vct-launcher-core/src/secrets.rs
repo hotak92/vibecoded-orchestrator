@@ -339,7 +339,7 @@ pub fn set(
     key: &str,
     value: &str,
 ) -> Result<(), String> {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     if for_tests::mock_set(scope, module_id, key, value) {
         return Ok(());
     }
@@ -354,7 +354,7 @@ pub fn get(
     module_id: &str,
     key: &str,
 ) -> Result<Option<String>, String> {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     if let Some(result) = for_tests::mock_get(scope, module_id, key) {
         return result;
     }
@@ -379,7 +379,7 @@ pub fn delete(
     module_id: &str,
     key: &str,
 ) -> Result<(), String> {
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     if for_tests::mock_delete(scope, module_id, key) {
         return Ok(());
     }
@@ -692,9 +692,15 @@ pub mod test_serialize {
 //
 // v0.2.42 W5-TEST3a: a thread-local in-memory HashMap that shadows the OS
 // keychain for tests. The production code path is completely unchanged —
-// the `#[cfg(test)]` guards in `get`/`set`/`delete` above are the only
-// intrusion into the production functions, and they only divert when the
-// thread-local mock is active.
+// the `#[cfg(any(test, debug_assertions))]` guards in `get`/`set`/`delete`
+// above are the only intrusion into the production functions, and they only
+// divert when the thread-local mock is active (i.e., after `enable_mock()`).
+//
+// Gated on `cfg(any(test, debug_assertions))` (matching `test_serialize`'s
+// gate) so that when `vct-launcher-core` is compiled as a debug-mode
+// dependency of the main launcher test binary, the module is visible and
+// the mock intercept in get/set/delete is active. Pure production release
+// builds (no debug_assertions) exclude this entirely.
 //
 // Map key: `(service_name(module_id), key)` — identical to what the OS
 // keychain uses as its (service, username) pair — so the mock faithfully
@@ -710,7 +716,7 @@ pub mod test_serialize {
 // RAII pattern (preferred):
 //   let _g = secrets::for_tests::MockGuard::new();
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub mod for_tests {
     use super::SecretScope;
     use std::cell::RefCell;
