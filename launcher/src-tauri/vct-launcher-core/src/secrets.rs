@@ -339,6 +339,10 @@ pub fn set(
     key: &str,
     value: &str,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if for_tests::mock_set(scope, module_id, key, value) {
+        return Ok(());
+    }
     let e = entry(scope, module_id, key)?;
     retry_with_backoff(|| e.set_password(value))
         .map_err(|err| format!("keyring set: {}", err))?;
@@ -350,6 +354,10 @@ pub fn get(
     module_id: &str,
     key: &str,
 ) -> Result<Option<String>, String> {
+    #[cfg(test)]
+    if let Some(result) = for_tests::mock_get(scope, module_id, key) {
+        return result;
+    }
     let e = entry(scope, module_id, key)?;
     match retry_with_backoff(|| e.get_password()) {
         Ok(v) => Ok(Some(v)),
@@ -371,6 +379,10 @@ pub fn delete(
     module_id: &str,
     key: &str,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if for_tests::mock_delete(scope, module_id, key) {
+        return Ok(());
+    }
     let e = entry(scope, module_id, key)?;
     match retry_with_backoff(|| e.delete_credential()) {
         Ok(()) => Ok(()),
@@ -676,6 +688,177 @@ pub mod test_serialize {
     }
 }
 
+// ─── Test mock keychain seam ──────────────────────────────────────────────
+//
+// v0.2.42 W5-TEST3a: a thread-local in-memory HashMap that shadows the OS
+// keychain for tests. The production code path is completely unchanged —
+// the `#[cfg(test)]` guards in `get`/`set`/`delete` above are the only
+// intrusion into the production functions, and they only divert when the
+// thread-local mock is active.
+//
+// Map key: `(service_name(module_id), key)` — identical to what the OS
+// keychain uses as its (service, username) pair — so the mock faithfully
+// mirrors the keychain namespace without needing to store SecretScope
+// (which carries a lifetime and can't live in a static).
+//
+// Usage:
+//   secrets::for_tests::enable_mock();
+//   secrets::for_tests::clear_mock();
+//   // ... call secrets::get / set / delete — all go through the map ...
+//   secrets::for_tests::disable_mock();
+//
+// RAII pattern (preferred):
+//   let _g = secrets::for_tests::MockGuard::new();
+
+#[cfg(test)]
+pub mod for_tests {
+    use super::SecretScope;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    // Thread-local store: Some(map) when mock is active, None when inactive.
+    thread_local! {
+        static MOCK_STORE: RefCell<Option<HashMap<(String, String), String>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Enable the thread-local mock keychain for this thread.
+    ///
+    /// After this call, `secrets::get/set/delete` on this thread will
+    /// operate on the in-memory map instead of the OS keychain. Calling
+    /// `enable_mock` when the mock is already active is a no-op (preserves
+    /// any entries already in the map).
+    pub fn enable_mock() {
+        MOCK_STORE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(HashMap::new());
+            }
+        });
+    }
+
+    /// Disable the thread-local mock keychain for this thread.
+    ///
+    /// After this call, `secrets::get/set/delete` fall through to the OS
+    /// keychain again. Safe to call when the mock isn't active.
+    pub fn disable_mock() {
+        MOCK_STORE.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+
+    /// Empty the thread-local mock store without disabling it.
+    ///
+    /// Useful for resetting state between test cases that share a mock
+    /// lifecycle, without the overhead of `disable_mock` + `enable_mock`.
+    pub fn clear_mock() {
+        MOCK_STORE.with(|cell| {
+            if let Some(map) = cell.borrow_mut().as_mut() {
+                map.clear();
+            }
+        });
+    }
+
+    /// Snapshot all entries currently in the mock store.
+    ///
+    /// Returns `None` when the mock isn't active. Useful for assertions
+    /// that need to inspect the full state of the in-memory keychain.
+    pub fn snapshot() -> Option<Vec<((String, String), String)>> {
+        MOCK_STORE.with(|cell| {
+            cell.borrow().as_ref().map(|map| {
+                map.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+        })
+    }
+
+    /// RAII guard: enables the mock on construction, disables+clears on drop.
+    ///
+    /// ```no_run
+    /// let _g = secrets::for_tests::MockGuard::new();
+    /// // mock is active for the duration of this scope
+    /// ```
+    pub struct MockGuard;
+
+    impl MockGuard {
+        pub fn new() -> Self {
+            enable_mock();
+            clear_mock();
+            MockGuard
+        }
+    }
+
+    impl Drop for MockGuard {
+        fn drop(&mut self) {
+            disable_mock();
+        }
+    }
+
+    // ── Internal helpers called from secrets::get/set/delete ──────────────
+
+    /// Called from `secrets::set` when `cfg(test)`. Returns `true` if the
+    /// mock was active and handled the write (caller must return Ok(())).
+    /// Returns `false` when the mock is inactive (caller falls through to
+    /// the real keychain).
+    pub(super) fn mock_set(
+        scope: SecretScope<'_>,
+        module_id: &str,
+        key: &str,
+        value: &str,
+    ) -> bool {
+        MOCK_STORE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            match slot.as_mut() {
+                None => false,
+                Some(map) => {
+                    let service = scope.service_name(module_id);
+                    map.insert((service, key.to_string()), value.to_string());
+                    true
+                }
+            }
+        })
+    }
+
+    /// Called from `secrets::get` when `cfg(test)`. Returns `Some(Ok(…))`
+    /// / `Some(Ok(None))` when the mock is active; `None` when inactive
+    /// (caller falls through to the real keychain).
+    pub(super) fn mock_get(
+        scope: SecretScope<'_>,
+        module_id: &str,
+        key: &str,
+    ) -> Option<Result<Option<String>, String>> {
+        MOCK_STORE.with(|cell| {
+            let slot = cell.borrow();
+            slot.as_ref().map(|map| {
+                let service = scope.service_name(module_id);
+                Ok(map.get(&(service, key.to_string())).cloned())
+            })
+        })
+    }
+
+    /// Called from `secrets::delete` when `cfg(test)`. Returns `true` if
+    /// the mock was active and handled the delete (caller must return
+    /// Ok(())). Returns `false` when the mock is inactive.
+    pub(super) fn mock_delete(
+        scope: SecretScope<'_>,
+        module_id: &str,
+        key: &str,
+    ) -> bool {
+        MOCK_STORE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            match slot.as_mut() {
+                None => false,
+                Some(map) => {
+                    let service = scope.service_name(module_id);
+                    map.remove(&(service, key.to_string()));
+                    true
+                }
+            }
+        })
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────
 //
 // Pure-function tests for keychain plumbing. The previous Fix #3 test
@@ -932,5 +1115,89 @@ mod tests {
     #[test]
     fn min_call_spacing_is_at_least_150ms() {
         assert!(MIN_CALL_SPACING >= std::time::Duration::from_millis(150));
+    }
+
+    // ─── Mock keychain seam tests (v0.2.42 W5-TEST3a) ─────────────────────
+    //
+    // These tests pin the in-memory mock layer WITHOUT touching the OS
+    // keychain. They are the ground-truth for `for_tests::enable_mock` /
+    // `disable_mock` / `clear_mock` / `snapshot` contract.
+
+    /// get-after-set returns the stored value.
+    #[test]
+    fn mock_get_after_set_returns_value() {
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k1", "secret_value").unwrap();
+        let v = get(scope, "mod", "k1").unwrap();
+        assert_eq!(v.as_deref(), Some("secret_value"));
+    }
+
+    /// delete removes the entry; subsequent get returns None.
+    #[test]
+    fn mock_delete_removes_entry() {
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k2", "to_delete").unwrap();
+        delete(scope, "mod", "k2").unwrap();
+        let v = get(scope, "mod", "k2").unwrap();
+        assert!(v.is_none(), "entry must be gone after delete");
+    }
+
+    /// disable_mock causes get/set/delete to fall through (no longer
+    /// intercepted). Verified by checking that `snapshot()` returns None
+    /// after disable — the mock map is gone.
+    #[test]
+    fn mock_disabled_snapshot_returns_none() {
+        for_tests::enable_mock();
+        for_tests::clear_mock();
+        let snap = for_tests::snapshot();
+        assert!(snap.is_some(), "mock active → snapshot Some");
+        for_tests::disable_mock();
+        let snap = for_tests::snapshot();
+        assert!(snap.is_none(), "mock inactive → snapshot None");
+    }
+
+    /// clear_mock empties the map without disabling it.
+    #[test]
+    fn mock_clear_resets_entries_while_keeping_mock_active() {
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "mod", "k3", "v3").unwrap();
+        assert!(get(scope, "mod", "k3").unwrap().is_some());
+        for_tests::clear_mock();
+        assert!(
+            get(scope, "mod", "k3").unwrap().is_none(),
+            "entry must be gone after clear"
+        );
+        // Mock still active — snapshot is Some([]).
+        assert_eq!(for_tests::snapshot().unwrap().len(), 0);
+    }
+
+    /// PerProject and Global scopes store entries independently — the
+    /// service_name differs, so no cross-scope collision.
+    #[test]
+    fn mock_scope_isolation_per_project_vs_global() {
+        let _g = for_tests::MockGuard::new();
+        let per = SecretScope::PerProject { project_id: "proj_iso" };
+        let global = SecretScope::Global;
+        set(per, "mod", "key", "per_val").unwrap();
+        set(global, "mod", "key", "global_val").unwrap();
+        assert_eq!(get(per, "mod", "key").unwrap().as_deref(), Some("per_val"));
+        assert_eq!(
+            get(global, "mod", "key").unwrap().as_deref(),
+            Some("global_val")
+        );
+    }
+
+    /// snapshot returns all entries currently in the mock store.
+    #[test]
+    fn mock_snapshot_enumerates_all_entries() {
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+        set(scope, "m", "a", "1").unwrap();
+        set(scope, "m", "b", "2").unwrap();
+        let snap = for_tests::snapshot().expect("mock active");
+        assert_eq!(snap.len(), 2);
     }
 }
