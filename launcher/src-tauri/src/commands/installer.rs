@@ -3573,6 +3573,49 @@ pub async fn update_orchestrator<R: Runtime>(
         return Err("Not a git repository — cannot update".to_string());
     }
 
+    // v0.2.43 V0243-15: audit_log coverage for the update flow.
+    // Capture the pre-pull state (old SHA + branch) so the `_start` row
+    // carries the full context for forensic analysis. Best-effort: any
+    // failure here is logged but must NOT block the update.
+    let update_start_ms = chrono::Utc::now().timestamp_millis();
+    let old_sha = read_head_sha(&install_path).await;
+    let old_version = env!("CARGO_PKG_VERSION").to_string();
+    // Helper closure: soft-write a single audit row via the app's Db.
+    // Captures a clone of the AppHandle so it doesn't prevent the
+    // original `app` from being moved into `restart_launcher` later.
+    let audit_app = app.clone();
+    let write_audit = move |operation: &str, detail: serde_json::Value| {
+        use tauri::Manager as _;
+        if let Some(db) = audit_app.try_state::<crate::db::Db>() {
+            let _ = db.audit(operation, None, None, &detail);
+        }
+    };
+    // Capture pull_branch for the _start entry (read before the pull so the
+    // row is accurate even if the pull later fails).
+    let start_branch = {
+        let out = tokio::process::Command::new("git").silent()
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&install_path)
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                let b = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if b.is_empty() || b == "HEAD" { "main".to_string() } else { b }
+            }
+            _ => "main".to_string(),
+        }
+    };
+    write_audit(
+        "update_orchestrator_start",
+        serde_json::json!({
+            "old_version": old_version,
+            "source_commit": old_sha,
+            "branch": start_branch,
+            "install_path": path,
+        }),
+    );
+
     // v0.2.21 (Stream A Design B extension): pin the canonical public
     // AGPL upstream BEFORE any network ops. Same posture as the launcher
     // self-update (see commands/self_update.rs): we never trust `origin`
@@ -3815,6 +3858,16 @@ pub async fn update_orchestrator<R: Runtime>(
             revert_pre_pull_rename(backup);
         }
         let _ = ensure_hub_started_after_update(&install_path);
+        // v0.2.43 V0243-15: audit complete for the no-op path.
+        write_audit(
+            "update_orchestrator_complete",
+            serde_json::json!({
+                "success": true,
+                "duration_ms": chrono::Utc::now().timestamp_millis() - update_start_ms,
+                "note": "already_up_to_date",
+                "branch": start_branch,
+            }),
+        );
         return Ok(InstallResult {
             success: true,
             install_path: path,
@@ -4024,6 +4077,19 @@ pub async fn update_orchestrator<R: Runtime>(
     }
 
     emit_progress(&window, "done", "Orchestrator updated successfully!", 100.0);
+
+    // v0.2.43 V0243-15: audit_log complete entry (success path).
+    let new_sha = read_head_sha(&install_path).await;
+    write_audit(
+        "update_orchestrator_complete",
+        serde_json::json!({
+            "success": true,
+            "duration_ms": chrono::Utc::now().timestamp_millis() - update_start_ms,
+            "old_version": old_version,
+            "new_sha": new_sha,
+            "branch": start_branch,
+        }),
+    );
 
     Ok(InstallResult {
         success: true,
