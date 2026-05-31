@@ -8598,6 +8598,234 @@ def _prefix_adopt_kg_bindings_pass(
     return {"adopts": adopts, "multi_candidates": multi_candidates}
 
 
+def _w40_run_adoption_uplifts(
+    *,
+    prefix_adopts: "list[tuple[str, str, str, str, int]]",
+    weaviate_url: str,
+    deferral_report: "DeferralReport",
+    db_path: "Path",
+) -> None:
+    """v0.2.42 RT-13: W40-adoption smart-path uplift.
+
+    For each (project_id, role, old_name, new_name, row_count) entry in
+    ``prefix_adopts``, run ``migrate_collections`` against the newly-adopted
+    ``new_name`` collection to detect schema drift between the legacy-named
+    collection and the current orchestrator target schema.
+
+    Decision table:
+      noop / patch_props → apply silently (additive or no-op; no re-embed).
+      copy               → apply (copies existing vectors; no re-embed cost).
+      rebuild            → emit ``schema_migration_required`` deferral entry;
+                           DO NOT apply automatically (full re-embed required,
+                           user must consent and schedule downtime).
+
+    Writes an ``audit_log`` row to ``launcher.db`` per adopted collection:
+      operation='kg_collection_adopt_uplift'
+      detail={'collection_name': ..., 'smart_path_action': ...,
+              'applied': true|false}
+
+    Soft-fail: any per-collection migrate error becomes a deferral entry;
+    the binding flip is already committed, so this step cannot undo adoption.
+
+    Args:
+        prefix_adopts: output from ``_prefix_adopt_kg_bindings_pass``
+            — list of (project_id, role, old_name, new_name, row_count).
+        weaviate_url: resolved Weaviate base URL.
+        deferral_report: active ``DeferralReport`` instance for the run.
+        db_path: absolute path to ``launcher.db`` (for audit writes).
+    """
+    import sqlite3
+    import argparse as _argparse
+
+    seen_collections: set[str] = set()
+    for (project_id, role, old_name, new_name, _row_count) in prefix_adopts:
+        if new_name in seen_collections:
+            # Multiple bindings pointing at the same adopted collection (e.g.
+            # KG + shared KG both adopted the same name). Only process once.
+            continue
+        seen_collections.add(new_name)
+
+        smart_action = "unknown"
+        applied = False
+        error_msg: "str | None" = None
+
+        try:
+            # Temporarily override the env so migrate_collections targets
+            # exactly ``new_name``.  Determine which env key maps to this
+            # collection (KG or Dev) based on the suffix.
+            if new_name.endswith("_KnowledgeGraph"):
+                env_key = "KG_COLLECTION"
+            elif new_name.endswith("_Development"):
+                env_key = "DEVELOPMENT_COLLECTION"
+            else:
+                # Unknown suffix — skip (conservative; don't override env
+                # with something we can't undo if migrate_collections
+                # picks up extra collections from the env).
+                _log_install_event(
+                    "7e/10", "skip",
+                    f"RT-13: adopted collection {new_name!r} has unknown suffix; "
+                    f"skipping smart-path uplift",
+                    data={"collection": new_name, "project_id": project_id},
+                )
+                continue
+
+            saved_env = os.environ.get(env_key)
+            os.environ[env_key] = new_name
+            try:
+                # A minimal args namespace — migrate_collections only needs
+                # force_rebuild.  dry_run=False so changes are applied.
+                _args = _argparse.Namespace(force_rebuild=False)
+                result = _project_init.migrate_collections(
+                    _args,
+                    dry_run=False,
+                    weaviate_url=weaviate_url,
+                    log_event=_log_install_event,
+                )
+            finally:
+                if saved_env is None:
+                    os.environ.pop(env_key, None)
+                else:
+                    os.environ[env_key] = saved_env
+
+            # Inspect the plan result for the adopted collection.
+            plan_entries = [
+                e for e in (result.get("plan") or [])
+                if e.get("collection") == new_name
+            ]
+            if plan_entries:
+                smart_action = plan_entries[0].get("action", "unknown")
+            elif result.get("errors"):
+                # Errors list is populated when the collection is missing
+                # entirely or the plan build failed.
+                smart_action = "error"
+                error_msg = str(result["errors"][0].get("error", ""))
+            else:
+                smart_action = "noop"  # nothing to do
+
+            if smart_action in ("noop", "patch_props", "copy"):
+                applied = True
+                _log_install_event(
+                    "7e/10", "ok",
+                    f"RT-13 uplift: applied {smart_action!r} for {new_name!r} "
+                    f"(adopted from {old_name!r})",
+                    data={"collection": new_name, "action": smart_action,
+                          "project_id": project_id},
+                )
+            elif smart_action == "rebuild":
+                # Destructive rebuild requires user consent — defer.
+                applied = False
+                _log_install_event(
+                    "7e/10", "warn",
+                    f"RT-13 uplift: rebuild required for {new_name!r} — deferred",
+                    data={"collection": new_name, "action": "rebuild",
+                          "project_id": project_id},
+                )
+                deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id=f"schema_migration_required_{new_name}",
+                        title=f"Schema migration required for adopted collection `{new_name}`",
+                        detected=(
+                            f"After adopting `{old_name}` → `{new_name}` "
+                            f"(project_id={project_id}), the migrate_collections "
+                            f"smart-path determined the collection needs a REBUILD "
+                            f"(schema invariants changed in a way that requires "
+                            f"drop + re-embed). This was NOT applied automatically "
+                            f"because it requires re-embedding all objects "
+                            f"(~{_row_count} objects in the adopted collection)."
+                        ),
+                        why_deferred=(
+                            "A rebuild drops the collection and re-embeds every "
+                            "object. This takes time (cost proportional to "
+                            f"~{_row_count} objects × embedding latency) and cannot "
+                            "be safely auto-applied in an unattended install run. "
+                            "Run the command below when you can afford the downtime."
+                        ),
+                        command_to_apply=(
+                            f"python install.py --update --migrate-collections "
+                            f"--force-rebuild\n"
+                            f"# Or migrate only this collection interactively:\n"
+                            f"python -c \"from vco_lib import project_init; "
+                            f"import argparse, os; "
+                            f"os.environ['KG_COLLECTION']='{new_name}'; "
+                            f"project_init.migrate_collections(argparse.Namespace(force_rebuild=True))\""
+                        ),
+                        severity="warning",
+                        kg_node_refs=[
+                            "knowledge/concepts/config-projection-contract-2026-05-24.md",
+                        ],
+                    )
+                )
+            else:
+                # error or unknown action — log + soft-fail.
+                applied = False
+                _log_install_event(
+                    "7e/10", "warn",
+                    f"RT-13 uplift: unexpected action {smart_action!r} for "
+                    f"{new_name!r}; no-op",
+                    data={"collection": new_name, "action": smart_action,
+                          "error": error_msg or ""},
+                )
+
+        except Exception as exc:
+            applied = False
+            smart_action = "error"
+            error_msg = str(exc)
+            _log_install_event(
+                "7e/10", "warn",
+                f"RT-13 uplift: migrate failed for {new_name!r}: {exc}",
+                data={"collection": new_name, "error": error_msg[:200]},
+            )
+
+        # Write audit entry to launcher.db (best-effort).
+        _w40_write_adoption_audit(
+            db_path=db_path,
+            collection_name=new_name,
+            smart_path_action=smart_action,
+            applied=applied,
+        )
+
+
+def _w40_write_adoption_audit(
+    *,
+    db_path: "Path",
+    collection_name: str,
+    smart_path_action: str,
+    applied: bool,
+) -> None:
+    """Write a ``kg_collection_adopt_uplift`` audit entry to ``launcher.db``.
+
+    Best-effort: any sqlite error is logged and silently swallowed.
+    """
+    import sqlite3 as _sqlite3
+    import json as _json
+
+    if not db_path.is_file():
+        return
+    try:
+        conn = _sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            now_ms = int(time.time() * 1000)
+            detail = _json.dumps({
+                "collection_name": collection_name,
+                "smart_path_action": smart_path_action,
+                "applied": applied,
+            })
+            conn.execute(
+                "INSERT INTO audit_log (operation, detail, created_at) "
+                "VALUES (?, ?, ?)",
+                ("kg_collection_adopt_uplift", detail, now_ms),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        _log_install_event(
+            "7e/10", "warn",
+            f"RT-13: audit write failed for {collection_name!r}: {exc}",
+            data={"collection": collection_name, "error": str(exc)[:200]},
+        )
+
+
 def _self_heal_kg_bindings_on_update(
     deferral_report: "DeferralReport",
 ) -> None:
@@ -8913,6 +9141,24 @@ def _self_heal_kg_bindings_on_update(
             "no case-mismatched KG bindings or access rows; self-heal no-op",
         )
         return
+
+    # v0.2.42 RT-13: W40-adoption smart-path uplift.
+    #
+    # After each binding flip has been committed, run the migrate_collections
+    # smart-path against every newly-adopted collection to detect schema
+    # drift between the legacy-named collection and the current orchestrator
+    # target schema. Applied BEFORE the deferral-entry block so any
+    # rebuild deferrals are merged into the same UPDATE_DEFERRED.md write.
+    #
+    # Soft-fail: migrate errors become deferral entries; the binding flip
+    # already committed so this step cannot roll back the adoption.
+    if prefix_adopts:
+        _w40_run_adoption_uplifts(
+            prefix_adopts=prefix_adopts,
+            weaviate_url=weaviate_url,
+            deferral_report=deferral_report,
+            db_path=db_path,
+        )
 
     # Emit deferral entries. Case-rebinds + prefix-adopts share an
     # informational `kg_binding_self_healed` entry because both are
