@@ -2822,16 +2822,18 @@ mod tests {
     // -----------------------------------------------------------------
     // v0.2.40 L1.M: legacy-username migration tests.
     //
-    // The full READ-legacy → WRITE-canonical → DELETE-legacy → UPSERT-row
-    // flow touches the host keychain via `secrets::get/set/delete`. There
-    // is no mock-keychain injection seam in `secrets.rs` (adding one is
-    // L1.M scope-creep). Tests that exercise the keychain are gated
-    // behind `#[ignore]` and carefully scoped to leave the dev-box
-    // keychain in a known-good state.
+    // v0.2.42 W5 update: a thread-local mock keychain seam was added to
+    // `vct-launcher-core/src/secrets.rs` (`secrets::for_tests`). The
+    // full READ-legacy → WRITE-canonical → DELETE-legacy → UPSERT-row
+    // flow is now exercised hermetically via the mock (no host keychain
+    // access, no `#[ignore]`). The previously `#[ignore]`d tests have
+    // been un-ignored and use `secrets::for_tests::MockGuard`.
     //
-    // The DB-side branches (1b: row already at canonical → no-op,
-    // BRANCH 3: no row + no legacy entry → no-op) are exercised
-    // hermetically below by seeding the DB directly.
+    // All branches are now covered without touching the host keychain:
+    // BRANCH 1b (mock_empty_no_op, migrate_no_op_when_row_already_at_canonical_username),
+    // BRANCH 2 (mock_seeded_migrate_succeeds, migrate_full_flow_legacy_to_canonical),
+    // BRANCH 3 (mock_empty_no_op, migrate_does_not_error_on_clean_install),
+    // idempotency (mock_idempotent_double_call).
     // -----------------------------------------------------------------
 
     /// L1.M BRANCH 1b (hermetic): a row already pointing at the
@@ -2898,7 +2900,8 @@ mod tests {
     ///
     /// We exercise the SQL pathway directly (db.upsert_license_key) to
     /// pin the contract; the wrapper helper's keychain ordering is
-    /// exercised by the `#[ignore]`d keychain-touching tests below.
+    /// exercised by the mock-keychain tests below (migrate_full_flow_legacy_to_canonical,
+    /// migrate_does_not_error_on_clean_install — both un-ignored in v0.2.42 W5).
     #[tokio::test]
     async fn migrate_row_rewrite_preserves_key_prefix() {
         let db = Db::open_in_memory().expect("in-memory");
