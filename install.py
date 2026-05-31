@@ -8320,6 +8320,80 @@ def _ensure_collections(embed_config: dict,
                   "failed": [{"name": n, "error": e[:200]} for n, e in failed]},
         )
 
+    # V0243-18: warn when the Diagrams collection was just created (or
+    # already existed) but no .mmd / .excalidraw sources are present in
+    # the project. Users won't get useful results from describe_excalidraw
+    # or diagram-search skills until diagrams exist on disk.
+    _warn_if_diagrams_empty(diagrams_name, weaviate_url)
+
+
+def _warn_if_diagrams_empty(diagrams_name: str, weaviate_url: str) -> None:
+    """V0243-18 — Emit an install-log warning when the Diagrams collection
+    has been bootstrapped but contains 0 rows and no .mmd / .excalidraw
+    source files exist under ``.claude/diagrams/``.
+
+    Skills like ``describe_excalidraw`` and diagram-search will return
+    nothing until diagrams are created. The warning surfaces this so the
+    user understands why the feature appears "empty" on a fresh install.
+
+    Soft-fail throughout: transport errors, missing collection, or a
+    Weaviate count-query failure are all treated as "unknown" and the
+    warning is suppressed (we don't want false positives).
+
+    Idempotent: emits only a log line (no deferral entry — this is
+    informational, not actionable in the same way as a schema drift).
+    """
+    if not diagrams_name:
+        return
+
+    # Count .mmd + .excalidraw files under .claude/diagrams/.
+    diagrams_dir = PROJECT_ROOT / ".claude" / "diagrams"
+    source_count = 0
+    if diagrams_dir.is_dir():
+        for ext in ("*.mmd", "*.excalidraw"):
+            source_count += len(list(diagrams_dir.rglob(ext)))
+
+    if source_count > 0:
+        # Sources exist — collection will be populated; no warning needed.
+        _log_install_event(
+            "7b/10", "info",
+            f"diagrams_empty_check: {source_count} source file(s) found under "
+            f".claude/diagrams/ — no empty-collection warning",
+            data={"diagrams_collection": diagrams_name,
+                  "source_count": source_count},
+        )
+        return
+
+    # No sources. Try to get the Weaviate object count to distinguish
+    # "just created / genuinely empty" from "creation failed" (failed →
+    # count unknown → skip warning).
+    from vco_lib.project_init import _http_count_objects
+    count = _http_count_objects(diagrams_name, weaviate_url=weaviate_url)
+
+    if count is None:
+        # Unknown — Weaviate unreachable or collection absent; skip.
+        return
+
+    if count > 0:
+        # Has objects but no on-disk sources (e.g. reinstall after manual
+        # diagram creation). Not a problem — no warning.
+        return
+
+    # count == 0 AND no on-disk sources → user hasn't created diagrams yet.
+    print(
+        f"  WARN [7b/10] Diagrams collection `{diagrams_name}` is empty: "
+        f"no .mmd / .excalidraw sources found under .claude/diagrams/. "
+        f"Skills like describe_excalidraw will return nothing until you "
+        f"save diagrams there (via the mermaid or excalidraw MCP tools)."
+    )
+    _log_install_event(
+        "7b/10", "warn",
+        f"Diagrams collection empty: no .mmd sources found",
+        data={"diagrams_collection": diagrams_name,
+              "source_count": 0,
+              "weaviate_count": 0},
+    )
+
 
 # ---------------------------------------------------------------------------
 # Step 7c: Seed Weaviate with bundled knowledge/ + docs/
@@ -9011,6 +9085,293 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
         )
 
     _log_install_event("7d/10", "ok", "schema migrations completed")
+
+    # V0243-2: additive named-vector slot migration for per-project KG +
+    # Development collections. Runs after the shell-script migrations so
+    # the collections are guaranteed to exist before we attempt slot adds.
+    _migrate_kg_named_vector_slots(deferral_report)
+
+    # V0243-14: emit deferred cleanup suggestions for residual lowercase
+    # legacy code-graph collections. Idempotent; never auto-drops.
+    _emit_lowercase_codegraph_cleanup_deferrals(deferral_report)
+
+
+def _migrate_kg_named_vector_slots(deferral_report: "DeferralReport") -> None:
+    """V0243-2 — Ensure $KG_COLLECTION and $DEVELOPMENT_COLLECTION carry all
+    5 named-vector slots from the v0.2.18 catalog.
+
+    Background: collections created before v0.2.18 were built with 3 slots
+    (qwen3_embed, ollama_embed, openai_embed). v0.2.18 added arctic2_embed +
+    openai_text_embed. The drift-detector intentionally does NOT fire on the
+    two new slots (so basic search still works), but every install/update
+    should silently patch them in when missing.
+
+    Strategy: additive patch_props (UNION) — vector slots can be added
+    without re-embedding existing data. The new slots start empty; the
+    embedding-enrichment step (commit 9 / EmbeddingService) fills them
+    lazily as the user runs sync or queries.
+
+    Idempotent: running twice produces 0 additions on the second pass
+    (every slot present → all Skipped).
+
+    Soft-fail: Weaviate unreachable or collection missing → skip silently
+    (those are existing deferred conditions upstream). Any per-slot error
+    is captured as a deferral entry and does NOT abort install.
+
+    Scope: per-project KG ($KG_COLLECTION) + per-project Development
+    ($DEVELOPMENT_COLLECTION). Shared KG and code-graph collections are
+    handled separately by `migrate_collections_to_v0218_schema`.
+    """
+    from vco_lib.weaviate_schema import (
+        KG_NAMED_VECTORS,
+        migrate_collection_to_target,
+    )
+
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+    kg_coll = os.environ.get("KG_COLLECTION", "")
+    dev_coll = os.environ.get("DEVELOPMENT_COLLECTION", "")
+
+    targets = [(n, "kg") for n in [kg_coll] if n] + [
+        (n, "dev") for n in [dev_coll] if n
+    ]
+
+    if not targets:
+        _log_install_event(
+            "7d/10", "skip",
+            "kg_named_vector_slots: no KG_COLLECTION/DEVELOPMENT_COLLECTION set",
+        )
+        return
+
+    print("[7d/10] Migrating KG named-vector slots (V0243-2) ... ", flush=True)
+    _log_install_event(
+        "7d/10", "start",
+        "kg_named_vector_slots: ensuring 5-slot catalog on KG + Dev",
+        data={"kg": kg_coll, "dev": dev_coll, "weaviate_url": weaviate_url},
+    )
+
+    all_ok = True
+    for coll_name, coll_type in targets:
+        try:
+            report = migrate_collection_to_target(
+                coll_name,
+                KG_NAMED_VECTORS,
+                weaviate_url=weaviate_url,
+            )
+        except Exception as exc:
+            # Transport failure, missing collection, etc. — skip silently.
+            print(f"  [kg_named_vector_slots] {coll_name}: skipped ({exc})")
+            _log_install_event(
+                "7d/10", "warn",
+                f"kg_named_vector_slots: {coll_name} skipped: {type(exc).__name__}",
+                data={"collection": coll_name, "error": str(exc)[:200]},
+            )
+            continue
+
+        if report.added_slots:
+            print(f"  [kg_named_vector_slots] {coll_name}: "
+                  f"added {report.added_slots}")
+        elif report.skipped_slots:
+            print(f"  [kg_named_vector_slots] {coll_name}: "
+                  f"all slots present (noop)")
+        if report.errors:
+            all_ok = False
+            for err in report.errors:
+                slot = err.get("slot", "?")
+                reason = err.get("reason", "?")
+                print(f"  [kg_named_vector_slots] {coll_name}: "
+                      f"slot {slot} error: {reason}")
+                deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id=f"kg_named_vector_slot_error_{coll_name}_{slot}",
+                        title=(
+                            f"Named-vector slot migration failed: "
+                            f"{coll_name}/{slot}"
+                        ),
+                        detected=(
+                            f"Migration of vector slot `{slot}` on collection "
+                            f"`{coll_name}` failed during install step 7d: "
+                            f"{reason}"
+                        ),
+                        why_deferred=(
+                            "Adding a vector slot failed. The collection will "
+                            "continue to work with the existing slots, but new "
+                            "embedding backends (arctic2_embed / "
+                            "openai_text_embed) will not be available until "
+                            "the migration succeeds."
+                        ),
+                        command_to_apply=(
+                            f"python -m vco_lib.project_init "
+                            f"migrate-collections --name "
+                            f"{os.environ.get('PROJECT_NAME', 'YourProject')} "
+                            f"--json"
+                        ),
+                        severity="warning",
+                        kg_node_refs=[],
+                    )
+                )
+        _log_install_event(
+            "7d/10",
+            "ok" if not report.errors else "warn",
+            f"kg_named_vector_slots: {coll_name} done",
+            data={
+                "collection": coll_name,
+                "added": report.added_slots,
+                "skipped": report.skipped_slots,
+                "errors": report.errors,
+            },
+        )
+
+    if all_ok:
+        print("  [kg_named_vector_slots] OK")
+    _log_install_event(
+        "7d/10",
+        "ok" if all_ok else "warn",
+        "kg_named_vector_slots: migration pass completed",
+    )
+
+
+def _emit_lowercase_codegraph_cleanup_deferrals(
+    deferral_report: "DeferralReport",
+) -> None:
+    """V0243-14 — Emit deferred cleanup suggestions for residual lowercase
+    legacy code-graph collections.
+
+    Background: early orchestrator versions wrote code-graph collections
+    with lowercase prefixes (e.g. ``myproject_CodeFunction`` instead of the
+    canonical ``MyProject_CodeFunction``). These can linger alongside the
+    correctly-cased collections, wasting Weaviate memory and causing
+    confusing duplicate search results.
+
+    Strategy:
+      * For each canonical CodeXxx suffix, detect any Weaviate class whose
+        name ends in that suffix AND whose FULL name (prefix included) is a
+        pure-lowercase form of an existing canonical-cased class.
+      * If the lowercase variant has fewer than 100 objects it is
+        "clearly residual" — safe to drop.
+      * We NEVER auto-drop. Instead, one deferral entry per qualifying
+        collection is emitted to UPDATE_DEFERRED.md with an explicit
+        `python -m vco_lib.project_init drop-collection …` command.
+
+    Idempotent — runs every update; already-absent collections produce no
+    entries (the check re-reads the live schema each run).
+
+    Soft-fail: Weaviate unreachable → skip silently.
+    """
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+
+    # Read live schema (soft-fail on transport errors).
+    try:
+        resp = urllib.request.urlopen(
+            f"{weaviate_url}/v1/schema", timeout=8,
+        )
+        schema = json.loads(resp.read())
+    except Exception:
+        return  # Weaviate down — skip silently, upstream already deferred this.
+
+    all_classes: list[str] = [
+        c.get("class", "") for c in schema.get("classes", [])
+        if isinstance(c, dict) and c.get("class")
+    ]
+    # Build a lookup: lower(name) -> set of canonical names sharing that key.
+    from_lower: dict[str, list[str]] = {}
+    for cls in all_classes:
+        key = cls.lower()
+        from_lower.setdefault(key, []).append(cls)
+
+    # Code collection suffixes from the canonical catalog.
+    from vco_lib.weaviate_schema import _CODE_COLLECTION_SUFFIXES
+
+    residual: list[str] = []
+    for cls in all_classes:
+        # Skip already-canonical: class is its own lone lower-representative.
+        key = cls.lower()
+        siblings = from_lower.get(key, [])
+        # Must have a case-different sibling to qualify as residual.
+        canonical_siblings = [s for s in siblings if s != cls]
+        if not canonical_siblings:
+            continue
+        # Must end in a code-graph suffix.
+        if not any(cls.endswith(sfx) for sfx in _CODE_COLLECTION_SUFFIXES):
+            continue
+        # Must be the LOWERCASE variant (i.e. cls == key → all lower).
+        if cls != cls.lower():
+            continue
+        residual.append(cls)
+
+    if not residual:
+        _log_install_event(
+            "7d/10", "ok",
+            "lowercase_codegraph_cleanup: no residual lowercase collections",
+        )
+        return
+
+    # Count objects in each residual collection (< 100 = clearly residual).
+    from vco_lib.project_init import _http_count_objects
+
+    for cls in residual:
+        count = _http_count_objects(cls, weaviate_url=weaviate_url)
+        if count is None:
+            # Unknown count — don't defer a drop (could be data-bearing).
+            _log_install_event(
+                "7d/10", "warn",
+                f"lowercase_codegraph_cleanup: {cls} count unknown; skipping",
+                data={"collection": cls},
+            )
+            continue
+        if count >= 100:
+            # Plausibly real data — skip.
+            _log_install_event(
+                "7d/10", "info",
+                f"lowercase_codegraph_cleanup: {cls} has {count} rows (>=100); skipping",
+                data={"collection": cls, "count": count},
+            )
+            continue
+
+        # Qualify as residual: lowercase + case-sibling + < 100 rows.
+        canonical_siblings = [s for s in from_lower.get(cls.lower(), []) if s != cls]
+        canonical_str = ", ".join(f"`{s}`" for s in sorted(canonical_siblings))
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id=f"lowercase_codegraph_residual_{cls}",
+                title=f"Residual lowercase code-graph collection: {cls}",
+                detected=(
+                    f"Collection `{cls}` ({count} objects) appears to be a "
+                    f"residual lowercase variant of the canonical "
+                    f"{canonical_str}. It was likely created by an older "
+                    f"version of the orchestrator and can be safely dropped."
+                ),
+                why_deferred=(
+                    "The orchestrator never auto-drops populated collections "
+                    "(even with < 100 rows) to avoid accidental data loss. "
+                    "Inspect `{cls}` with the Weaviate console or the CLI, "
+                    "then drop it manually when confident the data is "
+                    "captured in the canonical collection."
+                ),
+                command_to_apply=(
+                    f"python -m vco_lib.project_init drop-collection "
+                    f"--name {cls} --yes"
+                ),
+                severity="info",
+                kg_node_refs=[],
+            )
+        )
+        _log_install_event(
+            "7d/10", "info",
+            f"lowercase_codegraph_cleanup: deferred drop for {cls} ({count} rows)",
+            data={"collection": cls, "count": count,
+                  "canonical_siblings": canonical_siblings},
+        )
+
+    _log_install_event(
+        "7d/10", "ok",
+        f"lowercase_codegraph_cleanup: {len(residual)} candidate(s) processed",
+    )
 
 
 def _detect_legacy_shared_kg_class(deferral_report: "DeferralReport") -> None:
