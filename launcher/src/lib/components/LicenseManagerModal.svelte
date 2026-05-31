@@ -21,6 +21,10 @@
   import { onMount } from 'svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import { moduleLicenseKeys, formatTimestamp, statusBadge } from '$lib/stores/moduleLicenseKeys';
+  import { modules } from '$lib/stores/modules';
+  // v0.2.42 W6 (UX-1): only render license rows for modules that are
+  // actually installed (or the reserved orchestrator root slot).
+  import { moduleIsInstalled } from '$lib/module-active-gate';
   import type { LicenseKeySummary } from '$lib/types/launcher';
 
   let { onClose }: { onClose: () => void } = $props();
@@ -32,6 +36,16 @@
   // every `$state<Generic>(...)` site below. Renaming the derived-store
   // alias removes the symbol collision.
   const summary = $derived($moduleLicenseKeys);
+
+  // v0.2.42 W6 (UX-1): filter license key rows to only those whose
+  // module is actually installed (or the reserved `__orchestrator__` slot,
+  // which represents the orchestrator itself and is always shown).
+  const visibleKeys = $derived(
+    summary.keys.filter((k: LicenseKeySummary) =>
+      k.module_id === '__orchestrator__' ||
+      moduleIsInstalled(k.module_id, $modules.installed),
+    ),
+  );
 
   // Per-row key inputs. Keyed by module_id so each row has its own
   // independent textbox state. Initialised lazily on first render.
@@ -142,9 +156,9 @@
   {/snippet}
 
   {#snippet body()}
-    {#if summary.loading && summary.keys.length === 0}
+    {#if summary.loading && visibleKeys.length === 0}
       <p class="loading">Loading license keys…</p>
-    {:else if summary.keys.length === 0}
+    {:else if visibleKeys.length === 0}
       <p class="empty">
         No paid-module license keys yet. Activate one through the
         Orchestrator tier dialog, or paste a key below once you have one.
@@ -161,7 +175,7 @@
     {/if}
 
     <ul class="key-list">
-      {#each summary.keys as row (row.module_id)}
+      {#each visibleKeys as row (row.module_id)}
         {@const badge = statusBadge(row)}
         {@const lastResult = lastResults[row.module_id]}
         <li class="key-row">

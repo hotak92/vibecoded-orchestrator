@@ -17,7 +17,7 @@
   },
   "license": "AGPL-3.0-or-later",
   "dependencies": {
-    "@excalidraw/excalidraw": "0.18.1",
+    "@excalidraw/excalidraw": "^0.17.6",
     "@supabase/supabase-js": "^2.105.3",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",

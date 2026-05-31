@@ -2360,6 +2360,10 @@ def _cli_apply_user_secrets(args: argparse.Namespace) -> int:
         )
         return 4
 
+    # codeql[py/clear-text-logging-sensitive-data]: false positive —
+    # `known_keys` is a list of env-var NAME strings (e.g. "GITHUB_TOKEN"),
+    # not their values. It is the "strip set" used to redact secrets from
+    # the projection output. No secret values are printed here.
     print(json.dumps({
         "ok": True,
         "report": report,
@@ -2392,9 +2396,15 @@ def _cli_user_secret_known_keys(args: argparse.Namespace) -> int:
         return 3
 
     if args.json:
+        # codeql[py/clear-text-logging-sensitive-data]: false positive —
+        # `keys` is a list[str] of env-var NAMES, not values. The
+        # `user-secret-known-keys` subcommand's entire purpose is to print
+        # these identifiers so the Rust caller can verify the bridge.
         print(json.dumps(keys))
     else:
         for k in keys:
+            # codeql[py/clear-text-logging-sensitive-data]: false positive —
+            # `k` is a key NAME string (e.g. "GITHUB_TOKEN"), not its value.
             print(k)
     return 0
 

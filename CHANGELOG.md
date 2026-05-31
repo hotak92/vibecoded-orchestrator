@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **SEC-1 (CodeQL config)**: added `.github/codeql-config.yml` to suppress CodeQL alerts on vendored third-party dist bundles (Excalidraw canvas, Mermaid) and false-positive `py/clear-text-logging-sensitive-data` alerts in `config_projection.py` (logs key NAMES, not values). Inline `# codeql[...]` comments added at each suppression site. Full triage in `docs/codeql-triage-v0.2.42.md`. ([W6])
+- **SEC-1 (stack-trace-exposure real fix)**: `GET /health` in `code_embedding_service/server.py` now logs the full exception internally and returns a generic error message rather than `str(e)`, avoiding internal path/model info leakage through the API. ([W6])
+- **SEC-2 (npm audit)**: ran `npm audit fix --force` in `launcher/`; upgraded `@excalidraw/excalidraw` from 0.17.x to 0.17.6 and `ws` from 8.20.0 to 8.21.0. Zero vulnerabilities after fix. Build + tests verified. ([W6])
+
+### UX
+
+- **UX-1 (paid-modules-agnostic gating)**: introduced `moduleIsActive(moduleId, installed)` and `moduleIsInstalled(moduleId, installed)` pure helpers (`launcher/src/lib/module-active-gate.ts`) as the single gate for all paid-module-specific UI. RL Reranker status panel + RT-4 Reset button now visible only when the module container is running; License Manager shows rows only for installed modules. 16 unit tests covering all status transitions. ([W6])
+- **RT-4 (Reset to global weights button)**: wired the Tauri command `reset_weights_to_global` (registered by W3) to a "Reset to global weights" button on the RL Reranker module config tab. Button is gated by `moduleIsActive` (visible only when container is running). ([W6])
+
 ## [0.2.41] — 2026-05-31
 
 ### Fixed
