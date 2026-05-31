@@ -8092,6 +8092,24 @@ def _rebuild_collections(args: argparse.Namespace) -> None:
     _project_init.rebuild_collections(args, log_event=_log_install_event)
 
 
+def _is_orchestrator_root_install() -> bool:
+    """Return True iff PROJECT_ROOT is an orchestrator clone (not a per-project install).
+
+    Detection: PROJECT_ROOT contains ALL THREE of:
+      - vct-module.json  (orchestrator identity marker)
+      - install.py       (orchestrator entry-point)
+      - vco_lib/         (orchestrator library package)
+
+    Per-project installs have `.vco-manifest.json` and no install.py.
+    Orchestrator self-installs have all three markers above.  Never raises.
+    """
+    return (
+        (PROJECT_ROOT / "vct-module.json").is_file()
+        and (PROJECT_ROOT / "install.py").is_file()
+        and (PROJECT_ROOT / "vco_lib").is_dir()
+    )
+
+
 def _seed_weaviate_shared_kg_only(
     *,
     args: "argparse.Namespace",
@@ -8099,12 +8117,19 @@ def _seed_weaviate_shared_kg_only(
     sync_kg: "Path",
     weaviate_url: str,
     current_shared_kg: str,
+    current_kg_collection: str = "",
 ) -> "list[str]":
     """Run the shared-KG seed step only (no per-project KG sync).
 
     v0.2.42 CI-10: extracted from ``_seed_weaviate`` so the diff-gate
     skip path can still run the shared KG seed without the full per-project
     sync. Returns a list of error strings (empty = success).
+
+    v0.2.43 V0243-0: on orchestrator-root installs where
+    ``current_shared_kg == current_kg_collection`` (the per-project KG IS
+    the shared KG — typical when both env vars point at the same collection),
+    skip the shared seed to avoid a redundant double-sync and record the
+    skip in ``app_state.last_installed_shared_kg_collection``.
     """
     seed_errors: list[str] = []
     shared_write_disabled = (
@@ -8116,6 +8141,23 @@ def _seed_weaviate_shared_kg_only(
         return seed_errors
     if not current_shared_kg:
         print("  → shared KG seed: skipped (SHARED_KG_COLLECTION empty)")
+        return seed_errors
+
+    # V0243-0: orchestrator-root self-install where per-project KG == shared KG.
+    # Running kg-sync twice against the same collection would be wasteful;
+    # record the collection as synced and return early.
+    if (
+        _is_orchestrator_root_install()
+        and current_kg_collection
+        and current_shared_kg == current_kg_collection
+    ):
+        print(
+            f"  → shared KG seed: skipping — orchestrator-root install, "
+            f"per-project KG '{current_kg_collection}' IS the shared KG"
+        )
+        _write_app_state_key(
+            _APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_kg_collection
+        )
         return seed_errors
     if not sync_kg.exists():
         return seed_errors
@@ -8321,6 +8363,7 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
                     sync_kg=sync_kg,
                     weaviate_url=weaviate_url,
                     current_shared_kg=current_shared_kg,
+                    current_kg_collection=current_kg_collection,
                 )
                 _log_install_event("7c/10", "ok", "CI-10: diff-gate skip complete")
                 return
@@ -8417,6 +8460,7 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         sync_kg=sync_kg,
         weaviate_url=weaviate_url,
         current_shared_kg=current_shared_kg,
+        current_kg_collection=current_kg_collection,
     )
     seed_errors.extend(shared_errors)
 
