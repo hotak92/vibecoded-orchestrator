@@ -33,7 +33,10 @@ name: Manifest Validate (paid modules)
 
 on:
   push:
-    branches: [main]
+    # v0.2.42: include release/** so manifest-validate runs on the release
+    # branch (required by the pre-release-gate in release.yml + branch
+    # protection that fast-forwards release/v0.2.x → main).
+    branches: [main, "release/**"]
     paths-ignore:
       - 'knowledge/**'
       - '.claude/context/**'

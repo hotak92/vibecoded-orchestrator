@@ -60,7 +60,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # v0.2.42: include release/** so the pre-release-gate (CI-6, W7)
+    # can verify CI on the release branch BEFORE merging to main. Branch
+    # protection requires CI green on the target SHA; without this filter,
+    # release/v0.2.x → main merges are blocked because CI never ran on
+    # the branch.
+    branches: [main, "release/**"]
     paths-ignore:
       - 'knowledge/**'
       - 'docs/**'

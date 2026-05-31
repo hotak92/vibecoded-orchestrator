@@ -9,7 +9,10 @@ on:
   # exclude list + the rationale on why `**.md` and `templates/**` are
   # NOT in the ignore list.
   push:
-    branches: [ "main" ]
+    # v0.2.42: include release/** so CodeQL runs on release branches
+    # (pre-release-gate verification + branch-protection requires CodeQL
+    # green on the target SHA before release → main merge).
+    branches: [ "main", "release/**" ]
     paths-ignore:
       - 'knowledge/**'
       - 'docs/**'
