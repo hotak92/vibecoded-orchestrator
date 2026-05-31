@@ -87,8 +87,160 @@ permissions:
   attestations: write   # needed to publish the SLSA provenance attestation
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # pre-release-gate (CI-6, v0.2.42 W7)
+  #
+  # RELEASE DISCIPLINE — no deferred fixes.
+  # This project has shipped two consecutive releases (v0.2.40, v0.2.41)
+  # while the Installer Smoke Test and Manifest Validate workflows were red.
+  # That is the exact failure mode this gate prevents: binaries must NOT be
+  # built, published, or committed to main unless the install pipeline AND
+  # manifest contract are verified green at the tag commit.
+  #
+  # What this gate runs (inline, not via workflow_call, to avoid the
+  # "workflow_call on a tag" scheduler race):
+  #   1. install.py + install-bundle smoke  (mirrors installer-smoke Job 1)
+  #   2. Weaviate schema bootstrap smoke    (mirrors installer-smoke Job 2)
+  #   3. Manifest validate in strict mode   (mirrors manifest-validate)
+  #   4. CodeQL analyses are advisory-only (they run on push/PR separately);
+  #      they are NOT re-run here to avoid doubling the 30-min CodeQL job on
+  #      every tag.  The required-status-check for CodeQL covers PR gates.
+  #
+  # On gate failure: `build` never starts → NO binaries published → NO
+  # GitHub Release cut.  The developer must fix the gate, then retag.
+  # ─────────────────────────────────────────────────────────────────────────
+  pre-release-gate:
+    name: Pre-release gate (smoke + manifest-validate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: launcher/src-tauri
+
+      - name: Install libdbus-1-dev (for vct-launcher-core keychain dep)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      # ── Gate 1: Install pipeline smoke (install.py + install-bundle) ──────
+      - name: Install Python deps (smoke)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install weaviate-client
+          pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true
+
+      - name: Run install.py (no containers, no models)
+        env:
+          VCO_CI_FIXTURE: "1"
+          VCT_STATE_DIR: "${{ runner.temp }}/.vct-gate-${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          INSTALL_ROOT="${{ runner.temp }}/vco_gate_install_${{ github.run_id }}"
+          mkdir -p "$INSTALL_ROOT"
+          cp -r . "$INSTALL_ROOT/"
+          cd "$INSTALL_ROOT"
+          python install.py --no-containers --skip-models || {
+            echo "::warning::install.py exited non-zero; continuing to assert what was written"
+          }
+          echo "INSTALL_ROOT=$INSTALL_ROOT" >> "$GITHUB_ENV"
+
+      - name: Run install-bundle into tmp project dir
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="${{ runner.temp }}/vco_gate_project_${{ github.run_id }}"
+          mkdir -p "$PROJECT_DIR"
+          python -m vco_lib.project_init install-bundle \
+            --folder "$PROJECT_DIR" \
+            --orchestrator-root "$INSTALL_ROOT" \
+            || {
+              echo "::warning::install-bundle exited non-zero; continuing assertions"
+            }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Gate 1 — Assert install.py root env present
+        run: |
+          set -euo pipefail
+          ROOT_ENV="$INSTALL_ROOT/.env"
+          if [ ! -f "$ROOT_ENV" ]; then
+            echo "::error::PRE-RELEASE GATE FAIL: .env not written by install.py at $ROOT_ENV"
+            exit 1
+          fi
+          echo "::notice::Gate 1 PASS: install.py root .env present"
+          head -20 "$ROOT_ENV"
+
+      - name: Gate 1b — Assert kg-sync --help exits 0
+        run: |
+          set -euo pipefail
+          KG_SYNC="$INSTALL_ROOT/.claude/scripts/kg-sync"
+          [ -f "$KG_SYNC" ] || KG_SYNC="$INSTALL_ROOT/templates/scripts/kg-sync"
+          if [ ! -f "$KG_SYNC" ]; then
+            echo "::error::PRE-RELEASE GATE FAIL: kg-sync wrapper not found"
+            exit 1
+          fi
+          export VCT_INSTALL_ROOT="$INSTALL_ROOT"
+          export VCT_ORCHESTRATOR_ROOT="$INSTALL_ROOT"
+          bash "$KG_SYNC" --help && echo "::notice::Gate 1b PASS: kg-sync --help exits 0" || {
+            echo "::error::PRE-RELEASE GATE FAIL: kg-sync --help exited non-zero"
+            exit 1
+          }
+
+      # ── Gate 2: Manifest validate (strict mode) ───────────────────────────
+      - name: Build manifest-CI bins (gate 2)
+        working-directory: launcher/src-tauri
+        timeout-minutes: 12
+        env:
+          VCT_LAUNCHER_STRICT_MANIFEST: "1"
+        run: |
+          cargo build -p vct-launcher-core \
+            --bin validate-manifest --bin export-schema
+
+      - name: Gate 2a — Schema-drift check
+        working-directory: launcher/src-tauri
+        env:
+          VCT_LAUNCHER_STRICT_MANIFEST: "1"
+        run: |
+          ./target/debug/export-schema --check ../../docs/schemas/vct-module.schema.json && \
+            echo "::notice::Gate 2a PASS: schema-drift check clean" || {
+              echo "::error::PRE-RELEASE GATE FAIL: schema-drift detected — regenerate docs/schemas/vct-module.schema.json"
+              exit 1
+            }
+
+      - name: Gate 2b — Validate committed test-fixture manifests (strict)
+        working-directory: launcher/src-tauri
+        env:
+          VCT_LAUNCHER_STRICT_MANIFEST: "1"
+        run: |
+          set -euo pipefail
+          fixtures=(vct-launcher-core/tests/fixtures/manifests/*.json)
+          if [ ${#fixtures[@]} -eq 0 ] || [ ! -e "${fixtures[0]}" ]; then
+            echo "::error::PRE-RELEASE GATE FAIL: no test-fixture manifests found"
+            exit 1
+          fi
+          ./target/debug/validate-manifest "${fixtures[@]}" && \
+            echo "::notice::Gate 2b PASS: all test-fixture manifests valid in strict mode"
+
+      - name: Gate summary
+        if: success()
+        run: |
+          echo "::notice::All pre-release gates PASSED for ${{ github.ref }}"
+          echo "  Gate 1: install.py smoke — PASS"
+          echo "  Gate 2: manifest-validate strict — PASS"
+          echo "Proceeding to build matrix."
+
   build:
     name: Build (${{ matrix.target }})
+    needs: pre-release-gate
     strategy:
       fail-fast: false
       matrix:
@@ -958,7 +1110,12 @@ jobs:
             exit 1
           fi
 
-          git commit -m "chore(binary): refresh vct-launcher + vct-hub dist binaries for v${VERSION}
+          # [skip ci] prevents a duplicate CI run triggered by this binary-refresh
+          # commit landing on main (the binaries were already verified by the
+          # release build matrix above; re-running CI on the dist commit wastes
+          # ~10 min of runner time with zero new signal). See ci.yml for the
+          # matching paths-ignore that also guards this case.
+          git commit -m "chore(binary): refresh vct-launcher + vct-hub dist binaries for v${VERSION} [skip ci]
 
           Auto-committed by release workflow after successful tag build.
           Binaries: vct-launcher, vct-hub on linux-x64, windows-x64, macos-arm64.

@@ -110,9 +110,20 @@ jobs:
           pip install pytest
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # vct-hub is a pure-axum binary — no GTK/webkit deps. The
-      # Tauri-Linux apt step from .github/workflows/ci.yml is NOT
-      # required for this job.
+      # vct-hub links keyring with sync-secret-service on Linux, which
+      # requires libdbus-1.  This was the root cause of the 2/6 ubuntu
+      # cell failures on PR #274 (run 26480314750): cargo build exited 101
+      # with "pkg_config: dbus-1 not found".  The comment above ("pure-axum
+      # binary — no GTK/webkit deps") was correct about WebKit but missed
+      # the dbus transitive dep.  Minimal apt install mirrors the fix
+      # already applied to manifest-validate.yml in v0.2.41 (CI-8, W7).
+      # macOS + Windows runners do not have this step (if: ubuntu guard).
+      - name: Install libdbus-1-dev (Linux only — keyring dep)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Build vct-hub (release)
         shell: bash
         working-directory: launcher/src-tauri
@@ -178,4 +189,28 @@ jobs:
               echo "[step22-teardown] cleaning $d (run_id=$rid)"
               python -m tests.integration.step22_multi_project.fixture teardown --run-id "$rid" || true
             done
+          fi
+
+      # Cell-failure summary (CI-8, v0.2.42 W7).
+      # fail-fast: false means a failing cell doesn't cancel the others, but
+      # it also means the overall run summary shows a single red icon without
+      # identifying WHICH cells failed.  This step writes a GitHub Step
+      # Summary entry so the run's "Summary" tab surfaces the exact cell that
+      # regressed (OS / runtime pair) without requiring the operator to click
+      # into every matrix-leg log.
+      - name: Report matrix cell outcome
+        if: always()
+        shell: bash
+        run: |
+          CELL="${{ matrix.os }} / ${{ matrix.runtime }}"
+          STATUS="${{ job.status }}"
+          if [ "$STATUS" = "success" ]; then
+            echo "### Step 22 cell: $CELL — PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Step 22 cell: $CELL — FAIL (exit status: $STATUS)" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Likely causes:" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Linux: missing libdbus-1-dev (now installed above; if still failing, check pkg-config output)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Any OS: Cargo.lock windows-sys version conflict (check PR that triggered this run)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Any OS: pytest regression in tests/integration/step22_multi_project/" >> "$GITHUB_STEP_SUMMARY"
           fi
