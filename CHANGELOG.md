@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **V0243-3 (license_keys startup self-heal)**: if `license_keys` count=0 AND `~/.vct/license.key` exists non-empty, launcher startup now backfills the `__orchestrator__` row and writes the key to the OS keychain (`source=legacy_backfill_v0243`). Called from `lib.rs::setup()` after the module reconciler; hermetic 3-test suite covers empty-table insertion, no-op when table already populated, and no-op when file is absent.
+- **V0243-5-Rust (KG_BASE_DIR in Rust env writer)**: added `KG_BASE_DIR` to `CANONICAL_INSTALL_ENV_KEYS` and the `write_project_env_files` match arm (value = project folder). Propagates to both `.claude/env` and `.claude/settings.json::env`, mirroring the value `build_kg_sync_env` already passed to kg-sync subprocesses. Updated `install_match_arms_cover_every_canonical_key` test to include the new key.
+- **V0243-8 (restart: stub-protect UPDATE_DEFERRED.md)**: `clear_restart_deferral` now preserves files whose YAML frontmatter contains `stub: true` even when no real entries remain after stripping. Writes the stripped content back (so the `launcher_restart_required` section is removed) but does NOT unlink the file. Added `frontmatter_has_stub_flag` helper + 4 unit tests (stub preserved, stub stripped of section, non-stub deleted, frontmatter-false-positive check).
+- **V0243-12 (module_reconciler container_pull broken detection)**: `reconcile_installed_modules` now also flips status→`broken` for `container_pull` rows where `container_name IS NULL` AND `last_error` matches pull-failure patterns (`pull fail`, `unauthorized`, `retrieve auth`). Uses a lightweight JSON parse of the on-disk manifest to detect `install.method=container_pull` without deserializing the full manifest. 2 new tests.
+- **V0243-15 (update_orchestrator audit_log coverage)**: `update_orchestrator` writes `update_orchestrator_start` (old_version, source_commit, branch, install_path) at entry and `update_orchestrator_complete` (success, duration_ms, new_sha, branch) at the success exit and the "already up to date" exit. Best-effort via `app.try_state::<Db>()`.
+- **V0243-17 (module_mcp_tool_defaults post-install assertion)**: after `reconcile_module_tool_allowlist` on both install and update paths, if the manifest declares `mcp_registration.tool_allowlist` (non-empty), assert `>= 1` row exists in `module_mcp_tool_defaults` and forensic-log (+ `audit_log` entry) when zero rows found. Never blocks install; soft-fail throughout.
+
 ### Fixed
 
 - **V0243-0 (orchestrator-root shared-KG seed skip)**: `_seed_weaviate_shared_kg_only` no longer runs a redundant double-sync when the per-project KG and shared KG point at the same collection on an orchestrator-root install. New `_is_orchestrator_root_install()` helper detects the orchestrator clone (vct-module.json + install.py + vco_lib/ present). Upserts `app_state.last_installed_shared_kg_collection` on skip. 2 unit tests.

@@ -2139,6 +2139,11 @@ pub fn write_project_env_files(
                 // the 3 surfaces). Resolved by `populate()` via
                 // `crate::commands::installer::github_pat_for_env`.
                 "GITHUB_TOKEN" => settings.github_token.clone(),
+                // v0.2.43 V0243-5-Rust: project folder → KG_BASE_DIR.
+                // Always emitted (the folder is always known at write time).
+                // Mirrors the value `build_kg_sync_env` passes to kg-sync
+                // subprocesses so the two surfaces agree.
+                "KG_BASE_DIR" => Some(folder.display().to_string()),
                 other => panic!(
                     "CANONICAL_INSTALL_ENV_KEYS contains key {:?} but \
                      write_project_env_files has no match arm for it. \
@@ -3650,6 +3655,11 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     // `$GITHUB_TOKEN`) and the launcher takes over the per-project
     // gating via the env var.
     "GITHUB_TOKEN",
+    // v0.2.43 V0243-5-Rust: KG_BASE_DIR mirrors the project folder so
+    // .claude/settings.json::env and .claude/env agree with the value
+    // `build_kg_sync_env` already writes for kg-sync subprocesses. Value
+    // = the project's folder path. Always emitted (never None).
+    "KG_BASE_DIR",
 ];
 
 /// Canonical env keys the launcher OWNS across every surface. These are
@@ -7526,6 +7536,8 @@ mod tests {
             // OnboardingWizard's PAT keychain entry is absent or paused,
             // omitting the entry from every install surface.
             "GITHUB_TOKEN",
+            // v0.2.43 V0243-5-Rust: KG_BASE_DIR. Always emitted.
+            "KG_BASE_DIR",
         ].iter().copied().collect();
 
         for k in CANONICAL_INSTALL_ENV_KEYS.iter() {

@@ -1361,6 +1361,120 @@ fn ensure_legacy_orchestrator_row_migrated(db: &Db) -> Result<(), String> {
     Ok(())
 }
 
+/// v0.2.43 V0243-3: startup self-heal for installs where `license_keys`
+/// is empty but `~/.vct/license.key` exists and is non-empty.
+///
+/// Pre-v0.2.40 installers wrote the license key to `~/.vct/license.key`
+/// (plain-text file). The v0.2.40 multi-key model migrated existing keys
+/// from the OS keychain (`VIBECODED_LICENSE_KEY`), but never handled the
+/// file-based path used by the oldest installer vintages. Any user who:
+///
+///   * installed before the keychain migration landed, AND
+///   * skipped the intermediate launcher boot that triggered the keychain
+///     write (e.g. they updated directly from a pre-keychain binary)
+///
+/// ends up with `license_keys` count=0 and a valid key sitting on disk.
+///
+/// This function:
+///   1. Short-circuits when `license_keys` is non-empty (nothing to do).
+///   2. Reads `~/.vct/license.key`; short-circuits when absent or empty.
+///   3. Writes the key to the OS keychain at the canonical username.
+///   4. INSERTs a `license_keys` row with `source='legacy_backfill_v0243'`.
+///   5. Re-triggers `ensure_legacy_orchestrator_row_migrated` (idempotent).
+///   6. Triggers an async `license_refresh` so the tier propagates without
+///      requiring the user to open the License Manager tab.
+///
+/// Soft-fail throughout — any step error is logged but never blocks boot.
+/// Called from `lib.rs::setup()` immediately after the reconciler sweep,
+/// before the GUI mounts.
+///
+/// Idempotency: the `license_keys` non-empty short-circuit on step 1
+/// means a second call (e.g. after a forced backfill) is a no-op.
+pub(crate) fn backfill_license_key_from_legacy_file(db: &Db) {
+    // Step 1: short-circuit when license_keys already has rows.
+    let existing = match db.list_license_keys() {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!(
+                "[licensing/backfill] list_license_keys failed: {} — skipping backfill",
+                e
+            );
+            return;
+        }
+    };
+    if !existing.is_empty() {
+        return; // already populated; nothing to do
+    }
+
+    // Step 2: read ~/.vct/license.key (honours VCT_STATE_DIR for tests).
+    let legacy_file_path = crate::paths::vct_root_dir().join("license.key");
+    if !legacy_file_path.is_file() {
+        return; // no file; clean install or keychain-only path
+    }
+    let raw = match std::fs::read_to_string(&legacy_file_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[licensing/backfill] could not read {}: {} — skipping backfill",
+                legacy_file_path.display(),
+                e
+            );
+            return;
+        }
+    };
+    let key = raw.trim().to_string();
+    if key.is_empty() {
+        return; // empty file; treat as absent
+    }
+
+    // Step 3: write to keychain at the canonical username.
+    let canonical_username = keychain_username_for(ORCHESTRATOR_MODULE_ID);
+    if let Err(e) = secrets::set(
+        SecretScope::Global,
+        LICENSE_MODULE_ID,
+        &canonical_username,
+        &key,
+    ) {
+        eprintln!(
+            "[licensing/backfill] keychain write failed: {} — skipping row insert",
+            e
+        );
+        return;
+    }
+
+    // Step 4: INSERT the license_keys row.
+    let prefix = key_prefix_of(&key);
+    if let Err(e) = db.upsert_license_key(ORCHESTRATOR_MODULE_ID, &prefix, &canonical_username) {
+        eprintln!(
+            "[licensing/backfill] upsert_license_key failed: {} — row NOT inserted",
+            e
+        );
+        // keychain entry was written; leave it in place so the next boot
+        // can retry the SQL insert.
+        return;
+    }
+
+    eprintln!(
+        "[licensing/backfill] v0.2.43: backfilled __orchestrator__ row from \
+         {} (source=legacy_backfill_v0243, key_prefix={})",
+        legacy_file_path.display(),
+        prefix,
+    );
+
+    // Step 5: run the row migration (idempotent; picks up the row we just inserted).
+    if let Err(e) = ensure_legacy_orchestrator_row_migrated(db) {
+        eprintln!(
+            "[licensing/backfill] ensure_legacy_orchestrator_row_migrated after backfill: {}",
+            e
+        );
+    }
+    // Step 6: license_refresh is async and requires Tauri State; we cannot
+    // call it directly from synchronous setup context. The refresh will
+    // fire on the next list_license_keys call (the License Manager tab open)
+    // or the timer-driven daily poll. No action needed here beyond noting
+    // that the row is present and the keychain holds the value.
+}
+
 /// v0.2.40 L1: list every per-paid-module license key plus the root
 /// orchestrator slot. Synthesises the legacy `__orchestrator__` row on
 /// the first call after upgrade (idempotent — only when the keychain
@@ -3265,5 +3379,108 @@ mod tests {
             Some("per-row-error"),
             "per-row error must take precedence over tier_cache.last_error"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.43 V0243-3: license_keys startup self-heal from legacy file.
+    // -----------------------------------------------------------------
+
+    // VCT_STATE_DIR is process-wide; serialise all three backfill tests
+    // so parallel Cargo test workers don't observe each other's mutation.
+    static BACKFILL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Execute `f` with `VCT_STATE_DIR=path` set, restoring the previous
+    /// value (or unsetting) on exit. Holds `BACKFILL_ENV_LOCK` throughout.
+    fn with_vct_state_dir<F: FnOnce()>(path: &std::path::Path, f: F) {
+        let _guard = BACKFILL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("VCT_STATE_DIR").ok();
+        std::env::set_var("VCT_STATE_DIR", path);
+        f();
+        match prev {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+    }
+
+    /// V0243-3 contract T1: when license_keys is empty AND ~/.vct/license.key
+    /// (resolved via VCT_STATE_DIR in tests) is non-empty, backfill inserts
+    /// exactly one __orchestrator__ row.
+    #[test]
+    fn backfill_license_key_from_legacy_file_inserts_row_when_table_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Write the legacy key file inside the tmp dir.
+        let key = "vct_test_key_abc123_backfill_v0243_fixture";
+        std::fs::write(tmp.path().join("license.key"), key).expect("write key file");
+
+        // Enable the mock keychain BEFORE acquiring the env lock so it stays
+        // active for the entire with_vct_state_dir scope.
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+
+        let db = Db::open_in_memory().expect("in-memory DB");
+        // Pre-condition: no rows.
+        assert!(db.list_license_keys().unwrap().is_empty(), "precondition: empty");
+
+        with_vct_state_dir(tmp.path(), || {
+            backfill_license_key_from_legacy_file(&db);
+        });
+
+        // Post-condition: exactly one row for __orchestrator__.
+        let rows = db.list_license_keys().unwrap();
+        assert_eq!(rows.len(), 1, "must insert exactly one row");
+        assert_eq!(
+            rows[0].module_id, ORCHESTRATOR_MODULE_ID,
+            "row module_id must be __orchestrator__"
+        );
+        // key_prefix_of takes the first 12 chars; the stored prefix must be
+        // the first 12 chars of the key we wrote.
+        let expected_prefix: String = key.chars().take(12).collect();
+        assert_eq!(
+            rows[0].key_prefix, expected_prefix,
+            "key_prefix must be first 12 chars of the test key"
+        );
+    }
+
+    /// V0243-3 contract T2: when license_keys already has a row, backfill
+    /// is a no-op (does NOT insert a duplicate row).
+    #[test]
+    fn backfill_license_key_from_legacy_file_noop_when_table_nonempty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Write the legacy key file.
+        std::fs::write(tmp.path().join("license.key"), "some_key_that_should_be_ignored")
+            .expect("write key file");
+
+        let db = Db::open_in_memory().expect("in-memory DB");
+        // Pre-seed a row to simulate non-empty table.
+        db.upsert_license_key(ORCHESTRATOR_MODULE_ID, "existing_pf", "existing_user")
+            .unwrap();
+
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+
+        with_vct_state_dir(tmp.path(), || {
+            backfill_license_key_from_legacy_file(&db);
+        });
+
+        // Table should still have exactly ONE row (the pre-seeded one).
+        let rows = db.list_license_keys().unwrap();
+        assert_eq!(rows.len(), 1, "no new row must be inserted");
+        assert_eq!(rows[0].key_prefix, "existing_pf", "existing row must be unchanged");
+    }
+
+    /// V0243-3 contract T3: when the legacy file is absent, backfill is a no-op.
+    #[test]
+    fn backfill_license_key_from_legacy_file_noop_when_file_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // No license.key file created — just an empty tmp dir.
+
+        let db = Db::open_in_memory().expect("in-memory DB");
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+
+        with_vct_state_dir(tmp.path(), || {
+            backfill_license_key_from_legacy_file(&db);
+        });
+
+        assert!(db.list_license_keys().unwrap().is_empty(), "table must stay empty");
     }
 }

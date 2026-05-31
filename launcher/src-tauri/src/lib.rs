@@ -1086,6 +1086,17 @@ pub fn run() {
                 }
             }
 
+            // v0.2.43 V0243-3: license_keys self-heal. If the table is empty
+            // AND ~/.vct/license.key exists with a non-empty key (legacy file
+            // written by pre-v0.2.40 installers), backfill a row and write the
+            // key to the OS keychain. Soft-fail; must run before the GUI mounts
+            // so the License Manager tile shows a sensible state on first boot.
+            {
+                use tauri::Manager;
+                let db_ref = app.state::<crate::db::Db>();
+                commands::licensing::backfill_license_key_from_legacy_file(&db_ref);
+            }
+
             // System tray (v1.1)
             if let Err(e) = tray::setup(&app.handle()) {
                 eprintln!("[vct] tray setup failed: {}", e);
