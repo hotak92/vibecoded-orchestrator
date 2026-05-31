@@ -608,6 +608,15 @@ jobs:
       #   - Cross-OS path handling in vco_lib.config_projection / env_template
       #     (the actual content of the F5 path-consolidation review item —
       #     a Windows branch in vct_root_dir resolver is a follow-up.)
+      #
+      # --no-hub (CI-3-nohub, v0.2.42): skip Step 8 (vct-hub deployment +
+      # start). GitHub-hosted Windows + macOS runners don't have a pre-built
+      # vct-hub binary on PATH, no GitHub release download is available from
+      # inside the CI sandbox, and no `cargo build` is available without the
+      # Rust toolchain step. --no-hub leaves any already-running hub untouched;
+      # only the launch step is skipped. Auto-start fallback: hub starts when
+      # the launcher is next opened, or when the first Claude Code session
+      # begins in any installed project (session-start-ensure-hub hook).
       - name: Run install.py (no containers, no models)
         env:
           VCO_CI_FIXTURE: "1"
@@ -620,7 +629,7 @@ jobs:
           # on Windows and macOS bash alike.
           cp -r . "$INSTALL_ROOT/"
           cd "$INSTALL_ROOT"
-          python install.py --no-containers --skip-models || {
+          python install.py --no-containers --skip-models --no-hub || {
             echo "::warning::install.py exited non-zero on ${{ matrix.kind }}; continuing to check what was written"
           }
           echo "INSTALL_ROOT=$INSTALL_ROOT" >> "$GITHUB_ENV"
