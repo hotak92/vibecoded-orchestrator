@@ -1186,6 +1186,15 @@ pub fn run() {
                 },
             );
 
+            // v0.2.42 D1: daily deprecation-state poll. Fetches the L0
+            // module catalog every 24h (30s boot delay) and applies the
+            // catalog's `deprecated` + deprecation message fields for every
+            // installed (project × module) pair via `module_update_poll`.
+            // Writes last-poll timestamps to app_state. Soft-fail throughout.
+            crate::commands::module_deprecation::spawn_deprecation_poll(
+                app.handle().clone(),
+            );
+
             // v0.2.6 (Bug D3): background watcher that polls services
             // every 30s and auto-restarts on running→stopped transitions.
             // Logs to <install>/state/logs/services-watcher.jsonl. User
