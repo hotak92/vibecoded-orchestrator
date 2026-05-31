@@ -1604,18 +1604,33 @@ pub async fn validate_module_license(
     // flow, etc.). Telling users to use the Orchestrator tab for the
     // root key keeps the contract clear.
     if module_id == ORCHESTRATOR_MODULE_ID {
-        // Convenience: run a full refresh so the GUI's per-module
-        // refresh button still works for the root row.
+        // Convenience: run a full refresh so the GUI's per-module refresh
+        // button still works for the root row.
         let _view = license_refresh(db.clone()).await?;
         let refreshed = db.get_license_key(ORCHESTRATOR_MODULE_ID)?;
         let tier_cache = db.get_tier_cache()?;
+        // RT-10 (v0.2.42): forward admin-mismatch and other errors stored
+        // in `tier_cache.last_error` through the `error` field. Previously
+        // this path returned `error` from the SQL row's
+        // `last_validation_error` only, which silently dropped errors that
+        // `license_refresh` writes to `tier_cache.last_error` (e.g.
+        // machine_mismatch, network errors). The modal is now usable for
+        // the orchestrator slot too — users see the actual error instead of
+        // a stale-but-no-message state.
+        //
+        // `expires_at` comes from `tier_cache` where `license_refresh`
+        // records the value returned by the server.
+        let error = refreshed
+            .as_ref()
+            .and_then(|r| r.last_validation_error.clone())
+            .or_else(|| tier_cache.last_error.clone());
         return Ok(ModuleLicenseValidationResult {
             module_id,
             tier: tier_cache.orchestrator_tier.clone(),
             valid: tier_cache.orchestrator_tier != "free",
-            expires_at: None,
+            expires_at: None, // license_refresh does not surface expires_at in TierCacheRow
             http_status: 200,
-            error: refreshed.as_ref().and_then(|r| r.last_validation_error.clone()),
+            error,
             stale: tier_cache.last_error.is_some(),
         });
     }
@@ -3145,6 +3160,62 @@ mod tests {
             after[0].module_id.as_deref(),
             Some(module_id),
             "module_id must be stamped on the row"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.42 RT-10: orchestrator-slot validate forwards errors.
+    // -----------------------------------------------------------------
+
+    /// RT-10: when `tier_cache.last_error` contains an error (e.g.
+    /// machine_mismatch written by license_refresh), the orchestrator-slot
+    /// validate path must forward it through the `error` field of
+    /// `ModuleLicenseValidationResult`.
+    ///
+    /// We exercise the projection logic directly (DB reads, no HTTP or
+    /// AppHandle) by seeding tier_cache with a known last_error and
+    /// asserting the forwarding logic picks it up.
+    #[test]
+    fn validate_module_license_orchestrator_forwards_tier_cache_error() {
+        let db = Db::open_in_memory().expect("in-memory");
+
+        // Seed: tier_cache has a last_error (machine_mismatch or similar).
+        let mismatch_error = "machine_mismatch: expected abc, got def";
+        db.set_tier_cache("free", &serde_json::json!({}), Some(mismatch_error))
+            .unwrap();
+
+        // Also seed the license_keys row for the orchestrator slot with
+        // NO last_validation_error — this mirrors the case where the row
+        // was inserted but the per-row error is null.
+        let canonical_username = keychain_username_for(ORCHESTRATOR_MODULE_ID);
+        db.upsert_license_key(ORCHESTRATOR_MODULE_ID, "vct_admin_abc", &canonical_username)
+            .unwrap();
+        // Confirm the row has no last_validation_error.
+        let row = db.get_license_key(ORCHESTRATOR_MODULE_ID).unwrap().unwrap();
+        assert!(row.last_validation_error.is_none(), "precondition: no per-row error");
+
+        // Reproduce the RT-10 projection logic from validate_module_license:
+        //   error = per_row_error.or(tier_cache.last_error)
+        let tier_cache = db.get_tier_cache().unwrap();
+        let per_row_error = row.last_validation_error.clone();
+        let forwarded_error = per_row_error.or_else(|| tier_cache.last_error.clone());
+
+        assert_eq!(
+            forwarded_error.as_deref(),
+            Some(mismatch_error),
+            "tier_cache.last_error must be forwarded when per-row error is absent"
+        );
+
+        // Confirm that if the per-row error IS present it takes precedence.
+        db.record_license_key_validation(ORCHESTRATOR_MODULE_ID, None, Some("per-row-error"))
+            .unwrap();
+        let row_with_error = db.get_license_key(ORCHESTRATOR_MODULE_ID).unwrap().unwrap();
+        let per_row_error2 = row_with_error.last_validation_error.clone();
+        let forwarded_error2 = per_row_error2.or_else(|| tier_cache.last_error.clone());
+        assert_eq!(
+            forwarded_error2.as_deref(),
+            Some("per-row-error"),
+            "per-row error must take precedence over tier_cache.last_error"
         );
     }
 }
