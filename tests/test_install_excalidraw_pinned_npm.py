@@ -161,10 +161,13 @@ class FilePinHappyPathTests(unittest.TestCase):
         #   2. `npm install -g <vendor-abs-dir>` (success)
         #   3. post-install `npm view -g <name> version` (returns 2.0.0)
         # Integrity probe is SKIPPED for file: pins → no 4th stage.
+        ls_json_200 = json.dumps({"dependencies": {
+            "excalidraw-mcp-server": {"version": "2.0.0"}
+        }})
         stages = [
             (0, "", ""),
             (0, "+ excalidraw-mcp-server@2.0.0\n", ""),
-            (0, "2.0.0\n", ""),
+            (0, ls_json_200, ""),
         ]
         run_factory = _mk_run_factory(stages)
         with _patch_manifest(manifest), _patch_npm_path(), \
@@ -191,12 +194,13 @@ class FilePinHappyPathTests(unittest.TestCase):
             "vco_lib/excalidraw_mcp_fork",
         )
         # First query reports the vendored version → no install.
+        ls_json_200 = json.dumps({"dependencies": {
+            "excalidraw-mcp-server": {"version": "2.0.0"}
+        }})
         stages = [
-            (0, "2.0.0\n", ""),  # `npm view -g <name> version`
+            (0, ls_json_200, ""),  # `npm ls -g --json` (already at pin)
             # `_installed_npm_integrity` call for the audit row.
-            (0, json.dumps({"dependencies": {
-                "excalidraw-mcp-server": {"version": "2.0.0"}
-            }}), ""),
+            (0, ls_json_200, ""),
         ]
         run_factory = _mk_run_factory(stages)
         with _patch_manifest(manifest), _patch_npm_path(), \
@@ -307,10 +311,13 @@ class FilePinFailurePathTests(unittest.TestCase):
                 },
             },
         }
+        ls_json_199 = json.dumps({"dependencies": {
+            "excalidraw-mcp-server": {"version": "1.9.9"}
+        }})
         stages = [
             (0, "", ""),                                      # absent
             (0, "+ excalidraw-mcp-server@1.9.9\n", ""),       # install (wrong landed)
-            (0, "1.9.9\n", ""),                               # verify (mismatch)
+            (0, ls_json_199, ""),                             # verify (mismatch)
         ]
         run_factory = _mk_run_factory(stages)
         with _patch_manifest(manifest), _patch_npm_path(), \
@@ -340,15 +347,16 @@ class FilePinFailurePathTests(unittest.TestCase):
         # First invocation: absent → install → verify.
         # Second invocation: already at 2.0.0 → short-circuit (one extra
         # query for integrity audit).
+        ls_json_200 = json.dumps({"dependencies": {
+            "excalidraw-mcp-server": {"version": "2.0.0"}
+        }})
         stages = [
             (0, "", ""),
             (0, "+ excalidraw-mcp-server@2.0.0\n", ""),
-            (0, "2.0.0\n", ""),
+            (0, ls_json_200, ""),
             # Second call:
-            (0, "2.0.0\n", ""),
-            (0, json.dumps({"dependencies": {
-                "excalidraw-mcp-server": {"version": "2.0.0"}
-            }}), ""),
+            (0, ls_json_200, ""),
+            (0, ls_json_200, ""),
         ]
         run_factory = _mk_run_factory(stages)
         with _patch_manifest(manifest), _patch_npm_path(), \

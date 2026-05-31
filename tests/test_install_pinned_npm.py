@@ -134,10 +134,10 @@ class InstallPinnedNpmHappyPathTests(unittest.TestCase):
             }
         })
         stages = [
-            (0, "", ""),                  # initial `npm view -g` (absent) → empty stdout
+            (0, "", ""),                  # initial `npm ls -g --json` (absent) → empty stdout
             (0, "+ claude-mermaid@1.6.3\n", ""),  # `npm install -g pkg@ver`
-            (0, "1.6.3\n", ""),           # post-install `npm view -g version`
-            (0, ls_json, ""),             # `npm ls -g --json --depth=0 pkg`
+            (0, ls_json, ""),             # post-install `npm ls -g --json` version verify
+            (0, ls_json, ""),             # `npm ls -g --json --depth=0 pkg` (integrity)
         ]
         run_factory = _mk_run_factory(stages)
 
@@ -163,8 +163,8 @@ class InstallPinnedNpmHappyPathTests(unittest.TestCase):
             }
         })
         stages = [
-            (0, "1.6.3\n", ""),  # `npm view -g version` (already at pin)
-            (0, ls_json, ""),    # `npm ls -g --json` for audit-only integrity probe
+            (0, ls_json, ""),  # `npm ls -g --json` (already at pin)
+            (0, ls_json, ""),  # `npm ls -g --json` for audit-only integrity probe
         ]
         run_factory = _mk_run_factory(stages)
         with _patch_manifest(), _patch_npm_path(), \
@@ -259,10 +259,13 @@ class InstallPinnedNpmFailurePathTests(unittest.TestCase):
     def test_post_install_version_mismatch_returns_false(self) -> None:
         # npm install reports success but the resolver landed a
         # different version (peer-dep conflict or workspace override).
+        ls_json_162 = json.dumps({"dependencies": {
+            "claude-mermaid": {"version": "1.6.2"}
+        }})
         stages = [
             (0, "", ""),                          # initial probe (absent)
             (0, "+ claude-mermaid@1.6.2\n", ""),  # install (wrong version landed)
-            (0, "1.6.2\n", ""),                   # post-install verify
+            (0, ls_json_162, ""),                 # post-install verify
         ]
         run_factory = _mk_run_factory(stages)
         with _patch_manifest(), _patch_npm_path(), \
@@ -283,10 +286,15 @@ class InstallPinnedNpmFailurePathTests(unittest.TestCase):
                 }
             }
         })
+        good_ls_json = json.dumps({
+            "dependencies": {
+                "claude-mermaid": {"version": "1.6.3"}
+            }
+        })
         stages = [
             (0, "", ""),                            # initial probe
             (0, "+ claude-mermaid@1.6.3\n", ""),    # install
-            (0, "1.6.3\n", ""),                     # version verify (OK)
+            (0, good_ls_json, ""),                  # version verify (OK)
             (0, bad_ls_json, ""),                   # integrity (mismatch)
         ]
         run_factory = _mk_run_factory(stages)
@@ -311,7 +319,7 @@ class InstallPinnedNpmFailurePathTests(unittest.TestCase):
         stages = [
             (0, "", ""),
             (0, "+ claude-mermaid@1.6.3\n", ""),
-            (0, "1.6.3\n", ""),
+            (0, ls_json_no_shasum, ""),  # version verify (uses same npm ls JSON)
             (0, ls_json_no_shasum, ""),
         ]
         run_factory = _mk_run_factory(stages)
@@ -343,7 +351,10 @@ class CheckNpmPinDriftTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_no_drift_when_installed_matches_pin(self) -> None:
-        stages = [(0, "1.6.3\n", "")]
+        ls_json = json.dumps({"dependencies": {
+            "claude-mermaid": {"version": "1.6.3"}
+        }})
+        stages = [(0, ls_json, "")]
         run_factory = _mk_run_factory(stages)
         with _patch_manifest(), _patch_npm_path(), \
              mock.patch.object(subprocess, "run", side_effect=run_factory):
@@ -352,7 +363,10 @@ class CheckNpmPinDriftTests(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_drift_detected_when_versions_differ(self) -> None:
-        stages = [(0, "1.6.2\n", "")]
+        ls_json = json.dumps({"dependencies": {
+            "claude-mermaid": {"version": "1.6.2"}
+        }})
+        stages = [(0, ls_json, "")]
         run_factory = _mk_run_factory(stages)
         with _patch_manifest(), _patch_npm_path(), \
              mock.patch.object(subprocess, "run", side_effect=run_factory):
