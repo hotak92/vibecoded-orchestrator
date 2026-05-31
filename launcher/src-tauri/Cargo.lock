@@ -4090,6 +4090,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "serial_test"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94e153fc76e1c6a068703d6d29c508a0b15c061c4b7e43da59cc097bc342673c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "serialize-to-javascript"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5335,7 +5360,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vct-hub"
-version = "0.2.41"
+version = "0.2.42"
 dependencies = [
  "axum",
  "chrono",
@@ -5360,7 +5385,7 @@ dependencies = [
 
 [[package]]
 name = "vct-launcher-core"
-version = "0.2.41"
+version = "0.2.42"
 dependencies = [
  "chrono",
  "directories",
@@ -5376,6 +5401,7 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "serial_test",
  "sha2 0.11.0",
  "shlex",
  "sysinfo",
@@ -5388,7 +5414,7 @@ dependencies = [
 
 [[package]]
 name = "vct-launcher-temp"
-version = "0.2.41"
+version = "0.2.42"
 dependencies = [
  "axum",
  "chrono",
