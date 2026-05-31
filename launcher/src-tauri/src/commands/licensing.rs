@@ -2689,70 +2689,151 @@ mod tests {
         assert_eq!(s.tier.as_deref(), Some("pro"));
     }
 
-    /// The legacy synthesis path is idempotent — calling it twice
-    /// with no keychain entry is a no-op (no row created). With the
-    /// keychain entry present a row is created on the first call;
-    /// the second call short-circuits because the row exists.
-    ///
-    /// This test isn't hermetic: it touches the host keychain via
-    /// `secrets::get()` directly (no injection seam exists on this
-    /// helper, and adding one is L1 scope-creep). On a dev box where
-    /// the legacy `VIBECODED_LICENSE_KEY` keychain entry is actually
-    /// present, the migration WILL synthesise a row on the first call —
-    /// in that case we still assert idempotency (second call doesn't
-    /// re-create the row), just from the "row exists" branch instead.
+    // -----------------------------------------------------------------
+    // v0.2.42 W5-TEST3b: three hermetic replacements for the former
+    // `ensure_legacy_migration_is_idempotent_when_no_legacy_keychain_entry`
+    // silent-pass test. Each pins one discrete branch of
+    // `ensure_legacy_orchestrator_row_migrated` using the mock keychain.
+    // -----------------------------------------------------------------
+
+    /// Pins BRANCH 3 of `ensure_legacy_orchestrator_row_migrated`: no
+    /// legacy keychain entry and no existing row → migration is a no-op,
+    /// no row is created.
     #[test]
-    fn ensure_legacy_migration_is_idempotent_when_no_legacy_keychain_entry() {
+    fn mock_empty_no_op_no_legacy_entry_no_row_created() {
+        let _mock = secrets::for_tests::MockGuard::new();
+        // Mock is empty — no legacy VIBECODED_LICENSE_KEY entry.
         let db = Db::open_in_memory().expect("in-memory");
-        // First call: result depends on host keychain state.
-        let _ = ensure_legacy_orchestrator_row_migrated(&db);
-        let after_first = db.get_license_key(ORCHESTRATOR_MODULE_ID).unwrap();
-        // Idempotent second call — state must be identical to first.
-        let _ = ensure_legacy_orchestrator_row_migrated(&db);
-        let after_second = db.get_license_key(ORCHESTRATOR_MODULE_ID).unwrap();
-        match (after_first, after_second) {
-            (None, None) => {
-                // Clean keychain branch: no legacy entry, no row.
-            }
-            (Some(a), Some(b)) => {
-                // Dev-box branch: legacy entry present → migrated.
-                // Idempotency: row content identical between calls.
-                assert_eq!(
-                    a.key_prefix, b.key_prefix,
-                    "second call must not change the row"
-                );
-                assert_eq!(
-                    a.keychain_username, b.keychain_username,
-                    "second call must not change the row"
-                );
-                // L1.M (v0.2.40): post-migration the canonical username
-                // is what every row carries. If the host's legacy entry
-                // got migrated by this call, the row should point at the
-                // canonical username (not the legacy one). If the row was
-                // ALREADY at canonical from a prior L1.M run, same answer.
-                assert_eq!(
-                    a.keychain_username,
-                    keychain_username_for(ORCHESTRATOR_MODULE_ID),
-                    "migrated row must point at canonical username, not legacy"
-                );
-            }
-            _ => panic!("idempotency violated: first call's row state differs from second"),
-        }
+        ensure_legacy_orchestrator_row_migrated(&db)
+            .expect("must not error on clean install");
+        let row = db.get_license_key(ORCHESTRATOR_MODULE_ID).unwrap();
+        assert!(row.is_none(), "no row must be created when no legacy entry exists");
+    }
+
+    /// Pins BRANCH 2 of `ensure_legacy_orchestrator_row_migrated`: a
+    /// legacy keychain entry is present and no row exists → migration
+    /// writes the canonical entry, deletes the legacy entry, and inserts
+    /// a row pointing at the canonical username.
+    #[test]
+    fn mock_seeded_migrate_succeeds_legacy_entry_creates_canonical_row() {
+        let _mock = secrets::for_tests::MockGuard::new();
+        let canonical = keychain_username_for(ORCHESTRATOR_MODULE_ID);
+        let test_value = "vct_pro_w5_mock_migration_test";
+
+        // Seed: legacy entry present, no row, no canonical entry.
+        secrets::set(
+            SecretScope::Global,
+            LICENSE_MODULE_ID,
+            LEGACY_KEYCHAIN_USERNAME,
+            test_value,
+        )
+        .expect("mock set legacy");
+
+        let db = Db::open_in_memory().expect("in-memory");
+        ensure_legacy_orchestrator_row_migrated(&db)
+            .expect("migration must succeed");
+
+        // Canonical entry holds the value.
+        let canonical_value = secrets::get(
+            SecretScope::Global,
+            LICENSE_MODULE_ID,
+            &canonical,
+        )
+        .expect("mock get canonical");
+        assert_eq!(
+            canonical_value.as_deref(),
+            Some(test_value),
+            "canonical entry must hold the migrated value"
+        );
+
+        // Legacy entry was deleted (best-effort; the mock always succeeds).
+        let legacy_value = secrets::get(
+            SecretScope::Global,
+            LICENSE_MODULE_ID,
+            LEGACY_KEYCHAIN_USERNAME,
+        )
+        .expect("mock get legacy");
+        assert!(
+            legacy_value.is_none(),
+            "legacy entry must be deleted post-migration"
+        );
+
+        // Row exists at canonical username.
+        let row = db
+            .get_license_key(ORCHESTRATOR_MODULE_ID)
+            .unwrap()
+            .expect("row must be created by migration");
+        assert_eq!(
+            row.keychain_username, canonical,
+            "row must point at canonical username"
+        );
+    }
+
+    /// Pins idempotency of `ensure_legacy_orchestrator_row_migrated`: a
+    /// second call after a successful migration is a no-op — the row and
+    /// keychain state are identical after both calls.
+    #[test]
+    fn mock_idempotent_double_call_same_end_state() {
+        let _mock = secrets::for_tests::MockGuard::new();
+        let canonical = keychain_username_for(ORCHESTRATOR_MODULE_ID);
+        let test_value = "vct_pro_w5_idempotent_test";
+
+        // Seed: legacy entry present, no row.
+        secrets::set(
+            SecretScope::Global,
+            LICENSE_MODULE_ID,
+            LEGACY_KEYCHAIN_USERNAME,
+            test_value,
+        )
+        .expect("mock set");
+
+        let db = Db::open_in_memory().expect("in-memory");
+
+        // First call: migrates.
+        ensure_legacy_orchestrator_row_migrated(&db)
+            .expect("first call must succeed");
+        let row_after_first = db
+            .get_license_key(ORCHESTRATOR_MODULE_ID)
+            .unwrap()
+            .expect("row after first call");
+
+        // Second call: hits BRANCH 1b (row already at canonical username).
+        ensure_legacy_orchestrator_row_migrated(&db)
+            .expect("second call must succeed");
+        let row_after_second = db
+            .get_license_key(ORCHESTRATOR_MODULE_ID)
+            .unwrap()
+            .expect("row after second call");
+
+        assert_eq!(
+            row_after_first.keychain_username, row_after_second.keychain_username,
+            "second call must not change row keychain_username"
+        );
+        assert_eq!(
+            row_after_first.key_prefix, row_after_second.key_prefix,
+            "second call must not change row key_prefix"
+        );
+        assert_eq!(
+            row_after_second.keychain_username, canonical,
+            "row must point at canonical username after idempotent double-call"
+        );
     }
 
     // -----------------------------------------------------------------
     // v0.2.40 L1.M: legacy-username migration tests.
     //
-    // The full READ-legacy → WRITE-canonical → DELETE-legacy → UPSERT-row
-    // flow touches the host keychain via `secrets::get/set/delete`. There
-    // is no mock-keychain injection seam in `secrets.rs` (adding one is
-    // L1.M scope-creep). Tests that exercise the keychain are gated
-    // behind `#[ignore]` and carefully scoped to leave the dev-box
-    // keychain in a known-good state.
+    // v0.2.42 W5 update: a thread-local mock keychain seam was added to
+    // `vct-launcher-core/src/secrets.rs` (`secrets::for_tests`). The
+    // full READ-legacy → WRITE-canonical → DELETE-legacy → UPSERT-row
+    // flow is now exercised hermetically via the mock (no host keychain
+    // access, no `#[ignore]`). The previously `#[ignore]`d tests have
+    // been un-ignored and use `secrets::for_tests::MockGuard`.
     //
-    // The DB-side branches (1b: row already at canonical → no-op,
-    // BRANCH 3: no row + no legacy entry → no-op) are exercised
-    // hermetically below by seeding the DB directly.
+    // All branches are now covered without touching the host keychain:
+    // BRANCH 1b (mock_empty_no_op, migrate_no_op_when_row_already_at_canonical_username),
+    // BRANCH 2 (mock_seeded_migrate_succeeds, migrate_full_flow_legacy_to_canonical),
+    // BRANCH 3 (mock_empty_no_op, migrate_does_not_error_on_clean_install),
+    // idempotency (mock_idempotent_double_call).
     // -----------------------------------------------------------------
 
     /// L1.M BRANCH 1b (hermetic): a row already pointing at the
@@ -2793,23 +2874,15 @@ mod tests {
     /// L1.M BRANCH 3 (hermetic): clean install — no row, no legacy
     /// keychain entry. Migration is a no-op (no row created).
     ///
-    /// This test is hermetic only when the dev-box host keychain does
-    /// NOT have a legacy `VIBECODED_LICENSE_KEY` entry. We can't assert
-    /// "no row created" universally because the legacy entry might be
-    /// present (we'd then migrate BRANCH 2). Instead we assert the
-    /// MIGRATION DOES NOT ERROR — covers the legitimate clean-install
-    /// branch (no panic, soft-fail discipline preserved).
-    ///
-    /// `#[ignore]` because the migration helper calls `secrets::get`
-    /// which fails on CI Ubuntu runners (no D-Bus secret-service
-    /// session). Run via `cargo test --lib ... -- --ignored` in an
-    /// environment with a host keychain. v0.2.41 CI-gate hotfix.
+    /// v0.2.42 W5-TEST3b: previously `#[ignore]`d because the migration
+    /// helper calls `secrets::get` which fails on CI Ubuntu runners (no
+    /// D-Bus). Now uses the mock keychain seam (secrets::for_tests) so
+    /// the test runs hermetically on CI without touching the host keychain.
     #[tokio::test]
-    #[ignore = "touches host OS keychain via secrets::get — opt-in via --ignored"]
     async fn migrate_does_not_error_on_clean_install() {
+        let _mock = secrets::for_tests::MockGuard::new();
         let db = Db::open_in_memory().expect("in-memory");
-        // No seeded row. Whether the host keychain has the legacy
-        // entry or not, the migration must complete cleanly.
+        // No seeded row, no legacy entry in mock → BRANCH 3, no-op.
         let r = ensure_legacy_orchestrator_row_migrated(&db);
         assert!(
             r.is_ok(),
@@ -2827,7 +2900,8 @@ mod tests {
     ///
     /// We exercise the SQL pathway directly (db.upsert_license_key) to
     /// pin the contract; the wrapper helper's keychain ordering is
-    /// exercised by the `#[ignore]`d keychain-touching tests below.
+    /// exercised by the mock-keychain tests below (migrate_full_flow_legacy_to_canonical,
+    /// migrate_does_not_error_on_clean_install — both un-ignored in v0.2.42 W5).
     #[tokio::test]
     async fn migrate_row_rewrite_preserves_key_prefix() {
         let db = Db::open_in_memory().expect("in-memory");
@@ -2868,44 +2942,22 @@ mod tests {
         );
     }
 
-    /// L1.M BRANCH 2 (touches host keychain — `#[ignore]`d).
+    /// L1.M BRANCH 2 (hermetic via mock keychain).
     /// End-to-end: legacy entry in keychain, no row → migration writes
     /// canonical entry, deletes legacy entry, inserts row at canonical.
+    /// Includes idempotency: second call hits BRANCH 1b and is a no-op.
     ///
-    /// IGNORED by default to avoid clobbering a developer's real
-    /// `VIBECODED_LICENSE_KEY` keychain entry during CI runs. Run via
-    /// `cargo test --lib commands::licensing::tests::migrate_full_flow_legacy_to_canonical -- --ignored`
-    /// in an environment where you don't mind the keychain being touched
-    /// (e.g. a fresh test user account, or after backing up the entry).
+    /// v0.2.42 W5-TEST3b: previously `#[ignore]`d because it touched
+    /// the host OS keychain. Now uses the mock keychain seam so it runs
+    /// hermetically on CI (no D-Bus / host keychain access).
     #[tokio::test]
-    #[ignore = "touches host OS keychain — opt-in via --ignored"]
     async fn migrate_full_flow_legacy_to_canonical() {
+        let _mock = secrets::for_tests::MockGuard::new();
         let db = Db::open_in_memory().expect("in-memory");
         let canonical = keychain_username_for(ORCHESTRATOR_MODULE_ID);
         let test_value = "vct_pro_l1m_migration_test_value";
 
-        // Capture prior state so we can restore (no clobbering the
-        // developer's real key).
-        let prior_legacy = secrets::get(
-            SecretScope::Global,
-            LICENSE_MODULE_ID,
-            LEGACY_KEYCHAIN_USERNAME,
-        )
-        .unwrap();
-        let prior_canonical = secrets::get(
-            SecretScope::Global,
-            LICENSE_MODULE_ID,
-            &canonical,
-        )
-        .unwrap();
-
-        // Seed: legacy keychain entry present, no row, no canonical
-        // entry yet.
-        let _ = secrets::delete(
-            SecretScope::Global,
-            LICENSE_MODULE_ID,
-            &canonical,
-        );
+        // Seed: legacy keychain entry present, no row, no canonical entry.
         secrets::set(
             SecretScope::Global,
             LICENSE_MODULE_ID,
@@ -2914,11 +2966,11 @@ mod tests {
         )
         .unwrap();
 
-        // Migration.
+        // Migration: BRANCH 2.
         ensure_legacy_orchestrator_row_migrated(&db)
             .expect("migration succeeds");
 
-        // Assert: canonical entry holds the value.
+        // Canonical entry holds the value.
         let canonical_value = secrets::get(
             SecretScope::Global,
             LICENSE_MODULE_ID,
@@ -2927,7 +2979,7 @@ mod tests {
         .unwrap();
         assert_eq!(canonical_value.as_deref(), Some(test_value));
 
-        // Assert: legacy entry was deleted.
+        // Legacy entry was deleted.
         let legacy_value = secrets::get(
             SecretScope::Global,
             LICENSE_MODULE_ID,
@@ -2939,14 +2991,15 @@ mod tests {
             "legacy keychain entry must be deleted post-migration"
         );
 
-        // Assert: row exists at canonical username.
+        // Row exists at canonical username.
         let row = db
             .get_license_key(ORCHESTRATOR_MODULE_ID)
             .unwrap()
             .expect("row created");
         assert_eq!(row.keychain_username, canonical);
 
-        // Idempotency: a second call is a no-op.
+        // Idempotency: second call hits BRANCH 1b (row already at
+        // canonical) and is a no-op.
         ensure_legacy_orchestrator_row_migrated(&db)
             .expect("second call no-op");
         let still_canonical = secrets::get(
@@ -2956,35 +3009,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(still_canonical.as_deref(), Some(test_value));
-
-        // Restore prior state so the dev-box keychain is unchanged.
-        let _ = secrets::delete(
-            SecretScope::Global,
-            LICENSE_MODULE_ID,
-            &canonical,
-        );
-        let _ = secrets::delete(
-            SecretScope::Global,
-            LICENSE_MODULE_ID,
-            LEGACY_KEYCHAIN_USERNAME,
-        );
-        if let Some(v) = prior_canonical {
-            secrets::set(
-                SecretScope::Global,
-                LICENSE_MODULE_ID,
-                &canonical,
-                &v,
-            )
-            .unwrap();
-        }
-        if let Some(v) = prior_legacy {
-            secrets::set(
-                SecretScope::Global,
-                LICENSE_MODULE_ID,
-                LEGACY_KEYCHAIN_USERNAME,
-                &v,
-            )
-            .unwrap();
-        }
     }
 }

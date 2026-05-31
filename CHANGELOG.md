@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI-7**: Added `launcher/dist/**` to `ci.yml` `paths-ignore` (push + pull_request) so the release binary-refresh commit no longer triggers the full CI matrix.
 - **CI-9**: Added `timeout-minutes: 12` to `manifest-validate.yml` `validate-manifests` job to prevent runaway Rust compilations from burning unbounded CI minutes.
 
+### Tests
+
+- W5-TEST3: added `cfg(any(test, debug_assertions))` thread-local mock keychain seam in `vct-launcher-core/src/secrets.rs`; un-ignored 2 L1.M keychain tests (`migrate_does_not_error_on_clean_install`, `migrate_full_flow_legacy_to_canonical`) + replaced 1 silent-pass test with 3 hermetic mock-backed siblings (`mock_empty_no_op`, `mock_seeded_migrate_succeeds`, `mock_idempotent_double_call`). All formerly-ignored tests now run on CI without D-Bus.
+
 ## [0.2.41] — 2026-05-31
 
 ### Fixed
