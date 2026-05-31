@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **RT-8**: Added `PRAGMA busy_timeout=5000` to both `Db::open()` (vct-launcher-core) and vct-hub's `open_db()` to match `install.py`'s `sqlite3.connect(..., timeout=5.0)`. Prevents SQLITE_BUSY failures when the launcher and a Python install script contend on the same DB file.
+- **RT-11**: `resolve_project_name` in `vco_lib/paths.py` now logs a `WARNING` instead of silently swallowing hub-resolver failures. Fallback to env-based resolution is unchanged; the warning makes drift visible in operator logs.
+
+### Tests
+
+- **TEST-1**: Fixed 8 `test_rebuild_diagram_index_cli.py` failures on dev boxes with a populated `~/.vct/launcher.db`. Added `autouse` fixture that sets `VCT_STATE_DIR` to a per-test tmp dir and seeds a minimal `projects` + `project_diagrams` schema with a `demo-project` row so the FK constraint in `_upsert_row` is satisfiable without touching the production DB.
+- **TEST-2**: Converted 31 silent `eprintln!("skipping...") + return` patterns to `#[ignore = "..."]` in `vct-hub/src/cli_api.rs` (11 Weaviate integration tests), `vct-hub/src/modules_api.rs` (8 keychain tests), `src/commands/secrets_cmd.rs` (8 keychain tests), `src/commands/dashboard.rs` (2 keychain tests). Tests now appear as `ignored` in `cargo test` output instead of silently passing.
+- **TEST-4**: `_weaviate_reachable()` in `tests/test_vco_lib_migrate.py` now checks `WEAVIATE_AVAILABLE` (guarded by `try: import weaviate` / `except ImportError`) before probing the network. Prevents `ImportError` from turning the `LiveMigrateIntegrationTest` class into a collection failure on envs without the weaviate client installed.
+- **TEST-5**: Deleted dead 129-line `BackfillCodeGraphProjectEnvTests` class (Phase 0.B Part 2, 2026-05-25 — legacy add-only-missing-keys contract replaced by `apply_project_env`). Added 2-test `LegacyBackfillRemovedTest` sentinel asserting the deprecated code path doesn't regress.
+- **TEST-6**: Converted 14 `pytest.skip` calls to `pytest.fail` for in-repo shipped assets (hook dirs/files, `_normalize_typed_links`, analyzer module, `weaviate_mcp.server`). Missing shipped files in CI are regressions, not legitimate skips. Net: 9 fewer skips, 0 new failures.
+- **TEST-7**: Moved 3 `daemon_usable_probe_*` tests in `vct-launcher-core/src/services/runtime.rs` from `#[ignore]` to `#[serial]` (new `serial_test = "3"` dev-dep). Tests now run serially on every `cargo test` invocation instead of being silently skipped.
+- **TEST-8**: Re-enabled `refresh_project_env_with_db_re_runs_env_writer` (`projects_v2.rs`). Added `python_env_available()` + `has_launcher_db()` helpers to `vct-launcher-core/src/test_env.rs`. Test now skips (eprintln+return) only when `python3 -c "import vco_lib"` fails; uses `with_state_dir` for an on-disk DB the Python subprocess can read.
+- **CLEAN-1**: Deleted dead `pub const RL_RERANKER_MODULE_ID` (hub-side, `vct-hub/src/module_supervisor.rs`) — zero callers since v0.2.40 NEW-3.E generalised the gate. Removes the `#[allow(dead_code)]` annotation too (~12 LoC).
+
 ## [0.2.41] — 2026-05-31
 
 ### Fixed
