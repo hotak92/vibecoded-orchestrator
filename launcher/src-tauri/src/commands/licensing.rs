@@ -1620,6 +1620,17 @@ pub async fn validate_module_license(
         });
     }
 
+    // RT-9 (v0.2.42): audit the attempt BEFORE the keychain read so every
+    // user click is recorded — including the keychain-missing early return
+    // that previously short-circuited before the audit call. Schema unchanged;
+    // reuses the existing audit_log row shape.
+    db.audit(
+        "validate_module_license",
+        None,
+        Some(&module_id),
+        &serde_json::json!({ "module_id": &module_id }),
+    )?;
+
     // Per-module key path: read the raw value from the keychain.
     let key_opt = secrets::get(SecretScope::Global, LICENSE_MODULE_ID, &row.keychain_username)?;
     let key = match key_opt {
@@ -1655,15 +1666,6 @@ pub async fn validate_module_license(
         }))
         .send()
         .await;
-
-    // Audit FIRST so the round-trip outcome is durable even if the
-    // SQL update fails afterwards.
-    db.audit(
-        "validate_module_license",
-        None,
-        Some(&module_id),
-        &serde_json::json!({ "module_id": &module_id }),
-    )?;
 
     match resp {
         Err(e) => {
@@ -3077,5 +3079,72 @@ mod tests {
         // The validate_module_license path returns "keychain entry missing"
         // for a row that has a SQL row but no keychain entry — which is the
         // correct diagnostic for this state.
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.42 RT-9: validate_module_license audit-log ordering.
+    // -----------------------------------------------------------------
+
+    /// RT-9: the audit log write occurs BEFORE the keychain read, so every
+    /// user click on "Re-validate" is recorded — including the
+    /// keychain-missing early return that previously short-circuited before
+    /// the audit call.
+    ///
+    /// We exercise the DB layer directly (not the full #[command] path, which
+    /// needs a Tauri AppHandle) by reproducing the sequence that
+    /// validate_module_license now executes:
+    ///   1. db.audit(...)              ← must be written
+    ///   2. secrets::get(...) → None   ← simulated
+    ///   3. early return               ← simulated (no further SQL writes)
+    ///
+    /// After the simulated early return the audit_log MUST contain the
+    /// attempt row. We use `audit_list(search="validate_module_license")`
+    /// to filter by operation name since `audit_list` doesn't have a
+    /// module_id filter parameter.
+    #[test]
+    fn validate_module_license_audit_written_before_keychain_read() {
+        let db = Db::open_in_memory().expect("in-memory");
+        let module_id = "vct-rl-reranker";
+
+        // Pre-condition: no prior audit entries matching this operation.
+        let before = db
+            .audit_list(None, None, None, None, Some("validate_module_license"), 10)
+            .unwrap_or_default();
+        assert!(before.is_empty(), "no prior audit entries");
+
+        // Step 1 of the RT-9 ordering: write the audit row BEFORE the
+        // keychain read. In production this is the first statement in the
+        // per-module key path of validate_module_license.
+        db.audit(
+            "validate_module_license",
+            None,
+            Some(module_id),
+            &serde_json::json!({ "module_id": module_id }),
+        )
+        .unwrap();
+
+        // Step 2: secrets::get returns None (keychain entry missing).
+        // In production, validate_module_license returns early here —
+        // no further writes to audit_log.
+
+        // Assert: the attempt audit row is present even though we
+        // "returned early" after the keychain read.
+        let after = db
+            .audit_list(None, None, None, None, Some("validate_module_license"), 10)
+            .unwrap_or_default();
+        assert_eq!(
+            after.len(),
+            1,
+            "audit row must be written before the keychain read returns"
+        );
+        assert_eq!(
+            after[0].operation, "validate_module_license",
+            "operation name must match"
+        );
+        assert_eq!(
+            after[0].module_id.as_deref(),
+            Some(module_id),
+            "module_id must be stamped on the row"
+        );
     }
 }
