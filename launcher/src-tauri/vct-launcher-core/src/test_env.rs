@@ -120,6 +120,42 @@ pub fn with_env_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
     }
 }
 
+/// Probe whether Python 3 with `vco_lib` is importable in this environment.
+///
+/// Used as a skip guard for tests that subprocess into Python
+/// (e.g. `refresh_project_env_with_db_re_runs_env_writer`). Returns
+/// `true` only if:
+///  1. A `python3` binary is reachable on PATH (or via the VCT venv
+///     resolution chain), AND
+///  2. `import vco_lib` succeeds in that interpreter.
+///
+/// Not gated on `cfg(test)` so it's usable from the launcher crate's
+/// tests too.
+#[cfg(any(test, debug_assertions))]
+pub fn python_env_available() -> bool {
+    // Fast path: check whether python3 can import vco_lib.
+    // We use the same interpreter discovery order as
+    // resolve_python_for_vco_lib_local() but do it cheaply without
+    // pulling in that function (which has many deps). A simple `which
+    // python3` + subprocess is sufficient for the probe.
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg("import vco_lib")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    matches!(output, Ok(out) if out.status.success())
+}
+
+/// Return `true` if the on-disk launcher DB exists (i.e. the launcher has
+/// been run at least once in this environment). Used alongside
+/// `python_env_available` to gate integration-level tests that require
+/// both an on-disk DB and a working Python env.
+#[cfg(any(test, debug_assertions))]
+pub fn has_launcher_db() -> bool {
+    crate::paths::vct_root_dir().join("launcher.db").exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
