@@ -97,7 +97,7 @@ tempfile = "3"
 # Version 0.8 is the family already transitively in the lockfile (via
 # Tauri / its deps), so adding it as a direct dep is zero net build
 # size — just promotes the resolved version to a first-class edge.
-schemars = { version = "0.8", features = ["preserve_order"] }
+schemars = { version = "1.2", features = ["preserve_order"] }
 
 # Bug 31: libc statvfs for free-space probe (Unix only)
 [target.'cfg(unix)'.dependencies]
