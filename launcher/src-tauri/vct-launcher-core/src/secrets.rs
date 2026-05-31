@@ -340,8 +340,8 @@ pub fn set(
     value: &str,
 ) -> Result<(), String> {
     #[cfg(any(test, debug_assertions))]
-    if for_tests::mock_set(scope, module_id, key, value) {
-        return Ok(());
+    if let Some(result) = for_tests::mock_set(scope, module_id, key, value) {
+        return result;
     }
     let e = entry(scope, module_id, key)?;
     retry_with_backoff(|| e.set_password(value))
@@ -720,12 +720,17 @@ pub mod test_serialize {
 pub mod for_tests {
     use super::SecretScope;
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Thread-local store: Some(map) when mock is active, None when inactive.
     thread_local! {
         static MOCK_STORE: RefCell<Option<HashMap<(String, String), String>>> =
             const { RefCell::new(None) };
+
+        // Keys registered to fail on the next `mock_set` call.
+        // Entry is consumed (one-shot) when the failure fires.
+        static MOCK_FAIL_KEYS: RefCell<HashSet<String>> =
+            RefCell::new(HashSet::new());
     }
 
     /// Enable the thread-local mock keychain for this thread.
@@ -746,14 +751,18 @@ pub mod for_tests {
     /// Disable the thread-local mock keychain for this thread.
     ///
     /// After this call, `secrets::get/set/delete` fall through to the OS
-    /// keychain again. Safe to call when the mock isn't active.
+    /// keychain again. Safe to call when the mock isn't active. Also clears
+    /// any pending fail-keys so they don't leak to subsequent mock sessions.
     pub fn disable_mock() {
         MOCK_STORE.with(|cell| {
             *cell.borrow_mut() = None;
         });
+        MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
     }
 
     /// Empty the thread-local mock store without disabling it.
+    ///
+    /// Also clears any pending fail-keys registered via `fail_next_set`.
     ///
     /// Useful for resetting state between test cases that share a mock
     /// lifecycle, without the overhead of `disable_mock` + `enable_mock`.
@@ -762,6 +771,30 @@ pub mod for_tests {
             if let Some(map) = cell.borrow_mut().as_mut() {
                 map.clear();
             }
+        });
+        MOCK_FAIL_KEYS.with(|cell| cell.borrow_mut().clear());
+    }
+
+    /// Register `key` (keychain username) to fail on the **next** `secrets::set`
+    /// call that targets it. The failure is one-shot: after firing it is
+    /// removed from the fail-set. Subsequent `secrets::set` calls with the
+    /// same key succeed normally.
+    ///
+    /// The mock must already be active (call after `enable_mock()` or inside a
+    /// `MockGuard` scope). Registering a fail-key when the mock is inactive is
+    /// a no-op — the `secrets::set` path that checks the fail-set is only
+    /// reached when `MOCK_STORE` is `Some`.
+    ///
+    /// # Usage
+    /// ```no_run
+    /// let _g = secrets::for_tests::MockGuard::new();
+    /// secrets::for_tests::fail_next_set("vct.mod.username");
+    /// let result = secrets::set(SecretScope::Global, "mod", "username", "val");
+    /// assert!(result.is_err(), "keychain write must fail");
+    /// ```
+    pub fn fail_next_set(key: &str) {
+        MOCK_FAIL_KEYS.with(|cell| {
+            cell.borrow_mut().insert(key.to_string());
         });
     }
 
@@ -803,24 +836,36 @@ pub mod for_tests {
 
     // ── Internal helpers called from secrets::get/set/delete ──────────────
 
-    /// Called from `secrets::set` when `cfg(test)`. Returns `true` if the
-    /// mock was active and handled the write (caller must return Ok(())).
-    /// Returns `false` when the mock is inactive (caller falls through to
-    /// the real keychain).
+    /// Called from `secrets::set` when `cfg(test)`.
+    ///
+    /// Returns:
+    /// - `None`       — mock is inactive; caller falls through to the real keychain.
+    /// - `Some(Ok(()))` — mock was active and handled the write successfully.
+    /// - `Some(Err(…))` — mock was active and injected a failure (key was in
+    ///   the fail-set via `fail_next_set`). The fail entry is consumed (one-shot).
     pub(super) fn mock_set(
         scope: SecretScope<'_>,
         module_id: &str,
         key: &str,
         value: &str,
-    ) -> bool {
+    ) -> Option<Result<(), String>> {
         MOCK_STORE.with(|cell| {
             let mut slot = cell.borrow_mut();
             match slot.as_mut() {
-                None => false,
+                None => None,
                 Some(map) => {
                     let service = scope.service_name(module_id);
+                    // Check if this key has a registered failure (one-shot).
+                    let should_fail = MOCK_FAIL_KEYS.with(|fail_cell| {
+                        fail_cell.borrow_mut().remove(key)
+                    });
+                    if should_fail {
+                        return Some(Err(format!(
+                            "mock keychain set failure injected for key: {key}"
+                        )));
+                    }
                     map.insert((service, key.to_string()), value.to_string());
-                    true
+                    Some(Ok(()))
                 }
             }
         })
@@ -1205,5 +1250,59 @@ mod tests {
         set(scope, "m", "b", "2").unwrap();
         let snap = for_tests::snapshot().expect("mock active");
         assert_eq!(snap.len(), 2);
+    }
+
+    // ─── fail_next_set tests (v0.2.42 D2) ─────────────────────────────────
+
+    /// fail_next_set causes the next secrets::set for that key to return Err.
+    /// The entry is one-shot: a subsequent set for the same key succeeds.
+    #[test]
+    fn mock_fail_next_set_is_one_shot() {
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+
+        for_tests::fail_next_set("target_key");
+
+        // First call fails (failure consumed).
+        let first = set(scope, "mod", "target_key", "val1");
+        assert!(first.is_err(), "first set must fail after fail_next_set");
+
+        // Second call succeeds (fail-set is now empty for this key).
+        let second = set(scope, "mod", "target_key", "val2");
+        assert!(second.is_ok(), "second set must succeed (one-shot exhausted)");
+
+        // Entry was written by the successful second call.
+        assert_eq!(
+            get(scope, "mod", "target_key").unwrap().as_deref(),
+            Some("val2")
+        );
+    }
+
+    /// fail_next_set is key-scoped: only the targeted key fails; other keys
+    /// in the same mock session are unaffected.
+    #[test]
+    fn mock_fail_next_set_scoped_to_targeted_key() {
+        let _g = for_tests::MockGuard::new();
+        let scope = SecretScope::Global;
+
+        for_tests::fail_next_set("fail_key");
+
+        // Unregistered key succeeds normally.
+        set(scope, "mod", "ok_key", "ok_val").unwrap();
+        assert_eq!(
+            get(scope, "mod", "ok_key").unwrap().as_deref(),
+            Some("ok_val"),
+            "ok_key must not be affected by fail registered for fail_key"
+        );
+
+        // Registered key still fails (not yet consumed).
+        let result = set(scope, "mod", "fail_key", "val");
+        assert!(result.is_err(), "fail_key must fail as registered");
+
+        // Failure doesn't write to the store.
+        assert!(
+            get(scope, "mod", "fail_key").unwrap().is_none(),
+            "failed write must not leave a stale entry"
+        );
     }
 }

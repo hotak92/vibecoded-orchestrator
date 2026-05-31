@@ -3095,31 +3095,49 @@ mod tests {
     /// `validate_module_license` will return "keychain entry missing" on
     /// the next user click rather than silently claiming the key is active.
     ///
-    /// `#[ignore]` because injecting a keychain failure requires the
-    /// mock-keychain seam that W5 is responsible for adding. Once W5 lands,
-    /// remove the `#[ignore]` and replace the `secrets::set` stub comment
-    /// with the mock-keychain injection call.
+    /// Uses the W5 mock-keychain seam (`secrets::for_tests::fail_next_set`)
+    /// to inject a one-shot keychain write failure and verify that step 3
+    /// (prefix update) is never reached.
     #[test]
-    #[ignore = "depends on W5 mock-keychain seam to inject keychain write failure"]
     fn set_module_license_key_pending_row_left_when_keychain_fails() {
+        let _guard = secrets::for_tests::MockGuard::new();
         let db = Db::open_in_memory().expect("in-memory");
         let module_id = "vct-rl-reranker";
         let username = keychain_username_for(module_id);
+        let raw_key = "vct_pro_abcdefghijklmnop";
 
-        // Step 1: SQL row with "(pending)".
+        // Step 1: SQL row with "(pending)" — mirrors what set_module_license_key
+        // does as its very first write (RT-7 invariant).
         db.upsert_license_key(module_id, "(pending)", &username).unwrap();
+        let pending_row = db.get_license_key(module_id).unwrap().unwrap();
+        assert_eq!(pending_row.key_prefix, "(pending)", "step 1: sentinel present");
 
-        // Step 2: keychain write FAILS (injected via W5 mock seam).
-        // TODO(W5): replace with mock-keychain injection that returns Err.
-        // let _ = inject_keychain_failure(&username);
+        // Step 2: keychain write FAILS (injected via W5 mock seam, one-shot).
+        secrets::for_tests::fail_next_set(&username);
+        let keychain_result = secrets::set(
+            SecretScope::Global,
+            LICENSE_MODULE_ID,
+            &username,
+            raw_key,
+        );
+        assert!(
+            keychain_result.is_err(),
+            "mock failure must propagate as Err from secrets::set"
+        );
 
-        // Step 3 would NOT run (real code returns early on step 2 Err).
-
-        // Assert: row still has "(pending)" prefix — not cleaned up.
+        // Step 3 does NOT run (real code returns early on step 2 Err).
+        // DB must still have the "(pending)" sentinel — not cleaned up.
         let row = db.get_license_key(module_id).unwrap().unwrap();
         assert_eq!(
             row.key_prefix, "(pending)",
             "partial failure must leave (pending) sentinel, not a clean state"
+        );
+        // Keychain must have no entry for this username (failure didn't write).
+        let keychain_entry = secrets::get(SecretScope::Global, LICENSE_MODULE_ID, &username)
+            .expect("mock get must not error");
+        assert!(
+            keychain_entry.is_none(),
+            "failed keychain write must not leave a stale entry"
         );
         // The validate_module_license path returns "keychain entry missing"
         // for a row that has a SQL row but no keychain entry — which is the
