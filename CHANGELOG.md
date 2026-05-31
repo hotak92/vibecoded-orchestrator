@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **V0243-2 (BLOCKER — kg_named_vector_slots migration)**: `_migrate_kg_named_vector_slots` added to install.py step 7d/10. Ensures `$KG_COLLECTION` and `$DEVELOPMENT_COLLECTION` carry all 5 named-vector slots from the v0.2.18 catalog (qwen3_embed + ollama_embed + openai_embed + arctic2_embed + openai_text_embed). Collections created before v0.2.18 only had 3 slots; the new slots are added additively (UNION strategy — no re-embedding of existing data). Idempotent; soft-fails with deferral entries on per-slot errors. 7 unit + integration tests (`tests/test_v0243_kg_named_vector_migration.py`).
+- **V0243-14 (P2 — lowercase code-graph cleanup deferrals)**: `_emit_lowercase_codegraph_cleanup_deferrals` added to step 7d/10. On each install/update, detects Weaviate code-graph collections whose name is an all-lowercase form of a canonical-cased sibling (e.g. `myproject_codefunction` alongside `MyProject_CodeFunction`) with < 100 rows (clearly residual). Emits `UPDATE_DEFERRED.md` entries per qualifying collection with an explicit drop command. Never auto-drops; idempotent.
+- **V0243-18 (P3 — empty Diagrams collection warning)**: `_warn_if_diagrams_empty` added to `_ensure_collections` (step 7b/10). After the Diagrams collection is bootstrapped, checks for `.mmd` / `.excalidraw` sources under `.claude/diagrams/` and queries the Weaviate object count. When both are zero, prints a clear `WARN` message so users understand why `describe_excalidraw` and diagram-search skills return nothing.
+
 ## [0.2.42] — 2026-05-31
 
 47 commits across 11 worktree-isolated agent branches (W1-W8 fanout + D1-D3 deferral closers) plus a cargo-warning cleanup. Headline themes: (a) v0.2.40's silent-contamination guards are now AIRTIGHT (RT-1 closes the RLClient singleton hole F1 left open), (b) the long-broken `Installer Smoke Test` workflow turns green for the first time since v0.2.38 (W1 + W7), (c) launcher-side prep for the next vct-rl-reranker container iteration (L1.M multi-key licensing GUI gating, R3-R5 weights pipeline polish, W8 pull-token gateway end-to-end working), (d) **new discipline**: nothing deferred to v0.2.43. Every audit finding closed in-tag.
