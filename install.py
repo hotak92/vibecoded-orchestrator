@@ -12522,24 +12522,44 @@ def _delete_vct_hub_cutover_sentinel() -> None:
 
 
 def _probe_vct_hub_health(timeout: float = 0.5) -> bool:
-    """Probe ``http://localhost:<hub.port>/health``. Returns True when
+    """Probe ``http://localhost:<hub.port>/api/v1/health``. Returns True when
     the hub responds with status<400, False otherwise.
 
     Reads the hub port from ``vct_root_dir()/hub.port`` (written by
     vct-hub on startup). Soft-fail on every error (file missing, port
     unparseable, connection refused, timeout).
+
+    v0.2.43 V0243-1: corrected endpoint from ``/health`` to
+    ``/api/v1/health`` (the hub's actual health route; ``/health`` 404s
+    on all vct-hub versions shipped since v0.2.21). This endpoint
+    intentionally requires NO auth header — the probe runs before the
+    hub token file is readable.
+
+    On a successful probe, any pre-existing ``~/.vct/v0.2.21-cutover.flag``
+    is unlinked (cleanup of a stale migration sentinel that an interrupted
+    v0.2.21 install may have left behind).
     """
     try:
         from vco_lib.paths import vct_root_dir
-        port_file = vct_root_dir() / "hub.port"
+        root = vct_root_dir()
+        port_file = root / "hub.port"
         if not port_file.is_file():
             return False
         port_raw = port_file.read_text(encoding="utf-8").strip()
         if not port_raw.isdigit():
             return False
-        url = f"http://127.0.0.1:{port_raw}/health"
+        url = f"http://127.0.0.1:{port_raw}/api/v1/health"
         resp = urllib.request.urlopen(url, timeout=timeout)
-        return resp.status < 400
+        healthy = resp.status < 400
+        if healthy:
+            # V0243-1: unlink stale v0.2.21-cutover.flag when hub is up.
+            legacy_flag = root / "v0.2.21-cutover.flag"
+            try:
+                if legacy_flag.is_file():
+                    legacy_flag.unlink()
+            except OSError:
+                pass  # Best-effort; not critical.
+        return healthy
     except Exception:
         return False
 
