@@ -5854,6 +5854,40 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     return result
 
 
+def _path_resolves_on_disk(file_path_str: str) -> bool:
+    """v0.2.44 V44-A: try multiple normalization strategies before declaring orphan.
+
+    Strategies (any True → file exists, do NOT prune):
+      1. Direct relative-to-PROJECT_ROOT
+      2. Resolve PROJECT_ROOT first (handles symlinked install dirs)
+      3. Absolute path directly
+      4. Strip .claude/worktrees/agent-XXX/ prefix
+    """
+    # 1. Direct relative-to-PROJECT_ROOT (canonical)
+    if (PROJECT_ROOT / file_path_str).exists():
+        return True
+    # 2. Resolve PROJECT_ROOT first (handles symlinked install dirs)
+    try:
+        if (PROJECT_ROOT.resolve() / file_path_str).exists():
+            return True
+    except (OSError, ValueError):
+        pass
+    # 3. Absolute path directly
+    try:
+        candidate = Path(file_path_str)
+        if candidate.is_absolute() and candidate.exists():
+            return True
+    except (OSError, ValueError):
+        pass
+    # 4. Strip worktree prefix (.claude/worktrees/agent-XXX/foo.md → foo.md)
+    if ".claude/worktrees/agent-" in file_path_str:
+        import re
+        m = re.search(r"\.claude/worktrees/agent-[^/]+/(.*)$", file_path_str)
+        if m and (PROJECT_ROOT / m.group(1)).exists():
+            return True
+    return False
+
+
 def _prune_stale_kg_rows(
     collection_name: str,
     weaviate_url: str,
@@ -5882,17 +5916,9 @@ def _prune_stale_kg_rows(
     if dry_run is None:
         dry_run = not _is_orchestrator_root_install()
 
-    knowledge_root = PROJECT_ROOT / "knowledge"
-    on_disk = _compute_on_disk_content_hashes(knowledge_root)
-    # Build normalised path set covering both absolute and relative forms.
-    on_disk_paths: set[str] = set(on_disk.keys())
-    on_disk_rel: set[str] = set()
-    for p in on_disk_paths:
-        try:
-            on_disk_rel.add(str(Path(p).relative_to(PROJECT_ROOT)))
-        except ValueError:
-            pass
-    all_on_disk = on_disk_paths | on_disk_rel
+    # v0.2.44 V44-A: existence is checked via _path_resolves_on_disk per row
+    # below (multi-strategy: relative, resolved, absolute, worktree-stripped).
+    # The earlier all_on_disk set-build is no longer needed.
 
     # Fetch all stored (uuid, file_path) pairs from Weaviate.
     stored: list[tuple[str, str]] = []  # (uuid, file_path)
@@ -5935,9 +5961,12 @@ def _prune_stale_kg_rows(
         return
 
     stale_uuids: list[str] = []
+    stale_paths: list[str] = []
     for uid, fp in stored:
-        if fp not in all_on_disk:
+        if not _path_resolves_on_disk(fp):
             stale_uuids.append(uid)
+            stale_paths.append(fp)
+            print(f"    → pruned orphan row file_path={fp!r}")
 
     if not stale_uuids:
         _log_install_event(
@@ -8558,6 +8587,97 @@ def _is_orchestrator_root_install() -> bool:
     )
 
 
+def _rebind_orchestrator_root_to_canonical(canonical: str) -> list[str]:
+    """v0.2.44 V44-A: rebind orchestrator-root pointers to canonical KG name.
+
+    Updates (all soft-fail; collected errors returned as list):
+      1. project_kg_bindings rows (role='primary' AND role='shared') for the
+         orchestrator-root project_id. Uses a writable sqlite3 connection
+         to ~/.vct/launcher.db (env override: VCT_LAUNCHER_DB_PATH).
+      2. .claude/settings.json env.KG_COLLECTION = canonical
+         .claude/settings.json env.SHARED_KG_COLLECTION = canonical
+      3. .claude/env managed block: KG_COLLECTION + SHARED_KG_COLLECTION = canonical
+
+    Returns empty list on full success, otherwise list of error strings.
+    Never raises — every operation is wrapped.
+    """
+    errors: list[str] = []
+    # 1. launcher.db rebind
+    try:
+        from vco_lib.launcher_db_reader import (
+            get_orchestrator_root_project_id, _discover_db_path,
+        )
+        pid = get_orchestrator_root_project_id()
+        db_path = _discover_db_path()
+        if pid and db_path:
+            import sqlite3
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=5.0)
+                try:
+                    import time
+                    now_ms = int(time.time() * 1000)
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE project_kg_bindings SET collection_name = ?, updated_at = ? "
+                        "WHERE project_id = ? AND role = 'primary'",
+                        (canonical, now_ms, pid),
+                    )
+                    cur.execute(
+                        "UPDATE project_kg_bindings SET collection_name = ?, updated_at = ? "
+                        "WHERE project_id = ? AND role = 'shared'",
+                        (canonical, now_ms, pid),
+                    )
+                    conn.commit()
+                    print(f"    → launcher.db: rebound primary+shared bindings → {canonical}")
+                finally:
+                    conn.close()
+            except Exception as e:
+                errors.append(f"launcher.db UPDATE failed: {e}")
+        elif not pid:
+            errors.append("launcher.db: no orchestrator-root project row found (skipped)")
+        elif not db_path:
+            errors.append("launcher.db: file not found (skipped)")
+    except Exception as e:
+        errors.append(f"launcher_db_reader import/use failed: {e}")
+
+    # 2. .claude/settings.json env block
+    try:
+        settings_path = PROJECT_ROOT / ".claude" / "settings.json"
+        if settings_path.is_file():
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+            env_block = data.setdefault("env", {})
+            env_block["KG_COLLECTION"] = canonical
+            env_block["SHARED_KG_COLLECTION"] = canonical
+            settings_path.write_text(
+                json.dumps(data, indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"    → .claude/settings.json env: KG_COLLECTION = SHARED_KG_COLLECTION = {canonical}")
+    except Exception as e:
+        errors.append(f".claude/settings.json update failed: {e}")
+
+    # 3. .claude/env managed block
+    try:
+        env_path = PROJECT_ROOT / ".claude" / "env"
+        if env_path.is_file():
+            text = env_path.read_text(encoding="utf-8")
+            # Update both export lines inside the vco-managed block.
+            import re
+            for var in ("KG_COLLECTION", "SHARED_KG_COLLECTION"):
+                # Replace any existing export line for the var (within or outside block).
+                text = re.sub(
+                    rf'^export {var}=".*?"$',
+                    f'export {var}="{canonical}"',
+                    text,
+                    flags=re.MULTILINE,
+                )
+            env_path.write_text(text, encoding="utf-8")
+            print(f"    → .claude/env: KG_COLLECTION = SHARED_KG_COLLECTION = {canonical}")
+    except Exception as e:
+        errors.append(f".claude/env update failed: {e}")
+
+    return errors
+
+
 def _seed_weaviate_shared_kg_only(
     *,
     args: "argparse.Namespace",
@@ -8591,21 +8711,60 @@ def _seed_weaviate_shared_kg_only(
         print("  → shared KG seed: skipped (SHARED_KG_COLLECTION empty)")
         return seed_errors
 
-    # V0243-0: orchestrator-root self-install where per-project KG == shared KG.
-    # Running kg-sync twice against the same collection would be wasteful;
-    # record the collection as synced and return early.
-    if (
-        _is_orchestrator_root_install()
-        and current_kg_collection
-        and current_shared_kg == current_kg_collection
-    ):
+    # v0.2.44 V44-A: orchestrator-root adopt-and-route.
+    #
+    # When this is the orchestrator clone itself, the per-project KG and the
+    # shared KG are the same logical collection. Names can legitimately differ
+    # due to legacy migrations (e.g. VCO_dev's VCODev_KnowledgeGraph survives
+    # from the Claude/→VCO_dev migration while SHARED_KG_COLLECTION points at
+    # the canonical VibeCodedOrchestrator_KnowledgeGraph).
+    #
+    # Strategy: pick SHARED_KG_COLLECTION as canonical (predictable, matches
+    # public-shipping convention). Rebind both project_kg_bindings rows
+    # (primary + shared) and both env keys (KG_COLLECTION + SHARED_KG_COLLECTION)
+    # to that canonical name. Skip the shared-seed sync step — one collection
+    # serves both roles.
+    #
+    # No re-embedding. No re-syncing. No collection renaming. Just rebind
+    # pointers + update app_state.
+    if _is_orchestrator_root_install():
+        canonical = current_shared_kg or current_kg_collection
+        if not canonical:
+            print("  → shared KG seed: skipped (orchestrator-root, "
+                  "no KG_COLLECTION or SHARED_KG_COLLECTION set)")
+            return seed_errors
+
+        # Diagnostic: report row counts on both physical collections.
+        try:
+            primary_count = _count_weaviate_class_objects(
+                weaviate_url, current_kg_collection
+            ) if current_kg_collection else 0
+        except Exception:
+            primary_count = -1
+        try:
+            shared_count = _count_weaviate_class_objects(
+                weaviate_url, current_shared_kg
+            ) if current_shared_kg else 0
+        except Exception:
+            shared_count = -1
         print(
-            f"  → shared KG seed: skipping — orchestrator-root install, "
-            f"per-project KG '{current_kg_collection}' IS the shared KG"
+            f"  → orchestrator-root adopt-and-route: "
+            f"primary={current_kg_collection or '(unset)'}={primary_count} rows, "
+            f"shared={current_shared_kg or '(unset)'}={shared_count} rows"
         )
-        _write_app_state_key(
-            _APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_kg_collection
-        )
+        print(f"  → canonical = {canonical} (SHARED_KG_COLLECTION wins)")
+
+        # Rebind launcher.db (if available) and both env keys to canonical.
+        rebind_errors = _rebind_orchestrator_root_to_canonical(canonical)
+        if rebind_errors:
+            for e in rebind_errors:
+                print(f"    ! rebind: {e}")
+
+        _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, canonical)
+        _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, canonical)
+
+        print("  → shared KG seed: skipped (orchestrator-root, "
+              "canonical collection serves both roles)")
         return seed_errors
     if not sync_kg.exists():
         return seed_errors
@@ -8916,11 +9075,15 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
             json.dumps({"nodes_synced": _nodes_synced or 0, "nodes_skipped": _nodes_skipped}),
         )
 
-    # V0243-6: prune stale KG rows after full-sync (orchestrator-root only).
-    # Runs only when _sync_all=True so it fires after a complete re-seed
-    # (not after a partial diff-only sync, where orphan detection would
-    # produce false positives for files we deliberately skipped).
-    if not seed_errors and _sync_all and current_kg_collection:
+    # v0.2.44 V44-A: always prune on --update.
+    #
+    # Previous version gated on _sync_all=True out of fear that partial-sync
+    # would mark "deliberately skipped" files as orphans. But the prune compares
+    # Weaviate file_path entries to on-disk presence — files that don't exist
+    # on disk at all are always safe to remove regardless of the partial-sync
+    # changelist. The _sync_all gate caused the 192 orphan accumulation on
+    # VCO_dev's KG (v0.2.43 post-update audit).
+    if not seed_errors and current_kg_collection:
         _prune_stale_kg_rows(current_kg_collection, weaviate_url)
 
     # 3. Cross-project shared KG seed (Step 7d).
