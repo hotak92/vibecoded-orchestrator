@@ -1851,6 +1851,110 @@ def _vct_state_dir() -> Path:
     return vct_root_dir()
 
 
+# ---------------------------------------------------------------------------
+# v0.2.44 V44-I: cross-OS advisory lock for the install-state mutation block.
+#
+# Background: install.py is not concurrency-safe across processes. Two
+# simultaneous `python install.py --update` invocations (e.g. an IDE
+# post-pull hook racing a manual run) can interleave writes to
+# `.claude/settings.json` and `.claude/env` — each write is atomic per
+# surface but not across surfaces. The two surfaces then disagree, which
+# breaks the Phase 0.B config-projection contract.
+#
+# V44-H surfaced this as a known-issue ("Concurrent install.py --update
+# from two terminals can split-brain env surfaces"). V44-I closes it
+# in-tag per the "no deferred fixes" discipline (CLAUDE.md 2026-05-31).
+#
+# Lock path: `<vct_root_dir>/install.py.lock` (honours VCT_STATE_DIR so
+# tests can scope the lock per-tmpdir). Soft-fails to WARNING when the
+# file can't be opened or locked — never blocks install.
+# ---------------------------------------------------------------------------
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def _install_advisory_lock(timeout_seconds: float = 60.0):
+    """v0.2.44 V44-I: cross-OS advisory lock for the duration of the
+    install-state mutation block.
+
+    Prevents the split-brain hazard where two install.py processes
+    interleave writes to .claude/settings.json and .claude/env.
+
+    Cross-OS:
+      - POSIX (Linux/macOS): fcntl.flock with LOCK_EX | LOCK_NB; retry
+        with exponential backoff up to timeout_seconds. Lock file under
+        vco_lib.paths.vct_root_dir() / "install.py.lock".
+      - Windows: msvcrt.locking(LK_NBLCK, 1) on a 1-byte region at
+        offset 0 of the same lock file; same retry pattern.
+
+    Soft-fail: if the lock file cannot be created or locked at all
+    (permission errors, filesystem quirks), emit a WARNING and continue
+    without the lock. The lock is a defensive measure, not a hard gate.
+    """
+    # Resolve lock path via the canonical resolver (mirrors the Rust
+    # `paths::vct_root_dir`). install.py imports vco_lib at module load
+    # so this should always succeed; if it doesn't, the unrecoverable
+    # import error has already prevented this code path from running.
+    from vco_lib.paths import vct_root_dir as _vct_root_dir
+    lock_path = _vct_root_dir() / "install.py.lock"
+
+    fp = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fp = open(str(lock_path), "a+b")
+    except Exception as e:
+        print(
+            f"  WARNING: could not open install lock {lock_path}: {e} "
+            f"(proceeding without concurrency protection)"
+        )
+        yield None
+        return
+
+    deadline = time.monotonic() + timeout_seconds
+    backoff = 0.25
+    acquired = False
+    try:
+        while time.monotonic() < deadline:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                time.sleep(backoff)
+                backoff = min(backoff * 1.5, 2.0)
+
+        if not acquired:
+            print(
+                f"  WARNING: install lock {lock_path} held by another "
+                f"process for >{timeout_seconds}s; proceeding without "
+                f"concurrency protection"
+            )
+
+        yield fp if acquired else None
+    finally:
+        if acquired:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    fp.seek(0)
+                    msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            if fp is not None:
+                fp.close()
+        except Exception:
+            pass
+
+
 def _write_storage_toml_direct(choice: dict) -> Path:
     """Python fallback when no launcher binary is on disk.
 
@@ -8657,6 +8761,13 @@ def _check_dual_clone() -> Optional[tuple]:
     This helper surfaces the deviation so install.py can WARN before
     proceeding. The install is not blocked (per user directive
     2026-06-01: "warn but proceed; user is expected to have one VCO root").
+
+    v0.2.44 V44-I: skip the dual-clone check when the launcher.db is
+    owned by a different uid than the current process (POSIX) — common
+    in sudo / docker exec / Codespaces scenarios where ~/.vct/ resolves
+    to a homedir we don't own. Avoids a confusing WARN that points at
+    a folder the user has never seen. On Windows, use os.access(db_path,
+    os.W_OK) as a write-access proxy for the uid check.
     """
     try:
         from vco_lib.launcher_db_reader import (
@@ -8669,6 +8780,25 @@ def _check_dual_clone() -> Optional[tuple]:
         db_path = _discover_db_path()
         if not db_path:
             return None
+
+        # v0.2.44 V44-I: uid ownership check BEFORE reading the DB.
+        # If the DB file isn't ours, this isn't the launcher.db we
+        # should be reconciling against — silently return None rather
+        # than emitting a spurious dual-clone WARN.
+        try:
+            if sys.platform != "win32":
+                if db_path.stat().st_uid != os.getuid():
+                    return None  # not our launcher.db
+            else:
+                # Windows: best-effort write-access check as a uid proxy.
+                if not os.access(str(db_path), os.W_OK):
+                    return None
+        except Exception:
+            # uid check is best-effort; on failure fall through to the
+            # normal read path rather than incorrectly suppressing the
+            # warning.
+            pass
+
         import sqlite3
         try:
             conn = sqlite3.connect(
@@ -8740,13 +8870,43 @@ def _rebind_orchestrator_root_to_canonical(canonical: str) -> list[str]:
     # by V44-F's seed_errors deferral discriminator so this does NOT
     # escalate to a "warn" audit-log entry (the warn already fired
     # at the dual-clone detection site via V44-H/H6).
-    if _DUAL_CLONE_DETECTED_THIS_RUN:
+    #
+    # v0.2.44 V44-I: read-and-reset the module flag so it doesn't leak
+    # across _seed_weaviate invocations within the same process (pytest
+    # tests share the imported install module; an earlier test that set
+    # the flag would otherwise mis-trigger the short-circuit in a later
+    # test that exercises a legitimate rebind).
+    global _DUAL_CLONE_DETECTED_THIS_RUN
+    _dual_clone_was_set = _DUAL_CLONE_DETECTED_THIS_RUN
+    _DUAL_CLONE_DETECTED_THIS_RUN = False
+    if _dual_clone_was_set:
         errors.append(
             "dual-clone detected: skipping rebind to avoid corrupting "
             "registered clone's bindings (skipped — re-run install.py from "
             "the registered folder to commit)"
         )
         return errors
+
+    # v0.2.44 V44-I: acquire the cross-OS advisory lock around the
+    # install-state mutation block. Both the launcher.db UPDATE below
+    # AND the apply_project_env() call (settings.json + .claude/env)
+    # are mutating shared state — without the lock, two install.py
+    # processes can interleave writes across the two surfaces and
+    # produce a split-brain. Soft-fails to WARNING if the lock can't
+    # be acquired; never blocks.
+    with _install_advisory_lock(timeout_seconds=60.0):
+        return _rebind_orchestrator_root_to_canonical_locked(canonical, errors)
+
+
+def _rebind_orchestrator_root_to_canonical_locked(
+    canonical: str, errors: list[str]
+) -> list[str]:
+    """v0.2.44 V44-I: the actual rebind work, called under the advisory
+    lock from _rebind_orchestrator_root_to_canonical. Split out so the
+    lock scope is a single `with` block at the call site rather than
+    an indented body in the original function (keeps the diff small
+    and the surrounding docstring + dual-clone guard intact).
+    """
     # 1. launcher.db rebind — the authoritative state change. NOT an env
     #    surface, so not in the Phase 0.B single-writer contract's scope.
     pid: str | None = None
@@ -9139,6 +9299,26 @@ def _resolve_orchestrator_root_canonical(
 
 
 def _seed_weaviate(args: argparse.Namespace) -> None:
+    """v0.2.44 V44-I: thin wrapper around :func:`_seed_weaviate_impl`
+    that guarantees the ``_DUAL_CLONE_DETECTED_THIS_RUN`` module-level
+    flag is reset to False after the call returns (even if the impl
+    raises). The flag is intended to live for ONE _seed_weaviate
+    invocation; without this wrapper, pytest tests sharing the imported
+    install module would see leaked True values from earlier tests,
+    causing legitimate rebind paths to short-circuit incorrectly.
+
+    Production callers invoke _seed_weaviate once per process so the
+    cleanup is a no-op in normal operation.
+    """
+    global _DUAL_CLONE_DETECTED_THIS_RUN
+    try:
+        _DUAL_CLONE_DETECTED_THIS_RUN = False
+        return _seed_weaviate_impl(args)
+    finally:
+        _DUAL_CLONE_DETECTED_THIS_RUN = False
+
+
+def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     """Seed Weaviate with bundled knowledge/ + docs/.
 
     v0.2.42 CI-10: on ``--update`` runs (not fresh install), gate the sync

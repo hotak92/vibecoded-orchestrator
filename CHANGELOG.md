@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      and how to drop it manually (non-destructive).
   4. Env-vs-DB disagreement now warns loudly during install (rather than
      silently letting env win when set).
+- **V44-I closes V44-H's deferred known-issues**:
+  - **Parallel `install.py --update` concurrency lock**: cross-OS advisory
+    lockfile under `~/.vct/install.py.lock` (fcntl on POSIX, msvcrt.locking
+    on Windows) acquired around the install-state mutation block. Prevents
+    split-brain `.claude/settings.json` ↔ `.claude/env` writes when two
+    install processes race. 60s acquisition timeout with exponential backoff;
+    soft-fails to "proceeding without concurrency protection" WARN if the
+    lock file can't be created.
+  - **Dual-clone uid check**: `_check_dual_clone` now skips silently when
+    `~/.vct/launcher.db` is owned by a different uid than the current
+    process (POSIX) or write-inaccessible (Windows). Eliminates the
+    spurious dual-clone WARN previously observed in sudo / docker exec
+    contexts where `HOME` resolves to a foreign user's homedir.
 - **MCP shared-write gate semantic fix (V44-F)**: store_knowledge_node's
   SHARED_KG_WRITE_DISABLED gate now fires on `scope == "shared"` rather
   than on `target_collection_name == SHARED_KG_COLLECTION`. Post-v0.2.44
@@ -140,19 +153,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 - New KG node `knowledge/concepts/orchestrator-root-kg-collection-identity-2026-06-01.md`
   documenting the new contract + 4-release history. (V44-D)
-
-### Known issues
-- **Concurrent `install.py --update` from two terminals can split-brain env
-  surfaces.** install.py is not currently concurrency-safe; running it
-  simultaneously from two terminals (e.g., an IDE post-pull hook + manual
-  invocation) can produce `.claude/settings.json` and `.claude/env` writes
-  that disagree. Workaround: serialize manually. Fix planned for v0.2.45
-  (advisory lockfile under `~/.vct/`).
-- **Multi-user / sudo / `docker exec` runs may emit a spurious dual-clone
-  WARNING** if `~/.vct/launcher.db` was registered by a different uid. The
-  rebind is correctly suppressed in this case (V44-H/H5) so no state
-  corruption results; the warning is just confusing. Fix planned for v0.2.45
-  (uid-aware DB-path resolution).
 
 ## [0.2.43] — 2026-05-31
 

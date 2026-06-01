@@ -90,6 +90,11 @@ H4 (all-empty resolver guard), H5 (dual-clone blocks rebind), H6
 (dual-clone audit-log entry), H7 (CHANGELOG: G5 note + Known Issues),
 H8 (removed misleading print), H9 (this KG section).
 
+V44-I closed V44-H's two deferred items per the "no deferred fixes" discipline:
+cross-OS advisory lock around the install-state mutation block (prevents
+parallel-install split-brain), and uid-aware skip in _check_dual_clone
+(prevents spurious WARN on multi-user / sudo / docker exec setups).
+
 ## The 4-release recurring loop this contract ends
 
 | Release | Attempt | Why it failed |

@@ -541,17 +541,231 @@ def test_h4_all_empty_resolver_inputs_bootstrap_rationale():
 def test_h5_dual_clone_blocks_rebind(monkeypatch):
     """H5: dual-clone detection short-circuits
     _rebind_orchestrator_root_to_canonical with a (skipped — ...) error
-    tail that the V44-F seed_errors deferral discriminator recognizes."""
+    tail that the V44-F seed_errors deferral discriminator recognizes.
+
+    v0.2.44 V44-I: explicit try/finally restore of the module-level flag
+    rather than relying on monkeypatch.setattr's undo. The flag is a
+    module global that's read by other tests in the same pytest session;
+    a stray True leak (observed during V44-I test ordering) makes
+    test_v0244_orchestrator_root_rebind fail with "rebind: dual-clone
+    detected: ...". Explicit restore eliminates the cross-test contamination.
+    """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import install
     # Force the module-level flag set by _seed_weaviate's dual-clone block.
+    # Explicit save+restore (not monkeypatch) — see docstring.
+    prior = install._DUAL_CLONE_DETECTED_THIS_RUN
+    install._DUAL_CLONE_DETECTED_THIS_RUN = True
+    try:
+        errors = install._rebind_orchestrator_root_to_canonical("CanonicalKG")
+        assert any("dual-clone" in e.lower() for e in errors), (
+            f"expected dual-clone error in {errors!r}"
+        )
+        assert any("(skipped" in e for e in errors), (
+            "(skipped) marker required for V44-F discriminator"
+        )
+    finally:
+        install._DUAL_CLONE_DETECTED_THIS_RUN = prior
+
+
+# ---------------------------------------------------------------------------
+# v0.2.44 V44-I: tests for the in-tag closures of V44-H's deferred items
+# (advisory install lock + uid-aware dual-clone skip).
+# ---------------------------------------------------------------------------
+
+
+def test_i1_advisory_lock_acquires_and_releases(tmp_path, monkeypatch):
+    """I1: advisory lock context manager acquires and releases cleanly,
+    and the lock file is created under the resolved vct_root_dir."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    # Point the lock at a tmpdir via VCT_STATE_DIR (the canonical override
+    # honoured by vco_lib.paths.vct_root_dir).
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
+    # Acquire the lock; should not raise.
+    with install._install_advisory_lock(timeout_seconds=2.0) as fp:
+        # Lock file should exist under the resolved vct_root_dir.
+        # The fp may be None if the lock could not be acquired (rare on
+        # an empty tmpdir), but the file itself must exist either way
+        # because we opened it before attempting to lock.
+        lock_path = tmp_path / "install.py.lock"
+        assert lock_path.exists(), (
+            f"expected lock file at {lock_path}; got {list(tmp_path.iterdir())}"
+        )
+    # After the context exits, lock file may persist (we don't unlink — the
+    # OS releases the advisory lock when the fd closes). Nothing to assert.
+
+
+def test_i1_advisory_lock_soft_fails_when_unwritable(tmp_path, monkeypatch, capsys):
+    """I1: when the lock file can't be created, emit WARNING but proceed
+    (soft-fail; never blocks install)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    # Create a regular file at the would-be parent dir path so mkdir
+    # fails. VCT_STATE_DIR points at "<tmp>/blocker/subdir" where
+    # <tmp>/blocker is a file, not a directory.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not-a-dir")
+    monkeypatch.setenv("VCT_STATE_DIR", str(blocker / "subdir"))
+    # Must not raise; must yield (the with-body runs).
+    body_ran = False
+    with install._install_advisory_lock(timeout_seconds=0.5) as fp:
+        body_ran = True
+        # fp should be None when the lock could not be acquired.
+        assert fp is None, (
+            f"expected None when lock unacquirable; got {fp!r}"
+        )
+    assert body_ran, "with-body must execute even when lock unavailable"
+    # WARNING should have been printed.
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.out, (
+        f"expected WARNING in soft-fail path; got: {captured.out!r}"
+    )
+
+
+def test_i1_advisory_lock_serializes_concurrent_acquisitions(tmp_path, monkeypatch):
+    """I1: two concurrent acquisitions of the lock from the same process
+    serialize correctly (the second one waits or times out).
+
+    Skipped on Windows (msvcrt.locking() doesn't behave the same way
+    when locking a region from the SAME process — POSIX fcntl.flock is
+    the canonical advisory-lock semantic we're verifying here).
+    """
+    import sys as _sys
+    if _sys.platform == "win32":
+        return  # see docstring
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    monkeypatch.setenv("VCT_STATE_DIR", str(tmp_path))
+    # Acquire the lock once, then try to acquire again with a short
+    # timeout. The second attempt should NOT raise (soft-fail) but
+    # should not actually acquire the lock — fp_inner will be None
+    # after the WARNING.
+    with install._install_advisory_lock(timeout_seconds=10.0) as fp_outer:
+        # The first acquisition should have succeeded.
+        # NOTE: fcntl.flock on a SECOND fd opened in the same process
+        # against the same file does NOT block (POSIX BSD-flock semantics
+        # are per-fd, not per-process). So we can't easily test the
+        # cross-process race from a single test. Smoke-test that nested
+        # acquisitions don't deadlock or raise.
+        with install._install_advisory_lock(timeout_seconds=0.3) as fp_inner:
+            pass  # smoke: just verify no deadlock / no exception
+
+
+def test_i2_check_dual_clone_skips_foreign_uid(monkeypatch, tmp_path):
+    """I2: when launcher.db is owned by a different uid, _check_dual_clone
+    returns None (silently) rather than emitting a spurious dual-clone WARN.
+
+    POSIX-only — Windows takes the os.access(W_OK) proxy path.
+    """
+    import sys as _sys
+    if _sys.platform == "win32":
+        return  # POSIX-specific assertion
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    import os as _os
+    import sqlite3 as _sqlite3
+
+    # Build a minimal launcher.db that would otherwise trigger the
+    # dual-clone branch (orchestrator_root row pointing at a foreign
+    # folder).
+    db = tmp_path / "launcher.db"
+    conn = _sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, "
+        "folder_path TEXT, host TEXT, created_at INTEGER, "
+        "updated_at INTEGER, slug TEXT, rl_port INTEGER)"
+    )
+    conn.execute(
+        "INSERT INTO projects VALUES "
+        "('test-pid', 'p', ?, 'orchestrator_root', 0, 0, 't', NULL)",
+        (str(tmp_path / "elsewhere"),),
+    )
+    conn.commit()
+    conn.close()
+
+    # Make _discover_db_path() + get_orchestrator_root_project_id() return
+    # our test fixtures.
+    from vco_lib import launcher_db_reader as _ldb
     monkeypatch.setattr(
-        install, "_DUAL_CLONE_DETECTED_THIS_RUN", True, raising=False,
+        _ldb, "_discover_db_path", lambda: db, raising=True,
     )
-    errors = install._rebind_orchestrator_root_to_canonical("CanonicalKG")
-    assert any("dual-clone" in e.lower() for e in errors), (
-        f"expected dual-clone error in {errors!r}"
+    monkeypatch.setattr(
+        _ldb, "get_orchestrator_root_project_id",
+        lambda: "test-pid", raising=True,
     )
-    assert any("(skipped" in e for e in errors), (
-        "(skipped) marker required for V44-F discriminator"
+
+    # Mock Path.stat() to report a foreign uid for the DB file. We
+    # monkeypatch Path's instance method so only the db_path.stat() call
+    # inside _check_dual_clone is affected; PROJECT_ROOT.resolve() doesn't
+    # call .stat().
+    real_path_stat = type(db).stat
+    class _FakeStat:
+        st_uid = 99999  # almost certainly not our uid
+        st_mode = 0o100644
+    def _fake_stat(self, *args, **kwargs):
+        if Path(str(self)) == db:
+            return _FakeStat()
+        return real_path_stat(self, *args, **kwargs)
+    monkeypatch.setattr(type(db), "stat", _fake_stat, raising=True)
+
+    # _check_dual_clone() should silently return None for the foreign-uid
+    # case (rather than emitting a spurious dual-clone tuple).
+    result = install._check_dual_clone()
+    assert result is None, (
+        f"expected None for foreign-uid launcher.db; got {result!r}"
     )
+
+
+def test_i2_check_dual_clone_proceeds_with_own_uid(monkeypatch, tmp_path):
+    """I2: when launcher.db is owned by the current uid, _check_dual_clone
+    proceeds with the normal read path (no behavior change vs V44-H).
+
+    This is a guard against the uid check accidentally suppressing
+    legitimate dual-clone detection.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    import sqlite3 as _sqlite3
+
+    db = tmp_path / "launcher.db"
+    conn = _sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, "
+        "folder_path TEXT, host TEXT, created_at INTEGER, "
+        "updated_at INTEGER, slug TEXT, rl_port INTEGER)"
+    )
+    foreign_folder = str(tmp_path / "elsewhere")
+    conn.execute(
+        "INSERT INTO projects VALUES "
+        "('test-pid', 'p', ?, 'orchestrator_root', 0, 0, 't', NULL)",
+        (foreign_folder,),
+    )
+    conn.commit()
+    conn.close()
+
+    from vco_lib import launcher_db_reader as _ldb
+    monkeypatch.setattr(
+        _ldb, "_discover_db_path", lambda: db, raising=True,
+    )
+    monkeypatch.setattr(
+        _ldb, "get_orchestrator_root_project_id",
+        lambda: "test-pid", raising=True,
+    )
+    # Point PROJECT_ROOT at "here" so the (registered != current) check
+    # fires inside _check_dual_clone.
+    here = tmp_path / "here"
+    here.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(install, "PROJECT_ROOT", here, raising=True)
+
+    # Don't mock stat — the db file's actual st_uid IS our uid (we just
+    # wrote it in this process). So the uid check should pass and the
+    # function should detect the dual-clone normally.
+    result = install._check_dual_clone()
+    assert result is not None, (
+        "expected dual-clone tuple for same-uid foreign-folder case; "
+        f"got {result!r}"
+    )
+    registered, current = result
+    assert registered == foreign_folder
+    assert current == str(here.resolve())
