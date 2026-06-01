@@ -1351,6 +1351,7 @@ pub(crate) async fn run_migrate_dry_run(
 #[command]
 pub async fn update_project_v2(
     project_id: String,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<UpdateProjectResult, String> {
     // 1. Resolve project from DB.
@@ -1423,6 +1424,41 @@ pub async fn update_project_v2(
         warnings.push(msg);
     }
 
+    // 6. v0.2.44 V44-G4 (RL-chat ask 2026-06-01): auto-retry stuck
+    //    module_installs rows for this project. Non-blocking — any retry
+    //    failure flows through as a `warnings[]` entry; the bundle
+    //    update itself never fails because the user's queued install
+    //    didn't recover this cycle.
+    let retry_reports = crate::commands::module_service::retry_failed_module_installs(
+        Some(&row.id),
+        &db,
+        Some(&app),
+    )
+    .await;
+    for report in &retry_reports {
+        match report.decision.as_str() {
+            "retried_success" | "self_healed" => {
+                warnings.push(format!(
+                    "module {} auto-recovered (decision={}, new_status={})",
+                    report.module_id,
+                    report.decision,
+                    report.new_status.as_deref().unwrap_or("?"),
+                ));
+            }
+            "retried_failed" => {
+                warnings.push(format!(
+                    "module {} retry failed: {}",
+                    report.module_id,
+                    report.error.as_deref().unwrap_or("(no message)"),
+                ));
+            }
+            _ => {
+                // skipped_* / retried_unavailable — audit-only, no
+                // user-facing message (the audit log carries the detail).
+            }
+        }
+    }
+
     db.audit(
         "project_update_bundle",
         Some(&row.id),
@@ -1438,6 +1474,7 @@ pub async fn update_project_v2(
                 "skipped_existing": summary.skipped_existing,
                 "errors_count": summary.errors_count,
             },
+            "retry_reports": retry_reports,
         }),
     )?;
     let _ = db.log_change("projects", "update_bundle", Some(&row.id), Some(&row.id));
@@ -1539,6 +1576,7 @@ pub struct UpdateAllReport {
 #[command]
 pub async fn update_all_projects(
     opts: Option<UpdateAllOptions>,
+    app: tauri::AppHandle,
     db: State<'_, Db>,
 ) -> Result<UpdateAllReport, String> {
     let opts = opts.unwrap_or_default();
@@ -1566,7 +1604,7 @@ pub async fn update_all_projects(
         // Use the same internal pipeline as `update_project_v2`. Going
         // through the public command would require Tauri State plumbing
         // we already have; we just call it directly.
-        let result = update_project_v2(row.id.clone(), db.clone()).await;
+        let result = update_project_v2(row.id.clone(), app.clone(), db.clone()).await;
         match result {
             Ok(r) => {
                 entries.push(UpdateAllProjectEntry {

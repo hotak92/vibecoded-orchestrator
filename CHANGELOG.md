@@ -66,6 +66,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (V44-G3)
 
 ### Added
+- **V44-G4 auto-retry policy for failed paid-module installs**:
+  `module_installs` rows in `error` or `broken` status are now auto-retried
+  when either (a) the user clicks "Update" on a project, or (b) the user
+  clicks "Update orchestrator" (gated by the
+  `auto_retry_failed_paid_module_installs_on_orchestrator_update` setting,
+  default `true`). Per-row decision tree: self-heals when a healthy
+  container already exists; skips unlicensed or version-incompatible modules
+  with a clear audit-log entry; re-invokes `install_module_for_project` for
+  the rest (Trigger A only — Trigger B is restart-bound and defers actual
+  installs to the next launcher boot's resume sweep). Closes the
+  v0.2.34→v0.2.42 W8 pull-token gateway recovery gap surfaced by RL chat
+  2026-06-01. New helper `module_service::retry_failed_module_installs` +
+  Tauri commands `get_auto_retry_failed_installs_setting` /
+  `set_auto_retry_failed_installs_setting` for the Settings page toggle.
 - `vco_lib/launcher_db_reader.py`: tiny read-only helper exposing
   `get_orchestrator_root_project_id()`, `get_kg_binding(role)`, and
   `get_orchestrator_root_bindings()`. Soft-fails on missing/corrupt DB.

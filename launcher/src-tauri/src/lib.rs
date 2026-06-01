@@ -1498,6 +1498,10 @@ pub fn run() {
             // time. Reads `ACTIVE_EMBEDDING` from `.claude/env`, falls
             // back to `DEFAULT_EMBEDDING_SOURCE`.
             commands::module_service::get_project_embedding_source,
+            // v0.2.44 V44-G4: orchestrator-update auto-retry toggle for
+            // stuck paid-module installs (per RL-chat ask 2026-06-01).
+            commands::module_service::get_auto_retry_failed_installs_setting,
+            commands::module_service::set_auto_retry_failed_installs_setting,
             // v0.2.31 Agent J: module_weights_state Tauri commands removed
             // alongside migration 020. The dashboard's live reads now go
             // through `module_db_client::module_db_read_row` against the

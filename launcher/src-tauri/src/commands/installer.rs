@@ -3560,6 +3560,22 @@ fn revert_pre_pull_rename(backup_path: &Path) {
 /// On any error before step 4, return the error to the GUI (and
 /// revert the pre-pull rename if applicable). The current launcher
 /// keeps running, so the user can retry.
+/// v0.2.44 V44-G4 helper: bucket `RetryReport`s by decision into a
+/// JSON-friendly summary the audit log can carry alongside the raw
+/// per-row payload. Keeps the audit detail compact while still
+/// allowing downstream tooling to reconstruct the per-decision
+/// breakdown without parsing every row.
+fn retry_summary_counts(
+    reports: &[crate::commands::module_service::RetryReport],
+) -> serde_json::Value {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+    for r in reports {
+        *counts.entry(r.decision.as_str()).or_insert(0) += 1;
+    }
+    serde_json::to_value(counts).unwrap_or(serde_json::json!({}))
+}
+
 #[command]
 pub async fn update_orchestrator<R: Runtime>(
     app: AppHandle<R>,
@@ -3965,6 +3981,11 @@ pub async fn update_orchestrator<R: Runtime>(
     // user state to lose, so spawn the new binary detached + exit.
     // Reuse the v0.2.15-shipped restart_launcher command to keep the
     // restart codepath identical to the W4 user-click flow.
+    // v0.2.44 V44-G4: clone the AppHandle here so the post-restart
+    // retry block (Trigger B sweep + final audit) can still reach
+    // `app.try_state::<Db>()` after `restart_launcher` consumes its
+    // owned copy. AppHandle is Clone (cheap reference-counted handle).
+    let post_restart_app = app.clone();
     if let Err(e) = crate::commands::restart::restart_launcher(app, path.clone()).await {
         // v0.2.17 (Reviewer A finding A2): auto-restart failed. The
         // earlier install.py invocation suppressed the
@@ -4077,6 +4098,63 @@ pub async fn update_orchestrator<R: Runtime>(
     }
 
     emit_progress(&window, "done", "Orchestrator updated successfully!", 100.0);
+
+    // v0.2.44 V44-G4 (RL-chat ask 2026-06-01): Trigger B — auto-retry
+    // stuck module_installs rows across ALL projects after a successful
+    // orchestrator update. Gated by the per-user toggle (default ON).
+    // Disabled by users who keep deliberately-failed modules and don't
+    // want them auto-reinstalled on launcher updates.
+    //
+    // Non-blocking: emits its own audit row; any retry failure is
+    // recorded but never poisons the orchestrator-update result. The
+    // launcher restart at the end of this function happens unconditionally.
+    //
+    // Note 1: we use try_state because the DB may not be registered
+    // when `update_orchestrator` is invoked via `update_orchestrator_at`
+    // (an early-boot recovery surface that runs before app setup).
+    //
+    // Note 2: we pass `None` for the AppHandle. Here's why — the
+    // orchestrator-update path culminates in a launcher restart (see
+    // `restart_launcher` call below), which means any in-process install
+    // we kick off would run in the OLD binary that's about to exit.
+    // Instead we let the self-heal branch flip rows whose container is
+    // already healthy (the common case for stuck rows after a binary
+    // upgrade), and audit-log the rest as `retried_unavailable`. The
+    // post-restart binary's `resume_containers_on_startup` sweep then
+    // picks up where this stops. For rows requiring an actual install
+    // re-run, the user clicks the per-project Update button (Trigger A,
+    // which DOES pass `Some(&app)` since no restart follows).
+    {
+        use tauri::Manager as _;
+        if let Some(db) = post_restart_app.try_state::<crate::db::Db>() {
+            let enabled =
+                crate::commands::module_service::auto_retry_on_orchestrator_update_enabled(&db);
+            if enabled {
+                let reports =
+                    crate::commands::module_service::retry_failed_module_installs(
+                        None, &db, None,
+                    )
+                    .await;
+                let summary = retry_summary_counts(&reports);
+                write_audit(
+                    "module_install_auto_retry_sweep",
+                    serde_json::json!({
+                        "trigger": "update_orchestrator",
+                        "total": reports.len(),
+                        "summary": summary,
+                    }),
+                );
+            } else {
+                write_audit(
+                    "module_install_auto_retry_sweep",
+                    serde_json::json!({
+                        "trigger": "update_orchestrator",
+                        "skipped": "disabled_by_setting",
+                    }),
+                );
+            }
+        }
+    }
 
     // v0.2.43 V0243-15: audit_log complete entry (success path).
     let new_sha = read_head_sha(&install_path).await;
