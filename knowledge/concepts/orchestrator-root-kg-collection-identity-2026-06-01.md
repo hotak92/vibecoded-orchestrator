@@ -8,7 +8,7 @@ tags:
 - design-contract
 - v0.2.44
 created: 2026-06-01T03:30:00Z
-updated: 2026-06-01T03:30:00Z
+updated: 2026-06-01T15:30:00Z
 status: active
 ---
 
@@ -49,6 +49,46 @@ surfaces.
    d. Skip the shared-seed sync.
 3. If false (per-project install):
    - No rebind. KG_COLLECTION and SHARED_KG_COLLECTION resolve as usual.
+
+## v0.2.44 G-series follow-ups
+
+The original V44-A contract said "Canonical = SHARED_KG_COLLECTION wins"
+unconditionally. V44-G1 refined this into a hybrid priority chain:
+
+1. **Weaviate-existence check first.** If exactly ONE candidate collection
+   exists (preferring extant-with-rows), pick it. This means a stale env
+   value pointing at a non-existent collection cannot beat the actual data.
+2. **First-install heuristic on true tie.** When multiple candidates exist
+   with rows, env wins on FRESH install (`app_state.last_installed_kg_collection`
+   unset) and DB wins on SUBSEQUENT update (key set — bindings are authoritative
+   once recorded).
+3. **Bootstrap fallback.** If no candidate exists in Weaviate (truly fresh
+   install), env wins.
+4. **Weaviate-unreachable defers** (V44-H/H1). If Weaviate is unreachable
+   for ALL candidates, the rebind is deferred — existing bindings are
+   preserved unchanged, and a `deferred:` rationale is returned. The caller
+   in `_seed_weaviate_shared_kg_only` MUST honor the prefix and skip rebind.
+
+V44-G2 added a dual-clone WARNING (different folder than launcher.db's
+registered orchestrator_root). V44-H/H5 escalated this to also skip the
+rebind step when dual-clone is detected (prevents cross-clone state
+corruption).
+
+V44-G3 hardened the access-matrix structural-row guard in `kg.rs`.
+
+V44-G4 added an auto-retry policy for stuck `module_installs` rows
+(triggered on project-update AND orchestrator-update).
+
+V44-G5 untracked the developer-local `scripts/migrate-shared-secrets.py`
+and extended the lint-contract test to skip Claude Code's pre-edit
+snapshots in `.claude/state/tool_backups/`.
+
+V44-H closed 9 fix-now items from the multi-Opus pre-tag review:
+H1 (deferred-rebind on Weaviate unreachable), H2 (orphan notice fires
+against pre-resolution KG), H3 (path-traversal hardening on prune),
+H4 (all-empty resolver guard), H5 (dual-clone blocks rebind), H6
+(dual-clone audit-log entry), H7 (CHANGELOG: G5 note + Known Issues),
+H8 (removed misleading print), H9 (this KG section).
 
 ## The 4-release recurring loop this contract ends
 

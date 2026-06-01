@@ -442,3 +442,116 @@ def test_g1_subsequent_update_db_wins(monkeypatch):
     assert kg == "DbWinner_KG"
     assert sh == "DbWinner_KG"
     assert "subsequent update" in rat or "db" in rat.lower()
+
+
+# ────────────────────────────────────────────────────────────────────────
+# V44-H: synthesizer fix-now items (post-5+2+1 pre-tag review)
+# ────────────────────────────────────────────────────────────────────────
+
+
+def test_h1_weaviate_unreachable_defers_rebind(monkeypatch):
+    """H1: when all candidates return None from Weaviate (unreachable),
+    resolver returns a 'deferred:' rationale and DB-recorded names as
+    last-known-good fallback."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    monkeypatch.setattr(install, "_count_weaviate_class_objects", lambda _u, _n: None)
+    kg, sh, rat = install._resolve_orchestrator_root_canonical(
+        env_kg="EnvKG",
+        env_shared="EnvShared",
+        db_primary="DbKG",
+        db_shared="DbShared",
+        weaviate_url="http://x",
+    )
+    assert rat.startswith("deferred:"), f"expected deferred rationale, got {rat!r}"
+    # DB-recorded names win as fallback when set (last known good state).
+    assert kg == "DbKG"
+    assert sh == "DbShared"
+
+
+def test_h2_orphan_notice_fires_when_env_reassigned(
+    monkeypatch, capsys, tmp_path,
+):
+    """H2: when G1 reassigns current_kg_collection, the orphan notice in
+    _seed_weaviate_shared_kg_only must still fire for the PRE-resolution
+    name (passed via the new orphan_candidate_kg kwarg)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    monkeypatch.setattr(install, "_is_orchestrator_root_install", lambda: True)
+    monkeypatch.setattr(
+        install, "_rebind_orchestrator_root_to_canonical", lambda c: [],
+    )
+    monkeypatch.setattr(install, "_write_app_state_key", lambda *a, **k: None)
+
+    def _count(_u, name):
+        return 100 if name == "OldKG" else 0
+
+    monkeypatch.setattr(install, "_count_weaviate_class_objects", _count)
+    monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
+
+    class _A:
+        update = True
+
+    install._seed_weaviate_shared_kg_only(
+        args=_A(),
+        venv_py=tmp_path / "py",
+        sync_kg=tmp_path / "sync",
+        weaviate_url="http://x",
+        current_shared_kg="NewKG",
+        current_kg_collection="NewKG",  # already reassigned by G1
+        orphan_candidate_kg="OldKG",    # pre-reassignment name
+    )
+    out = capsys.readouterr().out
+    assert "Orphan collection 'OldKG' retains 100 rows" in out
+
+
+def test_h3_path_traversal_blocked():
+    """H3: _path_resolves_on_disk rejects path traversal that escapes
+    PROJECT_ROOT. /etc/passwd exists on Linux but is outside the project
+    tree — the orphan-prune must be allowed to remove a row pointing at
+    such a value."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    # /etc/passwd almost certainly exists on Linux but isn't inside PROJECT_ROOT
+    assert install._path_resolves_on_disk("../../../etc/passwd") is False
+    # Worktree-prefix branch also blocked when the stripped path traverses
+    assert install._path_resolves_on_disk(
+        ".claude/worktrees/agent-x/../../../../../../etc/passwd"
+    ) is False
+
+
+def test_h4_all_empty_resolver_inputs_bootstrap_rationale():
+    """H4: when all 4 inputs are empty/None, return bootstrap rationale
+    with empty canonical names (no empty-string propagation into
+    downstream GraphQL)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    kg, sh, rat = install._resolve_orchestrator_root_canonical(
+        env_kg="",
+        env_shared="",
+        db_primary=None,
+        db_shared=None,
+        weaviate_url="http://x",
+    )
+    assert kg == ""
+    assert sh == ""
+    assert "bootstrap" in rat.lower()
+
+
+def test_h5_dual_clone_blocks_rebind(monkeypatch):
+    """H5: dual-clone detection short-circuits
+    _rebind_orchestrator_root_to_canonical with a (skipped — ...) error
+    tail that the V44-F seed_errors deferral discriminator recognizes."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+    # Force the module-level flag set by _seed_weaviate's dual-clone block.
+    monkeypatch.setattr(
+        install, "_DUAL_CLONE_DETECTED_THIS_RUN", True, raising=False,
+    )
+    errors = install._rebind_orchestrator_root_to_canonical("CanonicalKG")
+    assert any("dual-clone" in e.lower() for e in errors), (
+        f"expected dual-clone error in {errors!r}"
+    )
+    assert any("(skipped" in e for e in errors), (
+        "(skipped) marker required for V44-F discriminator"
+    )

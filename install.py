@@ -412,6 +412,16 @@ _RESUME_ENABLED: bool = True
 # so no eviction needed.
 _PENDING_EVENTS: list[str] = []
 
+# v0.2.44 V44-H/H5: set True when _seed_weaviate detects a dual-clone
+# situation (PROJECT_ROOT has all orchestrator-root file markers but
+# launcher.db's orchestrator_root project_id points at a DIFFERENT
+# folder). When set, _rebind_orchestrator_root_to_canonical short-circuits
+# with a "(skipped)" error tail so it doesn't UPDATE the OTHER project's
+# bindings (cross-clone state corruption). The "(skipped)" substring is
+# recognized by V44-F's seed_errors deferral discriminator so this does
+# NOT escalate to a "warn" audit-log entry.
+_DUAL_CLONE_DETECTED_THIS_RUN: bool = False
+
 # Fix 1 (v0.2.13): unix timestamp marking the start of the current install
 # run. Populated by _run_install() at entry. Used by
 # _refresh_dist_binary_after_rebuild to distinguish "freshly produced this
@@ -5854,29 +5864,63 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     return result
 
 
+def _safe_inside_project(candidate: "Path") -> bool:
+    """v0.2.44 V44-H: return True iff candidate resolves to a path inside
+    PROJECT_ROOT. Defends against stored file_path values containing '..'
+    that would otherwise escape the project tree (e.g. "../../../etc/passwd"
+    would resolve to an existing file outside PROJECT_ROOT and erroneously
+    keep an orphan KG row alive forever).
+
+    Resolve both sides so symlinked install dirs compare consistently. Soft
+    fail (return False) on any OS / value error — a failed resolution should
+    behave like "outside the project" so the prune is permitted to delete
+    the stale row.
+    """
+    try:
+        resolved = candidate.resolve()
+        project_resolved = PROJECT_ROOT.resolve()
+        return resolved.is_relative_to(project_resolved)
+    except (OSError, ValueError):
+        return False
+
+
 def _path_resolves_on_disk(file_path_str: str) -> bool:
     """v0.2.44 V44-A: try multiple normalization strategies before declaring orphan.
 
     Strategies (any True → file exists, do NOT prune):
-      1. Direct relative-to-PROJECT_ROOT
-      2. Resolve PROJECT_ROOT first (handles symlinked install dirs)
-      3. Absolute path directly
-      4. Strip .claude/worktrees/agent-XXX/ prefix
+      1. Direct relative-to-PROJECT_ROOT (must resolve INSIDE PROJECT_ROOT)
+      2. Resolve PROJECT_ROOT first (handles symlinked install dirs;
+         must resolve INSIDE PROJECT_ROOT)
+      3. Absolute path directly (intentionally bypasses PROJECT_ROOT —
+         bundled-template absolute paths are legitimately outside)
+      4. Strip .claude/worktrees/agent-XXX/ prefix (must resolve INSIDE
+         PROJECT_ROOT)
+
+    v0.2.44 V44-H: strategies 1, 2, 4 now require the resolved path to
+    lie inside PROJECT_ROOT. Previously, a stored value like
+    "../../../etc/passwd" would resolve to an existing file outside the
+    project tree and keep a corrupted KG row alive forever (closes Adv-1
+    P1-1 + P1-2).
     """
     # 1. Direct relative-to-PROJECT_ROOT (canonical)
     try:
-        if (PROJECT_ROOT / file_path_str).exists():
+        candidate = PROJECT_ROOT / file_path_str
+        if _safe_inside_project(candidate) and candidate.exists():
             return True
     except (OSError, ValueError):
         # NUL bytes / invalid chars in stored file_path would crash Path.exists()
         pass
     # 2. Resolve PROJECT_ROOT first (handles symlinked install dirs)
     try:
-        if (PROJECT_ROOT.resolve() / file_path_str).exists():
+        candidate = PROJECT_ROOT.resolve() / file_path_str
+        if _safe_inside_project(candidate) and candidate.exists():
             return True
     except (OSError, ValueError):
         pass
-    # 3. Absolute path directly
+    # 3. Absolute path directly — intentionally bypasses PROJECT_ROOT
+    # semantics. Bundled-template absolute paths (e.g. paths written by
+    # an absolute-mode sync_knowledge_graph.py run) are legitimately
+    # outside PROJECT_ROOT and must continue to count as on-disk.
     try:
         candidate = Path(file_path_str)
         if candidate.is_absolute() and candidate.exists():
@@ -5887,8 +5931,10 @@ def _path_resolves_on_disk(file_path_str: str) -> bool:
     if ".claude/worktrees/agent-" in file_path_str:
         import re
         m = re.search(r"\.claude/worktrees/agent-[^/]+/(.*)$", file_path_str)
-        if m and (PROJECT_ROOT / m.group(1)).exists():
-            return True
+        if m:
+            candidate = PROJECT_ROOT / m.group(1)
+            if _safe_inside_project(candidate) and candidate.exists():
+                return True
     return False
 
 
@@ -8685,6 +8731,22 @@ def _rebind_orchestrator_root_to_canonical(canonical: str) -> list[str]:
     Never raises — every operation is wrapped.
     """
     errors: list[str] = []
+    # v0.2.44 V44-H/H5: dual-clone short-circuit. When _seed_weaviate
+    # detected that launcher.db's orchestrator_root project_id points at
+    # a DIFFERENT folder than PROJECT_ROOT, running the rebind UPDATEs
+    # would corrupt the registered clone's bindings (the launcher would
+    # then point at the wrong on-disk root). Skip both the DB UPDATE and
+    # the env projection here. The "(skipped — ...)" tail is recognized
+    # by V44-F's seed_errors deferral discriminator so this does NOT
+    # escalate to a "warn" audit-log entry (the warn already fired
+    # at the dual-clone detection site via V44-H/H6).
+    if _DUAL_CLONE_DETECTED_THIS_RUN:
+        errors.append(
+            "dual-clone detected: skipping rebind to avoid corrupting "
+            "registered clone's bindings (skipped — re-run install.py from "
+            "the registered folder to commit)"
+        )
+        return errors
     # 1. launcher.db rebind — the authoritative state change. NOT an env
     #    surface, so not in the Phase 0.B single-writer contract's scope.
     pid: str | None = None
@@ -8783,6 +8845,9 @@ def _seed_weaviate_shared_kg_only(
     weaviate_url: str,
     current_shared_kg: str,
     current_kg_collection: str = "",
+    orphan_candidate_kg: "Optional[str]" = None,
+    rebind_deferred: bool = False,
+    rebind_deferred_rationale: str = "",
 ) -> "list[str]":
     """Run the shared-KG seed step only (no per-project KG sync).
 
@@ -8831,11 +8896,19 @@ def _seed_weaviate_shared_kg_only(
                   "no KG_COLLECTION or SHARED_KG_COLLECTION set)")
             return seed_errors
 
+        # v0.2.44 V44-H/H2: orphan-detection must compare the PRE-resolution
+        # KG name (the one this install replaced) against canonical, NOT the
+        # post-V44-G1 reassigned current_kg_collection. Otherwise once G1
+        # picks the same value for both env and resolved, the orphan check
+        # always sees canonical == current_kg_collection and the notice is
+        # silently masked (Reader-4 FN1 against VCO_dev's actual state).
+        orphan_kg = orphan_candidate_kg or current_kg_collection
+
         # Diagnostic: report row counts on both physical collections.
         try:
             primary_count = _count_weaviate_class_objects(
-                weaviate_url, current_kg_collection
-            ) if current_kg_collection else 0
+                weaviate_url, orphan_kg
+            ) if orphan_kg else 0
         except Exception:
             primary_count = -1
         try:
@@ -8846,26 +8919,44 @@ def _seed_weaviate_shared_kg_only(
             shared_count = -1
         print(
             f"  → orchestrator-root adopt-and-route: "
-            f"primary={current_kg_collection or '(unset)'}={primary_count} rows, "
+            f"primary={orphan_kg or '(unset)'}={primary_count} rows, "
             f"shared={current_shared_kg or '(unset)'}={shared_count} rows"
         )
-        print(f"  → canonical = {canonical} (SHARED_KG_COLLECTION wins)")
+        # v0.2.44 V44-H/H8: removed misleading "(SHARED_KG_COLLECTION wins)"
+        # tail. The V44-G1 hybrid-SoT rationale line printed upstream already
+        # names the actual decision source — appending an unconditional
+        # "SHARED wins" was a lie when G1 picked via Weaviate-existence or
+        # the first-install heuristic.
+        print(f"  → canonical = {canonical}")
 
-        # v0.2.44 fix-now-3: notify user about orphan collection retention.
-        # When the canonical-loser collection still has rows, those rows survive
-        # in Weaviate but no longer have a binding. User may want to clean up.
+        # v0.2.44 fix-now-3 (+ V44-H/H2): notify user about orphan collection
+        # retention. When the canonical-loser collection still has rows, those
+        # rows survive in Weaviate but no longer have a binding. User may
+        # want to clean up. Compares against orphan_kg (pre-resolution name).
         if (
-            current_kg_collection
-            and canonical != current_kg_collection
+            orphan_kg
+            and canonical != orphan_kg
             and isinstance(primary_count, int) and primary_count > 0
         ):
             print(
-                f"  ⚠ Orphan collection '{current_kg_collection}' retains "
+                f"  ⚠ Orphan collection '{orphan_kg}' retains "
                 f"{primary_count} rows after rebind. The orchestrator-root install "
                 f"now uses '{canonical}'. To free up Weaviate storage, drop the "
                 f"orphan collection manually (REST: DELETE /v1/schema/"
-                f"{current_kg_collection}) or via the launcher's Weaviate panel."
+                f"{orphan_kg}) or via the launcher's Weaviate panel."
             )
+
+        # v0.2.44 V44-H/H1: when the hybrid resolver returned a deferred
+        # rationale (Weaviate unreachable for ALL candidates), DO NOT touch
+        # launcher.db or env surfaces — the resolver had no authoritative
+        # signal and would clobber last-known-good bindings with possibly-
+        # stale env values. Print the deferral and return without
+        # rebinding or writing app_state.
+        if rebind_deferred:
+            print(f"  ⏸ Rebind deferred: {rebind_deferred_rationale}")
+            print("  → shared KG seed: skipped (orchestrator-root, "
+                  "canonical collection serves both roles)")
+            return seed_errors
 
         # Rebind launcher.db (if available) and both env keys to canonical.
         rebind_errors = _rebind_orchestrator_root_to_canonical(canonical)
@@ -8884,6 +8975,7 @@ def _seed_weaviate_shared_kg_only(
             for e in rebind_errors:
                 is_deferral = (
                     "(skipped)" in e
+                    or "(skipped —" in e  # V44-H/H5 dual-clone short-circuit
                     or "reconciled on next launcher boot" in e
                     or "config_projection apply failed" in e
                 )
@@ -8958,7 +9050,23 @@ def _resolve_orchestrator_root_canonical(
         (canonical_kg, canonical_shared, rationale)
         rationale is a short human-readable string naming which branch fired.
         Suitable for direct ``print()`` into install logs.
+
+        v0.2.44 V44-H: when ``rationale.startswith("deferred:")`` the caller
+        MUST NOT trigger ``_rebind_orchestrator_root_to_canonical`` — the
+        resolver was unable to obtain authoritative existence signals (e.g.
+        Weaviate unreachable) and the returned values are the existing
+        bindings unchanged. Rebinding on a deferred signal would clobber
+        the last-known-good state with possibly-stale env values. See H1.
     """
+    # v0.2.44 V44-H/H4: all-empty guard. When none of the four inputs are set
+    # we have nothing to resolve — this is a true bootstrap before any env or
+    # DB binding has been recorded. Returning empty strings here is correct
+    # (downstream callers already handle the empty-collection case) but we
+    # tag the rationale so observers can distinguish "bootstrap" from
+    # "no-conflict-empty".
+    if not (env_kg or env_shared or db_primary or db_shared):
+        return "", "", "no canonical resolvable; bootstrap path"
+
     # No-conflict fast path: when env and DB agree (or DB has no value),
     # fill empties from DB and preserve env where set. This matches the
     # pre-V44-G1 V44-B "fill empties only" behavior.
@@ -8983,6 +9091,20 @@ def _resolve_orchestrator_root_canonical(
             counts[c] = None  # treat as nonexistent on any error
     extant_with_data = [c for c, n in counts.items() if n is not None and n > 0]
     extant_any = [c for c, n in counts.items() if n is not None]
+    # v0.2.44 V44-H/H1: distinguish "all unreachable" (every count is None,
+    # i.e. Weaviate down or transient failure on every candidate) from
+    # "all empty" (every count is 0, candidates exist but have no rows).
+    # When unreachable, we have NO authoritative signal — rebinding would
+    # gamble the last-known-good state on a transient outage. Return a
+    # deferred rationale and prefer the DB-recorded names (last known good)
+    # so the caller can short-circuit the rebind.
+    all_unreachable = bool(counts) and all(c is None for c in counts.values())
+    if all_unreachable and candidates:
+        return (
+            (db_primary or env_kg),
+            (db_shared or env_shared),
+            "deferred: Weaviate unreachable; preserving existing bindings",
+        )
 
     if len(extant_with_data) == 1:
         winner = extant_with_data[0]
@@ -8995,7 +9117,8 @@ def _resolve_orchestrator_root_canonical(
             f"weaviate (only '{winner}' exists; rowcount=0)"
         )
     if len(extant_any) == 0:
-        # Neither exists → env wins (bootstrap case; nothing to anchor on).
+        # Neither exists in Weaviate (and we DID get reachable answers, so this
+        # isn't a transient outage) → genuine bootstrap; env wins.
         return env_kg, env_shared, "env (no candidates exist in Weaviate yet)"
 
     # Step 2: multiple candidates exist (true tie). Apply first-install heuristic.
@@ -9124,12 +9247,35 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
                 f"  ⚠ DUAL-CLONE WARNING: this install ({current}) has all "
                 f"orchestrator-root file markers, but launcher.db's "
                 f"orchestrator_root project_id points at a DIFFERENT folder: "
-                f"{registered}. The install will proceed but will rebind that "
-                f"OTHER project's bindings. To avoid cross-clone state "
-                f"corruption, run install.py from {registered} instead, or "
-                f"update the launcher's project registry to point at the "
-                f"current location."
+                f"{registered}. The install will proceed but the rebind step "
+                f"will be SKIPPED to avoid corrupting the registered clone's "
+                f"bindings. To commit a rebind, re-run install.py from "
+                f"{registered} instead, or update the launcher's project "
+                f"registry to point at the current location."
             )
+            # v0.2.44 V44-H/H5: signal to _rebind_orchestrator_root_to_canonical
+            # that it must not run for this install — otherwise the rebind
+            # UPDATEs would corrupt the OTHER registered clone's bindings.
+            global _DUAL_CLONE_DETECTED_THIS_RUN
+            _DUAL_CLONE_DETECTED_THIS_RUN = True
+            # v0.2.44 V44-H/H6: dual-clone WARNING also lands in install.jsonl
+            # as a "warn"-level audit entry so post-run audits can see it.
+            _log_install_event(
+                "7c/10", "warn", "dual-clone detected",
+                data={"registered": registered, "current": current},
+            )
+
+    # v0.2.44 V44-H/H2: capture pre-resolution KG name BEFORE the G1
+    # reassignment below. Used downstream by the orphan-collection notice
+    # in _seed_weaviate_shared_kg_only so the warning fires against the
+    # collection this install actually replaced (not against the
+    # post-reassignment value, which would mask the notice).
+    _pre_resolution_kg = current_kg_collection
+    # v0.2.44 V44-H/H1: track whether the hybrid resolver punted on the
+    # rebind decision (Weaviate unreachable). The caller below must honor
+    # the deferral by skipping _rebind_orchestrator_root_to_canonical.
+    _rebind_deferred = False
+    _rebind_deferred_rationale = ""
 
     if _is_orchestrator_root_install():
         if _db_primary or _db_shared:
@@ -9142,6 +9288,9 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
                     weaviate_url=weaviate_url,
                 )
             )
+            if rationale.startswith("deferred:"):
+                _rebind_deferred = True
+                _rebind_deferred_rationale = rationale
             if (
                 resolved_kg != current_kg_collection
                 or resolved_shared != current_shared_kg
@@ -9251,6 +9400,9 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
                     weaviate_url=weaviate_url,
                     current_shared_kg=current_shared_kg,
                     current_kg_collection=current_kg_collection,
+                    orphan_candidate_kg=_pre_resolution_kg,
+                    rebind_deferred=_rebind_deferred,
+                    rebind_deferred_rationale=_rebind_deferred_rationale,
                 )
                 _log_install_event("7c/10", "ok", "CI-10: diff-gate skip complete")
                 return
@@ -9370,6 +9522,9 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         weaviate_url=weaviate_url,
         current_shared_kg=current_shared_kg,
         current_kg_collection=current_kg_collection,
+        orphan_candidate_kg=_pre_resolution_kg,
+        rebind_deferred=_rebind_deferred,
+        rebind_deferred_rationale=_rebind_deferred_rationale,
     )
     seed_errors.extend(shared_errors)
 

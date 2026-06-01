@@ -105,10 +105,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collection that actually exists), falling back to "env wins on
   first install / DB wins on subsequent update" heuristic. Replaces
   V44-F's silent-env-wins behavior.
+- **V44-G5 developer-script untracking + lint-test tool_backups exclusion**:
+  `scripts/migrate-shared-secrets.py` is now gitignored (was an untracked
+  developer-local one-off helper that accidentally got committed via V44-G5's
+  initial commit and immediately reverted). The lint test
+  `tests/test_vct_root_dir_consolidation.py` now also excludes
+  `.claude/state/tool_backups/` (Claude Code's pre-edit snapshots) from the
+  inline-pattern scan; pre-edit snapshots by definition contain the file's
+  pre-refactor state, which is a false positive.
+- **V44-H pre-tag hardening (5+2+1 multi-Opus review)**:
+  1. `_resolve_orchestrator_root_canonical`: Weaviate-unreachable for ALL
+     candidates now returns a `deferred:` rationale. The caller in
+     `_seed_weaviate_shared_kg_only` honors the prefix and skips the rebind
+     so a transient Weaviate outage cannot clobber last-known-good bindings.
+  2. Orphan-collection notice now compares against the PRE-resolution KG
+     name (new `orphan_candidate_kg` kwarg) so the warning still fires
+     after V44-G1 reassigns `current_kg_collection`.
+  3. `_path_resolves_on_disk` strategies 1, 2, 4 now require the resolved
+     path to lie inside `PROJECT_ROOT` — stored values containing `..`
+     can no longer keep a corrupted KG row alive forever.
+  4. `_resolve_orchestrator_root_canonical` short-circuits when ALL four
+     inputs are empty with a bootstrap rationale (no empty-string
+     propagation into downstream GraphQL).
+  5. Dual-clone detection now also SKIPS `_rebind_orchestrator_root_to_canonical`
+     via a module-level flag, with a `(skipped — ...)` error tail that
+     the V44-F deferral discriminator recognizes. Prevents the rebind
+     UPDATEs from corrupting the OTHER registered clone's bindings.
+  6. Dual-clone detection also writes a `warn`-level audit_log entry
+     (was print-only).
+  7. Removed misleading `"(SHARED_KG_COLLECTION wins)"` tail from the
+     `→ canonical = ...` print — V44-G1's rationale line printed just
+     above already names the actual decision source.
 
 ### Documentation
 - New KG node `knowledge/concepts/orchestrator-root-kg-collection-identity-2026-06-01.md`
   documenting the new contract + 4-release history. (V44-D)
+
+### Known issues
+- **Concurrent `install.py --update` from two terminals can split-brain env
+  surfaces.** install.py is not currently concurrency-safe; running it
+  simultaneously from two terminals (e.g., an IDE post-pull hook + manual
+  invocation) can produce `.claude/settings.json` and `.claude/env` writes
+  that disagree. Workaround: serialize manually. Fix planned for v0.2.45
+  (advisory lockfile under `~/.vct/`).
+- **Multi-user / sudo / `docker exec` runs may emit a spurious dual-clone
+  WARNING** if `~/.vct/launcher.db` was registered by a different uid. The
+  rebind is correctly suppressed in this case (V44-H/H5) so no state
+  corruption results; the warning is just confusing. Fix planned for v0.2.45
+  (uid-aware DB-path resolution).
 
 ## [0.2.43] — 2026-05-31
 
