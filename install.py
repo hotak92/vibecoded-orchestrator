@@ -8719,6 +8719,28 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
     )
 
+    # v0.2.44 V44-B: prefer launcher.db bindings as canonical source for
+    # orchestrator-root. If unavailable, fall back to env (logged at WARNING).
+    # Closes architectural-debt phase 1 of the v0.2.43 V0243-0 recurring bug:
+    # the launcher's project_kg_bindings table is the SoT; env vars are a
+    # projection that can drift silently when settings.json is stale.
+    try:
+        from vco_lib.launcher_db_reader import get_orchestrator_root_bindings
+        _db_primary, _db_shared = get_orchestrator_root_bindings()
+    except Exception:
+        _db_primary, _db_shared = (None, None)
+
+    if _is_orchestrator_root_install() and (_db_primary or _db_shared):
+        if _db_primary and not current_kg_collection:
+            current_kg_collection = _db_primary
+            print("  → KG_COLLECTION sourced from launcher.db (primary binding)")
+        if _db_shared and not current_shared_kg:
+            current_shared_kg = _db_shared
+            print("  → SHARED_KG_COLLECTION sourced from launcher.db (shared binding)")
+    elif _is_orchestrator_root_install():
+        print("  WARNING: orchestrator-root install but launcher.db unavailable; "
+              "falling back to env for KG collection resolution")
+
     if is_update and sync_kg.exists():
         stored_embedding = _read_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
         stored_kg = _read_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION)
