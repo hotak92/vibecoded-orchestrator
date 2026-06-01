@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.44] - 2026-06-01
+
+### Fixed
+- **Orchestrator-root shared-KG re-seeding loop ENDED** (4-release recurring
+  bug): install.py now detects orchestrator-root as a category (not via
+  string-equality of collection names) and rebinds both `project_kg_bindings`
+  rows + both env keys to a single canonical collection name on every
+  `--update`. SHARED_KG_COLLECTION wins as canonical. No re-embedding, no
+  re-syncing, no destructive operations on existing collections. (V44-A)
+- **Stale KG row prune no longer gated on full-sync**: `_prune_stale_kg_rows`
+  now runs on every `--update` regardless of CI-10 partial-vs-full sync state.
+  Multi-strategy path matching handles symlinked install dirs, absolute
+  paths, and `.claude/worktrees/agent-*/` prefixes. (V44-A)
+- **Structural-row guard**: orchestrator-root's WRITE access to its primary
+  collection cannot be revoked via the access-matrix UI (was implicitly safe;
+  now defensively asserted with a clear error message). Other access-matrix
+  mutations unchanged. (V44-C)
+
+### Added
+- `vco_lib/launcher_db_reader.py`: tiny read-only helper exposing
+  `get_orchestrator_root_project_id()`, `get_kg_binding(role)`, and
+  `get_orchestrator_root_bindings()`. Soft-fails on missing/corrupt DB.
+  install.py now reads launcher.db bindings (the SoT) instead of env vars
+  (a projection) for orchestrator-root canonical-collection resolution. (V44-B)
+- `install.py::_rebind_orchestrator_root_to_canonical()`: writes canonical
+  collection name into launcher.db `project_kg_bindings` (both roles) +
+  `.claude/settings.json` env block + `.claude/env` managed block.
+  Soft-fails on any error; collected errors logged but never raise. (V44-A)
+
+### Changed
+- `claude_mcp_servers/weaviate_mcp/server.py`: docstring example updated
+  to reflect post-rebind state where orchestrator-root KG_COLLECTION ==
+  SHARED_KG_COLLECTION. (V44-C)
+- `claude_mcp_servers/scripts/repair_kg_typed_links.py`: usage-string
+  example no longer uses VCO_dev-specific name. (V44-C)
+
+### Documentation
+- New KG node `knowledge/concepts/orchestrator-root-kg-collection-identity-2026-06-01.md`
+  documenting the new contract + 4-release history. (V44-D)
+
 ## [0.2.43] — 2026-05-31
 
 20 items across 4 worktree-isolated agent branches (A install.py / B launcher Rust / C Weaviate cleanup / D CI + housekeeping). Headline themes: (a) orchestrator-root install hardening — manifest refresh, portability env keys written pre-launcher-boot, stale KG row pruning, hub probe URL fixed after multi-tag regression; (b) KG schema migration safety — additive named-vector UNION strategy ensures pre-v0.2.18 collections gain all 5 slots without re-embedding, plus lowercase-collection cleanup deferrals; (c) launcher resilience — license_keys legacy-file self-heal, container_pull broken-detection, post-install MCP tool defaults assertion; (d) release pipeline — Gate 3 closes the v0.2.42 retag class where launcher/dist/ could silently regress under a new tag.

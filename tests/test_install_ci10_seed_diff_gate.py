@@ -408,12 +408,18 @@ class ContentHashHelpersTest(unittest.TestCase):
         os.environ.pop("VCT_STATE_DIR", None)
 
 
-# ─── V0243-0: orchestrator-root shared-KG seed skip ──────────────────────────
+# ─── V0243-0 (updated for v0.2.44 V44-A adopt-and-route) ─────────────────────
 
 
 class OrchestratorRootSharedKgSkipTest(unittest.TestCase):
-    """V0243-0: _seed_weaviate_shared_kg_only skips when orchestrator-root
-    install has per-project KG == shared KG (same collection = double sync).
+    """v0.2.44 V44-A: ``_seed_weaviate_shared_kg_only`` ALWAYS short-circuits
+    on orchestrator-root installs — picks a canonical collection name, rebinds
+    pointers, and skips the sync subprocess. Names CAN legitimately differ
+    (legacy migrations); the function no longer gates on name-equality.
+
+    These tests cover both the same-name (v0.2.43 V0243-0) and different-name
+    (post-migration) cases. The second test was inverted in V44-A: pre-V44 the
+    sync ran when names differed; post-V44 the rebind path skips it.
     """
 
     def _make_db(self, tmp: str) -> Path:
@@ -428,7 +434,9 @@ class OrchestratorRootSharedKgSkipTest(unittest.TestCase):
         return db_path
 
     def test_skip_when_shared_kg_equals_per_project_kg(self):
-        """shared_kg == kg_collection on orchestrator-root → skip sync, upsert app_state."""
+        """V44-A: shared_kg == kg_collection on orchestrator-root →
+        rebind to canonical (= shared), skip sync, upsert BOTH app_state keys.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["VCT_STATE_DIR"] = tmp
             db_path = self._make_db(tmp)
@@ -443,9 +451,12 @@ class OrchestratorRootSharedKgSkipTest(unittest.TestCase):
 
             collection = "VCODev_KnowledgeGraph"
 
-            # Stub _is_orchestrator_root_install → True and subprocess.run.
+            # V44-A: count helper is invoked for the diagnostic print; stub it
+            # so a missing Weaviate doesn't blow up the call.
             with mock.patch.object(install, "_is_orchestrator_root_install", return_value=True), \
                  mock.patch.object(install, "_discover_app_state_db_path", return_value=db_path), \
+                 mock.patch.object(install, "_count_weaviate_class_objects", return_value=0), \
+                 mock.patch.object(install, "_rebind_orchestrator_root_to_canonical", return_value=[]) as rebind_mock, \
                  mock.patch("subprocess.run", side_effect=_fake_run):
                 errors = install._seed_weaviate_shared_kg_only(
                     args=argparse.Namespace(),
@@ -456,28 +467,52 @@ class OrchestratorRootSharedKgSkipTest(unittest.TestCase):
                     current_kg_collection=collection,
                 )
 
-            # No subprocess.run calls (sync was skipped).
+                # Read app_state INSIDE the with-block so the mock is in effect.
+                stored_primary = install._read_app_state_key(
+                    install._APP_STATE_KEY_LAST_KG_COLLECTION
+                )
+                stored_shared = install._read_app_state_key(
+                    install._APP_STATE_KEY_LAST_SHARED_KG_COLLECTION
+                )
+
+            # V44-A: rebind helper invoked with canonical = collection.
+            rebind_mock.assert_called_once_with(collection)
+
+            # No subprocess.run calls (sync was skipped — orchestrator-root path).
             sync_calls = [c for c in captured_subprocess if "sync_knowledge_graph" in " ".join(c)]
-            self.assertEqual(sync_calls, [], "sync must NOT run when shared==per-project KG")
+            self.assertEqual(sync_calls, [], "sync must NOT run on orchestrator-root")
 
             # No errors returned.
             self.assertEqual(errors, [])
 
-            # app_state key written.
-            stored = install._read_app_state_key(
-                install._APP_STATE_KEY_LAST_SHARED_KG_COLLECTION
+            # V44-A: BOTH app_state keys upserted to canonical (= collection).
+            self.assertEqual(
+                stored_primary, collection,
+                "app_state.last_installed_kg_collection = canonical",
             )
-            self.assertEqual(stored, collection, "app_state key must be upserted to collection name")
+            self.assertEqual(
+                stored_shared, collection,
+                "app_state.last_installed_shared_kg_collection = canonical",
+            )
 
         os.environ.pop("VCT_STATE_DIR", None)
 
-    def test_no_skip_when_shared_kg_differs_from_per_project_kg(self):
-        """shared_kg != kg_collection → skip logic must NOT fire (sync still runs)."""
+    def test_canonical_rebind_when_shared_kg_differs_from_per_project_kg(self):
+        """V44-A: shared_kg != kg_collection on orchestrator-root →
+        STILL skip sync, pick canonical = shared, rebind both pointers.
+
+        This test was INVERTED in V44-A. Pre-V44 the sync subprocess ran when
+        the two collection names differed (V0243-0's string-equality gate
+        failed). V44-A's adopt-and-route detects orchestrator-root as a
+        CATEGORY and rebinds to a single canonical collection regardless of
+        name equality. SHARED wins as canonical.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["VCT_STATE_DIR"] = tmp
             db_path = self._make_db(tmp)
 
-            # Write a minimal sync_kg stub so sync_kg.exists() is True.
+            # Write a minimal sync_kg stub so sync_kg.exists() is True if the
+            # legacy branch were taken (it shouldn't be, post-V44).
             sync_kg = Path(tmp) / "sync_knowledge_graph.py"
             sync_kg.write_text("# stub\n")
 
@@ -489,21 +524,52 @@ class OrchestratorRootSharedKgSkipTest(unittest.TestCase):
                     returncode = 0
                 return _R()
 
+            shared = "VibeCodedOrchestrator_KnowledgeGraph"
+            kg = "VCODev_KnowledgeGraph"
+
             with mock.patch.object(install, "_is_orchestrator_root_install", return_value=True), \
                  mock.patch.object(install, "_discover_app_state_db_path", return_value=db_path), \
+                 mock.patch.object(install, "_count_weaviate_class_objects", return_value=0), \
+                 mock.patch.object(install, "_rebind_orchestrator_root_to_canonical", return_value=[]) as rebind_mock, \
                  mock.patch("subprocess.run", side_effect=_fake_run):
                 errors = install._seed_weaviate_shared_kg_only(
                     args=argparse.Namespace(),
                     venv_py=Path("/fake/python"),
                     sync_kg=sync_kg,
                     weaviate_url="http://localhost:8081",
-                    current_shared_kg="VibeCodedOrchestrator_KnowledgeGraph",
-                    current_kg_collection="VCODev_KnowledgeGraph",
+                    current_shared_kg=shared,
+                    current_kg_collection=kg,
                 )
 
-            # subprocess.run MUST have been called (shared != per-project).
-            sync_calls = [c for c in captured_subprocess if str(sync_kg) in " ".join(c)]
-            self.assertTrue(len(sync_calls) >= 1, "sync must run when shared != per-project KG")
+                stored_primary = install._read_app_state_key(
+                    install._APP_STATE_KEY_LAST_KG_COLLECTION
+                )
+                stored_shared = install._read_app_state_key(
+                    install._APP_STATE_KEY_LAST_SHARED_KG_COLLECTION
+                )
+
+            # V44-A: canonical = SHARED (predictable, public-shipping convention).
+            rebind_mock.assert_called_once_with(shared)
+
+            # Sync subprocess MUST NOT run (post-V44 adopt-and-route).
+            sync_calls = [c for c in captured_subprocess if "sync_knowledge_graph" in " ".join(c)]
+            self.assertEqual(
+                sync_calls, [],
+                "V44-A: sync must NOT run on orchestrator-root, even when "
+                "shared_kg != per-project kg (canonical rebind path)",
+            )
+
+            self.assertEqual(errors, [], "rebind path must succeed silently")
+
+            # Both app_state keys upserted to canonical (= SHARED).
+            self.assertEqual(
+                stored_primary, shared,
+                "V44-A: last_kg_collection rebound to canonical (SHARED)",
+            )
+            self.assertEqual(
+                stored_shared, shared,
+                "V44-A: last_shared_kg_collection rebound to canonical (SHARED)",
+            )
 
         os.environ.pop("VCT_STATE_DIR", None)
 

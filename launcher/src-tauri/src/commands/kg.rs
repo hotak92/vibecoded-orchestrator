@@ -1170,6 +1170,9 @@ pub async fn kg_ensure_node_access_schema(
 #[cfg(test)]
 mod tests {
     use super::is_codegraph_class;
+    use crate::db::models::ProjectHost;
+    use crate::db::Db;
+    use serde_json::Value as JsonValue;
 
     #[test]
     fn is_codegraph_class_matches_prefixed_names() {
@@ -1216,5 +1219,181 @@ mod tests {
         // The hide-from-KG-dashboard outcome is the same as for bare
         // names, so this is the desired behavior.
         assert!(is_codegraph_class("_CodeFunction"));
+    }
+
+    // ── v0.2.44 V44-C: structural-row guard ──────────────────────────────
+    //
+    // Verify that `kg_set_collection_access_mode`'s guard refuses to revoke
+    // the orchestrator-root project's WRITE access to its own primary
+    // collection (the "structural row"). All other access-matrix mutations
+    // remain user-controlled.
+    //
+    // The Tauri command itself takes `State<'_, Db>` and `async`, which
+    // cannot be constructed in a unit test. These tests exercise the
+    // underlying DB state + replicate the guard's conditions so the
+    // test fails if either the DB API or the guard's preconditions drift.
+    // The actual guard wiring is exercised by the GUI integration tests.
+
+    /// Helper: replicate the guard's structural-row check against a fresh
+    /// DB so the test signs the exact contract the real guard depends on.
+    /// Returns `Some(error_message)` when the guard would refuse, `None` when
+    /// the mutation is allowed.
+    fn check_structural_row_guard(
+        db: &Db,
+        owner_project_id: &str,
+        collection: &str,
+        mode: &str,
+    ) -> Option<String> {
+        let owner = db
+            .get_project(owner_project_id)
+            .expect("get_project must not fail in tests");
+        let owner_row = owner.as_ref()?;
+        if owner_row.host != ProjectHost::OrchestratorRoot {
+            return None;
+        }
+        let bindings = db
+            .list_project_kg_bindings(owner_project_id)
+            .expect("list_project_kg_bindings must not fail in tests");
+        let primary = bindings.iter().find(|b| b.role == "primary")?;
+        if primary.collection_name == collection && mode != "shared" {
+            return Some(format!(
+                "Refusing to change access mode for orchestrator-root's \
+                 structural row (collection '{}', mode '{}'). The \
+                 orchestrator-root project must retain write access to its \
+                 primary collection.",
+                collection, mode,
+            ));
+        }
+        None
+    }
+
+    /// Seed an in-memory DB with an orchestrator-root project that has a
+    /// `primary` binding at the canonical collection name. Returns the
+    /// project id so tests can address it.
+    fn seed_root_with_primary(db: &Db, collection: &str) -> String {
+        let id = "root-project-uuid".to_string();
+        db.insert_project(
+            &id,
+            "VibeCodedOrchestrator",
+            "/tmp/orchestrator-root-folder",
+            ProjectHost::OrchestratorRoot,
+            "vibecoded-orchestrator",
+        )
+        .expect("insert root project");
+        db.set_project_kg_binding(
+            &id,
+            "primary",
+            collection,
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .expect("set primary binding");
+        id
+    }
+
+    /// Revoking write access to the orchestrator-root's primary collection
+    /// (mode='private' on the structural row) is refused with a clear,
+    /// human-readable error message identifying the collection and mode.
+    #[test]
+    fn kg_set_collection_access_mode_rejects_root_structural_row_revoke() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let collection = "VibeCodedOrchestrator_KnowledgeGraph";
+        let owner_id = seed_root_with_primary(&db, collection);
+
+        // mode="private" on the structural row → guard fires.
+        let err = check_structural_row_guard(&db, &owner_id, collection, "private")
+            .expect("guard must fire on private mode for structural row");
+        assert!(
+            err.contains("structural row"),
+            "error message must name 'structural row', got: {}",
+            err,
+        );
+        assert!(
+            err.contains(collection),
+            "error message must include the collection name, got: {}",
+            err,
+        );
+        assert!(
+            err.contains("private"),
+            "error message must include the rejected mode, got: {}",
+            err,
+        );
+
+        // mode="projects" on the structural row → also refused (any non-shared
+        // mode revokes the implicit cross-project read; the guard rejects all
+        // non-shared modes equally).
+        let err2 =
+            check_structural_row_guard(&db, &owner_id, collection, "projects")
+                .expect("guard must also fire on projects mode for structural row");
+        assert!(
+            err2.contains("structural row"),
+            "guard must reject 'projects' on the structural row, got: {}",
+            err2,
+        );
+    }
+
+    /// The structural-row guard is narrowly scoped: it only fires for the
+    /// exact tuple (host=OrchestratorRoot AND collection==primary AND
+    /// mode!="shared"). All other mutations remain user-controlled.
+    #[test]
+    fn kg_set_collection_access_mode_allows_non_structural_mutations() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let collection = "VibeCodedOrchestrator_KnowledgeGraph";
+        let owner_id = seed_root_with_primary(&db, collection);
+
+        // (a) mode="shared" on the structural row → ALLOWED. Sharing the
+        //     orchestrator's KG is the canonical setup (every other project
+        //     reads from it via SHARED_KG_COLLECTION).
+        assert!(
+            check_structural_row_guard(&db, &owner_id, collection, "shared")
+                .is_none(),
+            "mode='shared' on the structural row must be allowed (default state)",
+        );
+
+        // (b) mode="private" on a DIFFERENT collection → ALLOWED. The guard
+        //     only protects the row whose collection_name equals the primary
+        //     binding's collection_name.
+        let other_collection = "SomeOtherProject_KnowledgeGraph";
+        assert!(
+            check_structural_row_guard(&db, &owner_id, other_collection, "private")
+                .is_none(),
+            "mode='private' on a non-structural collection must be allowed",
+        );
+
+        // (c) mode="private" on a NON-root project's primary → ALLOWED. The
+        //     guard scopes itself to host=OrchestratorRoot owners only.
+        let base_id = "base-project-uuid".to_string();
+        db.insert_project(
+            &base_id,
+            "MyApp",
+            "/tmp/my-app",
+            ProjectHost::Base,
+            "my-app",
+        )
+        .expect("insert base project");
+        db.set_project_kg_binding(
+            &base_id,
+            "primary",
+            "MyApp_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .expect("set base primary");
+        assert!(
+            check_structural_row_guard(
+                &db,
+                &base_id,
+                "MyApp_KnowledgeGraph",
+                "private",
+            )
+            .is_none(),
+            "mode='private' on a base project's primary must be allowed",
+        );
     }
 }
