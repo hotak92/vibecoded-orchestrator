@@ -394,8 +394,15 @@ class OrchestratorRootRebindTest(unittest.TestCase):
         """VCT_LAUNCHER_DB_PATH points at a nonexistent file → rebind helper
         reports the missing-DB error but the install MUST NOT crash.
 
-        Validates V44-A's soft-fail discipline: env keys still get updated
-        (settings.json + .claude/env) even when launcher.db can't be reached.
+        Validates V44-A's soft-fail discipline. v0.2.44 V44-E refactor:
+        env-surface writes now route through
+        ``vco_lib.config_projection.apply_project_env`` (the Phase 0.B
+        single-writer contract). When launcher.db is missing we cannot
+        build a full bundle, so env-surface projection is deferred to
+        the launcher's first-boot env-refresh. The test verifies the
+        soft-fail flow: no crash, app_state upsert still runs, env
+        files are left untouched, and the deferral is signalled via
+        the captured rebind diagnostics (printed but not propagated).
         """
         kg = "VCODev_KG"
         shared = "VibeCodedOrchestrator_KG"
@@ -412,18 +419,28 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             self.tmp / "definitely-does-not-exist.db"
         )
 
-        # Stage .claude/settings.json + .claude/env in tmp so the env-rewrite
-        # branches have something to write to. PROJECT_ROOT is pinned to tmp.
+        # Stage .claude/settings.json + .claude/env in tmp. The rebind helper
+        # MUST NOT touch them when launcher.db is missing — the launcher's
+        # first-boot env-refresh is the canonical reconciliation path.
         claude_dir = self.tmp / ".claude"
         claude_dir.mkdir(parents=True, exist_ok=True)
         settings_path = claude_dir / "settings.json"
-        settings_path.write_text('{"env": {"KG_COLLECTION": "stale", '
-                                 '"SHARED_KG_COLLECTION": "stale"}}\n')
+        original_settings_text = (
+            '{"env": {"KG_COLLECTION": "stale", '
+            '"SHARED_KG_COLLECTION": "stale"}}\n'
+        )
+        settings_path.write_text(original_settings_text)
         env_path = claude_dir / "env"
-        env_path.write_text(
+        original_env_text = (
             'export KG_COLLECTION="stale"\n'
             'export SHARED_KG_COLLECTION="stale"\n'
         )
+        env_path.write_text(original_env_text)
+
+        # Spy on apply_project_env so we can assert it was NOT called when
+        # launcher.db is missing (the contract requires a DB-resolved bundle
+        # and there's no safe way to construct one without the DB).
+        from vco_lib import config_projection as _cp
 
         with mock.patch.object(
             install, "_is_orchestrator_root_install", return_value=True
@@ -431,7 +448,9 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             install, "_discover_app_state_db_path", return_value=app_state_db
         ), mock.patch.object(
             install, "PROJECT_ROOT", self.tmp
-        ), self._patch_count(), mock.patch(
+        ), mock.patch.object(
+            _cp, "apply_project_env", wraps=_cp.apply_project_env
+        ) as apply_spy, self._patch_count(), mock.patch(
             "subprocess.run", side_effect=self._fake_run
         ):
             errors = install._seed_weaviate_shared_kg_only(
@@ -467,16 +486,27 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             "app_state upsert must run even when launcher.db missing",
         )
 
-        # .claude/settings.json rewritten to canonical.
-        import json as _json
-        updated_settings = _json.loads(settings_path.read_text())
-        self.assertEqual(updated_settings["env"]["KG_COLLECTION"], shared)
-        self.assertEqual(updated_settings["env"]["SHARED_KG_COLLECTION"], shared)
+        # apply_project_env MUST NOT have been called — without launcher.db
+        # we can't build a full bundle, so env projection is deferred.
+        self.assertEqual(
+            apply_spy.call_count, 0,
+            "apply_project_env must not be called when launcher.db is missing — "
+            "the contract requires a DB-resolved bundle; env reconciliation "
+            "is deferred to the launcher's first-boot env-refresh",
+        )
 
-        # .claude/env rewritten to canonical.
-        updated_env_text = env_path.read_text()
-        self.assertIn(f'export KG_COLLECTION="{shared}"', updated_env_text)
-        self.assertIn(f'export SHARED_KG_COLLECTION="{shared}"', updated_env_text)
+        # Env files MUST be left untouched (no direct writes from the rebind
+        # helper anymore — the Phase 0.B single-writer contract gates them).
+        self.assertEqual(
+            settings_path.read_text(), original_settings_text,
+            ".claude/settings.json must NOT be touched when launcher.db is "
+            "missing (deferred to launcher boot)",
+        )
+        self.assertEqual(
+            env_path.read_text(), original_env_text,
+            ".claude/env must NOT be touched when launcher.db is missing "
+            "(deferred to launcher boot)",
+        )
 
 
 if __name__ == "__main__":

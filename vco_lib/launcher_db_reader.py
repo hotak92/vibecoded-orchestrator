@@ -45,16 +45,28 @@ def _discover_db_path() -> Optional[Path]:
 
     Resolution priority:
       1. ``VCT_LAUNCHER_DB_PATH`` env override (must point at an existing file).
-      2. ``~/.vct/launcher.db`` (default install location).
+      2. :func:`vco_lib.paths.launcher_db_path` — honours ``VCT_STATE_DIR``
+         env override and falls back to ``~/.vct/launcher.db``.
 
     Returns ``None`` when neither yields an existing regular file.
+
+    v0.2.44 V44-E: delegates the default-path branch to
+    :func:`vco_lib.paths.launcher_db_path` so the single source-of-truth
+    helper in ``vco_lib.paths`` owns cross-OS path resolution + the
+    ``VCT_STATE_DIR`` override (the previous inline form bypassed the
+    env override silently). Satisfies
+    ``tests/test_vct_root_dir_consolidation::test_no_inline_reconstructions_outside_paths_module``.
     """
     override = os.environ.get("VCT_LAUNCHER_DB_PATH", "").strip()
     if override:
         p = Path(override)
         return p if p.is_file() else None
-    default = Path.home() / ".vct" / "launcher.db"
-    return default if default.is_file() else None
+    try:
+        from vco_lib.paths import launcher_db_path
+        default = launcher_db_path()
+        return default if default.is_file() else None
+    except Exception:
+        return None
 
 
 def _open_db_readonly() -> Optional[sqlite3.Connection]:

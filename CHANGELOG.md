@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collection cannot be revoked via the access-matrix UI (was implicitly safe;
   now defensively asserted with a clear error message). Other access-matrix
   mutations unchanged. (V44-C)
+- **Lint-contract conformance**: launcher_db_reader.py delegates path
+  resolution to vco_lib.paths.launcher_db_path() (test_vct_root_dir_consolidation);
+  _rebind_orchestrator_root_to_canonical routes env-surface writes through
+  vco_lib.config_projection.apply_project_env() (test_config_projection_single_writer).
+  (V44-E)
 
 ### Added
 - `vco_lib/launcher_db_reader.py`: tiny read-only helper exposing

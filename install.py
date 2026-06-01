@@ -8593,16 +8593,34 @@ def _rebind_orchestrator_root_to_canonical(canonical: str) -> list[str]:
     Updates (all soft-fail; collected errors returned as list):
       1. project_kg_bindings rows (role='primary' AND role='shared') for the
          orchestrator-root project_id. Uses a writable sqlite3 connection
-         to ~/.vct/launcher.db (env override: VCT_LAUNCHER_DB_PATH).
-      2. .claude/settings.json env.KG_COLLECTION = canonical
-         .claude/settings.json env.SHARED_KG_COLLECTION = canonical
-      3. .claude/env managed block: KG_COLLECTION + SHARED_KG_COLLECTION = canonical
+         to ~/.vct/launcher.db (env override: VCT_LAUNCHER_DB_PATH). The
+         launcher.db is the SOURCE OF TRUTH for canonical env values per
+         the Phase 0.B config-projection contract; this UPDATE is the
+         authoritative state change.
+      2. Env-surface projection (.claude/settings.json + .claude/env)
+         routed through ``vco_lib.config_projection.apply_project_env``
+         — the SINGLE legal writer of those surfaces per the Phase 0.B
+         contract. Bundle is built via ``project_env_from_db(pid)`` so
+         the env files pick up the canonical name we just UPDATEd into
+         the bindings plus all other canonical keys derived from the DB.
+
+    v0.2.44 V44-E: env-surface writes were previously direct
+    ``.write_text`` calls on settings.json and ``.claude/env``, which
+    violated ``tests/test_config_projection_single_writer``. Refactored
+    to delegate to ``apply_project_env`` (the canonical single writer).
+    The DB-unreachable branch is now best-effort — without the launcher
+    DB we can't safely build a full bundle (the deep-merge contract would
+    DELETE canonical keys not present in a minimal bundle), so we soft-
+    fail and rely on the launcher's first-boot env-refresh to reconcile.
 
     Returns empty list on full success, otherwise list of error strings.
     Never raises — every operation is wrapped.
     """
     errors: list[str] = []
-    # 1. launcher.db rebind
+    # 1. launcher.db rebind — the authoritative state change. NOT an env
+    #    surface, so not in the Phase 0.B single-writer contract's scope.
+    pid: str | None = None
+    db_path: Path | None = None
     try:
         from vco_lib.launcher_db_reader import (
             get_orchestrator_root_project_id, _discover_db_path,
@@ -8640,40 +8658,51 @@ def _rebind_orchestrator_root_to_canonical(canonical: str) -> list[str]:
     except Exception as e:
         errors.append(f"launcher_db_reader import/use failed: {e}")
 
-    # 2. .claude/settings.json env block
+    # 2. Env-surface projection — routed through the single legal writer.
+    #    We re-resolve project_id via the folder-based resolver too, so
+    #    if get_orchestrator_root_project_id() returned None (e.g. host
+    #    column wasn't populated), the folder-match path may still succeed.
     try:
-        settings_path = PROJECT_ROOT / ".claude" / "settings.json"
-        if settings_path.is_file():
-            data = json.loads(settings_path.read_text(encoding="utf-8"))
-            env_block = data.setdefault("env", {})
-            env_block["KG_COLLECTION"] = canonical
-            env_block["SHARED_KG_COLLECTION"] = canonical
-            settings_path.write_text(
-                json.dumps(data, indent=2) + "\n", encoding="utf-8"
+        from vco_lib.config_projection import (
+            apply_project_env,
+            project_env_from_db,
+            DbUnreachable,
+            ProjectNotFound,
+        )
+        # Resolve project_id for the env projection — prefer the host-tag
+        # lookup (already done above as `pid`); fall back to folder match
+        # when the host column is empty.
+        proj_id_for_env = pid or _resolve_project_id_by_folder(PROJECT_ROOT)
+        if proj_id_for_env is None:
+            errors.append(
+                "config_projection: orchestrator-root project_id not "
+                "resolvable; env files will be reconciled on next launcher boot"
             )
-            print(f"    → .claude/settings.json env: KG_COLLECTION = SHARED_KG_COLLECTION = {canonical}")
-    except Exception as e:
-        errors.append(f".claude/settings.json update failed: {e}")
-
-    # 3. .claude/env managed block
-    try:
-        env_path = PROJECT_ROOT / ".claude" / "env"
-        if env_path.is_file():
-            text = env_path.read_text(encoding="utf-8")
-            # Update both export lines inside the vco-managed block.
-            import re
-            for var in ("KG_COLLECTION", "SHARED_KG_COLLECTION"):
-                # Replace any existing export line for the var (within or outside block).
-                text = re.sub(
-                    rf'^export {var}=".*?"$',
-                    f'export {var}="{canonical}"',
-                    text,
-                    flags=re.MULTILINE,
+        else:
+            try:
+                bundle = project_env_from_db(proj_id_for_env)
+                report = apply_project_env(bundle)
+                print(
+                    "    → env surfaces (settings.json + .claude/env): "
+                    f"KG/SHARED = {canonical} "
+                    f"(via apply_project_env, {sum(len(v) for v in report.values())} keys total)"
                 )
-            env_path.write_text(text, encoding="utf-8")
-            print(f"    → .claude/env: KG_COLLECTION = SHARED_KG_COLLECTION = {canonical}")
+            except DbUnreachable as e:
+                # Launcher DB went away between the rebind UPDATE above and
+                # the bundle build here — extremely rare race. Soft-fail;
+                # the launcher's next boot will reconcile env surfaces.
+                errors.append(
+                    f"config_projection: launcher.db unreachable for env "
+                    f"projection ({e}); env files will be reconciled on next "
+                    f"launcher boot"
+                )
+            except ProjectNotFound as e:
+                errors.append(
+                    f"config_projection: project_id {proj_id_for_env} not "
+                    f"found in launcher.db ({e})"
+                )
     except Exception as e:
-        errors.append(f".claude/env update failed: {e}")
+        errors.append(f"config_projection apply failed: {e}")
 
     return errors
 
