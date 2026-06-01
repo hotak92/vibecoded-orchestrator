@@ -223,6 +223,10 @@ docs/ADMIN_LICENSE.md
 claude_mcp_servers/rl_server/
 claude_mcp_servers/scripts/rl_*.py
 !claude_mcp_servers/scripts/rl_kg_search.py
+
+# Developer-local one-off migration scripts. These run outside the
+# launcher and may carry user-specific assumptions; not bundled.
+scripts/migrate-shared-secrets.py
 claude_mcp_servers/scripts/migrate_rl_log_*.py
 claude_mcp_servers/scripts/offline_trainer*.py
 claude_mcp_servers/scripts/retrieval_rl*.py
