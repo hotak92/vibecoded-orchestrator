@@ -34,6 +34,7 @@
     KgCollectionAccess,
     CodegraphAccessMatrix,
     ProjectRef,
+    ProjectStateSnapshot,
   } from '$lib/types/project-state';
   import type { ProjectView } from '$lib/types/launcher';
 
@@ -46,6 +47,11 @@
   let cgLoading = $state(true);
   let allProjects = $state<ProjectView[]>([]);
   let projectsLoading = $state(true);
+  // v0.2.44 V44-C: cache this project's primary KG binding collection name
+  // so we can render the orchestrator-root structural row as non-editable.
+  // null when the snapshot hasn't loaded yet or the project has no primary
+  // binding (treated as "no structural row to protect").
+  let primaryKgCollection = $state<string | null>(null);
 
   // Codegraph grant modal state
   let showCgGrantModal = $state(false);
@@ -87,17 +93,47 @@
     }
   }
 
+  // v0.2.44 V44-C: load this project's KG bindings so we can identify the
+  // primary collection (whose access row is structural for orchestrator-root).
+  async function loadPrimaryKgBinding() {
+    try {
+      const snap = await invoke<ProjectStateSnapshot>('get_project_state_snapshot', { projectId });
+      const primary = snap.kg_bindings.find((b) => b.role === 'primary');
+      primaryKgCollection = primary ? primary.collection_name : null;
+    } catch {
+      // Soft-fail: if the snapshot isn't available the guard simply
+      // doesn't engage and the row remains editable (backend guard
+      // is still the authoritative gate).
+      primaryKgCollection = null;
+    }
+  }
+
   onMount(() => {
     void loadKg();
     void loadCg();
     void loadProjects();
+    void loadPrimaryKgBinding();
   });
   $effect(() => {
     if (projectId) {
       void loadKg();
       void loadCg();
+      void loadPrimaryKgBinding();
     }
   });
+
+  // v0.2.44 V44-C: row-level guard. True only when the active project is
+  // the orchestrator-root AND the row is for that project's primary KG
+  // collection — exactly the structural case the backend rejects. All
+  // other rows remain user-editable.
+  function isRootStructuralRow(collectionName: string): boolean {
+    const active = allProjects.find((p) => p.id === projectId);
+    if (!active) return false;
+    const isRoot =
+      active.slug === 'orchestrator-root' || (active as any).host === 'orchestrator_root';
+    if (!isRoot) return false;
+    return primaryKgCollection !== null && primaryKgCollection === collectionName;
+  }
 
   // ─── KG collection access change ─────────────────────────────────
   //
@@ -318,7 +354,13 @@
                 {/if}
               </td>
               <td class="ps-col-action">
-                {#if c.access === 'none'}
+                {#if isRootStructuralRow(c.name)}
+                  <button
+                    class="ps-btn-link"
+                    disabled
+                    title="Structural row for orchestrator-root — write access cannot be revoked"
+                  >Locked</button>
+                {:else if c.access === 'none'}
                   <button
                     class="ps-btn-link"
                     onclick={() => setOwnAccess(c.name, 'private')}

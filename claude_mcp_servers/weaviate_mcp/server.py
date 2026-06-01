@@ -1660,6 +1660,13 @@ def _format_failed_collections_hint(failed: list[str]) -> str:
         VibeCodedOrchestrator_KnowledgeGraph [self/KG_COLLECTION src=default(empty-env-coerced)],
         VibeCodedOrchestrator_Development [peer/VCT_KG_ACCESS_LIST]
 
+    Example resolution for orchestrator-root (post-v0.2.44)::
+
+        KG_COLLECTION        = VibeCodedOrchestrator_KnowledgeGraph  [self/KG_COLLECTION]
+        SHARED_KG_COLLECTION = VibeCodedOrchestrator_KnowledgeGraph  [self/SHARED_KG_COLLECTION]
+        (Both env keys hold the same canonical name; one physical collection
+         serves both primary and shared roles for orchestrator-root.)
+
     Shown after the truncated raw list in WeaviateSchemaError messages
     so users debugging a "no results" bug can see at a glance whether
     the MCP picked up the right env vars.

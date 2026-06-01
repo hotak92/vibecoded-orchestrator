@@ -878,6 +878,38 @@ pub async fn kg_set_collection_access_mode(
     if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
         return Err(format!("invalid mode: {}", req.mode));
     }
+    // v0.2.44 V44-C: structural-row guard.
+    //
+    // The orchestrator-root project's WRITE access to its own primary collection
+    // is structural — revoking it breaks the install (kg-sync etc. would refuse
+    // to write to the canonical KG). All OTHER access-matrix mutations remain
+    // user-controlled (per-project opt-outs, granting read to other projects,
+    // non-structural-collection changes, etc.).
+    {
+        let owner = db
+            .get_project(&req.owner_project_id)
+            .map_err(|e| format!("get_project failed: {}", e))?;
+        if let Some(owner_row) = owner {
+            if owner_row.host == crate::db::models::ProjectHost::OrchestratorRoot {
+                let primary_binding = db
+                    .list_project_kg_bindings(&req.owner_project_id)
+                    .map_err(|e| format!("list_project_kg_bindings failed: {}", e))?
+                    .into_iter()
+                    .find(|b| b.role == "primary");
+                if let Some(pb) = primary_binding {
+                    if pb.collection_name == req.collection && req.mode != "shared" {
+                        return Err(format!(
+                            "Refusing to change access mode for orchestrator-root's \
+                             structural row (collection '{}', mode '{}'). The \
+                             orchestrator-root project must retain write access to its \
+                             primary collection.",
+                            req.collection, req.mode,
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // Owner always has write
     db.kg_set_access(&req.owner_project_id, &req.collection, "write")?;
 

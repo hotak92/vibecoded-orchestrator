@@ -21,7 +21,7 @@ data.update().
 
 Usage:
     python repair_kg_typed_links.py
-    python repair_kg_typed_links.py --collections VCODev_KnowledgeGraph LegacyKG
+    python repair_kg_typed_links.py --collections MyProject_KnowledgeGraph LegacyKG
     python repair_kg_typed_links.py --dry-run
 
 Environment:
