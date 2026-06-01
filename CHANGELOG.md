@@ -29,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   _rebind_orchestrator_root_to_canonical routes env-surface writes through
   vco_lib.config_projection.apply_project_env() (test_config_projection_single_writer).
   (V44-E)
+- **Hardening from adversarial post-merge review (V44-F)**:
+  1. `_path_resolves_on_disk` strategy 1 now wraps `Path.exists()` in
+     try/except — prevents prune-loop crash on NUL/invalid-char file_paths.
+  2. `_rebind_orchestrator_root_to_canonical` errors propagate into
+     `seed_errors` so audit-log "warn" entries fire on rebind failures
+     (was silently absorbed into print-only).
+  3. New informational notice when an orphan collection retains rows
+     after the canonical rebind — tells user where the old data lives
+     and how to drop it manually (non-destructive).
+  4. Env-vs-DB disagreement now warns loudly during install (rather than
+     silently letting env win when set).
+- **MCP shared-write gate semantic fix (V44-F)**: store_knowledge_node's
+  SHARED_KG_WRITE_DISABLED gate now fires on `scope == "shared"` rather
+  than on `target_collection_name == SHARED_KG_COLLECTION`. Post-v0.2.44
+  rebind makes KG == SHARED for orchestrator-root, which would otherwise
+  block legitimate scope='project' writes when the gate is on. Found by
+  v0.2.44 RL adversarial review.
 
 ### Added
 - `vco_lib/launcher_db_reader.py`: tiny read-only helper exposing

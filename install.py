@@ -5864,8 +5864,12 @@ def _path_resolves_on_disk(file_path_str: str) -> bool:
       4. Strip .claude/worktrees/agent-XXX/ prefix
     """
     # 1. Direct relative-to-PROJECT_ROOT (canonical)
-    if (PROJECT_ROOT / file_path_str).exists():
-        return True
+    try:
+        if (PROJECT_ROOT / file_path_str).exists():
+            return True
+    except (OSError, ValueError):
+        # NUL bytes / invalid chars in stored file_path would crash Path.exists()
+        pass
     # 2. Resolve PROJECT_ROOT first (handles symlinked install dirs)
     try:
         if (PROJECT_ROOT.resolve() / file_path_str).exists():
@@ -8783,11 +8787,44 @@ def _seed_weaviate_shared_kg_only(
         )
         print(f"  → canonical = {canonical} (SHARED_KG_COLLECTION wins)")
 
+        # v0.2.44 fix-now-3: notify user about orphan collection retention.
+        # When the canonical-loser collection still has rows, those rows survive
+        # in Weaviate but no longer have a binding. User may want to clean up.
+        if (
+            current_kg_collection
+            and canonical != current_kg_collection
+            and isinstance(primary_count, int) and primary_count > 0
+        ):
+            print(
+                f"  ⚠ Orphan collection '{current_kg_collection}' retains "
+                f"{primary_count} rows after rebind. The orchestrator-root install "
+                f"now uses '{canonical}'. To free up Weaviate storage, drop the "
+                f"orphan collection manually (REST: DELETE /v1/schema/"
+                f"{current_kg_collection}) or via the launcher's Weaviate panel."
+            )
+
         # Rebind launcher.db (if available) and both env keys to canonical.
         rebind_errors = _rebind_orchestrator_root_to_canonical(canonical)
         if rebind_errors:
             for e in rebind_errors:
                 print(f"    ! rebind: {e}")
+            # v0.2.44 fix-now-2: propagate the "definitely broken" tier so
+            # the audit-log "warn" entry fires on real DB write failures or
+            # import errors. Two error classes stay non-propagated and
+            # preserve V44-A/V44-E's soft-fail discipline:
+            #   - Deferrals: "(skipped)", "reconciled on next launcher boot"
+            #     — these are legitimate first-boot reconciliation signals.
+            #   - "config_projection apply failed:" — V44-E documents env
+            #     projection as best-effort; failures here also defer to
+            #     the launcher's env-refresh, so they stay print-only.
+            for e in rebind_errors:
+                is_deferral = (
+                    "(skipped)" in e
+                    or "reconciled on next launcher boot" in e
+                    or "config_projection apply failed" in e
+                )
+                if not is_deferral:
+                    seed_errors.append(e)
 
         _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, canonical)
         _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, canonical)
@@ -8922,9 +8959,23 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         if _db_primary and not current_kg_collection:
             current_kg_collection = _db_primary
             print("  → KG_COLLECTION sourced from launcher.db (primary binding)")
+        elif _db_primary and current_kg_collection and _db_primary != current_kg_collection:
+            # v0.2.44 fix-now-4: env vs DB disagreement is suspect; warn loudly.
+            # The rebind step downstream will canonicalize, but log for diagnostics.
+            print(
+                f"  ⚠ KG_COLLECTION disagreement: env={current_kg_collection!r}, "
+                f"launcher.db.primary={_db_primary!r}. Rebind will reconcile to "
+                f"canonical (SHARED_KG_COLLECTION wins)."
+            )
         if _db_shared and not current_shared_kg:
             current_shared_kg = _db_shared
             print("  → SHARED_KG_COLLECTION sourced from launcher.db (shared binding)")
+        elif _db_shared and current_shared_kg and _db_shared != current_shared_kg:
+            print(
+                f"  ⚠ SHARED_KG_COLLECTION disagreement: env={current_shared_kg!r}, "
+                f"launcher.db.shared={_db_shared!r}. Rebind will reconcile to "
+                f"canonical (env wins as final canonical)."
+            )
     elif _is_orchestrator_root_install():
         print("  WARNING: orchestrator-root install but launcher.db unavailable; "
               "falling back to env for KG collection resolution")

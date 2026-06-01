@@ -4911,7 +4911,15 @@ async def store_knowledge_node(
         # gate is on. Resolving the gate at call time (not import time) means
         # the env var is honoured even when overridden mid-session, and lets
         # the test suite reload the value without re-importing the module.
-        if target_collection_name == SHARED_KG_COLLECTION and SHARED_KG_COLLECTION:
+        #
+        # v0.2.44 fix-now-6: gate on requested SCOPE, not on the resolved target
+        # name. After the orchestrator-root rebind (KG == SHARED), the previous
+        # name-equality predicate would fire for scope='project' writes too,
+        # blocking ALL writes when the gate is on. The semantic intent of the
+        # gate is "block CROSS-PROJECT shared writes", which corresponds to
+        # scope='shared' regardless of whether the physical collection happens
+        # to be the same as the per-project one.
+        if scope == "shared" and SHARED_KG_COLLECTION:
             if _resolve_shared_kg_write_disabled():
                 return json.dumps({
                     "status": "error",
