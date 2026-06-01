@@ -8591,6 +8591,70 @@ def _is_orchestrator_root_install() -> bool:
     )
 
 
+def _check_dual_clone() -> Optional[tuple]:
+    """v0.2.44 V44-G2: detect dual-clone hazard.
+
+    Returns ``(registered_folder_path, current_project_root)`` tuple if
+    ``launcher.db``'s orchestrator-root ``project_id`` points at a DIFFERENT
+    folder than ``PROJECT_ROOT``. Returns ``None`` when there's no conflict
+    or when the DB is unavailable.
+
+    Background: ``_is_orchestrator_root_install()`` returns True from any
+    on-disk clone that has the three file markers (vct-module.json,
+    install.py, vco_lib/). The DB row ``projects.host='orchestrator_root'``
+    is the single authoritative pointer to which clone is "the" orchestrator
+    root for this user. If a user accidentally has two clones on disk and
+    runs install.py from the WRONG one, the install would rebind the OTHER
+    project's bindings to this clone's identity — silent cross-clone state
+    corruption.
+
+    This helper surfaces the deviation so install.py can WARN before
+    proceeding. The install is not blocked (per user directive
+    2026-06-01: "warn but proceed; user is expected to have one VCO root").
+    """
+    try:
+        from vco_lib.launcher_db_reader import (
+            get_orchestrator_root_project_id,
+            _discover_db_path,
+        )
+        pid = get_orchestrator_root_project_id()
+        if not pid:
+            return None
+        db_path = _discover_db_path()
+        if not db_path:
+            return None
+        import sqlite3
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, timeout=5.0
+            )
+            try:
+                row = conn.execute(
+                    "SELECT folder_path FROM projects WHERE id = ? LIMIT 1",
+                    (pid,),
+                ).fetchone()
+                if not row:
+                    return None
+                registered = str(row[0])
+                current = str(PROJECT_ROOT.resolve())
+                # Resolve registered too — handle symlinks consistently. If
+                # the registered path no longer exists on disk, fall back
+                # to the raw value (comparison still triggers the warning).
+                try:
+                    registered_resolved = str(Path(registered).resolve())
+                except Exception:
+                    registered_resolved = registered
+                if registered_resolved != current:
+                    return (registered, current)
+                return None
+            finally:
+                conn.close()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 def _rebind_orchestrator_root_to_canonical(canonical: str) -> list[str]:
     """v0.2.44 V44-A: rebind orchestrator-root pointers to canonical KG name.
 
@@ -8954,6 +9018,25 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         _db_primary, _db_shared = get_orchestrator_root_bindings()
     except Exception:
         _db_primary, _db_shared = (None, None)
+
+    # v0.2.44 V44-G2: dual-clone WARNING. Fires when launcher.db's
+    # orchestrator-root project_id points at a folder different from
+    # PROJECT_ROOT. User directive 2026-06-01: warn but proceed; the
+    # supported configuration is "one VCO root project per user".
+    if _is_orchestrator_root_install():
+        dual_clone = _check_dual_clone()
+        if dual_clone is not None:
+            registered, current = dual_clone
+            print(
+                f"  ⚠ DUAL-CLONE WARNING: this install ({current}) has all "
+                f"orchestrator-root file markers, but launcher.db's "
+                f"orchestrator_root project_id points at a DIFFERENT folder: "
+                f"{registered}. The install will proceed but will rebind that "
+                f"OTHER project's bindings. To avoid cross-clone state "
+                f"corruption, run install.py from {registered} instead, or "
+                f"update the launcher's project registry to point at the "
+                f"current location."
+            )
 
     if _is_orchestrator_root_install() and (_db_primary or _db_shared):
         if _db_primary and not current_kg_collection:

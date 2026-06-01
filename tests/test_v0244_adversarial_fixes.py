@@ -223,3 +223,102 @@ def test_shared_kg_write_disabled_does_not_block_project_scope_on_orchestrator_r
     assert 'target_collection_name == SHARED_KG_COLLECTION' not in src, (
         "Old predicate still present"
     )
+
+
+# ─── V44-G2: dual-clone WARNING tests ─────────────────────────────────────
+
+def test_g2_dual_clone_warning_fires(monkeypatch, tmp_path, capsys):
+    """G2: when launcher.db orchestrator-root project points at a DIFFERENT
+    folder than PROJECT_ROOT, _check_dual_clone must return a (registered,
+    current) tuple indicating the mismatch.
+    """
+    import sys
+    import sqlite3
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    # Build a fixture launcher.db
+    db_path = tmp_path / "launcher.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY, name TEXT, folder_path TEXT,
+            host TEXT, created_at INT, updated_at INT, slug TEXT, rl_port INT
+        )
+        """
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    conn.execute(
+        "INSERT INTO projects VALUES ('test-pid', 'TestProj', ?, "
+        "'orchestrator_root', 0, 0, 'test', NULL)",
+        (str(elsewhere),),  # registered points elsewhere
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db_path))
+
+    # PROJECT_ROOT is tmp_path itself, not tmp_path/elsewhere
+    monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
+
+    result = install._check_dual_clone()
+    assert result is not None, (
+        "expected dual-clone mismatch tuple, got None"
+    )
+    registered, current = result
+    assert "elsewhere" in registered, (
+        f"registered path should mention 'elsewhere', got {registered!r}"
+    )
+    assert str(tmp_path.resolve()) == current, (
+        f"current path should equal resolved PROJECT_ROOT, got {current!r}"
+    )
+
+
+def test_g2_no_warning_when_paths_match(monkeypatch, tmp_path):
+    """G2: when launcher.db folder_path matches PROJECT_ROOT, _check_dual_clone
+    returns None (no warning).
+    """
+    import sys
+    import sqlite3
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    db_path = tmp_path / "launcher.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY, name TEXT, folder_path TEXT,
+            host TEXT, created_at INT, updated_at INT, slug TEXT, rl_port INT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO projects VALUES ('test-pid', 'TestProj', ?, "
+        "'orchestrator_root', 0, 0, 'test', NULL)",
+        (str(tmp_path),),  # matches PROJECT_ROOT
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("VCT_LAUNCHER_DB_PATH", str(db_path))
+    monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
+
+    assert install._check_dual_clone() is None
+
+
+def test_g2_no_warning_when_db_missing(monkeypatch, tmp_path):
+    """G2: missing launcher.db -> returns None gracefully (no crash, no warning)."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    monkeypatch.setenv(
+        "VCT_LAUNCHER_DB_PATH", str(tmp_path / "nonexistent.db")
+    )
+    monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
+
+    assert install._check_dual_clone() is None

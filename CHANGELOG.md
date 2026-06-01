@@ -57,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collection name into launcher.db `project_kg_bindings` (both roles) +
   `.claude/settings.json` env block + `.claude/env` managed block.
   Soft-fails on any error; collected errors logged but never raise. (V44-A)
+- **V44-G2 dual-clone WARNING**: when launcher.db's orchestrator-root
+  project_id points at a folder different from PROJECT_ROOT, install.py
+  prints a clear WARNING explaining the situation but proceeds. User
+  is expected to have one VCO root project.
 
 ### Changed
 - `claude_mcp_servers/weaviate_mcp/server.py`: docstring example updated
