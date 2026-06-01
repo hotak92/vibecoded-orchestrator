@@ -1,15 +1,3 @@
-<!-- vco-deferral-reminder-begin -->
-**Pending VCO action**: `.claude/context/UPDATE_DEFERRED.md` exists.
-Read it at session start — it contains commands to resolve
-unresolved VCO install actions.
-
-To remove THIS reminder block: once the deferral is resolved (e.g.
-via `--update --force`), VCO's next install run will delete
-UPDATE_DEFERRED.md AND strip this block. Manual cleanup if needed:
-delete everything between the HTML-comment markers wrapping this
-block.
-<!-- vco-deferral-reminder-end -->
-
 <!-- BEGIN: SETUP-ONLY (project-scoping nudge — remove after the user has either declined or completed the scoping pass) -->
 ## FIRST SESSION — wait for the user to define the project, then offer to scope agents/skills
 
@@ -62,6 +50,31 @@ These rules apply to YOU (Claude) working inside any project that has VCO instal
 6. **Knowledge Graph writes should match scope.** Project-specific patterns → per-project KG (default `scope="project"`). Cross-project patterns that other projects on the same machine would benefit from → shared KG (`scope="shared"`). Don't pollute the shared KG with project-internal trivia; don't isolate genuinely reusable knowledge to a single project.
 
 7. **When in doubt about an update flow, ask.** "Should I run `install.py --update`?" or "Should I drop the Weaviate collection to re-embed with the new model?" are reasonable questions to ask the user before acting — those operations take time and a wrong call costs the user more than the question.
+
+---
+
+## Release discipline — no deferred fixes (added 2026-05-31, post-v0.2.41 retrospective)
+
+**Hard rule**: never push a tagged release if there is ANY known unresolved issue at tag time. "Known" means anything that has been (a) reported by an audit/review, (b) flagged by CI on the current branch, (c) reproduced as a bug in this or a prior cycle and not yet closed, or (d) explicitly written down as a backlog/follow-up item targeting "next version."
+
+**Triggers this rule (do NOT do these things)**:
+- "We'll fix the smoke test in the next release." → **No.** Fix it in this release or explicitly delete the assertion.
+- "Backlog for v0.2.X+1: …" → **No.** Either close in v0.2.X or document a deliberate scope decision the user has explicitly approved.
+- "Push v0.2.X tag now while CI is still red on installer-smoke — it's not gating Release anyway." → **No.** Red gates block tagging, period. Even non-Release-gating workflows.
+- "We can clean up the dead code/imports/TODO later." → **No.** Either delete it now or open a non-deferred follow-up that lands within the same tag's cycle.
+
+**What "no deferred fixes" requires before every tag**:
+1. `UPDATE_DEFERRED.md` is EMPTY (no rows queued for next release).
+2. `gh run list --limit 30` on the release branch + main shows zero red conclusions on ANY workflow (Release, CI, installer-smoke, manifest-validate, hook-os-parity, codeql, etc.) — including informational ones.
+3. No `TODO(next-release)` / `FIXME(v0.2.X+1)` / `XXX` annotations have been added since the last tag without being closed.
+4. CHANGELOG.md `[Unreleased]` section is EMPTY (all entries moved into the tagged version block).
+5. Every audit/review artifact under `.claude/context/reviews/` for the current cycle has been reconciled (no `IN-SCOPE` items still pending; all `OUT-OF-SCOPE` items have explicit user-approval rationale recorded inline).
+
+**Why this rule exists**: v0.2.40 shipped 18 agent landings + R3-R5 follow-ups all flagged "ops follow-up needed" / "container-side TODO" / "dead code, cleanup next release". v0.2.41 was a CI-gate hotfix that ALSO shipped with installer-smoke still red + Weaviate-bootstrap still failing + 4 deferred items. Each chained bugfix release erodes the user-facing credibility of every prior tag. User correction 2026-05-31: "do not push a release if you are deferring fixing some issue with the release. Fix first then push."
+
+**How to apply when scope feels too big**: ask the user "this would push v0.2.X out by N days — accept defer with explicit rationale OR cut scope from this release?" Then act on whichever they choose. Don't decide unilaterally to defer.
+
+**Cross-reference**: `/home/martino/.claude/projects/-home-martino-Desktop-PROGETTI-VCO-dev/memory/feedback_no_release_with_deferred_fixes.md` (the auto-memory entry for this rule).
 
 ---
 
