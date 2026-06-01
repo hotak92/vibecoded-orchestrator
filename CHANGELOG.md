@@ -46,6 +46,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rebind makes KG == SHARED for orchestrator-root, which would otherwise
   block legitimate scope='project' writes when the gate is on. Found by
   v0.2.44 RL adversarial review.
+- **V44-G3 lint-contract robustness against local dev-only artefacts**:
+  `tests/test_vct_root_dir_consolidation.py::test_no_inline_reconstructions_outside_paths_module`
+  now excludes two path classes that trigger false positives only on
+  local developer checkouts (not on CI / clean clones):
+  (a) `.claude/worktrees/agent-*/` — transient git-worktree mirrors
+  spawned by the multi-agent harness containing full copies of production
+  code (incl. `install.py` and `vco_lib/paths.py`) that look like
+  violations but are scratch dirs; the canonical files are already covered
+  by the main repo_root scan + `allowed` set.
+  (b) `.claude/scripts/` — gitignored bundle copies of
+  `templates/scripts/` scripts. The canonical template
+  `templates/scripts/generate-kg-summary.py` is already allow-listed (with
+  documented rationale for its inline construction — it can't import
+  `vco_lib` because the template is reused inside per-project installs
+  that don't ship `vco_lib` on PYTHONPATH). Flagging the bundle copy is
+  double-counting. CI runs were unaffected (clean clones don't carry
+  either artefact); local dev runs of the lint test now match CI behaviour.
+  (V44-G3)
 
 ### Added
 - `vco_lib/launcher_db_reader.py`: tiny read-only helper exposing

@@ -187,6 +187,22 @@ def test_no_inline_reconstructions_outside_paths_module():
     in production code outside ``vco_lib/paths.py`` (the single source
     of truth) and ``templates/scripts/generate-kg-summary.py`` (which
     documents WHY it can't import vco_lib).
+
+    Path-exclusion semantics (v0.2.44 V44-G3):
+      * ``.claude/worktrees/agent-*/`` — transient git-worktree mirrors
+        spawned by the multi-agent harness. They contain full copies of
+        production code (including ``install.py`` / ``vco_lib/paths.py``)
+        that LOOK like violations to a naive rglob walk but aren't —
+        they're scratch dirs that get cleaned up between sessions. The
+        canonical files inside them are already covered by the main
+        repo_root scan + the ``allowed`` set, so re-scanning the mirror
+        copies would only produce false-positive duplicates.
+      * ``.claude/scripts/`` — gitignored bundle copies of files under
+        ``templates/scripts/``. Whatever the template ships, the bundle
+        mirrors. The canonical template at
+        ``templates/scripts/generate-kg-summary.py`` is already in the
+        ``allowed`` set (with documented design rationale for the inline
+        construction); flagging the gitignored copy is double-counting.
     """
     import re
 
@@ -212,6 +228,25 @@ def test_no_inline_reconstructions_outside_paths_module():
         # Skip third-party / venv / tests.
         rel = py_file.relative_to(repo_root)
         if any(part in skip_dirs for part in rel.parts):
+            continue
+        # Skip transient agent-worktree mirrors (scratch dirs spawned
+        # by the multi-agent harness — full copies of production code,
+        # not production code themselves). Match any path component
+        # shaped like ``agent-<hexhash>`` directly under
+        # ``.claude/worktrees/``.
+        rel_parts = rel.parts
+        if (
+            len(rel_parts) >= 3
+            and rel_parts[0] == ".claude"
+            and rel_parts[1] == "worktrees"
+            and rel_parts[2].startswith("agent-")
+        ):
+            continue
+        # Skip the gitignored ``.claude/scripts/`` bundle copies. The
+        # canonical source for these scripts lives at
+        # ``templates/scripts/`` and is already covered by the
+        # ``allowed`` set when applicable.
+        if len(rel_parts) >= 2 and rel_parts[0] == ".claude" and rel_parts[1] == "scripts":
             continue
         if py_file in allowed:
             continue
