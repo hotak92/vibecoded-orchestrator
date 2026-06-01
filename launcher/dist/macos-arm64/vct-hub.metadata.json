@@ -1,11 +1,11 @@
 {
-  "source_sha": "e7baaf4ae17173a8501b37fd0853421fed2f02c2",
-  "source_short_sha": "e7baaf4",
-  "source_hash": "eb0e1c09148f825cf3cbe362c918642db8dff302",
-  "built_at": "2026-05-31T20:30:46Z",
-  "launcher_version": "0.2.42",
+  "source_sha": "aaddb8f6fe55d8ef77da582b98f6b0db74641bf7",
+  "source_short_sha": "aaddb8f",
+  "source_hash": "5fb24328890ac0014251a193179d80d4f28d54e3",
+  "built_at": "2026-06-01T01:02:17Z",
+  "launcher_version": "0.2.43",
   "host_target": "macos-arm64",
   "binary_name": "vct-hub",
-  "binary_size_bytes": 6938672,
+  "binary_size_bytes": 6938688,
   "tier": "experimental"
 }
