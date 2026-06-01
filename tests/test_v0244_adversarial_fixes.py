@@ -141,7 +141,13 @@ def test_orphan_collection_notice_fires(monkeypatch, tmp_path, capsys):
 
 
 def test_env_db_disagreement_warning(monkeypatch, capsys, tmp_path):
-    """Fix 4: when env value disagrees with DB value, a WARNING prints."""
+    """Fix 4 (V44-G1 updated): when env value disagrees with DB value, the
+    hybrid SoT resolver fires and logs its rationale.
+
+    V44-G1 replaced V44-F's silent "disagreement" WARNING prints with an
+    explicit hybrid resolver (check Weaviate → first-install heuristic).
+    The rationale must appear in stdout; the V44-F warning strings must NOT.
+    """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import install
 
@@ -155,13 +161,17 @@ def test_env_db_disagreement_warning(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(install, "_is_orchestrator_root_install", lambda: True)
     monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
 
-    # Stub everything downstream of the warning that could blow up.
+    # Stub everything downstream of the resolver that could blow up.
     monkeypatch.setattr(install, "_read_app_state_key", lambda k: None)
     monkeypatch.setattr(install, "_write_app_state_key", lambda *a, **k: None)
     monkeypatch.setattr(install, "_compute_on_disk_content_hashes", lambda *a, **k: {})
     monkeypatch.setattr(install, "_batch_query_weaviate_content_hashes", lambda *a, **k: {})
     monkeypatch.setattr(install, "_seed_weaviate_shared_kg_only", lambda **k: [])
     monkeypatch.setattr(install, "_prune_stale_kg_rows", lambda *a, **k: None)
+    # No collections exist in Weaviate → hybrid resolver hits the bootstrap
+    # branch (env wins, "no candidates exist in Weaviate yet"). For richer
+    # branch coverage see the four test_g1_* cases below.
+    monkeypatch.setattr(install, "_count_weaviate_class_objects", lambda *a, **k: None)
 
     # We need .claude/scripts/sync_knowledge_graph.py to exist for the path.
     scripts = tmp_path / ".claude" / "scripts"
@@ -180,21 +190,30 @@ def test_env_db_disagreement_warning(monkeypatch, capsys, tmp_path):
         update = True
         skip_seed = False
 
-    # Call should not raise; we only care about stdout containing the WARNING.
+    # Call should not raise; we only care about stdout containing the rationale.
     try:
         install._seed_weaviate(_Args())
     except SystemExit:
         pass
     except Exception:
-        # Other failures downstream are fine — we just need the warning print
-        # which happens at the V44-B block, before any of the failure points.
+        # Other failures downstream are fine — we just need the rationale print
+        # which happens at the V44-G1 block, before any of the failure points.
         pass
 
     out = capsys.readouterr().out
-    assert (
-        "KG_COLLECTION disagreement" in out
-        or "SHARED_KG_COLLECTION disagreement" in out
-    ), f"disagreement warning not printed; stdout was:\n{out}"
+    # V44-G1: rationale print replaces V44-F's WARNING. The resolver always
+    # emits a "hybrid SoT" line (either "resolution:" for changes or
+    # "no disagreement" for agreement).
+    assert "hybrid SoT" in out, (
+        f"hybrid SoT rationale not printed; stdout was:\n{out}"
+    )
+    # Old V44-F WARNING prints are subsumed and MUST NOT reappear.
+    assert "KG_COLLECTION disagreement" not in out, (
+        "V44-F's removed WARNING leaked back into stdout"
+    )
+    assert "SHARED_KG_COLLECTION disagreement" not in out, (
+        "V44-F's removed WARNING leaked back into stdout"
+    )
 
 
 def test_shared_kg_write_disabled_does_not_block_project_scope_on_orchestrator_root(monkeypatch):
@@ -322,3 +341,104 @@ def test_g2_no_warning_when_db_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
 
     assert install._check_dual_clone() is None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# V44-G1: hybrid env-vs-DB SoT resolver branch coverage
+# ────────────────────────────────────────────────────────────────────────
+
+
+def test_g1_hybrid_resolution_picks_only_extant_collection(monkeypatch):
+    """G1: when env and DB agree (no conflict), resolver short-circuits to
+    the "no conflict" branch regardless of Weaviate contents."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    # Mock _count: env_shared=VibeCodedOrchestrator_KG exists with 1130 rows,
+    # everything else returns None (nonexistent).
+    def _count(_url, name):
+        return 1130 if name == "VibeCodedOrchestrator_KG" else None
+    monkeypatch.setattr(install, "_count_weaviate_class_objects", _count)
+
+    kg, sh, rat = install._resolve_orchestrator_root_canonical(
+        env_kg="VCODev_KG",
+        env_shared="VibeCodedOrchestrator_KG",
+        db_primary="VCODev_KG",
+        db_shared="VibeCodedOrchestrator_KG",
+        weaviate_url="http://x",
+    )
+    # env_kg == db_primary AND env_shared == db_shared → no disagreement.
+    assert "no conflict" in rat
+    assert kg == "VCODev_KG"
+    assert sh == "VibeCodedOrchestrator_KG"
+
+
+def test_g1_hybrid_picks_extant_when_env_db_disagree(monkeypatch):
+    """G1: env=X, DB=Y, only Y exists in Weaviate → pick Y (with rows wins)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    def _count(_url, name):
+        return 1130 if name == "DbWinner_KG" else None  # only DB's value exists
+    monkeypatch.setattr(install, "_count_weaviate_class_objects", _count)
+
+    kg, sh, rat = install._resolve_orchestrator_root_canonical(
+        env_kg="EnvLoser_KG",
+        env_shared="EnvLoserShared_KG",
+        db_primary="DbWinner_KG",
+        db_shared="DbWinner_KG",
+        weaviate_url="http://x",
+    )
+    assert kg == "DbWinner_KG"
+    assert sh == "DbWinner_KG"
+    assert "weaviate" in rat
+
+
+def test_g1_first_install_heuristic_env_wins(monkeypatch):
+    """G1: env=X, DB=Y, BOTH exist with rows (true tie) → env wins on fresh
+    install (app_state.last_installed_kg_collection UNSET)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    def _count(_url, name):
+        return 500  # every candidate exists with rows
+    monkeypatch.setattr(install, "_count_weaviate_class_objects", _count)
+    # Fresh install — app_state key UNSET.
+    monkeypatch.setattr(install, "_read_app_state_key", lambda k: None)
+
+    kg, sh, rat = install._resolve_orchestrator_root_canonical(
+        env_kg="EnvWinner_KG",
+        env_shared="EnvWinner_KG",
+        db_primary="DbValue_KG",
+        db_shared="DbValue_KG",
+        weaviate_url="http://x",
+    )
+    assert kg == "EnvWinner_KG"
+    assert sh == "EnvWinner_KG"
+    assert "fresh install" in rat or "env" in rat.lower()
+
+
+def test_g1_subsequent_update_db_wins(monkeypatch):
+    """G1: env=X, DB=Y, BOTH exist with rows (true tie) → DB wins on
+    subsequent update (app_state.last_installed_kg_collection SET)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import install
+
+    def _count(_url, name):
+        return 500  # every candidate exists with rows
+    monkeypatch.setattr(install, "_count_weaviate_class_objects", _count)
+    # Subsequent update — app_state key SET.
+    monkeypatch.setattr(
+        install, "_read_app_state_key", lambda k: "VibeCodedOrchestrator_KG",
+    )
+
+    kg, sh, rat = install._resolve_orchestrator_root_canonical(
+        env_kg="EnvStale_KG",
+        env_shared="EnvStale_KG",
+        db_primary="DbWinner_KG",
+        db_shared="DbWinner_KG",
+        weaviate_url="http://x",
+    )
+    assert kg == "DbWinner_KG"
+    assert sh == "DbWinner_KG"
+    assert "subsequent update" in rat or "db" in rat.lower()

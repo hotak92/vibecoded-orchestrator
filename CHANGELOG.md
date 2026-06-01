@@ -86,6 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SHARED_KG_COLLECTION. (V44-C)
 - `claude_mcp_servers/scripts/repair_kg_typed_links.py`: usage-string
   example no longer uses VCO_dev-specific name. (V44-C)
+- **V44-G1 hybrid SoT resolution**: install.py now resolves env-vs-DB
+  KG collection disagreement by querying Weaviate first (pick the
+  collection that actually exists), falling back to "env wins on
+  first install / DB wins on subsequent update" heuristic. Replaces
+  V44-F's silent-env-wins behavior.
 
 ### Documentation
 - New KG node `knowledge/concepts/orchestrator-root-kg-collection-identity-2026-06-01.md`

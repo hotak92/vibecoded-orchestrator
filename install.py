@@ -8923,6 +8923,98 @@ def _seed_weaviate_shared_kg_only(
     return seed_errors
 
 
+def _resolve_orchestrator_root_canonical(
+    env_kg: str,
+    env_shared: str,
+    db_primary: "Optional[str]",
+    db_shared: "Optional[str]",
+    weaviate_url: str,
+) -> "tuple[str, str, str]":
+    """v0.2.44 V44-G1: hybrid env-vs-DB conflict resolution.
+
+    User directive (2026-06-01): when env and DB disagree on the canonical
+    KG collection name for orchestrator-root, resolve via this priority chain:
+
+      1. CHECK WEAVIATE first. If exactly ONE candidate collection actually
+         exists, pick it (preferring an extant-with-data candidate over an
+         extant-empty one when only one of each kind exists).
+      2. If MULTIPLE candidates exist (true tie), apply the first-install
+         heuristic: env wins on fresh install (``app_state.last_installed_
+         kg_collection`` unset), DB wins on subsequent update (key SET).
+      3. If NEITHER candidate exists, env wins (bootstrap case — nothing
+         in Weaviate to anchor on).
+
+    Replaces V44-F's silent "env-wins / DB-wins via WARNING print" behavior
+    with an explicit, observable decision logged via the returned rationale.
+
+    Args:
+        env_kg: KG_COLLECTION from process env (may be empty).
+        env_shared: SHARED_KG_COLLECTION from process env (may be empty).
+        db_primary: launcher.db primary binding for orchestrator-root (or None).
+        db_shared: launcher.db shared binding for orchestrator-root (or None).
+        weaviate_url: Weaviate base URL for existence checks.
+
+    Returns:
+        (canonical_kg, canonical_shared, rationale)
+        rationale is a short human-readable string naming which branch fired.
+        Suitable for direct ``print()`` into install logs.
+    """
+    # No-conflict fast path: when env and DB agree (or DB has no value),
+    # fill empties from DB and preserve env where set. This matches the
+    # pre-V44-G1 V44-B "fill empties only" behavior.
+    env_disagreement_kg = bool(db_primary and env_kg and db_primary != env_kg)
+    env_disagreement_shared = bool(db_shared and env_shared and db_shared != env_shared)
+    if not env_disagreement_kg and not env_disagreement_shared:
+        out_kg = env_kg or (db_primary or "")
+        out_shared = env_shared or (db_shared or "")
+        return out_kg, out_shared, "no conflict (env wins when set, DB fills empties)"
+
+    # Disagreement — apply hybrid algorithm.
+    # Step 1: Weaviate existence check. Build the candidate set from all four
+    # values (env_kg, env_shared, db_primary, db_shared), excluding empties.
+    candidates = {env_kg, env_shared, db_primary or "", db_shared or ""} - {""}
+    counts: "dict[str, Optional[int]]" = {}
+    for c in candidates:
+        try:
+            n = _count_weaviate_class_objects(weaviate_url, c)
+            # n is int (>=0) on success, None on error/nonexistent.
+            counts[c] = n if isinstance(n, int) and n >= 0 else None
+        except Exception:
+            counts[c] = None  # treat as nonexistent on any error
+    extant_with_data = [c for c, n in counts.items() if n is not None and n > 0]
+    extant_any = [c for c, n in counts.items() if n is not None]
+
+    if len(extant_with_data) == 1:
+        winner = extant_with_data[0]
+        return winner, winner, (
+            f"weaviate (only '{winner}' has rows; counts={counts})"
+        )
+    if len(extant_any) == 1:
+        winner = extant_any[0]
+        return winner, winner, (
+            f"weaviate (only '{winner}' exists; rowcount=0)"
+        )
+    if len(extant_any) == 0:
+        # Neither exists → env wins (bootstrap case; nothing to anchor on).
+        return env_kg, env_shared, "env (no candidates exist in Weaviate yet)"
+
+    # Step 2: multiple candidates exist (true tie). Apply first-install heuristic.
+    try:
+        last_kg = _read_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION)
+    except Exception:
+        last_kg = None
+    if not last_kg:
+        return env_kg, env_shared, (
+            "env (fresh install; app_state.last_installed_kg_collection unset)"
+        )
+    # Subsequent update → DB wins (bindings are authoritative once recorded).
+    return (
+        (db_primary or env_kg),
+        (db_shared or env_shared),
+        "db (subsequent update; bindings authoritative)",
+    )
+
+
 def _seed_weaviate(args: argparse.Namespace) -> None:
     """Seed Weaviate with bundled knowledge/ + docs/.
 
@@ -9008,11 +9100,12 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
         or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
     )
 
-    # v0.2.44 V44-B: prefer launcher.db bindings as canonical source for
-    # orchestrator-root. If unavailable, fall back to env (logged at WARNING).
-    # Closes architectural-debt phase 1 of the v0.2.43 V0243-0 recurring bug:
-    # the launcher's project_kg_bindings table is the SoT; env vars are a
-    # projection that can drift silently when settings.json is stale.
+    # v0.2.44 V44-G1: hybrid env-vs-DB SoT resolution (replaces V44-B fill-only
+    # + V44-F disagreement-WARNING). Per user directive (2026-06-01): when env
+    # and DB disagree, check Weaviate first (pick the collection that actually
+    # exists), then fall back to "env wins on fresh install / DB wins on
+    # subsequent update". See _resolve_orchestrator_root_canonical for the full
+    # priority chain.
     try:
         from vco_lib.launcher_db_reader import get_orchestrator_root_bindings
         _db_primary, _db_shared = get_orchestrator_root_bindings()
@@ -9038,30 +9131,32 @@ def _seed_weaviate(args: argparse.Namespace) -> None:
                 f"current location."
             )
 
-    if _is_orchestrator_root_install() and (_db_primary or _db_shared):
-        if _db_primary and not current_kg_collection:
-            current_kg_collection = _db_primary
-            print("  → KG_COLLECTION sourced from launcher.db (primary binding)")
-        elif _db_primary and current_kg_collection and _db_primary != current_kg_collection:
-            # v0.2.44 fix-now-4: env vs DB disagreement is suspect; warn loudly.
-            # The rebind step downstream will canonicalize, but log for diagnostics.
-            print(
-                f"  ⚠ KG_COLLECTION disagreement: env={current_kg_collection!r}, "
-                f"launcher.db.primary={_db_primary!r}. Rebind will reconcile to "
-                f"canonical (SHARED_KG_COLLECTION wins)."
+    if _is_orchestrator_root_install():
+        if _db_primary or _db_shared:
+            resolved_kg, resolved_shared, rationale = (
+                _resolve_orchestrator_root_canonical(
+                    env_kg=current_kg_collection,
+                    env_shared=current_shared_kg,
+                    db_primary=_db_primary,
+                    db_shared=_db_shared,
+                    weaviate_url=weaviate_url,
+                )
             )
-        if _db_shared and not current_shared_kg:
-            current_shared_kg = _db_shared
-            print("  → SHARED_KG_COLLECTION sourced from launcher.db (shared binding)")
-        elif _db_shared and current_shared_kg and _db_shared != current_shared_kg:
-            print(
-                f"  ⚠ SHARED_KG_COLLECTION disagreement: env={current_shared_kg!r}, "
-                f"launcher.db.shared={_db_shared!r}. Rebind will reconcile to "
-                f"canonical (env wins as final canonical)."
-            )
-    elif _is_orchestrator_root_install():
-        print("  WARNING: orchestrator-root install but launcher.db unavailable; "
-              "falling back to env for KG collection resolution")
+            if (
+                resolved_kg != current_kg_collection
+                or resolved_shared != current_shared_kg
+            ):
+                print(
+                    f"  → hybrid SoT resolution: KG={resolved_kg!r}, "
+                    f"SHARED={resolved_shared!r} ({rationale})"
+                )
+                current_kg_collection = resolved_kg
+                current_shared_kg = resolved_shared
+            else:
+                print(f"  → hybrid SoT: no disagreement ({rationale})")
+        else:
+            print("  WARNING: orchestrator-root install but launcher.db unavailable; "
+                  "falling back to env for KG collection resolution")
 
     if is_update and sync_kg.exists():
         stored_embedding = _read_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
