@@ -29,6 +29,14 @@
   // rebase. See `.claude/context/reviews/v0240-pre-push-2026-05-30
   // /discovery-A3-fabio-branch-collision-audit.md`.
   import LicenseManagerModal from '$lib/components/LicenseManagerModal.svelte';
+  // v0.2.43 (Fabio branch feat/orchestrator-update-progress-modal): full-
+  // screen blocking overlay for the orchestrator self-update flow. Mount +
+  // close pattern mirrors `InstallWizard` and the L1 `LicenseManagerModal`
+  // sibling above. Opened by `ui.openOrchestratorUpdateProgress()` from
+  // `UpdateBadge.svelte::handleAction`; the modal self-closes after the
+  // hold+fade completion lifecycle (1.8 s + 400 ms) or on user-dismiss in
+  // the error path. Namespacing reserved by A3 collision audit.
+  import OrchestratorUpdateProgressModal from '$lib/components/OrchestratorUpdateProgressModal.svelte';
   import InstallWizard from '$lib/components/InstallWizard.svelte';
   import McpDashboard from '$lib/components/McpDashboard.svelte';
   import OnboardingWizard from '$lib/components/OnboardingWizard.svelte';
@@ -278,6 +286,15 @@
        open/close shape as InstallWizard above. -->
   {#if uiState.showLicenseManager}
     <LicenseManagerModal onClose={() => ui.closeLicenseManager()} />
+  {/if}
+  <!-- v0.2.43 (Fabio): full-screen blocking overlay during self-update.
+       Opened by `ui.openOrchestratorUpdateProgress()` from
+       UpdateBadge.handleAction right before invoking any updater action
+       (runUpdate / applyPendingInstall / runRestart). The modal subscribes
+       to `$orchestrator.progress` directly (no dup listener) and self-
+       closes after the completion hold+fade timer expires. -->
+  {#if uiState.showOrchestratorUpdateProgress}
+    <OrchestratorUpdateProgressModal />
   {/if}
   <ChangelogModal bind:open={showChangelog} />
   <ExternalServicesDialog />
