@@ -248,6 +248,19 @@ def test_no_inline_reconstructions_outside_paths_module():
         # ``allowed`` set when applicable.
         if len(rel_parts) >= 2 and rel_parts[0] == ".claude" and rel_parts[1] == "scripts":
             continue
+        # Skip ``.claude/state/tool_backups/`` — auto-generated pre-edit
+        # snapshots created by Claude Code's Edit hook. These are
+        # timestamp-prefixed copies of files that get modified; they
+        # contain the file's pre-edit state, which by definition may
+        # contain the very patterns we just refactored away. They're
+        # transient build artefacts, not production code.
+        if (
+            len(rel_parts) >= 3
+            and rel_parts[0] == ".claude"
+            and rel_parts[1] == "state"
+            and rel_parts[2] == "tool_backups"
+        ):
+            continue
         if py_file in allowed:
             continue
         try:
