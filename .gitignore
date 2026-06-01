@@ -237,3 +237,4 @@ tests/test_mcp_rl_*.py
 # orchestrator. Tracked elsewhere when needed.
 vco_lib/import_from_orchestrator.py
 tests/test_import_from_orchestrator.py
+.logo-backup-*/

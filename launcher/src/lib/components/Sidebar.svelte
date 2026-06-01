@@ -291,6 +291,45 @@
   ]);
 
   const currentPath = $derived($page.url.pathname);
+
+  // ─── v0.2.43 (Fabio): collapsible sidebar groups ──────────────────────
+  // Each group header (Workspace / Knowledge / Team / System / …) toggles
+  // a $state record of `{ groupLabel: boolean }` (true = expanded). State
+  // is persisted to localStorage under SIDEBAR_COLLAPSE_KEY so the user's
+  // layout survives reload + restart. Default: all groups expanded.
+  //
+  // We intentionally store the collapsed state ONLY in localStorage (not
+  // launcher.db) per Fabio's preference 2026-06-01: simpler, no schema
+  // migration, sufficient for a UI preference. If the user wipes WebView
+  // storage all groups default back to expanded — acceptable UX cost.
+  const SIDEBAR_COLLAPSE_KEY = 'vct.sidebar.collapsedGroups';
+
+  function loadCollapsedGroups(): Record<string, boolean> {
+    if (typeof localStorage === 'undefined') return {};
+    try {
+      const raw = localStorage.getItem(SIDEBAR_COLLAPSE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  let collapsedGroups = $state<Record<string, boolean>>(loadCollapsedGroups());
+
+  function toggleGroup(label: string) {
+    collapsedGroups = { ...collapsedGroups, [label]: !collapsedGroups[label] };
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSE_KEY, JSON.stringify(collapsedGroups));
+    } catch {
+      // ignore — non-critical for UX
+    }
+  }
+
+  function isCollapsed(label: string): boolean {
+    return collapsedGroups[label] === true;
+  }
 </script>
 
 <aside class="sidebar">
@@ -301,29 +340,47 @@
   {/if}
   <nav class="sidebar-nav">
     {#each groups as group}
-      <div class="group">
-        <div class="group-label">{group.label}</div>
-        {#each group.items as item}
-          {@const active = item.match(currentPath)}
-          {@const locked = item.proOnly === true && !hasPro}
-          <a
-            class="nav-item"
-            class:active
-            class:locked
-            href={locked ? '/store' : item.href}
-            title={locked
-              ? `${item.label} is a Pro feature. Click to activate Pro.`
-              : item.sub}
+      {@const collapsed = isCollapsed(group.label)}
+      <div class="group" class:collapsed>
+        <button
+          type="button"
+          class="group-label"
+          aria-expanded={!collapsed}
+          aria-controls={`sidebar-group-${group.label.toLowerCase().replace(/\s+/g, '-')}`}
+          onclick={() => toggleGroup(group.label)}
+          title={collapsed ? `Espandi ${group.label}` : `Comprimi ${group.label}`}
+        >
+          <span class="group-chevron" aria-hidden="true">▾</span>
+          <span class="group-label-text">{group.label}</span>
+        </button>
+        {#if !collapsed}
+          <div
+            class="group-items"
+            id={`sidebar-group-${group.label.toLowerCase().replace(/\s+/g, '-')}`}
           >
-            <span class="nav-label">
-              {item.label}
-              {#if locked}
-                <span class="nav-pro-badge">Pro</span>
-              {/if}
-            </span>
-            <span class="nav-sub">{item.sub}</span>
-          </a>
-        {/each}
+            {#each group.items as item}
+              {@const active = item.match(currentPath)}
+              {@const locked = item.proOnly === true && !hasPro}
+              <a
+                class="nav-item"
+                class:active
+                class:locked
+                href={locked ? '/store' : item.href}
+                title={locked
+                  ? `${item.label} is a Pro feature. Click to activate Pro.`
+                  : item.sub}
+              >
+                <span class="nav-label">
+                  {item.label}
+                  {#if locked}
+                    <span class="nav-pro-badge">Pro</span>
+                  {/if}
+                </span>
+                <span class="nav-sub">{item.sub}</span>
+              </a>
+            {/each}
+          </div>
+        {/if}
       </div>
     {/each}
   </nav>
@@ -369,14 +426,61 @@
     flex-direction: column;
     gap: 2px;
   }
+  /* When the group is collapsed we tighten the gap so the next group
+     pulls up against the header instead of leaving a 16px ghost-gap. */
+  .group.collapsed {
+    gap: 0;
+  }
 
+  /* v0.2.43 (Fabio): group header is now a button that toggles
+     collapsed state. Visually still looks like a label (small caps,
+     muted) but reveals affordance via a rotating chevron and hover
+     background. */
   .group-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    background: transparent;
+    border: none;
+    cursor: pointer;
     font-size: 10px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.8px;
     color: var(--color-muted);
     padding: 6px 10px 4px;
+    text-align: left;
+    border-radius: 6px;
+    transition: background 0.15s ease, color 0.15s ease;
+    font-family: inherit;
+  }
+  .group-label:hover {
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--color-mid);
+  }
+  .group-label:focus-visible {
+    outline: 1px solid rgba(0, 191, 166, 0.5);
+    outline-offset: 1px;
+  }
+  .group-chevron {
+    display: inline-block;
+    font-size: 10px;
+    line-height: 1;
+    transform: rotate(0deg);
+    transition: transform 0.18s ease;
+    color: var(--color-muted);
+  }
+  .group.collapsed .group-chevron {
+    transform: rotate(-90deg);
+  }
+  .group-label-text {
+    flex: 1;
+  }
+  .group-items {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .nav-item {
