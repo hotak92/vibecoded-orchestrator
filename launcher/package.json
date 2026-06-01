@@ -35,6 +35,7 @@
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tailwindcss/vite": "^4.3.0",
     "@tauri-apps/cli": "^2",
+    "@types/node": "^22.0.0",
     "svelte": "^5.56.0",
     "svelte-check": "^4.4.8",
     "tailwindcss": "^4.2.4",
