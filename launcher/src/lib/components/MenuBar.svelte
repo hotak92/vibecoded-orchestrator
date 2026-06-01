@@ -121,16 +121,11 @@
   <div class="accent-strip" aria-hidden="true"></div>
   <!-- Left: Logo + project selector -->
   <div class="menu-left">
-    <!-- v0.2.43 (Fabio branch feat/launcher-logo-circular-white): rimosso
-         <span class="menu-logo-text">VCT Launcher</span> perché lo stesso
-         testo appare nel titlebar nativo della finestra (impostato in
-         tauri.conf.json `app.windows[0].title`). Mantenuta l'icona come
-         marker visivo dell'app; la ProjectSelector dropdown ora si
-         accosta direttamente al logo, recuperando spazio orizzontale. -->
-    <div class="menu-logo">
-      <img src="/logo.png" alt="VCT Launcher" class="menu-logo-img" />
-    </div>
-
+    <!-- v0.2.43 (Fabio branch feat/launcher-logo-circular-white):
+         brand logo moved from here to the StatusBar footer (see
+         StatusBar.svelte `.status-brand`). The Windows titlebar already
+         carries the embedded .ico icon — duplicating it here was visually
+         noisy. ProjectSelector is now the first menubar element. -->
     <ProjectSelector />
   </div>
 
@@ -252,20 +247,6 @@
     display: flex;
     align-items: center;
     gap: 20px;
-  }
-
-  .menu-logo {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    -webkit-app-region: drag;
-  }
-
-  .menu-logo-img {
-    width: 28px;
-    height: 28px;
-    border-radius: 6px;
-    object-fit: contain;
   }
 
   .menu-right {

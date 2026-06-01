@@ -26,6 +26,14 @@
     <span>{appCount} app{appCount !== 1 ? 's' : ''} activated</span>
     {#if version}
       <span class="status-sep">|</span>
+      <!-- v0.2.43 (Fabio branch feat/launcher-logo-circular-white): mini
+           brand watermark next to the version. Replaces the menubar logo
+           (which was visually duplicating the Windows titlebar icon).
+           Keeps the brand visible without stealing top-bar real estate. -->
+      <span class="status-brand" aria-hidden="true">
+        <img src="/logo.png" alt="" class="status-brand-logo" />
+        <span>VCT</span>
+      </span>
       <span>v{version}</span>
     {/if}
   </div>
@@ -67,5 +75,21 @@
 
   .status-sep {
     opacity: 0.3;
+  }
+
+  .status-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--color-mid, #94A3B8);
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  .status-brand-logo {
+    width: 14px;
+    height: 14px;
+    display: block;
+    user-select: none;
+    -webkit-user-drag: none;
   }
 </style>
