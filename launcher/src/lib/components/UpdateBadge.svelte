@@ -22,6 +22,7 @@
   import { onMount } from 'svelte';
   import { orchestrator } from '$lib/stores/orchestrator';
   import { updater } from '$lib/stores/updater';
+  import { ui } from '$lib/stores/ui';
   import OrchestratorUpdateDivergenceModal from './OrchestratorUpdateDivergenceModal.svelte';
 
   let popoverOpen = $state(false);
@@ -96,6 +97,21 @@
 
   async function handleAction() {
     popoverOpen = false;
+    if (kindCopy.actionKey === null) return;
+    // v0.2.40 (Fabio): open the full-screen blocking progress overlay
+    // BEFORE invoking the updater action. The overlay subscribes to
+    // `$orchestrator.progress` (already populated by the install_progress
+    // Tauri listener) and stays up across the entire flow:
+    //   - `runUpdate`           — git pull + install.py --update + restart
+    //   - `applyPendingInstall` — install.py --update only
+    //   - `runRestart`          — re-exec the dist binary; the launcher
+    //                             dies mid-call so the overlay blinks
+    //                             once at restart, which is correct UX.
+    // The overlay owns its own completion lifecycle (1.8 s hold at 100 %
+    // + 400 ms fade-out), then calls ui.closeOrchestratorUpdateProgress()
+    // itself — UpdateBadge no longer needs the rising/falling-edge
+    // bookkeeping that lived here in the first draft of this branch.
+    ui.openOrchestratorUpdateProgress();
     switch (kindCopy.actionKey) {
       case 'restart':
         await updater.runRestart();
@@ -105,8 +121,6 @@
         break;
       case 'fetch_install':
         await updater.runUpdate();
-        break;
-      default:
         break;
     }
   }

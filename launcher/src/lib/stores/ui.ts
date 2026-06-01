@@ -43,6 +43,15 @@ interface UIState {
   // ambiguity, distinct enough that grep/sed across the codebase won't
   // hit both flags.
   showLicenseManager: boolean;
+  // v0.2.40 (Fabio branch feat/orchestrator-update-progress-modal):
+  // full-screen blocking overlay shown while the self-update of the
+  // orchestrator is in flight (any of: update_orchestrator, apply_pending_install,
+  // restart_launcher). Name was reserved by the A3 collision audit — see the
+  // `showLicenseManager` comment above. The modal lives in +layout.svelte and
+  // reads `$orchestrator.progress` (already populated by the install_progress
+  // Tauri listener at stores/orchestrator.ts:108); UpdateBadge.svelte only
+  // opens it via openOrchestratorUpdateProgress() — no duplicated listener.
+  showOrchestratorUpdateProgress: boolean;
   // Cross-component trigger for ProjectSelector's "Create project" modal.
   // Set by routes that don't render their own form (e.g. /projects list
   // page's "+ Add Project" button) so the modal opens from the globally-
@@ -67,6 +76,7 @@ function createUIStore() {
     onboardingForced: false,
     showCreateProject: false,
     showLicenseManager: false,
+    showOrchestratorUpdateProgress: false,
   });
 
   return {
@@ -137,6 +147,15 @@ function createUIStore() {
       update((s) => ({ ...s, showLicenseManager: true })),
     closeLicenseManager: () =>
       update((s) => ({ ...s, showLicenseManager: false })),
+    // v0.2.40 (Fabio): orchestrator self-update progress overlay. Opened
+    // by UpdateBadge.svelte right before invoking any of the three updater
+    // store actions (runUpdate / applyPendingInstall / runRestart). Closed
+    // by OrchestratorUpdateProgressModal.svelte itself after the completion
+    // hold+fade timer expires, or by the user dismissing an error state.
+    openOrchestratorUpdateProgress: () =>
+      update((s) => ({ ...s, showOrchestratorUpdateProgress: true })),
+    closeOrchestratorUpdateProgress: () =>
+      update((s) => ({ ...s, showOrchestratorUpdateProgress: false })),
   };
 }
 
