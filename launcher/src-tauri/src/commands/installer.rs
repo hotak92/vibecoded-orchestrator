@@ -3576,6 +3576,180 @@ fn retry_summary_counts(
     serde_json::to_value(counts).unwrap_or(serde_json::json!({}))
 }
 
+// =====================================================================
+// v0.2.45 V45-B: wait_for_binary_refresh
+//
+// Release-workflow ordering bug: every tag ships in TWO steps.
+//   1. Source tag commit (e.g. `f7682a3` at 23:54 UTC) bumps
+//      `vct-module.json::version` to v0.2.X.
+//   2. Auto-committed `chore(binary): refresh dist binaries for v0.2.X`
+//      (e.g. `88f9758` at 00:43 UTC, ~49 min later) replaces the
+//      `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`
+//      and the actual binary blob.
+//
+// Inside that ~49-min window, `vco_upstream/main` advertises the new
+// source version via `vct-module.json` (what `read_source_version`
+// reads) but the on-disk `vct-launcher.metadata.json::launcher_version`
+// still carries the previous version + the old binary blob.
+//
+// `check_for_updates` sees `remote_ahead`; the user clicks Update;
+// `update_orchestrator` runs `git pull --ff-only` + install.py; then
+// `restart_launcher` faithfully re-execs the ON-DISK binary — which
+// is the previous version. Post-restart UI banner says "Current
+// v0.2.X" but the running process is v0.2.X-1.
+//
+// Fix: before re-execing, poll for the on-disk binary version to
+// catch up with the source version. If the binary-refresh commit
+// hasn't landed within `WAIT_FOR_BINARY_REFRESH_TIMEOUT_SECS`,
+// surface a clear error so the user retries later instead of
+// relaunching into a stale binary.
+//
+// Structural fix (tag the binary-refresh commit, not the source
+// commit) is deferred to v0.2.46-46-1.
+// =====================================================================
+
+/// Production timeout for `WaitForBinaryRefresh`. Conservative
+/// 5-minute cap: the historical binary-refresh window is ~49 min, but
+/// blocking the user that long is worse UX than surfacing a clear
+/// "retry in a few minutes" error.
+pub(crate) const WAIT_FOR_BINARY_REFRESH_TIMEOUT_SECS: u64 = 300;
+
+/// Production poll interval. 15 s is a deliberate balance between
+/// responsiveness (binary-refresh commits usually appear within a
+/// minute or two once CI kicks off) and not hammering the remote
+/// (one `git pull` per iteration).
+pub(crate) const WAIT_FOR_BINARY_REFRESH_INTERVAL_SECS: u64 = 15;
+
+/// Config + entry point for the binary-refresh poll loop.
+///
+/// Held as a struct so tests can swap the timeout / interval / skip
+/// the real `git pull` without parameterizing the production call
+/// sites. `disable_git_pull` is set true only inside the unit tests
+/// below — production always pulls.
+pub(crate) struct WaitForBinaryRefresh<'a> {
+    pub install_path: &'a Path,
+    pub branch: &'a str,
+    pub timeout: std::time::Duration,
+    pub interval: std::time::Duration,
+    pub disable_git_pull: bool,
+}
+
+impl<'a> WaitForBinaryRefresh<'a> {
+    /// Production constructor: 5-min timeout, 15-s interval, real
+    /// `git pull` enabled.
+    pub(crate) fn default_production(install_path: &'a Path, branch: &'a str) -> Self {
+        Self {
+            install_path,
+            branch,
+            timeout: std::time::Duration::from_secs(WAIT_FOR_BINARY_REFRESH_TIMEOUT_SECS),
+            interval: std::time::Duration::from_secs(WAIT_FOR_BINARY_REFRESH_INTERVAL_SECS),
+            disable_git_pull: false,
+        }
+    }
+
+    /// Poll until `read_on_disk_binary_version` matches
+    /// `read_source_version` or the timeout elapses.
+    ///
+    /// Soft-fail on transient git-pull errors (network blip, brief
+    /// 503 from the remote) — the next iteration retries.
+    /// Hard-fail on timeout: returns Err with a user-facing message
+    /// naming both versions so the caller can surface it verbatim
+    /// in the UI.
+    pub(crate) async fn run(&self) -> Result<(), String> {
+        use std::time::Instant;
+        let deadline = Instant::now() + self.timeout;
+        let mut iteration: u32 = 0;
+        loop {
+            iteration += 1;
+            let source_version = read_source_version(self.install_path).ok_or_else(|| {
+                "Could not read source version from vct-module.json".to_string()
+            })?;
+            let on_disk_version =
+                read_on_disk_binary_version(self.install_path).unwrap_or_default();
+            if !on_disk_version.is_empty() && on_disk_version == source_version {
+                if iteration > 1 {
+                    eprintln!(
+                        "[v0.2.45 V45-B] binary refresh landed after {} poll(s): on-disk now v{}",
+                        iteration, on_disk_version,
+                    );
+                }
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let displayed = if on_disk_version.is_empty() {
+                    "<unknown>".to_string()
+                } else {
+                    on_disk_version
+                };
+                return Err(format!(
+                    "Binary refresh for v{} did not land within {} sec. \
+                     On-disk binary is v{}. The Release workflow is still \
+                     building/committing the new dist binaries. Wait a \
+                     few minutes and click Update again.",
+                    source_version,
+                    self.timeout.as_secs(),
+                    displayed,
+                ));
+            }
+            eprintln!(
+                "[v0.2.45 V45-B] waiting for binary refresh: source=v{} on_disk=v{} (iteration {})",
+                source_version,
+                if on_disk_version.is_empty() {
+                    "<unknown>".to_string()
+                } else {
+                    on_disk_version
+                },
+                iteration,
+            );
+            // Re-pull main to pick up the binary-refresh commit if
+            // it landed since the last iteration. Soft-fail: a
+            // transient network error MUST NOT terminate the wait —
+            // the next iteration retries. Tests skip the pull
+            // entirely (no git remote in tmpdirs) and mutate
+            // `vct-launcher.metadata.json` directly between
+            // iterations to simulate the commit arriving.
+            if !self.disable_git_pull {
+                if let Err(e) =
+                    run_git_pull_ff_only(self.install_path, self.branch).await
+                {
+                    eprintln!(
+                        "[v0.2.45 V45-B] git pull warning (will retry next iteration): {}",
+                        e
+                    );
+                }
+            }
+            tokio::time::sleep(self.interval).await;
+        }
+    }
+}
+
+/// Minimal git-pull helper for the binary-refresh poll loop.
+///
+/// Runs `git pull --ff-only <VCO_UPSTREAM_REMOTE> <branch>` in the
+/// install path. Returns Err with the trimmed stderr tail on
+/// non-success — the caller already treats this as transient and
+/// retries on the next iteration. Same `.silent()` wrapper the rest
+/// of installer.rs uses so the Windows console window stays hidden.
+async fn run_git_pull_ff_only(install_path: &Path, branch: &str) -> Result<(), String> {
+    let out = tokio::process::Command::new("git")
+        .silent()
+        .args([
+            "pull",
+            "--ff-only",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            branch,
+        ])
+        .current_dir(install_path)
+        .output()
+        .await
+        .map_err(|e| format!("git pull spawn failed: {}", e))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(stderr.trim().to_string());
+    }
+    Ok(())
+}
+
 #[command]
 pub async fn update_orchestrator<R: Runtime>(
     app: AppHandle<R>,
@@ -3976,6 +4150,33 @@ pub async fn update_orchestrator<R: Runtime>(
         "Update applied — restarting launcher...",
         95.0,
     );
+
+    // v0.2.45 V45-B: don't restart into a stale on-disk binary.
+    //
+    // Between the source-tag commit and the auto-committed binary-
+    // refresh (`chore(binary): refresh dist binaries for v0.2.X`),
+    // `vco_upstream/main` advertises the new source version but
+    // `launcher/dist/<arch>/vct-launcher.metadata.json` still
+    // carries the previous launcher_version. Re-execing here would
+    // relaunch the OLD binary while the UI claims "Current v0.2.X".
+    //
+    // Block restart until on-disk version catches up with source
+    // version (poll + re-pull every 15 s, up to 5 min). On timeout,
+    // surface the error to the GUI — the user retries when CI
+    // finishes the binary commit.
+    emit_progress(
+        &window,
+        "update",
+        "Waiting for new launcher binary...",
+        96.0,
+    );
+    if let Err(e) = WaitForBinaryRefresh::default_production(&install_path, &pull_branch)
+        .run()
+        .await
+    {
+        eprintln!("[v0.2.45 V45-B] update_orchestrator: {}", e);
+        return Err(e);
+    }
 
     // v0.2.17 (plan 0.0): auto-restart. The launcher has no in-flight
     // user state to lose, so spawn the new binary detached + exit.
@@ -4793,6 +4994,53 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
         "Update applied — restarting launcher...",
         95.0,
     );
+
+    // v0.2.45 V45-B: don't restart into a stale on-disk binary.
+    // Same rationale as the inline call in `update_orchestrator`:
+    // block restart until the on-disk `vct-launcher.metadata.json`
+    // version catches up with `vct-module.json` version (poll + re-
+    // pull every 15 s, up to 5 min). On timeout, surface the error
+    // to the GUI — the user retries when CI finishes the binary
+    // commit.
+    //
+    // Self-contained branch detection so this helper doesn't need
+    // a branch parameter ripped through both call sites
+    // (`merge_orchestrator_with_upstream` /
+    // `rebase_orchestrator_onto_upstream`). Defaults to "main" on
+    // any git failure — matches the convention used by the
+    // sibling `pull_branch` detection in `update_orchestrator`.
+    let v45b_branch = {
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(install_path)
+            .output()
+            .await;
+        match out {
+            Ok(o) if o.status.success() => {
+                let b = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if b.is_empty() || b == "HEAD" {
+                    "main".to_string()
+                } else {
+                    b
+                }
+            }
+            _ => "main".to_string(),
+        }
+    };
+    emit_progress(
+        window,
+        "update",
+        "Waiting for new launcher binary...",
+        96.0,
+    );
+    if let Err(e) = WaitForBinaryRefresh::default_production(install_path, &v45b_branch)
+        .run()
+        .await
+    {
+        eprintln!("[v0.2.45 V45-B] run_post_pull_install_and_restart: {}", e);
+        return Err(e);
+    }
 
     if let Err(e) =
         crate::commands::restart::restart_launcher(app, path_string.clone()).await
@@ -7981,6 +8229,199 @@ mod tests {
         let p = tmp();
         assert_eq!(classify_install_target(&p), InstallMode::Fresh);
         fs::remove_dir_all(&p).ok();
+    }
+
+    // ---- v0.2.45 V45-B: wait_for_binary_refresh ------------------------
+    //
+    // The poll loop checks `vct-module.json::version` (source) against
+    // `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`
+    // (on-disk binary). These helpers fabricate the minimum on-disk
+    // layout the readers require — no git remote, no real binary blob.
+    // Tests run with `disable_git_pull=true` so they don't try to
+    // contact a remote that doesn't exist for the tmp dir.
+
+    fn write_v0245_source_version(install_path: &Path, version: &str) {
+        let v = serde_json::json!({"version": version}).to_string();
+        fs::write(install_path.join("vct-module.json"), v).unwrap();
+    }
+
+    fn write_v0245_on_disk_version(install_path: &Path, version: &str) {
+        let dist_arch = install_path
+            .join("launcher")
+            .join("dist")
+            .join(launcher_dist_subdir());
+        fs::create_dir_all(&dist_arch).unwrap();
+        let v = serde_json::json!({"launcher_version": version}).to_string();
+        fs::write(dist_arch.join("vct-launcher.metadata.json"), v).unwrap();
+    }
+
+    fn clear_v0245_on_disk_version(install_path: &Path) {
+        let meta = install_path
+            .join("launcher")
+            .join("dist")
+            .join(launcher_dist_subdir())
+            .join("vct-launcher.metadata.json");
+        let _ = fs::remove_file(&meta);
+    }
+
+    #[tokio::test]
+    async fn test_v0245_wait_returns_ok_when_versions_match_immediately() {
+        let p = tmp();
+        write_v0245_source_version(&p, "0.2.45");
+        write_v0245_on_disk_version(&p, "0.2.45");
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            // Generous timeout to prove the loop returns on the FIRST
+            // iteration without waiting; if it ever hit the sleep
+            // path the test would still pass but take 1 s — keep the
+            // interval tiny so a regression doesn't slip past.
+            timeout: std::time::Duration::from_secs(5),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let started = std::time::Instant::now();
+        let res = waiter.run().await;
+        let elapsed = started.elapsed();
+        assert!(res.is_ok(), "expected Ok, got {:?}", res);
+        // First-iteration return: should be near-instant, certainly
+        // under the interval sleep.
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "expected near-instant return, took {:?}",
+            elapsed
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[tokio::test]
+    async fn test_v0245_wait_times_out_when_binary_stays_stale() {
+        let p = tmp();
+        write_v0245_source_version(&p, "0.2.45");
+        write_v0245_on_disk_version(&p, "0.2.44");
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            // Short timeout so the test finishes quickly; the interval
+            // is the smallest meaningful value so we cycle a few
+            // times before tripping the deadline.
+            timeout: std::time::Duration::from_millis(300),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let started = std::time::Instant::now();
+        let res = waiter.run().await;
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "expected timeout Err, got {:?}", res);
+        let err = res.unwrap_err();
+        // Verify the user-facing message names both versions so the
+        // GUI can surface it verbatim. DO NOT change the format
+        // casually — see comment on the helper.
+        assert!(
+            err.contains("v0.2.45"),
+            "error should name source version 0.2.45: {}",
+            err
+        );
+        assert!(
+            err.contains("v0.2.44"),
+            "error should name on-disk version 0.2.44: {}",
+            err
+        );
+        assert!(
+            err.contains("did not land within"),
+            "error should mention the timeout: {}",
+            err
+        );
+        // We should have actually waited (at least one interval) before
+        // returning — not bailed out before even sleeping.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50),
+            "should have slept at least once, took {:?}",
+            elapsed
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[tokio::test]
+    async fn test_v0245_wait_succeeds_when_binary_appears_mid_poll() {
+        // Simulate the binary-refresh commit arriving mid-poll: start
+        // with source=0.2.45 + no on-disk metadata (initial state
+        // after the source-tag commit), then write on-disk=0.2.45
+        // ~120ms in (simulating the chore(binary) commit landing).
+        let p = tmp();
+        write_v0245_source_version(&p, "0.2.45");
+        clear_v0245_on_disk_version(&p);
+
+        let mutator_path = p.clone();
+        let mutator = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            write_v0245_on_disk_version(&mutator_path, "0.2.45");
+        });
+
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            timeout: std::time::Duration::from_secs(2),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let res = waiter.run().await;
+        let _ = mutator.await;
+        assert!(
+            res.is_ok(),
+            "expected Ok once binary appears mid-poll, got {:?}",
+            res
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[tokio::test]
+    async fn test_v0245_wait_errors_when_source_version_missing() {
+        // Defensive: if vct-module.json is missing or empty, the
+        // helper has nothing to compare against. Surface a clear
+        // error immediately rather than poll forever.
+        let p = tmp();
+        // Intentionally NO vct-module.json written.
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            timeout: std::time::Duration::from_secs(2),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let res = waiter.run().await;
+        assert!(res.is_err(), "expected Err for missing source version");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("source version"),
+            "error should mention source version: {}",
+            err
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_v0245_wait_default_production_uses_5_min_timeout() {
+        // Documents the production timeout via the constructor —
+        // shouldn't drift below 5 min without rationale (the comment
+        // on WAIT_FOR_BINARY_REFRESH_TIMEOUT_SECS spells out the
+        // UX-vs-correctness tradeoff).
+        let p = std::path::PathBuf::from("/tmp/dummy");
+        let waiter = WaitForBinaryRefresh::default_production(&p, "main");
+        assert_eq!(
+            waiter.timeout,
+            std::time::Duration::from_secs(300),
+            "production timeout must be 5 min unless explicitly changed",
+        );
+        assert_eq!(
+            waiter.interval,
+            std::time::Duration::from_secs(15),
+            "production interval must be 15 s unless explicitly changed",
+        );
+        assert!(
+            !waiter.disable_git_pull,
+            "production constructor must enable git pull",
+        );
     }
 
     // ---- install_root_complete_at predicate ----------------------------
