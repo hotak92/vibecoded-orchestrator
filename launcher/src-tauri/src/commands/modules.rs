@@ -1859,6 +1859,29 @@ pub async fn update_module_for_project(
     module_id: String,
     db: State<'_, Db>,
 ) -> Result<ModuleInstallRow, String> {
+    // v0.2.45 V45-F: warm the L0 catalog before resolve_manifest_for_install
+    // (V45-C) does its on-disk-vs-L0 version comparison.
+    // resolve_install_metadata reads app_state[module_catalog.cache]
+    // synchronously — if that row is empty/expired, V45-C's "L0 has newer
+    // version" branch silently falls back to the on-disk manifest's version
+    // (which is the WHOLE POINT we're trying to avoid for the "publish new
+    // version, then run Update" flow).
+    //
+    // cached_module_catalog respects the 15-min TTL: this is a no-op if
+    // the cache is already fresh (typical Modules-tab navigation case),
+    // a single HTTP fetch + cache-write otherwise. Soft-fail
+    // (`let _ = ...`) — any catalog-fetch error MUST NOT block the
+    // per-project update; the resolve_manifest_for_install path will
+    // fall back to whatever cache state exists (and the stale-fallback
+    // inside cached_module_catalog itself also keeps the surface graceful
+    // on transient network drops).
+    //
+    // Foundation for every future paid module: every update path goes
+    // through this entry point, so freshness at the L0 layer is now a
+    // pre-condition of the resolve step rather than a "if the user
+    // happens to have visited Modules tab recently" lottery.
+    let _ = crate::commands::module_catalog_client::cached_module_catalog(&db).await;
+
     // 1. Verify the module IS installed.
     let previous_install = db
         .get_module_install(&project_id, &module_id)?

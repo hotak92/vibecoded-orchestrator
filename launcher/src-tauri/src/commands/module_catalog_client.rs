@@ -1317,4 +1317,106 @@ mod tests {
             None => std::env::remove_var("VCT_MODULE_CATALOG_URL"),
         }
     }
+
+    // ─── 5. v0.2.45 V45-F — post-bust catalog-refresh contract ──────────
+    //
+    // V45-F adds a non-blocking refresh after
+    // `bust_cache_if_launcher_version_changed` reports VersionChanged. We
+    // can't unit-test the spawn from inside lib.rs::setup (it needs a
+    // real Tauri AppHandle), and `cached_module_catalog` does real HTTP
+    // when the cache is empty (no mock injection point at the
+    // module_catalog_client surface). So we test the CONTRACT by piecing
+    // together the two halves the production path stitches:
+    //
+    //   1. After a bust returns VersionChanged, the cache is GONE
+    //      (precondition the V45-F spawn relies on — otherwise the
+    //      spawn wouldn't have anything to refill).
+    //   2. After write_cache fires with a fresh envelope (what
+    //      cached_module_catalog calls on the success branch of its
+    //      internal fetch+write), the cache IS populated again — i.e.
+    //      the next on-disk-vs-L0 version compare in V45-C will see
+    //      data instead of an empty-cache error.
+    //
+    // This is intentionally a contract test (the underlying calls are
+    // already covered above); end-to-end coverage of the live spawn
+    // path remains a hand-test until we add an HTTP injection seam to
+    // module_catalog_client.
+
+    #[test]
+    fn test_v0245_v45f_post_bust_cache_refill_contract() {
+        let db = open_db();
+
+        // Seed prior-version marker + cached envelope so the bust path
+        // produces VersionChanged (the only branch that triggers V45-F's
+        // spawn in lib.rs::setup).
+        db.app_state_set(APP_STATE_KEY_LAUNCHER_VERSION, "0.2.44")
+            .unwrap();
+        let stale = parse_response_text(canonical_fixture()).unwrap();
+        write_cache(&db, &stale).unwrap();
+        assert!(
+            read_cache_raw(&db).is_some(),
+            "test precondition: cache seeded"
+        );
+
+        // Step 1: launcher boots into v0.2.45 → bust fires.
+        let outcome = bust_cache_if_version_changed_inner(&db, "0.2.45");
+        assert!(
+            matches!(outcome, VersionBustOutcome::VersionChanged { .. }),
+            "bust must report VersionChanged so the V45-F spawn condition fires"
+        );
+        assert!(
+            read_cache_raw(&db).is_none(),
+            "post-bust precondition: cache is empty — V45-F's refresh has \
+             something to do (otherwise resolve_manifest_for_install in \
+             V45-C would silently fall back to the on-disk manifest's \
+             version, exactly the bug V45-F prevents)"
+        );
+
+        // Step 2: V45-F's spawn runs cached_module_catalog. On the
+        // success branch (which we can't trigger without a network mock)
+        // it calls write_cache with the freshly-fetched envelope. We
+        // simulate that here to assert the cache-refill side effect.
+        let fresh = parse_response_text(canonical_fixture()).unwrap();
+        write_cache(&db, &fresh).unwrap();
+
+        // Postcondition: the next call to resolve_install_metadata (which
+        // reads `app_state[module_catalog.cache]` synchronously inside
+        // V45-C's resolve_manifest_for_install) will see fresh data.
+        let cached = read_cache_raw(&db).expect("cache must be repopulated");
+        assert_eq!(
+            cached.modules.len(),
+            1,
+            "fresh envelope has the canonical-fixture module count"
+        );
+    }
+
+    #[test]
+    fn test_v0245_v45f_cached_module_catalog_is_ttl_bounded_warm_path() {
+        // Part 2's pre-warm in update_module_for_project relies on
+        // cached_module_catalog being a no-op when the cache is fresh —
+        // otherwise every per-project update would do an unnecessary
+        // HTTP fetch. This re-asserts the TTL contract from the V45-F
+        // pre-warm perspective: a fresh cache must stay fresh, the
+        // TTL gate is what makes the pre-warm cheap.
+        let db = open_db();
+
+        // Seed a fresh cache (within the 15-min TTL — write_cache uses
+        // now_epoch_seconds() so the entry is fresh by construction).
+        let envelope = parse_response_text(canonical_fixture()).unwrap();
+        write_cache(&db, &envelope).unwrap();
+
+        // read_cache_if_fresh is the gate cached_module_catalog uses to
+        // short-circuit fetch when the cache is fresh.
+        let fresh = read_cache_if_fresh(&db);
+        assert!(
+            fresh.is_some(),
+            "freshly-written cache must satisfy read_cache_if_fresh — V45-F's \
+             pre-warm in update_module_for_project depends on this being a \
+             no-op for warm caches (otherwise every update path would HTTP-fetch)"
+        );
+        assert_eq!(
+            fresh.unwrap().fetched_at, envelope.fetched_at,
+            "the freshly-cached envelope is returned unchanged"
+        );
+    }
 }

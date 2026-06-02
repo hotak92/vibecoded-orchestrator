@@ -649,12 +649,67 @@ pub fn run() {
             // Soft-fails: a DB hiccup here MUST NOT block boot — the
             // worst case is "user clicks ↻ manually" or "cache survives
             // until its TTL".
+            //
+            // v0.2.45 V45-F: when bust_cache_if_launcher_version_changed
+            // reports VersionChanged, ALSO proactively re-fetch the L0
+            // catalog so V45-C's resolve_manifest_for_install (which
+            // compares on-disk vs L0 version to pick the freshest source)
+            // sees newly-published module versions immediately on the
+            // first install/update attempt post-update. Without this,
+            // the freshly-busted cache stays empty until something else
+            // (UI mount, manual ↻) triggers a fetch — and any module-
+            // install flow that fires in that window resolves against
+            // L0Synth's empty-cache error path or a stale on-disk
+            // manifest.
+            //
+            // The refresh is spawned non-blocking so launcher boot
+            // latency is unaffected; same soft-fail discipline as the
+            // bust call itself. cached_module_catalog is idempotent and
+            // TTL-bounded (15-min TTL), so over-refresh is harmless if
+            // a future change widens the spawn condition.
+            //
+            // Foundation for every future paid module (per user
+            // directive 2026-06-02: "build a strong foundation for
+            // every future paid module"). Periodic timer refresh
+            // deferred to v0.2.46-46-4.
             {
                 use tauri::Manager;
                 if let Some(db) = app.try_state::<db::Db>() {
-                    let _ = commands::module_catalog_client::bust_cache_if_launcher_version_changed(
-                        db.inner(),
-                    );
+                    let bust_outcome =
+                        commands::module_catalog_client::bust_cache_if_launcher_version_changed(
+                            db.inner(),
+                        );
+                    if matches!(
+                        bust_outcome,
+                        commands::module_catalog_client::VersionBustOutcome::VersionChanged { .. }
+                    ) {
+                        let refresh_handle = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            use tauri::Manager;
+                            eprintln!(
+                                "[v0.2.45 V45-F] refreshing L0 module catalog post launcher-version-change"
+                            );
+                            let db = refresh_handle.state::<crate::db::Db>();
+                            match commands::module_catalog_client::cached_module_catalog(
+                                db.inner(),
+                            )
+                            .await
+                            {
+                                Ok(catalog) => {
+                                    eprintln!(
+                                        "[v0.2.45 V45-F] L0 catalog refreshed (modules: {})",
+                                        catalog.modules.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[v0.2.45 V45-F] L0 catalog refresh failed (soft-fail): {}",
+                                        e
+                                    );
+                                }
+                            }
+                        });
+                    }
                 }
             }
 
