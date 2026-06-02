@@ -7,6 +7,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.45] - 2026-06-02
+
+Hotfix release closing 3 root causes surfaced on VCO_dev during the post-v0.2.44 "Update orchestrator" audit (2026-06-02 ~01:34 UTC). All 6 V45 agents (A-F) merged in-tag; no deferred fixes per the post-v0.2.41 retrospective rule. Foundation work for every future paid module — V45-C through V45-F install the contracts (manifest version-compare at resolve time, placeholder-URL detection family, status state-machine completeness, L0 catalog refresh on lifecycle events) that v0.2.46+ will build on. Per user directive 2026-06-02: "RL module is not released, so can skip any legacy compatibility issue, but we need to make sure that — together with it — we build a strong foundation for every future paid module."
+
+### Fixed
+
+- **install.py self-relaunches under the MCP venv** when `weaviate` is not
+  importable. The launcher's `update_orchestrator` Tauri command spawns
+  install.py under `detect_python()` → `/usr/bin/python3.12` on Linux, but
+  step 7d (`_migrate_kg_named_vector_slots`) does an in-process
+  `import weaviate` via `vco_lib.project_init._connect_v4_client`.
+  `weaviate-client` lives only in `claude_mcp_servers/.venv`, so the
+  import failed → 4 `UPDATE_DEFERRED.md` entries per launcher-driven
+  update. New `_ensure_running_under_mcp_venv()` at `main()` entry probes
+  `importlib.util.find_spec("weaviate")` and `os.execv`'s into the MCP
+  venv when missing. No-op for CLI users (venv already activated) and
+  re-entry-guarded via `VCT_INSTALL_RELAUNCHED=1`. Soft-fails when the
+  MCP venv interpreter doesn't exist (install proceeds with system Python
+  and re-fails at step 7d as before — at least the deferral captures the
+  error). Latent since v0.2.43 (`0cb229c`); VCO_dev was the first machine
+  to drive it via the launcher. (V45-A)
+
+- **Launcher polls for the binary-refresh commit before re-execing**.
+  Every release ships in two steps: source tag (e.g., `f7682a3` at
+  23:54 UTC) and a `chore(binary): refresh ... for v0.2.X` auto-commit
+  ~49 min later (`88f9758` at 00:43 UTC for v0.2.44). Inside that window,
+  `vco_upstream/main` advertises the new source version in
+  `state/install-manifest.json` but still carries the old
+  `launcher/dist/<arch>/vct-launcher` binary. `update_orchestrator`
+  (installer.rs) and `run_post_pull_install_and_restart` now poll
+  (15s interval, 5min timeout) for `read_on_disk_binary_version ==
+  read_source_version` before re-execing — closing the window where the
+  launcher would silently restart the OLD binary. New
+  `WaitForBinaryRefresh` test harness with parameterized
+  timeout/interval/git-pull-skip flag for deterministic poll-loop tests.
+  Latent since v0.2.16 wired the post-update auto-restart; previous
+  releases dodged it via timing luck. Structural fix (tag the
+  binary-refresh commit instead of the source commit) deferred to
+  v0.2.46-46-1. (V45-B)
+
+- **`resolve_manifest_for_install` compares L0 catalog version vs on-disk**.
+  Phase 1 of the resolver used to unconditionally win when the on-disk
+  manifest existed (`Installed(path)`), so a paid module's "Retry install"
+  after an L0 catalog refresh would still install the stale on-disk
+  version. New version-compare logic falls through to `L0Synth` Phase 3
+  when the L0 catalog has a strictly newer version than the on-disk
+  manifest; on-disk still wins when versions are equal or L0 is older.
+  Audit-logged via `module_manifest_resolved` for observability. Fixes
+  the user's RL "retry install" picking v0.2.7 when L0 advertised v0.2.8.
+  New `parse_semver` helper with canonical-form acceptance + strict
+  ordering. (V45-C)
+
+- **Pull-token placeholder family widened** to catch the
+  `placeholder.<tld>`, `placeholder`, and `<host>.placeholder` shapes
+  (case-insensitive) alongside the existing `example.*` family.
+  `is_pull_token_placeholder` previously only matched `example`,
+  `example.com|net|org|invalid|test`, so v0.2.7's
+  `https://placeholder.supabase.co/functions/v1/rl-pull-token` slipped
+  through and the request landed at a nonexistent host, falling through
+  to anonymous `podman pull` against private GHCR → 401. v0.2.42 W8's
+  "Phase 3A pull-token gateway" only wired the `example.*` family.
+  Now also catches HTTP and explicit-port variants. (V45-D)
+
+- **Module status state machine completeness on container-start failure**.
+  `start_container_after_install` failures now flip `status='error'`
+  alongside the existing `set_module_last_error` call, so the V44-G4
+  auto-retry sweep (which predicates on `status IN ('error', 'broken')`)
+  can recover rows stuck in `status='installed' + last_error != NULL +
+  container_name = NULL`. Pre-v0.2.45 partial-failure rows are backfilled
+  once at launcher startup via new one-shot
+  `backfill_partial_container_start_failures` Db method (idempotent
+  UPDATE on `module_installs`). Closes V44-G4's blind spot. (V45-E)
+
+- **L0 catalog refresh on launcher-version-change + per-project update**.
+  `bust_cache_if_launcher_version_changed` (which fires when the
+  orchestrator version bumps) now spawns a non-blocking
+  `cached_module_catalog` refetch on a background tokio task.
+  `update_module_for_project` warms the cache pre-resolve, so a stale
+  catalog can never produce a stale `Installed` manifest decision in
+  V45-C's resolver. TTL-bounded warm path (no excessive refetches).
+  Periodic-timer refresh deferred to v0.2.46-46-4. (V45-F)
+
+### Added
+
+- **`VCT_RL_PULL_TOKEN_ENDPOINT` env var**: runtime override for the RL
+  Reranker pull-token endpoint. Short-circuits the L0 catalog / L1
+  manifest / hardcoded-default resolution chain inside
+  `installer_engine::request_pull_token` and POSTs the license-key
+  request to the override URL verbatim. Empty/whitespace-only values are
+  ignored. Use when the on-disk endpoint is wrong (manifest still carries
+  a `placeholder.<tld>` URL, tenant has migrated, gateway staged behind
+  a custom domain). Documented in `docs/CONFIGURATION.md`. Per-module-id
+  generalization (`VCT_<MODULE_ID>_PULL_TOKEN_ENDPOINT`) deferred to
+  v0.2.46-46-2; the V45-D shape is intentionally module-id-flavoured so
+  the upgrade is backwards-compatible. (V45-D)
+
+- **`WaitForBinaryRefresh` test harness**: parameterized timeout, poll
+  interval, and git-pull-skip flag for deterministic poll-loop tests.
+  5 async/sync tests covering immediate-success, timeout, mid-poll
+  appearance, missing-source-version, and the production 5-min default.
+  (V45-B)
+
+- **One-shot `backfill_partial_container_start_failures` Db method**:
+  idempotent UPDATE on `module_installs` that flips pre-v0.2.45 rows
+  matching the partial-failure pattern (`status='installed' +
+  last_error LIKE '%container%' + container_name IS NULL`) to
+  `status='error'`. Wired into launcher startup. (V45-E)
+
+- **`scripts/v0245-pre-ship-check.sh`**: cloned from v0244 with v0.2.45
+  version assertions, V45-specific test gates (`test_v0245_*` Python
+  tests + `cargo test --lib test_v0245`), and the `[Unreleased]`-empty
+  CHANGELOG assertion. Same 17+ PASS / 0 FAIL contract.
+
+### Changed
+
+- **Version pins bumped 0.2.44 → 0.2.45** across the canonical sites:
+  `pyproject.toml`, `vct-module.json`, `launcher/package.json`,
+  `launcher/package-lock.json`, `launcher/src-tauri/Cargo.toml`,
+  `launcher/src-tauri/tauri.conf.json`,
+  `launcher/src-tauri/vct-hub/Cargo.toml`,
+  `launcher/src-tauri/vct-launcher-core/Cargo.toml`, and the three
+  matching entries in `launcher/src-tauri/Cargo.lock`. Dist-binary
+  metadata (`launcher/dist/<arch>/*.metadata.json`) and
+  `state/install-manifest.json` are NOT bumped here — they are written
+  by the Release workflow on the binary build and by `install.py` at
+  install time, respectively.
+
+### Documentation
+
+- New KG node
+  `knowledge/concepts/paid-module-install-update-foundation-2026-06-02.md`
+  documenting the 4 paid-module foundation contracts installed by V45-C
+  through V45-F, the 3 root causes addressed in v0.2.45, the v0.2.46+
+  follow-up backlog, and cross-references to
+  `[[v0244-shipped-v0245-hotfix-rationale-2026-06-02]]`. (V45-G)
+
+### Verified
+
+- `[Unreleased]` block is EMPTY at tag time (no-deferred-fixes rule from
+  the post-v0.2.41 retrospective).
+- `tests/test_v0245_self_relaunch_under_venv.py` (V45-A) passes on
+  integrated `main`.
+- 26 `cargo test --lib test_v0245*` Rust tests across
+  `installer_engine.rs` (V45-D, 11 tests), `installer.rs` (V45-B, 5
+  tests), `modules.rs` (V45-C, 7 tests), `module_catalog_client.rs`
+  (V45-F, 2 tests) pass on integrated `main`. V45-E ships 4 additional
+  `v0245_backfill_*` tests in `vct-launcher-core/src/db/modules.rs`.
+- `bash scripts/v0245-pre-ship-check.sh` reports zero FAIL on a clean
+  fixture.
+
 ## [0.2.44] - 2026-06-01
 
 ### Fixed
