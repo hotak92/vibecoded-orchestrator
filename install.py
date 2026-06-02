@@ -2113,7 +2113,57 @@ def _persist_storage_choice(choice: dict, install_root: Path) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+def _ensure_running_under_mcp_venv() -> None:
+    """v0.2.45 V45-A: relaunch under MCP venv if weaviate import is missing.
+
+    Why: the launcher's update_orchestrator Tauri command (installer.rs)
+    spawns install.py under detect_python() — typically /usr/bin/python3.12
+    on Linux, NOT claude_mcp_servers/.venv/bin/python. install.py step 7d
+    (_migrate_kg_named_vector_slots) does an in-process `import weaviate`
+    via vco_lib.project_init._connect_v4_client. weaviate-client only lives
+    in the MCP venv. Without this relaunch, every launcher-driven update
+    deferred 4 entries to UPDATE_DEFERRED.md with ModuleNotFoundError.
+
+    No-op when:
+      - weaviate is already importable (CLI users with venv activated)
+      - we're already running under the resolved MCP venv (re-entry guard
+        via VCT_INSTALL_RELAUNCHED env)
+      - the resolved interpreter doesn't exist / can't be resolved
+        (soft-fail; install proceeds with system Python and step 7d will
+        still raise — but at least UPDATE_DEFERRED captures the error
+        and we have not introduced a new failure mode)
+    """
+    import importlib.util
+    if importlib.util.find_spec("weaviate") is not None:
+        return  # already importable — nothing to do
+    # Re-entry guard: avoid exec loops if the relaunch points back at us
+    if os.environ.get("VCT_INSTALL_RELAUNCHED") == "1":
+        return
+    try:
+        target = _resolve_venv_python_for_install(PROJECT_ROOT)
+    except Exception:
+        return
+    if not target:
+        return
+    # Compare resolved interpreter against sys.executable; skip if same
+    try:
+        if Path(target).resolve() == Path(sys.executable).resolve():
+            return
+    except Exception:
+        # Fallback: string-compare
+        if str(target) == sys.executable:
+            return
+    if not Path(target).is_file():
+        return
+    env = os.environ.copy()
+    env["VCT_INSTALL_RELAUNCHED"] = "1"
+    print(f"[v0.2.45 V45-A] relaunching install.py under MCP venv: {target}")
+    sys.stdout.flush()
+    os.execve(str(target), [str(target), *sys.argv], env)
+
+
 def main() -> int:
+    _ensure_running_under_mcp_venv()
     # 2026-04-29 fix (wizard install-path lockdown): defensive
     # source-repo check — install.py operates on PROJECT_ROOT which is
     # the directory it was launched from. If someone has copied
