@@ -658,6 +658,62 @@ pub fn run() {
                 }
             }
 
+            // v0.2.45 V45-E: one-shot startup backfill of module_installs
+            // rows stuck in the pre-v0.2.45 partial-failure state.
+            //
+            // Pre-v0.2.45, `start_container_after_install` failures called
+            // `set_module_last_error` without flipping `status` — the row
+            // sat in:
+            //   status='installed' + last_error != NULL + container_name IS NULL
+            // → invisible to V44-G4's `status IN ('error', 'broken')`
+            // auto-retry predicate. The V45-E status-flip in
+            // commands/modules.rs prevents NEW occurrences; this backfill
+            // heals EXISTING rows from previous launcher versions so they
+            // surface to V44-G4 on the next sweep.
+            //
+            // Idempotent (WHERE filters on the partial-failure shape, so
+            // already-flipped rows are excluded). Non-destructive (UPDATE
+            // only). Soft-fail (a DB hiccup MUST NOT block boot — the
+            // manual "Reinstall" button remains the recovery path).
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    match db.backfill_partial_container_start_failures() {
+                        Ok(0) => { /* clean slate; no rows to patch */ }
+                        Ok(n) => {
+                            eprintln!(
+                                "[v0.2.45 V45-E] backfilled {} module_installs row(s) \
+                                 from 'installed'+last_error partial-failure state \
+                                 → 'error' (now visible to V44-G4 auto-retry)",
+                                n
+                            );
+                            // Roll up a single audit entry rather than
+                            // one-per-row — this is a system-wide
+                            // migration step, not a per-(project,module)
+                            // user action. `project_id`/`module_id` left
+                            // None: the sweep's scope is orchestrator-wide.
+                            let _ = db.audit(
+                                "module_installs_partial_failure_backfill_v0245_v45_e",
+                                None,
+                                None,
+                                &serde_json::json!({
+                                    "rows_backfilled": n,
+                                    "reason": "pre-v0.2.45 container-start-failure left status='installed' + last_error != NULL + container_name = NULL — invisible to V44-G4 status IN ('error','broken') auto-retry predicate",
+                                    "remediation": "flipped status='installed' → 'error' so V44-G4 picks them up on the next sweep",
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[v0.2.45 V45-E] backfill SQL failed (soft-fail; \
+                                 manual Reinstall remains the recovery path): {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             // v0.2.34 (Agent B): if the previous launcher process flagged
             // the next boot as "needs a fresh hardware redetect" (set by
             // `self_update::finish_apply_after_pull` right before

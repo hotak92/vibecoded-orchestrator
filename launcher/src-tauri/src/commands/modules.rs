@@ -1650,14 +1650,34 @@ pub async fn install_module_for_project(
                         // NEW-3.C (2026-05-28): persist the error to
                         // module_installs.last_error so the GUI tile renders a
                         // clear failure state instead of "installed but no
-                        // container" silent-fail. Status intentionally stays
-                        // 'installed' — the install succeeded; only the
-                        // post-install container start failed. The user can
-                        // retry via Restart from the dashboard.
+                        // container" silent-fail.
                         let _ = db.set_module_last_error(
                             &project_id,
                             &module_id,
                             Some(&e),
+                        );
+                        // v0.2.45 V45-E: ALSO flip status to 'error' so V44-G4
+                        // auto-retry can heal the row on the next
+                        // orchestrator-update. Pre-v0.2.45 the status stayed
+                        // 'installed' on a container-start-failure (only
+                        // last_error was set), leaving the row in:
+                        //   status='installed' + last_error != NULL + container_name = NULL
+                        // which is invisible to V44-G4's
+                        //   status IN ('error', 'broken')
+                        // predicate (see module_service::retry_failed_module_installs
+                        // around line 2057). The install itself succeeded
+                        // (image is on disk after a clean podman pull), but
+                        // the post-install container start failed — flipping
+                        // status to Error funnels the user to the same
+                        // recovery path as a true install-time failure
+                        // (Reinstall / auto-retry) instead of stranding the
+                        // row in a half-state that only manual GUI clicks
+                        // can recover from.
+                        let _ = db.set_module_status(
+                            &project_id,
+                            &module_id,
+                            ModuleStatus::Error,
+                            Some(e.clone()),
                         );
                         let _ = app.emit(
                             "module://container-start-failed",

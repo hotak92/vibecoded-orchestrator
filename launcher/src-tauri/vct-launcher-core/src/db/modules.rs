@@ -334,6 +334,57 @@ impl Db {
         Ok(())
     }
 
+    /// v0.2.45 V45-E: one-shot startup backfill of rows orphaned by the
+    /// pre-v0.2.45 container-start-failure state-machine bug.
+    ///
+    /// Before v0.2.45, `start_container_after_install` failures called
+    /// `set_module_last_error` WITHOUT a status flip. The resulting rows
+    /// landed in:
+    ///   status='installed' + last_error != NULL + container_name IS NULL
+    /// — invisible to V44-G4's `status IN ('error', 'broken')` auto-retry
+    /// predicate (see `module_service::retry_failed_module_installs`),
+    /// stranding paid-module rows in a half-state that only manual
+    /// "Reinstall" clicks could recover from.
+    ///
+    /// This UPDATE flips those rows to `status='error'` so V44-G4 picks
+    /// them up on the next orchestrator-update sweep. Three safety
+    /// properties:
+    ///
+    ///   * **Idempotent** — the WHERE clause excludes rows already at
+    ///     `status='error'`, so a second run is a no-op (returns 0).
+    ///   * **Conservative** — only touches rows that match ALL of:
+    ///     status='installed' + last_error IS NOT NULL + container_name
+    ///     IS NULL. Legitimately-installed rows (status='installed' with
+    ///     a container_name set) are untouched. Rows that already have
+    ///     status='error' are untouched.
+    ///   * **Non-destructive** — UPDATE only, no DELETE. The
+    ///     `last_error` payload is preserved for the GUI tile and for
+    ///     V44-G4's audit log.
+    ///
+    /// Returns the row count for the audit log. Soft-fail callers should
+    /// `eprintln!` and continue on Err — backfill failure must NEVER
+    /// block launcher boot (the existing rows just stay invisible to
+    /// auto-retry until the user clicks Reinstall manually).
+    pub fn backfill_partial_container_start_failures(&self) -> Result<usize, String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs
+                    SET status = 'error'
+                  WHERE status = 'installed'
+                    AND last_error IS NOT NULL
+                    AND container_name IS NULL",
+                [],
+            )
+            .map_err(|e| {
+                format!(
+                    "backfill_partial_container_start_failures: {}",
+                    e
+                )
+            })?;
+        Ok(n)
+    }
+
     pub fn get_module_install(
         &self,
         project_id: &str,
@@ -923,5 +974,212 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─── v0.2.45 V45-E: backfill_partial_container_start_failures ───────
+    //
+    // These tests cover the one-shot startup backfill that flips
+    // pre-v0.2.45 stuck rows (status='installed' + last_error != NULL +
+    // container_name IS NULL) to status='error' so V44-G4 auto-retry
+    // can heal them.
+
+    /// Helper: seed a row in the exact partial-failure shape we're
+    /// migrating away from. Mirrors what a pre-v0.2.45 launcher would
+    /// have written when `start_container_after_install` failed
+    /// post-pull: status stays 'installed', last_error is set,
+    /// container_name is NULL.
+    fn seed_partial_failure_row(
+        db: &Db,
+        project_id: &str,
+        module_id: &str,
+        err_msg: &str,
+    ) {
+        db.insert_module_install(
+            &format!("install-id-{}", module_id),
+            project_id,
+            module_id,
+            "0.2.7",
+            "/tmp/install-path",
+        )
+        .expect("seed insert");
+        // Status starts as 'installing' from insert; flip to
+        // 'installed' to match what a successful install + failed
+        // container-start would have left behind pre-v0.2.45.
+        db.set_module_status(project_id, module_id, ModuleStatus::Installed, None)
+            .expect("seed: flip to installed");
+        db.set_module_last_error(project_id, module_id, Some(err_msg))
+            .expect("seed: set last_error");
+        // container_name intentionally NOT set — that's the stuck
+        // shape (post-pull, pre-container-start).
+    }
+
+    /// V45-E backfill flips a stuck row from 'installed' → 'error'.
+    /// The row was in the exact shape produced by a pre-v0.2.45
+    /// container-start-failure: status='installed', last_error != NULL,
+    /// container_name IS NULL. Post-backfill it must be visible to
+    /// V44-G4's `status IN ('error', 'broken')` predicate.
+    #[test]
+    fn v0245_backfill_flips_stuck_row_to_error() {
+        let (db, pid) = open_db_with_project();
+        seed_partial_failure_row(
+            &db,
+            &pid,
+            "vct-rl-reranker",
+            "podman start exited 125: image not found",
+        );
+
+        let pre = db
+            .get_module_install(&pid, "vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pre.status, ModuleStatus::Installed);
+        assert!(pre.last_error.is_some());
+        assert!(pre.container_name.is_none());
+
+        let n = db
+            .backfill_partial_container_start_failures()
+            .expect("backfill must succeed");
+        assert_eq!(n, 1, "exactly one stuck row should be flipped");
+
+        let post = db
+            .get_module_install(&pid, "vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            post.status,
+            ModuleStatus::Error,
+            "stuck row must be flipped to 'error' for V44-G4 visibility"
+        );
+        // last_error preserved — the GUI tile and audit log still
+        // need it.
+        assert_eq!(
+            post.last_error.as_deref(),
+            Some("podman start exited 125: image not found"),
+            "last_error payload must be preserved on backfill"
+        );
+        assert!(
+            post.container_name.is_none(),
+            "container_name stays NULL (we don't synthesize one)"
+        );
+    }
+
+    /// V45-E backfill is idempotent: running it twice on the same DB
+    /// returns 0 on the second call. Required because the backfill
+    /// runs on EVERY launcher startup — re-running on already-healed
+    /// rows must be a clean no-op.
+    #[test]
+    fn v0245_backfill_is_idempotent() {
+        let (db, pid) = open_db_with_project();
+        seed_partial_failure_row(&db, &pid, "vct-rl-reranker", "failure 1");
+
+        let n1 = db
+            .backfill_partial_container_start_failures()
+            .expect("first backfill");
+        assert_eq!(n1, 1, "first run flips the stuck row");
+
+        let n2 = db
+            .backfill_partial_container_start_failures()
+            .expect("second backfill");
+        assert_eq!(
+            n2, 0,
+            "second run must be a no-op (row is already at 'error')"
+        );
+    }
+
+    /// V45-E backfill must NOT touch rows that are legitimately
+    /// 'installed' (i.e. have a container_name set and no last_error).
+    /// Those are healthy installed modules — leaving them as 'installed'
+    /// is correct.
+    #[test]
+    fn v0245_backfill_does_not_touch_healthy_installed_rows() {
+        let (db, pid) = open_db_with_project();
+
+        // Row 1: stuck partial failure → must be flipped.
+        seed_partial_failure_row(&db, &pid, "stuck-mod", "container start failed");
+        // Row 2: healthy install with container_name set, no last_error
+        // → must be left alone.
+        db.insert_module_install(
+            "install-id-healthy",
+            &pid,
+            "healthy-mod",
+            "0.2.7",
+            "/tmp/healthy",
+        )
+        .expect("seed healthy");
+        db.set_module_status(&pid, "healthy-mod", ModuleStatus::Installed, None)
+            .expect("flip healthy to installed");
+        db.set_module_container_name(&pid, "healthy-mod", "healthy-container")
+            .expect("set container_name on healthy");
+
+        let n = db
+            .backfill_partial_container_start_failures()
+            .expect("backfill");
+        assert_eq!(n, 1, "only the stuck row should be flipped");
+
+        let stuck = db
+            .get_module_install(&pid, "stuck-mod")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stuck.status, ModuleStatus::Error);
+
+        let healthy = db
+            .get_module_install(&pid, "healthy-mod")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            healthy.status,
+            ModuleStatus::Installed,
+            "healthy row must be untouched (container_name was set)"
+        );
+        assert_eq!(
+            healthy.container_name.as_deref(),
+            Some("healthy-container")
+        );
+    }
+
+    /// V45-E backfill must NOT touch rows that are already at
+    /// 'error'. Those have either been flipped by V45-E's modules.rs
+    /// patch (the steady-state path post-v0.2.45) or by some other
+    /// path. The WHERE clause filters on status='installed' precisely
+    /// to leave them alone.
+    #[test]
+    fn v0245_backfill_does_not_touch_already_error_rows() {
+        let (db, pid) = open_db_with_project();
+        db.insert_module_install(
+            "install-id-1",
+            &pid,
+            "already-errored-mod",
+            "0.2.7",
+            "/tmp/x",
+        )
+        .expect("seed");
+        // This row mirrors what a POST-v0.2.45 container-start-failure
+        // produces: status='error' + last_error + container_name=NULL.
+        db.set_module_status(
+            &pid,
+            "already-errored-mod",
+            ModuleStatus::Error,
+            Some("already in error state".into()),
+        )
+        .expect("seed to error");
+
+        let n = db
+            .backfill_partial_container_start_failures()
+            .expect("backfill");
+        assert_eq!(
+            n, 0,
+            "row already at 'error' must be excluded by status='installed' filter"
+        );
+
+        let row = db
+            .get_module_install(&pid, "already-errored-mod")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, ModuleStatus::Error);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("already in error state"),
+            "last_error must be preserved (no double-touch)"
+        );
     }
 }
