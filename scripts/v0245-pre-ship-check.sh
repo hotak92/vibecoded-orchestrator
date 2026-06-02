@@ -110,8 +110,17 @@ cd "$REPO_ROOT"
 #  5. `pytest` on PATH if no venv probe matched.
 #  6. Bare `python3` (will fail clearly if pytest missing).
 _PYTEST_PY=""
+_PYTEST_CMD=()
 if [ -n "${PYTEST:-}" ]; then
-    _PYTEST_PY="$PYTEST"
+    # User supplied PYTEST — autodetect whether it's a python interpreter
+    # (case A: PYTEST=/path/to/venv/bin/python) or a pytest binary (case B:
+    # PYTEST=/path/to/venv/bin/pytest). Without this disambiguation, case B
+    # would resolve to `pytest -m pytest tests/...` which is a marker filter
+    # that matches nothing ("6 deselected" footgun caught in v0.2.45 ship).
+    case "$(basename -- "$PYTEST")" in
+        pytest|pytest-*|*-pytest) _PYTEST_CMD=("$PYTEST") ;;
+        *)                        _PYTEST_PY="$PYTEST" ;;
+    esac
 elif [ -x ".venv/bin/python" ]; then
     _PYTEST_PY=".venv/bin/python"
 elif [ -x ".venv/bin/python3" ]; then
@@ -125,10 +134,12 @@ elif command -v pytest >/dev/null 2>&1; then
 else
     _PYTEST_PY="python3"
 fi
-if [ -n "$_PYTEST_PY" ]; then
-    _PYTEST_CMD=("$_PYTEST_PY" -m pytest)
-else
-    _PYTEST_CMD=(pytest)
+if [ ${#_PYTEST_CMD[@]} -eq 0 ]; then
+    if [ -n "$_PYTEST_PY" ]; then
+        _PYTEST_CMD=("$_PYTEST_PY" -m pytest)
+    else
+        _PYTEST_CMD=(pytest)
+    fi
 fi
 
 # ── Section 1: Local build gates ─────────────────────────────────────────────
