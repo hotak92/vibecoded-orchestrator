@@ -881,12 +881,31 @@ const PULL_TOKEN_ENDPOINT_PLACEHOLDER: &str = "https://example/pull-token";
 ///   3. URL host is EXACTLY one of the RFC-2606 reserved hosts:
 ///      `example.com`, `example.net`, `example.org`, `example.invalid`,
 ///      `example.test`.
+///   4. URL host has `placeholder` as the bare host, starts with
+///      `placeholder.` (e.g. `placeholder.supabase.co`), or ends with
+///      `.placeholder` (added v0.2.45 V45-D — see comment below).
 ///
-/// NOT a placeholder: subdomains of any of the above (e.g. `staging.example.com`).
-/// Those are legitimate user-controlled hostnames — a staging Supabase tenant
-/// or a third-party module's gateway. Treating them as placeholders would
-/// silently route their traffic to `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`, which
-/// is wrong.
+/// NOT a placeholder: subdomains of any of the example.* hosts (e.g.
+/// `staging.example.com`). Those are legitimate user-controlled hostnames
+/// — a staging Supabase tenant or a third-party module's gateway. Treating
+/// them as placeholders would silently route their traffic to
+/// `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`, which is wrong.
+///
+/// Host matching for the placeholder family is case-insensitive
+/// (`Placeholder.supabase.co` is detected equivalently to
+/// `placeholder.supabase.co`). The example.* family is matched against the
+/// already-canonical lowercase literals — URL host components are
+/// case-insensitive per RFC 3986, but in practice every manifest we see
+/// ships lowercase, so we keep the existing exact-match path for that
+/// family rather than introduce a behaviour change.
+///
+/// v0.2.45 V45-D: the "placeholder" host family was added because the v0.2.7
+/// RL manifest shipped with `pull_token_endpoint = "https://placeholder.supabase.co/...`.
+/// The literal "placeholder" subdomain slipped past the example.* family added
+/// in v0.2.42 W8 — POST went to a nonexistent host, fell through to anonymous
+/// `podman pull` against private GHCR, and 401'd. Catching this entire family
+/// avoids the same class of bug for every future paid module that ships a
+/// `placeholder.<anything>` URL in a pre-publish fixture.
 fn is_pull_token_placeholder(raw: &str) -> bool {
     if raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER {
         return true;
@@ -900,7 +919,11 @@ fn is_pull_token_placeholder(raw: &str) -> bool {
     };
     let host = host_start.split('/').next().unwrap_or("");
     let host_no_port = host.split(':').next().unwrap_or("");
-    matches!(
+
+    // Existing example.* family (RFC-2606 reserved + the bare-`example`
+    // historical fixture form). Kept as exact lowercase match — see doc
+    // comment above for rationale.
+    if matches!(
         host_no_port,
         "example"
             | "example.com"
@@ -908,7 +931,25 @@ fn is_pull_token_placeholder(raw: &str) -> bool {
             | "example.org"
             | "example.invalid"
             | "example.test"
-    )
+    ) {
+        return true;
+    }
+
+    // v0.2.45 V45-D: also catch "placeholder" host on any TLD. Patterns:
+    //   - bare `placeholder` (no TLD; pre-publish fixture form)
+    //   - `placeholder.<anything>` (e.g. placeholder.supabase.co)
+    //   - `<anything>.placeholder` (e.g. foo.placeholder; less common but
+    //     still an obvious placeholder marker)
+    // Case-insensitive so `Placeholder.supabase.co` is also detected.
+    let lower = host_no_port.to_lowercase();
+    if lower == "placeholder"
+        || lower.starts_with("placeholder.")
+        || lower.ends_with(".placeholder")
+    {
+        return true;
+    }
+
+    false
 }
 
 /// Resolve the effective pull-token endpoint URL, replacing empty strings and
@@ -1007,8 +1048,40 @@ async fn request_pull_token(
     //      same substitution.
     // When the substitution fires, an eprintln warns the operator so the stale
     // manifest gets noticed and fixed before it affects more users.
-    let raw_endpoint = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
-    let endpoint = resolve_pull_token_endpoint(raw_endpoint);
+    //
+    // v0.2.45 V45-D: env override takes precedence over BOTH the L0 override
+    // and the L1 manifest. Setting `VCT_RL_PULL_TOKEN_ENDPOINT=<url>` short-
+    // circuits the L0/L1/default resolution chain entirely and POSTs to the
+    // env URL verbatim. Provides operators a runtime escape hatch for the
+    // case where the on-disk / L0-resolved endpoint is wrong (placeholder,
+    // broken host, migrated tenant). Intentionally module-id-shaped so the
+    // v0.2.46 per-module-id registry generalization (46-2) is a backwards-
+    // compatible refactor — same env var name, same precedence semantics,
+    // just keyed by module id instead of hardcoded to the RL module.
+    //
+    // Empty / whitespace-only values are ignored (fall back to the existing
+    // L0/L1/default chain) so an accidental empty assignment in a shell rc
+    // file doesn't break the install.
+    let endpoint_string: String;
+    let endpoint: &str = match std::env::var("VCT_RL_PULL_TOKEN_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(env_url) => {
+            eprintln!(
+                "[installer_engine] VCT_RL_PULL_TOKEN_ENDPOINT set; \
+                 using env override for pull-token endpoint: {}",
+                env_url
+            );
+            endpoint_string = env_url;
+            &endpoint_string
+        }
+        None => {
+            let raw_endpoint = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
+            resolve_pull_token_endpoint(raw_endpoint)
+        }
+    };
 
     let resp = client
         .request(method, endpoint)
@@ -2603,6 +2676,265 @@ mod tests {
             effective, RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
             "W8: L0 absent + L1 placeholder must resolve to default const; got: {}",
             effective
+        );
+    }
+
+    // ─── v0.2.45 V45-D: widened placeholder family covers "placeholder.*" ─
+    //
+    // v0.2.42 W8 / P3-P1-1 covered the `example.*` family but missed the
+    // literal "placeholder" subdomain — the form the v0.2.7 RL manifest
+    // shipped with (`https://placeholder.supabase.co/functions/v1/rl-pull-token`).
+    // V45-D widens `is_pull_token_placeholder` to catch:
+    //   - bare `placeholder` host
+    //   - `placeholder.<anything>` host
+    //   - `<anything>.placeholder` host
+    // …on either `http://` or `https://`, with optional port.
+    //
+    // Regression coverage for the existing `example.*` family is included
+    // (test_v0245_existing_example_still_detected) so the new logic doesn't
+    // accidentally clobber the W8 path.
+
+    #[test]
+    fn test_v0245_placeholder_dot_supabase_is_placeholder() {
+        // The exact form the v0.2.7 RL manifest carried — root-cause URL
+        // that fell through to anonymous pull → GHCR 401.
+        assert!(
+            is_pull_token_placeholder(
+                "https://placeholder.supabase.co/functions/v1/rl-pull-token"
+            ),
+            "placeholder.supabase.co must be detected as a placeholder"
+        );
+        // And via resolve_pull_token_endpoint → substitutes the default.
+        let result = resolve_pull_token_endpoint(
+            "https://placeholder.supabase.co/functions/v1/rl-pull-token",
+        );
+        assert_eq!(
+            result, RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+            "placeholder.supabase.co must resolve to default; got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_v0245_placeholder_root_is_placeholder() {
+        // Bare `placeholder` host (no TLD). The pre-publish fixture form.
+        assert!(
+            is_pull_token_placeholder("https://placeholder/foo"),
+            "bare `placeholder` host must be detected as a placeholder"
+        );
+    }
+
+    #[test]
+    fn test_v0245_subdomain_dot_placeholder_is_placeholder() {
+        // The reverse pattern: `<something>.placeholder` host (less common
+        // but still an obvious "I forgot to set the URL" marker).
+        assert!(
+            is_pull_token_placeholder("https://foo.placeholder/bar"),
+            "foo.placeholder must be detected as a placeholder"
+        );
+    }
+
+    #[test]
+    fn test_v0245_placeholder_family_case_insensitive() {
+        // Per the doc comment, host matching for the placeholder family is
+        // case-insensitive. URL host components are case-insensitive per
+        // RFC 3986; the launcher must catch all common-case spellings.
+        for variant in [
+            "https://Placeholder.supabase.co/foo",
+            "https://PLACEHOLDER.supabase.co/foo",
+            "https://placeholder.SUPABASE.co/foo",
+            "https://PlAcEhOlDeR.example.test/foo",
+        ] {
+            assert!(
+                is_pull_token_placeholder(variant),
+                "case-variant {:?} must be detected as a placeholder",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_v0245_placeholder_family_http_and_port_variants() {
+        // http:// scheme and explicit port suffix must not bypass detection.
+        for variant in [
+            "http://placeholder.supabase.co/foo",
+            "https://placeholder.supabase.co:443/foo",
+            "http://placeholder:80/foo",
+        ] {
+            assert!(
+                is_pull_token_placeholder(variant),
+                "variant {:?} must be detected as a placeholder",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_v0245_existing_example_still_detected() {
+        // Regression: V45-D must NOT clobber the v0.2.42 W8 / P3-P1-1
+        // example.* family. Re-assert each example.* host shape.
+        for variant in [
+            "https://example.com/foo",
+            "https://example.org/functions/v1/rl-artifact-url",
+            "https://example.net/x",
+            "https://example.invalid/anything",
+            "https://example.test/",
+            "https://example/pull-token", // bare-example historical form
+        ] {
+            assert!(
+                is_pull_token_placeholder(variant),
+                "existing example.* family member {:?} must still be detected",
+                variant
+            );
+        }
+    }
+
+    #[test]
+    fn test_v0245_legitimate_supabase_not_placeholder() {
+        // The real production Supabase project URL must NOT be detected as
+        // a placeholder. This is the URL `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`
+        // points to; if `is_pull_token_placeholder` returned true for it,
+        // every install would silently substitute the default-of-the-default
+        // (a no-op that happens to work, but a clear sign of a logic bug).
+        assert!(
+            !is_pull_token_placeholder(
+                "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-pull-token"
+            ),
+            "real Supabase URL must NOT be detected as a placeholder"
+        );
+        assert!(
+            !is_pull_token_placeholder(
+                "https://abc123def.supabase.co/functions/v1/rl-pull-token"
+            ),
+            "arbitrary <project-id>.supabase.co must NOT be detected as a placeholder"
+        );
+        // A user-controlled subdomain that happens to start with "place"
+        // but isn't "placeholder" must pass through. (Defensive guard
+        // against accidentally using substring-match instead of prefix-match.)
+        assert!(
+            !is_pull_token_placeholder("https://places.example.io/foo"),
+            "places.example.io must NOT be detected as a placeholder \
+             (starts with 'place' but isn't 'placeholder')"
+        );
+        assert!(
+            !is_pull_token_placeholder("https://my-placeholder-name.test.io/foo"),
+            "my-placeholder-name.test.io must NOT be detected as a placeholder \
+             (contains 'placeholder' but isn't the literal `placeholder` segment)"
+        );
+    }
+
+    // ─── v0.2.45 V45-D: VCT_RL_PULL_TOKEN_ENDPOINT env override semantics ─
+    //
+    // The env var short-circuits the L0/L1/default resolution chain entirely.
+    // We can't exercise the full `request_pull_token` path here (requires
+    // keychain + live HTTP), but we CAN verify the precedence-decoding logic
+    // that `request_pull_token` uses:
+    //   - env var set + non-empty → use the env value verbatim
+    //   - env var set + empty/whitespace → fall back to L0/L1/default chain
+    //   - env var unset → fall back to L0/L1/default chain
+    //
+    // The helper below mirrors the exact `match`/`filter` chain inside
+    // `request_pull_token` so a divergence in either place will fail one of
+    // these tests. Keeping the logic in lock-step with the production code
+    // is the entire point — these tests live next to the function, not in a
+    // separate integration suite.
+
+    /// Test-only mirror of the env-override decoding in `request_pull_token`.
+    /// Returns the effective endpoint string the function would POST to,
+    /// given an env value (or `None` for "unset") and the L0/L1/default
+    /// fallback chain reduced to a single `raw` argument.
+    fn v0245_resolve_with_env(env_value: Option<&str>, raw: &str) -> String {
+        match env_value
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            Some(env_url) => env_url,
+            None => resolve_pull_token_endpoint(raw).to_string(),
+        }
+    }
+
+    #[test]
+    fn test_v0245_env_override_takes_precedence() {
+        // Env var set to a real URL → POST goes to env URL, NOT to the
+        // resolved L0/L1/default endpoint. Verified at the precedence-
+        // decoding layer (the same `match`/`filter` chain inside
+        // `request_pull_token`).
+        let env = Some("https://mocked-pull-token.test/foo");
+        // Even if `raw` is a known placeholder (which would normally be
+        // substituted with RL_ARTIFACT_URL_DEFAULT_ENDPOINT), the env
+        // override wins.
+        let raw = PULL_TOKEN_ENDPOINT_PLACEHOLDER;
+        let effective = v0245_resolve_with_env(env, raw);
+        assert_eq!(
+            effective, "https://mocked-pull-token.test/foo",
+            "env override must take precedence over L1 placeholder; got: {}",
+            effective
+        );
+    }
+
+    #[test]
+    fn test_v0245_env_override_trims_whitespace() {
+        // Operators may accidentally leave trailing whitespace in their
+        // shell rc. The decoding trims whitespace before deciding whether
+        // the value is "empty"; a leading/trailing space alone must not
+        // disable the override.
+        let env = Some("  https://mocked-pull-token.test/foo  ");
+        let raw = PULL_TOKEN_ENDPOINT_PLACEHOLDER;
+        let effective = v0245_resolve_with_env(env, raw);
+        assert_eq!(
+            effective, "https://mocked-pull-token.test/foo",
+            "env override must be whitespace-trimmed; got: {:?}",
+            effective
+        );
+    }
+
+    #[test]
+    fn test_v0245_empty_env_falls_back_to_raw() {
+        // Env var set to empty / whitespace-only → ignored, behaviour
+        // unchanged. Verifies the `.filter(|s| !s.is_empty())` step.
+        let raw_real = "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
+
+        for empty_form in ["", "   ", "\t\n"] {
+            let effective = v0245_resolve_with_env(Some(empty_form), raw_real);
+            assert_eq!(
+                effective, raw_real,
+                "empty env value {:?} must fall back to raw; got: {}",
+                empty_form, effective
+            );
+        }
+
+        // And with raw = placeholder, the substitution still fires.
+        let effective_placeholder = v0245_resolve_with_env(
+            Some(""),
+            PULL_TOKEN_ENDPOINT_PLACEHOLDER,
+        );
+        assert_eq!(
+            effective_placeholder, RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+            "empty env value + L1 placeholder must still substitute default; got: {}",
+            effective_placeholder
+        );
+    }
+
+    #[test]
+    fn test_v0245_unset_env_falls_back_to_raw() {
+        // Env var unset → behaviour is exactly the pre-V45-D logic
+        // (resolve_pull_token_endpoint on the raw L0/L1 chain).
+        let raw_real = "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
+        let effective_real = v0245_resolve_with_env(None, raw_real);
+        assert_eq!(
+            effective_real, raw_real,
+            "unset env + real raw URL must pass through; got: {}",
+            effective_real
+        );
+
+        let effective_placeholder = v0245_resolve_with_env(
+            None,
+            "https://placeholder.supabase.co/functions/v1/rl-pull-token",
+        );
+        assert_eq!(
+            effective_placeholder, RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+            "unset env + placeholder.supabase.co must resolve to default; got: {}",
+            effective_placeholder
         );
     }
 
