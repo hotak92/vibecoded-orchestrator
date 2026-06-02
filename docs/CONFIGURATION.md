@@ -284,6 +284,7 @@ Set these before running `bash first-install.sh` (or export them for the duratio
 | `VCT_CONTAINER_RUNTIME=podman|docker` | Pin the container runtime instead of auto-probing. Useful in CI where both runtimes might be present but only one is configured. |
 | `VCT_STATE_DIR=/path` | Override `~/.vct/` as the launcher state-root. Lets dev launchers run alongside production without contaminating state. Hub binaries pick this up automatically; resolver clients honour it too. |
 | `VCT_DISABLE_HOOKS=1` | See section below. |
+| `VCT_RL_PULL_TOKEN_ENDPOINT=<url>` | (v0.2.45 V45-D) Runtime override for the RL module's paid-module pull-token gateway URL. Short-circuits the L0 catalog / L1 manifest / hardcoded-default resolution chain inside `installer_engine::request_pull_token` and POSTs the license-key request to `<url>` verbatim. Use when the on-disk endpoint is wrong (manifest still carries a `placeholder.<tld>` URL, tenant has migrated, gateway is being staged behind a custom domain). Empty / whitespace-only values are ignored. Per-module-id generalization (`VCT_<MODULE_ID>_PULL_TOKEN_ENDPOINT`) is on the v0.2.46-46-2 backlog; the V45-D shape is intentionally module-id-flavoured so that the upgrade is backwards-compatible. |
 
 ## Disabling hooks for debugging or CI
 
