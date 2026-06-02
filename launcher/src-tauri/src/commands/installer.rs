@@ -781,10 +781,12 @@ pub async fn get_installed_version(path: String) -> Result<String, String> {
 ///   "Update orchestrator". Resolved by `apply_pending_install`
 ///   (install.py --update, no git pull — source is already current).
 /// - `binary_stale`: the running launcher's compiled version differs
-///   from `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`
-///   on disk. Happens when a newer binary lands via `git pull` without
-///   install.py running its binary-swap path. Resolved by
-///   `restart_launcher` (re-exec the on-disk binary).
+///   from `launcher/dist/<arch>/<launcher-binary>.metadata.json::launcher_version`
+///   on disk (`vct-launcher.metadata.json` on Linux/macOS,
+///   `vct-launcher.exe.metadata.json` on Windows). Happens when a
+///   newer binary lands via `git pull` without install.py running its
+///   binary-swap path. Resolved by `restart_launcher` (re-exec the
+///   on-disk binary).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateStatus {
     /// Existing v0.2.x semantics: local branch is behind `origin/main`.
@@ -802,9 +804,11 @@ pub struct UpdateStatus {
     /// `env!("CARGO_PKG_VERSION")` — the version the currently-running
     /// launcher was compiled with.
     pub running_version: String,
-    /// `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`.
-    /// Empty string when the sidecar metadata is absent (e.g. dev build
-    /// running from `cargo run` with no dist artifacts staged).
+    /// `launcher/dist/<arch>/<launcher-binary>.metadata.json::launcher_version`
+    /// — i.e. `vct-launcher.metadata.json` on Linux/macOS,
+    /// `vct-launcher.exe.metadata.json` on Windows. Empty string when
+    /// the sidecar metadata is absent (e.g. dev build running from
+    /// `cargo run` with no dist artifacts staged).
     pub on_disk_binary_version: String,
 }
 
@@ -1002,17 +1006,25 @@ fn read_manifest_version(install_path: &Path) -> Option<String> {
 }
 
 /// Read the on-disk binary version from
-/// `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`.
-/// The arch subdir is selected via the same helper the restart_launcher
-/// path uses (`launcher_binary_relative_path` in commands::restart) —
-/// keep both functions in sync.
+/// `launcher/dist/<arch>/<launcher-binary>.metadata.json::launcher_version`.
+/// The arch subdir is selected via `launcher_dist_subdir()` and the
+/// binary filename via `launcher_binary_filename()` — both mirror the
+/// `commands::restart::launcher_binary_relative_path` pattern. On
+/// Windows the sidecar is `vct-launcher.exe.metadata.json` (with `.exe.`
+/// infix) because `scripts/build-bundled-launcher.sh` stages it as
+/// `${DEST}.metadata.json` where `$DEST` already carries the `.exe`
+/// extension. v0.2.45 V45-H fixed a hardcoded path that only resolved
+/// on Linux/macOS — on Windows the lookup returned `None`, which made
+/// V45-B's `wait_for_binary_refresh` always time out after 5 minutes
+/// (FINDING C1 of the v0.2.45 pre-tag review).
 fn read_on_disk_binary_version(install_path: &Path) -> Option<String> {
     let subdir = launcher_dist_subdir();
+    let binary = launcher_binary_filename();
     let meta_path = install_path
         .join("launcher")
         .join("dist")
         .join(subdir)
-        .join("vct-launcher.metadata.json");
+        .join(format!("{}.metadata.json", binary));
     if let Ok(txt) = std::fs::read_to_string(&meta_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
             if let Some(s) = val.get("launcher_version").and_then(|v| v.as_str()) {
@@ -1041,6 +1053,25 @@ fn launcher_dist_subdir() -> &'static str {
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         "linux-x64"
+    }
+}
+
+/// Compile-time per-OS launcher binary filename. Mirror of
+/// `commands::restart::launcher_binary_relative_path` (which returns the
+/// `(subdir, filename)` pair as a tuple); duplicated here so paths in
+/// installer.rs don't have to hardcode `vct-launcher.metadata.json` and
+/// silently break on Windows where the actual on-disk sidecar is
+/// `vct-launcher.exe.metadata.json` (because `${DEST}.metadata.json` in
+/// `scripts/build-bundled-launcher.sh` includes the `.exe` extension).
+/// Added in v0.2.45 V45-H — keep in lock-step with the restart helper.
+fn launcher_binary_filename() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "vct-launcher.exe"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "vct-launcher"
     }
 }
 
@@ -8252,15 +8283,23 @@ mod tests {
             .join(launcher_dist_subdir());
         fs::create_dir_all(&dist_arch).unwrap();
         let v = serde_json::json!({"launcher_version": version}).to_string();
-        fs::write(dist_arch.join("vct-launcher.metadata.json"), v).unwrap();
+        // Use launcher_binary_filename() so the test fixture matches the
+        // exact same per-OS layout the production code looks for. On
+        // Windows that resolves to `vct-launcher.exe.metadata.json`; on
+        // Linux/macOS to `vct-launcher.metadata.json`. Without this the
+        // tests would silently regress to the pre-V45-H hardcoded path
+        // and pass on Linux while masking the Windows bug.
+        let meta_name = format!("{}.metadata.json", launcher_binary_filename());
+        fs::write(dist_arch.join(meta_name), v).unwrap();
     }
 
     fn clear_v0245_on_disk_version(install_path: &Path) {
+        let meta_name = format!("{}.metadata.json", launcher_binary_filename());
         let meta = install_path
             .join("launcher")
             .join("dist")
             .join(launcher_dist_subdir())
-            .join("vct-launcher.metadata.json");
+            .join(meta_name);
         let _ = fs::remove_file(&meta);
     }
 
@@ -11999,14 +12038,22 @@ MemAvailable:   23456789 kB
         #[test]
         fn test_read_on_disk_binary_version_present() {
             // Cross-OS: build the path the same way the helper does
-            // (`launcher_dist_subdir()` is compile-time per-target). Use
-            // PathBuf operations throughout — no string `/` literals.
+            // (`launcher_dist_subdir()` + `launcher_binary_filename()`
+            // are compile-time per-target). Use PathBuf operations
+            // throughout — no string `/` literals.
+            //
+            // v0.2.45 V45-H: the metadata sidecar filename is OS-dependent
+            // (`vct-launcher.metadata.json` on Linux/macOS,
+            // `vct-launcher.exe.metadata.json` on Windows). Use the
+            // helper so this test exercises the correct path on each OS
+            // and would fail on Windows without the V45-H fix.
             let dir = tmp();
             let subdir = launcher_dist_subdir();
             let bin_dir = dir.join("launcher").join("dist").join(subdir);
             fs::create_dir_all(&bin_dir).unwrap();
+            let meta_name = format!("{}.metadata.json", launcher_binary_filename());
             fs::write(
-                bin_dir.join("vct-launcher.metadata.json"),
+                bin_dir.join(meta_name),
                 r#"{"launcher_version": "0.2.15", "host_target": "any"}"#,
             )
             .unwrap();
@@ -12031,6 +12078,59 @@ MemAvailable:   23456789 kB
             // the canonical strings the install.py side knows about.
             let s = launcher_dist_subdir();
             assert!(matches!(s, "linux-x64" | "macos-arm64" | "windows-x64"));
+        }
+
+        // v0.2.45 V45-H — pinpoint test for FINDING C1 of the pre-tag
+        // review. Verifies that `read_on_disk_binary_version` looks for
+        // the correct per-OS sidecar filename, mirroring what
+        // `scripts/build-bundled-launcher.sh` actually stages on disk
+        // (`${DEST}.metadata.json` where `$DEST` carries `.exe` on
+        // Windows). Without the V45-H fix this test would fail on
+        // Windows (helper would search for `vct-launcher.metadata.json`
+        // and miss the real `vct-launcher.exe.metadata.json`).
+        #[test]
+        fn test_v0245_v45h_metadata_filename_matches_on_disk_per_os() {
+            let dir = tmp();
+            // Compute the expected on-disk filename WITHOUT going through
+            // launcher_binary_filename(). We hardcode the per-OS shape
+            // the build script writes — if the production helper ever
+            // drifts from this, the test catches it.
+            let expected_filename = if cfg!(target_os = "windows") {
+                "vct-launcher.exe.metadata.json"
+            } else {
+                "vct-launcher.metadata.json"
+            };
+            let arch_dir = dir
+                .join("launcher")
+                .join("dist")
+                .join(launcher_dist_subdir());
+            fs::create_dir_all(&arch_dir).unwrap();
+            fs::write(
+                arch_dir.join(expected_filename),
+                r#"{"launcher_version":"0.2.45"}"#,
+            )
+            .unwrap();
+            let result = read_on_disk_binary_version(&dir);
+            assert_eq!(
+                result.as_deref(),
+                Some("0.2.45"),
+                "read_on_disk_binary_version must find {} on this OS",
+                expected_filename
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        // v0.2.45 V45-H: paired sanity-check on the new helper. Catches
+        // accidental regressions that would unify both branches to the
+        // same literal — e.g. someone "simplifying" the cfg block.
+        #[test]
+        fn test_v0245_v45h_launcher_binary_filename_per_os() {
+            let name = launcher_binary_filename();
+            if cfg!(target_os = "windows") {
+                assert_eq!(name, "vct-launcher.exe");
+            } else {
+                assert_eq!(name, "vct-launcher");
+            }
         }
 
         #[test]
