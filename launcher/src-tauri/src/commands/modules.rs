@@ -1198,6 +1198,38 @@ impl ManifestSource {
     }
 }
 
+/// v0.2.45 V45-C: tiny semver parser used by `resolve_manifest_for_install`
+/// to compare the on-disk manifest version against the L0 catalog version.
+///
+/// We don't pull in the `semver` crate just for this — splitting on `.` and
+/// parsing three `u64` components covers every published module version
+/// (v0.2.7, v0.2.8, 1.0.0, …). Pre-release and build-metadata suffixes are
+/// not supported; if a version string carries one (e.g. "0.2.8-rc1") we
+/// return None and the caller's safety net (`None` → on-disk wins) keeps
+/// behaviour conservative — we won't synthesize from a version we can't
+/// confidently compare.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let s = s.trim().trim_start_matches('v');
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch_raw = parts.next()?;
+    // Reject anything with a pre-release / build-metadata suffix on the
+    // patch component (e.g. "0.2.8-rc1", "0.2.8+build42"). The safety net
+    // (None → on-disk wins) covers these — we'd rather honour the
+    // user's last-installed version than guess at suffix ordering.
+    if patch_raw.chars().any(|c| !c.is_ascii_digit()) {
+        return None;
+    }
+    let patch = patch_raw.parse::<u64>().ok()?;
+    // Reject trailing components ("0.2.8.4") — same reason: ambiguous
+    // ordering semantics. Pure 3-component versions only.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
 /// v0.2.33 B2: three-phase install manifest resolver. Returns the
 /// manifest the installer engine should consume plus a tag describing
 /// where it came from.
@@ -1233,8 +1265,80 @@ pub(crate) fn resolve_manifest_for_install(
     module_id: &str,
 ) -> Result<(ModuleManifest, ManifestSource), String> {
     // Phase 1: on-disk extracted manifest.
-    if let Ok((m, path)) = find_installed_manifest(db, module_id) {
-        return Ok((m, ManifestSource::Installed(path)));
+    //
+    // v0.2.45 V45-C: the original v0.2.33 contract was "on-disk wins
+    // unconditionally". That was the right call before the catalog-refresh
+    // model (a re-install was supposed to drive against the manifest the
+    // user last actually pulled, not invisibly morph into an upgrade).
+    //
+    // After v0.2.44, the L0 catalog cache is the source of truth for "what
+    // version should this module be at right now", and the catalog-refresh
+    // path populates it deterministically before the install retry runs.
+    // The new contract: phase 1 still wins for re-installs at the SAME or
+    // OLDER version (catalog stale / no upgrade available), but when L0
+    // advertises a strictly newer semver, we fall through to phase 3
+    // (L0Synth) so the retry pulls the published version the user clicked
+    // Install for.
+    //
+    // Audit-logged at decision time via `module_manifest_resolved` so the
+    // post-incident triage path can see which version was on disk, which
+    // version L0 advertised, and which branch we took. Safety net: any
+    // parse failure on either version string → phase 1 wins (we don't
+    // synthesize from a malformed L0 entry).
+    match find_installed_manifest(db, module_id) {
+        Ok((on_disk_m, on_disk_path)) => {
+            let on_disk_v = on_disk_m.version.clone();
+            // resolve_install_metadata is cache-only / no-network. Err
+            // (e.g. catalog cache empty) maps to "no L0 version known" —
+            // we honour the on-disk manifest in that case.
+            let l0_v_opt = resolve_install_metadata(db, module_id)
+                .ok()
+                .map(|l0| l0.version);
+            let l0_is_newer = match (
+                parse_semver(&on_disk_v),
+                l0_v_opt.as_deref().and_then(parse_semver),
+            ) {
+                (Some(od), Some(l0)) => l0 > od,
+                _ => false, // any parse failure → on-disk wins (safety net)
+            };
+            if l0_is_newer {
+                eprintln!(
+                    "[v0.2.45 V45-C] L0 catalog has newer version for {}: \
+                     on_disk={} l0={} — synthesizing from L0",
+                    module_id,
+                    on_disk_v,
+                    l0_v_opt.as_deref().unwrap_or("?"),
+                );
+                let _ = db.audit(
+                    "module_manifest_resolved",
+                    None,
+                    Some(module_id),
+                    &serde_json::json!({
+                        "module_id": module_id,
+                        "on_disk_version": on_disk_v,
+                        "l0_version": l0_v_opt,
+                        "decision": "l0_newer_synthesized",
+                    }),
+                );
+                // Fall through to phase 2 / phase 3 — do NOT return here.
+            } else {
+                let _ = db.audit(
+                    "module_manifest_resolved",
+                    None,
+                    Some(module_id),
+                    &serde_json::json!({
+                        "module_id": module_id,
+                        "on_disk_version": on_disk_v,
+                        "l0_version": l0_v_opt,
+                        "decision": "on_disk_winner",
+                    }),
+                );
+                return Ok((on_disk_m, ManifestSource::Installed(on_disk_path)));
+            }
+        }
+        Err(_) => {
+            // No on-disk manifest at all — fall through to phase 2/3.
+        }
     }
 
     // Phase 2: dev affordance.
@@ -3847,23 +3951,30 @@ mod tests {
         restore_env(prev_state, prev_dev);
     }
 
-    /// Test 6 (re-install preference): even when the L0 cache holds an
-    /// entry, the on-disk installed manifest wins. The version on disk
-    /// may be older than L0 (e.g. user installed v0.2.7 last week, L0
-    /// has been bumped to v0.2.8 today) — install (as opposed to
-    /// update) MUST drive against the on-disk one, not L0; otherwise a
-    /// "reinstall to fix a broken state" silently morphs into an
-    /// upgrade and we'd surprise the user.
+    /// Test 6 (re-install preference, v0.2.45 V45-C amended):
+    ///
+    /// Originally this test pinned "on-disk wins unconditionally even when
+    /// L0 is newer", on the rationale that re-install must NOT silently
+    /// morph into an upgrade. V45-C reverses that contract for the
+    /// strictly-newer case: when L0 advertises a strictly newer semver
+    /// (e.g. catalog refresh moved RL Reranker from 0.2.7 → 0.2.8), the
+    /// retry-install path is expected to pull the new version — that's
+    /// what the user clicked Install for.
+    ///
+    /// This test now pins the EQUAL-versions branch (L0 stale or unchanged
+    /// relative to on-disk): on-disk still wins so a re-install of the
+    /// same version doesn't re-pull. The strictly-newer branch is covered
+    /// by `test_v0245_l0_wins_when_strictly_newer` below.
     #[test]
-    fn cold_start_install_prefers_installed_manifest_when_present() {
+    fn cold_start_install_prefers_installed_manifest_when_l0_not_newer() {
         let (_lock, tmp, prev_state, prev_dev) = isolate_state();
         let db = open_db();
 
-        // Seed L0 cache with v0.2.8 (newer than what's on disk).
+        // Seed L0 cache with v0.2.7 (SAME as what's on disk → on-disk wins).
         let envelope = L0CatalogResponse {
             schema_version: 1,
             fetched_at: "2026-05-25T00:00:00Z".into(),
-            modules: vec![fake_l0_rl("0.2.8")],
+            modules: vec![fake_l0_rl("0.2.7")],
         };
         db.app_state_set(
             crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
@@ -3918,19 +4029,19 @@ mod tests {
                 );
             }
             other => panic!(
-                "expected ManifestSource::Installed, got {:?} — \
-                 phase-1 preference is broken (would silently turn a \
-                 re-install into a version upgrade against the user's \
-                 expectations)",
+                "expected ManifestSource::Installed (L0 = on_disk), got \
+                 {:?} — phase-1 preference is broken (would silently \
+                 turn a re-install into a no-op re-pull against the \
+                 user's expectations)",
                 other,
             ),
         }
-        // The version MUST be the on-disk v0.2.7, NOT the L0 v0.2.8.
-        // If this ever fails it means phase 3 leaked in front of
-        // phase 1.
+        // The version MUST be the on-disk v0.2.7. If this ever fails it
+        // means phase 3 leaked in front of phase 1 even for equal versions.
         assert_eq!(
             manifest.version, "0.2.7",
-            "on-disk version must win — phase 1 must run before phase 3"
+            "on-disk version must win when L0 is equal — re-install \
+             must not synthesize when nothing has changed"
         );
 
         restore_env(prev_state, prev_dev);
@@ -4115,5 +4226,293 @@ mod tests {
         assert_eq!(b["module_id"], "module-b");
         assert_eq!(a["error"], "first failure");
         assert_eq!(b["error"], "second failure");
+    }
+
+    // ─── v0.2.45 V45-C: resolve_manifest_for_install version-compare ────
+    //
+    // Behaviour pinned: when phase 1 (on-disk manifest) is present AND
+    // the L0 catalog cache holds an entry for the same module, the
+    // resolver compares semver and falls through to phase 3 (L0Synth)
+    // iff L0 is strictly newer. Every other branch (L0 absent / equal /
+    // older / unparseable / on-disk-unparseable) honours the on-disk
+    // manifest. Safety net: parse failures default to on-disk-wins so we
+    // never synthesize from a version we can't confidently compare.
+
+    /// Helper: plant an on-disk vct-module.json at the given version.
+    /// Mirrors what Agent C's `extract_manifest_from_image` would write
+    /// after `container_pull` succeeded. Only the fields the resolver
+    /// touches matter — the rest are filled to ModuleManifest's required
+    /// shape.
+    fn plant_installed_manifest(tmp: &std::path::Path, version: &str) {
+        let module_dir = tmp.join("modules").join("vct-rl-reranker");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let installed_manifest = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-rl-reranker",
+            "name": "RL Reranker",
+            "version": version,
+            "description": "v0.2.45 V45-C fixture",
+            "category": "paid-independent",
+            "license": {
+                "required": true,
+                "variant_ids": ["x"],
+                "min_orchestrator_tier": "pro"
+            },
+            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
+            "install": {
+                "method": "container_pull",
+                "container": {
+                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "pull_token_endpoint": "https://example/pull-token"
+                }
+            },
+            "runtime": {"type": "container", "command": ""}
+        });
+        std::fs::write(
+            module_dir.join("vct-module.json"),
+            installed_manifest.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Case 1: on-disk manifest present, L0 catalog cache empty →
+    /// `resolve_install_metadata` returns Err → l0_v_opt is None →
+    /// l0_is_newer = false → phase 1 wins.
+    #[test]
+    fn test_v0245_on_disk_wins_when_l0_unavailable() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // Plant ONLY the on-disk manifest — leave catalog cache empty.
+        plant_installed_manifest(tmp.path(), "0.2.7");
+        // Sanity: cache is empty → resolve_install_metadata returns Err.
+        assert!(
+            resolve_install_metadata(&db, "vct-rl-reranker").is_err(),
+            "test pre-cond: L0 cache must be empty for this branch",
+        );
+
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("phase 1 must succeed when L0 is absent");
+        match &source {
+            ManifestSource::Installed(_) => {}
+            other => panic!(
+                "L0 unavailable → on-disk must win, got {:?}",
+                other,
+            ),
+        }
+        assert_eq!(manifest.version, "0.2.7");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Case 2: on-disk v0.2.7, L0 v0.2.7 (identical) → l0_is_newer = false →
+    /// phase 1 wins. Re-install of the same version must not synthesize.
+    #[test]
+    fn test_v0245_on_disk_wins_when_versions_equal() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // Both versions match.
+        plant_installed_manifest(tmp.path(), "0.2.7");
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-06-02T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.7")],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("phase 1 must succeed for equal versions");
+        match &source {
+            ManifestSource::Installed(_) => {}
+            other => panic!(
+                "equal versions → on-disk must win, got {:?}",
+                other,
+            ),
+        }
+        assert_eq!(manifest.version, "0.2.7");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Case 3 (THE bug fix): on-disk v0.2.7, L0 v0.2.8 → l0_is_newer =
+    /// true → fall through to phase 3 → ManifestSource::L0Synth + L0
+    /// version wins. This is exactly the user-reported failure mode:
+    /// catalog-refresh moves RL Reranker 0.2.7 → 0.2.8, user clicks
+    /// Retry, install should pull 0.2.8 not 0.2.7.
+    #[test]
+    fn test_v0245_l0_wins_when_strictly_newer() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        plant_installed_manifest(tmp.path(), "0.2.7");
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-06-02T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.8")],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("phase 3 must succeed when L0 is newer + cache populated");
+        assert_eq!(
+            source,
+            ManifestSource::L0Synth,
+            "L0 strictly newer must take phase 3 (L0Synth), got {:?}",
+            source,
+        );
+        // L0Synth carries the L0 version — the user-visible bug was that
+        // retry was pulling the stale 0.2.7 against expectations.
+        assert_eq!(
+            manifest.version, "0.2.8",
+            "L0Synth must carry the L0 version, not the on-disk one",
+        );
+        assert_eq!(source.as_audit_str(), "l0-synth");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Case 4: on-disk v0.2.8, L0 v0.2.7 (catalog stale relative to disk)
+    /// → l0_is_newer = false → phase 1 wins. This safeguards against a
+    /// stale-catalog edge case: the user installed a hotfix manually,
+    /// L0 hasn't been refreshed yet. On-disk reflects truth.
+    #[test]
+    fn test_v0245_on_disk_wins_when_l0_older() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        plant_installed_manifest(tmp.path(), "0.2.8");
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-06-02T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.7")],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("phase 1 must succeed when L0 is older");
+        match &source {
+            ManifestSource::Installed(_) => {}
+            other => panic!(
+                "L0 older than on-disk → on-disk must win, got {:?} \
+                 (would imply downgrade-on-retry)",
+                other,
+            ),
+        }
+        assert_eq!(manifest.version, "0.2.8");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Case 5 (safety net): on-disk version unparseable ("abc"), L0 v0.2.8
+    /// → parse_semver returns None on on-disk → l0_is_newer = false →
+    /// phase 1 wins. We never synthesize from L0 when we can't confidently
+    /// compare versions; honour the user's last-installed manifest.
+    #[test]
+    fn test_v0245_on_disk_wins_when_parse_fails() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // Plant an on-disk manifest with an unparseable version string.
+        // ModuleManifest::from_json accepts any non-empty string for
+        // version — the SchemaVersion check is on `manifest_version`, not
+        // on `version` (which is free-form).
+        plant_installed_manifest(tmp.path(), "abc");
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-06-02T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.8")],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("phase 1 safety-net must succeed when parse fails");
+        match &source {
+            ManifestSource::Installed(_) => {}
+            other => panic!(
+                "unparseable on-disk version → safety net says on-disk \
+                 wins (refuse to synthesize from L0 when versions are \
+                 incomparable), got {:?}",
+                other,
+            ),
+        }
+        assert_eq!(manifest.version, "abc");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    // ─── parse_semver unit tests ─────────────────────────────────────────
+
+    /// Pin the parser's accept-set against a representative range of
+    /// version strings: stable releases, leading-v prefix, multi-digit
+    /// components. Pure 3-component digits-only must all parse.
+    #[test]
+    fn test_v0245_parse_semver_accepts_canonical_forms() {
+        assert_eq!(parse_semver("0.2.7"), Some((0, 2, 7)));
+        assert_eq!(parse_semver("0.2.8"), Some((0, 2, 8)));
+        assert_eq!(parse_semver("v0.2.45"), Some((0, 2, 45)));
+        assert_eq!(parse_semver("1.0.0"), Some((1, 0, 0)));
+        assert_eq!(parse_semver("12.34.56"), Some((12, 34, 56)));
+        assert_eq!(parse_semver("  0.2.7  "), Some((0, 2, 7)));
+    }
+
+    /// Pin the parser's reject-set against everything the safety net is
+    /// supposed to bail on: pre-release suffixes, build-metadata, missing
+    /// components, trailing components, non-numeric components. Any None
+    /// here is the signal for `l0_is_newer = false` → on-disk wins.
+    #[test]
+    fn test_v0245_parse_semver_rejects_uncertain_forms() {
+        // Pre-release / build-metadata suffixes — ordering is ambiguous.
+        assert_eq!(parse_semver("0.2.8-rc1"), None);
+        assert_eq!(parse_semver("0.2.8+build42"), None);
+        // Missing patch.
+        assert_eq!(parse_semver("0.2"), None);
+        // Trailing component (CalVer-style).
+        assert_eq!(parse_semver("0.2.8.4"), None);
+        // Non-numeric components.
+        assert_eq!(parse_semver("abc"), None);
+        assert_eq!(parse_semver("0.a.0"), None);
+        // Empty.
+        assert_eq!(parse_semver(""), None);
+    }
+
+    /// Pin the strict-ordering predicate that drives the
+    /// `l0_is_newer` decision: tuple comparison gives the lexicographic
+    /// semver ordering for free, but the tests double-check the cases
+    /// that matter for the v0.2.7 → v0.2.8 fix path.
+    #[test]
+    fn test_v0245_parse_semver_ordering_is_strict() {
+        let a = parse_semver("0.2.7").unwrap();
+        let b = parse_semver("0.2.8").unwrap();
+        assert!(b > a, "0.2.8 must be strictly greater than 0.2.7");
+        assert!(a < b);
+        assert!(!(a > b));
+        // Equal is NOT greater.
+        let c = parse_semver("0.2.7").unwrap();
+        assert!(!(a > c));
+        // Minor / major bumps.
+        assert!(parse_semver("0.3.0").unwrap() > parse_semver("0.2.99").unwrap());
+        assert!(parse_semver("1.0.0").unwrap() > parse_semver("0.99.99").unwrap());
     }
 }
