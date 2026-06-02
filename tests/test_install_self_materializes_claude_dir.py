@@ -239,11 +239,35 @@ class MaterializeIsIdempotentTest(unittest.TestCase):
                 set(second_snapshot.keys()),
                 "file set changed between calls",
             )
+            # `.vco-manifest.json` writes a fresh `updated_at` ISO-second
+            # timestamp on every render — deliberately, so per-project
+            # bundle-update can diff "last render" timestamps. When the
+            # two calls span a second boundary, bytes differ but EFFECTIVE
+            # content is identical. Compare it semantically by stripping
+            # the volatile timestamp fields. (v0.2.45 V45-I: fix for flaky
+            # CI runs where the second boundary was crossed; the test
+            # contract is "idempotent content", not "byte-identical".)
+            manifest_rel = ".claude/.vco-manifest.json"
+            volatile_manifest_fields = ("updated_at", "installed_at")
             for relpath in first_snapshot:
-                self.assertEqual(
-                    first_snapshot[relpath], second_snapshot[relpath],
-                    f"file content changed between calls: {relpath}",
-                )
+                first_bytes = first_snapshot[relpath]
+                second_bytes = second_snapshot[relpath]
+                if relpath == manifest_rel:
+                    first_obj = json.loads(first_bytes.decode("utf-8"))
+                    second_obj = json.loads(second_bytes.decode("utf-8"))
+                    for field in volatile_manifest_fields:
+                        first_obj.pop(field, None)
+                        second_obj.pop(field, None)
+                    self.assertEqual(
+                        first_obj, second_obj,
+                        "manifest content (excluding volatile timestamp "
+                        "fields) changed between calls",
+                    )
+                else:
+                    self.assertEqual(
+                        first_bytes, second_bytes,
+                        f"file content changed between calls: {relpath}",
+                    )
         finally:
             shutil.rmtree(install_root)
 
