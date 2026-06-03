@@ -3137,8 +3137,13 @@ def main() -> int:
 
     # Step 9: Configure Claude Code settings (skip on update)
     if mode == "install":
+        # v0.2.46 V47-A (Gap A): thread the run-scoped DeferralReport so the
+        # managed-block merge can emit `claude_settings_user_modified_preserved`
+        # and `claude_settings_unparseable` entries when it leaves the file
+        # alone.
         _configure_claude_settings(embed_config,
-                                   adopt_project_mode=adopt_project_mode)
+                                   adopt_project_mode=adopt_project_mode,
+                                   deferral_report=_deferral_report)
     else:
         print("[skip] Claude settings (preserved during update)")
         # 0.2.11 / PR-1: pre-0.2.11 installs wired BASH_ENV in
@@ -17263,24 +17268,34 @@ def _reconcile_env_keys(env_path: Path) -> dict:
 # Step 9: Configure Claude Code
 # ---------------------------------------------------------------------------
 
-def _configure_claude_settings(embed_config: dict,
-                               adopt_project_mode: str | None = None) -> None:
-    """Create .claude/settings.json with MCP server configuration.
+# v0.2.46 V47-A (Gap A): managed-block merge schema for .claude/settings.json.
+#
+# The top-level `_vco_managed_keys` JSON array names the keys VCO owns. On
+# refresh, VCO replaces only those keys with current defaults; everything
+# else (user-added permissions, custom hooks, custom MCP servers, etc.)
+# survives by construction.
+#
+# Why a top-level JSON array, not JSONC marker comments: json.loads() (the
+# parser used everywhere in install.py and the per-project bundle apply at
+# install.py:6849) rejects JSONC comments. A JSON-native sentinel sidesteps
+# the need for a comment-stripping parser. See audit
+# `.claude/context/audits/v0246-part2-pre-fanout-map-2026-06-03.md` § A.3
+# Option 1 for the design rationale.
+#
+# Keys VCO owns by default. Extend this tuple if other keys become
+# VCO-managed in a future release. The list is written into every new
+# settings.json so legacy detection ("file exists but no _vco_managed_keys")
+# stays unambiguous.
+_VCO_MANAGED_KEYS_SENTINEL: str = "_vco_managed_keys"
+_VCO_SETTINGS_MANAGED_KEYS: tuple[str, ...] = ("env", "hooks")
 
-    v0.2.46 V47-G-stub: accepts optional `adopt_project_mode` for Wave-2
-    V47-A (Gap A — settings.json managed-block merge) to mode-gate the
-    additive-merge logic. Stub is a pure passthrough; V47-A will use the
-    mode to decide between "skip existing" (current behavior), "refresh
-    managed block only", or "replace all" (--adopt-project-replace-all).
+
+def _build_vco_settings_defaults(embed_config: dict) -> dict:
+    """Return the VCO-default ``settings.json`` contents (refreshed on every call).
+
+    Builds the env block + permissions block + ``_vco_managed_keys`` sentinel
+    that V47-A (Gap A) uses for managed-block merge. Pure function — no I/O.
     """
-    settings_dir = PROJECT_ROOT / ".claude"
-    settings_dir.mkdir(exist_ok=True)
-
-    settings_file = settings_dir / "settings.json"
-    if settings_file.exists():
-        print("  Claude settings: already configured")
-        return
-
     # Build the env block for weaviate-kg MCP
     weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
     weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
@@ -17333,7 +17348,12 @@ def _configure_claude_settings(embed_config: dict,
     # fork-bomb risk that the BASH_ENV shim carried on lean-ctx 3.x. See
     # knowledge/concepts/lean-ctx-shim-disabled.md for the incident write-up.
 
-    settings = {
+    return {
+        # V47-A (Gap A): sentinel key listing VCO-managed top-level keys.
+        # Refresh logic replaces only the listed keys; everything else
+        # (user permissions extensions, custom MCPs, custom hooks) is
+        # preserved.
+        _VCO_MANAGED_KEYS_SENTINEL: list(_VCO_SETTINGS_MANAGED_KEYS),
         "permissions": {
             "allow": [
                 "Bash(git *)",
@@ -17344,9 +17364,226 @@ def _configure_claude_settings(embed_config: dict,
         "env": env_block,
     }
 
-    settings_file.write_text(
-        json.dumps(settings, indent=2) + "\n", encoding="utf-8",
+
+def _merge_vco_settings_managed_block(
+    existing: dict,
+    defaults: dict,
+) -> dict:
+    """Return ``existing`` with VCO-managed keys refreshed from ``defaults``.
+
+    V47-A (Gap A) managed-block merge:
+      - Keys listed in ``existing[_VCO_MANAGED_KEYS_SENTINEL]`` get replaced
+        from ``defaults``.
+      - ``_VCO_MANAGED_KEYS_SENTINEL`` itself is refreshed from ``defaults``
+        so future VCO versions can extend the managed-keys list without a
+        manual user edit (additive only — never shrinks the list silently).
+      - Every other top-level key in ``existing`` is preserved verbatim.
+
+    Pure function: takes two dicts, returns a new dict. No I/O.
+    """
+    managed = existing.get(_VCO_MANAGED_KEYS_SENTINEL)
+    if not isinstance(managed, list):
+        # Defensive fallback: caller should have routed unmanaged files
+        # elsewhere. Treat as managed-block-aware but with empty managed
+        # list — preserve everything except the sentinel itself.
+        managed = []
+
+    # Start from existing (preserves user-added keys), then refresh
+    # managed keys + the sentinel itself.
+    merged: dict = dict(existing)
+
+    # Replace only the keys VCO currently owns. If `defaults` lacks a
+    # listed key (e.g., a key was retired in this VCO version), leave the
+    # existing value alone — retirement should be an explicit decision,
+    # not a silent drop.
+    for key in managed:
+        if key in defaults:
+            merged[key] = defaults[key]
+
+    # Refresh the sentinel itself: if VCO has added new managed keys in
+    # this version (defaults' sentinel ⊋ existing's sentinel), surface
+    # the union so future refreshes know to manage them too. Never
+    # shrink: if VCO removed a key in this version, the legacy entry
+    # stays in the sentinel as a stale-but-harmless marker.
+    new_managed_keys = defaults.get(_VCO_MANAGED_KEYS_SENTINEL, [])
+    if isinstance(new_managed_keys, list):
+        # Stable order: existing entries first (preserving user-visible
+        # order), then any new keys VCO added.
+        union: list[str] = list(managed)
+        for k in new_managed_keys:
+            if k not in union:
+                union.append(k)
+        merged[_VCO_MANAGED_KEYS_SENTINEL] = union
+
+    return merged
+
+
+def _configure_claude_settings(
+    embed_config: dict,
+    adopt_project_mode: str | None = None,
+    deferral_report: "DeferralReport | None" = None,
+) -> None:
+    """Create or refresh ``.claude/settings.json`` with MCP server configuration.
+
+    v0.2.46 V47-A (Gap A) — managed-block merge. Behavior matrix:
+
+    * File missing → write VCO defaults (including ``_vco_managed_keys``).
+    * File exists + parses + has ``_vco_managed_keys`` → managed-block merge:
+      refresh listed keys from defaults, preserve every other top-level key.
+    * File exists + parses + no ``_vco_managed_keys`` (legacy / external) →
+      treat as user-owned. Land VCO defaults as ``settings.json.vco-new``
+      sibling, emit deferral entry, leave original alone.
+    * File exists + parse fails → emit deferral entry, leave file alone.
+    * ``adopt_project_mode == "replace-all"`` → unconditionally overwrite
+      with VCO defaults (advanced/explicit opt-in via
+      ``--adopt-project-replace-all``).
+    * ``adopt_project_mode in (None, "adopt")`` → use the safe matrix above.
+    * ``adopt_project_mode == "no-adopt"`` and ``"dry-run"`` are handled
+      upstream in ``main()`` before this function is reached.
+
+    The ``deferral_report`` kwarg is optional so existing fresh-install
+    callers don't break; deferrals are silently skipped when the report
+    isn't threaded.
+    """
+    settings_dir = PROJECT_ROOT / ".claude"
+    settings_dir.mkdir(exist_ok=True)
+
+    settings_file = settings_dir / "settings.json"
+    defaults = _build_vco_settings_defaults(embed_config)
+    rendered_defaults = json.dumps(defaults, indent=2) + "\n"
+
+    # Case 1: file missing — write fresh VCO defaults.
+    if not settings_file.exists():
+        settings_file.write_text(rendered_defaults, encoding="utf-8")
+        return
+
+    # Case 2: --adopt-project-replace-all — overwrite outright.
+    if adopt_project_mode == "replace-all":
+        settings_file.write_text(rendered_defaults, encoding="utf-8")
+        print("  Claude settings: replaced (--adopt-project-replace-all)")
+        return
+
+    # Case 3: file exists — try to parse and decide.
+    try:
+        existing_text = settings_file.read_text(encoding="utf-8")
+        existing = json.loads(existing_text)
+    except (OSError, json.JSONDecodeError) as exc:
+        # Parse / read failed — emit deferral and leave file alone.
+        print(
+            "  Claude settings: existing file unparseable "
+            f"({type(exc).__name__}); preserved on disk"
+        )
+        if deferral_report is not None:
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="claude_settings_unparseable",
+                    title="`.claude/settings.json` unparseable; preserved on disk",
+                    detected=(
+                        f"`.claude/settings.json` exists but failed to parse as "
+                        f"JSON ({type(exc).__name__}: {exc}). VCO did not modify "
+                        "the file."
+                    ),
+                    why_deferred=(
+                        "Auto-replacing an unparseable settings file would "
+                        "discard user customizations that may still be "
+                        "recoverable. Inspect manually and either repair the "
+                        "JSON or accept VCO defaults via the command below."
+                    ),
+                    command_to_apply=(
+                        "python install.py --adopt-project-replace-all"
+                    ),
+                    severity="warning",
+                    kg_node_refs=[],
+                )
+            )
+        return
+
+    if not isinstance(existing, dict):
+        # JSON parsed to a non-object (array, string, number) — treat the
+        # same as unparseable: VCO defaults are a dict, can't merge with
+        # a non-dict.
+        print(
+            "  Claude settings: existing file is not a JSON object; "
+            "preserved on disk"
+        )
+        if deferral_report is not None:
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="claude_settings_unparseable",
+                    title=(
+                        "`.claude/settings.json` is not a JSON object; "
+                        "preserved on disk"
+                    ),
+                    detected=(
+                        "`.claude/settings.json` parsed to a "
+                        f"{type(existing).__name__} (expected a JSON object). "
+                        "VCO did not modify the file."
+                    ),
+                    why_deferred=(
+                        "VCO's settings template is a JSON object; cannot "
+                        "merge with a non-object structure."
+                    ),
+                    command_to_apply=(
+                        "python install.py --adopt-project-replace-all"
+                    ),
+                    severity="warning",
+                    kg_node_refs=[],
+                )
+            )
+        return
+
+    # Case 4: file parsed and is a dict — managed-block detection.
+    if _VCO_MANAGED_KEYS_SENTINEL in existing:
+        # Managed-block-aware file → refresh listed keys, preserve rest.
+        merged = _merge_vco_settings_managed_block(existing, defaults)
+        settings_file.write_text(
+            json.dumps(merged, indent=2) + "\n", encoding="utf-8"
+        )
+        print("  Claude settings: managed keys refreshed (user keys preserved)")
+        return
+
+    # Case 5: file parsed but has no _vco_managed_keys — legacy / external.
+    # Land VCO defaults as `.vco-new` sibling and emit deferral.
+    vco_new_path = settings_file.with_suffix(settings_file.suffix + ".vco-new")
+    vco_new_path.write_text(rendered_defaults, encoding="utf-8")
+    print(
+        "  Claude settings: legacy file detected (no `_vco_managed_keys`); "
+        f"VCO defaults written to {vco_new_path.name}, original preserved"
     )
+    if deferral_report is not None:
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="claude_settings_user_modified_preserved",
+                title=(
+                    "`.claude/settings.json` preserved (no VCO-managed-block "
+                    "marker)"
+                ),
+                detected=(
+                    "`.claude/settings.json` exists but lacks the top-level "
+                    f"`{_VCO_MANAGED_KEYS_SENTINEL}` array that marks the file "
+                    "as VCO-managed. VCO treats this as user-owned and did "
+                    f"not modify it. VCO defaults landed at "
+                    f"`.claude/settings.json.vco-new`."
+                ),
+                why_deferred=(
+                    "Without the managed-keys sentinel VCO cannot tell which "
+                    "top-level keys are safe to refresh and which are user "
+                    "extensions. Manual merge keeps you in control. To accept "
+                    "VCO defaults outright run the command below; to merge "
+                    "selectively, copy the keys you want from "
+                    "`.claude/settings.json.vco-new` into your existing file, "
+                    f"then add a top-level "
+                    f'`"{_VCO_MANAGED_KEYS_SENTINEL}": '
+                    f"{list(_VCO_SETTINGS_MANAGED_KEYS)!r}` so future updates "
+                    "refresh those keys automatically."
+                ),
+                command_to_apply=(
+                    "python install.py --adopt-project-replace-all"
+                ),
+                severity="warning",
+                kg_node_refs=[],
+            )
+        )
 
 
 def _cleanup_legacy_bash_env_shim(args: argparse.Namespace) -> None:
