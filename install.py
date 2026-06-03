@@ -5935,17 +5935,30 @@ def _batch_query_weaviate_content_hashes(
     that sets content_hash), subsequent --update runs only embed changed
     files. Nodes created before v0.2.17 (no content_hash property) will
     be re-synced once (to populate content_hash), then skipped forever.
+
+    v0.2.46 V46-A: dropped the broken ``where: Like "%"`` filter (SQL-wildcard
+    convention rejected by Weaviate's BM25 tokenizer as "only stopwords
+    provided"; silently swallowed null response across v0.2.42–v0.2.45,
+    causing full re-embed on every ``--update``). Also bumped ``limit``
+    1000 → 10000 (Weaviate's ``QUERY_MAXIMUM_RESULTS`` default; previous
+    value would silently truncate the user's 1193-row collection even if
+    the filter were fixed) and now inspect ``body["errors"]`` BEFORE
+    consuming ``data`` (loud failure on GraphQL-level errors). See
+    ``knowledge/concepts/silent-zero-fallback-antipattern.md`` instance #3.
     """
     try:
         import urllib.request as _ur
         import json as _json
         # GraphQL: fetch file_path + content_hash for every object.
-        # Use limit=1000 with after-cursor pagination (Weaviate v1 cursor API).
-        # For typical orchestrator repos (~100 KG nodes), a single page is enough.
+        # v0.2.46 V46-A: no `where` filter — pre-v0.2.46 used `Like "%"`
+        # which is SQL-wildcard syntax (Weaviate uses `*`) and was rejected
+        # as "only stopwords provided", yielding HTTP 200 with errors-array.
+        # limit=10000 = Weaviate's QUERY_MAXIMUM_RESULTS default; saturation
+        # warning below flags when we approach the cap (future enhancement
+        # = cursor pagination via `after:`).
         gql = {
             "query": (
-                f"{{ Get {{ {collection_name}(limit: 1000, "
-                f"where: {{path: [\"file_path\"], operator: Like, valueText: \"%\"}}) "
+                f"{{ Get {{ {collection_name}(limit: 10000) "
                 f"{{ file_path content_hash }} }} }}"
             ),
         }
@@ -5959,11 +5972,47 @@ def _batch_query_weaviate_content_hashes(
         with _ur.urlopen(req, timeout=10) as resp:  # noqa: S310
             body = _json.loads(resp.read())
 
+        # v0.2.46 V46-A: inspect errors array BEFORE consuming data.
+        # Weaviate (and GraphQL generally) returns HTTP 200 with a non-empty
+        # errors-array for non-fatal query problems (invalid filter syntax,
+        # missing properties, etc.). Without this check, pre-v0.2.46 code
+        # silently treated 200+errors as "empty result" and triggered full
+        # re-embed. See knowledge/concepts/mcp-loud-fail-error-pattern.md
+        # § GraphQL errors[] array.
+        if body.get("errors"):
+            first_err = (body["errors"][0] or {}).get("message", "unknown")
+            _log_install_event(
+                "7c/10", "warn",
+                f"CI-10: GraphQL errors for {collection_name!r}: "
+                f"{first_err[:200]}",
+                data={
+                    "collection": collection_name,
+                    "errors": [
+                        (e or {}).get("message", "")[:200]
+                        for e in body["errors"][:3]
+                    ],
+                },
+            )
+            return {}
+
         objects = (
             body.get("data", {})
             .get("Get", {})
             .get(collection_name, [])
         ) or []
+
+        # v0.2.46 V46-A: saturation warning — signals approaching Weaviate's
+        # QUERY_MAXIMUM_RESULTS cap. Future enhancement is cursor pagination
+        # via `after:` parameter (V46-G scope).
+        if len(objects) >= 10000:
+            _log_install_event(
+                "7c/10", "warn",
+                f"CI-10: hit Weaviate QUERY_MAXIMUM_RESULTS cap (10000) for "
+                f"{collection_name!r}; some rows may be missing — consider "
+                f"cursor pagination",
+                data={"collection": collection_name, "rows": len(objects)},
+            )
+
         result: dict[str, str] = {}
         for obj in objects:
             fp = (obj.get("file_path") or "").strip()
@@ -6128,12 +6177,18 @@ def _prune_stale_kg_rows(
     stored: list[tuple[str, str]] = []  # (uuid, file_path)
     try:
         base = (weaviate_url or "http://localhost:8081").rstrip("/")
-        # Use a generous limit; orchestrator KGs are typically <200 nodes.
+        # v0.2.46 V46-A: dropped the broken `where: Like "%"` filter (same
+        # bug as CI-10 in _batch_query_weaviate_content_hashes — Weaviate's
+        # BM25 tokenizer rejects `%` as "only stopwords provided" and the
+        # null response was silently coalesced to []). With the filter
+        # dropped, the secondary `{ Get { ... } }` brace-balance issue that
+        # Investigator 1 reproduced live ("Expected Name, found EOF") also
+        # disappears because the string is now syntactically simpler.
+        # Bumped limit 2000 → 10000 (Weaviate's QUERY_MAXIMUM_RESULTS
+        # default); saturation warning below signals if we approach the cap.
         gql_query = (
-            "{ Get { "
-            f"{collection_name}(limit: 2000, "
-            f"where: {{path: [\"file_path\"], operator: Like, valueText: \"%\"}}) "
-            f"{{ _additional {{ id }} file_path }} }}"
+            f"{{ Get {{ {collection_name}(limit: 10000) "
+            f"{{ _additional {{ id }} file_path }} }} }}"
         )
         import json as _json
         import urllib.request as _ur
@@ -6146,11 +6201,48 @@ def _prune_stale_kg_rows(
         )
         with _ur.urlopen(req, timeout=15) as resp:  # noqa: S310
             body = _json.loads(resp.read())
+
+        # v0.2.46 V46-A: inspect errors array BEFORE consuming data. See
+        # knowledge/concepts/mcp-loud-fail-error-pattern.md § GraphQL
+        # errors[] array. Non-empty errors → WARN + early return (prune
+        # check is best-effort; no destructive action is taken without
+        # an authoritative stored-rows list).
+        if body.get("errors"):
+            first_err = (body["errors"][0] or {}).get("message", "unknown")
+            _log_install_event(
+                "7c/10", "warn",
+                f"V0243-6: GraphQL errors fetching prune candidates from "
+                f"{collection_name!r}: {first_err[:200]}",
+                data={
+                    "collection": collection_name,
+                    "errors": [
+                        (e or {}).get("message", "")[:200]
+                        for e in body["errors"][:3]
+                    ],
+                },
+            )
+            return
+
         objects = (
             body.get("data", {})
             .get("Get", {})
             .get(collection_name, [])
         ) or []
+
+        # v0.2.46 V46-A: saturation warning — same caveat as CI-10. If we
+        # hit the cap, the prune set is INCOMPLETE; aborting is safer than
+        # deleting based on a truncated view (we might mark live rows as
+        # stale because they fell past the limit).
+        if len(objects) >= 10000:
+            _log_install_event(
+                "7c/10", "warn",
+                f"V0243-6: hit Weaviate QUERY_MAXIMUM_RESULTS cap (10000) "
+                f"for {collection_name!r}; aborting prune to avoid "
+                f"false-positives — consider cursor pagination",
+                data={"collection": collection_name, "rows": len(objects)},
+            )
+            return
+
         for obj in objects:
             uid = (obj.get("_additional") or {}).get("id") or ""
             fp = (obj.get("file_path") or "").strip()
