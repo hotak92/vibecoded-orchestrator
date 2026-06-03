@@ -7,6 +7,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.46] - 2026-06-03
+
+Hotfix release closing the 5th instance of a recurring KG re-embed bug
+(persisted v0.2.42 → v0.2.45 across 4 prior "fixes") + RL Reranker
+client-side install hardening + 10 silent-truncation footgun cleanups.
+
+The headline bug: `install.py:5948` (`_batch_query_weaviate_content_hashes`)
+and `install.py:6135` (`_prune_stale_kg_rows`) both shipped a GraphQL
+filter `where: {operator: Like, valueText: "%"}` — `%` is SQL wildcard
+convention; Weaviate uses `*` and rejects `%` as "only stopwords
+provided". The HTTP 200 + errors-array response was silently coalesced
+to `{}` via `body.get(..., []) or []`, so the diff gate saw zero stored
+hashes on every update → full re-embed of all KG files. 4 parallel
+Opus investigators converged HIGH confidence on the root cause; 2
+auditors independently verified the proposed fix doesn't lose any
+feature. See `knowledge/concepts/silent-zero-fallback-antipattern.md`
+instance #3 + `knowledge/concepts/install-py-collection-bootstrap-bugs.md`
+v0.2.46 section.
+
+V46-B's live integration test caught a SECOND v0.2.43 bug in the same
+prune function: the batch-delete used `valueText: <list>` (singular)
+when ContainsAny on a UUID list requires `valueTextArray` (plural).
+Fixed in V46-A-followup. Exactly why live integration tests matter.
+
+### Fixed
+
+- **install.py CI-10 / V0243-6 stopword GraphQL filter**: drop the broken
+  `where: {Like, "%"}` clause that has been silently re-embedding every
+  KG file on every `--update` since v0.2.42 (2026-05-31). Bump
+  `limit: 1000` → `limit: 10000` (Weaviate's QUERY_MAXIMUM_RESULTS
+  default). Inspect `body.get("errors")` BEFORE consuming data; non-empty
+  → WARN log + full-sync fallback (loud, not silent). Plus V46-A-followup:
+  fix the batch-delete in `_prune_stale_kg_rows` from `valueText:<list>`
+  to `valueTextArray:<list>` (a separate v0.2.43-era bug that V46-B's
+  live integration test caught). (V46-A, V46-A-followup)
+
+- **10 silent-truncation footguns** across `templates/scripts/*.py` and
+  `claude_mcp_servers/weaviate_mcp/server.py`:
+  - Pattern A (cursor pagination for full-enumeration):
+    `get_all_weaviate_nodes`, `rebuild_all`, `list_all_nodes` (kg-search
+    list), `detect_duplicates`, `process_documents`
+  - Pattern B (emit `truncated: true` flag for top-N queries):
+    `get_node_info` inbound-link scan, `query_code_graph` relations,
+    `query_code_structure` MCP tool callers/imports/interactions/
+    composed_by/type_users
+
+  Pre-v0.2.46 these silently degraded behavior on collections >1000
+  (Pattern A) or >20-50 (Pattern B). LLM consumers of the MCP tool now
+  see a truncation signal. (V46-D)
+
+- **RL Reranker client-side install path**
+  (`installer_engine.rs::container_pull`):
+  - C1: honor server's `tag` value over client-resolved L0 version
+  - C1-followup: preserve client GPU-variant suffix
+    (`-cpu`/`-cuda`/`-rocm`/`-metal`) when server returns a bare
+    patch-level tag (variant resolution stays client-side per the edge
+    function's documented contract)
+  - C2: per-pull `--authfile <tmp>` via tempfile RAII; removes the risk
+    of `podman logout` invalidating a concurrent paid-module pull
+  - C3: audit-log emission — `pull_token_requested` /
+    `pull_token_resolved` (with `server_tag` / `client_resolved_tag` /
+    `effective_tag_with_variant` / `tag_mismatch`) / `pull_token_failed`
+    (with HTTP code + `error_class` classification). License key NEVER
+    logged in full — 12-char prefix only.
+  - C4: hard-fail on MAJOR/MINOR tag mismatch with publisher-pointing
+    error message (variant suffix is NOT a version component — same
+    base version, different VARIANTS = no mismatch)
+  - C5: documented in code comments
+
+  Surfaced by v0.2.45 post-ship forensic. Fixed in coordination with
+  RL chat (`vct-rl-reranker` repo owner) who confirmed end-to-end smoke
+  green from their machine 2026-06-03. (V46-E)
+
+### Added
+
+- **`vco_lib/weaviate_helpers.py`**: reusable helpers for safe Weaviate
+  GraphQL interaction. `check_graphql_errors(body, ctx, on_error)` and
+  `post_graphql_safe(url, gql, ctx, on_error)` centralize the
+  errors-array inspection pattern that the recurring re-embed bug was
+  rooted in. Plus `WeaviateGraphQLError` exception class. Future
+  callers should use `post_graphql_safe` to inherit the protection by
+  default. (V46-F)
+
+- **Live integration tests against real Weaviate** (no mocks):
+  `tests/test_v0246_v46b_live_ci10_diff_gate.py`. Brings up a real
+  Weaviate (or skips cleanly when unreachable), seeds 3 known objects
+  with known `content_hash` values, calls
+  `_batch_query_weaviate_content_hashes` directly (NOT mocked), asserts
+  the production function returns the expected data. Includes defensive
+  source-inspection regression guards that run unconditionally (no
+  Weaviate dep) to prevent reintroduction of the SQL-wildcard pattern.
+  This is THE missing test that let the bug ship across v0.2.42–v0.2.45.
+  (V46-B)
+
+- **Pre-ship-check Gate 18 + 18b**: `scripts/v0246-pre-ship-check.sh`
+  clones the v0245 script + adds Gate 18a (live diff-gate fetches
+  correctly) + Gate 18b (live prune deletes orphans correctly). The
+  structural fix for the "fresh-clone blind spot" that hid the bug
+  across 4 releases. (V46-C)
+
+### Changed
+
+- **Version pins bumped 0.2.45 → 0.2.46** across the canonical sites:
+  `pyproject.toml`, `vct-module.json`, `launcher/package.json`,
+  `launcher/package-lock.json`, `launcher/src-tauri/Cargo.toml`,
+  `launcher/src-tauri/tauri.conf.json`,
+  `launcher/src-tauri/vct-hub/Cargo.toml`,
+  `launcher/src-tauri/vct-launcher-core/Cargo.toml`, and the three
+  matching entries in `launcher/src-tauri/Cargo.lock`. Dist-binary
+  metadata (`launcher/dist/<arch>/*.metadata.json`) is NOT bumped here
+  — it is written by the Release workflow on the binary build.
+  `claude_mcp_servers/pyproject.toml` is independently versioned and
+  stays at its current version.
+
+### Documentation
+
+- KG nodes extended (no new nodes — extended 3 existing ones per the
+  KG hygiene rule "update before create"):
+  - `silent-zero-fallback-antipattern.md` — instance #3 (install.py
+    GraphQL Like-`%`); now documents the 4-release recurrence + the
+    "missing invariant" (real Weaviate test required) + the design
+    fix layers.
+  - `mcp-loud-fail-error-pattern.md` — new sub-pattern: GraphQL
+    `errors[]` array MUST be inspected (third response shape outside
+    connection/query-time).
+  - `install-py-collection-bootstrap-bugs.md` — v0.2.46 section
+    documenting the recurring bug + release-archaeology table showing
+    why each prior fix didn't hold.
+
+- `HANDOFF-TO-RL-CHAT-2026-06-03-v0.2.46-PLAN.md` +
+  `HANDOFF-TO-RL-CHAT-2026-06-03-RESPONSE-v0.2.46-STATUS.md` (response
+  after RL chat's smoke + Supabase secret bump).
+
+### Verified
+
+- All V46 tests pass on integrated `main` (V46-A 11 + V46-B 7 + V46-D 16
+  + V46-E 9 + V46-F 12 = 55 Python + Rust tests across the fanout).
+- Live two-pass smoke on real Weaviate (Gate 18a + Gate 18b) PASS.
+- `cargo check --lib` clean.
+- `[Unreleased]` block EMPTY at tag time (no-deferred-fixes rule from
+  the post-v0.2.41 retrospective).
+- Supabase edge function `rl-artifact-url` deployment verified
+  returning `tag: "0.2.8"` after `GHCR_PAID_TAG_DEFAULT=0.2.8` secret
+  bump (operational fix shipped alongside this release).
+
 ## [0.2.45] - 2026-06-02
 
 Hotfix release closing 3 root causes surfaced on VCO_dev during the post-v0.2.44 "Update orchestrator" audit (2026-06-02 ~01:34 UTC). All 6 V45 agents (A-F) merged in-tag; no deferred fixes per the post-v0.2.41 retrospective rule. Foundation work for every future paid module — V45-C through V45-F install the contracts (manifest version-compare at resolve time, placeholder-URL detection family, status state-machine completeness, L0 catalog refresh on lifecycle events) that v0.2.46+ will build on. Per user directive 2026-06-02: "RL module is not released, so can skip any legacy compatibility issue, but we need to make sure that — together with it — we build a strong foundation for every future paid module."
