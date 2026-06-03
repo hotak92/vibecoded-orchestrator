@@ -1404,6 +1404,262 @@ def _resolve_adopt_project_mode(args) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# v0.2.46 V47-F (Gap F): PROJECT_NAME precedence resolver for NEW adopt.
+# ---------------------------------------------------------------------------
+
+def _read_project_name_from_vscode_settings(install_path: Path) -> str | None:
+    """Read `claude-code.env.PROJECT_NAME` from `.vscode/settings.json`.
+
+    Returns the string value if present and non-empty, else None. Soft-fails
+    to None on any parse / read error so the precedence chain falls through
+    to the next layer.
+
+    Looks at two layouts to be robust against editor variations:
+      1. `claude-code.env.PROJECT_NAME` (the canonical workspace key the
+         Claude Code VS Code extension uses)
+      2. `env.PROJECT_NAME` (a degenerate layout some users hand-write)
+    """
+    settings = install_path / ".vscode" / "settings.json"
+    if not settings.is_file():
+        return None
+    try:
+        text = settings.read_text(encoding="utf-8")
+        data = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # Layout 1: claude-code.env.PROJECT_NAME (canonical).
+    cc_env = data.get("claude-code.env")
+    if isinstance(cc_env, dict):
+        val = cc_env.get("PROJECT_NAME")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    # Layout 2: env.PROJECT_NAME (degenerate).
+    env_block = data.get("env")
+    if isinstance(env_block, dict):
+        val = env_block.get("PROJECT_NAME")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return None
+
+
+def _read_project_name_from_envfile(env_path: Path) -> str | None:
+    """Read PROJECT_NAME=<val> from a .env-format file (.claude/env or .env).
+
+    Returns the string value if present and non-empty, else None. Skips
+    commented-out lines (leading ``#``) — we want a USER-SET active value,
+    not a placeholder. Soft-fails to None on any read error.
+
+    Strips surrounding single/double quotes if the value is wrapped in
+    them (common in env-file convention: PROJECT_NAME="My Project").
+    """
+    if not env_path.is_file():
+        return None
+    try:
+        text = env_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        s = raw.lstrip()
+        # Skip blank lines + comments. A line beginning with "#" is NOT
+        # an active assignment — the V47-F resolver must not pick up a
+        # disabled placeholder.
+        if not s or s.startswith("#"):
+            continue
+        eq = s.find("=")
+        if eq <= 0:
+            continue
+        key = s[:eq].strip()
+        if key != "PROJECT_NAME":
+            continue
+        val = s[eq + 1:].strip()
+        # Strip surrounding quotes if any.
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+            val = val[1:-1]
+        if val:
+            return val
+        return None
+    return None
+
+
+def _resolve_project_name_for_adopt(
+    install_path: Path,
+    args,
+    interactive: bool | None = None,
+) -> str:
+    """v0.2.46 V47-F: resolve PROJECT_NAME for a NEW adopt operation.
+
+    Precedence (highest → lowest):
+      1. ``args.project_name`` — explicit ``--project-name`` CLI flag
+      2. ``.vscode/settings.json claude-code.env.PROJECT_NAME``
+      3. ``.claude/env PROJECT_NAME=`` (active, uncommented)
+      4. ``.env PROJECT_NAME=`` (active, uncommented)
+      5. Interactive prompt (TTY + not ``--yes``)
+      6. Folder name (sanitized fallback — matches pre-V47-F derivation)
+
+    Used ONLY in the NEW adopt path (when ``.vco-manifest.json`` is
+    absent — i.e. the caller has decided this is a fresh / 3rd-party tree
+    being adopted). Existing VCO projects already have a resolved
+    PROJECT_NAME at install time, threaded through ``_reconcile_env_keys``
+    which is additive-only — those installs MUST NOT call this helper or
+    they risk re-deriving + overwriting a user-pinned name. This contract
+    is critical to the V47-F non-destructiveness rule (see the dedicated
+    pre-ship gate test ``test_existing_project_name_preserved_on_update``).
+
+    Args:
+        install_path: The target directory being adopted. NOT necessarily
+            the orchestrator-clone PROJECT_ROOT — adopt targets are
+            arbitrary user directories.
+        args: ``argparse.Namespace`` (or any object with ``getattr``
+            attribute access) carrying ``project_name`` (optional) and
+            ``yes`` (optional). Missing attributes default to None / False.
+        interactive: Force the interactive-prompt path on/off (testing
+            override). ``None`` (default) auto-detects ``sys.stdin.isatty()``
+            and ``not args.yes``.
+
+    Returns:
+        The resolved PROJECT_NAME as a raw string (NOT sanitized — callers
+        sanitize when they need a Weaviate class basename). Never empty —
+        falls back to folder name if everything else returns None.
+    """
+    # 1. CLI flag wins.
+    cli_name = getattr(args, "project_name", None)
+    if isinstance(cli_name, str) and cli_name.strip():
+        return cli_name.strip()
+
+    # 2. .vscode/settings.json claude-code.env.PROJECT_NAME
+    vscode_name = _read_project_name_from_vscode_settings(install_path)
+    if vscode_name:
+        return vscode_name
+
+    # 3. .claude/env PROJECT_NAME=
+    claude_env_name = _read_project_name_from_envfile(
+        install_path / ".claude" / "env"
+    )
+    if claude_env_name:
+        return claude_env_name
+
+    # 4. .env PROJECT_NAME=
+    dotenv_name = _read_project_name_from_envfile(install_path / ".env")
+    if dotenv_name:
+        return dotenv_name
+
+    # 5. Interactive prompt (TTY + not --yes).
+    folder_default = install_path.name or "Project"
+    if interactive is None:
+        is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+        suppressed = bool(getattr(args, "yes", False))
+        interactive = is_tty and not suppressed
+    if interactive:
+        try:
+            print(
+                "\n[adopt-project] No PROJECT_NAME found via CLI flag, "
+                ".vscode/settings.json, .claude/env, or .env."
+            )
+            prompt = f"  Project name? [default: {folder_default}]: "
+            entered = input(prompt).strip()
+            if entered:
+                return entered
+        except (EOFError, KeyboardInterrupt):
+            # Fall through to folder-name default on input failure.
+            pass
+
+    # 6. Folder name fallback.
+    return folder_default
+
+
+def _log_project_name_pin_diff(
+    install_path: Path,
+    resolved_name: str,
+) -> None:
+    """v0.2.46 V47-F: emit an informational log when launcher.db / .env
+    PROJECT_NAME differs from what folder-name derivation WOULD produce.
+
+    Pure informational — no action taken, just visibility. Helps surface
+    pre-V47-F installs that pinned a name like ``ARTup`` while sitting in
+    a folder like ``python/``. Soft-fails to no-op if either side can't
+    be read.
+
+    Called from the update path (existing-project branch) to confirm the
+    non-destructiveness rule held: whatever the existing project has, it
+    keeps. The log line lets the user see WHY their PROJECT_NAME isn't
+    matching the folder name.
+    """
+    folder_derived = install_path.name or ""
+    if not folder_derived:
+        return
+
+    # Try the launcher.db first — it's the authoritative source of truth
+    # for a registered VCO project.
+    pinned: str | None = None
+    pinned_source: str = ""
+    try:
+        from vco_lib.launcher_db_reader import (  # noqa: F401
+            _discover_db_path,
+        )
+        # Best-effort DB lookup. Soft-fail to .env fallback below.
+        try:
+            from vco_lib.config_projection import project_env_from_db
+            # Resolve project_id via folder match (cheap helper that
+            # install.py already uses elsewhere).
+            pid = _resolve_project_id_by_folder(install_path)
+            if pid is not None:
+                bundle = project_env_from_db(pid)
+                # Bundle's env carries the canonical PROJECT_NAME.
+                env_block = getattr(bundle, "env", None) or {}
+                if isinstance(env_block, dict):
+                    db_name = env_block.get("PROJECT_NAME")
+                    if isinstance(db_name, str) and db_name.strip():
+                        pinned = db_name.strip()
+                        pinned_source = "launcher.db"
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Fall back to the .env file if the DB didn't yield a value.
+    if pinned is None:
+        env_name = _read_project_name_from_envfile(install_path / ".env")
+        if env_name:
+            pinned = env_name
+            pinned_source = ".env"
+
+    if pinned is None:
+        return
+
+    # Sanitize both sides to a Weaviate-class basename for the comparison.
+    # If the pinned name SANITIZES to the same value as the folder name,
+    # there's no surprise to surface — just nothing to log.
+    try:
+        from vco_lib.project_init import sanitize_for_weaviate_class
+        pinned_sanitized = sanitize_for_weaviate_class(pinned)
+        folder_sanitized = sanitize_for_weaviate_class(folder_derived)
+    except Exception:
+        return
+    if pinned_sanitized == folder_sanitized:
+        return
+
+    msg = (
+        f"  PROJECT_NAME pinned to {pinned!r} (source: {pinned_source}) "
+        f"— folder-name derivation would have produced "
+        f"{folder_sanitized!r} (from folder {folder_derived!r})."
+    )
+    print(msg)
+    _log_install_event(
+        "project-name", "info",
+        "PROJECT_NAME pinned differs from folder-derivation",
+        data={
+            "pinned": pinned,
+            "pinned_sanitized": pinned_sanitized,
+            "folder": folder_derived,
+            "folder_sanitized": folder_sanitized,
+            "source": pinned_source,
+        },
+    )
+
+
 def _venv_triage(install_path: Path,
                  adopt_project_mode: str | None = None,
                  force_rebuild: bool = False) -> dict:
@@ -2724,6 +2980,23 @@ def main() -> int:
     # V47-G-stub ships only the CLI surface + dispatch contract. Detection
     # heuristic + interactive prompt land in V47-G-final.
     # ----------------------------------------------------------------------
+    # v0.2.46 V47-F (Gap F): explicit PROJECT_NAME override.
+    # Highest-precedence layer of _resolve_project_name_for_adopt — beats
+    # .vscode/settings.json, .claude/env, .env, and the interactive prompt.
+    # Used ONLY in the NEW adopt path (when .vco-manifest.json is absent);
+    # existing-project updates keep their existing PROJECT_NAME (additive-
+    # only contract in _reconcile_env_keys).
+    parser.add_argument(
+        "--project-name", type=str, default=None,
+        help="v0.2.46 (adopt mode): explicit PROJECT_NAME override for "
+             "the new adopt path. Pinned as the canonical project name "
+             "for KG / Development collection derivation. Beats "
+             ".vscode/settings.json claude-code.env.PROJECT_NAME, "
+             ".claude/env, .env, and the interactive prompt. Existing "
+             "VCO projects (with .vco-manifest.json) are NEVER re-derived "
+             "by this flag — they keep whatever PROJECT_NAME they have at "
+             "update time.")
+
     _adopt_project_group = parser.add_mutually_exclusive_group()
     _adopt_project_group.add_argument(
         "--adopt-project", action="store_true", default=False,
@@ -3275,6 +3548,12 @@ def main() -> int:
         _write_env_config(embed_config, args, joern_available=joern_available)
     else:
         print("[skip] .env configuration (preserved during update)")
+        # v0.2.46 V47-F (Gap F): informational log when PROJECT_NAME differs
+        # from folder-name derivation. Pure visibility — the existing project
+        # KEEPS whatever PROJECT_NAME it already has (non-destructive rule).
+        # Helps surface pre-V47-F installs that pinned a name like "ARTup"
+        # while sitting in a folder like "python/".
+        _log_project_name_pin_diff(PROJECT_ROOT, "")
         # A3 (2026-05-28): reconcile any canonical env keys added since the
         # user's original install. Additive-only: user-set values preserved,
         # only missing keys are appended.
