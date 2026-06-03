@@ -137,6 +137,12 @@ if str(PROJECT_ROOT) not in sys.path:
 from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
+# v0.2.46 V47-B (Gap B): symlinks under install path are never touched.
+from vco_lib.symlink_handler import (  # noqa: E402
+    compute_vco_new_path,
+    emit_symlink_deferral,
+    is_symlink_blocking,
+)
 
 
 # 2026-04-29 fix (wizard install-path lockdown): defensive sanity check
@@ -1131,13 +1137,30 @@ def _replace_or_append_block(existing: str, block: str) -> str:
 
 
 def update_merge_notification_block(
-    context_state_path: Path, preserved_files: list[str]
+    context_state_path: Path, preserved_files: list[str],
+    deferral_report: "DeferralReport | None" = None,
 ) -> bool:
     """Append (or refresh) the merge-notification block in
     `.claude/CONTEXT_STATE.md`. Returns True iff the file was written.
+
+    v0.2.46 V47-B (Gap B): if `context_state_path` is a symlink, VCO
+    writes the notification block to a sibling ``.vco-new`` path and
+    emits a deferral entry. The original symlink is never touched.
     """
     block = _build_merge_notification_block(preserved_files)
-    if not context_state_path.exists():
+
+    # v0.2.46 V47-B: symlink at CONTEXT_STATE.md → write to sibling.
+    if is_symlink_blocking(context_state_path):
+        vco_new = compute_vco_new_path(context_state_path)
+        if deferral_report is not None:
+            emit_symlink_deferral(deferral_report, context_state_path, vco_new)
+        vco_new.parent.mkdir(parents=True, exist_ok=True)
+        vco_new.write_text(block)
+        return True
+
+    # v0.2.46 V47-B: use lexists so a dangling symlink isn't treated
+    # as "file doesn't exist".
+    if not os.path.lexists(os.fspath(context_state_path)):
         context_state_path.parent.mkdir(parents=True, exist_ok=True)
         context_state_path.write_text(block)
         return True
@@ -1169,6 +1192,7 @@ def _copy_recursive_preserve(
     install_root: Path,
     preserve: list[str],
     preserved_present: list[str],
+    deferral_report: "DeferralReport | None" = None,
 ) -> tuple[int, int]:
     """Preserve-aware recursive copy. For each FILE encountered:
       - If its install-relative path is in `preserve` AND a file already
@@ -1177,21 +1201,71 @@ def _copy_recursive_preserve(
       - Otherwise, plain overwrite copy.
 
     Returns `(files_visited, new_files_written)`.
+
+    v0.2.46 V47-B (Gap B): if `dst` is itself a symlink, OR if its parent
+    directory is a symlink, VCO does NOT touch it. The intended content
+    is written to `<dst>.vco-new` instead and a deferral entry is added
+    (when `deferral_report` is provided). The original symlink is
+    preserved bit-for-bit. Symlinked DIRECTORIES are not recursed into
+    for writes — recursion stops at the symlink boundary.
     """
+    # v0.2.46 V47-B: if dst is a symlinked directory, don't recurse in
+    # for writes. Compute the sibling and land everything under it.
+    if src.is_dir() and is_symlink_blocking(dst):
+        vco_new = compute_vco_new_path(dst)
+        if deferral_report is not None:
+            emit_symlink_deferral(
+                deferral_report, dst, vco_new, install_root=install_root
+            )
+        # Mirror the source tree into the sibling instead of through
+        # the symlink. Use the same preserve-aware copy so user-
+        # modifications under the .vco-new tree still produce .new
+        # siblings (extremely unlikely on a fresh sibling, but safe).
+        return _copy_recursive_preserve(
+            src, vco_new, install_root, preserve, preserved_present,
+            deferral_report=deferral_report,
+        )
+
     if src.is_dir():
-        dst.mkdir(parents=True, exist_ok=True)
+        # v0.2.46 V47-B: use lexists-equivalent guard on the parent
+        # before mkdir. `mkdir(exist_ok=True)` on a symlink-to-dir
+        # would silently succeed and route subsequent writes through
+        # the symlink — exactly what we are forbidding.
+        if not dst.exists() and not os.path.lexists(os.fspath(dst)):
+            dst.mkdir(parents=True, exist_ok=True)
+        elif not is_symlink_blocking(dst):
+            # Real directory already exists — no-op.
+            pass
         files_visited = 0
         new_files = 0
         for entry in src.iterdir():
             v, n = _copy_recursive_preserve(
-                entry, dst / entry.name, install_root, preserve, preserved_present
+                entry, dst / entry.name, install_root, preserve, preserved_present,
+                deferral_report=deferral_report,
             )
             files_visited += v
             new_files += n
         return files_visited, new_files
 
     rel = str(dst.relative_to(install_root))
-    if rel in preserve and dst.exists():
+
+    # v0.2.46 V47-B: dst is a symlink (file or dangling). Refuse to
+    # overwrite the symlink; write VCO's content to the sibling.
+    if is_symlink_blocking(dst):
+        vco_new = compute_vco_new_path(dst)
+        vco_new.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, vco_new)
+        if deferral_report is not None:
+            emit_symlink_deferral(
+                deferral_report, dst, vco_new, install_root=install_root
+            )
+        return 1, 1
+
+    # v0.2.46 V47-B: use lexists (not exists) to detect prior content,
+    # so a dangling symlink at dst is NOT treated as "nothing here".
+    # (Caught above by is_symlink_blocking, but kept for defense-in-
+    # depth in case any future refactor drops the islink check.)
+    if rel in preserve and os.path.lexists(os.fspath(dst)):
         sibling = _new_sibling_path(dst)
         sibling.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, sibling)
@@ -1236,6 +1310,19 @@ def apply_conflict_strategy(
 
     if strategy == "delete_claude_and_reinstall":
         claude_dir = install_path / ".claude"
+        # v0.2.46 V47-B (Gap B): explicit symlink guard. The resolve()
+        # check below already mitigates symlink-escape attacks, but a
+        # symlinked .claude/ ROOT (e.g., .claude → ~/.claude/shared)
+        # would still be rmtree'd by reaching its target. Hard rule:
+        # never touch a symlink at the install path; refuse the
+        # destructive op and let the caller decide.
+        if is_symlink_blocking(claude_dir):
+            raise ValueError(
+                f"refusing to delete: {claude_dir} is a symlink "
+                f"(VCO never replaces symlinks under the install path; "
+                f"remove the symlink manually before re-running with "
+                f"delete_claude_and_reinstall)"
+            )
         if claude_dir.exists():
             canon_install = install_path.resolve()
             canon_claude = claude_dir.resolve()
@@ -6730,7 +6817,10 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 # orchestrator-self now uses the same pipeline.
 # ---------------------------------------------------------------------------
 
-def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
+def _materialize_orchestrator_self_claude_dir(
+    install_root: Path,
+    deferral_report: "DeferralReport | None" = None,
+) -> None:
     """Render the orchestrator-self's runtime .claude/ contents from templates.
 
     Copies ``templates/hooks/*`` → ``<install_root>/.claude/hooks/`` and
@@ -6750,6 +6840,13 @@ def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
     missing OS template doesn't kill the install on an unexpected
     platform.
 
+    v0.2.46 V47-B (Gap B): if ``.claude/`` (or ``.claude/hooks/`` /
+    ``.claude/scripts/``) is a symlink, VCO writes its content to a
+    sibling ``.vco-new`` path and emits a deferral entry. The original
+    symlink is preserved. Symlinks at individual file targets are also
+    caught — the symlinked file is left alone and VCO's content lands
+    at the sibling.
+
     Honors ``--skip-materialize-claude-dir`` for tests / special-case
     installs targeting a pre-populated .claude/ directory.
     """
@@ -6765,18 +6862,66 @@ def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
     copied_scripts = 0
     warnings: list[str] = []
 
+    # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, redirect
+    # the entire materialization to a sibling .vco-new tree. This catches
+    # the ARTup-style case where the user symlinked .claude to a shared
+    # workflow tree — VCO refuses to touch it.
+    if is_symlink_blocking(claude_dir):
+        vco_new_claude = compute_vco_new_path(claude_dir)
+        if deferral_report is not None:
+            emit_symlink_deferral(
+                deferral_report, claude_dir, vco_new_claude,
+                install_root=install_root,
+            )
+        warnings.append(
+            f".claude/ is a symlink — materializing into "
+            f"{vco_new_claude.name} instead (see UPDATE_DEFERRED.md)"
+        )
+        claude_dir = vco_new_claude
+
     # 1. Hooks: templates/hooks/* → .claude/hooks/* preserving exec bit.
     hooks_src = templates_dir / "hooks"
     hooks_dst = claude_dir / "hooks"
     if not hooks_src.is_dir():
         warnings.append(f"templates/hooks/ missing at {hooks_src}")
     else:
+        # v0.2.46 V47-B: symlinked .claude/hooks/ → redirect to sibling.
+        if is_symlink_blocking(hooks_dst):
+            vco_new_hooks = compute_vco_new_path(hooks_dst)
+            if deferral_report is not None:
+                emit_symlink_deferral(
+                    deferral_report, hooks_dst, vco_new_hooks,
+                    install_root=install_root,
+                )
+            warnings.append(
+                f".claude/hooks is a symlink — writing into "
+                f"{vco_new_hooks.name} instead"
+            )
+            hooks_dst = vco_new_hooks
+
         hooks_dst.mkdir(parents=True, exist_ok=True)
         for src in hooks_src.iterdir():
             if not src.is_file():
                 continue  # Skip _lib/ and other subdirs; handled below.
+            target = hooks_dst / src.name
+            # v0.2.46 V47-B: individual hook file is a symlink → skip
+            # the in-place copy; land VCO's version at the sibling.
+            if is_symlink_blocking(target):
+                vco_new_file = compute_vco_new_path(target)
+                if deferral_report is not None:
+                    emit_symlink_deferral(
+                        deferral_report, target, vco_new_file,
+                        install_root=install_root,
+                    )
+                try:
+                    shutil.copy2(src, vco_new_file)
+                except OSError as e:
+                    warnings.append(
+                        f"failed to copy {src.name} to .vco-new sibling: {e}"
+                    )
+                continue
             try:
-                shutil.copy2(src, hooks_dst / src.name)
+                shutil.copy2(src, target)
                 copied_hooks += 1
             except OSError as e:
                 warnings.append(f"failed to copy {src.name}: {e}")
@@ -6784,7 +6929,24 @@ def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
         for sub in hooks_src.iterdir():
             if sub.is_dir():
                 dst_sub = hooks_dst / sub.name
-                if dst_sub.exists():
+                # v0.2.46 V47-B: never rmtree a symlinked subdir; land
+                # at sibling instead.
+                if is_symlink_blocking(dst_sub):
+                    vco_new_sub = compute_vco_new_path(dst_sub)
+                    if deferral_report is not None:
+                        emit_symlink_deferral(
+                            deferral_report, dst_sub, vco_new_sub,
+                            install_root=install_root,
+                        )
+                    try:
+                        shutil.copytree(sub, vco_new_sub)
+                    except OSError as e:
+                        warnings.append(
+                            f"failed to copy hooks subdir "
+                            f"{sub.name} to .vco-new sibling: {e}"
+                        )
+                    continue
+                if os.path.lexists(os.fspath(dst_sub)):
                     shutil.rmtree(dst_sub)
                 try:
                     shutil.copytree(sub, dst_sub)
@@ -6797,12 +6959,42 @@ def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
     if not scripts_src.is_dir():
         warnings.append(f"templates/scripts/ missing at {scripts_src}")
     else:
+        # v0.2.46 V47-B: symlinked .claude/scripts/ → redirect to sibling.
+        if is_symlink_blocking(scripts_dst):
+            vco_new_scripts = compute_vco_new_path(scripts_dst)
+            if deferral_report is not None:
+                emit_symlink_deferral(
+                    deferral_report, scripts_dst, vco_new_scripts,
+                    install_root=install_root,
+                )
+            warnings.append(
+                f".claude/scripts is a symlink — writing into "
+                f"{vco_new_scripts.name} instead"
+            )
+            scripts_dst = vco_new_scripts
+
         scripts_dst.mkdir(parents=True, exist_ok=True)
         for src in scripts_src.iterdir():
             if not src.is_file():
                 continue
+            target = scripts_dst / src.name
+            # v0.2.46 V47-B: individual script file is a symlink → skip.
+            if is_symlink_blocking(target):
+                vco_new_file = compute_vco_new_path(target)
+                if deferral_report is not None:
+                    emit_symlink_deferral(
+                        deferral_report, target, vco_new_file,
+                        install_root=install_root,
+                    )
+                try:
+                    shutil.copy2(src, vco_new_file)
+                except OSError as e:
+                    warnings.append(
+                        f"failed to copy {src.name} to .vco-new sibling: {e}"
+                    )
+                continue
             try:
-                shutil.copy2(src, scripts_dst / src.name)
+                shutil.copy2(src, target)
                 copied_scripts += 1
             except OSError as e:
                 warnings.append(f"failed to copy {src.name}: {e}")
@@ -6818,6 +7010,22 @@ def _materialize_orchestrator_self_claude_dir(install_root: Path) -> None:
         try:
             settings_dst = claude_dir / "settings.json"
             settings_dst.parent.mkdir(parents=True, exist_ok=True)
+
+            # v0.2.46 V47-B (Gap B): symlinked settings.json → write to
+            # sibling. Catches the case where the user symlinks
+            # settings.json to a shared config tree across projects.
+            if is_symlink_blocking(settings_dst):
+                vco_new_settings = compute_vco_new_path(settings_dst)
+                if deferral_report is not None:
+                    emit_symlink_deferral(
+                        deferral_report, settings_dst, vco_new_settings,
+                        install_root=install_root,
+                    )
+                warnings.append(
+                    f".claude/settings.json is a symlink — writing into "
+                    f"{vco_new_settings.name} instead"
+                )
+                settings_dst = vco_new_settings
 
             # v0.2.30 fix: preserve existing settings.json's `env` block on
             # re-render. Pre-v0.2.30 this code unconditionally overwrote
@@ -7038,17 +7246,37 @@ def _refresh_orchestrator_self_vco_manifest(install_root: Path) -> None:
     }
 
     try:
-        claude_dir.mkdir(parents=True, exist_ok=True)
+        # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, write
+        # the manifest to a sibling .vco-new tree. os.replace() on a
+        # symlinked DESTINATION would replace the symlink itself on POSIX
+        # (silently destroying the user's link); on Windows it errors.
+        # Either is unacceptable per the hard rule.
+        target_claude = claude_dir
+        if is_symlink_blocking(target_claude):
+            target_claude = compute_vco_new_path(target_claude)
+            target_claude.mkdir(parents=True, exist_ok=True)
+            manifest_path_effective = target_claude / ".vco-manifest.json"
+        else:
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            manifest_path_effective = manifest_path
+
+        # v0.2.46 V47-B: also guard the manifest file itself.
+        if is_symlink_blocking(manifest_path_effective):
+            manifest_path_effective = compute_vco_new_path(
+                manifest_path_effective
+            )
+
         payload_bytes = (json.dumps(manifest_payload, indent=2, sort_keys=True) + "\n")
         # Atomic write via tempfile + replace.
         import tempfile as _tf
         fd, tmp_path = _tf.mkstemp(
-            dir=str(claude_dir), suffix=".tmp", prefix=".vco-manifest-",
+            dir=str(manifest_path_effective.parent),
+            suffix=".tmp", prefix=".vco-manifest-",
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(payload_bytes)
-            os.replace(tmp_path, str(manifest_path))
+            os.replace(tmp_path, str(manifest_path_effective))
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -17264,7 +17492,8 @@ def _reconcile_env_keys(env_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def _configure_claude_settings(embed_config: dict,
-                               adopt_project_mode: str | None = None) -> None:
+                               adopt_project_mode: str | None = None,
+                               deferral_report: "DeferralReport | None" = None) -> None:
     """Create .claude/settings.json with MCP server configuration.
 
     v0.2.46 V47-G-stub: accepts optional `adopt_project_mode` for Wave-2
@@ -17272,12 +17501,51 @@ def _configure_claude_settings(embed_config: dict,
     additive-merge logic. Stub is a pure passthrough; V47-A will use the
     mode to decide between "skip existing" (current behavior), "refresh
     managed block only", or "replace all" (--adopt-project-replace-all).
+
+    v0.2.46 V47-B (Gap B): if ``.claude/`` is a symlink OR
+    ``.claude/settings.json`` is a symlink, VCO writes its content to a
+    sibling ``.vco-new`` path and emits a deferral entry. The original
+    symlink is preserved bit-for-bit. The ``adopt_project_mode`` is read
+    for log-message differentiation only — the symlink rule is mode-
+    AGNOSTIC (per user decision 2026-06-03).
     """
     settings_dir = PROJECT_ROOT / ".claude"
+
+    # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, route the
+    # write to a sibling .vco-new directory. Never mkdir over a symlink.
+    if is_symlink_blocking(settings_dir):
+        vco_new_dir = compute_vco_new_path(settings_dir)
+        if deferral_report is not None:
+            emit_symlink_deferral(
+                deferral_report, settings_dir, vco_new_dir,
+                install_root=PROJECT_ROOT,
+            )
+        print(
+            f"  Claude settings: .claude/ is a symlink — writing to "
+            f"{vco_new_dir.name}/ instead (see UPDATE_DEFERRED.md)"
+        )
+        settings_dir = vco_new_dir
+
     settings_dir.mkdir(exist_ok=True)
 
     settings_file = settings_dir / "settings.json"
-    if settings_file.exists():
+
+    # v0.2.46 V47-B (Gap B): if settings.json is itself a symlink,
+    # write to sibling. Use lexists for the "is this slot already
+    # occupied?" check so dangling symlinks still trigger the skip.
+    if is_symlink_blocking(settings_file):
+        vco_new_file = compute_vco_new_path(settings_file)
+        if deferral_report is not None:
+            emit_symlink_deferral(
+                deferral_report, settings_file, vco_new_file,
+                install_root=PROJECT_ROOT,
+            )
+        print(
+            f"  Claude settings: settings.json is a symlink — writing to "
+            f"{vco_new_file.name} instead (see UPDATE_DEFERRED.md)"
+        )
+        settings_file = vco_new_file
+    elif os.path.lexists(os.fspath(settings_file)):
         print("  Claude settings: already configured")
         return
 
@@ -17495,7 +17763,10 @@ def _cleanup_legacy_bash_env_shim(args: argparse.Namespace) -> None:
 # Step 9b: Install agents + skills from templates/
 # ---------------------------------------------------------------------------
 
-def _install_agents_and_skills(args: argparse.Namespace) -> None:
+def _install_agents_and_skills(
+    args: argparse.Namespace,
+    deferral_report: "DeferralReport | None" = None,
+) -> None:
     """Copy agents and skills from templates/ into .claude/, substituting paths.
 
     Bundled agents live at templates/agents/free/. Skills live at templates/skills/.
@@ -17504,6 +17775,12 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
         {{ORCHESTRATOR_ROOT}} → this install directory
         {{PROJECTS_ROOT}}     → parent directory
         {{HOME}}              → user home directory
+
+    v0.2.46 V47-B (Gap B): symlinks at any agent/skill target are left
+    alone; VCO's content lands at a ``.vco-new`` sibling and a deferral
+    entry is emitted. Uses ``os.path.lexists`` (not ``Path.exists``) for
+    the "is this already present?" check so dangling symlinks aren't
+    silently treated as "vacant slot".
     """
     print("[9b/10] Installing agents, skills, and hooks ... ", flush=True)
 
@@ -17525,15 +17802,50 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(content, encoding="utf-8")
 
+    # v0.2.46 V47-B: if .claude/ is a symlink, refuse to mkdir() over it
+    # or write through it. The whole agents/skills install routes into
+    # a sibling .vco-new tree.
+    if is_symlink_blocking(claude_dir):
+        vco_new_claude = compute_vco_new_path(claude_dir)
+        if deferral_report is not None:
+            emit_symlink_deferral(
+                deferral_report, claude_dir, vco_new_claude,
+                install_root=PROJECT_ROOT,
+            )
+        claude_dir = vco_new_claude
+        agents_dst = claude_dir / "agents"
+        skills_dst = claude_dir / "skills"
+
     installed_agents = 0
     skipped_agents = 0
     if args.with_agents:
+        # v0.2.46 V47-B: if .claude/agents/ is a symlink, route to sibling.
+        if is_symlink_blocking(agents_dst):
+            vco_new_agents = compute_vco_new_path(agents_dst)
+            if deferral_report is not None:
+                emit_symlink_deferral(
+                    deferral_report, agents_dst, vco_new_agents,
+                    install_root=PROJECT_ROOT,
+                )
+            agents_dst = vco_new_agents
+
         agents_dst.mkdir(parents=True, exist_ok=True)
         free_src = templates_dir / "agents" / "free"
         if free_src.exists():
             for agent_file in sorted(free_src.glob("*.md")):
                 target = agents_dst / agent_file.name
-                if target.exists():
+                # v0.2.46 V47-B: per-file symlink → land at sibling.
+                if is_symlink_blocking(target):
+                    vco_new_target = compute_vco_new_path(target)
+                    if deferral_report is not None:
+                        emit_symlink_deferral(
+                            deferral_report, target, vco_new_target,
+                            install_root=PROJECT_ROOT,
+                        )
+                    _copy_with_subs(agent_file, vco_new_target)
+                    continue
+                # Use lexists so dangling symlinks count as "occupied".
+                if os.path.lexists(os.fspath(target)):
                     skipped_agents += 1
                     continue
                 _copy_with_subs(agent_file, target)
@@ -17544,10 +17856,29 @@ def _install_agents_and_skills(args: argparse.Namespace) -> None:
     if args.with_skills:
         skills_src = templates_dir / "skills"
         if skills_src.exists():
+            # v0.2.46 V47-B: if .claude/skills/ is a symlink, route to sibling.
+            if is_symlink_blocking(skills_dst):
+                vco_new_skills = compute_vco_new_path(skills_dst)
+                if deferral_report is not None:
+                    emit_symlink_deferral(
+                        deferral_report, skills_dst, vco_new_skills,
+                        install_root=PROJECT_ROOT,
+                    )
+                skills_dst = vco_new_skills
+
             skills_dst.mkdir(parents=True, exist_ok=True)
             for skill_dir in sorted(p for p in skills_src.iterdir() if p.is_dir()):
                 target = skills_dst / skill_dir.name
-                if target.exists():
+                # v0.2.46 V47-B: per-skill symlink → land at sibling.
+                if is_symlink_blocking(target):
+                    vco_new_target = compute_vco_new_path(target)
+                    if deferral_report is not None:
+                        emit_symlink_deferral(
+                            deferral_report, target, vco_new_target,
+                            install_root=PROJECT_ROOT,
+                        )
+                    target = vco_new_target
+                elif os.path.lexists(os.fspath(target)):
                     skipped_skills += 1
                     continue
                 target.mkdir(parents=True, exist_ok=True)
