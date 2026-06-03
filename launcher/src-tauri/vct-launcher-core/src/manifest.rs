@@ -2519,7 +2519,14 @@ mod tests {
         // the version that `runtime.args` + `gpu_image_variants` already
         // pin. Pre-v0.2.22 the manifest top-level was 0.1.2 (an unreleased
         // bump), while this test still asserted 0.1.0 — both stale.
-        assert_eq!(manifest.version, "0.1.1");
+        //
+        // v0.2.47 (2026-06-04): bumped to 0.2.8 — current latest released on
+        // GHCR (`ghcr.io/hotak92/vct-rl-reranker:0.2.8-{cpu,cuda,rocm}`).
+        // The paid-module's release cadence is decoupled from the launcher's,
+        // so this assertion will need bumping again when the paid module ships
+        // a new tag — track via the GHCR_PAID_TAG_DEFAULT secret on the
+        // rl-artifact-url Supabase function.
+        assert_eq!(manifest.version, "0.2.8");
         assert_eq!(manifest.install.method, InstallMethod::ContainerPull);
         assert!(manifest.license.required);
         assert_eq!(manifest.license.min_orchestrator_tier, "pro");
@@ -2904,7 +2911,13 @@ mod tests {
         );
 
         // Flatten controls + verify at least one of each interactive
-        // kind exists. Info is required (section 1 is status-only).
+        // kind exists. An info banner is required (section 1 is status-only).
+        // Both ``info`` and ``info_dynamic`` count as info banners — they
+        // render the same surface, but ``info_dynamic`` pulls its message
+        // from module_db at runtime instead of a static literal. The current
+        // vct-rl-reranker manifest uses ``info_dynamic`` exclusively for
+        // section 1 (v0.2.32+); the static ``info`` variant survives for
+        // back-compat with manifests that haven't migrated yet.
         let mut has_checkbox = false;
         let mut has_button = false;
         let mut has_multi_select = false;
@@ -2915,7 +2928,8 @@ mod tests {
                     ConfigControl::Checkbox { .. } => has_checkbox = true,
                     ConfigControl::Button { .. } => has_button = true,
                     ConfigControl::MultiSelect { .. } => has_multi_select = true,
-                    ConfigControl::Info { .. } => has_info = true,
+                    ConfigControl::Info { .. }
+                    | ConfigControl::InfoDynamic { .. } => has_info = true,
                     ConfigControl::Select { .. } => {}
                     // v0.2.26+ kinds — not exercised by the current
                     // vct-rl-reranker manifest, but acknowledged here
@@ -2929,7 +2943,6 @@ mod tests {
                     // v0.2.32 additions — same acknowledgement: the
                     // RL manifest may grow these but the test doesn't
                     // assert on them.
-                    | ConfigControl::InfoDynamic { .. }
                     | ConfigControl::DatePicker { .. }
                     // v0.2.33 forward-compat fallback — would only fire
                     // if a future RL manifest ships a control kind this
