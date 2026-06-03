@@ -3603,6 +3603,217 @@ def _rl_pack_linked_embs_for_node(
     return packed_embs, packed_types
 
 
+def _rl_enrich_nodes_with_linked_embs(
+    nodes: list[dict],
+    query_emb: "list[float] | None",
+    active_slot: str,
+    *,
+    coll_resolver=None,
+) -> None:
+    """Attach v3 training fields to each node in-place.
+
+    For every node (post-collapse, one entry per file):
+      - ``n_emb``: best-chunk vector (the matched chunk; pulled from the
+        node's existing ``emb`` field, which the search path already
+        populated from Weaviate's returned object). Logging both ``emb``
+        AND ``n_emb`` is redundant but cheap; offline_trainer prefers
+        ``n_emb`` when both are present (v3 contract).
+      - ``linked_embs``: MAX_LINKED packed vectors built by
+        ``_rl_pack_linked_embs_for_node`` (extras_of_this_node + actual_links,
+        truncated).
+      - ``linked_type_names``: parallel array of per-slot node_type strings.
+      - ``cos_qn``: max cos(query_emb, n_emb). Already present in many
+        cases (set by the search path's per-result enrichment block at
+        server.py:4179-4185); recomputed here only when missing.
+      - ``cos_ql``: mean cos(query_emb, link_i) over linked_embs.
+        Pre-computed scalar so offline replay matches online byte-identically
+        without re-fetching link embeddings (the locked design from the
+        2026-06-04 spec).
+      - ``cos_nl``: mean cos(n_emb, link_i) over linked_embs. Same rationale.
+
+    ONE batched Weaviate ``fetch_objects`` per collection (grouped by the
+    ``collection`` field on each node dict) does the heavy lifting:
+
+        Filter.by_property("source_node_id").contains_any([all source ids])
+        | Filter.by_property("title").contains_any([all link titles])
+        + include_vector=True
+
+    Soft-fail: if Weaviate is unreachable or the fetch raises, the node
+    keeps whatever fields were already set (typically just ``emb`` +
+    ``cos_qn``); ``linked_embs`` stays absent and the v3 event ships a
+    truncated payload. The offline trainer defaults missing ``linked_embs``
+    to ``[]`` and the gradient step degenerates to "no linked-slot input"
+    — same as a node with no actual links would produce.
+
+    Args:
+        nodes: Mutable list of per-node dicts (post-collapse). Modified
+            in place — function returns None.
+        query_emb: Active-slot query vector. When None, ``cos_qn`` /
+            ``cos_ql`` are not computed.
+        active_slot: Named-vector slot to pull from Weaviate objects
+            (e.g. ``"qwen3_embed"``).
+        coll_resolver: Optional callable ``(collection_name) -> coll
+            handle`` for testing. Defaults to ``get_weaviate_client()
+            .collections.get(name)``.
+    """
+    if not nodes:
+        return
+
+    # Group nodes by collection so we can issue ONE fetch per collection.
+    by_collection: dict[str, list[dict]] = {}
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        c = str(n.get("collection") or "")
+        if not c:
+            continue
+        by_collection.setdefault(c, []).append(n)
+
+    if not by_collection:
+        return
+
+    if coll_resolver is None:
+        try:
+            client = get_weaviate_client()
+        except Exception as exc:
+            logger.debug("RL enrich: get_weaviate_client failed (%s); skipping", exc)
+            return
+
+        def coll_resolver(name: str):  # noqa: E306 — local fallback
+            return client.collections.get(name)
+
+    # Import Filter lazily; the search path already does this elsewhere.
+    try:
+        from weaviate.classes.query import Filter  # type: ignore
+    except Exception as exc:
+        logger.debug("RL enrich: Filter import failed (%s); skipping", exc)
+        return
+
+    for collection_name, group_nodes in by_collection.items():
+        # Collect identifiers we'll need from Weaviate.
+        source_ids: list[str] = []
+        link_titles: list[str] = []
+        for n in group_nodes:
+            sid = n.get("source_node_id") or n.get("title")
+            if sid:
+                source_ids.append(str(sid))
+            for raw in n.get("links") or []:
+                link_str = raw if isinstance(raw, str) else str(raw)
+                if "::" in link_str:
+                    link_str = link_str.split("::", 1)[1]
+                link_str = link_str.strip().strip("[").strip("]")
+                if link_str:
+                    link_titles.append(link_str)
+
+        # Dedup before sending across the wire (Weaviate accepts repeats but
+        # the in-process post-filter dicts only key by unique strings).
+        unique_source_ids = list({s for s in source_ids if s})
+        unique_link_titles = list({t for t in link_titles if t})
+
+        if not unique_source_ids and not unique_link_titles:
+            continue
+
+        # Build filter: source_node_id in [...] OR title in [...].
+        try:
+            filt = None
+            if unique_source_ids:
+                filt = Filter.by_property("source_node_id").contains_any(unique_source_ids)
+            if unique_link_titles:
+                title_filt = Filter.by_property("title").contains_any(unique_link_titles)
+                filt = title_filt if filt is None else (filt | title_filt)
+        except Exception as exc:
+            logger.debug("RL enrich: filter build failed (%s); skipping group", exc)
+            continue
+
+        # ONE Weaviate roundtrip for this collection. Generous limit upper-bound:
+        # MAX_LINKED chunks per node + actual links per node, both capped.
+        max_rows = len(group_nodes) * (_RL_MAX_LINKED * 2 + 8)
+        try:
+            coll = coll_resolver(collection_name)
+            resp = coll.query.fetch_objects(
+                filters=filt,
+                include_vector=True,
+                limit=max_rows,
+            )
+            fetched = list(resp.objects)
+        except Exception as exc:
+            logger.debug(
+                "RL enrich: fetch_objects on %s failed (%s); skipping group",
+                collection_name, exc,
+            )
+            continue
+
+        # Index by source_node_id (for sibling chunks) and by title (for actual links).
+        sibling_objs_by_source_id: dict[str, list] = {}
+        link_objs_by_title: dict[str, object] = {}
+        for obj in fetched:
+            try:
+                props = obj.properties
+            except AttributeError:
+                continue
+            sid = props.get("source_node_id")
+            if sid:
+                sibling_objs_by_source_id.setdefault(str(sid), []).append(obj)
+            title = props.get("title")
+            if title:
+                # title -> single object; if multiple chunks of the same title
+                # land in the result, the highest-chunk-num one wins (arbitrary
+                # but deterministic). For linked-node embeddings the chunk
+                # choice is asymmetric — we want ONE representative emb per
+                # linked node.
+                existing = link_objs_by_title.get(str(title))
+                if existing is None:
+                    link_objs_by_title[str(title)] = obj
+                else:
+                    try:
+                        if (props.get("chunk_num") or 0) < (
+                            getattr(existing, "properties", {}).get("chunk_num") or 0
+                        ):
+                            continue
+                        link_objs_by_title[str(title)] = obj
+                    except (AttributeError, TypeError):
+                        pass
+
+        # Per-node enrichment.
+        for n in group_nodes:
+            packed_embs, packed_types = _rl_pack_linked_embs_for_node(
+                n,
+                sibling_objs_by_source_id,
+                link_objs_by_title,
+                active_slot,
+            )
+            n["linked_embs"] = packed_embs
+            n["linked_type_names"] = packed_types
+
+            # n_emb: prefer the existing emb (already on the dict from search).
+            n_emb = n.get("emb")
+            if n_emb:
+                n["n_emb"] = n_emb
+
+            # cos_qn (re-)compute when we have both inputs.
+            if query_emb and n_emb and "cos_qn" not in n:
+                try:
+                    n["cos_qn"] = _cosine(query_emb, n_emb)
+                except Exception:
+                    pass
+
+            # cos_ql = mean cos(query, link_i)
+            if query_emb and packed_embs:
+                try:
+                    cosines = [_cosine(query_emb, e) for e in packed_embs]
+                    n["cos_ql"] = sum(cosines) / max(len(cosines), 1)
+                except Exception:
+                    pass
+
+            # cos_nl = mean cos(n_emb, link_i)
+            if n_emb and packed_embs:
+                try:
+                    cosines = [_cosine(n_emb, e) for e in packed_embs]
+                    n["cos_nl"] = sum(cosines) / max(len(cosines), 1)
+                except Exception:
+                    pass
+
+
 async def _rl_cache_and_rerank(
     task_id: str,
     query: str,
