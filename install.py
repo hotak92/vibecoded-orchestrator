@@ -1404,21 +1404,43 @@ def _resolve_adopt_project_mode(args) -> str | None:
     return None
 
 
-def _venv_triage(install_path: Path, adopt_project_mode: str | None = None) -> dict:
+def _venv_triage(install_path: Path,
+                 adopt_project_mode: str | None = None,
+                 force_rebuild: bool = False) -> dict:
     """Decide what to do with `<install_path>/.venv` on a lightweight
     re-install.
 
     v0.2.46 V47-G-stub: accepts optional `adopt_project_mode` for downstream
-    Wave-2 (Gap D) to mode-gate destructive venv-recreation. Stub is a
-    pure passthrough: Wave 2's V47-D agent will add the actual guard logic.
+    Wave-2 (Gap D) to mode-gate destructive venv-recreation.
+
+    v0.2.46 V47-D (Gap D, this commit): wire the actual guard logic.
+    When `.venv` exists but `.vco-manifest.json` does NOT — i.e. VCO has
+    no manifest record proving it owns this venv — the venv is treated
+    as a 3rd-party environment (ARTup-class projects with 9+ GB
+    scientific stacks). In that case:
+
+      * A would-be "recreate" (Python-version mismatch) is downgraded
+        to "skip-no-manifest" UNLESS adopt_project_mode == "replace-all"
+        (explicit user opt-in to overwrite everything) OR
+        `force_rebuild=True` (CLI flag `--rebuild-venv`).
+      * A would-be "upgrade" path with no requirements.txt on disk AND
+        no manifest is also downgraded to "skip-no-manifest" — VCO has
+        no way to know what to install.
+
+    Caller (`_run_lightweight`) handles "skip-no-manifest" as a no-op
+    plus an UPDATE_DEFERRED.md entry explaining how to force-rebuild.
 
     Cases:
       1. .venv missing       → action="create", recreate fully
-      2. .venv exists, Python version mismatch → action="recreate",
-         drop + recreate
-      3. .venv exists, Python OK, requirements.txt drift → action="upgrade",
-         pip install -r ... --upgrade in place
-      4. .venv exists, all matches  → action="skip"
+      2. .venv exists, no manifest, no requirements.txt, no force →
+         action="skip-no-manifest" (NEW; 3rd-party venv VCO can't manage)
+      3. .venv exists, Python version mismatch:
+         - manifest present OR replace-all OR force_rebuild →
+           action="recreate"
+         - else → action="skip-no-manifest" (NEW; preserve 3rd-party venv)
+      4. .venv exists, Python OK, requirements.txt drift →
+         action="upgrade", pip install -r ... --upgrade in place
+      5. .venv exists, all matches  → action="skip"
 
     Returns {"action": one_of(...), "reason": str, "venv_python": Path|None}.
     The caller (`_run_lightweight`) executes the action.
@@ -1432,6 +1454,30 @@ def _venv_triage(install_path: Path, adopt_project_mode: str | None = None) -> d
     if not venv.is_dir() or not venv_python.exists():
         return {"action": "create", "reason": ".venv missing",
                 "venv_python": None}
+
+    # v0.2.46 V47-D: figure out whether VCO has a manifest record proving
+    # it owns this venv. Absence of .vco-manifest.json is the load-bearing
+    # signal that this is a 3rd-party environment we must not destroy.
+    manifest_path = install_path / ".claude" / ".vco-manifest.json"
+    has_manifest = manifest_path.is_file()
+    requirements_path = install_path / "requirements.txt"
+    has_requirements = requirements_path.is_file()
+
+    # Hard guard for the "VCO has no clue what's in this venv" case:
+    # neither manifest nor requirements.txt → don't recreate, don't
+    # upgrade, just inform the caller via deferral.
+    if (not has_manifest and not has_requirements
+            and not force_rebuild
+            and adopt_project_mode != "replace-all"):
+        return {
+            "action": "skip-no-manifest",
+            "reason": (
+                "no .vco-manifest.json + no requirements.txt — "
+                "this is a 3rd-party venv VCO does not manage; "
+                "pass --rebuild-venv to force a rebuild"
+            ),
+            "venv_python": venv_python,
+        }
 
     # Python version check.
     try:
@@ -1447,6 +1493,25 @@ def _venv_triage(install_path: Path, adopt_project_mode: str | None = None) -> d
 
     expected = f"{sys.version_info.major}.{sys.version_info.minor}"
     if not venv_pyver or venv_pyver != expected:
+        # v0.2.46 V47-D: ONLY recreate when (a) we have a manifest
+        # proving VCO owns this venv, OR (b) the user has explicitly
+        # opted in via --adopt-project-replace-all or --rebuild-venv.
+        # Otherwise this would silently destroy a user's 3rd-party
+        # environment (e.g. ARTup's 9.2 GB scientific stack) on a
+        # Python-version-drift adopt — the HIGH finding from the
+        # venv-architecture audit (2026-06-03).
+        if not has_manifest and adopt_project_mode != "replace-all" \
+                and not force_rebuild:
+            return {
+                "action": "skip-no-manifest",
+                "reason": (
+                    f"Python version mismatch (.venv={venv_pyver!r}, "
+                    f"launcher={expected!r}) but no .vco-manifest.json — "
+                    "refusing to destroy a 3rd-party venv; pass "
+                    "--rebuild-venv to force a rebuild"
+                ),
+                "venv_python": venv_python,
+            }
         return {"action": "recreate",
                 "reason": f"Python version mismatch (.venv={venv_pyver!r}, "
                           f"launcher={expected!r})",
@@ -1515,8 +1580,14 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # v0.2.46 V47-G-stub: thread adopt_project_mode through to _venv_triage
     # so Wave-2 V47-D can mode-gate destructive "recreate" actions when the
     # tree is being adopted (don't wipe a user's 3rd-party .venv).
+    # v0.2.46 V47-D: also thread force_rebuild=args.rebuild_venv so the
+    # `--rebuild-venv` CLI flag overrides the adopt-guard when the user
+    # explicitly opts in to a rebuild.
     adopt_project_mode = _resolve_adopt_project_mode(args)
-    triage = _venv_triage(PROJECT_ROOT, adopt_project_mode=adopt_project_mode)
+    force_rebuild = getattr(args, "rebuild_venv", False)
+    triage = _venv_triage(PROJECT_ROOT,
+                          adopt_project_mode=adopt_project_mode,
+                          force_rebuild=force_rebuild)
     print(f"[2/4] Venv triage: action={triage['action']} ({triage['reason']})")
     _log_install_event(
         "lightweight", "ok",
@@ -1542,6 +1613,48 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         _install_requirements(venv_python, dev=args.dev)
     elif triage["action"] == "upgrade":
         _install_requirements(triage["venv_python"], dev=args.dev)
+    elif triage["action"] == "skip-no-manifest":
+        # v0.2.46 V47-D (Gap D): the venv exists but VCO has no manifest
+        # record proving it owns it. Refuse to destroy it. Emit a
+        # deferral entry so the user sees "VCO didn't touch your venv,
+        # run install.py --rebuild-venv if you want VCO to rebuild it."
+        # The deferral is appended via _lightweight_deferral further
+        # down (the report-writer runs at the end of _run_lightweight).
+        # We attach the entry here so the venv-skip rationale is
+        # contiguous with the triage decision in the log timeline.
+        _venv_path = PROJECT_ROOT / ".venv"
+        _manifest_path = PROJECT_ROOT / ".claude" / ".vco-manifest.json"
+        # We can't add to the deferral report until it's instantiated
+        # later; stash the entry payload on the args namespace so the
+        # later block can pick it up. The args namespace is the only
+        # mutable cross-step carrier inside _run_lightweight without
+        # threading another argument through.
+        args._venv_skip_no_manifest_entry = DeferralEntry(
+            condition_id="venv_skip_no_manifest",
+            title="Venv preserved (no VCO manifest detected)",
+            detected=(
+                f"Found `.venv` at {_venv_path} but no "
+                f".vco-manifest.json at {_manifest_path}. VCO treats this "
+                "as a 3rd-party environment it does not manage, and will "
+                "NOT recreate it. Reason: " + triage["reason"]
+            ),
+            why_deferred=(
+                "Recreating a venv that VCO did not install could "
+                "destroy a user-curated environment (e.g. a "
+                "9+ GB scientific stack from an upstream project). "
+                "The orchestrator refuses to do this silently. If VCO "
+                "is in fact correct to rebuild the venv (the launcher's "
+                "Python is intentionally different from what created "
+                "it), re-run with the explicit `--rebuild-venv` flag."
+            ),
+            command_to_apply=(
+                f"python install.py --lightweight --rebuild-venv"
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/venv-adopt-guard-v0246.md",
+            ],
+        )
     else:
         # action == "skip"
         pass
@@ -1586,6 +1699,15 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # fresh DeferralReport so any stale-unit auto-repair surfaces in
     # UPDATE_DEFERRED.md the user reads at next session.
     _lightweight_deferral = DeferralReport()
+
+    # v0.2.46 V47-D (Gap D): if the venv-triage step earlier hit the
+    # "skip-no-manifest" branch, attach its deferral entry to the report
+    # so it lands in UPDATE_DEFERRED.md alongside any other lightweight
+    # deferrals. The triage step itself can't write to the report (the
+    # report is instantiated here); it stashes the payload on args.
+    _venv_skip_entry = getattr(args, "_venv_skip_no_manifest_entry", None)
+    if _venv_skip_entry is not None:
+        _lightweight_deferral.add_entry(_venv_skip_entry)
 
     # PR-14b (v0.2.11 MCP simplification): SearXNG no longer ships in the
     # default compose stack; Ollama MCP is dropped from the default install;
@@ -2485,6 +2607,21 @@ def main() -> int:
                         help="Used with --lightweight. The previous install path "
                              "whose absolute occurrences in .env / settings.json "
                              "should be rewritten to the current PROJECT_ROOT.")
+    # v0.2.46 V47-D (Gap D): explicit override for the new venv-adopt guard.
+    # By default, `_venv_triage` refuses to recreate a `.venv` when no
+    # `.vco-manifest.json` is present (= "VCO doesn't own this venv —
+    # could be a user's 3rd-party scientific stack"). When the user
+    # KNOWS the recreate is correct, `--rebuild-venv` opts in.
+    parser.add_argument("--rebuild-venv", action="store_true", default=False,
+                        help="v0.2.46: force-rebuild the project's .venv even "
+                             "when VCO can't prove it owns it (no "
+                             ".vco-manifest.json). By default, the lightweight "
+                             "re-install path refuses to destroy a 3rd-party "
+                             "venv on Python-version drift or when no "
+                             "requirements.txt is present. Pass this flag when "
+                             "you know VCO is correct to rebuild — e.g. you "
+                             "intentionally changed the launcher's Python "
+                             "version and the project's venv needs to follow.")
     # v0.2.10 (Bug L2 — cross-OS boot-service materialization). The
     # compose-project working directory may not match the install path
     # (the canonical example: install at ~/.../VCO_dev but compose lives
