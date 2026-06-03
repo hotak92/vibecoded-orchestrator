@@ -408,7 +408,13 @@ class CodeGraphQuery:
                         sib_filter = Filter.by_property("file_path").equal(file_path)
                         if self.project:
                             sib_filter = sib_filter & Filter.by_property("project").equal(self.project)
-                        sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=64)
+                        # v0.2.46 V46-D: limit=64 is an intentional top-N cap
+                        # (siblings are sorted by proximity AFTER the fetch).
+                        # We don't emit a per-call truncation signal here
+                        # because the caller (`_format_code_result_by_rank`)
+                        # already only uses up to `max_total - 1` results.
+                        SIBLING_FETCH_LIMIT = 64
+                        sib_resp = coll_obj.query.fetch_objects(filters=sib_filter, limit=SIBLING_FETCH_LIMIT)
                         for obj in sib_resp.objects:
                             sp = obj.properties or {}
                             if sp.get("full_name") == exclude_full_name:
@@ -771,9 +777,15 @@ class CodeGraphQuery:
 
                 func_uuid = response.objects[0].uuid
 
-                # Find references
+                # Find references — Pattern B (intentional top-N cap, but
+                # the truncation signal is emitted so the user can
+                # re-run with --limit). v0.2.46 V46-D: previously
+                # `limit=50` was hard-coded and the user had no signal
+                # that the candidate-callers pool was capped at 50
+                # total functions.
+                CALLERS_FETCH_LIMIT = 50
                 caller_response = coll.query.fetch_objects(
-                    limit=50  # Increased limit for thorough search
+                    limit=CALLERS_FETCH_LIMIT
                 )
 
                 # Filter for functions that call target
@@ -783,12 +795,26 @@ class CodeGraphQuery:
                     if any(ref.uuid == func_uuid for ref in calls_refs):
                         callers.append(obj)
 
+                fetched_count = len(caller_response.objects)
+                truncated = fetched_count >= CALLERS_FETCH_LIMIT
+
                 print(f"\n🔗 Callers of function '{target}':")
                 print(f"   Found {len(callers)} callers:\n")
 
                 for caller in callers:
                     print(f"   - {caller.properties.get('full_name')}")
                     print(f"     {caller.properties.get('signature')}")
+
+                if truncated:
+                    print(
+                        f"\n⚠️  Searched only the first {CALLERS_FETCH_LIMIT} "
+                        f"candidate functions. Some callers may be missing."
+                    )
+                    print(
+                        "   For a thorough scan, use the MCP "
+                        "`query_code_structure(\"callers\", ...)` tool or "
+                        "raise the limit in this script."
+                    )
 
             elif query_type == "methods":
                 # List class methods
@@ -838,11 +864,15 @@ class CodeGraphQuery:
                     filters=Filter.by_property("full_name").equal(target),
                     limit=1
                 )
+                # v0.2.46 V46-D: emit truncation signal (Pattern B). The
+                # `limit=50` is an intentional top-N cap, but previously
+                # the user had no way to know when the cap was hit.
+                INTERACTIONS_FETCH_LIMIT = 50
                 if func_resp.objects:
                     source_uuid = str(func_resp.objects[0].uuid)
                     ix_resp = interactions_coll.query.fetch_objects(
                         filters=Filter.by_ref("source_function").by_id().equal(source_uuid),
-                        limit=50
+                        limit=INTERACTIONS_FETCH_LIMIT
                     )
                 else:
                     mod_coll = self.client.collections.get(self._coll("CodeModule"))
@@ -856,9 +886,10 @@ class CodeGraphQuery:
                     source_uuid = str(mod_resp.objects[0].uuid)
                     ix_resp = interactions_coll.query.fetch_objects(
                         filters=Filter.by_ref("source_module").by_id().equal(source_uuid),
-                        limit=50
+                        limit=INTERACTIONS_FETCH_LIMIT
                     )
 
+                truncated = len(ix_resp.objects) >= INTERACTIONS_FETCH_LIMIT
                 print(f"\n🔗 Cross-service interactions from '{target}':")
                 print(f"   Found {len(ix_resp.objects)} interactions:\n")
                 for obj in ix_resp.objects:
@@ -868,6 +899,12 @@ class CodeGraphQuery:
                     if p.get('description'):
                         print(f"     {p.get('description','')}")
                     print()
+
+                if truncated:
+                    print(
+                        f"⚠️  Result list capped at {INTERACTIONS_FETCH_LIMIT}. "
+                        f"Some interactions from '{target}' may be missing."
+                    )
 
             else:
                 print(f"❌ Unknown query type: {query_type}")

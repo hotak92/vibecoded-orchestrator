@@ -5590,6 +5590,14 @@ def query_code_structure(
     try:
         client = get_weaviate_client()
 
+        # v0.2.46 V46-D: per-call truncation metadata. Branches that
+        # cap their result list at a known limit set _truncation_meta
+        # so the response can carry a `truncated: bool` + `limit: int`
+        # signal. Branches that return a small fixed-size list (1-element
+        # lookups, methods/extends/composes that read a single object's
+        # field) leave it as None (never truncated).
+        _truncation_meta: dict | None = None
+
         # Resolve project: explicit arg > env default > no filter
         # Pass project="" to explicitly search all projects regardless of env default
         effective_project = project if project is not None else (CODE_GRAPH_PROJECT or None)
@@ -5625,11 +5633,18 @@ def query_code_structure(
                 results = [{"path": imp.properties.get("path"), "file_path": imp.properties.get("path", "")} for imp in imports]
 
             else:  # imports
+                # v0.2.46 V46-D: emit truncation signal so the LLM
+                # consumer knows when the list is capped at IMPORTS_LIMIT.
+                IMPORTS_LIMIT = 20
                 response = coll.query.fetch_objects(
                     filters=with_project(Filter.by_property("imports").contains_any([target])),
-                    limit=20
+                    limit=IMPORTS_LIMIT
                 )
                 results = [{"path": obj.properties.get("path"), "file_path": obj.properties.get("path", "")} for obj in response.objects]
+                _truncation_meta = {
+                    "truncated": len(response.objects) >= IMPORTS_LIMIT,
+                    "limit": IMPORTS_LIMIT,
+                }
 
         elif query_type == "methods":
             # List methods in a class
@@ -5666,11 +5681,13 @@ def query_code_structure(
             } for base in extends]
 
         elif query_type == "callers":
-            # Find all functions that call the target function
+            # Find all functions that call the target function.
+            # v0.2.46 V46-D: emit truncation signal.
+            CALLERS_LIMIT = 50
             coll = client.collections.get(_proj_coll("CodeFunction"))
             response = coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("call_names").contains_any([target])),
-                limit=50
+                limit=CALLERS_LIMIT
             )
             results = [
                 {
@@ -5680,11 +5697,17 @@ def query_code_structure(
                 }
                 for obj in response.objects
             ]
+            _truncation_meta = {
+                "truncated": len(response.objects) >= CALLERS_LIMIT,
+                "limit": CALLERS_LIMIT,
+            }
 
         elif query_type == "interactions":
             # Find outbound cross-service interactions from a function or module.
             # 1. Try matching target as CodeFunction full_name first, then CodeModule path.
             # 2. Filter CodeInteraction by source_function/source_module reference.
+            # v0.2.46 V46-D: emit truncation signal.
+            INTERACTIONS_LIMIT = 50
             interactions_coll = client.collections.get(_proj_coll("CodeInteraction"))
 
             func_coll = client.collections.get(_proj_coll("CodeFunction"))
@@ -5697,7 +5720,7 @@ def query_code_structure(
                 source_uuid = str(func_resp.objects[0].uuid)
                 ix_resp = interactions_coll.query.fetch_objects(
                     filters=Filter.by_ref("source_function").by_id().equal(source_uuid),
-                    limit=50
+                    limit=INTERACTIONS_LIMIT
                 )
             else:
                 mod_coll = client.collections.get(_proj_coll("CodeModule"))
@@ -5713,7 +5736,7 @@ def query_code_structure(
                 source_uuid = str(mod_resp.objects[0].uuid)
                 ix_resp = interactions_coll.query.fetch_objects(
                     filters=Filter.by_ref("source_module").by_id().equal(source_uuid),
-                    limit=50
+                    limit=INTERACTIONS_LIMIT
                 )
 
             results = []
@@ -5729,6 +5752,10 @@ def query_code_structure(
                     "source_project": props.get("source_project", ""),
                     "description": props.get("description", "")
                 })
+            _truncation_meta = {
+                "truncated": len(ix_resp.objects) >= INTERACTIONS_LIMIT,
+                "limit": INTERACTIONS_LIMIT,
+            }
 
         elif query_type == "path":
             # BFS path-finding through CodeFunction.calls (text-array property)
@@ -5836,10 +5863,12 @@ def query_code_structure(
 
         elif query_type == "composed_by":
             # Find classes that compose (contain as a field) the given class name.
+            # v0.2.46 V46-D: emit truncation signal.
+            COMPOSED_BY_LIMIT = 50
             coll = client.collections.get(_proj_coll("CodeClass"))
             response = coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("composes").contains_any([target])),
-                limit=50
+                limit=COMPOSED_BY_LIMIT
             )
             results = [
                 {
@@ -5848,13 +5877,19 @@ def query_code_structure(
                 }
                 for obj in response.objects
             ]
+            _truncation_meta = {
+                "truncated": len(response.objects) >= COMPOSED_BY_LIMIT,
+                "limit": COMPOSED_BY_LIMIT,
+            }
 
         elif query_type == "type_users":
             # Find functions that reference a given type name in their annotations.
+            # v0.2.46 V46-D: emit truncation signal.
+            TYPE_USERS_LIMIT = 50
             coll = client.collections.get(_proj_coll("CodeFunction"))
             response = coll.query.fetch_objects(
                 filters=with_project(Filter.by_property("type_uses").contains_any([target])),
-                limit=50
+                limit=TYPE_USERS_LIMIT
             )
             results = [
                 {
@@ -5864,6 +5899,10 @@ def query_code_structure(
                 }
                 for obj in response.objects
             ]
+            _truncation_meta = {
+                "truncated": len(response.objects) >= TYPE_USERS_LIMIT,
+                "limit": TYPE_USERS_LIMIT,
+            }
 
         else:
             return json.dumps({
@@ -5871,13 +5910,22 @@ def query_code_structure(
                 "error": f"Unknown query type: {query_type}. Supported: dependencies, imports, callers, methods, extends, interactions, path, composes, composed_by, type_users"
             }, indent=2)
 
-        return _large_result({
+        # v0.2.46 V46-D: include truncation metadata for top-N queries so
+        # the LLM consumer can decide whether to re-query with a higher
+        # limit. Branches that don't apply a cap leave _truncation_meta
+        # as None — the field is then omitted to keep response sizes
+        # tight for trivial queries.
+        response_payload = {
             "success": True,
             "query_type": query_type,
             "target": target,
             "count": len(results),
-            "results": results
-        })
+            "results": results,
+        }
+        if _truncation_meta is not None:
+            response_payload["truncated"] = _truncation_meta["truncated"]
+            response_payload["limit"] = _truncation_meta["limit"]
+        return _large_result(response_payload)
 
     except WeaviateUnreachable as exc:
         # Loud-fail per 2026-05-08 silent-zero antipattern fix.

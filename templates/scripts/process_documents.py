@@ -241,20 +241,42 @@ def store_document_chunks(
     chunks: List[Dict],
     source_id: str
 ) -> bool:
-    """Store document chunks in Weaviate, replacing old versions"""
+    """Store document chunks in Weaviate, replacing old versions.
+
+    v0.2.46 V46-D: cursor-paginates the delete-then-replace scan so
+    large multi-chunk documents (> 1000 chunks) no longer leave stale
+    chunks behind after re-ingest.
+    """
     try:
         collection = server.client.collections.get(DOCUMENT_CHUNKS_COLLECTION)
 
-        # Delete old chunks for this document
-        existing = collection.query.fetch_objects(
-            filters=Filter.by_property("source_id").equal(source_id),
-            limit=1000
-        )
-
+        # Delete old chunks for this document — enumerate ALL of them.
+        source_filter = Filter.by_property("source_id").equal(source_id)
         deleted_count = 0
-        for obj in existing.objects:
-            collection.data.delete_by_id(obj.uuid)
-            deleted_count += 1
+        PAGE_SIZE = 1000
+        cursor = None
+        while True:
+            if cursor is not None:
+                page = collection.query.fetch_objects(
+                    filters=source_filter, limit=PAGE_SIZE, after=cursor
+                )
+            else:
+                page = collection.query.fetch_objects(
+                    filters=source_filter, limit=PAGE_SIZE
+                )
+            if not page.objects:
+                break
+            for obj in page.objects:
+                collection.data.delete_by_id(obj.uuid)
+                deleted_count += 1
+            # If we got a partial page, no more results.
+            if len(page.objects) < PAGE_SIZE:
+                break
+            # We just deleted the previous page from the same collection,
+            # so subsequent fetches naturally re-page from the top —
+            # using cursor=None keeps things correct because deleted rows
+            # disappear from the result set entirely.
+            cursor = None
 
         if deleted_count > 0:
             print(f"  🗑️  Deleted {deleted_count} old chunks")

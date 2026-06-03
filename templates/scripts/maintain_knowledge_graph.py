@@ -129,18 +129,44 @@ def get_all_knowledge_files() -> Dict[str, Path]:
     return files
 
 
+def _fetch_all_objects_paginated(collection, page_size: int = 1000):
+    """Fetch every object in a Weaviate v4 collection via cursor pagination.
+
+    v0.2.46 V46-D: fixes silent-truncation footgun. Previously
+    `fetch_objects(limit=1000)` silently dropped nodes 1001+ when the
+    collection grew, which broke orphan-detection and rebuild logic.
+    """
+    all_objects = []
+    cursor = None
+    while True:
+        if cursor is not None:
+            response = collection.query.fetch_objects(limit=page_size, after=cursor)
+        else:
+            response = collection.query.fetch_objects(limit=page_size)
+        if not response.objects:
+            break
+        all_objects.extend(response.objects)
+        if len(response.objects) < page_size:
+            break
+        cursor = response.objects[-1].uuid
+    return all_objects
+
+
 def get_all_weaviate_nodes(server: WeaviateMCPServer) -> Dict[str, str]:
     """
     Get all nodes from Weaviate
 
     Returns dict: {title: file_path}
+
+    v0.2.46 V46-D: uses cursor pagination so collections > 1000 nodes
+    are fully enumerated (orphan-detection previously missed nodes 1001+).
     """
     try:
         collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
-        results = collection.query.fetch_objects(limit=1000)
+        objects = _fetch_all_objects_paginated(collection)
 
         nodes = {}
-        for obj in results.objects:
+        for obj in objects:
             title = obj.properties.get("title")
             file_path = obj.properties.get("file_path")
             if title and file_path:
@@ -375,13 +401,16 @@ def rebuild_all(server: WeaviateMCPServer):
     print()
 
     # Delete all nodes
+    # v0.2.46 V46-D: cursor-paginate so collections > 1000 nodes are
+    # fully drained (previously rebuild left nodes 1001+ undeleted,
+    # producing stale ghosts after resync).
     print("🗑️  Deleting all Weaviate nodes...")
     try:
         collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
-        results = collection.query.fetch_objects(limit=1000)
+        objects = _fetch_all_objects_paginated(collection)
 
         deleted_count = 0
-        for obj in results.objects:
+        for obj in objects:
             collection.data.delete_by_id(obj.uuid)
             deleted_count += 1
 
