@@ -6520,6 +6520,141 @@ pub fn inspect_project_leftovers(path: String) -> ProjectLeftovers {
 }
 
 // ---------------------------------------------------------------------------
+// v0.2.46 V47-G-final: third-party detection signals for Add-Project wizard
+// ---------------------------------------------------------------------------
+//
+// Mirrors the Python `_detect_third_party_project` heuristic in install.py.
+// Used by the launcher GUI to decide whether to show the adopt-project modal
+// when the user clicks "Add Project" and picks a directory that contains
+// existing-project signals (CLAUDE.md, .env, .venv/, .claude/, knowledge/).
+//
+// Rust-side scan is intentionally CHEAP (no rglob, no recursive walks except
+// for knowledge/) — the modal only needs to show whether to prompt the user,
+// not run the full V47-G-final detail enumeration. When the user clicks
+// Adopt, install.py runs and does the canonical detection again with its
+// own logic. This command is purely a UI gate.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThirdPartyDetection {
+    /// True iff any signal triggered + .vco-manifest.json is NOT present
+    /// (existing VCO projects never count as third-party).
+    pub has_signals: bool,
+    /// True iff the install path contains a .vco-manifest.json — short-
+    /// circuits has_signals to false. Surfaced separately so the launcher
+    /// can show a distinct "this is a VCO project, use Update instead"
+    /// hint when needed.
+    pub manifest_present: bool,
+    /// One-line label per detected signal (display-ready).
+    pub signals: Vec<String>,
+    /// Short summary like "4 signals detected".
+    pub summary: String,
+}
+
+#[command]
+pub fn detect_third_party_project_signals(install_path: String) -> ThirdPartyDetection {
+    let root = PathBuf::from(&install_path);
+    let mut out = ThirdPartyDetection {
+        has_signals: false,
+        manifest_present: false,
+        signals: Vec::new(),
+        summary: String::from("no signals"),
+    };
+
+    if !root.is_dir() {
+        return out;
+    }
+
+    // Manifest short-circuit: existing VCO project — never prompt.
+    let manifest = root.join(".claude").join(".vco-manifest.json");
+    if manifest.is_file() {
+        out.manifest_present = true;
+        out.summary = "vco-manifest present (existing VCO project)".into();
+        return out;
+    }
+
+    // Signal 1: .claude/ with content.
+    let claude_dir = root.join(".claude");
+    if claude_dir.is_dir() {
+        let entry_count = std::fs::read_dir(&claude_dir)
+            .map(|rd| rd.flatten().count())
+            .unwrap_or(0);
+        if entry_count > 0 {
+            out.signals.push(format!(
+                ".claude/ (existing orchestrator artifacts, {entry_count} entries)"
+            ));
+        }
+    }
+
+    // Signal 2: non-empty CLAUDE.md.
+    let claude_md = root.join("CLAUDE.md");
+    if claude_md.is_file() {
+        let size = std::fs::metadata(&claude_md).map(|m| m.len()).unwrap_or(0);
+        if size > 0 {
+            out.signals.push(format!("CLAUDE.md (existing project instructions, {size} bytes)"));
+        }
+    }
+
+    // Signal 3: .env with content.
+    let env_path = root.join(".env");
+    if env_path.is_file() {
+        let size = std::fs::metadata(&env_path).map(|m| m.len()).unwrap_or(0);
+        if size > 0 {
+            // We don't run the secrets heuristic in Rust — install.py does the
+            // canonical scan. Just flag presence.
+            out.signals.push(format!(".env (with content, {size} bytes)"));
+        }
+    }
+
+    // Signal 4: venv-like directory (.venv / venv / env) with pyvenv.cfg.
+    for name in [".venv", "venv", "env"] {
+        let candidate = root.join(name);
+        if candidate.is_dir() && candidate.join("pyvenv.cfg").is_file() {
+            out.signals.push(format!("{name}/ (Python virtualenv)"));
+            break;
+        }
+    }
+
+    // Signal 5: knowledge/ with at least one .md file (shallow scan).
+    let knowledge_dir = root.join("knowledge");
+    if knowledge_dir.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(&knowledge_dir) {
+            // Shallow first — if there are direct .md files we're done.
+            let mut found = false;
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|x| x == "md") {
+                    found = true;
+                    break;
+                }
+                // Single-level subdir scan: knowledge/concepts/*.md etc.
+                if p.is_dir() {
+                    if let Ok(sub_rd) = std::fs::read_dir(&p) {
+                        if sub_rd.flatten().any(|e| {
+                            e.path().extension().is_some_and(|x| x == "md")
+                        }) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if found {
+                out.signals.push("knowledge/ (with markdown files)".into());
+            }
+        }
+    }
+
+    out.has_signals = !out.signals.is_empty();
+    out.summary = if out.has_signals {
+        let n = out.signals.len();
+        format!("{n} signal{} detected", if n == 1 { "" } else { "s" })
+    } else {
+        "no signals".into()
+    };
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Bug 22: optional GitHub PAT for future auto-update flows that pull
 // upstream commits into the bundled source. The PAT is NOT required for
 // initial install (Bug 17) or per-project update (Bug 21) — those are

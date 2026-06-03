@@ -1818,6 +1818,11 @@ pub fn run() {
             commands::secrets_cmd::list_grants_for_project,
             commands::secrets_cmd::pause_secret_for_project,
             commands::secrets_cmd::resume_secret_for_project,
+            // v0.2.46 V47-C followup (landed with V47-G-final): stub Tauri
+            // wrapper for the per-project SecretsTab's "Migrate from .env"
+            // button. Returns an "unavailable" error today; full Rust
+            // wrapper queued for v0.2.47.
+            commands::secrets_cmd::migrate_env_secrets_from_dotenv,
             // 0.2.x backlog #3: shared-tab key-collision shadow badge.
             commands::secrets_cmd::list_user_secret_keys_v2,
             // Bug H (v0.2.8 / Phase 5): register secrets by KEY only.
@@ -1980,6 +1985,7 @@ pub fn run() {
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
             commands::installer::inspect_project_leftovers,
+            commands::installer::detect_third_party_project_signals,
             commands::installer::update_orchestrator_at,
             // GitHub PAT lifecycle. `register_github_pat` is wired in the
             // OnboardingWizard (Bug 22) for first-run capture, AND in the
