@@ -126,6 +126,13 @@ class TestVenvTriage(unittest.TestCase):
 
     def test_recreate_when_python_version_mismatch(self):
         # Make a fake .venv whose python prints a wrong version.
+        # v0.2.46 V47-D: ALSO write a .vco-manifest.json so the new
+        # adopt-guard recognises this as a VCO-managed venv (and so
+        # the destructive "recreate" path is allowed). Without the
+        # manifest the triage would correctly downgrade to
+        # "skip-no-manifest" — see test_v0246_v47d_venv_adopt_guard.py
+        # for the new behaviour. This Wave-1 test continues to pin
+        # the canonical "VCO-owned venv + Python drift → recreate" path.
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / ".venv" / "bin").mkdir(parents=True)
@@ -136,6 +143,11 @@ class TestVenvTriage(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_py.chmod(0o755)
+            # v0.2.46 V47-D: signal VCO-ownership via manifest.
+            (root / ".claude").mkdir(parents=True, exist_ok=True)
+            (root / ".claude" / ".vco-manifest.json").write_text(
+                '{"version": "0.2.46", "files": []}', encoding="utf-8",
+            )
             triage = install._venv_triage(root)
             self.assertEqual(triage["action"], "recreate")
             self.assertIn("Python version mismatch", triage["reason"])
