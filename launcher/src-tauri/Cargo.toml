@@ -171,7 +171,13 @@ globset = "0.4"
 notify = "8"
 
 # System info (RAM, CPU). MIT-licensed, lightweight. Used by detect_system.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# v0.2.46: pinned to "0.38" — the entire sysinfo 0.39.x line requires rustc
+# 1.95+, which breaks contributors / CI runners still on 1.94. API surface
+# we use (System::new, refresh_memory, total_memory) is stable across 0.38
+# and 0.39. Forward-compatible: when the project's rustc floor moves to
+# 1.95, bump back to "0.39" or latest. Must match pin in
+# vct-launcher-core/Cargo.toml.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 # v0.2.17 (hotfix): path canonicalization that avoids `\\?\` UNC
 # prefixes on Windows. `std::fs::canonicalize` on Windows always
