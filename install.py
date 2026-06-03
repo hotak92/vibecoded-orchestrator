@@ -2139,11 +2139,26 @@ def _ensure_running_under_mcp_venv() -> None:
     # Re-entry guard: avoid exec loops if the relaunch points back at us
     if os.environ.get("VCT_INSTALL_RELAUNCHED") == "1":
         return
+    # v0.2.46 Part-1.5 H1: when any soft-fail path below short-circuits the
+    # relaunch (no MCP venv resolvable, target non-existent, etc.), print a
+    # breadcrumb so step 7d's eventual ModuleNotFoundError on `import weaviate`
+    # points the user at the venv-resolution cause rather than appearing as
+    # an unrelated traceback. Audit finding 2026-06-03 (venv-architecture).
+    def _warn_silent_fallback(reason: str) -> None:
+        print(
+            "[v0.2.45 V45-A] could not relaunch under MCP venv "
+            f"({reason}) — proceeding with system Python; "
+            "step 7d (_migrate_kg_named_vector_slots) may fail with "
+            "ModuleNotFoundError: weaviate."
+        )
+        sys.stdout.flush()
     try:
         target = _resolve_venv_python_for_install(PROJECT_ROOT)
-    except Exception:
+    except Exception as _resolve_exc:
+        _warn_silent_fallback(f"_resolve_venv_python_for_install raised: {_resolve_exc}")
         return
     if not target:
+        _warn_silent_fallback("_resolve_venv_python_for_install returned None")
         return
     # Compare resolved interpreter against sys.executable; skip if same
     try:
@@ -2154,6 +2169,7 @@ def _ensure_running_under_mcp_venv() -> None:
         if str(target) == sys.executable:
             return
     if not Path(target).is_file():
+        _warn_silent_fallback(f"resolved interpreter does not exist: {target}")
         return
     env = os.environ.copy()
     env["VCT_INSTALL_RELAUNCHED"] = "1"
@@ -2163,6 +2179,15 @@ def _ensure_running_under_mcp_venv() -> None:
 
 
 def main() -> int:
+    # v0.2.46 Part-1.5 H3: DO NOT call _log_install_event or any code that
+    # buffers state into module-level variables BEFORE this line. When
+    # _ensure_running_under_mcp_venv() execve's into the MCP venv, the new
+    # process re-imports install.py from scratch — any module-level state
+    # accumulated in the pre-relaunch process (incl. _PENDING_EVENTS) is
+    # lost. Today the discipline is naturally preserved because nothing
+    # logs before main() runs; this comment exists to keep that invariant
+    # explicit when future refactors are tempted to log earlier.
+    # Audit finding 2026-06-03 (venv-runtime-adversarial S5).
     _ensure_running_under_mcp_venv()
     # 2026-04-29 fix (wizard install-path lockdown): defensive
     # source-repo check — install.py operates on PROJECT_ROOT which is
@@ -6397,6 +6422,26 @@ def _create_venv(project_root: Path) -> Path:
 # Step 5: Install dependencies
 # ---------------------------------------------------------------------------
 
+def _pip_subprocess_env() -> dict[str, str]:
+    """v0.2.46 Part-1.5 H2: env for pip subprocess calls with PYTHONPATH scrubbed.
+
+    The user's shell PYTHONPATH leaks into venv pip subprocesses by default
+    (subprocess.run inherits os.environ unless told otherwise). With a non-empty
+    PYTHONPATH, pip resolves imports against sibling-project paths during the
+    install, occasionally shadowing the freshly-installed venv packages. This
+    is rare in practice but unboundedly weird when it bites.
+
+    Empty-string PYTHONPATH is preserved (vs deletion) so any child of the pip
+    subprocess that probes PYTHONPATH sees a defined-but-empty value rather
+    than inherited-from-parent semantics.
+
+    Audit finding 2026-06-03 (venv-runtime-adversarial S6).
+    """
+    env = os.environ.copy()
+    env["PYTHONPATH"] = ""
+    return env
+
+
 def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     label = "with dev extras" if dev else "production"
     print(f"[4/10] Installing dependencies ({label}) ... ", flush=True)
@@ -6410,6 +6455,7 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     pip_up = subprocess.run(
         [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
         capture_output=True, text=True,
+        env=_pip_subprocess_env(),
     )
     if pip_up.returncode != 0:
         print("  FAIL (pip upgrade)")
@@ -6445,7 +6491,8 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
             cmd = [str(venv_python), "-m", "pip", "install",
                    "-r", str(req_file), "-r", str(req_dev)]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            env=_pip_subprocess_env())
     if result.returncode != 0:
         print("  FAIL")
         # Show last 30 lines of error
@@ -6486,6 +6533,7 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         [str(venv_python), "-m", "pip", "install", "-e", "."],
         cwd=str(PROJECT_ROOT),
         capture_output=True, text=True,
+        env=_pip_subprocess_env(),
     )
     if editable_result.returncode != 0:
         print("FAIL")
@@ -6534,6 +6582,7 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
          str(PROJECT_ROOT / "claude_mcp_servers")],
         cwd=str(PROJECT_ROOT),
         capture_output=True, text=True,
+        env=_pip_subprocess_env(),
     )
     if mcp_editable_result.returncode != 0:
         print("FAIL")
