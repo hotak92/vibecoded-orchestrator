@@ -305,7 +305,127 @@ class TestMultiCollection:
 
 
 # ----------------------------------------------------------------------
-# 7. No query_emb -> cos_qn / cos_ql skipped, cos_nl still computed.
+# 7. Code* collections pre-skipped (v0.2.47 RL-6b-2 audit FAIL Item 7).
+# ----------------------------------------------------------------------
+
+
+class TestCodeCollectionsSkipped:
+    """Code* schemas have no `source_node_id` / `links` and `_format_obj`
+    defaults their `title` to "Untitled" — every enrichment fetch_objects
+    would error against them. Skip pre-emptively by collection-name prefix.
+    """
+
+    def test_codefunction_collection_skipped(self) -> None:
+        nodes = [
+            {
+                "title": "Untitled",
+                "collection": "CodeFunction",
+                "emb": [1.0, 0.0],
+            }
+        ]
+        _rl_enrich_nodes_with_linked_embs(
+            nodes,
+            query_emb=[1.0, 0.0],
+            active_slot="qwen3_embed",
+            coll_resolver=lambda name: (_ for _ in ()).throw(
+                AssertionError(f"should not fetch for Code* collection: {name}")
+            ),
+        )
+        assert "linked_embs" not in nodes[0]
+
+    def test_codeclass_collection_skipped(self) -> None:
+        nodes = [{"title": "Untitled", "collection": "CodeClass"}]
+        _rl_enrich_nodes_with_linked_embs(
+            nodes,
+            query_emb=None,
+            active_slot="qwen3_embed",
+            coll_resolver=lambda name: (_ for _ in ()).throw(
+                AssertionError(f"should not fetch for Code* collection: {name}")
+            ),
+        )
+        assert "linked_embs" not in nodes[0]
+
+    def test_kg_collection_still_enriched(self) -> None:
+        nodes = [
+            {
+                "title": "A",
+                "node_type": "concept",
+                "collection": "VCODev_KnowledgeGraph",
+                "emb": [1.0, 0.0],
+                "source_id": "uuid-a",
+                "chunk_number": 1,
+            }
+        ]
+        coll = _fake_coll([])  # empty result -> empty linked_embs
+        _rl_enrich_nodes_with_linked_embs(
+            nodes,
+            query_emb=None,
+            active_slot="qwen3_embed",
+            coll_resolver=_resolver_for({"VCODev_KnowledgeGraph": coll}),
+        )
+        assert nodes[0]["linked_embs"] == []
+
+
+# ----------------------------------------------------------------------
+# 8. `source_id` (the `_format_obj` output field) read primarily.
+# ----------------------------------------------------------------------
+
+
+class TestSourceIdFieldName:
+    """`_format_obj` renames the Weaviate property `source_node_id` to
+    `source_id` in its output dict. Both helpers read `source_id` primarily
+    so they work with the dicts the search path actually produces.
+    """
+
+    def test_source_id_used_when_present(self) -> None:
+        nodes = [
+            {
+                "title": "A",
+                "node_type": "concept",
+                "collection": "VCODev_KnowledgeGraph",
+                "emb": [0.5, 0.5],
+                "source_id": "uuid-a",  # `_format_obj` output field name
+                "chunk_number": 2,
+            }
+        ]
+        coll = _fake_coll([
+            _fake_obj(vec=[0.1, 0.1], source_node_id="uuid-a", chunk_num=1, title="A"),
+            _fake_obj(vec=[0.3, 0.3], source_node_id="uuid-a", chunk_num=3, title="A"),
+        ])
+        _rl_enrich_nodes_with_linked_embs(
+            nodes,
+            query_emb=[1.0, 0.0],
+            active_slot="qwen3_embed",
+            coll_resolver=_resolver_for({"VCODev_KnowledgeGraph": coll}),
+        )
+        assert nodes[0]["linked_embs"] == [[0.1, 0.1], [0.3, 0.3]]
+
+    def test_legacy_source_node_id_fallback_still_works(self) -> None:
+        """Helper still reads raw `source_node_id` when callers pass un-formatted dicts."""
+        nodes = [
+            {
+                "title": "A",
+                "node_type": "concept",
+                "collection": "VCODev_KnowledgeGraph",
+                "emb": [0.5, 0.5],
+                "source_node_id": "uuid-a",
+                "chunk_number": 1,
+            }
+        ]
+        coll = _fake_coll([
+            _fake_obj(vec=[0.9, 0.9], source_node_id="uuid-a", chunk_num=2, title="A"),
+        ])
+        _rl_enrich_nodes_with_linked_embs(
+            nodes,
+            query_emb=None,
+            active_slot="qwen3_embed",
+            coll_resolver=_resolver_for({"VCODev_KnowledgeGraph": coll}),
+        )
+        assert nodes[0]["linked_embs"] == [[0.9, 0.9]]
+
+
+# ----------------------------------------------------------------------
+# 9. No query_emb -> cos_qn / cos_ql skipped, cos_nl still computed.
 # ----------------------------------------------------------------------
 
 

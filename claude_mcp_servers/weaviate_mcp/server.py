@@ -2790,6 +2790,12 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
         "source_id": source_id,
         "chunk_number": chunk_number,
         "total_chunks": total_chunks,
+        # v0.2.47 RL-6b-2: surface KG wikilink titles so the RL enrichment
+        # helper can fetch linked-node embeddings. Code collections + diagrams
+        # don't have a `links` property → defaults to empty list. The KG
+        # schema's `links: text[]` is populated by sync_knowledge_graph from
+        # the markdown frontmatter / wikilink parse.
+        "links": obj.properties.get("links", []),
     }
 
 
@@ -3554,7 +3560,12 @@ def _rl_pack_linked_embs_for_node(
     node_type = node.get("node_type") or "concept"
 
     # Step 1: extra chunks of THIS node (same source_node_id, different chunk_num).
-    source_id = node.get("source_node_id") or node.get("title") or ""
+    # `_format_obj` exports this field as `source_id` (already resolved from
+    # `obj.properties.source_node_id` at format time, falling through to title
+    # when the property is absent). Read `source_id` first; fall back to the
+    # raw `source_node_id` property name for callers that pass un-formatted
+    # node dicts (none today, but keep the helper schema-agnostic).
+    source_id = node.get("source_id") or node.get("source_node_id") or node.get("title") or ""
     matched_chunk = node.get("chunk_number")
     if source_id:
         siblings = sibling_objs_by_source_id.get(source_id) or []
@@ -3690,11 +3701,27 @@ def _rl_enrich_nodes_with_linked_embs(
         return
 
     for collection_name, group_nodes in by_collection.items():
+        # Skip collections whose schema doesn't match the KG row shape this
+        # helper expects. The Code* family (CodeFunction / CodeClass / CodeAPI /
+        # CodeInteraction / CodeModule) has no `source_node_id`, no `links`,
+        # and (per `_format_obj`'s "Untitled" default) all rows would group
+        # under a single bogus source_id — every per-call enrichment would
+        # then crash inside fetch_objects (caught by the per-group try/except
+        # below but logging debug-level noise on every search). Pre-filtering
+        # here is cleaner. See KG node concepts/code-graph-schema for the
+        # canonical schema reference.
+        if collection_name.startswith("Code"):
+            continue
+
         # Collect identifiers we'll need from Weaviate.
+        # Read `source_id` (the `_format_obj` output field name; resolved at
+        # format time from `obj.properties.source_node_id` with title fallback)
+        # first; fall back to raw `source_node_id` for callers that pass
+        # un-formatted node dicts.
         source_ids: list[str] = []
         link_titles: list[str] = []
         for n in group_nodes:
-            sid = n.get("source_node_id") or n.get("title")
+            sid = n.get("source_id") or n.get("source_node_id") or n.get("title")
             if sid:
                 source_ids.append(str(sid))
             for raw in n.get("links") or []:
@@ -3935,10 +3962,21 @@ async def _rl_cache_and_rerank(
             #
             # v0.2.31 telemetry audit fix (Item 2.4 — was 7.4% missing):
             # propagate emb + cos_qn / cos_ql / cos_nl when the upstream
-            # search path enriched the candidate dict. cos_ql / cos_nl
-            # are typically absent (no label_embedding in scope at the
-            # MCP search-tool level — that lives in the offline trainer)
-            # and the writer's payload builder soft-omits None fields.
+            # search path enriched the candidate dict.
+            #
+            # v0.2.47 RL-6b-2 (2026-06-04): the search-path enrichment now
+            # ALSO attaches `n_emb` / `linked_embs` / `linked_type_names`
+            # to each node dict (see ``_rl_enrich_nodes_with_linked_embs``).
+            # This v2-shaped log_nodes builder DOES NOT propagate them yet
+            # — the JSONL writer's per-node record below stays at the v2
+            # field set. C6c will switch the write path from
+            # ``RLTelemetryWriter.log_retrieval`` to
+            # ``hub_writer.post_rl_event`` with a v3 payload that includes
+            # the new fields. Until then, enrichment is forward-prep:
+            # it lives on the dicts that flow into the RL container's
+            # ``/cache_nodes`` request (where the container-side rerank
+            # could optionally consume it), but does NOT flow into the
+            # JSONL telemetry corpus.
             log_nodes: list[dict] = []
             for idx, n in enumerate(all_nodes):
                 if not isinstance(n, dict):
@@ -4193,6 +4231,16 @@ async def _semantic_graph_search_body(
     raw_primary: list[tuple[object, str]] = []
     failed_collections_schema: list[str] = []
     successful_collections: list[str] = []
+    # v0.2.47 RL-6b-2: hoist query_vector / query_target to FUNCTION scope
+    # so they're defined even if `collections_to_search` is empty (in which
+    # case the for-loop body never runs and the post-collapse references
+    # at the RL enrich + _rl_cache_and_rerank sites would otherwise hit
+    # NameError). Pre-v0.2.47 this was latent — every reachable code path
+    # set `query_vector` inside the loop, but a fresh install with no
+    # configured KG collections would not. Initializing them here makes
+    # the no-op-collections-search path explicit and crash-free.
+    query_vector: list[float] | None = None
+    query_target: str = ""
     for coll_name in collections_to_search:
         handle = _coll_for(coll_name)
         if handle is None:
@@ -4203,8 +4251,10 @@ async def _semantic_graph_search_body(
         # into _rl_cache_and_rerank → log_retrieval. ``query_vector``
         # may be None on near_text path (Weaviate-vectoriser mode); in
         # that case we skip emb enrichment.
-        query_vector: list[float] | None = None
-        query_target: str = ""
+        # (Per-iteration re-init — the function-scope defaults above
+        # only apply when the loop never runs.)
+        query_vector = None
+        query_target = ""
         try:
             if EMBEDDING_SOURCE == "weaviate":
                 nt_kwargs = dict(query=query, limit=fetch_limit, return_metadata=["distance"])
@@ -4319,6 +4369,29 @@ async def _semantic_graph_search_body(
     # the same reason hybrid_search does (retrieval_rl.py keys on title; two
     # chunks of the same node would silently collide in `signed[title]`).
     all_formatted = _collapse_to_one_per_node(all_formatted, score_field="score")
+
+    # v0.2.47 RL-6b-2: enrich each node with `n_emb` / `linked_embs` /
+    # `linked_type_names` / `cos_qn` / `cos_ql` / `cos_nl` BEFORE the RL
+    # path sees the candidates. Same shape as the sibling hybrid_search
+    # wiring — one batched Weaviate fetch per collection (grouped by
+    # `collection` field on each node dict). Soft-fail throughout.
+    # NB: `query_vector` and `query_target` are leaked from the
+    # per-collection for-loop above (Python's last-iteration binding,
+    # same convention as the existing `query_emb=query_vector` arg
+    # below). When the fan-out had zero successful collections both
+    # remain at their initial None / "" sentinels; the helper degrades
+    # to a no-op-with-empty-fields write.
+    try:
+        _rl_enrich_nodes_with_linked_embs(
+            all_formatted,
+            query_emb=query_vector,
+            active_slot=query_target,
+        )
+    except Exception as exc:
+        logger.debug(
+            "semantic_graph_search: RL enrich failed (%s); proceeding without linked_embs",
+            exc,
+        )
 
     # RL: rerank + cache using all over-fetched nodes; return top-k primary results.
     # v0.2.24: propagate partial-fan-out schema failures so telemetry
@@ -4775,10 +4848,18 @@ async def _hybrid_search_body(
     # body never had `query_vector` in scope. None on the Weaviate-vectoriser
     # path (no raw vectors returned); the writer handles None gracefully.
     query_vector: list[float] | None = None
+    # v0.2.47 RL-6b-2: ALSO capture the target named-vector slot so the
+    # v3 enrichment helper knows which slot to pull from each fetched
+    # object's `.vector` dict. The slot stays the same across every
+    # collection in this fan-out (it's the active embedding's slot —
+    # the per-collection schema decides whether to honor it, not which
+    # slot to read).
+    query_target: str = ""
     if EMBEDDING_SOURCE != "weaviate":
         try:
-            _vec, _ = await _get_search_vector(query)
+            _vec, _slot = await _get_search_vector(query)
             query_vector = _vec
+            query_target = _slot or ""
         except Exception as exc:
             # Best-effort capture — vector unavailable means downstream
             # log_retrieval omits the field, but search itself proceeds.
@@ -4897,6 +4978,23 @@ async def _hybrid_search_body(
     for r in all_results:
         if "score" not in r and "combined_score" in r:
             r["score"] = r["combined_score"]
+
+    # v0.2.47 RL-6b-2: enrich each node with `n_emb` / `linked_embs` /
+    # `linked_type_names` / `cos_qn` / `cos_ql` / `cos_nl` BEFORE the RL
+    # path sees the candidates. One batched Weaviate fetch per collection
+    # (grouped by `collection` field on each node dict). Soft-fail
+    # throughout: missing query_vector or Weaviate-unreachable leaves
+    # the nodes as-is and the v3 retrieval event ships with whatever
+    # was already attached by the search-time near_vector enrichment
+    # (typically `emb` + `cos_qn`).
+    try:
+        _rl_enrich_nodes_with_linked_embs(
+            all_results,
+            query_emb=query_vector,
+            active_slot=query_target,
+        )
+    except Exception as exc:
+        logger.debug("hybrid_search: RL enrich failed (%s); proceeding without linked_embs", exc)
 
     # RL: rerank + cache using all candidates; return top-k.
     # v0.2.24: propagate any per-collection schema failures from the
