@@ -200,8 +200,17 @@ class RLTelemetryWriter:
         task_type: str,
         citations: Dict[str, Optional[bool]],
         cosine_sims: Optional[Dict[str, float]] = None,
+        literal_cited: Optional[Dict[str, bool]] = None,
+        cross_encoder_cited: Optional[Dict[str, bool]] = None,
     ) -> None:
-        """Log a citation event to local JSONL + (if consented) upload queue."""
+        """Log a citation event to local JSONL + (if consented) upload queue.
+
+        v3 fields ``literal_cited`` and ``cross_encoder_cited`` are optional
+        per-node boost-flag dicts consumed by
+        ``vco_lib.rl_training_targets.compute_unified_targets``. ``cosine_sims``
+        stays RAW (no bonuses pre-applied) so the formula is replayable
+        offline if coefficients are retuned.
+        """
         if not _local_logging_disabled():
             try:
                 self._local.log_citations(
@@ -209,6 +218,8 @@ class RLTelemetryWriter:
                     task_type=task_type,
                     citations=citations,
                     cosine_sims=cosine_sims,
+                    literal_cited=literal_cited,
+                    cross_encoder_cited=cross_encoder_cited,
                 )
             except Exception as exc:
                 logger.debug("RLTelemetryWriter: local log_citations failed (%s)", exc)
@@ -219,6 +230,8 @@ class RLTelemetryWriter:
                 task_type=task_type,
                 citations=citations,
                 cosine_sims=cosine_sims,
+                literal_cited=literal_cited,
+                cross_encoder_cited=cross_encoder_cited,
             )
             _enqueue(self._etype_citations, payload)
 
@@ -258,6 +271,16 @@ class RLTelemetryWriter:
             }
             if n.get("emb"):
                 rec["emb"] = list(n["emb"])
+            # v3+: best-chunk vector (renamed from `emb` for v3 disambiguation)
+            if n.get("n_emb"):
+                rec["n_emb"] = list(n["n_emb"])
+            # v3+: MAX_LINKED packed linked-slot embeddings
+            if n.get("linked_embs"):
+                rec["linked_embs"] = [list(e) for e in n["linked_embs"] if e]
+            if n.get("linked_type_names"):
+                rec["linked_type_names"] = [str(t) for t in n["linked_type_names"]]
+            if n.get("node_type"):
+                rec["node_type"] = str(n["node_type"])
             for field in ("cos_qn", "cos_ql", "cos_nl"):
                 val = n.get(field)
                 if val is not None:
@@ -294,6 +317,8 @@ class RLTelemetryWriter:
         task_type: str,
         citations: Dict[str, Optional[bool]],
         cosine_sims: Optional[Dict[str, float]],
+        literal_cited: Optional[Dict[str, bool]] = None,
+        cross_encoder_cited: Optional[Dict[str, bool]] = None,
     ) -> Dict[str, Any]:
         """Build the queue-bound payload for a citation event.
 
@@ -303,6 +328,11 @@ class RLTelemetryWriter:
         Lets the offline RL pipeline anchor the citation event by its
         own embedding triple if the paired retrieval event was dropped
         at training_loader steps 4/6.
+
+        v3 (v0.2.47): adds ``literal_cited`` + ``cross_encoder_cited``
+        per-node boost-flag dicts. Stored as separate fields (NOT baked
+        into ``cosine_sims``) so historical events stay replayable when
+        the bonus coefficients are retuned.
         """
         payload: Dict[str, Any] = {
             "schema_version": RLDataLogger.SCHEMA_VERSION,
@@ -319,4 +349,10 @@ class RLTelemetryWriter:
         }
         if cosine_sims:
             payload["cosine_sims"] = {t: float(v) for t, v in cosine_sims.items()}
+        if literal_cited:
+            payload["literal_cited"] = {t: bool(v) for t, v in literal_cited.items()}
+        if cross_encoder_cited:
+            payload["cross_encoder_cited"] = {
+                t: bool(v) for t, v in cross_encoder_cited.items()
+            }
         return payload

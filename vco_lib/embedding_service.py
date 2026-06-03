@@ -167,6 +167,18 @@ DEFAULT_TEXT_SLOT = ("ollama_embed", 1024)
 DEFAULT_CODE_SLOT = ("ollama_code_embed", 768)
 
 
+def _memo_key(text: str) -> str:
+    """Cheap, collision-resistant fingerprint for the embed-memo cache.
+
+    24 hex chars of sha256 = 96 bits of entropy → collision probability
+    ~negligible up to ~10^14 distinct strings (well past the 512-entry
+    LRU cap). Cheaper than a full sha256 hexdigest and dict-key-friendly.
+    """
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
 def _resolve_text_slot(model_id: str) -> tuple[str, int]:
     """Map a model id to (slot_name, dim) using TEXT_SLOT_MAP."""
     lowered = model_id.lower()
@@ -832,6 +844,20 @@ class EmbeddingService:
         self._text_ready: bool | None = None
         self._code_ready: bool | None = None
 
+        # Per-instance embed-result memo cache (v0.2.47 RL-3).
+        # MCP-side RL telemetry calls ``embed_text`` for both the query
+        # (at retrieval time) and the answer chunks (at citation time);
+        # users often re-query the same string within a session. Without
+        # this memo, every call hits Ollama / OpenAI fresh — cold-path
+        # tax that dominates the citation-detection latency.
+        # Key = sha256(text)[:24] (cheap collision-resistant fingerprint).
+        # Cap = 512 entries (~4 MB at 1024-dim float32); evict oldest on
+        # overflow. Cache is per-EmbeddingService instance and intentionally
+        # process-local (no cross-process sharing).
+        self._embed_memo_text: dict[str, list[float]] = {}
+        self._embed_memo_code: dict[str, list[float]] = {}
+        self._embed_memo_cap: int = 512
+
     # ---- construction --------------------------------------------------
 
     @classmethod
@@ -1135,20 +1161,47 @@ class EmbeddingService:
     def embed_text(self, text: str) -> list[float]:
         """Embed one text via the active text backend.
 
+        v0.2.47 RL-3: memo'd per-instance via ``_embed_memo_text``
+        (cap 512). Returns the cached vector when the same text has
+        been embedded before in this process.
+
         Raises:
             RuntimeError: If the active backend is unreachable or
                 returns an error.
         """
-        return self._embed_text_via_active(text)
+        key = _memo_key(text)
+        cached = self._embed_memo_text.get(key)
+        if cached is not None:
+            return cached
+        vec = self._embed_text_via_active(text)
+        self._memo_put(self._embed_memo_text, key, vec)
+        return vec
 
     def embed_code(self, code: str) -> list[float]:
         """Embed one code snippet via the active code backend.
 
+        v0.2.47 RL-3: memo'd per-instance via ``_embed_memo_code``.
+
         Raises:
             RuntimeError: If the active backend is unreachable or
                 returns an error.
         """
-        return self._embed_code_via_active(code)
+        key = _memo_key(code)
+        cached = self._embed_memo_code.get(key)
+        if cached is not None:
+            return cached
+        vec = self._embed_code_via_active(code)
+        self._memo_put(self._embed_memo_code, key, vec)
+        return vec
+
+    def _memo_put(
+        self, memo: dict[str, list[float]], key: str, vec: list[float]
+    ) -> None:
+        """Insert into a memo dict, evicting the oldest entry when over cap."""
+        if len(memo) >= self._embed_memo_cap:
+            # dict iteration order = insertion order (PEP 468); pop oldest.
+            memo.pop(next(iter(memo)))
+        memo[key] = vec
 
     # ---- batched embed (preferred for re-indexing) --------------------
 

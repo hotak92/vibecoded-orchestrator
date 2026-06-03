@@ -110,7 +110,19 @@ class RLDataLogger:
     # every retrieval event, and schema_version on every citation event.
     # Legacy events must be converted by scripts/migrate_rl_log_v1_to_v2.py
     # before offline_trainer will accept them — there is no runtime fallback.
-    SCHEMA_VERSION: int = 2
+    #
+    # v3 (v0.2.47, 2026-06-04) aligns MCP-side and paid-module-side schemas.
+    # Citation events gain per-node `literal_cited` (title appears in ANSWER
+    # text via word-boundary regex) and `cross_encoder_cited` (Pro-tier
+    # cross-encoder verdict; absent on free / v0.2.9 deferral). Retrieval
+    # events gain per-node `n_emb` (best-chunk vector), `linked_embs`
+    # (MAX_LINKED packed: extra_chunks_of_same_node + actual_linked_nodes),
+    # and `linked_type_names`. These let online + offline training share
+    # the SAME `_rl_model.update(...)` inputs byte-identically (per the
+    # unified-target formula in vco_lib.rl_training_targets). Pre-v3
+    # readers ignore unknown fields; v3 readers default missing fields to
+    # all-False / empty (lossless vs pre-v3 behavior).
+    SCHEMA_VERSION: int = 3
 
     def __init__(
         self,
@@ -199,8 +211,29 @@ class RLDataLogger:
                 "score": round(float(n.get("score", 0.0)), 4),
                 "tier": str(n.get("tier", "top_k")),
             }
+            # `emb` is the legacy whole-node embedding from Weaviate.
+            # `n_emb` (v3+) is the SAME field semantically — best-chunk vector
+            # for the matched chunk — but the v3 callers pass it under the
+            # new name so the offline trainer can disambiguate v2 vs v3
+            # payloads. Persist both shapes when present.
             if n.get("emb"):
                 rec["emb"] = _round_emb(n["emb"])
+            if n.get("n_emb"):
+                rec["n_emb"] = _round_emb(n["n_emb"])
+            # v3+: per-node packed linked-slot embeddings (MAX_LINKED total,
+            # extra_chunks_of_this_node first then actual_linked_nodes).
+            # Stored already in the order _rl_model.update() consumes; offline
+            # replay does NO re-packing.
+            if n.get("linked_embs"):
+                rec["linked_embs"] = [
+                    _round_emb(e) for e in n["linked_embs"] if e
+                ]
+            if n.get("linked_type_names"):
+                rec["linked_type_names"] = [
+                    str(t) for t in n["linked_type_names"]
+                ]
+            if n.get("node_type"):
+                rec["node_type"] = str(n["node_type"])
             # Log cosine features when available (used by offline trainer;
             # cos_ql=0.5 is valid for nodes with no links, but should NOT be
             # logged here if it's a fallback for "value not computed")
@@ -244,20 +277,33 @@ class RLDataLogger:
         task_type: str,
         citations: "dict[str, bool | None]",
         cosine_sims: "dict[str, float] | None" = None,
+        literal_cited: "dict[str, bool] | None" = None,
+        cross_encoder_cited: "dict[str, bool] | None" = None,
     ) -> None:
         """
         Log citation feedback: which nodes were actually used by the agent.
 
         Args:
-            task_id:     Task identifier (matches the retrieval event).
-            task_type:   Agent task category.
-            citations:   Mapping of node title → cited flag.
-                         ``True`` = cited, ``False`` = not cited,
-                         ``None`` = inconclusive (cross-encoder call failed).
-            cosine_sims: Optional mapping of node title → cosine similarity
-                         (cos(node_emb, agent_output_emb)).  When stored, the
-                         offline trainer can reconstruct the same analog
-                         advantage rewards without the original agent output.
+            task_id:             Task identifier (matches the retrieval event).
+            task_type:           Agent task category.
+            citations:           Mapping of node title → cited flag.
+                                 ``True`` = cited, ``False`` = not cited,
+                                 ``None`` = inconclusive (cross-encoder call failed).
+            cosine_sims:         Optional mapping of node title → RAW cosine
+                                 similarity (cos(node_emb, agent_output_emb)).
+                                 RAW values, NO bonuses pre-applied — offline
+                                 trainer reapplies them via
+                                 ``vco_lib.rl_training_targets.compute_unified_targets``.
+            literal_cited:       v3+. Per-node bool — True iff the node's
+                                 title/slug/wikilink/file_path appears as a
+                                 word-boundary match in the ANSWER text. Used
+                                 as a boost-flag input to the unified target
+                                 formula. Absent for pre-v3 events; readers
+                                 default missing entries to False.
+            cross_encoder_cited: v3+. Per-node bool — Pro-tier cross-encoder
+                                 verdict. Absent in v0.2.9 (cross-encoder
+                                 wiring on MCP side is deferred); readers
+                                 default missing entries to False.
         """
         # v0.2.40 F3: stamp the embedding triple
         # (embedding_source, embedding_dim, embedding_model) on every
@@ -285,6 +331,14 @@ class RLDataLogger:
         if cosine_sims:
             record["cosine_sims"] = {
                 t: round(float(v), 4) for t, v in cosine_sims.items()
+            }
+        if literal_cited:
+            record["literal_cited"] = {
+                t: bool(v) for t, v in literal_cited.items()
+            }
+        if cross_encoder_cited:
+            record["cross_encoder_cited"] = {
+                t: bool(v) for t, v in cross_encoder_cited.items()
             }
 
         self._append(record)
