@@ -237,6 +237,7 @@ async fn run_install_inner(
                 fallback.as_deref(),
                 &manifest.id,
                 l0_pull_token_endpoint,
+                Some(db),
             )
             .await?;
 
@@ -447,7 +448,56 @@ async fn container_pull(
     fallback_tag: Option<&str>,
     module_id: &str,
     l0_pull_token_endpoint: Option<&str>,
+    // v0.2.46 V46-E (C3): optional Db handle for audit-log emission.
+    // `Option<&Db>` rather than `&Db` so test callers (and any future
+    // caller path that doesn't have a Db handle plumbed in) can pass
+    // `None`. Auditing is best-effort: a None db handle silently
+    // disables audit emission; a failing `db.audit` call eprintlns and
+    // continues. The install MUST NOT be blocked by audit failures.
+    db: Option<&crate::db::Db>,
 ) -> Result<String, String> {
+    // ─── Step 0 (v0.2.46 V46-E C3): resolve endpoint + emit pre-request
+    // audit BEFORE the gateway POST. Resolves endpoint + license-key
+    // prefix from the same sources `request_pull_token` will consult.
+    // Best-effort auditing: any DB write failure is logged and dropped —
+    // the install proceeds either way.
+    //
+    // We compute `endpoint_for_audit` unconditionally (cheap; reused for
+    // the success-path audit too) and only do the keychain read +
+    // audit-row write when `db` is Some.
+    let endpoint_for_audit: String = {
+        let env_override = std::env::var("VCT_RL_PULL_TOKEN_ENDPOINT")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        match env_override {
+            Some(e) => e,
+            None => {
+                let raw = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
+                resolve_pull_token_endpoint(raw).to_string()
+            }
+        }
+    };
+    if db.is_some() {
+        // Read the license-key prefix for the audit detail. We use the
+        // SAME keychain accessor as `request_pull_token` so the prefix
+        // we audit reflects the key actually used for the POST. On Err
+        // (no license activated / keychain failure) we audit with a
+        // sentinel prefix so the audit row still exists — the failure
+        // mode is then visible in the `pull_token_failed` row.
+        let license_key_for_audit = crate::commands::licensing::read_license_key_from_keychain()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "<unavailable>".to_string());
+        audit_pull_token_requested(
+            db,
+            module_id,
+            &endpoint_for_audit,
+            &license_key_for_audit,
+            tag,
+        );
+    }
+
     // ─── Step 1: try to obtain a pull token from the signed-URL gateway ─
     //
     // v0.2.35 (Phase 3A): `request_pull_token` is now the canonical
@@ -469,13 +519,113 @@ async fn container_pull(
     // carries the actual cause (license_invalid / tier_insufficient /
     // network / etc.) so the user sees an actionable error instead of
     // the old "Phase 3A gateway not deployed" footer.
-    let (token, token_username, token_request_err): (Option<String>, Option<String>, Option<String>) = match request_pull_token(container, l0_pull_token_endpoint).await {
+    //
+    // v0.2.46 V46-E (C1/C4): inspect the server-returned `tag` field
+    // (added in this release). If the server returns a tag that
+    // diverges from the client-resolved tag:
+    //   - patch-only difference (same major.minor) → honor server's tag
+    //     (server is SoT for what's pullable); log WARN.
+    //   - major or minor difference → hard-fail with a publisher-pointing
+    //     error message. This indicates server-side catalog drift; the
+    //     orchestrator team can't fix it and routing the failure to the
+    //     publisher prevents wasted support cycles.
+    //   - no `tag` field (pre-v0.2.46 server) → behave as before.
+    //
+    // The decision is captured in `effective_tag` below; that's the
+    // string fed into `decide_variant_to_pull` and `podman pull`.
+    let (token, token_username, token_request_err, effective_tag): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = match request_pull_token(container, l0_pull_token_endpoint).await {
         Ok(tok) => {
             eprintln!(
                 "[installer_engine] container_pull[{}]: obtained pull token (expires_in={}s)",
                 module_id, tok.expires_in_s
             );
-            (Some(tok.pull_token), tok.username, None)
+            // v0.2.46 V46-E C1/C4: tag-mismatch detection & resolution.
+            let server_tag_opt = tok
+                .tag
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let (resolved_tag, class) = match server_tag_opt {
+                Some(server_tag) => {
+                    let class = classify_tag_mismatch(tag, server_tag);
+                    match class {
+                        VersionMismatchClass::Same => (tag.to_string(), class),
+                        VersionMismatchClass::PatchOnly => {
+                            // Honor the server's tag — server is the
+                            // authoritative SoT for what's actually pullable.
+                            //
+                            // v0.2.46 V46-E (C1 follow-up): preserve the
+                            // variant suffix from the client tag. The
+                            // registry only carries variant-suffixed tags
+                            // (e.g. `0.2.5-cuda`, `0.2.5-cpu`), never bare
+                            // `0.2.5`. If the server returns a bare tag,
+                            // we re-append the client's GPU-dispatched
+                            // suffix so the upcoming `podman pull` finds
+                            // the right manifest. If the server already
+                            // included a suffix, we trust it as-is.
+                            let merged = merge_server_tag_with_client_variant(server_tag, tag);
+                            eprintln!(
+                                "[installer_engine] container_pull[{}]: tag mismatch (PATCH): \
+                                 client resolved {:?}, server returned {:?}, \
+                                 effective (with variant) {:?}. \
+                                 Honoring server tag (server is SoT for pullability).",
+                                module_id, tag, server_tag, merged
+                            );
+                            (merged, class)
+                        }
+                        VersionMismatchClass::MinorOrMajor => {
+                            // Audit BEFORE returning Err so the audit row
+                            // records the mismatch even on hard-fail. The
+                            // effective_tag is the would-be-merged value
+                            // we never actually pull — recording it makes
+                            // it obvious to forensic readers what would
+                            // have been pulled if we hadn't hard-failed.
+                            let effective_for_audit =
+                                merge_server_tag_with_client_variant(server_tag, tag);
+                            audit_pull_token_resolved(
+                                db,
+                                module_id,
+                                &endpoint_for_audit,
+                                Some(server_tag),
+                                tag,
+                                &effective_for_audit,
+                                tok.username.as_deref(),
+                                tok.expires_in_s,
+                                &class,
+                            );
+                            let endpoint_for_msg = l0_pull_token_endpoint
+                                .unwrap_or(&container.pull_token_endpoint);
+                            return Err(format!(
+                                "pull-token gateway returned tag {:?} but the launcher's \
+                                 L0-resolved version is {:?}. This is server-side catalog \
+                                 drift — the module publisher needs to update the artifact \
+                                 gateway at {:?} to match the catalog (a major or minor \
+                                 version is mismatched, which can't be auto-honored safely). \
+                                 Please contact the module publisher to resolve.",
+                                server_tag, tag, endpoint_for_msg
+                            ));
+                        }
+                    }
+                }
+                None => (tag.to_string(), VersionMismatchClass::Same),
+            };
+            audit_pull_token_resolved(
+                db,
+                module_id,
+                &endpoint_for_audit,
+                server_tag_opt,
+                tag,
+                &resolved_tag,
+                tok.username.as_deref(),
+                tok.expires_in_s,
+                &class,
+            );
+            (Some(tok.pull_token), tok.username, None, resolved_tag)
         }
         Err(e) => {
             eprintln!(
@@ -483,40 +633,65 @@ async fn container_pull(
                  Falling back to anonymous pull — will succeed only if the image is public.",
                 module_id, e
             );
-            (None, None, Some(e))
+            audit_pull_token_failed(db, module_id, &e);
+            (None, None, Some(e), tag.to_string())
         }
     };
 
     // ─── Step 2: pick container runtime (podman preferred, docker fallback) ─
     let runtime = detect_container_runtime().await?;
 
-    // ─── Step 3: login (if token), then probe + pull + logout ──────────
+    // ─── Step 3 (v0.2.46 V46-E C2): build a per-pull --authfile rather
+    // than running `podman login` / `podman logout` against the global
+    // auth state. Two reasons:
+    //   1. Concurrent paid-module pulls: if module A's `podman logout`
+    //      fires while module B's pull is in flight, B's session is
+    //      invalidated mid-pull. The previous code hit this whenever two
+    //      paid modules installed within the same minute.
+    //   2. Cleanup hygiene: the previous flow had to remember to call
+    //      `podman logout` on every error path (`?`-propagation +
+    //      explicit hard-fail branches). The per-pull authfile uses RAII
+    //      — `NamedTempFile` drops the file when `authfile_guard` goes
+    //      out of scope, even on panic.
+    //
+    // Pre-v0.2.46 (kept for reference, may be deleted in v0.2.47):
+    //     container_login(...)
+    //     podman pull <image>
+    //     podman logout <registry>   // even on error paths
+    //
+    // v0.2.46+:
+    //     let authfile = build_per_pull_authfile(...)
+    //     podman pull --authfile <path> <image>
+    //     // authfile drops, file deleted
     let registry = container
         .registry
         .clone()
         .unwrap_or_else(|| infer_registry_from_image(&container.image));
-    if let Some(t) = token.as_deref() {
-        // v0.2.36: server returns the GHCR username alongside the
-        // pull_token. For personal-account packages this MUST be the
-        // PAT owner's GitHub login (synthetic usernames get 403 from
-        // ghcr.io). Pre-v0.2.36 server response omitted this field —
-        // fall back to the historical `vct-paid-module` literal so
-        // mismatched-version client/server pairings still attempt
-        // a login (it'll fail with a clear error, not silently break).
+    // v0.2.36: server returns the GHCR username alongside the pull_token.
+    // For personal-account packages this MUST be the PAT owner's GitHub
+    // login (synthetic usernames get 403 from ghcr.io). Pre-v0.2.36 server
+    // response omitted this field — fall back to the historical
+    // `vct-paid-module` literal so mismatched-version client/server
+    // pairings still attempt auth (it'll fail with a clear error, not
+    // silently break).
+    let authfile_guard: Option<tempfile::NamedTempFile> = if let Some(t) = token.as_deref() {
         let login_username = token_username.as_deref().unwrap_or("vct-paid-module");
-        container_login(&runtime, &registry, login_username, t).await?;
-    }
+        Some(build_per_pull_authfile(&registry, login_username, t)?)
+    } else {
+        None
+    };
+    let authfile_path: Option<&Path> = authfile_guard.as_ref().map(|f| f.path());
 
     // ─── Step 3a (v0.2.35): probe primary tag, fall back to cpu if missing ─
     //
     // The probe is a `manifest inspect` call — it issues a HEAD-equivalent
     // request to the registry without downloading layers. Cheap, scoped
-    // to the same auth context as the upcoming pull, and lets us decide
-    // FROM the registry's authoritative answer whether the chosen
-    // variant exists. Pre-v0.2.35 the launcher fired the pull blind and
-    // surfaced a cryptic `denied` error on miss; now the user gets a
-    // structured fallback (or a clear "no variant available" hard-fail
-    // when even the CPU fallback is missing).
+    // to the same auth context as the upcoming pull (via --authfile),
+    // and lets us decide FROM the registry's authoritative answer whether
+    // the chosen variant exists. Pre-v0.2.35 the launcher fired the pull
+    // blind and surfaced a cryptic `denied` error on miss; now the user
+    // gets a structured fallback (or a clear "no variant available" hard-
+    // fail when even the CPU fallback is missing).
     //
     // The decision tree itself lives in `decide_variant_to_pull` — a
     // pure helper that takes a probe-closure and the candidate tags so
@@ -524,15 +699,27 @@ async fn container_pull(
     // primary-miss-fallback-hit / both-miss / probe-error-degrades) by
     // injecting a fake probe instead of needing a live registry.
     let runtime_for_probe = runtime.clone();
+    let authfile_path_for_probe: Option<std::path::PathBuf> =
+        authfile_path.map(|p| p.to_path_buf());
+    // v0.2.46 V46-E C1: use `effective_tag` rather than the input `tag`
+    // so a server-honored patch-level override flows through to both the
+    // registry probe AND the eventual `podman pull` invocation.
     let decision = decide_variant_to_pull(
         &container.image,
-        tag,
+        &effective_tag,
         fallback_tag,
         module_id,
         |probe_image, probe_tag| {
             let runtime = runtime_for_probe.clone();
+            let authfile_pb = authfile_path_for_probe.clone();
             async move {
-                probe_image_tag_exists(&probe_image, &probe_tag, &runtime).await
+                probe_image_tag_exists_with_authfile(
+                    &probe_image,
+                    &probe_tag,
+                    &runtime,
+                    authfile_pb.as_deref(),
+                )
+                .await
             }
         },
     )
@@ -542,17 +729,9 @@ async fn container_pull(
         Ok(t) => t,
         Err(decision_err) => {
             // Hard-fail the install BEFORE issuing the doomed pull.
-            // Always logout so we don't leak the token in the runtime's
-            // auth.json (mirrors the post-pull logout path).
-            if token.is_some() {
-                let _ = Command::new(&runtime)
-                    .silent()
-                    .args(["logout", &registry])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await;
-            }
+            // No explicit logout needed — `authfile_guard` will drop and
+            // delete the temp file when this function returns, with no
+            // global state to clean up.
             return Err(decision_err);
         }
     };
@@ -571,8 +750,18 @@ async fn container_pull(
     // `git clone` / `git pull` sites further down, where the same Stdio +
     // .status() pattern carries the same latent deadlock risk on
     // unexpectedly verbose repos.
-    let pull_status = Command::new(&runtime)
-        .silent()
+    //
+    // v0.2.46 V46-E (C2): `--authfile <tmp>` replaces the previous
+    // `podman login`/`podman logout` dance. The authfile contains a
+    // base64-encoded `username:token` for ONLY the target registry, so
+    // it can't bleed into other concurrent paid-module pulls.
+    // `silent()` takes self by value (consumes Command) — apply it
+    // FIRST, then mutate via &mut for the conditional --authfile flag.
+    let mut pull_cmd = Command::new(&runtime).silent();
+    if let Some(path) = authfile_path {
+        pull_cmd.arg("--authfile").arg(path);
+    }
+    let pull_status = pull_cmd
         .args(["pull", &image_ref])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -580,17 +769,8 @@ async fn container_pull(
         .await
         .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
 
-    // Always logout if we logged in (even on pull failure) so the token
-    // doesn't linger in the runtime's auth.json.
-    if token.is_some() {
-        let _ = Command::new(&runtime)
-            .silent()
-            .args(["logout", &registry])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
+    // No explicit logout — `authfile_guard` drops at end-of-scope, taking
+    // the temp file with it. No global auth.json mutation to undo.
 
     if !pull_status.success() {
         return Err(format!(
@@ -636,10 +816,13 @@ async fn container_pull(
 ///     "probe inconclusive" and degrade gracefully — NOT as "tag
 ///     missing", since false-negatives would prevent valid pulls.
 ///
-/// Auth context: the caller must have run `container_login` BEFORE
-/// invoking this for a private registry — `manifest inspect` honours
-/// the runtime's auth.json the same way `pull` does, so the same login
-/// token covers both calls.
+/// Auth context: the caller must pass an `--authfile` (or have credentials
+/// in the runtime's default auth.json) for private-registry probes —
+/// `manifest inspect` honours the runtime's auth.json the same way `pull`
+/// does. v0.2.46 V46-E (C2) switched the launcher from global
+/// `podman login` to per-pull `--authfile`; use
+/// `probe_image_tag_exists_with_authfile` to scope the credentials to
+/// this one call.
 ///
 /// Runtime support:
 ///   - Podman: `podman manifest inspect` is built-in (all supported
@@ -654,15 +837,49 @@ async fn container_pull(
 /// sequence costs 1 extra round-trip per install attempt. GHCR's
 /// unauthenticated rate limits are 60/hour/IP; the AUTHENTICATED rate is
 /// 5000/hour — and the launcher is always authenticated by the time the
-/// probe runs (Step 3 above runs after `container_login`). At one install
-/// per minute the probe contributes 60 inspects/hour, well under cap.
+/// probe runs (Step 3 above builds the per-pull --authfile BEFORE this
+/// helper runs). At one install per minute the probe contributes 60
+/// inspects/hour, well under cap.
+// Kept for backward-compat: integration tests under `#[cfg(test)]`
+// (the two `#[ignore]` probe tests against docker.io/library/hello-world)
+// reference this no-authfile variant. The non-test code path now goes
+// through `probe_image_tag_exists_with_authfile`.
+#[allow(dead_code)]
 pub(crate) async fn probe_image_tag_exists(
     image: &str,
     tag: &str,
     runtime: &str,
 ) -> Result<bool, String> {
+    probe_image_tag_exists_with_authfile(image, tag, runtime, None).await
+}
+
+/// v0.2.46 V46-E (C2): variant of `probe_image_tag_exists` that takes an
+/// optional `--authfile` path. The probe must use the same auth context
+/// as the upcoming `podman pull --authfile <file>`, otherwise the registry
+/// returns 401/403 on private repos even when the same launcher will
+/// successfully pull a few lines later.
+///
+/// Replaces the previous `podman login` + `podman logout` global-state
+/// dance with a per-pull authfile — avoids cross-module session collision
+/// when multiple paid modules pull concurrently.
+pub(crate) async fn probe_image_tag_exists_with_authfile(
+    image: &str,
+    tag: &str,
+    runtime: &str,
+    authfile: Option<&Path>,
+) -> Result<bool, String> {
     let image_ref = format!("{}:{}", image, tag);
-    let output = Command::new(runtime)
+    // `silent()` consumes the Command; apply it first, then mutate via
+    // &mut for the conditional --authfile flag.
+    let mut cmd = Command::new(runtime).silent();
+    if let Some(path) = authfile {
+        // `--authfile <path>` is supported by both podman (since the
+        // skopeo unification) and docker (since v23+). Passed BEFORE the
+        // subcommand so it's parsed as a global flag, mirroring how
+        // `podman pull --authfile` is invoked below.
+        cmd.arg("--authfile").arg(path);
+    }
+    let output = cmd
         .args(["manifest", "inspect", &image_ref])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -834,6 +1051,329 @@ struct PullTokenResponse {
     pub username: Option<String>,
     #[serde(default)]
     pub expires_in_s: u64,
+    /// v0.2.46 V46-E (C1): server-returned image tag. The server is the
+    /// canonical SoT for "what tag is actually pullable from the registry"
+    /// — the L0 catalog may advertise a newer version (e.g. v0.2.8) while
+    /// the gateway still serves an older tag (e.g. 0.1.0). When `Some` and
+    /// non-empty, the caller compares against the client-resolved tag and:
+    ///   - same value → no action.
+    ///   - patch-level difference → honor server's tag, log WARN.
+    ///   - major/minor difference → hard-fail with a publisher-pointing
+    ///     error so the failure routes to the right responsible party.
+    /// Optional so pre-v0.2.46 servers (which omit this field) still parse.
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+/// v0.2.46 V46-E (C2): build a temporary docker/podman `auth.json` file
+/// containing credentials for a single registry. Used in place of the
+/// previous global `podman login` + `podman logout` flow to avoid cross-
+/// module auth-session collision when multiple paid modules pull
+/// concurrently against the same registry (e.g. ghcr.io).
+///
+/// Auth.json shape (per containers/auth.json(5) and docker/cli reference):
+///   `{ "auths": { "<registry>": { "auth": "<base64(username:token)>" } } }`
+///
+/// The returned `NamedTempFile` auto-deletes on drop, so callers don't
+/// need explicit cleanup — even on early-return error paths, RAII tears
+/// the file down. The file is created with mode 0o600 on Unix (default
+/// for `NamedTempFile`); secret leakage via stat/world-read is not a
+/// concern on the launcher's local FS.
+///
+/// Returns a `NamedTempFile`. The path is accessed via `.path()` and
+/// passed to `--authfile`. The file MUST stay alive for the duration of
+/// the pull (callers should hold the handle in scope).
+pub(crate) fn build_per_pull_authfile(
+    registry: &str,
+    username: &str,
+    token: &str,
+) -> Result<tempfile::NamedTempFile, String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use std::io::Write as _;
+
+    let auth_b64 = B64.encode(format!("{}:{}", username, token));
+    let json = serde_json::json!({
+        "auths": {
+            registry: { "auth": auth_b64 }
+        }
+    });
+    let mut f = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("build_per_pull_authfile: create temp file: {}", e))?;
+    f.write_all(json.to_string().as_bytes())
+        .map_err(|e| format!("build_per_pull_authfile: write auth.json: {}", e))?;
+    // Flush + sync so the on-disk content is visible to the spawned
+    // `podman pull` child before we hand it the path. `write_all` returns
+    // when the buffer is committed to the file descriptor; `flush` is
+    // belt-and-suspenders against any future buffered-writer wrapper.
+    f.flush()
+        .map_err(|e| format!("build_per_pull_authfile: flush: {}", e))?;
+    Ok(f)
+}
+
+/// v0.2.46 V46-E (C1 follow-up): known GPU-variant suffixes used by the
+/// RL Reranker image (and every future paid module that ships a per-GPU
+/// variant matrix). Order matters for suffix matching — longest match
+/// first wins, so `-cuda` is checked before any hypothetical `-cu`
+/// (none exists today; defensive in case a future module ships one).
+///
+/// TODO(v0.2.47): drive this list from the L0 catalog's
+/// `compatibility.variants` field rather than hardcoding. Catalog-driven
+/// resolution lets new module publishers ship custom variants (e.g.
+/// `-tensorrt`, `-trt-llm`) without a launcher rebuild. For v0.2.46 the
+/// four below are the only published variants across all paid modules.
+pub(crate) const KNOWN_VARIANT_SUFFIXES: &[&str] = &["-cuda", "-rocm", "-metal", "-cpu"];
+
+/// v0.2.46 V46-E (C1 follow-up): extract the variant suffix from a tag if
+/// it ends with one of the `KNOWN_VARIANT_SUFFIXES`. Returns the suffix
+/// (with leading dash) or `None` if no known variant suffix is found.
+///
+/// Used to preserve the GPU variant across a server-tag override: when
+/// the gateway returns a patch-only-different bare tag like `"0.2.5"`,
+/// the launcher must re-append the variant suffix (e.g. `-cuda`) from
+/// the original client tag, because the registry only carries variant-
+/// suffixed tags (`0.2.5-cuda`, `0.2.5-cpu`, `0.2.5-rocm`) — never the
+/// bare `0.2.5`.
+pub(crate) fn extract_variant_suffix(tag: &str) -> Option<&'static str> {
+    KNOWN_VARIANT_SUFFIXES
+        .iter()
+        .find(|s| tag.ends_with(*s))
+        .copied()
+}
+
+/// v0.2.46 V46-E (C1 follow-up): given a server-returned tag (which may
+/// or may not include a variant suffix) and a client-resolved tag (which
+/// always includes the variant suffix the GPU-mode dispatcher chose),
+/// produce the effective tag to feed into `decide_variant_to_pull` and
+/// `podman pull`.
+///
+/// Decision tree:
+///   - Server tag already ends with a known variant suffix → use as-is
+///     (server explicitly chose a variant; trust it).
+///   - Server tag lacks a suffix AND client tag has one → append client's
+///     suffix to server's bare tag (preserves the GPU dispatch decision).
+///   - Server tag lacks a suffix AND client tag lacks one (legacy single-
+///     tag module) → use server's tag as-is.
+pub(crate) fn merge_server_tag_with_client_variant(server_tag: &str, client_tag: &str) -> String {
+    if extract_variant_suffix(server_tag).is_some() {
+        return server_tag.to_string();
+    }
+    if let Some(suffix) = extract_variant_suffix(client_tag) {
+        return format!("{}{}", server_tag, suffix);
+    }
+    server_tag.to_string()
+}
+
+/// v0.2.46 V46-E (C1/C4): classify the divergence between a client-resolved
+/// version tag and a server-returned version tag.
+///
+/// Pure helper so unit tests can exercise the classification logic without
+/// touching the install path. Parses dotted-numeric prefixes the same way
+/// `version_lt` above does, ignoring any non-numeric suffix (e.g. `-cuda`).
+///
+/// Returns:
+///   - `Same`: tags are byte-equal OR parse to the same major.minor.patch.
+///   - `PatchOnly`: major.minor matches but patch differs (e.g. 0.1.0 vs 0.1.1).
+///     Honor the server's tag; emit a WARN so the divergence is visible.
+///   - `MinorOrMajor`: major OR minor differs (e.g. 0.1.0 vs 0.2.8).
+///     Hard-fail with a publisher-pointing error — the server's catalog is
+///     out of sync with the published L0 catalog and the user can't fix it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VersionMismatchClass {
+    Same,
+    PatchOnly,
+    MinorOrMajor,
+}
+
+pub(crate) fn classify_tag_mismatch(client_tag: &str, server_tag: &str) -> VersionMismatchClass {
+    if client_tag == server_tag {
+        return VersionMismatchClass::Same;
+    }
+    // Reuse the same numeric-prefix parser as `version_lt`. We extract the
+    // FIRST three segments (major.minor.patch); extra segments (build /
+    // pre-release) are ignored for the classification — they signal a
+    // hand-tagged build, not a SemVer-meaningful jump.
+    fn parse3(v: &str) -> (u64, u64, u64) {
+        let parts: Vec<u64> = v
+            .split('.')
+            .map(|p| {
+                p.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
+            .map(|s| s.parse::<u64>().unwrap_or(0))
+            .collect();
+        (
+            parts.first().copied().unwrap_or(0),
+            parts.get(1).copied().unwrap_or(0),
+            parts.get(2).copied().unwrap_or(0),
+        )
+    }
+    let (ca, cb, cc) = parse3(client_tag);
+    let (sa, sb, sc) = parse3(server_tag);
+
+    if ca == sa && cb == sb && cc == sc {
+        // Parsed equal — e.g. `0.1.0` vs `0.1.0-cuda` (same SemVer with
+        // a suffix). Treat as Same for mismatch-classification purposes;
+        // the suffix difference is semantic at the registry layer, not
+        // the launcher's catalog-drift concern.
+        return VersionMismatchClass::Same;
+    }
+    if ca == sa && cb == sb {
+        // Same major.minor, different patch.
+        return VersionMismatchClass::PatchOnly;
+    }
+    VersionMismatchClass::MinorOrMajor
+}
+
+/// v0.2.46 V46-E (C3): classify a `request_pull_token` error string into a
+/// stable `error_class` for the audit log.
+///
+/// The classification is by substring match against the user-readable
+/// strings emitted by `format_pull_token_error` (which already maps from
+/// the structured `(status, code)` returned by the rl-artifact-url edge
+/// function). Pure helper so unit tests can pin the mapping without
+/// spinning up an HTTP server.
+///
+/// Returns one of: `"license_invalid"` | `"license_expired"` |
+/// `"tier_insufficient"` | `"network"` | `"transient_server_error"` |
+/// `"unknown"`.
+pub(crate) fn classify_pull_token_error(err_msg: &str) -> &'static str {
+    let lower = err_msg.to_lowercase();
+    // Order matters: more-specific patterns first. The strings below match
+    // the user-readable messages from `format_pull_token_error` plus the
+    // reqwest transport-error prefix `POST <url>: <reqwest::Error>`.
+    if lower.contains("license key is invalid")
+        || lower.contains("license_invalid")
+        || lower.contains("has been revoked")
+    {
+        "license_invalid"
+    } else if lower.contains("license has expired") || lower.contains("license_expired") {
+        "license_expired"
+    } else if lower.contains("requires the") && lower.contains("tier")
+        || lower.contains("tier_insufficient")
+    {
+        "tier_insufficient"
+    } else if lower.contains("temporarily unavailable")
+        || lower.contains("try again in a few minutes")
+        || lower.contains("http 5")
+    {
+        "transient_server_error"
+    } else if lower.starts_with("post ")
+        || lower.contains("build http client")
+        || lower.contains("parse pull-token response")
+        || lower.contains("keychain read failed")
+        || lower.contains("no license activated")
+    {
+        "network"
+    } else {
+        "unknown"
+    }
+}
+
+/// v0.2.46 V46-E (C3): best-effort license-key prefix for audit log details.
+///
+/// Always 12-char prefix (matching `vct_launcher_core::db::license_keys::
+/// key_prefix_of`) — never the full key. Pure helper so tests can pin the
+/// behaviour without keychain access.
+pub(crate) fn license_key_prefix_for_audit(key: &str) -> String {
+    key.chars().take(12).collect()
+}
+
+/// v0.2.46 V46-E (C3): emit a `pull_token_requested` audit-log row.
+///
+/// Best-effort: if `db` is `None` (test or legacy caller without DB
+/// handle) OR `Db::audit` returns Err, we log to eprintln and continue.
+/// Auditing must NEVER block the install flow — the install is the
+/// primary user-visible action; audit is forensic.
+fn audit_pull_token_requested(
+    db: Option<&crate::db::Db>,
+    module_id: &str,
+    endpoint: &str,
+    license_key: &str,
+    client_resolved_tag: &str,
+) {
+    let Some(db) = db else { return };
+    let detail = serde_json::json!({
+        "module_id": module_id,
+        "endpoint": endpoint,
+        "license_key_prefix": license_key_prefix_for_audit(license_key),
+        "client_resolved_tag": client_resolved_tag,
+    });
+    if let Err(e) = db.audit("pull_token_requested", None, Some(module_id), &detail) {
+        eprintln!(
+            "[installer_engine] audit_pull_token_requested[{}]: write failed: {}",
+            module_id, e
+        );
+    }
+}
+
+/// v0.2.46 V46-E (C3): emit a `pull_token_resolved` audit-log row on success.
+///
+/// `server_tag` is optional because pre-v0.2.46 servers omitted the field.
+/// `tag_mismatch_class` indicates whether the server-returned tag diverged
+/// from the client-resolved tag (and how — patch-only / minor-major).
+///
+/// `endpoint` and `effective_tag_with_variant` are included so future
+/// debugging can answer "what URL did we hit?" and "what image:tag did we
+/// actually pull?" with a single SQL query against the audit log — no
+/// need to cross-reference launcher stderr after the fact.
+#[allow(clippy::too_many_arguments)]
+fn audit_pull_token_resolved(
+    db: Option<&crate::db::Db>,
+    module_id: &str,
+    endpoint: &str,
+    server_tag: Option<&str>,
+    client_resolved_tag: &str,
+    effective_tag_with_variant: &str,
+    username: Option<&str>,
+    expires_in_s: u64,
+    mismatch_class: &VersionMismatchClass,
+) {
+    let Some(db) = db else { return };
+    let class_str = match mismatch_class {
+        VersionMismatchClass::Same => "none",
+        VersionMismatchClass::PatchOnly => "patch_only",
+        VersionMismatchClass::MinorOrMajor => "minor_or_major",
+    };
+    let detail = serde_json::json!({
+        "module_id": module_id,
+        "endpoint": endpoint,
+        "server_tag": server_tag,
+        "client_resolved_tag": client_resolved_tag,
+        "effective_tag_with_variant": effective_tag_with_variant,
+        "username": username,
+        "expires_in_s": expires_in_s,
+        "tag_mismatch": !matches!(mismatch_class, VersionMismatchClass::Same),
+        "mismatch_class": class_str,
+    });
+    if let Err(e) = db.audit("pull_token_resolved", None, Some(module_id), &detail) {
+        eprintln!(
+            "[installer_engine] audit_pull_token_resolved[{}]: write failed: {}",
+            module_id, e
+        );
+    }
+}
+
+/// v0.2.46 V46-E (C3): emit a `pull_token_failed` audit-log row on Err.
+fn audit_pull_token_failed(
+    db: Option<&crate::db::Db>,
+    module_id: &str,
+    error_msg: &str,
+) {
+    let Some(db) = db else { return };
+    let error_class = classify_pull_token_error(error_msg);
+    let excerpt: String = error_msg.chars().take(200).collect();
+    let detail = serde_json::json!({
+        "module_id": module_id,
+        "error_class": error_class,
+        "error_excerpt": excerpt,
+    });
+    if let Err(e) = db.audit("pull_token_failed", None, Some(module_id), &detail) {
+        eprintln!(
+            "[installer_engine] audit_pull_token_failed[{}]: write failed: {}",
+            module_id, e
+        );
+    }
 }
 
 /// Request a short-lived registry pull token from the manifest's
@@ -1191,70 +1731,12 @@ pub(crate) async fn detect_container_runtime() -> Result<String, String> {
     Err("no container runtime found (tried podman, docker)".into())
 }
 
-/// `<runtime> login <registry> -u <username> --password-stdin` with the
-/// token piped to stdin. Stdin-feed avoids exposing the token in argv
-/// (where `ps` would see it).
-///
-/// v0.2.36 (2026-05-26): the username is NO LONGER irrelevant. Empirical
-/// finding from dogfooding: ghcr.io's `/v2/token` endpoint, when called
-/// during `podman/docker login`, rejects mismatched username/credential
-/// pairs with `403 Forbidden — Requesting bearer token: invalid status
-/// code from registry`. For personal-account GHCR packages the username
-/// MUST be the PAT owner's GitHub login. The caller is responsible for
-/// passing the correct username — usually obtained from the
-/// `rl-artifact-url` response's `username` field (server-controlled, so
-/// even if we ever switch from personal-account to org packages, the
-/// client side stays the same).
-///
-/// Cross-runtime + cross-OS: `login` subcommand syntax is identical
-/// between podman and docker; `--password-stdin` works on Linux, macOS,
-/// and Windows for both. Verified manually 2026-05-26 with podman on
-/// Linux; documented to work the same way per docker CLI reference.
-async fn container_login(
-    runtime: &str,
-    registry: &str,
-    username: &str,
-    token: &str,
-) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut child = Command::new(runtime)
-        .silent()
-        .args(["login", registry, "-u", username, "--password-stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn {} login: {}", runtime, e))?;
-
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or("login stdin not captured")?;
-        stdin
-            .write_all(token.as_bytes())
-            .await
-            .map_err(|e| format!("write token to {} login stdin: {}", runtime, e))?;
-        // stdin drops here → EOF, login proceeds.
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("wait {} login: {}", runtime, e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "{} login {} failed (exit {}): {}",
-            runtime,
-            registry,
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).chars().take(300).collect::<String>()
-        ));
-    }
-    Ok(())
-}
+// v0.2.46 V46-E (C2): `container_login` removed. Was the global
+// `podman login --password-stdin` flow that mutated
+// `$XDG_RUNTIME_DIR/containers/auth.json`. Replaced by
+// `build_per_pull_authfile` + `podman pull --authfile <tmp>` to avoid
+// cross-module session collisions and eliminate the cleanup-on-error
+// burden. See `container_pull` Step 3 for the new flow.
 
 fn infer_registry_from_image(image: &str) -> String {
     // "ghcr.io/hotak92/vct-rl-reranker" → "ghcr.io"
@@ -1589,7 +2071,7 @@ async fn run_upgrade_inner(
                 app, project_id, &manifest.id, InstallStage::Clone, 0, 1,
                 "Fetching updated source (legacy fallback)",
             );
-            let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode, l0_pull_token_endpoint).await?;
+            let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode, l0_pull_token_endpoint, Some(db)).await?;
             // v0.2.33 (Agent C, L0b): re-extract the manifest after a
             // re-pull. The upgrade flow may have brought in a new
             // image version whose manifest differs from the previous
@@ -1646,7 +2128,7 @@ async fn run_upgrade_inner(
         step_index, total_steps, "Fetching updated source",
     );
     step_index += 1;
-    let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode, l0_pull_token_endpoint).await?;
+    let pulled_tag = refetch_artifact(manifest, &install_dir, gpu_mode, l0_pull_token_endpoint, Some(db)).await?;
 
     // v0.2.33 (Agent C, L0b): re-extract the manifest after the
     // upgrade re-pull. See the legacy-fallback comment above for
@@ -1787,6 +2269,12 @@ async fn refetch_artifact(
     install_dir: &Path,
     gpu_mode: crate::commands::gpu_policy::GpuMode,
     l0_pull_token_endpoint: Option<&str>,
+    // v0.2.46 V46-E (C3): forward the Db handle into `container_pull` so
+    // the upgrade path emits the same `pull_token_*` audit rows the install
+    // path now writes. `Option<&Db>` mirrors `container_pull`'s shape so
+    // a `None` caller still works (e.g. the unit tests further down don't
+    // touch the audit log).
+    db: Option<&crate::db::Db>,
 ) -> Result<Option<String>, String> {
     match manifest.install.method {
         InstallMethod::GitClone => {
@@ -1877,6 +2365,7 @@ async fn refetch_artifact(
                 fallback.as_deref(),
                 &manifest.id,
                 l0_pull_token_endpoint,
+                db,
             )
             .await?;
             return Ok(Some(actual_tag));
@@ -2240,7 +2729,7 @@ mod tests {
 
             let manifest =
                 manifest_for_local_install(&install_dir.display().to_string());
-            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu, None).await;
+            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu, None, None).await;
             assert!(res.is_ok(), "local refetch must succeed when dir exists: {:?}", res);
             // v0.2.35 (Agent N): Local refetch returns None (no tag involved).
             assert_eq!(res.unwrap(), None, "Local refetch must return None — no tag involved");
@@ -2264,7 +2753,7 @@ mod tests {
             let install_dir = tmp.path().join("never-existed");
             let manifest =
                 manifest_for_local_install(&install_dir.display().to_string());
-            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu, None).await;
+            let res = refetch_artifact(&manifest, &install_dir, GpuMode::Cpu, None, None).await;
             assert!(res.is_err(), "missing install_dir must Err");
             let msg = res.unwrap_err();
             assert!(
@@ -3453,5 +3942,468 @@ mod tests {
                 status.code(),
             );
         });
+    }
+
+    // ─── v0.2.46 V46-E: RL client-side hardening ────────────────────────
+    //
+    // Seven tests covering:
+    //   C1 — honor server's `tag` over client-resolved L0 version
+    //   C3 — audit-log emission for the pull-token gateway
+    //   C4 — hard-fail on MAJOR/MINOR tag mismatch (with publisher-pointing msg)
+    //   redaction — license_key is logged ONLY as 12-char prefix
+    //
+    // The C1/C4 split is enforced by `classify_tag_mismatch`:
+    //   - Same major.minor.patch → Same (no action)
+    //   - Same major.minor, different patch → PatchOnly (honor server, WARN)
+    //   - Different major OR minor → MinorOrMajor (hard-fail)
+    //
+    // The audit tests use `crate::db::Db::open_in_memory()` and inspect the
+    // `audit_log` table via `Db::audit_list` — same pattern as
+    // commands/installer.rs tests for github_pat_file_migration.
+
+    #[test]
+    fn test_v46e_c1_honor_server_tag() {
+        // C1: when server returns a tag with a patch-only difference,
+        // classify_tag_mismatch flags it as PatchOnly and the caller honors
+        // the server's tag. (The integration with `container_pull` is
+        // covered by `effective_tag` flowing into `decide_variant_to_pull`;
+        // here we pin the classification logic that drives that decision.)
+        assert_eq!(
+            classify_tag_mismatch("0.1.0", "0.1.1"),
+            VersionMismatchClass::PatchOnly,
+            "0.1.0 vs 0.1.1 must classify as PatchOnly (honor server)",
+        );
+        assert_eq!(
+            classify_tag_mismatch("0.2.8", "0.2.5"),
+            VersionMismatchClass::PatchOnly,
+            "0.2.8 vs 0.2.5 must classify as PatchOnly (server is SoT)",
+        );
+        // Same value → Same (no action — most common case).
+        assert_eq!(
+            classify_tag_mismatch("0.1.0", "0.1.0"),
+            VersionMismatchClass::Same,
+            "identical tags must classify as Same",
+        );
+        // Same SemVer with a build suffix → Same (the registry layer
+        // handles the suffix; the launcher's catalog drift concern is
+        // only the dotted-numeric prefix). This is the v46-E followup
+        // clarification: variant suffix is NOT a version component.
+        assert_eq!(
+            classify_tag_mismatch("0.1.0", "0.1.0-cuda"),
+            VersionMismatchClass::Same,
+            "0.1.0 vs 0.1.0-cuda must classify as Same (suffix ignored)",
+        );
+        // Variant suffix asymmetry: 0.2.8-cuda vs 0.2.8 — Same.
+        assert_eq!(
+            classify_tag_mismatch("0.2.8-cuda", "0.2.8"),
+            VersionMismatchClass::Same,
+            "0.2.8-cuda vs 0.2.8 must classify as Same",
+        );
+    }
+
+    #[test]
+    fn test_v46e_c1_followup_preserves_variant_suffix() {
+        // V46-E follow-up: when the server returns a bare patch-level
+        // override (e.g. `0.2.5`) and the client tag has a variant suffix
+        // (`-cuda`), the launcher must re-append the client's suffix so
+        // the registry probe + `podman pull` find the right manifest.
+        // The registry only carries variant-suffixed tags; a bare
+        // `0.2.5` pull would 404.
+        assert_eq!(
+            merge_server_tag_with_client_variant("0.2.5", "0.2.8-cuda"),
+            "0.2.5-cuda",
+            "bare server tag + cuda client must merge to 0.2.5-cuda",
+        );
+        assert_eq!(
+            merge_server_tag_with_client_variant("0.2.5", "0.2.8-cpu"),
+            "0.2.5-cpu",
+            "bare server tag + cpu client must merge to 0.2.5-cpu",
+        );
+        assert_eq!(
+            merge_server_tag_with_client_variant("0.2.5", "0.2.8-rocm"),
+            "0.2.5-rocm",
+            "bare server tag + rocm client must merge to 0.2.5-rocm",
+        );
+        // If the server explicitly returned a suffixed tag, honor it as-is
+        // (server is SoT — maybe the publisher wants to force a specific
+        // variant for a particular release).
+        assert_eq!(
+            merge_server_tag_with_client_variant("0.2.5-cuda", "0.2.8-cuda"),
+            "0.2.5-cuda",
+            "server-suffixed tag passes through unchanged",
+        );
+        // Cross-variant: server says -cpu, client wanted -cuda. Server
+        // wins (e.g. publisher disabled CUDA temporarily).
+        assert_eq!(
+            merge_server_tag_with_client_variant("0.2.5-cpu", "0.2.8-cuda"),
+            "0.2.5-cpu",
+            "server's variant overrides client's variant",
+        );
+        // Legacy single-tag module: neither side has a suffix.
+        assert_eq!(
+            merge_server_tag_with_client_variant("0.2.5", "0.2.8"),
+            "0.2.5",
+            "no suffix on either side → server tag as-is",
+        );
+        // extract_variant_suffix isolated unit test (defends against a
+        // future refactor that adds a new variant and forgets to update
+        // KNOWN_VARIANT_SUFFIXES).
+        assert_eq!(extract_variant_suffix("0.2.8-cuda"), Some("-cuda"));
+        assert_eq!(extract_variant_suffix("0.2.8-cpu"), Some("-cpu"));
+        assert_eq!(extract_variant_suffix("0.2.8-rocm"), Some("-rocm"));
+        assert_eq!(extract_variant_suffix("0.2.8-metal"), Some("-metal"));
+        assert_eq!(extract_variant_suffix("0.2.8"), None);
+        assert_eq!(extract_variant_suffix("0.2.8-tensorrt"), None);
+    }
+
+    #[test]
+    fn test_v46e_c2_authfile_has_correct_shape() {
+        // V46-E C2: per-pull authfile contains the docker/podman
+        // auth.json shape: { "auths": { "<registry>": { "auth": "<b64>" } } }.
+        // Verify the file is created, contains the expected JSON, and
+        // the base64 round-trips to the original `username:token`.
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use std::io::Read as _;
+
+        let registry = "ghcr.io";
+        let username = "vct-bot-rl";
+        let token = "ghp_redactedTOKEN1234567890abcdef";
+        let mut authfile =
+            build_per_pull_authfile(registry, username, token).expect("authfile builds");
+        // Path must exist on disk.
+        let path = authfile.path().to_path_buf();
+        assert!(path.exists(), "authfile path must exist on disk");
+
+        // Read the file content and parse as JSON.
+        // `authfile.as_file_mut()` gives us a &mut File; seek back to start.
+        use std::io::Seek as _;
+        authfile
+            .as_file_mut()
+            .seek(std::io::SeekFrom::Start(0))
+            .expect("seek to start");
+        let mut content = String::new();
+        authfile
+            .as_file_mut()
+            .read_to_string(&mut content)
+            .expect("read authfile");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("authfile is valid json");
+        let auth_b64 = parsed
+            .pointer("/auths/ghcr.io/auth")
+            .and_then(|v| v.as_str())
+            .expect("auths.ghcr.io.auth must be present");
+
+        // Round-trip: base64-decode and split on `:`.
+        let decoded = B64.decode(auth_b64).expect("auth field is valid base64");
+        let decoded_str = String::from_utf8(decoded).expect("decoded auth is utf-8");
+        assert_eq!(
+            decoded_str, "vct-bot-rl:ghp_redactedTOKEN1234567890abcdef",
+            "decoded auth must round-trip to <username>:<token>",
+        );
+
+        // Tempfile auto-deletes on drop — guard against any leak by
+        // explicitly dropping and re-checking the path.
+        drop(authfile);
+        assert!(
+            !path.exists(),
+            "authfile must be deleted on drop (RAII cleanup)"
+        );
+    }
+
+    #[test]
+    fn test_v46e_c3_audit_log_emitted_on_request() {
+        // C3: `audit_pull_token_requested` writes a row with:
+        //   - operation = "pull_token_requested"
+        //   - module_id matches
+        //   - detail.endpoint matches
+        //   - detail.license_key_prefix is the FIRST 12 chars only
+        //   - detail.client_resolved_tag matches
+        let db = crate::db::Db::open_in_memory().expect("in-memory db");
+        let full_key = "vct_admin_TUVWXYZ1234567890abcdef";
+        audit_pull_token_requested(
+            Some(&db),
+            "vct-rl-reranker",
+            "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url",
+            full_key,
+            "0.2.8",
+        );
+        let events = db
+            .audit_list(None, None, None, None, Some("pull_token_requested"), 10)
+            .expect("audit_list");
+        let row = events
+            .iter()
+            .find(|e| e.operation == "pull_token_requested")
+            .expect("must find pull_token_requested row");
+        assert_eq!(row.module_id.as_deref(), Some("vct-rl-reranker"));
+        let detail: serde_json::Value =
+            serde_json::from_str(&row.detail).expect("detail is valid json");
+        assert_eq!(
+            detail.get("module_id").and_then(|v| v.as_str()),
+            Some("vct-rl-reranker"),
+        );
+        assert_eq!(
+            detail.get("endpoint").and_then(|v| v.as_str()),
+            Some("https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url"),
+        );
+        // The CRITICAL security invariant: prefix is 12 chars, NEVER full.
+        let prefix = detail
+            .get("license_key_prefix")
+            .and_then(|v| v.as_str())
+            .expect("license_key_prefix must be present");
+        assert_eq!(prefix, "vct_admin_TU", "must be first 12 chars only");
+        assert_eq!(prefix.len(), 12, "prefix MUST be exactly 12 chars");
+        assert!(
+            !row.detail.contains("TUVWXYZ1234567890abcdef"),
+            "audit row MUST NOT contain the full license key (got: {})",
+            row.detail
+        );
+        assert_eq!(
+            detail.get("client_resolved_tag").and_then(|v| v.as_str()),
+            Some("0.2.8"),
+        );
+    }
+
+    #[test]
+    fn test_v46e_c3_audit_log_emitted_on_resolved() {
+        // C3: `audit_pull_token_resolved` writes a row with:
+        //   - operation = "pull_token_resolved"
+        //   - server_tag matches
+        //   - tag_mismatch = true when server_tag != client_resolved_tag
+        //   - mismatch_class reflects the classification result
+        //   - endpoint + effective_tag_with_variant included (v0.2.46
+        //     follow-up — RL chat enhancement: lets future debugging
+        //     answer "what URL? what tag was actually pulled?" via a
+        //     single SQL query against audit_log)
+        let db = crate::db::Db::open_in_memory().expect("in-memory db");
+        let class = classify_tag_mismatch("0.2.8-cuda", "0.1.0");
+        let effective = merge_server_tag_with_client_variant("0.1.0", "0.2.8-cuda");
+        audit_pull_token_resolved(
+            Some(&db),
+            "vct-rl-reranker",
+            "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url",
+            Some("0.1.0"),
+            "0.2.8-cuda",
+            &effective,
+            Some("vct-bot-rl"),
+            900,
+            &class,
+        );
+        let events = db
+            .audit_list(None, None, None, None, Some("pull_token_resolved"), 10)
+            .expect("audit_list");
+        let row = events
+            .iter()
+            .find(|e| e.operation == "pull_token_resolved")
+            .expect("must find pull_token_resolved row");
+        let detail: serde_json::Value =
+            serde_json::from_str(&row.detail).expect("detail is valid json");
+        assert_eq!(
+            detail.get("server_tag").and_then(|v| v.as_str()),
+            Some("0.1.0"),
+        );
+        assert_eq!(
+            detail.get("client_resolved_tag").and_then(|v| v.as_str()),
+            Some("0.2.8-cuda"),
+        );
+        assert_eq!(
+            detail.get("endpoint").and_then(|v| v.as_str()),
+            Some("https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url"),
+            "endpoint must be recorded in audit detail",
+        );
+        assert_eq!(
+            detail.get("effective_tag_with_variant").and_then(|v| v.as_str()),
+            Some("0.1.0-cuda"),
+            "effective_tag_with_variant must record the actually-pulled tag",
+        );
+        assert_eq!(
+            detail.get("tag_mismatch").and_then(|v| v.as_bool()),
+            Some(true),
+            "0.2.8 vs 0.1.0 must record tag_mismatch=true",
+        );
+        assert_eq!(
+            detail.get("mismatch_class").and_then(|v| v.as_str()),
+            Some("minor_or_major"),
+            "0.2.8 vs 0.1.0 is a minor-version difference",
+        );
+        assert_eq!(
+            detail.get("username").and_then(|v| v.as_str()),
+            Some("vct-bot-rl"),
+        );
+        assert_eq!(
+            detail.get("expires_in_s").and_then(|v| v.as_u64()),
+            Some(900),
+        );
+    }
+
+    #[test]
+    fn test_v46e_c3_audit_log_emitted_on_failure() {
+        // C3: `audit_pull_token_failed` writes a row with:
+        //   - operation = "pull_token_failed"
+        //   - error_class = "license_invalid" for the canonical 401 message
+        //   - error_excerpt is truncated to 200 chars (not the full error)
+        let db = crate::db::Db::open_in_memory().expect("in-memory db");
+        let canonical_401 =
+            "your license key is invalid or has been revoked. \
+             Open Settings → License → Refresh; if the problem persists, contact support.";
+        audit_pull_token_failed(Some(&db), "vct-rl-reranker", canonical_401);
+        let events = db
+            .audit_list(None, None, None, None, Some("pull_token_failed"), 10)
+            .expect("audit_list");
+        let row = events
+            .iter()
+            .find(|e| e.operation == "pull_token_failed")
+            .expect("must find pull_token_failed row");
+        let detail: serde_json::Value =
+            serde_json::from_str(&row.detail).expect("detail is valid json");
+        assert_eq!(
+            detail.get("module_id").and_then(|v| v.as_str()),
+            Some("vct-rl-reranker"),
+        );
+        assert_eq!(
+            detail.get("error_class").and_then(|v| v.as_str()),
+            Some("license_invalid"),
+            "canonical 401 license-invalid message must classify as license_invalid",
+        );
+        let excerpt = detail
+            .get("error_excerpt")
+            .and_then(|v| v.as_str())
+            .expect("excerpt must be present");
+        assert!(
+            excerpt.len() <= 200,
+            "excerpt must be truncated to 200 chars; got {} chars",
+            excerpt.len()
+        );
+
+        // Also verify tier_insufficient + network classifications fire
+        // on representative error messages.
+        let tier_msg =
+            "this module requires the pro tier; your license validates as free. \
+             Upgrade on the dashboard, then open Settings → License → Refresh.";
+        assert_eq!(
+            classify_pull_token_error(tier_msg),
+            "tier_insufficient",
+            "tier_insufficient message must classify accordingly",
+        );
+        let network_msg = "POST https://example.com/token: connection refused";
+        assert_eq!(
+            classify_pull_token_error(network_msg),
+            "network",
+            "reqwest-shaped error must classify as network",
+        );
+    }
+
+    #[test]
+    fn test_v46e_c4_hard_fail_on_minor_mismatch() {
+        // C4: a MAJOR or MINOR tag mismatch must classify as MinorOrMajor,
+        // which `container_pull` translates into a hard-fail Err with a
+        // publisher-pointing message. Here we pin the classification side;
+        // the message-construction side is exercised by the
+        // `effective_tag` plumbing in `container_pull` itself (which is
+        // structurally checked via cargo check + the existing decision-
+        // tree tests).
+        assert_eq!(
+            classify_tag_mismatch("0.2.8", "0.1.0"),
+            VersionMismatchClass::MinorOrMajor,
+            "0.2.8 vs 0.1.0 is a MINOR mismatch — must hard-fail",
+        );
+        assert_eq!(
+            classify_tag_mismatch("1.0.0", "2.0.0"),
+            VersionMismatchClass::MinorOrMajor,
+            "1.0.0 vs 2.0.0 is a MAJOR mismatch — must hard-fail",
+        );
+        assert_eq!(
+            classify_tag_mismatch("0.1.0", "1.1.0"),
+            VersionMismatchClass::MinorOrMajor,
+            "0.1.0 vs 1.1.0 is a MAJOR mismatch — must hard-fail",
+        );
+    }
+
+    #[test]
+    fn test_v46e_c4_no_hard_fail_on_patch_mismatch() {
+        // C4 inverse: a PATCH-only difference must NOT hard-fail —
+        // classify_tag_mismatch returns PatchOnly which is the "honor
+        // server's tag with a WARN" arm in container_pull.
+        assert_eq!(
+            classify_tag_mismatch("0.1.0", "0.1.1"),
+            VersionMismatchClass::PatchOnly,
+            "0.1.0 vs 0.1.1 must classify as PatchOnly (no hard-fail)",
+        );
+        // The PatchOnly arm is NOT MinorOrMajor — pinning this asymmetry
+        // protects against a future refactor that accidentally collapses
+        // the two arms.
+        assert_ne!(
+            classify_tag_mismatch("0.1.0", "0.1.1"),
+            VersionMismatchClass::MinorOrMajor,
+            "patch-only diff must NOT be classified as minor/major",
+        );
+    }
+
+    #[test]
+    fn test_v46e_license_key_prefix_only_logged() {
+        // Redaction invariant: license_key_prefix_for_audit MUST NEVER
+        // return more than 12 chars. This is the security-critical
+        // invariant that prevents accidental full-key disclosure in the
+        // audit log.
+        //
+        // Test across:
+        //   - Long admin keys (vct_admin_<48 chars>)
+        //   - Short keys (<12 chars — return whole string, no padding)
+        //   - Unicode keys (multi-byte chars; .chars().take(12) handles
+        //     this correctly — 12 SCALAR VALUES, not 12 bytes)
+        //   - Empty key (fallback path; must produce empty string,
+        //     not panic)
+        let long = "vct_admin_TUVWXYZ1234567890abcdef0123456789ABCDEF";
+        let prefix = license_key_prefix_for_audit(long);
+        assert_eq!(prefix, "vct_admin_TU");
+        assert_eq!(prefix.chars().count(), 12);
+
+        // Pre-v0.2.45 license format (shorter) — must still truncate
+        // gracefully without panic.
+        let short = "vct_abc";
+        let prefix_short = license_key_prefix_for_audit(short);
+        assert_eq!(prefix_short, "vct_abc");
+        assert!(prefix_short.chars().count() <= 12);
+
+        // Unicode safety — `.chars().take(12)` operates on Unicode
+        // scalar values; should NOT panic on multi-byte chars.
+        let unicode = "🔑vct_admin_xxx";
+        let prefix_uni = license_key_prefix_for_audit(unicode);
+        assert!(prefix_uni.chars().count() <= 12);
+
+        let empty = "";
+        let prefix_empty = license_key_prefix_for_audit(empty);
+        assert_eq!(prefix_empty, "");
+
+        // Cross-check: the in-memory Db audit-emission path also redacts
+        // (this guards against a future refactor that swaps the helper
+        // for an inline .chars().take(N) where someone accidentally
+        // bumps N). We exercise the full audit_pull_token_requested path
+        // here so the test fails if the redaction site ever drifts.
+        let db = crate::db::Db::open_in_memory().expect("in-memory db");
+        audit_pull_token_requested(
+            Some(&db),
+            "vct-test-module",
+            "https://example/test",
+            "SECRET_KEY_THAT_MUST_BE_REDACTED_4567890abcdef",
+            "0.0.1",
+        );
+        let events = db
+            .audit_list(None, None, None, None, Some("pull_token_requested"), 10)
+            .expect("audit_list");
+        let row = events
+            .iter()
+            .find(|e| e.operation == "pull_token_requested")
+            .expect("must find row");
+        assert!(
+            !row.detail.contains("MUST_BE_REDACTED"),
+            "audit row MUST NOT contain the un-redacted middle of the key; got: {}",
+            row.detail
+        );
+        assert!(
+            row.detail.contains("SECRET_KEY_T"),
+            "audit row MUST contain the 12-char prefix (sanity check); got: {}",
+            row.detail
+        );
     }
 }
