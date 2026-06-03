@@ -136,6 +136,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # callers; will be removed in PR 9 (cleanup).
 from vco_lib import bundled_versions as _bundled_versions  # noqa: E402
 from vco_lib import project_init as _project_init  # noqa: E402
+from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
 from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
 # v0.2.46 V47-B (Gap B): symlinks under install path are never touched.
 from vco_lib.symlink_handler import (  # noqa: E402
@@ -2695,6 +2696,438 @@ def _ensure_running_under_mcp_venv() -> None:
     os.execve(str(target), [str(target), *sys.argv], env)
 
 
+# ---------------------------------------------------------------------------
+# V47-C (v0.2.46 Part 2 Gap C): .env secret detection + keychain migration.
+#
+# Detects secret-shaped keys (TOKEN, SECRET, PAT, PASSWORD, AUTH, *_KEY)
+# in the project's `.env`, offers to migrate them to the OS keychain via
+# the vct-hub `/api/v1/secrets/migrate` endpoint. The keychain is the
+# launcher's authoritative store for credentials post-Phase-5 of the
+# secrets-consolidation plan; until V47-C, project `.env` files at
+# adopt-time stayed plaintext-on-disk indefinitely because the wizard
+# never offered a one-shot migration step. Asymmetric with
+# `~/.claude.json` (which has had `_is_secret_shaped_env_key` filtering
+# since PR-23 / v0.2.12) — this closes the gap on the per-project surface.
+#
+# Migration semantics (matches commands/secrets_import.rs):
+#   * Scope:    Shared { project_id: SENTINEL_SHARED }  (one slot per user)
+#   * Module:   "user"
+#   * Key:      original env var name (e.g. "OPENAI_API_KEY")
+#
+# Post-migration the `.env` value is replaced with `__vco_keychain__`;
+# the bundled secrets-resolver helper at
+# `templates/scripts/vct_secrets_resolve.sh` treats that sentinel as
+# "ask the hub".
+# ---------------------------------------------------------------------------
+
+def _post_secrets_to_hub(
+    secrets_payload: list[dict],
+) -> tuple[list[str], list[dict]]:
+    """POST to ``/api/v1/secrets/migrate`` and return ``(migrated, failed)``.
+
+    ``secrets_payload`` is ``[{"key": str, "value": str}, ...]``. The hub
+    routes each pair into the user-shared keychain bucket (same slot the
+    SecretsPanel's "Shared (this user)" tab writes to).
+
+    Returns:
+      * ``migrated`` — list of keys the hub confirmed it wrote.
+      * ``failed`` — list of ``{"key": str, "error": str}`` for entries
+        the hub could not write (transient keyring errors, permission
+        denied, etc.).
+
+    Raises ``RuntimeError`` only when the hub itself is unreachable or
+    returns a non-2xx response — those are install-blocking failures
+    that the caller should surface as a deferral.
+
+    Discovery: uses ``vco_lib.project_config._discover_hub`` so the
+    install path picks up the same port + token the resolver clients
+    use (no duplicated env-var probing).
+    """
+    # Lazy imports: keep install.py's import surface stable when V47-C
+    # isn't exercised on this run (most installs).
+    import json
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError(
+            "V47-C: cannot migrate secrets — `requests` not importable; "
+            "is the MCP venv active?"
+        ) from exc
+
+    from vco_lib.project_config import _discover_hub, HubUnreachable
+
+    try:
+        port, token = _discover_hub()
+    except HubUnreachable as exc:
+        raise RuntimeError(f"V47-C: hub unreachable: {exc}") from exc
+
+    url = f"http://127.0.0.1:{port}/api/v1/secrets/migrate"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps({"secrets": secrets_payload}).encode("utf-8")
+    try:
+        resp = requests.post(url, data=body, headers=headers, timeout=(2.0, 30.0))
+    except requests.RequestException as exc:
+        raise RuntimeError(f"V47-C: POST {url} failed: {exc}") from exc
+
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"V47-C: hub returned HTTP {resp.status_code}: "
+            f"{resp.text[:300]!r}"
+        )
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"V47-C: hub response not JSON: {resp.text[:300]!r}"
+        ) from exc
+
+    migrated = list(data.get("migrated") or [])
+    failed = list(data.get("failed") or [])
+    return migrated, failed
+
+
+def _print_secrets_migration_details() -> None:
+    """Print the long-form explanation shown on the ``details`` prompt option."""
+    print()
+    print("  What this does:")
+    print("    1. Reads each secret-shaped key/value from your `.env`")
+    print("    2. POSTs the values to your local vct-hub on 127.0.0.1")
+    print("    3. The hub writes them to the OS keychain (libsecret on")
+    print("       Linux, Keychain on macOS, Credential Manager on Windows)")
+    print("    4. The .env values are replaced with `__vco_keychain__`")
+    print("       so bundled tooling knows to ask the hub at runtime")
+    print()
+    print("  What this does NOT do:")
+    print("    * No values leave your machine. The hub binds 127.0.0.1.")
+    print("    * Your `.env` file is NOT deleted — the keys stay there")
+    print("      with a sentinel value so .env-aware tools keep working.")
+    print("    * Already-migrated entries (value == `__vco_keychain__`)")
+    print("      are silently skipped.")
+    print()
+    print("  Why migrate:")
+    print("    * Keychain encrypts secrets at rest (libsecret/Keychain).")
+    print("    * Plaintext .env is readable by ANY process running as you,")
+    print("      including a rogue `pip install` or browser extension.")
+    print("    * Launcher GUI can rotate/pause/revoke keys without you")
+    print("      having to grep through .env files.")
+    print()
+
+
+def _audit_and_offer_env_secret_migration(
+    project_root: Path,
+    deferral_report: DeferralReport,
+    adopt_project_mode: str | None,
+    args,
+) -> None:
+    """V47-C entry point. Audit ``.env`` and (interactively) migrate.
+
+    Behaviour matrix:
+
+    +-----------------+------------+--------------------------------+
+    | env candidates  | TTY + !yes | action                         |
+    +=================+============+================================+
+    | none            | n/a        | silent no-op                   |
+    +-----------------+------------+--------------------------------+
+    | >=1             | interactive | prompt Y / n / details         |
+    +-----------------+------------+--------------------------------+
+    | >=1             | --yes / CI  | KEEP-IN-ENV + deferral entry   |
+    +-----------------+------------+--------------------------------+
+
+    `adopt_project_mode`:
+      * ``"replace-all"`` → still prompt (secrets are sacrosanct; don't
+        auto-migrate without consent even in aggressive mode).
+      * ``"adopt"`` / ``None`` → standard interactive flow.
+      * ``"no-adopt"`` / ``"dry-run"`` → already short-circuited upstream
+        in ``main()``; we never reach this code path for them.
+
+    Called from ``main()`` after the dry-run early-exit, before the actual
+    install starts. Soft-fails on any exception — secrets handling must
+    never block the install (the user can re-run with secrets later).
+    """
+    try:
+        env_path = project_root / ".env"
+        candidates = _secrets_audit.audit_env_secrets(env_path)
+        if not candidates:
+            return  # silent no-op — no secret-shaped keys with real values
+
+        non_interactive = (
+            bool(getattr(args, "yes", False))
+            or bool(getattr(args, "quiet", False))
+            or not sys.stdin.isatty()
+        )
+
+        sorted_keys = sorted({c.key for c in candidates})
+        n = len(sorted_keys)
+        plural = "" if n == 1 else "s"
+
+        _log_install_event(
+            "v47c_env_secrets_audit", "ok",
+            f"detected {n} secret-shaped key{plural} in .env",
+            data={"keys": sorted_keys, "interactive": not non_interactive},
+        )
+
+        print()
+        print(f"  Detected {n} secret-shaped key{plural} in `.env`:")
+        for k in sorted_keys:
+            print(f"    * {k}")
+        print()
+
+        if non_interactive:
+            # Headless / scripted install: don't surprise the user by
+            # writing to their keychain. Default to keep-in-env, emit
+            # a deferral so a follow-up `--update --apply-deferred`
+            # surfaces the choice interactively next time.
+            print(
+                "  Running non-interactively (--yes / --quiet / no TTY) — "
+                "keeping secrets in .env."
+            )
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="env_secrets_retained_in_plaintext",
+                    title=(
+                        f"{n} secret-shaped key{plural} retained in plaintext "
+                        f"in .env"
+                    ),
+                    detected=(
+                        f"V47-C audit detected secret-shaped key{plural} in "
+                        f"`{env_path}`: {', '.join(f'`{k}`' for k in sorted_keys)}. "
+                        f"The install ran non-interactively so no migration "
+                        f"was performed."
+                    ),
+                    why_deferred=(
+                        "Migrating credentials to the OS keychain requires "
+                        "explicit user consent (writes to the keychain are "
+                        "irreversible from this process — the keychain becomes "
+                        "the source of truth). The install ran with --yes / "
+                        "--quiet / a non-TTY stdin so no consent could be "
+                        "collected."
+                    ),
+                    command_to_apply=(
+                        "# Re-run install.py interactively (no --yes / --quiet):\n"
+                        "#   python install.py --update --apply-deferred\n"
+                        "# At the prompt, answer 'Y' to migrate to the OS keychain.\n"
+                        "# Or migrate one-by-one from the launcher GUI's per-project\n"
+                        "# Secrets tab (V47-G-final)."
+                    ),
+                    severity="warning",
+                    kg_node_refs=[
+                        "knowledge/concepts/secret-management.md",
+                    ],
+                )
+            )
+            return
+
+        # Interactive: prompt with Y / n / details.
+        if adopt_project_mode == "replace-all":
+            print(
+                "  Note: --adopt-project-replace-all is set, but secrets "
+                "still require explicit consent."
+            )
+
+        while True:
+            try:
+                answer = input(
+                    "  Migrate these to the OS keychain? [Y/n/details] "
+                ).strip().lower()
+            except EOFError:
+                # stdin closed mid-prompt → degrade to non-interactive path.
+                print("  (stdin closed — keeping secrets in .env)")
+                return
+            if answer in ("", "y", "yes"):
+                choice = "migrate"
+                break
+            if answer in ("n", "no"):
+                choice = "keep"
+                break
+            if answer in ("d", "details"):
+                _print_secrets_migration_details()
+                continue
+            print("  Please answer Y, n, or details.")
+
+        if choice == "keep":
+            print("  Keeping secrets in .env (no keychain writes).")
+            _log_install_event(
+                "v47c_env_secrets_audit", "ok",
+                "user declined keychain migration",
+                data={"keys": sorted_keys, "choice": "keep"},
+            )
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="env_secrets_retained_in_plaintext",
+                    title=(
+                        f"{n} secret-shaped key{plural} retained in plaintext "
+                        f"in .env (user choice)"
+                    ),
+                    detected=(
+                        f"User declined the V47-C keychain-migration offer for "
+                        f"`{env_path}`: {', '.join(f'`{k}`' for k in sorted_keys)}."
+                    ),
+                    why_deferred=(
+                        "User declined the offer. The .env file remains the "
+                        "authoritative source for these secrets. Re-running "
+                        "install.py will re-offer the migration."
+                    ),
+                    command_to_apply=(
+                        "# To accept the offer on a future run:\n"
+                        "#   python install.py --update --apply-deferred\n"
+                        "# Or migrate one key at a time from the launcher GUI's\n"
+                        "# per-project Secrets tab (V47-G-final)."
+                    ),
+                    severity="info",
+                    kg_node_refs=[
+                        "knowledge/concepts/secret-management.md",
+                    ],
+                )
+            )
+            return
+
+        # User said Y — POST to hub, rewrite .env on success.
+        secrets_payload = [
+            {"key": c.key, "value": c.value} for c in candidates
+        ]
+        try:
+            migrated, failed = _post_secrets_to_hub(secrets_payload)
+        except RuntimeError as exc:
+            print(f"  Migration failed: {exc}")
+            print("  Keeping secrets in .env (no changes made).")
+            _log_install_event(
+                "v47c_env_secrets_audit", "warn",
+                f"hub-migrate failed: {exc}",
+                data={"keys": sorted_keys, "error": str(exc)},
+            )
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="env_secrets_hub_migration_failed",
+                    title=(
+                        f"V47-C: keychain migration failed for {n} "
+                        f"secret{plural}"
+                    ),
+                    detected=(
+                        f"User accepted the V47-C migration offer but the hub "
+                        f"call failed: {exc}. .env was NOT modified; the "
+                        f"keychain was NOT written to. Keys queued for retry: "
+                        f"{', '.join(f'`{k}`' for k in sorted_keys)}."
+                    ),
+                    why_deferred=(
+                        "The hub round-trip failed. Most common cause: the "
+                        "launcher / vct-hub is not running, or the user's "
+                        "keychain backend (libsecret on Linux, Keychain on "
+                        "macOS, Credential Manager on Windows) is unavailable. "
+                        "Auto-retry on the next install run isn't safe — the "
+                        "values may have changed in .env between runs."
+                    ),
+                    command_to_apply=(
+                        "# 1. Verify the launcher is running:\n"
+                        "#      vct-hub --status\n"
+                        "# 2. Re-run the migration:\n"
+                        "#      python install.py --update --apply-deferred"
+                    ),
+                    severity="warning",
+                    kg_node_refs=[
+                        "knowledge/concepts/secret-management.md",
+                    ],
+                )
+            )
+            return
+
+        # Rewrite .env: only the keys the hub confirmed.
+        if migrated:
+            try:
+                replaced, missed = _secrets_audit.rewrite_env_with_sentinels(
+                    env_path, migrated,
+                )
+            except Exception as exc:  # noqa: BLE001 — soft-fail
+                # Migration succeeded keychain-side but the rewrite failed.
+                # This is recoverable — re-run will detect "already in
+                # keychain" and offer to rewrite again.
+                print(
+                    f"  Migrated {len(migrated)} key{plural} to keychain, "
+                    f"but rewriting .env failed: {exc}"
+                )
+                _log_install_event(
+                    "v47c_env_secrets_audit", "warn",
+                    f"rewrite failed after successful hub-migrate: {exc}",
+                    data={"migrated": migrated, "error": str(exc)},
+                )
+            else:
+                print(
+                    f"  Migrated {replaced} key{plural} to the OS keychain. "
+                    f"`.env` values replaced with `__vco_keychain__`."
+                )
+                if missed:
+                    print(
+                        f"  Note: {len(missed)} key(s) not found in `.env` "
+                        f"at rewrite time: {', '.join(missed)}"
+                    )
+                _log_install_event(
+                    "v47c_env_secrets_audit", "ok",
+                    f"migrated {len(migrated)} key{plural}; replaced {replaced} in .env",
+                    data={"migrated": migrated, "missed": missed},
+                )
+
+        if failed:
+            failed_keys = [f.get("key", "?") for f in failed]
+            print(
+                f"  Failed to migrate {len(failed)} key{plural}: "
+                f"{', '.join(failed_keys)}"
+            )
+            for f in failed:
+                print(f"    {f.get('key', '?')}: {f.get('error', '?')}")
+            deferral_report.add_entry(
+                DeferralEntry(
+                    condition_id="env_secrets_hub_migration_partial",
+                    title=(
+                        f"V47-C: {len(failed)} of {n} secret{plural} failed to "
+                        f"migrate to keychain"
+                    ),
+                    detected=(
+                        f"Partial migration: {len(migrated)} succeeded, "
+                        f"{len(failed)} failed. Failed keys: "
+                        f"{', '.join(f'`{k}`' for k in failed_keys)}. "
+                        f"The succeeded keys' .env values were replaced with "
+                        f"`__vco_keychain__`; the failed keys' values remain "
+                        f"plaintext."
+                    ),
+                    why_deferred=(
+                        "The hub rejected some entries (transient keychain "
+                        "error, permission denied, etc.). The remaining "
+                        "plaintext values are flagged here so the user can "
+                        "retry after the underlying cause is fixed."
+                    ),
+                    command_to_apply=(
+                        "# Inspect the failures (check libsecret / Keychain / "
+                        "Credential Manager state),\n"
+                        "# then re-run:\n"
+                        "#   python install.py --update --apply-deferred"
+                    ),
+                    severity="warning",
+                    kg_node_refs=[
+                        "knowledge/concepts/secret-management.md",
+                    ],
+                )
+            )
+
+        # Best-effort perm hardening on Unix.
+        changed, msg = _secrets_audit.harden_env_perms(env_path)
+        if msg:
+            _log_install_event(
+                "v47c_env_perms", "ok" if changed else "info", msg,
+            )
+            if changed:
+                print(f"  Hardened .env file permissions ({msg}).")
+
+    except Exception as exc:  # noqa: BLE001 — V47-C is best-effort
+        # Never let secrets-audit block an install. Log + move on.
+        _log_install_event(
+            "v47c_env_secrets_audit", "warn",
+            f"audit raised unexpectedly: {exc}",
+        )
+
+
 def main() -> int:
     # v0.2.46 Part-1.5 H3: DO NOT call _log_install_event or any code that
     # buffers state into module-level variables BEFORE this line. When
@@ -3203,6 +3636,16 @@ def main() -> int:
             "No changes were made."
         )
         return 0
+
+    # v0.2.46 V47-C (Gap C): detect secret-shaped keys in `.env` and
+    # offer to migrate them to the OS keychain. Runs BEFORE the install
+    # work starts so the deferral entries land in the same UPDATE_DEFERRED
+    # write the rest of main() emits. Soft-fail by design — never blocks
+    # the install. See _audit_and_offer_env_secret_migration's docstring
+    # for the behaviour matrix.
+    _audit_and_offer_env_secret_migration(
+        PROJECT_ROOT, _deferral_report, adopt_project_mode, args,
+    )
 
     # Fix 1 (v0.2.13): mark this run's start timestamp so
     # _refresh_dist_binary_after_rebuild can tell "produced this run" apart
