@@ -1,20 +1,13 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { getVersion } from '@tauri-apps/api/app';
   import { currentUser } from '$lib/stores/auth';
 
   let appCount = $derived($currentUser?.apps?.length ?? 0);
-  let version = $state('');
 
-  onMount(async () => {
-    try {
-      version = await getVersion();
-    } catch {
-      // getVersion may fail in dev/web preview without Tauri runtime —
-      // leave version blank rather than show a stale hardcoded number.
-      version = '';
-    }
-  });
+  // v0.2.43 (Fabio branch feat/launcher-logo-circular-white):
+  // version string moved to the right-sidebar brand footer
+  // (RightSidebar.svelte `.rs-brand-footer`) so the statusbar
+  // is no longer a duplicate display surface. StatusBar now
+  // shows only realtime telemetry (connected state + app count).
 </script>
 
 <footer class="status-bar">
@@ -24,10 +17,6 @@
   </div>
   <div class="status-right">
     <span>{appCount} app{appCount !== 1 ? 's' : ''} activated</span>
-    {#if version}
-      <span class="status-sep">|</span>
-      <span>v{version}</span>
-    {/if}
   </div>
 </footer>
 
@@ -63,9 +52,5 @@
     display: flex;
     align-items: center;
     gap: 8px;
-  }
-
-  .status-sep {
-    opacity: 0.3;
   }
 </style>

@@ -9,6 +9,8 @@
   // - Multiple projects → click opens a Dropdown picker; on selection we
   //   launch and remember the last-launched id in localStorage.
 
+  import { onMount } from 'svelte';
+  import { getVersion } from '@tauri-apps/api/app';
   import { currentUser } from '$lib/stores/auth';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { orchestrator } from '$lib/stores/orchestrator';
@@ -16,6 +18,19 @@
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
   import Dropdown from '$lib/components/Dropdown.svelte';
+
+  // v0.2.43 (Fabio branch feat/launcher-logo-circular-white): brand
+  // footer at the bottom of the right sidebar (logo + "VCT Launcher" +
+  // version). Replaces the menubar logo (moved here) AND the
+  // statusbar version string (also moved here to avoid duplication).
+  let appVersion = $state('');
+  onMount(async () => {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      appVersion = '';
+    }
+  });
 
   interface App {
     id: string;
@@ -414,6 +429,18 @@
       </div>
     </div>
   {/if}
+
+  <!-- v0.2.43 (Fabio): brand footer. Sits at the bottom of the right
+       sidebar with margin-top:auto, separated from the content above
+       by a divider line. Replaces the menubar logo (visual duplicate
+       of the Windows titlebar icon) and the statusbar version string. -->
+  <div class="rs-brand-footer" aria-label="VCT Launcher brand">
+    <img src="/logo.png" alt="" class="rs-brand-logo" aria-hidden="true" />
+    <div class="rs-brand-name">VCT Launcher</div>
+    {#if appVersion}
+      <div class="rs-brand-version">v{appVersion}</div>
+    {/if}
+  </div>
 </aside>
 
 <style>
@@ -426,6 +453,38 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
+  }
+
+  /* v0.2.43 (Fabio): brand footer at the bottom of the right sidebar.
+     `margin-top: auto` pushes it down while the content above stays
+     packed at the top. A 1px top border mirrors the existing
+     `.sidebar-divider` style for visual continuity. */
+  .rs-brand-footer {
+    margin-top: auto;
+    padding: 20px 16px 16px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .rs-brand-logo {
+    width: 80px;
+    height: 80px;
+    user-select: none;
+    -webkit-user-drag: none;
+    pointer-events: none;
+  }
+  .rs-brand-name {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    color: var(--color-text, #F1F5F9);
+  }
+  .rs-brand-version {
+    font-size: 10px;
+    color: var(--color-muted, #475569);
+    font-family: ui-monospace, monospace;
   }
 
   .sidebar-section {

@@ -120,6 +120,47 @@ Hotfix release closing 3 root causes surfaced on VCO_dev during the post-v0.2.44
   tests + `cargo test --lib test_v0245`), and the `[Unreleased]`-empty
   CHANGELOG assertion. Same 17+ PASS / 0 FAIL contract.
 
+- **launcher (Fabio branch `feat/launcher-logo-circular-white`)**:
+  launcher UI polish + brand identity refresh. Robot logo redesigned as
+  robot-in-circle (white circular backdrop so the icon stays legible on
+  both dark + light Windows taskbar themes); ROBOT_ZOOM=1.70,
+  OFFSET_Y=-0.10 for visual center. Two distinct logo treatments now:
+  (a) UI-side `static/logo.png` keeps the **full robot** and is rendered
+  at 80px in the new R. sidebar brand footer; (b) OS-level icons
+  (`icon.ico`, `icon.icns`, `Square*Logo.png`) use a **head-only** variant
+  — for the small `.ico` slots (16/24/32/48) the head is drawn
+  pixel-perfect (no anti-aliasing, hand-snapped to the pixel grid for
+  taskbar legibility); for ≥64 the head is rendered via Playwright/
+  Chromium from a head-only SVG. `icon.ico` is built byte-by-byte with
+  per-size PNG payloads to bypass Pillow's `append_images=` ICO bug that
+  collapses multi-size into a single entry.
+
+- **launcher (Fabio)**: collapsible sidebar groups. Each group header
+  (Workspace / Knowledge / Team / System / Module configuration / Admin)
+  is now a button that toggles its items' visibility with an animated
+  chevron. Collapsed state persists to `localStorage` under
+  `vct.sidebar.collapsedGroups` (per-user UI preference; no
+  `launcher.db` schema migration needed). All groups default to
+  expanded; the gap between groups tightens when collapsed.
+
+- **launcher (Fabio)**: brand footer in `RightSidebar.svelte`. A
+  `margin-top:auto` block at the bottom of the right sidebar with a
+  divider line, the 80 px robot logo, "VCT Launcher" label, and the
+  `getVersion()`-fetched version string. Replaces (a) the old
+  menubar-side text+logo block (which visually duplicated the Windows
+  titlebar) and (b) the StatusBar version display (single source of
+  truth now). MenuBar logo + text removed; StatusBar shows only
+  realtime telemetry ("Connected · N apps activated").
+
+- **launcher (Fabio)**: window state plugin + maximized first launch.
+  Added `tauri-plugin-window-state` (Cargo + lib.rs + capabilities
+  permission) so the launcher remembers size / position / maximized
+  state across launches. Combined with `"maximized": true` in
+  `tauri.conf.json windows[0]`, the first launch opens full-screen and
+  every subsequent launch reuses whatever shape the user left it in
+  (Slack / Discord / VS Code style). Per-user state file under the
+  platform-conventional app-config dir.
+
 ### Changed
 
 - **Version pins bumped 0.2.44 → 0.2.45** across the canonical sites:

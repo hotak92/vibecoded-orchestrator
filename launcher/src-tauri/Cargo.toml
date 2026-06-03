@@ -55,6 +55,18 @@ tauri-plugin-dialog = "2"
 #   - Windows: Named mutex via OpenMutexW / CreateMutexW
 # Both are user-scoped (different users can run their own launcher).
 tauri-plugin-single-instance = "2"
+# v0.2.43 (Fabio branch feat/launcher-logo-circular-white): persist window
+# size + position + maximized state across launches. Without this, the
+# launcher always opens at the default 1200x800 even after the user
+# maximizes — irritating UX (Slack/Discord/VS Code all persist state).
+# The plugin auto-restores on `tauri::Builder::setup` and auto-saves on
+# window resize/move/close. Per-user state file at the OS conventional
+# app-config dir (`%APPDATA%/com.vibecodedtools.launcher/.window-state.json`
+# on Windows, `~/Library/Application Support/...` on macOS, `~/.config/...`
+# on Linux). Combined with `maximized: true` in tauri.conf.json `windows[]`,
+# the first launch opens full-screen + every subsequent launch reuses
+# whatever shape the user left it in.
+tauri-plugin-window-state = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
