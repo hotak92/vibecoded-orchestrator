@@ -19,7 +19,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use super::{
     api, auth, cli_api, config_api, db, lifecycle_api, mcp_tool_grants_api, module_db_api,
-    modules_api, project_state_api, weaviate_probe,
+    modules_api, project_state_api, secrets_api, weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -129,6 +129,15 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .nest(
             "/api/v1",
             mcp_tool_grants_api::router().with_state(launcher_state.clone()),
+        )
+        // v0.2.46 V47-C (Gap C): secret-migration endpoint. Mounted INSIDE
+        // the hub-wide auth layer (every caller — install.py, the GUI's
+        // future Secrets tab — sends the standard hub.token bearer). The
+        // endpoint writes to the OS keychain via vct_launcher_core::
+        // secrets::set; same threat model as the rest of /api/v1.
+        .nest(
+            "/api/v1",
+            secrets_api::router().with_state(launcher_state.clone()),
         )
         // v0.2.31: module-owned DB rows. Uses its OWN bearer-scope
         // middleware (require_module_scope) — token is the per-(module,
