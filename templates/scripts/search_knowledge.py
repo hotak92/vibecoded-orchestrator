@@ -529,22 +529,41 @@ def search_knowledge(
 
 
 def list_all_nodes():
-    """List all nodes in knowledge graph"""
+    """List all nodes in knowledge graph.
+
+    v0.2.46 V46-D: cursor-paginates so collections > 1000 nodes are
+    fully listed (previously the display silently truncated past 1000).
+    """
     client = get_weaviate_client()
 
     try:
         collection = client.collections.get(KG_COLLECTION)
-        response = collection.query.fetch_objects(limit=1000)
+
+        # Cursor-paginate to fetch every object.
+        all_objects = []
+        cursor = None
+        PAGE_SIZE = 1000
+        while True:
+            if cursor is not None:
+                response = collection.query.fetch_objects(limit=PAGE_SIZE, after=cursor)
+            else:
+                response = collection.query.fetch_objects(limit=PAGE_SIZE)
+            if not response.objects:
+                break
+            all_objects.extend(response.objects)
+            if len(response.objects) < PAGE_SIZE:
+                break
+            cursor = response.objects[-1].uuid
 
         # Group by type
         nodes_by_type = {}
-        for obj in response.objects:
+        for obj in all_objects:
             node_type = obj.properties.get('node_type', 'unknown')
             if node_type not in nodes_by_type:
                 nodes_by_type[node_type] = []
             nodes_by_type[node_type].append(obj.properties['title'])
 
-        print(f"\n📚 Knowledge Graph: {len(response.objects)} nodes\n")
+        print(f"\n📚 Knowledge Graph: {len(all_objects)} nodes\n")
         print("=" * 60)
 
         for node_type in sorted(nodes_by_type.keys()):

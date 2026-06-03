@@ -268,29 +268,71 @@ def find_connections(title: str):
         # Find inbound links (nodes that link to this one) — scan every
         # collection in the access matrix. Pre-P1-D this scanned only
         # ClaudeKnowledgeGraph, missing peer-project inbound references.
+        # v0.2.46 V46-D: previously capped at limit=200 (silently missed
+        # links from nodes 201+ in any one collection). Now cursor-
+        # paginates per collection so every linking node is inspected,
+        # and emits a per-collection truncation signal in the rare case
+        # the per-collection hard ceiling (10000) is exceeded.
         inbound: list[tuple[str, str]] = []  # (collection, source_title)
         seen_keys: set[tuple[str, str]] = set()  # (collection, source_node_id)
+        truncated_collections: list[str] = []
+        PAGE_SIZE = 500
+        # Defense-in-depth cap: if a collection has > 10000 objects we
+        # stop scanning that one and flag truncation; for an inbound-link
+        # scan, 10000 is already comically large and the user should know.
+        MAX_OBJECTS_PER_COLLECTION = 10000
 
         for coll_name in collections:
             try:
                 collection = client.collections.get(coll_name)
-                all_nodes = collection.query.fetch_objects(limit=200)
             except Exception:
                 continue
-            for obj in all_nodes.objects:
-                if title in (obj.properties.get('links', []) or []):
-                    source_id = obj.properties.get('source_node_id')
-                    key = (coll_name, source_id)
-                    # Dedupe per-collection by source_node_id (chunked
-                    # nodes share an id across chunks).
-                    if key not in seen_keys:
-                        inbound.append((coll_name, obj.properties.get('title', '')))
-                        seen_keys.add(key)
+
+            scanned = 0
+            cursor = None
+            hit_cap = False
+            while True:
+                try:
+                    if cursor is not None:
+                        page = collection.query.fetch_objects(limit=PAGE_SIZE, after=cursor)
+                    else:
+                        page = collection.query.fetch_objects(limit=PAGE_SIZE)
+                except Exception:
+                    break
+                if not page.objects:
+                    break
+                for obj in page.objects:
+                    if title in (obj.properties.get('links', []) or []):
+                        source_id = obj.properties.get('source_node_id')
+                        key = (coll_name, source_id)
+                        # Dedupe per-collection by source_node_id (chunked
+                        # nodes share an id across chunks).
+                        if key not in seen_keys:
+                            inbound.append((coll_name, obj.properties.get('title', '')))
+                            seen_keys.add(key)
+                scanned += len(page.objects)
+                if scanned >= MAX_OBJECTS_PER_COLLECTION:
+                    hit_cap = True
+                    break
+                if len(page.objects) < PAGE_SIZE:
+                    break
+                cursor = page.objects[-1].uuid
+
+            if hit_cap:
+                truncated_collections.append(coll_name)
 
         print(f"INBOUND ({len(inbound)}):")
         for coll_name, link_title in inbound:
             label = f" {_collection_label(coll_name)}" if multi else ""
             print(f"  ← {link_title}{label}")
+
+        if truncated_collections:
+            print()
+            print(
+                f"⚠️  Inbound-link scan capped at {MAX_OBJECTS_PER_COLLECTION} "
+                f"objects in: {', '.join(truncated_collections)}."
+            )
+            print("   Some inbound references may be missing from the list above.")
 
         # Show exploration hint
         total_connections = len(target_links) + len(inbound)

@@ -131,15 +131,37 @@ class DuplicateDetector:
         print(f"   Collection: {COLLECTION_NAME}\n")
 
         # Get all nodes (first chunks only - they have full metadata)
+        # v0.2.46 V46-D: cursor-paginate so collections > 1000 nodes are
+        # fully scanned (previously duplicates in nodes 1001+ were
+        # silently missed).
         try:
-            results = self.collection.query.fetch_objects(
-                filters=Filter.by_property("chunk_num").equal(1),
-                limit=1000,
-                return_metadata=MetadataQuery(distance=True),
-                return_properties=["title", "file_path", "node_type", "tags"]
-            )
+            nodes = []
+            cursor = None
+            PAGE_SIZE = 1000
+            chunk_filter = Filter.by_property("chunk_num").equal(1)
+            while True:
+                if cursor is not None:
+                    page = self.collection.query.fetch_objects(
+                        filters=chunk_filter,
+                        limit=PAGE_SIZE,
+                        after=cursor,
+                        return_metadata=MetadataQuery(distance=True),
+                        return_properties=["title", "file_path", "node_type", "tags"]
+                    )
+                else:
+                    page = self.collection.query.fetch_objects(
+                        filters=chunk_filter,
+                        limit=PAGE_SIZE,
+                        return_metadata=MetadataQuery(distance=True),
+                        return_properties=["title", "file_path", "node_type", "tags"]
+                    )
+                if not page.objects:
+                    break
+                nodes.extend(page.objects)
+                if len(page.objects) < PAGE_SIZE:
+                    break
+                cursor = page.objects[-1].uuid
 
-            nodes = results.objects
             print(f"📊 Found {len(nodes)} nodes to analyze\n")
 
             duplicates = []
