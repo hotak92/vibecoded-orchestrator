@@ -1373,9 +1373,44 @@ def _lightweight_rewrite_paths(install_path: Path,
     return results
 
 
-def _venv_triage(install_path: Path) -> dict:
+def _resolve_adopt_project_mode(args) -> str | None:
+    """v0.2.46 Part 2 (V47-G-stub): resolve --adopt-project-* flags into a mode.
+
+    Returns one of:
+      - "adopt"        — explicit --adopt-project flag set
+      - "no-adopt"     — explicit --no-adopt-project flag set
+      - "replace-all"  — explicit --adopt-project-replace-all flag set
+      - "dry-run"      — explicit --adopt-project-dry-run flag set
+      - None           — no explicit signal
+
+    STUB: V47-G-stub only handles explicit flags. When no explicit signal is
+    given (None), V47-G-final will add the detection heuristic + interactive
+    prompt that decides whether to auto-prompt the user for adopt mode. Until
+    V47-G-final lands, None means "proceed with normal install/update flow".
+
+    The mode is threaded through to Wave 2 surfaces via an optional
+    `adopt_project_mode: str | None = None` kwarg on _run_lightweight,
+    _venv_triage, _configure_claude_settings, and any other function that
+    Wave 2 (V47-A through V47-F) needs to mode-gate.
+    """
+    if getattr(args, "adopt_project_dry_run", False):
+        return "dry-run"
+    if getattr(args, "adopt_project_replace_all", False):
+        return "replace-all"
+    if getattr(args, "adopt_project", False):
+        return "adopt"
+    if getattr(args, "no_adopt_project", False):
+        return "no-adopt"
+    return None
+
+
+def _venv_triage(install_path: Path, adopt_project_mode: str | None = None) -> dict:
     """Decide what to do with `<install_path>/.venv` on a lightweight
     re-install.
+
+    v0.2.46 V47-G-stub: accepts optional `adopt_project_mode` for downstream
+    Wave-2 (Gap D) to mode-gate destructive venv-recreation. Stub is a
+    pure passthrough: Wave 2's V47-D agent will add the actual guard logic.
 
     Cases:
       1. .venv missing       → action="create", recreate fully
@@ -1477,7 +1512,11 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         )
 
     # Step 3: venv triage
-    triage = _venv_triage(PROJECT_ROOT)
+    # v0.2.46 V47-G-stub: thread adopt_project_mode through to _venv_triage
+    # so Wave-2 V47-D can mode-gate destructive "recreate" actions when the
+    # tree is being adopted (don't wipe a user's 3rd-party .venv).
+    adopt_project_mode = _resolve_adopt_project_mode(args)
+    triage = _venv_triage(PROJECT_ROOT, adopt_project_mode=adopt_project_mode)
     print(f"[2/4] Venv triage: action={triage['action']} ({triage['reason']})")
     _log_install_event(
         "lightweight", "ok",
@@ -2519,6 +2558,47 @@ def main() -> int:
                              "left untouched; only the launch step is skipped. "
                              "Hub auto-starts on next launcher open or first Claude "
                              "Code session start (session-start-ensure-hub hook).")
+
+    # ----------------------------------------------------------------------
+    # v0.2.46 Part 2 (V47-G-stub): third-party-project adoption mode flags.
+    #
+    # Distinct from --on-conflict {adopt,...} (service-level adoption of a
+    # foreign Weaviate/Ollama/code_embed) and from --conflict-strategy
+    # adopt-as-is (file-level keep-on-disk-as-is). Those operate on
+    # individual surfaces inside an existing VCO project. THIS group decides
+    # what to do with the ENTIRE PROJECT when install.py is run against a
+    # directory that already has substantial pre-existing user content (a
+    # populated .claude/, an existing .env with secrets, a .venv with
+    # project-specific deps, a custom CLAUDE.md, etc.) but no .vco-manifest.
+    #
+    # V47-G-stub ships only the CLI surface + dispatch contract. Detection
+    # heuristic + interactive prompt land in V47-G-final.
+    # ----------------------------------------------------------------------
+    _adopt_project_group = parser.add_mutually_exclusive_group()
+    _adopt_project_group.add_argument(
+        "--adopt-project", action="store_true", default=False,
+        help="v0.2.46 (adopt mode): treat this directory as an existing "
+             "3rd-party project being adopted by VCO. Preserve pre-existing "
+             "files (CLAUDE.md, .env, .claude/settings.json, .venv) by hash "
+             "and land VCO defaults as .vco-new siblings + UPDATE_DEFERRED "
+             "entries. Skip the interactive detection prompt.")
+    _adopt_project_group.add_argument(
+        "--no-adopt-project", action="store_true", default=False,
+        help="v0.2.46 (adopt mode): explicitly refuse adopt mode. If "
+             "detection heuristic would otherwise prompt, exit non-zero "
+             "instead. Useful for CI that must never adopt unknown trees.")
+    _adopt_project_group.add_argument(
+        "--adopt-project-replace-all", action="store_true", default=False,
+        help="v0.2.46 (adopt mode, advanced): aggressive variant of "
+             "--adopt-project — overwrite pre-existing whitelist files "
+             "instead of preserving them. Use only when you want VCO's "
+             "defaults to land identically to a fresh install.")
+    _adopt_project_group.add_argument(
+        "--adopt-project-dry-run", action="store_true", default=False,
+        help="v0.2.46 (adopt mode): print intended adopt actions and exit "
+             "without touching any file. Useful to preview what adopt mode "
+             "would do before committing to it.")
+
     args = parser.parse_args()
 
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
@@ -2589,6 +2669,30 @@ def main() -> int:
         return _run_lightweight(args)
 
     mode = "update" if args.update else "install"
+
+    # v0.2.46 Part 2 (V47-G-stub): resolve --adopt-project-* mode and dispatch
+    # the early-exit cases (no-adopt / dry-run) before any work runs.
+    # Wave-2 agents (V47-A through V47-F) read this same value from `args`
+    # via `_resolve_adopt_project_mode(args)` inside their gap-specific
+    # functions. V47-G-final replaces the "None" branch with a detection
+    # heuristic + interactive prompt; for now, None means "proceed normally".
+    adopt_project_mode = _resolve_adopt_project_mode(args)
+    if adopt_project_mode == "no-adopt":
+        print(
+            "Adopt-project mode explicitly refused via --no-adopt-project. "
+            "Exiting without making changes."
+        )
+        return 1
+    if adopt_project_mode == "dry-run":
+        # STUB: V47-G-final will print the full intended action manifest
+        # (which files would be preserved, what symlinks would be skipped,
+        # which secrets would be flagged, etc.). Today it's a placeholder.
+        print(
+            "[adopt-project: dry-run] V47-G-stub placeholder. "
+            "V47-G-final will print the full action manifest here. "
+            "No changes were made."
+        )
+        return 0
 
     # Fix 1 (v0.2.13): mark this run's start timestamp so
     # _refresh_dist_binary_after_rebuild can tell "produced this run" apart
@@ -3033,7 +3137,8 @@ def main() -> int:
 
     # Step 9: Configure Claude Code settings (skip on update)
     if mode == "install":
-        _configure_claude_settings(embed_config)
+        _configure_claude_settings(embed_config,
+                                   adopt_project_mode=adopt_project_mode)
     else:
         print("[skip] Claude settings (preserved during update)")
         # 0.2.11 / PR-1: pre-0.2.11 installs wired BASH_ENV in
@@ -17158,8 +17263,16 @@ def _reconcile_env_keys(env_path: Path) -> dict:
 # Step 9: Configure Claude Code
 # ---------------------------------------------------------------------------
 
-def _configure_claude_settings(embed_config: dict) -> None:
-    """Create .claude/settings.json with MCP server configuration."""
+def _configure_claude_settings(embed_config: dict,
+                               adopt_project_mode: str | None = None) -> None:
+    """Create .claude/settings.json with MCP server configuration.
+
+    v0.2.46 V47-G-stub: accepts optional `adopt_project_mode` for Wave-2
+    V47-A (Gap A — settings.json managed-block merge) to mode-gate the
+    additive-merge logic. Stub is a pure passthrough; V47-A will use the
+    mode to decide between "skip existing" (current behavior), "refresh
+    managed block only", or "replace all" (--adopt-project-replace-all).
+    """
     settings_dir = PROJECT_ROOT / ".claude"
     settings_dir.mkdir(exist_ok=True)
 
