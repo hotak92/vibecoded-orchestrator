@@ -6289,6 +6289,14 @@ def _prune_stale_kg_rows(
         return
 
     # Batch-delete via Weaviate v1 batch/objects endpoint.
+    # v0.2.46 V46-A-followup: SECOND v0.2.43 bug caught by V46-B's live
+    # integration test — `valueText: <list>` returns HTTP 400 ("cannot
+    # unmarshal array into Go struct field of type string"). The
+    # correct field for `ContainsAny` with a list of UUIDs is
+    # `valueTextArray` (plural). Reproduced live 2026-06-03; the buggy
+    # form has been on disk since V0243-6 shipped in v0.2.43 (which is
+    # ALSO why the prune logic appeared to "no-op silently" — same
+    # silent-zero-fallback antipattern as the diff-gate fetch).
     try:
         base = (weaviate_url or "http://localhost:8081").rstrip("/")
         delete_body = _json.dumps({
@@ -6297,7 +6305,7 @@ def _prune_stale_kg_rows(
                 "where": {
                     "path": ["id"],
                     "operator": "ContainsAny",
-                    "valueText": stale_uuids,
+                    "valueTextArray": stale_uuids,
                 },
             },
             "output": "minimal",
