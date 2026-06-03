@@ -5422,6 +5422,7 @@ name = "vct-launcher-temp"
 version = "0.2.45"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chrono",
  "directories",
  "dunce",

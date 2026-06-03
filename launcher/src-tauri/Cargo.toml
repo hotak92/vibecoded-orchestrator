@@ -130,6 +130,15 @@ rand = { version = "0.9", default-features = false, features = ["std", "std_rng"
 # volumes module for non-test tempdir uses).
 tempfile = "3"
 
+# v0.2.46 V46-E (C2): base64 encoding for the per-pull `--authfile`
+# auth.json shape (`{"auths": {"<registry>": {"auth": "<b64 user:token>"}}}`).
+# Replaces the global-state `podman login` + `podman logout` flow so
+# concurrent paid-module pulls can't invalidate each other's auth
+# sessions. Transitively available via reqwest already; promoting to a
+# direct dep adds zero binary size and stabilises the API surface we
+# rely on (`engine::general_purpose::STANDARD`).
+base64 = "0.22"
+
 # PR-4 (2026-05-06): gitignore-aware filesystem walker. Used by
 # `copy_recursive_sync` in commands/installer.rs to avoid propagating
 # machine-local files (state/, .claude/agents/, tools/vct-secrets/,
