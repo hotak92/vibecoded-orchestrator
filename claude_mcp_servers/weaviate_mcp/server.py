@@ -309,6 +309,13 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 RL_SERVER_URL = os.getenv("RL_SERVER_URL", "http://localhost:11439")
 # Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL server for reranking.
 _RL_OVERFETCH = 2
+# v0.2.47 RL-6: maximum linked-slot vectors packed per node in the v3
+# retrieval event. Must MATCH `paid-modules/vct-rl-reranker/rl_model.py::MAX_LINKED`
+# (= 5). The container's `_rl_model.update(q_raw, n_raw, linked_raws, n_type_idx)`
+# only consumes the first MAX_LINKED entries — over-shipping wastes bytes.
+# Packing order is fixed: `extra_chunks_of_same_node + actual_linked_nodes`,
+# truncated to MAX_LINKED.
+_RL_MAX_LINKED: int = 5
 # Per-process call counter — used to order calls within a session (maps seq → transcript position).
 _rl_call_seq: int = 0
 # v0.2.28: hold strong references to in-flight `_rl_answer_monitor` tasks
@@ -321,6 +328,35 @@ _rl_call_seq: int = 0
 # (97.7% orphan-citation rate) is the symptom. Standard mitigation:
 # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
 _rl_monitor_tasks: "set[asyncio.Task]" = set()
+# v0.2.47 RL-6: per-task content cache for the citation-write monitor.
+# Populated by `_rl_cache_and_rerank` at retrieval time with the full per-node
+# payload (best-chunk vector, MAX_LINKED packed linked_embs, node_type, links,
+# cos_qn/ql/nl, etc.) PLUS the query embedding and active-embedding metadata.
+# Consumed by `_rl_answer_monitor` at citation time so it can compute
+# `cosine_sims` (max over answer-chunks × n_emb) + `literal_cited` and write
+# a single v3 citation event without re-fetching anything from Weaviate.
+#
+# Eviction: LRU-ish, bounded at `_RL_NODE_CACHE_MAX`. Entries are popped by
+# the monitor on success; expired-but-unwritten entries (timeout, evicted by
+# new traffic) are dropped silently — the retrieval event still got written
+# at cache-fill time, only the citation event is lost. This is the same
+# soft-fail discipline as the hub POST: no retry, no fallback.
+#
+# Each entry shape (matches what `_rl_answer_monitor` reads):
+#   {
+#       "nodes": list[dict],          # per-node with title / node_type /
+#                                     # n_emb / linked_embs / linked_type_names /
+#                                     # cos_qn / cos_ql / cos_nl / file_path / links
+#       "query_emb": list[float],     # 1024-dim active-slot vector
+#       "active_model": str,          # for chunker.for_model + event payload
+#       "embedding_source": str,
+#       "embedding_dim": int,
+#       "project_id": str | None,
+#       "project_name": str | None,
+#       "task_type": str,
+#   }
+_rl_node_content_cache: dict[str, dict] = {}
+_RL_NODE_CACHE_MAX: int = 256
 # KG search tool names as they appear in session transcripts (with and without mcp__ prefix).
 _KG_SEARCH_TOOLS: frozenset[str] = frozenset({
     "hybrid_search", "semantic_graph_search",
@@ -3472,6 +3508,99 @@ def _reset_rl_telemetry_writers() -> None:
     canonical reset path.
     """
     _rl_telemetry_writers.clear()
+
+
+def _rl_pack_linked_embs_for_node(
+    node: dict,
+    sibling_objs_by_source_id: dict[str, list],
+    link_objs_by_title: dict[str, object],
+    target_vector_name: str,
+) -> tuple[list[list[float]], list[str]]:
+    """Pack up to ``_RL_MAX_LINKED`` linked-slot vectors for one node.
+
+    Order matches what ``paid-modules/vct-rl-reranker/retrieval_rl.py::_train_rl_model``
+    builds online today (lines 914-918):
+
+        linked_raws = extra_chunks_of_same_node + actual_linked_nodes
+        linked_type_idxs_final = [n_type_idx] * len(extra_chunks) + linked_type_idxs
+
+    Offline replay reads this exact order from the v3 event and feeds it
+    into ``_rl_model.update(..., linked_raws=...)`` with NO repacking.
+
+    Args:
+        node: The retrieval result dict for which we're building linked_embs.
+            Must carry ``source_node_id`` (or fall through to title) and
+            ``chunk_number`` so we can filter out the matched chunk itself
+            from the sibling pool. ``links`` (a list of wikilink titles)
+            drives the actual_linked_nodes side.
+        sibling_objs_by_source_id: Pre-fetched Weaviate objects keyed by
+            ``source_node_id``. Each value is a list of objects from the
+            same KG row family. Vectors are pulled via
+            ``_extract_obj_vector(obj, target_vector_name)``.
+        link_objs_by_title: Pre-fetched Weaviate objects keyed by ``title``,
+            one per linked-node title we resolved.
+        target_vector_name: Active named-vector slot (e.g. "qwen3_embed")
+            for ``_extract_obj_vector`` to look up.
+
+    Returns:
+        ``(packed_embs, packed_type_names)`` — both lists length
+        ≤ ``_RL_MAX_LINKED``. ``packed_type_names`` carries the per-slot
+        ``node_type`` string the container resolves to an int via
+        ``self._rl_model.get_type_idx(name)`` (D1' invariant: type
+        indices are process-local; ALWAYS ship names across the wire).
+    """
+    packed_embs: list[list[float]] = []
+    packed_types: list[str] = []
+    node_type = node.get("node_type") or "concept"
+
+    # Step 1: extra chunks of THIS node (same source_node_id, different chunk_num).
+    source_id = node.get("source_node_id") or node.get("title") or ""
+    matched_chunk = node.get("chunk_number")
+    if source_id:
+        siblings = sibling_objs_by_source_id.get(source_id) or []
+        for sib in siblings:
+            try:
+                sib_chunk = sib.properties.get("chunk_num")
+            except (AttributeError, KeyError):
+                continue
+            if sib_chunk == matched_chunk:
+                continue  # the matched chunk itself; that's n_emb, not a linked slot
+            vec = _extract_obj_vector(sib, target_vector_name)
+            if not vec:
+                continue
+            packed_embs.append(vec)
+            packed_types.append(node_type)  # extra chunks share THIS node's type
+            if len(packed_embs) >= _RL_MAX_LINKED:
+                return packed_embs, packed_types
+
+    # Step 2: actual linked nodes (one vector per resolved link title).
+    raw_links = node.get("links") or []
+    for raw in raw_links:
+        if len(packed_embs) >= _RL_MAX_LINKED:
+            break
+        link_str = raw if isinstance(raw, str) else str(raw)
+        # Strip wikilink decorations the typed-link parser may have left:
+        # "uses::Tool" -> "Tool"; "[[Tool]]" -> "Tool".
+        if "::" in link_str:
+            link_str = link_str.split("::", 1)[1]
+        link_str = link_str.strip().strip("[").strip("]")
+        if not link_str:
+            continue
+        obj = link_objs_by_title.get(link_str)
+        if obj is None:
+            continue
+        vec = _extract_obj_vector(obj, target_vector_name)
+        if not vec:
+            continue
+        packed_embs.append(vec)
+        # Per-link node_type from the fetched object's properties; "concept" fallback.
+        try:
+            ltype = (obj.properties.get("node_type") or "concept") if hasattr(obj, "properties") else "concept"
+        except (AttributeError, KeyError):
+            ltype = "concept"
+        packed_types.append(str(ltype))
+
+    return packed_embs, packed_types
 
 
 async def _rl_cache_and_rerank(
