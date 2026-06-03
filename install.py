@@ -139,7 +139,11 @@ from vco_lib import project_init as _project_init  # noqa: E402
 from vco_lib import secrets_audit as _secrets_audit  # noqa: E402
 from vco_lib.deferral_report import DeferralEntry, DeferralReport  # noqa: E402
 # v0.2.46 V47-B (Gap B): symlinks under install path are never touched.
+# v0.2.46 post-adversarial L1: check_vco_new_collision guards against
+# silently clobbering .vco-new siblings that the user may have hand-
+# edited between install runs.
 from vco_lib.symlink_handler import (  # noqa: E402
+    check_vco_new_collision,
     compute_vco_new_path,
     emit_symlink_deferral,
     is_symlink_blocking,
@@ -19209,6 +19213,19 @@ def _configure_claude_settings(
                 deferral_report, settings_dir, vco_new_dir,
                 install_root=PROJECT_ROOT,
             )
+        # v0.2.46 post-adversarial L1: if the prior .vco-new dir from a
+        # previous install run is still here, refuse to clobber it.
+        if check_vco_new_collision(
+            vco_new_dir,
+            install_root=PROJECT_ROOT,
+            deferral=deferral_report,
+        ):
+            print(
+                f"  Claude settings: prior {vco_new_dir.name}/ from a "
+                f"previous run exists — leaving untouched (see "
+                f"UPDATE_DEFERRED.md for reconciliation)"
+            )
+            return
         print(
             f"  Claude settings: .claude/ is a symlink — writing to "
             f"{vco_new_dir.name}/ instead (see UPDATE_DEFERRED.md)"
@@ -19229,6 +19246,19 @@ def _configure_claude_settings(
                 deferral_report, settings_file, vco_new_file,
                 install_root=PROJECT_ROOT,
             )
+        # v0.2.46 post-adversarial L1: ditto for the settings.json.vco-new
+        # file from a prior run.
+        if check_vco_new_collision(
+            vco_new_file,
+            install_root=PROJECT_ROOT,
+            deferral=deferral_report,
+        ):
+            print(
+                f"  Claude settings: prior {vco_new_file.name} from a "
+                f"previous run exists — leaving untouched (see "
+                f"UPDATE_DEFERRED.md for reconciliation)"
+            )
+            return
         print(
             f"  Claude settings: settings.json is a symlink — writing to "
             f"{vco_new_file.name} instead (see UPDATE_DEFERRED.md)"
