@@ -61,6 +61,12 @@ pub mod mcp_tool_defaults;
 // validation outcome). Effective tier still projects through
 // `tier_cache.module_licenses` — `tier.rs` stays unchanged.
 pub mod license_keys;
+// Migration 025 — RL telemetry events queryable store (v0.2.47). Replaces
+// the JSONL corpus at `~/.claude/retrieval_rl_data/rl_events.jsonl`. The
+// MCP-side telemetry writer POSTs every event via the hub's
+// `POST /api/v1/rl/events` route; the hub is the sole writer (preserves
+// the launcher's single-writer architectural rule).
+pub mod rl_events;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {
