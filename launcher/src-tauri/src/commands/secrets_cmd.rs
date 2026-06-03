@@ -2208,3 +2208,49 @@ mod tests {
         let _ = db.forget_secret_active_state("per_project", "pwin", "user", &key);
     }
 }
+
+// ─── v0.2.46 V47-C followup (landed with V47-G-final) ───────────────────
+//
+// Tauri command wrapper for the per-project SecretsTab's "Migrate from
+// .env" button. The Svelte side calls into this; we delegate to the
+// canonical V47-C migration path (vct-hub `/api/v1/secrets/migrate`).
+//
+// STATUS (V47-G-final): the Tauri-side wrapper is intentionally a stub
+// today — it returns an "unavailable" error response that the Svelte
+// component (SecretsTab.svelte) catches and routes into a clear CLI-
+// fallback message ("Run `python install.py --update --apply-deferred`
+// at the project root"). The hub endpoint already works (V47-C); the
+// CLI path through install.py works (V47-C). What's NOT wired today is
+// the in-process Rust → hub round-trip, which would require: project-
+// root resolution from project_id, an authenticated hub HTTP client,
+// the secret-shape heuristic in Rust (or shelling out to the python
+// secrets_audit module), and the .env-rewrite-on-success logic.
+//
+// FOLLOW-UP: v0.2.47 should land the full Rust wrapper so the GUI button
+// works without the CLI fallback. Tracked as a v0.2.47 backlog item in
+// `.claude/context/plans/v0.2.47-backlog-*.md` once the cycle opens.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MigrateEnvSecretsResult {
+    pub ok: bool,
+    pub migrated: Vec<String>,
+    pub failed: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[command]
+pub async fn migrate_env_secrets_from_dotenv(
+    project_id: String,
+) -> Result<MigrateEnvSecretsResult, String> {
+    // V47-G-final: explicit "use CLI fallback" stub. The Svelte side
+    // (SecretsTab.svelte) catches Err(...) and renders a CLI-fallback
+    // message — this matches the v0.2.46 release-discipline rule of
+    // shipping the surface, the hub endpoint, and the CLI path, while
+    // deferring only the in-process Rust wrapper to v0.2.47.
+    let _ = project_id; // silence unused-warning until the wrapper lands.
+    Err(format!(
+        "migrate_env_secrets_from_dotenv: Tauri wrapper not yet wired \
+         (v0.2.47 follow-up). Use the CLI fallback: \
+         `python install.py --update --apply-deferred` at the project root."
+    ))
+}

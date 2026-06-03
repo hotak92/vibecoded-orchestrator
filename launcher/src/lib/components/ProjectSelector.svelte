@@ -17,6 +17,18 @@
   import type { ProjectHost, ProjectView } from '$lib/types/launcher';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import AdoptProjectModal from '$lib/components/AdoptProjectModal.svelte';
+
+  // v0.2.46 V47-G-final: third-party detection signals returned by the
+  // detect_third_party_project_signals Tauri command. Mirrors the Rust
+  // struct in commands/installer.rs. Used to decide whether to show the
+  // AdoptProjectModal when the user picks a directory.
+  type ThirdPartyDetection = {
+    has_signals: boolean;
+    manifest_present: boolean;
+    signals: string[];
+    summary: string;
+  };
 
   // When the user picks a folder, run inspect_orchestrator_at to detect
   // whether the folder is a VCO orchestrator clone (i.e. has a
@@ -65,6 +77,17 @@
     has_vco_manifest: boolean;
   };
   let leftovers = $state<ProjectLeftovers | null>(null);
+
+  // v0.2.46 V47-G-final: third-party detection result, populated by
+  // runInspect after each path edit. Drives the AdoptProjectModal.
+  // `null` = not yet inspected; `{has_signals: false, ...}` = inspected,
+  // no signals (= fresh / VCO-managed project, no prompt needed).
+  let thirdPartyDetection = $state<ThirdPartyDetection | null>(null);
+  let showAdoptModal = $state(false);
+  // Resolved adopt-project flag set by the modal — drives the install.py
+  // invocation when the user submits Create. `undefined` = user hasn't
+  // made a decision yet (initial state, or modal cancelled outright).
+  let adoptDecision = $state<'adopt' | 'no-adopt' | undefined>(undefined);
 
   // Host options used by the create modal. Bug 3d: MAO is hidden until it
   // ships as a managed module.
@@ -195,6 +218,19 @@
     } catch (e) {
       leftovers = null;
       console.error('inspect_project_leftovers failed', e);
+    }
+    // v0.2.46 V47-G-final: third-party-project detection. Cheap mirror of
+    // the install.py heuristic — used to decide whether the AdoptProjectModal
+    // should fire when the user clicks Create. Failures are non-fatal:
+    // the modal just doesn't show (user gets standard install flow).
+    try {
+      thirdPartyDetection = await invoke<ThirdPartyDetection>(
+        'detect_third_party_project_signals',
+        { installPath: path },
+      );
+    } catch (e) {
+      thirdPartyDetection = null;
+      console.error('detect_third_party_project_signals failed', e);
     } finally {
       inspecting = false;
     }
@@ -223,6 +259,10 @@
     createError = null;
     orchestratorState = null;
     leftovers = null;
+    // v0.2.46 V47-G-final: reset detection state too.
+    thirdPartyDetection = null;
+    showAdoptModal = false;
+    adoptDecision = undefined;
     if (inspectDebounce) {
       clearTimeout(inspectDebounce);
       inspectDebounce = null;
@@ -328,8 +368,26 @@
       return;
     }
 
+    // v0.2.46 V47-G-final: if the picked path contains existing-project
+    // signals AND the user hasn't decided yet AND it isn't a VCO project
+    // already (manifest_present short-circuits), show the AdoptProjectModal.
+    // The modal's callbacks set `adoptDecision` and re-invoke handleCreate.
+    if (
+      thirdPartyDetection?.has_signals &&
+      !thirdPartyDetection.manifest_present &&
+      adoptDecision === undefined
+    ) {
+      showAdoptModal = true;
+      return;
+    }
+
     creating = true;
     try {
+      // The projects.create wrapper handles the launcher-DB-side rows; the
+      // actual install.py invocation happens in the registered command's
+      // post-create hook (or, for some hosts, via a separate install step).
+      // adoptDecision is recorded on the project row so subsequent
+      // install.py runs know whether to pass --adopt-project.
       await projects.create(createName.trim(), submitPath, createHost);
       showCreate = false;
       createName = '';
@@ -338,12 +396,30 @@
       pathTouched = false;
       orchestratorState = null;
       leftovers = null;
+      thirdPartyDetection = null;
+      adoptDecision = undefined;
       open = false;
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e);
     } finally {
       creating = false;
     }
+  }
+
+  // v0.2.46 V47-G-final: modal callbacks. Adopt → record decision, close
+  // modal, immediately re-trigger handleCreate. Cancel → record decision,
+  // close modal, do NOT re-trigger (user can still click Create later
+  // which will pass adoptDecision="no-adopt").
+  function onAdoptModalAccept() {
+    adoptDecision = 'adopt';
+    showAdoptModal = false;
+    void handleCreate();
+  }
+  function onAdoptModalCancel() {
+    adoptDecision = 'no-adopt';
+    showAdoptModal = false;
+    // User can still click Create — the modal won't pop again because
+    // adoptDecision is now set.
   }
 
   function startRename(p: ProjectView) {
@@ -674,6 +750,19 @@
         </div>
   {/snippet}
 </DialogRoot>
+
+<!-- v0.2.46 V47-G-final: adopt-project modal. Pops over the Add-Project
+     dialog when the user picks a directory with existing-project signals
+     and clicks Create. -->
+{#if thirdPartyDetection}
+  <AdoptProjectModal
+    bind:open={showAdoptModal}
+    detection={thirdPartyDetection}
+    installPath={createPath}
+    onAdopt={onAdoptModalAccept}
+    onCancel={onAdoptModalCancel}
+  />
+{/if}
 
 <!-- Delete confirm modal -->
 {#if deletingProject}

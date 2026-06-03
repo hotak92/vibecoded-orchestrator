@@ -1461,25 +1461,552 @@ def _lightweight_rewrite_paths(install_path: Path,
     return results
 
 
-def _resolve_adopt_project_mode(args) -> str | None:
-    """v0.2.46 Part 2 (V47-G-stub): resolve --adopt-project-* flags into a mode.
+# ---------------------------------------------------------------------------
+# v0.2.46 V47-G-final: detection heuristic + interactive prompt
+# ---------------------------------------------------------------------------
+#
+# Replaces V47-G-stub's None / placeholder branches. Three pieces:
+#
+#   1. ``_detect_third_party_project(install_path)`` — heuristic scan that
+#      returns None when there's no signal (= proceed with fresh install),
+#      or a dict describing detected signals.
+#
+#   2. ``_prompt_adopt_decision(detection, args)`` — modal-style interactive
+#      prompt offering Adopt / Cancel / Show details. Safe defaults: non-TTY
+#      or --yes / --quiet → "no-adopt" (NEVER auto-adopt without explicit
+#      consent; CI must opt in via --adopt-project explicitly).
+#
+#   3. ``_print_adopt_dry_run_manifest(install_path)`` — real dry-run output
+#      replacing V47-G-stub's placeholder. Prints a section per Gap A-F.
+#
+# Plus:
+#   4. ``_resolve_adopt_project_mode(args, install_path=None)`` — extended
+#      signature. When ``install_path`` is provided AND no explicit flag is
+#      set, runs detection + prompt. When ``install_path`` is None (the
+#      V47-G-stub contract surface), behaves identically to the stub
+#      (returns None for no-flag case). Backward-compat is critical: the
+#      V47-G-stub contract tests must keep passing.
+
+# Names that look like a Python virtualenv directory. Tested in priority
+# order — the first hit wins for the signal label.
+_V47G_VENV_DIR_NAMES = (".venv", "venv", "env", ".env-py")
+
+
+def _v47g_is_venv_dir(path: Path) -> bool:
+    """True iff ``path`` is a directory that looks like a Python venv.
+
+    Signal: contains ``pyvenv.cfg`` (Python 3.3+ standard marker). Avoids
+    false positives like ``.venv/`` being an empty folder.
+    """
+    try:
+        if not path.is_dir():
+            return False
+        return (path / "pyvenv.cfg").is_file()
+    except OSError:
+        return False
+
+
+def _v47g_describe_venv(path: Path) -> str:
+    """Return a one-line summary of a venv (py version + rough pkg count).
+
+    Both pieces are best-effort: missing pyvenv.cfg / unreadable
+    site-packages → degrade to a generic label.
+    """
+    py_label = "Python ?"
+    pkg_label = "~? packages"
+    try:
+        cfg = (path / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
+        for line in cfg.splitlines():
+            if line.lower().startswith("version"):
+                # Format: "version = 3.12.3"
+                _, _, ver = line.partition("=")
+                ver = ver.strip()
+                if ver:
+                    py_label = f"Python {ver}"
+                    break
+    except OSError:
+        pass
+    # Rough pkg count by enumerating dist-info dirs in lib/.../site-packages.
+    try:
+        site_pkgs_candidates = list(path.glob("lib/python*/site-packages"))
+        if site_pkgs_candidates:
+            n = sum(
+                1 for p in site_pkgs_candidates[0].iterdir()
+                if p.name.endswith(".dist-info")
+            )
+            pkg_label = f"~{n} packages"
+    except OSError:
+        pass
+    return f"{py_label}, {pkg_label}"
+
+
+def _v47g_count_env_secrets(env_path: Path) -> int:
+    """Count secret-shaped keys in ``.env`` (best-effort, soft-fail to 0).
+
+    Reuses ``vco_lib.secrets_audit.audit_env_secrets`` for consistency with
+    V47-C's actual detection. Cheap on small ``.env`` files; degraded path
+    returns 0 (signal still reads "with content" via byte size).
+    """
+    try:
+        return len(_secrets_audit.audit_env_secrets(env_path))
+    except Exception:  # noqa: BLE001 — soft-fail
+        return 0
+
+
+def _detect_third_party_project(install_path: Path) -> dict | None:
+    """Heuristic: is this an existing 3rd-party project being adopted by VCO?
+
+    Returns ``None`` when there's no signal (= proceed with normal
+    install / fresh project flow). Returns a dict with structure::
+
+        {
+          "signals": [<one-line description per detected signal>, ...],
+          "summary": "<short summary string>",
+          "manifest_present": False,
+          "details": {<signal_key>: <verbose detail string>, ...},
+        }
+
+    when at least one signal is present.
+
+    ``manifest_present=True`` short-circuit: if ``.claude/.vco-manifest.json``
+    exists the project is already VCO-managed → NEVER treat as 3rd-party,
+    NEVER prompt. Returns None unconditionally in that case (we don't
+    second-guess existing VCO installs — the regular update flow runs).
+
+    Soft-fails to None on any I/O error so detection never blocks install.
+    """
+    try:
+        if install_path is None or not install_path.is_dir():
+            return None
+
+        manifest_path = install_path / ".claude" / ".vco-manifest.json"
+        if manifest_path.is_file():
+            # Existing VCO project — never prompt.
+            return None
+
+        signals: list[str] = []
+        details: dict[str, str] = {}
+
+        # Signal 1: .claude/ exists with at least one file.
+        claude_dir = install_path / ".claude"
+        if claude_dir.is_dir():
+            try:
+                n_entries = sum(1 for _ in claude_dir.iterdir())
+            except OSError:
+                n_entries = 0
+            if n_entries > 0:
+                # Try to give a rough idea of what's inside.
+                parts: list[str] = []
+                for sub in ("agents", "skills", "hooks", "scripts"):
+                    p = claude_dir / sub
+                    if p.is_dir():
+                        try:
+                            count = sum(1 for _ in p.iterdir())
+                            if count > 0:
+                                parts.append(f"{sub}={count}")
+                        except OSError:
+                            pass
+                inv = ", ".join(parts) if parts else f"{n_entries} entries"
+                signals.append(f".claude/ (existing orchestrator artifacts: {inv})")
+                details["claude_dir"] = (
+                    f"Directory '.claude/' contains {n_entries} top-level entries. "
+                    f"VCO will land its agents/skills/hooks/scripts beside these; "
+                    f"any pre-existing files matching VCO names will be preserved "
+                    f"as .vco-new siblings (see V47-A managed-block).\n"
+                    f"  Inventory: {inv}"
+                )
+
+        # Signal 2: CLAUDE.md exists with non-empty content.
+        claude_md = install_path / "CLAUDE.md"
+        if claude_md.is_file():
+            try:
+                size = claude_md.stat().st_size
+            except OSError:
+                size = 0
+            if size > 0:
+                signals.append(f"CLAUDE.md (existing project instructions, {size} bytes)")
+                details["claude_md"] = (
+                    f"CLAUDE.md exists ({size} bytes). VCO will append its "
+                    f"orchestrator-instruction block to the END of the file "
+                    f"(preserving everything above), or land a CLAUDE.md.vco-new "
+                    f"sibling in --adopt-project mode."
+                )
+
+        # Signal 3: .env exists with non-empty content.
+        env_path = install_path / ".env"
+        if env_path.is_file():
+            try:
+                size = env_path.stat().st_size
+            except OSError:
+                size = 0
+            if size > 0:
+                n_secrets = _v47g_count_env_secrets(env_path)
+                if n_secrets > 0:
+                    sig_line = f".env (with {n_secrets} secret-shaped key{'s' if n_secrets != 1 else ''})"
+                else:
+                    sig_line = f".env (with content, {size} bytes)"
+                signals.append(sig_line)
+                if n_secrets > 0:
+                    # Pull key names for the verbose details view.
+                    try:
+                        candidates = _secrets_audit.audit_env_secrets(env_path)
+                        keys = sorted({c.key for c in candidates})
+                        details["env"] = (
+                            f".env contains {n_secrets} key{'s' if n_secrets != 1 else ''} "
+                            f"matching the secret-shape heuristic. V47-C will offer "
+                            f"to migrate to the OS keychain (Y/n/details prompt). "
+                            f"Keys: {', '.join(keys)}"
+                        )
+                    except Exception:  # noqa: BLE001
+                        details["env"] = (
+                            f".env contains content matching secret-shape heuristic. "
+                            f"V47-C will offer to migrate to the OS keychain."
+                        )
+                else:
+                    details["env"] = (
+                        f".env exists ({size} bytes) but none of its keys look "
+                        f"secret-shaped — VCO's V47-C audit will be a no-op."
+                    )
+
+        # Signal 4: .venv (or similar) is a Python venv directory.
+        for venv_name in _V47G_VENV_DIR_NAMES:
+            candidate = install_path / venv_name
+            if _v47g_is_venv_dir(candidate):
+                desc = _v47g_describe_venv(candidate)
+                signals.append(f"{venv_name}/ ({desc})")
+                details["venv"] = (
+                    f"Found Python venv at '{venv_name}/' ({desc}). V47-D will "
+                    f"preserve this venv (action='skip-no-manifest'); use "
+                    f"--rebuild-venv if you want VCO's default venv instead."
+                )
+                break
+
+        # Signal 5: knowledge/ exists with .md files.
+        knowledge_dir = install_path / "knowledge"
+        if knowledge_dir.is_dir():
+            try:
+                md_count = sum(
+                    1 for p in knowledge_dir.rglob("*.md")
+                    # Soft-cap to keep this fast on huge trees.
+                    if p.is_file()
+                )
+                if md_count > 100:
+                    md_count = 100  # cap labelled below
+                    cap_label = "100+"
+                else:
+                    cap_label = str(md_count)
+            except OSError:
+                md_count = 0
+                cap_label = "0"
+            if md_count > 0:
+                signals.append(f"knowledge/ (with {cap_label} .md file{'s' if md_count != 1 else ''})")
+                details["knowledge"] = (
+                    f"knowledge/ directory exists with {cap_label} markdown file(s). "
+                    f"VCO's knowledge graph layer will index these alongside its own "
+                    f"shipped KG nodes; nothing is overwritten."
+                )
+
+        if not signals:
+            return None
+
+        return {
+            "signals": signals,
+            "summary": f"{len(signals)} signal{'s' if len(signals) != 1 else ''} detected",
+            "manifest_present": False,
+            "details": details,
+        }
+    except Exception:  # noqa: BLE001 — soft-fail
+        return None
+
+
+def _v47g_render_modal(install_path: Path, detection: dict) -> str:
+    """Render the ASCII modal-style header for the adopt prompt."""
+    lines: list[str] = []
+    border = "+" + "-" * 67 + "+"
+    lines.append("")
+    lines.append(border)
+    lines.append("| Existing project detected                                          |")
+    lines.append("|                                                                    |")
+    # Install path (may be long; we just print it, ascii box gives up on
+    # word-wrapping for long paths — this is fine for a one-shot CLI).
+    lines.append(f"| {str(install_path)}")
+    lines.append("| contains:")
+    for sig in detection.get("signals", []):
+        # Truncate visually long signals so the modal stays readable.
+        lines.append(f"|   * {sig}")
+    lines.append("|")
+    lines.append("| Adopt this project under VCO?")
+    lines.append("|")
+    lines.append("| Adopt mode: maximally protective. Existing files preserved;")
+    lines.append("| VCO defaults landed as .vco-new siblings; deferral entries")
+    lines.append("| generated for everything that needs your review.")
+    lines.append(border)
+    return "\n".join(lines)
+
+
+def _v47g_render_details(detection: dict) -> str:
+    """Render the expanded details view (one block per detected signal)."""
+    lines: list[str] = []
+    lines.append("")
+    lines.append("--- Detection details ---")
+    details = detection.get("details", {}) or {}
+    if not details:
+        lines.append("(no detailed information available)")
+    else:
+        for key, text in details.items():
+            lines.append(f"\n[{key}]")
+            for ln in text.splitlines():
+                lines.append(f"  {ln}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _prompt_adopt_decision(detection: dict, args) -> str:
+    """Interactive adopt-decision prompt.
 
     Returns one of:
-      - "adopt"        — explicit --adopt-project flag set
-      - "no-adopt"     — explicit --no-adopt-project flag set
+      - ``"adopt"``    — user picked Adopt (recommended path)
+      - ``"no-adopt"`` — user picked Cancel, or non-interactive default
+
+    Safety defaults (return ``"no-adopt"`` unconditionally):
+      - Non-TTY stdin (CI / scripted install)
+      - ``--yes`` flag (no consent → don't surprise the user)
+      - ``--quiet`` flag (no UI possible)
+
+    Rationale: adopting a 3rd-party tree is a load-bearing decision (V47-A
+    rewrites .claude/settings.json managed keys, V47-C may migrate secrets
+    to the keychain, V47-D protects the user's venv, etc.). Even though
+    adopt-mode is "maximally protective", the user should explicitly opt
+    in. CI that needs adopt-mode should pass ``--adopt-project`` explicitly.
+    """
+    # Safety defaults — never auto-adopt without explicit user consent.
+    non_interactive = (
+        bool(getattr(args, "yes", False))
+        or bool(getattr(args, "quiet", False))
+        or not sys.stdin.isatty()
+    )
+    if non_interactive:
+        print(
+            "\n[adopt-project] Detection found existing-project signals but "
+            "this install is running non-interactively (--yes / --quiet / "
+            "no TTY)."
+        )
+        print(
+            "  Defaulting to 'no-adopt' — pass --adopt-project explicitly "
+            "to adopt this tree."
+        )
+        return "no-adopt"
+
+    # Compute install_path from the args attribute commonly available
+    # (we want it for the modal header). If unavailable, derive from
+    # the global PROJECT_ROOT.
+    try:
+        install_path = PROJECT_ROOT
+    except NameError:
+        install_path = Path(".").resolve()
+
+    # Render the modal header. Subsequent re-renders (after "show details")
+    # repeat the header so the user sees the choices again.
+    modal = _v47g_render_modal(install_path, detection)
+
+    print(modal)
+    while True:
+        print("  1) Adopt (recommended)")
+        print("  2) Cancel")
+        print("  3) Show details")
+        try:
+            ans = input("  Choice [1-3]: ").strip()
+        except EOFError:
+            # Stdin closed mid-prompt → safe default.
+            print("  (stdin closed — defaulting to 'no-adopt')")
+            return "no-adopt"
+        if ans == "1":
+            return "adopt"
+        if ans == "2":
+            return "no-adopt"
+        if ans == "3":
+            print(_v47g_render_details(detection))
+            # Re-render the modal so the user can re-decide.
+            print(modal)
+            continue
+        print(f"  Please pick 1, 2, or 3 (got: {ans!r}).")
+
+
+def _print_adopt_dry_run_manifest(install_path: Path) -> None:
+    """Print the V47-G-final dry-run action manifest (one section per gap).
+
+    Replaces V47-G-stub's placeholder ``print("...V47-G-stub placeholder...")``.
+    For each of the v0.2.46 gaps (A-F), describes the action that WOULD be
+    taken if adopt-project ran. Never writes anything; this is purely
+    informational.
+
+    Soft-fails on any sub-section's I/O — the manifest must always complete.
+    """
+    print()
+    print("=" * 70)
+    print("V47-G-final dry-run manifest")
+    print("=" * 70)
+    print(f"Install path: {install_path}")
+
+    # Detection summary at the top.
+    detection = _detect_third_party_project(install_path)
+    if detection is None:
+        print("\nDetection: no third-party-project signals.")
+        print("           Adopt-project flow would be a no-op here (fresh install).")
+    else:
+        print(f"\nDetection: {detection.get('summary', 'signals detected')}")
+        for sig in detection.get("signals", []):
+            print(f"  * {sig}")
+
+    # Gap A — .claude/settings.json managed-block merge.
+    print()
+    print("[Gap A] .claude/settings.json managed-block merge")
+    settings_path = install_path / ".claude" / "settings.json"
+    try:
+        if settings_path.is_file():
+            print(f"  Would refresh managed keys in: {settings_path}")
+            print("  (User-set non-VCO keys preserved verbatim. See V47-A.)")
+        else:
+            print("  No existing .claude/settings.json — VCO would create one fresh.")
+    except OSError as e:
+        print(f"  (Could not inspect settings.json: {e})")
+
+    # Gap B — Symlinks under install path.
+    print()
+    print("[Gap B] Symlinks (V47-B: never touched, .vco-new sibling instead)")
+    sym_count = 0
+    try:
+        if install_path.is_dir():
+            for p in install_path.rglob("*"):
+                # Hard cap to keep dry-run fast on big trees.
+                if sym_count >= 20:
+                    print("  (... more symlinks omitted ...)")
+                    break
+                try:
+                    if p.is_symlink():
+                        sym_count += 1
+                        print(f"  - {p.relative_to(install_path)} → would emit .vco-new sibling")
+                except OSError:
+                    continue
+    except OSError as e:
+        print(f"  (Could not scan symlinks: {e})")
+    if sym_count == 0:
+        print("  (No symlinks detected — Gap B is a no-op for this tree.)")
+
+    # Gap C — .env secret-shaped keys.
+    print()
+    print("[Gap C] .env secrets (V47-C: offered for keychain migration)")
+    env_path = install_path / ".env"
+    if env_path.is_file():
+        try:
+            candidates = _secrets_audit.audit_env_secrets(env_path)
+        except Exception as e:  # noqa: BLE001
+            candidates = []
+            print(f"  (Audit failed: {e})")
+        if candidates:
+            keys = sorted({c.key for c in candidates})
+            print(f"  Would offer to migrate {len(keys)} key(s) to the OS keychain:")
+            for k in keys:
+                print(f"    * {k}")
+        else:
+            print("  .env exists but no secret-shaped keys detected — nothing to migrate.")
+    else:
+        print("  No .env file — Gap C is a no-op.")
+
+    # Gap D — venv triage.
+    print()
+    print("[Gap D] venv triage (V47-D: protect 3rd-party venvs)")
+    venv_found = False
+    for venv_name in _V47G_VENV_DIR_NAMES:
+        candidate = install_path / venv_name
+        if _v47g_is_venv_dir(candidate):
+            venv_found = True
+            desc = _v47g_describe_venv(candidate)
+            print(f"  Found: {venv_name}/ ({desc})")
+            manifest_path = install_path / ".claude" / ".vco-manifest.json"
+            if not manifest_path.is_file():
+                print("  Action: skip-no-manifest (preserve existing venv).")
+                print("          Use --rebuild-venv to override.")
+            else:
+                print("  Action: standard triage (manifest present).")
+            break
+    if not venv_found:
+        print("  No Python venv detected — VCO would create one fresh.")
+
+    # Gap E — foreign compose files (informational scan).
+    print()
+    print("[Gap E] Foreign compose files (V47-E: informational scan)")
+    compose_candidates = [
+        install_path / "docker-compose.yml",
+        install_path / "docker-compose.yaml",
+        install_path / "compose.yml",
+        install_path / "compose.yaml",
+        install_path / "podman-compose.yml",
+        install_path / "podman-compose.yaml",
+    ]
+    found_compose = [p for p in compose_candidates if p.is_file()]
+    if found_compose:
+        print(f"  Would log {len(found_compose)} foreign compose file(s):")
+        for p in found_compose:
+            print(f"    * {p.relative_to(install_path)}")
+        print("  (Informational only — VCO's compose work happens in its own dir.)")
+    else:
+        print("  No foreign compose files found.")
+
+    # Gap F — PROJECT_NAME resolution.
+    print()
+    print("[Gap F] PROJECT_NAME resolution (V47-F: precedence chain)")
+    print("  Resolution order:")
+    print("    1. --project-name CLI flag")
+    print("    2. .vscode/settings.json (claude-code.env.PROJECT_NAME)")
+    print("    3. .claude/env PROJECT_NAME=")
+    print("    4. .env PROJECT_NAME=")
+    print("    5. interactive prompt (or sanitized directory name fallback)")
+    # Try the actual resolver chain (read-only — won't write anything).
+    vscode_name = _read_project_name_from_vscode_settings(install_path)
+    if vscode_name:
+        print(f"  Active via .vscode: {vscode_name}")
+    claude_env = install_path / ".claude" / "env"
+    if claude_env.is_file():
+        claude_env_name = _read_project_name_from_envfile(claude_env)
+        if claude_env_name:
+            print(f"  Active via .claude/env: {claude_env_name}")
+    dotenv = install_path / ".env"
+    if dotenv.is_file():
+        env_name = _read_project_name_from_envfile(dotenv)
+        if env_name:
+            print(f"  Active via .env: {env_name}")
+    if not (vscode_name
+            or (claude_env.is_file() and _read_project_name_from_envfile(claude_env))
+            or (dotenv.is_file() and _read_project_name_from_envfile(dotenv))):
+        # Fallback would be the directory name.
+        print(f"  Fallback: sanitized directory name '{install_path.name}'")
+
+    print()
+    print("=" * 70)
+    print("Dry-run complete. No files modified.")
+    print("=" * 70)
+
+
+def _resolve_adopt_project_mode(args, install_path: Path | None = None) -> str | None:
+    """v0.2.46 V47-G-final: resolve --adopt-project-* flags + detection into a mode.
+
+    Returns one of:
+      - "adopt"        — explicit --adopt-project flag, OR detection prompt → adopt
+      - "no-adopt"     — explicit --no-adopt-project flag, OR detection prompt → cancel,
+                         OR detection signal in non-interactive context (safe default)
       - "replace-all"  — explicit --adopt-project-replace-all flag set
       - "dry-run"      — explicit --adopt-project-dry-run flag set
-      - None           — no explicit signal
+      - None           — no explicit flag AND no detection signal (= proceed normally)
 
-    STUB: V47-G-stub only handles explicit flags. When no explicit signal is
-    given (None), V47-G-final will add the detection heuristic + interactive
-    prompt that decides whether to auto-prompt the user for adopt mode. Until
-    V47-G-final lands, None means "proceed with normal install/update flow".
+    Explicit flags take precedence (we never override the user). Only when no
+    explicit flag is set AND ``install_path`` is provided does the helper run
+    the V47-G-final detection heuristic + interactive prompt.
 
-    The mode is threaded through to Wave 2 surfaces via an optional
-    `adopt_project_mode: str | None = None` kwarg on _run_lightweight,
-    _venv_triage, _configure_claude_settings, and any other function that
-    Wave 2 (V47-A through V47-F) needs to mode-gate.
+    Backward-compat: when ``install_path`` is None (the V47-G-stub contract
+    surface used by the contract test suite and any pre-V47-G-final caller),
+    behaves identically to the stub — no detection, returns None for the
+    no-flag case. This preserves the V47-G-stub contract.
     """
     if getattr(args, "adopt_project_dry_run", False):
         return "dry-run"
@@ -1489,6 +2016,21 @@ def _resolve_adopt_project_mode(args) -> str | None:
         return "adopt"
     if getattr(args, "no_adopt_project", False):
         return "no-adopt"
+    # No explicit flag — V47-G-final detection branch (only if install_path
+    # was provided by the caller). Stub-contract callers (no install_path)
+    # still get None here.
+    if install_path is not None:
+        try:
+            detection = _detect_third_party_project(install_path)
+        except Exception:  # noqa: BLE001 — soft-fail
+            detection = None
+        if detection is not None:
+            try:
+                return _prompt_adopt_decision(detection, args)
+            except Exception as e:  # noqa: BLE001 — soft-fail
+                # Prompt machinery broke (very unlikely) — safe default.
+                print(f"[adopt-project] Prompt failed ({e}); defaulting to 'no-adopt'.")
+                return "no-adopt"
     return None
 
 
@@ -1921,13 +2463,17 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         )
 
     # Step 3: venv triage
-    # v0.2.46 V47-G-stub: thread adopt_project_mode through to _venv_triage
+    # v0.2.46 V47-G-final: thread adopt_project_mode through to _venv_triage
     # so Wave-2 V47-D can mode-gate destructive "recreate" actions when the
     # tree is being adopted (don't wipe a user's 3rd-party .venv).
     # v0.2.46 V47-D: also thread force_rebuild=args.rebuild_venv so the
     # `--rebuild-venv` CLI flag overrides the adopt-guard when the user
     # explicitly opts in to a rebuild.
-    adopt_project_mode = _resolve_adopt_project_mode(args)
+    # NOTE: lightweight installs intentionally do NOT run the V47-G-final
+    # detection prompt — lightweight is the launcher's "I already know this
+    # is a VCO project, just refresh it" path, so adopt-detection would be
+    # noise. We pass install_path=None to skip detection here.
+    adopt_project_mode = _resolve_adopt_project_mode(args, install_path=None)
     force_rebuild = getattr(args, "rebuild_venv", False)
     triage = _venv_triage(PROJECT_ROOT,
                           adopt_project_mode=adopt_project_mode,
@@ -3613,13 +4159,14 @@ def main() -> int:
 
     mode = "update" if args.update else "install"
 
-    # v0.2.46 Part 2 (V47-G-stub): resolve --adopt-project-* mode and dispatch
+    # v0.2.46 Part 2 (V47-G-final): resolve --adopt-project-* mode and dispatch
     # the early-exit cases (no-adopt / dry-run) before any work runs.
     # Wave-2 agents (V47-A through V47-F) read this same value from `args`
     # via `_resolve_adopt_project_mode(args)` inside their gap-specific
-    # functions. V47-G-final replaces the "None" branch with a detection
-    # heuristic + interactive prompt; for now, None means "proceed normally".
-    adopt_project_mode = _resolve_adopt_project_mode(args)
+    # functions. V47-G-final's detection heuristic + interactive prompt fires
+    # here when no explicit flag is set AND PROJECT_ROOT shows existing-
+    # project signals (CLAUDE.md, .env, .venv/, .claude/, knowledge/).
+    adopt_project_mode = _resolve_adopt_project_mode(args, install_path=PROJECT_ROOT)
     if adopt_project_mode == "no-adopt":
         print(
             "Adopt-project mode explicitly refused via --no-adopt-project. "
@@ -3627,14 +4174,10 @@ def main() -> int:
         )
         return 1
     if adopt_project_mode == "dry-run":
-        # STUB: V47-G-final will print the full intended action manifest
-        # (which files would be preserved, what symlinks would be skipped,
-        # which secrets would be flagged, etc.). Today it's a placeholder.
-        print(
-            "[adopt-project: dry-run] V47-G-stub placeholder. "
-            "V47-G-final will print the full action manifest here. "
-            "No changes were made."
-        )
+        # V47-G-final: print the full intended action manifest (which files
+        # would be preserved, what symlinks would be skipped, which secrets
+        # would be flagged, etc.). One section per Gap A-F.
+        _print_adopt_dry_run_manifest(PROJECT_ROOT)
         return 0
 
     # v0.2.46 V47-C (Gap C): detect secret-shaped keys in `.env` and
