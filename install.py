@@ -1546,6 +1546,19 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         # action == "skip"
         pass
 
+    # Gap E (v0.2.46): inform the user about project-owned compose files so
+    # they know VCO detected — and will not touch — their containers.
+    if foreign := _scan_foreign_compose_files(PROJECT_ROOT):
+        print(f"[i] Detected {len(foreign)} non-VCO compose file(s) — leaving alone:")
+        for p in foreign:
+            print(f"    {p}")
+        print()
+        _log_install_event(
+            "foreign_compose_scan", "info",
+            f"detected {len(foreign)} non-VCO compose file(s): "
+            + ", ".join(str(p) for p in foreign),
+        )
+
     # Step 4: container ensure (skip model pulls + seed; both
     # idempotent and unchanged on lightweight path).
     if args.no_containers:
@@ -2787,6 +2800,19 @@ def main() -> int:
     # whether launcher.db exists yet (pre-first-boot fresh installs).
     if _is_orchestrator_root_install():
         _emit_orchestrator_root_env_keys(PROJECT_ROOT)
+
+    # Gap E (v0.2.46): inform the user about project-owned compose files so
+    # they know VCO detected — and will not touch — their containers.
+    if foreign := _scan_foreign_compose_files(PROJECT_ROOT):
+        print(f"[i] Detected {len(foreign)} non-VCO compose file(s) — leaving alone:")
+        for p in foreign:
+            print(f"    {p}")
+        print()
+        _log_install_event(
+            "foreign_compose_scan", "info",
+            f"detected {len(foreign)} non-VCO compose file(s): "
+            + ", ".join(str(p) for p in foreign),
+        )
 
     # Step 6: Container services (restart on update to pick up config changes)
     if not args.no_containers:
@@ -7447,6 +7473,97 @@ def _decide_action(name: str, probe: str, evidence: str,
     if ans in ("3", "abort"):
         return ACTION_ABORT
     return ACTION_ALT_PORT
+
+
+def _scan_foreign_compose_files(
+    project_root: Path,
+    max_depth: int = 3,
+) -> list[Path]:
+    """Return relative paths of non-VCO compose files under *project_root*.
+
+    Scans up to *max_depth* levels deep for files matching:
+        docker-compose*.yml / docker-compose*.yaml
+        compose*.yml / compose*.yaml
+        podman-compose*.yml / podman-compose*.yaml
+
+    Excludes files owned by VCO:
+        - anything under ``infrastructure/``
+        - anything under ``claude_mcp_servers/``
+
+    Returns a list of ``Path`` objects relative to *project_root*,
+    sorted for stable output. Never raises; returns an empty list on I/O
+    errors.
+
+    Performance: bounded O(n) walk at depth ≤ 3 — fast even for large
+    repos because the depth limit prevents full-tree traversal.
+    """
+    _VCO_OWNED_PREFIXES: tuple[str, ...] = ("infrastructure", "claude_mcp_servers")
+    _COMPOSE_STEMS: tuple[str, ...] = (
+        "docker-compose",
+        "compose",
+        "podman-compose",
+    )
+    _COMPOSE_SUFFIXES: tuple[str, ...] = (".yml", ".yaml")
+
+    def _is_vco_owned(rel: Path) -> bool:
+        """Return True if *rel* is under a VCO-managed subtree."""
+        parts = rel.parts
+        return len(parts) > 0 and parts[0] in _VCO_OWNED_PREFIXES
+
+    def _is_compose_filename(name: str) -> bool:
+        """Return True if *name* matches any of the compose file patterns."""
+        lower = name.lower()
+        for suffix in _COMPOSE_SUFFIXES:
+            if lower.endswith(suffix):
+                stem = lower[: -len(suffix)]  # e.g. "docker-compose.dev"
+                for prefix in _COMPOSE_STEMS:
+                    if stem == prefix or stem.startswith(prefix + "."):
+                        return True
+        return False
+
+    results: list[Path] = []
+    try:
+        for entry in project_root.iterdir():
+            _walk(entry, project_root, current_depth=1, max_depth=max_depth,
+                  results=results, check_fn=_is_compose_filename,
+                  vco_owned_fn=_is_vco_owned)
+    except OSError:
+        pass
+
+    results.sort()
+    return results
+
+
+def _walk(
+    path: Path,
+    root: Path,
+    current_depth: int,
+    max_depth: int,
+    results: list[Path],
+    check_fn: "Callable[[str], bool]",
+    vco_owned_fn: "Callable[[Path], bool]",
+) -> None:
+    """Recursive helper for :func:`_scan_foreign_compose_files`."""
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return
+
+    if vco_owned_fn(rel):
+        return
+
+    if path.is_file() and not path.is_symlink():
+        if check_fn(path.name):
+            results.append(rel)
+        return
+
+    if path.is_dir() and not path.is_symlink() and current_depth <= max_depth:
+        try:
+            for child in path.iterdir():
+                _walk(child, root, current_depth + 1, max_depth,
+                      results, check_fn, vco_owned_fn)
+        except OSError:
+            pass
 
 
 def _resolve_service_safety(args: argparse.Namespace) -> dict:
