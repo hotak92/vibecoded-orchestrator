@@ -7,15 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.46] - 2026-06-03
+## [0.2.46] - 2026-06-04
 
-Hotfix release closing the 5th instance of a recurring KG re-embed bug
-(persisted v0.2.42 → v0.2.45 across 4 prior "fixes") + RL Reranker
-client-side install hardening + 10 silent-truncation footgun cleanups.
+Two-part release: Part 1 closes the 5th instance of a recurring KG
+re-embed bug + RL Reranker client-side hardening + 10 silent-truncation
+footgun cleanups. Part 2 delivers the third-party project adoption mode
+(`--adopt-project` family) — gap-plugging across 7 agents (V47-A through
+V47-G-final) covering settings.json managed-block merge, symlink
+preservation, secrets detection + keychain migration, venv adopt-guard,
+foreign-compose scan, PROJECT_NAME precedence resolver, detection
+heuristic + interactive prompt + dry-run + GUI wizard + Secrets tab
+Migrate button.
 
-The headline bug: `install.py:5948` (`_batch_query_weaviate_content_hashes`)
-and `install.py:6135` (`_prune_stale_kg_rows`) both shipped a GraphQL
-filter `where: {operator: Like, valueText: "%"}` — `%` is SQL wildcard
+The Part 1 headline bug: `install.py:5948`
+(`_batch_query_weaviate_content_hashes`) and `install.py:6135`
+(`_prune_stale_kg_rows`) both shipped a GraphQL filter
+`where: {operator: Like, valueText: "%"}` — `%` is SQL wildcard
 convention; Weaviate uses `*` and rejects `%` as "only stopwords
 provided". The HTTP 200 + errors-array response was silently coalesced
 to `{}` via `body.get(..., []) or []`, so the diff gate saw zero stored
@@ -82,6 +89,8 @@ Fixed in V46-A-followup. Exactly why live integration tests matter.
 
 ### Added
 
+*Part 1 (V46):*
+
 - **`vco_lib/weaviate_helpers.py`**: reusable helpers for safe Weaviate
   GraphQL interaction. `check_graphql_errors(body, ctx, on_error)` and
   `post_graphql_safe(url, gql, ctx, on_error)` centralize the
@@ -107,7 +116,100 @@ Fixed in V46-A-followup. Exactly why live integration tests matter.
   structural fix for the "fresh-clone blind spot" that hid the bug
   across 4 releases. (V46-C)
 
+*Part 2 (V47):*
+
+- **Third-party project adoption mode** (`--adopt-project` /
+  `--no-adopt-project` / `--adopt-project-replace-all` /
+  `--adopt-project-dry-run`): install.py CLI flags + mutex group +
+  `_resolve_adopt_project_mode(args)` dispatcher. Enables safely
+  installing VCO into an existing project without overwriting
+  non-VCO config. (V47-G-stub + V47-G-final)
+
+- **`--project-name <NAME>` CLI flag**: explicit PROJECT_NAME override
+  at install time, highest-precedence layer in
+  `_resolve_project_name_for_adopt`. (V47-F)
+
+- **`--rebuild-venv` CLI flag**: forces `_venv_triage` to recreate the
+  project venv even when no `vct-module.json` manifest is present.
+  (V47-D)
+
+- **`.claude/settings.json` managed-block merge schema** with
+  `_vco_managed_keys` sentinel: file-present + sentinel → merge only
+  VCO-managed keys; file-present + no sentinel → legacy full overwrite;
+  file-absent → write VCO defaults. Prevents clobbering user-added
+  env vars on every install/update. (V47-A)
+
+- **`vco_lib/symlink_handler.py`**: `is_symlink_blocking(dest)`,
+  `compute_vco_new_path(dest)`, `emit_symlink_deferral(...)` — gate
+  logic for bundle-apply when destination path is a symlink. Resolves
+  the `os.path.exists` vs `os.path.lexists` divergence at gating sites
+  that silently skipped writing to broken-symlink destinations. (V47-B)
+
+- **`vco_lib/secrets_audit.py`** + **`vct-hub` POST
+  `/api/v1/secrets/migrate` endpoint**: `audit_env_secrets(path)`,
+  `is_secret_shaped_env_key(key)`, `rewrite_env_with_sentinels(...)`,
+  `harden_env_perms(path)`. Detects `.env` secret-shaped keys and
+  offers OS keychain migration. Full Rust round-trip for the Migrate
+  button deferred to v0.2.47; Python audit layer + hub endpoint land
+  in this release. (V47-C)
+
+- **Foreign-compose informational scan**: `_scan_foreign_compose_files(
+  install_path)` — walks the project tree, identifies
+  `docker-compose*.yml` / `compose*.yml` files NOT owned by VCO,
+  prints an informational summary. Non-blocking; no files are
+  modified. (V47-E)
+
+- **`_detect_third_party_project` heuristic**: examines
+  `install_path` for non-VCO markers (existing `requirements.txt`,
+  `package.json`, `Cargo.toml`, etc.) and returns a detection dict
+  with confidence score. (V47-G-final)
+
+- **Interactive adopt prompt + dry-run action manifest**:
+  `_prompt_adopt_decision(detection, args)` — modal-style interactive
+  prompt shown when `--adopt-project` is implied by heuristic.
+  `_print_adopt_dry_run_manifest(install_path)` — real dry-run that
+  lists every file that would be written without writing any. (V47-G-final)
+
+- **Launcher Add-Project wizard adopt modal**: GUI-side adopt wizard
+  step shown when the heuristic fires during project registration.
+  (V47-G-final)
+
+- **Launcher Secrets tab "Migrate from .env" button**: frontend
+  affordance that calls the `vct-hub` `/api/v1/secrets/migrate`
+  endpoint. Full Rust keychain-write round-trip deferred to v0.2.47;
+  the button + HTTP wiring land in this release. (V47-G-final)
+
+- **`scripts/v0246-part2-pre-ship-check.sh`**: Part 2 gate runner
+  (Gates 19–27) covering V47-A through V47-G-final contract surfaces.
+  (V47-CHANGELOG)
+
 ### Changed
+
+*Part 1 (V46):*
+
+- **Part 1 re-embed fix** (V46-A/A-followup): GraphQL `where: Like %`
+  → drop clause + saturation warning + `valueText` → `valueTextArray`
+  for ContainsAny batch-delete. (V46-A, V46-A-followup)
+
+- **Part 1.5 venv-audit hardening**: silent MCP-venv fallback now
+  emits a WARNING instead of silent continuation (H1); PYTHONPATH
+  scrubbed on pip subprocesses to prevent venv pollution (H2); log
+  guard added before os.execv relaunch (H3).
+
+- **`sysinfo` pinned to `"0.38"`** in both
+  `launcher/src-tauri/Cargo.toml` and
+  `launcher/src-tauri/vct-launcher-core/Cargo.toml`: the 0.39.x line
+  requires rustc 1.95+, breaking contributors/CI on 1.94. Forward-
+  compatible: relax both pins when the project's rustc floor moves to
+  1.95.
+
+- **10 silent-truncation footgun cleanups** (V46-D): cursor pagination
+  for full-enumeration queries (Pattern A) and `truncated: true` flag
+  emission for top-N queries (Pattern B) across 5 template scripts and
+  `weaviate_mcp/server.py`.
+
+- **RL Reranker client-side hardening**: variant suffix preservation +
+  per-pull `--authfile` via tempfile RAII + audit-log emission. (V46-E)
 
 - **Version pins bumped 0.2.45 → 0.2.46** across the canonical sites:
   `pyproject.toml`, `vct-module.json`, `launcher/package.json`,
@@ -120,6 +222,93 @@ Fixed in V46-A-followup. Exactly why live integration tests matter.
   — it is written by the Release workflow on the binary build.
   `claude_mcp_servers/pyproject.toml` is independently versioned and
   stays at its current version.
+
+*Part 2 (V47):*
+
+- **`_venv_triage`**: refuses destructive recreate when no manifest is
+  present (unless `force_rebuild=True` is passed via `--rebuild-venv`),
+  preserving third-party project venvs. (V47-D)
+
+- **PROJECT_NAME precedence resolver** (`_resolve_project_name_for_adopt`)
+  respects `.vscode/settings.json` / `.claude/env` / `.env` over
+  folder-name derivation. Explicit `--project-name` CLI flag wins
+  over all. (V47-F)
+
+### Fixed
+
+*Part 1 (V46):*
+
+- **install.py CI-10 / V0243-6 stopword GraphQL filter**: drop the
+  broken `where: {Like, "%"}` clause that has been silently re-embedding
+  every KG file on every `--update` since v0.2.42 (2026-05-31). Bump
+  `limit: 1000` → `limit: 10000` (Weaviate's QUERY_MAXIMUM_RESULTS
+  default). Inspect `body.get("errors")` BEFORE consuming data; non-empty
+  → WARN log + full-sync fallback (loud, not silent). Plus V46-A-followup:
+  fix the batch-delete in `_prune_stale_kg_rows` from `valueText:<list>`
+  to `valueTextArray:<list>` (a separate v0.2.43-era bug that V46-B's
+  live integration test caught). (V46-A, V46-A-followup)
+
+- **10 silent-truncation footguns** across `templates/scripts/*.py` and
+  `claude_mcp_servers/weaviate_mcp/server.py`:
+  - Pattern A (cursor pagination for full-enumeration):
+    `get_all_weaviate_nodes`, `rebuild_all`, `list_all_nodes` (kg-search
+    list), `detect_duplicates`, `process_documents`
+  - Pattern B (emit `truncated: true` flag for top-N queries):
+    `get_node_info` inbound-link scan, `query_code_graph` relations,
+    `query_code_structure` MCP tool callers/imports/interactions/
+    composed_by/type_users
+
+  Pre-v0.2.46 these silently degraded behavior on collections >1000
+  (Pattern A) or >20-50 (Pattern B). LLM consumers of the MCP tool now
+  see a truncation signal. (V46-D)
+
+- **RL Reranker client-side install path**
+  (`installer_engine.rs::container_pull`):
+  - C1: honor server's `tag` value over client-resolved L0 version
+  - C1-followup: preserve client GPU-variant suffix
+    (`-cpu`/`-cuda`/`-rocm`/`-metal`) when server returns a bare
+    patch-level tag (variant resolution stays client-side per the edge
+    function's documented contract)
+  - C2: per-pull `--authfile <tmp>` via tempfile RAII; removes the risk
+    of `podman logout` invalidating a concurrent paid-module pull
+  - C3: audit-log emission — `pull_token_requested` /
+    `pull_token_resolved` (with `server_tag` / `client_resolved_tag` /
+    `effective_tag_with_variant` / `tag_mismatch`) / `pull_token_failed`
+    (with HTTP code + `error_class` classification). License key NEVER
+    logged in full — 12-char prefix only.
+  - C4: hard-fail on MAJOR/MINOR tag mismatch with publisher-pointing
+    error message (variant suffix is NOT a version component — same
+    base version, different VARIANTS = no mismatch)
+  - C5: documented in code comments
+
+  Surfaced by v0.2.45 post-ship forensic. Fixed in coordination with
+  RL chat (`vct-rl-reranker` repo owner) who confirmed end-to-end smoke
+  green from their machine 2026-06-03. (V46-E)
+
+*Part 2 (V47):*
+
+- **HIGH-severity venv-architecture audit finding** (V47-D):
+  `_venv_triage` now refuses to destructively recreate a venv when no
+  `vct-module.json` manifest is found in a third-party project. Prevents
+  accidental wipeout of existing project virtualenvs.
+
+- **Symlink-following on bundle apply** (V47-B): `os.path.lexists`
+  replaces `os.path.exists` at the two gating sites in the bundle-apply
+  path, ensuring broken symlinks are detected and deferred rather than
+  silently skipped.
+
+### Security
+
+- **`.env` secret-shaped keys** detected by `vco_lib/secrets_audit.py`
+  and offered for OS keychain migration via `vct-hub` POST
+  `/api/v1/secrets/migrate`. (V47-C)
+
+- **`.env` file permissions hardened** to `0o600` on Unix after audit.
+  Windows path is a no-op (ACL-based security model). (V47-C)
+
+- **License key never logged in full**: 12-char prefix only in all
+  audit-log emissions; security-pinned by 2 levels of tests. (V46-E,
+  security-pinned in Part 1)
 
 ### Documentation
 
@@ -144,6 +333,8 @@ Fixed in V46-A-followup. Exactly why live integration tests matter.
 
 - All V46 tests pass on integrated `main` (V46-A 11 + V46-B 7 + V46-D 16
   + V46-E 9 + V46-F 12 = 55 Python + Rust tests across the fanout).
+- All V47-A through V47-G-final tests pass (V47-A + V47-B + V47-C +
+  V47-D + V47-E + V47-F + V47-G-stub 21 + V47-G-final tests).
 - Live two-pass smoke on real Weaviate (Gate 18a + Gate 18b) PASS.
 - `cargo check --lib` clean.
 - `[Unreleased]` block EMPTY at tag time (no-deferred-fixes rule from

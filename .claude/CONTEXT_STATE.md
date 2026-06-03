@@ -1,15 +1,16 @@
 # VCO_dev — Context State
 
-**Refreshed**: 2026-06-03 (revised) — v0.2.45 SHIPPED. v0.2.46 SCOPE EXPANDED: re-embed/RL fixes ALREADY VALIDATED + third-party-adoption mode (Gaps A,B,C,D,E,F,G) ADDED. Tag HELD until ALL of v0.2.46 lands + venv audit clears.
+**Refreshed**: 2026-06-04 — v0.2.46 Part 2 ALL LANDED. V47-CHANGELOG commit ready to stage. v0.2.46 ready for adversarial review then push/tag.
 
 ## TL;DR — v0.2.45 + v0.2.46 status
 
 - **v0.2.45 SHIPPED** 2026-06-03 17:39 UTC. All 6 binaries live. Tag annotates `465dd4a`, binary-refresh at `ff5e312`.
-- **v0.2.46 IN PROGRESS, NOT PUSHED**.
-  - **Part 1 — re-embed fix + RL hardening (DONE)**: all 7 V46 agents merged on `main` at `f868b4c` (V46-A/A-followup/B/C/D/E/F/G). 55 V46 tests pass. Pre-ship-check 24 PASS / 1 WARN / 3 pre-existing FAILs. 3+1+1 review GO HIGH (0 FIX-NOW, 19 follow-up obs originally queued for v0.2.47 — now re-evaluated against expanded v0.2.46 scope). RL chat smoke green; Supabase `GHCR_PAID_TAG_DEFAULT=0.2.8` bumped + redeployed.
-  - **Part 2 — third-party-adoption mode (PLANNED, NOT STARTED)**: user decision 2026-06-03 — no more small daily patches; consolidate ALL adopt-mode work into v0.2.46. Design at `.claude/context/plans/v0.2.46-third-party-adopt-design-2026-06-03.md`. Scope: Gaps A (settings.json managed-block), B (symlinks never touched + .vco-new sibling), C (secrets modal + keychain migration), D (venv no-manifest guard), E (foreign-compose informational scan), F (KG/PROJECT_NAME precedence, non-destructive for existing projects), G (full `--adopt` mode + GUI wizard). ~2970 LoC + ~90 tests + GUI + Rust changes. 2-3 tag-cycle weeks of work.
+- **v0.2.46 MECHANICS COMPLETE, NOT YET PUSHED**.
+  - **Part 1 — re-embed fix + RL hardening (DONE)**: all 7 V46 agents merged on `main` at `f868b4c`. 55 V46 tests pass. RL chat smoke green.
+  - **Part 2 — third-party-adoption mode (ALL LANDED)**: V47-A through V47-G-final merged at `66ae2a2`. All Part 2 gates 19–27 PASS (confirmed 2026-06-04).
+  - **V47-CHANGELOG (READY TO COMMIT)**: version pins confirmed 0.2.46 at all sites; CHANGELOG `[0.2.46]` block updated to `2026-06-04` with full Part 1 + Part 2 entries; `scripts/v0246-part2-pre-ship-check.sh` created with Gates 19–27.
 
-**Next step**: kick off v0.2.46 Part 2 agent fanout AFTER user's venv audit completes (so venv-audit findings inform any install.py changes that overlap with Part 2). Then tag once all of Part 1+2 validated + reviewed.
+**Next step**: Commit V47-CHANGELOG changes, then adversarial review, then push/tag v0.2.46.
 
 ### Part 2 progress (2026-06-04)
 - **Venv audit complete** — 2 parallel auditors (architecture + adversarial). Reports under `.claude/context/audits/venv-*-2026-06-03.md`. Findings: 4 MEDIUM, 0 CRITICAL. Three landed as Part 1.5 (`c444ba9`): H1 (silent MCP-venv fallback warning), H2 (PYTHONPATH scrub on pip subprocesses), H3 (no-log-before-relaunch code comment).
