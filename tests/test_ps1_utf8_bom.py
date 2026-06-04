@@ -41,11 +41,23 @@ _EXCLUDED_PATH_PARTS: tuple[str, ...] = (
 
 
 def _ps1_files() -> list[pathlib.Path]:
+    """All ``.ps1`` files under the repo, excluding transient agent state
+    AND vendored / build / clone paths we don't own.
+
+    Both branches converged on the same fix shape (the RL branch added
+    just ``.claude/worktrees/``; v0.2.46 KG-AUTO-HEAL-E broadened to
+    cover ``node_modules``, ``target``, ``.venv``, and the bundled
+    ``vibecoded-orchestrator`` clone too — all sources of false-positive
+    .ps1 files we don't own). Keeping the broader list.
+    """
     candidates = REPO_ROOT.rglob("*.ps1")
     out: list[pathlib.Path] = []
     for p in candidates:
         rel = p.relative_to(REPO_ROOT).as_posix()
-        if any(rel.startswith(prefix + "/") or f"/{prefix}/" in f"/{rel}" for prefix in _EXCLUDED_PATH_PARTS):
+        if any(
+            rel.startswith(prefix + "/") or f"/{prefix}/" in f"/{rel}"
+            for prefix in _EXCLUDED_PATH_PARTS
+        ):
             continue
         out.append(p)
     return sorted(out)

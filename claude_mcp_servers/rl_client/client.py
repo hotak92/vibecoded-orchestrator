@@ -334,6 +334,94 @@ class RLClient:
             logger.debug("RLClient.rl_update: response shape mismatch (%s)", exc)
             return RLUpdateResponse(ok=bool(data.get("ok", False)))
 
+    async def rl_update_v3(
+        self,
+        task_id: str,
+        *,
+        nodes_packed: List[dict],
+        query_emb: List[float],
+        cosine_sims: dict,
+        literal_cited: dict,
+        cross_encoder_cited: Optional[dict] = None,
+        task_type: Optional[str] = None,
+    ) -> RLUpdateResponse:
+        """v0.2.9 (C8) pre-packed payload contract for /rl_update.
+
+        Container is pure-train: MCP supplies everything the container
+        needs to apply the unified-target formula and step the gradient,
+        with NO embedding/chunking/data-logger writes happening
+        container-side. This client method is the mirror of the
+        container's ``_rl_update`` handler + ``schedule_update`` +
+        ``_update`` signatures (see retrieval_rl.py / rl_server.py in
+        the paid module).
+
+        Disabled mode / unreachable / 5xx → returns
+        ``RLUpdateResponse(ok=False)`` without raising. Caller treats
+        as fire-and-forget.
+
+        Args:
+            task_id: Single retrieval task_id this training event
+                pertains to. (The wire still uses ``task_ids: List``
+                for forward compatibility — multi-task batching is
+                deferred to v0.2.10+.)
+            nodes_packed: Per-node training records, each with
+                ``{title, node_type (string name), n_emb,
+                linked_embs, linked_type_names}``. Embeddings are
+                already in the active source's space.
+            query_emb: Query embedding vector in the active source's
+                space.
+            cosine_sims: ``{title: cos(answer_chunks, n_emb)}`` map.
+                Computed by MCP from the completed answer.
+            literal_cited: ``{title: bool}`` map — whether the node's
+                title/slug/wikilink/file_path appears in the agent's
+                answer (word-boundary regex). Training signal — boosts
+                the BCE target via the unified-target formula.
+            cross_encoder_cited: Optional ``{title: bool}`` map from a
+                cross-encoder reranker (Qwen3-Reranker-4B). ``None`` in
+                v0.2.9; the field is reserved for v0.2.10+ Pro-tier
+                wiring. Composes with literal_cited via the same bonus.
+            task_type: Optional category tag (logged server-side).
+        """
+        if not self.enabled:
+            return RLUpdateResponse(ok=False, skipped="disabled")
+
+        if not task_id or not nodes_packed or not query_emb:
+            return RLUpdateResponse(ok=True, skipped="no task_id or nodes or query_emb")
+
+        task_block: dict = {
+            "nodes_packed": list(nodes_packed),
+            "query_emb": list(query_emb),
+            "cosine_sims": dict(cosine_sims),
+            "literal_cited": dict(literal_cited),
+            "cross_encoder_cited": dict(cross_encoder_cited) if cross_encoder_cited else None,
+        }
+        payload: dict = {
+            "task_ids": [task_id],
+            "tasks": {task_id: task_block},
+            # v0.2.40 F1 cross-source guard (kept identical to
+            # ``rl_update``): the server rejects if its active
+            # embedding source doesn't match this field.
+            "embedding_source": self.active_embedding,
+            "active_embedding": self.active_embedding,
+        }
+        if task_type:
+            payload["task_type"] = task_type
+
+        try:
+            data = await self._post_json("/rl_update", payload, timeout=self._timeout)
+        except RLClientUnreachableError as exc:
+            logger.debug("RLClient.rl_update_v3: unreachable (%s)", exc)
+            return RLUpdateResponse(ok=False, error=str(exc))
+        except RLClientError as exc:
+            logger.debug("RLClient.rl_update_v3: error (%s)", exc)
+            return RLUpdateResponse(ok=False, error=str(exc))
+
+        try:
+            return RLUpdateResponse.model_validate(data)
+        except Exception as exc:  # noqa: BLE001 — keep response permissive
+            logger.debug("RLClient.rl_update_v3: response shape mismatch (%s)", exc)
+            return RLUpdateResponse(ok=bool(data.get("ok", False)))
+
     async def health(self) -> HealthResponse:
         """Probe the server's ``/health`` endpoint.
 

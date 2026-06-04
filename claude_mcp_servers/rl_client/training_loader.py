@@ -19,9 +19,13 @@ The loader is a pure generator — it never holds the full corpus in memory.
 Both source files are streamed line-by-line so 600+ MB files are handled
 without OOM risk.
 
-Schema contract: ``rl_logger.RLDataLogger.SCHEMA_VERSION == 2``.  All events
-written by v0.2.28+ pass; pre-v0.2.28 legacy rows (649 ``Claude``-cohort rows
-without schema_version) are dropped at step 3 of the funnel.
+Schema contract: ``rl_logger.RLDataLogger.SCHEMA_VERSION == 3`` as of
+v0.2.47 RL-3 (2026-06-04). All events written by v0.2.47+ pass. Pre-v0.2.28
+legacy rows (649 ``Claude``-cohort rows without schema_version) AND v2
+events (v0.2.28..v0.2.46) are dropped at step 3 of the funnel — the C9
+JSONL->DB migration script ports v2 rows into the new
+``launcher.db.rl_events`` table tagged ``schema_version=3`` first, so by
+the time the offline trainer runs there are no v2 rows on disk.
 """
 
 from __future__ import annotations
@@ -41,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Canonical schema version we accept (v1 rows are in .v1.bak archives).
 # ---------------------------------------------------------------------------
-_REQUIRED_SCHEMA_VERSION = str(RLDataLogger.SCHEMA_VERSION)  # "2"
+_REQUIRED_SCHEMA_VERSION = str(RLDataLogger.SCHEMA_VERSION)  # "3" as of v0.2.47
 _REQUIRED_EMBEDDING_DIM = "1024"
 
 # ---------------------------------------------------------------------------
@@ -103,7 +107,7 @@ def load_qwen3_training_corpus(
 
     1. Stream-read both files line-by-line.
     2. Drop JSON-parse failures (logged to stderr at DEBUG).
-    3. Drop ``schema_version != "2"`` rows.
+    3. Drop ``schema_version != "3"`` rows (post-v0.2.47).
     4. Drop missing / wrong-dim ``embedding_dim`` (must be ``"1024"``).
     5. Drop events with ``failure_mode`` set.
     6. Keep ``embedding_source == "qwen3"`` OR ``_reembedded_model == "qwen3-embedding:0.6b"``.
@@ -182,9 +186,9 @@ def load_qwen3_training_corpus(
                     )
                     continue
 
-                # Step 3: drop schema_version != "2".
+                # Step 3: drop schema_version != "3" (post-v0.2.47).
                 raw_sv = event.get("schema_version")
-                # Accept both int 2 and string "2" defensively.
+                # Accept both int 3 and string "3" defensively.
                 if str(raw_sv) != _REQUIRED_SCHEMA_VERSION:
                     logger.debug(
                         "training_loader: step-3 drop (schema_version=%r) at %s:%d",

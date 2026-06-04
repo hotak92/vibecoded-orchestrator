@@ -195,10 +195,22 @@ def _try_resolve_project_config():
     falls back to its existing os.getenv() default. The resolver client
     emits its own rate-limited warning on the fall-through path
     (Step 17); this MCP doesn't need to log anything extra.
+
+    v0.2.47 RL-6c follow-up: when ``VCT_DISABLE_HUB_RESOLVER=1`` is set in
+    the environment, this short-circuits to None so test fixtures get
+    pure env-fallback behavior. Without this guard, tests that
+    monkey-patch ``KG_COLLECTION`` / ``SHARED_KG_COLLECTION`` /
+    ``DIAGRAMS_COLLECTION`` env vars and reload the module had their
+    injection silently overridden by whatever the live vct-hub on the
+    dev machine reported. The env var is set once per test session via
+    ``tests/conftest.py``'s autouse fixture. Production runs leave it
+    unset, preserving the hub-first resolution semantics.
     """
     global _resolved_project_config
     if _resolved_project_config is not None:
         return _resolved_project_config
+    if os.environ.get("VCT_DISABLE_HUB_RESOLVER"):
+        return None
     if not _HAS_PROJECT_CONFIG or _resolve_project_config is None:
         return None
     try:
@@ -316,6 +328,13 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 RL_SERVER_URL = os.getenv("RL_SERVER_URL", "http://localhost:11439")
 # Over-fetch multiplier: fetch this many × limit from Weaviate, pass all to RL server for reranking.
 _RL_OVERFETCH = 2
+# v0.2.47 RL-6: maximum linked-slot vectors packed per node in the v3
+# retrieval event. Must MATCH `paid-modules/vct-rl-reranker/rl_model.py::MAX_LINKED`
+# (= 5). The container's `_rl_model.update(q_raw, n_raw, linked_raws, n_type_idx)`
+# only consumes the first MAX_LINKED entries — over-shipping wastes bytes.
+# Packing order is fixed: `extra_chunks_of_same_node + actual_linked_nodes`,
+# truncated to MAX_LINKED.
+_RL_MAX_LINKED: int = 5
 # Per-process call counter — used to order calls within a session (maps seq → transcript position).
 _rl_call_seq: int = 0
 # v0.2.28: hold strong references to in-flight `_rl_answer_monitor` tasks
@@ -328,6 +347,35 @@ _rl_call_seq: int = 0
 # (97.7% orphan-citation rate) is the symptom. Standard mitigation:
 # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
 _rl_monitor_tasks: "set[asyncio.Task]" = set()
+# v0.2.47 RL-6: per-task content cache for the citation-write monitor.
+# Populated by `_rl_cache_and_rerank` at retrieval time with the full per-node
+# payload (best-chunk vector, MAX_LINKED packed linked_embs, node_type, links,
+# cos_qn/ql/nl, etc.) PLUS the query embedding and active-embedding metadata.
+# Consumed by `_rl_answer_monitor` at citation time so it can compute
+# `cosine_sims` (max over answer-chunks × n_emb) + `literal_cited` and write
+# a single v3 citation event without re-fetching anything from Weaviate.
+#
+# Eviction: LRU-ish, bounded at `_RL_NODE_CACHE_MAX`. Entries are popped by
+# the monitor on success; expired-but-unwritten entries (timeout, evicted by
+# new traffic) are dropped silently — the retrieval event still got written
+# at cache-fill time, only the citation event is lost. This is the same
+# soft-fail discipline as the hub POST: no retry, no fallback.
+#
+# Each entry shape (matches what `_rl_answer_monitor` reads):
+#   {
+#       "nodes": list[dict],          # per-node with title / node_type /
+#                                     # n_emb / linked_embs / linked_type_names /
+#                                     # cos_qn / cos_ql / cos_nl / file_path / links
+#       "query_emb": list[float],     # 1024-dim active-slot vector
+#       "active_model": str,          # for chunker.for_model + event payload
+#       "embedding_source": str,
+#       "embedding_dim": int,
+#       "project_id": str | None,
+#       "project_name": str | None,
+#       "task_type": str,
+#   }
+_rl_node_content_cache: dict[str, dict] = {}
+_RL_NODE_CACHE_MAX: int = 256
 # KG search tool names as they appear in session transcripts (with and without mcp__ prefix).
 _KG_SEARCH_TOOLS: frozenset[str] = frozenset({
     "hybrid_search", "semantic_graph_search",
@@ -340,6 +388,33 @@ _RL_MONITOR_POLL_INTERVAL: float = 2.0
 _RL_MONITOR_ANSWER_THRESHOLD: int = 64_000   # chars
 _RL_TOOL_CONTENT_LIMIT: int = 20_000         # per Write/Edit, chars
 _RL_MONITOR_TIMEOUT: float = 600.0           # 10 min hard ceiling
+# v0.2.47 RL-7.5: minimum answer length (TOKENS) to compute citation events.
+# Below this, the monitor still POSTs to the RL container's /rl_update
+# (the container may treat short answers as negative-signal training data)
+# but we skip the citation-event write — too-short answers produce noisy
+# cosine signals (single-chunk embedding of a few hundred tokens carries
+# less signal than the noise threshold; the multi-chunk best-of-cosine
+# trick only pays off when the answer spans 3+ chunks).
+#
+# Default 25,000 tokens = ~100KB of text = roughly enough for 2-3 chunks
+# at qwen3's xlarge_context preset (target_tokens=9500) OR ~15 chunks at
+# arctic2's medium preset (target=2500). Either way ample signal for the
+# max-over-chunks cosine to discriminate cited-vs-not.
+#
+# Tunable via env so dogfood / Pro users can experiment. Pre-v0.2.47.5
+# this was a 200-char default which was way too low (typical Claude
+# preamble like "Sure! Let me look that up..." would have passed).
+_RL_MIN_ANSWER_TOKENS_FOR_CITATION: int = int(
+    os.getenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "25000")
+)
+# Back-compat alias for any test or downstream caller still importing
+# the chars-based name. The actual gate uses the tokens version below.
+_RL_MIN_ANSWER_CHARS_FOR_CITATION: int = _RL_MIN_ANSWER_TOKENS_FOR_CITATION * 4
+# Minimum title length for the literal-citation regex. Below this we skip
+# the per-node regex entirely — two-letter titles like "AI" / "RL" produce
+# enough false-positives ("curl", "url", "fail") to swamp any signal.
+# Matches the rule in paid-modules/vct-rl-reranker/retrieval_rl.py.
+_RL_LITERAL_CITED_MIN_TITLE_LEN: int = 3
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 EMBEDDING_SOURCE = os.getenv("EMBEDDING_SOURCE", "ollama")
 # Legacy text embedding model (kept for backward compat — old named vectors stay populated)
@@ -2803,6 +2878,12 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
         "source_id": source_id,
         "chunk_number": chunk_number,
         "total_chunks": total_chunks,
+        # v0.2.47 RL-6b-2: surface KG wikilink titles so the RL enrichment
+        # helper can fetch linked-node embeddings. Code collections + diagrams
+        # don't have a `links` property → defaults to empty list. The KG
+        # schema's `links: text[]` is populated by sync_knowledge_graph from
+        # the markdown frontmatter / wikilink parse.
+        "links": obj.properties.get("links", []),
     }
 
 
@@ -3094,11 +3175,27 @@ def _rl_find_all_transcripts_in_dir(slug_dir: Path) -> "list[Path]":
     the dir-resolution path is async (hub-aware), but the actual
     file-glob is pure I/O and benefits from being a separate sync
     helper.
+
+    v0.2.47 RL-7.5 (2026-06-04): also includes subagent transcripts at
+    ``<slug>/<parentSessionId>/subagents/agent-<agentId>.jsonl`` so the
+    monitor finds KG searches performed BY subagents. Subagent transcripts
+    have the same ``{type, message: {content: [blocks]}}`` shape as parent
+    transcripts (verified via Claude Code docs + filesystem probe
+    2026-06-04), so ``_rl_extract_answer_window`` works unchanged. Each
+    subagent file is independent — the seq-based tiebreak inside
+    ``_rl_answer_monitor`` still matches a KG call to its rightful
+    transcript because each subagent only sees its own KG search history.
     """
     if not slug_dir.exists():
         return []
+    parent_transcripts = list(slug_dir.glob("*.jsonl"))
+    # Subagent transcripts live under each parent session's subdirectory.
+    # We don't need to filter by parent session — every subagent file is
+    # a potential candidate for the KG-call lookup.
+    subagent_transcripts = list(slug_dir.glob("*/subagents/agent-*.jsonl"))
+    all_transcripts = parent_transcripts + subagent_transcripts
     return sorted(
-        slug_dir.glob("*.jsonl"),
+        all_transcripts,
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -3120,6 +3217,210 @@ async def _rl_find_all_transcripts() -> "list[Path]":
     if slug_dir is None:
         return []
     return _rl_find_all_transcripts_in_dir(slug_dir)
+
+
+def _rl_is_literal_cited(node: dict, answer_text_lower: str) -> bool:
+    """v0.2.47 RL-7: True iff any identity-form of `node` appears in the answer.
+
+    The forms checked (in order):
+      1. ``[[Title]]`` exact-match wikilink (Obsidian style).
+      2. ``[[Title]]`` lower-cased exact-match (case-insensitive markdown).
+      3. ``\\bTitle\\b`` word-boundary regex against the lower-cased answer.
+      4. Same three forms for the file_path slug (the stem, e.g.
+         ``foo`` from ``knowledge/concepts/foo.md``).
+      5. Same for the full file_path (with and without the ``.md`` suffix).
+
+    Caller passes a pre-lowered ``answer_text_lower`` — the helper is called
+    in a tight per-node loop and re-lowering each time would waste cycles.
+
+    Skips titles shorter than ``_RL_LITERAL_CITED_MIN_TITLE_LEN`` (default 3)
+    to avoid the "RL" / "AI" / "url" / "curl" false-positive class. Same
+    rule as ``paid-modules/vct-rl-reranker/retrieval_rl.py``.
+    """
+    if not isinstance(node, dict):
+        return False
+
+    forms: list[str] = []
+    title = (node.get("title") or "").strip()
+    if title and len(title) >= _RL_LITERAL_CITED_MIN_TITLE_LEN:
+        forms.append(title)
+    file_path = (node.get("file_path") or "").strip()
+    if file_path:
+        from pathlib import Path as _Path
+        slug = _Path(file_path).stem
+        if slug and len(slug) >= _RL_LITERAL_CITED_MIN_TITLE_LEN:
+            forms.append(slug)
+        forms.append(file_path)
+        if file_path.endswith(".md"):
+            forms.append(file_path[:-3])
+
+    if not forms:
+        return False
+
+    import re as _re
+    for form in forms:
+        form_lower = form.lower()
+        # WikiLink form: `[[Title]]` exact match (case-insensitive).
+        if f"[[{form_lower}]]" in answer_text_lower:
+            return True
+        # Word-boundary match for the bare form.
+        try:
+            if _re.search(r'\b' + _re.escape(form_lower) + r'\b', answer_text_lower):
+                return True
+        except _re.error:
+            # Malformed regex — defensively skip; never crash the monitor.
+            continue
+    return False
+
+
+async def _rl_compute_and_write_citations(
+    task_id: str,
+    answer: str,
+    ctx: dict,
+) -> "dict | None":
+    """v0.2.47 RL-7: compute the citation event from a complete answer + write it.
+
+    Reads the per-task cache populated by ``_rl_cache_and_rerank`` (the node
+    list with `n_emb` + metadata, the query embedding, the active embedding
+    model). Chunks the answer via ``Chunker.for_model(active_model)``,
+    embeds each chunk via the cached ``EmbeddingService``, then for each
+    node:
+
+      - ``cosine_sims[title] = max(_cosine(answer_chunk_emb, node.n_emb))``
+        across all answer chunks. Skips nodes without ``n_emb``.
+      - ``literal_cited[title]`` via ``_rl_is_literal_cited(node, answer_lower)``.
+
+    Calls ``compute_unified_targets(cosine_sims, literal_cited, None)`` to
+    derive the binary ``cited`` map (target > 0.6), then writes the citation
+    event via ``RLTelemetryWriter.log_citations`` — which POSTs to the
+    launcher's hub per C6c.
+
+    v0.2.47 RL-7/8 (C8): the function now ALSO mutates ``ctx`` in place,
+    adding ``cosine_sims_computed`` and ``literal_cited_computed`` keys.
+    The caller (``_rl_answer_monitor``) reads these to build the container
+    POST payload without re-embedding. Returns the result dict on success
+    (containing ``cosine_sims`` and ``literal_cited``) or ``None`` on
+    soft-fail. Soft-fail throughout: missing cache / no embedding service
+    / chunker error / hub POST 5xx all return ``None`` and log at debug.
+
+    The caller decides whether to also POST to the RL container's
+    ``/rl_update`` after this returns; the two writes are independent
+    (citation logging is unconditional; container training is Pro-tier
+    + container-running gated).
+    """
+    nodes = ctx.get("nodes") or []
+    if not nodes:
+        return None
+
+    active_model = ctx.get("active_model") or EMBEDDING_MODEL
+
+    # --- Step 1: chunk + embed the answer ---
+    try:
+        chunker = Chunker.for_model(active_model)
+        chunks = chunker.chunk_text(answer, source_id=task_id)
+    except Exception as exc:
+        logger.debug("RL citation: chunker failed (%s)", exc)
+        return None
+    if not chunks:
+        return None
+
+    svc = _get_embedding_service()
+    if svc is None:
+        logger.debug("RL citation: no EmbeddingService available; skip")
+        return None
+
+    answer_chunk_embs: list[list[float]] = []
+    for chunk in chunks:
+        # Chunker.chunk_text returns objects whose `.content` is the chunk text
+        # (matches sync_knowledge_graph's downstream consumer).
+        text = getattr(chunk, "content", None) or (
+            chunk if isinstance(chunk, str) else None
+        )
+        if not text:
+            continue
+        try:
+            vec = svc.embed_text(text)
+        except Exception as exc:
+            logger.debug("RL citation: chunk embed failed (%s); continuing", exc)
+            continue
+        if vec:
+            answer_chunk_embs.append(vec)
+
+    if not answer_chunk_embs:
+        return None
+
+    # --- Step 2: per-node cosine_sims (max over answer chunks vs node.n_emb) ---
+    answer_lower = answer.lower()
+    cosine_sims: dict[str, float] = {}
+    literal_cited: dict[str, bool] = {}
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        title = n.get("title", "")
+        if not title:
+            continue
+        n_emb = n.get("n_emb") or n.get("emb")
+        if not n_emb:
+            # No vector to compare against — skip the cosine side but
+            # still try the literal-cited check (it doesn't need an emb).
+            literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
+            continue
+        try:
+            best = max(_cosine(ac, n_emb) for ac in answer_chunk_embs)
+        except Exception:
+            continue
+        cosine_sims[title] = float(best)
+        literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
+
+    if not cosine_sims and not literal_cited:
+        return None
+
+    # --- Step 3: unified-target formula -> binary cited dict ---
+    try:
+        from vco_lib.rl_training_targets import compute_unified_targets
+        _targets, cited = compute_unified_targets(
+            cosine_sims,
+            literal_cited=literal_cited,
+            cross_encoder_cited=None,
+        )
+    except Exception as exc:
+        logger.debug("RL citation: compute_unified_targets failed (%s)", exc)
+        return None
+
+    # --- Step 4: write the citation event via the centralized writer ---
+    try:
+        writer = _get_rl_telemetry_writer()
+        if writer is None:
+            return None
+        writer.log_citations(
+            task_id=task_id,
+            task_type=ctx.get("task_type") or "mcp_interactive",
+            citations={t: bool(v) for t, v in cited.items()},
+            cosine_sims=cosine_sims,
+            literal_cited=literal_cited,
+            cross_encoder_cited=None,
+        )
+    except Exception as exc:
+        logger.debug("RL citation: writer.log_citations failed (%s)", exc)
+        return None
+
+    # Stash computed values back on ctx so the monitor's downstream
+    # /rl_update POST can reuse them without re-embedding the answer.
+    ctx["cosine_sims_computed"] = cosine_sims
+    ctx["literal_cited_computed"] = literal_cited
+
+    logger.debug(
+        "RL citation %s: wrote %d cosine entries, %d literal-cited, %d cited",
+        task_id[:8],
+        len(cosine_sims),
+        sum(1 for v in literal_cited.values() if v),
+        sum(1 for v in cited.values() if v),
+    )
+    return {
+        "cosine_sims": cosine_sims,
+        "literal_cited": literal_cited,
+        "cited": cited,
+    }
 
 
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
@@ -3193,27 +3494,100 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             # Right transcript — check if answer is complete
             answer, complete = _rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
             if complete and answer.strip():
-                # Submit to the RL server via the client adapter. The
-                # client handles "disabled mode" and unreachable-server
-                # cases internally (returns RLUpdateResponse(ok=False))
-                # — we never raise out of this background task.
-                client = _get_rl_client()
-                if client is not None:
-                    resp = await client.rl_update(
-                        task_ids=[task_id],
-                        agent_output=answer,
-                        task_type="mcp_interactive",
+                # v0.2.47 RL-7: MCP-side citation write (replaces the
+                # pre-v0.2.47 container-coupled write path that silently
+                # broke when the container was down — the failure mode
+                # diagnosed in `mcp-rl-online-training-monitor.md`
+                # §"Third silent failure mode"). Independent of the
+                # container POST below: writes the citation event to
+                # launcher.db via the hub regardless of whether the
+                # container is running. Soft-fail: a False return
+                # leaves the container leg unaffected.
+                #
+                # v0.2.47 RL-7.5: token-based gate (default 25k tokens via
+                # RL_MIN_ANSWER_TOKENS_FOR_CITATION env). Protects against
+                # cosine-noise from streaming snapshots — Claude often
+                # emits a "Sure! Let me look that up..." prefix before
+                # the substantive response, and using that early answer
+                # would write a noisy event we'd never overwrite.
+                # 25k tokens ≈ 2-3 chunks at qwen3's xlarge preset; enough
+                # for max-over-chunks cosine to discriminate cited-vs-not.
+                # Falls back to char-based approximation when TokenCounter
+                # is unavailable (1 token ≈ 4 chars).
+                try:
+                    from claude_mcp_servers.weaviate_mcp.chunking import TokenCounter
+                    answer_token_count = TokenCounter.count_tokens(answer)
+                except Exception:
+                    answer_token_count = len(answer) // 4
+
+                # Pop the per-task cache once; the citation-write path
+                # consumes ``nodes`` + ``query_emb`` and stashes computed
+                # ``cosine_sims`` / ``literal_cited`` back on the dict for
+                # the downstream /rl_update POST to reuse without
+                # re-embedding.
+                ctx = _rl_node_content_cache.pop(task_id, None)
+                citation_result: "dict | None" = None
+                if answer_token_count >= _RL_MIN_ANSWER_TOKENS_FOR_CITATION:
+                    if ctx is not None:
+                        try:
+                            citation_result = await _rl_compute_and_write_citations(
+                                task_id, answer, ctx,
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "RL monitor %s: citation write raised (%s); continuing",
+                                task_id[:8], exc,
+                            )
+                else:
+                    logger.debug(
+                        "RL monitor %s: answer too short (%d tokens < %d); skip citation",
+                        task_id[:8], answer_token_count, _RL_MIN_ANSWER_TOKENS_FOR_CITATION,
                     )
-                    if resp.ok:
-                        logger.debug(
-                            "RL monitor %s: trained on %d chars (transcript %s)",
-                            task_id[:8], len(answer), candidate.name[:8],
-                        )
-                    else:
-                        logger.debug(
-                            "RL monitor %s: rl_update not ok (%s)",
-                            task_id[:8], resp.error or resp.skipped or "unknown",
-                        )
+
+                # v0.2.47 C8: container POST uses the pre-packed payload
+                # shape. Only fires when (a) the container is reachable
+                # (client.enabled), (b) we have the ctx + computed
+                # cosine_sims/literal_cited (i.e. citation write ran),
+                # AND (c) we have at least one trainable signal. Container
+                # is pure-train: MCP supplies everything pre-frozen.
+                #
+                # Free-tier / no-container installs: the citation event is
+                # already on disk via the writer above; training is
+                # Pro-tier-only, so silent skip here is correct.
+                client = _get_rl_client()
+                if (
+                    client is not None
+                    and ctx is not None
+                    and citation_result is not None
+                ):
+                    nodes_packed = ctx.get("nodes") or []
+                    query_emb = ctx.get("query_emb") or []
+                    if nodes_packed and query_emb:
+                        try:
+                            resp = await client.rl_update_v3(
+                                task_id=task_id,
+                                nodes_packed=nodes_packed,
+                                query_emb=query_emb,
+                                cosine_sims=citation_result["cosine_sims"],
+                                literal_cited=citation_result["literal_cited"],
+                                cross_encoder_cited=None,
+                                task_type="mcp_interactive",
+                            )
+                            if resp.ok:
+                                logger.debug(
+                                    "RL monitor %s: trained on %d nodes (transcript %s)",
+                                    task_id[:8], len(nodes_packed), candidate.name[:8],
+                                )
+                            else:
+                                logger.debug(
+                                    "RL monitor %s: rl_update_v3 not ok (%s)",
+                                    task_id[:8], resp.error or resp.skipped or "unknown",
+                                )
+                        except Exception as exc:
+                            logger.debug(
+                                "RL monitor %s: rl_update_v3 raised (%s); continuing",
+                                task_id[:8], exc,
+                            )
                 return
             # Found the right transcript but answer not complete yet — stop scanning candidates
             break
@@ -3523,6 +3897,331 @@ def _reset_rl_telemetry_writers() -> None:
     _rl_telemetry_writers.clear()
 
 
+def _rl_pack_linked_embs_for_node(
+    node: dict,
+    sibling_objs_by_source_id: dict[str, list],
+    link_objs_by_title: dict[str, object],
+    target_vector_name: str,
+) -> tuple[list[list[float]], list[str]]:
+    """Pack up to ``_RL_MAX_LINKED`` linked-slot vectors for one node.
+
+    Order matches what ``paid-modules/vct-rl-reranker/retrieval_rl.py::_train_rl_model``
+    builds online today (lines 914-918):
+
+        linked_raws = extra_chunks_of_same_node + actual_linked_nodes
+        linked_type_idxs_final = [n_type_idx] * len(extra_chunks) + linked_type_idxs
+
+    Offline replay reads this exact order from the v3 event and feeds it
+    into ``_rl_model.update(..., linked_raws=...)`` with NO repacking.
+
+    Args:
+        node: The retrieval result dict for which we're building linked_embs.
+            Must carry ``source_node_id`` (or fall through to title) and
+            ``chunk_number`` so we can filter out the matched chunk itself
+            from the sibling pool. ``links`` (a list of wikilink titles)
+            drives the actual_linked_nodes side.
+        sibling_objs_by_source_id: Pre-fetched Weaviate objects keyed by
+            ``source_node_id``. Each value is a list of objects from the
+            same KG row family. Vectors are pulled via
+            ``_extract_obj_vector(obj, target_vector_name)``.
+        link_objs_by_title: Pre-fetched Weaviate objects keyed by ``title``,
+            one per linked-node title we resolved.
+        target_vector_name: Active named-vector slot (e.g. "qwen3_embed")
+            for ``_extract_obj_vector`` to look up.
+
+    Returns:
+        ``(packed_embs, packed_type_names)`` — both lists length
+        ≤ ``_RL_MAX_LINKED``. ``packed_type_names`` carries the per-slot
+        ``node_type`` string the container resolves to an int via
+        ``self._rl_model.get_type_idx(name)`` (D1' invariant: type
+        indices are process-local; ALWAYS ship names across the wire).
+    """
+    packed_embs: list[list[float]] = []
+    packed_types: list[str] = []
+    node_type = node.get("node_type") or "concept"
+
+    # Step 1: extra chunks of THIS node (same source_node_id, different chunk_num).
+    # `_format_obj` exports this field as `source_id` (already resolved from
+    # `obj.properties.source_node_id` at format time, falling through to title
+    # when the property is absent). Read `source_id` first; fall back to the
+    # raw `source_node_id` property name for callers that pass un-formatted
+    # node dicts (none today, but keep the helper schema-agnostic).
+    source_id = node.get("source_id") or node.get("source_node_id") or node.get("title") or ""
+    matched_chunk = node.get("chunk_number")
+    if source_id:
+        siblings = sibling_objs_by_source_id.get(source_id) or []
+        for sib in siblings:
+            try:
+                sib_chunk = sib.properties.get("chunk_num")
+            except (AttributeError, KeyError):
+                continue
+            if sib_chunk == matched_chunk:
+                continue  # the matched chunk itself; that's n_emb, not a linked slot
+            vec = _extract_obj_vector(sib, target_vector_name)
+            if not vec:
+                continue
+            packed_embs.append(vec)
+            packed_types.append(node_type)  # extra chunks share THIS node's type
+            if len(packed_embs) >= _RL_MAX_LINKED:
+                return packed_embs, packed_types
+
+    # Step 2: actual linked nodes (one vector per resolved link title).
+    raw_links = node.get("links") or []
+    for raw in raw_links:
+        if len(packed_embs) >= _RL_MAX_LINKED:
+            break
+        link_str = raw if isinstance(raw, str) else str(raw)
+        # Strip wikilink decorations the typed-link parser may have left:
+        # "uses::Tool" -> "Tool"; "[[Tool]]" -> "Tool".
+        if "::" in link_str:
+            link_str = link_str.split("::", 1)[1]
+        link_str = link_str.strip().strip("[").strip("]")
+        if not link_str:
+            continue
+        obj = link_objs_by_title.get(link_str)
+        if obj is None:
+            continue
+        vec = _extract_obj_vector(obj, target_vector_name)
+        if not vec:
+            continue
+        packed_embs.append(vec)
+        # Per-link node_type from the fetched object's properties; "concept" fallback.
+        try:
+            ltype = (obj.properties.get("node_type") or "concept") if hasattr(obj, "properties") else "concept"
+        except (AttributeError, KeyError):
+            ltype = "concept"
+        packed_types.append(str(ltype))
+
+    return packed_embs, packed_types
+
+
+def _rl_enrich_nodes_with_linked_embs(
+    nodes: list[dict],
+    query_emb: "list[float] | None",
+    active_slot: str,
+    *,
+    coll_resolver=None,
+) -> None:
+    """Attach v3 training fields to each node in-place.
+
+    For every node (post-collapse, one entry per file):
+      - ``n_emb``: best-chunk vector (the matched chunk; pulled from the
+        node's existing ``emb`` field, which the search path already
+        populated from Weaviate's returned object). Logging both ``emb``
+        AND ``n_emb`` is redundant but cheap; offline_trainer prefers
+        ``n_emb`` when both are present (v3 contract).
+      - ``linked_embs``: MAX_LINKED packed vectors built by
+        ``_rl_pack_linked_embs_for_node`` (extras_of_this_node + actual_links,
+        truncated).
+      - ``linked_type_names``: parallel array of per-slot node_type strings.
+      - ``cos_qn``: max cos(query_emb, n_emb). Already present in many
+        cases (set by the search path's per-result enrichment block at
+        server.py:4179-4185); recomputed here only when missing.
+      - ``cos_ql``: mean cos(query_emb, link_i) over linked_embs.
+        Pre-computed scalar so offline replay matches online byte-identically
+        without re-fetching link embeddings (the locked design from the
+        2026-06-04 spec).
+      - ``cos_nl``: mean cos(n_emb, link_i) over linked_embs. Same rationale.
+
+    ONE batched Weaviate ``fetch_objects`` per collection (grouped by the
+    ``collection`` field on each node dict) does the heavy lifting:
+
+        Filter.by_property("source_node_id").contains_any([all source ids])
+        | Filter.by_property("title").contains_any([all link titles])
+        + include_vector=True
+
+    Soft-fail: if Weaviate is unreachable or the fetch raises, the node
+    keeps whatever fields were already set (typically just ``emb`` +
+    ``cos_qn``); ``linked_embs`` stays absent and the v3 event ships a
+    truncated payload. The offline trainer defaults missing ``linked_embs``
+    to ``[]`` and the gradient step degenerates to "no linked-slot input"
+    — same as a node with no actual links would produce.
+
+    Args:
+        nodes: Mutable list of per-node dicts (post-collapse). Modified
+            in place — function returns None.
+        query_emb: Active-slot query vector. When None, ``cos_qn`` /
+            ``cos_ql`` are not computed.
+        active_slot: Named-vector slot to pull from Weaviate objects
+            (e.g. ``"qwen3_embed"``).
+        coll_resolver: Optional callable ``(collection_name) -> coll
+            handle`` for testing. Defaults to ``get_weaviate_client()
+            .collections.get(name)``.
+    """
+    if not nodes:
+        return
+
+    # Group nodes by collection so we can issue ONE fetch per collection.
+    by_collection: dict[str, list[dict]] = {}
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        c = str(n.get("collection") or "")
+        if not c:
+            continue
+        by_collection.setdefault(c, []).append(n)
+
+    if not by_collection:
+        return
+
+    if coll_resolver is None:
+        try:
+            client = get_weaviate_client()
+        except Exception as exc:
+            logger.debug("RL enrich: get_weaviate_client failed (%s); skipping", exc)
+            return
+
+        def coll_resolver(name: str):  # noqa: E306 — local fallback
+            return client.collections.get(name)
+
+    # Import Filter lazily; the search path already does this elsewhere.
+    try:
+        from weaviate.classes.query import Filter  # type: ignore
+    except Exception as exc:
+        logger.debug("RL enrich: Filter import failed (%s); skipping", exc)
+        return
+
+    for collection_name, group_nodes in by_collection.items():
+        # Skip collections whose schema doesn't match the KG row shape this
+        # helper expects. The Code* family (CodeFunction / CodeClass / CodeAPI /
+        # CodeInteraction / CodeModule) has no `source_node_id`, no `links`,
+        # and (per `_format_obj`'s "Untitled" default) all rows would group
+        # under a single bogus source_id — every per-call enrichment would
+        # then crash inside fetch_objects (caught by the per-group try/except
+        # below but logging debug-level noise on every search). Pre-filtering
+        # here is cleaner. See KG node concepts/code-graph-schema for the
+        # canonical schema reference.
+        if collection_name.startswith("Code"):
+            continue
+
+        # Collect identifiers we'll need from Weaviate.
+        # Read `source_id` (the `_format_obj` output field name; resolved at
+        # format time from `obj.properties.source_node_id` with title fallback)
+        # first; fall back to raw `source_node_id` for callers that pass
+        # un-formatted node dicts.
+        source_ids: list[str] = []
+        link_titles: list[str] = []
+        for n in group_nodes:
+            sid = n.get("source_id") or n.get("source_node_id") or n.get("title")
+            if sid:
+                source_ids.append(str(sid))
+            for raw in n.get("links") or []:
+                link_str = raw if isinstance(raw, str) else str(raw)
+                if "::" in link_str:
+                    link_str = link_str.split("::", 1)[1]
+                link_str = link_str.strip().strip("[").strip("]")
+                if link_str:
+                    link_titles.append(link_str)
+
+        # Dedup before sending across the wire (Weaviate accepts repeats but
+        # the in-process post-filter dicts only key by unique strings).
+        unique_source_ids = list({s for s in source_ids if s})
+        unique_link_titles = list({t for t in link_titles if t})
+
+        if not unique_source_ids and not unique_link_titles:
+            continue
+
+        # Build filter: source_node_id in [...] OR title in [...].
+        try:
+            filt = None
+            if unique_source_ids:
+                filt = Filter.by_property("source_node_id").contains_any(unique_source_ids)
+            if unique_link_titles:
+                title_filt = Filter.by_property("title").contains_any(unique_link_titles)
+                filt = title_filt if filt is None else (filt | title_filt)
+        except Exception as exc:
+            logger.debug("RL enrich: filter build failed (%s); skipping group", exc)
+            continue
+
+        # ONE Weaviate roundtrip for this collection. Generous limit upper-bound:
+        # MAX_LINKED chunks per node + actual links per node, both capped.
+        max_rows = len(group_nodes) * (_RL_MAX_LINKED * 2 + 8)
+        try:
+            coll = coll_resolver(collection_name)
+            resp = coll.query.fetch_objects(
+                filters=filt,
+                include_vector=True,
+                limit=max_rows,
+            )
+            fetched = list(resp.objects)
+        except Exception as exc:
+            logger.debug(
+                "RL enrich: fetch_objects on %s failed (%s); skipping group",
+                collection_name, exc,
+            )
+            continue
+
+        # Index by source_node_id (for sibling chunks) and by title (for actual links).
+        sibling_objs_by_source_id: dict[str, list] = {}
+        link_objs_by_title: dict[str, object] = {}
+        for obj in fetched:
+            try:
+                props = obj.properties
+            except AttributeError:
+                continue
+            sid = props.get("source_node_id")
+            if sid:
+                sibling_objs_by_source_id.setdefault(str(sid), []).append(obj)
+            title = props.get("title")
+            if title:
+                # title -> single object; if multiple chunks of the same title
+                # land in the result, the highest-chunk-num one wins (arbitrary
+                # but deterministic). For linked-node embeddings the chunk
+                # choice is asymmetric — we want ONE representative emb per
+                # linked node.
+                existing = link_objs_by_title.get(str(title))
+                if existing is None:
+                    link_objs_by_title[str(title)] = obj
+                else:
+                    try:
+                        if (props.get("chunk_num") or 0) < (
+                            getattr(existing, "properties", {}).get("chunk_num") or 0
+                        ):
+                            continue
+                        link_objs_by_title[str(title)] = obj
+                    except (AttributeError, TypeError):
+                        pass
+
+        # Per-node enrichment.
+        for n in group_nodes:
+            packed_embs, packed_types = _rl_pack_linked_embs_for_node(
+                n,
+                sibling_objs_by_source_id,
+                link_objs_by_title,
+                active_slot,
+            )
+            n["linked_embs"] = packed_embs
+            n["linked_type_names"] = packed_types
+
+            # n_emb: prefer the existing emb (already on the dict from search).
+            n_emb = n.get("emb")
+            if n_emb:
+                n["n_emb"] = n_emb
+
+            # cos_qn (re-)compute when we have both inputs.
+            if query_emb and n_emb and "cos_qn" not in n:
+                try:
+                    n["cos_qn"] = _cosine(query_emb, n_emb)
+                except Exception:
+                    pass
+
+            # cos_ql = mean cos(query, link_i)
+            if query_emb and packed_embs:
+                try:
+                    cosines = [_cosine(query_emb, e) for e in packed_embs]
+                    n["cos_ql"] = sum(cosines) / max(len(cosines), 1)
+                except Exception:
+                    pass
+
+            # cos_nl = mean cos(n_emb, link_i)
+            if n_emb and packed_embs:
+                try:
+                    cosines = [_cosine(n_emb, e) for e in packed_embs]
+                    n["cos_nl"] = sum(cosines) / max(len(cosines), 1)
+                except Exception:
+                    pass
+
+
 async def _rl_cache_and_rerank(
     task_id: str,
     query: str,
@@ -3644,10 +4343,16 @@ async def _rl_cache_and_rerank(
             #
             # v0.2.31 telemetry audit fix (Item 2.4 — was 7.4% missing):
             # propagate emb + cos_qn / cos_ql / cos_nl when the upstream
-            # search path enriched the candidate dict. cos_ql / cos_nl
-            # are typically absent (no label_embedding in scope at the
-            # MCP search-tool level — that lives in the offline trainer)
-            # and the writer's payload builder soft-omits None fields.
+            # search path enriched the candidate dict.
+            #
+            # v0.2.47 RL-6c (2026-06-04): also propagate the v3 enrichment
+            # fields (n_emb / linked_embs / linked_type_names / node_type /
+            # links) that ``_rl_enrich_nodes_with_linked_embs`` attached to
+            # each node dict upstream. The writer's
+            # ``_build_v3_retrieval_event`` consumes them when present;
+            # absent values omit cleanly. The writer itself was switched
+            # from JSONL to a hub POST in the same release cycle — see
+            # ``claude_mcp_servers/rl_client/telemetry_writer.py``.
             log_nodes: list[dict] = []
             for idx, n in enumerate(all_nodes):
                 if not isinstance(n, dict):
@@ -3659,6 +4364,17 @@ async def _rl_cache_and_rerank(
                 }
                 if n.get("emb"):
                     rec["emb"] = n["emb"]
+                # v3 per-node fields (from C6b-1/2 enrichment).
+                if n.get("n_emb"):
+                    rec["n_emb"] = n["n_emb"]
+                if n.get("linked_embs"):
+                    rec["linked_embs"] = n["linked_embs"]
+                if n.get("linked_type_names"):
+                    rec["linked_type_names"] = n["linked_type_names"]
+                if n.get("node_type"):
+                    rec["node_type"] = n["node_type"]
+                if n.get("links"):
+                    rec["links"] = n["links"]
                 for cos_field in ("cos_qn", "cos_ql", "cos_nl"):
                     val = n.get(cos_field)
                     if val is not None:
@@ -3674,6 +4390,29 @@ async def _rl_cache_and_rerank(
                 failed_collections=failed_collections,
                 query_emb=query_emb,
             )
+
+            # v0.2.47 RL-6c: populate _rl_node_content_cache so the
+            # citation-write monitor (C7) can compute citations later
+            # without re-fetching anything from Weaviate. LRU-ish eviction
+            # at _RL_NODE_CACHE_MAX. Per-task entry shape is documented
+            # at the cache's module-level definition (line ~340).
+            try:
+                _rl_node_content_cache[task_id] = {
+                    "nodes": list(log_nodes),
+                    "query_emb": list(query_emb) if query_emb is not None else None,
+                    "active_model": EMBEDDING_MODEL,
+                    "embedding_source": EMBEDDING_SOURCE,
+                    "embedding_dim": len(query_emb) if query_emb else 0,
+                    "project_id": None,  # free-tier fallback; resolver lookup deferred to C7
+                    "project_name": PROJECT_NAME if "PROJECT_NAME" in globals() else "",
+                    "task_type": "mcp_interactive",
+                }
+                # Evict oldest entry when over cap (dict iteration order
+                # preserves insertion order on Python 3.7+).
+                while len(_rl_node_content_cache) > _RL_NODE_CACHE_MAX:
+                    _rl_node_content_cache.pop(next(iter(_rl_node_content_cache)))
+            except Exception as exc:
+                logger.debug("RL node-content cache populate failed (%s)", exc)
     except Exception as exc:
         logger.debug("RL telemetry log_retrieval failed (%s); continuing", exc)
 
@@ -3902,6 +4641,16 @@ async def _semantic_graph_search_body(
     raw_primary: list[tuple[object, str]] = []
     failed_collections_schema: list[str] = []
     successful_collections: list[str] = []
+    # v0.2.47 RL-6b-2: hoist query_vector / query_target to FUNCTION scope
+    # so they're defined even if `collections_to_search` is empty (in which
+    # case the for-loop body never runs and the post-collapse references
+    # at the RL enrich + _rl_cache_and_rerank sites would otherwise hit
+    # NameError). Pre-v0.2.47 this was latent — every reachable code path
+    # set `query_vector` inside the loop, but a fresh install with no
+    # configured KG collections would not. Initializing them here makes
+    # the no-op-collections-search path explicit and crash-free.
+    query_vector: list[float] | None = None
+    query_target: str = ""
     for coll_name in collections_to_search:
         handle = _coll_for(coll_name)
         if handle is None:
@@ -3912,8 +4661,10 @@ async def _semantic_graph_search_body(
         # into _rl_cache_and_rerank → log_retrieval. ``query_vector``
         # may be None on near_text path (Weaviate-vectoriser mode); in
         # that case we skip emb enrichment.
-        query_vector: list[float] | None = None
-        query_target: str = ""
+        # (Per-iteration re-init — the function-scope defaults above
+        # only apply when the loop never runs.)
+        query_vector = None
+        query_target = ""
         try:
             if EMBEDDING_SOURCE == "weaviate":
                 nt_kwargs = dict(query=query, limit=fetch_limit, return_metadata=["distance"])
@@ -4028,6 +4779,29 @@ async def _semantic_graph_search_body(
     # the same reason hybrid_search does (retrieval_rl.py keys on title; two
     # chunks of the same node would silently collide in `signed[title]`).
     all_formatted = _collapse_to_one_per_node(all_formatted, score_field="score")
+
+    # v0.2.47 RL-6b-2: enrich each node with `n_emb` / `linked_embs` /
+    # `linked_type_names` / `cos_qn` / `cos_ql` / `cos_nl` BEFORE the RL
+    # path sees the candidates. Same shape as the sibling hybrid_search
+    # wiring — one batched Weaviate fetch per collection (grouped by
+    # `collection` field on each node dict). Soft-fail throughout.
+    # NB: `query_vector` and `query_target` are leaked from the
+    # per-collection for-loop above (Python's last-iteration binding,
+    # same convention as the existing `query_emb=query_vector` arg
+    # below). When the fan-out had zero successful collections both
+    # remain at their initial None / "" sentinels; the helper degrades
+    # to a no-op-with-empty-fields write.
+    try:
+        _rl_enrich_nodes_with_linked_embs(
+            all_formatted,
+            query_emb=query_vector,
+            active_slot=query_target,
+        )
+    except Exception as exc:
+        logger.debug(
+            "semantic_graph_search: RL enrich failed (%s); proceeding without linked_embs",
+            exc,
+        )
 
     # RL: rerank + cache using all over-fetched nodes; return top-k primary results.
     # v0.2.24: propagate partial-fan-out schema failures so telemetry
@@ -4484,10 +5258,18 @@ async def _hybrid_search_body(
     # body never had `query_vector` in scope. None on the Weaviate-vectoriser
     # path (no raw vectors returned); the writer handles None gracefully.
     query_vector: list[float] | None = None
+    # v0.2.47 RL-6b-2: ALSO capture the target named-vector slot so the
+    # v3 enrichment helper knows which slot to pull from each fetched
+    # object's `.vector` dict. The slot stays the same across every
+    # collection in this fan-out (it's the active embedding's slot —
+    # the per-collection schema decides whether to honor it, not which
+    # slot to read).
+    query_target: str = ""
     if EMBEDDING_SOURCE != "weaviate":
         try:
-            _vec, _ = await _get_search_vector(query)
+            _vec, _slot = await _get_search_vector(query)
             query_vector = _vec
+            query_target = _slot or ""
         except Exception as exc:
             # Best-effort capture — vector unavailable means downstream
             # log_retrieval omits the field, but search itself proceeds.
@@ -4606,6 +5388,23 @@ async def _hybrid_search_body(
     for r in all_results:
         if "score" not in r and "combined_score" in r:
             r["score"] = r["combined_score"]
+
+    # v0.2.47 RL-6b-2: enrich each node with `n_emb` / `linked_embs` /
+    # `linked_type_names` / `cos_qn` / `cos_ql` / `cos_nl` BEFORE the RL
+    # path sees the candidates. One batched Weaviate fetch per collection
+    # (grouped by `collection` field on each node dict). Soft-fail
+    # throughout: missing query_vector or Weaviate-unreachable leaves
+    # the nodes as-is and the v3 retrieval event ships with whatever
+    # was already attached by the search-time near_vector enrichment
+    # (typically `emb` + `cos_qn`).
+    try:
+        _rl_enrich_nodes_with_linked_embs(
+            all_results,
+            query_emb=query_vector,
+            active_slot=query_target,
+        )
+    except Exception as exc:
+        logger.debug("hybrid_search: RL enrich failed (%s); proceeding without linked_embs", exc)
 
     # RL: rerank + cache using all candidates; return top-k.
     # v0.2.24: propagate any per-collection schema failures from the

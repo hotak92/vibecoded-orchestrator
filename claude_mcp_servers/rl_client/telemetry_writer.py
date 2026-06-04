@@ -1,52 +1,78 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""RLTelemetryWriter — fan-out RL events to local JSONL + upload queue.
+"""RLTelemetryWriter — fan-out RL events to launcher.db (via hub) + upload queue.
 
-Two-channel design:
+v0.2.47 RL-6c (2026-06-04) — HARD CUTOVER from JSONL to launcher.db.
+Pre-v0.2.47 design wrote a local ``~/.claude/retrieval_rl_data/rl_events.jsonl``
+file via ``rl_logger.RLDataLogger``. v0.2.47 replaces that path with a
+hub HTTP POST to ``http://127.0.0.1:<port>/api/v1/rl/events`` (added in
+C4 + C5). Reasons:
 
-  1. **Local JSONL** (always-on by default; user-opt-out via the
+  * Queryable + indexed (SQLite) rather than flat-file.
+  * Cross-project dashboards: the launcher Identity tab can join against
+    the ``projects`` table for per-project event-rate displays.
+  * Single source of truth: offline_trainer reads via the hub's GET
+    endpoint, NOT by re-opening the JSONL.
+  * Preserves the launcher's single-writer architectural rule (Python
+    never opens launcher.db directly — see
+    ``vco_lib/config_projection.py:488-491`` + the KG node
+    ``launcher-hub-single-writer-principle``).
+
+Two-channel design (v0.2.47):
+
+  1. **Hub write** (always-on by default; user-opt-out via the
      Preferences "Collect retrieval data locally" toggle, which writes
      ``RL_LOCAL_LOGGING_DISABLED=true`` to ``.claude/env``).
-     Wraps ``rl_logger.RLDataLogger`` — keeps the v0.2.x free-tier
-     behavior unchanged: every retrieval + citation event is appended
-     to ``~/.claude/retrieval_rl_data/rl_events.jsonl`` so when the
-     user upgrades to Pro the historical training data is already
-     there.
+     Calls ``hub_writer.post_rl_event`` (commit C5) — soft-fails on
+     hub unreachable, missing token, etc. Events lost in those cases
+     are LOST (per the locked decision 2026-06-04: no retry queue,
+     no JSONL fallback). The hub auto-starts on every Claude Code
+     session via ``session-start-ensure-hub.sh``, bounding the
+     down-window to "user explicitly stopped the hub".
 
   2. **Upload queue** (opt-in only; gated on ``consent.rl_data ==
      True`` from ``~/.vibecoded/config.json``). Publishes the same
      event payload to the existing ``VCThelpers.telemetry.queue``
-     SQLite queue, which the uploader batch-sends to the central
-     hub when consented.
+     SQLite queue, which the uploader batch-sends to Supabase when
+     consented. The Supabase-side schema for these payloads
+     (``rl_retrieval`` / ``rl_citations`` event_types) has not been
+     verified end-to-end as of v0.2.47 ship; the payload builders
+     here already include the v3 fields so a future Supabase
+     migration only needs to add columns, not reshape the writer.
+     Track as v0.2.48 work — see SELF-HANDOFF v2 §"What's NOT in scope".
 
-The writer is **graceful under failure**:
+Migration of the historical 700 MB JSONL corpus at
+``~/.claude/retrieval_rl_data/rl_events.jsonl`` happens via the C9
+one-shot script, NOT through this writer.
 
-  * Local opt-out via env → skip JSONL writes (no-op return).
-  * VCThelpers.telemetry not importable (lean install) → upload-queue
-    side becomes a no-op; local writes still happen.
-  * Consent denied → no enqueue, but local writes still happen.
-  * Either side raises → log at debug, never propagate.
-
-The ``log_retrieval`` and ``log_citations`` signatures match
-``RLDataLogger`` exactly so callers can swap one for the other
-without touching arguments.
+The ``log_retrieval`` and ``log_citations`` signatures stay backwards-
+compatible — callers pre-v0.2.47 still invoke
+``writer.log_retrieval(task_id=..., task_type=..., ...)``; the
+implementation switched out from under them.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
-from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional
 
+from .hub_writer import post_rl_event
 from .rl_logger import RLDataLogger
 
 logger = logging.getLogger(__name__)
 
 
 # Env var: when set to a truthy value, even local JSONL writes are
-# skipped. Surfaced in Preferences UI → "Collect retrieval data
-# locally" toggle (off → writes "RL_LOCAL_LOGGING_DISABLED=true" to
-# the project's ``.claude/env``). Default empty/false = collect.
+# skipped (events are lost). Surfaced in Preferences UI → "Collect
+# retrieval data locally" toggle (off → writes
+# "RL_LOCAL_LOGGING_DISABLED=true" to the project's ``.claude/env``).
+# Default empty/false = collect.
+# Name preserved from the pre-v0.2.47 JSONL design for back-compat with
+# users who already set it in `.claude/env`; the env reads "local" but
+# now gates the launcher.db hub write — same opt-out semantics
+# (user-controlled "don't record my retrievals").
 _LOCAL_OPT_OUT_ENV = "RL_LOCAL_LOGGING_DISABLED"
 
 # Telemetry event_type used for queue publishes. Hub-side schemas
@@ -95,49 +121,56 @@ def _enqueue(event_type: str, payload: Dict[str, Any]) -> bool:
 
 
 class RLTelemetryWriter:
-    """Fan-out RL retrieval/citation events to local JSONL + upload queue.
+    """Fan-out RL retrieval/citation events to launcher.db (via hub) + upload queue.
+
+    v0.2.47 RL-6c (2026-06-04): the local write target is now the
+    launcher's SQLite ``rl_events`` table reached via the hub's
+    ``POST /api/v1/rl/events`` route, NOT the pre-v0.2.47 JSONL file.
+    The ``log_retrieval`` / ``log_citations`` signatures are unchanged
+    so callers in ``weaviate_mcp/server.py`` keep working without edits.
 
     Args:
-        log_path: Override for the local JSONL path. Defaults to the
-            ``RLDataLogger.DEFAULT_PATH`` (~/.claude/retrieval_rl_data/
-            rl_events.jsonl).
-        project: Project name tag written to every event.
+        project: Project name tag written to every event. Maps to the
+            v3 hub envelope's ``project_name`` column.
+        project_id: Optional FK to ``projects.id``. NULL for free-tier
+            installs that haven't registered the workspace with the
+            launcher.
         embedding_source: Tag (qwen3 / arctic / openai / codesage / legacy).
         embedding_dim: Vector dim of the active embedding.
         embedding_model: Full model id (for log forensics).
         upload_event_type_retrieval / upload_event_type_citations:
             Override the queue event_type strings (tests).
+        hub_post_fn: Override for the hub POST callable. Defaults to
+            ``hub_writer.post_rl_event``. Tests inject a stub so they
+            can assert what payload would have been written without
+            standing up a real hub server.
     """
 
     def __init__(
         self,
         *,
-        log_path: Optional[Path] = None,
         project: str = "",
+        project_id: Optional[str] = None,
         embedding_source: str = "",
         embedding_dim: int = 0,
         embedding_model: str = "",
         upload_event_type_retrieval: str = _EVENT_TYPE_RETRIEVAL,
         upload_event_type_citations: str = _EVENT_TYPE_CITATIONS,
+        hub_post_fn=None,
     ) -> None:
-        self._local = RLDataLogger(
-            log_path=log_path,
-            project=project,
-            embedding_source=embedding_source,
-            embedding_dim=embedding_dim,
-            embedding_model=embedding_model,
-        )
         self._project = project
+        self._project_id = project_id
         self._embedding_source = embedding_source
         self._embedding_dim = embedding_dim
         self._embedding_model = embedding_model
         self._etype_retrieval = upload_event_type_retrieval
         self._etype_citations = upload_event_type_citations
-
-    @property
-    def log_path(self) -> Path:
-        """Resolved path of the local JSONL log."""
-        return self._local.log_path
+        # Hub POST callable. Lazily resolves to the default at construction
+        # time so unit tests can swap it cleanly via the kwarg.
+        self._hub_post = hub_post_fn if hub_post_fn is not None else post_rl_event
+        # Capture the last envelope written for hub-post stub assertions
+        # in tests. None until the first successful (or attempted) write.
+        self._last_envelope: Optional[Dict[str, Any]] = None
 
     # ---- public API ---------------------------------------------------
 
@@ -152,10 +185,13 @@ class RLTelemetryWriter:
         failure_mode: Optional[str] = None,
         failed_collections: Optional[List[str]] = None,
     ) -> None:
-        """Log a retrieval event to local JSONL + (if consented) upload queue.
+        """Log a retrieval event to launcher.db (via hub) + (if consented) upload queue.
 
-        Signature matches ``RLDataLogger.log_retrieval`` exactly so
-        callers can swap the two transparently.
+        v0.2.47 RL-6c: the local write target switched from JSONL to the
+        launcher's SQLite ``rl_events`` table. The hub validates the
+        envelope shape; payload_json carries the full v3 event JSON
+        verbatim and is what the offline trainer reads back via the
+        hub's GET endpoint.
 
         ``failure_mode`` and ``failed_collections`` are v0.2.24 additions
         (RL-defect-2026-05-22): when the fan-out hits a degraded mode
@@ -164,10 +200,13 @@ class RLTelemetryWriter:
         of training-pair construction while still using it as a
         query-distribution signal.
         """
-        # Local write (gated on user opt-out env)
+        # Hub write (gated on user opt-out env). Soft-fail: a False return
+        # from post_rl_event means hub unreachable / missing token / 5xx.
+        # Per the locked decision 2026-06-04, lost events stay lost
+        # (no retry queue, no JSONL fallback).
         if not _local_logging_disabled():
             try:
-                self._local.log_retrieval(
+                event = self._build_v3_retrieval_event(
                     task_id=task_id,
                     task_type=task_type,
                     query=query,
@@ -177,10 +216,17 @@ class RLTelemetryWriter:
                     failure_mode=failure_mode,
                     failed_collections=failed_collections,
                 )
+                envelope = self._wrap_for_hub("retrieval", task_id, task_type, event)
+                self._last_envelope = envelope
+                self._hub_post(envelope)
             except Exception as exc:
-                logger.debug("RLTelemetryWriter: local log_retrieval failed (%s)", exc)
+                logger.debug("RLTelemetryWriter: hub log_retrieval failed (%s)", exc)
 
-        # Upload publish (gated on consent.rl_data)
+        # Upload publish (gated on consent.rl_data). v0.2.47 note:
+        # the Supabase end-to-end wiring for these payloads has not been
+        # verified — the payload builder includes the v3 fields so a
+        # future Supabase migration just adds columns. Track as
+        # v0.2.48 work.
         if _upload_consent_granted():
             payload = self._build_retrieval_payload(
                 task_id=task_id,
@@ -200,18 +246,39 @@ class RLTelemetryWriter:
         task_type: str,
         citations: Dict[str, Optional[bool]],
         cosine_sims: Optional[Dict[str, float]] = None,
+        literal_cited: Optional[Dict[str, bool]] = None,
+        cross_encoder_cited: Optional[Dict[str, bool]] = None,
+        answer_text: Optional[str] = None,
     ) -> None:
-        """Log a citation event to local JSONL + (if consented) upload queue."""
+        """Log a citation event to launcher.db (via hub) + (if consented) upload queue.
+
+        v3 fields ``literal_cited`` and ``cross_encoder_cited`` are optional
+        per-node boost-flag dicts consumed by
+        ``vco_lib.rl_training_targets.compute_unified_targets``. ``cosine_sims``
+        stays RAW (no bonuses pre-applied) so the formula is replayable
+        offline if coefficients are retuned.
+
+        ``answer_text`` (v3+ optional) reserves a field for the agent's full
+        answer so future versions can opt-in to logging answers for offline
+        multi-model training without a schema bump. v0.2.9 leaves this None
+        (privacy/size); None ⇒ the field is omitted from the event entirely.
+        """
         if not _local_logging_disabled():
             try:
-                self._local.log_citations(
+                event = self._build_v3_citation_event(
                     task_id=task_id,
                     task_type=task_type,
                     citations=citations,
                     cosine_sims=cosine_sims,
+                    literal_cited=literal_cited,
+                    cross_encoder_cited=cross_encoder_cited,
+                    answer_text=answer_text,
                 )
+                envelope = self._wrap_for_hub("citation", task_id, task_type, event)
+                self._last_envelope = envelope
+                self._hub_post(envelope)
             except Exception as exc:
-                logger.debug("RLTelemetryWriter: local log_citations failed (%s)", exc)
+                logger.debug("RLTelemetryWriter: hub log_citations failed (%s)", exc)
 
         if _upload_consent_granted():
             payload = self._build_citation_payload(
@@ -219,6 +286,9 @@ class RLTelemetryWriter:
                 task_type=task_type,
                 citations=citations,
                 cosine_sims=cosine_sims,
+                literal_cited=literal_cited,
+                cross_encoder_cited=cross_encoder_cited,
+                answer_text=answer_text,
             )
             _enqueue(self._etype_citations, payload)
 
@@ -258,6 +328,16 @@ class RLTelemetryWriter:
             }
             if n.get("emb"):
                 rec["emb"] = list(n["emb"])
+            # v3+: best-chunk vector (renamed from `emb` for v3 disambiguation)
+            if n.get("n_emb"):
+                rec["n_emb"] = list(n["n_emb"])
+            # v3+: MAX_LINKED packed linked-slot embeddings
+            if n.get("linked_embs"):
+                rec["linked_embs"] = [list(e) for e in n["linked_embs"] if e]
+            if n.get("linked_type_names"):
+                rec["linked_type_names"] = [str(t) for t in n["linked_type_names"]]
+            if n.get("node_type"):
+                rec["node_type"] = str(n["node_type"])
             for field in ("cos_qn", "cos_ql", "cos_nl"):
                 val = n.get(field)
                 if val is not None:
@@ -294,6 +374,9 @@ class RLTelemetryWriter:
         task_type: str,
         citations: Dict[str, Optional[bool]],
         cosine_sims: Optional[Dict[str, float]],
+        literal_cited: Optional[Dict[str, bool]] = None,
+        cross_encoder_cited: Optional[Dict[str, bool]] = None,
+        answer_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build the queue-bound payload for a citation event.
 
@@ -303,6 +386,11 @@ class RLTelemetryWriter:
         Lets the offline RL pipeline anchor the citation event by its
         own embedding triple if the paired retrieval event was dropped
         at training_loader steps 4/6.
+
+        v3 (v0.2.47): adds ``literal_cited`` + ``cross_encoder_cited``
+        per-node boost-flag dicts. Stored as separate fields (NOT baked
+        into ``cosine_sims``) so historical events stay replayable when
+        the bonus coefficients are retuned.
         """
         payload: Dict[str, Any] = {
             "schema_version": RLDataLogger.SCHEMA_VERSION,
@@ -319,4 +407,158 @@ class RLTelemetryWriter:
         }
         if cosine_sims:
             payload["cosine_sims"] = {t: float(v) for t, v in cosine_sims.items()}
+        if literal_cited:
+            payload["literal_cited"] = {t: bool(v) for t, v in literal_cited.items()}
+        if cross_encoder_cited:
+            payload["cross_encoder_cited"] = {
+                t: bool(v) for t, v in cross_encoder_cited.items()
+            }
+        if answer_text is not None:
+            payload["answer_text"] = str(answer_text)
         return payload
+
+    # ---- v3 hub event builders (v0.2.47 RL-6c) -----------------------
+
+    def _build_v3_retrieval_event(
+        self,
+        *,
+        task_id: str,
+        task_type: str,
+        query: str,
+        nodes: List[Dict[str, Any]],
+        session_id: str,
+        query_emb: Optional[List[float]],
+        failure_mode: Optional[str] = None,
+        failed_collections: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Build the v3 retrieval event JSON stored in launcher.db's payload_json.
+
+        Shape matches the SELF-HANDOFF v2 spec § "v3 retrieval event payload".
+        Per-node records carry the same field set as ``_build_retrieval_payload``
+        (the consented-upload queue payload) PLUS the raw query text — the
+        hub keeps query strings because launcher.db is local-only, NOT
+        uploaded. Supabase still strips them in the queue payload.
+        """
+        node_records: List[Dict[str, Any]] = []
+        for n in nodes:
+            rec: Dict[str, Any] = {
+                "title": str(n.get("title", "")),
+                "score": float(n.get("score", 0.0)),
+                "tier": str(n.get("tier", "top_k")),
+            }
+            if n.get("emb"):
+                rec["emb"] = list(n["emb"])
+            if n.get("n_emb"):
+                rec["n_emb"] = list(n["n_emb"])
+            if n.get("linked_embs"):
+                rec["linked_embs"] = [list(e) for e in n["linked_embs"] if e]
+            if n.get("linked_type_names"):
+                rec["linked_type_names"] = [str(t) for t in n["linked_type_names"]]
+            if n.get("node_type"):
+                rec["node_type"] = str(n["node_type"])
+            if n.get("links"):
+                rec["links"] = [str(lnk) for lnk in n["links"][:10]]
+            for field in ("cos_qn", "cos_ql", "cos_nl"):
+                val = n.get(field)
+                if val is not None:
+                    rec[field] = float(val)
+            node_records.append(rec)
+
+        event: Dict[str, Any] = {
+            "event": "retrieval",
+            "schema_version": RLDataLogger.SCHEMA_VERSION,
+            "ts": _now_iso(),
+            "project": self._project,
+            "task_id": task_id,
+            "session_id": session_id,
+            "task_type": task_type,
+            "query": (query or "")[:2000],
+            "embedding_source": self._embedding_source,
+            "embedding_dim": self._embedding_dim,
+            "embedding_model": self._embedding_model,
+            "nodes": node_records,
+        }
+        if query_emb is not None:
+            event["query_emb"] = list(query_emb)
+        if failure_mode:
+            event["failure_mode"] = str(failure_mode)
+        if failed_collections:
+            event["failed_collections"] = [
+                str(c) for c in list(failed_collections)[:32]
+            ]
+        return event
+
+    def _build_v3_citation_event(
+        self,
+        *,
+        task_id: str,
+        task_type: str,
+        citations: Dict[str, Optional[bool]],
+        cosine_sims: Optional[Dict[str, float]],
+        literal_cited: Optional[Dict[str, bool]] = None,
+        cross_encoder_cited: Optional[Dict[str, bool]] = None,
+        answer_text: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build the v3 citation event JSON stored in launcher.db's payload_json."""
+        event: Dict[str, Any] = {
+            "event": "citation",
+            "schema_version": RLDataLogger.SCHEMA_VERSION,
+            "ts": _now_iso(),
+            "project": self._project,
+            "task_id": task_id,
+            "task_type": task_type,
+            "embedding_source": self._embedding_source,
+            "embedding_dim": self._embedding_dim,
+            "embedding_model": self._embedding_model,
+            "citations": {
+                title: (bool(cited) if cited is not None else None)
+                for title, cited in citations.items()
+            },
+        }
+        if cosine_sims:
+            event["cosine_sims"] = {
+                t: round(float(v), 4) for t, v in cosine_sims.items()
+            }
+        if literal_cited:
+            event["literal_cited"] = {t: bool(v) for t, v in literal_cited.items()}
+        if cross_encoder_cited:
+            event["cross_encoder_cited"] = {
+                t: bool(v) for t, v in cross_encoder_cited.items()
+            }
+        if answer_text is not None:
+            event["answer_text"] = str(answer_text)
+        return event
+
+    def _wrap_for_hub(
+        self,
+        event_type: str,
+        task_id: str,
+        task_type: str,
+        event_json: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Wrap a v3 event in the hub POST envelope shape.
+
+        Matches ``vct-hub/src/rl_events_api::PostEventBody``. The hub
+        denormalizes indexed columns out of the envelope; ``payload_json``
+        carries the full v3 event JSON verbatim so downstream readers
+        (offline_trainer via the hub's GET endpoint) get bytewise-identical
+        replayable events.
+        """
+        return {
+            "event_type": event_type,
+            "schema_version": int(event_json.get("schema_version") or RLDataLogger.SCHEMA_VERSION),
+            "ts_ms": int(time.time() * 1000),
+            "project_id": self._project_id,
+            "project_name": self._project or None,
+            "task_id": task_id,
+            "task_type": task_type,
+            "embedding_source": self._embedding_source or None,
+            "embedding_dim": self._embedding_dim or None,
+            "embedding_model": self._embedding_model or None,
+            "payload_json": json.dumps(event_json),
+        }
+
+
+def _now_iso() -> str:
+    """Local-clock ISO 8601 timestamp matching the pre-v0.2.47 RLDataLogger format."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())

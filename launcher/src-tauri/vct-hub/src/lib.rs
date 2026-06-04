@@ -38,6 +38,7 @@ pub mod module_db_api;
 pub mod modules_api;
 pub mod project_state_api;
 pub mod retrieval_tuning_io;
+pub mod rl_events_api;
 pub mod secrets_api;
 pub mod server;
 pub mod weaviate_probe;

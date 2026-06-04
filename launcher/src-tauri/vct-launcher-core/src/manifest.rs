@@ -2517,10 +2517,15 @@ mod tests {
         // v0.2.46: pin the manifest's series rather than the exact patch
         // level so the test stays useful across paid-module releases
         // without needing a hand-edit on every bump. Earlier exact-equal
-        // assertions (0.1.0 / 0.1.1) drifted out of sync with releases.
-        // Asserts (a) starts with "0." (catches a major-version reorg)
-        // AND (b) lands in a known active series. Update the allowlist
-        // when the paid module's major minor advances.
+        // assertions (0.1.0 / 0.1.1 / 0.2.8) drifted out of sync with
+        // releases — the manifest is at 0.2.9 today and will be 0.2.10
+        // soon. Asserts (a) starts with "0." (catches a major-version
+        // reorg) AND (b) lands in a known active series. Update the
+        // allowlist when the paid module's major minor advances.
+        //
+        // Supersedes the v0.2.47 RL branch's `assert_eq!(version, "0.2.8")`
+        // hand-edit which would have needed bumping again to 0.2.9 for
+        // the paired ship.
         assert!(
             manifest.version.starts_with("0."),
             "manifest.version = {:?} — expected a 0.x release",
@@ -2919,7 +2924,13 @@ mod tests {
         );
 
         // Flatten controls + verify at least one of each interactive
-        // kind exists. Info is required (section 1 is status-only).
+        // kind exists. An info banner is required (section 1 is status-only).
+        // Both ``info`` and ``info_dynamic`` count as info banners — they
+        // render the same surface, but ``info_dynamic`` pulls its message
+        // from module_db at runtime instead of a static literal. The current
+        // vct-rl-reranker manifest uses ``info_dynamic`` exclusively for
+        // section 1 (v0.2.32+); the static ``info`` variant survives for
+        // back-compat with manifests that haven't migrated yet.
         let mut has_checkbox = false;
         let mut has_button = false;
         let mut has_multi_select = false;
@@ -2930,7 +2941,8 @@ mod tests {
                     ConfigControl::Checkbox { .. } => has_checkbox = true,
                     ConfigControl::Button { .. } => has_button = true,
                     ConfigControl::MultiSelect { .. } => has_multi_select = true,
-                    ConfigControl::Info { .. } => has_info = true,
+                    ConfigControl::Info { .. }
+                    | ConfigControl::InfoDynamic { .. } => has_info = true,
                     ConfigControl::Select { .. } => {}
                     // v0.2.26+ kinds — not exercised by the current
                     // vct-rl-reranker manifest, but acknowledged here
@@ -2944,7 +2956,6 @@ mod tests {
                     // v0.2.32 additions — same acknowledgement: the
                     // RL manifest may grow these but the test doesn't
                     // assert on them.
-                    | ConfigControl::InfoDynamic { .. }
                     | ConfigControl::DatePicker { .. }
                     // v0.2.33 forward-compat fallback — would only fire
                     // if a future RL manifest ships a control kind this

@@ -176,35 +176,108 @@ class TokenCounter:
         return total
 
 
-# Model-specific context limits (max input tokens).
-# Used to auto-configure chunk sizes when the embedding model is known.
+# v0.2.47 RL-7.5 / chunker-preset-overhaul (2026-06-04): re-cast MODEL_TOKEN_LIMITS
+# as **`num_ctx` we send to Ollama**,
+# NOT the model's architectural max input. This is the chunker routing key —
+# we want chunks to fit comfortably inside the context window we actually
+# request from the backend, not the theoretical ceiling.
+#
+# Conservative per-model `num_ctx`:
+#   * snowflake-arctic-embed2 stays at 4k (low-VRAM contributors). Model
+#     architecturally supports 8k via RoPE but our Ollama config caps at 4k.
+#   * qwen3-embedding:0.6b set to 10k. Model architecturally supports 32k
+#     (verified via `ollama show qwen3-embedding:0.6b`) but at 0.6B params
+#     the quality drop-off past ~10k is steep — keep room for headroom.
+#   * jina-embeddings-v2-base-code: 2k. v2 was TRAINED at 512 even though
+#     architecture supports 8k via ALiBi; jumping to 8k gives degraded
+#     embedding quality for the modest gain in chunk size. 2k is a safe
+#     middle ground for low-power code-search.
+#   * codesage-large-v2: 2k (hard architectural cap — config.json says
+#     `max_position_embeddings=2048`; no point requesting more).
+#   * text-embedding-3-small: 8k (OpenAI documented 8191 cap).
+#   * bge-m3:latest, embeddinggemma:300m-bf16, granite-embedding:278m-fp16:
+#     NEW entries — verified via `ollama show` 2026-06-04.
+#
+# To raise any of these: bump the value here AND ensure the embedding adapter
+# sends the new `num_ctx` to Ollama (see vco_lib/embedding_providers/ollama.py).
+# The model dict is the single source of truth.
 MODEL_TOKEN_LIMITS: dict[str, int] = {
     # Text embedding models
-    "snowflake-arctic-embed2:latest": 2_048,     # proven working at 2048 tokens
-    "snowflake-arctic-embed2": 2_048,
-    "qwen3-embedding:0.6b": 8_192,              # Ollama default ctx=4096; we set num_ctx=8192 in API calls
-    "qwen3-embedding": 8_192,                    # Supports up to 32k with num_ctx override
-    "text-embedding-3-small": 8_191,
+    "snowflake-arctic-embed2:latest": 4_096,     # was 2_048; bump to 4k
+    "snowflake-arctic-embed2": 4_096,
+    "snowflake-arctic-embed2:568m": 4_096,        # explicit-size variant
+    "qwen3-embedding:0.6b": 10_240,               # was 8_192; bump to 10k (model arch supports 32k)
+    "qwen3-embedding": 10_240,
+    "text-embedding-3-small": 8_191,              # OpenAI documented cap
+    "bge-m3:latest": 8_192,                       # NEW (verified via ollama show)
+    "bge-m3": 8_192,
+    "embeddinggemma:300m-bf16": 2_048,            # NEW (Modelfile pins num_ctx=2048)
+    "embeddinggemma": 2_048,
+    "granite-embedding:278m-fp16": 512,           # NEW (small model, 512 architectural cap)
+    "granite-embedding": 512,
     # Code embedding models
-    "unclemusclez/jina-embeddings-v2-base-code:latest": 8_192,
-    "jina-embeddings-v2-base-code": 8_192,
-    "codesage/codesage-large-v2": 2_048,          # CodeSage uses 2048 max seq len
+    "unclemusclez/jina-embeddings-v2-base-code:latest": 2_048,  # was 8_192; v2 trained at 512
+    "jina-embeddings-v2-base-code": 2_048,
+    "codesage/codesage-large-v2": 2_048,          # hard architectural cap
     "codesage-large-v2": 2_048,
 }
 
+# Chunker revision sentinel. Bumped whenever MODEL_TOKEN_LIMITS or
+# CHUNKING_PRESETS change in a way that produces different chunk
+# boundaries — i.e. existing Weaviate rows are stale and recall
+# degrades. Read by the launcher's version-change startup hook
+# (see launcher/src-tauri/src/commands/module_catalog_client.rs::
+# bust_cache_if_launcher_version_changed for the existing pattern).
+#
+# When the launcher detects this changed across an update, it should
+# write an UPDATE_DEFERRED.md entry telling the user to run
+# `.claude/scripts/kg-sync --all --force` + `code-graph-analyze . --force`
+# to re-chunk under the new presets. Today this is a manual user
+# action — see https://github.com/hotak92/vibecoded-orchestrator
+# issue tracking #TBD for the launcher-side automation.
+#
+# Revision history:
+#   v0.2.47.5 (2026-06-04): re-cast as num_ctx (was: model architectural max).
+#     Quadrupled qwen3 chunks (1500 → 13500 max tokens). 5-tier presets.
+#   pre-v0.2.47.5: 3-tier presets, MODEL_TOKEN_LIMITS = model architectural max.
+_CHUNKER_REVISION: str = "v0.2.47.5"
+
+
 # Default chunking presets by model class.
-# (min_tokens, max_tokens, target_tokens)
+# (min_tokens, max_tokens, target_tokens). Five tiers for fine-grained
+# routing across the 512..16k+ range. Each preset packs the target around
+# 60-70% of `max_tokens` so the chunker has room to fit a paragraph boundary
+# without spilling into a hard truncate.
+#
+# v0.2.47 RL-7.5 tunings (user-locked 2026-06-04):
+#   * xsmall_context: (170, 400, 330)        ~512  num_ctx (granite-embedding)
+#   * small_context:  (550, 1600, 1100)      ~2k   num_ctx (jina, codesage, embeddinggemma)
+#   * medium_context: (1100, 3200, 2500)     ~4k   num_ctx (arctic2)
+#   * large_context:  (2200, 6400, 4600)     ~8k   num_ctx (openai, bge-m3)
+#   * xlarge_context: (4600, 13500, 9500)    ~16k+ num_ctx (qwen3-embedding @ 10k)
 CHUNKING_PRESETS: dict[str, tuple[int, int, int]] = {
-    "small_context":  (300,  500,  400),    # models with ≤512 token context
-    "medium_context": (500,  1500, 1000),   # models with 2k-8k token context (arctic, jina, codesage)
-    "large_context":  (1000, 2000, 1500),   # models with ≥32k token context (qwen3-embedding)
+    "xsmall_context": (170,  400,   330),
+    "small_context":  (550,  1600,  1100),
+    "medium_context": (1100, 3200,  2500),
+    "large_context":  (2200, 6400,  4600),
+    "xlarge_context": (4600, 13500, 9500),
 }
 
 
 def chunking_preset_for_model(model_name: str) -> tuple[int, int, int]:
     """Return (min_tokens, max_tokens, target_tokens) for a given model.
 
-    Falls back to 'large_context' if the model is unknown.
+    The model's MODEL_TOKEN_LIMITS value is the ``num_ctx`` we actually
+    send to Ollama (NOT the model's architectural max input). Tier
+    boundaries are picked so each preset packs comfortably inside its
+    associated num_ctx window.
+
+    Falls back to ``large_context`` (safe default for unknown 8k-class
+    models) when the name doesn't match any registered entry. Past
+    v0.2.46 the default was also `large_context` but the preset values
+    have changed — the v0.2.47 RL-7.5 presets are MORE generous, so an
+    unknown model getting `large_context` will produce LARGER chunks
+    than before.
     """
     limit = MODEL_TOKEN_LIMITS.get(model_name)
     if limit is None:
@@ -216,10 +289,14 @@ def chunking_preset_for_model(model_name: str) -> tuple[int, int, int]:
     if limit is None:
         return CHUNKING_PRESETS["large_context"]
     if limit <= 512:
+        return CHUNKING_PRESETS["xsmall_context"]
+    if limit <= 2048:
         return CHUNKING_PRESETS["small_context"]
-    if limit <= 8192:
+    if limit <= 4096:
         return CHUNKING_PRESETS["medium_context"]
-    return CHUNKING_PRESETS["large_context"]
+    if limit <= 8192:
+        return CHUNKING_PRESETS["large_context"]
+    return CHUNKING_PRESETS["xlarge_context"]
 
 
 class Chunker:

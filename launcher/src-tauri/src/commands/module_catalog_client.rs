@@ -563,8 +563,15 @@ pub enum VersionBustOutcome {
     /// Same version as last boot. Cache preserved.
     SameVersion,
     /// Different version detected. Cache wiped (rows_deleted = number of
-    /// `module_catalog.cache*` rows removed).
-    VersionChanged { rows_deleted: usize },
+    /// `module_catalog.cache*` rows removed). ``prev`` and ``running``
+    /// carry the version strings so downstream consumers (e.g. the
+    /// chunker-revision deferral hook in `chunker_revision_deferral.rs`)
+    /// can react to specific upgrade-pair patterns.
+    VersionChanged {
+        rows_deleted: usize,
+        prev: String,
+        running: String,
+    },
     /// A DB read failed; logged on stderr and treated as a no-op. We
     /// don't propagate the error because startup paths can't usefully
     /// recover.
@@ -623,7 +630,11 @@ fn bust_cache_if_version_changed_inner(db: &Db, running_version: &str) -> Versio
                     prev, running_version, rows_deleted
                 );
             }
-            VersionBustOutcome::VersionChanged { rows_deleted }
+            VersionBustOutcome::VersionChanged {
+                rows_deleted,
+                prev: prev.to_string(),
+                running: running_version.to_string(),
+            }
         }
     }
 }
@@ -1134,8 +1145,14 @@ mod tests {
 
         let outcome = bust_cache_if_version_changed_inner(&db, "0.2.34");
         match outcome {
-            VersionBustOutcome::VersionChanged { rows_deleted } => {
+            VersionBustOutcome::VersionChanged {
+                rows_deleted,
+                prev,
+                running,
+            } => {
                 assert_eq!(rows_deleted, 2, "should remove envelope + fetched-at rows");
+                assert_eq!(prev, "0.2.33", "prev version from app_state");
+                assert_eq!(running, "0.2.34", "running == arg to inner");
             }
             other => panic!("expected VersionChanged, got {:?}", other),
         }

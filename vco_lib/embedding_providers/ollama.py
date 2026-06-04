@@ -76,6 +76,43 @@ KNOWN_OLLAMA_DIMS: dict[str, int] = {
 }
 
 
+# v0.2.47 RL-7.5 (2026-06-04): default num_ctx we send to Ollama when the
+# caller doesn't override. Used when the model isn't registered in
+# MODEL_TOKEN_LIMITS (chunking.py). Conservative — matches the pre-v0.2.47
+# default so unknown models still embed at 8k rather than the Ollama
+# default of 4k (which silently truncates inputs > 4096 tokens).
+_NUM_CTX_FALLBACK: int = 8192
+
+
+def _num_ctx_for_model(model: str) -> int:
+    """Resolve the ``num_ctx`` to send to Ollama for a given embedding model.
+
+    Reads ``claude_mcp_servers.weaviate_mcp.chunking.MODEL_TOKEN_LIMITS``
+    when importable (the canonical source of truth for "what num_ctx do
+    we want for this model"), falling back to ``_NUM_CTX_FALLBACK``
+    otherwise. The chunking module is the SoT because chunk sizes must
+    match the context window we actually request — if they're out of
+    sync, oversized chunks get silently truncated by Ollama at num_ctx
+    and the embedding signal degrades.
+
+    Soft-fail: the lookup is best-effort. Any import error or missing
+    entry falls through to ``_NUM_CTX_FALLBACK`` (8192).
+    """
+    try:
+        from claude_mcp_servers.weaviate_mcp.chunking import MODEL_TOKEN_LIMITS
+    except Exception:
+        return _NUM_CTX_FALLBACK
+    val = MODEL_TOKEN_LIMITS.get(model)
+    if val is None:
+        # Partial match (e.g. caller passed "qwen3-embedding" while the dict
+        # has both "qwen3-embedding" AND "qwen3-embedding:0.6b").
+        for key, registered in MODEL_TOKEN_LIMITS.items():
+            if key in model or model in key:
+                val = registered
+                break
+    return int(val) if val is not None else _NUM_CTX_FALLBACK
+
+
 def looks_like_embedding_model(name: str) -> bool:
     """Return True if `name` looks like an Ollama embedding model."""
     lowered = name.lower()
@@ -149,18 +186,25 @@ class OllamaAdapter:
 
     # ---- embed --------------------------------------------------------------
 
-    def embed(self, model: str, text: str, num_ctx: int = 8192) -> list[float]:
+    def embed(self, model: str, text: str, num_ctx: int | None = None) -> list[float]:
         """Embed a single text with the named model.
 
         Tries ``/api/embed`` first (newer Ollama), falls back to
-        ``/api/embeddings`` on 404 (older Ollama). ``num_ctx`` is passed
-        for qwen3-embedding compatibility — its actual capacity is 32k
-        but Ollama defaults to 4096 (silent truncation).
+        ``/api/embeddings`` on 404 (older Ollama).
+
+        ``num_ctx`` controls the Ollama context window. When the caller
+        passes ``None`` (the v0.2.47+ default), it's auto-resolved from
+        ``MODEL_TOKEN_LIMITS`` in ``claude_mcp_servers.weaviate_mcp.chunking``
+        so it matches the chunker's per-model target. Pre-v0.2.47 default
+        was a hard 8192 which silently truncated longer inputs for
+        qwen3-embedding (whose chunker preset wants up to ~13.5k).
 
         Raises:
             RuntimeError: On non-2xx responses other than the 404 that
                 triggers the legacy fallback.
         """
+        if num_ctx is None:
+            num_ctx = _num_ctx_for_model(model)
         # Try the modern batched endpoint first.
         try:
             response = self.session.post(
@@ -208,7 +252,7 @@ class OllamaAdapter:
         self,
         model: str,
         texts: list[str],
-        num_ctx: int = 8192,
+        num_ctx: int | None = None,
     ) -> list[list[float]]:
         """Embed a batch of texts with the named model.
 
@@ -220,12 +264,18 @@ class OllamaAdapter:
         An empty ``texts`` list returns an empty list without making
         any HTTP call.
 
+        ``num_ctx`` matches ``embed()``'s behavior — None auto-resolves
+        via ``_num_ctx_for_model``. See ``embed`` docstring for rationale.
+
         Raises:
             RuntimeError: On non-2xx responses other than the 404 that
                 triggers the legacy fallback.
         """
         if not texts:
             return []
+
+        if num_ctx is None:
+            num_ctx = _num_ctx_for_model(model)
 
         try:
             response = self.session.post(

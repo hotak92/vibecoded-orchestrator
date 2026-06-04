@@ -88,7 +88,17 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 # resolver emits its own rate-limited warning so callers don't need to
 # log anything extra. See `.claude/context/plans/v0.2.21-resolver-design.md`.
 def _resolve_collections() -> tuple[str, str]:
-    """Return (kg_collection, development_collection) via hub, env-fallback."""
+    """Return (kg_collection, development_collection) via hub, env-fallback.
+
+    v0.2.47 RL-6c follow-up: VCT_DISABLE_HUB_RESOLVER short-circuit for
+    the test session. See ``server.py::_try_resolve_project_config`` for
+    the matching guard + ``tests/conftest.py`` for the autouse fixture.
+    """
+    if os.environ.get("VCT_DISABLE_HUB_RESOLVER"):
+        return (
+            os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            os.getenv("DEVELOPMENT_COLLECTION", ""),
+        )
     try:
         from vco_lib.project_config import resolve  # type: ignore[import-not-found]
         cfg = resolve(Path(__file__).resolve().parent.parent.parent)

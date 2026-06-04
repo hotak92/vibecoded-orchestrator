@@ -118,27 +118,29 @@ class TelemetryWriterFailureFieldsTest(unittest.TestCase):
             self.assertNotIn("failed_collections", rec)
 
     def test_writer_passes_failure_fields_through(self):
-        with tempfile.TemporaryDirectory() as td:
-            log_path = Path(td) / "rl_events.jsonl"
-            writer = RLTelemetryWriter(
-                log_path=log_path,
-                project="testproj",
-                embedding_source="qwen3",
-                embedding_dim=1024,
-                embedding_model="qwen3-embedding:0.6b",
-            )
-            writer.log_retrieval(
-                task_id="task-failure-via-writer",
-                task_type="mcp_interactive",
-                query="any query",
-                nodes=[],
-                session_id="sess-2",
-                failure_mode="partial_fan_out_schema_missing",
-                failed_collections=["A_KG"],
-            )
-            rec = json.loads(log_path.read_text().strip())
-            self.assertEqual(rec["failure_mode"], "partial_fan_out_schema_missing")
-            self.assertEqual(rec["failed_collections"], ["A_KG"])
+        # v0.2.47 RL-6c: writer no longer writes JSONL; it POSTs to the hub.
+        # Capture the envelope via the injected hub_post_fn stub.
+        captured: list[dict] = []
+        writer = RLTelemetryWriter(
+            project="testproj",
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=lambda env, timeout=2.0: captured.append(env) or True,
+        )
+        writer.log_retrieval(
+            task_id="task-failure-via-writer",
+            task_type="mcp_interactive",
+            query="any query",
+            nodes=[],
+            session_id="sess-2",
+            failure_mode="partial_fan_out_schema_missing",
+            failed_collections=["A_KG"],
+        )
+        self.assertEqual(len(captured), 1)
+        rec = json.loads(captured[0]["payload_json"])
+        self.assertEqual(rec["failure_mode"], "partial_fan_out_schema_missing")
+        self.assertEqual(rec["failed_collections"], ["A_KG"])
 
 
 class RlCacheAndRerankAlwaysLogsTest(unittest.TestCase):

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.46] - 2026-06-04
 
+### RL Telemetry (Unified target / pure-train container / hub-side citations) — landing alongside v0.2.46
+
+- **Vendored-file byte-identity guarantee** for the orchestrator ↔ paid-module file pairs that exist solely because the container image must build standalone. Two pairs are covered: `vco_lib/rl_training_targets.py` ↔ `paid-modules/vct-rl-reranker/_training_targets.py`, and `claude_mcp_servers/rl_client/rl_logger.py` ↔ `paid-modules/vct-rl-reranker/rl_logger.py`. New `tests/test_vendored_file_sync.py` (SHA-256 drift test, CI-gated) and `scripts/sync-vendored-files.sh` (canonical→vendored re-sync, self-anchored, post-copy verified) enforce the guarantee mechanically. Header comments on the canonical files name the vendored siblings + the test path + the sync command, eliminating the "vendored copy drifted silently" failure mode reported during v0.2.47 RL telemetry work.
+
+- `RLDataLogger.log_citations` + `RLTelemetryWriter.log_citations` accept an optional `answer_text: str | None = None` kwarg (omitted from the event when None). Reserves the schema slot for future answer-text logging (offline multi-model training) without a v3→v4 schema bump. v0.2.9 callers leave it None.
+
+(Full v0.2.47 RL chain — 14 commits, RL-1 through RL-8 — landed via merge from `rl/citation-detection-mcp-side`. Pairs with paid-module `vct-rl-reranker` v0.2.9 release. The "v0.2.47" prefix on those commits is historical; all of them ship in v0.2.46.)
+
 Three-part release: Part 1 closes the 5th instance of a recurring KG
 re-embed bug + RL Reranker client-side hardening + 10 silent-truncation
 footgun cleanups. Part 2 delivers the third-party project adoption mode

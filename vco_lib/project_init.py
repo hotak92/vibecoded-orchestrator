@@ -4714,6 +4714,114 @@ def _emit_bash_env_cleanup_deferral(
 
 
 # ---------------------------------------------------------------------------
+# v0.2.47 RL-7.5 (2026-06-04): chunker-preset overhaul
+# ---------------------------------------------------------------------------
+
+
+# Version (inclusive lower bound on the NEW side) at which the chunker-preset
+# overhaul lands. Anyone whose prior manifest's `vco_version` was strictly
+# less than this needs to re-sync KG + codegraph against the new presets.
+# Mirrors `CHUNKER_BUMP_VERSION` in
+# `launcher/src-tauri/src/commands/chunker_revision_deferral.rs`.
+_CHUNKER_BUMP_VERSION = "0.2.46"
+
+
+def _parse_semver(version: str) -> "tuple[int, int, int] | None":
+    """Parse "X.Y.Z" into (major, minor, patch). None on malformed input.
+
+    Doesn't pull in `packaging` — orchestrator version strings are always
+    plain semver without pre-release tags.
+    """
+    parts = version.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]), int(parts[2]))
+    except ValueError:
+        return None
+
+
+def _crosses_chunker_boundary(prev_version: str, running_version: str) -> bool:
+    """True iff this upgrade crosses the v0.2.46 chunker-preset boundary."""
+    prev = _parse_semver(prev_version)
+    running = _parse_semver(running_version)
+    bump = _parse_semver(_CHUNKER_BUMP_VERSION)
+    if prev is None or running is None or bump is None:
+        return False
+    return prev < bump <= running
+
+
+def _emit_chunker_resync_deferral(
+    folder: Path,
+    prev_version: str,
+    running_version: str,
+) -> None:
+    """Emit `chunker_preset_overhaul_pending`: KG + codegraph need re-syncing
+    after an upgrade across the v0.2.46 chunker-preset boundary.
+
+    Post-v0.2.46 the chunker uses MUCH larger chunks for qwen3-embedding
+    (target_tokens 9500 vs. legacy 1000) and a five-tier preset routing
+    (xsmall/small/medium/large/xlarge). Existing Weaviate rows synced under
+    the legacy presets have stale chunk boundaries: relevant content lives
+    in chunk N+1 that the new preset would have folded into chunk N. Search
+    recall degrades on long answers until the user re-syncs.
+
+    Per-project entry: each project's KG + codegraph are independent
+    Weaviate collections, so each gets its own deferral entry.
+
+    Severity is `info` — searches still WORK, they just return less
+    relevant top-k results. The user can defer the re-sync indefinitely.
+    """
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    detected = (
+        f"This project's `.vco-manifest.json` recorded `vco_version="
+        f"{prev_version}`; the current orchestrator is `{running_version}`. "
+        f"The chunker presets in `claude_mcp_servers/weaviate_mcp/chunking.py` "
+        f"changed at v{_CHUNKER_BUMP_VERSION} (target chunk size for qwen3 "
+        f"jumped from ~1000 tokens to ~9500). Existing Weaviate rows in this "
+        f"project's KG + code graph were chunked under the LEGACY presets — "
+        f"search recall degrades on long answers because relevant content "
+        f"lives in chunk N+1 that the new preset would have folded into "
+        f"chunk N."
+    )
+    cmd = (
+        "# Re-chunk this project's KG under the new presets:\n"
+        f"cd {folder}\n"
+        ".claude/scripts/kg-sync --all --force\n"
+        "\n"
+        "# Re-chunk this project's code graph under the new presets:\n"
+        ".claude/scripts/code-graph-analyze . --force\n"
+        "\n"
+        "# Both commands are heavy I/O (re-embeds every chunk via Ollama).\n"
+        "# Consider running them when you're not actively coding."
+    )
+
+    entry = DeferralEntry(
+        condition_id="chunker_preset_overhaul_pending",
+        title="KG + codegraph re-sync recommended (chunker presets changed)",
+        detected=detected,
+        why_deferred=(
+            "Auto-rechunking every KG row and code-graph entity at install "
+            "time would block the bundle update for minutes and consume "
+            "significant Ollama GPU time. We defer the decision so the user "
+            "can pick a quiet moment. Searches WORK in the meantime — they "
+            "just return less relevant top-k results than they would under "
+            "the new presets. Once you run the re-sync commands below, "
+            "this deferral self-resolves on the next bundle update."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+        kg_node_refs=[
+            "knowledge/concepts/parallel-pr-coordination-gotchas-2026-05-10.md",
+        ],
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
+# ---------------------------------------------------------------------------
 # PR-22 (v0.2.12, 2026-05-16): legacy `docker-compose.override.yml` rename
 #
 # PR-10A (v0.2.11) shipped writing the launcher-managed compose override at
@@ -6033,6 +6141,31 @@ def install_project_bundle(
                  f"manifest write failed: {err}",
                  data={"error": err})
             result["errors"].append({"path": str(_MANIFEST_REL), "error": err})
+
+    # v0.2.47 RL-7.5 chunker-preset deferral (per-project flow).
+    # When the prior `.vco-manifest.json` recorded a vco_version strictly
+    # less than v0.2.46 AND the current orchestrator is >= v0.2.46, append
+    # a `chunker_preset_overhaul_pending` deferral entry. Per-project flow
+    # is independent of the launcher-driven flow (which writes the same
+    # deferral to the orchestrator-root project only — see
+    # `launcher/src-tauri/src/commands/chunker_revision_deferral.rs`).
+    # Soft-fail: a write error logs but doesn't abort the install.
+    if not dry_run:
+        prev_version = (manifest or {}).get("vco_version") or ""
+        running_version = result.get("vco_version") or ""
+        if prev_version and running_version and _crosses_chunker_boundary(
+            prev_version, running_version,
+        ):
+            try:
+                _emit_chunker_resync_deferral(folder, prev_version, running_version)
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"chunker-resync deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"chunker-resync deferral write failed: {err}"
+                )
 
     # Per-project deferral entries — single entry per case, listing all
     # affected files. Two distinct cases are tracked:

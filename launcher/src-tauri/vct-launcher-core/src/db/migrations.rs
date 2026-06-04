@@ -138,6 +138,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "license_keys + license_key_validations: per-paid-module license keys (L1, v0.2.40). Each paid module owns its own row keyed by module_id; reserved '__orchestrator__' slot preserves the legacy single-key behaviour. tier_cache stays the EFFECTIVE projection.",
         sql: include_str!("migrations/024_license_keys.sql"),
     },
+    Migration {
+        version: 25,
+        description: "rl_events: queryable telemetry store for RL retrieval + citation events (v0.2.47). Replaces the JSONL corpus at ~/.claude/retrieval_rl_data/rl_events.jsonl. MCP-side telemetry writers POST events via the hub's POST /api/v1/rl/events route; the hub is the sole writer (preserves launcher single-writer rule). offline_trainer reads via a future GET endpoint; the dashboard widget joins against projects for per-project event-rate displays.",
+        sql: include_str!("migrations/025_rl_events.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

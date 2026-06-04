@@ -114,29 +114,35 @@ class CitationEventEmbeddingTripleTelemetryWriterTest(unittest.TestCase):
     include the triple."""
 
     def test_writer_local_jsonl_carries_full_triple(self):
-        """RLTelemetryWriter writes the local JSONL through
-        RLDataLogger, so its citation event must carry the same triple
-        verified in T1."""
-        with tempfile.TemporaryDirectory() as td:
-            log_path = Path(td) / "rl_events.jsonl"
-            writer = RLTelemetryWriter(
-                log_path=log_path,
-                project="testproj",
-                embedding_source="qwen3",
-                embedding_dim=1024,
-                embedding_model="qwen3-embedding:0.6b",
-            )
-            writer.log_citations(
-                task_id="task-cite-via-writer",
-                task_type="mcp_interactive",
-                citations={"NodeA": True},
-                cosine_sims={"NodeA": 0.812},
-            )
-            rec = json.loads(log_path.read_text().strip())
-
-            self.assertEqual(rec["embedding_source"], "qwen3")
-            self.assertEqual(rec["embedding_dim"], 1024)
-            self.assertEqual(rec["embedding_model"], "qwen3-embedding:0.6b")
+        """v0.2.47 RL-6c: the local write target moved from JSONL to the
+        hub. The full embedding triple still has to be present on the
+        envelope's indexed columns AND embedded in the payload_json
+        (same v3 event shape, different transport)."""
+        captured: list[dict] = []
+        writer = RLTelemetryWriter(
+            project="testproj",
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=lambda env, timeout=2.0: captured.append(env) or True,
+        )
+        writer.log_citations(
+            task_id="task-cite-via-writer",
+            task_type="mcp_interactive",
+            citations={"NodeA": True},
+            cosine_sims={"NodeA": 0.812},
+        )
+        self.assertEqual(len(captured), 1)
+        envelope = captured[0]
+        # Indexed columns:
+        self.assertEqual(envelope["embedding_source"], "qwen3")
+        self.assertEqual(envelope["embedding_dim"], 1024)
+        self.assertEqual(envelope["embedding_model"], "qwen3-embedding:0.6b")
+        # And mirrored inside the payload_json (the v3 event):
+        rec = json.loads(envelope["payload_json"])
+        self.assertEqual(rec["embedding_source"], "qwen3")
+        self.assertEqual(rec["embedding_dim"], 1024)
+        self.assertEqual(rec["embedding_model"], "qwen3-embedding:0.6b")
 
     def test_writer_upload_payload_carries_full_triple(self):
         """The queue-bound payload built by
@@ -231,26 +237,28 @@ class CitationEventRetrievalParityTest(unittest.TestCase):
         ``"qwen3"``. Verified by the sibling test in
         test_telemetry_orchestrator_v0231.py
         (RLTelemetryWriterEmbeddingFieldsTest); this test pins the
-        value flows through the citation event as well."""
-        with tempfile.TemporaryDirectory() as td:
-            log_path = Path(td) / "rl_events.jsonl"
-            writer = RLTelemetryWriter(
-                log_path=log_path,
-                project="testproj",
-                # Canonical defaults the orchestrator picks for qwen3.
-                embedding_source="qwen3",
-                embedding_dim=1024,
-                embedding_model="qwen3-embedding:0.6b",
-            )
-            writer.log_citations(
-                task_id="task-default",
-                task_type="mcp_interactive",
-                citations={"N1": True},
-            )
-            rec = json.loads(log_path.read_text().strip())
-            self.assertEqual(rec["embedding_source"], "qwen3")
-            self.assertEqual(rec["embedding_dim"], 1024)
-            self.assertEqual(rec["embedding_model"], "qwen3-embedding:0.6b")
+        value flows through the citation event as well.
+
+        v0.2.47 RL-6c: capture via hub_post_fn stub (JSONL gone)."""
+        captured: list[dict] = []
+        writer = RLTelemetryWriter(
+            project="testproj",
+            # Canonical defaults the orchestrator picks for qwen3.
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=lambda env, timeout=2.0: captured.append(env) or True,
+        )
+        writer.log_citations(
+            task_id="task-default",
+            task_type="mcp_interactive",
+            citations={"N1": True},
+        )
+        self.assertEqual(len(captured), 1)
+        rec = json.loads(captured[0]["payload_json"])
+        self.assertEqual(rec["embedding_source"], "qwen3")
+        self.assertEqual(rec["embedding_dim"], 1024)
+        self.assertEqual(rec["embedding_model"], "qwen3-embedding:0.6b")
 
 
 if __name__ == "__main__":
