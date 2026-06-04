@@ -811,7 +811,32 @@ def resolve(project_root: Path | str) -> ProjectConfig:
     raises so the caller's try/except can choose. See the parent plan
     ``.claude/context/plans/v0.2.21-hub-detachment-and-resolver.md``
     §"Resolver clients" for the migration discipline.
+
+    **v0.2.46 KG-AUTO-HEAL-E test-stability gate**: when the env var
+    ``VCT_DISABLE_HUB_RESOLVER`` is set to a truthy value, this function
+    raises :class:`HubUnreachable` immediately — without making any HTTP
+    probe. Mirrors the gate at ``weaviate_mcp/server.py::
+    _try_resolve_project_config`` (added in v0.2.47 RL-6c) so tests
+    that monkey-patch ``KG_COLLECTION`` / ``SHARED_KG_COLLECTION`` env
+    vars produce the SAME result regardless of whether a launcher hub
+    is running on the dev machine. The MCP-side gate alone wasn't
+    enough — the CLI-side callers (templates/scripts/get_node_info.py
+    etc.) also need the same escape hatch. Without it, the hub returns
+    the project's REAL bindings + env overrides are silently ignored.
+
+    Production runs leave the env var unset → hub-first resolution
+    semantics preserved exactly.
     """
+    if os.environ.get("VCT_DISABLE_HUB_RESOLVER", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        raise HubUnreachable(
+            "VCT_DISABLE_HUB_RESOLVER set; resolver short-circuited "
+            "(test gate or explicit opt-out)"
+        )
+
     if isinstance(project_root, str):
         arg = project_root
     else:

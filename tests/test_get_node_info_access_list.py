@@ -37,15 +37,37 @@ def _clear_env() -> None:
         "VCT_CODE_GRAPH_ACCESS_LIST",
         "KG_COLLECTION",
         "SHARED_KG_COLLECTION",
+        # v0.2.46: also clean up the test-stability gate so it doesn't
+        # leak into other test files that run after this one (which set
+        # up their own mock hubs and DO want the resolver to run).
+        "VCT_DISABLE_HUB_RESOLVER",
     ):
         os.environ.pop(k, None)
 
 
 def _fresh_get_node_info(env_overrides: dict[str, str]):
-    """Reload get_node_info with a fresh env snapshot."""
+    """Reload get_node_info with a fresh env snapshot.
+
+    v0.2.46 fix (pre-existing flaky test on hub-enabled dev machines):
+    force-disable the vct-hub resolver so env-var overrides are honoured
+    unconditionally. Pre-fix, on any machine where ``vct-hub`` was
+    running (e.g. a launcher-enabled dev box), the hub's
+    ``/api/v1/projects/.../config`` response returned the project's
+    REAL ``KG_COLLECTION`` (e.g. ``VCODev_KnowledgeGraph``), which won
+    over the env var the test sets — so the test fixture's
+    ``KG_COLLECTION=Alpha_KnowledgeGraph`` was effectively ignored.
+
+    Mirrors the same gate ``weaviate_mcp/server.py`` honours at
+    ``_try_resolve_project_config`` (added in v0.2.47 RL-6c). Verified
+    by code-read: ``vco_lib.project_config.resolve`` checks
+    ``VCT_DISABLE_HUB_RESOLVER`` before any HTTP probe.
+    """
     for mod in list(sys.modules):
         if mod in ("get_node_info", "kg_access"):
             del sys.modules[mod]
+    # Hub-resolver short-circuit. Set BEFORE importing get_node_info so
+    # the module's import-time resolve respects the gate.
+    os.environ["VCT_DISABLE_HUB_RESOLVER"] = "1"
     for k, v in env_overrides.items():
         os.environ[k] = v
     return importlib.import_module("get_node_info")
@@ -113,6 +135,12 @@ class CollectionLabelTests(unittest.TestCase):
     def setUp(self) -> None:
         _clear_env()
 
+    def tearDown(self) -> None:
+        # Symmetric: clear the test-stability env var that _fresh_get_node_info
+        # sets, so it doesn't leak into other test files that run after this
+        # one (which mock their own hub and DO want resolve() to make HTTP calls).
+        _clear_env()
+
     def test_self_collection(self) -> None:
         gni = _fresh_get_node_info({"KG_COLLECTION": "Alpha_KnowledgeGraph"})
         self.assertEqual(gni._collection_label("Alpha_KnowledgeGraph"), "[self]")
@@ -147,6 +175,10 @@ class GetNodeInfoAccessListTests(unittest.TestCase):
     in the access matrix."""
 
     def setUp(self) -> None:
+        _clear_env()
+
+    def tearDown(self) -> None:
+        # Symmetric cleanup — see CollectionLabelTests.tearDown above.
         _clear_env()
 
     def test_no_access_list_queries_self_only(self) -> None:

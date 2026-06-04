@@ -458,6 +458,102 @@ class V46BSourceRegressionGuardTest(unittest.TestCase):
             "§ \"Real instance #3\".",
         )
 
+    # v0.2.46 KG-AUTO-HEAL-E: extension to cover the refactored helper.
+    #
+    # After v0.2.46 the V46-A safety triad lives in
+    # ``vco_lib.kg_sync.batch_query_content_hashes`` — the install.py
+    # function ``_batch_query_weaviate_content_hashes`` is now a 3-line
+    # wrapper that delegates to it. The original
+    # ``test_batch_query_does_not_contain_broken_filter`` above still
+    # runs and passes, BUT it would now pass VACUOUSLY (the wrapper
+    # doesn't contain GraphQL at all). Without this extension, a future
+    # refactor that drops the safety triad in ``vco_lib/kg_sync.py``
+    # would silently re-introduce the v0.2.42 bug.
+    #
+    # The V46 audit (`.claude/context/audits/v0.2.46-compat-V46-2026-06-04.md`)
+    # flagged this as watch-out #2: "the guard passes vacuously while
+    # the new helper in vco_lib/kg_sync.py is unguarded". This test
+    # closes that gap.
+
+    def test_vco_lib_kg_sync_does_not_contain_broken_filter(self) -> None:
+        """v0.2.46 KG-AUTO-HEAL-E: extend the V46-B regression guard to
+        cover the new ``vco_lib.kg_sync.batch_query_content_hashes``
+        helper. After the v0.2.46 refactor, this helper hosts the V46-A
+        safety triad (no Like-% / limit:10000 / errors-before-data /
+        saturation warning) that install.py's
+        ``_batch_query_weaviate_content_hashes`` used to host inline.
+
+        The old install.py guard above still passes (the wrapper has no
+        GraphQL) but is now vacuous — this is the real guard.
+        """
+        import inspect
+
+        import vco_lib.kg_sync
+
+        src = inspect.getsource(vco_lib.kg_sync.batch_query_content_hashes)
+        self.assertFalse(
+            self._has_broken_filter(src),
+            "REGRESSION: vco_lib.kg_sync.batch_query_content_hashes "
+            "reintroduced the v0.2.42 SQL-wildcard filter "
+            "``where: Like \"%\"``. This filter silently returns 0 hits "
+            "against any populated Weaviate collection (BM25 tokenizer "
+            "rejects '%' as a stopword). See knowledge/concepts/"
+            "silent-zero-fallback-antipattern.md § \"Real instance #3\".",
+        )
+
+    def test_vco_lib_kg_sync_uses_v46f_post_graphql_safe(self) -> None:
+        """The helper MUST route via ``vco_lib.weaviate_helpers.post_graphql_safe``
+        (V46-F), NOT open-coded urllib.urlopen. The V46-F path inspects
+        ``body['errors']`` BEFORE consuming ``data`` — the load-bearing
+        safety property. A regression where the helper bypasses V46-F
+        and rolls its own ``urlopen`` loop would re-open the silent-zero
+        fallback bug class.
+        """
+        import inspect
+
+        import vco_lib.kg_sync
+
+        src = inspect.getsource(vco_lib.kg_sync.batch_query_content_hashes)
+        self.assertIn(
+            "post_graphql_safe",
+            src,
+            "REGRESSION: vco_lib.kg_sync.batch_query_content_hashes no "
+            "longer calls post_graphql_safe — the V46-F errors-array "
+            "gate has been bypassed. Restore the call OR add an "
+            "equivalent inline ``body.get('errors')`` check BEFORE any "
+            "``data`` consumption.",
+        )
+        # Belt-and-suspenders: ensure the legacy raw-urlopen path didn't
+        # creep back in.
+        self.assertNotIn(
+            "urlopen",
+            src,
+            "REGRESSION: vco_lib.kg_sync.batch_query_content_hashes "
+            "appears to use raw urllib.urlopen. This bypasses V46-F's "
+            "errors-array gate. Route via post_graphql_safe instead.",
+        )
+
+    def test_vco_lib_kg_sync_keeps_limit_10000(self) -> None:
+        """Saturation cap: pre-v0.2.46 used ``limit: 1000`` which silently
+        truncated the user's 1193-row VCO_dev collection. V46-A bumped
+        to 10000 (Weaviate's QUERY_MAXIMUM_RESULTS default). Any value
+        smaller than 10000 in this helper's source is a regression.
+        """
+        import inspect
+
+        import vco_lib.kg_sync
+
+        src = inspect.getsource(vco_lib.kg_sync.batch_query_content_hashes)
+        # The literal "10000" should appear in either the f-string or
+        # the QUERY_MAX_LIMIT constant reference.
+        self.assertTrue(
+            "10000" in src or "QUERY_MAX_LIMIT" in src,
+            "REGRESSION: vco_lib.kg_sync.batch_query_content_hashes "
+            "appears to have dropped the limit:10000 / QUERY_MAX_LIMIT "
+            "reference. Anything smaller silently truncates collections "
+            ">1k objects.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

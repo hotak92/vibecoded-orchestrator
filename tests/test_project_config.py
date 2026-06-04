@@ -114,6 +114,13 @@ class _ResolverTestBase(unittest.TestCase):
         project_config._test_clear_cache()
         project_config._test_reset_session()
         # Force env-only discovery so the test never touches the disk.
+        # v0.2.46: also opt-OUT of the suite-wide autouse
+        # ``VCT_DISABLE_HUB_RESOLVER=1`` from ``tests/conftest.py`` —
+        # these tests spawn a mock hub session and DO want
+        # ``resolve()`` to make HTTP calls. The mock.patch.dict with
+        # clear=False merges into existing env, so we explicitly
+        # remove the gate; the tearDown will restore it.
+        os.environ.pop("VCT_DISABLE_HUB_RESOLVER", None)
         self._env_patch = mock.patch.dict(
             os.environ,
             {"VCT_HUB_PORT": "9999", "VCT_HUB_TOKEN": "test-token-abc"},

@@ -27,9 +27,28 @@ import pathlib
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 UTF8_BOM = b"\xef\xbb\xbf"
 
+# v0.2.46: skip ephemeral / external paths the test should NEVER scan.
+# Pre-fix the test walked into `.claude/worktrees/` (agent worktrees can
+# carry pre-BOM-fix .ps1 snapshots) and `node_modules`, which produced
+# false-positive offenders that made the test pointlessly flaky.
+_EXCLUDED_PATH_PARTS: tuple[str, ...] = (
+    ".claude/worktrees",      # parallel-agent worktrees (per-agent ephemera)
+    "node_modules",           # vendored JS deps (sometimes ship .ps1 wrappers)
+    "target",                 # Rust build artifacts
+    ".venv",                  # Python virtualenvs
+    "vibecoded-orchestrator", # the bundled clone (shipped as-is; not our content)
+)
+
 
 def _ps1_files() -> list[pathlib.Path]:
-    return sorted(REPO_ROOT.rglob("*.ps1"))
+    candidates = REPO_ROOT.rglob("*.ps1")
+    out: list[pathlib.Path] = []
+    for p in candidates:
+        rel = p.relative_to(REPO_ROOT).as_posix()
+        if any(rel.startswith(prefix + "/") or f"/{prefix}/" in f"/{rel}" for prefix in _EXCLUDED_PATH_PARTS):
+            continue
+        out.append(p)
+    return sorted(out)
 
 
 def test_ps1_files_with_non_ascii_have_utf8_bom() -> None:

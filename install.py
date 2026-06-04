@@ -7661,116 +7661,82 @@ def _batch_query_weaviate_content_hashes(
     collection_name: str,
     weaviate_url: str,
 ) -> "dict[str, str]":
-    """Fetch stored content_hash values from a Weaviate collection.
+    """Thin wrapper around ``vco_lib.kg_sync.batch_query_content_hashes``.
 
-    Returns a dict mapping file_path → content_hash for every object in
-    the collection that has both properties populated. Objects without a
-    content_hash (e.g. created before v0.2.17) return an empty string for
-    that file_path — the diff logic treats this as "always stale" for that
-    file, which triggers a single-file re-sync (correct: we want to fill in
-    the missing hash).
+    v0.2.46 KG-AUTO-HEAL-E: this function used to host the full V46-A
+    safety-triad implementation (no Like-% / limit:10000 / errors-before-
+    data / saturation warning). It was extracted into
+    ``vco_lib/kg_sync.py`` so the v0.2.46 KG-rebind re-sync path can
+    share the exact same hardened code path (single source of truth +
+    one regression-guard target). See plan §9.6 + the V46 audit at
+    ``.claude/context/audits/v0.2.46-compat-V46-2026-06-04.md`` (top-of-
+    report "CRITICAL: WATCH OUT FOR" item #1).
 
-    Uses the Weaviate v1 GraphQL aggregate endpoint with a cursor-based
-    batch fetch. Falls back to an empty dict on any error so the caller
-    treats the absence of stored hashes as "full sync required".
+    This wrapper preserves the legacy ``(collection_name, weaviate_url)``
+    positional signature so install.py's existing call sites (at lines
+    11675 and 11827) keep working without modification. It also keeps
+    the existing ``_log_install_event`` observability channel — the new
+    helper's ``on_warn`` callback is mapped to install-time deferral
+    log entries.
 
-    v0.2.42 CI-10: "pay once, never again" — this function is the key
-    enabler. Once hashes are stored in Weaviate (after the first sync
-    that sets content_hash), subsequent --update runs only embed changed
-    files. Nodes created before v0.2.17 (no content_hash property) will
-    be re-synced once (to populate content_hash), then skipped forever.
+    Original docstring preserved for historical reference:
 
-    v0.2.46 V46-A: dropped the broken ``where: Like "%"`` filter (SQL-wildcard
-    convention rejected by Weaviate's BM25 tokenizer as "only stopwords
-    provided"; silently swallowed null response across v0.2.42–v0.2.45,
-    causing full re-embed on every ``--update``). Also bumped ``limit``
-    1000 → 10000 (Weaviate's ``QUERY_MAXIMUM_RESULTS`` default; previous
-    value would silently truncate the user's 1193-row collection even if
-    the filter were fixed) and now inspect ``body["errors"]`` BEFORE
-    consuming ``data`` (loud failure on GraphQL-level errors). See
-    ``knowledge/concepts/silent-zero-fallback-antipattern.md`` instance #3.
+      Returns a dict mapping ``file_path`` → ``content_hash`` for every
+      object in the collection that has both properties populated.
+      Objects without a content_hash (e.g. created before v0.2.17) return
+      an empty string for that file_path — the diff logic treats this
+      as "always stale" for that file, which triggers a single-file
+      re-sync (correct: we want to fill in the missing hash).
+
+      v0.2.42 CI-10: "pay once, never again" — this function is the key
+      enabler. Once hashes are stored in Weaviate (after the first sync
+      that sets content_hash), subsequent ``--update`` runs only embed
+      changed files. Nodes created before v0.2.17 (no content_hash
+      property) will be re-synced once (to populate content_hash), then
+      skipped forever.
+
+      v0.2.46 V46-A (now in ``vco_lib.kg_sync``): dropped the broken
+      ``where: Like "%"`` filter, bumped ``limit`` 1000 → 10000, and
+      inspects ``body["errors"]`` BEFORE consuming ``data``. See
+      ``knowledge/concepts/silent-zero-fallback-antipattern.md``
+      instance #3.
     """
-    try:
-        import urllib.request as _ur
-        import json as _json
-        # GraphQL: fetch file_path + content_hash for every object.
-        # v0.2.46 V46-A: no `where` filter — pre-v0.2.46 used `Like "%"`
-        # which is SQL-wildcard syntax (Weaviate uses `*`) and was rejected
-        # as "only stopwords provided", yielding HTTP 200 with errors-array.
-        # limit=10000 = Weaviate's QUERY_MAXIMUM_RESULTS default; saturation
-        # warning below flags when we approach the cap (future enhancement
-        # = cursor pagination via `after:`).
-        gql = {
-            "query": (
-                f"{{ Get {{ {collection_name}(limit: 10000) "
-                f"{{ file_path content_hash }} }} }}"
-            ),
-        }
-        data = _json.dumps(gql).encode()
-        req = _ur.Request(
-            f"{weaviate_url}/v1/graphql",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with _ur.urlopen(req, timeout=10) as resp:  # noqa: S310
-            body = _json.loads(resp.read())
+    from vco_lib.kg_sync import batch_query_content_hashes
 
-        # v0.2.46 V46-A: inspect errors array BEFORE consuming data.
-        # Weaviate (and GraphQL generally) returns HTTP 200 with a non-empty
-        # errors-array for non-fatal query problems (invalid filter syntax,
-        # missing properties, etc.). Without this check, pre-v0.2.46 code
-        # silently treated 200+errors as "empty result" and triggered full
-        # re-embed. See knowledge/concepts/mcp-loud-fail-error-pattern.md
-        # § GraphQL errors[] array.
-        if body.get("errors"):
-            first_err = (body["errors"][0] or {}).get("message", "unknown")
+    def _on_warn(channel: str, payload: "dict") -> None:
+        # Map the helper's structured warn channels back into the
+        # legacy CI-10 install-event log so existing dashboards /
+        # `UPDATE_DEFERRED.md` parsing keeps working.
+        if channel == "graphql_errors":
+            errs = payload.get("errors", [])
+            first = errs[0] if errs else "unknown"
             _log_install_event(
                 "7c/10", "warn",
-                f"CI-10: GraphQL errors for {collection_name!r}: "
-                f"{first_err[:200]}",
-                data={
-                    "collection": collection_name,
-                    "errors": [
-                        (e or {}).get("message", "")[:200]
-                        for e in body["errors"][:3]
-                    ],
-                },
+                f"CI-10: GraphQL errors for {collection_name!r}: {first[:200]}",
+                data={"collection": collection_name, "errors": errs},
             )
-            return {}
-
-        objects = (
-            body.get("data", {})
-            .get("Get", {})
-            .get(collection_name, [])
-        ) or []
-
-        # v0.2.46 V46-A: saturation warning — signals approaching Weaviate's
-        # QUERY_MAXIMUM_RESULTS cap. Future enhancement is cursor pagination
-        # via `after:` parameter (V46-G scope).
-        if len(objects) >= 10000:
+        elif channel == "saturation":
             _log_install_event(
                 "7c/10", "warn",
                 f"CI-10: hit Weaviate QUERY_MAXIMUM_RESULTS cap (10000) for "
                 f"{collection_name!r}; some rows may be missing — consider "
                 f"cursor pagination",
-                data={"collection": collection_name, "rows": len(objects)},
+                data={"collection": collection_name, "rows": payload.get("rows", 0)},
+            )
+        elif channel == "transport_failure":
+            errs = payload.get("errors", [])
+            first = errs[0] if errs else "unknown"
+            _log_install_event(
+                "7c/10", "warn",
+                f"CI-10: batch hash query failed for {collection_name!r}: {first[:200]}",
+                data={"collection": collection_name, "error": first[:200]},
             )
 
-        result: dict[str, str] = {}
-        for obj in objects:
-            fp = (obj.get("file_path") or "").strip()
-            ch = (obj.get("content_hash") or "").strip()
-            if fp:
-                result[fp] = ch
-        return result
-    except Exception as exc:
-        _log_install_event(
-            "7c/10", "warn",
-            f"CI-10: batch hash query failed for {collection_name!r}: {exc}",
-            data={"collection": collection_name, "error": str(exc)[:200]},
-        )
-        return {}
+    return batch_query_content_hashes(
+        weaviate_url=weaviate_url,
+        collection_name=collection_name,
+        on_warn=_on_warn,
+    )
 
 
 def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
