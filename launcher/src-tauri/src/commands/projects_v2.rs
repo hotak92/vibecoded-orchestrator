@@ -223,6 +223,33 @@ pub fn get_shared_kg_write_disabled(db: &Db, project_id: &str) -> Result<bool, S
     Ok(_migrate_shared_kg_setting(db, project_id)?.unwrap_or(false))
 }
 
+/// v0.2.46 Decision B — per-project setting key for the symmetric READ
+/// gate (`SHARED_KG_READ_DISABLED`). When `true`, the project's env
+/// surfaces carry `SHARED_KG_READ_DISABLED=true`, which the MCP's
+/// `_kg_collections_to_search` reads to drop the shared collection from
+/// the hybrid_search / semantic_graph_search fan-out. No legacy alias —
+/// pre-v0.2.46 the read path was unconditional, so there's no
+/// historical key to honour.
+pub const SETTING_KEY_SHARED_KG_READ_DISABLED: &str = "shared_kg_read_disabled";
+
+/// v0.2.46 Decision B — read the current SHARED_KG_READ_DISABLED toggle
+/// from the DB. Defaults to `false` (reads allowed) when no row exists.
+/// No legacy-alias migration because the key is new — pre-v0.2.46 the
+/// read path was unconditional, so no DB row could exist under a prior
+/// name. Symmetric mirror of `get_shared_kg_write_disabled` in shape +
+/// default semantics.
+pub fn get_shared_kg_read_disabled(db: &Db, project_id: &str) -> Result<bool, String> {
+    let val = db
+        .get_setting(
+            project_id,
+            PROJECT_SETTINGS_MODULE_ID,
+            SETTING_KEY_SHARED_KG_READ_DISABLED,
+        )?
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(val)
+}
+
 /// Deprecated alias of `get_shared_kg_write_disabled`. Will be removed once
 /// the legacy command + env var are dropped (target: 2026-08).
 #[deprecated(
@@ -2052,6 +2079,8 @@ pub fn write_project_env_files(
     let shared_kg_write_disabled = settings.shared_kg_write_disabled_str();
     // Legacy alias (kept for ~3 releases, target removal 2026-08).
     let shared_kg_opt_out_legacy = shared_kg_write_disabled;
+    // v0.2.46 Decision B — symmetric READ gate string form.
+    let shared_kg_read_disabled = settings.shared_kg_read_disabled_str();
     let active_embedding = settings.active_embedding.as_str();
     let weaviate_url = settings.weaviate_url.as_str();
     let ollama_url = settings.ollama_url.as_str();
@@ -2113,6 +2142,12 @@ pub fn write_project_env_files(
                 "SHARED_KG_WRITE_DISABLED" => Some(shared_kg_write_disabled.to_string()),
                 // Legacy alias — same value, removed in ~3 releases.
                 "SHARED_KG_OPT_OUT" => Some(shared_kg_opt_out_legacy.to_string()),
+                // v0.2.46 Decision B — symmetric READ gate. No legacy
+                // alias because pre-v0.2.46 the read path was
+                // unconditional. Always emitted (string "true"/"false")
+                // so the MCP's env-fallback resolution sees a value
+                // even when the user has not flipped it.
+                "SHARED_KG_READ_DISABLED" => Some(shared_kg_read_disabled.to_string()),
                 "ACTIVE_EMBEDDING" => Some(active_embedding.to_string()),
                 // PR-3 (2026-05-06): launcher-resolved service URLs + ports.
                 "WEAVIATE_URL" => Some(weaviate_url.to_string()),
@@ -3232,6 +3267,76 @@ pub async fn set_shared_kg_write_disabled(
     })
 }
 
+/// v0.2.46 Decision B — Tauri-exposed getter for the SHARED_KG_READ_DISABLED
+/// toggle. Used by the launcher GUI's Identity tab to render the current
+/// state of the toggle without a full hub round-trip. Read-only mirror of
+/// the setter below.
+#[command]
+pub async fn get_shared_kg_read_disabled_cmd(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    get_shared_kg_read_disabled(&db, &project_id)
+}
+
+/// v0.2.46 Decision B — persist the symmetric SHARED_KG_READ_DISABLED
+/// toggle and refresh all per-project env surfaces so the new value
+/// takes effect immediately.
+///
+/// Symmetric mirror of `set_shared_kg_write_disabled`: when `true`, the
+/// MCP's `_kg_collections_to_search` drops `SHARED_KG_COLLECTION` from
+/// the hybrid_search / semantic_graph_search fan-out for this project.
+/// Pre-v0.2.46 the read path was unconditional; v0.2.46 lets users opt
+/// OUT explicitly while keeping the default ON.
+///
+/// No legacy-alias clean-up — the key is new in v0.2.46, so no
+/// historical row could exist.
+#[command]
+pub async fn set_shared_kg_read_disabled(
+    project_id: String,
+    read_disabled: bool,
+    db: State<'_, Db>,
+) -> Result<RenameProjectResult, String> {
+    let row = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+    let count = db.list_module_installs_for_project(&project_id)?.len() as u32;
+
+    db.set_setting(
+        &project_id,
+        PROJECT_SETTINGS_MODULE_ID,
+        SETTING_KEY_SHARED_KG_READ_DISABLED,
+        &serde_json::Value::Bool(read_disabled),
+    )?;
+
+    // Refresh all env surfaces with the new value. Same warning-surface
+    // pattern as `set_shared_kg_write_disabled`.
+    let mut warnings: Vec<String> = Vec::new();
+    let folder = Path::new(&row.folder_path);
+    if let Err(e) = apply_project_env_via_python(&project_id, folder, &db) {
+        let msg = format!(
+            "shared-KG read-disabled env refresh failed: {}. \
+             Toggle persisted to DB but env files may be stale.",
+            e
+        );
+        eprintln!("[vct] warning: {}", msg);
+        warnings.push(msg);
+    }
+
+    db.audit(
+        "project_shared_kg_read_disabled",
+        Some(&project_id),
+        None,
+        &serde_json::json!({ "read_disabled": read_disabled }),
+    )?;
+    let _ = db.log_change("projects", "update", Some(&project_id), Some(&project_id));
+
+    Ok(RenameProjectResult {
+        project: ProjectView::from_row(row, count),
+        warnings,
+    })
+}
+
 /// Deprecated alias of `set_shared_kg_write_disabled`. Logs a deprecation
 /// notice to stderr and delegates. Slated for removal once the legacy env
 /// var + DB key are fully retired (target: 2026-08, ~3 releases).
@@ -3627,6 +3732,9 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     "SHARED_KG_COLLECTION",
     "SHARED_KG_WRITE_DISABLED",
     "SHARED_KG_OPT_OUT",
+    // v0.2.46 Decision B — symmetric READ gate. No legacy alias
+    // because pre-v0.2.46 the read path was unconditional.
+    "SHARED_KG_READ_DISABLED",
     "PROJECT_NAME",
     // PR-8 cross-PR handoff (v0.2.11 / 2026-05-15): added at the
     // Rust first-install boundary so newly-registered projects get
@@ -5080,6 +5188,8 @@ mod tests {
         assert!(env_raw.contains(r#"export SHARED_KG_COLLECTION="VibeCodedOrchestrator_KnowledgeGraph""#));
         assert!(env_raw.contains(r#"export SHARED_KG_WRITE_DISABLED="false""#));
         assert!(env_raw.contains(r#"export SHARED_KG_OPT_OUT="false""#));
+        // v0.2.46 Decision B — symmetric READ gate (default false).
+        assert!(env_raw.contains(r#"export SHARED_KG_READ_DISABLED="false""#));
 
         // 2. Bug 30: canonical .claude/settings.json env block — the
         // channel that actually propagates to MCP subprocesses (the
@@ -5111,6 +5221,8 @@ mod tests {
         assert_eq!(env["SHARED_KG_WRITE_DISABLED"], "false");
         // Legacy alias mirrors the canonical value (kept for ~3 releases).
         assert_eq!(env["SHARED_KG_OPT_OUT"], "false");
+        // v0.2.46 Decision B — symmetric READ gate (default false).
+        assert_eq!(env["SHARED_KG_READ_DISABLED"], "false");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -7551,7 +7663,10 @@ mod tests {
             "CODE_GRAPH_PROJECT",
             "DEVELOPMENT_COLLECTION",
             "SHARED_KG_COLLECTION", "SHARED_KG_WRITE_DISABLED",
-            "SHARED_KG_OPT_OUT", "ACTIVE_EMBEDDING",
+            "SHARED_KG_OPT_OUT",
+            // v0.2.46 Decision B — symmetric READ gate.
+            "SHARED_KG_READ_DISABLED",
+            "ACTIVE_EMBEDDING",
             "WEAVIATE_URL", "WEAVIATE_PORT",
             "OLLAMA_URL", "OLLAMA_PORT",
             "CODE_EMBED_URL", "CODE_EMBED_PORT",

@@ -165,6 +165,46 @@
   let loadedKg = $state('');
   let loadedCg = $state('');
 
+  // v0.2.46 Decision B — per-project SHARED_KG_READ_DISABLED toggle.
+  // Symmetric mirror of the write-disable toggle (which has the same
+  // setter wired through `projectsStore.setSharedKgWriteDisabled` but
+  // no UI yet). When `true`, this project's hybrid_search /
+  // semantic_graph_search stop searching the shared KG. Default false
+  // (reads on, asymmetric-by-default).
+  let sharedKgReadDisabled = $state(false);
+  let savingReadDisabled = $state(false);
+
+  async function loadSharedKgReadDisabled() {
+    try {
+      sharedKgReadDisabled = await invoke<boolean>('get_shared_kg_read_disabled_cmd', { projectId });
+    } catch {
+      // Soft-fail: getter unreachable (test contexts, partial install).
+      // Default off — matches the canonical default on a missing row.
+      sharedKgReadDisabled = false;
+    }
+  }
+
+  async function toggleSharedKgReadDisabled(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const newValue = target.checked;
+    savingReadDisabled = true;
+    try {
+      await projectsStore.setSharedKgReadDisabled(projectId, newValue);
+      sharedKgReadDisabled = newValue;
+      toast.success(
+        newValue
+          ? 'Excluded from shared KG reads'
+          : 'Re-enabled shared KG reads',
+      );
+    } catch (e) {
+      toast.error(e);
+      // Revert checkbox to actual state on failure.
+      target.checked = sharedKgReadDisabled;
+    } finally {
+      savingReadDisabled = false;
+    }
+  }
+
   const isDirty = $derived(
     !!identity && (editKg.trim() !== loadedKg || editCg.trim() !== loadedCg),
   );
@@ -276,8 +316,12 @@
 
   onMount(load);
   onMount(loadDetectedKgClasses);
+  onMount(loadSharedKgReadDisabled);
   $effect(() => {
-    if (projectId) void load();
+    if (projectId) {
+      void load();
+      void loadSharedKgReadDisabled();
+    }
   });
 </script>
 
@@ -470,6 +514,34 @@
         >
           Manage shared KG collection ({detectedKgClasses.length} candidates)
         </button>
+      {/if}
+
+      <!-- v0.2.46 Decision B — symmetric READ gate. Hidden for the
+           orchestrator-root project (which IS the shared KG; excluding
+           it from its own reads makes no sense). For peer projects,
+           offers an opt-out toggle so users can run a project in
+           strict-isolation mode (no shared KG fan-out on
+           hybrid_search / semantic_graph_search). Default off (reads
+           on). The write-disable toggle has the same DB+env semantics
+           but no UI yet; both share the same persistence path. -->
+      {#if !identity.is_orchestrator_root}
+        <label class="ps-shared-kg-read-toggle">
+          <input
+            type="checkbox"
+            checked={sharedKgReadDisabled}
+            disabled={savingReadDisabled}
+            onchange={toggleSharedKgReadDisabled}
+          />
+          <span>
+            Exclude this project from reading the shared KG
+            <span class="ps-form-hint" style="display: block; margin-top: 2px;">
+              When enabled, hybrid_search and semantic_graph_search stop
+              fanning out into <code>{sharedKgName}</code> for this
+              project. The project's own primary KG and any peer-grant
+              access remain searchable. Default off.
+            </span>
+          </span>
+        </label>
       {/if}
     </div>
 
@@ -719,6 +791,32 @@
     margin-top: 6px;
     color: #f5b342;
     font-style: italic;
+  }
+
+  /* v0.2.46 Decision B — symmetric READ gate toggle. Same visual
+     language as the existing form labels; the checkbox sits inline
+     with a brief explainer so users can see the affordance without
+     opening docs. */
+  .ps-shared-kg-read-toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 14px;
+    padding: 8px 10px;
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .ps-shared-kg-read-toggle input[type='checkbox'] {
+    margin-top: 2px;
+  }
+  .ps-shared-kg-read-toggle code {
+    font-family: ui-monospace, monospace;
+    background: rgba(255, 255, 255, 0.05);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 10px;
   }
 
   /* PR-26 / Group E (v0.2.12): picker affordance hint. */

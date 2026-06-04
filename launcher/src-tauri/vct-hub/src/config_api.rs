@@ -250,6 +250,20 @@ struct ProjectConfigResponse {
     ollama_url: String,
     grpc_port: u16,
     shared_kg_write_disabled: bool,
+    /// v0.2.46 Decision B — per-project READ gate for the shared KG.
+    /// Symmetric mirror of ``shared_kg_write_disabled`` above. When
+    /// ``true``, the MCP's ``_kg_collections_to_search`` drops
+    /// ``SHARED_KG_COLLECTION`` from the hybrid_search /
+    /// semantic_graph_search fan-out so this project stops searching
+    /// the shared corpus. Read was unconditional pre-v0.2.46
+    /// (asymmetric-by-default); v0.2.46 lets users opt OUT explicitly
+    /// while keeping default ON.
+    ///
+    /// Additive field — pre-v0.2.46 Python clients see an unknown
+    /// field and ignore it; the parser back-fills with ``false`` for
+    /// pre-v0.2.46 hubs paired with v0.2.46+ clients. ``schema_version``
+    /// stays at 1 because the field is defaultable client-side.
+    shared_kg_read_disabled: bool,
     /// v0.2.40 R2 — RL Reranker per-project flags exposed for the
     /// in-container reader. Until v0.2.40 these three booleans were
     /// SETTER-only: the GUI checkboxes wrote them into
@@ -427,6 +441,19 @@ async fn project_config(
     let shared_kg_write_disabled = h
         .0
         .get_setting(&project.id, "orchestrator-core", "shared_kg_write_disabled")
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 7a. shared_kg_read_disabled (v0.2.46 Decision B — module_settings
+    // → orchestrator-core). Symmetric mirror of the write gate above.
+    // Default false (reads allowed). Pre-v0.2.46 the read path was
+    // unconditional, so no historical rows exist under any prior key —
+    // no migration helper needed.
+    let shared_kg_read_disabled = h
+        .0
+        .get_setting(&project.id, "orchestrator-core", "shared_kg_read_disabled")
         .ok()
         .flatten()
         .and_then(|v| v.as_bool())
@@ -659,6 +686,7 @@ async fn project_config(
         ollama_url,
         grpc_port,
         shared_kg_write_disabled,
+        shared_kg_read_disabled,
         rl_use_global,
         rl_online_training_disabled,
         rl_global_training_source_flag,
@@ -1268,6 +1296,12 @@ mod tests {
         );
         assert_eq!(
             body.get("shared_kg_write_disabled").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        // v0.2.46 Decision B — symmetric READ gate. Default false on
+        // a freshly-seeded project (no module_settings rows).
+        assert_eq!(
+            body.get("shared_kg_read_disabled").and_then(|v| v.as_bool()),
             Some(false)
         );
 
@@ -2308,6 +2342,74 @@ kg_tier_full = 0.8
         assert_eq!(
             obj.get("rl_use_global").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    /// v0.2.46 Decision B — symmetric READ gate, default branch.
+    ///
+    /// A project with no row in ``module_settings`` for
+    /// ``orchestrator-core / shared_kg_read_disabled`` must read back
+    /// the field as ``false`` (reads allowed). Mirrors the write-gate
+    /// default contract exactly.
+    #[tokio::test]
+    async fn config_emits_shared_kg_read_disabled_default_false() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-read-default", "myproject");
+
+        let resp = reqwest::get(format!("{}/projects/p-read-default/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        assert_eq!(
+            body.get("shared_kg_read_disabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "shared_kg_read_disabled default must be false; body={}",
+            body,
+        );
+    }
+
+    /// v0.2.46 Decision B — symmetric READ gate, set → fetch round-trip.
+    ///
+    /// Writing the flag via the same DB path the GUI setter would use
+    /// (`module_id = "orchestrator-core"`, key `shared_kg_read_disabled`)
+    /// must surface that value in the resolver response. Pins the
+    /// canonical key strings so a rename surfaces here loudly.
+    #[tokio::test]
+    async fn config_emits_shared_kg_read_disabled_when_set() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-read-set", "myproject");
+
+        // Mirror the GUI setter path exactly: module_id is the literal
+        // "orchestrator-core" string (same scope as the write gate).
+        h.0.set_setting(
+            "p-read-set",
+            "orchestrator-core",
+            "shared_kg_read_disabled",
+            &serde_json::Value::Bool(true),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-read-set/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        assert_eq!(
+            body.get("shared_kg_read_disabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "shared_kg_read_disabled set→fetch round-trip; body={}",
+            body,
+        );
+
+        // Write gate stays at default false — confirms the two flags
+        // are independent rows, not aliased to each other.
+        assert_eq!(
+            body.get("shared_kg_write_disabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "write gate must NOT be flipped by setting the read gate",
         );
     }
 }

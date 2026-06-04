@@ -33,7 +33,9 @@
 use std::path::PathBuf;
 
 use crate::commands::installer::resolve_orchestrator_root;
-use crate::commands::projects_v2::{get_shared_kg_write_disabled, sanitize_kg_collection};
+use crate::commands::projects_v2::{
+    get_shared_kg_read_disabled, get_shared_kg_write_disabled, sanitize_kg_collection,
+};
 use crate::db::Db;
 use crate::services::adoption::{self, AdoptionMode};
 
@@ -207,6 +209,15 @@ pub struct ProjectEnvSettings {
     /// True ⇒ project carries `SHARED_KG_WRITE_DISABLED=true`.
     pub shared_kg_write_disabled: bool,
 
+    /// v0.2.46 Decision B — symmetric READ gate. Mirror of
+    /// `shared_kg_write_disabled` above. When `true`, the project's env
+    /// surfaces carry `SHARED_KG_READ_DISABLED=true`, which the MCP's
+    /// `_kg_collections_to_search` reads to drop `SHARED_KG_COLLECTION`
+    /// from the hybrid_search / semantic_graph_search fan-out. Pre-
+    /// v0.2.46 the read path was unconditional (asymmetric-by-default);
+    /// v0.2.46 lets users opt OUT explicitly while keeping default ON.
+    pub shared_kg_read_disabled: bool,
+
     /// CPU-only flag (mirror of `!use_gpu`). True when the launcher's
     /// install was configured for CPU-only. Reserved for future per-
     /// project compose-override generation.
@@ -356,6 +367,9 @@ impl ProjectEnvSettings {
             dev_collection: format!("{}_Development", kg_basename),
             shared_kg_collection: LAST_RESORT_SHARED_KG_COLLECTION.to_string(),
             shared_kg_write_disabled: false,
+            // v0.2.46 Decision B — symmetric read gate. Default off
+            // (reads allowed) on a fresh defaults-only struct.
+            shared_kg_read_disabled: false,
             cpu_only: true,
             use_gpu: false,
             project_name: project_name.to_string(),
@@ -379,6 +393,13 @@ impl ProjectEnvSettings {
     /// `"true"` / `"false"` string form for env writers.
     pub fn shared_kg_write_disabled_str(&self) -> &'static str {
         if self.shared_kg_write_disabled { "true" } else { "false" }
+    }
+
+    /// v0.2.46 Decision B — `"true"` / `"false"` string form for env
+    /// writers. Mirrors `shared_kg_write_disabled_str` exactly so the
+    /// pair-builder match arm has a symmetric helper to call.
+    pub fn shared_kg_read_disabled_str(&self) -> &'static str {
+        if self.shared_kg_read_disabled { "true" } else { "false" }
     }
 }
 
@@ -582,6 +603,14 @@ pub fn populate(
         None => false,
     };
 
+    // v0.2.46 Decision B — symmetric READ gate. Same resolution shape
+    // as the write gate above; default false (reads allowed) when the
+    // row is absent OR no project_id was provided (test contexts).
+    let shared_kg_read_disabled = match project_id {
+        Some(pid) => get_shared_kg_read_disabled(db, pid).unwrap_or(false),
+        None => false,
+    };
+
     let use_gpu = db
         .app_state_get_bool(APP_STATE_KEY_USE_GPU)
         .ok()
@@ -654,6 +683,7 @@ pub fn populate(
         dev_collection: own_dev,
         shared_kg_collection,
         shared_kg_write_disabled,
+        shared_kg_read_disabled,
         cpu_only: !use_gpu,
         use_gpu,
         project_name: project_name.to_string(),
@@ -1068,6 +1098,9 @@ mod tests {
         assert_eq!(s.active_embedding, "qwen3");
         assert_eq!(s.shared_kg_write_disabled_str(), "false");
         assert!(!s.shared_kg_write_disabled);
+        // v0.2.46 Decision B — symmetric read gate defaults to off.
+        assert_eq!(s.shared_kg_read_disabled_str(), "false");
+        assert!(!s.shared_kg_read_disabled);
         assert!(!s.use_gpu);
         assert!(s.cpu_only);
     }
@@ -1170,6 +1203,9 @@ mod tests {
         assert_eq!(s.kg_collection, "Acme_KnowledgeGraph");
         assert_eq!(s.shared_kg_collection, "VibeCodedOrchestrator_KnowledgeGraph");
         assert!(!s.shared_kg_write_disabled);
+        // v0.2.46 Decision B — symmetric read gate defaults off when
+        // no project row exists (populate gets `None` for project_id).
+        assert!(!s.shared_kg_read_disabled);
     }
 
     #[test]

@@ -351,6 +351,22 @@ class ProjectConfig:
     rl_use_global: bool = False
     rl_online_training_disabled: bool = False
     rl_global_training_source_flag: bool = False
+    #: v0.2.46 Decision B — per-project READ gate for the shared KG.
+    #: Symmetric mirror of ``shared_kg_write_disabled``. When ``True``,
+    #: the MCP's ``_kg_collections_to_search`` drops
+    #: ``SHARED_KG_COLLECTION`` from the hybrid_search /
+    #: semantic_graph_search fan-out so this project stops searching
+    #: the shared corpus. Read was unconditional pre-v0.2.46 (asymmetric
+    #: access model); v0.2.46 lets users opt OUT explicitly while
+    #: keeping the default ON.
+    #:
+    #: Pre-v0.2.46 hubs paired with v0.2.46+ clients omit the field;
+    #: the parser back-fills with ``False`` so old hubs don't crash new
+    #: clients (the env-fallback path in the MCP then resolves from
+    #: ``SHARED_KG_READ_DISABLED`` directly). Default ``False`` also
+    #: matches the GUI's pre-unchecked checkbox state. Declared last to
+    #: keep the frozen-dataclass init signature backward-compat.
+    shared_kg_read_disabled: bool = False
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -779,6 +795,13 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             ),
             rl_global_training_source_flag=bool(
                 body.get("rl_global_training_source_flag", False)
+            ),
+            # v0.2.46 Decision B additive field — pre-v0.2.46 hubs omit
+            # it; default ``False`` keeps the symmetric default-off
+            # behaviour and matches the Rust handler's
+            # ``unwrap_or(false)`` contract on absent rows.
+            shared_kg_read_disabled=bool(
+                body.get("shared_kg_read_disabled", False)
             ),
         )
     except (KeyError, TypeError, ValueError) as exc:

@@ -1643,6 +1643,10 @@ pub fn run() {
             commands::projects_v2::update_project_v2,
             commands::projects_v2::rename_project_v2,
             commands::projects_v2::set_shared_kg_write_disabled,
+            // v0.2.46 Decision B — symmetric READ gate. Mirrors
+            // set_shared_kg_write_disabled in shape; defaults off.
+            commands::projects_v2::set_shared_kg_read_disabled,
+            commands::projects_v2::get_shared_kg_read_disabled_cmd,
             // Deprecated alias — delegates to set_shared_kg_write_disabled,
             // logs a deprecation warning. Slated for removal ~2026-08.
             commands::projects_v2::set_shared_kg_opt_out,

@@ -308,6 +308,13 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "SHARED_KG_COLLECTION",
     "SHARED_KG_WRITE_DISABLED",
     "SHARED_KG_OPT_OUT",
+    # v0.2.46 Decision B — per-project READ gate for the shared KG.
+    # Symmetric mirror of SHARED_KG_WRITE_DISABLED; no legacy alias
+    # because the read path was unconditional pre-v0.2.46. Consumed by
+    # ``claude_mcp_servers/weaviate_mcp/server.py::
+    # _resolve_shared_kg_read_disabled`` to gate hybrid_search /
+    # semantic_graph_search fan-out into the shared collection.
+    "SHARED_KG_READ_DISABLED",
     "PROJECT_NAME",
     "CODE_GRAPH_PROJECT",
     "ACTIVE_EMBEDDING",
@@ -1312,6 +1319,14 @@ def project_env_from_db(
             conn, project_id, "orchestrator-core",
             "shared_kg_write_disabled", default=False,
         )
+        # v0.2.46 Decision B — symmetric read gate. Same module_id +
+        # default semantics as the write gate above (orchestrator-core
+        # scope, default false meaning reads allowed). No legacy alias
+        # to honour — pre-v0.2.46 the read path was unconditional.
+        shared_kg_read_disabled = _fetch_module_setting_bool(
+            conn, project_id, "orchestrator-core",
+            "shared_kg_read_disabled", default=False,
+        )
         if active_embedding_override is not None:
             active_embedding = active_embedding_override
         else:
@@ -1364,6 +1379,9 @@ def project_env_from_db(
     _set("SHARED_KG_WRITE_DISABLED", "true" if shared_kg_write_disabled else "false")
     # Legacy alias — same value, kept for ~3 releases (target 2026-08).
     _set("SHARED_KG_OPT_OUT", "true" if shared_kg_write_disabled else "false")
+    # v0.2.46 Decision B — symmetric read gate. No legacy alias because
+    # the read path was unconditional pre-v0.2.46.
+    _set("SHARED_KG_READ_DISABLED", "true" if shared_kg_read_disabled else "false")
     _set("PROJECT_NAME", proj.name)
     _set("CODE_GRAPH_PROJECT", sanitized)
     _set("ACTIVE_EMBEDDING", active_embedding)

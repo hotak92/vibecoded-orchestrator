@@ -18768,6 +18768,9 @@ def _ensure_env_template(env_path: Path, project_name: str = "<project>",
         ),
         "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",
+        # v0.2.46 Decision B — symmetric READ gate. No legacy alias
+        # because pre-v0.2.46 the read path was unconditional.
+        "SHARED_KG_READ_DISABLED": "false",
         "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
         "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
         "WEAVIATE_PORT": weaviate_port,
@@ -18876,14 +18879,18 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         f"DEVELOPMENT_COLLECTION={os.environ.get('DEVELOPMENT_COLLECTION', 'Development')}",
         "",
         "# Cross-project shared KG (all vco installs on this machine read",
-        "# from it alongside their own KG — read access is unconditional).",
+        "# from it alongside their own KG by default — v0.2.46 added a",
+        "# symmetric per-project READ opt-out gate, asymmetric-by-default).",
         "# Seeded at install time from vibecoded-orchestrator/knowledge/.",
-        "# Set SHARED_KG_WRITE_DISABLED=true to gate WRITES from this project",
-        "# only (reads stay on). SHARED_KG_OPT_OUT is the legacy alias kept",
-        "# for ~3 releases (target removal: 2026-08).",
+        "# Set SHARED_KG_WRITE_DISABLED=true to gate WRITES from this project,",
+        "# SHARED_KG_READ_DISABLED=true to gate READS. SHARED_KG_OPT_OUT is",
+        "# the legacy write alias kept for ~3 releases (target removal:",
+        "# 2026-08); no read alias because the read path was unconditional",
+        "# pre-v0.2.46.",
         f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibeCodedOrchestrator_KnowledgeGraph')}",
         "SHARED_KG_WRITE_DISABLED=false",
         "SHARED_KG_OPT_OUT=false",
+        "SHARED_KG_READ_DISABLED=false",
         "",
     ]
 
@@ -19008,6 +19015,8 @@ def _reconcile_env_keys(env_path: Path) -> dict:
         ),
         "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",
+        # v0.2.46 Decision B — symmetric READ gate.
+        "SHARED_KG_READ_DISABLED": "false",
         "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
         "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
         "WEAVIATE_PORT": weaviate_port,
@@ -19128,11 +19137,15 @@ def _build_vco_settings_defaults(embed_config: dict) -> dict:
         # "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E).
         # Picker overrides this per-project.
         "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph",
-        # Asymmetric shared-KG access (since 2026-05-01): reads always-on,
-        # writes gated by SHARED_KG_WRITE_DISABLED. SHARED_KG_OPT_OUT kept
-        # as a legacy alias for ~3 releases (target removal: 2026-08).
+        # Symmetric shared-KG access since v0.2.46 (Decision B), but
+        # asymmetric-by-default: reads + writes both ON by default; users
+        # who want strict isolation flip both gates. SHARED_KG_OPT_OUT
+        # kept as a legacy write-alias for ~3 releases (target removal:
+        # 2026-08); no read alias because the read path was unconditional
+        # pre-v0.2.46.
         "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",
+        "SHARED_KG_READ_DISABLED": "false",
         # PR-7 (v0.2.11): PROJECT_NAME + CODE_GRAPH_PROJECT pin the
         # Orchestrator Project's own namespace so its
         # `post-file-edit.{sh,ps1}` hook resolves a stable name instead of

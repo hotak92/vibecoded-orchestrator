@@ -58,6 +58,9 @@ per-key:
   * ``SHARED_KG_WRITE_DISABLED`` / ``SHARED_KG_OPT_OUT``
                                — feature gates; users may want to flip
                                  them via shell rc for ad-hoc sessions.
+  * ``SHARED_KG_READ_DISABLED`` — v0.2.46 symmetric read gate; same
+                                 shell-rc-flip rationale as the write
+                                 gate above.
   * ``ACTIVE_EMBEDDING``       — picks named-vector slot; shell tools
                                  (scripts that bypass the MCP) need it.
   * ``WEAVIATE_URL`` / ``WEAVIATE_PORT``
@@ -245,6 +248,11 @@ _CANONICAL_ENV_TEMPLATE_KEYS: tuple[str, ...] = (
     # Feature flags
     "SHARED_KG_WRITE_DISABLED",
     "SHARED_KG_OPT_OUT",
+    # v0.2.46 Decision B — symmetric read gate. No legacy alias because
+    # pre-v0.2.46 the read path was unconditional. Must be a member of
+    # ``config_projection._CANONICAL_KEYS`` for the subset invariant
+    # check (`_assert_subset_invariant`) below to pass.
+    "SHARED_KG_READ_DISABLED",
     # Embedding profile
     "ACTIVE_EMBEDDING",
     # Service endpoints

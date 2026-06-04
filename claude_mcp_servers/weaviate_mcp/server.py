@@ -17,19 +17,26 @@ Core Tools:
 - search_code_graph: Find code entities by concept/purpose
 - query_code_structure: Query dependencies, callers, inheritance, interactions
 
-Shared KG access (asymmetric, since 2026-05-01):
-- READ paths (hybrid_search, semantic_graph_search) ALWAYS query the shared
-  collection when SHARED_KG_COLLECTION is set. This is non-negotiable: the
-  headline value prop of the orchestrator is that knowledge accumulates
-  across all projects. There is NO per-project read opt-out.
+Shared KG access (symmetric since v0.2.46, asymmetric-by-default):
+- DEFAULT (fresh project): READ + WRITE both enabled. The headline value
+  prop of the orchestrator is that knowledge accumulates across all
+  projects, so reads are on by default; writes are on so per-project
+  insights can be promoted to the shared corpus.
+- READ paths (hybrid_search, semantic_graph_search) query the shared
+  collection when SHARED_KG_COLLECTION is set AND SHARED_KG_READ_DISABLED
+  is not true. Setting SHARED_KG_READ_DISABLED=true on a project excludes
+  its hybrid_search / semantic_graph_search fan-out from the shared
+  collection (the project still sees its own primary KG + any peer
+  matrix entries). New in v0.2.46 — pre-v0.2.46 reads were unconditional.
 - WRITE paths (store_knowledge_node with scope='shared', or any write whose
   resolved target is SHARED_KG_COLLECTION) consult SHARED_KG_WRITE_DISABLED.
   When true, writes are REFUSED with a clear error rather than silently
   rerouted to the project KG — silent reroutes used to mislead callers
   into thinking their cross-project insight had landed in the shared KG.
-- Legacy alias: SHARED_KG_OPT_OUT (boolean) is honoured as a read-only
+- Legacy alias: SHARED_KG_OPT_OUT (boolean) is honoured as a write-only
   alias for SHARED_KG_WRITE_DISABLED for ~3 releases (2026-05 → 2026-08).
-  The new key wins when both are set.
+  The new key wins when both are set. No legacy alias exists for the read
+  gate (SHARED_KG_READ_DISABLED is canonical from v0.2.46 onward).
 
 Connection:
 - HTTP: localhost:8081 (configurable via WEAVIATE_URL)
@@ -1179,6 +1186,41 @@ SHARED_KG_WRITE_DISABLED = _resolve_shared_kg_write_disabled()
 # write gate (legacy callers that relied on this to gate reads will, by
 # design, now read the shared KG anyway).
 SHARED_KG_OPT_OUT = SHARED_KG_WRITE_DISABLED
+
+
+# Per-project READ gate (v0.2.46 — Decision B). Symmetric mirror of the
+# WRITE gate above. When true, ``_kg_collections_to_search`` drops
+# ``SHARED_KG_COLLECTION`` from the fan-out list — hybrid_search /
+# semantic_graph_search stop fanning out to the shared KG for this
+# project. The project's own primary KG + any peers granted via the
+# access matrix remain searchable.
+#
+# No legacy alias: ``SHARED_KG_READ_DISABLED`` is canonical from v0.2.46
+# onward. Pre-v0.2.46 the read path was unconditional (the asymmetric
+# model), so there's no historical key to honour. ``SHARED_KG_OPT_OUT``
+# is a WRITE-only alias (see comment above) — it does NOT gate reads.
+#
+# Default false (reads allowed). Asymmetric-by-default semantic: fresh
+# projects READ the shared KG. Users who want strict isolation flip both
+# SHARED_KG_READ_DISABLED and SHARED_KG_WRITE_DISABLED to true.
+def _resolve_shared_kg_read_disabled() -> bool:
+    """Resolve the read-disabled flag from the environment.
+
+    Precedence:
+      1. ``SHARED_KG_READ_DISABLED`` (canonical key) — wins if set.
+      2. False otherwise (default: reads allowed).
+
+    Returns:
+        True if shared-KG reads are disabled for this project,
+        False otherwise.
+    """
+    canonical = os.environ.get("SHARED_KG_READ_DISABLED")
+    if canonical is not None:
+        return canonical.strip().lower() in ("1", "true", "yes")
+    return False
+
+
+SHARED_KG_READ_DISABLED = _resolve_shared_kg_read_disabled()
 # Project-specific documentation collection (e.g. ProjectName_development).
 # When set, hybrid_search also searches this collection automatically.
 # Auto-pairing convention: the launcher should set `KG_COLLECTION=Foo` AND
@@ -1608,10 +1650,17 @@ def _kg_collections_to_search(
     out: list[str] = []
     if KG_COLLECTION and KG_COLLECTION.strip():
         out.append(KG_COLLECTION)
+    # v0.2.46 Decision B — SHARED_KG_READ_DISABLED is the symmetric mirror
+    # of SHARED_KG_WRITE_DISABLED. When true the shared collection drops
+    # out of the fan-out so hybrid_search / semantic_graph_search stop
+    # searching it for this project. Same single-line gate covers both
+    # callers (``hybrid_search`` + ``semantic_graph_search``) because both
+    # route through this helper.
     if (
         SHARED_KG_COLLECTION
         and SHARED_KG_COLLECTION.strip()
         and SHARED_KG_COLLECTION != KG_COLLECTION
+        and not SHARED_KG_READ_DISABLED
     ):
         out.append(SHARED_KG_COLLECTION)
     for coll in _kg_peer_collections():
@@ -6350,7 +6399,10 @@ async def backfill_embeddings(
 if __name__ == "__main__":
     logger.info(f"Starting Claude Orchestrator Weaviate MCP Server")
     logger.info(f"Primary Collection: {KG_COLLECTION}")
-    logger.info(f"Shared Collection: {SHARED_KG_COLLECTION if SHARED_KG_COLLECTION else 'None'} (read: always-on)")
+    read_state = "DISABLED" if SHARED_KG_READ_DISABLED else "enabled"
+    logger.info(f"Shared Collection: {SHARED_KG_COLLECTION if SHARED_KG_COLLECTION else 'None'} (read: {read_state})")
+    if SHARED_KG_READ_DISABLED:
+        logger.info("Shared Collection reads: DISABLED (SHARED_KG_READ_DISABLED=true)")
     if SHARED_KG_WRITE_DISABLED:
         logger.info("Shared Collection writes: DISABLED (SHARED_KG_WRITE_DISABLED=true)")
     else:

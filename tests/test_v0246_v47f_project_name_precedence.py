@@ -365,6 +365,12 @@ def test_existing_project_name_preserved_on_update(tmp_path):
         "SHARED_KG_COLLECTION=VibeCodedOrchestrator_KnowledgeGraph\n"
         "SHARED_KG_WRITE_DISABLED=false\n"
         "SHARED_KG_OPT_OUT=false\n"
+        # v0.2.46 Decision B — symmetric READ gate joined the canonical
+        # set. Fixture updated to be "fully-populated" under the new
+        # contract so the reconcile noop assertion below still pins the
+        # additive-only invariant rather than accidentally tripping on
+        # the newly-introduced canonical key.
+        "SHARED_KG_READ_DISABLED=false\n"
         "ACTIVE_EMBEDDING=qwen3\n"
         "WEAVIATE_URL=http://localhost:8081\n"
         "WEAVIATE_PORT=8081\n"

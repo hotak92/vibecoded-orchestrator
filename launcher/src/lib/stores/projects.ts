@@ -255,6 +255,32 @@ function createProjectsStore() {
       return this.setSharedKgWriteDisabled(id, optOut);
     },
 
+    /**
+     * v0.2.46 Decision B — toggle the project's SHARED_KG_READ_DISABLED
+     * setting. Symmetric mirror of `setSharedKgWriteDisabled`: when
+     * `true`, the MCP's `_kg_collections_to_search` drops the shared
+     * collection from the hybrid_search / semantic_graph_search fan-out
+     * for this project. Pre-v0.2.46 the read path was unconditional;
+     * v0.2.46 lets users opt OUT explicitly while keeping default ON.
+     *
+     * Persists to DB AND refreshes the 2 launcher-owned env surfaces
+     * (.claude/env, .claude/settings.json) so the new value takes
+     * effect without a relaunch.
+     */
+    async setSharedKgReadDisabled(id: string, readDisabled: boolean): Promise<ProjectView> {
+      const result = await invoke<RenameProjectResult>('set_shared_kg_read_disabled', {
+        projectId: id,
+        readDisabled,
+      });
+      const updated = result.project;
+      for (const w of result.warnings) toast.error(w);
+      update((s) => ({
+        ...s,
+        projects: s.projects.map((p) => (p.id === id ? updated : p)),
+      }));
+      return updated;
+    },
+
     async switchHost(id: string, newHost: ProjectHost): Promise<SwitchHostResult> {
       const result = await invoke<SwitchHostResult>('switch_project_host_v2', {
         id,
