@@ -232,38 +232,20 @@ QUERY="$MODULE_NAME $NEW_STRING_SNIPPET"
 # === Run searches in parallel to stay within 5s timeout ===
 KG_TMP=$(mktemp)
 CODE_TMP=$(mktemp)
-# Dual-layout venv resolution (PR-25 / v0.2.12). Modern installs put the
-# venv at <repo_root>/.venv (top-level); pre-v0.2.x installs had it at
-# <repo_root>/claude_mcp_servers/.venv. Hardcoding only the latter caused
-# this hook to silently fall through to system python on modern installs,
-# where weaviate-client isn't available, so the KG search subprocess
-# crashed and pre-edit context injection silently broke.
-_VENV_BASE="${VCT_INSTALL_ROOT:-$PROJECT_ROOT}"
-VENV=""
-if [ -n "${VCT_VENV:-}" ]; then
-    if [ -x "$VCT_VENV/bin/python" ]; then
-        VENV="$VCT_VENV/bin/python"
-    elif [ -x "$VCT_VENV/Scripts/python.exe" ]; then
-        VENV="$VCT_VENV/Scripts/python.exe"
-    elif [ -x "$VCT_VENV" ]; then
-        VENV="$VCT_VENV"
-    fi
-fi
-if [ -z "$VENV" ]; then
-    for _cand in \
-        "$_VENV_BASE/.venv/bin/python" \
-        "$_VENV_BASE/.venv/Scripts/python.exe" \
-        "$_VENV_BASE/claude_mcp_servers/.venv/bin/python" \
-        "$_VENV_BASE/claude_mcp_servers/.venv/Scripts/python.exe"; do
-        if [ -x "$_cand" ]; then
-            VENV="$_cand"
-            break
-        fi
-    done
-fi
+# v0.2.46 post-adversarial: source shared resolver. The previous inline
+# logic fell back to $PROJECT_ROOT/.venv when $VCT_INSTALL_ROOT was unset
+# — that's the USER's project venv, which won't have weaviate-client +
+# vco_lib, so the KG search subprocess would crash with ImportError. The
+# shared helper enforces the canonical precedence and refuses to silently
+# activate the user's venv. (PR-25 / v0.2.12 dual-layout history preserved
+# in the helper's docstring.)
 # Final fallback: if no venv resolved, the rl_kg_search subprocess below
 # will short-circuit (writes empty KG_TMP) and the hook still exits 0
 # without blocking the edit. Don't hard-fail.
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+resolve_vco_venv_python "$SCRIPT_DIR"
+VENV="${VCO_VENV_PYTHON:-}"
 
 # KG search with RL reranking — same pipeline as weaviate MCP (Weaviate → RL server → top-k)
 # Falls back to raw Weaviate order if RL server is unreachable.

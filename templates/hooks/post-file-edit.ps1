@@ -98,13 +98,14 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
 }
 
 # 2. Docs auto-sync (background side-effect).
+# v0.2.46 post-adversarial: dot-source the shared resolver instead of
+# the inline VCT_INSTALL_ROOT-or-ProjectRoot fallback (the latter pointed
+# at the USER's venv which doesn't have vco_lib + weaviate-client).
+. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
 if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and ($EditedFile -like "*.md")) {
-    $venvPy = Join-Path (if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }) "claude_mcp_servers\.venv\Scripts\python.exe"
-    if (-not (Test-Path $venvPy)) {
-        $venvPy = Join-Path (if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }) "claude_mcp_servers/.venv/bin/python"
-    }
+    $venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
     $uploadScript = Join-Path $ProjectRoot ".claude/scripts/upload_docs.py"
-    if ((Test-Path $venvPy) -and (Test-Path $uploadScript)) {
+    if ($venvPy -and (Test-Path $uploadScript)) {
         Start-Process -FilePath $venvPy -ArgumentList @($uploadScript, $EditedFile) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
     }
 }
@@ -146,17 +147,10 @@ if ($EditedFile.StartsWith($DiagramsDir, [StringComparison]::OrdinalIgnoreCase) 
     if (($nowTs - $lastTs) -ge 60) {
         Set-Content -Path $throttleFile -Value $nowTs -Encoding ascii -ErrorAction SilentlyContinue
 
-        # Resolve venv-Python — same chain as the docs branch above.
-        $venvBase = if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }
-        $diagVenv = ""
-        foreach ($cand in @(
-            (Join-Path $venvBase ".venv/Scripts/python.exe"),
-            (Join-Path $venvBase ".venv/bin/python"),
-            (Join-Path $venvBase "claude_mcp_servers/.venv/Scripts/python.exe"),
-            (Join-Path $venvBase "claude_mcp_servers/.venv/bin/python")
-        )) {
-            if (Test-Path $cand) { $diagVenv = $cand; break }
-        }
+        # v0.2.46 post-adversarial: shared resolver (already dot-sourced
+        # above at the docs branch). Falls back to system python ONLY when
+        # no VCO venv is resolvable — never to the USER's project venv.
+        $diagVenv = Resolve-VcoVenvPython -ScriptDir $ScriptDir
         if (-not $diagVenv) {
             $diagVenv = (Get-Command python -ErrorAction SilentlyContinue).Source
         }

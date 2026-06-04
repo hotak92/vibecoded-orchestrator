@@ -178,34 +178,14 @@ $Query = "$ModuleName $NewSnippet".Trim()
 $KgTmp = New-TemporaryFile
 $CodeTmp = New-TemporaryFile
 
-# Dual-layout venv resolution (PR-25 / v0.2.12). Modern installs put the
-# venv at <repo_root>\.venv (top-level); pre-v0.2.x installs had it at
-# <repo_root>\claude_mcp_servers\.venv. Hardcoding only the latter caused
-# this hook to silently fall through to system python on modern installs,
-# where weaviate-client isn't available, so KG search silently broke.
-$VenvBase = if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }
-$VenvPy = $null
-if ($env:VCT_VENV) {
-    $cand = Join-Path $env:VCT_VENV "Scripts\python.exe"
-    if (Test-Path $cand) { $VenvPy = $cand }
-    if (-not $VenvPy) {
-        $cand = Join-Path $env:VCT_VENV "bin/python"
-        if (Test-Path $cand) { $VenvPy = $cand }
-    }
-    if (-not $VenvPy -and (Test-Path $env:VCT_VENV -PathType Leaf)) {
-        $VenvPy = $env:VCT_VENV
-    }
-}
-if (-not $VenvPy) {
-    foreach ($cand in @(
-        (Join-Path $VenvBase ".venv\Scripts\python.exe"),
-        (Join-Path $VenvBase ".venv/bin/python"),
-        (Join-Path $VenvBase "claude_mcp_servers\.venv\Scripts\python.exe"),
-        (Join-Path $VenvBase "claude_mcp_servers/.venv/bin/python")
-    )) {
-        if (Test-Path $cand) { $VenvPy = $cand; break }
-    }
-}
+# v0.2.46 post-adversarial: dot-source shared resolver. The previous
+# inline logic fell back to $ProjectRoot/.venv when $VCT_INSTALL_ROOT was
+# unset — that's the USER's project venv, which won't have weaviate-
+# client + vco_lib. Shared helper enforces canonical 3-tier order +
+# refuses to silently activate the user's venv. (PR-25 / v0.2.12
+# dual-layout history preserved in the helper's docstring.)
+. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
+$VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 # Final fallback: if no venv resolved, leave $VenvPy as $null — the
 # (Test-Path $VenvPy) gate below skips the KG search subprocess and the
 # hook still exits 0 without blocking the edit.

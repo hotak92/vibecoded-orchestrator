@@ -99,29 +99,15 @@ case "$FILE_PATH" in
     *) exit 0 ;;
 esac
 
-# Resolve venv-Python so we can `import vco_lib.diagram_paths` even
-# when system Python lacks the orchestrator clone on sys.path. Mirrors
-# the resolution chain in pre-edit-context-inject.sh (PR-25 / v0.2.12).
-_VENV_BASE="${VCT_INSTALL_ROOT:-$PROJECT_ROOT}"
-VENV=""
-if [ -n "${VCT_VENV:-}" ] && [ -x "$VCT_VENV/bin/python" ]; then
-    VENV="$VCT_VENV/bin/python"
-elif [ -n "${VCT_VENV:-}" ] && [ -x "$VCT_VENV/Scripts/python.exe" ]; then
-    VENV="$VCT_VENV/Scripts/python.exe"
-fi
-if [ -z "$VENV" ]; then
-    for _cand in \
-        "$_VENV_BASE/.venv/bin/python" \
-        "$_VENV_BASE/.venv/Scripts/python.exe" \
-        "$_VENV_BASE/claude_mcp_servers/.venv/bin/python" \
-        "$_VENV_BASE/claude_mcp_servers/.venv/Scripts/python.exe"; do
-        if [ -x "$_cand" ]; then
-            VENV="$_cand"
-            break
-        fi
-    done
-fi
-[ -z "$VENV" ] && VENV="$PY"
+# v0.2.46 post-adversarial: source shared resolver. Previous inline logic
+# fell back to $PROJECT_ROOT/.venv when $VCT_INSTALL_ROOT was unset — that's
+# the USER's venv and won't have vco_lib.diagram_paths. Shared helper
+# refuses that fallback. PR-25 / v0.2.12 dual-layout history preserved in
+# the helper's docstring.
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+resolve_vco_venv_python "$SCRIPT_DIR"
+VENV="${VCO_VENV_PYTHON:-$PY}"
 
 # Validate via the canonical CLI. The CLI prints the corrective
 # message on stderr and exits 2 on violation — exactly the contract
