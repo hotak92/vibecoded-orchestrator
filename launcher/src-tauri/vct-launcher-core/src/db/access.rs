@@ -188,6 +188,154 @@ impl Db {
         Ok(total_renamed)
     }
 
+    /// v0.2.46 Decision A — boot-time backfill for orchestrator-root
+    /// primary/shared row alignment.
+    ///
+    /// Background: the GUI's `KG / Codegraph` tab saves one
+    /// `project_kg_bindings` row at a time (one role per save).
+    /// Pre-v0.2.46, saving `Role=primary` for the orchestrator-root
+    /// project did NOT touch the `Role=shared` row, leaving the two
+    /// out-of-sync. The v0.2.40 W40-B research doc §4b documented this
+    /// as the canonical drift class on VCO_dev's dogfood machine.
+    ///
+    /// v0.2.46 fixes this at write-time via
+    /// `set_project_kg_binding_with_root_sync` in `project_state.rs`.
+    /// THIS function backfills the same invariant at boot, for users
+    /// upgrading from a release where the write-time sync didn't exist
+    /// yet (every release v0.2.12-v0.2.45).
+    ///
+    /// Behaviour:
+    /// - Looks up the orchestrator-root project by slug.
+    /// - If the project has a `role='primary'` binding row AND a
+    ///   `role='shared'` row that names a DIFFERENT `collection_name`,
+    ///   rewrites the shared row's `collection_name` to match primary.
+    ///   The shared row gets `config_json.manual_override =
+    ///   "v0.2.46-sync-shared-to-primary-boot"` so a downstream auditor
+    ///   can see which boot did the fix.
+    /// - If the project has primary but NO shared row, INSERTs the
+    ///   shared row pointing at primary's `collection_name`.
+    /// - If primary doesn't exist at all (fresh machine, no
+    ///   orchestrator-root yet), no-op.
+    /// - If shared == primary already, no-op (idempotent).
+    ///
+    /// Soft-fail contract: returns Result; the boot caller logs and
+    /// continues. Same shape as `migrate_legacy_shared_kg_collection_names`.
+    ///
+    /// Returns `(updated: usize, inserted: usize)` so the caller can
+    /// surface what happened.
+    pub fn sync_shared_to_primary_for_orchestrator_root(
+        &self,
+    ) -> Result<(usize, usize), String> {
+        const ORCH_SLUG: &str = "orchestrator-root";
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let guard = self.lock();
+
+        // Step 1: find orchestrator-root project_id.
+        let project_id: Option<String> = guard
+            .query_row(
+                "SELECT id FROM projects WHERE slug = ?1",
+                params![ORCH_SLUG],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        let project_id = match project_id {
+            Some(p) => p,
+            None => return Ok((0, 0)), // no orchestrator-root yet → nothing to sync
+        };
+
+        // Step 2: read primary collection_name. If absent, nothing to mirror.
+        let primary_name: Option<String> = guard
+            .query_row(
+                "SELECT collection_name FROM project_kg_bindings
+                 WHERE project_id = ?1 AND role = 'primary'",
+                params![project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        let primary_name = match primary_name {
+            Some(name) if !name.is_empty() => name,
+            _ => return Ok((0, 0)),
+        };
+
+        // Step 3: read current shared row (if any).
+        let shared_now: Option<String> = guard
+            .query_row(
+                "SELECT collection_name FROM project_kg_bindings
+                 WHERE project_id = ?1 AND role = 'shared'",
+                params![project_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+
+        // Step 4: decide path.
+        match shared_now {
+            Some(ref existing) if existing == &primary_name => {
+                // Aligned already; no-op (idempotent).
+                Ok((0, 0))
+            }
+            Some(_) => {
+                // Existing shared row disagrees with primary; UPDATE.
+                let cfg = format!(
+                    "{{\"manual_override\":\"v0.2.46-sync-shared-to-primary-boot\"}}"
+                );
+                let updated = guard
+                    .execute(
+                        "UPDATE project_kg_bindings
+                         SET collection_name = ?1,
+                             config_json = ?2,
+                             updated_at = ?3
+                         WHERE project_id = ?4 AND role = 'shared'",
+                        params![primary_name, cfg, now, project_id],
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "sync_shared_to_primary_for_orchestrator_root: UPDATE: {}",
+                            e
+                        )
+                    })?;
+                if updated > 0 {
+                    eprintln!(
+                        "[vct] sync-shared-to-primary: orchestrator-root shared row \
+                         rewritten to '{}' (matches primary)",
+                        primary_name
+                    );
+                }
+                Ok((updated, 0))
+            }
+            None => {
+                // No shared row exists; INSERT one matching primary.
+                let cfg = format!(
+                    "{{\"manual_override\":\"v0.2.46-sync-shared-to-primary-boot\"}}"
+                );
+                let inserted = guard
+                    .execute(
+                        "INSERT INTO project_kg_bindings
+                         (project_id, role, collection_name, embedding_model,
+                          embedding_dim, kg_dir_path, weaviate_url,
+                          config_json, updated_at)
+                         VALUES (?1, 'shared', ?2, NULL, NULL, NULL, NULL,
+                                 ?3, ?4)",
+                        params![project_id, primary_name, cfg, now],
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "sync_shared_to_primary_for_orchestrator_root: INSERT: {}",
+                            e
+                        )
+                    })?;
+                if inserted > 0 {
+                    eprintln!(
+                        "[vct] sync-shared-to-primary: orchestrator-root shared row \
+                         created pointing at '{}' (matches primary)",
+                        primary_name
+                    );
+                }
+                Ok((0, inserted))
+            }
+        }
+    }
+
     /// W40-B (v0.2.40): cross-prefix self-heal for `project_kg_bindings`
     /// at launcher boot.
     ///
@@ -1053,6 +1201,260 @@ mod migrate_shared_kg_tests {
             .migrate_legacy_shared_kg_collection_names(CANONICAL)
             .unwrap();
         assert_eq!(second, 0, "second call must be a no-op");
+    }
+}
+
+// ─── Tests: sync_shared_to_primary_for_orchestrator_root (v0.2.46 Decision A boot backfill) ─────────
+
+#[cfg(test)]
+mod sync_shared_to_primary_tests {
+    use crate::db::Db;
+
+    /// Seed the orchestrator-root project plus arbitrary KG binding rows.
+    /// Returns the project_id so tests can inspect post-state.
+    fn seed_orchestrator_root(db: &Db) -> String {
+        let project_id = "orch-root-test";
+        let now = 1_700_000_000_000_i64;
+        let folder = format!("/tmp/test-sync-shared/{}", project_id);
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT OR IGNORE INTO projects \
+                 (id, name, folder_path, host, slug, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'orchestrator_root', 'orchestrator-root', ?4, ?4)",
+                rusqlite::params![project_id, "Orchestrator Root Test", folder, now],
+            )
+            .expect("seed orchestrator-root project");
+        project_id.to_string()
+    }
+
+    fn seed_kg_binding(
+        db: &Db,
+        project_id: &str,
+        role: &str,
+        collection_name: &str,
+        config_override: Option<&str>,
+    ) {
+        let now = 1_700_000_000_000_i64;
+        let cfg = config_override.unwrap_or("{}");
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT OR REPLACE INTO project_kg_bindings
+                 (project_id, role, collection_name, embedding_model,
+                  embedding_dim, kg_dir_path, weaviate_url,
+                  config_json, updated_at)
+                 VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4, ?5)",
+                rusqlite::params![project_id, role, collection_name, cfg, now],
+            )
+            .unwrap_or_else(|e| panic!("seed binding {} for {}: {}", role, project_id, e));
+    }
+
+    fn read_collection(db: &Db, project_id: &str, role: &str) -> Option<String> {
+        let guard = db.lock();
+        guard
+            .query_row(
+                "SELECT collection_name FROM project_kg_bindings
+                 WHERE project_id = ?1 AND role = ?2",
+                rusqlite::params![project_id, role],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    fn read_config(db: &Db, project_id: &str, role: &str) -> Option<String> {
+        let guard = db.lock();
+        guard
+            .query_row(
+                "SELECT config_json FROM project_kg_bindings
+                 WHERE project_id = ?1 AND role = ?2",
+                rusqlite::params![project_id, role],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+    }
+
+    /// VCO_dev-shape state: primary points at a populated collection, shared
+    /// is stuck at a previous canonical (`VibeCodedOrchestrator_KnowledgeGraph`).
+    /// Boot backfill must rewrite shared to match primary.
+    #[test]
+    fn vco_dev_shape_shared_rewritten_to_primary() {
+        let db = Db::open_in_memory().unwrap();
+        let project_id = seed_orchestrator_root(&db);
+        seed_kg_binding(&db, &project_id, "primary", "VCODev_KnowledgeGraph", None);
+        seed_kg_binding(
+            &db,
+            &project_id,
+            "shared",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            Some(r#"{"manual_override":"v0.2.28-recovery"}"#),
+        );
+
+        let (updated, inserted) = db
+            .sync_shared_to_primary_for_orchestrator_root()
+            .expect("sync should succeed");
+        assert_eq!(updated, 1);
+        assert_eq!(inserted, 0);
+
+        assert_eq!(
+            read_collection(&db, &project_id, "shared").as_deref(),
+            Some("VCODev_KnowledgeGraph"),
+            "shared must now equal primary"
+        );
+        // The mirror sentinel should be present.
+        assert!(
+            read_config(&db, &project_id, "shared")
+                .unwrap_or_default()
+                .contains("v0.2.46-sync-shared-to-primary-boot"),
+            "shared config_json should record the boot-sync sentinel"
+        );
+        // Primary unchanged.
+        assert_eq!(
+            read_collection(&db, &project_id, "primary").as_deref(),
+            Some("VCODev_KnowledgeGraph")
+        );
+    }
+
+    /// When shared row is absent entirely (partial-state edge case), it
+    /// must be INSERTED pointing at primary.
+    #[test]
+    fn shared_row_inserted_when_absent() {
+        let db = Db::open_in_memory().unwrap();
+        let project_id = seed_orchestrator_root(&db);
+        seed_kg_binding(&db, &project_id, "primary", "RootKG", None);
+        // No shared row.
+
+        let (updated, inserted) = db
+            .sync_shared_to_primary_for_orchestrator_root()
+            .expect("sync should succeed");
+        assert_eq!(updated, 0);
+        assert_eq!(inserted, 1);
+
+        assert_eq!(
+            read_collection(&db, &project_id, "shared").as_deref(),
+            Some("RootKG")
+        );
+    }
+
+    /// When shared already equals primary, the call is a no-op.
+    #[test]
+    fn aligned_state_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        let project_id = seed_orchestrator_root(&db);
+        seed_kg_binding(&db, &project_id, "primary", "Same", None);
+        seed_kg_binding(&db, &project_id, "shared", "Same", None);
+
+        let (updated, inserted) = db
+            .sync_shared_to_primary_for_orchestrator_root()
+            .expect("sync should succeed");
+        assert_eq!(updated, 0);
+        assert_eq!(inserted, 0);
+    }
+
+    /// Calling the boot sync twice in a row must be safe (idempotent).
+    #[test]
+    fn idempotent_second_call() {
+        let db = Db::open_in_memory().unwrap();
+        let project_id = seed_orchestrator_root(&db);
+        seed_kg_binding(&db, &project_id, "primary", "VCODev_KnowledgeGraph", None);
+        seed_kg_binding(
+            &db,
+            &project_id,
+            "shared",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            Some(r#"{"manual_override":"v0.2.28-recovery"}"#),
+        );
+
+        let (u1, i1) = db
+            .sync_shared_to_primary_for_orchestrator_root()
+            .unwrap();
+        assert_eq!((u1, i1), (1, 0));
+
+        let (u2, i2) = db
+            .sync_shared_to_primary_for_orchestrator_root()
+            .unwrap();
+        assert_eq!((u2, i2), (0, 0), "second call must be no-op");
+    }
+
+    /// If no orchestrator-root project exists (fresh machine, peer-only),
+    /// the function returns (0, 0) cleanly.
+    #[test]
+    fn no_orchestrator_root_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        // Don't seed any project at all.
+        let (updated, inserted) = db
+            .sync_shared_to_primary_for_orchestrator_root()
+            .expect("sync should succeed even when no project exists");
+        assert_eq!((updated, inserted), (0, 0));
+    }
+
+    /// If primary doesn't exist (only shared, e.g. partial install),
+    /// no-op (we don't auto-create primary from shared — one-way mirror).
+    #[test]
+    fn shared_only_without_primary_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        let project_id = seed_orchestrator_root(&db);
+        seed_kg_binding(&db, &project_id, "shared", "StrayShared", None);
+        // No primary.
+
+        let (updated, inserted) = db
+            .sync_shared_to_primary_for_orchestrator_root()
+            .unwrap();
+        assert_eq!((updated, inserted), (0, 0));
+        // Stray shared stays put.
+        assert_eq!(
+            read_collection(&db, &project_id, "shared").as_deref(),
+            Some("StrayShared")
+        );
+    }
+
+    /// Peer projects MUST NOT be touched by this function (only operates
+    /// on orchestrator-root). If a peer has primary=X, shared=Y (Y != X),
+    /// boot sync leaves both alone.
+    #[test]
+    fn peer_projects_untouched() {
+        let db = Db::open_in_memory().unwrap();
+        // Seed BOTH orchestrator-root AND a peer with mismatched bindings.
+        let root_id = seed_orchestrator_root(&db);
+        seed_kg_binding(&db, &root_id, "primary", "RootKG", None);
+        seed_kg_binding(&db, &root_id, "shared", "OldRootKG", None);
+
+        let peer_id = "peer-project";
+        let now = 1_700_000_000_000_i64;
+        let folder = format!("/tmp/test-sync-shared/{}", peer_id);
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects \
+                     (id, name, folder_path, host, slug, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, 'base', 'peer-project', ?4, ?4)",
+                    rusqlite::params![peer_id, "Peer", folder, now],
+                )
+                .unwrap();
+        }
+        seed_kg_binding(&db, peer_id, "primary", "PeerKG", None);
+        seed_kg_binding(&db, peer_id, "shared", "PeerSharedDifferent", None);
+
+        let _ = db
+            .sync_shared_to_primary_for_orchestrator_root()
+            .unwrap();
+
+        // Peer must be unchanged.
+        assert_eq!(
+            read_collection(&db, peer_id, "primary").as_deref(),
+            Some("PeerKG")
+        );
+        assert_eq!(
+            read_collection(&db, peer_id, "shared").as_deref(),
+            Some("PeerSharedDifferent"),
+            "peer shared row must NOT be touched by boot sync"
+        );
+        // Root was healed.
+        assert_eq!(
+            read_collection(&db, &root_id, "shared").as_deref(),
+            Some("RootKG")
+        );
     }
 }
 

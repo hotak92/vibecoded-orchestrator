@@ -1000,6 +1000,54 @@ pub fn run() {
                 }
             }
 
+            // v0.2.46 Decision A — orchestrator-root primary/shared backfill.
+            //
+            // For users upgrading from any release v0.2.12-v0.2.45 where
+            // the write-time auto-sync didn't exist yet: the GUI's "Save
+            // KG binding" path wrote one row at a time, so a primary
+            // rebind never propagated to shared. v0.2.46 fixes write-
+            // time via `Db::set_project_kg_binding_with_root_sync` in
+            // `project_state.rs`; THIS boot step backfills any drift
+            // that was left over from the prior release shape.
+            //
+            // Idempotent (no-op when shared already matches primary). No
+            // network calls (pure SQLite). Soft-fail.
+            //
+            // Position: AFTER NEW-12 (canonical name finalized first) and
+            // BEFORE W40-B (so the cross-prefix adopt operates on a
+            // shared row that's already aligned with primary).
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    match db.inner().sync_shared_to_primary_for_orchestrator_root() {
+                        Ok((updated, inserted)) => {
+                            if updated > 0 || inserted > 0 {
+                                eprintln!(
+                                    "[vct] sync-shared-to-primary (boot): \
+                                     orchestrator-root updated={} inserted={}",
+                                    updated, inserted
+                                );
+                                let _ = db.audit(
+                                    "kg_binding_shared_synced_to_primary_at_boot",
+                                    None,
+                                    None,
+                                    &serde_json::json!({
+                                        "updated": updated,
+                                        "inserted": inserted,
+                                    }),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] sync-shared-to-primary warning (non-fatal): {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             // W40-B (v0.2.40, 2026-05-30): cross-prefix KG binding
             // adoption + env regen-on-stale.
             //

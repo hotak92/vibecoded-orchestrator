@@ -665,8 +665,21 @@ pub async fn set_project_kg_binding(
         }
     }
 
-    let row = db.set_project_kg_binding(
+    // v0.2.46 Decision A — orchestrator-root primary/shared atomic auto-sync.
+    // Resolve the project's slug so the DB layer can detect the
+    // orchestrator-root case (slug == "orchestrator-root"). For peer
+    // projects the slug isn't "orchestrator-root", so only the
+    // requested row is written. Soft-fail to empty-string on a missing
+    // project (the underlying write will fail with a clearer FK error).
+    let project_slug = db
+        .get_project(&project_id)
+        .ok()
+        .flatten()
+        .map(|p| p.slug)
+        .unwrap_or_default();
+    let row = db.set_project_kg_binding_with_root_sync(
         &project_id,
+        &project_slug,
         &req.role,
         &req.collection_name,
         req.embedding_model.as_deref(),

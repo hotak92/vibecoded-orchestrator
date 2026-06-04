@@ -1019,6 +1019,142 @@ impl Db {
         })
     }
 
+    /// v0.2.46 Decision A — orchestrator-root primary/shared atomic auto-sync.
+    ///
+    /// Wraps `set_project_kg_binding` in a single lock-acquired transaction.
+    /// When `project_slug == "orchestrator-root"` AND `role == "primary"`,
+    /// ALSO upserts the `shared` row to the same `collection_name` so both
+    /// rows stay equal by construction. This eliminates the drift class the
+    /// v0.2.40 W40-B research doc §4b documented (primary rebound but
+    /// shared row stale).
+    ///
+    /// Semantics:
+    /// - **Always** writes the explicitly-requested (role, collection_name) row.
+    /// - **One-way mirror**: only `primary → shared` triggers the sync. Writing
+    ///   directly to `shared` for orchestrator-root does NOT touch `primary`,
+    ///   so a stale GUI form can't silently overwrite the canonical primary.
+    /// - **For peer projects**: the slug isn't `"orchestrator-root"`, so only
+    ///   the requested row is written. No mirror.
+    /// - **Mirror sentinel**: the mirrored shared row gets
+    ///   `config_json.manual_override = "v0.2.46-sync-shared-to-primary"` so
+    ///   the env-backfill path can audit the sync source.
+    /// - **Atomic via single lock**: both writes happen under one `self.lock()`
+    ///   acquisition, so a concurrent reader sees either both rows aligned or
+    ///   neither (no half-state window).
+    ///
+    /// Returns the `ProjectKgBinding` for the EXPLICITLY-requested role,
+    /// matching `set_project_kg_binding`'s contract.
+    pub fn set_project_kg_binding_with_root_sync(
+        &self,
+        project_id: &str,
+        project_slug: &str,
+        role: &str,
+        collection_name: &str,
+        embedding_model: Option<&str>,
+        embedding_dim: Option<i64>,
+        kg_dir_path: Option<&str>,
+        weaviate_url: Option<&str>,
+        config: &JsonValue,
+    ) -> Result<ProjectKgBinding, String> {
+        check_in("kg_binding.role", role, VALID_KG_ROLE)?;
+        let now = Utc::now().timestamp_millis();
+        let cfg = json_to_str(config);
+        // Build the mirror config (only used when mirroring to shared).
+        let mirror_config = {
+            // Start from the user-supplied config (preserving any user-set
+            // keys) and override `manual_override` to flag the sync source.
+            let mut m = match config {
+                JsonValue::Object(o) => o.clone(),
+                _ => serde_json::Map::new(),
+            };
+            m.insert(
+                "manual_override".to_string(),
+                JsonValue::String("v0.2.46-sync-shared-to-primary".to_string()),
+            );
+            json_to_str(&JsonValue::Object(m))
+        };
+
+        let should_mirror = project_slug == "orchestrator-root" && role == "primary";
+
+        let guard = self.lock();
+        // Both upserts inside one connection lock. SQLite serialises
+        // writes through this Mutex; a transaction here is belt-and-
+        // suspenders for atomic visibility across the two row writes.
+        guard
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| format!("set_project_kg_binding_with_root_sync: BEGIN: {}", e))?;
+
+        let primary_write = guard.execute(
+            "INSERT INTO project_kg_bindings
+             (project_id, role, collection_name, embedding_model, embedding_dim,
+              kg_dir_path, weaviate_url, config_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(project_id, role) DO UPDATE SET
+                collection_name = excluded.collection_name,
+                embedding_model = excluded.embedding_model,
+                embedding_dim = excluded.embedding_dim,
+                kg_dir_path = excluded.kg_dir_path,
+                weaviate_url = excluded.weaviate_url,
+                config_json = excluded.config_json,
+                updated_at = excluded.updated_at",
+            params![
+                project_id, role, collection_name, embedding_model, embedding_dim,
+                kg_dir_path, weaviate_url, cfg, now,
+            ],
+        );
+
+        if let Err(e) = primary_write {
+            // Best-effort rollback; even if it fails, the lock release
+            // restores a consistent state at the SQLite WAL level.
+            let _ = guard.execute_batch("ROLLBACK");
+            return Err(format!("set_project_kg_binding_with_root_sync: primary write: {}", e));
+        }
+
+        if should_mirror {
+            let mirror_write = guard.execute(
+                "INSERT INTO project_kg_bindings
+                 (project_id, role, collection_name, embedding_model, embedding_dim,
+                  kg_dir_path, weaviate_url, config_json, updated_at)
+                 VALUES (?1, 'shared', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(project_id, role) DO UPDATE SET
+                    collection_name = excluded.collection_name,
+                    embedding_model = excluded.embedding_model,
+                    embedding_dim = excluded.embedding_dim,
+                    kg_dir_path = excluded.kg_dir_path,
+                    weaviate_url = excluded.weaviate_url,
+                    config_json = excluded.config_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    project_id, collection_name, embedding_model, embedding_dim,
+                    kg_dir_path, weaviate_url, mirror_config, now,
+                ],
+            );
+            if let Err(e) = mirror_write {
+                let _ = guard.execute_batch("ROLLBACK");
+                return Err(format!(
+                    "set_project_kg_binding_with_root_sync: shared mirror write: {}",
+                    e
+                ));
+            }
+        }
+
+        guard
+            .execute_batch("COMMIT")
+            .map_err(|e| format!("set_project_kg_binding_with_root_sync: COMMIT: {}", e))?;
+
+        Ok(ProjectKgBinding {
+            project_id: project_id.to_string(),
+            role: role.to_string(),
+            collection_name: collection_name.to_string(),
+            embedding_model: embedding_model.map(str::to_string),
+            embedding_dim,
+            kg_dir_path: kg_dir_path.map(str::to_string),
+            weaviate_url: weaviate_url.map(str::to_string),
+            config: config.clone(),
+            updated_at: now,
+        })
+    }
+
     pub fn list_project_kg_bindings(
         &self,
         project_id: &str,
@@ -1942,6 +2078,259 @@ mod tests {
         db.delete_project_kg_binding("p1", "shared").unwrap();
         let bindings = db.list_project_kg_bindings("p1").unwrap();
         assert_eq!(bindings.len(), 1);
+    }
+
+    // v0.2.46 Decision A — orchestrator-root primary→shared auto-sync.
+    //
+    // The orchestrator-root project is special: its primary KG binding
+    // IS the shared KG name every peer project resolves through
+    // `resolve_shared_kg_from_orchestrator_root`. To eliminate the drift
+    // class the v0.2.40 W40-B research doc §4b documented (primary
+    // rebound but shared row stale), writes to the orchestrator-root
+    // primary row must atomically mirror to the shared row.
+    //
+    // For peer projects, the shared row stays user-controlled
+    // (a peer can be configured to read from a custom shared name).
+    //
+    // The atomic write goes through a new method
+    // `set_project_kg_binding_with_root_sync` that wraps the standard
+    // path in a single lock-acquired transaction. The signature mirrors
+    // `set_project_kg_binding` plus a `project_slug` to detect the
+    // orchestrator-root case (slug comparison happens in the wrapper, not
+    // in the DB-layer write — the DB layer doesn't know slugs are
+    // semantically meaningful).
+
+    const ORCHESTRATOR_ROOT_SLUG_FOR_TEST: &str = "orchestrator-root";
+
+    #[test]
+    fn root_primary_write_mirrors_to_shared() {
+        let db = make_db();
+        // Seed orchestrator-root project (slug = the canonical value).
+        let folder = if cfg!(windows) {
+            format!(r"C:\tmp\vct-test-root-{}", uuid::Uuid::new_v4())
+        } else {
+            format!("/tmp/vct-test-root-{}", uuid::Uuid::new_v4())
+        };
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'orchestrator_root', ?4, ?5, ?5)",
+                    params![
+                        "root1",
+                        "Orchestrator Root",
+                        folder,
+                        ORCHESTRATOR_ROOT_SLUG_FOR_TEST,
+                        1_700_000_000_000_i64,
+                    ],
+                )
+                .unwrap();
+        }
+        // Seed a shared row first that names a DIFFERENT collection (the
+        // stale state). After the atomic root sync, it must be rewritten.
+        db.set_project_kg_binding(
+            "root1",
+            "shared",
+            "StaleSharedName",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!({"manual_override": "v0.2.28-recovery"}),
+        )
+        .unwrap();
+
+        // Write the primary via the new auto-sync method, naming a
+        // populated collection.
+        db.set_project_kg_binding_with_root_sync(
+            "root1",
+            ORCHESTRATOR_ROOT_SLUG_FOR_TEST,
+            "primary",
+            "RootKnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+        )
+        .expect("root sync should succeed");
+
+        // BOTH primary and shared rows must now name the new value.
+        let bindings = db.list_project_kg_bindings("root1").unwrap();
+        let primary = bindings.iter().find(|b| b.role == "primary").unwrap();
+        let shared = bindings.iter().find(|b| b.role == "shared").unwrap();
+        assert_eq!(primary.collection_name, "RootKnowledgeGraph");
+        assert_eq!(
+            shared.collection_name, "RootKnowledgeGraph",
+            "shared row MUST mirror primary for orchestrator-root"
+        );
+        // The shared row's manual_override should reflect the sync source
+        // (so the env-backfill path can audit it).
+        assert_eq!(
+            shared
+                .config
+                .get("manual_override")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "v0.2.46-sync-shared-to-primary",
+            "shared row's config_json.manual_override should signal the sync source"
+        );
+    }
+
+    #[test]
+    fn peer_primary_write_does_not_mirror_to_shared() {
+        let db = make_db();
+        seed_project(&db, "peer1", "Peer Project");
+        // Seed a shared row that names a DIFFERENT collection.
+        db.set_project_kg_binding(
+            "peer1",
+            "shared",
+            "PeerSharedName",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+        // Write the primary via the auto-sync method, but pass a peer slug.
+        db.set_project_kg_binding_with_root_sync(
+            "peer1",
+            "peer-project",
+            "primary",
+            "PeerPrimary",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .expect("peer write should succeed");
+
+        // Primary is updated, shared is unchanged.
+        let bindings = db.list_project_kg_bindings("peer1").unwrap();
+        let primary = bindings.iter().find(|b| b.role == "primary").unwrap();
+        let shared = bindings.iter().find(|b| b.role == "shared").unwrap();
+        assert_eq!(primary.collection_name, "PeerPrimary");
+        assert_eq!(
+            shared.collection_name, "PeerSharedName",
+            "peer projects keep their own shared name; only orchestrator-root mirrors"
+        );
+    }
+
+    #[test]
+    fn root_shared_write_does_not_back_mirror_to_primary() {
+        // Writing directly to the shared role on orchestrator-root must
+        // NOT propagate to primary (one-way mirror only). The shared row
+        // is treated as a derived value the launcher manages; only
+        // writes to PRIMARY trigger the sync. This prevents a stale GUI
+        // form from overwriting the canonical primary.
+        let db = make_db();
+        let folder = if cfg!(windows) {
+            format!(r"C:\tmp\vct-test-root2-{}", uuid::Uuid::new_v4())
+        } else {
+            format!("/tmp/vct-test-root2-{}", uuid::Uuid::new_v4())
+        };
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'orchestrator_root', ?4, ?5, ?5)",
+                    params![
+                        "root2",
+                        "Orchestrator Root 2",
+                        folder,
+                        ORCHESTRATOR_ROOT_SLUG_FOR_TEST,
+                        1_700_000_000_000_i64,
+                    ],
+                )
+                .unwrap();
+        }
+        db.set_project_kg_binding(
+            "root2",
+            "primary",
+            "RootPrimary",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+        // Write to shared role only. Primary must NOT be touched.
+        db.set_project_kg_binding_with_root_sync(
+            "root2",
+            ORCHESTRATOR_ROOT_SLUG_FOR_TEST,
+            "shared",
+            "DifferentSharedName",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .expect("shared-only write should succeed");
+
+        let bindings = db.list_project_kg_bindings("root2").unwrap();
+        let primary = bindings.iter().find(|b| b.role == "primary").unwrap();
+        let shared = bindings.iter().find(|b| b.role == "shared").unwrap();
+        assert_eq!(
+            primary.collection_name, "RootPrimary",
+            "primary must NOT be overwritten when writing to shared"
+        );
+        assert_eq!(shared.collection_name, "DifferentSharedName");
+    }
+
+    #[test]
+    fn root_primary_write_creates_shared_when_absent() {
+        // Edge case: orchestrator-root has primary but no shared row yet
+        // (e.g., during a partial-state install). The auto-sync must
+        // INSERT the shared row, not just UPDATE.
+        let db = make_db();
+        let folder = if cfg!(windows) {
+            format!(r"C:\tmp\vct-test-root3-{}", uuid::Uuid::new_v4())
+        } else {
+            format!("/tmp/vct-test-root3-{}", uuid::Uuid::new_v4())
+        };
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'orchestrator_root', ?4, ?5, ?5)",
+                    params![
+                        "root3",
+                        "Orchestrator Root 3",
+                        folder,
+                        ORCHESTRATOR_ROOT_SLUG_FOR_TEST,
+                        1_700_000_000_000_i64,
+                    ],
+                )
+                .unwrap();
+        }
+        // No shared row yet.
+        let initial = db.list_project_kg_bindings("root3").unwrap();
+        assert_eq!(initial.len(), 0);
+
+        db.set_project_kg_binding_with_root_sync(
+            "root3",
+            ORCHESTRATOR_ROOT_SLUG_FOR_TEST,
+            "primary",
+            "FreshRootKG",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+
+        let bindings = db.list_project_kg_bindings("root3").unwrap();
+        assert_eq!(bindings.len(), 2, "both primary and shared rows must exist");
+        assert!(bindings.iter().any(|b| b.role == "primary" && b.collection_name == "FreshRootKG"));
+        assert!(bindings.iter().any(|b| b.role == "shared" && b.collection_name == "FreshRootKG"));
     }
 
     #[test]

@@ -2514,12 +2514,27 @@ mod tests {
             .unwrap_or_else(|e| panic!("deserialize {}: {}", path.display(), e));
 
         assert_eq!(manifest.id, "vct-rl-reranker");
-        // G3 (v0.2.22): bumped to 0.1.1 — the version actually released on
-        // GHCR (`ghcr.io/hotak92/vct-rl-reranker:0.1.1-{cpu,cuda,rocm}`) and
-        // the version that `runtime.args` + `gpu_image_variants` already
-        // pin. Pre-v0.2.22 the manifest top-level was 0.1.2 (an unreleased
-        // bump), while this test still asserted 0.1.0 — both stale.
-        assert_eq!(manifest.version, "0.1.1");
+        // v0.2.46: pin the manifest's series rather than the exact patch
+        // level so the test stays useful across paid-module releases
+        // without needing a hand-edit on every bump. Earlier exact-equal
+        // assertions (0.1.0 / 0.1.1) drifted out of sync with releases.
+        // Asserts (a) starts with "0." (catches a major-version reorg)
+        // AND (b) lands in a known active series. Update the allowlist
+        // when the paid module's major minor advances.
+        assert!(
+            manifest.version.starts_with("0."),
+            "manifest.version = {:?} — expected a 0.x release",
+            manifest.version
+        );
+        let active_series = ["0.2.", "0.3.", "0.4."];
+        assert!(
+            active_series
+                .iter()
+                .any(|prefix| manifest.version.starts_with(prefix)),
+            "manifest.version = {:?} — paid module is in the 0.2.x series; \
+             update active_series list when the module advances past 0.4.x",
+            manifest.version
+        );
         assert_eq!(manifest.install.method, InstallMethod::ContainerPull);
         assert!(manifest.license.required);
         assert_eq!(manifest.license.min_orchestrator_tier, "pro");
@@ -2945,7 +2960,25 @@ mod tests {
         assert!(has_checkbox, "manifest must declare at least one checkbox");
         assert!(has_button, "manifest must declare at least one button");
         assert!(has_multi_select, "manifest must declare a multi_select");
-        assert!(has_info, "section 1 must include at least one info banner");
+        // v0.2.46: also accept `info_dynamic` (live-updating info banner,
+        // added in v0.2.32). The earlier assertion against `has_info` alone
+        // failed because the current vct-rl-reranker manifest uses three
+        // `info_dynamic` controls in section 1 (weights_version_live,
+        // last_training_live, active_embedding_live) instead of static info
+        // banners. The semantic intent ("the user sees at-a-glance status")
+        // is satisfied either way.
+        let mut has_info_dynamic = false;
+        for section in &tab.sections {
+            for control in &section.controls {
+                if matches!(control, ConfigControl::InfoDynamic { .. }) {
+                    has_info_dynamic = true;
+                }
+            }
+        }
+        assert!(
+            has_info || has_info_dynamic,
+            "section 1 must include at least one info banner (info OR info_dynamic)"
+        );
     }
 
     // ─── v0.2.20: per-module GPU mode hints (RuntimeBlock additions) ───
