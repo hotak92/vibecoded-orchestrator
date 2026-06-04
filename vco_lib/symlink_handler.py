@@ -66,9 +66,18 @@ __all__ = [
     "is_symlink_blocking",
     "compute_vco_new_path",
     "emit_symlink_deferral",
+    "check_vco_new_collision",
     "SYMLINK_PRESERVED_CONDITION_ID",
     "VCO_NEW_SUFFIX",
+    "VCO_NEW_COLLISION_CONDITION_ID",
 ]
+
+
+# Stable condition_id for the V47-B-followup (post-adversarial L1) check:
+# a .vco-new sibling from a PRIOR install run already exists at the path
+# VCO would write to now. The caller may have hand-edited it between runs
+# and we'd silently clobber that work without this guard.
+VCO_NEW_COLLISION_CONDITION_ID = "vco_new_sibling_collision"
 
 
 SYMLINK_PRESERVED_CONDITION_ID = "symlink_preserved_under_install_path"
@@ -251,3 +260,100 @@ def emit_symlink_deferral(
         severity="info",
     )
     deferral.add_entry(entry)
+
+
+
+def check_vco_new_collision(
+    vco_new: Path,
+    install_root: Path | None = None,
+    deferral: "DeferralReport | None" = None,
+) -> bool:
+    """v0.2.46 post-adversarial L1: detect pre-existing `.vco-new` siblings.
+
+    Returns True iff a prior install run already wrote content at
+    ``vco_new``. The caller should:
+      - Skip the write (don't silently clobber).
+      - Print a one-line warning to the user.
+      - Optionally emit a structured deferral so UPDATE_DEFERRED.md
+        names the collision and tells the user how to reconcile.
+
+    Adversarial review S4 surfaced this: if a user hand-edited a
+    ``.claude/agents.vco-new`` between runs (perhaps mid-reconciliation,
+    perhaps to tweak the bundled defaults), the NEXT install run would
+    silently overwrite that work via ``shutil.copy2`` / ``write_text``
+    with ``exist_ok=True``. No timestamp, no warning, no recovery hint.
+
+    The L1 fix is conservative: detect the collision (presence check via
+    ``os.path.lexists`` so dangling symlinks at the sibling path also
+    trip the gate), let the caller skip the write, emit a deferral
+    instructing the user to either (a) delete the prior ``.vco-new``
+    to accept a fresh stage on the next run, or (b) move the prior
+    ``.vco-new`` somewhere safe and re-run.
+
+    Why presence-check, not timestamp-suffix re-naming:
+        The adversarial proposed "use ``.vco-new.<timestamp>`` so old
+        siblings are preserved." That accumulates noise — every re-run
+        adds a new dated dir/file, the user has no way to know which
+        one they meant to keep, and grep-discoverability for
+        ``find . -name '*.vco-new'`` degrades. Presence-check + skip
+        preserves the simple naming scheme and pushes the conflict to
+        the user (the right place — they're the one who hand-edited).
+
+    Args:
+        vco_new: The would-be write target (already computed via
+            ``compute_vco_new_path``).
+        install_root: For relative-path display in the deferral entry.
+        deferral: Optional ``DeferralReport`` to emit a structured
+            collision entry. When None, the function only returns the
+            boolean (caller logs / warns however it wants).
+
+    Returns:
+        True iff a collision is detected (caller must skip the write).
+        False iff the slot is free (caller proceeds normally).
+    """
+    if not os.path.lexists(os.fspath(vco_new)):
+        return False  # slot is free — caller proceeds
+
+    if deferral is not None:
+        # Lazy import — same rationale as emit_symlink_deferral.
+        from vco_lib.deferral_report import DeferralEntry
+
+        if install_root is not None:
+            try:
+                display = str(Path(vco_new).relative_to(install_root))
+            except ValueError:
+                display = str(vco_new)
+        else:
+            display = str(vco_new)
+
+        detected = (
+            f"`{display}` already exists from a prior install run. VCO "
+            f"refused to overwrite it; the original .vco-new content was "
+            f"preserved untouched. The new content VCO would have written "
+            f"was NOT staged this run."
+        )
+        why_deferred = (
+            "Silently clobbering a `.vco-new` sibling from a prior run "
+            "could destroy user work (the user may have hand-edited the "
+            "sibling between runs to tweak the bundled defaults). VCO "
+            "preserves the prior content and asks the user to reconcile."
+        )
+        command_to_apply = (
+            f"# Option A — discard prior .vco-new and re-stage fresh on next run:\n"
+            f"rm -rf '{display}'  &&  python install.py --update\n"
+            f"\n"
+            f"# Option B — move prior .vco-new aside, then re-stage:\n"
+            f"mv '{display}' '{display}.kept-by-user'  &&  python install.py --update"
+        )
+
+        entry = DeferralEntry(
+            condition_id=VCO_NEW_COLLISION_CONDITION_ID,
+            title=".vco-new sibling collision (prior run)",
+            detected=detected,
+            why_deferred=why_deferred,
+            command_to_apply=command_to_apply,
+            severity="info",
+        )
+        deferral.add_entry(entry)
+
+    return True

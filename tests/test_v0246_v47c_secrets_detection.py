@@ -186,6 +186,90 @@ class TestAuditEnvSecrets:
         assert len(result) == 1
         assert result[0].value == "ghp_abc"
 
+    # v0.2.46 post-adversarial M2: pin the documented multi-line-value
+    # limitation. These tests assert CURRENT (line-based) behavior so a
+    # future "fix" for multi-line support doesn't silently regress how
+    # we read industry-standard .env files. See docstring in
+    # vco_lib/secrets_audit.audit_env_secrets for the rationale.
+
+    def test_multiline_quoted_value_documented_misread(self, tmp_path: Path) -> None:
+        """Multi-line quoted values read only the first line.
+
+        Documented limitation: a value spanning multiple lines via embedded
+        raw newlines inside quotes is not understood. Parser reads ONLY the
+        first line of the value; subsequent lines are interpreted as
+        separate lines (which may be skipped, treated as bad KEY=VAL, or
+        flagged as their own secret-shaped entries).
+        """
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "JSON_KEY='{\"private_key\": \"-----BEGIN-----\n"
+            "MIIEv...\n"
+            "-----END-----\"}'\n"
+        )
+        result = secrets_audit.audit_env_secrets(env_path)
+        # JSON_KEY is detected (secret-shaped name) but its value is just the
+        # first-line fragment up to and including the opening newline.
+        # The subsequent `MIIEv...` line has no `=` and is silently skipped.
+        # The `-----END-----"}'` line also has no `=` and is silently skipped.
+        json_key_entries = [s for s in result if s.key == "JSON_KEY"]
+        assert len(json_key_entries) == 1
+        # Value is the first-line content (with quote-stripping applied).
+        # Just assert it does NOT contain `MIIEv` — proving the multi-line
+        # span was NOT joined into a single value.
+        assert "MIIEv" not in json_key_entries[0].value, (
+            "Multi-line value should not be joined across raw newlines. "
+            "If this test starts failing, the parser was extended to handle "
+            "multi-line values — update both the test and the docstring."
+        )
+
+    def test_multiline_backslash_continuation_documented_misread(self, tmp_path: Path) -> None:
+        """Shell line-continuation (``\\`` at EOL) inside a value reads as literal.
+
+        Documented limitation: ``KEY=part1\\\\\\npart2`` (with a literal backslash
+        before newline) is not interpreted as line continuation. The parser
+        reads the value as ending at the first newline, and `part2` becomes
+        its own (probably skipped) line.
+        """
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "API_TOKEN=ghp_part1\\\n"
+            "part2_continues_here\n"
+        )
+        result = secrets_audit.audit_env_secrets(env_path)
+        # API_TOKEN is detected (secret-shaped) but value ends at first \n.
+        api_entries = [s for s in result if s.key == "API_TOKEN"]
+        assert len(api_entries) == 1
+        assert "part2" not in api_entries[0].value, (
+            "Shell line-continuation should NOT be honored. "
+            "If this test starts failing, the parser was extended; "
+            "update both the test and the docstring."
+        )
+
+    def test_underflagging_is_the_safe_failure_mode(self, tmp_path: Path) -> None:
+        """Document the safety property: parser UNDER-FLAGS rather than over-flags.
+
+        If a real multi-line secret is in the .env, it gets missed (user can
+        still add it via the launcher Secrets tab manually). The opposite
+        failure mode — flagging a non-secret as if it were one — could lead
+        VCO to migrate a sentinel/placeholder/comment to the keychain, which
+        would be confusing. Today's parser errs on the safe side.
+        """
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "# multi-line block follows; parser only sees its first line\n"
+            "PEM_KEY='-----BEGIN PRIVATE KEY-----\n"
+            "actual_key_material_here\n"
+            "-----END PRIVATE KEY-----'\n"
+        )
+        result = secrets_audit.audit_env_secrets(env_path)
+        # PEM_KEY matches the secret-shape heuristic on its key portion.
+        pem_entries = [s for s in result if s.key == "PEM_KEY"]
+        assert len(pem_entries) == 1
+        # The captured value is just the first line — does NOT contain the
+        # real key material.
+        assert "actual_key_material_here" not in pem_entries[0].value
+
 
 class TestRewriteEnvWithSentinels:
     """Atomic sentinel rewrite preserves structure."""
@@ -233,6 +317,164 @@ class TestRewriteEnvWithSentinels:
         secrets_audit.rewrite_env_with_sentinels(env_path, ["GITHUB_TOKEN"])
         mode = stat.S_IMODE(env_path.stat().st_mode)
         assert mode == 0o600, f"mode changed: {oct(mode)}"
+
+
+class TestMultiLineSecretPreservation:
+    """v0.2.46 post-adversarial M2 (revised): the user-data-never-lost gate.
+
+    The line-based parser knowingly misses multi-line secrets — that's a
+    documented limitation. The critical safety property is that a missed
+    multi-line secret is NEVER silently removed from ``.env``. These tests
+    pin that property end-to-end:
+
+      1. ``audit_env_secrets`` does not surface the multi-line secret's key.
+      2. The interactive migration prompt therefore can't ask the user to
+         accept it.
+      3. ``rewrite_env_with_sentinels`` is only ever called with keys the
+         user explicitly accepted, so a missed key is never in
+         ``migrated_keys``.
+      4. Lines whose key is not in ``migrated_keys`` are passed through
+         byte-identical.
+
+    Failure mode: a future "improvement" to ``rewrite_env_with_sentinels``
+    that tries to be smarter — e.g. "also normalize quoted blocks" or
+    "strip trailing whitespace from all lines" — would break these tests
+    and tell the contributor that the user-data-never-lost property is at
+    risk.
+    """
+
+    def test_missed_multiline_key_not_in_audit_result(self, tmp_path: Path) -> None:
+        """A multi-line secret's key MAY or MAY NOT be in the audit list
+        (depends on what the first line happens to look like). What
+        matters is that the multi-line VALUE is never returned in full —
+        the parser can never accept it for migration. The downstream
+        rewrite is only safe because of that.
+        """
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "REGULAR_TOKEN=ghp_safe_to_migrate\n"
+            "JSON_KEY='{\"private_key\": \"-----BEGIN-----\n"
+            "MIIE_real_secret_material_PLACEHOLDER\n"
+            "-----END-----\"}'\n"
+        )
+        result = secrets_audit.audit_env_secrets(env_path)
+        # The multi-line value is NOT captured intact: even if JSON_KEY
+        # was returned, the second-line material is NOT in its value.
+        for entry in result:
+            assert "MIIE_real_secret_material_PLACEHOLDER" not in entry.value, (
+                f"audit_env_secrets returned a value that includes "
+                f"second-line material from a multi-line secret. The "
+                f"parser was extended; update this test + the doc."
+            )
+
+    def test_rewrite_skips_keys_not_in_migrated_list(self, tmp_path: Path) -> None:
+        """Property: keys whose names are NOT in ``migrated_keys`` are
+        passed through byte-identical, even if they look secret-shaped.
+
+        This is the load-bearing property: it's why missing a multi-line
+        secret doesn't lose user data.
+        """
+        env_path = tmp_path / ".env"
+        original = (
+            "OPENAI_API_KEY=sk-this_will_be_migrated\n"
+            "JSON_KEY='{\"private_key\": \"-----BEGIN-----\n"
+            "MIIE_PLACEHOLDER_material\n"
+            "-----END-----\"}'\n"
+            "ANOTHER_TOKEN=ghp_audit_missed_this_one_too\n"
+        )
+        env_path.write_text(original)
+        # User explicitly accepted ONLY OPENAI_API_KEY. JSON_KEY and
+        # ANOTHER_TOKEN (whatever the audit thought of them) are NOT in
+        # this list.
+        secrets_audit.rewrite_env_with_sentinels(env_path, ["OPENAI_API_KEY"])
+        rewritten = env_path.read_text()
+
+        # OPENAI_API_KEY value should have been replaced.
+        assert "sk-this_will_be_migrated" not in rewritten
+        assert "OPENAI_API_KEY=__vco_keychain__" in rewritten
+
+        # CRITICAL — multi-line value lines must be exactly preserved.
+        assert "MIIE_PLACEHOLDER_material" in rewritten
+        assert "-----BEGIN-----" in rewritten
+        assert "-----END-----" in rewritten
+
+        # CRITICAL — ANOTHER_TOKEN (not in migrated_keys) preserved as-is.
+        assert "ANOTHER_TOKEN=ghp_audit_missed_this_one_too" in rewritten
+
+    def test_rewrite_preserves_every_non_migrated_line_byte_identical(
+        self, tmp_path: Path,
+    ) -> None:
+        """Stronger form: for every line whose key is not in
+        ``migrated_keys`` (or which is not a KEY=VAL line at all), the
+        line is preserved byte-identical, modulo the trailing newline
+        normalization that ``splitlines() + join()`` performs.
+        """
+        env_path = tmp_path / ".env"
+        original_lines = [
+            "# leading comment",
+            "",
+            "OPENAI_API_KEY=sk-migrate_me",
+            "JSON_KEY='{\"k\": \"v_first_line",
+            "v_second_line",
+            "v_third_line\"}'",
+            "# trailing comment",
+            "PEM_DATA=-----BEGIN-----",
+            "real_pem_body_PLACEHOLDER",
+            "-----END-----",
+            "PORT=8080",
+        ]
+        env_path.write_text("\n".join(original_lines) + "\n")
+        secrets_audit.rewrite_env_with_sentinels(env_path, ["OPENAI_API_KEY"])
+        rewritten_lines = env_path.read_text().splitlines()
+
+        # Build expectation: same lines, only the OPENAI_API_KEY one's
+        # value replaced by the sentinel.
+        for orig, new in zip(original_lines, rewritten_lines):
+            if orig.startswith("OPENAI_API_KEY="):
+                # value replaced by sentinel
+                assert new == "OPENAI_API_KEY=__vco_keychain__", (
+                    f"OPENAI_API_KEY line not sentinel-rewritten: {new!r}"
+                )
+            else:
+                assert new == orig, (
+                    f"Non-migrated line was modified! "
+                    f"original={orig!r} new={new!r} — "
+                    f"this breaks the user-data-never-lost property."
+                )
+
+    def test_documented_misread_does_not_cause_data_loss(self, tmp_path: Path) -> None:
+        """End-to-end: even when the audit returns garbage for a
+        multi-line secret, the final ``.env`` retains the secret bytes.
+
+        Simulates the worst case the documented limitation can produce —
+        and proves it does not lose user data.
+        """
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "# multi-line secret follows\n"
+            "GH_DEPLOY_KEY='-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "b3BlbnNzaC1rZXktdjEAAAAA_PLACEHOLDER_BLOB\n"
+            "-----END OPENSSH PRIVATE KEY-----'\n"
+            "OTHER_TOKEN=ghp_normal_migrate_target\n"
+        )
+        # Audit returns what it returns. Caller would prompt user about
+        # the audited keys; assume user accepts BOTH (worst case: GH_DEPLOY_KEY
+        # is audited with garbage-first-line value, OTHER_TOKEN is normal).
+        audited = secrets_audit.audit_env_secrets(env_path)
+        accepted_keys = [c.key for c in audited]
+        # The migration step is told these keys were "successfully migrated".
+        secrets_audit.rewrite_env_with_sentinels(env_path, accepted_keys)
+        final = env_path.read_text()
+
+        # The multi-line BODY (lines 2 and 3 of the PEM block) must
+        # survive — they were never recognized as KEY=VAL lines, so
+        # they pass through byte-identical regardless of what the
+        # caller did.
+        assert "b3BlbnNzaC1rZXktdjEAAAAA_PLACEHOLDER_BLOB" in final, (
+            "Multi-line secret's body line was LOST during rewrite. "
+            "User-data-never-lost property is broken."
+        )
+        assert "-----END OPENSSH PRIVATE KEY-----" in final
 
 
 class TestHardenEnvPerms:

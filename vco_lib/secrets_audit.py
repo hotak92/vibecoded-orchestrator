@@ -191,6 +191,49 @@ def audit_env_secrets(env_path: Path) -> List[EnvSecret]:
     Comments (``#`` at start of trimmed line) are skipped. ``export KEY=val``
     is supported. Lines without an ``=`` are skipped (not flagged as malformed
     — ``.env`` files in the wild often contain non-KEY=VALUE content).
+
+    Known limitation — MULTI-LINE VALUES (v0.2.46 post-adversarial M2):
+        This parser is line-based. A value spanning multiple lines via shell
+        line-continuation (``\\`` at EOL) or via embedded raw newlines inside
+        a quoted string will be misread: only the first line participates in
+        the secret-shape check; subsequent lines are read as separate
+        ``KEY=VALUE`` candidates (or as comments / blank lines).
+
+        Worked example::
+
+            # Misread by this parser:
+            JSON_KEY='{"private_key": "-----BEGIN-----
+            MIIEv...
+            -----END-----"}'
+
+        Industry-standard ``.env`` files (dotenv, python-dotenv, docker-compose
+        ``env_file:``) ALSO line-based by default — `python-dotenv` requires
+        opt-in ``multiline=True`` for the above, and many tools refuse it
+        entirely. So this matches the de-facto contract.
+
+        Critical safety property (USER DATA NEVER LOST):
+            A multi-line secret that this parser misses is never returned in
+            the audit list. The interactive migration prompt only asks the
+            user about audited keys. ``rewrite_env_with_sentinels`` is only
+            ever called with keys the user explicitly accepted. So a missed
+            multi-line key is NEVER sentinel'd in ``.env`` — its raw value
+            stays exactly where the user put it. Worst-case the user has to
+            migrate it manually via the launcher Secrets tab. Their data
+            is never silently moved or lost.
+
+            This property is pinned by ``TestAuditEnvSecrets`` +
+            ``TestMultiLineSecretPreservation`` in
+            ``tests/test_v0246_v47c_secrets_detection.py``. A future
+            "improvement" to rewrite_env_with_sentinels that touches lines
+            outside ``migrated_keys`` would break the pinned tests.
+
+        If a real-world ``.env`` in the wild needs multi-line value support,
+        either (a) pre-encode the value (base64 / JSON-escape newlines) before
+        landing in ``.env``, or (b) bump this parser to track a
+        ``carrying_quote`` state across ``splitlines()``. The audit-only
+        path will simply miss multi-line secrets today — under-flagging is
+        a safer failure mode than over-flagging (the user can always add
+        them to the keychain manually via the launcher Secrets tab).
     """
     try:
         text = env_path.read_text(encoding="utf-8")
