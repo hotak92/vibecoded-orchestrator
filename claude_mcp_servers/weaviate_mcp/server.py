@@ -381,16 +381,28 @@ _RL_MONITOR_POLL_INTERVAL: float = 2.0
 _RL_MONITOR_ANSWER_THRESHOLD: int = 64_000   # chars
 _RL_TOOL_CONTENT_LIMIT: int = 20_000         # per Write/Edit, chars
 _RL_MONITOR_TIMEOUT: float = 600.0           # 10 min hard ceiling
-# v0.2.47 RL-7: minimum answer length (chars) to compute citation events.
+# v0.2.47 RL-7.5: minimum answer length (TOKENS) to compute citation events.
 # Below this, the monitor still POSTs to the RL container's /rl_update
 # (the container may treat short answers as negative-signal training data)
 # but we skip the citation-event write — too-short answers produce noisy
-# cosine signals (single-chunk embedding of 5-50 chars carries less signal
-# than the noise threshold). Tunable via the env so dogfood / Pro users
-# can experiment.
-_RL_MIN_ANSWER_CHARS_FOR_CITATION: int = int(
-    os.getenv("RL_MIN_ANSWER_CHARS_FOR_CITATION", "200")
+# cosine signals (single-chunk embedding of a few hundred tokens carries
+# less signal than the noise threshold; the multi-chunk best-of-cosine
+# trick only pays off when the answer spans 3+ chunks).
+#
+# Default 25,000 tokens = ~100KB of text = roughly enough for 2-3 chunks
+# at qwen3's xlarge_context preset (target_tokens=9500) OR ~15 chunks at
+# arctic2's medium preset (target=2500). Either way ample signal for the
+# max-over-chunks cosine to discriminate cited-vs-not.
+#
+# Tunable via env so dogfood / Pro users can experiment. Pre-v0.2.47.5
+# this was a 200-char default which was way too low (typical Claude
+# preamble like "Sure! Let me look that up..." would have passed).
+_RL_MIN_ANSWER_TOKENS_FOR_CITATION: int = int(
+    os.getenv("RL_MIN_ANSWER_TOKENS_FOR_CITATION", "25000")
 )
+# Back-compat alias for any test or downstream caller still importing
+# the chars-based name. The actual gate uses the tokens version below.
+_RL_MIN_ANSWER_CHARS_FOR_CITATION: int = _RL_MIN_ANSWER_TOKENS_FOR_CITATION * 4
 # Minimum title length for the literal-citation regex. Below this we skip
 # the per-node regex entirely — two-letter titles like "AI" / "RL" produce
 # enough false-positives ("curl", "url", "fail") to swamp any signal.
@@ -3114,11 +3126,27 @@ def _rl_find_all_transcripts_in_dir(slug_dir: Path) -> "list[Path]":
     the dir-resolution path is async (hub-aware), but the actual
     file-glob is pure I/O and benefits from being a separate sync
     helper.
+
+    v0.2.47 RL-7.5 (2026-06-04): also includes subagent transcripts at
+    ``<slug>/<parentSessionId>/subagents/agent-<agentId>.jsonl`` so the
+    monitor finds KG searches performed BY subagents. Subagent transcripts
+    have the same ``{type, message: {content: [blocks]}}`` shape as parent
+    transcripts (verified via Claude Code docs + filesystem probe
+    2026-06-04), so ``_rl_extract_answer_window`` works unchanged. Each
+    subagent file is independent — the seq-based tiebreak inside
+    ``_rl_answer_monitor`` still matches a KG call to its rightful
+    transcript because each subagent only sees its own KG search history.
     """
     if not slug_dir.exists():
         return []
+    parent_transcripts = list(slug_dir.glob("*.jsonl"))
+    # Subagent transcripts live under each parent session's subdirectory.
+    # We don't need to filter by parent session — every subagent file is
+    # a potential candidate for the KG-call lookup.
+    subagent_transcripts = list(slug_dir.glob("*/subagents/agent-*.jsonl"))
+    all_transcripts = parent_transcripts + subagent_transcripts
     return sorted(
-        slug_dir.glob("*.jsonl"),
+        all_transcripts,
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -3413,13 +3441,22 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                 # container is running. Soft-fail: a False return
                 # leaves the container leg unaffected.
                 #
-                # The min-length gate (default 200 chars; tunable via
-                # RL_MIN_ANSWER_CHARS_FOR_CITATION env) protects against
-                # cosine-noise from very short streaming answers — Claude
-                # often emits a "Sure!" or "Let me check..." prefix
-                # before the substantive response, and using that early
-                # snapshot would write a noisy event we'd never overwrite.
-                if len(answer) >= _RL_MIN_ANSWER_CHARS_FOR_CITATION:
+                # v0.2.47 RL-7.5: token-based gate (default 25k tokens via
+                # RL_MIN_ANSWER_TOKENS_FOR_CITATION env). Protects against
+                # cosine-noise from streaming snapshots — Claude often
+                # emits a "Sure! Let me look that up..." prefix before
+                # the substantive response, and using that early answer
+                # would write a noisy event we'd never overwrite.
+                # 25k tokens ≈ 2-3 chunks at qwen3's xlarge preset; enough
+                # for max-over-chunks cosine to discriminate cited-vs-not.
+                # Falls back to char-based approximation when TokenCounter
+                # is unavailable (1 token ≈ 4 chars).
+                try:
+                    from claude_mcp_servers.weaviate_mcp.chunking import TokenCounter
+                    answer_token_count = TokenCounter.count_tokens(answer)
+                except Exception:
+                    answer_token_count = len(answer) // 4
+                if answer_token_count >= _RL_MIN_ANSWER_TOKENS_FOR_CITATION:
                     ctx = _rl_node_content_cache.pop(task_id, None)
                     if ctx is not None:
                         try:
@@ -3431,8 +3468,8 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                             )
                 else:
                     logger.debug(
-                        "RL monitor %s: answer too short (%d chars < %d); skip citation",
-                        task_id[:8], len(answer), _RL_MIN_ANSWER_CHARS_FOR_CITATION,
+                        "RL monitor %s: answer too short (%d tokens < %d); skip citation",
+                        task_id[:8], answer_token_count, _RL_MIN_ANSWER_TOKENS_FOR_CITATION,
                     )
 
                 # Submit to the RL server via the client adapter. The

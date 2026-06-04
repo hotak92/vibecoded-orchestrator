@@ -685,6 +685,28 @@ pub fn run() {
                         commands::module_catalog_client::bust_cache_if_launcher_version_changed(
                             db.inner(),
                         );
+                    // v0.2.47 RL-7.5: chunker-revision deferral — when the
+                    // running launcher version crosses the v0.2.46 boundary
+                    // (any pre-v0.2.46 → v0.2.46+), append a re-sync notice
+                    // to the orchestrator-root project's
+                    // .claude/context/UPDATE_DEFERRED.md. The new chunker
+                    // presets in claude_mcp_servers/weaviate_mcp/chunking.py
+                    // produce different chunk boundaries; existing Weaviate
+                    // rows are stale and search recall degrades on long
+                    // answers until the user re-syncs.
+                    // Soft-fails: any write error logs to stderr and proceeds.
+                    if let commands::module_catalog_client::VersionBustOutcome::VersionChanged {
+                        ref prev,
+                        ref running,
+                        ..
+                    } = bust_outcome
+                    {
+                        let _ = commands::chunker_revision_deferral::write_chunker_deferral_if_crossing_boundary(
+                            db.inner(),
+                            prev,
+                            running,
+                        );
+                    }
                     if matches!(
                         bust_outcome,
                         commands::module_catalog_client::VersionBustOutcome::VersionChanged { .. }

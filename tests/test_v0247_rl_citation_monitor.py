@@ -29,6 +29,7 @@ import pytest
 from claude_mcp_servers.weaviate_mcp.server import (
     _RL_LITERAL_CITED_MIN_TITLE_LEN,
     _RL_MIN_ANSWER_CHARS_FOR_CITATION,
+    _RL_MIN_ANSWER_TOKENS_FOR_CITATION,
     _rl_compute_and_write_citations,
     _rl_is_literal_cited,
 )
@@ -319,9 +320,19 @@ class TestComputeAndWriteCitations:
 
 
 class TestThresholdConstants:
-    def test_min_answer_chars_default(self) -> None:
-        # Default 200 chars; tunable via RL_MIN_ANSWER_CHARS_FOR_CITATION env.
-        assert _RL_MIN_ANSWER_CHARS_FOR_CITATION >= 100
+    def test_min_answer_tokens_default(self) -> None:
+        # v0.2.47 RL-7.5: bumped to a token-based threshold.
+        # Default 25k tokens; tunable via RL_MIN_ANSWER_TOKENS_FOR_CITATION env.
+        # 25k tokens ≈ 2-3 chunks at qwen3's xlarge preset (target=9500).
+        assert _RL_MIN_ANSWER_TOKENS_FOR_CITATION >= 10_000
+
+    def test_chars_alias_is_4x_the_token_value(self) -> None:
+        # Back-compat alias for downstream callers still importing the
+        # chars-based name. 1 token ≈ 4 chars conventional approximation.
+        assert (
+            _RL_MIN_ANSWER_CHARS_FOR_CITATION
+            == _RL_MIN_ANSWER_TOKENS_FOR_CITATION * 4
+        )
 
     def test_min_title_len_is_3(self) -> None:
         # Pinning at 3 — same rule as the paid module.

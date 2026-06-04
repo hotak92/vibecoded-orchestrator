@@ -11,6 +11,10 @@ pub mod codegraph;
 // "authoritative refresh" path); `--language` is optional and scopes the
 // re-walk + prune to one language.
 pub mod codegraph_reanalyze;
+// v0.2.47 RL-7.5 (2026-06-04): chunker-revision deferral. Writes an
+// UPDATE_DEFERRED.md row when an upgrade crosses the v0.2.46 chunker
+// boundary so the user re-syncs KG / codegraph against the new presets.
+pub mod chunker_revision_deferral;
 pub mod coordination;
 pub mod dashboard;
 pub mod desktop_shortcut;

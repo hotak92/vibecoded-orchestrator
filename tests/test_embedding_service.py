@@ -318,9 +318,11 @@ class OllamaAdapterTests(unittest.TestCase):
         )
         vec = self.adapter.embed("qwen3-embedding:0.6b", "hello")
         self.assertEqual(vec, [0.1, 0.2, 0.3])
-        # Verify num_ctx=8192 was passed
+        # v0.2.47 RL-7.5 (2026-06-04): num_ctx now auto-resolves from
+        # MODEL_TOKEN_LIMITS per-model. qwen3-embedding:0.6b is registered
+        # at 10240 — a 4× bump from the pre-v0.2.47.5 hardcoded 8192 default.
         _, _, kwargs = self.session.calls[-1]
-        self.assertEqual(kwargs["json"]["options"]["num_ctx"], 8192)
+        self.assertEqual(kwargs["json"]["options"]["num_ctx"], 10240)
 
     def test_embed_falls_back_to_legacy_on_404(self):
         self.session.script(
