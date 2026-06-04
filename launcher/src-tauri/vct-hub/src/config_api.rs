@@ -477,21 +477,25 @@ async fn project_config(
         .find(|b| b.role == "shared")
         .map(|b| b.collection_name.clone())
         .unwrap_or_default();
-    let development_collection = kg_bindings
-        .iter()
-        .find(|b| b.role == "archive")
-        .map(|b| b.collection_name.clone())
-        .unwrap_or_default();
-
-    // Diagrams collection (Phase 1.5 — fix/a1-indexing-pipeline 2026-05-25).
-    // No dedicated kg_bindings role yet; derive from the primary KG
-    // collection via the canonical suffix swap (`_KnowledgeGraph` →
-    // `_Diagrams`). Mirrors the Python rule in
-    // `vco_lib.config_projection::project_env_from_db` and
-    // `vco_lib.project_init::derive_project_collection_names` so the
-    // indexer (Python) and the MCP resolver (Python via hub) agree on
-    // the same canonical name. Computed after `kg_collection` is
-    // unwrapped below so we have the post-binding-resolution name.
+    // v0.2.46 Decision C — `development_collection` derives from the
+    // primary KG collection via suffix-swap `_KnowledgeGraph` →
+    // `_Development`, NOT from a `role='archive'` binding row.
+    //
+    // Background: pre-v0.2.46 the hub looked for `role='archive'` here,
+    // but no installer / launcher / migration ever wrote such a row in
+    // the current schema. The value was always empty in hub responses.
+    // Meanwhile the launcher's own `populate()` in
+    // `project_env_settings.rs` derives the dev name from the project
+    // name via the same suffix-swap rule. The two consumers drifted.
+    //
+    // This change unifies on the suffix-swap rule (mirroring the
+    // diagrams derivation 30 lines below). The actual derivation is
+    // computed AFTER `kg_collection` is unwrapped from the Option, so
+    // we have the post-binding-resolution name to swap on.
+    //
+    // The empty-string-on-missing fallback for non-canonical primary
+    // names (rename case) uses `sanitize_collection_prefix(project.slug)`,
+    // identical to the diagrams pattern at line ~524.
 
     // service_misconfigured gate: every registered project should
     // have a primary KG binding after the launcher's startup
@@ -511,6 +515,18 @@ async fn project_config(
                 ),
             );
         }
+    };
+
+    // v0.2.46 Decision C — development collection name derives from the
+    // primary KG via the canonical suffix swap (mirrors the diagrams
+    // rule immediately below). When the primary's name doesn't end with
+    // `_KnowledgeGraph` (e.g. a custom-rename install), fall back to a
+    // slug-sanitized derivation.
+    let development_collection = if kg_collection.ends_with("_KnowledgeGraph") {
+        let basename = &kg_collection[..kg_collection.len() - "_KnowledgeGraph".len()];
+        format!("{}_Development", basename)
+    } else {
+        format!("{}_Development", sanitize_collection_prefix(&project.slug))
     };
 
     // Diagrams collection name — derived from `kg_collection` once it's
@@ -1277,6 +1293,140 @@ mod tests {
             .expect("codegraph_access_list");
         let cg_strs: Vec<&str> = cg_list.iter().filter_map(|v| v.as_str()).collect();
         assert!(cg_strs.contains(&"myproject"));
+    }
+
+    /// v0.2.46 Decision C — `development_collection` derives from the
+    /// primary KG via suffix-swap `_KnowledgeGraph` → `_Development`,
+    /// NOT from a `role='archive'` binding row.
+    ///
+    /// Reason: pre-v0.2.46 the hub looked for `role='archive'` to fill
+    /// this field, but no installer / launcher / migration ever wrote
+    /// such a row in the current schema — the value was always empty in
+    /// hub responses. The launcher's own `populate()` (in
+    /// `project_env_settings.rs`) already derives the dev name from the
+    /// project name; the hub was inconsistent. v0.2.46 unifies on the
+    /// suffix-swap rule so hub and launcher agree.
+    ///
+    /// This test seeds a project with ONLY primary + shared (no archive
+    /// row) and asserts `development_collection` is still populated
+    /// from the primary's basename. The existing
+    /// `config_happy_path_returns_full_envelope` test still passes
+    /// because the fixture seeds primary too — the archive row it also
+    /// seeds becomes irrelevant.
+    #[tokio::test]
+    async fn config_development_collection_derives_from_primary_kg() {
+        let (base, h) = spawn_config_api_hub().await;
+        // Seed primary + shared but NOT archive.
+        let project_id = "p-no-archive";
+        let slug = "myproject";
+        let folder = format!("/tmp/test-config-project-{}", project_id);
+        seed_project(&h.0, project_id, "Test Display Name", &folder, slug);
+        h.0
+            .set_project_kg_binding(
+                project_id,
+                "primary",
+                "MyCustomKG_KnowledgeGraph",
+                Some("qwen3-embedding:0.6b"),
+                Some(1024),
+                None,
+                None,
+                &empty_json_obj(),
+            )
+            .unwrap();
+        h.0
+            .set_project_kg_binding(
+                project_id,
+                "shared",
+                "VibeCodedOrchestrator_KnowledgeGraph",
+                Some("qwen3-embedding:0.6b"),
+                Some(1024),
+                None,
+                None,
+                &empty_json_obj(),
+            )
+            .unwrap();
+        // Codegraph binding required (avoids the test hitting an
+        // unrelated 503 from missing codegraph data).
+        h.0
+            .set_project_codegraph_binding(
+                project_id,
+                "MyCustomKG",
+                Some("codesage-large-v2"),
+                Some(2048),
+                None,
+                None,
+                true,
+                &empty_json_obj(),
+            )
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, project_id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        // development_collection MUST be derived from primary via
+        // suffix-swap, NOT from a (non-existent) archive row.
+        assert_eq!(
+            body.get("development_collection").and_then(|v| v.as_str()),
+            Some("MyCustomKG_Development"),
+            "development_collection must derive from primary KG by \
+             suffix-swap _KnowledgeGraph → _Development (Decision C)"
+        );
+    }
+
+    /// v0.2.46 Decision C edge case — when primary's name does NOT end
+    /// with `_KnowledgeGraph` (e.g. an old custom rename), the dev name
+    /// falls back to `<sanitized_slug>_Development`, mirroring the
+    /// diagrams derivation at line 524.
+    #[tokio::test]
+    async fn config_development_collection_falls_back_to_slug_for_non_canonical_primary() {
+        let (base, h) = spawn_config_api_hub().await;
+        let project_id = "p-non-canonical";
+        let slug = "weirdproject";
+        let folder = format!("/tmp/test-config-project-{}", project_id);
+        seed_project(&h.0, project_id, "Weird Project", &folder, slug);
+        // Primary name doesn't end with _KnowledgeGraph — non-canonical.
+        h.0
+            .set_project_kg_binding(
+                project_id,
+                "primary",
+                "WeirdName_Custom",
+                None,
+                None,
+                None,
+                None,
+                &empty_json_obj(),
+            )
+            .unwrap();
+        h.0
+            .set_project_codegraph_binding(
+                project_id,
+                "Weirdproject",
+                Some("codesage-large-v2"),
+                Some(2048),
+                None,
+                None,
+                true,
+                &empty_json_obj(),
+            )
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, project_id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        // Fallback: sanitize_collection_prefix(slug) + "_Development".
+        // For slug "weirdproject" → "Weirdproject" (capitalized first letter).
+        assert_eq!(
+            body.get("development_collection").and_then(|v| v.as_str()),
+            Some("Weirdproject_Development"),
+            "non-canonical primary name (no _KnowledgeGraph suffix) should \
+             fall back to slug-derived dev name, mirroring the diagrams rule"
+        );
     }
 
     #[tokio::test]
