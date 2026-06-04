@@ -381,6 +381,21 @@ _RL_MONITOR_POLL_INTERVAL: float = 2.0
 _RL_MONITOR_ANSWER_THRESHOLD: int = 64_000   # chars
 _RL_TOOL_CONTENT_LIMIT: int = 20_000         # per Write/Edit, chars
 _RL_MONITOR_TIMEOUT: float = 600.0           # 10 min hard ceiling
+# v0.2.47 RL-7: minimum answer length (chars) to compute citation events.
+# Below this, the monitor still POSTs to the RL container's /rl_update
+# (the container may treat short answers as negative-signal training data)
+# but we skip the citation-event write — too-short answers produce noisy
+# cosine signals (single-chunk embedding of 5-50 chars carries less signal
+# than the noise threshold). Tunable via the env so dogfood / Pro users
+# can experiment.
+_RL_MIN_ANSWER_CHARS_FOR_CITATION: int = int(
+    os.getenv("RL_MIN_ANSWER_CHARS_FOR_CITATION", "200")
+)
+# Minimum title length for the literal-citation regex. Below this we skip
+# the per-node regex entirely — two-letter titles like "AI" / "RL" produce
+# enough false-positives ("curl", "url", "fail") to swamp any signal.
+# Matches the rule in paid-modules/vct-rl-reranker/retrieval_rl.py.
+_RL_LITERAL_CITED_MIN_TITLE_LEN: int = 3
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
 EMBEDDING_SOURCE = os.getenv("EMBEDDING_SOURCE", "ollama")
 # Legacy text embedding model (kept for backward compat — old named vectors stay populated)
@@ -3127,6 +3142,196 @@ async def _rl_find_all_transcripts() -> "list[Path]":
     return _rl_find_all_transcripts_in_dir(slug_dir)
 
 
+def _rl_is_literal_cited(node: dict, answer_text_lower: str) -> bool:
+    """v0.2.47 RL-7: True iff any identity-form of `node` appears in the answer.
+
+    The forms checked (in order):
+      1. ``[[Title]]`` exact-match wikilink (Obsidian style).
+      2. ``[[Title]]`` lower-cased exact-match (case-insensitive markdown).
+      3. ``\\bTitle\\b`` word-boundary regex against the lower-cased answer.
+      4. Same three forms for the file_path slug (the stem, e.g.
+         ``foo`` from ``knowledge/concepts/foo.md``).
+      5. Same for the full file_path (with and without the ``.md`` suffix).
+
+    Caller passes a pre-lowered ``answer_text_lower`` — the helper is called
+    in a tight per-node loop and re-lowering each time would waste cycles.
+
+    Skips titles shorter than ``_RL_LITERAL_CITED_MIN_TITLE_LEN`` (default 3)
+    to avoid the "RL" / "AI" / "url" / "curl" false-positive class. Same
+    rule as ``paid-modules/vct-rl-reranker/retrieval_rl.py``.
+    """
+    if not isinstance(node, dict):
+        return False
+
+    forms: list[str] = []
+    title = (node.get("title") or "").strip()
+    if title and len(title) >= _RL_LITERAL_CITED_MIN_TITLE_LEN:
+        forms.append(title)
+    file_path = (node.get("file_path") or "").strip()
+    if file_path:
+        from pathlib import Path as _Path
+        slug = _Path(file_path).stem
+        if slug and len(slug) >= _RL_LITERAL_CITED_MIN_TITLE_LEN:
+            forms.append(slug)
+        forms.append(file_path)
+        if file_path.endswith(".md"):
+            forms.append(file_path[:-3])
+
+    if not forms:
+        return False
+
+    import re as _re
+    for form in forms:
+        form_lower = form.lower()
+        # WikiLink form: `[[Title]]` exact match (case-insensitive).
+        if f"[[{form_lower}]]" in answer_text_lower:
+            return True
+        # Word-boundary match for the bare form.
+        try:
+            if _re.search(r'\b' + _re.escape(form_lower) + r'\b', answer_text_lower):
+                return True
+        except _re.error:
+            # Malformed regex — defensively skip; never crash the monitor.
+            continue
+    return False
+
+
+async def _rl_compute_and_write_citations(
+    task_id: str,
+    answer: str,
+    ctx: dict,
+) -> bool:
+    """v0.2.47 RL-7: compute the citation event from a complete answer + write it.
+
+    Reads the per-task cache populated by ``_rl_cache_and_rerank`` (the node
+    list with `n_emb` + metadata, the query embedding, the active embedding
+    model). Chunks the answer via ``Chunker.for_model(active_model)``,
+    embeds each chunk via the cached ``EmbeddingService``, then for each
+    node:
+
+      - ``cosine_sims[title] = max(_cosine(answer_chunk_emb, node.n_emb))``
+        across all answer chunks. Skips nodes without ``n_emb``.
+      - ``literal_cited[title]`` via ``_rl_is_literal_cited(node, answer_lower)``.
+
+    Calls ``compute_unified_targets(cosine_sims, literal_cited, None)`` to
+    derive the binary ``cited`` map (target > 0.6), then writes the citation
+    event via ``RLTelemetryWriter.log_citations`` — which POSTs to the
+    launcher's hub per C6c.
+
+    Returns True on a successful write, False otherwise. Soft-fail
+    throughout: missing cache / no embedding service / chunker error
+    / hub POST 5xx all return False and log at debug.
+
+    The caller (``_rl_answer_monitor``) decides whether to also POST to
+    the RL container's ``/rl_update`` after this returns; the two writes
+    are independent.
+    """
+    nodes = ctx.get("nodes") or []
+    if not nodes:
+        return False
+
+    active_model = ctx.get("active_model") or EMBEDDING_MODEL
+
+    # --- Step 1: chunk + embed the answer ---
+    try:
+        chunker = Chunker.for_model(active_model)
+        chunks = chunker.chunk_text(answer, source_id=task_id)
+    except Exception as exc:
+        logger.debug("RL citation: chunker failed (%s)", exc)
+        return False
+    if not chunks:
+        return False
+
+    svc = _get_embedding_service()
+    if svc is None:
+        logger.debug("RL citation: no EmbeddingService available; skip")
+        return False
+
+    answer_chunk_embs: list[list[float]] = []
+    for chunk in chunks:
+        # Chunker.chunk_text returns objects whose `.content` is the chunk text
+        # (matches sync_knowledge_graph's downstream consumer).
+        text = getattr(chunk, "content", None) or (
+            chunk if isinstance(chunk, str) else None
+        )
+        if not text:
+            continue
+        try:
+            vec = svc.embed_text(text)
+        except Exception as exc:
+            logger.debug("RL citation: chunk embed failed (%s); continuing", exc)
+            continue
+        if vec:
+            answer_chunk_embs.append(vec)
+
+    if not answer_chunk_embs:
+        return False
+
+    # --- Step 2: per-node cosine_sims (max over answer chunks vs node.n_emb) ---
+    answer_lower = answer.lower()
+    cosine_sims: dict[str, float] = {}
+    literal_cited: dict[str, bool] = {}
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        title = n.get("title", "")
+        if not title:
+            continue
+        n_emb = n.get("n_emb") or n.get("emb")
+        if not n_emb:
+            # No vector to compare against — skip the cosine side but
+            # still try the literal-cited check (it doesn't need an emb).
+            literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
+            continue
+        try:
+            best = max(_cosine(ac, n_emb) for ac in answer_chunk_embs)
+        except Exception:
+            continue
+        cosine_sims[title] = float(best)
+        literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
+
+    if not cosine_sims and not literal_cited:
+        return False
+
+    # --- Step 3: unified-target formula -> binary cited dict ---
+    try:
+        from vco_lib.rl_training_targets import compute_unified_targets
+        _targets, cited = compute_unified_targets(
+            cosine_sims,
+            literal_cited=literal_cited,
+            cross_encoder_cited=None,
+        )
+    except Exception as exc:
+        logger.debug("RL citation: compute_unified_targets failed (%s)", exc)
+        return False
+
+    # --- Step 4: write the citation event via the centralized writer ---
+    try:
+        writer = _get_rl_telemetry_writer()
+        if writer is None:
+            return False
+        writer.log_citations(
+            task_id=task_id,
+            task_type=ctx.get("task_type") or "mcp_interactive",
+            citations={t: bool(v) for t, v in cited.items()},
+            cosine_sims=cosine_sims,
+            literal_cited=literal_cited,
+            cross_encoder_cited=None,
+        )
+    except Exception as exc:
+        logger.debug("RL citation: writer.log_citations failed (%s)", exc)
+        return False
+
+    logger.debug(
+        "RL citation %s: wrote %d cosine entries, %d literal-cited, %d cited",
+        task_id[:8],
+        len(cosine_sims),
+        sum(1 for v in literal_cited.values() if v),
+        sum(1 for v in cited.values() if v),
+    )
+    return True
+
+
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     """
     Background asyncio task: poll the session transcript until Claude's answer
@@ -3198,6 +3403,38 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             # Right transcript — check if answer is complete
             answer, complete = _rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
             if complete and answer.strip():
+                # v0.2.47 RL-7: MCP-side citation write (replaces the
+                # pre-v0.2.47 container-coupled write path that silently
+                # broke when the container was down — the failure mode
+                # diagnosed in `mcp-rl-online-training-monitor.md`
+                # §"Third silent failure mode"). Independent of the
+                # container POST below: writes the citation event to
+                # launcher.db via the hub regardless of whether the
+                # container is running. Soft-fail: a False return
+                # leaves the container leg unaffected.
+                #
+                # The min-length gate (default 200 chars; tunable via
+                # RL_MIN_ANSWER_CHARS_FOR_CITATION env) protects against
+                # cosine-noise from very short streaming answers — Claude
+                # often emits a "Sure!" or "Let me check..." prefix
+                # before the substantive response, and using that early
+                # snapshot would write a noisy event we'd never overwrite.
+                if len(answer) >= _RL_MIN_ANSWER_CHARS_FOR_CITATION:
+                    ctx = _rl_node_content_cache.pop(task_id, None)
+                    if ctx is not None:
+                        try:
+                            await _rl_compute_and_write_citations(task_id, answer, ctx)
+                        except Exception as exc:
+                            logger.debug(
+                                "RL monitor %s: citation write raised (%s); continuing",
+                                task_id[:8], exc,
+                            )
+                else:
+                    logger.debug(
+                        "RL monitor %s: answer too short (%d chars < %d); skip citation",
+                        task_id[:8], len(answer), _RL_MIN_ANSWER_CHARS_FOR_CITATION,
+                    )
+
                 # Submit to the RL server via the client adapter. The
                 # client handles "disabled mode" and unreachable-server
                 # cases internally (returns RLUpdateResponse(ok=False))
