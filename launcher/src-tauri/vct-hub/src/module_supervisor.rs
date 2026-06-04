@@ -40,7 +40,9 @@
 //! helpers via HTTP proxy (see `lifecycle_api.rs::module_*` handlers).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -464,6 +466,37 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 /// catalog cache.
 pub type ManifestResolver = Box<dyn Fn(&str) -> Option<ModuleManifest> + Send + Sync>;
 
+/// Injection point for the NULL-container-name branch's container-start
+/// step. Production callers pass [`real_start_after_install`] (which
+/// wraps [`start_container_after_install`] and therefore shells out to
+/// `podman` / `docker`). Test callers pass a stub that always returns
+/// `Err(...)` so the test does not depend on the host having a real
+/// container runtime + image cached.
+///
+/// Why this is injectable (v0.2.46): without it, the
+/// `resume_null_container_service_routes_through_start_after_install`
+/// test pins `last_error.is_some()` against a real podman invocation —
+/// which is environment-dependent (podman+image → succeeds; no podman →
+/// fails as the test expects; docker-only → unknown). Injecting the
+/// starter makes the test hermetic across all three states.
+pub type StartAfterInstall = Box<
+    dyn for<'a> Fn(
+            &'a ModuleManifest,
+            &'a ProjectRow,
+            &'a Db,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
+
+/// Production `StartAfterInstall` — forwards to the real
+/// [`start_container_after_install`].
+pub fn real_start_after_install() -> StartAfterInstall {
+    Box::new(|manifest, project, db| {
+        Box::pin(async move { start_container_after_install(manifest, project, db).await })
+    })
+}
+
 /// Iterate every `status='installed'` install row and ensure its
 /// container is running. Soft-fail per row. Called from
 /// `server.rs::start_hub_server` at hub boot.
@@ -510,6 +543,20 @@ pub type ManifestResolver = Box<dyn Fn(&str) -> Option<ModuleManifest> + Send + 
 /// to the next row — one broken module must not block the rest of the
 /// resume sweep.
 pub async fn resume_containers_on_startup(db: &Db, resolve_manifest: ManifestResolver) {
+    resume_containers_on_startup_with_starter(db, resolve_manifest, real_start_after_install())
+        .await
+}
+
+/// Test-friendly variant of [`resume_containers_on_startup`] that takes
+/// an injected `StartAfterInstall` for the NULL-container-name branch.
+/// Production code paths should call [`resume_containers_on_startup`]
+/// (which wires the real [`start_container_after_install`]); only tests
+/// pass a stub. See [`StartAfterInstall`] for rationale.
+pub async fn resume_containers_on_startup_with_starter(
+    db: &Db,
+    resolve_manifest: ManifestResolver,
+    start_after_install: StartAfterInstall,
+) {
     let rows = match db.list_module_installs_needing_start() {
         Ok(v) => v,
         Err(e) => {
@@ -615,8 +662,15 @@ pub async fn resume_containers_on_startup(db: &Db, resolve_manifest: ManifestRes
                 // resolved container_name back to the DB row so the
                 // existing-path branch picks it up on subsequent
                 // resumes.
+                //
+                // v0.2.46: invoked via the injected `start_after_install`
+                // so tests can substitute a deterministic stub instead of
+                // requiring a real podman + cached image on the test host.
+                // Production code goes through `real_start_after_install`,
+                // which is byte-equivalent to calling
+                // `start_container_after_install` directly.
                 if let Err(e) =
-                    start_container_after_install(&manifest, &project, db).await
+                    start_after_install(&manifest, &project, db).await
                 {
                     eprintln!(
                         "[module_supervisor] resume: start_container_after_install({}, {}): {}",
@@ -1066,6 +1120,18 @@ mod tests {
     /// This is the failure mode this branch fixes — pre-v0.2.40 the row
     /// was skipped entirely because `list_module_installs_with_containers`
     /// excluded NULL-container rows.
+    ///
+    /// v0.2.46 hermeticity fix: pinning behaviour on real
+    /// `start_container_after_install` made this test environment-
+    /// dependent (a host with podman + the RL Reranker image cached would
+    /// SUCCEED the call and break the `last_error.is_some()` assertion).
+    /// We now drive the NULL-container branch via the new
+    /// `StartAfterInstall` injection and pass a stub that always returns
+    /// `Err(...)`, so the assertion holds whether the test host has
+    /// podman+image, docker, or neither. The branch logic under test
+    /// (NEW-3.C's `set_module_last_error` write after a failed start) is
+    /// unchanged — only the source of the failure switched from a real
+    /// `podman run` shell-out to a deterministic in-process stub.
     #[test]
     fn resume_null_container_service_routes_through_start_after_install() {
         let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -1107,7 +1173,21 @@ mod tests {
             );
             let (resolver, visited) = tracking_resolver(manifests);
 
-            resume_containers_on_startup(&db, resolver).await;
+            // Hermetic stub: simulate the failure mode the NEW-3.E NULL-
+            // container branch is designed to surface. The error string
+            // is propagated to `last_error` via NEW-3.C's
+            // `set_module_last_error`. We do NOT call
+            // `set_module_container_name` from here — the production
+            // code only persists the name on Ok, so a failing stub
+            // leaves `container_name=NULL`, matching what a real
+            // `podman run` failure would do.
+            let starter: StartAfterInstall = Box::new(|_manifest, _project, _db| {
+                Box::pin(async move {
+                    Err("test stub: container start unavailable".to_string())
+                })
+            });
+
+            resume_containers_on_startup_with_starter(&db, resolver, starter).await;
 
             // Resolver was invoked for our row.
             let visited_ids = visited.lock().unwrap().clone();
