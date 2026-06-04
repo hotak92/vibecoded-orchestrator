@@ -52,11 +52,21 @@ def test_detect_returns_none_for_nonexistent_path(tmp_path: Path):
 
 
 def test_detect_returns_none_when_vco_manifest_present(tmp_path: Path):
-    """If .vco-manifest.json present → project is already VCO-managed,
-    never prompt. This is the ``manifest_present`` short-circuit.
+    """If a WELL-FORMED .vco-manifest.json present → project is already
+    VCO-managed, never prompt. This is the ``manifest_present`` short-circuit.
+
+    v0.2.46 post-adversarial L2 tightened the shape check: an empty /
+    unparseable / unrecognized-shape manifest is now classified "broken"
+    rather than "valid" and proceeds with detection (so the user sees
+    they have a broken state). To pin the original V47-G-final intent
+    here, the manifest must contain at least one of the
+    `_V47G_MANIFEST_EXPECTED_KEYS` (vco_version / schema_version /
+    files / bundled_files).
     """
     (tmp_path / ".claude").mkdir()
-    (tmp_path / ".claude" / ".vco-manifest.json").write_text('{"version":"x"}')
+    (tmp_path / ".claude" / ".vco-manifest.json").write_text(
+        '{"vco_version": "0.2.46"}'
+    )
     # Add an obvious signal that would normally trigger detection:
     (tmp_path / "CLAUDE.md").write_text("# project notes")
     assert install_py._detect_third_party_project(tmp_path) is None
