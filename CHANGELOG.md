@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Vendored-file byte-identity guarantee** for the orchestrator ↔ paid-module file pairs that exist solely because the container image must build standalone. Two pairs are covered: `vco_lib/rl_training_targets.py` ↔ `paid-modules/vct-rl-reranker/_training_targets.py`, and `claude_mcp_servers/rl_client/rl_logger.py` ↔ `paid-modules/vct-rl-reranker/rl_logger.py`. New `tests/test_vendored_file_sync.py` (SHA-256 drift test, CI-gated) and `scripts/sync-vendored-files.sh` (canonical→vendored re-sync, self-anchored, post-copy verified) enforce the guarantee mechanically. Header comments on the canonical files name the vendored siblings + the test path + the sync command, eliminating the "vendored copy drifted silently" failure mode reported during v0.2.47 RL telemetry work.
+
+### Changed
+- `RLDataLogger.log_citations` + `RLTelemetryWriter.log_citations` accept an optional `answer_text: str | None = None` kwarg (omitted from the event when None). Reserves the schema slot for future answer-text logging (offline multi-model training) without a v3→v4 schema bump. v0.2.9 callers leave it None.
+
 ## [0.2.46] - 2026-06-03
 
 Hotfix release closing the 5th instance of a recurring KG re-embed bug

@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-# NOTE: This file is a verbatim copy of the AGPL-side logger from
-# ``paid-modules/vct-rl-reranker/rl_logger.py``. The canonical copy
-# in the private repo MUST stay byte-identical when the wire/event
-# schema evolves — Pydantic schemas in ``rl_client/schemas.py`` are
-# the formal contract. Keep this file in sync via copy, not edit.
+# This file is VENDORED into paid-modules/vct-rl-reranker/rl_logger.py
+# Both copies MUST stay byte-identical. The byte-identity test in
+# tests/test_vendored_file_sync.py enforces this on every CI run.
+# To re-sync after an edit: ./scripts/sync-vendored-files.sh
 """
 Global RL data logger for retrieval training data collection.
 
@@ -279,6 +278,7 @@ class RLDataLogger:
         cosine_sims: "dict[str, float] | None" = None,
         literal_cited: "dict[str, bool] | None" = None,
         cross_encoder_cited: "dict[str, bool] | None" = None,
+        answer_text: "str | None" = None,
     ) -> None:
         """
         Log citation feedback: which nodes were actually used by the agent.
@@ -304,6 +304,12 @@ class RLDataLogger:
                                  verdict. Absent in v0.2.9 (cross-encoder
                                  wiring on MCP side is deferred); readers
                                  default missing entries to False.
+            answer_text:         v3+ optional. The full agent answer text.
+                                 v0.2.9 leaves this None (privacy/size) —
+                                 the field reserves DB space so future
+                                 versions can opt in to logging answers
+                                 for offline multi-model training without
+                                 a schema bump. None ⇒ field omitted.
         """
         # v0.2.40 F3: stamp the embedding triple
         # (embedding_source, embedding_dim, embedding_model) on every
@@ -340,6 +346,8 @@ class RLDataLogger:
             record["cross_encoder_cited"] = {
                 t: bool(v) for t, v in cross_encoder_cited.items()
             }
+        if answer_text is not None:
+            record["answer_text"] = str(answer_text)
 
         self._append(record)
 

@@ -248,6 +248,7 @@ class RLTelemetryWriter:
         cosine_sims: Optional[Dict[str, float]] = None,
         literal_cited: Optional[Dict[str, bool]] = None,
         cross_encoder_cited: Optional[Dict[str, bool]] = None,
+        answer_text: Optional[str] = None,
     ) -> None:
         """Log a citation event to launcher.db (via hub) + (if consented) upload queue.
 
@@ -256,6 +257,11 @@ class RLTelemetryWriter:
         ``vco_lib.rl_training_targets.compute_unified_targets``. ``cosine_sims``
         stays RAW (no bonuses pre-applied) so the formula is replayable
         offline if coefficients are retuned.
+
+        ``answer_text`` (v3+ optional) reserves a field for the agent's full
+        answer so future versions can opt-in to logging answers for offline
+        multi-model training without a schema bump. v0.2.9 leaves this None
+        (privacy/size); None ⇒ the field is omitted from the event entirely.
         """
         if not _local_logging_disabled():
             try:
@@ -266,6 +272,7 @@ class RLTelemetryWriter:
                     cosine_sims=cosine_sims,
                     literal_cited=literal_cited,
                     cross_encoder_cited=cross_encoder_cited,
+                    answer_text=answer_text,
                 )
                 envelope = self._wrap_for_hub("citation", task_id, task_type, event)
                 self._last_envelope = envelope
@@ -281,6 +288,7 @@ class RLTelemetryWriter:
                 cosine_sims=cosine_sims,
                 literal_cited=literal_cited,
                 cross_encoder_cited=cross_encoder_cited,
+                answer_text=answer_text,
             )
             _enqueue(self._etype_citations, payload)
 
@@ -368,6 +376,7 @@ class RLTelemetryWriter:
         cosine_sims: Optional[Dict[str, float]],
         literal_cited: Optional[Dict[str, bool]] = None,
         cross_encoder_cited: Optional[Dict[str, bool]] = None,
+        answer_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build the queue-bound payload for a citation event.
 
@@ -404,6 +413,8 @@ class RLTelemetryWriter:
             payload["cross_encoder_cited"] = {
                 t: bool(v) for t, v in cross_encoder_cited.items()
             }
+        if answer_text is not None:
+            payload["answer_text"] = str(answer_text)
         return payload
 
     # ---- v3 hub event builders (v0.2.47 RL-6c) -----------------------
@@ -486,6 +497,7 @@ class RLTelemetryWriter:
         cosine_sims: Optional[Dict[str, float]],
         literal_cited: Optional[Dict[str, bool]] = None,
         cross_encoder_cited: Optional[Dict[str, bool]] = None,
+        answer_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build the v3 citation event JSON stored in launcher.db's payload_json."""
         event: Dict[str, Any] = {
@@ -513,6 +525,8 @@ class RLTelemetryWriter:
             event["cross_encoder_cited"] = {
                 t: bool(v) for t, v in cross_encoder_cited.items()
             }
+        if answer_text is not None:
+            event["answer_text"] = str(answer_text)
         return event
 
     def _wrap_for_hub(

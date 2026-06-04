@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
+# This file is VENDORED into paid-modules/vct-rl-reranker/_training_targets.py
+# Both copies MUST stay byte-identical. The byte-identity test in
+# tests/test_vendored_file_sync.py enforces this on every CI run.
+# To re-sync after an edit: ./scripts/sync-vendored-files.sh
 """Unified RL training-target computation — single source of truth.
 
 Used by THREE paths that must agree numerically:
