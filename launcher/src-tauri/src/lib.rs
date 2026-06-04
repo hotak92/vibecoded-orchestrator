@@ -1048,6 +1048,62 @@ pub fn run() {
                 }
             }
 
+            // v0.2.46 Decision A/B/C cousin — kg_collection_access reconcile.
+            //
+            // Drops `kg_collection_access` rows whose collection_name (a)
+            // doesn't appear in any `project_kg_bindings` row on this
+            // machine AND (b) doesn't exist as a Weaviate class. These
+            // are orphans left over from prior rebinds where the access
+            // matrix wasn't kept in sync.
+            //
+            // The on-write propagation in `set_project_kg_binding_with_root_sync`
+            // (project_state.rs) handles the forward case; this boot step
+            // backfills any drift from before the on-write propagation
+            // existed (every release v0.2.12-v0.2.45).
+            //
+            // Soft-fail: Weaviate unreachable → log + continue. Pure-SQL
+            // path is tested in `kg_access_propagation_tests`; the
+            // `_at_boot` wrapper just adds the HTTP probe.
+            //
+            // Position: AFTER sync-shared-to-primary (so the orchestrator-
+            // root shared row's collection_name is already canonical) and
+            // BEFORE W40-B (W40-B may itself rebind, but it tags the
+            // change with `manual_override:v0.2.40-prefix-adopt`; the
+            // on-write propagation also handles that path).
+            {
+                use tauri::Manager;
+                if let Some(db) = app.try_state::<db::Db>() {
+                    let weaviate_url = std::env::var("WEAVIATE_URL")
+                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                    let reconcile = tauri::async_runtime::block_on(
+                        db.inner().reconcile_kg_collection_access_at_boot(&weaviate_url),
+                    );
+                    match reconcile {
+                        Ok(dropped) => {
+                            if dropped > 0 {
+                                eprintln!(
+                                    "[vct] reconcile-kg-access (boot): dropped {} \
+                                     orphan kg_collection_access rows",
+                                    dropped
+                                );
+                                let _ = db.audit(
+                                    "kg_collection_access_reconciled_at_boot",
+                                    None,
+                                    None,
+                                    &serde_json::json!({ "dropped": dropped }),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] reconcile-kg-access warning (non-fatal): {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
             // W40-B (v0.2.40, 2026-05-30): cross-prefix KG binding
             // adoption + env regen-on-stale.
             //

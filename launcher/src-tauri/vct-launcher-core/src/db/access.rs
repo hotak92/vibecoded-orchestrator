@@ -96,6 +96,240 @@ impl Db {
             .map_err(|e| format!("collect: {}", e))
     }
 
+    /// v0.2.46 Decision A/B/C cousin — delete a single `kg_collection_access`
+    /// row by (project_id, collection_name). Idempotent: missing rows
+    /// return 0, never error. Required by `reconcile_kg_collection_access`
+    /// (boot helper) and `kg_rename_access` (write-time propagation).
+    pub fn kg_delete_access(
+        &self,
+        project_id: &str,
+        collection: &str,
+    ) -> Result<usize, String> {
+        let guard = self.lock();
+        guard
+            .execute(
+                "DELETE FROM kg_collection_access
+                  WHERE project_id = ?1 AND collection_name = ?2",
+                params![project_id, collection],
+            )
+            .map_err(|e| format!("kg_delete_access: {}", e))
+    }
+
+    /// v0.2.46 Decision A/B/C cousin — rename an access row's
+    /// `collection_name` for a single (project_id, old). Used by the
+    /// on-rebind propagation: when a `project_kg_bindings` row's
+    /// `collection_name` changes, the matching access-matrix row(s)
+    /// need to point at the new name too.
+    ///
+    /// Collision handling: if a row already exists at the target name
+    /// for the same project, we DELETE the old row (no duplicate keys)
+    /// and leave the existing target row's `access_level` UNCHANGED —
+    /// matching the "never lower an existing privilege" discipline
+    /// from the install.py parity self-heal at line 13383+.
+    ///
+    /// Returns 1 when a row was renamed or merged, 0 when no source
+    /// row existed (idempotent).
+    pub fn kg_rename_access(
+        &self,
+        project_id: &str,
+        old_collection: &str,
+        new_collection: &str,
+    ) -> Result<usize, String> {
+        if old_collection == new_collection {
+            return Ok(0); // trivial no-op
+        }
+        let guard = self.lock();
+
+        // Probe: does the source row exist?
+        let source_exists: bool = guard
+            .query_row(
+                "SELECT 1 FROM kg_collection_access
+                  WHERE project_id = ?1 AND collection_name = ?2",
+                params![project_id, old_collection],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| format!("kg_rename_access: source probe: {}", e))?
+            .is_some();
+        if !source_exists {
+            return Ok(0);
+        }
+
+        // Probe: does the target row already exist?
+        let target_exists: bool = guard
+            .query_row(
+                "SELECT 1 FROM kg_collection_access
+                  WHERE project_id = ?1 AND collection_name = ?2",
+                params![project_id, new_collection],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| format!("kg_rename_access: target probe: {}", e))?
+            .is_some();
+
+        if target_exists {
+            // Collision: drop the source row; leave the target row's
+            // privilege level unchanged. (Never lower an existing
+            // privilege — same shape as install.py parity self-heal.)
+            guard
+                .execute(
+                    "DELETE FROM kg_collection_access
+                      WHERE project_id = ?1 AND collection_name = ?2",
+                    params![project_id, old_collection],
+                )
+                .map_err(|e| format!("kg_rename_access: drop source on collision: {}", e))?;
+            Ok(1)
+        } else {
+            // Simple rename: UPDATE the row's collection_name.
+            let renamed = guard
+                .execute(
+                    "UPDATE kg_collection_access
+                        SET collection_name = ?1
+                      WHERE project_id = ?2 AND collection_name = ?3",
+                    params![new_collection, project_id, old_collection],
+                )
+                .map_err(|e| format!("kg_rename_access: UPDATE: {}", e))?;
+            Ok(renamed)
+        }
+    }
+
+    /// v0.2.46 Decision A/B/C cousin — boot-time reconciliation of
+    /// `kg_collection_access` against current binding rows + Weaviate
+    /// schema.
+    ///
+    /// For each access-matrix row, drop it iff BOTH:
+    /// 1. The collection name doesn't appear as a `collection_name` in
+    ///    ANY `project_kg_bindings` row for ANY project on this machine
+    ///    (= no binding owns it), AND
+    /// 2. The collection name doesn't appear in `existing_classes` (=
+    ///    Weaviate doesn't have it either).
+    ///
+    /// Preserves rows where EITHER condition holds:
+    /// - The class exists in Weaviate but no local binding names it
+    ///   (peer-access to a peer's collection; user may have manually
+    ///   granted this via the access-matrix GUI).
+    /// - A binding names the collection but Weaviate doesn't have it
+    ///   yet (binding owns the lazy-create expectation).
+    ///
+    /// Idempotent: a second call after a successful reconcile finds no
+    /// rows matching the drop predicate.
+    ///
+    /// The caller is responsible for fetching `existing_classes` from
+    /// Weaviate (mirroring `adopt_populated_collections_at_boot`'s
+    /// schema-probe pattern). This function is pure-SQL so it's safe
+    /// to test without network mocks.
+    ///
+    /// Returns the count of dropped rows.
+    pub fn reconcile_kg_collection_access(
+        &self,
+        existing_classes: &std::collections::HashSet<String>,
+    ) -> Result<usize, String> {
+        let guard = self.lock();
+
+        // Collect all (project_id, collection_name) pairs from the
+        // access matrix.
+        let mut stmt = guard
+            .prepare(
+                "SELECT project_id, collection_name FROM kg_collection_access",
+            )
+            .map_err(|e| format!("reconcile: prepare list: {}", e))?;
+        let access_rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| format!("reconcile: query list: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("reconcile: collect list: {}", e))?;
+        drop(stmt);
+
+        // Collect every collection name that appears in any binding row.
+        let mut stmt2 = guard
+            .prepare(
+                "SELECT DISTINCT collection_name FROM project_kg_bindings",
+            )
+            .map_err(|e| format!("reconcile: prepare bindings: {}", e))?;
+        let binding_collections: std::collections::HashSet<String> = stmt2
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("reconcile: query bindings: {}", e))?
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|e| format!("reconcile: collect bindings: {}", e))?;
+        drop(stmt2);
+
+        let mut dropped: usize = 0;
+        for (project_id, collection_name) in &access_rows {
+            let has_binding = binding_collections.contains(collection_name);
+            let has_class = existing_classes.contains(collection_name);
+            if !has_binding && !has_class {
+                guard
+                    .execute(
+                        "DELETE FROM kg_collection_access
+                          WHERE project_id = ?1 AND collection_name = ?2",
+                        params![project_id, collection_name],
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "reconcile: DELETE ({}, {}): {}",
+                            project_id, collection_name, e
+                        )
+                    })?;
+                dropped += 1;
+                eprintln!(
+                    "[vct] reconcile-kg-access: dropped orphan project_id={} collection={}",
+                    project_id, collection_name
+                );
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// v0.2.46 Decision A/B/C cousin — async wrapper around
+    /// `reconcile_kg_collection_access` that probes Weaviate's `/v1/schema`
+    /// to build the `existing_classes` set, then delegates to the pure-SQL
+    /// helper. Suitable for the launcher boot-init sequence.
+    ///
+    /// Soft-fail: Weaviate unreachable → return `Err` so the caller can
+    /// log + continue without blocking boot. Same shape as
+    /// `adopt_populated_collections_at_boot`.
+    pub async fn reconcile_kg_collection_access_at_boot(
+        &self,
+        weaviate_url: &str,
+    ) -> Result<usize, String> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("reconcile_at_boot: reqwest client: {}", e))?;
+
+        let schema_url = format!("{}/v1/schema", weaviate_url.trim_end_matches('/'));
+        let resp = client
+            .get(&schema_url)
+            .send()
+            .await
+            .map_err(|e| format!("reconcile_at_boot: GET {}: {}", schema_url, e))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "reconcile_at_boot: {} returned status {}",
+                schema_url,
+                resp.status().as_u16()
+            ));
+        }
+        let schema: JsonValue = resp
+            .json()
+            .await
+            .map_err(|e| format!("reconcile_at_boot: parse {}: {}", schema_url, e))?;
+
+        let existing_classes: std::collections::HashSet<String> = schema
+            .get("classes")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        c.get("class").and_then(|v| v.as_str()).map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        self.reconcile_kg_collection_access(&existing_classes)
+    }
+
     /// Init-time migration: rewrite legacy shared-KG collection names in
     /// `kg_collection_access` to the current canonical name.
     ///
@@ -1455,6 +1689,245 @@ mod sync_shared_to_primary_tests {
             read_collection(&db, &root_id, "shared").as_deref(),
             Some("RootKG")
         );
+    }
+}
+
+// ─── Tests: kg_delete_access + kg_rename_access + reconcile_kg_collection_access (v0.2.46 Decision A/B/C cousin) ───
+
+#[cfg(test)]
+mod kg_access_propagation_tests {
+    use crate::db::Db;
+
+    fn seed_project(db: &Db, project_id: &str) {
+        let now = 1_700_000_000_000_i64;
+        let folder = format!("/tmp/test-kg-access/{}", project_id);
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT OR IGNORE INTO projects \
+                 (id, name, folder_path, host, slug, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'base', ?1, ?4, ?4)",
+                rusqlite::params![project_id, project_id, folder, now],
+            )
+            .unwrap();
+    }
+
+    fn read_access(db: &Db, project_id: &str, collection: &str) -> Option<String> {
+        db.kg_get_access(project_id, collection).unwrap_or(None)
+    }
+
+    // ─── kg_delete_access ─────────────────────────────────────────────
+
+    #[test]
+    fn kg_delete_access_removes_existing_row() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.kg_set_access("p1", "Foo_KnowledgeGraph", "read").unwrap();
+        assert_eq!(read_access(&db, "p1", "Foo_KnowledgeGraph"), Some("read".to_string()));
+
+        let deleted = db.kg_delete_access("p1", "Foo_KnowledgeGraph").unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(read_access(&db, "p1", "Foo_KnowledgeGraph"), None);
+    }
+
+    #[test]
+    fn kg_delete_access_missing_row_is_zero() {
+        // Idempotent: deleting a non-existent row returns 0, not an error.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        let deleted = db.kg_delete_access("p1", "NonExistent").unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn kg_delete_access_scoped_to_project() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        seed_project(&db, "p2");
+        db.kg_set_access("p1", "Shared_KG", "read").unwrap();
+        db.kg_set_access("p2", "Shared_KG", "read").unwrap();
+
+        let deleted = db.kg_delete_access("p1", "Shared_KG").unwrap();
+        assert_eq!(deleted, 1);
+        // p2's row untouched.
+        assert_eq!(read_access(&db, "p2", "Shared_KG"), Some("read".to_string()));
+        assert_eq!(read_access(&db, "p1", "Shared_KG"), None);
+    }
+
+    // ─── kg_rename_access ─────────────────────────────────────────────
+
+    #[test]
+    fn kg_rename_access_updates_collection_name() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.kg_set_access("p1", "OldName_KnowledgeGraph", "write").unwrap();
+
+        let renamed = db
+            .kg_rename_access("p1", "OldName_KnowledgeGraph", "NewName_KnowledgeGraph")
+            .unwrap();
+        assert_eq!(renamed, 1);
+        assert_eq!(read_access(&db, "p1", "OldName_KnowledgeGraph"), None);
+        assert_eq!(
+            read_access(&db, "p1", "NewName_KnowledgeGraph"),
+            Some("write".to_string())
+        );
+    }
+
+    #[test]
+    fn kg_rename_access_no_source_row_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        let renamed = db
+            .kg_rename_access("p1", "Absent", "Whatever")
+            .unwrap();
+        assert_eq!(renamed, 0);
+    }
+
+    #[test]
+    fn kg_rename_access_when_target_already_exists_keeps_higher_privilege() {
+        // If a row already exists at the target name, the rename merges:
+        // - the OLD row is deleted (preserves no-duplicate invariant)
+        // - the EXISTING target row's access_level is left UNCHANGED
+        //   (never lower an existing privilege — same shape as the
+        //   parity self-heal at install.py:13383).
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.kg_set_access("p1", "Source_KG", "read").unwrap();
+        db.kg_set_access("p1", "Target_KG", "write").unwrap();
+
+        let renamed = db.kg_rename_access("p1", "Source_KG", "Target_KG").unwrap();
+        // Renamed=1 means we resolved the collision (deleted Source_KG).
+        assert_eq!(renamed, 1);
+        assert_eq!(read_access(&db, "p1", "Source_KG"), None);
+        // Target_KG keeps its WRITE level (don't downgrade to read).
+        assert_eq!(read_access(&db, "p1", "Target_KG"), Some("write".to_string()));
+    }
+
+    #[test]
+    fn kg_rename_access_scoped_to_project() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        seed_project(&db, "p2");
+        db.kg_set_access("p1", "OldName_KG", "read").unwrap();
+        db.kg_set_access("p2", "OldName_KG", "read").unwrap();
+
+        let renamed = db
+            .kg_rename_access("p1", "OldName_KG", "NewName_KG")
+            .unwrap();
+        assert_eq!(renamed, 1);
+        // p2 untouched.
+        assert_eq!(read_access(&db, "p2", "OldName_KG"), Some("read".to_string()));
+        assert_eq!(read_access(&db, "p2", "NewName_KG"), None);
+    }
+
+    // ─── reconcile_kg_collection_access (boot helper) ─────────────────
+
+    /// reconcile drops rows whose `collection_name` doesn't match any
+    /// binding for any project AND doesn't appear in the supplied
+    /// `existing_classes` set (the Weaviate-known classes). Keeps rows
+    /// whose collection EITHER exists in Weaviate OR is named by a
+    /// binding row somewhere (e.g. a peer's primary).
+    #[test]
+    fn reconcile_drops_orphan_with_no_binding_and_no_class() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        seed_project(&db, "p2");
+        // p1 owns Foo_KG (its binding); p2 grants read access on it.
+        let folder = format!("/tmp/test-kg-access/orphan");
+        let _ = folder; // suppress unused
+        db.set_project_kg_binding(
+            "p1",
+            "primary",
+            "Foo_KG",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        db.kg_set_access("p1", "Foo_KG", "write").unwrap();
+        db.kg_set_access("p2", "Foo_KG", "read").unwrap();
+        // p2 ALSO grants read on a stale name — no binding, no Weaviate class.
+        db.kg_set_access("p2", "StaleOrphan_KG", "read").unwrap();
+
+        // Pretend Weaviate has only Foo_KG (no StaleOrphan_KG).
+        let existing: std::collections::HashSet<String> =
+            ["Foo_KG".to_string()].into_iter().collect();
+
+        let dropped = db.reconcile_kg_collection_access(&existing).unwrap();
+        assert_eq!(dropped, 1, "must drop StaleOrphan_KG");
+
+        // Live rows preserved.
+        assert_eq!(read_access(&db, "p1", "Foo_KG"), Some("write".to_string()));
+        assert_eq!(read_access(&db, "p2", "Foo_KG"), Some("read".to_string()));
+        // Orphan dropped.
+        assert_eq!(read_access(&db, "p2", "StaleOrphan_KG"), None);
+    }
+
+    #[test]
+    fn reconcile_keeps_rows_for_existing_classes_without_binding() {
+        // If a class exists in Weaviate but no binding row names it, we
+        // STILL keep the access row — the user may legitimately grant
+        // peer-access to a peer's collection we don't have a binding
+        // for. The reconcile is "drop unreferenced AND unknown", not
+        // "drop everything without a binding".
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.kg_set_access("p1", "PeerOrch_KG", "read").unwrap();
+
+        let existing: std::collections::HashSet<String> =
+            ["PeerOrch_KG".to_string()].into_iter().collect();
+
+        let dropped = db.reconcile_kg_collection_access(&existing).unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(read_access(&db, "p1", "PeerOrch_KG"), Some("read".to_string()));
+    }
+
+    #[test]
+    fn reconcile_keeps_rows_named_by_binding_even_when_class_absent() {
+        // Weaviate-class absence is NOT a delete trigger when a binding
+        // row still names that collection — the binding owns the
+        // expectation that the class will exist lazily.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.set_project_kg_binding(
+            "p1",
+            "primary",
+            "LazyClass_KG",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        db.kg_set_access("p1", "LazyClass_KG", "write").unwrap();
+
+        // Weaviate is empty.
+        let existing: std::collections::HashSet<String> = Default::default();
+
+        let dropped = db.reconcile_kg_collection_access(&existing).unwrap();
+        assert_eq!(dropped, 0, "binding-named collection must NOT be dropped even when absent from Weaviate");
+        assert_eq!(read_access(&db, "p1", "LazyClass_KG"), Some("write".to_string()));
+    }
+
+    #[test]
+    fn reconcile_idempotent_second_call_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.kg_set_access("p1", "Orphan_KG", "read").unwrap();
+        let existing: std::collections::HashSet<String> = Default::default();
+        assert_eq!(db.reconcile_kg_collection_access(&existing).unwrap(), 1);
+        // Second call: orphan gone, no further work.
+        assert_eq!(db.reconcile_kg_collection_access(&existing).unwrap(), 0);
+    }
+
+    #[test]
+    fn reconcile_empty_db_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        let existing: std::collections::HashSet<String> = Default::default();
+        assert_eq!(db.reconcile_kg_collection_access(&existing).unwrap(), 0);
     }
 }
 

@@ -1084,6 +1084,32 @@ impl Db {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| format!("set_project_kg_binding_with_root_sync: BEGIN: {}", e))?;
 
+        // v0.2.46 Decision A/B/C cousin — kg_collection_access propagation.
+        // Capture the OLD collection_name for the (project_id, role) row
+        // BEFORE we overwrite it, so we can rename matching access-matrix
+        // rows in the same transaction. Also capture the old shared row's
+        // collection_name when we'll mirror to shared.
+        let old_primary: Option<String> = guard
+            .query_row(
+                "SELECT collection_name FROM project_kg_bindings
+                 WHERE project_id = ?1 AND role = ?2",
+                params![project_id, role],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        let old_shared: Option<String> = if should_mirror {
+            guard
+                .query_row(
+                    "SELECT collection_name FROM project_kg_bindings
+                     WHERE project_id = ?1 AND role = 'shared'",
+                    params![project_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+        } else {
+            None
+        };
+
         let primary_write = guard.execute(
             "INSERT INTO project_kg_bindings
              (project_id, role, collection_name, embedding_model, embedding_dim,
@@ -1141,6 +1167,69 @@ impl Db {
         guard
             .execute_batch("COMMIT")
             .map_err(|e| format!("set_project_kg_binding_with_root_sync: COMMIT: {}", e))?;
+
+        // v0.2.46 Decision A/B/C cousin — propagate the collection rename
+        // into `kg_collection_access`. Same `guard` lock is still held;
+        // these are post-transaction writes that auto-commit individually.
+        // Soft-fail per-call: if the access-matrix rename hiccups, the
+        // binding write already succeeded — caller logs at WARN. The boot
+        // reconcile (Db::reconcile_kg_collection_access) catches any stale
+        // rows on the next launcher start.
+        let rename_in_access = |old: &str, new: &str| {
+            if old == new {
+                return; // no work
+            }
+            // Inline the rename logic instead of calling self.kg_rename_access
+            // (which would acquire its own lock — we already hold one).
+            let source_exists: bool = guard
+                .query_row(
+                    "SELECT 1 FROM kg_collection_access
+                      WHERE project_id = ?1 AND collection_name = ?2",
+                    params![project_id, old],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some();
+            if !source_exists {
+                return;
+            }
+            let target_exists: bool = guard
+                .query_row(
+                    "SELECT 1 FROM kg_collection_access
+                      WHERE project_id = ?1 AND collection_name = ?2",
+                    params![project_id, new],
+                    |_| Ok(()),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .is_some();
+            if target_exists {
+                let _ = guard.execute(
+                    "DELETE FROM kg_collection_access
+                      WHERE project_id = ?1 AND collection_name = ?2",
+                    params![project_id, old],
+                );
+            } else {
+                let _ = guard.execute(
+                    "UPDATE kg_collection_access
+                        SET collection_name = ?1
+                      WHERE project_id = ?2 AND collection_name = ?3",
+                    params![new, project_id, old],
+                );
+            }
+        };
+
+        if let Some(prev) = &old_primary {
+            rename_in_access(prev, collection_name);
+        }
+        if should_mirror {
+            if let Some(prev_shared) = &old_shared {
+                rename_in_access(prev_shared, collection_name);
+            }
+        }
 
         Ok(ProjectKgBinding {
             project_id: project_id.to_string(),
@@ -2331,6 +2420,135 @@ mod tests {
         assert_eq!(bindings.len(), 2, "both primary and shared rows must exist");
         assert!(bindings.iter().any(|b| b.role == "primary" && b.collection_name == "FreshRootKG"));
         assert!(bindings.iter().any(|b| b.role == "shared" && b.collection_name == "FreshRootKG"));
+    }
+
+    // v0.2.46 Decision A/B/C cousin — on-write access-matrix propagation.
+    //
+    // When a binding row's collection_name changes, matching access-matrix
+    // rows MUST follow the rename so the resolved kg_access_list stays
+    // consistent with the binding.
+
+    #[test]
+    fn rebind_via_root_sync_renames_matching_access_row() {
+        let db = make_db();
+        seed_project(&db, "p1", "Peer Project");
+        db.kg_set_access("p1", "OldPrimary_KG", "write").unwrap();
+        // Seed primary BEFORE the rebind so the OLD name is observable.
+        db.set_project_kg_binding(
+            "p1", "primary", "OldPrimary_KG", None, None, None, None, &JsonValue::Null,
+        )
+        .unwrap();
+
+        // Rebind via the root-sync method (peer slug — no shared mirror).
+        db.set_project_kg_binding_with_root_sync(
+            "p1",
+            "peer-project",
+            "primary",
+            "NewPrimary_KG",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+
+        // Access row was renamed.
+        assert_eq!(
+            db.kg_get_access("p1", "OldPrimary_KG").unwrap(),
+            None,
+            "old access row must be gone"
+        );
+        assert_eq!(
+            db.kg_get_access("p1", "NewPrimary_KG").unwrap(),
+            Some("write".to_string()),
+            "new access row must exist with old access_level preserved"
+        );
+    }
+
+    #[test]
+    fn rebind_with_no_existing_access_row_is_clean_noop_on_access() {
+        let db = make_db();
+        seed_project(&db, "p1", "Peer Project");
+        // No kg_collection_access row yet.
+        db.set_project_kg_binding(
+            "p1", "primary", "OldPrimary_KG", None, None, None, None, &JsonValue::Null,
+        )
+        .unwrap();
+        db.set_project_kg_binding_with_root_sync(
+            "p1",
+            "peer-project",
+            "primary",
+            "NewPrimary_KG",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+
+        // No row was created (we only RENAME existing rows, never SEED).
+        assert_eq!(db.kg_get_access("p1", "OldPrimary_KG").unwrap(), None);
+        assert_eq!(db.kg_get_access("p1", "NewPrimary_KG").unwrap(), None);
+    }
+
+    #[test]
+    fn root_rebind_renames_both_primary_and_shared_access_rows() {
+        let db = make_db();
+        let folder = if cfg!(windows) {
+            format!(r"C:\tmp\vct-test-root-{}", uuid::Uuid::new_v4())
+        } else {
+            format!("/tmp/vct-test-root-{}", uuid::Uuid::new_v4())
+        };
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'orchestrator_root', ?4, ?5, ?5)",
+                    params![
+                        "root1",
+                        "Orchestrator Root",
+                        folder,
+                        "orchestrator-root",
+                        1_700_000_000_000_i64,
+                    ],
+                )
+                .unwrap();
+        }
+        // Seed primary + shared both at the old name; seed an access row at the old name.
+        db.set_project_kg_binding(
+            "root1", "primary", "OldRoot_KG", None, None, None, None, &JsonValue::Null,
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            "root1", "shared", "OldRoot_KG", None, None, None, None, &JsonValue::Null,
+        )
+        .unwrap();
+        db.kg_set_access("root1", "OldRoot_KG", "write").unwrap();
+
+        // Rebind primary via root-sync — shared mirrors, both old-name
+        // entries (which both equal OldRoot_KG) should map to the new
+        // name. The access row should also be renamed.
+        db.set_project_kg_binding_with_root_sync(
+            "root1",
+            "orchestrator-root",
+            "primary",
+            "NewRoot_KG",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+
+        assert_eq!(db.kg_get_access("root1", "OldRoot_KG").unwrap(), None);
+        assert_eq!(
+            db.kg_get_access("root1", "NewRoot_KG").unwrap(),
+            Some("write".to_string())
+        );
     }
 
     #[test]
