@@ -37,39 +37,16 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 [ -z "${PY:-}" ] && exit 0  # No Python available — silent no-op
 
-# Cross-OS venv path with dual-layout resolution (PR-25 / v0.2.12).
-# Modern installs put the venv at <repo_root>/.venv (top-level); pre-v0.2.x
-# installs had it at <repo_root>/claude_mcp_servers/.venv. Hardcoding only
-# the latter caused this hook to silently fall through to system python on
-# modern installs, where weaviate-client / dependencies aren't installed,
-# and crash inside the generator. POSIX uses .venv/bin/python; Windows
-# venvs use .venv/Scripts/python.exe — try four candidates in priority
-# order (VCT_VENV env override → top-level .venv → legacy
-# claude_mcp_servers/.venv → POSIX before Windows on each layer).
-INSTALL_ROOT="${VCT_INSTALL_ROOT:-$PROJECT_ROOT}"
-VENV=""
-if [ -n "${VCT_VENV:-}" ]; then
-    if [ -x "$VCT_VENV/bin/python" ]; then
-        VENV="$VCT_VENV/bin/python"
-    elif [ -x "$VCT_VENV/Scripts/python.exe" ]; then
-        VENV="$VCT_VENV/Scripts/python.exe"
-    elif [ -x "$VCT_VENV" ]; then
-        # VCT_VENV pointed straight at the interpreter
-        VENV="$VCT_VENV"
-    fi
-fi
-if [ -z "$VENV" ]; then
-    for _cand in \
-        "$INSTALL_ROOT/.venv/bin/python" \
-        "$INSTALL_ROOT/.venv/Scripts/python.exe" \
-        "$INSTALL_ROOT/claude_mcp_servers/.venv/bin/python" \
-        "$INSTALL_ROOT/claude_mcp_servers/.venv/Scripts/python.exe"; do
-        if [ -x "$_cand" ]; then
-            VENV="$_cand"
-            break
-        fi
-    done
-fi
+# v0.2.46 post-adversarial: source shared resolver. Previous inline logic
+# fell back to $PROJECT_ROOT/.venv when $VCT_INSTALL_ROOT was unset — that's
+# the USER's project venv and won't have weaviate-client + vco_lib. Shared
+# helper enforces the canonical 3-tier order and refuses to silently
+# activate the user's venv. (PR-25 / v0.2.12 dual-layout history preserved
+# in the helper's docstring.)
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+resolve_vco_venv_python "$SCRIPT_DIR"
+VENV="${VCO_VENV_PYTHON:-}"
 GENERATOR="$PROJECT_ROOT/.claude/scripts/generate-kg-summary.py"
 
 # Silent fallback: if venv or generator script not present, exit clean.

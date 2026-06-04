@@ -23,40 +23,16 @@ if ($env:CLAUDE_CODE_DISABLE_AUTO_MEMORY) { exit 0 }
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Resolve-Path (Join-Path $ScriptDir "..\..")).Path }
 
-# Dual-layout venv resolution (PR-25 / v0.2.12). Modern installs put the
-# venv at <repo_root>\.venv (top-level); pre-v0.2.x installs had it at
-# <repo_root>\claude_mcp_servers\.venv. Hardcoding only the latter caused
-# this hook to silently fall through to system python on modern installs,
-# where dependencies aren't installed, and crash inside the generator.
-# Try four candidates: VCT_VENV env override → top-level .venv → legacy
-# claude_mcp_servers/.venv, each in POSIX (bin/python) then Windows
-# (Scripts/python.exe) layout.
-$venvBase = if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }
-$venvPy = $null
-if ($env:VCT_VENV) {
-    $cand = Join-Path $env:VCT_VENV "Scripts\python.exe"
-    if (Test-Path $cand) { $venvPy = $cand }
-    if (-not $venvPy) {
-        $cand = Join-Path $env:VCT_VENV "bin/python"
-        if (Test-Path $cand) { $venvPy = $cand }
-    }
-    if (-not $venvPy -and (Test-Path $env:VCT_VENV -PathType Leaf)) {
-        # VCT_VENV pointed straight at the interpreter
-        $venvPy = $env:VCT_VENV
-    }
-}
-if (-not $venvPy) {
-    foreach ($cand in @(
-        (Join-Path $venvBase ".venv\Scripts\python.exe"),
-        (Join-Path $venvBase ".venv/bin/python"),
-        (Join-Path $venvBase "claude_mcp_servers\.venv\Scripts\python.exe"),
-        (Join-Path $venvBase "claude_mcp_servers/.venv/bin/python")
-    )) {
-        if (Test-Path $cand) { $venvPy = $cand; break }
-    }
-}
+# v0.2.46 post-adversarial: dot-source shared resolver. Previous inline
+# logic fell back to $ProjectRoot/.venv when $VCT_INSTALL_ROOT was unset,
+# activating the USER's venv (which doesn't have weaviate-client + vco_lib).
+# Shared helper refuses that fallback. PR-25 / v0.2.12 dual-layout history
+# preserved in the helper's docstring.
+. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
+$venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 $generator = Join-Path $ProjectRoot ".claude/scripts/generate-kg-summary.py"
 
+if (-not $venvPy) { exit 0 }
 if (-not (Test-Path $venvPy)) { exit 0 }
 if (-not (Test-Path $generator)) { exit 0 }
 

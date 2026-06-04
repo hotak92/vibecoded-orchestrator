@@ -70,22 +70,27 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ANALYZER="${VCT_ANALYZER_SCRIPT:-$DEFAULT_REPO_ROOT/.claude/scripts/analyze_code_graph.py}"
-# Dual-layout venv resolution (PR-25 / v0.2.12). Modern installs put the
-# venv at <repo_root>/.venv (top-level); pre-v0.2.x installs had it at
-# <repo_root>/claude_mcp_servers/.venv. Hardcoding the latter caused this
-# hook to silently fall through to system python on modern installs —
-# where weaviate-client isn't installed — and crash inside the analyzer.
-# VCT_VENV overrides everything when set explicitly.
-if [ -n "${VCT_VENV:-}" ]; then
-    VENV="$VCT_VENV"
-elif [ -d "$DEFAULT_REPO_ROOT/.venv" ]; then
-    VENV="$DEFAULT_REPO_ROOT/.venv"
-elif [ -d "$DEFAULT_REPO_ROOT/claude_mcp_servers/.venv" ]; then
-    VENV="$DEFAULT_REPO_ROOT/claude_mcp_servers/.venv"
+# v0.2.46 post-adversarial: source shared resolver. Previous inline logic
+# derived $VENV from $DEFAULT_REPO_ROOT = $SCRIPT_DIR/../.. — which in a
+# user-project install is the USER's project root, not VCO's clone. The
+# resulting VENV would point at the user's project venv (no weaviate-
+# client + no vco_lib). Shared helper consults $VCT_INSTALL_ROOT (canonical)
+# first and only falls back to clone-relative when the 2-up path looks
+# like a real VCO clone (has install.py + first-install.sh).
+# Resolves to a python INTERPRETER directly; we expose it via $VENV here
+# for back-compat with the existing $VENV/bin/python expansion below
+# (which still works because $VENV-as-interpreter still has a valid
+# parent dir, just unused).
+# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+resolve_vco_venv_python "$SCRIPT_DIR"
+# VCO_VENV_PYTHON is the interpreter path. Set VENV to its grandparent
+# (the venv DIR) so the existing "$VENV/bin/python" expansion below still
+# locates the same interpreter. Empty → downstream falls back to system
+# PATH via _lib/find-python.sh, same graceful-degrade behaviour as before.
+if [ -n "${VCO_VENV_PYTHON:-}" ]; then
+    VENV="$(cd "$(dirname "$VCO_VENV_PYTHON")/.." 2>/dev/null && pwd)"
 else
-    # Final fallback: empty → caller falls back to system PATH lookup
-    # via _lib/find-python.sh. Hook may degrade gracefully (no
-    # weaviate-client) but won't hard-fail.
     VENV=""
 fi
 

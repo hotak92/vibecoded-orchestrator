@@ -137,23 +137,17 @@ if [[ "$EDITED_FILE" == "$DIAGRAMS_DIR"/* ]] \
         echo "$NOW_TS" > "$THROTTLE_FILE" 2>/dev/null || true
 
         # Resolve venv-Python so `import vco_lib.diagram_indexer` works.
-        # Same chain as pre-edit-context-inject.sh.
-        _VENV_BASE="${VCT_INSTALL_ROOT:-$PROJECT_ROOT}"
-        _DIAG_VENV=""
-        if [ -n "${VCT_VENV:-}" ] && [ -x "$VCT_VENV/bin/python" ]; then
-            _DIAG_VENV="$VCT_VENV/bin/python"
-        fi
-        if [ -z "$_DIAG_VENV" ]; then
-            for _cand in \
-                "$_VENV_BASE/.venv/bin/python" \
-                "$_VENV_BASE/claude_mcp_servers/.venv/bin/python"; do
-                if [ -x "$_cand" ]; then
-                    _DIAG_VENV="$_cand"
-                    break
-                fi
-            done
-        fi
-        [ -z "$_DIAG_VENV" ] && _DIAG_VENV="$PY"
+        # v0.2.46 post-adversarial: source the shared resolver (POSIX hooks
+        # all share resolve-vco-venv.sh — no more inline drift). The
+        # helper NEVER falls back to $PROJECT_ROOT/.venv (the user's venv,
+        # which won't have weaviate-client + vco_lib). When no VCO venv is
+        # resolvable, we degrade to find-python's $PY which at least lets
+        # the indexer's import-time error surface as a real ImportError
+        # rather than running the wrong interpreter.
+        # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+        . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+        resolve_vco_venv_python "$SCRIPT_DIR"
+        _DIAG_VENV="${VCO_VENV_PYTHON:-$PY}"
 
         # Build the indexer command. Pass --diagrams-collection when
         # DIAGRAMS_COLLECTION is set in the env (fix/a1-indexing-pipeline

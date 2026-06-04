@@ -68,27 +68,14 @@ $ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
     (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 }
 
-# Venv-Python resolution — match the chain used in pre-edit-context-inject.ps1.
-$VenvBase = if ($env:VCT_INSTALL_ROOT) { $env:VCT_INSTALL_ROOT } else { $ProjectRoot }
-$Venv = ""
-if ($env:VCT_VENV) {
-    foreach ($cand in @(
-        (Join-Path $env:VCT_VENV "bin/python"),
-        (Join-Path $env:VCT_VENV "Scripts/python.exe")
-    )) {
-        if (Test-Path $cand) { $Venv = $cand; break }
-    }
-}
-if (-not $Venv) {
-    foreach ($cand in @(
-        (Join-Path $VenvBase ".venv/bin/python"),
-        (Join-Path $VenvBase ".venv/Scripts/python.exe"),
-        (Join-Path $VenvBase "claude_mcp_servers/.venv/bin/python"),
-        (Join-Path $VenvBase "claude_mcp_servers/.venv/Scripts/python.exe")
-    )) {
-        if (Test-Path $cand) { $Venv = $cand; break }
-    }
-}
+# v0.2.46 post-adversarial: dot-source shared resolver. Previous inline
+# logic fell back to $ProjectRoot/.venv when $VCT_INSTALL_ROOT was unset
+# — the USER's venv, which doesn't have vco_lib.diagram_paths. Shared
+# helper enforces canonical 3-tier order; system PATH is the last-resort
+# fallback (which is appropriate here — diagram-path validation is a
+# cheap check that should fail-open on missing tooling).
+. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
+$Venv = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 if (-not $Venv) {
     $Venv = (Get-Command python -ErrorAction SilentlyContinue).Source
 }
