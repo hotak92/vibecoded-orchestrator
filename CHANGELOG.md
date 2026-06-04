@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.46] - 2026-06-04
 
-Two-part release: Part 1 closes the 5th instance of a recurring KG
+Three-part release: Part 1 closes the 5th instance of a recurring KG
 re-embed bug + RL Reranker client-side hardening + 10 silent-truncation
 footgun cleanups. Part 2 delivers the third-party project adoption mode
 (`--adopt-project` family) — gap-plugging across 7 agents (V47-A through
@@ -17,7 +17,12 @@ V47-G-final) covering settings.json managed-block merge, symlink
 preservation, secrets detection + keychain migration, venv adopt-guard,
 foreign-compose scan, PROJECT_NAME precedence resolver, detection
 heuristic + interactive prompt + dry-run + GUI wizard + Secrets tab
-Migrate button.
+Migrate button. **Part 3 (KG-AUTO-HEAL A through E + module_supervisor
+hermetic fix + housekeeping)** delivers the zero-manual-step KG/Dev/
+access auto-heal across launcher boot + write paths + hub resolver so
+3rd-party users post-update see correct collection routing without any
+GUI clicks, even when upgrading from a prior release where binding rows
+drifted (full v0.2.12–v0.2.45 migration coverage).
 
 The Part 1 headline bug: `install.py:5948`
 (`_batch_query_weaviate_content_hashes`) and `install.py:6135`
@@ -86,6 +91,20 @@ Fixed in V46-A-followup. Exactly why live integration tests matter.
   Surfaced by v0.2.45 post-ship forensic. Fixed in coordination with
   RL chat (`vct-rl-reranker` repo owner) who confirmed end-to-end smoke
   green from their machine 2026-06-03. (V46-E)
+
+*Part 3 (KG-AUTO-HEAL):*
+
+- **`module_supervisor::tests::resume_null_container_service_routes_through_start_after_install` made hermetic**: previously environment-dependent — passed when no container runtime was installed, failed when podman or docker was available because the test relied on `start_container_after_install` to FAIL (which it doesn't when the CLI is reachable). Now uses `Fn`-pointer injection (`StartAfterInstall` boxed async closure mirroring the existing `ManifestResolver` pattern); the test injects a stub that always errors, so the NEW-3.C assertion (`last_error.is_some()`) holds independent of host runtime. Cross-runtime verified: `detect_container_runtime` (line 246) iterates `["podman", "docker"]` symmetrically; the test now short-circuits before either path. (KG-AUTO-HEAL release-blocker)
+
+- **Dark-mode CSS bug in `launcher/src/lib/components/StorageSettingsCard.svelte`**: the Storage settings card (volume reuse panel) used undefined CSS variables (`--bg-card`, `--text-muted`, `--bg-button`, `--accent`, `--border-subtle`) with light-mode hex fallbacks (`#fff`, `#1a1a1a`, `#f9f9fb`, `#2563eb`). Every fallback won → unreadable white card on the app's dark theme. Aligned to the canonical `ps-*` recipe used by `IdentityTab` / `SecretsTab` / `SettingsTab` / `KgCodegraphTab` / `SkillsTab` / `HooksTab` (rgba surfaces, `color: inherit`, `#888` muted, `#c4b3ff` section headings, `rgb(0,191,166)` teal primary). Native `<select>` styling NOT overridden — `src/app.css`'s global `color-scheme: dark` covers all dropdowns app-wide (lesson from `0d540b6 fix(secrets): dropdown styling`). No layout / class-name changes.
+
+- **`.claude/CONTEXT_STATE.md` no longer tracked**: file is a per-project working artifact (VCO_dev's daily state — current task, recent progress, blockers). Was tracked on local `main` so every public-repo clone inherited VCO_dev's working state instead of a blank slate. The file is NOT yet on `origin/main` (verified via `git log origin/main -- .claude/CONTEXT_STATE.md` empty), so removing it from the tracked set before v0.2.46 push keeps the public repo clean. `install.py`'s `DEFAULT_PRESERVE_LIST` already treats it as a per-project artifact (preserves existing installs' files across updates), so behaviour for upgrading users is unchanged.
+
+- **2 pre-existing stale-fixture failures in `manifest::tests::vct_rl_reranker_manifest_*`**: `manifest.version` assertion was hardcoded to `"0.1.1"` (pre-v0.2.22) but the live paid-module manifest is at `0.2.9`. `has_info` assertion required a static `Info` control but the current manifest uses `InfoDynamic` (introduced v0.2.32). Bumped to series-prefix match (any 0.2.x / 0.3.x / 0.4.x) AND extended to accept `InfoDynamic` as also satisfying the "section 1 must include at least one info banner" spirit.
+
+- **`test_get_node_info_access_list.py` + 5 other test files: hub-resolver leak**: tests setting `KG_COLLECTION` / `SHARED_KG_COLLECTION` env vars and asserting against env-fallback paths were silently losing to live hub-resolved values on dev machines running `vct-hub`. 21 pre-existing test failures across `test_get_node_info_access_list.py`, `test_shared_kg.py`, `test_search_knowledge_access_list.py`, `test_v0246_v46d_truncation_fixes.py`, `test_kg_collection_env_backfill.py`. Fixed in two layers: (a) gate inside `vco_lib.project_config.resolve()` itself, (b) `tests/conftest.py` autouse `monkeypatch.setenv("VCT_DISABLE_HUB_RESOLVER", "1")` for the whole suite. All 6 files green. See KG node `parallel-pr-coordination-gotchas-2026-05-10.md` §14 (reinforced + 2026-06-04 update).
+
+- **`test_ps1_utf8_bom.py` scanned `.claude/worktrees/`**: walked into per-agent worktree directories (which carry pre-BOM-fix `.ps1` snapshots by design) and reported them as offenders. Test now excludes `.claude/worktrees`, `node_modules`, `target`, `.venv`, `vibecoded-orchestrator` — scans only files we actually own.
 
 ### Added
 
@@ -182,6 +201,20 @@ Fixed in V46-A-followup. Exactly why live integration tests matter.
 - **`scripts/v0246-part2-pre-ship-check.sh`**: Part 2 gate runner
   (Gates 19–27) covering V47-A through V47-G-final contract surfaces.
   (V47-CHANGELOG)
+
+*Part 3 (KG-AUTO-HEAL A through E):*
+
+- **`Db::set_project_kg_binding_with_root_sync`** + **`Db::sync_shared_to_primary_for_orchestrator_root`** (`vct-launcher-core/src/db/project_state.rs` + `access.rs`): the orchestrator-root project's `project_kg_bindings(role='shared')` row now atomically mirrors the `role='primary')` row at two points — write-time (GUI save) AND boot-time backfill (handles upgrades from any prior release where the write-time auto-sync didn't exist). One-way mirror: only primary→shared triggers sync; writing directly to shared does NOT touch primary. Mirrored rows tagged with `config_json.manual_override = "v0.2.46-sync-shared-to-primary[-boot]"` for downstream audit. Closes the v0.2.40 W40-B research doc §4b drift class. (KG-AUTO-HEAL-A)
+
+- **Hub `development_collection` derives via suffix-swap from primary KG** (`vct-hub/src/config_api.rs`): the pre-v0.2.46 lookup for `role='archive'` always returned an empty string (no installer ever wrote such a row in the current schema). Now mirrors the diagrams derivation immediately below — `_KnowledgeGraph` → `_Development` swap on the resolved primary, slug-sanitized fallback for non-canonical primary names. Unifies hub-served + launcher-populate + Python-derived values which had drifted silently. (KG-AUTO-HEAL-C)
+
+- **`SHARED_KG_READ_DISABLED` per-project read opt-out**: symmetric with the existing `SHARED_KG_WRITE_DISABLED` knob. When set, the MCP excludes `SHARED_KG_COLLECTION` from `collections_to_query` in `hybrid_search` and `semantic_graph_search` fan-out. Plumbed across 13 surfaces: env-resolver + DB-fetch + hub response + Rust env_settings + GUI toggle (per-project Identity tab, default OFF). Asymmetric-by-default preserved: fresh projects read shared KG; users opt OUT explicitly per-project. (KG-AUTO-HEAL-B)
+
+- **`Db::kg_delete_access` + `Db::kg_rename_access` + `Db::reconcile_kg_collection_access` + `reconcile_kg_collection_access_at_boot`** (`vct-launcher-core/src/db/access.rs`): the access-matrix surface for the `kg_collection_access` table. `set_project_kg_binding_with_root_sync` now propagates collection renames into matching access-matrix rows (collision-safe: keeps higher privilege, never lowers). Boot reconcile drops orphan rows whose collection_name doesn't exist in Weaviate AND doesn't match any binding for any project. Keeps rows where either condition holds (peer-access to a peer collection stays live; binding-named collections that don't exist yet stay live). (KG-AUTO-HEAL-D)
+
+- **`vco_lib/kg_sync.py`** (NEW module): extracts the V46-A-hardened content-hash fetch from `install.py::_batch_query_weaviate_content_hashes` into a reusable helper. Single source of truth for both `install.py --update`'s CI-10 diff gate AND the forthcoming KG-rebind re-sync path. Routes via `vco_lib.weaviate_helpers.post_graphql_safe` (V46-F) rather than open-coded `urlopen` — inherits the errors-array gate. `install.py` function is now a thin wrapper preserving the legacy `_log_install_event` observability channel via a structured `on_warn(channel, payload)` callback. V46-B regression guard EXTENDED to inspect the new helper's source (avoids the "wrapper passes vacuously" failure mode). (KG-AUTO-HEAL-E)
+
+- **`VCT_DISABLE_HUB_RESOLVER` env-gate** now lives in `vco_lib.project_config.resolve()` itself (was previously only at `weaviate_mcp/server.py::_try_resolve_project_config`, missing all CLI-side callers). Every consumer of the resolver — MCP, CLI scripts (`get_node_info.py`, `search_knowledge.py`), helpers — inherits the short-circuit. `tests/conftest.py` (NEW) sets `VCT_DISABLE_HUB_RESOLVER=1` via autouse `monkeypatch` for the whole orchestrator suite so tests injecting `KG_COLLECTION` / `SHARED_KG_COLLECTION` env vars on dev-machines-with-hub no longer lose silently to live hub-resolved values. Tests that DO exercise the resolver (`test_project_config.py::_ResolverTestBase`) explicitly opt-out in setUp. Closes the dev-only-test-failure class documented in `knowledge/concepts/parallel-pr-coordination-gotchas-2026-05-10.md` §14. (KG-AUTO-HEAL-E)
 
 ### Changed
 
