@@ -242,3 +242,4 @@ tests/test_mcp_rl_*.py
 vco_lib/import_from_orchestrator.py
 tests/test_import_from_orchestrator.py
 .logo-backup-*/
+.claude/CONTEXT_STATE.md
