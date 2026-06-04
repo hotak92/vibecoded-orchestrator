@@ -3128,6 +3128,38 @@ pub async fn rename_project_v2(
     new_name: String,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
+    // v0.2.46 KG-AUTO-HEAL adversarial-review H3 follow-up: reject
+    // rename when host='orchestrator_root'. The orchestrator-root
+    // project's slug ('orchestrator-root') is canonical and used by
+    // multiple auto-heal paths that match on slug:
+    //   - `Db::sync_shared_to_primary_for_orchestrator_root` queries
+    //     `WHERE slug = 'orchestrator-root'`.
+    //   - `Db::set_project_kg_binding_with_root_sync` detects
+    //     orchestrator-root via `project_slug == "orchestrator-root"`.
+    //   - `resolve_shared_kg_from_orchestrator_root` (in
+    //     `project_env_settings.rs`) reads the orchestrator-root's
+    //     primary binding by slug.
+    //
+    // A rename changes the slug → all of the above silently no-op →
+    // the auto-heal is bypassed entirely. Match the create-time
+    // reject at line 350+ for symmetry (host='orchestrator_root' is
+    // a reserved value with a single fixed slug).
+    if let Some(row) = db.get_project(&id).ok().flatten() {
+        if row.host == ProjectHost::OrchestratorRoot {
+            return Err(
+                "Cannot rename the orchestrator-root project: its slug \
+                 ('orchestrator-root') is canonical and used by the v0.2.46 \
+                 KG-AUTO-HEAL flow (boot self-heal, primary-shared mirror, \
+                 shared-KG resolver). Renaming would silently disable the \
+                 auto-heal. If you want to rebrand the project for display, \
+                 change the project's NAME via this command's `new_name` \
+                 arg — but the slug stays 'orchestrator-root'. (Symmetric \
+                 to the create-time reject for `host='orchestrator_root'`.)"
+                    .to_string(),
+            );
+        }
+    }
+
     // Generate a fresh slug derived from the new name so URLs track
     // renames. The old slug becomes invalid; existing bookmarks 404
     // gracefully via the /p/[slug] resolver. Documented in

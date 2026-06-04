@@ -538,21 +538,67 @@ class V46BSourceRegressionGuardTest(unittest.TestCase):
         truncated the user's 1193-row VCO_dev collection. V46-A bumped
         to 10000 (Weaviate's QUERY_MAXIMUM_RESULTS default). Any value
         smaller than 10000 in this helper's source is a regression.
+
+        v0.2.46 KG-AUTO-HEAL adversarial-review H1 follow-up: the
+        previous form of this test (``"10000" in src or "QUERY_MAX_LIMIT"
+        in src``) was VACUOUS — the function's docstring mentions both
+        magic strings + the saturation check has its own
+        ``QUERY_MAX_LIMIT`` reference unrelated to the GraphQL limit
+        clause. A regression that dropped the GraphQL ``limit: ...``
+        value to 100 passed the old form. This tightened version
+        captures the value INSIDE the actual GraphQL query string and
+        asserts it's ``>= 10000``.
         """
         import inspect
+        import re
 
         import vco_lib.kg_sync
 
         src = inspect.getsource(vco_lib.kg_sync.batch_query_content_hashes)
-        # The literal "10000" should appear in either the f-string or
-        # the QUERY_MAX_LIMIT constant reference.
-        self.assertTrue(
-            "10000" in src or "QUERY_MAX_LIMIT" in src,
-            "REGRESSION: vco_lib.kg_sync.batch_query_content_hashes "
-            "appears to have dropped the limit:10000 / QUERY_MAX_LIMIT "
-            "reference. Anything smaller silently truncates collections "
-            ">1k objects.",
+
+        # Capture the limit value inside the ACTUAL GraphQL query string,
+        # not the docstring. The query construction looks like:
+        #   gql = {
+        #       "query": (
+        #           f"{{ Get {{ {collection_name}(limit: {QUERY_MAX_LIMIT}) "
+        #           f"{{ file_path content_hash }} }} }}"
+        #       ),
+        #   }
+        # So we narrow to the literal ``(limit: ...)`` pattern — the docstring's
+        # plain ``limit: 10000`` reference (without parentheses, without the
+        # collection-name preamble) won't match this pattern.
+        m = re.search(
+            r"\(limit:\s*(?:\{?(?P<const>QUERY_MAX_LIMIT)\}?|(?P<digits>\d+))",
+            src,
         )
+        self.assertIsNotNone(
+            m,
+            "REGRESSION: vco_lib.kg_sync.batch_query_content_hashes "
+            "no longer emits a ``limit: ...`` clause in its GraphQL "
+            "query string. Anything missing this clause silently uses "
+            "Weaviate's default limit (100) and truncates collections "
+            ">100 objects.",
+        )
+        # If the captured group is the constant, walk the module to
+        # resolve its value at runtime — pins the actual numeric.
+        if m.group("const"):
+            self.assertEqual(
+                vco_lib.kg_sync.QUERY_MAX_LIMIT,
+                10000,
+                f"REGRESSION: QUERY_MAX_LIMIT = {vco_lib.kg_sync.QUERY_MAX_LIMIT}, "
+                "expected 10000 (Weaviate's QUERY_MAXIMUM_RESULTS default). "
+                "Anything smaller silently truncates collections >N objects.",
+            )
+        else:
+            value = int(m.group("digits"))
+            self.assertGreaterEqual(
+                value,
+                10000,
+                f"REGRESSION: vco_lib.kg_sync.batch_query_content_hashes "
+                f"emits ``limit: {value}`` which is < 10000 (Weaviate's "
+                f"QUERY_MAXIMUM_RESULTS default). Anything smaller silently "
+                f"truncates collections >{value} objects.",
+            )
 
 
 if __name__ == "__main__":

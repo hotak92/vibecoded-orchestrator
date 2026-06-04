@@ -129,6 +129,14 @@ impl Db {
     ///
     /// Returns 1 when a row was renamed or merged, 0 when no source
     /// row existed (idempotent).
+    ///
+    /// v0.2.46 adversarial-review L3 follow-up: collision-handling now
+    /// genuinely "never lowers an existing privilege". Previously the
+    /// code dropped the source row unconditionally on collision —
+    /// preserving the TARGET row's level, which silently downgraded
+    /// when the source was higher. Now it picks the higher level
+    /// between (source.access_level, target.access_level) and writes
+    /// it to the target before dropping the source.
     pub fn kg_rename_access(
         &self,
         project_id: &str,
@@ -140,37 +148,49 @@ impl Db {
         }
         let guard = self.lock();
 
-        // Probe: does the source row exist?
-        let source_exists: bool = guard
+        // Probe: read source row's access_level (None if absent).
+        let source_level: Option<String> = guard
             .query_row(
-                "SELECT 1 FROM kg_collection_access
+                "SELECT access_level FROM kg_collection_access
                   WHERE project_id = ?1 AND collection_name = ?2",
                 params![project_id, old_collection],
-                |_| Ok(()),
+                |r| r.get::<_, String>(0),
             )
             .optional()
-            .map_err(|e| format!("kg_rename_access: source probe: {}", e))?
-            .is_some();
-        if !source_exists {
-            return Ok(0);
-        }
+            .map_err(|e| format!("kg_rename_access: source probe: {}", e))?;
+        let source_level = match source_level {
+            Some(level) => level,
+            None => return Ok(0),
+        };
 
-        // Probe: does the target row already exist?
-        let target_exists: bool = guard
+        // Probe: read target row's access_level (None if absent).
+        let target_level: Option<String> = guard
             .query_row(
-                "SELECT 1 FROM kg_collection_access
+                "SELECT access_level FROM kg_collection_access
                   WHERE project_id = ?1 AND collection_name = ?2",
                 params![project_id, new_collection],
-                |_| Ok(()),
+                |r| r.get::<_, String>(0),
             )
             .optional()
-            .map_err(|e| format!("kg_rename_access: target probe: {}", e))?
-            .is_some();
+            .map_err(|e| format!("kg_rename_access: target probe: {}", e))?;
 
-        if target_exists {
-            // Collision: drop the source row; leave the target row's
-            // privilege level unchanged. (Never lower an existing
-            // privilege — same shape as install.py parity self-heal.)
+        if let Some(existing_target_level) = target_level {
+            // Collision. Pick the higher privilege level — never lower
+            // an existing privilege (matches install.py parity self-heal).
+            // Privilege ordering (low → high): "none" < "read" < "write".
+            let higher = pick_higher_access_level(&source_level, &existing_target_level);
+            if higher != existing_target_level {
+                // Source had a higher level than target — upgrade target.
+                guard
+                    .execute(
+                        "UPDATE kg_collection_access
+                            SET access_level = ?1
+                          WHERE project_id = ?2 AND collection_name = ?3",
+                        params![higher, project_id, new_collection],
+                    )
+                    .map_err(|e| format!("kg_rename_access: upgrade target: {}", e))?;
+            }
+            // Drop the source row in either case (no duplicate keys).
             guard
                 .execute(
                     "DELETE FROM kg_collection_access
@@ -1075,6 +1095,30 @@ fn infer_table_for_op(op: &str) -> Option<&'static str> {
     }
 }
 
+/// v0.2.46 adversarial-review L3 follow-up: pick the higher of two
+/// `kg_collection_access.access_level` strings.
+///
+/// Privilege ordering (low → high): ``"none" < "read" < "write"``. Unknown
+/// values are treated as below "none" (safer to fall through to the other
+/// side's level). Used by `kg_rename_access`'s collision path to
+/// **never lower an existing privilege** — the v0.2.28 install.py parity
+/// self-heal discipline applied at the helper-function layer.
+fn pick_higher_access_level(a: &str, b: &str) -> String {
+    fn rank(level: &str) -> u8 {
+        match level {
+            "write" => 3,
+            "read" => 2,
+            "none" => 1,
+            _ => 0, // unknown — lowest, so it never wins over a known value
+        }
+    }
+    if rank(a) >= rank(b) {
+        a.to_string()
+    } else {
+        b.to_string()
+    }
+}
+
 // ─── Audit log ───────────────────────────────────────────────────────────
 
 impl Db {
@@ -1787,9 +1831,16 @@ mod kg_access_propagation_tests {
     fn kg_rename_access_when_target_already_exists_keeps_higher_privilege() {
         // If a row already exists at the target name, the rename merges:
         // - the OLD row is deleted (preserves no-duplicate invariant)
-        // - the EXISTING target row's access_level is left UNCHANGED
-        //   (never lower an existing privilege — same shape as the
-        //   parity self-heal at install.py:13383).
+        // - the HIGHER of (source, existing-target) access_level is
+        //   preserved on the target (never lower an existing privilege).
+        //
+        // v0.2.46 adversarial-review L3 follow-up: previously this test
+        // only covered the source-lower case (source=read, target=write),
+        // which silently passed because the implementation dropped the
+        // source and left the target unchanged. That was the right answer
+        // BY ACCIDENT — when source is HIGHER (write) and target is
+        // LOWER (read), the pre-L3 implementation would have downgraded
+        // the user's effective access. Both directions are now tested.
         let db = Db::open_in_memory().unwrap();
         seed_project(&db, "p1");
         db.kg_set_access("p1", "Source_KG", "read").unwrap();
@@ -1801,6 +1852,45 @@ mod kg_access_propagation_tests {
         assert_eq!(read_access(&db, "p1", "Source_KG"), None);
         // Target_KG keeps its WRITE level (don't downgrade to read).
         assert_eq!(read_access(&db, "p1", "Target_KG"), Some("write".to_string()));
+    }
+
+    #[test]
+    fn kg_rename_access_source_higher_target_lower_upgrades_target() {
+        // v0.2.46 adversarial-review L3: when source has HIGHER privilege
+        // than the existing target, the target row's access_level must
+        // be UPGRADED to the source's level (never lower the user's
+        // effective privilege). Pre-L3 the source was simply dropped
+        // and the target left at its lower level — silent downgrade.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.kg_set_access("p1", "Source_KG", "write").unwrap();
+        db.kg_set_access("p1", "Target_KG", "read").unwrap();
+
+        let renamed = db.kg_rename_access("p1", "Source_KG", "Target_KG").unwrap();
+        assert_eq!(renamed, 1);
+        assert_eq!(read_access(&db, "p1", "Source_KG"), None);
+        // Target_KG must be UPGRADED to write (source's level).
+        assert_eq!(
+            read_access(&db, "p1", "Target_KG"),
+            Some("write".to_string()),
+            "L3 invariant: rename must upgrade target to source's higher \
+             privilege, never silently downgrade"
+        );
+    }
+
+    #[test]
+    fn kg_rename_access_equal_privileges_no_change() {
+        // When source and target have the same level, the merge drops
+        // source and leaves target unchanged.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.kg_set_access("p1", "Source_KG", "read").unwrap();
+        db.kg_set_access("p1", "Target_KG", "read").unwrap();
+
+        let renamed = db.kg_rename_access("p1", "Source_KG", "Target_KG").unwrap();
+        assert_eq!(renamed, 1);
+        assert_eq!(read_access(&db, "p1", "Source_KG"), None);
+        assert_eq!(read_access(&db, "p1", "Target_KG"), Some("read".to_string()));
     }
 
     #[test]
