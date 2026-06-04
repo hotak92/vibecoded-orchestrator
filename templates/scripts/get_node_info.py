@@ -24,6 +24,14 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 # orchestrator-self path; user projects ship with a different
 # KG_COLLECTION. The hub is now the single source of truth.
 def _resolve_kg_collections() -> tuple[str, str]:
+    # v0.2.47 RL-6c follow-up: VCT_DISABLE_HUB_RESOLVER short-circuit for
+    # the test session. See server.py::_try_resolve_project_config for
+    # the matching guard + tests/conftest.py for the autouse fixture.
+    if os.environ.get("VCT_DISABLE_HUB_RESOLVER"):
+        return (
+            os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            os.getenv("SHARED_KG_COLLECTION", ""),
+        )
     try:
         from vco_lib.project_config import resolve  # type: ignore[import-not-found]
         cfg = resolve(Path(__file__).resolve().parent.parent.parent)

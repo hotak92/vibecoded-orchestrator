@@ -29,7 +29,21 @@ UTF8_BOM = b"\xef\xbb\xbf"
 
 
 def _ps1_files() -> list[pathlib.Path]:
-    return sorted(REPO_ROOT.rglob("*.ps1"))
+    """All ``.ps1`` files under the repo, excluding transient agent state.
+
+    ``.claude/worktrees/`` contains checkouts of OTHER branches' code that
+    haven't been BOM-fixed yet — scanning into them produces false
+    positives that don't reflect the state of THIS branch. Same exclusion
+    pattern as ``test_vct_root_dir_consolidation`` uses for tool_backups.
+    """
+    excluded_prefixes = (".claude/worktrees/",)
+    out: list[pathlib.Path] = []
+    for p in REPO_ROOT.rglob("*.ps1"):
+        rel = p.relative_to(REPO_ROOT).as_posix()
+        if any(rel.startswith(pref) for pref in excluded_prefixes):
+            continue
+        out.append(p)
+    return sorted(out)
 
 
 def test_ps1_files_with_non_ascii_have_utf8_bom() -> None:

@@ -188,10 +188,22 @@ def _try_resolve_project_config():
     falls back to its existing os.getenv() default. The resolver client
     emits its own rate-limited warning on the fall-through path
     (Step 17); this MCP doesn't need to log anything extra.
+
+    v0.2.47 RL-6c follow-up: when ``VCT_DISABLE_HUB_RESOLVER=1`` is set in
+    the environment, this short-circuits to None so test fixtures get
+    pure env-fallback behavior. Without this guard, tests that
+    monkey-patch ``KG_COLLECTION`` / ``SHARED_KG_COLLECTION`` /
+    ``DIAGRAMS_COLLECTION`` env vars and reload the module had their
+    injection silently overridden by whatever the live vct-hub on the
+    dev machine reported. The env var is set once per test session via
+    ``tests/conftest.py``'s autouse fixture. Production runs leave it
+    unset, preserving the hub-first resolution semantics.
     """
     global _resolved_project_config
     if _resolved_project_config is not None:
         return _resolved_project_config
+    if os.environ.get("VCT_DISABLE_HUB_RESOLVER"):
+        return None
     if not _HAS_PROJECT_CONFIG or _resolve_project_config is None:
         return None
     try:
@@ -3964,19 +3976,14 @@ async def _rl_cache_and_rerank(
             # propagate emb + cos_qn / cos_ql / cos_nl when the upstream
             # search path enriched the candidate dict.
             #
-            # v0.2.47 RL-6b-2 (2026-06-04): the search-path enrichment now
-            # ALSO attaches `n_emb` / `linked_embs` / `linked_type_names`
-            # to each node dict (see ``_rl_enrich_nodes_with_linked_embs``).
-            # This v2-shaped log_nodes builder DOES NOT propagate them yet
-            # — the JSONL writer's per-node record below stays at the v2
-            # field set. C6c will switch the write path from
-            # ``RLTelemetryWriter.log_retrieval`` to
-            # ``hub_writer.post_rl_event`` with a v3 payload that includes
-            # the new fields. Until then, enrichment is forward-prep:
-            # it lives on the dicts that flow into the RL container's
-            # ``/cache_nodes`` request (where the container-side rerank
-            # could optionally consume it), but does NOT flow into the
-            # JSONL telemetry corpus.
+            # v0.2.47 RL-6c (2026-06-04): also propagate the v3 enrichment
+            # fields (n_emb / linked_embs / linked_type_names / node_type /
+            # links) that ``_rl_enrich_nodes_with_linked_embs`` attached to
+            # each node dict upstream. The writer's
+            # ``_build_v3_retrieval_event`` consumes them when present;
+            # absent values omit cleanly. The writer itself was switched
+            # from JSONL to a hub POST in the same release cycle — see
+            # ``claude_mcp_servers/rl_client/telemetry_writer.py``.
             log_nodes: list[dict] = []
             for idx, n in enumerate(all_nodes):
                 if not isinstance(n, dict):
@@ -3988,6 +3995,17 @@ async def _rl_cache_and_rerank(
                 }
                 if n.get("emb"):
                     rec["emb"] = n["emb"]
+                # v3 per-node fields (from C6b-1/2 enrichment).
+                if n.get("n_emb"):
+                    rec["n_emb"] = n["n_emb"]
+                if n.get("linked_embs"):
+                    rec["linked_embs"] = n["linked_embs"]
+                if n.get("linked_type_names"):
+                    rec["linked_type_names"] = n["linked_type_names"]
+                if n.get("node_type"):
+                    rec["node_type"] = n["node_type"]
+                if n.get("links"):
+                    rec["links"] = n["links"]
                 for cos_field in ("cos_qn", "cos_ql", "cos_nl"):
                     val = n.get(cos_field)
                     if val is not None:
@@ -4003,6 +4021,29 @@ async def _rl_cache_and_rerank(
                 failed_collections=failed_collections,
                 query_emb=query_emb,
             )
+
+            # v0.2.47 RL-6c: populate _rl_node_content_cache so the
+            # citation-write monitor (C7) can compute citations later
+            # without re-fetching anything from Weaviate. LRU-ish eviction
+            # at _RL_NODE_CACHE_MAX. Per-task entry shape is documented
+            # at the cache's module-level definition (line ~340).
+            try:
+                _rl_node_content_cache[task_id] = {
+                    "nodes": list(log_nodes),
+                    "query_emb": list(query_emb) if query_emb is not None else None,
+                    "active_model": EMBEDDING_MODEL,
+                    "embedding_source": EMBEDDING_SOURCE,
+                    "embedding_dim": len(query_emb) if query_emb else 0,
+                    "project_id": None,  # free-tier fallback; resolver lookup deferred to C7
+                    "project_name": PROJECT_NAME if "PROJECT_NAME" in globals() else "",
+                    "task_type": "mcp_interactive",
+                }
+                # Evict oldest entry when over cap (dict iteration order
+                # preserves insertion order on Python 3.7+).
+                while len(_rl_node_content_cache) > _RL_NODE_CACHE_MAX:
+                    _rl_node_content_cache.pop(next(iter(_rl_node_content_cache)))
+            except Exception as exc:
+                logger.debug("RL node-content cache populate failed (%s)", exc)
     except Exception as exc:
         logger.debug("RL telemetry log_retrieval failed (%s); continuing", exc)
 

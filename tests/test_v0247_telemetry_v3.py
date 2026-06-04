@@ -21,6 +21,7 @@ These tests pin contracts; the live-integration tests live elsewhere
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -43,23 +44,21 @@ class TestSchemaVersionAlignment:
     def test_telemetry_writer_inherits_schema_version_from_logger(self) -> None:
         """RLTelemetryWriter references RLDataLogger.SCHEMA_VERSION directly
         — bumping the logger automatically bumps the writer's payloads."""
-        with tempfile.TemporaryDirectory() as td:
-            writer = RLTelemetryWriter(
-                project="X",
-                log_path=Path(td) / "ev.jsonl",
-                embedding_source="qwen3",
-                embedding_dim=1024,
-                embedding_model="qwen3-embedding:0.6b",
-            )
-            payload = writer._build_retrieval_payload(
-                task_id="t1",
-                task_type="x",
-                query="q",
-                nodes=[],
-                session_id="",
-                query_emb=None,
-            )
-            assert payload["schema_version"] == 3
+        writer = RLTelemetryWriter(
+            project="X",
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+        )
+        payload = writer._build_retrieval_payload(
+            task_id="t1",
+            task_type="x",
+            query="q",
+            nodes=[],
+            session_id="",
+            query_emb=None,
+        )
+        assert payload["schema_version"] == 3
 
 
 # ----------------------------------------------------------------------
@@ -240,71 +239,85 @@ class TestRetrievalV3Fields:
 
 
 class TestTelemetryWriterPassThrough:
-    def _writer(self, td: Path) -> RLTelemetryWriter:
-        return RLTelemetryWriter(
+    """v0.2.47 RL-6c: the writer no longer writes JSONL. It POSTs a v3
+    envelope to the hub. Tests inject a stub `hub_post_fn` that captures
+    what would have been posted, so they can assert on the envelope
+    without standing up a real hub server.
+    """
+
+    def _writer_with_captured_posts(self):
+        captured: list[dict] = []
+
+        def stub_post(envelope: dict, timeout: float = 2.0) -> bool:
+            captured.append(envelope)
+            return True
+
+        w = RLTelemetryWriter(
             project="X",
-            log_path=td / "ev.jsonl",
             embedding_source="qwen3",
             embedding_dim=1024,
             embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=stub_post,
         )
+        return w, captured
 
     def test_log_citations_v3_signature_accepted(self) -> None:
-        """Calling log_citations with the new kwargs MUST NOT raise."""
-        with tempfile.TemporaryDirectory() as td:
-            w = self._writer(Path(td))
-            w.log_citations(
-                task_id="t1",
-                task_type="x",
-                citations={"A": True},
-                cosine_sims={"A": 0.9},
-                literal_cited={"A": True},
-                cross_encoder_cited=None,
-            )
-            event = json.loads((Path(td) / "ev.jsonl").read_text().strip())
-            assert event["literal_cited"] == {"A": True}
+        """Calling log_citations with the new kwargs MUST NOT raise + posts
+        an envelope with the literal_cited flag dict inside payload_json."""
+        w, captured = self._writer_with_captured_posts()
+        w.log_citations(
+            task_id="t1",
+            task_type="x",
+            citations={"A": True},
+            cosine_sims={"A": 0.9},
+            literal_cited={"A": True},
+            cross_encoder_cited=None,
+        )
+        assert len(captured) == 1
+        env = captured[0]
+        assert env["event_type"] == "citation"
+        event = json.loads(env["payload_json"])
+        assert event["literal_cited"] == {"A": True}
 
     def test_build_citation_payload_includes_v3_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            w = self._writer(Path(td))
-            payload = w._build_citation_payload(
-                task_id="t1",
-                task_type="x",
-                citations={"A": True},
-                cosine_sims={"A": 0.9},
-                literal_cited={"A": True},
-                cross_encoder_cited={"A": False},
-            )
-            assert payload["literal_cited"] == {"A": True}
-            assert payload["cross_encoder_cited"] == {"A": False}
-            assert payload["schema_version"] == 3
+        w, _ = self._writer_with_captured_posts()
+        payload = w._build_citation_payload(
+            task_id="t1",
+            task_type="x",
+            citations={"A": True},
+            cosine_sims={"A": 0.9},
+            literal_cited={"A": True},
+            cross_encoder_cited={"A": False},
+        )
+        assert payload["literal_cited"] == {"A": True}
+        assert payload["cross_encoder_cited"] == {"A": False}
+        assert payload["schema_version"] == 3
 
     def test_build_retrieval_payload_includes_v3_node_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            w = self._writer(Path(td))
-            payload = w._build_retrieval_payload(
-                task_id="t1",
-                task_type="x",
-                query="q",
-                nodes=[
-                    {
-                        "title": "A",
-                        "score": 0.9,
-                        "tier": "top_k",
-                        "n_emb": [0.1, 0.2],
-                        "linked_embs": [[0.3, 0.4]],
-                        "linked_type_names": ["concept"],
-                        "node_type": "concept",
-                    }
-                ],
-                session_id="",
-                query_emb=None,
-            )
-            n = payload["nodes"][0]
-            assert n["n_emb"] == [0.1, 0.2]
-            assert n["linked_embs"] == [[0.3, 0.4]]
-            assert n["linked_type_names"] == ["concept"]
-            assert n["node_type"] == "concept"
+        w, _ = self._writer_with_captured_posts()
+        payload = w._build_retrieval_payload(
+            task_id="t1",
+            task_type="x",
+            query="q",
+            nodes=[
+                {
+                    "title": "A",
+                    "score": 0.9,
+                    "tier": "top_k",
+                    "n_emb": [0.1, 0.2],
+                    "linked_embs": [[0.3, 0.4]],
+                    "linked_type_names": ["concept"],
+                    "node_type": "concept",
+                }
+            ],
+            session_id="",
+            query_emb=None,
+        )
+        n = payload["nodes"][0]
+        assert n["n_emb"] == [0.1, 0.2]
+        assert n["linked_embs"] == [[0.3, 0.4]]
+        assert n["linked_type_names"] == ["concept"]
+        assert n["node_type"] == "concept"
 
 
 # ----------------------------------------------------------------------
@@ -420,3 +433,181 @@ class TestMemoKey:
         key = _memo_key("any text here")
         assert len(key) == 24
         int(key, 16)  # must be valid hex; raises otherwise
+
+
+# ----------------------------------------------------------------------
+# 7. v0.2.47 RL-6c: HARD CUTOVER from JSONL to hub POST.
+# ----------------------------------------------------------------------
+
+
+class TestHubCutoverEnvelopeShape:
+    """The writer now POSTs an envelope matching the hub's
+    `PostEventBody` schema; tests pin the shape so a future hub-side
+    schema change can't silently drift the writer."""
+
+    def _make(self, hub_post_fn):
+        return RLTelemetryWriter(
+            project="VCO_dev",
+            project_id="uuid-fake-project",
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=hub_post_fn,
+        )
+
+    def test_retrieval_envelope_carries_indexed_columns(self) -> None:
+        captured: list[dict] = []
+        w = self._make(lambda env, timeout=2.0: captured.append(env) or True)
+        w.log_retrieval(
+            task_id="t1",
+            task_type="mcp_interactive",
+            query="hello",
+            nodes=[],
+            session_id="sess-1",
+        )
+        assert len(captured) == 1
+        env = captured[0]
+        assert env["event_type"] == "retrieval"
+        assert env["schema_version"] == 3
+        assert env["project_id"] == "uuid-fake-project"
+        assert env["project_name"] == "VCO_dev"
+        assert env["task_id"] == "t1"
+        assert env["task_type"] == "mcp_interactive"
+        assert env["embedding_source"] == "qwen3"
+        assert env["embedding_dim"] == 1024
+        assert env["embedding_model"] == "qwen3-embedding:0.6b"
+        # payload_json is the full v3 event JSON.
+        event = json.loads(env["payload_json"])
+        assert event["event"] == "retrieval"
+        assert event["schema_version"] == 3
+        assert event["task_id"] == "t1"
+        assert event["session_id"] == "sess-1"
+
+    def test_citation_envelope_carries_indexed_columns(self) -> None:
+        captured: list[dict] = []
+        w = self._make(lambda env, timeout=2.0: captured.append(env) or True)
+        w.log_citations(
+            task_id="t2",
+            task_type="x",
+            citations={"A": True},
+        )
+        assert len(captured) == 1
+        env = captured[0]
+        assert env["event_type"] == "citation"
+        assert env["task_id"] == "t2"
+        event = json.loads(env["payload_json"])
+        assert event["event"] == "citation"
+        assert event["citations"] == {"A": True}
+
+    def test_project_id_none_round_trips_as_null(self) -> None:
+        captured: list[dict] = []
+        w = RLTelemetryWriter(
+            project="VCO_dev",
+            project_id=None,  # free-tier: no FK
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=lambda env, timeout=2.0: captured.append(env) or True,
+        )
+        w.log_retrieval(
+            task_id="t1",
+            task_type="x",
+            query="q",
+            nodes=[],
+        )
+        env = captured[0]
+        assert env["project_id"] is None
+        assert env["project_name"] == "VCO_dev"
+
+    def test_failure_mode_propagates_into_payload(self) -> None:
+        captured: list[dict] = []
+        w = self._make(lambda env, timeout=2.0: captured.append(env) or True)
+        w.log_retrieval(
+            task_id="t1",
+            task_type="x",
+            query="q",
+            nodes=[],
+            failure_mode="all_collections_schema_missing",
+            failed_collections=["VCODev_KG", "Shared_KG"],
+        )
+        event = json.loads(captured[0]["payload_json"])
+        assert event["failure_mode"] == "all_collections_schema_missing"
+        assert event["failed_collections"] == ["VCODev_KG", "Shared_KG"]
+
+
+class TestHubPostSoftFail:
+    """When the hub POST fails (returns False or raises), the writer
+    MUST NOT propagate the error to the caller. Lost events stay lost."""
+
+    def test_post_returns_false_does_not_raise(self) -> None:
+        w = RLTelemetryWriter(
+            project="X",
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=lambda env, timeout=2.0: False,
+        )
+        # No exception even though hub returned False.
+        w.log_retrieval(
+            task_id="t1", task_type="x", query="q", nodes=[]
+        )
+        w.log_citations(task_id="t2", task_type="x", citations={})
+
+    def test_post_raising_does_not_propagate(self) -> None:
+        def boom(env, timeout=2.0):
+            raise RuntimeError("simulated hub crash")
+
+        w = RLTelemetryWriter(
+            project="X",
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=boom,
+        )
+        # No exception even though stub raises.
+        w.log_retrieval(
+            task_id="t1", task_type="x", query="q", nodes=[]
+        )
+        w.log_citations(task_id="t2", task_type="x", citations={})
+
+
+class TestLocalLoggingDisabledEnv:
+    """RL_LOCAL_LOGGING_DISABLED env var still gates the hub-write path
+    (same opt-out semantics as the pre-v0.2.47 JSONL gate)."""
+
+    def test_env_set_skips_hub_post(self) -> None:
+        from unittest.mock import patch
+
+        captured: list[dict] = []
+        w = RLTelemetryWriter(
+            project="X",
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=lambda env, timeout=2.0: captured.append(env) or True,
+        )
+        with patch.dict("os.environ", {"RL_LOCAL_LOGGING_DISABLED": "true"}, clear=False):
+            w.log_retrieval(
+                task_id="t1", task_type="x", query="q", nodes=[]
+            )
+        # No hub post happened because the env opt-out was set.
+        assert captured == []
+
+    def test_env_unset_posts_normally(self) -> None:
+        from unittest.mock import patch
+
+        captured: list[dict] = []
+        w = RLTelemetryWriter(
+            project="X",
+            embedding_source="qwen3",
+            embedding_dim=1024,
+            embedding_model="qwen3-embedding:0.6b",
+            hub_post_fn=lambda env, timeout=2.0: captured.append(env) or True,
+        )
+        env_without = dict(os.environ)
+        env_without.pop("RL_LOCAL_LOGGING_DISABLED", None)
+        with patch.dict("os.environ", env_without, clear=True):
+            w.log_retrieval(
+                task_id="t1", task_type="x", query="q", nodes=[]
+            )
+        assert len(captured) == 1

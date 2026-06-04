@@ -29,10 +29,17 @@ from claude_mcp_servers.rl_client.training_loader import (
 # ---------------------------------------------------------------------------
 
 def _make_retrieval(**overrides: Any) -> dict[str, Any]:
-    """Minimal valid retrieval event (passes all 10 steps by default)."""
+    """Minimal valid retrieval event (passes all 10 steps by default).
+
+    v0.2.47 RL-3 bumped ``RLDataLogger.SCHEMA_VERSION`` 2 -> 3; the loader
+    enforces the live class attribute, so fixtures here ship v3. The C9
+    JSONL->DB migration script ports historical v2 events into the new
+    ``launcher.db.rl_events`` table tagged with ``schema_version=3``, so
+    the loader never sees v2 at training time.
+    """
     base: dict[str, Any] = {
         "event": "retrieval",
-        "schema_version": "2",
+        "schema_version": "3",
         "ts": "2026-05-28T12:00:00+00:00",
         "project": "orchestrator-root",
         "task_id": "task-001",
@@ -50,10 +57,13 @@ def _make_retrieval(**overrides: Any) -> dict[str, Any]:
 
 
 def _make_citation(**overrides: Any) -> dict[str, Any]:
-    """Minimal valid citation event (passes all relevant steps)."""
+    """Minimal valid citation event (passes all relevant steps).
+
+    v0.2.47 RL-3: schema_version bumped 2 -> 3 (see _make_retrieval docstring).
+    """
     base: dict[str, Any] = {
         "event": "citation",
-        "schema_version": "2",
+        "schema_version": "3",
         "ts": "2026-05-28T12:01:00+00:00",
         "project": "orchestrator-root",
         "task_id": "task-001",
@@ -146,8 +156,8 @@ def test_step3_missing_schema_version_dropped(tmp_path: Path) -> None:
 
 
 def test_step3_wrong_schema_version_dropped(tmp_path: Path) -> None:
-    """Step 3: rows with schema_version=1 are dropped."""
-    ev = _make_retrieval(task_id="v1row", schema_version="1")
+    """Step 3: rows with schema_version<3 are dropped (e.g. legacy v2)."""
+    ev = _make_retrieval(task_id="v2row", schema_version="2")
     primary = tmp_path / "rl_events.jsonl"
     _write_jsonl(primary, [ev])
     results = _load_all(primary_path=primary, qwen3_path=None, backfill_query_emb=False)
@@ -155,8 +165,8 @@ def test_step3_wrong_schema_version_dropped(tmp_path: Path) -> None:
 
 
 def test_step3_int_schema_version_accepted(tmp_path: Path) -> None:
-    """Step 3: integer schema_version=2 (not string) is also accepted."""
-    ev = _make_retrieval(task_id="intv", schema_version=2)
+    """Step 3: integer schema_version=3 (not string) is also accepted."""
+    ev = _make_retrieval(task_id="intv", schema_version=3)
     primary = tmp_path / "rl_events.jsonl"
     _write_jsonl(primary, [ev])
     results = _load_all(primary_path=primary, qwen3_path=None, backfill_query_emb=False)

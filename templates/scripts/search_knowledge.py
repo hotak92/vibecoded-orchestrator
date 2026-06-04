@@ -32,7 +32,21 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 # resolver emits its own rate-limited warning on the fall-through path
 # (Step 17), so this caller doesn't need to log anything extra.
 def _resolve_kg_collections() -> tuple[str, str]:
-    """Return (kg_collection, shared_kg_collection) via hub, env-fallback."""
+    """Return (kg_collection, shared_kg_collection) via hub, env-fallback.
+
+    v0.2.47 RL-6c follow-up: when ``VCT_DISABLE_HUB_RESOLVER=1`` is set,
+    short-circuit to env-only resolution so test fixtures get their
+    injected env vars instead of whatever the live vct-hub reports. The
+    env var is set once per test session via ``tests/conftest.py``;
+    production runs leave it unset and keep the hub-first semantics.
+    Mirrors the matching guard in
+    ``claude_mcp_servers/weaviate_mcp/server.py::_try_resolve_project_config``.
+    """
+    if os.environ.get("VCT_DISABLE_HUB_RESOLVER"):
+        return (
+            os.getenv("KG_COLLECTION", "KnowledgeGraph"),
+            os.getenv("SHARED_KG_COLLECTION", ""),
+        )
     try:
         # Local import keeps the module importable in contexts where
         # vco_lib isn't on the path (e.g. minimal CI installs); the

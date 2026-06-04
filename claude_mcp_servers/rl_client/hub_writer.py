@@ -45,9 +45,18 @@ _DEFAULT_TIMEOUT_S = 2.0
 
 
 def _vct_root_dir() -> Path:
-    """Resolve <vct_root>: $VCT_STATE_DIR -> ~/.vct."""
-    env = os.environ.get("VCT_STATE_DIR")
-    return Path(env) if env else Path.home() / ".vct"
+    """Resolve <vct_root>: delegates to ``vco_lib.paths.vct_root_dir``.
+
+    v0.2.47 RL-5 follow-up: the original inline reconstruction was
+    flagged by ``tests/test_vct_root_dir_consolidation.py`` — only
+    ``vco_lib.paths`` is allowed to construct the root path. Delegation
+    here preserves the private-callsite shape (callers still go through
+    this thin wrapper for unit-test patching convenience) while keeping
+    the construction in exactly one place.
+    """
+    from vco_lib.paths import vct_root_dir as _canonical
+
+    return _canonical()
 
 
 def _read_hub_port() -> int:
