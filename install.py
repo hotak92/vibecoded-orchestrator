@@ -1557,6 +1557,66 @@ def _v47g_count_env_secrets(env_path: Path) -> int:
         return 0
 
 
+# Expected top-level keys in a well-formed ``.vco-manifest.json``. The
+# manifest writer (install.py:6886+) emits ``schema_version``,
+# ``vco_version``, ``installed_at``, ``updated_at``, ``files``,
+# ``preserved_files``. Any of the version/files keys is enough to
+# treat the JSON object as a real manifest — we're not validating
+# the whole schema here, just sanity-checking that the file isn't
+# empty / garbage / unrelated JSON.
+_V47G_MANIFEST_EXPECTED_KEYS: tuple[str, ...] = (
+    "vco_version",
+    "schema_version",
+    "files",
+    "bundled_files",  # legacy alias retained for back-compat reads
+)
+
+
+def _v47g_classify_manifest(manifest_path: Path) -> str:
+    """Classify ``.claude/.vco-manifest.json`` into one of three states.
+
+    Returns one of:
+      - ``"absent"`` — file does not exist (= truly 3rd-party project).
+      - ``"valid"``  — file exists, is non-empty, parses as a JSON object,
+        and contains at least one expected top-level key.
+      - ``"broken"`` — file exists but is empty / unparseable / shape-
+        unrecognized. Treated as a SIGNAL by detection so the user is
+        explicitly told the manifest is bad rather than silently
+        falling through.
+
+    v0.2.46 post-adversarial L2: closes the cosmetic finding from S2 of
+    the Part 2 adversarial review — "Empty/unparseable
+    .vco-manifest.json suppresses adopt prompt." By design, but better
+    to flag the broken state than silently treat as VCO-managed.
+
+    Soft-fail: any OSError during read returns ``"broken"`` (the file
+    exists but we can't tell what it says — same triage as a malformed
+    file from the user's perspective).
+    """
+    if not manifest_path.is_file():
+        return "absent"
+    try:
+        # Empty file is a common manifest-broken state (a partially-failed
+        # write left a zero-byte file behind). json.loads('') raises, so
+        # this is handled below — but checking size first lets us produce
+        # a cleaner branch path in tests.
+        raw = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return "broken"
+    if not raw.strip():
+        return "broken"
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return "broken"
+    if not isinstance(data, dict):
+        return "broken"
+    # Sanity check: at least one expected top-level key must be present.
+    if not any(k in data for k in _V47G_MANIFEST_EXPECTED_KEYS):
+        return "broken"
+    return "valid"
+
+
 def _detect_third_party_project(install_path: Path) -> dict | None:
     """Heuristic: is this an existing 3rd-party project being adopted by VCO?
 
@@ -1584,12 +1644,35 @@ def _detect_third_party_project(install_path: Path) -> dict | None:
             return None
 
         manifest_path = install_path / ".claude" / ".vco-manifest.json"
-        if manifest_path.is_file():
-            # Existing VCO project — never prompt.
+        manifest_status = _v47g_classify_manifest(manifest_path)
+        if manifest_status == "valid":
+            # Existing well-formed VCO project — never prompt.
             return None
+        # When the manifest is absent OR broken, we DO continue with
+        # detection. `broken` is treated as an extra signal below so the
+        # user sees that state explicitly rather than silently dropping
+        # into either "prompt with no context" or "skip without warning".
+        # (v0.2.46 post-adversarial L2.)
 
         signals: list[str] = []
         details: dict[str, str] = {}
+
+        if manifest_status == "broken":
+            signals.append(
+                ".claude/.vco-manifest.json (present but unparseable / "
+                "malformed — VCO state may need repair)"
+            )
+            details["manifest_broken"] = (
+                "`.claude/.vco-manifest.json` exists but is empty, "
+                "non-JSON, or missing every expected top-level key "
+                "(`vco_version`, `schema_version`, `bundled_files`, "
+                "`files`). VCO's normal manifest-driven update flow "
+                "cannot rely on it. Options: (a) restore from backup; "
+                "(b) treat as a 3rd-party project being re-adopted "
+                "(--adopt-project); (c) run --update --force to accept "
+                "VCO's bundled defaults over whatever the manifest "
+                "tracked."
+            )
 
         # Signal 1: .claude/ exists with at least one file.
         claude_dir = install_path / ".claude"
@@ -1716,7 +1799,14 @@ def _detect_third_party_project(install_path: Path) -> dict | None:
         return {
             "signals": signals,
             "summary": f"{len(signals)} signal{'s' if len(signals) != 1 else ''} detected",
+            # `manifest_present` is the legacy boolean (Wave-2 consumers use it).
+            # `manifest_status` is the L2 three-way classifier
+            # ("absent" / "valid" / "broken"). When status is "valid" we'd
+            # have returned None above; here we're either "absent" or
+            # "broken". The boolean stays False for back-compat with consumers
+            # that haven't migrated to the status string.
             "manifest_present": False,
+            "manifest_status": manifest_status,
             "details": details,
         }
     except Exception:  # noqa: BLE001 — soft-fail

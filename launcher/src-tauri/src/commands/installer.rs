@@ -6534,6 +6534,50 @@ pub fn inspect_project_leftovers(path: String) -> ProjectLeftovers {
 // Adopt, install.py runs and does the canonical detection again with its
 // own logic. This command is purely a UI gate.
 
+/// v0.2.46 post-adversarial L2: three-way classification of
+/// `.claude/.vco-manifest.json`. Mirrors `_v47g_classify_manifest` in
+/// install.py — both sides must agree (the M1 drift gate enforces
+/// signal-count equality, but the classification itself is also part
+/// of the contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestStatus {
+    /// File doesn't exist — truly 3rd-party project.
+    Absent,
+    /// File exists, parseable, has at least one expected top-level key.
+    Valid,
+    /// File exists but is empty / malformed / unrecognized.
+    Broken,
+}
+
+fn classify_vco_manifest(path: &std::path::Path) -> ManifestStatus {
+    if !path.is_file() {
+        return ManifestStatus::Absent;
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return ManifestStatus::Broken,
+    };
+    if raw.trim().is_empty() {
+        return ManifestStatus::Broken;
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return ManifestStatus::Broken,
+    };
+    let obj = match parsed.as_object() {
+        Some(o) => o,
+        None => return ManifestStatus::Broken,
+    };
+    // At least ONE of the expected top-level keys must be present.
+    // Kept in sync with _V47G_MANIFEST_EXPECTED_KEYS in install.py.
+    let expected_keys = ["vco_version", "schema_version", "files", "bundled_files"];
+    if expected_keys.iter().any(|k| obj.contains_key(*k)) {
+        ManifestStatus::Valid
+    } else {
+        ManifestStatus::Broken
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThirdPartyDetection {
     /// True iff any signal triggered + .vco-manifest.json is NOT present
@@ -6564,12 +6608,29 @@ pub fn detect_third_party_project_signals(install_path: String) -> ThirdPartyDet
         return out;
     }
 
-    // Manifest short-circuit: existing VCO project — never prompt.
+    // v0.2.46 post-adversarial L2: classify the manifest. The Python
+    // canonical helper (_v47g_classify_manifest in install.py) returns one
+    // of {"absent", "valid", "broken"}. We mirror only the YES/NO/BROKEN
+    // distinction here — the launcher's modal cares about the same three
+    // states. A WELL-FORMED manifest short-circuits to "existing VCO
+    // project"; a missing manifest passes through to normal detection; a
+    // BROKEN manifest gets called out as an extra signal (so the user
+    // sees the bad-state explicitly rather than silent fall-through).
     let manifest = root.join(".claude").join(".vco-manifest.json");
-    if manifest.is_file() {
+    let manifest_status = classify_vco_manifest(&manifest);
+    if manifest_status == ManifestStatus::Valid {
         out.manifest_present = true;
         out.summary = "vco-manifest present (existing VCO project)".into();
         return out;
+    }
+
+    // L2 broken-manifest signal — must match the Python signal count or
+    // the v0.2.46 M1 drift gate test (tests/test_v0246_v47gfinal_rust_python_drift.py)
+    // fails. Emit it BEFORE the regular detection so it heads the list.
+    if manifest_status == ManifestStatus::Broken {
+        out.signals.push(
+            ".claude/.vco-manifest.json (present but unparseable / malformed — VCO state may need repair)".into()
+        );
     }
 
     // Signal 1: .claude/ with content.

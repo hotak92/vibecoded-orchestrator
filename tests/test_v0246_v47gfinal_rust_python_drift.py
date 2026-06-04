@@ -94,10 +94,11 @@ def _count_signal_emits_rust(body: str) -> int:
 # ---------------------------------------------------------------------------
 
 # v0.2.46 V47-G-final shipped with 5 signals on each side.
+# v0.2.46 post-adversarial L2 added a 6th signal (broken-manifest).
 # If you add a signal: bump this constant + update both detection functions +
 # update the Svelte modal's "Show details" rendering. All three layers move
 # together by design.
-EXPECTED_SIGNAL_COUNT = 5
+EXPECTED_SIGNAL_COUNT = 6
 
 
 def test_python_detection_has_expected_signal_count():
