@@ -393,11 +393,36 @@
 </section>
 
 <style>
+  /* v0.2.46: replaced undefined --bg-*/--text-* tokens (which all fell
+   * through to light-mode hex fallbacks like #fff / #1a1a1a / #f9f9fb,
+   * producing an unreadable white card on this app's dark theme) with
+   * the same colour vocabulary the rest of the GUI uses — the `ps-*`
+   * recipe shared across IdentityTab / SecretsTab / SettingsTab /
+   * KgCodegraphTab / SkillsTab / HooksTab. No new tokens, no one-off
+   * button styling: just the canonical app values.
+   *
+   * Canonical recipe (do NOT diverge from this in new panels):
+   *   - Card surface       : rgba(255,255,255,0.03), radius 6px
+   *   - Border             : 1px solid rgba(255,255,255,0.12)
+   *   - Text               : inherit (= --color-text from app.css)
+   *   - Muted/hint text    : #888
+   *   - Sub-hint text      : #777
+   *   - Section heading h4 : #c4b3ff (purple-tinted accent)
+   *   - Input              : bg rgba(255,255,255,0.05), border (border above)
+   *   - Primary button     : bg rgb(0,191,166), color #000, padding 6px 14px
+   *   - Secondary button   : bg rgba(255,255,255,0.05), color inherit, border (border above)
+   *   - Code inline        : bg rgba(255,255,255,0.05), padding 1px 4px
+   *
+   * Native <select> dropdowns are styled globally by `app.css` —
+   * `color-scheme: dark` + explicit `select`/`select option` rules —
+   * so they are NOT overridden here. (Lesson from 0d540b6
+   * "fix(secrets): dropdown styling".)
+   */
+
   .storage-card {
-    background: var(--bg-card, #fff);
+    color: inherit;
     border-radius: 8px;
     padding: 1.5rem;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
     max-width: 920px;
   }
 
@@ -407,21 +432,25 @@
   }
 
   .lede {
-    color: var(--text-muted, #666);
+    color: #888;
     margin: 0 0 1.5rem 0;
+    font-size: 13px;
+    line-height: 1.4;
   }
 
   fieldset {
-    border: 1px solid var(--border, #e4e4e7);
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.12);
     border-radius: 6px;
-    padding: 1rem;
+    padding: 14px 16px;
     margin: 0 0 1.25rem 0;
   }
 
   legend {
     padding: 0 0.5rem;
     font-weight: 600;
-    color: var(--text, #1a1a1a);
+    color: #c4b3ff;
+    font-size: 13px;
   }
 
   .mode-group .radio-row {
@@ -434,7 +463,7 @@
   }
 
   .mode-group .radio-row:hover {
-    background: var(--bg-hover, #f5f5f7);
+    background: rgba(255,255,255,0.05);
   }
 
   .radio-label {
@@ -444,8 +473,8 @@
   }
 
   .radio-label .sub {
-    color: var(--text-muted, #666);
-    font-size: 0.875rem;
+    color: #888;
+    font-size: 11px;
   }
 
   .path-row {
@@ -456,6 +485,8 @@
     display: block;
     font-weight: 500;
     margin-bottom: 0.25rem;
+    font-size: 11px;
+    color: #888;
   }
 
   .path-input-wrap {
@@ -465,39 +496,61 @@
 
   .path-input-wrap input {
     flex: 1;
-    padding: 0.5rem 0.6rem;
-    border: 1px solid var(--border, #d4d4d8);
+    padding: 6px 10px;
+    background: rgba(255,255,255,0.05);
+    color: inherit;
+    border: 1px solid rgba(255,255,255,0.12);
     border-radius: 4px;
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-    font-size: 0.875rem;
+    font-size: 13px;
+  }
+
+  .path-input-wrap input:focus-visible {
+    outline: none;
+    border-color: rgba(0,191,166,0.55);
+    box-shadow: 0 0 0 3px rgba(0,191,166,0.10);
   }
 
   .path-input-wrap.small input {
     padding: 0.3rem 0.5rem;
   }
 
+  /* Secondary button — matches .ps-btn-secondary across the rest of the GUI. */
   button.browse {
-    padding: 0.5rem 0.9rem;
-    border: 1px solid var(--border, #d4d4d8);
-    background: var(--bg-button, #f9f9fb);
+    padding: 6px 14px;
+    background: rgba(255,255,255,0.05);
+    color: inherit;
+    border: 1px solid rgba(255,255,255,0.12);
     border-radius: 4px;
     cursor: pointer;
+    font-size: 12px;
+  }
+
+  button.browse:hover:not(:disabled) {
+    background: rgba(255,255,255,0.08);
+  }
+
+  button.browse:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   button.browse.small {
-    padding: 0.3rem 0.7rem;
-    font-size: 0.875rem;
+    padding: 4px 10px;
+    font-size: 11px;
   }
 
   .sub-h {
-    font-size: 0.95rem;
+    font-size: 13px;
     margin: 1rem 0 0.25rem 0;
+    color: #c4b3ff;
   }
 
   .hint {
-    font-size: 0.825rem;
-    color: var(--text-muted, #666);
+    font-size: 11px;
+    color: #777;
     margin: 0.25rem 0;
+    line-height: 1.4;
   }
 
   .svc-grid,
@@ -514,17 +567,30 @@
     text-align: left;
     padding: 0.45rem 0.5rem;
     vertical-align: top;
-    border-bottom: 1px solid var(--border-subtle, #ececef);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+
+  .svc-grid th,
+  .vol-grid th {
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-weight: 600;
+    font-size: 11px;
   }
 
   .vol-grid code {
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-    font-size: 0.825rem;
+    font-size: 12px;
+    background: rgba(255,255,255,0.05);
+    padding: 2px 6px;
+    border-radius: 3px;
   }
 
   .vol-grid code.path {
     word-break: break-all;
-    color: var(--text-muted, #555);
+    color: #888;
+    background: rgba(255,255,255,0.05);
   }
 
   .use-buttons {
@@ -533,13 +599,19 @@
     flex-wrap: wrap;
   }
 
+  /* Pills — also use the .ps-btn-secondary recipe, slimmer padding. */
   .use-buttons button {
-    padding: 0.2rem 0.55rem;
-    font-size: 0.8rem;
-    border: 1px solid var(--border, #d4d4d8);
+    padding: 3px 10px;
+    font-size: 11px;
+    background: rgba(255,255,255,0.05);
+    color: inherit;
+    border: 1px solid rgba(255,255,255,0.12);
     border-radius: 4px;
-    background: var(--bg-button, #f9f9fb);
     cursor: pointer;
+  }
+
+  .use-buttons button:hover:not(:disabled) {
+    background: rgba(255,255,255,0.08);
   }
 
   .alias-list {
@@ -553,16 +625,20 @@
     align-items: center;
     gap: 0.6rem;
     padding: 0.35rem 0;
-    border-bottom: 1px solid var(--border-subtle, #ececef);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
   }
 
   button.link {
     background: transparent;
     border: none;
-    color: var(--accent, #2563eb);
+    color: rgb(0,191,166);
     cursor: pointer;
     padding: 0;
-    font-size: 0.85rem;
+    font-size: 12px;
+  }
+
+  button.link:hover {
+    color: rgb(0,212,184);
   }
 
   .actions {
@@ -574,27 +650,33 @@
   }
 
   .path-info {
-    font-size: 0.825rem;
-    color: var(--text-muted, #555);
+    font-size: 11px;
+    color: #777;
   }
 
   .path-info code.path {
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
     word-break: break-all;
+    background: rgba(255,255,255,0.05);
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #888;
   }
 
+  /* Primary button — matches .ps-btn-primary across the rest of the GUI. */
   button.primary {
-    padding: 0.55rem 1.3rem;
-    background: var(--accent, #2563eb);
-    color: white;
+    padding: 6px 14px;
+    background: rgb(0,191,166);
+    color: #000;
     border: none;
     border-radius: 4px;
     cursor: pointer;
-    font-weight: 500;
+    font-size: 13px;
+    font-weight: 600;
   }
 
   button.primary:disabled {
-    opacity: 0.6;
+    opacity: 0.5;
     cursor: not-allowed;
   }
 
@@ -603,7 +685,7 @@
   }
 
   .muted {
-    color: var(--text-muted, #666);
+    color: #888;
   }
 
   code {
