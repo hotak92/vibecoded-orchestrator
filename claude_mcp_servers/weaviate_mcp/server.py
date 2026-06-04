@@ -3228,7 +3228,7 @@ async def _rl_compute_and_write_citations(
     task_id: str,
     answer: str,
     ctx: dict,
-) -> bool:
+) -> "dict | None":
     """v0.2.47 RL-7: compute the citation event from a complete answer + write it.
 
     Reads the per-task cache populated by ``_rl_cache_and_rerank`` (the node
@@ -3246,17 +3246,22 @@ async def _rl_compute_and_write_citations(
     event via ``RLTelemetryWriter.log_citations`` — which POSTs to the
     launcher's hub per C6c.
 
-    Returns True on a successful write, False otherwise. Soft-fail
-    throughout: missing cache / no embedding service / chunker error
-    / hub POST 5xx all return False and log at debug.
+    v0.2.47 RL-7/8 (C8): the function now ALSO mutates ``ctx`` in place,
+    adding ``cosine_sims_computed`` and ``literal_cited_computed`` keys.
+    The caller (``_rl_answer_monitor``) reads these to build the container
+    POST payload without re-embedding. Returns the result dict on success
+    (containing ``cosine_sims`` and ``literal_cited``) or ``None`` on
+    soft-fail. Soft-fail throughout: missing cache / no embedding service
+    / chunker error / hub POST 5xx all return ``None`` and log at debug.
 
-    The caller (``_rl_answer_monitor``) decides whether to also POST to
-    the RL container's ``/rl_update`` after this returns; the two writes
-    are independent.
+    The caller decides whether to also POST to the RL container's
+    ``/rl_update`` after this returns; the two writes are independent
+    (citation logging is unconditional; container training is Pro-tier
+    + container-running gated).
     """
     nodes = ctx.get("nodes") or []
     if not nodes:
-        return False
+        return None
 
     active_model = ctx.get("active_model") or EMBEDDING_MODEL
 
@@ -3266,14 +3271,14 @@ async def _rl_compute_and_write_citations(
         chunks = chunker.chunk_text(answer, source_id=task_id)
     except Exception as exc:
         logger.debug("RL citation: chunker failed (%s)", exc)
-        return False
+        return None
     if not chunks:
-        return False
+        return None
 
     svc = _get_embedding_service()
     if svc is None:
         logger.debug("RL citation: no EmbeddingService available; skip")
-        return False
+        return None
 
     answer_chunk_embs: list[list[float]] = []
     for chunk in chunks:
@@ -3293,7 +3298,7 @@ async def _rl_compute_and_write_citations(
             answer_chunk_embs.append(vec)
 
     if not answer_chunk_embs:
-        return False
+        return None
 
     # --- Step 2: per-node cosine_sims (max over answer chunks vs node.n_emb) ---
     answer_lower = answer.lower()
@@ -3319,7 +3324,7 @@ async def _rl_compute_and_write_citations(
         literal_cited[title] = _rl_is_literal_cited(n, answer_lower)
 
     if not cosine_sims and not literal_cited:
-        return False
+        return None
 
     # --- Step 3: unified-target formula -> binary cited dict ---
     try:
@@ -3331,13 +3336,13 @@ async def _rl_compute_and_write_citations(
         )
     except Exception as exc:
         logger.debug("RL citation: compute_unified_targets failed (%s)", exc)
-        return False
+        return None
 
     # --- Step 4: write the citation event via the centralized writer ---
     try:
         writer = _get_rl_telemetry_writer()
         if writer is None:
-            return False
+            return None
         writer.log_citations(
             task_id=task_id,
             task_type=ctx.get("task_type") or "mcp_interactive",
@@ -3348,7 +3353,12 @@ async def _rl_compute_and_write_citations(
         )
     except Exception as exc:
         logger.debug("RL citation: writer.log_citations failed (%s)", exc)
-        return False
+        return None
+
+    # Stash computed values back on ctx so the monitor's downstream
+    # /rl_update POST can reuse them without re-embedding the answer.
+    ctx["cosine_sims_computed"] = cosine_sims
+    ctx["literal_cited_computed"] = literal_cited
 
     logger.debug(
         "RL citation %s: wrote %d cosine entries, %d literal-cited, %d cited",
@@ -3357,7 +3367,11 @@ async def _rl_compute_and_write_citations(
         sum(1 for v in literal_cited.values() if v),
         sum(1 for v in cited.values() if v),
     )
-    return True
+    return {
+        "cosine_sims": cosine_sims,
+        "literal_cited": literal_cited,
+        "cited": cited,
+    }
 
 
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
@@ -3456,11 +3470,20 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                     answer_token_count = TokenCounter.count_tokens(answer)
                 except Exception:
                     answer_token_count = len(answer) // 4
+
+                # Pop the per-task cache once; the citation-write path
+                # consumes ``nodes`` + ``query_emb`` and stashes computed
+                # ``cosine_sims`` / ``literal_cited`` back on the dict for
+                # the downstream /rl_update POST to reuse without
+                # re-embedding.
+                ctx = _rl_node_content_cache.pop(task_id, None)
+                citation_result: "dict | None" = None
                 if answer_token_count >= _RL_MIN_ANSWER_TOKENS_FOR_CITATION:
-                    ctx = _rl_node_content_cache.pop(task_id, None)
                     if ctx is not None:
                         try:
-                            await _rl_compute_and_write_citations(task_id, answer, ctx)
+                            citation_result = await _rl_compute_and_write_citations(
+                                task_id, answer, ctx,
+                            )
                         except Exception as exc:
                             logger.debug(
                                 "RL monitor %s: citation write raised (%s); continuing",
@@ -3472,27 +3495,50 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                         task_id[:8], answer_token_count, _RL_MIN_ANSWER_TOKENS_FOR_CITATION,
                     )
 
-                # Submit to the RL server via the client adapter. The
-                # client handles "disabled mode" and unreachable-server
-                # cases internally (returns RLUpdateResponse(ok=False))
-                # — we never raise out of this background task.
+                # v0.2.47 C8: container POST uses the pre-packed payload
+                # shape. Only fires when (a) the container is reachable
+                # (client.enabled), (b) we have the ctx + computed
+                # cosine_sims/literal_cited (i.e. citation write ran),
+                # AND (c) we have at least one trainable signal. Container
+                # is pure-train: MCP supplies everything pre-frozen.
+                #
+                # Free-tier / no-container installs: the citation event is
+                # already on disk via the writer above; training is
+                # Pro-tier-only, so silent skip here is correct.
                 client = _get_rl_client()
-                if client is not None:
-                    resp = await client.rl_update(
-                        task_ids=[task_id],
-                        agent_output=answer,
-                        task_type="mcp_interactive",
-                    )
-                    if resp.ok:
-                        logger.debug(
-                            "RL monitor %s: trained on %d chars (transcript %s)",
-                            task_id[:8], len(answer), candidate.name[:8],
-                        )
-                    else:
-                        logger.debug(
-                            "RL monitor %s: rl_update not ok (%s)",
-                            task_id[:8], resp.error or resp.skipped or "unknown",
-                        )
+                if (
+                    client is not None
+                    and ctx is not None
+                    and citation_result is not None
+                ):
+                    nodes_packed = ctx.get("nodes") or []
+                    query_emb = ctx.get("query_emb") or []
+                    if nodes_packed and query_emb:
+                        try:
+                            resp = await client.rl_update_v3(
+                                task_id=task_id,
+                                nodes_packed=nodes_packed,
+                                query_emb=query_emb,
+                                cosine_sims=citation_result["cosine_sims"],
+                                literal_cited=citation_result["literal_cited"],
+                                cross_encoder_cited=None,
+                                task_type="mcp_interactive",
+                            )
+                            if resp.ok:
+                                logger.debug(
+                                    "RL monitor %s: trained on %d nodes (transcript %s)",
+                                    task_id[:8], len(nodes_packed), candidate.name[:8],
+                                )
+                            else:
+                                logger.debug(
+                                    "RL monitor %s: rl_update_v3 not ok (%s)",
+                                    task_id[:8], resp.error or resp.skipped or "unknown",
+                                )
+                        except Exception as exc:
+                            logger.debug(
+                                "RL monitor %s: rl_update_v3 raised (%s); continuing",
+                                task_id[:8], exc,
+                            )
                 return
             # Found the right transcript but answer not complete yet — stop scanning candidates
             break

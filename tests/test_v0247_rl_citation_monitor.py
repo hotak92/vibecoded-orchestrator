@@ -178,10 +178,18 @@ class TestComputeAndWriteCitations:
 
         p1, p2, p3 = _patch_helpers(svc, writer)
         with p1, p2, p3:
-            ok = asyncio.run(
+            result = asyncio.run(
                 _rl_compute_and_write_citations("task-123", answer, ctx)
             )
-        assert ok is True
+        # v0.2.9 C8: return type is dict|None (was bool). Truthy dict on
+        # success carries cosine_sims + literal_cited + cited for the
+        # caller's downstream container POST.
+        assert result is not None
+        assert "cosine_sims" in result
+        assert "literal_cited" in result
+        # Stashed back on ctx for monitor reuse.
+        assert ctx.get("cosine_sims_computed") == result["cosine_sims"]
+        assert ctx.get("literal_cited_computed") == result["literal_cited"]
         assert len(writer.calls) == 1
         call = writer.calls[0]
         assert call["task_id"] == "task-123"
@@ -201,8 +209,8 @@ class TestComputeAndWriteCitations:
         ctx = {"active_model": "qwen3-embedding:0.6b", "nodes": []}
         p1, p2, p3 = _patch_helpers(svc, writer)
         with p1, p2, p3:
-            ok = asyncio.run(_rl_compute_and_write_citations("t", "answer", ctx))
-        assert ok is False
+            result = asyncio.run(_rl_compute_and_write_citations("t", "answer", ctx))
+        assert result is None
         assert writer.calls == []
 
     def test_no_embedding_service_returns_false(self) -> None:
@@ -225,8 +233,8 @@ class TestComputeAndWriteCitations:
             return_value=writer,
         )
         with p1, p2, p3:
-            ok = asyncio.run(_rl_compute_and_write_citations("t", "a", ctx))
-        assert ok is False
+            result = asyncio.run(_rl_compute_and_write_citations("t", "a", ctx))
+        assert result is None
         assert writer.calls == []
 
     def test_chunker_failure_returns_false(self) -> None:
@@ -243,8 +251,8 @@ class TestComputeAndWriteCitations:
 
         p1, p2, p3 = _patch_helpers(svc, writer, chunker=_ExplodingChunker())
         with p1, p2, p3:
-            ok = asyncio.run(_rl_compute_and_write_citations("t", "a", ctx))
-        assert ok is False
+            result = asyncio.run(_rl_compute_and_write_citations("t", "a", ctx))
+        assert result is None
         assert writer.calls == []
 
     def test_node_without_n_emb_still_gets_literal_check(self) -> None:
@@ -292,8 +300,8 @@ class TestComputeAndWriteCitations:
             return_value=None,
         )
         with p1, p2, p3:
-            ok = asyncio.run(_rl_compute_and_write_citations("t", "a", ctx))
-        assert ok is False
+            result = asyncio.run(_rl_compute_and_write_citations("t", "a", ctx))
+        assert result is None
 
     def test_writer_log_citations_raising_returns_false(self) -> None:
         svc = _FakeEmbeddingService()
@@ -310,8 +318,8 @@ class TestComputeAndWriteCitations:
         p1, p2, p3 = _patch_helpers(svc, writer)
         with p1, p2, p3:
             # No exception propagates.
-            ok = asyncio.run(_rl_compute_and_write_citations("t", "a", ctx))
-        assert ok is False
+            result = asyncio.run(_rl_compute_and_write_citations("t", "a", ctx))
+        assert result is None
 
 
 # ----------------------------------------------------------------------
