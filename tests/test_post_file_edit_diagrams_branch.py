@@ -73,7 +73,12 @@ def test_non_diagram_edit_does_not_touch_throttle(tmp_path: Path):
     (project / ".claude" / "hooks" / "_lib").mkdir(parents=True)
     # Copy the hook and its dependencies.
     shutil.copy(HOOK_SH, project / ".claude" / "hooks" / "post-file-edit.sh")
-    for lib in ("find-python.sh", "stderr-cap.sh", "emit-context.sh"):
+    for lib in (
+        "find-python.sh",
+        "stderr-cap.sh",
+        "emit-context.sh",
+        "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
+    ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():
             shutil.copy(src, project / ".claude" / "hooks" / "_lib" / lib)
@@ -130,7 +135,12 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
     (project / ".venv" / "bin").mkdir(parents=True)
 
     shutil.copy(HOOK_SH, project / ".claude" / "hooks" / "post-file-edit.sh")
-    for lib in ("find-python.sh", "stderr-cap.sh", "emit-context.sh"):
+    for lib in (
+        "find-python.sh",
+        "stderr-cap.sh",
+        "emit-context.sh",
+        "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
+    ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():
             shutil.copy(src, project / ".claude" / "hooks" / "_lib" / lib)
@@ -236,7 +246,12 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
     (project / ".venv" / "bin").mkdir(parents=True)
 
     shutil.copy(HOOK_SH, project / ".claude" / "hooks" / "post-file-edit.sh")
-    for lib in ("find-python.sh", "stderr-cap.sh", "emit-context.sh"):
+    for lib in (
+        "find-python.sh",
+        "stderr-cap.sh",
+        "emit-context.sh",
+        "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
+    ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():
             shutil.copy(src, project / ".claude" / "hooks" / "_lib" / lib)

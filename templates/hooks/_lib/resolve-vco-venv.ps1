@@ -1,4 +1,4 @@
-# _lib/resolve-vco-venv.ps1
+﻿# _lib/resolve-vco-venv.ps1
 # Windows PowerShell mirror of resolve-vco-venv.sh.
 #
 # v0.2.46 post-adversarial follow-up — eliminates venv-resolver drift

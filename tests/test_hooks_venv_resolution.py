@@ -60,159 +60,177 @@ LAYOUT_DIRS = ["templates/hooks"]
 
 
 class HookHasDualLayoutResolutionSh(unittest.TestCase):
-    """Each .sh hook must include all three candidate paths in priority
-    order: $VCT_VENV → top-level .venv → claude_mcp_servers/.venv."""
+    """v0.2.46 post-adversarial F1 refactor: each .sh hook now SOURCES
+    the shared `_lib/resolve-vco-venv.sh` helper instead of inlining its
+    own resolver. The helper carries the canonical 3-tier precedence
+    ($VCT_VENV → $VCT_INSTALL_ROOT/.venv → clone-relative). These tests
+    now verify (a) each hook sources the helper, (b) the helper itself
+    encodes the dual-layout (top-level + legacy claude_mcp_servers).
+    """
 
     def test_sh_hooks_reference_all_three_candidates(self) -> None:
+        # Pre-refactor: each hook had inline references to all three
+        # candidates. Post-refactor: hooks delegate to the shared helper.
+        # We verify each hook SOURCES the helper, and the helper itself
+        # references all three candidates.
+        helper_path = REPO_ROOT / "templates/hooks/_lib/resolve-vco-venv.sh"
+        self.assertTrue(helper_path.is_file(),
+                        f"shared helper missing: {helper_path}")
+        helper_text = helper_path.read_text(encoding="utf-8")
+
+        with self.subTest(component="helper"):
+            self.assertIn("VCT_VENV", helper_text,
+                          f"{helper_path}: missing VCT_VENV override")
+            self.assertRegex(
+                helper_text,
+                r"/\.venv(/bin/python|/Scripts/python\.exe|\b)",
+                f"{helper_path}: missing top-level .venv candidate",
+            )
+            self.assertIn(
+                "claude_mcp_servers/.venv",
+                helper_text,
+                f"{helper_path}: missing legacy claude_mcp_servers/.venv candidate",
+            )
+
         for layout_dir in LAYOUT_DIRS:
             for hook in HOOKS_UNDER_TEST:
                 path = REPO_ROOT / layout_dir / f"{hook}.sh"
                 self.assertTrue(path.exists(), f"missing hook: {path}")
                 text = path.read_text(encoding="utf-8")
                 with self.subTest(hook=hook, layout=layout_dir):
-                    # All three candidates must appear somewhere in the file.
-                    self.assertIn("VCT_VENV", text,
-                                  f"{path}: missing VCT_VENV override")
-                    self.assertRegex(
-                        text,
-                        r"/\.venv(/bin/python|/Scripts/python\.exe|\b)",
-                        f"{path}: missing top-level .venv candidate",
-                    )
                     self.assertIn(
-                        "claude_mcp_servers/.venv",
+                        "resolve-vco-venv.sh",
                         text,
-                        f"{path}: missing legacy claude_mcp_servers/.venv candidate",
+                        f"{path}: doesn't source the shared venv resolver "
+                        f"(_lib/resolve-vco-venv.sh)",
                     )
 
     def test_sh_hooks_check_vct_venv_before_layout_candidates(self) -> None:
-        """VCT_VENV must be checked BEFORE either layout candidate so the
-        explicit override always wins."""
-        for layout_dir in LAYOUT_DIRS:
-            for hook in HOOKS_UNDER_TEST:
-                path = REPO_ROOT / layout_dir / f"{hook}.sh"
-                text = path.read_text(encoding="utf-8")
-                # Position of first VCT_VENV reference (excluding the comment block).
-                # We strip comment-only lines containing "PR-25" markers first.
-                non_comment_lines = []
-                for line in text.splitlines():
-                    if line.lstrip().startswith("#"):
-                        continue
-                    non_comment_lines.append(line)
-                non_comment = "\n".join(non_comment_lines)
+        """v0.2.46 post-adversarial F1: VCT_VENV-before-fallback ordering
+        now lives in the shared helper. Verify it there once instead of
+        repeating the check across each hook."""
+        helper_path = REPO_ROOT / "templates/hooks/_lib/resolve-vco-venv.sh"
+        text = helper_path.read_text(encoding="utf-8")
+        non_comment_lines = [
+            line for line in text.splitlines()
+            if not line.lstrip().startswith("#")
+        ]
+        non_comment = "\n".join(non_comment_lines)
 
-                vct_pos = non_comment.find("VCT_VENV")
-                modern_pos = non_comment.find(".venv")
-                # The first .venv match might be inside "VCT_VENV" itself —
-                # skip past it to find a "real" .venv path reference.
-                if modern_pos != -1 and modern_pos == vct_pos + 4:
-                    # ".venv" inside "VCT_VENV/.venv" — search past
-                    modern_pos = non_comment.find(".venv", modern_pos + 5)
-                with self.subTest(hook=hook, layout=layout_dir):
-                    self.assertGreater(vct_pos, -1,
-                                       f"{path}: VCT_VENV not in non-comment body")
-                    # Both must appear and VCT_VENV must come first.
-                    self.assertLess(
-                        vct_pos, modern_pos,
-                        f"{path}: VCT_VENV must be checked before layout fallback",
-                    )
+        vct_pos = non_comment.find("VCT_VENV")
+        modern_pos = non_comment.find(".venv")
+        # The first .venv match might be inside "VCT_VENV" itself — skip past.
+        if modern_pos != -1 and modern_pos == vct_pos + 4:
+            modern_pos = non_comment.find(".venv", modern_pos + 5)
+        self.assertGreater(vct_pos, -1,
+                           f"{helper_path}: VCT_VENV not in non-comment body")
+        self.assertLess(
+            vct_pos, modern_pos,
+            f"{helper_path}: VCT_VENV must be checked before layout fallback",
+        )
 
 
 class HookHasDualLayoutResolutionPs1(unittest.TestCase):
-    """Each .ps1 hook must include all three candidate paths."""
+    """v0.2.46 post-adversarial F1: PowerShell-side mirror of the
+    helper-sourcing contract. Each .ps1 hook dot-sources
+    `_lib/resolve-vco-venv.ps1`, and the helper itself has the
+    canonical dual-layout references.
+    """
 
     def test_ps1_hooks_reference_all_three_candidates(self) -> None:
+        helper_path = REPO_ROOT / "templates/hooks/_lib/resolve-vco-venv.ps1"
+        self.assertTrue(helper_path.is_file(),
+                        f"shared PS helper missing: {helper_path}")
+        helper_text = helper_path.read_text(encoding="utf-8")
+
+        with self.subTest(component="helper"):
+            self.assertIn("VCT_VENV", helper_text,
+                          f"{helper_path}: missing VCT_VENV override")
+            self.assertRegex(
+                helper_text,
+                r'(?:["\s])\.venv["\\/]?',
+                f"{helper_path}: missing top-level .venv candidate",
+            )
+            # PS uses Join-Path with separated string args, so
+            # `claude_mcp_servers` and `.venv` may not be joined by a literal
+            # slash in the source. Loosen the regex to allow either form.
+            self.assertRegex(
+                helper_text,
+                r"claude_mcp_servers",
+                f"{helper_path}: missing legacy claude_mcp_servers candidate",
+            )
+
         for layout_dir in LAYOUT_DIRS:
             for hook in HOOKS_UNDER_TEST:
                 path = REPO_ROOT / layout_dir / f"{hook}.ps1"
                 self.assertTrue(path.exists(), f"missing hook: {path}")
                 text = path.read_text(encoding="utf-8")
                 with self.subTest(hook=hook, layout=layout_dir):
-                    self.assertIn("VCT_VENV", text,
-                                  f"{path}: missing VCT_VENV override")
-                    # PS uses both forward and back slashes; match either.
-                    # The top-level candidate may appear as:
-                    #   Join-Path $DefaultRepoRoot ".venv"
-                    #   Join-Path $VenvBase ".venv\Scripts\python.exe"
-                    #   $DefaultRepoRoot/.venv
-                    # — match any of these forms.
-                    self.assertRegex(
+                    self.assertIn(
+                        "resolve-vco-venv.ps1",
                         text,
-                        r'(?:["\s])\.venv["\\/]?',
-                        f"{path}: missing top-level .venv candidate",
-                    )
-                    self.assertRegex(
-                        text,
-                        r"claude_mcp_servers[\\/]\.venv",
-                        f"{path}: missing legacy candidate",
+                        f"{path}: doesn't dot-source the shared venv resolver "
+                        f"(_lib/resolve-vco-venv.ps1)",
                     )
 
 
 class TopLevelVenvIsPreferredOverLegacy(unittest.TestCase):
-    """When both candidates exist, the top-level `.venv` must be tried FIRST.
-    Verified by checking the textual ordering of the two candidate paths
-    in each hook (the resolution scans top-down).
+    """v0.2.46 post-adversarial F1: top-level-vs-legacy precedence now
+    lives in the shared `_lib/resolve-vco-venv.{sh,ps1}` helpers. Verify
+    the ordering there once; the hooks delegate.
     """
 
     def test_sh_hooks_top_level_listed_before_legacy(self) -> None:
-        for layout_dir in LAYOUT_DIRS:
-            for hook in HOOKS_UNDER_TEST:
-                path = REPO_ROOT / layout_dir / f"{hook}.sh"
-                text = path.read_text(encoding="utf-8")
-                # Find first non-comment occurrence of each. Some hooks list
-                # them inside a for-loop with explicit ordering; others use
-                # an if/elif chain — both forms preserve the priority.
-                non_comment_text = "\n".join(
-                    line for line in text.splitlines()
-                    if not line.lstrip().startswith("#")
-                )
-                top_match = re.search(
-                    r'[\$/]\w*[\.\$\w_-]*/\.venv', non_comment_text
-                )
-                legacy_match = re.search(
-                    r'claude_mcp_servers/\.venv', non_comment_text
-                )
-                with self.subTest(hook=hook, layout=layout_dir):
-                    self.assertIsNotNone(top_match, f"{path}: no top-level .venv path")
-                    self.assertIsNotNone(legacy_match, f"{path}: no legacy path")
-                    self.assertLess(
-                        top_match.start(), legacy_match.start(),
-                        f"{path}: top-level .venv must be listed before "
-                        f"claude_mcp_servers/.venv (resolution priority)",
-                    )
+        # Refactor target: the shared bash helper, not each hook.
+        helper_path = REPO_ROOT / "templates/hooks/_lib/resolve-vco-venv.sh"
+        text = helper_path.read_text(encoding="utf-8")
+        non_comment_text = "\n".join(
+            line for line in text.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        top_match = re.search(r'[\$/]\w*[\.\$\w_-]*/\.venv', non_comment_text)
+        legacy_match = re.search(r'claude_mcp_servers/\.venv', non_comment_text)
+        self.assertIsNotNone(top_match, f"{helper_path}: no top-level .venv path")
+        self.assertIsNotNone(legacy_match, f"{helper_path}: no legacy path")
+        self.assertLess(
+            top_match.start(), legacy_match.start(),
+            f"{helper_path}: top-level .venv must be listed before "
+            f"claude_mcp_servers/.venv (resolution priority)",
+        )
 
     def test_ps1_hooks_top_level_listed_before_legacy(self) -> None:
-        for layout_dir in LAYOUT_DIRS:
-            for hook in HOOKS_UNDER_TEST:
-                path = REPO_ROOT / layout_dir / f"{hook}.ps1"
-                text = path.read_text(encoding="utf-8")
-                non_comment_text = "\n".join(
-                    line for line in text.splitlines()
-                    if not line.lstrip().startswith("#")
-                )
-                # Look for the top-level .venv candidate. PowerShell idioms
-                # used: Join-Path $base ".venv", Join-Path $base
-                # ".venv\Scripts\...", etc. The marker is `".venv` (after a
-                # quote or whitespace) NOT preceded by `claude_mcp_servers`.
-                # We find all occurrences of `.venv` then drop the legacy
-                # ones (where `claude_mcp_servers/` precedes immediately).
-                top_match = None
-                for m in re.finditer(r'\.venv', non_comment_text):
-                    start = m.start()
-                    preceding = non_comment_text[max(0, start - 24):start]
-                    if "claude_mcp_servers" in preceding:
-                        continue
-                    top_match = m
-                    break
-                legacy_match = re.search(
-                    r'claude_mcp_servers[\\/]\.venv', non_comment_text
-                )
-                with self.subTest(hook=hook, layout=layout_dir):
-                    self.assertIsNotNone(top_match, f"{path}: no top-level candidate")
-                    self.assertIsNotNone(legacy_match, f"{path}: no legacy candidate")
-                    self.assertLess(
-                        top_match.start(), legacy_match.start(),
-                        f"{path}: top-level must come before legacy",
-                    )
+        helper_path = REPO_ROOT / "templates/hooks/_lib/resolve-vco-venv.ps1"
+        text = helper_path.read_text(encoding="utf-8")
+        non_comment_text = "\n".join(
+            line for line in text.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        # Look for the top-level .venv candidate. PowerShell idioms
+        # used: Join-Path $base ".venv", Join-Path $base
+        # ".venv\Scripts\...", etc. The marker is `".venv` (after a
+        # quote or whitespace) NOT preceded by `claude_mcp_servers`.
+        # We find all occurrences of `.venv` then drop the legacy
+        # ones (where `claude_mcp_servers/` precedes immediately).
+        top_match = None
+        for m in re.finditer(r'\.venv', non_comment_text):
+            start = m.start()
+            preceding = non_comment_text[max(0, start - 64):start]
+            # The PS Join-Path idiom puts `claude_mcp_servers` upstream of
+            # `.venv` (in a chained Join-Path call), not directly adjacent.
+            # 64 chars of preceding context covers that span.
+            if "claude_mcp_servers" in preceding:
+                continue
+            top_match = m
+            break
+        # Loosened: PS Join-Path puts `claude_mcp_servers` and `.venv` as
+        # separate string args. We only care that BOTH appear in order.
+        legacy_match = re.search(r'claude_mcp_servers', non_comment_text)
+        self.assertIsNotNone(top_match, f"{helper_path}: no top-level candidate")
+        self.assertIsNotNone(legacy_match, f"{helper_path}: no legacy candidate")
+        self.assertLess(
+            top_match.start(), legacy_match.start(),
+            f"{helper_path}: top-level must come before legacy",
+        )
 
 
 class HooksAreSyntacticallyValid(unittest.TestCase):

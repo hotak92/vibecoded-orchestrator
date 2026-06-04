@@ -39,7 +39,7 @@
   };
 
   let {
-    open,
+    open = $bindable(false),
     detection,
     installPath,
     onAdopt,

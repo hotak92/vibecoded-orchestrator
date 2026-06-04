@@ -40,17 +40,21 @@ if (-not $ProjectName) { $ProjectName = Split-Path $RepoPath -Leaf }
 $ScriptDir = $PSScriptRoot
 $DefaultRepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 $Analyzer = if ($env:VCT_ANALYZER_SCRIPT) { $env:VCT_ANALYZER_SCRIPT } else { Join-Path $DefaultRepoRoot ".claude/scripts/analyze_code_graph.py" }
-# Dual-layout venv resolution (PR-25 / v0.2.12). Modern installs put the
-# venv at <repo_root>\.venv (top-level); pre-v0.2.x installs had it at
-# <repo_root>\claude_mcp_servers\.venv. Hardcoding the latter caused this
-# hook to silently fall through to system python on modern installs.
-# VCT_VENV overrides everything when set explicitly.
-if ($env:VCT_VENV) {
-    $Venv = $env:VCT_VENV
-} elseif (Test-Path (Join-Path $DefaultRepoRoot ".venv")) {
-    $Venv = Join-Path $DefaultRepoRoot ".venv"
-} elseif (Test-Path (Join-Path $DefaultRepoRoot "claude_mcp_servers/.venv")) {
-    $Venv = Join-Path $DefaultRepoRoot "claude_mcp_servers/.venv"
+# v0.2.46 post-adversarial: dot-source shared resolver. Previous inline
+# logic derived $Venv from $DefaultRepoRoot = $ScriptDir/../.. — which
+# in a user-project install is the USER's project root, not VCO's clone.
+# The resulting $Venv would point at the user's project venv (no
+# weaviate-client + no vco_lib). Shared helper consults $VCT_INSTALL_ROOT
+# (canonical) first and only falls back to clone-relative when the 2-up
+# path looks like a real VCO clone (has install.py + first-install.sh).
+# Returns a python INTERPRETER path; we expose it via $Venv (= its
+# grandparent dir) for back-compat with the downstream $Venv/bin/python
+# expansion that some call sites still rely on. PR-25 / v0.2.12 dual-
+# layout history preserved in the helper's docstring.
+. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
+$VcoVenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+if ($VcoVenvPy) {
+    $Venv = (Resolve-Path (Join-Path (Split-Path -Parent $VcoVenvPy) "..")).Path
 } else {
     $Venv = ""
 }

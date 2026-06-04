@@ -23,8 +23,8 @@
 --     commit), NOT by re-opening the JSONL.
 --
 -- Migration policy for the existing 700 MB JSONL corpus:
---   A one-shot migration script (`vco_lib/migrate_rl_jsonl_to_db.py`,
---   commit C9 of this work) validates each line as v2/v3, drops broken/v1
+--   A one-shot migration script (`claude_mcp_servers/scripts/migrate_rl_jsonl_to_db.py`,
+--   v0.2.46 RL-5/C9) validates each line as v2/v3, drops broken/v1
 --   rows, and POSTs the valid remainder via the hub. Original JSONL is
 --   renamed to `.pre-db-migration.bak` rather than deleted.
 --

@@ -393,7 +393,7 @@
 </section>
 
 <style>
-  /* v0.2.46: replaced undefined --bg-*/--text-* tokens (which all fell
+  /* v0.2.46: replaced undefined --bg-* and --text-* tokens (which all fell
    * through to light-mode hex fallbacks like #fff / #1a1a1a / #f9f9fb,
    * producing an unreadable white card on this app's dark theme) with
    * the same colour vocabulary the rest of the GUI uses — the `ps-*`

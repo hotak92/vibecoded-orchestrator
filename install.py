@@ -1643,6 +1643,34 @@ def _detect_third_party_project(install_path: Path) -> dict | None:
         if install_path is None or not install_path.is_dir():
             return None
 
+        # v0.2.46 post-adversarial L4 (orchestrator-clone exclusion):
+        # The VCO orchestrator clone itself has CLAUDE.md + .env + .venv
+        # + .claude/ + knowledge/ — every signal the heuristic looks for
+        # — but it does NOT carry a .vco-manifest.json (the manifest is
+        # written into PROJECTS VCO installs into, not into the VCO clone
+        # which is bootstrapped from the upstream tarball). Without this
+        # exclusion, every `install.py --update` on the orchestrator
+        # clone fires the adopt prompt + non-interactively defaults to
+        # "no-adopt" (per V47-G-final's safer-default rule) + EXITS
+        # without applying the update.
+        #
+        # The discriminator matches `validate_source_repo` in install.py
+        # (both `install.py` AND `first-install.sh` at install_path) —
+        # the same pair the venv-resolver helper uses to identify a real
+        # VCO clone. Add `vct-module.json` as a tertiary check so a 3rd-
+        # party project that happens to have both install.py and
+        # first-install.sh in its root (extremely unlikely combo) still
+        # gets the adopt prompt.
+        install_py_marker = install_path / "install.py"
+        first_install_marker = install_path / "first-install.sh"
+        vct_module_marker = install_path / "vct-module.json"
+        if (install_py_marker.is_file()
+                and first_install_marker.is_file()
+                and vct_module_marker.is_file()):
+            # This IS the VCO orchestrator clone — never prompt for
+            # adopt mode on it. The update flow proceeds normally.
+            return None
+
         manifest_path = install_path / ".claude" / ".vco-manifest.json"
         manifest_status = _v47g_classify_manifest(manifest_path)
         if manifest_status == "valid":
@@ -3862,6 +3890,14 @@ def main() -> int:
                         help="During --update, attempt to apply each pending entry "
                              "in .claude/context/UPDATE_DEFERRED.md. Resolved entries "
                              "are removed; the file is deleted when zero entries remain.")
+    parser.add_argument("--apply-orphan-deletes", action="store_true", default=False,
+                        help="During --update --apply-deferred, additionally consent "
+                             "to DELETE Weaviate collections marked by the "
+                             "`orphan_*_collection` deferral entries (the deferrals "
+                             "name 0-row legacy collections from older install.py "
+                             "versions). Destructive on the Weaviate side; the script "
+                             "still re-verifies the collection is empty + still "
+                             "exists before issuing the DELETE.")
     parser.add_argument("--force-pin-reset", action="store_true", default=False,
                         help="On --update, REINSTALL any globally-installed npm "
                              "package whose version drifted from "
@@ -4932,7 +4968,7 @@ def main() -> int:
 
     # Apply pending deferrals if requested (--update --apply-deferred).
     if args.update and getattr(args, "apply_deferred", False):
-        _apply_deferred_entries(_deferral_report, _deferral_folder)
+        _apply_deferred_entries(_deferral_report, _deferral_folder, args=args)
 
     # Write (or delete) the deferral report. On install runs, this is a no-op
     # (nothing accumulates); on update runs, any unresolved conditions land here.
@@ -5241,6 +5277,8 @@ def _write_update_deferred_stub(folder: Path, *, mode: str) -> None:
 def _apply_deferred_entries(
     current_run_report: DeferralReport,
     project_root: Path,
+    *,
+    args: "argparse.Namespace | None" = None,
 ) -> None:
     """Attempt to apply each entry in the persisted deferral report.
 
@@ -5328,6 +5366,148 @@ def _apply_deferred_entries(
                 "Pass --gpu or set VCT_GPU_VENDOR and re-run."
             )
             current_run_report.add_entry(entry)
+
+        elif cid.startswith("kg_named_vector_slot_error_"):
+            # v0.2.46 post-adversarial L4 (handler): named-vector slot
+            # migrations historically failed when install.py step 7d ran
+            # without `weaviate` importable (pre-V45-A self-relaunch).
+            # The Part 1.5 H1 venv-fallback warning + the venv-resolver
+            # helper close the underlying cause; this handler verifies
+            # the slot is now present in Weaviate's schema and clears
+            # the entry if so. The user is no longer asked to run
+            # `vco_lib.project_init migrate-collections` manually when
+            # the next `--update --apply-deferred` would do it.
+            print(f"  [try]  {cid}: verifying slot via Weaviate schema ...")
+            # Condition ID shape: kg_named_vector_slot_error_<Collection>_<slot>
+            # e.g. kg_named_vector_slot_error_VCODev_KnowledgeGraph_arctic2_embed
+            #      kg_named_vector_slot_error_VCODev_Development_openai_text_embed
+            #
+            # Both the COLLECTION name and the SLOT name can contain
+            # underscores, so a positional split (.rsplit / .partition)
+            # can't disambiguate. Instead we suffix-match against the
+            # known slot vocabulary; the remainder is the collection.
+            # The slot list mirrors `_KG_NAMED_VECTOR_SLOTS` in
+            # vco_lib/project_init.py — kept in sync by hand.
+            _KNOWN_SLOTS = (
+                "qwen3_embed",
+                "ollama_embed",
+                "openai_embed",
+                "arctic2_embed",
+                "openai_text_embed",
+            )
+            try:
+                payload = cid[len("kg_named_vector_slot_error_"):]
+                slot_name: str | None = None
+                for known in _KNOWN_SLOTS:
+                    if payload.endswith("_" + known):
+                        slot_name = known
+                        collection_name = payload[: -(len(known) + 1)]
+                        break
+                if slot_name is None:
+                    raise ValueError(
+                        f"unknown slot suffix in condition_id {cid!r}; "
+                        f"known slots: {_KNOWN_SLOTS}"
+                    )
+                weaviate_url = os.environ.get(
+                    "WEAVIATE_URL",
+                    f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
+                )
+                schema_url = f"{weaviate_url}/v1/schema/{collection_name}"
+                with urllib.request.urlopen(schema_url, timeout=10) as resp:
+                    schema = json.loads(resp.read())
+                vector_configs = schema.get("vectorConfig") or {}
+                if slot_name in vector_configs:
+                    print(
+                        f"  [ok]   {cid}: slot `{slot_name}` is present in "
+                        f"`{collection_name}`. Marking resolved."
+                    )
+                    # Resolved: do NOT re-add to current_run_report.
+                else:
+                    print(
+                        f"  [fail] {cid}: slot `{slot_name}` still missing "
+                        f"from `{collection_name}`. Keeping entry."
+                    )
+                    current_run_report.add_entry(entry)
+            except Exception as exc:  # noqa: BLE001 — soft-fail
+                print(f"  [fail] {cid}: probe failed ({exc}). Keeping entry.")
+                current_run_report.add_entry(entry)
+
+        elif cid == "orphan_orchestrator_development_collection":
+            # v0.2.46 post-adversarial L4 (handler): a 0-row legacy
+            # `VibeCodedOrchestrator_Development` Weaviate collection that
+            # older install.py versions created. Deleting it is destructive
+            # (Weaviate DROP can't be undone), but the deferral itself
+            # documents "Dropping is safe" — the collection has no callers
+            # and no rows. Gate auto-delete behind explicit user opt-in
+            # (`--apply-orphan-deletes` flag) so the default
+            # `--apply-deferred` flow remains non-destructive.
+            if getattr(args, "apply_orphan_deletes", False):
+                print(f"  [try]  {cid}: DELETE legacy orphan collection ...")
+                try:
+                    weaviate_url = os.environ.get(
+                        "WEAVIATE_URL",
+                        f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
+                    )
+                    # Re-verify still-orphaned (0 rows + still exists)
+                    # before destruction. A future install that
+                    # repopulated the collection should NOT see its rows
+                    # vanish because of a stale deferral.
+                    schema_url = (
+                        f"{weaviate_url}/v1/schema/"
+                        f"VibeCodedOrchestrator_Development"
+                    )
+                    try:
+                        with urllib.request.urlopen(schema_url, timeout=5) as resp:
+                            resp.read()  # exists
+                    except urllib.error.HTTPError as e:
+                        if e.code == 404:
+                            print(
+                                f"  [ok]   {cid}: collection already absent. "
+                                "Marking resolved."
+                            )
+                            continue
+                        raise
+                    # Sanity-check row count via aggregate (GraphQL):
+                    count_gql = (
+                        '{"query":"{ Aggregate { '
+                        'VibeCodedOrchestrator_Development { meta { count } } } }"}'
+                    )
+                    req = urllib.request.Request(
+                        f"{weaviate_url}/v1/graphql",
+                        data=count_gql.encode("utf-8"),
+                        method="POST",
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        body = json.loads(resp.read())
+                    count = (body.get("data", {})
+                                 .get("Aggregate", {})
+                                 .get("VibeCodedOrchestrator_Development", [{}])
+                                 [0].get("meta", {}).get("count"))
+                    if count is None or count > 0:
+                        print(
+                            f"  [skip] {cid}: collection has {count} rows "
+                            f"(not 0). Refusing to delete a non-orphan. "
+                            f"Keeping entry."
+                        )
+                        current_run_report.add_entry(entry)
+                        continue
+                    # Confirmed empty + still exists. Safe to drop.
+                    del_req = urllib.request.Request(schema_url, method="DELETE")
+                    urllib.request.urlopen(del_req, timeout=10)
+                    print(f"  [ok]   {cid}: collection dropped. Marking resolved.")
+                    # Resolved: do NOT re-add to current_run_report.
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"  [fail] {cid}: delete failed ({exc}). Keeping entry."
+                    )
+                    current_run_report.add_entry(entry)
+            else:
+                print(
+                    f"  [skip] {cid}: destructive — pass "
+                    f"--apply-orphan-deletes to consent."
+                )
+                current_run_report.add_entry(entry)
 
         else:
             # Unknown condition: preserve it to avoid silently losing info.
@@ -12411,8 +12591,19 @@ def _emit_orchestrator_root_schema_deferrals(
     }
 
     # ── (a) Orphan VibeCodedOrchestrator_Development ──────────────────────
+    # v0.2.46 post-adversarial: gate the "orphan" claim on the collection
+    # NOT being the current project's canonical Development collection.
+    # On an orchestrator-clone install (.claude/env sets
+    # DEVELOPMENT_COLLECTION=VibeCodedOrchestrator_Development) this IS
+    # the canonical dev collection — install.py creates it via the dev-
+    # collection bootstrap, then the per-project Development hooks
+    # populate it. Pre-fix, the install would create the collection,
+    # then this detector would re-emit the orphan deferral every run,
+    # causing an apply-deferred infinite loop that blocked the
+    # no-deferred-fixes rule at tag time.
     orphan_dev = "VibeCodedOrchestrator_Development"
-    if orphan_dev in class_map:
+    _current_dev_collection = os.environ.get("DEVELOPMENT_COLLECTION", "")
+    if orphan_dev in class_map and orphan_dev != _current_dev_collection:
         # Only emit if the collection appears to have 0 or very few rows.
         row_count = _count_weaviate_class_objects(weaviate_url, orphan_dev)
         if row_count is not None and row_count == 0:

@@ -126,5 +126,12 @@ resolve_vco_venv_python() {
     # All tiers failed. Caller MUST check $VCO_VENV_PYTHON for empty
     # before using and decide whether to soft-fail (typical) or hard-
     # fail (rare). NEVER fall back to $PROJECT_ROOT/.venv.
-    return 1
+    #
+    # v0.2.46 post-adversarial F1: return 0 on no-resolve. The output
+    # contract is $VCO_VENV_PYTHON (empty = "nothing resolved"); the
+    # return code is NOT part of the contract. Returning 1 here under
+    # `set -e` aborts the calling hook entirely — that breaks the
+    # documented soft-fail behaviour ("a broken venv never blocks the
+    # host Edit tool"). Test pin: tests/test_hooks_venv_resolution.py.
+    return 0
 }

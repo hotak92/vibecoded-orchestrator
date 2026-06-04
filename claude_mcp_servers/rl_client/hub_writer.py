@@ -11,7 +11,7 @@ Soft-fail discipline (locked decision 2026-06-04):
     - Caller does NOT raise; treats False as "event lost" and continues.
     - No retry queue. No JSONL fallback (the JSONL path is dead going
       forward; historical events come over via the one-shot migration
-      script in vco_lib/migrate_rl_jsonl_to_db.py).
+      script in claude_mcp_servers/scripts/migrate_rl_jsonl_to_db.py).
 
 Discovery:
     - Hub port: ``$VCT_HUB_PORT`` -> ``<vct_root>/hub.port`` -> 7700.

@@ -116,6 +116,16 @@ def hook_env(tmp_path: Path):
         'PY="$(command -v python3)"\n', encoding="utf-8"
     )
 
+    # v0.2.46 post-adversarial F1: hook now sources resolve-vco-venv.sh.
+    # Use the real production helper so we exercise the canonical resolution
+    # path (the test sets up $VCT_INSTALL_ROOT below pointing at the sandbox
+    # root, which has the .venv created at line 127-130).
+    real_resolver = REPO_ROOT / "templates" / "hooks" / "_lib" / "resolve-vco-venv.sh"
+    shutil.copy(
+        real_resolver,
+        install_root / "templates" / "hooks" / "_lib" / "resolve-vco-venv.sh",
+    )
+
     # detect-project stub — the hook sources it but we don't need
     # multi-codebase detection for the dedup test.
     (install_root / ".claude" / "scripts" / "detect-project.sh").write_text(

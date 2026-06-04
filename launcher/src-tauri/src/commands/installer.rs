@@ -6608,6 +6608,22 @@ pub fn detect_third_party_project_signals(install_path: String) -> ThirdPartyDet
         return out;
     }
 
+    // v0.2.46 post-adversarial L4 (orchestrator-clone exclusion):
+    // The VCO orchestrator clone itself has every signal the heuristic
+    // looks for but does NOT carry a .vco-manifest.json. Match the
+    // Python sibling exactly: presence of install.py + first-install.sh
+    // + vct-module.json proves this is the VCO clone, not a 3rd-party
+    // project. Suppresses the adopt prompt + the GUI modal pop-up on
+    // the orchestrator clone itself. Kept in sync with the Python
+    // helper _detect_third_party_project in install.py.
+    let install_py = root.join("install.py");
+    let first_install = root.join("first-install.sh");
+    let vct_module = root.join("vct-module.json");
+    if install_py.is_file() && first_install.is_file() && vct_module.is_file() {
+        out.summary = "orchestrator clone (not a 3rd-party project)".into();
+        return out;
+    }
+
     // v0.2.46 post-adversarial L2: classify the manifest. The Python
     // canonical helper (_v47g_classify_manifest in install.py) returns one
     // of {"absent", "valid", "broken"}. We mirror only the YES/NO/BROKEN
