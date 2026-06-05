@@ -13270,6 +13270,53 @@ def _w40_write_adoption_audit(
         )
 
 
+def _connect_launcher_db_with_retry(
+    db_path,
+    *,
+    attempts: int = 5,
+    base_delay: float = 0.4,
+):
+    """Open launcher.db, tolerating a transient `database is locked`.
+
+    The common case on Windows: the user runs `install.py --update` while the
+    launcher GUI is still open, so SQLite's single writer is briefly held and
+    a plain `connect()` raises `OperationalError: database is locked`. That is
+    NOT a real self-heal failure — it clears in well under a second once the
+    launcher commits. Without a retry the caller degrades to a `warning`
+    deferral that lingers until the user manually re-runs the update, even
+    though there was nothing to heal.
+
+    Strategy: a generous per-connection `timeout` plus `PRAGMA busy_timeout`
+    (the timeout arg alone does not cover locks hit mid-statement on every
+    platform), retried with linear backoff. Only `database is locked` /
+    `database is busy` are retried; any other sqlite error (corruption,
+    schema mismatch) is raised immediately so the caller still defers on the
+    genuinely-unsafe paths.
+
+    Raises the last `sqlite3.OperationalError` if every attempt is locked.
+    """
+    import sqlite3 as _sqlite3
+
+    last_err: "Exception | None" = None
+    for attempt in range(attempts):
+        try:
+            conn = _sqlite3.connect(str(db_path), timeout=5.0)
+            # busy_timeout makes SQLite wait on locks encountered *during*
+            # statements, not just at connect() time.
+            conn.execute("PRAGMA busy_timeout = 4000")
+            return conn
+        except _sqlite3.OperationalError as oe:
+            msg = str(oe).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            last_err = oe
+            if attempt < attempts - 1:
+                time.sleep(base_delay * (attempt + 1))
+    # Exhausted retries — re-raise so the caller's deferral path runs.
+    assert last_err is not None
+    raise last_err
+
+
 def _self_heal_kg_bindings_on_update(
     deferral_report: "DeferralReport",
 ) -> None:
@@ -13373,7 +13420,11 @@ def _self_heal_kg_bindings_on_update(
     prefix_adopts: list[tuple[str, str, str, str, int]] = []
     prefix_multi_candidates: list[tuple[str, str, str, list[tuple[str, int]]]] = []
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        # Retry on a transient lock (launcher GUI open during --update) so a
+        # brief lock does not degrade to a lingering deferral. Non-lock sqlite
+        # errors (corruption / schema mismatch) still propagate to the
+        # except-block below and produce the deferral as before.
+        conn = _connect_launcher_db_with_retry(db_path)
         try:
             cur = conn.cursor()
 

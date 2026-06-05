@@ -948,5 +948,94 @@ class RebindCollectionNamesHelperTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class TestConnectLauncherDbWithRetry(unittest.TestCase):
+    """Transient-lock retry for the self-heal launcher.db connection.
+
+    A launcher GUI open during `install.py --update` briefly holds SQLite's
+    single writer; the helper must retry rather than raise immediately (which
+    would degrade to a lingering `kg_binding_self_heal_db_error` deferral
+    even though nothing needed healing).
+    """
+
+    def setUp(self):
+        self._tmp = Path(__file__).resolve().parent / "_tmp_retry_db"
+        self._tmp.mkdir(exist_ok=True)
+        self.db_path = self._tmp / "launcher.db"
+        # Minimal valid sqlite file.
+        con = sqlite3.connect(str(self.db_path))
+        con.execute("CREATE TABLE t (id INTEGER)")
+        con.commit()
+        con.close()
+
+    def tearDown(self):
+        try:
+            self.db_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            self._tmp.rmdir()
+        except OSError:
+            pass
+
+    def test_connects_on_clean_db(self):
+        conn = install._connect_launcher_db_with_retry(self.db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT 1").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+    def test_retries_then_succeeds_after_transient_lock(self):
+        # First two connect() calls raise "database is locked", third works.
+        real_connect = sqlite3.connect
+        calls = {"n": 0}
+
+        def flaky_connect(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise sqlite3.OperationalError("database is locked")
+            return real_connect(*args, **kwargs)
+
+        with mock.patch.object(install, "time") as fake_time, \
+                mock.patch("sqlite3.connect", side_effect=flaky_connect):
+            fake_time.sleep = lambda _s: None  # don't actually wait
+            fake_time.time = time.time
+            conn = install._connect_launcher_db_with_retry(
+                self.db_path, attempts=5, base_delay=0.0,
+            )
+        try:
+            self.assertEqual(calls["n"], 3)
+            self.assertEqual(conn.execute("SELECT 1").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+    def test_non_lock_error_raises_immediately(self):
+        calls = {"n": 0}
+
+        def boom_connect(*args, **kwargs):
+            calls["n"] += 1
+            raise sqlite3.OperationalError("no such table: whatever")
+
+        with mock.patch("sqlite3.connect", side_effect=boom_connect):
+            with self.assertRaises(sqlite3.OperationalError):
+                install._connect_launcher_db_with_retry(
+                    self.db_path, attempts=5, base_delay=0.0,
+                )
+        # Non-lock error must NOT be retried.
+        self.assertEqual(calls["n"], 1)
+
+    def test_persistent_lock_eventually_raises(self):
+        def always_locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch.object(install, "time") as fake_time, \
+                mock.patch("sqlite3.connect", side_effect=always_locked):
+            fake_time.sleep = lambda _s: None
+            fake_time.time = time.time
+            with self.assertRaises(sqlite3.OperationalError):
+                install._connect_launcher_db_with_retry(
+                    self.db_path, attempts=3, base_delay=0.0,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
