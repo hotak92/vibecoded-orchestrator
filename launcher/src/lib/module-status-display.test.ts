@@ -19,6 +19,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   LAST_ERROR_TRUNCATE_BUDGET,
+  moduleActionForKind,
   resolveTileDisplay,
   semverLess,
   statusBadgeLabel,
@@ -277,5 +278,46 @@ describe('semverLess', () => {
   it('handles mismatched segment counts', () => {
     expect(semverLess('1', '1.0.1')).toBe(true);
     expect(semverLess('1.0', '1.0.0')).toBe(false);
+  });
+});
+
+describe('moduleActionForKind', () => {
+  it('broken → Reinstall via install', () => {
+    expect(moduleActionForKind('broken')).toEqual({
+      label: 'Reinstall',
+      method: 'install',
+    });
+  });
+
+  it('error → Retry install via install', () => {
+    expect(moduleActionForKind('error')).toEqual({
+      label: 'Retry install',
+      method: 'install',
+    });
+  });
+
+  it('update_available → Update via update', () => {
+    expect(moduleActionForKind('update_available')).toEqual({
+      label: 'Update',
+      method: 'update',
+    });
+  });
+
+  it('non-actionable kinds return null', () => {
+    for (const kind of [
+      'bundled',
+      'installed',
+      'available',
+      'subcomponent',
+      'coming_soon',
+    ]) {
+      expect(moduleActionForKind(kind)).toBeNull();
+    }
+  });
+
+  it('null / undefined / unknown kinds return null', () => {
+    expect(moduleActionForKind(null)).toBeNull();
+    expect(moduleActionForKind(undefined)).toBeNull();
+    expect(moduleActionForKind('totally-unknown')).toBeNull();
   });
 });
