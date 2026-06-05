@@ -487,5 +487,138 @@ class EmitDeferralTests(unittest.TestCase):
         self.assertIn("code-graph-analyze", text)
 
 
+# ---------------------------------------------------------------------------
+# _configured_canonical_class_names + folder-name-mismatch false positive
+# ---------------------------------------------------------------------------
+
+class ConfiguredCanonicalNamesTests(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="vco-cfgcanon-")
+        self.folder = Path(self.tmp)
+        (self.folder / ".claude").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_settings(self, env: dict):
+        (self.folder / ".claude" / "settings.json").write_text(
+            json.dumps({"env": env}), encoding="utf-8",
+        )
+
+    def _write_env_file(self, lines: list[str]):
+        (self.folder / ".claude" / "env").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8",
+        )
+
+    def test_empty_folder_returns_empty_set(self):
+        self.assertEqual(
+            project_init._configured_canonical_class_names(self.folder),
+            set(),
+        )
+
+    def test_reads_kg_and_dev_from_settings_json(self):
+        self._write_settings({
+            "KG_COLLECTION": "Test_KnowledgeGraph",
+            "DEVELOPMENT_COLLECTION": "Test_Development",
+            "DIAGRAMS_COLLECTION": "Test_Diagrams",
+        })
+        names = project_init._configured_canonical_class_names(self.folder)
+        self.assertIn("Test_KnowledgeGraph", names)
+        self.assertIn("Test_Development", names)
+        self.assertIn("Test_Diagrams", names)
+
+    def test_codegraph_family_expanded_from_prefix(self):
+        self._write_settings({"CODE_GRAPH_PROJECT": "Test"})
+        names = project_init._configured_canonical_class_names(self.folder)
+        for sfx in project_init._CODEGRAPH_SUFFIXES:
+            self.assertIn(f"Test{sfx}", names)
+
+    def test_reads_from_env_file_when_no_settings(self):
+        self._write_env_file([
+            '# comment',
+            'export KG_COLLECTION="Test_KnowledgeGraph"',
+            'export DEVELOPMENT_COLLECTION="Test_Development"',
+        ])
+        names = project_init._configured_canonical_class_names(self.folder)
+        self.assertIn("Test_KnowledgeGraph", names)
+        self.assertIn("Test_Development", names)
+
+    def test_settings_json_wins_over_env_file(self):
+        self._write_settings({"KG_COLLECTION": "Test_KnowledgeGraph"})
+        self._write_env_file(['export KG_COLLECTION="Other_KnowledgeGraph"'])
+        names = project_init._configured_canonical_class_names(self.folder)
+        self.assertIn("Test_KnowledgeGraph", names)
+        self.assertNotIn("Other_KnowledgeGraph", names)
+
+
+class FolderNameMismatchFalsePositiveTests(unittest.TestCase):
+    """Regression: folder basename 'test_install' derives canonical prefix
+    'TestInstall', but the project's configured KG_COLLECTION is
+    'Test_KnowledgeGraph' (project name 'test'). 'Test' is a substring of
+    'TestInstall', so _is_similar_prefix would mark the real in-use
+    collection as a legacy candidate. Passing configured_canonical_names
+    must suppress that false positive.
+    """
+
+    def test_configured_collection_not_flagged_as_legacy(self):
+        with mock.patch.object(
+            project_init, "_http_request",
+            side_effect=_make_http_request_mock(
+                ["Test_KnowledgeGraph", "Test_Development"],
+                counts={"Test_KnowledgeGraph": 0, "Test_Development": 0},
+            ),
+        ):
+            result = project_init._detect_legacy_kg_collections(
+                "test_install",
+                URL,
+                configured_canonical_names={
+                    "Test_KnowledgeGraph", "Test_Development",
+                },
+            )
+        self.assertEqual(
+            result, [],
+            "configured in-use collection must not be flagged as legacy",
+        )
+
+    def test_without_configured_names_still_false_positive(self):
+        # Documents the pre-fix behaviour: without the configured-names
+        # guard, the substring rule DOES (wrongly) flag the in-use class.
+        with mock.patch.object(
+            project_init, "_http_request",
+            side_effect=_make_http_request_mock(
+                ["Test_KnowledgeGraph"],
+                counts={"Test_KnowledgeGraph": 0},
+            ),
+        ):
+            result = project_init._detect_legacy_kg_collections(
+                "test_install", URL,
+            )
+        # 'Test' ⊂ 'TestInstall' → flagged. The guard (configured names)
+        # is what suppresses this in the real install path.
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["class_name"], "Test_KnowledgeGraph")
+
+    def test_genuine_legacy_still_detected_with_configured_guard(self):
+        # The guard must NOT over-suppress: a genuine legacy class (a
+        # DIFFERENT name from the configured one) is still detected.
+        with mock.patch.object(
+            project_init, "_http_request",
+            side_effect=_make_http_request_mock(
+                ["Foo_KnowledgeGraph", "FooBar_KnowledgeGraph"],
+                counts={"Foo_KnowledgeGraph": 50, "FooBar_KnowledgeGraph": 0},
+            ),
+        ):
+            result = project_init._detect_legacy_kg_collections(
+                "FooBar",
+                URL,
+                configured_canonical_names={"FooBar_KnowledgeGraph"},
+            )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["class_name"], "Foo_KnowledgeGraph")
+
+
 if __name__ == "__main__":
     unittest.main()

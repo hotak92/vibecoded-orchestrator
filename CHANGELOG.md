@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Legacy-collection detector no longer flags a project's in-use KG/code-graph
+  collection as "legacy" when the folder basename disagrees with the configured
+  `PROJECT_NAME` / `KG_COLLECTION`.** `_detect_legacy_*_collections` derived the
+  canonical prefix purely from the folder basename
+  (`sanitize_for_weaviate_class(folder.name)`). For a folder `test_install`
+  whose configured `KG_COLLECTION` is `Test_KnowledgeGraph` (project name
+  `test`), the derived prefix `TestInstall` differs from the real class, and the
+  substring rule in `_is_similar_prefix` (`Test` is a substring of
+  `TestInstall`) marked the real, in-use `Test_KnowledgeGraph` as a legacy
+  candidate to migrate into a non-existent `TestInstall_KnowledgeGraph` — a
+  destructive false-positive `kg_collection_legacy_candidates` deferral. The
+  detector now reads the project's actually-configured collection names from
+  `.claude/settings.json::env` (fallback `.claude/env`) via the new
+  `_configured_canonical_class_names(folder)` helper and skips any class in that
+  set. Genuine legacy collections under a different name are still detected.
+  (`vco_lib/project_init.py`, `tests/test_detect_legacy_kg_collections.py` +13
+  cases.)
+
 ## [0.2.48] - 2026-06-05
 
 Three-fix release closing the gap that broke v0.2.47's `Update orchestrator`

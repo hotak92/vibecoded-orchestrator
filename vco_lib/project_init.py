@@ -5185,6 +5185,86 @@ def _strip_known_suffix(class_name: str, suffixes: tuple) -> Optional[tuple]:
     return None
 
 
+def _configured_canonical_class_names(folder: Path) -> set:
+    """Collect the Weaviate class names THIS project is actually configured
+    to use, read from its on-disk env.
+
+    The legacy-collection detector otherwise derives the canonical prefix
+    purely from the folder basename (``sanitize_for_weaviate_class(folder.
+    name)``). When the folder basename and the project's *configured*
+    ``PROJECT_NAME`` / ``KG_COLLECTION`` disagree — e.g. folder
+    ``test_install`` but ``KG_COLLECTION=Test_KnowledgeGraph`` (project
+    name ``test``) — the derived prefix (``TestInstall``) does NOT match
+    the real canonical class (``Test_KnowledgeGraph``). The substring rule
+    in ``_is_similar_prefix`` ("Test" ⊂ "TestInstall") then makes the
+    real, in-use collection look like a *legacy* candidate to migrate into
+    a non-existent ``TestInstall_*`` class — a destructive false positive.
+
+    Returns the set of fully-qualified class names this project points at
+    (``KG_COLLECTION``, ``DEVELOPMENT_COLLECTION``, ``DIAGRAMS_COLLECTION``,
+    plus the code-graph family derived from ``CODE_GRAPH_PROJECT``). The
+    detector treats every name in this set as canonical → never legacy.
+
+    Resolution order (first hit wins per key):
+      1. ``.claude/settings.json`` ``env`` block (canonical channel since
+         PR-27 / v0.2.12).
+      2. ``.claude/env`` shell exports (``export KEY="value"``).
+
+    Soft-fails to an empty set on any error — callers must treat an empty
+    result as "no extra canonical names known" (the pre-existing
+    folder-name-derived behaviour is preserved).
+    """
+    names: set = set()
+    env: dict = {}
+
+    # --- 1. .claude/settings.json env ---
+    settings_file = folder / ".claude" / "settings.json"
+    if settings_file.is_file():
+        try:
+            data = json.loads(settings_file.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("env"), dict):
+                for k, v in data["env"].items():
+                    if isinstance(v, str) and v:
+                        env.setdefault(k, v)
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+    # --- 2. .claude/env shell exports (fill gaps only) ---
+    env_file = folder / ".claude" / "env"
+    if env_file.is_file():
+        try:
+            for line in env_file.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if s.startswith("export "):
+                    s = s[len("export "):]
+                if "=" not in s:
+                    continue
+                key, _, val = s.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and val:
+                    env.setdefault(key, val)
+        except OSError:
+            pass
+
+    # Direct collection-name keys.
+    for key in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION", "DIAGRAMS_COLLECTION"):
+        v = env.get(key)
+        if isinstance(v, str) and v:
+            names.add(v)
+
+    # Code-graph family is per-project-prefixed by CODE_GRAPH_PROJECT (a
+    # sanitized basename like "Test"), e.g. "Test_CodeFunction".
+    cg_prefix = env.get("CODE_GRAPH_PROJECT")
+    if isinstance(cg_prefix, str) and cg_prefix:
+        for sfx in _CODEGRAPH_SUFFIXES:
+            names.add(f"{cg_prefix}{sfx}")
+
+    return names
+
+
 def _is_similar_prefix(
     candidate_prefix: str,
     canonical_prefix: str,
@@ -5225,6 +5305,7 @@ def _detect_legacy_collections_with_suffixes(
     project_name: str,
     weaviate_url: str,
     suffixes: tuple,
+    configured_canonical_names: Optional[set] = None,
 ) -> list[dict]:
     """Shared core for legacy KG + legacy code-graph detection.
 
@@ -5233,6 +5314,12 @@ def _detect_legacy_collections_with_suffixes(
         weaviate_url: Weaviate REST endpoint.
         suffixes: tuple of class-name suffixes to inspect (KG family or
             code-graph family).
+        configured_canonical_names: optional set of class names THIS
+            project is actually configured to use (from its on-disk env).
+            Any class whose name is in this set is treated as canonical and
+            skipped — guards against the folder-name-vs-PROJECT_NAME
+            mismatch false positive (see
+            ``_configured_canonical_class_names``).
 
     Returns a list of candidate dicts, each with:
         {
@@ -5254,6 +5341,8 @@ def _detect_legacy_collections_with_suffixes(
     canonical_prefix = sanitize_for_weaviate_class(project_name)
     if not canonical_prefix:
         return []
+
+    configured = configured_canonical_names or set()
     # Conservative: if the project name didn't yield a real prefix and we
     # fell back to `_FALLBACK_PREFIX` ("vct"), do NOT scan — the fallback
     # is too generic and would match many unrelated classes.
@@ -5295,6 +5384,16 @@ def _detect_legacy_collections_with_suffixes(
         if class_name == canonical_name:
             continue
 
+        # Skip any class this project is ACTUALLY configured to use (read
+        # from its on-disk env). Guards the folder-name-vs-PROJECT_NAME
+        # mismatch: folder "test_install" derives canonical_prefix
+        # "TestInstall", but the project's configured KG_COLLECTION is
+        # "Test_KnowledgeGraph" — without this skip the real in-use
+        # collection is flagged as legacy and "migrated" into a
+        # non-existent TestInstall_* class (destructive false positive).
+        if class_name in configured:
+            continue
+
         # Conservative prefix-similarity check.  Without this we'd
         # mistakenly suggest migrating Agape_KnowledgeGraph just because
         # the user added a project called "Foo".
@@ -5320,6 +5419,7 @@ def _detect_legacy_collections_with_suffixes(
 
 def _detect_legacy_kg_collections(
     project_name: str, weaviate_url: str,
+    configured_canonical_names: Optional[set] = None,
 ) -> list[dict]:
     """Detect KG-family classes (KnowledgeGraph + Development) that look
     like THIS project's data under a different prefix.
@@ -5328,11 +5428,13 @@ def _detect_legacy_kg_collections(
     """
     return _detect_legacy_collections_with_suffixes(
         project_name, weaviate_url, _KG_SUFFIXES,
+        configured_canonical_names=configured_canonical_names,
     )
 
 
 def _detect_legacy_codegraph_collections(
     project_name: str, weaviate_url: str,
+    configured_canonical_names: Optional[set] = None,
 ) -> list[dict]:
     """Detect code-graph-family classes (CodeFunction / CodeModule /
     CodeClass / CodeAPI / CodeInteraction) that look like THIS project's
@@ -5343,6 +5445,7 @@ def _detect_legacy_codegraph_collections(
     """
     return _detect_legacy_collections_with_suffixes(
         project_name, weaviate_url, _CODEGRAPH_SUFFIXES,
+        configured_canonical_names=configured_canonical_names,
     )
 
 
@@ -6263,9 +6366,18 @@ def install_project_bundle(
         )
         legacy_kg_candidates: list[dict] = []
         legacy_codegraph_candidates: list[dict] = []
+        # Read the collection names THIS project is actually configured to
+        # use, so the detector never flags an in-use collection as legacy
+        # when the folder basename disagrees with the configured
+        # PROJECT_NAME / KG_COLLECTION (folder-name-mismatch false positive).
+        try:
+            configured_canonical = _configured_canonical_class_names(folder)
+        except Exception:
+            configured_canonical = set()
         try:
             legacy_kg_candidates = _detect_legacy_kg_collections(
                 derived_project_name, weaviate_url,
+                configured_canonical_names=configured_canonical,
             )
             _log("4.bundle.legacy-kg", "ok",
                  f"legacy KG candidates: {len(legacy_kg_candidates)}",
@@ -6281,6 +6393,7 @@ def install_project_bundle(
         try:
             legacy_codegraph_candidates = _detect_legacy_codegraph_collections(
                 derived_project_name, weaviate_url,
+                configured_canonical_names=configured_canonical,
             )
             _log("4.bundle.legacy-codegraph", "ok",
                  f"legacy code-graph candidates: {len(legacy_codegraph_candidates)}",
