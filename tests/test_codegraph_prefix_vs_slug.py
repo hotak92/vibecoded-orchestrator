@@ -162,6 +162,19 @@ class HookResolverFieldContract(unittest.TestCase):
             out.append(line)
         return "\n".join(out)
 
+    # v0.2.47 (extras): the hooks now query a SECOND resolver field
+    # (`code_graph_extra_paths`) in addition to the canonical
+    # `code_graph_collection_prefix`. Both are legitimate. The slug-
+    # alias `code_graph_project` remains banned — it routes writes to a
+    # divergent zombie prefix after rename. The allowlist below names
+    # every field the hook is allowed to ask for; new fields land here
+    # explicitly so the test catches accidental regressions to slug
+    # alias use.
+    ALLOWED_HOOK_RESOLVER_FIELDS = frozenset({
+        "code_graph_collection_prefix",  # canonical Weaviate prefix
+        "code_graph_extra_paths",        # v0.2.47 (extras)
+    })
+
     def test_hooks_ask_resolver_for_collection_prefix(self):
         """All hooks that resolve a project-name for the code-graph write
         target MUST ask the resolver for ``code_graph_collection_prefix``,
@@ -169,6 +182,11 @@ class HookResolverFieldContract(unittest.TestCase):
         canonical Weaviate prefix when the slug contains characters that
         the analyzer's sanitiser would re-canonicalise differently from
         the binding row.
+
+        v0.2.47: the hooks ALSO query ``code_graph_extra_paths`` to drive
+        the extras-path detection. Both fields are in the allowlist
+        ``ALLOWED_HOOK_RESOLVER_FIELDS``; the slug alias
+        ``code_graph_project`` remains banned.
 
         Strategy: scan non-comment lines for ``--field <name>``. The
         hooks construct the resolver path in a variable (``$_RESOLVER``)
@@ -183,27 +201,51 @@ class HookResolverFieldContract(unittest.TestCase):
                 fields,
                 f"{rel}: expected at least one '--field <name>' call",
             )
+            # At least one of the fields must be the canonical prefix —
+            # that's still the contract for the code-graph write target.
+            self.assertIn(
+                "code_graph_collection_prefix",
+                fields,
+                f"{rel}: at least one '--field code_graph_collection_prefix' "
+                f"call required (the canonical Weaviate-prefix resolver path)",
+            )
             for fld in fields:
-                self.assertEqual(
+                self.assertIn(
                     fld,
-                    "code_graph_collection_prefix",
-                    f"{rel}: '--field' must request "
-                    f"code_graph_collection_prefix; got {fld!r}. "
-                    "code_graph_project is the slug alias and routes "
-                    "writes to a divergent prefix after rename.",
+                    self.ALLOWED_HOOK_RESOLVER_FIELDS,
+                    f"{rel}: '--field {fld!r}' is not in the allowed-fields "
+                    "set. code_graph_project is the slug alias and routes "
+                    "writes to a divergent prefix after rename. New "
+                    "legitimate fields must be added to "
+                    "ALLOWED_HOOK_RESOLVER_FIELDS in this test class.",
                 )
 
+    # v0.2.47 (extras): PowerShell sibling extras-check uses
+    # ``-Field code_graph_extra_paths`` — same allowlist applies.
+    ALLOWED_PS1_RESOLVER_FIELDS = frozenset({
+        "code_graph_collection_prefix",
+        "code_graph_extra_paths",
+        # The PS1 sibling at templates/hooks/code-graph-incremental.ps1
+        # uses literal "code_graph_extra_paths" but it's quoted on the
+        # call site; the regex below matches unquoted tokens only.
+    })
+
     def test_ps1_hook_uses_collection_prefix_field(self):
-        """PowerShell sibling of post-file-edit.sh — cross-OS parity."""
+        """PowerShell sibling of post-file-edit.sh — cross-OS parity.
+
+        v0.2.47: the PS1 sibling also queries ``code_graph_extra_paths``
+        via the same allowlist pattern as the bash hook.
+        """
         path = PROJECT_ROOT / "templates" / "hooks" / "post-file-edit.ps1"
         text = self._strip_comments(path.read_text(encoding="utf-8"), "#")
         fields = re.findall(r"-Field\s+(\S+)", text)
         self.assertTrue(fields, f"{path}: expected at least one '-Field <name>' call")
         for fld in fields:
-            self.assertEqual(
+            self.assertIn(
                 fld,
-                "code_graph_collection_prefix",
-                f"{path}: '-Field' must request code_graph_collection_prefix.",
+                self.ALLOWED_PS1_RESOLVER_FIELDS,
+                f"{path}: '-Field {fld!r}' not in allowlist "
+                "(code_graph_project is the slug alias).",
             )
 
 

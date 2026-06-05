@@ -25,6 +25,14 @@ Usage:
     python analyze_code_graph.py /path/to/repo --language cpp
     python analyze_code_graph.py /path/to/repo --language javascript
     python analyze_code_graph.py /path/to/repo --language typescript
+
+v0.2.47 extras (knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md):
+    python analyze_code_graph.py /path/to/repo --project "MyProject" \
+        --extra-path /path/to/sibling/clone --extra-path /path/to/other
+    python analyze_code_graph.py /path/to/repo --project "MyProject" \
+        --extra-path /path/to/sibling/clone --prune-stale  # union-of-roots
+    python analyze_code_graph.py /path/to/repo --project "MyProject" \
+        --incremental --since-commit abc1234   # diff vs SHA, not HEAD~1
 """
 
 import argparse
@@ -883,6 +891,13 @@ class CodeGraphAnalyzer:
         # `language=` parameter (see _prune_stale_objects). Empty string =
         # legacy/global prune across every project row.
         self._prune_language: str = ""
+        # v0.2.47 (extras) — POSIX absolute path of the source root that
+        # owns the file currently being analyzed. The dispatcher sets it
+        # before each per-source-root pass; insert sites read it to stamp
+        # `project_source` on every emitted entity so the "Reindex" UI and
+        # debugging tools can tell primary-repo rows from extras-path rows.
+        # Empty string when no analyze is in progress.
+        self._current_source: str = ""
 
     def connect(self):
         """Connect to Weaviate."""
@@ -1079,6 +1094,13 @@ class CodeGraphAnalyzer:
                         Property(name="last_modified", data_type=DataType.DATE, description="Last modification time", skip_vectorization=True),
                         Property(name="file_hash", data_type=DataType.TEXT, description="SHA256 hash of file content", skip_vectorization=True),
                         Property(name="import_names", data_type=DataType.TEXT_ARRAY, description="List of imported module/package names", skip_vectorization=True),
+                        # v0.2.47 (extras): absolute POSIX path of the source
+                        # root that contributed this row. Primary repo for
+                        # native code; a `--extra-path` value for read-only
+                        # references indexed into this project's collections.
+                        # Empty string for pre-v0.2.47 rows (graceful fallback
+                        # — Weaviate treats absent properties as null).
+                        Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="imports", target_collection=self.coll_module, description="Imported modules"),
@@ -1125,6 +1147,8 @@ class CodeGraphAnalyzer:
                         Property(name="composes", data_type=DataType.TEXT_ARRAY, description="Class names used as field types (composition)", skip_vectorization=True),
                         Property(name="primary_layer", data_type=DataType.TEXT, description="Primary architectural layer (API, Service, Data, UI, Utility, etc.)", skip_vectorization=True),
                         Property(name="secondary_layers", data_type=DataType.TEXT_ARRAY, description="Secondary architectural layers if class spans multiple", skip_vectorization=True),
+                        # v0.2.47 (extras): source-root provenance (see CodeModule).
+                        Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -1168,6 +1192,8 @@ class CodeGraphAnalyzer:
                         Property(name="data_flow_vars", data_type=DataType.TEXT_ARRAY, description="Variable names that flow through the function (from Joern PDG)", skip_vectorization=True),
                         Property(name="layer", data_type=DataType.TEXT, description="Architectural layer (API, Service, Data, UI, Utility, etc.)", skip_vectorization=True),
                         Property(name="call_names", data_type=DataType.TEXT_ARRAY, description="Names of called functions (for callers queries)", skip_vectorization=True),
+                        # v0.2.47 (extras): source-root provenance (see CodeModule).
+                        Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -1204,6 +1230,8 @@ class CodeGraphAnalyzer:
                         # v0.2.18 (Plan C): canonical-lowercase language ID for scoped prune.
                         Property(name="language", data_type=DataType.TEXT, description="Canonical language ID (python, javascript, ...) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="proxy_target", data_type=DataType.TEXT, description="Target endpoint for proxy/forwarding routes (cross-language linking)", skip_vectorization=True),
+                        # v0.2.47 (extras): source-root provenance (see CodeModule).
+                        Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="handler", target_collection=self.coll_function, description="Handler function"),
@@ -1245,6 +1273,8 @@ class CodeGraphAnalyzer:
                         # the correct + safe primitive.
                         Property(name="language", data_type=DataType.TEXT, description="Source-side canonical language ID (caller's language) — Plan C scoped prune", skip_vectorization=True),
                         Property(name="description", data_type=DataType.TEXT, description="Human-readable summary for embedding (Python→HTTP POST /api/users via requests)"),
+                        # v0.2.47 (extras): source-root provenance (see CodeModule).
+                        Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="source_function", target_collection=self.coll_function, description="Function that makes the call"),
@@ -1281,6 +1311,12 @@ class CodeGraphAnalyzer:
         # repos. Idempotent — does nothing when the prop is already present.
         # Soft-fail per-collection so a single 422 doesn't wedge the whole run.
         self._ensure_language_property()
+
+        # v0.2.47 (extras) schema migration: ensure `project_source` property
+        # exists on all 5 code collections so pre-v0.2.47 installs that picked
+        # up the new analyzer pick up the property on the next analyze run.
+        # Idempotent + soft-fail per collection.
+        self._ensure_project_source_property()
 
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
@@ -1345,6 +1381,16 @@ class CodeGraphAnalyzer:
             props = insert_params.get("properties")
             if isinstance(props, dict) and not props.get("language"):
                 props["language"] = current_lang
+
+        # v0.2.47 (extras): stamp the absolute source-root path so consumers
+        # can tell primary-repo rows from extras-path rows. Same defensive
+        # pattern as `_current_language` above — empty value is a no-op, and
+        # we don't clobber when the caller pre-set the property.
+        current_source = getattr(self, "_current_source", "")
+        if current_source:
+            props = insert_params.get("properties")
+            if isinstance(props, dict) and not props.get("project_source"):
+                props["project_source"] = current_source
 
         # v0.2.16 docstring (above) claimed ``replace()`` is upsert.
         # weaviate-client v4.21 actually requires the object to PRE-EXIST
@@ -1457,11 +1503,53 @@ class CodeGraphAnalyzer:
                     f"Plan C language-property migration on {label} skipped: {e}"
                 )
 
+    def _ensure_project_source_property(self):
+        """v0.2.47 (extras) schema migration: add `project_source` to all 5
+        code collections so pre-v0.2.47 installs with existing data start
+        recording provenance on the next analyze run. The property is
+        nullable — pre-migration rows show NULL until they're touched by a
+        re-analyze. Idempotent + soft-fail per collection.
+        """
+        collections = [
+            ("CodeModule",      self.modules_collection),
+            ("CodeClass",       self.classes_collection),
+            ("CodeFunction",    self.functions_collection),
+            ("CodeAPI",         self.apis_collection),
+            ("CodeInteraction", self.interactions_collection),
+        ]
+        desc = (
+            "Absolute path of the source root that produced this row "
+            "(primary repo OR extra-path)"
+        )
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if "project_source" in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name="project_source",
+                        data_type=DataType.TEXT,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added project_source property to {label} schema (v0.2.47)")
+            except Exception as e:
+                logger.debug(
+                    f"v0.2.47 project_source migration on {label} skipped: {e}"
+                )
+
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
                           incremental: bool = False,
                           extract_cfg: bool = False,
                           extract_pdg: bool = False,
-                          prune_stale: bool = False) -> Dict[str, Any]:
+                          prune_stale: bool = False,
+                          extra_paths: Optional[List[Path]] = None,
+                          since_commit: Optional[str] = None) -> Dict[str, Any]:
         """Analyze repository and extract code entities.
 
         Args:
@@ -1477,6 +1565,19 @@ class CodeGraphAnalyzer:
                 (deleted files leave orphan rows otherwise). Default
                 False — opt-in via ``--prune-stale``. Bug 1.4 /
                 addendum H. Adds ``stats['stale_pruned']``.
+            extra_paths: v0.2.47 — additional source roots to walk in
+                the same pass as ``repo_path``. Each extra is analyzed
+                into the SAME per-project collections (no separate
+                prefix), with ``project_source`` stamped to the extra's
+                absolute path. ``visited_uuids`` is the UNION across
+                the primary repo + all extras so ``--prune-stale`` does
+                NOT delete the other roots' UUIDs.
+            since_commit: v0.2.47 — when combined with ``incremental``,
+                restricts the changed-files filter to
+                ``git log <sha>..HEAD`` instead of the default
+                ``HEAD~1..HEAD``. Per-source-root: each root that is a
+                git repo uses its own diff range; non-git roots fall
+                back to full scan with a stderr notice.
 
         Returns:
             Dictionary with analysis statistics. v0.2.16 adds:
@@ -1490,6 +1591,29 @@ class CodeGraphAnalyzer:
 
         if not repo_path.exists():
             raise ValueError(f"Repository path does not exist: {repo_path}")
+
+        # v0.2.47 (extras): validate + canonicalise extras up-front so
+        # downstream loops can assume each entry is an existing absolute
+        # directory. Silently drop entries that vanished between the
+        # caller's snapshot and now — soft-fail so a single mis-typed
+        # extra doesn't wedge the whole analyze.
+        canonical_extras: List[Path] = []
+        for extra in (extra_paths or []):
+            try:
+                resolved = extra.resolve()
+            except (OSError, RuntimeError) as exc:
+                print(
+                    f"⚠️  Extra path {extra} could not be resolved: {exc} — skipping",
+                    file=sys.stderr,
+                )
+                continue
+            if not resolved.exists() or not resolved.is_dir():
+                print(
+                    f"⚠️  Extra path {resolved} does not exist or is not a directory — skipping",
+                    file=sys.stderr,
+                )
+                continue
+            canonical_extras.append(resolved)
 
         # Run Joern CFG/PDG pre-pass if requested; store on instance for use by _extract_function
         if extract_cfg or extract_pdg:
@@ -1550,25 +1674,49 @@ class CodeGraphAnalyzer:
         # this, the fraction shown in the Re-analyze modal would drift up
         # per-language. The find + incremental-filter pass is cheap (no
         # Weaviate calls) so doing it twice is fine; we cache the result.
-        per_lang_files: List[Tuple[str, Any, List[Path]]] = []
-        for lang_name, find_fn, analyze_fn in lang_dispatch:
-            if lang and lang != lang_name:
-                continue
-            files = find_fn(repo_path)
-            if not files:
-                continue
-            if incremental:
-                files = self._filter_changed_files(repo_path, files)
-                if not files:
-                    print(f"ℹ️  No changed {lang_name} files to analyze")
+        #
+        # v0.2.47 (extras): each entry now records its source root too
+        # (primary repo OR a specific extra path). The dispatcher loop
+        # below sets `self._current_source` for the duration of each
+        # source root's pass so `_dedup_insert` / `_create_or_update_module`
+        # stamp `project_source` on every emitted entity. analyze_fn
+        # receives the source_root as its `repo_root` argument, so
+        # `file.relative_to(repo_root)` keeps producing a path that is
+        # local to the source tree (no awkward "/abs/extra/src/foo.py"
+        # relative paths showing up as `path` properties).
+        per_lang_files: List[Tuple[str, Any, List[Path], Path]] = []
+        source_roots: List[Path] = [repo_path] + canonical_extras
+        for source_root in source_roots:
+            for lang_name, find_fn, analyze_fn in lang_dispatch:
+                if lang and lang != lang_name:
                     continue
-            per_lang_files.append((lang_name, analyze_fn, list(files)))
+                files = find_fn(source_root)
+                if not files:
+                    continue
+                if incremental:
+                    files = self._filter_changed_files(
+                        source_root, files, since_commit=since_commit,
+                    )
+                    if not files:
+                        # Quiet skip — the typical case for clean repos.
+                        # We still surface one line per (root, lang) so
+                        # the operator sees the walk happened.
+                        print(
+                            f"ℹ️  No changed {lang_name} files to analyze "
+                            f"under {source_root}"
+                        )
+                        continue
+                per_lang_files.append(
+                    (lang_name, analyze_fn, list(files), source_root)
+                )
 
-        total_files = sum(len(fs) for _, _, fs in per_lang_files)
+        total_files = sum(len(fs) for _, _, fs, _ in per_lang_files)
         seen_files = 0
 
-        for lang_name, analyze_fn, files in per_lang_files:
-            print(f"📂 Found {len(files)} {lang_name} files to analyze")
+        for lang_name, analyze_fn, files, source_root in per_lang_files:
+            is_extra = source_root != repo_path
+            extra_tag = f" (extra: {source_root})" if is_extra else ""
+            print(f"📂 Found {len(files)} {lang_name} files to analyze{extra_tag}")
 
             # v0.2.18 (Plan C): every analyze_*_file path threads its canonical
             # language ID through `_current_language` so insert sites can stamp
@@ -1576,11 +1724,15 @@ class CodeGraphAnalyzer:
             # The dispatcher restores the prior value (in practice always "") on
             # exit so back-to-back lang_dispatch iterations don't leak state.
             self._current_language = lang_name
+            # v0.2.47 (extras): same pattern for `project_source`. POSIX
+            # path so Linux/macOS/Windows all produce a stable property
+            # value (matches the file_path_rel POSIX convention).
+            self._current_source = source_root.as_posix()
 
             for f in files:
                 if self._progress_emitter is not None and total_files > 0:
                     try:
-                        rel = str(f.relative_to(repo_path).as_posix())
+                        rel = str(f.relative_to(source_root).as_posix())
                     except Exception:
                         rel = str(f)
                     try:
@@ -1595,7 +1747,7 @@ class CodeGraphAnalyzer:
                         pass
                 seen_files += 1
                 try:
-                    result = analyze_fn(f, repo_path)
+                    result = analyze_fn(f, source_root)
                     stats['modules']  += result.get('modules', 0)
                     stats['classes']  += result.get('classes', 0)
                     stats['functions'] += result.get('functions', 0)
@@ -1605,7 +1757,13 @@ class CodeGraphAnalyzer:
                     # v0.2.16 (bug 0.2): write-to-Weaviate failure.
                     # Distinct from generic parse/IO errors so main()
                     # can return exit code 4 (vs. silent success).
-                    print(f"⚠️  Insert error in {f.relative_to(repo_path)}: {e}")
+                    # v0.2.47: relative-to the actual source_root (could
+                    # be an extra path), not always repo_path.
+                    try:
+                        rel_for_msg = f.relative_to(source_root)
+                    except ValueError:
+                        rel_for_msg = f
+                    print(f"⚠️  Insert error in {rel_for_msg}: {e}")
                     stats['files_skipped'] += 1
                     stats['insert_errors'] += 1
                 except Exception as e:
@@ -1613,7 +1771,11 @@ class CodeGraphAnalyzer:
                     # downstream, regex bug, file IO, etc.). Skip the
                     # file but DON'T flag the run as broken — the
                     # exit code stays 0 unless files_analyzed == 0.
-                    print(f"⚠️  Error analyzing {f.relative_to(repo_path)}: {e}")
+                    try:
+                        rel_for_msg = f.relative_to(source_root)
+                    except ValueError:
+                        rel_for_msg = f
+                    print(f"⚠️  Error analyzing {rel_for_msg}: {e}")
                     stats['files_skipped'] += 1
                     # Fallback: still classify as insert_error if a
                     # _DedupInsertError got chained through some
@@ -1634,6 +1796,10 @@ class CodeGraphAnalyzer:
         # Clear the per-language context now that the dispatch loop is
         # done (Plan C). The prune pass below doesn't depend on it.
         self._current_language = ""
+        # v0.2.47: also clear the per-source-root context so a subsequent
+        # standalone insert (cross-reference creation in the post-loop)
+        # doesn't accidentally re-stamp the last extra's path.
+        self._current_source = ""
 
         # v0.2.16 (1.4 / addendum H): --prune-stale pass.
         # Walk every per-project code-graph collection and delete any
@@ -2515,12 +2681,51 @@ class CodeGraphAnalyzer:
 
         return stats
 
-    def _filter_changed_files(self, repo_path: Path, files: List[Path]) -> List[Path]:
-        """Filter files to only those changed according to git."""
+    def _filter_changed_files(self, repo_path: Path, files: List[Path],
+                              since_commit: Optional[str] = None) -> List[Path]:
+        """Filter files to only those changed according to git.
+
+        v0.2.47: ``since_commit`` lets the caller specify the lower bound
+        of the diff range (``<sha>..HEAD``). Default ``None`` preserves
+        the legacy behaviour of ``HEAD~1..HEAD``. Non-git roots and
+        unknown SHAs fall back to the full file list with one stderr
+        notice — never a hard error.
+        """
+        # Quick git-repo check so non-git extras (e.g. a non-versioned
+        # vendored folder) skip the subprocess invocation entirely. This
+        # both speeds up the common case and produces a nicer log line.
+        if not (repo_path / ".git").exists():
+            print(
+                f"ℹ️  {repo_path} is not a git repository; analyzing all files",
+                file=sys.stderr,
+            )
+            return files
+
+        if since_commit:
+            # Validate the SHA exists before passing it to `git diff`; an
+            # unknown commit ID otherwise produces a confusing error
+            # message embedded in the stderr stream.
+            rev_check = subprocess.run(
+                ['git', 'rev-parse', '--verify', f'{since_commit}^{{commit}}'],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+            )
+            if rev_check.returncode != 0:
+                print(
+                    f"⚠️  --since-commit {since_commit} not found in {repo_path}; "
+                    f"falling back to full scan",
+                    file=sys.stderr,
+                )
+                return files
+            diff_range_lhs = since_commit
+        else:
+            diff_range_lhs = "HEAD~1"
+
         try:
             # Get changed files from git
             result = subprocess.run(
-                ['git', 'diff', '--name-only', 'HEAD~1', 'HEAD'],
+                ['git', 'diff', '--name-only', diff_range_lhs, 'HEAD'],
                 cwd=repo_path,
                 capture_output=True,
                 text=True,
@@ -3579,23 +3784,31 @@ class CodeGraphAnalyzer:
         # callers without a `language=` argument still get the right value.
         canonical_lang = _canonical_lang_id(language) or self._current_language or ""
 
+        # v0.2.47 (extras): source-root tag goes onto both update + insert
+        # paths so re-analyzes of pre-v0.2.47 rows backfill the property
+        # idempotently. Empty value is a no-op (same pattern as language).
+        current_source = getattr(self, "_current_source", "")
+
         # Check if exists
         if path in self.module_cache:
             # Update existing
+            update_props = {
+                "module_summary": module_summary,
+                "loc": loc,
+                "complexity": complexity,
+                "last_modified": last_modified.isoformat(),
+                "file_hash": file_hash,
+                "import_names": imports,
+                # Plan C: backfill `language` on update so pre-migration
+                # rows get the canonical value the next time we touch
+                # them, without needing a separate batch backfill pass.
+                "language": canonical_lang,
+            }
+            if current_source:
+                update_props["project_source"] = current_source
             self.modules_collection.data.update(
                 uuid=self.module_cache[path],
-                properties={
-                    "module_summary": module_summary,
-                    "loc": loc,
-                    "complexity": complexity,
-                    "last_modified": last_modified.isoformat(),
-                    "file_hash": file_hash,
-                    "import_names": imports,
-                    # Plan C: backfill `language` on update so pre-migration
-                    # rows get the canonical value the next time we touch
-                    # them, without needing a separate batch backfill pass.
-                    "language": canonical_lang,
-                }
+                properties=update_props,
             )
             # Still record as visited so --prune-stale doesn't delete it.
             if self._track_visited:
@@ -3618,6 +3831,8 @@ class CodeGraphAnalyzer:
                 "import_names": imports,
             }
         }
+        if current_source:
+            insert_params["properties"]["project_source"] = current_source
 
         # Add vector if embedding generation succeeded
         if embedding:
@@ -4393,6 +4608,28 @@ def main():
                        help='Language to analyze (default: all supported; language inferred from file extensions)')
     parser.add_argument('--incremental', '-i', action='store_true',
                        help='Only analyze changed files (requires git)')
+    # v0.2.47 (extras): additional source roots to walk in the same pass
+    # as `repo_path`. Repeatable. Each extra is indexed into the SAME
+    # `<--project>_Code*` collections; the analyzer stamps `project_source`
+    # on every emitted row so consumers can tell primary-repo rows from
+    # extras-path rows. `visited_uuids` is the UNION across primary + all
+    # extras so `--prune-stale` does NOT delete the other roots' UUIDs.
+    # See knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md.
+    parser.add_argument('--extra-path', dest='extra_paths', action='append',
+                       default=[], type=Path,
+                       help='Additional source root to walk in the same pass. '
+                            'Repeatable. All rows land in the SAME per-project '
+                            'collections; `project_source` records provenance.')
+    # v0.2.47 (extras): per-source-root incremental lower bound. With
+    # `--incremental`, restricts the changed-files filter to
+    # `git log <sha>..HEAD` instead of the default `HEAD~1..HEAD`. Each
+    # source root that is a git repo uses its OWN diff range relative to
+    # this SHA; non-git roots fall back to a full scan with a one-line
+    # stderr notice.
+    parser.add_argument('--since-commit', type=str, default=None,
+                       help='With --incremental, restrict the diff to '
+                            '<sha>..HEAD instead of HEAD~1..HEAD. Per source '
+                            'root; non-git roots fall back to full scan.')
     parser.add_argument('--create-collections', action='store_true',
                        help='Create Weaviate collections before analysis')
     parser.add_argument('--force-recreate', action='store_true',
@@ -4659,6 +4896,11 @@ def main():
             extract_cfg=args.cfg,
             extract_pdg=args.pdg,
             prune_stale=args.prune_stale,
+            # v0.2.47 (extras): pass-through. Empty list when the flag
+            # wasn't supplied — analyze_repository treats that the same
+            # as the pre-v0.2.47 single-root behaviour.
+            extra_paths=args.extra_paths or None,
+            since_commit=args.since_commit,
         )
 
         # Post-processing: create cross-references

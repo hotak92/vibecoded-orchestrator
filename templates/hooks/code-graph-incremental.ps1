@@ -59,9 +59,37 @@ if ($VcoVenvPy) {
     $Venv = ""
 }
 
+# v0.2.47 (extras) — parity with the .sh sibling. BEFORE sibling detection,
+# query the current project's `code_graph_extra_paths`. If the edited file
+# is under any enabled extra, set RepoPath = that extra and keep
+# ProjectName (extras index into the SAME per-project collections).
+# Backwards-compatible: pre-v0.2.47 hubs lack the field; the resolver
+# exits 4 and the loop is a no-op.
+$ExtrasMatched = $false
+if ($EditedFile -notlike "$RepoPath/*" -and $EditedFile -notlike "$RepoPath\*") {
+    $ExtrasResolver = Join-Path $RepoPath ".claude/scripts/vct_project_config.ps1"
+    if (Test-Path $ExtrasResolver) {
+        try {
+            $extras = (& pwsh -NoProfile -File $ExtrasResolver -Project $RepoPath -Field "code_graph_extra_paths" 2>$null)
+            if ($extras) {
+                foreach ($_line in ($extras -split "`n")) {
+                    $extraPath = $_line.Trim().TrimEnd('/').TrimEnd('\')
+                    if (-not $extraPath) { continue }
+                    if ($EditedFile -like "$extraPath/*" -or $EditedFile -like "$extraPath\*") {
+                        $RepoPath = $extraPath
+                        $ExtrasMatched = $true
+                        break
+                    }
+                }
+            }
+        } catch { }
+    }
+}
+
 # Auto-detect project (best-effort; helper may not exist on Windows).
+# v0.2.47: skip when extras already claimed the edited file.
 $DetectPs1 = Join-Path $DefaultRepoRoot ".claude/scripts/detect-project.ps1"
-if (Test-Path $DetectPs1) {
+if (-not $ExtrasMatched -and (Test-Path $DetectPs1)) {
     try {
         $detected = (& pwsh -NoProfile -File $DetectPs1 $EditedFile $RepoPath 2>$null).Trim()
         if ($detected) {

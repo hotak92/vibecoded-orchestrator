@@ -480,6 +480,63 @@ resolve_project_id() {
     esac
 }
 
+# ── v0.2.47 (extras): code_graph_extra_paths renderer ───────────────────
+# Hub wire shape (single-field envelope):
+#   {"code_graph_extra_paths": [{"path": "...", "enabled": true,
+#                                 "last_indexed_commit": "..."|null}, ...]}
+# We render only the `path` of `enabled=true` rows, newline-delimited.
+# Empty list → empty stdout + exit 0 (zero extras configured is valid).
+# Pre-v0.2.47 hubs return 404/field_not_found — handled upstream as exit 4.
+_render_extra_paths() {
+    local body="$1" field="$2"
+    if command -v jq >/dev/null 2>&1; then
+        local out
+        # `.field // []` defaults absent → empty array. `.[] | select(.enabled == true)`
+        # filters; `.path // empty` skips rows where path is missing (defensive).
+        # Trailing newline added by jq -r `.path` so multiple paths print one
+        # per line. Single trailing newline on empty output is fine — callers
+        # use `tr -d '[:space:]'` or `read -r` when they need a clean value.
+        out=$(printf '%s' "$body" | jq -r --arg f "$field" \
+            '(.[$f] // []) | map(select(.enabled == true)) | .[] | .path // empty' 2>/dev/null) || {
+            _emit_warning "field_decode_failed" "jq failed to decode code_graph_extra_paths; body=$body"
+            return 4
+        }
+        # Emit verbatim. Empty `out` → exit 0 with no stdout (intentional).
+        if [[ -n "$out" ]]; then
+            printf '%s\n' "$out"
+        fi
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        # Pipe body to python3 via stdin; pass field name through env so
+        # the script literal stays heredoc-safe (no `$field` interpolation).
+        printf '%s' "$body" | VCT_RENDER_FIELD="$field" python3 -c '
+import json, os, sys
+field = os.environ.get("VCT_RENDER_FIELD", "")
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(4)
+items = data.get(field) if isinstance(data, dict) else None
+if not isinstance(items, list):
+    # Field absent / wrong shape — treat as no extras (exit 0, blank).
+    sys.exit(0)
+for row in items:
+    if not isinstance(row, dict):
+        continue
+    if row.get("enabled") is True:
+        p = row.get("path")
+        if isinstance(p, str) and p:
+            sys.stdout.write(p + "\n")
+sys.exit(0)
+'
+        local rc=$?
+        return $rc
+    fi
+    err "neither jq nor python3 found on PATH; cannot render code_graph_extra_paths"
+    return 1
+}
+
 # ── Main: fetch config ──────────────────────────────────────────────────
 fetch_config() {
     local pid="$1" field="${2:-}"
@@ -513,6 +570,22 @@ fetch_config() {
             # treats that as "no warning" (defensive degradation).
             _maybe_warn_schema_version "$body" || true
             if [[ -n "$field" ]]; then
+                # v0.2.47 (extras): the `code_graph_extra_paths` field has
+                # a structured shape on the wire (array of {path, enabled,
+                # last_indexed_commit?}) but consumers — the hook chain in
+                # code-graph-incremental.sh — want plain newline-delimited
+                # paths of ENABLED rows only. Render it here so every
+                # bash caller gets the consumer-friendly format without
+                # re-parsing JSON. Empty array → empty output + exit 0
+                # (the spec: "no extras configured" is a valid state, not
+                # an error). Pre-v0.2.47 hubs that don't ship the field
+                # land in the existing "field_decode_failed" path with
+                # exit 4, which the hook treats as "no extras" — same
+                # observable behaviour as an explicit empty array.
+                if [[ "$field" == "code_graph_extra_paths" ]]; then
+                    _render_extra_paths "$body" "$field"
+                    return $?
+                fi
                 # Single-field envelope: {"<field>": <value>}. Unwrap.
                 local val
                 val=$(json_extract "$body" ".\"$field\"")

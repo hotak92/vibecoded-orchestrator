@@ -76,7 +76,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import requests
 
@@ -174,6 +174,27 @@ class FieldNotFound(ResolverError):
 
 
 # ─── Public dataclasses ─────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ExtraCodegraphPath:
+    """v0.2.47: a single read-only path contributing to a project's codegraph.
+
+    Mirrors the Rust ``CodeGraphExtraPath`` struct in
+    ``launcher/src-tauri/vct-hub/src/config_api.rs``. Frozen dataclass so
+    callers can use it as a dict key / pass it across thread boundaries
+    without defensive copies.
+
+    Pre-v0.2.47 hubs don't ship this field — the parser back-fills the
+    list with an empty tuple in that case, so old hubs paired with v0.2.47+
+    clients don't crash.
+    """
+
+    path: str
+    enabled: bool
+    #: Pre-v0.2.47 unconfigured / never-analyzed paths set this to ``None``.
+    #: Non-git extras also stay ``None`` (no SHA to track).
+    last_indexed_commit: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +388,20 @@ class ProjectConfig:
     #: matches the GUI's pre-unchecked checkbox state. Declared last to
     #: keep the frozen-dataclass init signature backward-compat.
     shared_kg_read_disabled: bool = False
+    #: v0.2.47 — read-only paths that contribute to this project's
+    #: codegraph (sibling clones, vendored references, etc.). Hooks
+    #: consult this list to decide whether an edit under an out-of-
+    #: project path should re-trigger analyze for THIS project. Each
+    #: entry mirrors the Rust ``CodeGraphExtraPath`` shape; the analyzer
+    #: walks every enabled extra in the same pass as the primary repo
+    #: and stamps ``project_source`` on the resulting rows.
+    #:
+    #: Pre-v0.2.47 hubs paired with v0.2.47+ clients omit this field;
+    #: the parser back-fills with ``()`` so old hubs don't crash new
+    #: clients — extras simply aren't visible to the hook chain until
+    #: the hub binary is updated. Empty tuple is also the natural
+    #: default for projects that haven't configured any extras yet.
+    code_graph_extra_paths: tuple[ExtraCodegraphPath, ...] = ()
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -696,6 +731,51 @@ def _resolve_project_id(project_arg: str) -> str:
 # ─── Internal: response → dataclass ─────────────────────────────────────
 
 
+def _parse_extra_codegraph_paths(
+    raw: Any,
+) -> tuple[ExtraCodegraphPath, ...]:
+    """Decode the hub's ``code_graph_extra_paths`` array into a tuple.
+
+    v0.2.47 (extras). Defensive: a non-list value or per-row decode
+    failure becomes an empty tuple / dropped row rather than an
+    exception. The resolver's outer ``KeyError, TypeError, ValueError``
+    catch in :func:`_from_hub_body` would otherwise translate one bad
+    row into a wholesale ``HubUnreachable`` — which is the wrong
+    response for "the hub returned 17 valid extras and 1 garbage one".
+
+    Each row mirrors the Rust ``CodeGraphExtraPath`` struct:
+    ``{"path": str, "enabled": bool, "last_indexed_commit": str | null}``.
+    """
+    if not isinstance(raw, list):
+        return ()
+    out: list[ExtraCodegraphPath] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        path = row.get("path")
+        if not isinstance(path, str) or not path:
+            # Path is the only truly required column. Skip the row.
+            continue
+        # `enabled` defaults to True when absent so a pre-v0.2.47 hub
+        # that ships only `{path}` rows is treated as "all enabled".
+        enabled_raw = row.get("enabled", True)
+        enabled = bool(enabled_raw) if not isinstance(enabled_raw, bool) else enabled_raw
+        commit_raw = row.get("last_indexed_commit")
+        commit: Optional[str]
+        if commit_raw is None:
+            commit = None
+        elif isinstance(commit_raw, str) and commit_raw:
+            commit = commit_raw
+        else:
+            commit = None
+        out.append(ExtraCodegraphPath(
+            path=path,
+            enabled=enabled,
+            last_indexed_commit=commit,
+        ))
+    return tuple(out)
+
+
 def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
     """Convert the hub's full-config JSON envelope into ProjectConfig.
 
@@ -802,6 +882,16 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             # ``unwrap_or(false)`` contract on absent rows.
             shared_kg_read_disabled=bool(
                 body.get("shared_kg_read_disabled", False)
+            ),
+            # v0.2.47 additive field — pre-v0.2.47 hubs omit it; empty
+            # tuple is the natural default. Each entry is one
+            # ExtraCodegraphPath; malformed entries are silently
+            # dropped (defense-in-depth so a single bad row doesn't
+            # wedge the whole resolve()). The hub already filters
+            # ``enabled`` to surface user intent — clients see the
+            # full list and decide per-call whether to filter further.
+            code_graph_extra_paths=_parse_extra_codegraph_paths(
+                body.get("code_graph_extra_paths", []),
             ),
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -1064,6 +1154,7 @@ def claude_session_dir_for(workspace_path: Path) -> Path:
 __all__ = [
     "DEFAULT_HUB_PORT",
     "EmbeddingModels",
+    "ExtraCodegraphPath",
     "FieldNotFound",
     "HUB_DISCOVERY_TTL_SECONDS",
     "HubUnreachable",

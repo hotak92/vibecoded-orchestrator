@@ -122,6 +122,13 @@ pub mod openai_cmd;
 pub mod orchestrator_core;
 pub mod orchestrator_root;
 pub mod project_identity;
+// v0.2.47 — per-project read-only filesystem paths contributing entities
+// to the project's codegraph collection. Backed by `vct-launcher-core::
+// db::codegraph_extras` (migration 026). Tauri command surface for the
+// launcher GUI's Identity-tab "Extra codegraph paths" panel; resolver
+// field `code_graph_extra_paths` on `/api/v1/projects/{id}/config`.
+// Plan: .claude/context/plans/v0.2.47-project-extra-codegraph-paths-2026-06-05.md.
+pub mod project_codegraph_extras;
 pub mod projects_v2;
 pub mod project_env_settings;
 pub mod project_state_cmd;

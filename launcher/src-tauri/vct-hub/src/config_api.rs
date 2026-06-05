@@ -324,6 +324,53 @@ struct ProjectConfigResponse {
     /// fields are additive (new readers see them; old readers ignore
     /// them).
     retrieval_tuning: RetrievalTuning,
+    /// v0.2.47 — extra read-only paths that contribute to this project's
+    /// codegraph collection. Sourced from
+    /// `project_codegraph_extra_paths` (only `enabled=1` rows). Hooks
+    /// (`.claude/hooks/code-graph-incremental.sh`) query this field via
+    /// the resolver clients (bash/ps1/python) to decide whether an edit
+    /// under an out-of-project path should re-trigger analyze for THIS
+    /// project — so they don't talk to SQLite directly. The launcher GUI
+    /// Identity tab "Extra codegraph paths" panel reads + mutates the
+    /// underlying rows via the Tauri commands in
+    /// `commands::project_codegraph_extras`.
+    ///
+    /// Additive field — pre-v0.2.47 Python/bash/ps1 clients see an
+    /// unknown field and ignore it (the parser back-fills with an
+    /// empty vector when missing, mirroring the established `diagrams_collection`
+    /// / `shared_kg_read_disabled` empty-default-on-missing pattern).
+    /// `schema_version` stays at 1 because the field is defaultable
+    /// client-side.
+    #[serde(default)]
+    code_graph_extra_paths: Vec<CodeGraphExtraPath>,
+}
+
+/// One enabled extra codegraph path for the resolver response.
+///
+/// Mirrors the relevant subset of `vct_launcher_core::db::codegraph_extras::CodegraphExtraPathRow`:
+/// `path` for prefix matching, `enabled` (always `true` in resolver responses
+/// — disabled rows are filtered out before serialisation), and
+/// `last_indexed_commit` for clients that want to drive incremental
+/// analyzer invocations with `--since-commit`. Other columns
+/// (`project_id`, `label`, `added_at`, `last_indexed_at`) are launcher-GUI
+/// concerns, not resolver concerns — kept out of the wire envelope to
+/// limit the per-request payload size.
+#[derive(Debug, Serialize)]
+struct CodeGraphExtraPath {
+    /// Absolute, canonicalised, cross-platform forward-slash form.
+    /// Hooks substring-match the edited-file path against this prefix.
+    path: String,
+    /// Always `true` in resolver responses (disabled rows are filtered
+    /// before populating the field). Kept on the wire so clients have a
+    /// single shape regardless of source — and so a future read-side
+    /// filter relaxation (e.g. "show disabled in the GUI fallback list")
+    /// is a one-line change in the populator without a schema bump.
+    enabled: bool,
+    /// Git SHA at the most recent analyze, when known. `None` for
+    /// non-git paths or paths that have not yet been analyzed. Resolver
+    /// clients pass this through to `code-graph-analyze --since-commit
+    /// <sha>` for incremental runs.
+    last_indexed_commit: Option<String>,
 }
 
 // ─── Handler ─────────────────────────────────────────────────────
@@ -662,6 +709,35 @@ async fn project_config(
         .to_string_lossy()
         .into_owned();
 
+    // 12. Project-extra codegraph paths (v0.2.47). Read enabled rows
+    // only — disabled rows are kept in the DB for history + label
+    // preservation but the resolver hides them so hooks / Python
+    // clients don't try to match against paths the user has paused.
+    // Service degradation: if the DB read fails (unlikely — same
+    // connection that produced all 11 prior reads), log + treat the
+    // field as empty rather than failing the resolver, since the
+    // extras are an enrichment of the core response. The fail mode
+    // we want to avoid is "one bug in a v0.2.47 path breaks every
+    // resolver call".
+    let code_graph_extra_paths: Vec<CodeGraphExtraPath> =
+        match h.0.list_enabled_codegraph_extras(&project.id) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| CodeGraphExtraPath {
+                    path: r.path,
+                    enabled: r.enabled,
+                    last_indexed_commit: r.last_indexed_commit,
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "[vct-hub config_api] list_enabled_codegraph_extras failed for project {}: {} (returning empty)",
+                    project.id, e
+                );
+                Vec::new()
+            }
+        };
+
     let response = ProjectConfigResponse {
         schema_version: RESOLVER_PROTOCOL_VERSION,
         project_id: project.id.clone(),
@@ -692,6 +768,7 @@ async fn project_config(
         rl_global_training_source_flag,
         claude_session_dir,
         retrieval_tuning,
+        code_graph_extra_paths,
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -2410,6 +2487,195 @@ kg_tier_full = 0.8
             body.get("shared_kg_write_disabled").and_then(|v| v.as_bool()),
             Some(false),
             "write gate must NOT be flipped by setting the read gate",
+        );
+    }
+
+    // ─── v0.2.47: code_graph_extra_paths field ──────────────────────────
+
+    /// On a freshly-seeded project with NO extras rows, the resolver
+    /// returns the field as an empty JSON array (NOT missing, NOT null).
+    /// Hooks + Python clients rely on the field being present so they
+    /// can iterate it unconditionally.
+    #[tokio::test]
+    async fn config_returns_empty_code_graph_extra_paths_by_default() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-no-extras", "myproject");
+
+        let resp = reqwest::get(format!("{}/projects/p-no-extras/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        let arr = body
+            .get("code_graph_extra_paths")
+            .and_then(|v| v.as_array())
+            .expect("code_graph_extra_paths present and is array");
+        assert!(arr.is_empty(), "empty array on a project with no extras; got {:?}", arr);
+    }
+
+    /// Enabled extras appear in the response in `added_at DESC` order
+    /// with `path`, `enabled`, and `last_indexed_commit` fields. The
+    /// project_id, label, added_at, last_indexed_at columns are NOT
+    /// projected (they are launcher-GUI concerns).
+    #[tokio::test]
+    async fn config_returns_enabled_code_graph_extra_paths() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-with-extras", "myproject");
+
+        // Seed three extras: newest first when listed.
+        h.0
+            .add_codegraph_extra("p-with-extras", "/opt/sibling-a", Some("Sibling A"))
+            .unwrap();
+        h.0
+            .add_codegraph_extra("p-with-extras", "/opt/sibling-b", None)
+            .unwrap();
+        h.0
+            .update_codegraph_extra_last_indexed(
+                "p-with-extras",
+                "/opt/sibling-b",
+                1_700_000_000_000,
+                Some("cafebabe"),
+            )
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-with-extras/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        let arr = body
+            .get("code_graph_extra_paths")
+            .and_then(|v| v.as_array())
+            .expect("code_graph_extra_paths present");
+        assert_eq!(arr.len(), 2, "two enabled extras seeded; body={}", body);
+
+        // All entries carry the three projected fields.
+        for entry in arr {
+            assert!(entry.get("path").is_some(), "path field present");
+            assert_eq!(
+                entry.get("enabled").and_then(|v| v.as_bool()),
+                Some(true),
+                "resolver-projected rows are always enabled=true",
+            );
+            // last_indexed_commit is Option<String>: null for un-analyzed,
+            // string for analyzed.
+            let lic = entry.get("last_indexed_commit");
+            assert!(lic.is_some(), "last_indexed_commit key always present");
+        }
+
+        // Find the row for sibling-b — should carry the commit SHA we
+        // recorded above.
+        let b = arr
+            .iter()
+            .find(|e| e.get("path").and_then(|v| v.as_str()) == Some("/opt/sibling-b"))
+            .expect("sibling-b row present");
+        assert_eq!(
+            b.get("last_indexed_commit").and_then(|v| v.as_str()),
+            Some("cafebabe"),
+        );
+
+        // sibling-a was never analyzed → null commit.
+        let a = arr
+            .iter()
+            .find(|e| e.get("path").and_then(|v| v.as_str()) == Some("/opt/sibling-a"))
+            .expect("sibling-a row present");
+        assert!(a.get("last_indexed_commit").unwrap().is_null());
+
+        // Negative: launcher-only columns are NOT projected to the wire.
+        for entry in arr {
+            assert!(
+                entry.get("project_id").is_none(),
+                "project_id is a launcher concern, not a resolver-wire field"
+            );
+            assert!(
+                entry.get("label").is_none(),
+                "label is a launcher GUI concern, not a resolver-wire field"
+            );
+            assert!(
+                entry.get("added_at").is_none(),
+                "added_at is a launcher concern, not a resolver-wire field"
+            );
+            assert!(
+                entry.get("last_indexed_at").is_none(),
+                "last_indexed_at is a launcher concern, not a resolver-wire field"
+            );
+        }
+    }
+
+    /// Disabled rows are filtered OUT of the resolver response. They
+    /// stay in the DB (for history + label preservation) but the hub
+    /// hides them so hooks / Python clients don't try to match against
+    /// paths the user has paused.
+    #[tokio::test]
+    async fn config_filters_disabled_code_graph_extra_paths() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-mixed", "myproject");
+
+        h.0
+            .add_codegraph_extra("p-mixed", "/opt/active", None)
+            .unwrap();
+        h.0
+            .add_codegraph_extra("p-mixed", "/opt/paused", None)
+            .unwrap();
+        h.0
+            .set_codegraph_extra_enabled("p-mixed", "/opt/paused", false)
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-mixed/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        let arr = body
+            .get("code_graph_extra_paths")
+            .and_then(|v| v.as_array())
+            .expect("code_graph_extra_paths present");
+        assert_eq!(arr.len(), 1, "only the enabled row reaches the wire");
+        assert_eq!(
+            arr[0].get("path").and_then(|v| v.as_str()),
+            Some("/opt/active")
+        );
+
+        // DB still has both rows — confirms the filter is at projection
+        // time, not via auto-deletion.
+        let all = h.0.list_codegraph_extras("p-mixed").unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    /// `?key=code_graph_extra_paths` returns just the new field
+    /// (single-field projection). Validates the field flows through
+    /// `single_field_response` via the serde Value path.
+    #[tokio::test]
+    async fn config_single_field_key_for_code_graph_extra_paths() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-key", "myproject");
+        h.0
+            .add_codegraph_extra("p-key", "/opt/x", None)
+            .unwrap();
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-key/config?key=code_graph_extra_paths",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        // Single-field shape: object with exactly one key.
+        let obj = body.as_object().expect("object");
+        assert_eq!(obj.len(), 1);
+        let arr = obj
+            .get("code_graph_extra_paths")
+            .and_then(|v| v.as_array())
+            .expect("the requested field");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0].get("path").and_then(|v| v.as_str()),
+            Some("/opt/x")
         );
     }
 }

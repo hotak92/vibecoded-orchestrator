@@ -486,6 +486,14 @@ pub fn run() {
         .manage(project_store)
         .manage(db_handle)
         .manage(local_config)
+        // v0.2.47 — per-project mutex registry for the codegraph-extras
+        // add / remove / toggle / reindex sequence. One AsyncMutex per
+        // project_id, lazily inserted. Without this, two concurrent
+        // mutations on the same project could interleave snapshot reads
+        // and analyzer invocations and leave the codegraph collection
+        // out of sync with the launcher DB. See
+        // commands::project_codegraph_extras::ExtrasLockRegistry.
+        .manage(commands::project_codegraph_extras::ExtrasLockRegistry::default())
         .setup(|app| {
             // Windows-only: clean up the previous launcher's .old.exe
             // left behind by `apply_launcher_update`'s rename-then-build
@@ -2182,6 +2190,18 @@ pub fn run() {
             // --prune-stale (authoritative refresh); --language is
             // optional and scopes the re-walk to one language.
             commands::codegraph_reanalyze::reanalyze_code_graph,
+            // v0.2.47 — project-extra codegraph paths. Read-only
+            // filesystem roots that contribute entities to the project's
+            // codegraph collection (e.g. a sibling clone the user wants
+            // indexed alongside their own code without it becoming a
+            // launcher project). Plan:
+            // .claude/context/plans/v0.2.47-project-extra-codegraph-paths-2026-06-05.md.
+            commands::project_codegraph_extras::list_project_codegraph_extra_paths,
+            commands::project_codegraph_extras::add_project_codegraph_extra_path,
+            commands::project_codegraph_extras::remove_project_codegraph_extra_path,
+            commands::project_codegraph_extras::set_project_codegraph_extra_path_enabled,
+            commands::project_codegraph_extras::sync_project_codegraph_extra_path,
+            commands::project_codegraph_extras::reindex_project_codegraph_after_extras_change,
             // KG auto-sync (2026-05-12): initial knowledge/ + docs/ sync
             // status + manual retry. Mirrors the codegraph Gap-2 pattern —
             // spawned from `create_project_v2` after bundle install so

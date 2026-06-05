@@ -31,6 +31,7 @@
   import { projects as projectsStore } from '$lib/stores/projects';
   import LegacyCollectionsModal from '$lib/components/LegacyCollectionsModal.svelte';
   import SharedKgPicker from '$lib/components/SharedKgPicker.svelte';
+  import ExtraCodegraphPathsPanel from '$lib/project-state/ExtraCodegraphPathsPanel.svelte';
   import type {
     ProjectIdentity,
     UpdateProjectIdentityRequest,
@@ -568,6 +569,12 @@
         </button>
       </div>
     {/if}
+
+    <!-- v0.2.47: extra codegraph paths panel. Read-only folders that
+         contribute to this project's codegraph collection without being
+         launcher projects themselves. Self-contained: loads its own
+         data and renders its own modals. -->
+    <ExtraCodegraphPathsPanel {projectId} />
   {/if}
 </section>
 

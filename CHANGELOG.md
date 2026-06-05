@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.47] - 2026-06-05
+
+Two-feature release. Both ship together because the supervisor-fix
+unblocks paid-module install on private GHCR images (RL Reranker v0.2.9
+hits this immediately) and the codegraph-extra-paths feature has been
+asked-for since the v0.2.40 multi-codebase work.
+
+### Supervisor image-resolution + docker-auth fix
+
+Closes the two-bug gap discovered post-v0.2.46 when the user attempted
+to install `vct-rl-reranker` v0.2.8 on a CUDA host: container start
+asked for `:0.2.8` (no variant) anonymously and 401'd against private
+GHCR, despite the install pull-token gateway working correctly.
+
+- **Bug 1 (variant suffix missing in start path)**: the launcher-side
+  `start_container_for_module` substituted bare `manifest.version`
+  ("0.2.8") into `{install.container.tag}` instead of piping through
+  `resolve_variant_tag(manifest, version, gpu_mode)`. Fix: promoted
+  `resolve_variant_tag` into `vct-launcher-core::services::container_runtime`
+  and threaded `gpu_mode` through `resolve_image_ref`. Both launcher
+  and hub-side supervisors read the persisted `GpuMode` from the same
+  `launcher.hardware_snapshot` row.
+- **Bug 2 (start path runs `podman/docker run` without authfile)**: even
+  if the variant is correct, cache eviction would fall through to
+  anonymous pull. Also discovered: `docker pull` doesn't support
+  `--authfile` at all (only `docker login` reads `~/.docker/config.json`),
+  so the existing v0.2.46 install path was silently docker-broken too.
+  Fix: per-runtime auth dispatch via `PerPullAuth::apply_to` —
+  podman gets `--authfile <file>`, docker gets `DOCKER_CONFIG=<dir>` env.
+  Plus a pre-pull from the start path that reuses the install path's
+  pull-token gateway so the cache is always warm.
+- **De-duplication**: two parallel copies of `resolve_image_ref` +
+  `build_podman_run_args` + helpers (one in launcher's `module_service.rs`,
+  one in hub's `module_supervisor.rs`) merged into a single
+  `vct-launcher-core::services::container_runtime` module. Both callers
+  now re-export via `pub use`. `DEDUP_SENTINEL` constant gives a compile-
+  time conflict if a future PR shadow-defines either helper.
+- See `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`
+  for the full two-bug analysis and `knowledge/concepts/paid-module-install-update-foundation-2026-06-02.md`
+  addendum for the gap classification.
+
+Test delta: +28 (vct-launcher-core 419→441, vct-hub 202→204, launcher 1297→1301).
+
+### Project-extra codegraph paths
+
+New per-project Identity tab feature: index additional read-only
+filesystem paths into a project's codegraph collection without making
+those paths launcher projects. Canonical use case: index a sibling
+`vibecoded-orchestrator/` clone into VCO_dev's codegraph for unified
+`search_code_graph` queries without registering the clone as a project.
+
+- **New migration `026_project_codegraph_extra_paths.sql`**: schema
+  `(project_id, path, label, added_at, last_indexed_at, last_indexed_commit, enabled)`
+  with PK `(project_id, path)` and CASCADE on project delete.
+- **6 Tauri commands** in `commands::project_codegraph_extras`:
+  `list_*`, `add_*` (returns two-variant `AddExtraPathOutcome::Added` /
+  `DisambiguationRequired`), `remove_*`, `set_*_enabled`, `sync_*`,
+  `reindex_*_after_extras_change`. Per-project mutex registry
+  (`ExtrasLockRegistry`) serialises add → reindex sequences so concurrent
+  mutations can't race the snapshot read.
+- **Hub resolver field** `code_graph_extra_paths: Vec<{path, enabled, last_indexed_commit}>`
+  on `/api/v1/projects/{id}/config`. Additive; older Python/bash/PS1
+  clients ignore the unknown field. Soft-fail-to-empty on DB read error.
+- **Analyzer CLI extensions** in `analyze_code_graph.py`:
+  `--extra-path <DIR>` (repeatable) walks additional source roots in
+  the same pass; `--since-commit <SHA>` restricts incremental analysis
+  to `<sha>..HEAD` per source root (non-git roots fall back to full
+  scan). `project_source` property stamped on every emitted row.
+  **Critical invariant**: `visited_uuids` is a single shared set across
+  primary + all extras so `--prune-stale` only deletes UUIDs that were
+  truly not visited. Multi-pass with `--prune-stale` would cause each
+  pass to delete the others' UUIDs — structurally impossible now.
+- **Hook update** in `code-graph-incremental.sh` (and `.ps1` sibling):
+  new check order — own-repo (fast path, no hub RTT) → extras of
+  current project → siblings → no-op. Edits under an extra path
+  re-index into the CURRENT project's codegraph prefix.
+- **Resolver client field** added to all 3 client libs:
+  `templates/scripts/vct_project_config.sh` and `.ps1` support
+  `--field code_graph_extra_paths` (newline-delimited enabled paths);
+  `vco_lib/project_config.py` adds `ExtraCodegraphPath` dataclass +
+  `ProjectConfig.code_graph_extra_paths: tuple[ExtraCodegraphPath, ...]`.
+- **GUI**: new `ExtraCodegraphPathsPanel.svelte` on the Identity tab
+  with per-row Sync/Disable/Remove. Auto-sync on add (minimisable
+  modal); re-sync with `--prune-stale` on remove or disable (so
+  orphan entries get pruned). Disambiguation modal when the picked
+  path is the root of an existing launcher project: "Add as project
+  (grant access matrix)" / "Add as path anyway" / "Cancel".
+- See `knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md`
+  for the architecture write-up.
+
+Test delta: +101 across all 5 surfaces (Rust core +20, Rust hub +4,
+Rust launcher +26, Python +20 covering analyzer + ProjectConfig +
+bash resolver + hook integration tests, Svelte vitest +11).
+
+### Two deferrals applied during this cycle (not part of the v0.2.47 feature work)
+
+- Dropped orphan Weaviate collection `VibeCodedOrchestrator_Development`
+  (0 rows, no callers — superseded by per-project Development
+  collections in v0.2.46).
+- Re-synced KG + codegraph with the v0.2.46 chunker preset overhaul
+  (heavy I/O ran in background during agent fan-out).
+
+### Totals
+
+Grand-total test delta: **+129** (1946 pre-v0.2.47 → 2075 post-v0.2.47).
+All gates green: vct-launcher-core 461, vct-hub 208, launcher 1327,
+svelte-check 0 errors, vitest 82, pytest 3579.
+
 ## [0.2.46] - 2026-06-04
 
 ### RL Telemetry (Unified target / pure-train container / hub-side citations) — landing alongside v0.2.46

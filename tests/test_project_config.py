@@ -29,6 +29,7 @@ from unittest import mock
 from vco_lib import project_config
 from vco_lib.project_config import (
     EmbeddingModels,
+    ExtraCodegraphPath,
     FieldNotFound,
     HubUnreachable,
     ProjectConfig,
@@ -77,6 +78,10 @@ FULL_BODY: dict[str, Any] = {
         "kg_tier_three_chunks": 0.65,
         "kg_tier_full": 0.75,
     },
+    # v0.2.47 additive — present here so the canonical fixture matches
+    # what v0.2.47+ hubs ship; tests that exercise the field set it
+    # explicitly with **{**FULL_BODY, "code_graph_extra_paths": ...}.
+    "code_graph_extra_paths": [],
 }
 
 
@@ -773,6 +778,119 @@ class ResolveRlFlagsTest(_ResolverTestBase):
         self.assertIs(cfg.rl_online_training_disabled, False)
         # Non-empty string is truthy in Python — bool("yes") == True.
         self.assertIs(cfg.rl_global_training_source_flag, True)
+
+
+# ─── code_graph_extra_paths (v0.2.47) ───────────────────────────────────
+
+
+class CodeGraphExtraPathsTest(_ResolverTestBase):
+    """v0.2.47 (extras): the additive ``code_graph_extra_paths`` field.
+
+    The hub returns a JSON array of ``{path, enabled, last_indexed_commit}``
+    objects. Pre-v0.2.47 hubs omit the field entirely; the client back-fills
+    with ``()`` so old hubs paired with new clients don't crash — extras
+    are simply invisible until the hub binary is updated.
+    """
+
+    def test_field_absent_back_fills_with_empty_tuple(self) -> None:
+        # Pre-v0.2.47 hub body — the key is missing entirely.
+        body_no_extras = {k: v for k, v in FULL_BODY.items()
+                          if k != "code_graph_extra_paths"}
+        self.session.get.return_value = _make_response(200, body_no_extras)
+        cfg = resolve(FULL_BODY["project_id"])
+        # Default is empty tuple — same shape as a hub returning [].
+        self.assertEqual(cfg.code_graph_extra_paths, ())
+
+    def test_field_empty_list_parses_to_empty_tuple(self) -> None:
+        body = {**FULL_BODY, "code_graph_extra_paths": []}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.code_graph_extra_paths, ())
+
+    def test_field_with_enabled_rows_round_trips(self) -> None:
+        rows = [
+            {"path": "/home/u/sibling-a", "enabled": True,
+             "last_indexed_commit": "abc1234"},
+            {"path": "/home/u/sibling-b", "enabled": False,
+             "last_indexed_commit": None},
+        ]
+        body = {**FULL_BODY, "code_graph_extra_paths": rows}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(len(cfg.code_graph_extra_paths), 2)
+        # Both rows preserved — the client doesn't filter by `enabled`.
+        # Consumers (the hook + the resolver bash sibling) filter.
+        a, b = cfg.code_graph_extra_paths
+        self.assertIsInstance(a, ExtraCodegraphPath)
+        self.assertEqual(a.path, "/home/u/sibling-a")
+        self.assertTrue(a.enabled)
+        self.assertEqual(a.last_indexed_commit, "abc1234")
+        self.assertEqual(b.path, "/home/u/sibling-b")
+        self.assertFalse(b.enabled)
+        self.assertIsNone(b.last_indexed_commit)
+
+    def test_malformed_row_silently_dropped(self) -> None:
+        # Defense-in-depth: one bad row shouldn't translate into a
+        # wholesale HubUnreachable for the resolve() call.
+        rows = [
+            {"path": "/home/u/good", "enabled": True,
+             "last_indexed_commit": None},
+            "garbage-not-a-dict",
+            {"enabled": True},  # path missing
+            {"path": "", "enabled": True},  # path empty
+            {"path": "/home/u/good-2", "enabled": True},
+        ]
+        body = {**FULL_BODY, "code_graph_extra_paths": rows}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        # Only the two well-formed rows survive.
+        self.assertEqual(
+            [p.path for p in cfg.code_graph_extra_paths],
+            ["/home/u/good", "/home/u/good-2"],
+        )
+
+    def test_non_list_value_back_fills_with_empty_tuple(self) -> None:
+        # If a future hub bug emits a scalar / dict instead of a list,
+        # we should NOT crash — defensive parser returns empty tuple.
+        body = {**FULL_BODY, "code_graph_extra_paths": "garbage"}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(cfg.code_graph_extra_paths, ())
+
+    def test_enabled_defaults_to_true_when_absent(self) -> None:
+        # Pre-spec hub that ships only ``{path}`` rows is interpreted
+        # as "all enabled". Matches the launcher GUI's default-on
+        # state for newly-added rows.
+        rows = [{"path": "/home/u/x"}]
+        body = {**FULL_BODY, "code_graph_extra_paths": rows}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertEqual(len(cfg.code_graph_extra_paths), 1)
+        self.assertTrue(cfg.code_graph_extra_paths[0].enabled)
+
+    def test_resolve_field_returns_raw_list(self) -> None:
+        # `resolve_field("code_graph_extra_paths")` returns the raw list
+        # without re-shaping — the single-field fast path doesn't go
+        # through `_from_hub_body`. Callers that want the
+        # ``ExtraCodegraphPath`` tuple should use ``resolve()`` instead.
+        rows = [
+            {"path": "/home/u/x", "enabled": True,
+             "last_indexed_commit": None},
+        ]
+        self.session.get.return_value = _make_response(
+            200, {"code_graph_extra_paths": rows}
+        )
+        val = resolve_field(
+            FULL_BODY["project_id"], "code_graph_extra_paths"
+        )
+        self.assertEqual(val, rows)
+
+    def test_extra_codegraph_path_frozen(self) -> None:
+        ep = ExtraCodegraphPath(
+            path="/x", enabled=True, last_indexed_commit=None,
+        )
+        with self.assertRaises(AttributeError):
+            ep.path = "/y"  # type: ignore[misc]
 
 
 if __name__ == "__main__":

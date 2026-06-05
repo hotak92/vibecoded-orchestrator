@@ -143,6 +143,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "rl_events: queryable telemetry store for RL retrieval + citation events (v0.2.47). Replaces the JSONL corpus at ~/.claude/retrieval_rl_data/rl_events.jsonl. MCP-side telemetry writers POST events via the hub's POST /api/v1/rl/events route; the hub is the sole writer (preserves launcher single-writer rule). offline_trainer reads via a future GET endpoint; the dashboard widget joins against projects for per-project event-rate displays.",
         sql: include_str!("migrations/025_rl_events.sql"),
     },
+    Migration {
+        version: 26,
+        description: "project_codegraph_extra_paths: read-only filesystem paths contributing entities to a project's codegraph (v0.2.47). Use case: index a sibling clone into the active project's codegraph without making it a launcher project. PRIMARY KEY (project_id, path); ON DELETE CASCADE on projects.id. Resolver field is additive; hooks query enabled rows by path-prefix. Plan: .claude/context/plans/v0.2.47-project-extra-codegraph-paths-2026-06-05.md.",
+        sql: include_str!("migrations/026_project_codegraph_extra_paths.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

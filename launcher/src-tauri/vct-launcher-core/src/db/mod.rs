@@ -67,6 +67,13 @@ pub mod license_keys;
 // `POST /api/v1/rl/events` route; the hub is the sole writer (preserves
 // the launcher's single-writer architectural rule).
 pub mod rl_events;
+// Migration 026 — per-project extra codegraph paths (v0.2.47). Read-only
+// filesystem roots contributing entities to the project's codegraph
+// collection. Tauri command surface in
+// `commands::project_codegraph_extras` (launcher crate); hub resolver
+// exposes enabled rows via the additive `code_graph_extra_paths` field.
+// Plan: .claude/context/plans/v0.2.47-project-extra-codegraph-paths-2026-06-05.md.
+pub mod codegraph_extras;
 
 /// Resolve the launcher DB path: `<VCT_STATE_DIR or ~/.vct>/launcher.db`.
 pub fn db_path() -> PathBuf {

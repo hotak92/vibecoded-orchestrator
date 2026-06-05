@@ -426,6 +426,26 @@ function Get-Config {
                     Emit-Warning -ErrorKind "field_decode_failed" -Detail "field $FieldName decoded null from hub response"
                     return 4
                 }
+                # v0.2.47 (extras): consumer-friendly render for
+                # code_graph_extra_paths — array of {path, enabled,
+                # last_indexed_commit?} on the wire, newline-delimited
+                # paths of `enabled=true` rows on stdout. Matches the
+                # bash sibling's shape so cross-OS callers see identical
+                # output. Empty enabled set → no stdout + exit 0.
+                if ($FieldName -eq "code_graph_extra_paths") {
+                    if ($val -is [System.Collections.IEnumerable] -and -not ($val -is [string])) {
+                        foreach ($row in $val) {
+                            if ($null -eq $row) { continue }
+                            $rowEnabled = $row.PSObject.Properties["enabled"]
+                            $rowPath = $row.PSObject.Properties["path"]
+                            if ($null -ne $rowEnabled -and $rowEnabled.Value -eq $true `
+                                -and $null -ne $rowPath -and $rowPath.Value) {
+                                [Console]::Out.WriteLine([string]$rowPath.Value)
+                            }
+                        }
+                    }
+                    return 0
+                }
                 # Arrays / nested objects → emit compact JSON; scalars → raw.
                 if ($val -is [System.Collections.IEnumerable] -and -not ($val -is [string])) {
                     [Console]::Out.Write(($val | ConvertTo-Json -Compress -Depth 8))

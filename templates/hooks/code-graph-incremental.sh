@@ -94,9 +94,64 @@ else
     VENV=""
 fi
 
-# Auto-detect project from file path (multi-codebase support) — silent if helper absent
+# v0.2.47 (extras): BEFORE the sibling detection, check the current
+# project's `code_graph_extra_paths`. If the edited file is under any of
+# them, re-point REPO_PATH to that extra and KEEP the current
+# PROJECT_NAME (extras index into the SAME per-project collections; they
+# don't get their own prefix). This makes edits under e.g.
+# `vibecoded-orchestrator/` show up in VCO_dev's codegraph without
+# vibecoded-orchestrator/ being a launcher project. See:
+# knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md
+#
+# Order of checks below (matches the spec, first match wins):
+#   1. Edit under current $REPO_PATH (no override needed — existing)
+#   2. NEW: Edit under any enabled extra of the CURRENT project
+#   3. Edit under a sibling project folder (existing detect-project.sh)
+#   4. None match — sibling detection returns "" → no-op
+#
+# Backwards-compatible: pre-v0.2.47 hubs lack the field → resolver exits
+# 4 → EXTRAS_LIST stays empty → the loop is a no-op → existing logic
+# runs unchanged. The resolver script is the same one we already called
+# above for PROJECT_NAME; if it isn't executable we silently skip extras.
+EXTRAS_MATCHED=0
+# Check (1) first: don't even query extras for the trivial own-repo case.
+# This avoids one hub round-trip per Edit in the common case and matches
+# the spec's "first match wins" ordering.
+case "$EDITED_FILE" in
+    "$REPO_PATH"/*)
+        : ;;  # under current repo — no remap; skip both extras + sibling
+    *)
+        _EXTRAS_RESOLVER="$REPO_PATH/.claude/scripts/vct_project_config.sh"
+        if [ -x "$_EXTRAS_RESOLVER" ]; then
+            # Resolver emits one path per line (enabled rows only). Exit 4
+            # ("field not found") is the pre-v0.2.47-hub case — silent no-op.
+            # We capture stdout-only; stderr (warnings) goes to the user.
+            EXTRAS_LIST=$(
+                "$_EXTRAS_RESOLVER" "$REPO_PATH" --field code_graph_extra_paths 2>/dev/null
+            ) || EXTRAS_LIST=""
+            if [ -n "$EXTRAS_LIST" ]; then
+                # Iterate paths line-by-line; first prefix-match wins.
+                # Strip any trailing slash so prefix-match is unambiguous.
+                while IFS= read -r _EXTRA_PATH; do
+                    [ -z "$_EXTRA_PATH" ] && continue
+                    _EXTRA_PATH="${_EXTRA_PATH%/}"
+                    case "$EDITED_FILE" in
+                        "$_EXTRA_PATH"/*)
+                            REPO_PATH="$_EXTRA_PATH"
+                            EXTRAS_MATCHED=1
+                            break
+                            ;;
+                    esac
+                done <<< "$EXTRAS_LIST"
+            fi
+        fi
+        ;;
+esac
+
+# Auto-detect project from file path (multi-codebase support) — silent if helper absent.
+# v0.2.47: skip sibling detection when an extras path already claimed the file.
 DETECT_HELPER="$DEFAULT_REPO_ROOT/.claude/scripts/detect-project.sh"
-if [ -f "$DETECT_HELPER" ]; then
+if [ "$EXTRAS_MATCHED" -eq 0 ] && [ -f "$DETECT_HELPER" ]; then
     # shellcheck source=/dev/null
     source "$DETECT_HELPER"
     DETECTED=$(detect_project_for_file "$EDITED_FILE" "$REPO_PATH" 2>/dev/null || true)
