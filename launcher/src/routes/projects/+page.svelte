@@ -14,6 +14,7 @@
   import { ui } from '$lib/stores/ui';
   import Toast from '$lib/components/Toast.svelte';
   import UpdateAllProjectsModal from '$lib/components/UpdateAllProjectsModal.svelte';
+  import BulkImportProjectsModal from '$lib/components/BulkImportProjectsModal.svelte';
 
   onMount(() => {
     void projects.load();
@@ -25,6 +26,8 @@
   // 0.2.x backlog #4 (2026-05-10): "Update all" modal state. Driven by
   // a $state boolean — see UpdateAllProjectsModal for the lifecycle.
   let updateAllOpen = $state(false);
+  // Scan-and-import-from-a-root-folder modal.
+  let bulkImportOpen = $state(false);
 
   function open(id: string) {
     projects.select(id);
@@ -38,6 +41,7 @@
 
 <Toast />
 <UpdateAllProjectsModal bind:open={updateAllOpen} />
+<BulkImportProjectsModal bind:open={bulkImportOpen} />
 
 <div class="pl-page">
   <header class="pl-header">
@@ -45,6 +49,14 @@
     <h1>Projects</h1>
     <button class="pl-add" onclick={() => ui.openCreateProject()}>
       + Add Project
+    </button>
+    <!-- Scan a root folder and bulk-import the projects found inside. -->
+    <button
+      class="pl-scan"
+      onclick={() => (bulkImportOpen = true)}
+      title="Scan a folder for projects and import several at once"
+    >
+      ⤓ Scan &amp; import
     </button>
     <!-- 0.2.x backlog #4: power-user "Update all" button. Sequential
          iteration; the modal shows per-project status. Disabled when
@@ -109,15 +121,19 @@
     display: flex; align-items: center; gap: 12px; margin-bottom: 24px;
   }
   .pl-header h1 { margin: 0; font-size: 22px; flex: 1; }
-  .pl-back, .pl-refresh, .pl-add, .pl-update-all {
+  .pl-back, .pl-refresh, .pl-add, .pl-update-all, .pl-scan {
     padding: 6px 12px; border-radius: 4px; cursor: pointer;
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.12);
     color: inherit; font-size: 13px;
   }
   .pl-back:hover, .pl-refresh:hover:not(:disabled), .pl-add:hover,
-  .pl-update-all:hover:not(:disabled) {
+  .pl-update-all:hover:not(:disabled), .pl-scan:hover {
     background: rgba(255,255,255,0.1);
+  }
+  .pl-scan {
+    border-color: rgba(0,191,166,0.3);
+    color: rgb(0,191,166);
   }
   /* 0.2.x backlog #4: distinct teal accent so the power-user action
    * reads as an action button, not a chrome control. Matches the Add

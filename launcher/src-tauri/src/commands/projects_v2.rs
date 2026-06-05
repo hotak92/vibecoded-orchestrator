@@ -5021,6 +5021,157 @@ fn launch_in_terminal_with_cli(folder: &str) -> Result<(), String> {
         .into())
 }
 
+// ───────────────────────── Bulk scan & import ─────────────────────────────
+//
+// "Scan a root folder for projects and import the selected ones." The
+// frontend cannot enumerate directories (tauri-plugin-fs is not enabled),
+// so the scan runs in Rust. Import itself reuses `create_project_v2`
+// unchanged — the GUI loops over the chosen candidates — so there is ONE
+// project-registration code path, shared with the single-add flow and with
+// install.py's vco_lib.project_init.
+
+/// One candidate folder found under the scanned root.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScannedProjectCandidate {
+    /// Absolute folder path.
+    pub folder_path: String,
+    /// Leaf folder name (a sensible default project name).
+    pub name: String,
+    /// True iff this path is already registered as a project.
+    pub already_registered: bool,
+    /// True iff the folder looks like a real project (git repo, .claude/,
+    /// CLAUDE.md, etc.) rather than an arbitrary directory.
+    pub looks_like_project: bool,
+    /// True iff this folder is the VCO orchestrator clone itself (must not
+    /// be added as a user project).
+    pub is_orchestrator_clone: bool,
+    /// Human-readable signal labels (why it looks like a project).
+    pub signals: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanProjectsResult {
+    /// The root that was scanned (echoed back, normalised).
+    pub root: String,
+    /// Every immediate subdirectory considered, project-like first.
+    pub candidates: Vec<ScannedProjectCandidate>,
+    /// Subdirectories skipped because they could not be read.
+    pub unreadable: Vec<String>,
+}
+
+/// Normalise a path for duplicate comparison: absolute where possible,
+/// trailing separators stripped, case-folded on Windows (its filesystem is
+/// case-insensitive, so `C:\Foo` and `c:\foo` are the same project).
+fn normalize_path_for_compare(p: &str) -> String {
+    let pb = PathBuf::from(p);
+    let canon = std::fs::canonicalize(&pb).unwrap_or(pb);
+    let s = canon.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// Scan the immediate subdirectories of `root` and classify each as a
+/// project candidate. Does NOT register anything — the GUI presents the
+/// list and then calls `create_project_v2` for the chosen folders.
+///
+/// `max_depth` is reserved for a future recursive scan; today only the
+/// direct children of `root` are inspected (depth 1), which matches how
+/// users lay out a "projects" parent folder.
+#[command]
+pub async fn scan_projects_under_root(
+    root: String,
+    db: State<'_, Db>,
+) -> Result<ScanProjectsResult, String> {
+    let root_pb = PathBuf::from(&root);
+    if !root_pb.is_dir() {
+        return Err(format!("Not a directory: {root}"));
+    }
+
+    // Build the set of already-registered paths (normalised) once.
+    let registered: std::collections::HashSet<String> = db
+        .list_projects()?
+        .into_iter()
+        .map(|p| normalize_path_for_compare(&p.folder_path))
+        .collect();
+
+    let mut candidates: Vec<ScannedProjectCandidate> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+
+    let read_dir = std::fs::read_dir(&root_pb)
+        .map_err(|e| format!("Cannot read {root}: {e}"))?;
+
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        // Skip dotfolders and common noise directories outright.
+        let leaf = entry.file_name().to_string_lossy().to_string();
+        if leaf.starts_with('.') || matches!(leaf.as_str(), "node_modules" | "__pycache__" | "target") {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+
+        // Reuse the canonical detector so the scan agrees with the single-
+        // add modal about what counts as a project / an orchestrator clone.
+        let detection = crate::commands::installer::detect_third_party_project_signals(
+            path_str.clone(),
+        );
+        let is_orchestrator_clone =
+            detection.summary.contains("orchestrator clone");
+        // A folder "looks like a project" if it has 3rd-party signals, OR
+        // it is an existing VCO project (manifest present), OR it has a .git
+        // dir (a plain git repo with no .claude yet is still importable).
+        let has_git = path.join(".git").is_dir();
+        let looks_like_project =
+            detection.has_signals || detection.manifest_present || has_git;
+
+        let mut signals = detection.signals;
+        if has_git && !signals.iter().any(|s| s.starts_with(".git")) {
+            signals.push(".git/ (git repository)".into());
+        }
+
+        candidates.push(ScannedProjectCandidate {
+            already_registered: registered
+                .contains(&normalize_path_for_compare(&path_str)),
+            name: leaf,
+            looks_like_project,
+            is_orchestrator_clone,
+            signals,
+            folder_path: path_str,
+        });
+    }
+
+    if let Err(e) = std::fs::read_dir(&root_pb) {
+        unreadable.push(format!("{root}: {e}"));
+    }
+
+    // Project-like, not-yet-registered, non-clone first; then the rest.
+    candidates.sort_by(|a, b| {
+        let rank = |c: &ScannedProjectCandidate| -> u8 {
+            if c.already_registered || c.is_orchestrator_clone {
+                2
+            } else if c.looks_like_project {
+                0
+            } else {
+                1
+            }
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    Ok(ScanProjectsResult {
+        root: normalize_path_for_compare(&root),
+        candidates,
+        unreadable,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9567,5 +9718,83 @@ export BY_HAND_KEY=\"user_typed\"
         // is expected. The assertion above is conditional for that
         // reason — `cargo test` may not always run from inside the
         // clone.)
+    }
+
+    // ─── Bulk scan & import ────────────────────────────────────────────
+
+    #[test]
+    fn normalize_path_strips_trailing_sep() {
+        let a = normalize_path_for_compare("/some/dir/");
+        let b = normalize_path_for_compare("/some/dir");
+        assert_eq!(a, b);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_path_is_case_insensitive_on_windows() {
+        // Windows filesystem is case-insensitive, so two casings of the
+        // same path must compare equal for duplicate detection.
+        let a = normalize_path_for_compare(r"C:\Foo\Bar");
+        let b = normalize_path_for_compare(r"c:\foo\bar");
+        assert_eq!(a, b);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn normalize_path_is_case_sensitive_off_windows() {
+        let a = normalize_path_for_compare("/Foo/Bar");
+        let b = normalize_path_for_compare("/foo/bar");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn scan_candidate_ranks_importable_before_skipped() {
+        // Verify the sort key directly (filesystem-independent): an
+        // importable project-like folder must sort before an already-
+        // registered one and before a plain non-project folder.
+        let mut v = vec![
+            ScannedProjectCandidate {
+                folder_path: "z_registered".into(),
+                name: "z_registered".into(),
+                already_registered: true,
+                looks_like_project: true,
+                is_orchestrator_clone: false,
+                signals: vec![],
+            },
+            ScannedProjectCandidate {
+                folder_path: "a_plain".into(),
+                name: "a_plain".into(),
+                already_registered: false,
+                looks_like_project: false,
+                is_orchestrator_clone: false,
+                signals: vec![],
+            },
+            ScannedProjectCandidate {
+                folder_path: "m_project".into(),
+                name: "m_project".into(),
+                already_registered: false,
+                looks_like_project: true,
+                is_orchestrator_clone: false,
+                signals: vec![],
+            },
+        ];
+        v.sort_by(|a, b| {
+            let rank = |c: &ScannedProjectCandidate| -> u8 {
+                if c.already_registered || c.is_orchestrator_clone {
+                    2
+                } else if c.looks_like_project {
+                    0
+                } else {
+                    1
+                }
+            };
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        assert_eq!(
+            v.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["m_project", "a_plain", "z_registered"],
+        );
     }
 }

@@ -1670,6 +1670,7 @@ pub fn run() {
             commands::projects_v2::get_project_v2,
             commands::projects_v2::get_project_by_slug,
             commands::projects_v2::create_project_v2,
+            commands::projects_v2::scan_projects_under_root,
             commands::projects_v2::update_project_v2,
             commands::projects_v2::rename_project_v2,
             commands::projects_v2::set_shared_kg_write_disabled,
