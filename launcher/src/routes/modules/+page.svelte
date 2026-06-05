@@ -18,5 +18,12 @@
   .page {
     height: 100%;
     overflow-y: auto;
+    /* Match the home page's content padding (28px 32px). Previously the
+       catalog rendered flush against the sidebar/top edges because
+       neither this wrapper nor ModuleCatalog's `.catalog` root carried
+       any padding. ModuleCatalog is a shared component, so the padding
+       lives here on the route wrapper rather than in the component. */
+    padding: 28px 32px;
+    box-sizing: border-box;
   }
 </style>

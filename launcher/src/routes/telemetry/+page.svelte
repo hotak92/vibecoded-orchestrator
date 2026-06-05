@@ -205,7 +205,7 @@
   .t-placeholder code {
     font-family: ui-monospace, monospace; color: #c4b3ff; font-size: 11px;
   }
-  .t-main { max-width: 720px; margin: 0 auto; padding: 16px; }
+  .t-main { max-width: 720px; margin: 0 auto; padding: 28px 16px 24px; }
   .t-warn {
     background: rgba(255,170,68,0.1); border: 1px solid rgba(255,170,68,0.3);
     color: #fc6; padding: 10px 12px; border-radius: 6px; font-size: 12px; margin-bottom: 12px;

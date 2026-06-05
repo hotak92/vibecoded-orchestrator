@@ -1,7 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { isAuthenticated, authLoading } from '$lib/stores/auth';
-  import { goto } from '$app/navigation';
+  import { goto, afterNavigate } from '$app/navigation';
   import { page } from '$app/stores';
   import { ui } from '$lib/stores/ui';
   import { orchestrator } from '$lib/stores/orchestrator';
@@ -66,6 +66,19 @@
   let { children } = $props();
 
   const uiState = $derived($ui);
+
+  // Scroll-reset on navigation. The chrome shell keeps a single scrolling
+  // container (`.main-content`); SvelteKit's client-side router does NOT
+  // reset its scrollTop between routes (the element persists across
+  // navigations), so arriving on a new page inherited the previous page's
+  // scroll offset — e.g. landing mid-way down /preferences/secrets.
+  // afterNavigate fires after the new page's DOM is committed; we snap the
+  // container back to the top. Hash links (in-page anchors) are left alone.
+  let mainEl = $state<HTMLElement | null>(null);
+  afterNavigate((nav) => {
+    if (nav.to?.url.hash) return;
+    if (mainEl) mainEl.scrollTop = 0;
+  });
 
   // Local mirrors so the modals can keep their `bind:open` ergonomics. We
   // reflect ui-store state into these and propagate user-driven closes
@@ -247,7 +260,7 @@
     <MenuBar />
     <div class="app-body">
       <Sidebar />
-      <main class="main-content">
+      <main class="main-content" bind:this={mainEl}>
         {@render children()}
       </main>
     </div>

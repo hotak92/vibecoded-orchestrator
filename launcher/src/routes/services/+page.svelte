@@ -565,6 +565,11 @@
 <style>
   .services-page {
     max-width: 900px;
+    /* Centre the content column. Without `margin: 0 auto` the 900px
+       block pinned to the left edge, leaving a large empty gutter on the
+       right (the table read as "stuck against the sidebar"). Mirrors the
+       /codegraph and /audit content centring. */
+    margin: 0 auto;
     padding: 1.5rem;
   }
   header h1 {
