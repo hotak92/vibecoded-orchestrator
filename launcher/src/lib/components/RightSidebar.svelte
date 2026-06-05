@@ -17,6 +17,8 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
+  import { modules } from '$lib/stores/modules';
+  import { moduleActionForKind } from '$lib/module-status-display';
   import Dropdown from '$lib/components/Dropdown.svelte';
 
   // v0.2.43 (Fabio branch feat/launcher-logo-circular-white): brand
@@ -192,6 +194,43 @@
     selectedApp !== null && effectiveStage === 'not_installed' && selectedApp.id === 'orchestrator'
   );
 
+  // Module repair/update action (Reinstall / Retry / Update) for an
+  // actionable catalog kind. Distinct from showLaunchActions/showInstallAction
+  // (which stay orchestrator-only): this surfaces the SAME action the
+  // /modules tile and the Home card now expose, so the right-rail status
+  // chip stops being a dead label for broken/update_available modules. The
+  // mapping is centralised in `moduleActionForKind`. NOT Pro-gated — an
+  // actionable kind is already-installed; only a selected project is
+  // required (install/update are per-project).
+  const moduleRepairAction = $derived(
+    selectedApp ? moduleActionForKind(selectedApp.catalogKind) : null
+  );
+  let moduleRepairBusy = $state(false);
+
+  async function runModuleRepair() {
+    if (!selectedApp || !moduleRepairAction) return;
+    const project = $selectedProject;
+    if (!project) {
+      toast.error('Select a project first to install or update modules.');
+      return;
+    }
+    moduleRepairBusy = true;
+    try {
+      if (moduleRepairAction.method === 'install') {
+        await modules.install(project.id, selectedApp.id);
+        toast.success(`${selectedApp.name} reinstalled`);
+      } else {
+        await modules.update(project.id, selectedApp.id);
+        toast.success(`${selectedApp.name} updated`);
+      }
+      await modules.loadCatalog();
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      moduleRepairBusy = false;
+    }
+  }
+
   type LaunchState = 'idle' | 'starting' | 'running' | 'error';
   let launchState = $state<LaunchState>('idle');
   let showPicker = $state(false);
@@ -343,6 +382,32 @@
           <p class="sidebar-info-key" style:font-size="11px" style:line-height="1.5">
             VCO isn't installed yet on this machine. Install Free runs the
             wizard with sensible defaults.
+          </p>
+        </div>
+      </div>
+
+      <div class="sidebar-divider"></div>
+    {:else if moduleRepairAction}
+      <!-- Actionable module (broken/error/update_available): expose the
+           Reinstall/Retry/Update action here too, so the right-rail status
+           chip is no longer a dead label. Same command path as the /modules
+           tile and the Home card (moduleActionForKind). Disabled + tooltip
+           when no project is selected (install/update are per-project). -->
+      <div class="sidebar-section">
+        <h4 class="sidebar-label">Quick Actions</h4>
+        <div class="sidebar-actions">
+          <button
+            class="btn-3d btn-3d-primary btn-3d-sm sidebar-action-btn"
+            disabled={moduleRepairBusy || !current}
+            title={!current ? 'Select a project first' : ''}
+            onclick={runModuleRepair}
+          >
+            {moduleRepairBusy ? 'Working…' : moduleRepairAction.label}
+          </button>
+          <p class="sidebar-info-key" style:font-size="11px" style:line-height="1.5">
+            {moduleRepairAction.method === 'update'
+              ? 'A newer version is available for this module.'
+              : 'This module needs to be reinstalled to work.'}
           </p>
         </div>
       </div>

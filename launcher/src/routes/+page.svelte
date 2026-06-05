@@ -20,6 +20,9 @@
   import { orchestrator } from '$lib/stores/orchestrator';
   import { modules } from '$lib/stores/modules';
   import { ui } from '$lib/stores/ui';
+  import { selectedProject } from '$lib/stores/projects';
+  import { toast } from '$lib/stores/toast';
+  import { moduleActionForKind } from '$lib/module-status-display';
   import type { ModuleCatalogEntry } from '$lib/types/launcher';
 
   onMount(() => {
@@ -138,6 +141,40 @@
     //    waitlist form. We do NOT advance to install.
     selectCard(c);
   }
+
+  // Per-card action (Reinstall / Retry / Update) for actionable kinds. The
+  // catalog `kind` → {label, method} mapping is centralised in
+  // `moduleActionForKind` so Home, RightSidebar, and ModuleCatalog stay in
+  // lockstep. install/update are per-project, so a project must be selected
+  // (the button is disabled + tooltipped otherwise). UPSERT-safe commands,
+  // so a double-click can't corrupt the row.
+  let cardActionBusyId = $state<string | null>(null);
+
+  async function handleCardModuleAction(e: MouseEvent, c: AppCard) {
+    e.stopPropagation(); // don't also toggle the right sidebar
+    const action = moduleActionForKind(c.badgeKind);
+    if (!action) return;
+    const project = $selectedProject;
+    if (!project) {
+      toast.error('Select a project first to install or update modules.');
+      return;
+    }
+    cardActionBusyId = c.entry.id;
+    try {
+      if (action.method === 'install') {
+        await modules.install(project.id, c.entry.id);
+        toast.success(`${c.entry.name} reinstalled`);
+      } else {
+        await modules.update(project.id, c.entry.id);
+        toast.success(`${c.entry.name} updated`);
+      }
+      await modules.loadCatalog();
+    } catch (err) {
+      toast.error(err);
+    } finally {
+      cardActionBusyId = null;
+    }
+  }
 </script>
 
 <!-- v0.2.32 M1 (2026-05-23): per-route document title for browser/OS
@@ -223,6 +260,21 @@
                     onclick={(e) => { e.stopPropagation(); window.location.assign(c.entry.cta_route); }}
                   >
                     Open dashboard
+                  </button>
+                {:else if moduleActionForKind(c.badgeKind)}
+                  <!-- Actionable status (broken/error/update_available):
+                       expose the action button here too, not just on the
+                       /modules page. Disabled + tooltipped when no project
+                       is selected (install/update are per-project). -->
+                  <button
+                    class="btn-3d btn-3d-primary btn-3d-sm"
+                    disabled={cardActionBusyId === c.entry.id || !$selectedProject}
+                    title={!$selectedProject ? 'Select a project first' : ''}
+                    onclick={(e) => handleCardModuleAction(e, c)}
+                  >
+                    {cardActionBusyId === c.entry.id
+                      ? '…'
+                      : moduleActionForKind(c.badgeKind)?.label}
                   </button>
                 {:else}
                   <span class="app-card-status app-card-installed">{c.badge}</span>
