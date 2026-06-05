@@ -7,6 +7,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.48] - 2026-06-05
+
+Three-fix release closing the gap that broke v0.2.47's `Update orchestrator`
+flow + a UX bug Fabio flagged in the License Manager modal + a structural
+fix so the underlying class of bug can't recur silently.
+
+### Update flow unblocked (the v0.2.47 ship + binary-refresh asymmetry)
+
+v0.2.47's "version bump" commit (`50665ca`) bumped pyproject.toml,
+Cargo.toml × 3, tauri.conf.json, package.json — but missed
+`vct-module.json`. CI auto-committed the v0.2.47 binary refresh on top,
+so `vct-launcher.metadata.json::launcher_version` advanced to "0.2.47"
+while `vct-module.json::version` stayed at "0.2.46". The launcher's
+`Update orchestrator` flow read both files on the next `git pull` and
+saw `source=0.2.46`, `on_disk=0.2.47`. The post-pull poll
+`WaitForBinaryRefresh` expected `on_disk == source` and could never
+match because on-disk was AHEAD of source. Five-minute deadlock,
+"Binary refresh did not land within 300 sec" modal, retry failed for
+the same reason.
+
+- **`vct-module.json`** (+ all 7 other version pins): bumped 0.2.46/0.2.47
+  → 0.2.48 in a single coordinated commit so no pin lags this time.
+- **`wait_for_binary_refresh` (`installer.rs:3689`)**: exit condition
+  changed from `on_disk == source` to `on_disk >= source` via the
+  existing `version_is_outdated()` semver helper. When on-disk is past
+  source, the loop now exits OK on the first iteration with an
+  `eprintln!` documenting the skew (the user keeps running the newer
+  binary; that's the only thing they could sensibly run). Pre-existing
+  tests (5 in `test_v0245_wait_*`) untouched + 2 new regression tests
+  (`test_v0248_wait_succeeds_when_on_disk_ahead_of_source`,
+  `test_v0248_wait_succeeds_when_on_disk_ahead_multi_digit`).
+
+### License Manager modal stranded after Remove (Fabio's report)
+
+Clicking `Remove` on the Orchestrator-tier card and confirming the
+prompt stranded the modal on the "No paid-module license keys yet"
+empty-state with no "paste a new key" textbox — even after restart.
+Root cause: `list_license_keys` (Rust side) only included the
+`__orchestrator__` row when a real SQLite row existed OR a legacy
+keychain entry was present for one-shot migration. After clear, neither
+held, so the wire payload had 0 rows. The front-end's `visibleKeys`
+filter always passes `module_id === '__orchestrator__'` through — but
+that's only useful if the row is IN the input array. The Orchestrator
+slot is a structural always-shown surface; tying its existence to a
+data-row presence check was the bug.
+
+- **`list_license_keys` (`licensing.rs:1483`)**: always emit a row for
+  `__orchestrator__`. Real persisted row when present; new
+  `synthetic_orchestrator_placeholder` (display name "Orchestrator tier
+  (root)", redacted_key="(not stored)", validation fields cleared) when
+  not. The GUI now renders the Save & Validate textbox in both cases.
+- New test `synthetic_orchestrator_placeholder_shape` pins the wire shape.
+
+### Pre-ship check generalized (the structural fix that would have caught the above)
+
+Per-release versioned gate-runner scripts (`v0242-pre-ship-check.sh`,
+`v0244-pre-ship-check.sh`, `v0245-pre-ship-check.sh`, `v0246-pre-ship-
+check.sh`, `v0246-part2-pre-ship-check.sh`) were exactly the
+antipattern that let v0.2.47 ship with the missed `vct-module.json`
+bump — there was no `v0247-pre-ship-check.sh`, so the version-pin gate
+that would have flagged it didn't run at all.
+
+- **New canonical `scripts/pre-ship-check.sh`** (replaces all five
+  per-release scripts). `EXPECTED_VERSION` resolves at runtime in this
+  priority: `$1` (argv) → `$EXPECTED_VERSION` (env) → `pyproject.toml`
+  (single source of truth). `VERSION_PIN_FILES` is a declared array
+  near the top — adding/removing a pinned file is a one-line change
+  with no version-number copies to keep in sync.
+- 5 per-release scripts deleted from `scripts/`. CI workflow
+  references (none found in `.github/workflows/`) require no follow-up.
+- Existing release-cycle gates carried forward intact (CI workflow
+  status, manifest validate, CodeQL alerts, CHANGELOG entry, working-
+  tree clean, dist-binaries presence, [Unreleased] empty,
+  re-embed-regression V46-C live gate when Weaviate is reachable).
+
+### CI re-greened (closed via the pre-ship-check sweep)
+
+- **Vitest CVE GHSA-5xrq-8626-4rwp** (critical): vitest@^3.2.4 →
+  ^4.1.8. The UI server arbitrary-file-read-and-execute issue was the
+  M1 follow-up queued from v0.2.46's release-readiness adversarial.
+  All 5 test files / 82 tests pass on vitest 4 (vanilla
+  `describe/it/expect/vi/beforeEach` surface, no breaking API
+  contacts).
+- **`tests/test_v0247_telemetry_v3.py::TestEmbeddingServiceMemoCache`
+  CI failure** (4 tests, since v0.2.47): `EmbeddingService.for_project`
+  probes the live text + code backends at construction time and raises
+  `NoEmbeddingBackendError` when neither is reachable. Memo-cache tests
+  don't actually need a live backend (they mock
+  `_embed_text_via_active`) but the constructor-time probe broke CI
+  every push since v0.2.47 ship. Fix: mock `text_backend_ready` +
+  `code_backend_ready` during the `for_project()` call in
+  `_make_service()`. Verified by running the suite with
+  `OLLAMA_URL=http://localhost:9999` (unreachable) — all 4 pass.
+
+### Diagnosed (no code change in v0.2.48)
+
+- **RL-module install reports success but no container appears on Fabio's
+  Windows + Docker machine**: matched both legs of v0.2.47's
+  `58ad931` supervisor + docker-auth fix (variant suffix stripped from
+  `docker run` tag + `docker pull` doesn't honor `--authfile`). The
+  v0.2.47 fix is correct; Fabio's machine just hadn't exercised it yet
+  because (a) `state/install-manifest.json` was still at 0.2.30 (`git
+  pull` advanced source + binary, but `install.py --update` / "Update
+  orchestrator" was skipped); (b) the RL module hadn't been re-installed
+  since the launcher binary advanced. His `module_installs` row showed
+  the pre-v0.2.47 codepath's silent-success shape (`status='installed'`
+  + `last_error != NULL` + `container_name = NULL`) with
+  `last_error="docker run failed (exit 125): Unable to find image
+  'ghcr.io/hotak92/vct-rl-reranker:0.2.9' locally → error from
+  registry: unauthorized"`. The image on disk is `:0.2.9-cpu` (proving
+  pull succeeded); `docker run` was invoked with bare `:0.2.9` (no
+  `-cpu` variant) → cache miss → re-pull → 401. Resolution: "Update
+  orchestrator" → reinstall RL → exercises the v0.2.47 fix.
+
+### Queued for v0.2.49
+
+- **Windows Desktop shortcut on install** (Fabio ask): Linux install
+  drops a `.desktop` file; Windows currently doesn't. Adding `.lnk`
+  creation to install.py touches the install path — bigger surface
+  than v0.2.48's scope.
+
+### Branch + worktree cleanup
+
+122 stale branches deleted from `vibecoded-orchestrator/` clone (14
+worktree branches from v0.2.42/v0.2.43 dev cycle + 108 audited fully-
+merged feat/v0.2.34/v0.2.35/v0.2.36/v0.2.37/v0.2.38/v0.2.39/v0.2.40
+agent-fanout branches). 14 worktree folders removed from disk. Each
+branch verified via `git cherry origin/main` patch-id equivalence to
+confirm 0 lost work before deletion.
+
 ## [0.2.47] - 2026-06-05
 
 Two-feature release. Both ship together because the supervisor-fix

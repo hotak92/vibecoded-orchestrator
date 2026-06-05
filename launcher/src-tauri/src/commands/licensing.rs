@@ -1479,6 +1479,16 @@ pub(crate) fn backfill_license_key_from_legacy_file(db: &Db) {
 /// orchestrator slot. Synthesises the legacy `__orchestrator__` row on
 /// the first call after upgrade (idempotent — only when the keychain
 /// has the legacy entry and no row exists).
+///
+/// v0.2.48: ALWAYS includes a `__orchestrator__` entry — either the
+/// real persisted row (when a key is active) or a synthetic placeholder
+/// (when none is). Without this guarantee, clearing the orchestrator
+/// key from the License Manager modal makes the modal's empty-state
+/// branch the only thing rendered, hiding the "paste a new key to
+/// rotate" textbox and stranding the user with no way to add a key
+/// short of editing the DB directly. The orchestrator-root slot is a
+/// structural always-shown surface; tying its existence to the DB
+/// row's presence was a UX trap.
 #[command]
 pub async fn list_license_keys(db: State<'_, Db>) -> Result<Vec<LicenseKeySummary>, String> {
     let db_ref: &Db = &db;
@@ -1492,7 +1502,32 @@ pub async fn list_license_keys(db: State<'_, Db>) -> Result<Vec<LicenseKeySummar
         );
     }
     let rows = db.list_license_keys()?;
-    Ok(rows.into_iter().map(|r| to_summary(db_ref, r)).collect())
+    let mut summaries: Vec<LicenseKeySummary> =
+        rows.into_iter().map(|r| to_summary(db_ref, r)).collect();
+    // v0.2.48 fix: always include the orchestrator-root slot. If the
+    // DB row exists, the map above already added it; otherwise inject
+    // a synthetic placeholder so the GUI always has a card to render.
+    if !summaries.iter().any(|s| s.module_id == ORCHESTRATOR_MODULE_ID) {
+        summaries.push(synthetic_orchestrator_placeholder(db_ref));
+    }
+    Ok(summaries)
+}
+
+/// v0.2.48: build an empty-state `LicenseKeySummary` for the
+/// orchestrator-root slot when no DB row exists. The redacted key is
+/// "(not stored)" and all validation fields are None / 0, matching the
+/// "Not validated" badge state the GUI already renders for fresh rows.
+fn synthetic_orchestrator_placeholder(db: &Db) -> LicenseKeySummary {
+    LicenseKeySummary {
+        module_id: ORCHESTRATOR_MODULE_ID.to_string(),
+        display_name: display_name_for(db, ORCHESTRATOR_MODULE_ID),
+        redacted_key: "(not stored)".to_string(),
+        tier: None,
+        validated_at: None,
+        last_validation_error: None,
+        created_at: 0,
+        updated_at: 0,
+    }
 }
 
 /// v0.2.40 L1: read a single per-module summary. Useful for the GUI's
@@ -2840,6 +2875,33 @@ mod tests {
         // Never the full key — redacted form ends with the ellipsis sentinel.
         assert!(s.redacted_key.ends_with('…'));
         assert_eq!(s.tier.as_deref(), Some("pro"));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.2.48: synthetic orchestrator placeholder for the License
+    // Manager modal's empty state. Pins the fix for the Fabio-reported
+    // bug where clearing the orchestrator key stranded the modal on
+    // the "no paid-module license keys yet" empty branch with no way
+    // back. The fix: always include a `__orchestrator__` row in the
+    // wire output, real or synthetic.
+    // -----------------------------------------------------------------
+
+    /// Pins the synthetic placeholder shape: `__orchestrator__` slot,
+    /// human-readable display name, "(not stored)" redacted key, all
+    /// validation fields cleared. Front-end's `visibleKeys` filter
+    /// passes this row through the always-shown branch.
+    #[test]
+    fn synthetic_orchestrator_placeholder_shape() {
+        let db = Db::open_in_memory().expect("in-memory");
+        let placeholder = synthetic_orchestrator_placeholder(&db);
+        assert_eq!(placeholder.module_id, ORCHESTRATOR_MODULE_ID);
+        assert_eq!(placeholder.display_name, "Orchestrator tier (root)");
+        assert_eq!(placeholder.redacted_key, "(not stored)");
+        assert!(placeholder.tier.is_none());
+        assert!(placeholder.validated_at.is_none());
+        assert!(placeholder.last_validation_error.is_none());
+        assert_eq!(placeholder.created_at, 0);
+        assert_eq!(placeholder.updated_at, 0);
     }
 
     // -----------------------------------------------------------------

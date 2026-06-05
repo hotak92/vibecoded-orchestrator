@@ -1,6 +1,6 @@
 {
   "name": "vct-launcher",
-  "version": "0.2.47",
+  "version": "0.2.48",
   "description": "",
   "type": "module",
   "scripts": {
@@ -41,7 +41,7 @@
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.3",
     "vite": "^6.0.3",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.8"
   },
   "overrides": {
     "cookie": "^0.7.0",

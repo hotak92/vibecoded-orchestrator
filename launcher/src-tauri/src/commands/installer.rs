@@ -3678,14 +3678,28 @@ impl<'a> WaitForBinaryRefresh<'a> {
         }
     }
 
-    /// Poll until `read_on_disk_binary_version` matches
-    /// `read_source_version` or the timeout elapses.
+    /// Poll until `read_on_disk_binary_version` is at least
+    /// `read_source_version` (semver-aware) or the timeout elapses.
     ///
     /// Soft-fail on transient git-pull errors (network blip, brief
     /// 503 from the remote) — the next iteration retries.
     /// Hard-fail on timeout: returns Err with a user-facing message
     /// naming both versions so the caller can surface it verbatim
     /// in the UI.
+    ///
+    /// v0.2.48: changed exit-condition from `on_disk == source` to
+    /// `on_disk >= source` (numeric semver compare). The old equality
+    /// check deadlocked the user's update flow when on-disk was
+    /// AHEAD of source — exactly what happened post-v0.2.47 when the
+    /// `vct-module.json` version-pin bump was missed but the binary
+    /// refresh for v0.2.47 had already landed (on_disk=0.2.47,
+    /// source=0.2.46). The newer binary is what the user wants to
+    /// restart into anyway — there's no `dist/` revision to "wait for"
+    /// in that case, so the loop would just time out at 300s with a
+    /// misleading "still building" modal. The `>=` rule is also the
+    /// only correct invariant: the source-pin says "binary must be at
+    /// least version X to satisfy this update"; if it's past X, the
+    /// update has already over-satisfied.
     pub(crate) async fn run(&self) -> Result<(), String> {
         use std::time::Instant;
         let deadline = Instant::now() + self.timeout;
@@ -3697,11 +3711,22 @@ impl<'a> WaitForBinaryRefresh<'a> {
             })?;
             let on_disk_version =
                 read_on_disk_binary_version(self.install_path).unwrap_or_default();
-            if !on_disk_version.is_empty() && on_disk_version == source_version {
+            if !on_disk_version.is_empty()
+                && !version_is_outdated(&on_disk_version, &source_version)
+            {
+                // on_disk >= source — either equal (the normal
+                // "binary refresh landed" case) or ahead (the
+                // version-pin-stale case fixed in v0.2.48). Both
+                // are valid exit states.
                 if iteration > 1 {
                     eprintln!(
-                        "[v0.2.45 V45-B] binary refresh landed after {} poll(s): on-disk now v{}",
-                        iteration, on_disk_version,
+                        "[v0.2.45 V45-B] binary refresh landed after {} poll(s): on-disk now v{} (source v{})",
+                        iteration, on_disk_version, source_version,
+                    );
+                } else if on_disk_version != source_version {
+                    eprintln!(
+                        "[v0.2.48] on-disk binary v{} is ahead of source v{} — proceeding (newer binary is what the user wants to run)",
+                        on_disk_version, source_version,
                     );
                 }
                 return Ok(());
@@ -8621,6 +8646,66 @@ mod tests {
         assert!(
             res.is_ok(),
             "expected Ok once binary appears mid-poll, got {:?}",
+            res
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[tokio::test]
+    async fn test_v0248_wait_succeeds_when_on_disk_ahead_of_source() {
+        // v0.2.48 regression test: the failure that prompted this fix.
+        //
+        // Scenario: source-version-bump commit forgot to bump
+        // vct-module.json (it stayed at 0.2.46) while the binary
+        // refresh for v0.2.47 already landed (on-disk metadata says
+        // 0.2.47). Old loop expected `on_disk == source`, never
+        // matched, timed out at 300s with misleading "still building"
+        // modal. New loop accepts on_disk >= source (semver-aware).
+        let p = tmp();
+        write_v0245_source_version(&p, "0.2.46");
+        write_v0245_on_disk_version(&p, "0.2.47");
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            timeout: std::time::Duration::from_secs(5),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let started = std::time::Instant::now();
+        let res = waiter.run().await;
+        let elapsed = started.elapsed();
+        assert!(
+            res.is_ok(),
+            "expected Ok when on-disk binary is ahead of source-pin; got {:?}",
+            res
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "expected near-instant return (no waiting), took {:?}",
+            elapsed,
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[tokio::test]
+    async fn test_v0248_wait_succeeds_when_on_disk_ahead_multi_digit() {
+        // Edge case for the numeric (not lexicographic) semver compare:
+        // "0.2.10" must be recognized as ahead of "0.2.9", not behind.
+        // (Lexicographic compare would put "0.2.10" < "0.2.9".)
+        let p = tmp();
+        write_v0245_source_version(&p, "0.2.9");
+        write_v0245_on_disk_version(&p, "0.2.10");
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            timeout: std::time::Duration::from_secs(5),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let res = waiter.run().await;
+        assert!(
+            res.is_ok(),
+            "expected Ok: 0.2.10 (on-disk) >= 0.2.9 (source); got {:?}",
             res
         );
         fs::remove_dir_all(&p).ok();

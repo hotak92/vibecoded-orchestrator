@@ -335,10 +335,29 @@ class TestEmbeddingServiceMemoCache:
     """
 
     def _make_service(self):
-        """Build a service whose backend calls we can intercept."""
+        """Build a service whose backend calls we can intercept.
+
+        v0.2.48 CI fix: ``EmbeddingService.for_project`` probes the
+        live text + code backends at construction time and raises
+        ``NoEmbeddingBackendError`` when neither is reachable. The memo
+        tests below mock ``_embed_text_via_active`` so a real backend
+        is never needed at call time, but the probe fired earlier
+        broke CI (no ollama / codeembed service in GitHub Actions).
+        Patch both readiness probes to return True for the duration of
+        the constructor, then return the constructed service with the
+        patches expired — the memo paths under test never touch the
+        probes again. This keeps the structural shape (an
+        EmbeddingService built via the canonical factory) while making
+        the test hermetic.
+        """
         from vco_lib.embedding_service import EmbeddingService
 
-        svc = EmbeddingService.for_project()
+        with patch.object(
+            EmbeddingService, "text_backend_ready", return_value=True
+        ), patch.object(
+            EmbeddingService, "code_backend_ready", return_value=True
+        ):
+            svc = EmbeddingService.for_project()
         return svc
 
     def test_repeat_call_returns_cached(self) -> None:

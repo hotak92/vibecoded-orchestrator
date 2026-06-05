@@ -1,21 +1,34 @@
 #!/usr/bin/env bash
-# v0.2.45 pre-ship gate runner.
+# Generic pre-ship gate runner — no version baked in.
 #
-# Runs the pre-ship gates before tagging v0.2.45.  Zero inputs;
-# outputs a pass/fail summary to stdout.
+# Runs the pre-ship gates before tagging the next release. Zero inputs
+# by default; outputs a pass/fail summary to stdout.
 #
-# v0.2.45 additions vs v0244-pre-ship-check.sh:
-#   - Gate 19: v0.2.45 Python test (V45-A self-relaunch under venv)
-#   - Gate 20: v0.2.45 Rust unit tests (cargo test --lib test_v0245*)
-#   - Gate 21: V45-E v0245_backfill_* unit tests in vct-launcher-core
-#   - Gate 22: VCT_RL_PULL_TOKEN_ENDPOINT documented in
-#              docs/CONFIGURATION.md (V45-D paper trail)
-#   - Gate 23: All forward version pins consistent at 0.2.45
-#   - Gate 24: [Unreleased] CHANGELOG block is empty
-#              (no-deferred-fixes rule)
+# Origin (2026-06-05, post-v0.2.47):
+#   v0.2.47 shipped with vct-module.json::version still at 0.2.46 because
+#   the pre-ship-check script that would have caught it (v0246-pre-ship-
+#   check.sh) was tied to the specific version "0.2.46". Without a v0247-
+#   pre-ship-check.sh being authored, the version-pin gate didn't run at
+#   all. The launcher then deadlocked the update flow at 300s with a
+#   misleading "still building" modal whenever it saw on_disk > source.
+#
+# Fix design (v0.2.48):
+#   - One script, one canonical name (this file).
+#   - EXPECTED_VERSION derived from pyproject.toml at runtime (single
+#     source of truth) — or overridden via $1 / $EXPECTED_VERSION for
+#     testing.
+#   - VERSION_PIN_FILES is a single declared list near the top: add a
+#     line when a new file gets a version pin, remove a line when one
+#     goes away. Every entry runs through the same `check_pin` helper.
+#   - Version-specific test-file presence checks are intentionally NOT
+#     re-introduced — the `pytest tests/` and `cargo test --lib` gates
+#     already exercise them; tying gate-presence to a particular release
+#     name is what we're moving away from.
 #
 # Usage:
-#   bash scripts/v0245-pre-ship-check.sh
+#   bash scripts/pre-ship-check.sh                  # auto-detect from pyproject.toml
+#   bash scripts/pre-ship-check.sh 0.2.49            # override version
+#   EXPECTED_VERSION=0.2.49 bash scripts/pre-ship-check.sh
 #
 # Exit code: 0 = all gates pass, 1 = one or more gates failed.
 #
@@ -28,7 +41,42 @@ REPO="hotak92/vibecoded-orchestrator"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-EXPECTED_VERSION="0.2.45"
+# ── Resolve EXPECTED_VERSION ───────────────────────────────────────────
+# Priority: $1 (argv) > $EXPECTED_VERSION (env) > pyproject.toml.
+# pyproject.toml is the canonical version source for the orchestrator
+# (the package definition consumed by `pip install .` + every other
+# manifest pin in the repo trails it). Single source of truth means the
+# script can never disagree with the actual release.
+EXPECTED_VERSION=""
+if [ "$#" -ge 1 ] && [ -n "$1" ]; then
+    EXPECTED_VERSION="$1"
+elif [ -n "${EXPECTED_VERSION:-}" ]; then
+    : # already set in env
+else
+    EXPECTED_VERSION="$(grep -m1 -E '^version = ' "$REPO_ROOT/pyproject.toml" \
+        | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+fi
+if [ -z "$EXPECTED_VERSION" ]; then
+    echo "ERROR: could not resolve EXPECTED_VERSION (pyproject.toml unreadable?)" >&2
+    exit 2
+fi
+
+# ── Canonical version-pin file list ────────────────────────────────────
+# Every file that carries a `version = "X.Y.Z"` or `"version": "X.Y.Z"`
+# pin matching the release. ADD a line when a new pin is introduced.
+# REMOVE a line when one goes away. Each entry runs through `check_pin`
+# below — the helper matches both TOML (`version = "x"`) and JSON
+# (`"version": "x"`) shapes.
+VERSION_PIN_FILES=(
+    "pyproject.toml"
+    "vct-module.json"
+    "launcher/package.json"
+    "launcher/package-lock.json"
+    "launcher/src-tauri/Cargo.toml"
+    "launcher/src-tauri/tauri.conf.json"
+    "launcher/src-tauri/vct-hub/Cargo.toml"
+    "launcher/src-tauri/vct-launcher-core/Cargo.toml"
+)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -89,7 +137,7 @@ check_workflow_last_run() {
 
 echo ""
 echo "============================================================"
-echo " v${EXPECTED_VERSION} pre-ship gate check"
+echo " Pre-ship gate check — v${EXPECTED_VERSION}"
 echo " Repo: $REPO"
 echo " Date: $(date -u '+%Y-%m-%d %H:%M UTC')"
 echo "============================================================"
@@ -142,10 +190,22 @@ if [ ${#_PYTEST_CMD[@]} -eq 0 ]; then
     fi
 fi
 
+# Resolve the cargo invocation that satisfies the workspace MSRV.
+# launcher/src-tauri depends on crates (e.g. sysinfo 0.39+) that require
+# rustc 1.95. On machines where the system `cargo` is older (e.g. snap
+# 1.94.1) but `rustup run 1.95` is available, prefer rustup. Falls back
+# to system cargo when rustup is not installed or 1.95 not present (CI
+# containers ship 1.95 as the system cargo, so the fallback is fine).
+if command -v rustup >/dev/null 2>&1 && rustup toolchain list 2>/dev/null | grep -q "^1\.95"; then
+    _CARGO=(rustup run 1.95 cargo)
+else
+    _CARGO=(cargo)
+fi
+
 # ── Section 1: Local build gates ─────────────────────────────────────────────
 echo "--- Local build gates ---"
 
-# Gate 1: Cargo.toml version matches expected v0.2.45
+# Gate 1: Cargo.toml version matches expected
 CARGO_VER="$(grep -m1 '^version = ' launcher/src-tauri/Cargo.toml \
     | sed -E 's/^version *= *"([^"]+)".*/\1/')"
 if [ "$CARGO_VER" = "$EXPECTED_VERSION" ]; then
@@ -155,85 +215,70 @@ else
 fi
 
 # Gate 2: cargo test --lib (unit tests).
-# Prefer rustup-run 1.95 when available — system `cargo` may be older
-# than the workspace MSRV (sysinfo 0.39 + tauri ≥ 2.x require 1.95).
-echo "  [running cargo test --lib...]"
-if command -v rustup >/dev/null 2>&1 && rustup toolchain list 2>/dev/null | grep -q "^1\.95"; then
-    if (rustup run 1.95 bash scripts/test-keychain-safe.sh > /tmp/w7-cargo-test.log 2>&1); then
-        gate_pass "cargo test --lib (keychain-safe, rustup 1.95)"
-    else
-        gate_fail "cargo test --lib (keychain-safe, rustup 1.95)" "See /tmp/w7-cargo-test.log"
-    fi
-elif bash scripts/test-keychain-safe.sh > /tmp/w7-cargo-test.log 2>&1; then
+echo "  [running cargo test --lib (keychain-safe)...]"
+if bash scripts/test-keychain-safe.sh > /tmp/preship-cargo-test.log 2>&1; then
     gate_pass "cargo test --lib (keychain-safe)"
 else
-    gate_fail "cargo test --lib (keychain-safe)" "See /tmp/w7-cargo-test.log"
+    gate_fail "cargo test --lib (keychain-safe)" "See /tmp/preship-cargo-test.log"
 fi
 
 # Gate 3: pytest
 echo "  [running pytest tests/ ...]"
-if "${_PYTEST_CMD[@]}" tests/ -q --tb=no > /tmp/w7-pytest.log 2>&1; then
+if "${_PYTEST_CMD[@]}" tests/ -q --tb=no > /tmp/preship-pytest.log 2>&1; then
     gate_pass "pytest tests/"
 else
-    gate_fail "pytest tests/" "See /tmp/w7-pytest.log (cmd: ${_PYTEST_CMD[*]})"
+    gate_fail "pytest tests/" "See /tmp/preship-pytest.log (cmd: ${_PYTEST_CMD[*]})"
 fi
 
 # Gate 4: npm test (svelte-check)
 echo "  [running npm run check in launcher/ ...]"
-if (cd launcher && npm run check > /tmp/w7-npm-check.log 2>&1); then
+if (cd launcher && npm run check > /tmp/preship-npm-check.log 2>&1); then
     gate_pass "npm run check (svelte-check)"
 else
-    gate_fail "npm run check (svelte-check)" "See /tmp/w7-npm-check.log"
+    gate_fail "npm run check (svelte-check)" "See /tmp/preship-npm-check.log"
 fi
 
 # Gate 5: npm audit (no critical/high)
 echo "  [running npm audit in launcher/ ...]"
 # npm audit exits non-zero if vulnerabilities >= moderate by default.
 # We only hard-fail on critical/high; moderate is warn.
-if (cd launcher && npm audit --audit-level=high > /tmp/w7-npm-audit.log 2>&1); then
+if (cd launcher && npm audit --audit-level=high > /tmp/preship-npm-audit.log 2>&1); then
     gate_pass "npm audit (no high/critical)"
 else
     # Check if it's high/critical or just moderate
     if (cd launcher && npm audit --audit-level=critical > /dev/null 2>&1); then
-        gate_warn "npm audit (high vulns found, no critical)" "See /tmp/w7-npm-audit.log"
+        gate_warn "npm audit (high vulns found, no critical)" "See /tmp/preship-npm-audit.log"
     else
-        gate_fail "npm audit (critical vulns found)" "See /tmp/w7-npm-audit.log"
+        gate_fail "npm audit (critical vulns found)" "See /tmp/preship-npm-audit.log"
     fi
 fi
 
-# Gate 6: manifest validate (strict mode). Uses _CARGO_PRE (rustup 1.95
-# when available) to satisfy the workspace MSRV.
-if command -v rustup >/dev/null 2>&1 && rustup toolchain list 2>/dev/null | grep -q "^1\.95"; then
-    _CARGO_PRE=(rustup run 1.95 cargo)
-else
-    _CARGO_PRE=(cargo)
-fi
-echo "  [building validate-manifest bin + running schema-drift check (cmd: ${_CARGO_PRE[*]})...]"
+# Gate 6: manifest validate (strict mode) + schema-drift check.
+echo "  [building validate-manifest + schema-drift check (cmd: ${_CARGO[*]})...]"
 if (cd launcher/src-tauri && \
-    "${_CARGO_PRE[@]}" build -p vct-launcher-core --bin validate-manifest --bin export-schema -q 2>/tmp/w7-manifest-build.log && \
+    "${_CARGO[@]}" build -p vct-launcher-core --bin validate-manifest --bin export-schema -q 2>/tmp/preship-manifest-build.log && \
     VCT_LAUNCHER_STRICT_MANIFEST=1 \
-    ./target/debug/export-schema --check ../../docs/schemas/vct-module.schema.json > /tmp/w7-schema-drift.log 2>&1); then
-    # Also run validate against fixtures
+    ./target/debug/export-schema --check ../../docs/schemas/vct-module.schema.json > /tmp/preship-schema-drift.log 2>&1); then
     if (cd launcher/src-tauri && \
         VCT_LAUNCHER_STRICT_MANIFEST=1 \
         ./target/debug/validate-manifest \
-        vct-launcher-core/tests/fixtures/manifests/*.json > /tmp/w7-manifest-validate.log 2>&1); then
+        vct-launcher-core/tests/fixtures/manifests/*.json > /tmp/preship-manifest-validate.log 2>&1); then
         gate_pass "manifest-validate (strict mode, schema-drift + fixtures)"
     else
-        gate_fail "manifest-validate (fixture validation)" "See /tmp/w7-manifest-validate.log"
+        gate_fail "manifest-validate (fixture validation)" "See /tmp/preship-manifest-validate.log"
     fi
 else
     gate_fail "manifest-validate (schema-drift or build)" \
-        "See /tmp/w7-manifest-build.log and /tmp/w7-schema-drift.log"
+        "See /tmp/preship-manifest-build.log and /tmp/preship-schema-drift.log"
 fi
 
-# Gate 7: no credential leaks in repo (scripts/check-no-secrets.sh)
+# Gate 7: no credential leaks in repo
 if [ -f scripts/check-no-secrets.sh ]; then
     echo "  [running check-no-secrets.sh ...]"
-    if bash scripts/check-no-secrets.sh > /tmp/w7-secrets.log 2>&1; then
+    if bash scripts/check-no-secrets.sh > /tmp/preship-secrets.log 2>&1; then
         gate_pass "check-no-secrets.sh"
     else
-        gate_fail "check-no-secrets.sh" "See /tmp/w7-secrets.log"
+        gate_fail "check-no-secrets.sh" "See /tmp/preship-secrets.log"
     fi
 else
     gate_warn "check-no-secrets.sh" "Script not found — skipping"
@@ -288,8 +333,6 @@ echo ""
 echo "--- Repo-level checks ---"
 
 # Gate 14: Allow auto-merge enabled (advisory — owner action, not code gate).
-# WARN-level only — see v0244 script for full rationale. `allow_auto_merge`
-# is repo-level setting; flip via `gh api -X PATCH /repos/$REPO -f allow_auto_merge=true`.
 echo "  [checking allow_auto_merge repo setting...]"
 AUTO_MERGE="$(gh api "/repos/$REPO" --jq '.allow_auto_merge' 2>/dev/null || echo "unknown")"
 if [ "$AUTO_MERGE" = "true" ]; then
@@ -305,11 +348,6 @@ fi
 echo "  [checking open CodeQL alerts...]"
 ALERT_COUNT="$(gh api "/repos/$REPO/code-scanning/alerts?state=open&severity=error" \
     --jq 'length' 2>/dev/null || echo "unknown")"
-# Tighter type check: only treat ALERT_COUNT as a numeric comparison
-# when it really is a non-negative integer (gh can return a JSON error
-# object that gets concatenated with the fallback "unknown" → produces
-# garbled output that the bare `-eq` test crashes on with
-# "integer expression expected").
 if [[ ! "$ALERT_COUNT" =~ ^[0-9]+$ ]]; then
     gate_warn "CodeQL error-severity alerts" \
         "Could not fetch (gh api error; run: gh auth status)"
@@ -320,10 +358,13 @@ else
         "Found $ALERT_COUNT open error-severity alerts — triage before release"
 fi
 
-# Gate 16: CHANGELOG has v0.2.45 entry
-# Match the Keep-a-Changelog heading shape: `## [0.2.45] - 2026-06-02`.
+# Gate 16: CHANGELOG has v$EXPECTED_VERSION entry.
+# Match the Keep-a-Changelog heading shape: `## [0.2.X] - 2026-MM-DD`.
 # Allow optional `v` prefix and optional surrounding brackets for flexibility.
-if grep -qE '^## \[?v?0\.2\.45\]?' CHANGELOG.md 2>/dev/null; then
+# Use a regex escape on the version (dots are regex metachars) so a
+# version "0.2.48" doesn't accidentally match "0.2.X" or "0X2X48".
+CHANGELOG_VERSION_RE="$(printf '%s' "$EXPECTED_VERSION" | sed -E 's/\./\\./g')"
+if grep -qE "^## \[?v?${CHANGELOG_VERSION_RE}\]?" CHANGELOG.md 2>/dev/null; then
     gate_pass "CHANGELOG.md has v$EXPECTED_VERSION section"
 else
     gate_fail "CHANGELOG.md has v$EXPECTED_VERSION section" \
@@ -340,73 +381,20 @@ else
         "Uncommitted changes present — commit or stash before tagging"
 fi
 
-# Gate 18: release.yml pre-release-gate job is present
+# Gate 18: release.yml pre-release-gate job is present (structural).
 if grep -q "pre-release-gate:" .github/workflows/release.yml 2>/dev/null; then
-    gate_pass "release.yml has pre-release-gate job (CI-6 W7)"
+    gate_pass "release.yml has pre-release-gate job (structural)"
 else
     gate_fail "release.yml has pre-release-gate job" \
-        "W7 pre-release-gate not found in release.yml — apply W7 branch before tagging"
+        "pre-release-gate job not found in release.yml"
 fi
 
 echo ""
 
-# ── Section 4: v0.2.45-specific gates ────────────────────────────────────────
-echo "--- v0.2.45-specific gates ---"
+# ── Section 4: Version-pin consistency ───────────────────────────────────────
+echo "--- Version-pin consistency (all files at v$EXPECTED_VERSION) ---"
+echo "  [checking ${#VERSION_PIN_FILES[@]} pinned files at $EXPECTED_VERSION...]"
 
-# Resolve the cargo invocation that satisfies the workspace MSRV.
-# launcher/src-tauri depends on crates (e.g. sysinfo 0.39+) that require
-# rustc 1.95. On machines where the system `cargo` is older (e.g. snap
-# 1.94.1) but `rustup run 1.95` is available, prefer rustup. Mirrors
-# how the local dev loop runs cargo. Falls back to system cargo when
-# rustup is not installed or 1.95 not present (CI containers ship 1.95
-# as the system cargo, so the fallback is fine there).
-if command -v rustup >/dev/null 2>&1 && rustup toolchain list 2>/dev/null | grep -q "^1\.95"; then
-    _CARGO=(rustup run 1.95 cargo)
-else
-    _CARGO=(cargo)
-fi
-
-# Gate 19: V45-A self-relaunch Python test
-echo "  [running v0.2.45 V45-A self-relaunch tests...]"
-if "${_PYTEST_CMD[@]}" tests/test_v0245_self_relaunch_under_venv.py -q --tb=short \
-        > /tmp/v0245-test-v45a.log 2>&1; then
-    gate_pass "tests/test_v0245_self_relaunch_under_venv.py (V45-A)"
-else
-    gate_fail "tests/test_v0245_self_relaunch_under_venv.py (V45-A)" \
-        "See /tmp/v0245-test-v45a.log"
-fi
-
-# Gate 20: V45-B/C/D/F Rust unit tests (cargo test --lib test_v0245)
-echo "  [running v0.2.45 cargo test --lib test_v0245* (cmd: ${_CARGO[*]}) ...]"
-if (cd launcher/src-tauri && \
-    "${_CARGO[@]}" test --lib test_v0245 -- --nocapture > /tmp/v0245-cargo-test.log 2>&1); then
-    gate_pass "cargo test --lib test_v0245* (V45-B/C/D/F Rust tests)"
-else
-    gate_fail "cargo test --lib test_v0245* (V45-B/C/D/F Rust tests)" \
-        "See /tmp/v0245-cargo-test.log"
-fi
-
-# Gate 21: V45-E v0245_backfill_* tests in vct-launcher-core
-echo "  [running v0.2.45 V45-E backfill tests (vct-launcher-core)...]"
-if (cd launcher/src-tauri && \
-    "${_CARGO[@]}" test --package vct-launcher-core --lib v0245_backfill -- --nocapture \
-        > /tmp/v0245-cargo-test-v45e.log 2>&1); then
-    gate_pass "cargo test (vct-launcher-core) v0245_backfill_* (V45-E)"
-else
-    gate_fail "cargo test (vct-launcher-core) v0245_backfill_* (V45-E)" \
-        "See /tmp/v0245-cargo-test-v45e.log"
-fi
-
-# Gate 22: VCT_RL_PULL_TOKEN_ENDPOINT documented in docs/CONFIGURATION.md (V45-D)
-if grep -q "VCT_RL_PULL_TOKEN_ENDPOINT" docs/CONFIGURATION.md 2>/dev/null; then
-    gate_pass "docs/CONFIGURATION.md mentions VCT_RL_PULL_TOKEN_ENDPOINT (V45-D)"
-else
-    gate_fail "docs/CONFIGURATION.md mentions VCT_RL_PULL_TOKEN_ENDPOINT (V45-D)" \
-        "V45-D added a row for the new env var; ensure docs are present"
-fi
-
-# Gate 23: All forward version pins consistent at 0.2.45
-echo "  [checking forward version pins consistent at $EXPECTED_VERSION...]"
 declare -a pin_failures=()
 check_pin() {
     local file="$1"
@@ -424,23 +412,20 @@ check_pin() {
         pin_failures+=("$file (got: $got)")
     fi
 }
-check_pin "pyproject.toml" "$EXPECTED_VERSION"
-check_pin "vct-module.json" "$EXPECTED_VERSION"
-check_pin "launcher/package.json" "$EXPECTED_VERSION"
-check_pin "launcher/package-lock.json" "$EXPECTED_VERSION"
-check_pin "launcher/src-tauri/Cargo.toml" "$EXPECTED_VERSION"
-check_pin "launcher/src-tauri/tauri.conf.json" "$EXPECTED_VERSION"
-check_pin "launcher/src-tauri/vct-hub/Cargo.toml" "$EXPECTED_VERSION"
-check_pin "launcher/src-tauri/vct-launcher-core/Cargo.toml" "$EXPECTED_VERSION"
+
+for f in "${VERSION_PIN_FILES[@]}"; do
+    check_pin "$f" "$EXPECTED_VERSION"
+done
+
 if [ "${#pin_failures[@]}" -eq 0 ]; then
-    gate_pass "all forward version pins at $EXPECTED_VERSION"
+    gate_pass "all ${#VERSION_PIN_FILES[@]} forward version pins at $EXPECTED_VERSION"
 else
     gate_fail "forward version pins at $EXPECTED_VERSION" \
         "Mismatch: ${pin_failures[*]}"
 fi
 
-# Gate 24: [Unreleased] CHANGELOG block is empty (no-deferred-fixes rule)
-# The block is allowed to exist as a heading; what's not allowed is content
+# Gate (no-deferred-fixes): [Unreleased] CHANGELOG block must be empty.
+# The block heading is allowed to exist; what's not allowed is content
 # between the heading and the first tagged version heading.
 UNRELEASED_BODY="$(awk '/^## \[Unreleased\]/,/^## \[[0-9]/' CHANGELOG.md \
     | sed -E '/^## \[/d' \
@@ -449,10 +434,47 @@ if [ -z "$UNRELEASED_BODY" ]; then
     gate_pass "CHANGELOG [Unreleased] block is empty (no-deferred-fixes rule)"
 else
     gate_fail "CHANGELOG [Unreleased] block is empty (no-deferred-fixes rule)" \
-        "Content found between [Unreleased] and [0.2.X]; move into the tagged block first"
+        "Content found between [Unreleased] and the next tagged heading; move into the tagged block first"
 fi
 
 echo ""
+
+# ── Section 5: live re-embed regression protection (V46-C) ───────────────────
+# Structural gate carried forward from v0.2.46. Catches the v0.2.42-v0.2.45
+# recurring re-embed bug by running the diff-gate code path against a real
+# Weaviate (V46-B's live integration tests), not just unit tests with
+# mocked _batch_query_weaviate_content_hashes. SKIPs cleanly when Weaviate
+# is unreachable (CI without Weaviate).
+LIVE_GATE_TEST="tests/test_v0246_v46b_live_ci10_diff_gate.py"
+if [ -f "$LIVE_GATE_TEST" ]; then
+    echo "--- Live re-embed regression protection (V46-C) ---"
+    _WEAVIATE_PROBE_URL="${WEAVIATE_URL:-http://localhost:8081}"
+    if ! curl -sf "${_WEAVIATE_PROBE_URL}/v1/.well-known/ready" >/dev/null 2>&1; then
+        gate_warn "Live re-embed regression protection (V46-C)" \
+            "SKIP — Weaviate not reachable at ${_WEAVIATE_PROBE_URL}; only enforced when Weaviate is up. This gate MUST pass on the release machine before tagging."
+    else
+        if "${_PYTEST_CMD[@]}" -q "$LIVE_GATE_TEST" \
+                -k "V46BLiveDiffGateTest and three_rows_returns_three_entries" \
+                > /tmp/preship-live-diff.log 2>&1; then
+            gate_pass "live diff-gate fetches stored hashes correctly"
+        else
+            gate_fail "live diff-gate FAILED — re-embed regression detected" \
+                "See /tmp/preship-live-diff.log. The v0.2.42-v0.2.45 recurring re-embed bug is back."
+        fi
+
+        if "${_PYTEST_CMD[@]}" -q "$LIVE_GATE_TEST" \
+                -k "V46BLivePruneTest and finds_and_deletes" \
+                > /tmp/preship-live-prune.log 2>&1; then
+            gate_pass "live prune deletes stale rows"
+        else
+            gate_fail "live prune FAILED — V0243-6 batch-delete bug is back" \
+                "See /tmp/preship-live-prune.log."
+        fi
+    fi
+    echo ""
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
 echo "============================================================"
 echo " SUMMARY"
 echo "============================================================"
