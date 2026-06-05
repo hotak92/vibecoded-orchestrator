@@ -10,6 +10,7 @@
   import { toast } from '$lib/stores/toast';
   import ProjectSelector from './ProjectSelector.svelte';
   import UpdateBadge from './UpdateBadge.svelte';
+  import NotificationBell from './NotificationBell.svelte';
 
   // MenuBar is mounted from the root layout, so it renders on every route.
   // Top-level navigation moved to the left Sidebar; MenuBar now hosts:
@@ -129,8 +130,9 @@
     <ProjectSelector />
   </div>
 
-  <!-- Right: Tier badge + Update badge + Avatar -->
+  <!-- Right: Notification bell + Tier badge + Update badge + Avatar -->
   <div class="menu-right">
+    <NotificationBell />
     <UpdateBadge />
 
     <button
