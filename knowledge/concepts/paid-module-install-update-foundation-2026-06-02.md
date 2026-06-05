@@ -11,9 +11,20 @@ tags:
 - status-state-machine
 - low-level-implementation
 created: 2026-06-02T12:00:00Z
-updated: 2026-06-02T12:00:00Z
+updated: 2026-06-05T00:00:00Z
 status: active
 ---
+
+> **2026-06-05 addendum**: the `pull-token-placeholder` tag refers to the
+> v0.2.45 STATE. As of v0.2.46 (`installer_engine.rs:1547-1650`), the
+> pull-token gateway is production-wired on the INSTALL path — license
+> verification + Supabase Edge Function (`rl-artifact-url`) + per-pull
+> authfile + audit-log trio. **But the supervisor's `podman run` does not
+> consume that infrastructure** — see [[refinedBy::supervisor-image-resolution-variant-gap-2026-06-04]]
+> for the symptom (`:0.2.8-cuda` pulls fine on install, then supervisor
+> tries `:0.2.8` anonymously and 401s) + the two-bug analysis + proposed
+> fix. Needs to ship in the next release.
+
 
 # Paid-module install + update foundation (v0.2.45)
 

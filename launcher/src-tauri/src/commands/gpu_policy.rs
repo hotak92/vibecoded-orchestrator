@@ -42,8 +42,6 @@
 //! always wins over the VRAM threshold AND over NVIDIA/AMD detection
 //! (only relevant on dual-GPU Mac Pros).
 
-use serde::{Deserialize, Serialize};
-
 /// Default VRAM threshold (GiB) below which we degrade to CPU-only mode.
 ///
 /// Tuned for the orchestrator-core model stack — see module docstring.
@@ -51,35 +49,16 @@ use serde::{Deserialize, Serialize};
 /// Keep this in sync with `install.py::_DEFAULT_GPU_VRAM_THRESHOLD_GB`.
 pub const DEFAULT_GPU_VRAM_THRESHOLD_GB: f64 = 8.0;
 
-/// The mode the GPU-using services (Ollama, code_embed, paid modules)
-/// will run in.
-///
-/// **Wire shape**: serialized as lowercase string (`"cuda"`, `"rocm"`,
-/// `"cpu"`, `"metal"`). The frontend consumes this via Tauri commands
-/// + the persisted hardware snapshot. Renaming a variant is a wire-
-/// breaking change — bump the snapshot version if it ever happens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GpuMode {
-    /// Discrete NVIDIA GPU with sufficient VRAM. Services use the
-    /// NVIDIA compose overlay (`docker-compose.gpu.yml` — CDI or
-    /// `--gpus all`).
-    Cuda,
-    /// Discrete AMD GPU with sufficient VRAM (v0.2.20). Services use
-    /// the ROCm compose overlay (`docker-compose.rocm.yml` —
-    /// `/dev/kfd` + `/dev/dri` device passthrough). Paid modules with
-    /// `gpu_image_variants` map this to a `-rocm` image tag.
-    Rocm,
-    /// CPU-only. Either no discrete GPU, insufficient VRAM, or user
-    /// override. Services fall back to CPU kernels (Ollama: CPU mode;
-    /// code_embed: ONNX CPU runtime).
-    Cpu,
-    /// Apple Silicon — unified memory + Metal. Services use the
-    /// Metal-aware code path (Ollama has built-in Metal acceleration,
-    /// code_embed falls back to CPU because the sentence-transformers
-    /// model lacks a Metal kernel today).
-    Metal,
-}
+// v0.2.47: `GpuMode` relocated to `vct-launcher-core::services::gpu_mode`
+// so the hub-side supervisor can resolve GPU variants the same way the
+// launcher-side installer does (closes the variant-suffix gap in the
+// supervisor start path — see
+// knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md).
+// The full `decide_gpu_mode` policy below stays here — it depends on the
+// launcher-only `HardwareSnapshot` pipeline. Re-exported under the
+// original name for source compatibility with the existing ~20 call
+// sites that use `crate::commands::gpu_policy::GpuMode`.
+pub use vct_launcher_core::services::gpu_mode::GpuMode;
 
 /// Pure decision function.
 ///

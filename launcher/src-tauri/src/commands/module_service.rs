@@ -26,7 +26,6 @@
 //! source list — `embedding_source` is a free-form string at every
 //! layer (DB, wire, helpers).
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -37,8 +36,30 @@ use tokio::process::Command;
 
 use crate::db::models::{ModuleStatus, ProjectRow};
 use crate::db::Db;
-use crate::manifest::{InstallMethod, ModuleManifest, PlaceholderCtx, PortMapping, VolumeMount};
+use crate::manifest::{InstallMethod, ModuleManifest, PlaceholderCtx};
 use vct_launcher_core::process::CommandExt as _;
+
+// v0.2.47: shared per-paid-module container helpers. Re-exported here as
+// `pub use` so existing call sites (and the local `#[cfg(test)]` block)
+// keep their unqualified imports. See
+// `vct-launcher-core::services::container_runtime` for the canonical
+// source; the previous local copies have been deleted to close the
+// drift gap that caused the supervisor-image-resolution-variant bug.
+pub use vct_launcher_core::services::container_runtime::{
+    build_podman_run_args, container_weights_path, ensure_volume_host_dirs,
+    resolve_container_name, resolve_image_ref, sanitize_path_component,
+};
+
+// Re-exports kept available for downstream callers / tests even though
+// this file doesn't reference them in the post-v0.2.47 body. The
+// `#[allow(unused_imports)]` is intentional: each re-export is part of
+// the module's public API (callers in `tests/`, the upcoming v0.2.48
+// hub→launcher fallback, etc.).
+#[allow(unused_imports)]
+pub use vct_launcher_core::services::container_runtime::{
+    build_port_arg, build_volume_arg, resolve_value, resolve_variant_tag, rl_placeholders,
+    DEDUP_SENTINEL, DEFAULT_OLLAMA_PORT,
+};
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -80,10 +101,9 @@ pub fn machine_id_hash_for_poll() -> String {
     crate::commands::licensing::machine_id_hash()
 }
 
-/// Default Ollama port used to resolve `{ollama_port}` in env values
-/// when the manifest doesn't override it. Matches the launcher's
-/// well-known service-port layout.
-const DEFAULT_OLLAMA_PORT: &str = "11435";
+// v0.2.47: `DEFAULT_OLLAMA_PORT` re-exported from
+// `vct-launcher-core::services::container_runtime` via the top-of-file
+// `pub use` block.
 
 // ─── Wire types ─────────────────────────────────────────────────────────
 
@@ -180,215 +200,19 @@ impl RlDashboardState {
     }
 }
 
-// ─── Pure helpers (testable without a container runtime) ────────────────
-
-/// Resolve `{project_slug}` (and any other launcher-wide tokens) into a
-/// concrete container name. Returns an error if the resolved name still
-/// contains unresolved placeholders — that's a manifest authoring bug
-/// (e.g. a typo `{project-slug}`) and should surface clearly instead of
-/// silently passing through to podman as a literal `{...}` string.
-pub fn resolve_container_name(template: &str, project_slug: &str) -> Result<String, String> {
-    let out = template.replace("{project_slug}", project_slug);
-    if out.contains('{') && out.contains('}') {
-        return Err(format!(
-            "container_name_template '{}' has unresolved placeholders after \
-             {{project_slug}} substitution → '{}'",
-            template, out
-        ));
-    }
-    Ok(out)
-}
-
-/// Resolve `{install.container.image}` + `{install.container.tag}` against
-/// the manifest's `install.container` block. The tag is chosen via the
-/// same rule `installer_engine::container_pull` uses (`tag_from_version`
-/// → manifest.version; else `install.ref` or `"latest"`).
-///
-/// v0.2.20 GPU-variant note: if the manifest declares
-/// `runtime.gpu_image_variants`, the install path already picked the
-/// matching variant tag at pull time. We don't try to recover the
-/// per-mode tag here — `tag_from_version` plus the manifest version is
-/// good enough for the start path because the image we want is the one
-/// already on disk after `container_pull`. If a future need arises (e.g.
-/// running CPU + CUDA side by side), this helper can be extended to
-/// accept a `GpuMode` argument.
-pub fn resolve_image_ref(
-    template: &str,
-    manifest: &ModuleManifest,
-) -> Result<String, String> {
-    let container = manifest
-        .install
-        .container
-        .as_ref()
-        .ok_or_else(|| {
-            "resolve_image_ref: install.container block missing (not a container_pull module)"
-                .to_string()
-        })?;
-
-    let tag = if container.tag_from_version {
-        manifest.version.clone()
-    } else {
-        manifest
-            .install
-            .r#ref
-            .clone()
-            .unwrap_or_else(|| "latest".to_string())
-    };
-
-    let out = template
-        .replace("{install.container.image}", &container.image)
-        .replace("{install.container.tag}", &tag);
-
-    if out.contains('{') && out.contains('}') {
-        return Err(format!(
-            "image_ref template '{}' has unresolved placeholders after \
-             install.container substitution → '{}'",
-            template, out
-        ));
-    }
-    Ok(out)
-}
-
-/// RL-specific placeholders not covered by `PlaceholderCtx::resolve`.
-fn rl_placeholders(rl_port: u16, project_slug: &str) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("{RL_SERVER_PORT}".to_string(), rl_port.to_string());
-    m.insert("{project_slug}".to_string(), project_slug.to_string());
-    m.insert("{ollama_port}".to_string(), DEFAULT_OLLAMA_PORT.to_string());
-    m
-}
-
-/// Two-layer placeholder resolver:
-///   1. Launcher-wide tokens (`{VCT_DATA}`, `{HOME}`, `{install_dir}`,
-///      `{MODULE_ID}`, etc.) via `PlaceholderCtx::resolve`.
-///   2. RL-specific tokens (`{RL_SERVER_PORT}`, `{project_slug}`,
-///      `{ollama_port}`) via the per-call map.
-fn resolve_value(
-    raw: &str,
-    ctx: &PlaceholderCtx,
-    placeholders: &HashMap<String, String>,
-) -> String {
-    let mut out = ctx.resolve(raw);
-    for (token, value) in placeholders {
-        out = out.replace(token, value);
-    }
-    out
-}
-
-/// Build a single `-p` arg value. Format: `[bind:]<host>:<container>`.
-/// Returns an error when `port.host` doesn't resolve to a valid u16
-/// (numeric string after placeholder substitution).
-fn build_port_arg(
-    port: &PortMapping,
-    placeholders: &HashMap<String, String>,
-) -> Result<String, String> {
-    let mut host = port.host.clone();
-    for (token, value) in placeholders {
-        host = host.replace(token, value);
-    }
-    host.parse::<u16>().map_err(|_| {
-        format!(
-            "port host '{}' (resolved from '{}') is not a valid u16",
-            host, port.host
-        )
-    })?;
-
-    let bind = port.bind.as_deref().unwrap_or("127.0.0.1");
-    if bind.is_empty() {
-        Ok(format!("{}:{}", host, port.container))
-    } else {
-        Ok(format!("{}:{}:{}", bind, host, port.container))
-    }
-}
-
-/// Build a single `-v` arg value. Format: `host:container[:mode]`.
-fn build_volume_arg(
-    vol: &VolumeMount,
-    ctx: &PlaceholderCtx,
-    placeholders: &HashMap<String, String>,
-) -> String {
-    let host = resolve_value(&vol.host, ctx, placeholders);
-    let container = resolve_value(&vol.container, ctx, placeholders);
-    match vol.mode.as_deref() {
-        Some(m) if !m.is_empty() => format!("{}:{}:{}", host, container, m),
-        _ => format!("{}:{}", host, container),
-    }
-}
-
-/// Build the full `podman run` argv (without the leading `podman`).
-///
-/// Layout:
-///   `run -d --name <name> [--restart=unless-stopped] -p ... -v ... -e ... <image> <command> <args...>`
-pub fn build_podman_run_args(
-    manifest: &ModuleManifest,
-    ctx: &PlaceholderCtx,
-    project: &ProjectRow,
-    rl_port: u16,
-    container_name: &str,
-    image: &str,
-) -> Result<Vec<String>, String> {
-    let runtime = &manifest.runtime;
-    // NEW-3 (2026-05-28): widened from `"container"`-only to also admit
-    // `"service"` — both types declare a long-running daemon backed by a
-    // container. `"cli"` / `"mcp_stdio"` / `"mcp_http"` have no podman args.
-    if !matches!(runtime.r#type.as_str(), "container" | "service") {
-        return Err(format!(
-            "build_podman_run_args: runtime.type must be 'container' or 'service', got '{}'",
-            runtime.r#type
-        ));
-    }
-
-    let placeholders = rl_placeholders(rl_port, &project.slug);
-    let mut args: Vec<String> = Vec::new();
-    args.push("run".into());
-    args.push("-d".into());
-    args.push("--name".into());
-    args.push(container_name.to_string());
-
-    if runtime.auto_restart {
-        args.push("--restart=unless-stopped".into());
-    }
-
-    // Ports: one `-p [bind:]host:container` per entry.
-    for port in &runtime.ports {
-        args.push("-p".into());
-        args.push(build_port_arg(port, &placeholders)?);
-    }
-
-    // Volumes: one `-v host:container[:mode]` per entry. Host paths
-    // resolved against PlaceholderCtx AND RL-specific placeholders.
-    for vol in &runtime.volumes {
-        args.push("-v".into());
-        args.push(build_volume_arg(vol, ctx, &placeholders));
-    }
-
-    // Env vars: env_fixed first (literal values still get placeholder
-    // substitution in case authors used `{RL_SERVER_PORT}` etc. inside),
-    // then env_derived. HashMap iteration is non-deterministic — tests
-    // must assert on set membership, not exact ordering.
-    for (k, v) in &runtime.env_fixed {
-        let resolved = resolve_value(v, ctx, &placeholders);
-        args.push("-e".into());
-        args.push(format!("{}={}", k, resolved));
-    }
-    for (k, v) in &runtime.env_derived {
-        let resolved = resolve_value(v, ctx, &placeholders);
-        args.push("-e".into());
-        args.push(format!("{}={}", k, resolved));
-    }
-
-    // Positional: image, then command + args (override of image CMD).
-    args.push(image.to_string());
-
-    // command + args undergo the same placeholder substitution so author
-    // can use `{project_slug}` in `--log-path /data/logs/rl_events_{project_slug}.jsonl`.
-    args.push(resolve_value(&runtime.command, ctx, &placeholders));
-    for a in &runtime.args {
-        args.push(resolve_value(a, ctx, &placeholders));
-    }
-
-    Ok(args)
-}
+// ─── Pure helpers (re-exported from core) ──────────────────────────────
+//
+// v0.2.47: `resolve_container_name`, `resolve_image_ref`,
+// `rl_placeholders`, `resolve_value`, `build_port_arg`, `build_volume_arg`,
+// `build_podman_run_args`, `sanitize_path_component`, and
+// `container_weights_path` have all been promoted into
+// `vct-launcher-core::services::container_runtime` and re-exported via
+// the `pub use` block at the top of this file. The local copies that
+// used to live here were near-identical to the hub-side copies in
+// `vct-hub::module_supervisor`; collapsing them removes the divergence
+// that produced the supervisor-image-resolution-variant bug.
+//
+// See `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`.
 
 /// Detect which container runtime to use. Mirrors
 /// `installer_engine::detect_container_runtime` (kept private over there;
@@ -409,30 +233,9 @@ async fn detect_container_runtime() -> Result<String, String> {
     Err("no container runtime found (tried podman, docker)".into())
 }
 
-/// Replace `[^A-Za-z0-9._-]` with `_` so a hostile string can never
-/// escape its directory. Idempotent on already-safe input.
-fn sanitize_path_component(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Path inside the container for a given (embedding_source, version)
-/// pair. The container's bind mount lives at `/data/state/...` and
-/// mirrors the host-side state dir.
-fn container_weights_path(embedding_source: &str, version: &str) -> String {
-    format!(
-        "/data/state/rl_model_{}_{}.pt",
-        sanitize_path_component(embedding_source),
-        sanitize_path_component(version),
-    )
-}
+// v0.2.47: `sanitize_path_component` + `container_weights_path` moved to
+// `vct-launcher-core::services::container_runtime` and re-exported at
+// the top of this file via `pub use`.
 
 // ─── Container lifecycle (Phase 1E) ─────────────────────────────────────
 
@@ -443,15 +246,57 @@ fn container_weights_path(embedding_source: &str, version: &str) -> String {
 /// Idempotent: if a same-named container already exists (running OR
 /// stopped) we `podman rm -f` it first. This makes the install flow
 /// recoverable from partial failures.
+///
+/// v0.2.47: looks up the persisted `GpuMode` and pipes it through
+/// `resolve_image_ref` so the variant suffix (`-cuda` / `-rocm` /
+/// `-cpu`) baked in at install time is preserved on start. Pre-v0.2.47
+/// this helper substituted `manifest.version` raw — which produced a
+/// bare `0.2.8` image ref where the registry actually carried
+/// `0.2.8-cuda`, and the supervisor's `podman run` triggered an
+/// anonymous re-pull that 401'd against private GHCR. See
+/// `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`.
 pub async fn start_container_for_module(
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
     project: &ProjectRow,
     rl_port: u16,
 ) -> Result<String, String> {
+    // v0.2.47: resolve the persisted GpuMode for this host. Soft-fail
+    // to None if no snapshot exists — `start_container_for_module_with_gpu_mode`
+    // treats None as "skip variant resolution" (legacy single-tag
+    // modules + cases where we can't safely guess). For modules with
+    // `gpu_image_variants` declared, lack of a snapshot here means the
+    // user never ran a redetect; we fall through to the bare tag,
+    // which matches pre-v0.2.47 behaviour and is no WORSE than the
+    // current state (still better than substituting bare version on
+    // private images — the pull-fallback below covers that).
+    let gpu_mode = read_persisted_gpu_mode();
+    start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode).await
+}
+
+/// v0.2.47: explicit-GpuMode form of `start_container_for_module`.
+/// Callers that already know the host's GpuMode (the launcher's
+/// `start_container_after_install` reads it from the persisted
+/// hardware snapshot at install time; the hub's resume sweep reads
+/// it via the resolver injected at hub startup) pass it directly.
+///
+/// `Some(GpuMode)` → variant suffix applied to the image ref via
+/// `resolve_variant_tag` (e.g. `:0.2.8` → `:0.2.8-cuda`). Also
+/// pre-pulls the variant-correct image with a valid pull-token /
+/// authfile BEFORE the `podman run`, so cache-evicted hosts never fall
+/// through to anonymous-pull-401.
+///
+/// `None` → bare-tag mode (legacy single-tag modules, OR cases where
+/// the caller has no GpuMode source). No variant suffix; no pre-pull.
+/// Backwards-compatible with pre-v0.2.47 behaviour.
+pub async fn start_container_for_module_with_gpu_mode(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    gpu_mode: Option<crate::commands::gpu_policy::GpuMode>,
+) -> Result<String, String> {
     let runtime = &manifest.runtime;
-    // NEW-3 (2026-05-28): widened from `"container"`-only to also admit
-    // `"service"` — both types are long-running daemons that podman manages.
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
             "start_container_for_module called for non-container runtime '{}'",
@@ -470,9 +315,28 @@ pub async fn start_container_for_module(
         })?,
         &manifest.version,
     );
-    let image = resolve_image_ref(&image_template, manifest)?;
+    // v0.2.47: thread `gpu_mode` into the core helper so variant-
+    // bearing manifests get the right `-cuda` / `-rocm` / `-cpu` suffix.
+    let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
 
     let podman = detect_container_runtime().await?;
+
+    // v0.2.47: pre-pull the variant-correct image with auth context
+    // attached, so a cache-evicted host doesn't fall through to
+    // `podman run`'s anonymous-pull-401 path. Soft-fail: if pre-pull
+    // returns an error, log it but let `podman run` make the final
+    // call — the cache may have the image already, in which case `run`
+    // succeeds without needing the registry. The legacy paid-modules
+    // path is one of: image-already-in-cache (no-op) OR image-in-cache-
+    // and-this-pre-pull-noops OR image-missing-and-pull-succeeds.
+    if gpu_mode.is_some() && manifest.install.method == InstallMethod::ContainerPull {
+        if let Err(e) = pre_pull_with_auth_for_start(manifest, &podman, &image).await {
+            eprintln!(
+                "[module_service] pre-pull for start failed (continuing — cache may suffice): {}",
+                e
+            );
+        }
+    }
 
     // Idempotency: force-remove any prior container with the same name.
     let _ = Command::new(&podman).silent()
@@ -484,18 +348,7 @@ pub async fn start_container_for_module(
 
     // mkdir -p every volume host path so podman doesn't fail on bind
     // mounts of nonexistent directories.
-    let placeholders = rl_placeholders(rl_port, &project.slug);
-    for vol in &runtime.volumes {
-        let host_resolved = resolve_value(&vol.host, ctx, &placeholders);
-        let path = PathBuf::from(&host_resolved);
-        if let Err(e) = tokio::fs::create_dir_all(&path).await {
-            eprintln!(
-                "[module_service] mkdir -p {} failed (will let podman surface the error): {}",
-                path.display(),
-                e
-            );
-        }
-    }
+    ensure_volume_host_dirs(manifest, ctx, rl_port, &project.slug).await;
 
     let args = build_podman_run_args(manifest, ctx, project, rl_port, &container_name, &image)?;
 
@@ -533,6 +386,122 @@ pub async fn start_container_for_module(
     }
 
     Ok(container_name)
+}
+
+/// v0.2.47: read the persisted hardware snapshot and return its
+/// `gpu_mode_decided`, or `None` if no snapshot exists / the read
+/// fails. Used by the `start_container_for_module` wrapper to
+/// preserve the variant suffix the installer pulled with.
+///
+/// Synchronous helper (no DB locking — `Db` is `Mutex<Connection>`,
+/// the read is bounded), called from the async start path. Soft-fail
+/// to `None` so a missing snapshot doesn't block container start.
+fn read_persisted_gpu_mode() -> Option<crate::commands::gpu_policy::GpuMode> {
+    // Open a short-lived connection to the launcher DB at the standard
+    // path. The start path is normally invoked with Tauri State carrying
+    // a `Db`, but the static fn here can't borrow that. We open a
+    // sibling connection — same on-disk file, same data — and dispose
+    // it on return.
+    let conn = rusqlite::Connection::open(crate::db::db_path()).ok()?;
+    let db = Db(std::sync::Mutex::new(conn));
+    crate::commands::installer::read_persisted_hardware_snapshot(&db)
+        .ok()
+        .flatten()
+        .map(|snap| snap.gpu_mode_decided)
+}
+
+/// v0.2.47: pre-pull the variant-correct image with proper auth context
+/// BEFORE `podman run`. Routes through `installer_engine::container_pull`'s
+/// pull-token gateway path indirectly: we replicate the same flow inline
+/// here (request token via the manifest's gateway, build per-pull
+/// authfile, pull `<image>:<tag>`, drop guard) so the start path doesn't
+/// require the GUI-side AppHandle that `run_install` does.
+///
+/// Soft-fails on every error — the caller logs and proceeds to
+/// `podman run`. If the image is already in the local cache, `run`
+/// succeeds without needing the pre-pull. If the image is missing AND
+/// pre-pull failed, `run` will surface the anonymous-pull failure
+/// itself; we don't double-report.
+async fn pre_pull_with_auth_for_start(
+    manifest: &ModuleManifest,
+    runtime: &str,
+    image_ref: &str,
+) -> Result<(), String> {
+    let container = manifest
+        .install
+        .container
+        .as_ref()
+        .ok_or_else(|| "install.container block missing".to_string())?;
+
+    // Fast-path: image already in local cache → no pull needed.
+    let inspect = Command::new(runtime)
+        .silent()
+        .args(["image", "exists", image_ref])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    if let Ok(s) = inspect {
+        if s.success() {
+            return Ok(());
+        }
+    }
+
+    // Image not in cache. Request a pull token (mirrors the install
+    // path's flow) and use a per-pull authfile.
+    let token_result =
+        crate::installer_engine::request_pull_token(container, None).await;
+    let registry = container
+        .registry
+        .clone()
+        .unwrap_or_else(|| {
+            image_ref
+                .split_once('/')
+                .map(|(host, _)| host.to_string())
+                .unwrap_or_else(|| "docker.io".to_string())
+        });
+    let guard_opt = match token_result {
+        Ok(tok) => {
+            let user = tok.username.as_deref().unwrap_or("vct-paid-module");
+            Some(crate::installer_engine::build_per_pull_authfile(
+                &registry,
+                user,
+                &tok.pull_token,
+                runtime,
+            )?)
+        }
+        Err(e) => {
+            // No token → anonymous pull. Will 401 on private images.
+            eprintln!(
+                "[module_service] pre-pull: pull-token gateway returned {}; \
+                 anonymous pull attempt (will 401 on private images).",
+                e
+            );
+            None
+        }
+    };
+
+    let mut pull_cmd = Command::new(runtime).silent();
+    if let Some(g) = guard_opt.as_ref() {
+        g.apply_to(&mut pull_cmd, runtime);
+    }
+    let pull_status = pull_cmd
+        .args(["pull", image_ref])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
+
+    if !pull_status.success() {
+        return Err(format!(
+            "{} pull failed (exit {}) for {}",
+            runtime,
+            pull_status.code().unwrap_or(-1),
+            image_ref
+        ));
+    }
+    Ok(())
 }
 
 /// Modules.rs-facing wrapper: allocates rl_port if needed, builds
@@ -2489,6 +2458,7 @@ mod tests {
         let got = resolve_image_ref(
             "{install.container.image}:{install.container.tag}",
             &manifest,
+            None,
         )
         .expect("resolve");
         assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.1.0");
@@ -2501,6 +2471,7 @@ mod tests {
         let got = resolve_image_ref(
             "{install.container.image}:{install.container.tag}",
             &manifest,
+            None,
         )
         .expect("resolve");
         assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:latest");
@@ -2670,7 +2641,7 @@ mod tests {
             manifest.install.container.as_ref().expect("container block present"),
             &manifest.version,
         );
-        let image = resolve_image_ref(&image_template, &manifest)
+        let image = resolve_image_ref(&image_template, &manifest, None)
             .expect("synthesized image must resolve");
 
         // Must not panic/error — the "container_name_template missing" error
@@ -3621,6 +3592,104 @@ mod tests {
             row_after.last_error.is_none(),
             "cli-runtime row must NOT trigger start path, row={:?}",
             row_after
+        );
+    }
+
+    // ─── v0.2.47: variant-aware image-ref + dedup tests ────────────────
+
+    /// v0.2.47 Bug-1 regression: when a manifest declares
+    /// `gpu_image_variants` AND the caller passes `Some(GpuMode::Cuda)`,
+    /// the resolved image ref carries the `-cuda` suffix end-to-end.
+    /// This is the exact failure mode the supervisor hit pre-v0.2.47:
+    /// substituting bare `manifest.version` produced `:0.2.8` which the
+    /// registry doesn't carry (only the variant-suffixed tags exist).
+    #[test]
+    fn v0247_resolve_image_ref_cuda_variant_end_to_end() {
+        use crate::manifest::GpuImageVariants;
+        let mut manifest = make_manifest(true, true);
+        manifest.version = "0.2.8".into();
+        manifest.runtime.gpu_image_variants = Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        });
+        let template = manifest.runtime.resolve_image_ref(
+            manifest.install.container.as_ref().expect("container block"),
+            &manifest.version,
+        );
+        let image = resolve_image_ref(
+            &template,
+            &manifest,
+            Some(crate::commands::gpu_policy::GpuMode::Cuda),
+        )
+        .expect("resolve");
+        assert_eq!(image, "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cuda");
+    }
+
+    /// v0.2.47: same fixture, `GpuMode::Cpu` arm. Verifies the dispatcher
+    /// is wired correctly for every variant, not just cuda.
+    #[test]
+    fn v0247_resolve_image_ref_cpu_variant_end_to_end() {
+        use crate::manifest::GpuImageVariants;
+        let mut manifest = make_manifest(true, true);
+        manifest.version = "0.2.8".into();
+        manifest.runtime.gpu_image_variants = Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        });
+        let template = manifest.runtime.resolve_image_ref(
+            manifest.install.container.as_ref().expect("container block"),
+            &manifest.version,
+        );
+        let image = resolve_image_ref(
+            &template,
+            &manifest,
+            Some(crate::commands::gpu_policy::GpuMode::Cpu),
+        )
+        .expect("resolve");
+        assert_eq!(image, "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cpu");
+    }
+
+    /// v0.2.47: legacy single-tag module (no `gpu_image_variants` block)
+    /// returns bare version tag regardless of gpu_mode. Pins the
+    /// backwards-compatibility invariant — pre-v0.2.47 manifests still
+    /// install + start the same way they always did.
+    #[test]
+    fn v0247_resolve_image_ref_legacy_no_variants_block_unchanged() {
+        let mut manifest = make_manifest(true, true);
+        manifest.version = "0.2.7".into();
+        // no gpu_image_variants on this manifest fixture
+        assert!(manifest.runtime.gpu_image_variants.is_none());
+        let image = resolve_image_ref(
+            "{install.container.image}:{install.container.tag}",
+            &manifest,
+            Some(crate::commands::gpu_policy::GpuMode::Cuda),
+        )
+        .expect("resolve");
+        assert_eq!(image, "ghcr.io/hotak92/vct-rl-reranker:0.2.7");
+    }
+
+    /// v0.2.47 de-dup regression: assert that the launcher and the hub
+    /// pull their `resolve_image_ref` / `build_podman_run_args` / etc.
+    /// from the SAME `vct-launcher-core::services::container_runtime`
+    /// module. We check by comparing the constant `DEDUP_SENTINEL`
+    /// re-exported through the local `pub use` block to the canonical
+    /// value defined in core — they must be byte-identical.
+    ///
+    /// If a future drift re-introduces a local copy of any of the
+    /// shared helpers, this test will still pass (the sentinel is
+    /// independent) — but the helper duplication review will catch it.
+    /// This test is the failure-mode-detection backstop: a refactor that
+    /// accidentally re-defines `DEDUP_SENTINEL` locally would shadow
+    /// the re-export and produce a mismatch.
+    #[test]
+    fn v0247_helpers_have_one_source_of_truth() {
+        assert_eq!(
+            DEDUP_SENTINEL,
+            vct_launcher_core::services::container_runtime::DEDUP_SENTINEL,
+            "module_service::DEDUP_SENTINEL must equal the core constant — \
+             a mismatch indicates accidental local-shadow re-introduction"
         );
     }
 }

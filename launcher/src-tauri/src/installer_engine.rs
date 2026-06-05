@@ -674,13 +674,21 @@ async fn container_pull(
     // `vct-paid-module` literal so mismatched-version client/server
     // pairings still attempt auth (it'll fail with a clear error, not
     // silently break).
-    let authfile_guard: Option<tempfile::NamedTempFile> = if let Some(t) = token.as_deref() {
-        let login_username = token_username.as_deref().unwrap_or("vct-paid-module");
-        Some(build_per_pull_authfile(&registry, login_username, t)?)
-    } else {
-        None
-    };
-    let authfile_path: Option<&Path> = authfile_guard.as_ref().map(|f| f.path());
+    // v0.2.47: build the per-pull auth context with the active runtime
+    // baked in. Docker doesn't accept `--authfile` on `pull` / `run`
+    // (only `docker login` reads `~/.docker/config.json`), so the core
+    // helper switches storage shape based on `runtime` and the
+    // `apply_to` method emits either `--authfile <file>` (podman) or
+    // `DOCKER_CONFIG=<dir>` env (docker). The probe helper below still
+    // takes a path-or-None for podman compat; docker probes carry the
+    // env via `apply_to` instead.
+    let authfile_guard: Option<vct_launcher_core::services::container_runtime::PerPullAuth> =
+        if let Some(t) = token.as_deref() {
+            let login_username = token_username.as_deref().unwrap_or("vct-paid-module");
+            Some(build_per_pull_authfile(&registry, login_username, t, &runtime)?)
+        } else {
+            None
+        };
 
     // ─── Step 3a (v0.2.35): probe primary tag, fall back to cpu if missing ─
     //
@@ -699,8 +707,17 @@ async fn container_pull(
     // primary-miss-fallback-hit / both-miss / probe-error-degrades) by
     // injecting a fake probe instead of needing a live registry.
     let runtime_for_probe = runtime.clone();
-    let authfile_path_for_probe: Option<std::path::PathBuf> =
-        authfile_path.map(|p| p.to_path_buf());
+    // v0.2.47: capture the probe-side auth. For podman, this is the
+    // path of the authfile (passed as `--authfile`). For docker, we
+    // capture the temp dir that backs the per-pull `config.json`
+    // (passed as `DOCKER_CONFIG=<dir>` env var on the probe Command).
+    // Both alternatives are cheap `Option<PathBuf>` so the cloned
+    // closure body can rebuild the same auth context per probe call.
+    let probe_authfile_path: Option<std::path::PathBuf> =
+        authfile_guard.as_ref().and_then(|g| g.path()).map(|p| p.to_path_buf());
+    let probe_docker_config_dir: Option<std::path::PathBuf> =
+        authfile_guard.as_ref().and_then(|g| g.docker_config_dir())
+            .map(|p| p.to_path_buf());
     // v0.2.46 V46-E C1: use `effective_tag` rather than the input `tag`
     // so a server-honored patch-level override flows through to both the
     // registry probe AND the eventual `podman pull` invocation.
@@ -711,13 +728,15 @@ async fn container_pull(
         module_id,
         |probe_image, probe_tag| {
             let runtime = runtime_for_probe.clone();
-            let authfile_pb = authfile_path_for_probe.clone();
+            let authfile_pb = probe_authfile_path.clone();
+            let docker_cfg_pb = probe_docker_config_dir.clone();
             async move {
-                probe_image_tag_exists_with_authfile(
+                probe_image_tag_exists_with_auth_context(
                     &probe_image,
                     &probe_tag,
                     &runtime,
                     authfile_pb.as_deref(),
+                    docker_cfg_pb.as_deref(),
                 )
                 .await
             }
@@ -751,15 +770,25 @@ async fn container_pull(
     // .status() pattern carries the same latent deadlock risk on
     // unexpectedly verbose repos.
     //
-    // v0.2.46 V46-E (C2): `--authfile <tmp>` replaces the previous
-    // `podman login`/`podman logout` dance. The authfile contains a
+    // v0.2.46 V46-E (C2): per-pull auth replaces the previous
+    // `podman login`/`podman logout` dance. The auth blob contains a
     // base64-encoded `username:token` for ONLY the target registry, so
     // it can't bleed into other concurrent paid-module pulls.
     // `silent()` takes self by value (consumes Command) — apply it
-    // FIRST, then mutate via &mut for the conditional --authfile flag.
+    // FIRST, then mutate via &mut for the conditional auth flag.
+    //
+    // v0.2.47: route through `PerPullAuth::apply_to` so docker (which
+    // doesn't accept `--authfile` on `pull`) gets `DOCKER_CONFIG=<dir>`
+    // and podman gets `--authfile <path>`. The probe-side helper above
+    // captures the same auth shape through `path()` /
+    // `docker_config_dir()` so the probe and the pull share the auth
+    // context — pre-v0.2.47 docker would have probed correctly (because
+    // `--authfile` is silently accepted by docker's parser) then
+    // attempted an anonymous pull (because docker's `pull` IGNORES the
+    // global `--authfile` flag, looking only at `DOCKER_CONFIG`).
     let mut pull_cmd = Command::new(&runtime).silent();
-    if let Some(path) = authfile_path {
-        pull_cmd.arg("--authfile").arg(path);
+    if let Some(guard) = authfile_guard.as_ref() {
+        guard.apply_to(&mut pull_cmd, &runtime);
     }
     let pull_status = pull_cmd
         .args(["pull", &image_ref])
@@ -853,6 +882,44 @@ pub(crate) async fn probe_image_tag_exists(
     probe_image_tag_exists_with_authfile(image, tag, runtime, None).await
 }
 
+/// v0.2.47: probe variant that accepts either a podman-style `--authfile`
+/// path OR a docker-style `DOCKER_CONFIG=<dir>` env. Routes to whichever
+/// the runtime supports.
+///
+/// Why a separate helper from `probe_image_tag_exists_with_authfile`:
+/// the existing podman-path helper is still called from a `#[ignore]`d
+/// integration test (`probe_image_tag_exists_*`); we keep it as the
+/// path-only flavour for backward source compatibility. New call sites
+/// in `container_pull` go through this auth-context variant so docker
+/// gets the same per-pull auth scoping podman does (otherwise docker
+/// would silently fall back to anonymous + 401 on private GHCR repos —
+/// the exact bug v0.2.47 closes on the supervisor side).
+pub(crate) async fn probe_image_tag_exists_with_auth_context(
+    image: &str,
+    tag: &str,
+    runtime: &str,
+    authfile: Option<&Path>,
+    docker_config_dir: Option<&Path>,
+) -> Result<bool, String> {
+    let image_ref = format!("{}:{}", image, tag);
+    let mut cmd = Command::new(runtime).silent();
+    if let Some(path) = authfile {
+        cmd.arg("--authfile").arg(path);
+    }
+    if let Some(dir) = docker_config_dir {
+        cmd.env("DOCKER_CONFIG", dir);
+    }
+    let output = cmd
+        .args(["manifest", "inspect", &image_ref])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("spawn {} manifest inspect: {}", runtime, e))?;
+
+    probe_image_tag_exists_classify_output(&image_ref, runtime, &output)
+}
+
 /// v0.2.46 V46-E (C2): variant of `probe_image_tag_exists` that takes an
 /// optional `--authfile` path. The probe must use the same auth context
 /// as the upcoming `podman pull --authfile <file>`, otherwise the registry
@@ -887,13 +954,22 @@ pub(crate) async fn probe_image_tag_exists_with_authfile(
         .await
         .map_err(|e| format!("spawn {} manifest inspect: {}", runtime, e))?;
 
+    probe_image_tag_exists_classify_output(&image_ref, runtime, &output)
+}
+
+/// v0.2.47: shared output classifier for the two `probe_image_tag_exists_*`
+/// variants. Decides whether a non-success `manifest inspect` is a
+/// genuine "missing tag" (Ok(false), routes to fallback) or a transport /
+/// auth / unsupported-subcommand error (Err, surfaces upward). Registry
+/// signals for genuine 404s are stable across docker + podman + GHCR.
+fn probe_image_tag_exists_classify_output(
+    image_ref: &str,
+    runtime: &str,
+    output: &std::process::Output,
+) -> Result<bool, String> {
     if output.status.success() {
         return Ok(true);
     }
-
-    // Non-zero exit: inspect stderr to distinguish "tag missing" from
-    // "transport / auth / unsupported-subcommand" errors. Registry
-    // signals for genuine 404s are stable across docker + podman + GHCR:
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let lower = stderr.to_lowercase();
     let signals_missing = lower.contains("manifest unknown")
@@ -904,10 +980,8 @@ pub(crate) async fn probe_image_tag_exists_with_authfile(
         || lower.contains("denied")
         // GHCR returns 403 `denied` for non-existent private tags when
         // the token is repo-scoped — treat it as "missing" so the
-        // fallback path engages. Public-image case is covered by the
-        // "manifest unknown" / "not found" strings above.
+        // fallback path engages.
         || lower.contains("no such manifest");
-
     if signals_missing {
         Ok(false)
     } else {
@@ -1037,7 +1111,7 @@ where
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct PullTokenResponse {
+pub(crate) struct PullTokenResponse {
     pub pull_token: String,
     /// v0.2.36 wire-contract addition. The GitHub username that the
     /// pull_token authenticates as — passed to `podman/docker login -u`.
@@ -1065,7 +1139,8 @@ struct PullTokenResponse {
     pub tag: Option<String>,
 }
 
-/// v0.2.46 V46-E (C2): build a temporary docker/podman `auth.json` file
+/// v0.2.46 V46-E (C2) / v0.2.47 cross-runtime: build a per-pull auth
+/// context (file for podman, directory-with-config.json for docker)
 /// containing credentials for a single registry. Used in place of the
 /// previous global `podman login` + `podman logout` flow to avoid cross-
 /// module auth-session collision when multiple paid modules pull
@@ -1074,40 +1149,25 @@ struct PullTokenResponse {
 /// Auth.json shape (per containers/auth.json(5) and docker/cli reference):
 ///   `{ "auths": { "<registry>": { "auth": "<base64(username:token)>" } } }`
 ///
-/// The returned `NamedTempFile` auto-deletes on drop, so callers don't
-/// need explicit cleanup — even on early-return error paths, RAII tears
-/// the file down. The file is created with mode 0o600 on Unix (default
-/// for `NamedTempFile`); secret leakage via stat/world-read is not a
-/// concern on the launcher's local FS.
+/// The returned `PerPullAuth` auto-deletes on drop (the underlying
+/// `NamedTempFile` / `TempDir` handle RAII), so callers don't need
+/// explicit cleanup — even on early-return error paths.
 ///
-/// Returns a `NamedTempFile`. The path is accessed via `.path()` and
-/// passed to `--authfile`. The file MUST stay alive for the duration of
-/// the pull (callers should hold the handle in scope).
+/// v0.2.47: delegated to `vct-launcher-core::services::container_runtime::
+/// build_per_pull_authfile` so the launcher AND the hub use the SAME
+/// runtime-aware helper (docker `pull` / `run` doesn't support
+/// `--authfile`; the core helper switches to `DOCKER_CONFIG=<dir>` for
+/// docker). Callers should prefer `PerPullAuth::apply_to(&mut cmd,
+/// runtime)` over hardcoding `--authfile`.
 pub(crate) fn build_per_pull_authfile(
     registry: &str,
     username: &str,
     token: &str,
-) -> Result<tempfile::NamedTempFile, String> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    use std::io::Write as _;
-
-    let auth_b64 = B64.encode(format!("{}:{}", username, token));
-    let json = serde_json::json!({
-        "auths": {
-            registry: { "auth": auth_b64 }
-        }
-    });
-    let mut f = tempfile::NamedTempFile::new()
-        .map_err(|e| format!("build_per_pull_authfile: create temp file: {}", e))?;
-    f.write_all(json.to_string().as_bytes())
-        .map_err(|e| format!("build_per_pull_authfile: write auth.json: {}", e))?;
-    // Flush + sync so the on-disk content is visible to the spawned
-    // `podman pull` child before we hand it the path. `write_all` returns
-    // when the buffer is committed to the file descriptor; `flush` is
-    // belt-and-suspenders against any future buffered-writer wrapper.
-    f.flush()
-        .map_err(|e| format!("build_per_pull_authfile: flush: {}", e))?;
-    Ok(f)
+    runtime: &str,
+) -> Result<vct_launcher_core::services::container_runtime::PerPullAuth, String> {
+    vct_launcher_core::services::container_runtime::build_per_pull_authfile(
+        registry, username, token, runtime,
+    )
 }
 
 /// v0.2.46 V46-E (C1 follow-up): known GPU-variant suffixes used by the
@@ -1544,7 +1604,7 @@ pub(crate) fn resolve_pull_token_endpoint(raw: &str) -> &str {
 /// body verbatim — that body has no `license_key` field, server returned
 /// 400 invalid-shape, every paid-module install fell through to anonymous
 /// pull and 401'd on the private registry.
-async fn request_pull_token(
+pub(crate) async fn request_pull_token(
     container: &crate::manifest::ContainerInstallBlock,
     // NEW-1 (2026-05-28): when the L0 catalog supplies a pull_token_endpoint,
     // prefer it over the L1 manifest's value. L0 is the server-side SoT and
@@ -4062,31 +4122,29 @@ mod tests {
         // auth.json shape: { "auths": { "<registry>": { "auth": "<b64>" } } }.
         // Verify the file is created, contains the expected JSON, and
         // the base64 round-trips to the original `username:token`.
+        //
+        // v0.2.47: read via the on-disk file path exposed by
+        // `PerPullAuth::path()` (podman-shape guards expose this; docker-
+        // shape guards expose `docker_config_dir()` instead). The
+        // internal NamedTempFile is no longer accessed directly — the
+        // public API surface for the auth blob is read-by-path.
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-        use std::io::Read as _;
 
         let registry = "ghcr.io";
         let username = "vct-bot-rl";
         let token = "ghp_redactedTOKEN1234567890abcdef";
-        let mut authfile =
-            build_per_pull_authfile(registry, username, token).expect("authfile builds");
-        // Path must exist on disk.
-        let path = authfile.path().to_path_buf();
+        let authfile =
+            build_per_pull_authfile(registry, username, token, "podman").expect("authfile builds");
+        // Path must exist on disk (podman-shape guard).
+        let path = authfile
+            .path()
+            .expect("podman shape exposes path")
+            .to_path_buf();
         assert!(path.exists(), "authfile path must exist on disk");
 
-        // Read the file content and parse as JSON.
-        // `authfile.as_file_mut()` gives us a &mut File; seek back to start.
-        use std::io::Seek as _;
-        authfile
-            .as_file_mut()
-            .seek(std::io::SeekFrom::Start(0))
-            .expect("seek to start");
-        let mut content = String::new();
-        authfile
-            .as_file_mut()
-            .read_to_string(&mut content)
-            .expect("read authfile");
-
+        // Read via fs::read_to_string — the file is open for read by the
+        // OS even while NamedTempFile holds the write handle.
+        let content = std::fs::read_to_string(&path).expect("read authfile");
         let parsed: serde_json::Value =
             serde_json::from_str(&content).expect("authfile is valid json");
         let auth_b64 = parsed

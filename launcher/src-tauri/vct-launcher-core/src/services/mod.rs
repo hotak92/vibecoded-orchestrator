@@ -8,3 +8,11 @@
 
 pub mod picker;
 pub mod runtime;
+
+// v0.2.47: shared per-paid-module container helpers. Previously two
+// near-identical copies lived in launcher/src/commands/module_service.rs
+// and vct-hub/src/module_supervisor.rs; the drift between them caused
+// the supervisor-image-resolution-variant-gap bug fixed in this release.
+// See knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md.
+pub mod container_runtime;
+pub mod gpu_mode;

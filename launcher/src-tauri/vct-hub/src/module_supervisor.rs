@@ -39,9 +39,8 @@
 //! writer of both. The launcher's `commands/module_service.rs` calls these
 //! helpers via HTTP proxy (see `lifecycle_api.rs::module_*` handlers).
 
-use std::collections::HashMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
@@ -50,10 +49,28 @@ use tokio::process::Command;
 
 use vct_launcher_core::db::models::ProjectRow;
 use vct_launcher_core::db::Db;
-use vct_launcher_core::manifest::{
-    InstallMethod, ModuleManifest, PlaceholderCtx, PortMapping, VolumeMount,
-};
+use vct_launcher_core::manifest::{InstallMethod, ModuleManifest, PlaceholderCtx};
 use vct_launcher_core::process::CommandExt as _;
+use vct_launcher_core::services::gpu_mode::GpuMode;
+
+// v0.2.47: shared per-paid-module container helpers. Re-exported here as
+// `pub use` so the test module + downstream callers keep their
+// unqualified imports. Source of truth lives in
+// `vct-launcher-core::services::container_runtime`. The previous local
+// copies (which had drifted out of sync with the launcher copies —
+// missing variant-tag resolution, missing `--authfile` on `podman run`)
+// are gone. See
+// `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`.
+pub use vct_launcher_core::services::container_runtime::{
+    build_podman_run_args, container_weights_path, ensure_volume_host_dirs,
+    resolve_container_name, resolve_image_ref, resolve_variant_tag, sanitize_path_component,
+};
+
+#[allow(unused_imports)]
+pub use vct_launcher_core::services::container_runtime::{
+    build_port_arg, build_volume_arg, resolve_value, rl_placeholders, DEDUP_SENTINEL,
+    DEFAULT_OLLAMA_PORT,
+};
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -64,182 +81,16 @@ pub const ORCHESTRATOR_ROOT_RL_PORT: u16 = 11442;
 pub const RL_PORT_RANGE_LO: u16 = 11500;
 pub const RL_PORT_RANGE_HI: u16 = 11900;
 
-/// Default Ollama port used to resolve `{ollama_port}` in env values.
-const DEFAULT_OLLAMA_PORT: &str = "11435";
-
-// ─── Pure helpers (testable without a container runtime) ────────────────
-
-/// Resolve `{project_slug}` (and any other launcher-wide tokens) into a
-/// concrete container name. Returns an error if the resolved name still
-/// contains unresolved placeholders.
-pub fn resolve_container_name(template: &str, project_slug: &str) -> Result<String, String> {
-    let out = template.replace("{project_slug}", project_slug);
-    if out.contains('{') && out.contains('}') {
-        return Err(format!(
-            "container_name_template '{}' has unresolved placeholders after \
-             {{project_slug}} substitution → '{}'",
-            template, out
-        ));
-    }
-    Ok(out)
-}
-
-/// Resolve `{install.container.image}` + `{install.container.tag}` against
-/// the manifest's `install.container` block.
-pub fn resolve_image_ref(
-    template: &str,
-    manifest: &ModuleManifest,
-) -> Result<String, String> {
-    let container = manifest
-        .install
-        .container
-        .as_ref()
-        .ok_or_else(|| {
-            "resolve_image_ref: install.container block missing (not a container_pull module)"
-                .to_string()
-        })?;
-
-    let tag = if container.tag_from_version {
-        manifest.version.clone()
-    } else {
-        manifest
-            .install
-            .r#ref
-            .clone()
-            .unwrap_or_else(|| "latest".to_string())
-    };
-
-    let out = template
-        .replace("{install.container.image}", &container.image)
-        .replace("{install.container.tag}", &tag);
-
-    if out.contains('{') && out.contains('}') {
-        return Err(format!(
-            "image_ref template '{}' has unresolved placeholders after \
-             install.container substitution → '{}'",
-            template, out
-        ));
-    }
-    Ok(out)
-}
-
-/// RL-specific placeholders.
-fn rl_placeholders(rl_port: u16, project_slug: &str) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert("{RL_SERVER_PORT}".to_string(), rl_port.to_string());
-    m.insert("{project_slug}".to_string(), project_slug.to_string());
-    m.insert("{ollama_port}".to_string(), DEFAULT_OLLAMA_PORT.to_string());
-    m
-}
-
-fn resolve_value(
-    raw: &str,
-    ctx: &PlaceholderCtx,
-    placeholders: &HashMap<String, String>,
-) -> String {
-    let mut out = ctx.resolve(raw);
-    for (token, value) in placeholders {
-        out = out.replace(token, value);
-    }
-    out
-}
-
-fn build_port_arg(
-    port: &PortMapping,
-    placeholders: &HashMap<String, String>,
-) -> Result<String, String> {
-    let mut host = port.host.clone();
-    for (token, value) in placeholders {
-        host = host.replace(token, value);
-    }
-    host.parse::<u16>().map_err(|_| {
-        format!(
-            "port host '{}' (resolved from '{}') is not a valid u16",
-            host, port.host
-        )
-    })?;
-
-    let bind = port.bind.as_deref().unwrap_or("127.0.0.1");
-    if bind.is_empty() {
-        Ok(format!("{}:{}", host, port.container))
-    } else {
-        Ok(format!("{}:{}:{}", bind, host, port.container))
-    }
-}
-
-fn build_volume_arg(
-    vol: &VolumeMount,
-    ctx: &PlaceholderCtx,
-    placeholders: &HashMap<String, String>,
-) -> String {
-    let host = resolve_value(&vol.host, ctx, placeholders);
-    let container = resolve_value(&vol.container, ctx, placeholders);
-    match vol.mode.as_deref() {
-        Some(m) if !m.is_empty() => format!("{}:{}:{}", host, container, m),
-        _ => format!("{}:{}", host, container),
-    }
-}
-
-/// Build the full `podman run` argv (without the leading `podman`).
-pub fn build_podman_run_args(
-    manifest: &ModuleManifest,
-    ctx: &PlaceholderCtx,
-    project: &ProjectRow,
-    rl_port: u16,
-    container_name: &str,
-    image: &str,
-) -> Result<Vec<String>, String> {
-    let runtime = &manifest.runtime;
-    // NEW-3.B (2026-05-28): aligned with launcher-side widening — accept
-    // both "container" and "service" runtime types.
-    if !matches!(runtime.r#type.as_str(), "container" | "service") {
-        return Err(format!(
-            "build_podman_run_args: runtime.type must be 'container', got '{}'",
-            runtime.r#type
-        ));
-    }
-
-    let placeholders = rl_placeholders(rl_port, &project.slug);
-    let mut args: Vec<String> = Vec::new();
-    args.push("run".into());
-    args.push("-d".into());
-    args.push("--name".into());
-    args.push(container_name.to_string());
-
-    if runtime.auto_restart {
-        args.push("--restart=unless-stopped".into());
-    }
-
-    for port in &runtime.ports {
-        args.push("-p".into());
-        args.push(build_port_arg(port, &placeholders)?);
-    }
-
-    for vol in &runtime.volumes {
-        args.push("-v".into());
-        args.push(build_volume_arg(vol, ctx, &placeholders));
-    }
-
-    for (k, v) in &runtime.env_fixed {
-        let resolved = resolve_value(v, ctx, &placeholders);
-        args.push("-e".into());
-        args.push(format!("{}={}", k, resolved));
-    }
-    for (k, v) in &runtime.env_derived {
-        let resolved = resolve_value(v, ctx, &placeholders);
-        args.push("-e".into());
-        args.push(format!("{}={}", k, resolved));
-    }
-
-    args.push(image.to_string());
-
-    args.push(resolve_value(&runtime.command, ctx, &placeholders));
-    for a in &runtime.args {
-        args.push(resolve_value(a, ctx, &placeholders));
-    }
-
-    Ok(args)
-}
+// ─── Pure helpers (re-exported from core) ──────────────────────────────
+//
+// v0.2.47: `resolve_container_name`, `resolve_image_ref`,
+// `build_podman_run_args`, `rl_placeholders`, `resolve_value`,
+// `build_port_arg`, `build_volume_arg`, `sanitize_path_component`,
+// `container_weights_path` are no longer authored here. They live in
+// `vct-launcher-core::services::container_runtime` and are re-exported
+// at the top of this file. Both the hub and the launcher consume the
+// SAME implementation — closing the drift gap that produced the
+// supervisor-image-resolution-variant bug.
 
 /// Detect which container runtime to use.
 async fn detect_container_runtime() -> Result<String, String> {
@@ -257,43 +108,48 @@ async fn detect_container_runtime() -> Result<String, String> {
     Err("no container runtime found (tried podman, docker)".into())
 }
 
-/// Replace unsafe path chars with `_`.
-pub fn sanitize_path_component(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// Path inside the container for a given (embedding_source, version).
-pub fn container_weights_path(embedding_source: &str, version: &str) -> String {
-    format!(
-        "/data/state/rl_model_{}_{}.pt",
-        sanitize_path_component(embedding_source),
-        sanitize_path_component(version),
-    )
-}
+// v0.2.47: `sanitize_path_component` + `container_weights_path` moved
+// to `vct-launcher-core::services::container_runtime` and re-exported
+// at the top of this file.
 
 // ─── Container lifecycle (Phase 1E) ─────────────────────────────────────
 
 /// Start (or restart) the container associated with `manifest` for the
 /// given project. Idempotent: existing same-named container is `podman
 /// rm -f`-ed first. Returns resolved container name on success.
+///
+/// v0.2.47: variant-aware. Reads the persisted launcher hardware
+/// snapshot (same row, same JSON shape the launcher writes) for the
+/// host's `GpuMode` and pipes it through `resolve_image_ref` so a
+/// manifest with `gpu_image_variants` produces e.g. `:0.2.8-cuda`
+/// instead of bare `:0.2.8`. Pre-v0.2.47 the supervisor substituted
+/// the bare manifest version, so the supervisor's `podman run`
+/// triggered an anonymous re-pull that 401'd against private GHCR for
+/// the never-published bare tag. See
+/// `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`.
 pub async fn start_container_for_module(
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
     project: &ProjectRow,
     rl_port: u16,
 ) -> Result<String, String> {
+    let gpu_mode = read_persisted_gpu_mode_for_supervisor();
+    start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode).await
+}
+
+/// v0.2.47: explicit-GpuMode form of `start_container_for_module`.
+/// Used by the resume sweep when the manifest resolver injected at hub
+/// startup already knows the host's GpuMode. Mirrors the launcher's
+/// `start_container_for_module_with_gpu_mode` so the two paths produce
+/// byte-identical image refs for the same `(manifest, gpu_mode)` pair.
+pub async fn start_container_for_module_with_gpu_mode(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    gpu_mode: Option<GpuMode>,
+) -> Result<String, String> {
     let runtime = &manifest.runtime;
-    // NEW-3.B (2026-05-28): aligned with launcher-side widening from NEW-3
-    // (v0.2.38) — accept both "container" and "service" runtime types here.
-    // The hub was previously gated on "container" only, creating a divergence.
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
             "start_container_for_module called for non-container runtime '{}'",
@@ -301,9 +157,6 @@ pub async fn start_container_for_module(
         ));
     }
 
-    // NEW-3.B (2026-05-28): use defaulting helpers so service/container
-    // modules without explicit container_name_template / image_ref get
-    // sensible defaults instead of hard-failing with ok_or_else().
     let name_template = runtime.resolve_container_name_template(&manifest.id);
     let container_name = resolve_container_name(&name_template, &project.slug)?;
     let image_template = runtime.resolve_image_ref(
@@ -312,7 +165,9 @@ pub async fn start_container_for_module(
         })?,
         &manifest.version,
     );
-    let image = resolve_image_ref(&image_template, manifest)?;
+    // v0.2.47: variant-aware image ref. Closes the supervisor-image-
+    // resolution-variant gap (see node above).
+    let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
 
     let podman = detect_container_runtime().await?;
 
@@ -323,18 +178,7 @@ pub async fn start_container_for_module(
         .status()
         .await;
 
-    let placeholders = rl_placeholders(rl_port, &project.slug);
-    for vol in &runtime.volumes {
-        let host_resolved = resolve_value(&vol.host, ctx, &placeholders);
-        let path = PathBuf::from(&host_resolved);
-        if let Err(e) = tokio::fs::create_dir_all(&path).await {
-            eprintln!(
-                "[module_supervisor] mkdir -p {} failed (will let podman surface the error): {}",
-                path.display(),
-                e
-            );
-        }
-    }
+    ensure_volume_host_dirs(manifest, ctx, rl_port, &project.slug).await;
 
     let args = build_podman_run_args(manifest, ctx, project, rl_port, &container_name, &image)?;
 
@@ -372,6 +216,37 @@ pub async fn start_container_for_module(
     }
 
     Ok(container_name)
+}
+
+/// v0.2.47: read the persisted hardware snapshot from `app_state` and
+/// return its `gpu_mode_decided`. Identical SQL row + JSON shape to the
+/// launcher's `read_persisted_hardware_snapshot` — the launcher is the
+/// canonical writer, the hub is a read-only consumer here.
+///
+/// Soft-fail to `None` on every error path (DB unavailable, row missing,
+/// JSON malformed). The caller treats `None` as "skip variant
+/// resolution" — backwards-compatible with pre-v0.2.47 behaviour.
+fn read_persisted_gpu_mode_for_supervisor() -> Option<GpuMode> {
+    use rusqlite::params;
+
+    // The hub keeps its own DB connection; we open a short-lived one
+    // here against the same launcher.db file rather than threading a
+    // connection through every resume-sweep callsite. The query is
+    // cheap (single key lookup).
+    let db_path = vct_launcher_core::db::db_path();
+    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM app_state WHERE key = ?1",
+            params!["launcher.hardware_snapshot"],
+            |row| row.get(0),
+        )
+        .ok();
+    let raw = raw?;
+    // Parse just enough of the JSON to extract `gpu_mode_decided`.
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let mode_str = v.get("gpu_mode_decided").and_then(|x| x.as_str())?;
+    serde_json::from_value::<GpuMode>(serde_json::Value::String(mode_str.to_string())).ok()
 }
 
 /// Allocate rl_port (if needed), start container, persist container name.
@@ -848,6 +723,7 @@ mod tests {
         let got = resolve_image_ref(
             "{install.container.image}:{install.container.tag}",
             &manifest,
+            None,
         )
         .expect("resolve");
         assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.1.0");
@@ -1035,7 +911,7 @@ mod tests {
             manifest.install.container.as_ref().expect("container block present"),
             &manifest.version,
         );
-        let image = resolve_image_ref(&image_template, &manifest)
+        let image = resolve_image_ref(&image_template, &manifest, None)
             .expect("synthesized image must resolve");
 
         assert_eq!(container_name, "vct-rl-reranker-acme-corp",
@@ -1400,5 +1276,52 @@ mod tests {
                 row_after
             );
         });
+    }
+
+    // ─── v0.2.47: variant-aware image-ref + dedup tests ────────────────
+
+    /// v0.2.47 Bug-1 regression (hub side): variant-aware image ref
+    /// flows end-to-end through `resolve_image_ref` with a
+    /// `Some(GpuMode::Cuda)` parameter. Mirrors the launcher-side test
+    /// `v0247_resolve_image_ref_cuda_variant_end_to_end` so both code
+    /// paths are pinned independently — a regression in either crate's
+    /// wiring of the shared core helper surfaces immediately.
+    #[test]
+    fn v0247_hub_resolve_image_ref_cuda_variant_end_to_end() {
+        use vct_launcher_core::manifest::GpuImageVariants;
+        let mut manifest = make_manifest(true, true);
+        manifest.version = "0.2.8".into();
+        manifest.runtime.gpu_image_variants = Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        });
+        let template = manifest.runtime.resolve_image_ref(
+            manifest.install.container.as_ref().expect("container block"),
+            &manifest.version,
+        );
+        let image = resolve_image_ref(&template, &manifest, Some(GpuMode::Cuda))
+            .expect("resolve");
+        assert_eq!(image, "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cuda");
+    }
+
+    /// v0.2.47 de-dup regression (hub side): assert that the hub and
+    /// the launcher pull from the SAME
+    /// `vct-launcher-core::services::container_runtime` module by
+    /// comparing the constant `DEDUP_SENTINEL` re-exported through the
+    /// local `pub use` block to the canonical value defined in core —
+    /// they must be byte-identical.
+    ///
+    /// Paired with `v0247_helpers_have_one_source_of_truth` on the
+    /// launcher side; both must pass to certify the de-duplication is
+    /// real and not just two structurally-identical copies.
+    #[test]
+    fn v0247_hub_helpers_have_one_source_of_truth() {
+        assert_eq!(
+            DEDUP_SENTINEL,
+            vct_launcher_core::services::container_runtime::DEDUP_SENTINEL,
+            "module_supervisor::DEDUP_SENTINEL must equal the core constant — \
+             a mismatch indicates accidental local-shadow re-introduction"
+        );
     }
 }

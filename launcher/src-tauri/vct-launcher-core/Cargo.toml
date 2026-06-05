@@ -90,8 +90,16 @@ dunce = "1"
 # Forward-compatible: relax both when project's rustc floor moves to 1.95.
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
-# tempfile for tests + intentional use in core (volumes module path probes)
+# tempfile for tests + intentional use in core (volumes module path probes,
+# and v0.2.47 per-pull authfile/dir guard in services::container_runtime)
 tempfile = "3"
+
+# v0.2.47: base64-encoded credentials in the per-pull auth.json blob built
+# by services::container_runtime::build_per_pull_authfile. Used to be a
+# direct dep of the launcher crate only; promoted here because the helper
+# is now shared with vct-hub. Transitively in the dep tree via reqwest,
+# so no net binary-size change.
+base64 = "0.22"
 
 # v0.2.33 (Agent F, C2): JSON Schema export for the manifest types. We
 # derive `JsonSchema` on the 31 public types in `manifest.rs` and the
