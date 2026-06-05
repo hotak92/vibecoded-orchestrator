@@ -21,6 +21,9 @@
   let modalInitial = $state<AccessMode | null>(null);
   let modalKind = $state<'collection' | 'node' | 'node-bulk'>('collection');
   let modalCollection = $state('');
+  // For 'collection' kind: every sibling collection the access applies to
+  // (KG + Development + Diagrams of one project move together).
+  let modalCollections = $state<string[]>([]);
   let modalNodeId = $state<string | null>(null);
   let modalNodeIds = $state<string[]>([]);
 
@@ -31,12 +34,16 @@
     view = 'viewer';
   }
 
-  function onAccessCollection(c: string) {
-    if (!project) return;
+  function onAccessCollection(collections: string[]) {
+    if (!project || collections.length === 0) return;
     modalKind = 'collection';
-    modalCollection = c;
+    modalCollections = collections;
+    modalCollection = collections[0];
     modalNodeId = null;
-    modalLabel = `Collection: ${c}`;
+    modalLabel =
+      collections.length === 1
+        ? `Collection: ${collections[0]}`
+        : `${collections.length} collections (${collections.join(', ')})`;
     modalInitial = { mode: 'private', project_ids: [], owner_project_id: project.id };
     modalOpen = true;
   }
@@ -66,14 +73,30 @@
   async function handleSave(mode: AccessMode) {
     if (!project) throw new Error('no project selected');
     if (modalKind === 'collection') {
-      await invoke('kg_set_collection_access_mode', {
-        req: {
-          owner_project_id: project.id,
-          collection: modalCollection,
-          mode: mode.mode,
-          project_ids: mode.project_ids,
-        },
-      });
+      // Apply the same access mode to every sibling collection (KG / Docs /
+      // Diagrams). Soft-fail per collection: the orchestrator-root structural
+      // guard may reject one member; we surface it but still apply the rest.
+      const targets = modalCollections.length > 0 ? modalCollections : [modalCollection];
+      const failures: string[] = [];
+      for (const collection of targets) {
+        try {
+          await invoke('kg_set_collection_access_mode', {
+            req: {
+              owner_project_id: project.id,
+              collection,
+              mode: mode.mode,
+              project_ids: mode.project_ids,
+            },
+          });
+        } catch (e) {
+          failures.push(`${collection}: ${e}`);
+        }
+      }
+      if (failures.length > 0) {
+        toast.error(`${targets.length - failures.length}/${targets.length} updated. ${failures[0]}`);
+      } else if (targets.length > 1) {
+        toast.success(`Access updated for ${targets.length} collections`);
+      }
     } else if (modalKind === 'node-bulk' && modalNodeIds.length > 0) {
       // Ensure schema first (best effort).
       try {
