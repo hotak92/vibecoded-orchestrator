@@ -171,6 +171,35 @@ pub async fn start_container_for_module_with_gpu_mode(
 
     let podman = detect_container_runtime().await?;
 
+    // v0.2.49 Phase 3: pre-pull the variant-correct image with the
+    // shared `vct_launcher_core::services::container_runtime::
+    // pre_pull_with_auth_for_start` helper — same byte-for-byte flow
+    // the launcher-side `start_container_for_module_with_gpu_mode`
+    // runs. Closes Bug 2 from
+    // `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`:
+    // the supervisor no longer falls through to anonymous `podman pull`
+    // on cache-miss for private GHCR packages. Soft-fail: if pre-pull
+    // returns an error, log and let `podman run` make the final call —
+    // the cache may have the image already, in which case `run`
+    // succeeds without needing the registry. Gated on
+    // `manifest.install.method == ContainerPull` AND `gpu_mode.is_some()`
+    // — legacy single-tag modules + cases where the caller has no
+    // GpuMode source (no persisted hardware snapshot yet) skip the
+    // pre-pull and fall through to the historical bare-tag path.
+    if gpu_mode.is_some() && manifest.install.method == InstallMethod::ContainerPull {
+        if let Err(e) =
+            vct_launcher_core::services::container_runtime::pre_pull_with_auth_for_start(
+                manifest, &podman, &image,
+            )
+            .await
+        {
+            eprintln!(
+                "[module_supervisor] pre-pull for start failed (continuing — cache may suffice): {}",
+                e
+            );
+        }
+    }
+
     let _ = Command::new(&podman).silent()
         .args(["rm", "-f", &container_name])
         .stdout(Stdio::null())
@@ -340,6 +369,35 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 /// launcher-side paths). The hub injects a closure that reads its own
 /// catalog cache.
 pub type ManifestResolver = Box<dyn Fn(&str) -> Option<ModuleManifest> + Send + Sync>;
+
+/// v0.2.49 Phase 3 production resolver. Walks the on-disk catalog the
+/// hub already maintains (`<vct_root_dir>/modules/<id>/vct-module.json`
+/// AND `<vct_root_dir>/bundled_manifests/*.json`) and returns the first
+/// manifest whose `id` matches the requested module_id.
+///
+/// Soft-fail: a missing / unparseable manifest returns `None`, matching
+/// the `ManifestResolver` contract used by `resume_containers_on_startup`.
+/// The caller logs the miss and skips the row.
+///
+/// Why a hub-local resolver (and not delegating to `commands::modules.rs`):
+/// the launcher's catalog scanner depends on Tauri State + the
+/// launcher's own paths module, neither reachable from this crate.
+/// Re-using `modules_api::scan_manifests` keeps the lookup logic
+/// in one place AND keeps the cross-crate boundary clean.
+pub fn lookup_manifest_by_id(module_id: &str) -> Option<ModuleManifest> {
+    super::modules_api::scan_manifests()
+        .into_iter()
+        .find(|(_, m)| m.id == module_id)
+        .map(|(_, m)| m)
+}
+
+/// v0.2.49 Phase 3: production `ManifestResolver` boxed for injection
+/// into [`resume_containers_on_startup`]. Wraps [`lookup_manifest_by_id`].
+/// Production callers (`server.rs::start_hub_server`) inject this;
+/// tests pass a custom closure that returns from an in-memory map.
+pub fn real_manifest_resolver() -> ManifestResolver {
+    Box::new(|id: &str| lookup_manifest_by_id(id))
+}
 
 /// Injection point for the NULL-container-name branch's container-start
 /// step. Production callers pass [`real_start_after_install`] (which
@@ -1323,5 +1381,150 @@ mod tests {
             "module_supervisor::DEDUP_SENTINEL must equal the core constant — \
              a mismatch indicates accidental local-shadow re-introduction"
         );
+    }
+
+    // ─── v0.2.49 Phase 3: hub-side manifest resolver ───────────────────
+
+    /// v0.2.49 Phase 3 helper: `VCT_STATE_DIR`-scoped guard used by the
+    /// manifest-resolver tests below.
+    struct VctStateDirGuard {
+        _td: tempfile::TempDir,
+        previous: Option<String>,
+    }
+
+    impl VctStateDirGuard {
+        fn new() -> Self {
+            use std::sync::{Mutex, OnceLock};
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let _g = LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let td = tempfile::tempdir().expect("tempdir");
+            let previous = std::env::var("VCT_STATE_DIR").ok();
+            std::env::set_var("VCT_STATE_DIR", td.path());
+            drop(_g);
+            Self { _td: td, previous }
+        }
+
+        fn vct_root(&self) -> std::path::PathBuf {
+            self._td.path().to_path_buf()
+        }
+    }
+
+    impl Drop for VctStateDirGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+                None => std::env::remove_var("VCT_STATE_DIR"),
+            }
+        }
+    }
+
+    /// Write a minimal valid manifest JSON to
+    /// `<vct_root>/bundled_manifests/<module_id>.json`.
+    fn write_manifest(vct_root: &std::path::Path, module_id: &str) {
+        let dir = vct_root.join("bundled_manifests");
+        std::fs::create_dir_all(&dir).expect("mkdir bundled_manifests");
+        let path = dir.join(format!("{}.json", module_id));
+        let json = serde_json::json!({
+            "manifest_version": 1,
+            "id": module_id,
+            "name": module_id,
+            "version": "0.0.1",
+            "description": "test",
+            "category": "paid-independent",
+            "compatibility": { "hosts": [] },
+            "license": { "required": false },
+            "requirements": {},
+            "install": {
+                "method": "container_pull",
+                "install_dir": format!("/tmp/{}", module_id),
+                "post_install": [],
+                "container": {
+                    "image": format!("ghcr.io/test/{}", module_id),
+                    "tag_from_version": true,
+                    "pull_token_endpoint": "https://example.invalid/x",
+                    "pull_token_method": "POST",
+                    "rotate_weights": false
+                }
+            },
+            "secrets": [],
+            "settings": [],
+            "runtime": {
+                "type": "container",
+                "command": "echo",
+                "args": [],
+                "env_fixed": {},
+                "env_derived": {},
+                "env_from_secrets": [],
+                "env_from_settings": [],
+                "ports": [],
+                "volumes": [],
+                "auto_restart": false,
+                "gpu_optional": true
+            },
+            "provides": [],
+            "consumes": []
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).expect("write manifest");
+    }
+
+    /// v0.2.49: `lookup_manifest_by_id` walks the on-disk catalog and
+    /// returns the manifest whose `id` matches. Pins the production
+    /// resolver wiring used by `server.rs` + `lifecycle_api::module_start`.
+    #[test]
+    fn v0249_lookup_manifest_by_id_finds_bundled() {
+        let g = VctStateDirGuard::new();
+        write_manifest(&g.vct_root(), "vct-test-module-49a");
+        let m = lookup_manifest_by_id("vct-test-module-49a")
+            .expect("manifest must be found by id");
+        assert_eq!(m.id, "vct-test-module-49a");
+        assert_eq!(m.runtime.r#type, "container");
+    }
+
+    /// v0.2.49: `lookup_manifest_by_id` returns `None` for an
+    /// unknown id (must not panic, must not pick a wrong manifest).
+    #[test]
+    fn v0249_lookup_manifest_by_id_returns_none_for_unknown() {
+        let _g = VctStateDirGuard::new();
+        // Empty catalog directory; nothing to find.
+        assert!(
+            lookup_manifest_by_id("vct-no-such-module").is_none(),
+            "unknown module_id must return None"
+        );
+    }
+
+    /// v0.2.49: `real_manifest_resolver()` is a thin closure-wrapping
+    /// of `lookup_manifest_by_id`. Pins that both paths agree on the
+    /// same lookup.
+    #[test]
+    fn v0249_real_manifest_resolver_matches_lookup_by_id() {
+        let g = VctStateDirGuard::new();
+        write_manifest(&g.vct_root(), "vct-test-module-49b");
+        let resolver = real_manifest_resolver();
+        let via_resolver = resolver("vct-test-module-49b").expect("resolver finds it");
+        let via_lookup = lookup_manifest_by_id("vct-test-module-49b").expect("lookup finds it");
+        assert_eq!(via_resolver.id, via_lookup.id);
+        assert_eq!(via_resolver.runtime.r#type, via_lookup.runtime.r#type);
+    }
+
+    /// v0.2.49: pre_pull_with_auth_for_start signature parity — the
+    /// supervisor's `start_container_for_module_with_gpu_mode` calls
+    /// the shared core helper. We can't assert behaviour without a
+    /// real podman, but we CAN assert the shared symbol is reachable
+    /// from this crate (a refactor that accidentally removed the
+    /// re-export OR renamed the function would fail compilation here).
+    #[allow(dead_code)]
+    fn _v0249_pre_pull_with_auth_for_start_reachable_from_hub() {
+        async fn _typecheck(
+            m: &ModuleManifest,
+            r: &str,
+            i: &str,
+        ) -> Result<(), String> {
+            vct_launcher_core::services::container_runtime::pre_pull_with_auth_for_start(m, r, i)
+                .await
+        }
+        let _ = _typecheck;
     }
 }

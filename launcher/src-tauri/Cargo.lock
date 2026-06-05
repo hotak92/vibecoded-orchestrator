@@ -5416,6 +5416,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "uuid",
  "windows-sys 0.59.0",
+ "winreg",
 ]
 
 [[package]]
@@ -5458,7 +5459,6 @@ dependencies = [
  "uuid",
  "vct-launcher-core",
  "windows-sys 0.59.0",
- "winreg",
 ]
 
 [[package]]

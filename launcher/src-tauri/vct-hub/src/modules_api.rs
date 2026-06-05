@@ -755,7 +755,10 @@ pub(crate) fn resolve_secret_for_subprocess_env(
 
 // ─── Manifest scanning (shared with commands::modules) ──────────────────
 
-fn scan_manifests() -> Vec<(std::path::PathBuf, vct_launcher_core::manifest::ModuleManifest)> {
+// v0.2.49 Phase 3: hoisted to `pub(crate)` so `lifecycle_api::module_start`
+// + `server.rs::start_hub_server`'s resume-on-boot manifest resolver can
+// reuse it without duplicating the filesystem walk.
+pub(crate) fn scan_manifests() -> Vec<(std::path::PathBuf, vct_launcher_core::manifest::ModuleManifest)> {
     let mut out = Vec::new();
     let vct_root = vct_launcher_core::paths::vct_root_dir();
     for subdir in [

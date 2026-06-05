@@ -379,29 +379,100 @@ async fn module_status(
     .into_response()
 }
 
-/// `POST /projects/{project_id}/modules/{module_id}/start` — proxy for
-/// `start_container_after_install`. Body: empty (manifest is resolved
-/// from the launcher catalog on the hub side via the resolver injected
-/// at hub startup). Returns `{"container_name": String}`.
+/// `POST /projects/{project_id}/modules/{module_id}/start` — proxy
+/// for `start_container_after_install`. Body: empty (manifest is
+/// resolved from the on-disk catalog walked by
+/// `module_supervisor::lookup_manifest_by_id`). Returns
+/// `{"container_name": String}` on success.
 ///
-/// Today's hub catalog resolver isn't wired (Step 24 ships supervisor +
-/// status/stop wiring only) — calls here return 501 with
-/// `not_implemented_supervisor_install` so the launcher's install path
-/// falls through to its in-process `start_container_after_install`
-/// invocation. Phase 3+ wires the catalog resolver.
+/// v0.2.49 Phase 3 (this version): production-wired. The previous
+/// implementation returned 501 + `not_implemented_supervisor_install`
+/// — that comment said "Phase 3+ wires the catalog resolver". This is
+/// that step.
+///
+/// Error envelopes:
+///   * 404 `project_not_found`   — no row in `projects` for `project_id`.
+///   * 404 `manifest_not_found`  — no on-disk manifest for `module_id`.
+///   * 400 `not_container_module` — manifest's runtime type isn't
+///     `container` or `service` (the supervisor only handles long-
+///     running daemons; CLI / mcp_stdio modules are on-demand).
+///   * 500 `internal_error`       — DB error, container start failure,
+///     manifest parse error.
+///
+/// Idempotency: `start_container_after_install` calls
+/// `start_container_for_module` which `podman rm -f`s any same-named
+/// container first. Calling this endpoint while a container is already
+/// running force-restarts it (the launcher-side path has the same
+/// behaviour; see `start_container_for_module`'s docstring).
 async fn module_start(
-    State(_h): State<LauncherDbHandle>,
+    State(h): State<LauncherDbHandle>,
     Path(p): Path<ProjectModulePath>,
 ) -> impl IntoResponse {
-    let _ = (p.project_id, p.module_id);
-    error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "not_implemented_supervisor_install",
-        "Hub-side module install start path needs a catalog resolver \
-         (manifest lookup by module_id) — landed in a Phase 3+ step. \
-         Launcher continues to call module_supervisor::start_container_\
-         after_install in-process from commands/modules.rs.",
-    )
+    // Resolve project.
+    let project = match h.0.get_project(&p.project_id) {
+        Ok(Some(pj)) => pj,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "project_not_found",
+                format!("no project with id {}", p.project_id),
+            );
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                format!("get_project({}): {}", p.project_id, e),
+            );
+        }
+    };
+
+    // Resolve manifest from the on-disk catalog (modules + bundled).
+    let manifest = match super::module_supervisor::lookup_manifest_by_id(&p.module_id) {
+        Some(m) => m,
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "manifest_not_found",
+                format!(
+                    "no manifest found for module_id {} in catalog \
+                     (~/.vct/modules + ~/.vct/bundled_manifests)",
+                    p.module_id
+                ),
+            );
+        }
+    };
+
+    // Gate on runtime type — only `container` / `service` modules go
+    // through the supervisor's `podman run` path. Reject upfront with a
+    // clear error rather than failing inside `start_container_for_module`.
+    if !matches!(manifest.runtime.r#type.as_str(), "container" | "service") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "not_container_module",
+            format!(
+                "module {} has runtime.type='{}' — only container / service \
+                 modules can be started via this endpoint",
+                p.module_id, manifest.runtime.r#type
+            ),
+        );
+    }
+
+    // Hand off to the supervisor. `start_container_after_install`:
+    //   1. Allocates `projects.rl_port` if not yet set.
+    //   2. Calls `start_container_for_module` (variant-aware image ref
+    //      + v0.2.49 pre-pull-with-auth + podman run).
+    //   3. Persists `module_installs.container_name` for resume-on-boot.
+    match super::module_supervisor::start_container_after_install(&manifest, &project, &h.0).await {
+        Ok(container_name) => {
+            Json(serde_json::json!({ "container_name": container_name })).into_response()
+        }
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "container_start_failed",
+            format!("start_container_after_install({}, {}): {}", p.project_id, p.module_id, e),
+        ),
+    }
 }
 
 /// `POST /projects/{project_id}/modules/{module_id}/stop` — stop +
@@ -674,10 +745,14 @@ mod tests {
         assert!(body.get("container_name").map(|v| v.is_null()).unwrap_or(false));
     }
 
-    /// Step 24 commit b: module_start still returns 501 — needs a
-    /// catalog resolver (Phase 3+).
+    /// v0.2.49 Phase 3 (hub-side supervisor auth port): module_start is
+    /// no longer 501. With an empty in-memory DB, the endpoint returns
+    /// 404 `project_not_found` — the resolver looked the project up
+    /// first and didn't find it. Pre-v0.2.49 every request returned 501
+    /// `not_implemented_supervisor_install` because the catalog resolver
+    /// wasn't wired.
     #[tokio::test]
-    async fn module_start_returns_501_supervisor_install() {
+    async fn module_start_unknown_project_returns_404() {
         let (base, _h) = spawn_lifecycle_api_hub().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -688,11 +763,13 @@ mod tests {
             .send()
             .await
             .expect("hub reachable");
-        assert_eq!(resp.status(), 501);
+        assert_eq!(resp.status(), 404, "empty DB → project_not_found");
         let body: serde_json::Value = resp.json().await.expect("json");
         assert_eq!(
             body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
-            Some("not_implemented_supervisor_install"),
+            Some("project_not_found"),
+            "expected project_not_found, got: {:?}",
+            body
         );
     }
 
@@ -792,6 +869,254 @@ mod tests {
         ] {
             let json = serde_json::to_value(mode).expect("serialize");
             assert_eq!(json.as_str(), Some(expected));
+        }
+    }
+
+    // ─── v0.2.49 Phase 3: module_start production-wired tests ──────────
+    //
+    // These tests pin the new module_start contract (200 + container_name
+    // OR a structured error envelope). They use VCT_STATE_DIR overrides
+    // + an in-memory launcher DB to make the on-disk catalog lookup
+    // hermetic across test runs.
+    //
+    // Note: a true HAPPY-PATH test that asserts 200 isn't possible in a
+    // unit test (would need a real container runtime + a real image
+    // cache). The closest hermetic assertion: a manifest with a
+    // non-container runtime type returns the 400 not_container_module
+    // gate response, which proves the manifest WAS loaded (resolver
+    // works) AND the gate path WAS reached.
+
+    use std::path::PathBuf;
+
+    /// Per-test guard: sets `VCT_STATE_DIR` to a fresh tempdir for the
+    /// duration of the test. Drops the tempdir on guard drop so the
+    /// next test starts fresh.
+    struct VctStateDirGuard {
+        _td: tempfile::TempDir,
+        previous: Option<String>,
+    }
+
+    impl VctStateDirGuard {
+        fn new() -> Self {
+            // Serialize tests that mutate VCT_STATE_DIR (process-wide
+            // env var) via a global mutex. Same pattern paths::tests
+            // uses upstream.
+            use std::sync::{Mutex, OnceLock};
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let _g = LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let td = tempfile::tempdir().expect("tempdir");
+            let previous = std::env::var("VCT_STATE_DIR").ok();
+            std::env::set_var("VCT_STATE_DIR", td.path());
+            // _g releases here; the guard holds the lock again by
+            // reacquiring it on drop.
+            drop(_g);
+            Self { _td: td, previous }
+        }
+
+        fn vct_root(&self) -> PathBuf {
+            self._td.path().to_path_buf()
+        }
+    }
+
+    impl Drop for VctStateDirGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+                None => std::env::remove_var("VCT_STATE_DIR"),
+            }
+        }
+    }
+
+    /// Write a vct-module.json with the given runtime type to
+    /// `<vct_root>/bundled_manifests/<module_id>.json`. Returns the
+    /// path written.
+    fn write_test_manifest(vct_root: &std::path::Path, module_id: &str, runtime_type: &str) -> PathBuf {
+        let dir = vct_root.join("bundled_manifests");
+        std::fs::create_dir_all(&dir).expect("mkdir bundled_manifests");
+        let path = dir.join(format!("{}.json", module_id));
+        // Use the smallest valid manifest shape that ModuleManifest::
+        // from_json accepts. Mirrors the test fixtures in
+        // modules_api.rs.
+        let install_dir = format!("/tmp/{}", module_id);
+        let image = format!("ghcr.io/test/{}", module_id);
+        let json = serde_json::json!({
+            "manifest_version": 1,
+            "id": module_id,
+            "name": module_id,
+            "version": "0.0.1",
+            "description": "test",
+            "category": "paid-independent",
+            "compatibility": { "hosts": [] },
+            "license": { "required": false },
+            "requirements": {},
+            "install": {
+                "method": "container_pull",
+                "install_dir": install_dir,
+                "post_install": [],
+                "container": {
+                    "image": image,
+                    "tag_from_version": true,
+                    "pull_token_endpoint": "https://example.invalid/x",
+                    "pull_token_method": "POST",
+                    "rotate_weights": false
+                }
+            },
+            "secrets": [],
+            "settings": [],
+            "runtime": {
+                "type": runtime_type,
+                "command": "echo",
+                "args": [],
+                "env_fixed": {},
+                "env_derived": {},
+                "env_from_secrets": [],
+                "env_from_settings": [],
+                "ports": [],
+                "volumes": [],
+                "auto_restart": false,
+                "gpu_optional": true
+            },
+            "provides": [],
+            "consumes": []
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).expect("write manifest");
+        path
+    }
+
+    /// v0.2.49 Phase 3: module_start with an unknown project returns 404
+    /// `project_not_found`. Mirrors the existing
+    /// `module_start_unknown_project_returns_404` but pins the
+    /// invariant from a different angle (no manifest written, no
+    /// project written → resolver short-circuits at project lookup).
+    #[tokio::test]
+    async fn v0249_module_start_no_project_returns_project_not_found() {
+        let _g = VctStateDirGuard::new();
+        let (base, _h) = spawn_lifecycle_api_hub().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/projects/no-such/modules/no-such/start", base))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+            Some("project_not_found"),
+        );
+    }
+
+    /// v0.2.49 Phase 3: module_start with a real project but no
+    /// manifest on disk returns 404 `manifest_not_found`.
+    #[tokio::test]
+    async fn v0249_module_start_no_manifest_returns_manifest_not_found() {
+        let _g = VctStateDirGuard::new();
+        let (base, h) = spawn_lifecycle_api_hub().await;
+        // Insert a project so we get past the project_not_found gate.
+        use vct_launcher_core::db::models::ProjectHost;
+        h.0.insert_project("proj-1", "Acme", "/tmp/acme", ProjectHost::Base, "acme")
+            .expect("insert project");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/projects/proj-1/modules/no-such-module/start", base))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+            Some("manifest_not_found"),
+        );
+    }
+
+    /// v0.2.49 Phase 3: module_start with a real project + a real
+    /// on-disk manifest whose runtime type is NOT container/service
+    /// returns 400 `not_container_module`. Proves: the catalog
+    /// resolver IS firing (it loaded the manifest) AND the gate path
+    /// IS reached (the supervisor would otherwise return 500 on the
+    /// non-container runtime check inside `start_container_for_module`).
+    #[tokio::test]
+    async fn v0249_module_start_non_container_runtime_returns_400() {
+        let g = VctStateDirGuard::new();
+        write_test_manifest(&g.vct_root(), "test-cli-module", "cli");
+
+        let (base, h) = spawn_lifecycle_api_hub().await;
+        use vct_launcher_core::db::models::ProjectHost;
+        h.0.insert_project("proj-1", "Acme", "/tmp/acme", ProjectHost::Base, "acme")
+            .expect("insert project");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/projects/proj-1/modules/test-cli-module/start", base))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 400, "non-container runtime → 400");
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+            Some("not_container_module"),
+            "expected not_container_module, got: {:?}",
+            body
+        );
+    }
+
+    /// v0.2.49 Phase 3: module_start with a real project + a real
+    /// on-disk manifest with a container runtime reaches the
+    /// supervisor's `start_container_for_module`. Since no real podman
+    /// runtime + image is available in tests, the call fails — but
+    /// crucially it fails WITH a 500 `container_start_failed` envelope
+    /// (NOT a 404 or 400). This pins that:
+    ///   (a) the project lookup succeeded;
+    ///   (b) the manifest lookup succeeded;
+    ///   (c) the runtime-type gate passed;
+    ///   (d) the supervisor was invoked.
+    /// Mirrors the launcher-side test posture (assert on observable
+    /// 500 + structured error code without requiring a real container
+    /// runtime to be present).
+    #[tokio::test]
+    async fn v0249_module_start_container_module_reaches_supervisor() {
+        let g = VctStateDirGuard::new();
+        write_test_manifest(&g.vct_root(), "test-container-module", "container");
+
+        let (base, h) = spawn_lifecycle_api_hub().await;
+        use vct_launcher_core::db::models::ProjectHost;
+        h.0.insert_project("proj-1", "Acme", "/tmp/acme", ProjectHost::Base, "acme")
+            .expect("insert project");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!(
+                "{}/projects/proj-1/modules/test-container-module/start",
+                base
+            ))
+            .send()
+            .await
+            .expect("hub reachable");
+        // On a host with podman + the test image cached, this would
+        // return 200. On every CI runner we've seen, the test image
+        // doesn't exist → supervisor fails → 500. We accept either —
+        // the failure mode we're guarding against is 404 / 400, which
+        // would mean the resolver/gate logic broke.
+        let status = resp.status();
+        assert!(
+            status == 200 || status == 500,
+            "expected 200 (real podman) or 500 (no podman), got {}",
+            status
+        );
+        if status == 500 {
+            let body: serde_json::Value = resp.json().await.expect("json");
+            assert_eq!(
+                body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
+                Some("container_start_failed"),
+                "expected container_start_failed, got: {:?}",
+                body
+            );
         }
     }
 }

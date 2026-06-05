@@ -1110,34 +1110,13 @@ where
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub(crate) struct PullTokenResponse {
-    pub pull_token: String,
-    /// v0.2.36 wire-contract addition. The GitHub username that the
-    /// pull_token authenticates as — passed to `podman/docker login -u`.
-    /// For personal-account GHCR packages this MUST match the PAT
-    /// owner's GitHub login (empirically verified 2026-05-26: synthetic
-    /// usernames get 403 from ghcr.io). For org-package paths
-    /// (v0.2.36+) the server returns a synthetic username + a properly-
-    /// scoped registry token. Optional so a v0.2.36 launcher remains
-    /// compatible with the pre-v0.2.36 server response shape.
-    #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub expires_in_s: u64,
-    /// v0.2.46 V46-E (C1): server-returned image tag. The server is the
-    /// canonical SoT for "what tag is actually pullable from the registry"
-    /// — the L0 catalog may advertise a newer version (e.g. v0.2.8) while
-    /// the gateway still serves an older tag (e.g. 0.1.0). When `Some` and
-    /// non-empty, the caller compares against the client-resolved tag and:
-    ///   - same value → no action.
-    ///   - patch-level difference → honor server's tag, log WARN.
-    ///   - major/minor difference → hard-fail with a publisher-pointing
-    ///     error so the failure routes to the right responsible party.
-    /// Optional so pre-v0.2.46 servers (which omit this field) still parse.
-    #[serde(default)]
-    pub tag: Option<String>,
-}
+// v0.2.49: the canonical `PullTokenResponse` lives in
+// `vct-launcher-core::services::container_runtime` so the launcher AND
+// the hub-side supervisor deserialise the same struct. Re-exported here
+// as `pub(crate)` so the launcher's existing usage sites (this file +
+// module_service.rs) keep compiling without import sweeps. Field set is
+// unchanged from the pre-v0.2.49 launcher copy.
+pub(crate) use vct_launcher_core::services::container_runtime::PullTokenResponse;
 
 /// v0.2.46 V46-E (C2) / v0.2.47 cross-runtime: build a per-pull auth
 /// context (file for podman, directory-with-config.json for docker)
@@ -1455,128 +1434,18 @@ fn audit_pull_token_failed(
 ///   install from a useless POST to `https://example/`.
 /// - Pattern mirrors `module_service::DEFAULT_RL_LATEST_VERSION_ENDPOINT` and
 ///   `licensing::VALIDATE_TIER_DEFAULT_ENDPOINT`.
-pub(crate) const RL_ARTIFACT_URL_DEFAULT_ENDPOINT: &str =
-    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
-
-/// Placeholder strings baked into test fixtures and into any `vct-module.json`
-/// that was published without running manifest-hygiene CI. When the resolved
-/// `pull_token_endpoint` matches one of these patterns, `request_pull_token`
-/// substitutes `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` and logs a warning so the
-/// operator can track down and fix the stale manifest.
-///
-/// v0.2.42 P3-P1-1: widened from a single literal to a small family of
-/// obvious placeholders. The detection (see `is_pull_token_placeholder`)
-/// matches the bare RFC-2606 reserved hosts + the historical `example`
-/// fixture form, but NOT arbitrary subdomains (e.g. `staging.example.com`
-/// is a legitimate user-controlled URL that must pass through unchanged).
-const PULL_TOKEN_ENDPOINT_PLACEHOLDER: &str = "https://example/pull-token";
-
-/// Returns true if `raw` matches one of the known placeholder URL shapes
-/// that must be substituted with the default const. Pure function.
-///
-/// Detection rules (any one matches → placeholder):
-///   1. Exact match against `PULL_TOKEN_ENDPOINT_PLACEHOLDER` (back-compat).
-///   2. URL has `example` as the bare host (the historical fixture form,
-///      no TLD).
-///   3. URL host is EXACTLY one of the RFC-2606 reserved hosts:
-///      `example.com`, `example.net`, `example.org`, `example.invalid`,
-///      `example.test`.
-///   4. URL host has `placeholder` as the bare host, starts with
-///      `placeholder.` (e.g. `placeholder.supabase.co`), or ends with
-///      `.placeholder` (added v0.2.45 V45-D — see comment below).
-///
-/// NOT a placeholder: subdomains of any of the example.* hosts (e.g.
-/// `staging.example.com`). Those are legitimate user-controlled hostnames
-/// — a staging Supabase tenant or a third-party module's gateway. Treating
-/// them as placeholders would silently route their traffic to
-/// `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`, which is wrong.
-///
-/// Host matching for the placeholder family is case-insensitive
-/// (`Placeholder.supabase.co` is detected equivalently to
-/// `placeholder.supabase.co`). The example.* family is matched against the
-/// already-canonical lowercase literals — URL host components are
-/// case-insensitive per RFC 3986, but in practice every manifest we see
-/// ships lowercase, so we keep the existing exact-match path for that
-/// family rather than introduce a behaviour change.
-///
-/// v0.2.45 V45-D: the "placeholder" host family was added because the v0.2.7
-/// RL manifest shipped with `pull_token_endpoint = "https://placeholder.supabase.co/...`.
-/// The literal "placeholder" subdomain slipped past the example.* family added
-/// in v0.2.42 W8 — POST went to a nonexistent host, fell through to anonymous
-/// `podman pull` against private GHCR, and 401'd. Catching this entire family
-/// avoids the same class of bug for every future paid module that ships a
-/// `placeholder.<anything>` URL in a pre-publish fixture.
-fn is_pull_token_placeholder(raw: &str) -> bool {
-    if raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER {
-        return true;
-    }
-    let host_start = if let Some(rest) = raw.strip_prefix("https://") {
-        rest
-    } else if let Some(rest) = raw.strip_prefix("http://") {
-        rest
-    } else {
-        return false;
-    };
-    let host = host_start.split('/').next().unwrap_or("");
-    let host_no_port = host.split(':').next().unwrap_or("");
-
-    // Existing example.* family (RFC-2606 reserved + the bare-`example`
-    // historical fixture form). Kept as exact lowercase match — see doc
-    // comment above for rationale.
-    if matches!(
-        host_no_port,
-        "example"
-            | "example.com"
-            | "example.net"
-            | "example.org"
-            | "example.invalid"
-            | "example.test"
-    ) {
-        return true;
-    }
-
-    // v0.2.45 V45-D: also catch "placeholder" host on any TLD. Patterns:
-    //   - bare `placeholder` (no TLD; pre-publish fixture form)
-    //   - `placeholder.<anything>` (e.g. placeholder.supabase.co)
-    //   - `<anything>.placeholder` (e.g. foo.placeholder; less common but
-    //     still an obvious placeholder marker)
-    // Case-insensitive so `Placeholder.supabase.co` is also detected.
-    let lower = host_no_port.to_lowercase();
-    if lower == "placeholder"
-        || lower.starts_with("placeholder.")
-        || lower.ends_with(".placeholder")
-    {
-        return true;
-    }
-
-    false
-}
-
-/// Resolve the effective pull-token endpoint URL, replacing empty strings and
-/// the known placeholder family with `RL_ARTIFACT_URL_DEFAULT_ENDPOINT`.
-///
-/// v0.2.42 (W8 + P3-P1-1): extracted as a pure helper so unit tests can verify
-/// the substitution logic without spinning up an HTTP client or keychain.
-///
-/// Substitution fires when:
-///   - `raw` is empty (malformed publish)
-///   - `raw` is a known placeholder shape (see `is_pull_token_placeholder`)
-///
-/// In both cases the function logs a warning and returns the default const.
-/// Any other non-empty string is returned as-is (trusts the caller's URL).
-pub(crate) fn resolve_pull_token_endpoint(raw: &str) -> &str {
-    if raw.is_empty() || is_pull_token_placeholder(raw) {
-        eprintln!(
-            "[installer_engine] pull_token_endpoint is {:?}; \
-             substituting default RL_ARTIFACT_URL_DEFAULT_ENDPOINT. \
-             Fix the module manifest to remove this warning.",
-            raw
-        );
-        RL_ARTIFACT_URL_DEFAULT_ENDPOINT
-    } else {
-        raw
-    }
-}
+// v0.2.49: these pull-token gateway constants + helpers moved to
+// `vct-launcher-core::services::container_runtime` so the hub-side
+// supervisor (Phase 3 auth port) consumes the SAME placeholder family,
+// the SAME default endpoint, and the SAME `resolve_pull_token_endpoint`
+// substitution logic the launcher does. Re-exported here so the
+// existing `pub(crate)` call sites + tests in this file keep their
+// unqualified imports working.
+#[allow(unused_imports)]
+pub(crate) use vct_launcher_core::services::container_runtime::{
+    is_pull_token_placeholder, resolve_pull_token_endpoint, PULL_TOKEN_ENDPOINT_PLACEHOLDER,
+    RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+};
 
 /// `pull_token_endpoint` (Phase 3A, v0.2.35).
 ///
@@ -1604,169 +1473,32 @@ pub(crate) fn resolve_pull_token_endpoint(raw: &str) -> &str {
 /// body verbatim — that body has no `license_key` field, server returned
 /// 400 invalid-shape, every paid-module install fell through to anonymous
 /// pull and 401'd on the private registry.
+/// v0.2.49: thin wrapper around the shared
+/// `vct-launcher-core::services::container_runtime::request_pull_token`.
+/// The hub-side supervisor's pre-pull-with-auth flow calls the same
+/// core helper, so both crates emit byte-identical POST bodies for the
+/// same `(license_key, machine_id_hash, endpoint)` triple. License read
+/// + machine_id_hash both live in `vct_launcher_core::licensing` since
+/// v0.2.49 — see that module's docstring for the cross-platform
+/// invariants.
 pub(crate) async fn request_pull_token(
     container: &crate::manifest::ContainerInstallBlock,
-    // NEW-1 (2026-05-28): when the L0 catalog supplies a pull_token_endpoint,
-    // prefer it over the L1 manifest's value. L0 is the server-side SoT and
-    // always carries the real Supabase URL; L1 (image-extracted) may contain
-    // a placeholder (e.g. "placeholder.supabase.co/…") if the publisher
-    // shipped the image without running manifest-hygiene CI.
     l0_pull_token_endpoint: Option<&str>,
 ) -> Result<PullTokenResponse, String> {
-    // 1. License key from keychain.
-    let license_key = crate::commands::licensing::read_license_key_from_keychain()
-        .map_err(|e| format!("keychain read failed: {}", e))?
-        .ok_or_else(|| {
-            "no license activated — open Settings → License → Activate to enter your key".to_string()
-        })?;
-
-    // 2. Machine ID hash — sha256 of 8-byte big-endian MAC. Same algorithm
-    // `license_refresh` uses, so the server sees a consistent binding
-    // when comparing pull-time vs activation-time machine identity.
-    let machine_hash = crate::commands::licensing::machine_id_hash();
-
-    // 3. HTTP client. 15s timeout — long enough to absorb a slow GHCR
-    // token-exchange roundtrip on the server side; short enough to not
-    // hang the install UI.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("build http client: {}", e))?;
-
-    let method = container
-        .pull_token_method
-        .parse::<reqwest::Method>()
-        .unwrap_or(reqwest::Method::POST);
-
-    // NEW-1 (2026-05-28): prefer L0 catalog URL over L1 manifest's value.
-    // v0.2.42 (W8): additionally replace empty strings and the well-known
-    // placeholder "https://example/pull-token" with the hardcoded default
-    // const. This handles two failure modes:
-    //   a. L0 override absent AND L1 manifest carries the placeholder →
-    //      would POST to a non-existent host; now falls back to the real URL.
-    //   b. L0 override absent AND L1 manifest carries "" (malformed publish) →
-    //      same substitution.
-    // When the substitution fires, an eprintln warns the operator so the stale
-    // manifest gets noticed and fixed before it affects more users.
-    //
-    // v0.2.45 V45-D: env override takes precedence over BOTH the L0 override
-    // and the L1 manifest. Setting `VCT_RL_PULL_TOKEN_ENDPOINT=<url>` short-
-    // circuits the L0/L1/default resolution chain entirely and POSTs to the
-    // env URL verbatim. Provides operators a runtime escape hatch for the
-    // case where the on-disk / L0-resolved endpoint is wrong (placeholder,
-    // broken host, migrated tenant). Intentionally module-id-shaped so the
-    // v0.2.46 per-module-id registry generalization (46-2) is a backwards-
-    // compatible refactor — same env var name, same precedence semantics,
-    // just keyed by module id instead of hardcoded to the RL module.
-    //
-    // Empty / whitespace-only values are ignored (fall back to the existing
-    // L0/L1/default chain) so an accidental empty assignment in a shell rc
-    // file doesn't break the install.
-    let endpoint_string: String;
-    let endpoint: &str = match std::env::var("VCT_RL_PULL_TOKEN_ENDPOINT")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        Some(env_url) => {
-            eprintln!(
-                "[installer_engine] VCT_RL_PULL_TOKEN_ENDPOINT set; \
-                 using env override for pull-token endpoint: {}",
-                env_url
-            );
-            endpoint_string = env_url;
-            &endpoint_string
-        }
-        None => {
-            let raw_endpoint = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
-            resolve_pull_token_endpoint(raw_endpoint)
-        }
-    };
-
-    let resp = client
-        .request(method, endpoint)
-        .json(&serde_json::json!({
-            "license_key": license_key,
-            "machine_id_hash": machine_hash,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("POST {}: {}", endpoint, e))?;
-
-    let status = resp.status();
-    if status.is_success() {
-        let parsed: PullTokenResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("parse pull-token response: {}", e))?;
-        return Ok(parsed);
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .unwrap_or_else(|_| serde_json::json!({}));
-    Err(format_pull_token_error(status.as_u16(), &body))
+    vct_launcher_core::services::container_runtime::request_pull_token(
+        container,
+        l0_pull_token_endpoint,
+    )
+    .await
 }
 
-/// Map a non-2xx `rl-artifact-url` response into a user-actionable string.
-///
-/// Lifted to a free function so the test module can exercise every
-/// error-code/HTTP-status pairing without spinning up an HTTP server.
-/// The error body shape is `{ error: <code>, detail?: <string>,
-/// required_tier?: <string>, got?: <string> }` per the edge function
-/// at `launcher/supabase/functions/rl-artifact-url/index.ts`.
-pub(crate) fn format_pull_token_error(status: u16, body: &serde_json::Value) -> String {
-    let code = body
-        .get("error")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown_error");
-    let detail = body
-        .get("detail")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    match (status, code) {
-        (400, _) => format!(
-            "pull-token gateway rejected the request shape ({}). \
-             This is a launcher bug — please report it. detail={}",
-            code, detail
-        ),
-        (401, "license_invalid") => {
-            "your license key is invalid or has been revoked. \
-             Open Settings → License → Refresh; if the problem persists, \
-             contact support."
-                .to_string()
-        }
-        (401, "license_expired") => {
-            "your license has expired. Renew on the dashboard, then \
-             open Settings → License → Refresh."
-                .to_string()
-        }
-        (401, "tier_insufficient") => {
-            let required = body
-                .get("required_tier")
-                .and_then(|v| v.as_str())
-                .unwrap_or("pro");
-            let got = body.get("got").and_then(|v| v.as_str()).unwrap_or("free");
-            format!(
-                "this module requires the {} tier; your license validates as {}. \
-                 Upgrade on the dashboard, then open Settings → License → Refresh.",
-                required, got
-            )
-        }
-        (401, _) => format!(
-            "license check failed at the pull-token gateway: {} ({})",
-            code, detail
-        ),
-        (500, _) => format!(
-            "pull-token gateway is temporarily unavailable ({}). \
-             Try again in a few minutes; if it persists, check Services tab.",
-            detail
-        ),
-        (s, c) => format!("pull-token gateway returned HTTP {}: {} ({})", s, c, detail),
-    }
-}
+/// v0.2.49: re-export the shared error formatter so the launcher's
+/// existing test module + downstream callers (`container_pull` error
+/// path) keep their unqualified imports working. The unused-imports
+/// lint runs at module scope and doesn't see the in-file test mod's
+/// `use super::*`, so we allow it.
+#[allow(unused_imports)]
+pub(crate) use vct_launcher_core::services::container_runtime::format_pull_token_error;
 
 /// Detect which container runtime to use. Prefers podman (matches the
 /// rest of VCO's container stack), falls back to docker.

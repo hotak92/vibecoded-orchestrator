@@ -410,12 +410,11 @@ fn read_persisted_gpu_mode() -> Option<crate::commands::gpu_policy::GpuMode> {
         .map(|snap| snap.gpu_mode_decided)
 }
 
-/// v0.2.47: pre-pull the variant-correct image with proper auth context
-/// BEFORE `podman run`. Routes through `installer_engine::container_pull`'s
-/// pull-token gateway path indirectly: we replicate the same flow inline
-/// here (request token via the manifest's gateway, build per-pull
-/// authfile, pull `<image>:<tag>`, drop guard) so the start path doesn't
-/// require the GUI-side AppHandle that `run_install` does.
+/// v0.2.47 + v0.2.49: pre-pull the variant-correct image with proper
+/// auth context BEFORE `podman run`. The actual implementation lives
+/// in `vct-launcher-core::services::container_runtime::
+/// pre_pull_with_auth_for_start` so the hub-side supervisor (Phase 3
+/// auth port) and the launcher run byte-identical pre-pull code paths.
 ///
 /// Soft-fails on every error — the caller logs and proceeds to
 /// `podman run`. If the image is already in the local cache, `run`
@@ -427,81 +426,10 @@ async fn pre_pull_with_auth_for_start(
     runtime: &str,
     image_ref: &str,
 ) -> Result<(), String> {
-    let container = manifest
-        .install
-        .container
-        .as_ref()
-        .ok_or_else(|| "install.container block missing".to_string())?;
-
-    // Fast-path: image already in local cache → no pull needed.
-    let inspect = Command::new(runtime)
-        .silent()
-        .args(["image", "exists", image_ref])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-    if let Ok(s) = inspect {
-        if s.success() {
-            return Ok(());
-        }
-    }
-
-    // Image not in cache. Request a pull token (mirrors the install
-    // path's flow) and use a per-pull authfile.
-    let token_result =
-        crate::installer_engine::request_pull_token(container, None).await;
-    let registry = container
-        .registry
-        .clone()
-        .unwrap_or_else(|| {
-            image_ref
-                .split_once('/')
-                .map(|(host, _)| host.to_string())
-                .unwrap_or_else(|| "docker.io".to_string())
-        });
-    let guard_opt = match token_result {
-        Ok(tok) => {
-            let user = tok.username.as_deref().unwrap_or("vct-paid-module");
-            Some(crate::installer_engine::build_per_pull_authfile(
-                &registry,
-                user,
-                &tok.pull_token,
-                runtime,
-            )?)
-        }
-        Err(e) => {
-            // No token → anonymous pull. Will 401 on private images.
-            eprintln!(
-                "[module_service] pre-pull: pull-token gateway returned {}; \
-                 anonymous pull attempt (will 401 on private images).",
-                e
-            );
-            None
-        }
-    };
-
-    let mut pull_cmd = Command::new(runtime).silent();
-    if let Some(g) = guard_opt.as_ref() {
-        g.apply_to(&mut pull_cmd, runtime);
-    }
-    let pull_status = pull_cmd
-        .args(["pull", image_ref])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
-
-    if !pull_status.success() {
-        return Err(format!(
-            "{} pull failed (exit {}) for {}",
-            runtime,
-            pull_status.code().unwrap_or(-1),
-            image_ref
-        ));
-    }
-    Ok(())
+    vct_launcher_core::services::container_runtime::pre_pull_with_auth_for_start(
+        manifest, runtime, image_ref,
+    )
+    .await
 }
 
 /// Modules.rs-facing wrapper: allocates rl_port if needed, builds
@@ -1545,6 +1473,31 @@ async fn parse_recent_event_stats_from_path(path: &Path) -> (u32, f32) {
 /// Iterate every `status='installed'` install row and ensure its
 /// container is running. Soft-fail per row. Called from
 /// `lib.rs::setup()` at launcher boot.
+///
+/// ## Precedence order with hub-side resume (v0.2.49 Phase 3)
+///
+/// As of v0.2.49 the hub-side `vct-hub::module_supervisor::resume_
+/// containers_on_startup` is the PRIMARY production code path —
+/// wired in `vct-hub/src/server.rs::start_hub_server` with the real
+/// `real_manifest_resolver` (was a `|_id| None` stub pre-v0.2.49).
+/// This launcher-side path is now a FALLBACK with two roles:
+///
+///   1. **Hub-unreachable edge case**: if `vct-hub` hasn't booted yet
+///      when the launcher reaches `lib.rs::setup()` (rare on the same
+///      machine — the launcher spawns the hub — but possible during
+///      upgrade flows when the hub binary is being swapped), this path
+///      starts the containers itself.
+///   2. **Idempotency backstop**: both layers check
+///      `is_container_running` before starting. If the hub already ran
+///      a successful resume sweep, every container is running and this
+///      path is a per-row no-op. If a race produced a half-started
+///      container, the second sweep's `podman rm -f` + restart heals
+///      it.
+///
+/// The two paths share NO mutable state — both read `module_installs`
+/// rows via `Db` (with WAL mode so concurrent readers don't block) and
+/// both write `container_name` + `last_error` via the same single-
+/// writer SQL UPDATEs. Double-resume is safe.
 ///
 /// v0.2.40 (R1): mirror of W40-D's hub-side
 /// `vct-hub::module_supervisor::resume_containers_on_startup`

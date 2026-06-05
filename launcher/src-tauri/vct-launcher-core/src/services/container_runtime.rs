@@ -559,6 +559,391 @@ pub async fn ensure_volume_host_dirs(
     }
 }
 
+// ─── Pull-token gateway HTTP core (v0.2.49) ────────────────────────────
+//
+// Why these live in core (v0.2.49 Phase 3 hub-supervisor auth port):
+// pre-v0.2.49 `installer_engine::request_pull_token` was launcher-private
+// — `vct-hub`'s `module_supervisor::start_container_for_module` couldn't
+// reach it. The supervisor therefore had no way to pre-pull the variant-
+// correct image with proper credentials before `podman run`, falling
+// through to anonymous-pull-401 on private GHCR packages. See
+// `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`.
+//
+// The HTTP body of `request_pull_token` is portable (license_key +
+// machine_id_hash POST to the gateway URL); the only launcher-coupled
+// parts were the keychain read and `machine_id_hash` — both now in
+// `vct-launcher-core::licensing`. The whole flow can move to core.
+
+/// Hard-coded fallback for the pull-token gateway URL. Used when the
+/// resolved endpoint (L0 override → L1 manifest → env override) is
+/// empty or matches a known placeholder pattern. Mirrors the launcher's
+/// `installer_engine::RL_ARTIFACT_URL_DEFAULT_ENDPOINT`.
+pub const RL_ARTIFACT_URL_DEFAULT_ENDPOINT: &str =
+    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
+
+/// Historical exact-match placeholder string still found in some
+/// pre-publish manifests. Preserved for backwards-compat with
+/// v0.2.42-and-earlier publish artifacts. `pub` so the launcher's
+/// existing test suite (which compared the launcher-private copy
+/// against the well-known placeholder value pre-v0.2.49) can keep its
+/// assertions targeting this single source of truth.
+pub const PULL_TOKEN_ENDPOINT_PLACEHOLDER: &str = "https://example/pull-token";
+
+/// Pull-token gateway response (deserialised from the edge function's
+/// JSON body). Mirrors `installer_engine::PullTokenResponse` — moved
+/// to core because the request helper now lives here. Field set kept
+/// IDENTICAL so the launcher's existing wrapper deserialises into the
+/// same struct.
+#[derive(Debug, serde::Deserialize)]
+pub struct PullTokenResponse {
+    pub pull_token: String,
+    /// The GitHub username the pull_token authenticates as. Passed to
+    /// `podman/docker login -u`. Optional so a v0.2.36 launcher remains
+    /// compatible with the pre-v0.2.36 server response shape.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub expires_in_s: u64,
+    /// Server-returned image tag (v0.2.46 V46-E C1). When `Some` and
+    /// non-empty, the caller compares against the client-resolved tag
+    /// and may adjust on patch-level drift.
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+/// Returns true if `raw` matches a known placeholder URL pattern. Pure
+/// function — used by `resolve_pull_token_endpoint` to substitute the
+/// hardcoded default. See the launcher's v0.2.45 V45-D + v0.2.42 W8 +
+/// v0.2.42 P3-P1-1 history for the families recognised here:
+///
+///   1. Exact `PULL_TOKEN_ENDPOINT_PLACEHOLDER` (back-compat).
+///   2. Bare `example` host (no TLD).
+///   3. RFC-2606 `example.{com,net,org,invalid,test}` exact-host.
+///   4. Bare `placeholder`, `placeholder.<anything>`, `<anything>.placeholder`.
+///
+/// `pub` so the launcher's existing test suite (which exercised every
+/// branch of the placeholder family against the pre-v0.2.49 launcher-
+/// private copy) can re-export and continue asserting the same
+/// invariants from this single source of truth.
+pub fn is_pull_token_placeholder(raw: &str) -> bool {
+    if raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER {
+        return true;
+    }
+    let host_start = if let Some(rest) = raw.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        rest
+    } else {
+        return false;
+    };
+    let host = host_start.split('/').next().unwrap_or("");
+    let host_no_port = host.split(':').next().unwrap_or("");
+
+    if matches!(
+        host_no_port,
+        "example"
+            | "example.com"
+            | "example.net"
+            | "example.org"
+            | "example.invalid"
+            | "example.test"
+    ) {
+        return true;
+    }
+
+    let lower = host_no_port.to_lowercase();
+    if lower == "placeholder"
+        || lower.starts_with("placeholder.")
+        || lower.ends_with(".placeholder")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Resolve the effective pull-token endpoint URL. Empty / placeholder
+/// inputs are replaced with `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` and an
+/// operator-visible warning is logged. Any other non-empty string is
+/// returned as-is.
+pub fn resolve_pull_token_endpoint(raw: &str) -> &str {
+    if raw.is_empty() || is_pull_token_placeholder(raw) {
+        eprintln!(
+            "[container_runtime] pull_token_endpoint is {:?}; \
+             substituting default RL_ARTIFACT_URL_DEFAULT_ENDPOINT. \
+             Fix the module manifest to remove this warning.",
+            raw
+        );
+        RL_ARTIFACT_URL_DEFAULT_ENDPOINT
+    } else {
+        raw
+    }
+}
+
+/// Map a non-2xx pull-token gateway response into a user-readable
+/// string. Same body shape the launcher's
+/// `installer_engine::format_pull_token_error` handles — moved to core
+/// so the hub-side caller doesn't need to re-derive the mapping.
+pub fn format_pull_token_error(status: u16, body: &serde_json::Value) -> String {
+    let code = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_error");
+    let detail = body
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match (status, code) {
+        (400, _) => format!(
+            "pull-token gateway rejected the request shape ({}). \
+             This is a launcher bug — please report it. detail={}",
+            code, detail
+        ),
+        (401, "license_invalid") => {
+            "your license key is invalid or has been revoked. \
+             Open Settings → License → Refresh; if the problem persists, \
+             contact support."
+                .to_string()
+        }
+        (401, "license_expired") => {
+            "your license has expired. Renew on the dashboard, then \
+             open Settings → License → Refresh."
+                .to_string()
+        }
+        (401, "tier_insufficient") => {
+            let required = body
+                .get("required_tier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pro");
+            let got = body.get("got").and_then(|v| v.as_str()).unwrap_or("free");
+            format!(
+                "this module requires the {} tier; your license validates as {}. \
+                 Upgrade on the dashboard, then open Settings → License → Refresh.",
+                required, got
+            )
+        }
+        (401, _) => format!(
+            "license check failed at the pull-token gateway: {} ({})",
+            code, detail
+        ),
+        (500, _) => format!(
+            "pull-token gateway is temporarily unavailable ({}). \
+             Try again in a few minutes; if it persists, check Services tab.",
+            detail
+        ),
+        (s, c) => format!("pull-token gateway returned HTTP {}: {} ({})", s, c, detail),
+    }
+}
+
+/// HTTP-only pull-token request. `license_key` and `machine_hash` are
+/// passed in by the caller (each crate reads them via
+/// `vct_launcher_core::licensing::read_license_key_from_keychain()` +
+/// `vct_launcher_core::licensing::machine_id_hash()` respectively — the
+/// helper does NOT pull from the keychain itself so it stays free of
+/// any test-only / Tauri-only coupling).
+///
+/// Endpoint resolution precedence (highest-first):
+///   1. `VCT_RL_PULL_TOKEN_ENDPOINT` env var (operator escape hatch;
+///      non-empty after trim).
+///   2. `l0_pull_token_endpoint` (when supplied — the L0 catalog override).
+///   3. `container.pull_token_endpoint` (the manifest's value).
+///   4. `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` (substituted in for empty /
+///      placeholder values via `resolve_pull_token_endpoint`).
+///
+/// 15s timeout — same as launcher's pre-v0.2.49 path.
+///
+/// v0.2.49 Phase 3: the launcher's
+/// `installer_engine::request_pull_token` is now a 5-line wrapper that
+/// reads the keychain + computes the machine hash, then calls this
+/// helper. The hub-side supervisor calls it via the same wrapper
+/// pattern. Both wrappers see byte-identical request bodies for the
+/// same `(license_key, machine_hash, endpoint)` triple.
+pub async fn request_pull_token_http(
+    container: &crate::manifest::ContainerInstallBlock,
+    l0_pull_token_endpoint: Option<&str>,
+    license_key: &str,
+    machine_hash: &str,
+) -> Result<PullTokenResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("build http client: {}", e))?;
+
+    let method = container
+        .pull_token_method
+        .parse::<reqwest::Method>()
+        .unwrap_or(reqwest::Method::POST);
+
+    let endpoint_string: String;
+    let endpoint: &str = match std::env::var("VCT_RL_PULL_TOKEN_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(env_url) => {
+            eprintln!(
+                "[container_runtime] VCT_RL_PULL_TOKEN_ENDPOINT set; \
+                 using env override for pull-token endpoint: {}",
+                env_url
+            );
+            endpoint_string = env_url;
+            &endpoint_string
+        }
+        None => {
+            let raw_endpoint = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
+            resolve_pull_token_endpoint(raw_endpoint)
+        }
+    };
+
+    let resp = client
+        .request(method, endpoint)
+        .json(&serde_json::json!({
+            "license_key": license_key,
+            "machine_id_hash": machine_hash,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("POST {}: {}", endpoint, e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        let parsed: PullTokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse pull-token response: {}", e))?;
+        return Ok(parsed);
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Err(format_pull_token_error(status.as_u16(), &body))
+}
+
+/// Convenience wrapper around [`request_pull_token_http`] that reads
+/// the license key + machine_id_hash via the shared
+/// `vct_launcher_core::licensing` helpers. Both launcher and hub call
+/// this directly (the v0.2.47 launcher inlined the same three lines —
+/// promoting them here is a strict de-duplication).
+pub async fn request_pull_token(
+    container: &crate::manifest::ContainerInstallBlock,
+    l0_pull_token_endpoint: Option<&str>,
+) -> Result<PullTokenResponse, String> {
+    let license_key = crate::licensing::read_license_key_from_keychain()
+        .map_err(|e| format!("keychain read failed: {}", e))?
+        .ok_or_else(|| {
+            "no license activated — open Settings → License → Activate to enter your key"
+                .to_string()
+        })?;
+    let machine_hash = crate::licensing::machine_id_hash();
+    request_pull_token_http(container, l0_pull_token_endpoint, &license_key, &machine_hash).await
+}
+
+// ─── Pre-pull-with-auth (v0.2.49) ──────────────────────────────────────
+
+/// Pre-pull the variant-correct image with proper auth context BEFORE
+/// the supervisor's `podman run`. Used by both the launcher-side
+/// `start_container_for_module` and the hub-side
+/// `module_supervisor::start_container_for_module` so a cache-evicted
+/// host doesn't fall through to `podman run`'s anonymous-pull-401 path.
+///
+/// Soft-fails on every error — the caller logs and proceeds to
+/// `podman run`. If the image is already in the local cache, `run`
+/// succeeds without the pre-pull. If the image is missing AND pre-pull
+/// failed, `run` will surface the anonymous-pull failure itself; we
+/// don't double-report.
+///
+/// Algorithm:
+///   1. Fast-path: `<runtime> image exists <image_ref>` → if Ok, return.
+///   2. Request a pull token via the shared
+///      `request_pull_token(container, None)` (uses
+///      `vct_launcher_core::licensing` for the keychain read +
+///      machine_id_hash so launcher and hub agree byte-for-byte).
+///   3. Build a per-pull auth guard (`build_per_pull_authfile`).
+///   4. Apply the guard to a `<runtime> pull` command and execute.
+///   5. Return Ok on exit-0; Err on non-zero or pull-token failure.
+///
+/// `runtime` matches the launcher's `detect_container_runtime()` /
+/// hub's local copy: `"podman"` or `"docker"`. Other values pass through
+/// to `PerPullAuth::apply_to`'s catch-all (podman-shape `--authfile`).
+pub async fn pre_pull_with_auth_for_start(
+    manifest: &crate::manifest::ModuleManifest,
+    runtime: &str,
+    image_ref: &str,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let container = manifest
+        .install
+        .container
+        .as_ref()
+        .ok_or_else(|| "install.container block missing".to_string())?;
+
+    // Fast-path: image already in local cache → no pull needed.
+    let inspect = Command::new(runtime)
+        .args(["image", "exists", image_ref])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    if let Ok(s) = inspect {
+        if s.success() {
+            return Ok(());
+        }
+    }
+
+    // Image not in cache. Request a pull token (mirrors the install
+    // path's flow) and use a per-pull authfile.
+    let token_result = request_pull_token(container, None).await;
+    let registry = container.registry.clone().unwrap_or_else(|| {
+        image_ref
+            .split_once('/')
+            .map(|(host, _)| host.to_string())
+            .unwrap_or_else(|| "docker.io".to_string())
+    });
+    let guard_opt = match token_result {
+        Ok(tok) => {
+            let user = tok.username.as_deref().unwrap_or("vct-paid-module");
+            Some(build_per_pull_authfile(&registry, user, &tok.pull_token, runtime)?)
+        }
+        Err(e) => {
+            // No token → anonymous pull. Will 401 on private images.
+            // Same soft-fail discipline the launcher had pre-v0.2.49.
+            eprintln!(
+                "[container_runtime] pre-pull: pull-token gateway returned {}; \
+                 anonymous pull attempt (will 401 on private images).",
+                e
+            );
+            None
+        }
+    };
+
+    let mut pull_cmd = Command::new(runtime);
+    if let Some(g) = guard_opt.as_ref() {
+        g.apply_to(&mut pull_cmd, runtime);
+    }
+    let pull_status = pull_cmd
+        .args(["pull", image_ref])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
+
+    if !pull_status.success() {
+        return Err(format!(
+            "{} pull failed (exit {}) for {}",
+            runtime,
+            pull_status.code().unwrap_or(-1),
+            image_ref
+        ));
+    }
+    Ok(())
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -973,5 +1358,140 @@ mod tests {
             DEDUP_SENTINEL,
             "vct-launcher-core::services::container_runtime::v0.2.47"
         );
+    }
+
+    // ─── v0.2.49: pull-token gateway HTTP core ─────────────────────────
+
+    /// v0.2.49: empty endpoint string → substituted with the default
+    /// const. Mirrors the launcher's pre-v0.2.49
+    /// `installer_engine::resolve_pull_token_endpoint` test.
+    #[test]
+    fn v0249_resolve_pull_token_endpoint_empty_string_substitutes_default() {
+        assert_eq!(resolve_pull_token_endpoint(""), RL_ARTIFACT_URL_DEFAULT_ENDPOINT);
+    }
+
+    /// v0.2.49: known placeholder shapes are substituted; legitimate
+    /// URLs pass through verbatim. Exercises the full
+    /// `is_pull_token_placeholder` family the launcher v0.2.45 V45-D +
+    /// v0.2.42 W8 / P3-P1-1 chain hardened against.
+    #[test]
+    fn v0249_resolve_pull_token_endpoint_placeholder_family_substituted() {
+        for placeholder in [
+            "https://example/pull-token",
+            "https://example.com/x",
+            "https://example.invalid/x",
+            "https://placeholder.supabase.co/x",
+            "https://Placeholder.supabase.co/x",
+            "https://foo.placeholder/x",
+        ] {
+            assert_eq!(
+                resolve_pull_token_endpoint(placeholder),
+                RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+                "placeholder {} must be substituted",
+                placeholder
+            );
+        }
+    }
+
+    /// v0.2.49: legitimate user-controlled URL passes through.
+    #[test]
+    fn v0249_resolve_pull_token_endpoint_legit_url_passes_through() {
+        let real = "https://abc123.supabase.co/functions/v1/rl-artifact-url";
+        assert_eq!(resolve_pull_token_endpoint(real), real);
+        let staging = "https://staging.example.com/x";
+        assert_eq!(resolve_pull_token_endpoint(staging), staging);
+    }
+
+    /// v0.2.49: `format_pull_token_error` maps the 401 license_invalid
+    /// code into a user-actionable message. Pins one branch of the
+    /// matcher; the full matrix lives in the launcher's
+    /// `installer_engine::tests` which now exercises the same shared
+    /// helper via re-export.
+    #[test]
+    fn v0249_format_pull_token_error_401_license_invalid() {
+        let body = serde_json::json!({ "error": "license_invalid" });
+        let msg = format_pull_token_error(401, &body);
+        assert!(
+            msg.contains("license key is invalid"),
+            "expected license-invalid message, got: {}",
+            msg
+        );
+    }
+
+    /// v0.2.49: `format_pull_token_error` covers a generic 5xx with an
+    /// "unavailable / try again" message.
+    #[test]
+    fn v0249_format_pull_token_error_500_generic() {
+        let body = serde_json::json!({ "error": "internal", "detail": "db down" });
+        let msg = format_pull_token_error(500, &body);
+        assert!(
+            msg.contains("temporarily unavailable") || msg.contains("Try again"),
+            "expected unavailable / try-again message, got: {}",
+            msg
+        );
+    }
+
+    /// v0.2.49: `PullTokenResponse` deserialises the canonical JSON
+    /// shape the launcher's installer_engine produced pre-v0.2.49. Pins
+    /// wire compat across the move.
+    #[test]
+    fn v0249_pull_token_response_deserialises_v_canonical_shape() {
+        let raw = r#"{
+            "pull_token": "ghp_abcdef",
+            "username": "vct-bot-rl",
+            "expires_in_s": 900,
+            "tag": "0.2.8-cuda"
+        }"#;
+        let parsed: PullTokenResponse = serde_json::from_str(raw).expect("parse");
+        assert_eq!(parsed.pull_token, "ghp_abcdef");
+        assert_eq!(parsed.username.as_deref(), Some("vct-bot-rl"));
+        assert_eq!(parsed.expires_in_s, 900);
+        assert_eq!(parsed.tag.as_deref(), Some("0.2.8-cuda"));
+    }
+
+    /// v0.2.49: `PullTokenResponse` tolerates missing optional fields
+    /// (forward-compat with pre-v0.2.36 server shape that omitted
+    /// `username` + pre-v0.2.46 shape that omitted `tag`).
+    #[test]
+    fn v0249_pull_token_response_optional_fields_default() {
+        let raw = r#"{ "pull_token": "tok" }"#;
+        let parsed: PullTokenResponse = serde_json::from_str(raw).expect("parse minimal");
+        assert_eq!(parsed.pull_token, "tok");
+        assert!(parsed.username.is_none());
+        assert_eq!(parsed.expires_in_s, 0);
+        assert!(parsed.tag.is_none());
+    }
+
+    /// v0.2.49 wire-contract: `request_pull_token_http` is reachable
+    /// from this module's public API. A future refactor that renames
+    /// the function or changes its arity would break the assignment.
+    /// Type-level check only; never invoked.
+    #[allow(dead_code)]
+    fn _v0249_request_pull_token_http_signature_check() {
+        async fn _typecheck(
+            c: &crate::manifest::ContainerInstallBlock,
+            l: Option<&str>,
+            k: &str,
+            h: &str,
+        ) -> Result<PullTokenResponse, String> {
+            request_pull_token_http(c, l, k, h).await
+        }
+        let _ = _typecheck;
+    }
+
+    /// v0.2.49 wire-contract: `pre_pull_with_auth_for_start` is
+    /// reachable from this module's public API. Paired with the
+    /// hub-side test that asserts the same symbol is reachable from
+    /// the hub crate.
+    #[allow(dead_code)]
+    fn _v0249_pre_pull_with_auth_for_start_signature_check() {
+        async fn _typecheck(
+            m: &crate::manifest::ModuleManifest,
+            r: &str,
+            i: &str,
+        ) -> Result<(), String> {
+            pre_pull_with_auth_for_start(m, r, i).await
+        }
+        let _ = _typecheck;
     }
 }
