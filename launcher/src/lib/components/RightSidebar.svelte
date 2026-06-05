@@ -18,6 +18,7 @@
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import NotificationBell from '$lib/components/NotificationBell.svelte';
 
   // v0.2.43 (Fabio branch feat/launcher-logo-circular-white): brand
   // footer at the bottom of the right sidebar (logo + "VCT Launcher" +
@@ -282,6 +283,12 @@
 </script>
 
 <aside class="right-sidebar">
+  <!-- Error-notification bell. Always visible (independent of app
+       selection) so persisted error toasts are reachable from anywhere. -->
+  <div class="sidebar-bell-bar">
+    <NotificationBell />
+  </div>
+
   {#if selectedApp}
     <div class="sidebar-section">
       <div
@@ -448,6 +455,12 @@
 </aside>
 
 <style>
+  .sidebar-bell-bar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 10px 12px 0;
+  }
+
   .right-sidebar {
     width: 260px;
     flex-shrink: 0;
