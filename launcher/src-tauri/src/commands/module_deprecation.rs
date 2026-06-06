@@ -525,12 +525,23 @@ pub async fn poll_deprecations_once(app: &AppHandle) {
 
     let mut errors: Vec<String> = Vec::new();
 
-    for (project_id, module_id, _container) in &installs {
+    for (project_id_opt, module_id, _container) in &installs {
         // Modules not in the catalog are not deprecated by definition — skip
         // rather than applying false (avoids spurious "un-deprecate" events for
         // modules that have been removed from the catalog without a sunset).
         let entry = match catalog_map.get(module_id.as_str()) {
             Some(e) => e,
+            None => continue,
+        };
+
+        // v0.2.49 Stream A: deprecation polling is per-project. Global
+        // installs (project_id IS NULL) don't have a project to attribute
+        // the deprecation event to and don't have per-project deprecation
+        // seen-marks; skip them here. A future iteration could add a
+        // machine-wide deprecation surface; until then global modules
+        // surface deprecation via the L0 catalog UI only.
+        let project_id = match project_id_opt.as_deref() {
+            Some(p) => p,
             None => continue,
         };
 

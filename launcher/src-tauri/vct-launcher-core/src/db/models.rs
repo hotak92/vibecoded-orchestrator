@@ -114,7 +114,16 @@ impl ModuleStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleInstallRow {
     pub id: String,
-    pub project_id: String,
+    /// v0.2.49 Stream A: nullable to support `install.scope = "global"`.
+    /// `None` ⇒ global install (exactly one row per machine for this
+    /// module; per-project routing happens inside the container). `Some(_)`
+    /// ⇒ per-project install (the v0.2.20–v0.2.48 behaviour).
+    ///
+    /// The DB column was made nullable by migration 027 (Stream A,
+    /// v0.2.49). Backwards compat: pre-v0.2.49 callers that constructed
+    /// rows with `project_id: "some-uuid".into()` now need to use
+    /// `Some("some-uuid".into())`.
+    pub project_id: Option<String>,
     pub module_id: String,
     pub module_version: String,
     pub install_path: String,

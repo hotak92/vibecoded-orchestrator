@@ -1536,6 +1536,21 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 use tauri::Manager;
                 let db = rl_resume_handle.state::<crate::db::Db>();
+                // v0.2.49 Stream A: ALWAYS run the global auto-migration
+                // before the resume sweep. Idempotent — re-running after
+                // a successful migration is a no-op. Resolves manifests
+                // through `find_installed_manifest` so only modules with
+                // a post-install extract see the migration; modules
+                // without an extracted manifest stay untouched.
+                crate::commands::module_service::auto_migrate_per_project_to_global(
+                    &db,
+                    |module_id: &str| {
+                        crate::commands::modules::find_installed_manifest(&db, module_id)
+                            .ok()
+                            .map(|(m, _path)| m)
+                    },
+                )
+                .await;
                 crate::commands::module_service::resume_containers_on_startup(&db).await;
             });
             // Daily weights-update poll. license_reader closure returns

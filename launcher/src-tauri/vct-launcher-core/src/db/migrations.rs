@@ -148,6 +148,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "project_codegraph_extra_paths: read-only filesystem paths contributing entities to a project's codegraph (v0.2.47). Use case: index a sibling clone into the active project's codegraph without making it a launcher project. PRIMARY KEY (project_id, path); ON DELETE CASCADE on projects.id. Resolver field is additive; hooks query enabled rows by path-prefix. Plan: .claude/context/plans/v0.2.47-project-extra-codegraph-paths-2026-06-05.md.",
         sql: include_str!("migrations/026_project_codegraph_extra_paths.sql"),
     },
+    Migration {
+        version: 27,
+        description: "module_installs.project_id nullable + partial unique indexes for global-scope installs (v0.2.49 Stream A). NULL project_id == one install per machine, used by modules whose manifest declares install.scope = 'global' (vct-rl-reranker v0.2.10+). Pre-existing rows survive verbatim (the recreate-and-copy mirrors migration 013's pattern). Plan: .claude/context/plans/v0.2.49-global-install-per-project-routing-plan-2026-06-06.md.",
+        sql: include_str!("migrations/027_module_installs_nullable_project.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
@@ -667,5 +672,223 @@ mod tests {
         // are skipped via version check; but the SQL itself is also
         // IF EXISTS-guarded as a belt-and-braces measure).
         apply(&conn).expect("second apply (idempotent)");
+    }
+
+    // ─── v0.2.49 Stream A: migration 027 ─────────────────────────────────
+
+    /// On a fresh DB, migration 027 leaves `module_installs.project_id`
+    /// nullable and the partial unique indexes in place. An INSERT with
+    /// NULL project_id succeeds; a second INSERT with NULL project_id +
+    /// same module_id is rejected by the partial-global unique index.
+    #[test]
+    fn migration_027_accepts_null_project_id_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('g1', NULL, 'vct-rl-reranker', '0.2.10', '/path', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("global insert must succeed");
+
+        // Second insert with NULL project_id + same module_id must FAIL
+        // (the partial unique index `idx_mi_unique_global` enforces this).
+        let dup = conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('g2', NULL, 'vct-rl-reranker', '0.2.11', '/path2', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        );
+        assert!(
+            dup.is_err(),
+            "second global insert for same module_id must be rejected by partial unique index"
+        );
+    }
+
+    /// Migration 027 preserves all pre-existing per-project rows when
+    /// upgrading from version 26 (the post-add-project-codegraph-paths
+    /// schema).
+    #[test]
+    fn migration_027_preserves_existing_per_project_rows_on_upgrade() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 26).expect("apply up to v26");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed project");
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at, container_name)
+             VALUES ('mi1', 'p1', 'vct-rl-reranker', '0.2.7', '/x', 'installed', 1, ?1, 'reranker-p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed install row");
+
+        // Apply 027.
+        apply(&conn).expect("apply remaining");
+
+        // Row survives verbatim.
+        let (project_id, module_id, container_name): (Option<String>, String, Option<String>) =
+            conn.query_row(
+                "SELECT project_id, module_id, container_name FROM module_installs WHERE id = 'mi1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("read back");
+        assert_eq!(project_id.as_deref(), Some("p1"));
+        assert_eq!(module_id, "vct-rl-reranker");
+        assert_eq!(container_name.as_deref(), Some("reranker-p1"));
+    }
+
+    /// After migration 027 a per-project row + a global row for the SAME
+    /// module_id can coexist (the partial unique indexes allow this).
+    #[test]
+    fn migration_027_allows_per_project_and_global_rows_for_same_module() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed project");
+        // Per-project row.
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('pp', 'p1', 'mod-x', '0.1.0', '/pp', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("per-project insert");
+        // Global row.
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('g', NULL, 'mod-x', '0.2.0', '/g', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("global insert");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM module_installs WHERE module_id = 'mod-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "both rows coexist");
+    }
+
+    /// Per-project UNIQUE(project_id, module_id) is still enforced after
+    /// migration 027 (the partial index `idx_mi_unique_per_project`
+    /// preserves the constraint for non-NULL project_id).
+    #[test]
+    fn migration_027_per_project_unique_constraint_still_holds() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed");
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('pp1', 'p1', 'mod-x', '0.1.0', '/pp1', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("first");
+        let dup = conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('pp2', 'p1', 'mod-x', '0.1.0', '/pp2', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate (project_id, module_id) pair must be rejected"
+        );
+    }
+
+    /// Migration 027 is idempotent — running `apply()` twice on a fresh
+    /// DB is a no-op the second time.
+    #[test]
+    fn migration_027_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
+    }
+
+    /// ON DELETE CASCADE still removes per-project rows when the parent
+    /// project is deleted — the FK relationship was preserved through
+    /// the table recreate-and-copy.
+    #[test]
+    fn migration_027_fk_cascade_still_works_for_per_project_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed project");
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('pp', 'p1', 'mod-x', '0.1.0', '/pp', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("pp insert");
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('g', NULL, 'mod-y', '0.1.0', '/g', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("global insert");
+
+        conn.execute("DELETE FROM projects WHERE id = 'p1'", [])
+            .expect("delete project");
+
+        let pp_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM module_installs WHERE project_id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pp_remaining, 0, "per-project rows cascade-deleted");
+
+        let global_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM module_installs WHERE project_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            global_remaining, 1,
+            "global rows untouched by per-project delete"
+        );
     }
 }

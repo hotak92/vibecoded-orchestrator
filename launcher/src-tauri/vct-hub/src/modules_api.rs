@@ -141,7 +141,9 @@ struct StatusQuery {
 
 #[derive(Debug, Serialize)]
 struct InstalledRowView {
-    project_id: String,
+    /// v0.2.49 Stream A: nullable to expose global installs to GUI.
+    /// `None` ⇒ global install (one row per machine).
+    project_id: Option<String>,
     module_id: String,
     module_version: String,
     status: String,
