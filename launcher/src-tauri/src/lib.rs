@@ -2045,6 +2045,13 @@ pub fn run() {
             commands::diagrams_cmd::seed_project_mcp_tool_grants,
             commands::diagrams_cmd::set_project_module_enabled,
             commands::diagrams_cmd::list_project_modules,
+            // v0.2.49 Stream B: per-project enable toggle for global-
+            // scope modules. The Svelte renderer calls
+            // `module_set_enabled_for_project` from the per-project
+            // Modules panel; `module_is_enabled_for_project` hydrates
+            // the toggle UI on mount. See `module_enabled.rs`.
+            commands::module_enabled::module_set_enabled_for_project,
+            commands::module_enabled::module_is_enabled_for_project,
             // Phase 1.5.7 wire-up: DiagramsTab calls
             // `is_project_module_active` on mount to decide whether to
             // render the diagrams UI or the "module disabled" overlay.
