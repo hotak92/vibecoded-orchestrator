@@ -86,6 +86,11 @@ pub mod module_db;
 pub mod module_default_weights;
 pub mod module_deprecation;
 pub mod module_dispatch;
+// v0.2.49 Stream B: per-project enable toggle for global-scope modules.
+// Closes the gap where `vct-rl-reranker`-shape modules (one install on
+// the host, visible across every project) had no way to be silenced
+// per-project. See `module_enabled.rs` for the full design notes.
+pub mod module_enabled;
 pub mod module_gui;
 // v0.2.33 Agent C (L0b): post-install manifest extraction +
 // startup reconciler. `module_manifest_extract` runs after

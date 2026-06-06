@@ -402,6 +402,26 @@ class ProjectConfig:
     #: the hub binary is updated. Empty tuple is also the natural
     #: default for projects that haven't configured any extras yet.
     code_graph_extra_paths: tuple[ExtraCodegraphPath, ...] = ()
+    #: v0.2.49 Stream B — per-project enable toggle for the RL Reranker
+    #: (a global-scope module). Source: hub reads
+    #: ``module_settings(project_id, "vct-rl-reranker", "enabled_for_project")``
+    #: and exposes the resolved bool here. Default ``True`` when no row
+    #: exists (fail-open: a corrupted setting never silently disables
+    #: a module the user expects to work).
+    #:
+    #: Consumer: ``claude_mcp_servers/weaviate_mcp/server.py::
+    #: _rl_cache_and_rerank`` reads this and short-circuits the rerank
+    #: request when ``False`` — search returns base cosine order
+    #: instead. The server-side telemetry path
+    #: (``/data/logs/rl_events_<slug>.jsonl``) is untouched: that file
+    #: is written by the RL container itself, not by the MCP, so
+    #: disabling the client gate cannot drop training events.
+    #:
+    #: Pre-v0.2.49 hubs paired with v0.2.49+ clients omit the field;
+    #: the parser back-fills with ``True`` so old hubs don't crash new
+    #: clients. Declared last to keep frozen-dataclass init signature
+    #: backward-compat.
+    rl_reranker_enabled_for_project: bool = True
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -892,6 +912,15 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             # full list and decide per-call whether to filter further.
             code_graph_extra_paths=_parse_extra_codegraph_paths(
                 body.get("code_graph_extra_paths", []),
+            ),
+            # v0.2.49 Stream B additive field — pre-v0.2.49 hubs omit it;
+            # default ``True`` matches the hub-side fail-open default
+            # (`Db::module_is_enabled_for_project` returns true on absent
+            # row) and the launcher GUI's "no opinion = enabled" UX. Old
+            # hubs paired with new clients see the default; new hubs
+            # paired with old clients have the field silently ignored.
+            rl_reranker_enabled_for_project=bool(
+                body.get("rl_reranker_enabled_for_project", True)
             ),
         )
     except (KeyError, TypeError, ValueError) as exc:

@@ -1568,6 +1568,27 @@ pub async fn install_module_for_project(
             // (defaults can be reconciled again on next install/update).
             reconcile_module_tool_allowlist(&manifest, &module_id, &db);
 
+            // v0.2.49 Stream B: when a global-scope module finishes
+            // installing, seed `enabled=true` rows in `module_settings`
+            // for every existing project so the module is on by default
+            // across the host. The seeding loop is a no-op for
+            // per-project-scope modules (the legacy default) — the
+            // helper short-circuits via `install_scope_is_global()`.
+            //
+            // Soft-fail throughout: the helper logs per-row failures
+            // and returns the success count. We audit the count for
+            // forensic trace.
+            if manifest.install_scope_is_global() {
+                let seeded = crate::commands::module_enabled
+                    ::seed_enabled_rows_for_new_global_module(&db, &manifest, &module_id);
+                let _ = db.audit(
+                    "module_global_enable_seeded_on_install",
+                    Some(&project_id),
+                    Some(&module_id),
+                    &serde_json::json!({ "projects_seeded": seeded }),
+                );
+            }
+
             // v0.2.43 V0243-17: post-install assertion — if the manifest
             // declares mcp_registration.tool_allowlist, at least 1 row
             // MUST be present in module_mcp_tool_defaults after reconcile.
@@ -2268,6 +2289,16 @@ pub async fn uninstall_module_v2(
             module_id, e
         );
     }
+    // v0.2.49 Stream B: drop every per-project `enabled_for_project`
+    // row for this module so a future reinstall starts clean (no stale
+    // `false` lingering for a project that disabled the module). We
+    // call this unconditionally — the helper short-circuits to 0 deletes
+    // when the module had no rows (project-scope modules don't get the
+    // toggle), so there's no need to gate on `install_scope_is_global()`
+    // here. Idempotent and safe even when the manifest is missing (which
+    // is why `clear_module_settings` above already runs unconditionally).
+    let cleared_enable_rows = crate::commands::module_enabled
+        ::clear_enabled_rows_for_uninstalled_module(&db, &module_id);
     db.audit(
         "module_uninstall",
         Some(&project_id),
@@ -2279,6 +2310,7 @@ pub async fn uninstall_module_v2(
             "deregister_mcp": uninstall_block.deregister_mcp,
             "clear_secrets": uninstall_block.clear_secrets,
             "manifest_found": manifest_opt.is_some(),
+            "cleared_enabled_for_project_rows": cleared_enable_rows,
         }),
     )?;
     Ok(())

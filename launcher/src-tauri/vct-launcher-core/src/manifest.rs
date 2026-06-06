@@ -2024,6 +2024,51 @@ impl ModuleManifest {
         self.compatibility.hosts.iter().any(|h| h == host)
     }
 
+    /// v0.2.49 Stream B — install scope detection.
+    ///
+    /// Returns `true` when this module is installed at GLOBAL scope (one
+    /// install on the host, shared/visible across every project) and
+    /// `false` when it is installed at PER-PROJECT scope (the legacy
+    /// default — one install row per `(project_id, module_id)` pair).
+    ///
+    /// The canonical source-of-truth for this distinction is the
+    /// `install.scope` field added by Stream A. While Stream A's field
+    /// is landing in parallel, this helper falls back to a conservative
+    /// default of "per-project" (returns `false`) when the field isn't
+    /// present yet. Once Stream A merges, the body of this helper should
+    /// read `matches!(self.install.scope, Some(InstallScope::Global))`
+    /// (or whatever exact spelling Stream A chooses) — the call sites
+    /// in `module_enabled.rs`, `projects_v2.rs`, and `modules.rs` that
+    /// branch on it do NOT need to change.
+    ///
+    /// Forward-compat note: callers should treat the answer as "the
+    /// best-effort scope at the time of the call". A manifest authored
+    /// today without `install.scope` and a manifest authored tomorrow
+    /// with `install.scope: per_project` both return `false`; that's
+    /// the right answer in both cases. Only an EXPLICIT global declaration
+    /// flips this to `true` — there is no scenario where the seeding
+    /// logic should treat an absent scope as global.
+    pub fn install_scope_is_global(&self) -> bool {
+        // TODO(stream-a): replace this body with the real scope read
+        // once `install.scope` lands. Suggested integration:
+        //
+        //     use InstallScope::Global;
+        //     matches!(self.install.scope, Some(Global))
+        //
+        // Until then, the conservative default of `false` (per-project)
+        // preserves pre-v0.2.49 behaviour — no module is treated as
+        // global until it explicitly declares so.
+        //
+        // Defensive fallback: even if the field arrives in some form
+        // we don't expect, falling back to `false` means the install /
+        // uninstall / create_project_v2 hooks just skip the
+        // global-scope seeding step. The user still gets a working
+        // module; only the multi-project enable rows are absent. They
+        // can be backfilled idempotently on the next install or via
+        // a launcher-init hook.
+        false
+    }
+
     /// NEW-3.D (2026-05-28): validate that a `service`/`container` runtime
     /// module has the fields needed for the launcher's container start path.
     /// Returns a Vec of [`ManifestWarning`]s (empty = fully valid).

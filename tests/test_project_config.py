@@ -311,6 +311,40 @@ class ResolveHappyPathTest(_ResolverTestBase):
         self.assertEqual(cfg.shared_kg_collection, "")
         self.assertEqual(cfg.development_collection, "")
 
+    def test_rl_reranker_enabled_for_project_defaults_true_when_field_absent(
+        self,
+    ) -> None:
+        """v0.2.49 Stream B back-compat: pre-v0.2.49 hubs omit the
+        field; new clients must back-fill with ``True`` (fail-open).
+        Without this, every project paired with an old hub would
+        silently lose its RL reranker.
+        """
+        # Use the canonical FULL_BODY but explicitly remove the new
+        # field to simulate the pre-v0.2.49 hub.
+        body = {k: v for k, v in FULL_BODY.items() if k != "rl_reranker_enabled_for_project"}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertTrue(cfg.rl_reranker_enabled_for_project)
+
+    def test_rl_reranker_enabled_for_project_parses_explicit_false(self) -> None:
+        """Explicit ``False`` from a v0.2.49+ hub flows through to the
+        ProjectConfig dataclass unchanged. Pins the per-project disable
+        contract between the hub and the MCP gate.
+        """
+        body = {**FULL_BODY, "rl_reranker_enabled_for_project": False}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertFalse(cfg.rl_reranker_enabled_for_project)
+
+    def test_rl_reranker_enabled_for_project_parses_explicit_true(self) -> None:
+        """Explicit ``True`` round-trips. Sanity that the back-fill
+        default doesn't quietly override an explicit ``True``.
+        """
+        body = {**FULL_BODY, "rl_reranker_enabled_for_project": True}
+        self.session.get.return_value = _make_response(200, body)
+        cfg = resolve(FULL_BODY["project_id"])
+        self.assertTrue(cfg.rl_reranker_enabled_for_project)
+
 
 # ─── Error mapping ──────────────────────────────────────────────────────
 

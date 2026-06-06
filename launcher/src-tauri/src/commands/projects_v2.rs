@@ -531,6 +531,29 @@ pub async fn create_project_v2(
         }
     }
 
+    // v0.2.49 Stream B: seed `enabled_for_project=true` rows for every
+    // global-scope module already installed on the host. Without this,
+    // a brand-new project would default to "no opinion" for each global
+    // module (which still reads as enabled — see the DB-layer
+    // fail-open) but the renderer wouldn't have a row to display a
+    // toggle against. Seeding writes an explicit row so the GUI's
+    // per-project Modules panel knows which global modules to surface.
+    //
+    // Soft-fail throughout: `seed_enabled_rows_for_new_project` logs
+    // per-module failures and returns the success count. We audit the
+    // count for forensic trace and continue regardless. Mirrors the
+    // soft-fail pattern of `set_project_module_enabled` below.
+    let global_modules_seeded = crate::commands::module_enabled
+        ::seed_enabled_rows_for_new_project(&db, &row.id);
+    if global_modules_seeded > 0 {
+        let _ = db.audit(
+            "project_global_module_enable_seeded",
+            Some(&row.id),
+            None,
+            &serde_json::json!({ "modules_seeded": global_modules_seeded }),
+        );
+    }
+
     // Phase 1.1 (diagrams): seed the project-modules row for `diagrams`
     // so the (Phase 1.5.7) conditional CLAUDE.md template renderer sees
     // the module as active by default. The plan is opt-out — the user

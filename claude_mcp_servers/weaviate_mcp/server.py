@@ -4278,6 +4278,42 @@ async def _rl_cache_and_rerank(
         # VCThelpers not available (pure free install) → free tier behavior.
         _rl_enabled = False
 
+    # v0.2.49 Stream B — per-project enable toggle. After the tier
+    # check, consult the hub-resolved
+    # `rl_reranker_enabled_for_project` flag: when the user has
+    # explicitly disabled the RL reranker for THIS project (via the
+    # launcher GUI's per-project Modules panel), skip the rerank
+    # request even when the license tier would permit it. The
+    # server-side telemetry path is unaffected — the RL container's
+    # local JSONL writer still records every retrieval event the
+    # container observes (which, with this gate ON, is none from this
+    # project). Reads through `_try_resolve_project_config` so the
+    # hub-down branch falls open (enabled): never silently disable a
+    # paying user's reranker because the hub crashed mid-session.
+    if _rl_enabled:
+        try:
+            _pc = _try_resolve_project_config()
+            if _pc is not None and not getattr(
+                _pc, "rl_reranker_enabled_for_project", True
+            ):
+                logger.debug(
+                    "RL retrieval gated off for this project (per-project "
+                    "enable toggle is OFF) — using Weaviate order"
+                )
+                _rl_enabled = False
+        except Exception as exc:
+            # Conservative: log + leave _rl_enabled untouched. The
+            # hub-down branch ALREADY falls open via the None return
+            # path above; only an exception in the getattr/path could
+            # land here. Mirrors the rest of the resolver call sites
+            # in this file (silent fall-through to env-fallback / safe
+            # default).
+            logger.debug(
+                "RL per-project enable resolver raised (%s); leaving "
+                "gate at tier-decision value",
+                exc,
+            )
+
     # Rerank gate: Pro/MAO tier with at least one node → spawn monitor
     # + call RL server. Free tier OR empty all_nodes → skip rerank but
     # STILL fall through to the telemetry block below so the offline
