@@ -18,7 +18,7 @@
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
   import { modules } from '$lib/stores/modules';
-  import { moduleActionForKind } from '$lib/module-status-display';
+  import { moduleActionForKind, detectModuleErrorAfterAction } from '$lib/module-status-display';
   import Dropdown from '$lib/components/Dropdown.svelte';
 
   // v0.2.43 (Fabio branch feat/launcher-logo-circular-white): brand
@@ -215,17 +215,48 @@
       return;
     }
     moduleRepairBusy = true;
+    const toastKey = `module:${selectedApp.id}:${moduleRepairAction.method}`;
+    console.info('[right-rail] module repair start', {
+      module: selectedApp.id,
+      method: moduleRepairAction.method,
+      project: project.id,
+    });
     try {
-      if (moduleRepairAction.method === 'install') {
-        await modules.install(project.id, selectedApp.id);
-        toast.success(`${selectedApp.name} reinstalled`);
-      } else {
-        await modules.update(project.id, selectedApp.id);
-        toast.success(`${selectedApp.name} updated`);
-      }
+      const row =
+        moduleRepairAction.method === 'install'
+          ? await modules.install(project.id, selectedApp.id)
+          : await modules.update(project.id, selectedApp.id);
+
+      // Same caveat as the Home handler: the command resolves even when the
+      // container start failed, but the resolved row can be misleadingly
+      // clean (status='installed', last_error=null) — the real failure only
+      // surfaces once the catalog recomputes `kind` to 'error'/'broken'
+      // (verified via live test 2026-06-06). Reload both surfaces and
+      // inspect them together (see detectModuleErrorAfterAction).
       await modules.loadCatalog();
+      await modules.loadInstalled(project.id);
+      console.info('[right-rail] module repair returned row', {
+        module: selectedApp.id,
+        status: row?.status,
+        last_error: row?.last_error,
+        container_name: row?.container_name,
+      });
+      const errMsg = detectModuleErrorAfterAction(
+        selectedApp.id,
+        $modules.catalog,
+        $modules.installed,
+      );
+      if (errMsg) {
+        toast.error(`${selectedApp.name}: ${errMsg}`, { key: toastKey });
+      } else {
+        toast.success(
+          `${selectedApp.name} ${moduleRepairAction.method === 'install' ? 'reinstalled' : 'updated'}`,
+          { key: toastKey },
+        );
+      }
     } catch (e) {
-      toast.error(e);
+      console.error('[right-rail] module repair threw', { module: selectedApp.id, e });
+      toast.error(e, { key: toastKey });
     } finally {
       moduleRepairBusy = false;
     }

@@ -19,6 +19,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   LAST_ERROR_TRUNCATE_BUDGET,
+  detectModuleErrorAfterAction,
   moduleActionForKind,
   resolveTileDisplay,
   semverLess,
@@ -319,5 +320,47 @@ describe('moduleActionForKind', () => {
     expect(moduleActionForKind(null)).toBeNull();
     expect(moduleActionForKind(undefined)).toBeNull();
     expect(moduleActionForKind('totally-unknown')).toBeNull();
+  });
+});
+
+describe('detectModuleErrorAfterAction', () => {
+  const ID = 'vct-rl-reranker';
+
+  it('detects error from catalog kind even when the row is misleadingly clean', () => {
+    // The live-test case (2026-06-06): install resolves with a clean row
+    // (status='installed', last_error=null) but the catalog kind is 'error'.
+    const catalog = [{ id: ID, kind: 'error' }];
+    const installed = [{ module_id: ID, last_error: null, status: 'installed' }];
+    const msg = detectModuleErrorAfterAction(ID, catalog, installed);
+    expect(msg).not.toBeNull();
+    expect(msg).toContain('error');
+  });
+
+  it('prefers the row last_error message when present', () => {
+    const catalog = [{ id: ID, kind: 'error' }];
+    const installed = [
+      { module_id: ID, last_error: 'docker run failed (exit 125): unauthorized', status: 'error' },
+    ];
+    expect(detectModuleErrorAfterAction(ID, catalog, installed)).toBe(
+      'docker run failed (exit 125): unauthorized',
+    );
+  });
+
+  it('detects broken kind', () => {
+    const catalog = [{ id: ID, kind: 'broken' }];
+    const installed = [{ module_id: ID, last_error: null }];
+    expect(detectModuleErrorAfterAction(ID, catalog, installed)).not.toBeNull();
+  });
+
+  it('returns null on a genuine success (kind installed, no last_error)', () => {
+    const catalog = [{ id: ID, kind: 'installed' }];
+    const installed = [{ module_id: ID, last_error: null, status: 'installed' }];
+    expect(detectModuleErrorAfterAction(ID, catalog, installed)).toBeNull();
+  });
+
+  it('detects error from the row even when the catalog entry is missing', () => {
+    const catalog: Array<{ id: string; kind: string }> = [];
+    const installed = [{ module_id: ID, last_error: 'boom', status: 'error' }];
+    expect(detectModuleErrorAfterAction(ID, catalog, installed)).toBe('boom');
   });
 });
