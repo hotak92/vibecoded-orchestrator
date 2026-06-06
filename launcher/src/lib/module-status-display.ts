@@ -261,3 +261,40 @@ export function moduleActionForKind(
       return null;
   }
 }
+
+/**
+ * Detect whether a just-attempted install/update actually failed.
+ *
+ * Why this exists (2026-06-06, found via live test): the backend
+ * `install_module_for_project` / `update_module_for_project` commands
+ * resolve with a row whose `status` is still `'installed'` and
+ * `last_error` is `null` even when the container START failed afterwards
+ * (e.g. RL reranker: docker run exit 125, unauthorized). The real error
+ * only materialises one tick later, when `loadCatalog()` recomputes the
+ * catalog entry's `kind` to `'error'`/`'broken'`. So inspecting the
+ * resolved row alone (the previous fix) misses the failure on Windows/
+ * Docker — the row is clean. Callers must instead RELOAD the catalog and
+ * pass the fresh entries here.
+ *
+ * @param moduleId       the module that was just installed/updated
+ * @param catalog        the freshly reloaded catalog entries (after loadCatalog)
+ * @param installedRows  the freshly reloaded installed rows (carry last_error)
+ * @returns a human-readable error message if the module ended up in an
+ *          error/broken state, otherwise `null` (success).
+ */
+export function detectModuleErrorAfterAction(
+  moduleId: string,
+  catalog: ReadonlyArray<{ id: string; kind: string }>,
+  installedRows: ReadonlyArray<{ module_id: string; last_error: string | null; status?: string }>,
+): string | null {
+  const entry = catalog.find((m) => m.id === moduleId);
+  const row = installedRows.find((r) => r.module_id === moduleId);
+  const kindIsError = entry?.kind === 'error' || entry?.kind === 'broken';
+  const rowIsError =
+    row?.status === 'error' || row?.status === 'broken' || !!row?.last_error;
+  if (!kindIsError && !rowIsError) return null;
+  return (
+    row?.last_error ??
+    `install did not complete (status: ${entry?.kind ?? row?.status ?? 'unknown'})`
+  );
+}

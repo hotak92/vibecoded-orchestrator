@@ -22,7 +22,7 @@
   import { ui } from '$lib/stores/ui';
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
-  import { moduleActionForKind } from '$lib/module-status-display';
+  import { moduleActionForKind, detectModuleErrorAfterAction } from '$lib/module-status-display';
   import type { ModuleCatalogEntry } from '$lib/types/launcher';
 
   onMount(() => {
@@ -160,17 +160,51 @@
       return;
     }
     cardActionBusyId = c.entry.id;
+    // Toast key for the bell inbox: an error and a later success for the
+    // SAME module action cancel out (auto-resolve).
+    const toastKey = `module:${c.entry.id}:${action.method}`;
+    console.info('[home] module action start', {
+      module: c.entry.id,
+      method: action.method,
+      project: project.id,
+    });
     try {
-      if (action.method === 'install') {
-        await modules.install(project.id, c.entry.id);
-        toast.success(`${c.entry.name} reinstalled`);
-      } else {
-        await modules.update(project.id, c.entry.id);
-        toast.success(`${c.entry.name} updated`);
-      }
+      const row =
+        action.method === 'install'
+          ? await modules.install(project.id, c.entry.id)
+          : await modules.update(project.id, c.entry.id);
+
+      // CRITICAL: install_module_for_project / update_module_for_project
+      // resolve even when the CONTAINER START failed — but the resolved row
+      // can be misleadingly clean (status='installed', last_error=null);
+      // the real failure only surfaces once the catalog recomputes `kind`
+      // to 'error'/'broken' (verified via live test 2026-06-06, RL docker
+      // exit 125). So reload BOTH surfaces and inspect them together rather
+      // than trusting the immediate row (see detectModuleErrorAfterAction).
       await modules.loadCatalog();
+      await modules.loadInstalled(project.id);
+      console.info('[home] module action returned row', {
+        module: c.entry.id,
+        status: row?.status,
+        last_error: row?.last_error,
+        container_name: row?.container_name,
+      });
+      const errMsg = detectModuleErrorAfterAction(
+        c.entry.id,
+        $modules.catalog,
+        $modules.installed,
+      );
+      if (errMsg) {
+        toast.error(`${c.entry.name}: ${errMsg}`, { key: toastKey });
+      } else {
+        toast.success(
+          `${c.entry.name} ${action.method === 'install' ? 'reinstalled' : 'updated'}`,
+          { key: toastKey },
+        );
+      }
     } catch (err) {
-      toast.error(err);
+      console.error('[home] module action threw', { module: c.entry.id, err });
+      toast.error(err, { key: toastKey });
     } finally {
       cardActionBusyId = null;
     }

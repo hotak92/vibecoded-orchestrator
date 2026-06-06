@@ -38,6 +38,7 @@
     resolveTileDisplay,
     truncateLastError,
     statusBadgeLabel,
+    detectModuleErrorAfterAction,
   } from '$lib/module-status-display';
   // v0.2.35 Agent M (2026-05-26): preflight modal shown when the
   // install-pipeline preflight (`check_container_runtime_available`)
@@ -335,8 +336,23 @@
   // without re-triggering the runtime preflight (we just confirmed it).
   async function runInstall(m: ModuleCatalogEntry) {
     if (!project) return;
+    // Shared dedup/auto-resolve key with the bell inbox: a later success
+    // for the same module action clears the stored error.
+    const toastKey = `module:${m.id}:install`;
     try {
       await modules.install(project.id, m.id);
+      // The resolved row can be misleadingly clean (status='installed',
+      // last_error=null) even when the container START failed — the real
+      // failure only surfaces after the catalog recomputes `kind`. Reload
+      // both surfaces, then inspect (see detectModuleErrorAfterAction).
+      await modules.loadCatalog();
+      await modules.loadInstalled(project.id);
+      const errMsg = detectModuleErrorAfterAction(m.id, $modules.catalog, $modules.installed);
+      if (errMsg) {
+        toast.error(`${m.name}: ${errMsg}`, { key: toastKey });
+      } else {
+        toast.success(`${m.name} installed`, { key: toastKey });
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // If the error looks like a missing-secret error from the Rust side,
@@ -344,7 +360,7 @@
       if (msg.toLowerCase().includes('secret') || msg.toLowerCase().includes('keychain')) {
         openSecretsPrompt = m;
       } else {
-        alert(`Install failed: ${msg}`);
+        toast.error(`Install failed: ${msg}`, { key: toastKey });
       }
     }
   }
@@ -387,11 +403,22 @@
       alert('Select a project from the menu bar first.');
       return;
     }
+    const toastKey = `module:${m.id}:update`;
     try {
       await modules.update(project.id, m.id);
+      // Same caveat as runInstall: re-read catalog + installed and inspect
+      // the recomputed kind — the resolved row can be misleadingly clean.
+      await modules.loadCatalog();
+      await modules.loadInstalled(project.id);
+      const errMsg = detectModuleErrorAfterAction(m.id, $modules.catalog, $modules.installed);
+      if (errMsg) {
+        toast.error(`${m.name}: ${errMsg}`, { key: toastKey });
+      } else {
+        toast.success(`${m.name} updated`, { key: toastKey });
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      alert(`Update failed: ${msg}`);
+      toast.error(`Update failed: ${msg}`, { key: toastKey });
     }
   }
 
