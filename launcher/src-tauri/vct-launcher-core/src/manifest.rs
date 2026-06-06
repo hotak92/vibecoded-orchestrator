@@ -1702,16 +1702,31 @@ impl RuntimeBlock {
     ///   `resolve_image_ref` on the resulting template string instead; here
     ///   we synthesize the canonical template that the free function handles)
     ///
-    /// Concretely: when `tag_from_version` is true we return
-    /// `"{install.container.image}:{version}"` filled with the actual
-    /// version; when false we return the template
-    /// `"{install.container.image}:{install.container.tag}"` so the
-    /// caller's existing `resolve_image_ref` free function can substitute
-    /// the tag from `install.r#ref`.
+    /// v0.2.49: ALWAYS returns the canonical template form (NOT a
+    /// pre-rendered string) when `runtime.image_ref` is unset.
+    ///
+    /// Pre-v0.2.49 fast-path returned `"{image}:{version}"` directly
+    /// when `tag_from_version == true` — "avoiding a second round-trip
+    /// through the template substitution path". That shortcut SILENTLY
+    /// BYPASSED the variant-suffix resolution in the free-function
+    /// `resolve_image_ref`: the free function's `.replace()` against
+    /// the `{install.container.tag}` placeholder is a no-op on a
+    /// pre-rendered string, so the GPU mode never gets applied to the
+    /// tag. Result on the start path: container starts with bare
+    /// `:0.2.9` instead of `:0.2.9-cuda`, podman tries to fetch a tag
+    /// that doesn't exist on private GHCR, "manifest unknown" exit 125.
+    ///
+    /// The install path got lucky because it has its own variant
+    /// dispatch (`decide_variant_to_pull` calls `probe + fallback`),
+    /// which papered over the shortcut. The start path doesn't, so it
+    /// hit the bare-tag bug end-to-end.
+    ///
+    /// Fix: always return the template form so the free function gets
+    /// to apply both placeholders AND the variant suffix.
     pub fn resolve_image_ref(
         &self,
-        container_install: &ContainerInstallBlock,
-        module_version: &str,
+        _container_install: &ContainerInstallBlock,
+        _module_version: &str,
     ) -> String {
         // NEW-3.B (2026-05-28): use declared value when non-empty.
         if let Some(t) = self.image_ref.as_deref() {
@@ -1719,19 +1734,14 @@ impl RuntimeBlock {
                 return t.to_string();
             }
         }
-        // Synthesize: produce the canonical template that resolve_image_ref
-        // (the free function) already knows how to substitute.
-        if container_install.tag_from_version {
-            // Embed the version directly — avoids a second round-trip through
-            // the template substitution path.
-            format!("{}:{}", container_install.image, module_version)
-        } else {
-            // Return the standard template; the free function will substitute
-            // {install.container.tag} from install.r#ref or "latest".
-            format!(
-                "{{install.container.image}}:{{install.container.tag}}"
-            )
-        }
+        // v0.2.49: canonical template form. The free function
+        // `vct_launcher_core::services::container_runtime::resolve_image_ref`
+        // substitutes `{install.container.image}` from
+        // `container_install.image` and `{install.container.tag}` from
+        // either `manifest.version` (`tag_from_version=true`) or
+        // `install.r#ref`/`"latest"` (`tag_from_version=false`), then
+        // applies the GPU variant suffix from `gpu_image_variants`.
+        "{install.container.image}:{install.container.tag}".to_string()
     }
 }
 
