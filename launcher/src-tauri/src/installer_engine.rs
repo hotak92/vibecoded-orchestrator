@@ -940,9 +940,9 @@ pub(crate) async fn probe_image_tag_exists(
     probe_image_tag_exists_with_authfile(image, tag, runtime, None).await
 }
 
-/// v0.2.47: probe variant that accepts either a podman-style `--authfile`
-/// path OR a docker-style `DOCKER_CONFIG=<dir>` env. Routes to whichever
-/// the runtime supports.
+/// v0.2.47: probe variant that accepts either a podman-style auth path
+/// OR a docker-style `DOCKER_CONFIG=<dir>` env. Routes to whichever the
+/// runtime supports.
 ///
 /// Why a separate helper from `probe_image_tag_exists_with_authfile`:
 /// the existing podman-path helper is still called from a `#[ignore]`d
@@ -952,6 +952,19 @@ pub(crate) async fn probe_image_tag_exists(
 /// gets the same per-pull auth scoping podman does (otherwise docker
 /// would silently fall back to anonymous + 401 on private GHCR repos —
 /// the exact bug v0.2.47 closes on the supervisor side).
+///
+/// v0.2.49: switched the podman branch from `cmd.arg("--authfile").arg(path)`
+/// (argv flag, position-sensitive) to `cmd.env("REGISTRY_AUTH_FILE", path)`
+/// (env var, position-independent). Same root cause as the original
+/// `PerPullAuth::apply_to` bug closed by `b4830e04`: `--authfile` is
+/// SUBCOMMAND-scoped on podman 4.x (`podman manifest inspect --authfile X
+/// image` works; `podman --authfile X manifest inspect image` returns
+/// "unknown flag: --authfile" exit 125). Adding the arg before
+/// `.args(["manifest", "inspect", ...])` put it in the broken
+/// global-flag position. The probe always errored on private images,
+/// silently degrading `decide_variant_to_pull` to "blind-pull legacy
+/// behaviour" → the fallback-to-alternate-variant mechanism NEVER ran
+/// for ROCm/Metal hosts whose primary variant wasn't on the registry.
 pub(crate) async fn probe_image_tag_exists_with_auth_context(
     image: &str,
     tag: &str,
@@ -962,7 +975,12 @@ pub(crate) async fn probe_image_tag_exists_with_auth_context(
     let image_ref = format!("{}:{}", image, tag);
     let mut cmd = Command::new(runtime).silent();
     if let Some(path) = authfile {
-        cmd.arg("--authfile").arg(path);
+        // v0.2.49: env-var sibling of --authfile (per podman release notes
+        // since 1.3). Position-independent, so safe to set before
+        // .args([...]). The previous `cmd.arg("--authfile").arg(path)`
+        // produced the broken `podman --authfile X manifest inspect Y`
+        // argv shape that podman 4.x rejects.
+        cmd.env("REGISTRY_AUTH_FILE", path);
     }
     if let Some(dir) = docker_config_dir {
         cmd.env("DOCKER_CONFIG", dir);
@@ -987,6 +1005,19 @@ pub(crate) async fn probe_image_tag_exists_with_auth_context(
 /// Replaces the previous `podman login` + `podman logout` global-state
 /// dance with a per-pull authfile — avoids cross-module session collision
 /// when multiple paid modules pull concurrently.
+///
+/// v0.2.49: switched the auth-attachment from `cmd.arg("--authfile").arg(path)`
+/// (argv flag, position-sensitive) to `cmd.env("REGISTRY_AUTH_FILE", path)`
+/// (env var, position-independent). Same root cause as the original
+/// `PerPullAuth::apply_to` bug closed by `b4830e04`. Pre-v0.2.49 comment
+/// at this site WRONGLY asserted that `--authfile` is parsed as a global
+/// flag — it is in fact SUBCOMMAND-scoped on podman 4.x. The
+/// `podman --authfile X manifest inspect Y` shape is rejected with
+/// "unknown flag: --authfile" exit 125. The REGISTRY_AUTH_FILE env var
+/// is the position-independent equivalent (per podman release notes
+/// since 1.3) and the docker `--authfile` parsing differs anyway —
+/// this path-only flavour is retained only for the `#[ignore]`d
+/// integration test that exercises a public unauthenticated image.
 pub(crate) async fn probe_image_tag_exists_with_authfile(
     image: &str,
     tag: &str,
@@ -995,14 +1026,14 @@ pub(crate) async fn probe_image_tag_exists_with_authfile(
 ) -> Result<bool, String> {
     let image_ref = format!("{}:{}", image, tag);
     // `silent()` consumes the Command; apply it first, then mutate via
-    // &mut for the conditional --authfile flag.
+    // &mut for the conditional env attachment.
     let mut cmd = Command::new(runtime).silent();
     if let Some(path) = authfile {
-        // `--authfile <path>` is supported by both podman (since the
-        // skopeo unification) and docker (since v23+). Passed BEFORE the
-        // subcommand so it's parsed as a global flag, mirroring how
-        // `podman pull --authfile` is invoked below.
-        cmd.arg("--authfile").arg(path);
+        // v0.2.49: env-var sibling of --authfile (position-independent).
+        // Replaces the broken `cmd.arg("--authfile").arg(path)` that
+        // produced argv shape `podman --authfile X manifest inspect Y`
+        // — rejected by podman 4.x's CLI parser as "unknown flag".
+        cmd.env("REGISTRY_AUTH_FILE", path);
     }
     let output = cmd
         .args(["manifest", "inspect", &image_ref])
@@ -3713,6 +3744,74 @@ mod tests {
                 exists,
             );
         });
+    }
+
+    /// v0.2.49 regression test (live podman): verify the env-var auth
+    /// shape used by `probe_image_tag_exists_with_authfile` and
+    /// `probe_image_tag_exists_with_auth_context` is accepted by the
+    /// real podman binary's CLI parser.
+    ///
+    /// Pre-v0.2.49 the probe helpers ran:
+    ///     podman --authfile /tmp/X manifest inspect ghcr.io/.../image:tag
+    /// which podman 4.x rejects with "Error: unknown flag: --authfile"
+    /// (exit 125). `--authfile` is SUBCOMMAND-scoped, not global — the
+    /// same bug class as the `PerPullAuth::apply_to` regression closed
+    /// by `b4830e04`. Because both probe helpers were only covered by
+    /// argv-shape unit tests (`format!("{:?}", cmd).contains("--authfile")`),
+    /// neither caught the live podman parser rejection.
+    ///
+    /// This test exercises the env-var shape end-to-end with the real
+    /// podman binary on PATH. We spawn `REGISTRY_AUTH_FILE=X podman
+    /// --version` (the cheapest invocation that traverses the global-
+    /// flag-vs-subcommand-scope parsing logic). Equivalent test in
+    /// `container_runtime.rs::tests` for the pull-side fix:
+    /// `per_pull_auth_podman_env_var_accepted_by_live_podman`.
+    ///
+    /// Skipped (clean return) on hosts without a podman binary so CI
+    /// runs on builder boxes without container runtimes stay green.
+    #[test]
+    fn probe_with_registry_auth_file_env_accepted_by_live_podman() {
+        let Ok(probe) = std::process::Command::new("which").arg("podman").output() else {
+            return;
+        };
+        if !probe.status.success() {
+            return;
+        }
+        // Build a real per-pull authfile (same helper the probe call
+        // sites use to produce the path that flows into the env var).
+        let guard = vct_launcher_core::services::container_runtime::build_per_pull_authfile(
+            "ghcr.io",
+            "bot",
+            "tok",
+            "podman",
+        )
+        .expect("build podman authfile");
+        let path = guard
+            .path()
+            .expect("podman guard exposes path()")
+            .to_owned();
+        let output = std::process::Command::new("podman")
+            .env("REGISTRY_AUTH_FILE", &path)
+            .arg("--version")
+            .output()
+            .expect("spawn podman --version");
+        assert!(
+            output.status.success(),
+            "podman --version with REGISTRY_AUTH_FILE set must succeed \
+             (caught a parser regression if not), stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Negative assert: a regression that reintroduces the broken
+        // `--authfile`-before-subcommand shape would produce stderr
+        // containing "unknown flag" with exit 125. Pin that explicitly
+        // so a future revert is loud, not silent.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("unknown flag"),
+            "podman CLI parser rejected the env-var shape (regression!), \
+             stderr={}",
+            stderr
+        );
     }
 
     /// v0.2.37 (Issue 7): regression test for the pipe-buffer deadlock

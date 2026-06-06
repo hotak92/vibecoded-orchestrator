@@ -318,3 +318,115 @@ reinforcement" section of this node was correct: "this class of bug
 ship a fix only to the surface that triggered the user-reported bug;
 the structural fix is single-source-of-truth in core." v0.2.49 is that
 structural fix.
+
+## v0.2.49 post-Phase3 dogfooding audit (2026-06-06 evening)
+
+**Context**: while validating Phase 3 + the b4830e04 REGISTRY_AUTH_FILE
+fix end-to-end on the RL chat's dogfood box, the install path was
+confirmed green (`pull_token_resolved → module_install_done`) but the
+start path immediately failed with `manifest unknown` 125 on bare tag
+`:0.2.9`. Two NEW bugs surfaced that v0.2.46/v0.2.47/v0.2.49-Phase3 all
+missed despite the test surface looking comprehensive.
+
+### Bug B — `ModuleRuntime::resolve_image_ref` shortcircuits to pre-rendered string
+
+**Status**: ✅ FIXED in commit a5327309 (v0.2.49).
+
+`vct-launcher-core/src/manifest.rs:1711-1734` had a fast-path: when
+`runtime.image_ref` is unset AND `install.container.tag_from_version
+== true`, returned `format!("{}:{}", container.image, module_version)`
+instead of the template form `"{install.container.image}:{install.container.tag}"`.
+
+The downstream free-function
+`container_runtime::resolve_image_ref(template, manifest, gpu_mode)`
+applies the GPU variant suffix via `.replace("{install.container.tag}", &variant_tag)`.
+On a pre-rendered string the replace is a no-op. The variant
+(`0.2.9-cuda`) is computed correctly but never applied. Output is the
+bare `:0.2.9`.
+
+**Why install path got lucky**: install has its own variant dispatch
+(`decide_variant_to_pull` calls `probe → fallback` with an explicit
+variant tag constructed at the call site, bypassing `resolve_image_ref`
+entirely). Install succeeds despite the bug.
+
+**Why start path doesn't get lucky**: start path's
+`start_container_for_module_with_gpu_mode` calls `resolve_image_ref`
+once and uses whatever comes out — no probe/fallback. Bare tag flows
+all the way to `podman pull` which then fails (GHCR only has the
+variant-suffixed tags for private paid modules).
+
+**Fix** (commit a5327309): always return the canonical template form when `image_ref` is
+unset, regardless of `tag_from_version`. The implementation:
+- Removes the fast-path that returned a pre-rendered `"{image}:{version}"` string
+- Now ALWAYS returns `"{install.container.image}:{install.container.tag}"` template
+- The free function gets to apply both placeholders AND the variant suffix via `.replace()`
+- Args `container_install` and `module_version` become unused (`_`-prefixed)
+
+### Bug C — Probe helpers reuse the broken `--authfile`-before-subcommand pattern
+
+`launcher/src-tauri/src/installer_engine.rs:955-1015` defines two
+probe helpers (`probe_image_tag_exists_with_auth_context` and
+`probe_image_tag_exists_with_authfile`) that both run:
+
+```rust
+cmd.arg("--authfile").arg(path);
+cmd.args(["manifest", "inspect", &image_ref]);
+```
+
+Same `--authfile`-before-subcommand pattern that bit `apply_to`. Podman
+4.x rejects `podman --authfile X manifest inspect Y` with "unknown
+flag". Probe always errors → `decide_variant_to_pull` degrades to
+"blind-pull legacy behaviour" → fallback-to-alternate-variant
+mechanism NEVER fires.
+
+**Latent ROCm/Metal bug**: on AMD or Apple Silicon hosts where the
+publisher hasn't pushed a matching variant, the fallback logic is the
+only thing that picks a working variant. With the probe broken, AMD
+users see a hard install failure for any module shipping mixed-arch
+variants.
+
+**Fix**: switch probe helpers from argv flag to `REGISTRY_AUTH_FILE`
+env var (same shape as `apply_to`'s v0.2.49 fix). Add a live-podman
+regression test mirroring `per_pull_auth_podman_env_var_accepted_by_live_podman`.
+
+### Meta-lesson: argv-shape unit tests miss CLI parser rejections
+
+ALL three bugs in this family share a common failure mode:
+
+1. Original `apply_to` `--authfile`-before-subcommand bug (closed
+   `b4830e04`)
+2. Probe helpers' `--authfile`-before-subcommand bug (Bug C, still open)
+3. Manifest's `resolve_image_ref` template-shortcut bug (Bug B, still
+   open)
+
+All three were covered by SOME tests. None of those tests caught the
+bugs because the tests asserted on **synthesized argv shapes** (e.g.
+`format!("{:?}", cmd).contains("--authfile")`) or **synthesized
+result strings** (e.g. equality on the formatted ref), not on the
+**effect when run against the live binary**.
+
+The b4830e04 fix added `per_pull_auth_podman_env_var_accepted_by_live_podman`
+which spawns real `podman --version` and verifies the parser accepts
+the env-var shape. That's the test pattern that catches CLI-shape
+bugs. Bug C's fix will replicate it for the probe helpers.
+
+**Generalized lesson** (worth its own KG node): when testing code
+that builds command-line invocations for an external binary, at
+least one test per code path MUST exercise the live binary's parser
+end-to-end. Synthesized-string tests miss flag-position bugs and
+similar parser-rejection failures. The cost (skipping when binary
+absent) is much lower than the cost of a 3-release latent bug.
+
+### Cross-references
+
+- [[refines::Podman --authfile flag position bug (v0.2.47–v0.2.48) → env var fix (v0.2.49)]]
+  — same family
+- [[refines::Pre-install catalog architecture — L0 public endpoint + post-install on-disk manifest]]
+  — L0 catalog drives the variant list; the v0.2.49 publisher contract
+  closes the publisher-side gap that the b4830e04 fix paired with
+- HANDOFF-TO-MAIN-VCO-CHAT-2026-06-06-V2-RL-INSTALL-VALIDATION.md
+  (repo root) — full operational report
+- `.claude/context/plans/v0.2.49-remaining-rl-install-bugs-2026-06-06.md`
+  — fix plan
+- `.claude/context/SELF-HANDOFF-RL-CHAT-2026-06-06-EVENING.md` —
+  resume notes for the next RL chat session
