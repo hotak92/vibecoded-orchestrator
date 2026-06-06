@@ -45,6 +45,17 @@
   import { onMount, onDestroy } from 'svelte';
   import { invoke, listen } from '$lib/tauri';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  // v0.2.49 Stream D: weights update flow is paid-module territory.
+  // If the license lapsed between the server-side poller firing the
+  // update event and the user clicking a choice, we MUST disable the
+  // three action buttons so the user is forced to re-activate first.
+  // The Rust `apply_weights_update` command also enforces server-side
+  // (the L0 catalog gate rejects unlicensed paid-module fetches), so
+  // this is defence-in-depth UX.
+  import { license } from '$lib/stores/license';
+  import { modules } from '$lib/stores/modules';
+  import { ui } from '$lib/stores/ui';
+  import { moduleIsLicenseGated } from '$lib/license-gate';
 
   // Locked wire contracts (Stream B owns the emitter side):
   //   module://weights-update-available
@@ -82,6 +93,22 @@
   let progress = $state<FinetuneProgressPayload | null>(null);
   let error = $state<string | null>(null);
   let busy = $state(false);
+
+  // v0.2.49 Stream D: derive license-gate state from the current
+  // payload's module_id. The catalog is hydrated by other surfaces
+  // (Modules tab, Configure tab) — we read but don't trigger a load
+  // ourselves to keep this component event-driven only. If the
+  // catalog hasn't loaded yet `catalogEntry` is null, the gate
+  // defaults to false (the buttons remain clickable + Rust enforces
+  // server-side as the authoritative gate).
+  const catalogEntry = $derived.by(() => {
+    const cur = current;
+    if (!cur) return null;
+    return $modules.catalog.find((m) => m.id === cur.module_id) ?? null;
+  });
+  const weightsLicenseGated = $derived(
+    moduleIsLicenseGated(catalogEntry, $license.cache),
+  );
 
   // Auto-dismiss timer handle — cleared on unmount or on re-trigger to
   // prevent stale callbacks from clearing a freshly-shown modal.
@@ -298,19 +325,51 @@
             </div>
           </div>
         {:else}
-          <div class="actions">
+          {#if weightsLicenseGated}
+            <!-- v0.2.49 Stream D: license-gate banner inside the
+                 weights update prompt. The three action buttons below
+                 are disabled when gated so the user is forced to
+                 re-activate first. "Open License Manager" is the
+                 escape hatch. -->
+            <div
+              class="license-gate-banner"
+              role="alert"
+              data-testid="weights-license-gate-banner"
+            >
+              <strong>License expired — re-activate to continue</strong>
+              <p>
+                A weights update is available but applying it requires an
+                active license. Re-activate to download and apply.
+              </p>
+              <button
+                type="button"
+                class="btn btn-secondary"
+                onclick={() => ui.openLicenseManager()}
+                data-testid="weights-license-open-manager"
+              >
+                Open License Manager
+              </button>
+            </div>
+          {/if}
+          <div class="actions" class:gated={weightsLicenseGated}>
             <button
               class="btn btn-primary"
-              disabled={busy}
-              title={TIP_NOW}
+              disabled={busy || weightsLicenseGated}
+              aria-disabled={weightsLicenseGated ? 'true' : undefined}
+              title={weightsLicenseGated
+                ? 'License required — re-activate to enable.'
+                : TIP_NOW}
               onclick={() => choose('now')}
             >
               Fine-tune on my data (recommended)
             </button>
             <button
               class="btn btn-secondary"
-              disabled={busy}
-              title={TIP_SKIP}
+              disabled={busy || weightsLicenseGated}
+              aria-disabled={weightsLicenseGated ? 'true' : undefined}
+              title={weightsLicenseGated
+                ? 'License required — re-activate to enable.'
+                : TIP_SKIP}
               onclick={() => choose('skip')}
             >
               Use unmodified
@@ -411,6 +470,41 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+  /* v0.2.49 Stream D: subtle dim on the action stack when gated. The
+     buttons themselves use the standard disabled treatment; the
+     wrapper opacity adds reinforcement without hiding the third
+     "Skip this update" button which stays clickable so the user can
+     dismiss the prompt without re-activating. */
+  .actions.gated {
+    filter: saturate(0.6);
+  }
+  /* v0.2.49 Stream D: in-modal license-gate banner. Red-tinted so it
+     stands out against the standard modal chrome. Sits ABOVE the
+     action row inside the same body so the user reads the gate
+     condition before scanning the (now-disabled) primary button. */
+  .license-gate-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border-radius: 8px;
+    background: rgba(231, 76, 60, 0.10);
+    border: 1px solid rgba(231, 76, 60, 0.35);
+    color: var(--color-fg, #f3f4f6);
+    font-size: 13px;
+  }
+  .license-gate-banner strong {
+    color: #ff7868;
+    font-size: 14px;
+  }
+  .license-gate-banner p {
+    margin: 0;
+    color: var(--color-mid, #9ca3af);
+    line-height: 1.4;
+  }
+  .license-gate-banner button {
+    align-self: flex-start;
   }
   .btn {
     padding: 10px 16px;

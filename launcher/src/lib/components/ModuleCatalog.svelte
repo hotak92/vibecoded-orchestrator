@@ -44,6 +44,11 @@
   // returns `available: false`. Runs on every Install click — see the
   // handleInstall flow below for the gating logic.
   import InstallPreflightRuntimeModal from '$lib/components/InstallPreflightRuntimeModal.svelte';
+  // v0.2.49 Stream D: license-gate helper. Used to gate the per-project
+  // enable toggle on installed paid modules (so a user whose license
+  // lapsed POST-install can't flip the enable bit until they re-activate)
+  // and to add a hover tooltip on tiles for unlicensed paid modules.
+  import { moduleIsLicenseGated, moduleNeedsLicense } from '$lib/license-gate';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -671,7 +676,19 @@
               <div class="card-title-row">
                 <h3 class="card-name">{m.name}</h3>
                 {#if m.license_required}
-                  <span class="tier-badge">
+                  <!-- v0.2.49 Stream D: enriched tier badge tooltip when
+                       the module is paid AND the user lacks a valid
+                       license. Catches the "I clicked Install and got a
+                       weird Activate dialog" surprise by signalling the
+                       gate before the user clicks. -->
+                  {@const badgeGated = moduleNeedsLicense(m) && !m.is_licensed}
+                  <span
+                    class="tier-badge"
+                    class:tier-gated={badgeGated}
+                    title={badgeGated
+                      ? `${tierLabel(m.min_orchestrator_tier === 'free' ? 'pro' : m.min_orchestrator_tier)} license required to install or configure this module.`
+                      : `${tierLabel(m.min_orchestrator_tier === 'free' ? 'pro' : m.min_orchestrator_tier)} tier`}
+                  >
                     {tierLabel(m.min_orchestrator_tier === 'free' ? 'pro' : m.min_orchestrator_tier)}
                   </span>
                 {:else}
@@ -748,10 +765,27 @@
               {/if}
             {:else if display.kind === 'installed'}
               <!-- Installed: toggle + (optional Update) + (optional Start) + Uninstall -->
-              <label class="enabled-toggle">
+              <!-- v0.2.49 Stream D: per-tile license gate for the enable
+                   toggle. If the module is paid AND the orchestrator-tier
+                   license is missing/expired, disable the toggle so a
+                   user whose license lapsed POST-install can't flip the
+                   enable bit until they re-activate. Update + Uninstall
+                   buttons stay clickable — Update needs to be reachable
+                   so a user can pull a fix that doesn't itself need the
+                   license, and Uninstall is always a reversible exit. -->
+              {@const tileLicenseGated = moduleIsLicenseGated(m, $license.cache)}
+              <label
+                class="enabled-toggle"
+                class:license-gated={tileLicenseGated}
+                title={tileLicenseGated
+                  ? 'License required to change enable state. Re-activate the license to manage this module.'
+                  : undefined}
+              >
                 <input
                   type="checkbox"
                   checked={display.install_row.enabled}
+                  disabled={tileLicenseGated}
+                  aria-disabled={tileLicenseGated ? 'true' : undefined}
                   onchange={(e) => handleToggleEnabled(m, (e.target as HTMLInputElement).checked)}
                   aria-label="Enable or disable {m.name}"
                 />
@@ -1152,6 +1186,17 @@
     cursor: help;
   }
 
+  /* v0.2.49 Stream D: tier badge for unlicensed paid modules. Subtle
+     red-tinted variant to signal "this is gated" without screaming —
+     the actual blocking happens in the Install button → Activate
+     license flow below. cursor:help cues the title-attribute
+     tooltip is the next step. */
+  .tier-badge.tier-gated {
+    background: rgba(231, 76, 60, 0.16);
+    color: #ff8a7e;
+    cursor: help;
+  }
+
   /* Bug 16: kind-aware status badges. */
   .status-badge {
     font-size: 10px;
@@ -1269,6 +1314,19 @@
 
   .enabled-toggle input {
     accent-color: var(--color-teal);
+  }
+
+  /* v0.2.49 Stream D: gated state for the per-project enable toggle on
+     installed paid modules whose license has lapsed. cursor:help cues
+     the tooltip; opacity + saturate match the Configure-tab body gating
+     so the GUI feels consistent across surfaces. */
+  .enabled-toggle.license-gated {
+    opacity: 0.55;
+    cursor: help;
+    filter: saturate(0.6);
+  }
+  .enabled-toggle.license-gated input {
+    cursor: not-allowed;
   }
 
   .mono {

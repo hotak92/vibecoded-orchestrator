@@ -27,6 +27,16 @@
   // Reset button are only shown when the RL module is both installed AND
   // its container is running.
   import { moduleIsActive, RL_RERANKER_MODULE_ID } from '$lib/module-active-gate';
+  // v0.2.49 Stream D: license-gate for the per-route "Reset to global
+  // weights" button. Reuses the same gate predicate that gates the
+  // schema-rendered controls inside `ModuleConfigTab.svelte` so the
+  // user experience is consistent — when the license lapses, BOTH the
+  // schema controls AND this destructive reset button are inert at
+  // the same time. The banner inside `ModuleConfigTab` is the only
+  // visible affordance; the wrapper here just defensively disables
+  // the reset button so a click can't slip through.
+  import { license } from '$lib/stores/license';
+  import { moduleIsLicenseGated } from '$lib/license-gate';
 
   const RL_MODULE_ID = RL_RERANKER_MODULE_ID;
 
@@ -59,6 +69,18 @@
   // isn't running (no inference available, flags have no effect).
   const rlIsActive = $derived(moduleIsActive(RL_MODULE_ID, $modules.installed));
   const showStatusPanel = $derived(moduleId === RL_MODULE_ID && rlIsActive);
+
+  // v0.2.49 Stream D: license-gate for THIS route's controls (the
+  // "Reset to global weights" button below). Looks up the catalog
+  // entry by moduleId; if it's a paid module + the license is
+  // missing/expired, the reset button is disabled (visually grayed
+  // by CSS, functionally inert via the native disabled attribute).
+  const catalogEntry = $derived(
+    $modules.catalog.find((m) => m.id === moduleId) ?? null,
+  );
+  const licenseGated = $derived(
+    moduleIsLicenseGated(catalogEntry, $license.cache),
+  );
 
   let configTab = $state<ConfigTab | null>(null);
   let loadError = $state<string | null>(null);
@@ -185,8 +207,12 @@
           <div class="weights-reset-row">
             <button
               class="weights-reset-btn"
-              disabled={resettingWeights}
-              title="Discard project-specific fine-tuning and revert to the current global weights model."
+              class:license-gated={licenseGated}
+              disabled={resettingWeights || licenseGated}
+              aria-disabled={licenseGated ? 'true' : undefined}
+              title={licenseGated
+                ? 'License required to reset weights.'
+                : 'Discard project-specific fine-tuning and revert to the current global weights model.'}
               onclick={() => void handleResetWeights()}
             >
               {resettingWeights ? 'Resetting…' : 'Reset to global weights'}
@@ -269,6 +295,17 @@
   .weights-reset-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* v0.2.49 Stream D: explicit gated affordance. The disabled
+     attribute already greys the button; this rule layers a
+     `not-allowed` cursor + a slightly more saturated grey so
+     hovering tells the user "this is intentionally inert", not
+     "transient busy state". */
+  .weights-reset-btn.license-gated {
+    opacity: 0.45;
+    cursor: not-allowed;
+    filter: saturate(0.6);
   }
 
   .weights-reset-success {
