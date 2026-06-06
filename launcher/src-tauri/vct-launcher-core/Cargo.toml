@@ -69,8 +69,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Regex (used by manifest validation patterns + PII scrub)
 regex = "1"
 
-# MAC address for machine binding (matches Python validator.py)
-mac_address = "1"
 hex = "0.4"
 
 # Platform hostname
