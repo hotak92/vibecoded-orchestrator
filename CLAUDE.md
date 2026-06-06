@@ -1,3 +1,15 @@
+<!-- vco-deferral-reminder-begin -->
+**Pending VCO action**: `.claude/context/UPDATE_DEFERRED.md` exists.
+Read it at session start — it contains commands to resolve
+unresolved VCO install actions.
+
+To remove THIS reminder block: once the deferral is resolved (e.g.
+via `--update --force`), VCO's next install run will delete
+UPDATE_DEFERRED.md AND strip this block. Manual cleanup if needed:
+delete everything between the HTML-comment markers wrapping this
+block.
+<!-- vco-deferral-reminder-end -->
+
 <!-- BEGIN: SETUP-ONLY (project-scoping nudge — remove after the user has either declined or completed the scoping pass) -->
 ## FIRST SESSION — wait for the user to define the project, then offer to scope agents/skills
 
@@ -33,6 +45,27 @@ The orchestrator is licensed **AGPL-3.0**. If you modify any orchestrator-shippe
 
 ---
 
+## UI / VISUAL WORK — read the brand reference FIRST
+
+Before generating ANY mockup, component, modal, loading screen, icon, or visual
+asset for the launcher (or any VCO-branded surface), **read
+[`.claude/references/VCO_BRAND_REFERENCE.md`](.claude/references/VCO_BRAND_REFERENCE.md)**.
+It contains the real design tokens (palette, typography, logo, signature
+components, motion vocabulary) extracted from `launcher/src/app.css` and the
+shipped modals. The brand identity is **navy + teal `#00BFA6` + purple `#7B5FFF`
++ pink `#FF4FA0`**, Inter font, robot-in-circle logo (`/logo-512.png`), 3D
+buttons, glass cards, logo-fill loaders.
+
+Do NOT re-derive the palette from individual components, invent colors, or redraw
+the logo by hand — use the tokens verbatim so the first generation is already
+brand-consistent. When AskUserQuestion offers a style choice for a VCO visual,
+include "**Brand VCO**" (navy/teal identity from the reference) as a ready option,
+not something the user has to type. Available design skills (`refactoring-ui`,
+`gui-ux-expert`, `microinteractions`, `design`) should be used proactively for
+substantial UI work.
+
+---
+
 ## Good behaviour — rules for working in a VCO-installed project
 
 These rules apply to YOU (Claude) working inside any project that has VCO installed. They're independent of the project's own domain — keep them in mind regardless of whether you're coding a Rust web app, training an ML model, or writing documentation.
@@ -50,6 +83,30 @@ These rules apply to YOU (Claude) working inside any project that has VCO instal
 6. **Knowledge Graph writes should match scope.** Project-specific patterns → per-project KG (default `scope="project"`). Cross-project patterns that other projects on the same machine would benefit from → shared KG (`scope="shared"`). Don't pollute the shared KG with project-internal trivia; don't isolate genuinely reusable knowledge to a single project.
 
 7. **When in doubt about an update flow, ask.** "Should I run `install.py --update`?" or "Should I drop the Weaviate collection to re-embed with the new model?" are reasonable questions to ask the user before acting — those operations take time and a wrong call costs the user more than the question.
+
+---
+
+<!-- BEGIN: FABIO-LOCAL (our private operational policy — NOT shipped by the bundle; do not strip on update) -->
+## This checkout is our PRIVATE OPERATIONAL copy — VCO development happens elsewhere (added 2026-06-05)
+
+**Two distinct checkouts, two distinct purposes:**
+
+| Path | Role | Push to public repo? |
+|---|---|---|
+| `C:\Vco-orchestrator_public_repo\vibecoded-orchestrator` | **VCO source development** — clone of the public repo. All code changes, fixes, new features, branches, and PRs targeting VCO itself happen HERE. | YES (via branches + PR; Martino merges releases) |
+| `C:\Users\fabio\Desktop\Lavoro\Programmatore\Progetti Freelance\Martino\vibecoded-orchestrator` (THIS folder) | **Private operational install** — the VCO instance we actually run day-to-day. We manage installs / updates / secrets / projects through the **launcher GUI**, not by editing source. | **NO — never push this checkout to the public repo.** |
+
+**Hard rules for THIS operational checkout:**
+1. **Never `git push` from here to the public remote.** A `pre-push` guard hook (`.git/hooks/pre-push`) blocks it; if it's bypassed, STOP. This copy may carry private state (secrets config, project registrations, local DB) that must not reach the public repo.
+2. **Do NOT make VCO source-code fixes here.** When you find a bug/gap in the install/update flow (or anywhere in VCO), fix it in the **public-repo clone** (`C:\Vco-orchestrator_public_repo\vibecoded-orchestrator`) on an isolated branch, then report to Martino on `vct-coordination` so he merges it for the release. Branch-isolation + Martino-OK rule still applies (see MEMORY.md).
+3. **Local-only resolutions are fine here.** Resolving a deferral, clearing a false-positive, running the GUI update, editing OUR CLAUDE.md / CONTEXT_STATE — all fine in this checkout. Just don't push it upstream and don't author shippable VCO source changes here.
+4. **Both checkouts currently share the same `origin` remote** (`hotak92/vibecoded-orchestrator`). That's exactly why rule 1 exists — without the guard, a stray `git push` from this folder would publish operational state.
+
+**Workflow when you spot a VCO bug while working in this operational copy:**
+- Reproduce / confirm here (read-only is fine), but author the fix + tests in the public-repo clone on a branch.
+- Commit there; message Martino on `vct-coordination` (`send_message(to: "claude-orchestrator")` — NOT `reply`) with the bug, the fix, and the commit SHA.
+- Let Martino do the merge/release.
+<!-- END: FABIO-LOCAL -->
 
 ---
 
