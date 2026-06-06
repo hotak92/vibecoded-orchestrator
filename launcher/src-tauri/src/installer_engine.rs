@@ -756,19 +756,30 @@ async fn container_pull(
     };
 
     let image_ref = format!("{}:{}", container.image, resolved_tag);
-    // v0.2.37 (Issue 7): drain stdout/stderr via Stdio::null() rather than
-    // Stdio::piped(). `podman pull` of a large image (5.5GB / 7 layers) emits
-    // tens of KB of layer-progress text to stderr; combined with `.status()`
-    // — which doesn't drain the pipes — the OS-level pipe buffer (64KB on
-    // Linux) fills up and the child blocks on write, while the parent blocks
-    // on wait, producing a deadlock that surfaces as `exit -1` AFTER the
-    // image has actually been downloaded successfully (`podman images`
-    // confirms presence). The launcher reports progress via Tauri events
-    // through `report_progress`, NOT by parsing pull stdout, so dropping the
-    // output is safe — no UX regression. Same fix is applied to the two
-    // `git clone` / `git pull` sites further down, where the same Stdio +
-    // .status() pattern carries the same latent deadlock risk on
-    // unexpectedly verbose repos.
+    // v0.2.37 (Issue 7): the original symptom was that `podman pull` of a
+    // large image (5.5GB / 7 layers) emits tens of KB of layer-progress
+    // text to stderr; combined with `.status()` — which doesn't drain the
+    // pipes — the OS-level pipe buffer (64KB on Linux) fills up and the
+    // child blocks on write, while the parent blocks on wait, producing a
+    // deadlock that surfaces as `exit -1` AFTER the image has actually
+    // been downloaded successfully. The v0.2.37 workaround was
+    // `Stdio::null()` on both streams — which sidestepped the deadlock by
+    // letting the OS discard the writes, but also threw away the
+    // actionable stderr tail (e.g. "Error: unauthorized") that the user
+    // needs to diagnose a failure.
+    //
+    // v0.2.49: switch from `.status()` to `.output()`. tokio's `.output()`
+    // actively drains both stdio streams via internal piping in the
+    // background, so the child never blocks on write — fixing the
+    // UNDERLYING issue the Stdio::null() workaround papered over. We can
+    // now capture stderr safely. stdout is set to Stdio::null() at the
+    // caller; tokio's .output() still forces piping internally but the
+    // buffered stdout is discarded after the call returns, so it functions
+    // as null from the caller's view. Layer-progress text isn't useful in
+    // error reports either way. The two analogous `git clone` / `git pull`
+    // sites further down still use `.status()` + Stdio::null() — git rarely
+    // emits cryptic errors, so the surface-stderr conversion is deferred
+    // to a future cleanup.
     //
     // v0.2.46 V46-E (C2): per-pull auth replaces the previous
     // `podman login`/`podman logout` dance. The auth blob contains a
@@ -790,41 +801,88 @@ async fn container_pull(
     if let Some(guard) = authfile_guard.as_ref() {
         guard.apply_to(&mut pull_cmd, &runtime);
     }
-    let pull_status = pull_cmd
+    let pull_output = pull_cmd
         .args(["pull", &image_ref])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stdout(Stdio::null())   // layer-progress text isn't useful in errors
+        .stderr(Stdio::piped())  // capture for error message
+        .output()                // active drain — no deadlock
         .await
         .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
 
     // No explicit logout — `authfile_guard` drops at end-of-scope, taking
     // the temp file with it. No global auth.json mutation to undo.
 
-    if !pull_status.success() {
-        return Err(format!(
-            "{} pull failed (exit {}): {}{}",
-            runtime,
-            pull_status.code().unwrap_or(-1),
-            image_ref,
-            if token.is_none() {
-                // v0.2.35: the request_pull_token error is now the
-                // authoritative reason for the 401. Quote it verbatim
-                // so the user sees the actual cause (e.g. "your license
-                // has expired") instead of the pre-v0.2.35 generic
-                // "Phase 3A gateway not deployed" footer that masked
-                // every real failure mode.
-                match token_request_err.as_deref() {
-                    Some(reason) => format!(" — license check failed: {}", reason),
-                    None => " — and the pull-token gateway returned no error detail (this is unexpected; please report)".to_string(),
-                }
-            } else {
-                String::new()
-            }
+    if !pull_output.status.success() {
+        return Err(format_pull_failure(
+            &runtime,
+            pull_output.status.code(),
+            &image_ref,
+            &pull_output.stderr,
+            token.is_some(),
+            token_request_err.as_deref(),
         ));
     }
 
     Ok(resolved_tag)
+}
+
+/// v0.2.49: format a podman/docker pull failure error for the user.
+/// `stderr` is the captured stderr from the failed pull (active-drained
+/// via tokio's .output() — see callsite). We keep only the LAST 2KB to
+/// bound memory + log size. The actionable error is almost always the
+/// last line (e.g. "Error: unauthorized" or "manifest unknown") — layer-
+/// progress text and prior connection-retry lines are noise.
+fn format_pull_failure(
+    runtime: &str,
+    exit_code: Option<i32>,
+    image_ref: &str,
+    stderr: &[u8],
+    token_present: bool,
+    token_request_err: Option<&str>,
+) -> String {
+    let stderr_str = String::from_utf8_lossy(stderr);
+    let stderr_tail = if stderr_str.len() > 2048 {
+        // Snap `start` forward to the next char boundary so we never slice
+        // mid-multi-byte. from_utf8_lossy's U+FFFD replacements are 3 bytes,
+        // and registry errors may contain non-ASCII (localized auth errors).
+        let mut start = stderr_str.len() - 2048;
+        while start < stderr_str.len() && !stderr_str.is_char_boundary(start) {
+            start += 1;
+        }
+        let truncated = &stderr_str[start..];
+        // Skip past the first newline so we don't start mid-line.
+        match truncated.find('\n') {
+            Some(nl_idx) => &truncated[nl_idx + 1..],
+            None => truncated,
+        }
+    } else {
+        &stderr_str[..]
+    };
+    let stderr_tail_trimmed = stderr_tail.trim();
+    format!(
+        "{} pull failed (exit {}): {}{}{}",
+        runtime,
+        exit_code.unwrap_or(-1),
+        image_ref,
+        if !stderr_tail_trimmed.is_empty() {
+            format!(" — {}", stderr_tail_trimmed)
+        } else {
+            String::new()
+        },
+        if !token_present {
+            // v0.2.35: the request_pull_token error is the authoritative
+            // reason for the 401. Quote it verbatim so the user sees the
+            // actual cause (e.g. "your license has expired") instead of
+            // the pre-v0.2.35 generic "Phase 3A gateway not deployed"
+            // footer that masked every real failure mode.
+            match token_request_err {
+                Some(reason) => format!(" — license check failed: {}", reason),
+                None => " — and the pull-token gateway returned no error detail (this is unexpected; please report)".to_string(),
+            }
+        } else {
+            String::new()
+        },
+    )
 }
 
 /// v0.2.35 (Agent N): probe whether `<image>:<tag>` exists on the
@@ -4195,5 +4253,82 @@ mod tests {
             "audit row MUST contain the 12-char prefix (sanity check); got: {}",
             row.detail
         );
+    }
+
+    #[test]
+    fn format_pull_failure_includes_stderr_tail() {
+        // Realistic podman pull failure: a few layer-progress lines + the
+        // actionable error at the end.
+        let stderr = b"Trying to pull ghcr.io/foo:bar...\n\
+                       Error: initializing source docker://ghcr.io/foo:bar: \
+                       unable to retrieve auth token: invalid username/password: unauthorized\n";
+        let msg = format_pull_failure(
+            "podman",
+            Some(125),
+            "ghcr.io/foo:bar",
+            stderr,
+            true,  // token present — no license-check-failed suffix
+            None,
+        );
+        assert!(msg.contains("podman pull failed (exit 125)"), "got: {}", msg);
+        assert!(msg.contains("ghcr.io/foo:bar"), "got: {}", msg);
+        assert!(msg.contains("unauthorized"), "stderr tail must surface the auth error: {}", msg);
+    }
+
+    #[test]
+    fn format_pull_failure_truncates_to_last_2kb_at_newline_boundary() {
+        // 5KB synthetic stderr; only the LAST 2KB should appear, starting
+        // at a newline boundary (so we don't render mid-line garbage).
+        let mut huge = String::with_capacity(5000);
+        for i in 0..200 {
+            huge.push_str(&format!("noise line {}\n", i));
+        }
+        huge.push_str("Error: manifest unknown\n");
+        let msg = format_pull_failure(
+            "podman",
+            Some(125),
+            "ghcr.io/foo:bar",
+            huge.as_bytes(),
+            true,
+            None,
+        );
+        // The actionable error must be present.
+        assert!(msg.contains("manifest unknown"), "actionable error must be in last 2KB: {}", msg);
+        // The very first line ("noise line 0") must NOT be present — we
+        // dropped the prefix.
+        assert!(!msg.contains("noise line 0"), "old lines must have been truncated: {}", msg);
+        // Message length stays bounded (helper output should be well under
+        // image_ref + runtime + 2KB + format overhead ≈ 2.2KB).
+        assert!(msg.len() < 2500, "formatted msg should be ~2KB-bounded: len={}", msg.len());
+    }
+
+    #[test]
+    fn format_pull_failure_survives_multibyte_at_truncation_boundary() {
+        // Construct a stderr where a multi-byte UTF-8 char straddles the
+        // (len - 2048) byte. Without char-boundary snapping, the slice
+        // panics: "byte index N is not a char boundary; it is inside '<c>'".
+        //
+        // Use a pure 2-byte-char pad ("é" = 0xC3 0xA9). With 2050 copies
+        // (4100 bytes) plus a 17-byte ASCII suffix, total = 4117 bytes
+        // and (len - 2048) = 2069 — which lands on a 0xA9 continuation
+        // byte (NOT a char boundary). Pre-fix this panics; post-fix the
+        // `is_char_boundary` loop snaps `start` forward to byte 2070.
+        let mut huge = String::with_capacity(4200);
+        for _ in 0..2050 {
+            huge.push('é');
+        }
+        huge.push_str("\nError: bad auth\n");
+        let msg = format_pull_failure(
+            "podman",
+            Some(125),
+            "ghcr.io/foo:bar",
+            huge.as_bytes(),
+            true,
+            None,
+        );
+        // No panic (we got here). Actionable tail still surfaces.
+        assert!(msg.contains("Error: bad auth"), "tail must surface actionable error: {}", msg);
+        // Bounded.
+        assert!(msg.len() < 2500, "msg should be 2KB-bounded: len={}", msg.len());
     }
 }
