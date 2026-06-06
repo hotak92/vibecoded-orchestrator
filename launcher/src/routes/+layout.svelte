@@ -120,6 +120,21 @@
   });
 
   onMount(() => {
+    // Hide the boot splash (#vct-splash in app.html) now that the Svelte app
+    // has mounted. The splash is plain inline HTML/CSS rendered by the WebView
+    // before this code runs, so cold-start reads as "Avvio in corso…" instead
+    // of a black/frozen WebView while the backend's blocking boot probes run.
+    // We add `.vct-splash-hide` (opacity→0 over 280ms) then remove the node
+    // after the fade so it never intercepts pointer events. Wrapped in a guard
+    // because the element is absent in unit/SSR contexts.
+    {
+      const splash = document.getElementById('vct-splash');
+      if (splash) {
+        splash.classList.add('vct-splash-hide');
+        setTimeout(() => splash.remove(), 320);
+      }
+    }
+
     // Check onboarding / changelog gates once per app load.
     //
     // Bug 14 fix (2026-05-05): the `onboarding_complete` flag now lives in

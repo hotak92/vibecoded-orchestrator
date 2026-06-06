@@ -8,9 +8,175 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+    <!--
+      Boot splash (feat/boot-loading-martino).
+
+      Rendered by the WebView IMMEDIATELY: inline CSS, ZERO JS, ZERO external
+      font dependency — so the user never sees a black WebView while the
+      Svelte app + its first `invoke` calls wait behind the backend's blocking
+      boot probes (Weaviate reconcile/adopt, Docker daemon probe — each up to
+      5s when the service is down, see lib.rs setup()). +layout.svelte hides
+      #vct-splash on mount. The real fix (move those probes off the blocking
+      setup path) is a backend v0.2.49 candidate; this is the frontend
+      stop-gap so cold-start reads as "starting…" instead of "frozen/black".
+
+      Design note: this is the "Martino-style" splash — dual counter-rotating
+      orbital rings + a pulsing core with a vector monogram. We deliberately
+      use a VECTOR (SVG) logo, NOT logo-512.png, because the raster PNG looks
+      soft/upscaled on HiDPI displays; the inline SVG stays razor-sharp at any
+      scale. The progress bar is INDETERMINATE on purpose: during boot there
+      is no Tauri event channel yet, so there is no real percentage to show —
+      a fake "37%" would be a lie. Per-service health checks with real
+      progress are a future backend task (see KG node + coordination board).
+    -->
+    <style>
+      #vct-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 99999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 26px;
+        /* navy radial backdrop — matches the launcher's app.css base */
+        background:
+          radial-gradient(1100px 760px at 50% 8%, #16203f 0%, transparent 60%),
+          radial-gradient(820px 620px at 108% 118%, #241a4a 0%, transparent 55%),
+          #0a1228;
+        color: #e6ecff;
+        font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+        transition: opacity 280ms ease;
+      }
+      #vct-splash.vct-splash-hide {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      /* ---- orbital logo ---- */
+      #vct-splash .vct-logo {
+        position: relative;
+        width: 120px;
+        height: 120px;
+      }
+      #vct-splash .vct-ring {
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        border: 2px solid rgba(123, 95, 255, 0.16);
+      }
+      #vct-splash .vct-ring::after {
+        content: '';
+        position: absolute;
+        inset: -2px;
+        border-radius: 50%;
+        border: 2px solid transparent;
+        border-top-color: #00bfa6;
+        border-right-color: #7b5fff;
+        filter: drop-shadow(0 0 6px rgba(0, 191, 166, 0.55));
+        animation: vct-spin 1.4s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+      }
+      #vct-splash .vct-ring.inner {
+        inset: 22px;
+        border-color: rgba(0, 191, 166, 0.12);
+      }
+      #vct-splash .vct-ring.inner::after {
+        border-top-color: #7b5fff;
+        border-left-color: #00bfa6;
+        border-right-color: transparent;
+        animation: vct-spin-rev 2s linear infinite;
+      }
+      #vct-splash .vct-core {
+        position: absolute;
+        inset: 38px;
+        border-radius: 50%;
+        background: radial-gradient(circle at 35% 30%, #2b3370, #161a3a);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: 0 0 24px rgba(0, 191, 166, 0.5), inset 0 0 12px rgba(0, 0, 0, 0.6);
+        animation: vct-pulse 2.2s ease-in-out infinite;
+      }
+      /* vector monogram — crisp at any scale, no raster sgranatura */
+      #vct-splash .vct-core svg { width: 26px; height: 26px; display: block; }
+
+      #vct-splash .vct-text {
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
+      #vct-splash .vct-text b {
+        background: linear-gradient(120deg, #00bfa6, #7b5fff);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      #vct-splash .vct-sub {
+        font-size: 11px;
+        color: #7b88b0;
+        margin-top: -16px;
+        letter-spacing: 0.04em;
+      }
+
+      /* ---- indeterminate bar (honest: no fake percentage at boot) ---- */
+      #vct-splash .vct-bar {
+        width: 180px;
+        height: 3px;
+        border-radius: 2px;
+        background: rgba(255, 255, 255, 0.08);
+        overflow: hidden;
+      }
+      #vct-splash .vct-bar::after {
+        content: '';
+        display: block;
+        width: 38%;
+        height: 100%;
+        border-radius: 2px;
+        background: linear-gradient(90deg, #7b5fff, #00bfa6);
+        box-shadow: 0 0 10px rgba(0, 191, 166, 0.55);
+        animation: vct-slide 1.2s ease-in-out infinite;
+      }
+
+      @keyframes vct-spin     { to { transform: rotate(360deg); } }
+      @keyframes vct-spin-rev { to { transform: rotate(-360deg); } }
+      @keyframes vct-pulse {
+        0%, 100% { box-shadow: 0 0 18px rgba(0, 191, 166, 0.45), inset 0 0 12px rgba(0, 0, 0, 0.6); }
+        50%      { box-shadow: 0 0 34px rgba(0, 191, 166, 0.6),  inset 0 0 12px rgba(0, 0, 0, 0.6); }
+      }
+      @keyframes vct-slide {
+        0%   { transform: translateX(-110%); }
+        100% { transform: translateX(385%); }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #vct-splash .vct-ring::after,
+        #vct-splash .vct-ring.inner::after,
+        #vct-splash .vct-core,
+        #vct-splash .vct-bar::after { animation: none; }
+      }
+    </style>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">
+    <div id="vct-splash">
+      <div class="vct-logo" aria-hidden="true">
+        <div class="vct-ring"></div>
+        <div class="vct-ring inner"></div>
+        <div class="vct-core">
+          <!-- robot-head monogram, vector — stays sharp on any HiDPI scale -->
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="5" y="7" width="14" height="11" rx="3.2" stroke="#00bfa6" stroke-width="1.8"/>
+            <line x1="12" y1="3.4" x2="12" y2="6.6" stroke="#00bfa6" stroke-width="1.8" stroke-linecap="round"/>
+            <circle cx="12" cy="2.6" r="1.2" fill="#ff4fa0"/>
+            <circle cx="9.4" cy="12.2" r="1.5" fill="#00bfa6"/>
+            <circle cx="14.6" cy="12.2" r="1.5" fill="#7b5fff"/>
+          </svg>
+        </div>
+      </div>
+      <div class="vct-text">VCT <b>Launcher</b></div>
+      <div class="vct-bar"></div>
+      <div class="vct-sub">Avvio in corso…</div>
+    </div>
     <div style="display: contents">%sveltekit.body%</div>
   </body>
 </html>
