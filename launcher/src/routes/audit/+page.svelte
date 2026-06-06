@@ -415,7 +415,6 @@
   .lede {
     font-size: 13px;
     color: var(--color-mid);
-    max-width: 720px;
   }
 
   .audit-intro {
@@ -426,7 +425,6 @@
     border: 1px solid rgba(0, 191, 166, 0.18);
     border-radius: 12px;
     color: var(--color-text);
-    max-width: 760px;
   }
   .audit-intro h3 {
     font-size: 13px;
