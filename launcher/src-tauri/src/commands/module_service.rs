@@ -470,6 +470,330 @@ pub async fn start_container_after_install(
     Ok(container_name)
 }
 
+// ─── v0.2.49 Stream A: global container lifecycle ─────────────────────
+
+/// Fixed RL listen port for a GLOBAL-scope module. One port per machine
+/// per module — no per-project allocation table because there is exactly
+/// ONE container per global module. Chosen above the orchestrator-root
+/// port + above the per-project allocation range to avoid collision
+/// with both.
+pub const GLOBAL_RL_PORT: u16 = 11443;
+
+/// v0.2.49 Stream A: start (or restart) the GLOBAL container for a
+/// module. Sibling of [`start_container_for_module`].
+///
+/// Differences:
+///   * No `ProjectRow` arg — global containers are not project-scoped.
+///   * Container name = bare module_id (via [`resolve_global_container_name`]),
+///     not `{module_id}-{project_slug}`.
+///   * Volume paths substitute `"global"` for `{project_slug}` so the
+///     state dir is stable across launcher restarts.
+///   * Listens on [`GLOBAL_RL_PORT`] machine-wide.
+pub async fn start_global_container_for_module(
+    manifest: &ModuleManifest,
+    module_id: &str,
+    db: &Db,
+) -> Result<String, String> {
+    use vct_launcher_core::services::container_runtime::{
+        build_podman_run_args_global, ensure_volume_host_dirs_global, resolve_global_container_name,
+        resolve_image_ref,
+    };
+
+    let runtime = &manifest.runtime;
+    if !matches!(runtime.r#type.as_str(), "container" | "service") {
+        return Err(format!(
+            "start_global_container_for_module called for non-container runtime '{}'",
+            runtime.r#type
+        ));
+    }
+
+    let name_template = runtime.resolve_container_name_template(&manifest.id);
+    let container_name = resolve_global_container_name(&name_template, module_id)?;
+    let image_template = runtime.resolve_image_ref(
+        manifest.install.container.as_ref().ok_or_else(|| {
+            "install.container block missing — required for container/service modules".to_string()
+        })?,
+        &manifest.version,
+    );
+
+    let gpu_mode = read_persisted_gpu_mode();
+    let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
+
+    let podman = detect_container_runtime().await?;
+
+    // Pre-pull with auth for cache-evicted hosts (v0.2.47 pattern).
+    if gpu_mode.is_some() && manifest.install.method == InstallMethod::ContainerPull {
+        if let Err(e) = pre_pull_with_auth_for_start(manifest, &podman, &image).await {
+            eprintln!(
+                "[module_service] global pre-pull for start failed (continuing — cache may suffice): {}",
+                e
+            );
+        }
+    }
+
+    // Idempotency: force-remove any prior container with the same name.
+    let _ = Command::new(&podman)
+        .silent()
+        .args(["rm", "-f", &container_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    let ctx = PlaceholderCtx::new(&manifest.id);
+    ensure_volume_host_dirs_global(manifest, &ctx, GLOBAL_RL_PORT).await;
+
+    let args =
+        build_podman_run_args_global(manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image)?;
+
+    let mut cmd = Command::new(&podman).silent();
+    cmd.args(&args);
+    cmd.env_clear();
+    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+        .await
+        .map_err(|_| format!("{} run timed out after 60s for {}", podman, container_name))?
+        .map_err(|e| format!("spawn {} run: {}", podman, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} run failed (exit {}) for {}: {}",
+            podman,
+            output.status.code().unwrap_or(-1),
+            container_name,
+            stderr.chars().take(500).collect::<String>()
+        ));
+    }
+
+    // Persist resolved container_name on the global install row so
+    // subsequent resume sweeps short-circuit on the running-probe path.
+    db.set_global_module_container_name(module_id, &container_name)?;
+
+    Ok(container_name)
+}
+
+/// v0.2.49 Stream A: install-time wrapper for global containers.
+/// Sibling of [`start_container_after_install`] for per-project modules.
+pub async fn start_global_container_after_install(
+    manifest: &ModuleManifest,
+    db: &Db,
+) -> Result<String, String> {
+    start_global_container_for_module(manifest, &manifest.id, db).await
+}
+
+/// v0.2.49 Stream A: one-shot auto-migration that converts per-project
+/// install rows into a single global row when the on-disk manifest now
+/// declares `install.scope = "global"`.
+///
+/// Trigger: launcher boot. Per the v0.2.49 plan (user decision: "no
+/// prompt, no legacy support — me + Fabio are the only users"), the
+/// migration applies destructively on first launch after the manifest
+/// flip:
+///
+///   1. For each installed module whose on-disk extracted manifest
+///      declares `install.scope = "global"`.
+///   2. If a global row already exists for that module → skip
+///      (idempotent: migration already ran).
+///   3. Otherwise: enumerate per-project rows, stop+remove their
+///      containers, delete the rows, then insert ONE global row,
+///      then start the global container.
+///
+/// Soft-fail throughout: any failure logs and continues; partial
+/// migrations are recoverable on next boot (the per-project rows that
+/// failed to delete stay; the global row is created from the first row's
+/// metadata so the install path is captured). Audit-logged with
+/// `operation = "module_migrated_to_global_scope"`.
+///
+/// **Idempotency contract**: re-running this function after a successful
+/// migration is a NO-OP — the global row exists, so the per-module
+/// branch short-circuits before any destructive work.
+pub async fn auto_migrate_per_project_to_global(
+    db: &Db,
+    resolve_manifest: impl Fn(&str) -> Option<ModuleManifest>,
+) {
+    // Enumerate every distinct module_id that has at least one
+    // per-project row. Using `list_module_installs_with_status` for all
+    // three steady-state statuses gives us a small set per machine
+    // (rarely more than a handful of modules).
+    let mut seen_modules: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for status in &["installed", "running", "stopped", "error", "broken"] {
+        match db.list_module_installs_with_status(status) {
+            Ok(rows) => {
+                for row in rows {
+                    if row.project_id.is_some() {
+                        seen_modules.insert(row.module_id);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[auto_migrate] list_module_installs_with_status({}) failed: {}",
+                    status, e
+                );
+            }
+        }
+    }
+
+    for module_id in seen_modules {
+        // Look up the on-disk manifest. If it can't be found OR it
+        // doesn't declare scope=global, leave per-project rows alone.
+        let manifest = match resolve_manifest(&module_id) {
+            Some(m) => m,
+            None => {
+                // Module installed but no manifest on disk — the post-
+                // install extract step never ran. Skip; can't determine
+                // intended scope.
+                continue;
+            }
+        };
+        if !manifest.install.scope.is_global() {
+            continue;
+        }
+
+        // Already migrated? If a global row exists, we're done.
+        match db.get_global_module_install(&module_id) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {} // proceed to migration
+            Err(e) => {
+                eprintln!(
+                    "[auto_migrate] get_global_module_install({}) failed: {}",
+                    module_id, e
+                );
+                continue;
+            }
+        }
+
+        // List per-project rows for this module.
+        let per_project_rows = match db.list_per_project_installs_for_module(&module_id) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "[auto_migrate] list_per_project_installs_for_module({}) failed: {}",
+                    module_id, e
+                );
+                continue;
+            }
+        };
+
+        if per_project_rows.is_empty() {
+            // No per-project rows — nothing to migrate. The first install
+            // through the per-project path didn't happen, OR they were
+            // already cleaned up. Either way, the install code path
+            // will create a global row on next install attempt.
+            continue;
+        }
+
+        eprintln!(
+            "[auto_migrate] {} declares install.scope=global with {} per-project row(s); \
+             migrating to single global row",
+            module_id,
+            per_project_rows.len(),
+        );
+
+        // Stop + remove each per-project container.
+        for row in &per_project_rows {
+            if let Some(container_name) = row.container_name.as_deref() {
+                if !container_name.is_empty() {
+                    if let Err(e) = stop_container_for_project(container_name).await {
+                        eprintln!(
+                            "[auto_migrate] stop_container_for_project({}) failed: {}",
+                            container_name, e
+                        );
+                    }
+                }
+            }
+        }
+
+        // Capture install path + version from the first row (all rows
+        // for the same module share these — install_path is a template
+        // resolved against `{VCT_MODULES}/{MODULE_ID}` which is project-
+        // agnostic; version is the same per (module_id, manifest)).
+        let install_path = per_project_rows[0].install_path.clone();
+        let module_version = per_project_rows[0].module_version.clone();
+
+        // Delete every per-project row.
+        for row in &per_project_rows {
+            if let Some(pid) = row.project_id.as_deref() {
+                if let Err(e) = db.delete_module_install(pid, &module_id) {
+                    eprintln!(
+                        "[auto_migrate] delete_module_install({}, {}) failed: {}",
+                        pid, module_id, e
+                    );
+                }
+            }
+        }
+
+        // Insert the global row.
+        let install_id = uuid::Uuid::new_v4().to_string();
+        let global_row = match db.insert_global_module_install(
+            &install_id,
+            &module_id,
+            &module_version,
+            &install_path,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "[auto_migrate] insert_global_module_install({}) failed: {}",
+                    module_id, e
+                );
+                continue;
+            }
+        };
+        // Mark Installed so the resume sweep will start the container.
+        let _ = db.set_global_module_status(&module_id, ModuleStatus::Installed, None);
+        let _ = db.audit(
+            "module_migrated_to_global_scope",
+            None,
+            Some(&module_id),
+            &serde_json::json!({
+                "per_project_row_count": per_project_rows.len(),
+                "new_install_id": global_row.id,
+                "module_version": module_version,
+                "install_path": install_path,
+            }),
+        );
+
+        // Best-effort start. Failures are logged and surfaced via
+        // last_error; the resume sweep will retry on next boot.
+        if matches!(
+            manifest.runtime.r#type.as_str(),
+            "container" | "service"
+        ) && manifest.install.method == InstallMethod::ContainerPull
+        {
+            match start_global_container_after_install(&manifest, db).await {
+                Ok(name) => {
+                    eprintln!(
+                        "[auto_migrate] started global container {} for {}",
+                        name, module_id
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[auto_migrate] start_global_container_after_install({}) failed: {}",
+                        module_id, e
+                    );
+                    let _ = db.set_global_module_last_error(&module_id, Some(&e));
+                }
+            }
+        }
+    }
+}
+
 /// Ensure `projects.rl_port` is populated for the project. Allocates if
 /// NULL (fixed for orchestrator_root, random otherwise). Returns the
 /// final value.
@@ -1578,7 +1902,7 @@ where
             return;
         }
     };
-    for (project_id, module_id, container_name_opt) in rows {
+    for (project_id_opt, module_id, container_name_opt) in rows {
         // Load the manifest first — both the runtime-type gate AND the
         // restart paths need it. Failure here is "module installed
         // from a catalog that's no longer on disk" — skip noisily.
@@ -1615,73 +1939,83 @@ where
             }
         }
 
-        // Resolve the project row once for both branches below.
-        let project = match db.get_project(&project_id) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                eprintln!(
-                    "[module_service] resume: project {} not found, skipping",
-                    project_id
-                );
-                continue;
+        // v0.2.49 Stream A: branch on project_id presence to select the
+        // global vs per-project resume path.
+        //
+        // * `project_id IS NULL` ⇒ GLOBAL install row. One container
+        //   per machine; no project_slug substitution; container name
+        //   is the bare module_id (e.g. `vct-rl-reranker`).
+        // * `project_id IS Some(_)` ⇒ PER-PROJECT install row. The
+        //   existing v0.2.20–v0.2.48 path. Resolve the project + slug,
+        //   substitute `{project_slug}` in templates, allocate rl_port.
+        match project_id_opt {
+            None => {
+                // GLOBAL path.
+                if let Err(e) =
+                    start_global_container_for_module(&manifest, &module_id, db).await
+                {
+                    eprintln!(
+                        "[module_service] resume: start_global_container_for_module({}): {}",
+                        module_id, e
+                    );
+                    // Mirror NEW-3.C: surface to last_error so the GUI
+                    // can render a clear failure state. Soft-fail.
+                    let _ = db.set_global_module_last_error(&module_id, Some(&e));
+                }
             }
-            Err(e) => {
-                eprintln!("[module_service] resume: get_project({}): {}", project_id, e);
-                continue;
-            }
-        };
-
-        match container_name_opt {
-            Some(_container_name) => {
-                // Existing path: name was previously resolved + persisted;
-                // restart with the manifest. `start_container_for_module`
-                // re-resolves from the manifest (via NEW-3.B defaulting
-                // helpers if needed), producing the same name for the
-                // same `(module_id, project_slug)` pair.
-                let rl_port = match ensure_project_rl_port(db, &project) {
-                    Ok(p) => p,
+            Some(project_id) => {
+                // PER-PROJECT path (existing behaviour).
+                let project = match db.get_project(&project_id) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        eprintln!(
+                            "[module_service] resume: project {} not found, skipping",
+                            project_id
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         eprintln!(
-                            "[module_service] resume: ensure_rl_port({}): {}",
+                            "[module_service] resume: get_project({}): {}",
                             project_id, e
                         );
                         continue;
                     }
                 };
-                let ctx = PlaceholderCtx::new(&module_id);
-                if let Err(e) =
-                    start_container_for_module(&manifest, &ctx, &project, rl_port).await
-                {
-                    eprintln!(
-                        "[module_service] resume: start_container_for_module({}, {}): {}",
-                        project_id, module_id, e
-                    );
-                }
-            }
-            None => {
-                // v0.2.40 R1 path (mirror of W40-D): container_name=NULL
-                // means install-time auto-start either failed or never ran
-                // (e.g. install predates v0.2.39 NEW-3.B's defaulting
-                // helpers). Route through `start_container_after_install`
-                // — same path install-time auto-start uses post-v0.2.39.
-                // This both starts the container AND persists the
-                // resolved container_name back to the DB row so the
-                // existing-path branch picks it up on subsequent
-                // resumes.
-                if let Err(e) =
-                    start_container_after_install(&manifest, &project, db).await
-                {
-                    eprintln!(
-                        "[module_service] resume: start_container_after_install({}, {}): {}",
-                        project_id, module_id, e
-                    );
-                    // NEW-3.C surface: write to last_error so the GUI
-                    // tile can render a clear failure state. Status
-                    // intentionally stays 'installed' (the install
-                    // succeeded; only the post-boot container start
-                    // failed). Soft-fail: ignore the DB write error here
-                    // too — it's already a degraded path.
-                    let _ = db.set_module_last_error(&project_id, &module_id, Some(&e));
+
+                match container_name_opt {
+                    Some(_container_name) => {
+                        let rl_port = match ensure_project_rl_port(db, &project) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!(
+                                    "[module_service] resume: ensure_rl_port({}): {}",
+                                    project_id, e
+                                );
+                                continue;
+                            }
+                        };
+                        let ctx = PlaceholderCtx::new(&module_id);
+                        if let Err(e) =
+                            start_container_for_module(&manifest, &ctx, &project, rl_port).await
+                        {
+                            eprintln!(
+                                "[module_service] resume: start_container_for_module({}, {}): {}",
+                                project_id, module_id, e
+                            );
+                        }
+                    }
+                    None => {
+                        if let Err(e) =
+                            start_container_after_install(&manifest, &project, db).await
+                        {
+                            eprintln!(
+                                "[module_service] resume: start_container_after_install({}, {}): {}",
+                                project_id, module_id, e
+                            );
+                            let _ = db.set_module_last_error(&project_id, &module_id, Some(&e));
+                        }
+                    }
                 }
             }
         }
@@ -1980,13 +2314,24 @@ pub async fn retry_failed_module_installs(
         match collect(status) {
             Ok(rows) => {
                 for row in rows {
+                    // v0.2.49 Stream A: this retry sweep walks per-project
+                    // rows only. Global rows (project_id IS NULL) are
+                    // healed through a separate path (the resume sweep's
+                    // global branch fires per-launcher-boot and per-
+                    // orchestrator-update; failures land in
+                    // module_installs.last_error and the GUI surfaces a
+                    // Reinstall CTA when status=error).
+                    let project_id = match row.project_id {
+                        Some(p) => p,
+                        None => continue,
+                    };
                     if let Some(pid) = project_id_filter {
-                        if row.project_id != pid {
+                        if project_id != pid {
                             continue;
                         }
                     }
                     candidates.push((
-                        row.project_id,
+                        project_id,
                         row.module_id,
                         row.container_name,
                         (*status).to_string(),
@@ -2320,6 +2665,7 @@ mod tests {
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
                 }),
+                scope: crate::manifest::InstallScope::PerProject,
             },
             secrets: vec![],
             settings: vec![],
@@ -3644,5 +3990,222 @@ mod tests {
             "module_service::DEDUP_SENTINEL must equal the core constant — \
              a mismatch indicates accidental local-shadow re-introduction"
         );
+    }
+
+    // ─── v0.2.49 Stream A: auto-migration tests ─────────────────────────
+
+    /// Auto-migration is a NO-OP when no module declares scope=global.
+    /// Per-project rows are untouched.
+    #[test]
+    fn v0249_auto_migrate_noop_when_no_global_scope_manifests() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let db = Db::open_in_memory().expect("DB");
+            let project_id = "test-proj".to_string();
+            db.insert_project(
+                &project_id,
+                "Test",
+                "/tmp/test",
+                ProjectHost::Base,
+                "test-slug",
+            )
+            .expect("insert project");
+            db.insert_module_install(
+                "install-pp",
+                &project_id,
+                "vct-rl-reranker",
+                "0.2.7",
+                "/per-project",
+            )
+            .expect("pp insert");
+            db.set_module_status(&project_id, "vct-rl-reranker", ModuleStatus::Installed, None)
+                .expect("set installed");
+
+            // Resolver returns a manifest with scope=PerProject (default).
+            let manifest = make_manifest(true, true);
+            auto_migrate_per_project_to_global(&db, |id: &str| {
+                if id == "vct-rl-reranker" {
+                    Some(manifest.clone())
+                } else {
+                    None
+                }
+            })
+            .await;
+
+            // Per-project row untouched.
+            let pp_row = db
+                .get_module_install(&project_id, "vct-rl-reranker")
+                .unwrap()
+                .unwrap();
+            assert_eq!(pp_row.module_id, "vct-rl-reranker");
+            assert!(pp_row.project_id.is_some());
+            // No global row created.
+            assert!(db
+                .get_global_module_install("vct-rl-reranker")
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    /// Auto-migration converts N per-project rows into ONE global row +
+    /// audit log entry.
+    #[test]
+    fn v0249_auto_migrate_per_project_to_global_happy_path() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let db = Db::open_in_memory().expect("DB");
+            // Three projects, all with the per-project install row.
+            for (id, slug) in [("p1", "p1-slug"), ("p2", "p2-slug"), ("p3", "p3-slug")] {
+                db.insert_project(
+                    id,
+                    "Test",
+                    &format!("/tmp/{}", id),
+                    ProjectHost::Base,
+                    slug,
+                )
+                .expect("insert project");
+                db.insert_module_install(
+                    &format!("install-{}", id),
+                    id,
+                    "vct-rl-reranker",
+                    "0.2.7",
+                    "/per-project",
+                )
+                .expect("pp insert");
+                db.set_module_status(id, "vct-rl-reranker", ModuleStatus::Installed, None)
+                    .expect("set installed");
+            }
+
+            // Manifest now declares scope=global.
+            let mut manifest = make_manifest(true, true);
+            manifest.install.scope = crate::manifest::InstallScope::Global;
+            auto_migrate_per_project_to_global(&db, |id: &str| {
+                if id == "vct-rl-reranker" {
+                    Some(manifest.clone())
+                } else {
+                    None
+                }
+            })
+            .await;
+
+            // All per-project rows deleted.
+            let pp_rows = db
+                .list_per_project_installs_for_module("vct-rl-reranker")
+                .unwrap();
+            assert_eq!(
+                pp_rows.len(),
+                0,
+                "per-project rows must be deleted after migration"
+            );
+
+            // One global row created.
+            let g_row = db
+                .get_global_module_install("vct-rl-reranker")
+                .unwrap()
+                .expect("global row exists");
+            assert!(g_row.project_id.is_none());
+            assert_eq!(g_row.module_version, "0.2.7");
+        });
+    }
+
+    /// Auto-migration is IDEMPOTENT — re-running after a successful
+    /// migration is a no-op (the global row already exists, so the
+    /// per-module branch short-circuits).
+    #[test]
+    fn v0249_auto_migrate_is_idempotent() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let db = Db::open_in_memory().expect("DB");
+            let project_id = "p1".to_string();
+            db.insert_project(
+                &project_id,
+                "Test",
+                "/tmp/p1",
+                ProjectHost::Base,
+                "p1-slug",
+            )
+            .expect("insert project");
+            db.insert_module_install(
+                "install-pp",
+                &project_id,
+                "vct-rl-reranker",
+                "0.2.7",
+                "/per-project",
+            )
+            .expect("pp insert");
+            db.set_module_status(
+                &project_id,
+                "vct-rl-reranker",
+                ModuleStatus::Installed,
+                None,
+            )
+            .expect("set installed");
+
+            let mut manifest = make_manifest(true, true);
+            manifest.install.scope = crate::manifest::InstallScope::Global;
+
+            // First run.
+            auto_migrate_per_project_to_global(&db, |id: &str| {
+                if id == "vct-rl-reranker" {
+                    Some(manifest.clone())
+                } else {
+                    None
+                }
+            })
+            .await;
+
+            let g_row_first = db
+                .get_global_module_install("vct-rl-reranker")
+                .unwrap()
+                .unwrap();
+            let first_id = g_row_first.id.clone();
+
+            // Second run — must be a no-op (same id preserved).
+            auto_migrate_per_project_to_global(&db, |id: &str| {
+                if id == "vct-rl-reranker" {
+                    Some(manifest.clone())
+                } else {
+                    None
+                }
+            })
+            .await;
+
+            let g_row_second = db
+                .get_global_module_install("vct-rl-reranker")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                g_row_second.id, first_id,
+                "global row id must be preserved across re-runs (idempotency)"
+            );
+        });
+    }
+
+    /// Auto-migration skips modules whose manifest can't be resolved
+    /// (e.g. installed but post-install extract never ran).
+    #[test]
+    fn v0249_auto_migrate_skips_modules_with_no_manifest() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let db = Db::open_in_memory().expect("DB");
+            let pid = "p1".to_string();
+            db.insert_project(&pid, "Test", "/tmp/p1", ProjectHost::Base, "p1-slug")
+                .expect("insert project");
+            db.insert_module_install("install-pp", &pid, "unknown-mod", "0.1.0", "/x")
+                .expect("pp insert");
+            db.set_module_status(&pid, "unknown-mod", ModuleStatus::Installed, None)
+                .expect("set installed");
+
+            // Resolver returns None for everything.
+            auto_migrate_per_project_to_global(&db, |_| None).await;
+
+            // Per-project row untouched.
+            let pp = db
+                .get_module_install(&pid, "unknown-mod")
+                .unwrap()
+                .unwrap();
+            assert!(pp.project_id.is_some(), "per-project row preserved");
+            assert!(db.get_global_module_install("unknown-mod").unwrap().is_none());
+        });
     }
 }

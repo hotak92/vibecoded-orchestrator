@@ -102,6 +102,73 @@ pub fn resolve_container_name(template: &str, project_slug: &str) -> Result<Stri
     Ok(out)
 }
 
+/// v0.2.49 Stream A: resolve a GLOBAL container name. For global-scope
+/// installs the container name is the bare `module_id` — no
+/// `{project_slug}` suffix, no per-project naming, exactly one container
+/// per machine. Strips a trailing `-{project_slug}` if the manifest's
+/// `container_name_template` carries one (most manifests do), so a
+/// per-project module flipped to `install.scope = "global"` produces a
+/// clean bare-id container name without requiring the manifest author
+/// to author a separate template.
+///
+/// Rules:
+///   * `"vct-rl-reranker-{project_slug}"` → `"vct-rl-reranker"`
+///   * `"vct-rl-reranker"` → `"vct-rl-reranker"` (idempotent)
+///   * `"custom-{project_slug}-suffix"` → error (the `{project_slug}`
+///     isn't trailing; can't safely strip without changing semantics).
+///     Authors of global modules should drop the placeholder explicitly.
+pub fn resolve_global_container_name(
+    template: &str,
+    module_id: &str,
+) -> Result<String, String> {
+    // Strip a trailing `-{project_slug}` only — anywhere else and the
+    // template is ambiguous for global scope.
+    let stripped = template
+        .strip_suffix("-{project_slug}")
+        .or_else(|| template.strip_suffix("_{project_slug}"))
+        .unwrap_or(template);
+
+    if stripped.contains("{project_slug}") {
+        return Err(format!(
+            "container_name_template '{}' contains {{project_slug}} in a \
+             non-trailing position; cannot safely resolve for install.scope='global'. \
+             Drop the placeholder in your manifest, or move it to a trailing \
+             `-{{project_slug}}` suffix.",
+            template
+        ));
+    }
+
+    if stripped.contains('{') && stripped.contains('}') {
+        return Err(format!(
+            "container_name_template '{}' has unresolved placeholders → '{}'",
+            template, stripped
+        ));
+    }
+
+    if stripped.is_empty() {
+        // Fallback to the bare module id — authoring slip; better than
+        // returning an empty container name to podman.
+        return Ok(module_id.to_string());
+    }
+    Ok(stripped.to_string())
+}
+
+/// v0.2.49 Stream A: placeholder map for a GLOBAL container. Mirrors
+/// [`rl_placeholders`] but uses a fixed `"global"` literal for
+/// `{project_slug}` (so volume / log paths like
+/// `/data/state/{project_slug}/...` resolve to `/data/state/global/...`
+/// instead of erroring on the unresolved placeholder). `RL_SERVER_PORT`
+/// still comes from the caller — every container needs ONE listen port
+/// (allocated machine-wide for global modules vs per-project for
+/// per-project modules).
+pub fn rl_placeholders_global(rl_port: u16) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("{RL_SERVER_PORT}".to_string(), rl_port.to_string());
+    m.insert("{project_slug}".to_string(), "global".to_string());
+    m.insert("{ollama_port}".to_string(), DEFAULT_OLLAMA_PORT.to_string());
+    m
+}
+
 /// Resolve `{install.container.image}` + `{install.container.tag}` against
 /// the manifest's `install.container` block. The tag is chosen via the
 /// same rule `container_pull` uses (`tag_from_version` →
@@ -354,6 +421,98 @@ pub fn build_podman_run_args(
     }
 
     Ok(args)
+}
+
+/// v0.2.49 Stream A: build the full `podman run` argv for a GLOBAL
+/// container — no per-project state. Sibling of
+/// [`build_podman_run_args`] used by the global supervisor + global
+/// install path.
+///
+/// Differences vs `build_podman_run_args`:
+///   * Takes no `ProjectRow` — there's no project for a global install.
+///   * Uses [`rl_placeholders_global`], which substitutes `"global"` for
+///     `{project_slug}` (so volume paths like
+///     `/data/state/{project_slug}/...` resolve to a stable global dir).
+///   * `rl_port` is the machine-wide allocated port (one per global
+///     module — the container listens on this single port for every
+///     project's requests).
+pub fn build_podman_run_args_global(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+) -> Result<Vec<String>, String> {
+    let runtime = &manifest.runtime;
+    if !matches!(runtime.r#type.as_str(), "container" | "service") {
+        return Err(format!(
+            "build_podman_run_args_global: runtime.type must be 'container' or 'service', got '{}'",
+            runtime.r#type
+        ));
+    }
+
+    let placeholders = rl_placeholders_global(rl_port);
+    let mut args: Vec<String> = Vec::new();
+    args.push("run".into());
+    args.push("-d".into());
+    args.push("--name".into());
+    args.push(container_name.to_string());
+
+    if runtime.auto_restart {
+        args.push("--restart=unless-stopped".into());
+    }
+
+    for port in &runtime.ports {
+        args.push("-p".into());
+        args.push(build_port_arg(port, &placeholders)?);
+    }
+
+    for vol in &runtime.volumes {
+        args.push("-v".into());
+        args.push(build_volume_arg(vol, ctx, &placeholders));
+    }
+
+    for (k, v) in &runtime.env_fixed {
+        let resolved = resolve_value(v, ctx, &placeholders);
+        args.push("-e".into());
+        args.push(format!("{}={}", k, resolved));
+    }
+    for (k, v) in &runtime.env_derived {
+        let resolved = resolve_value(v, ctx, &placeholders);
+        args.push("-e".into());
+        args.push(format!("{}={}", k, resolved));
+    }
+
+    args.push(image.to_string());
+
+    args.push(resolve_value(&runtime.command, ctx, &placeholders));
+    for a in &runtime.args {
+        args.push(resolve_value(a, ctx, &placeholders));
+    }
+
+    Ok(args)
+}
+
+/// v0.2.49 Stream A: best-effort `mkdir -p` for each volume's host path
+/// for a GLOBAL container. Sibling of [`ensure_volume_host_dirs`] that
+/// substitutes `"global"` for `{project_slug}`.
+pub async fn ensure_volume_host_dirs_global(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    rl_port: u16,
+) {
+    let placeholders = rl_placeholders_global(rl_port);
+    for vol in &manifest.runtime.volumes {
+        let host_resolved = resolve_value(&vol.host, ctx, &placeholders);
+        let path = PathBuf::from(&host_resolved);
+        if let Err(e) = tokio::fs::create_dir_all(&path).await {
+            eprintln!(
+                "[container_runtime] global mkdir -p {} failed (will let podman surface the error): {}",
+                path.display(),
+                e
+            );
+        }
+    }
 }
 
 /// Replace `[^A-Za-z0-9._-]` with `_` so a hostile string can never
@@ -1027,6 +1186,7 @@ mod tests {
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
                 }),
+                scope: crate::manifest::InstallScope::PerProject,
             },
             secrets: vec![],
             settings: vec![],
@@ -1576,5 +1736,172 @@ mod tests {
             pre_pull_with_auth_for_start(m, r, i).await
         }
         let _ = _typecheck;
+    }
+
+    // ─── v0.2.49 Stream A: global container helpers ──────────────────────
+
+    /// Trailing `-{project_slug}` is stripped.
+    #[test]
+    fn v0249_resolve_global_container_name_strips_trailing_project_slug() {
+        let result =
+            resolve_global_container_name("vct-rl-reranker-{project_slug}", "vct-rl-reranker")
+                .expect("resolve");
+        assert_eq!(result, "vct-rl-reranker");
+    }
+
+    /// Trailing `_{project_slug}` is also stripped (underscore variant).
+    #[test]
+    fn v0249_resolve_global_container_name_strips_underscore_variant() {
+        let result =
+            resolve_global_container_name("my_module_{project_slug}", "my-module").expect("resolve");
+        assert_eq!(result, "my_module");
+    }
+
+    /// Template without `{project_slug}` passes through unchanged.
+    #[test]
+    fn v0249_resolve_global_container_name_idempotent_on_bare_name() {
+        let result =
+            resolve_global_container_name("vct-rl-reranker", "vct-rl-reranker").expect("resolve");
+        assert_eq!(result, "vct-rl-reranker");
+    }
+
+    /// `{project_slug}` in non-trailing position is rejected — the
+    /// resolver refuses to silently mangle the name.
+    #[test]
+    fn v0249_resolve_global_container_name_rejects_non_trailing_placeholder() {
+        let result = resolve_global_container_name(
+            "prefix-{project_slug}-suffix",
+            "vct-rl-reranker",
+        );
+        assert!(result.is_err());
+    }
+
+    /// Unresolved non-`{project_slug}` placeholders are rejected.
+    #[test]
+    fn v0249_resolve_global_container_name_rejects_unresolved_placeholders() {
+        let result = resolve_global_container_name("name-{module_id}", "vct-rl-reranker");
+        assert!(result.is_err());
+    }
+
+    /// `rl_placeholders_global` substitutes `"global"` for `{project_slug}`.
+    #[test]
+    fn v0249_rl_placeholders_global_uses_fixed_slug() {
+        let placeholders = rl_placeholders_global(11443);
+        assert_eq!(placeholders.get("{project_slug}").map(|s| s.as_str()), Some("global"));
+        assert_eq!(placeholders.get("{RL_SERVER_PORT}").map(|s| s.as_str()), Some("11443"));
+    }
+
+    /// `build_podman_run_args_global` rejects non-container runtime types
+    /// — mirrors the per-project builder's contract.
+    #[test]
+    fn v0249_build_podman_run_args_global_rejects_cli_runtime() {
+        let mut manifest = make_rl_manifest_global_for_test();
+        manifest.runtime.r#type = "cli".into();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let result = build_podman_run_args_global(&manifest, &ctx, 11443, "vct-rl-reranker", "img");
+        assert!(result.is_err());
+    }
+
+    /// `build_podman_run_args_global` produces a `podman run` argv that
+    /// includes the bare container name (no slug suffix) and the
+    /// expected `-d` + `--name` flags.
+    #[test]
+    fn v0249_build_podman_run_args_global_uses_bare_container_name() {
+        let manifest = make_rl_manifest_global_for_test();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/x/y:0.2.10",
+        )
+        .expect("build");
+        assert_eq!(args[0], "run");
+        assert_eq!(args[1], "-d");
+        assert_eq!(args[2], "--name");
+        assert_eq!(args[3], "vct-rl-reranker");
+        // Image lives somewhere in the argv (after env flags).
+        assert!(args.iter().any(|a| a == "ghcr.io/x/y:0.2.10"));
+    }
+
+    /// Local fixture: minimal RL-shaped manifest with
+    /// `install.scope = global` for the v0.2.49 Stream A tests above.
+    fn make_rl_manifest_global_for_test() -> crate::manifest::ModuleManifest {
+        use crate::manifest::{
+            Compatibility, ContainerInstallBlock, InstallBlock, InstallMethod, InstallScope,
+            LicenseBlock, ModuleCategory, ModuleManifest, Requirements, RuntimeBlock,
+        };
+        use std::collections::HashMap;
+
+        let mut env_fixed = HashMap::new();
+        env_fixed.insert("RL_SERVER_PORT".into(), "11443".into());
+
+        ModuleManifest {
+            manifest_version: 1,
+            id: "vct-rl-reranker".into(),
+            name: "RL Reranker".into(),
+            version: "0.2.10".into(),
+            description: "".into(),
+            publisher: None,
+            homepage: None,
+            repository: None,
+            icon: None,
+            category: ModuleCategory::PaidIndependent,
+            tags: vec![],
+            compatibility: Compatibility::default(),
+            license: LicenseBlock::default(),
+            requirements: Requirements::default(),
+            install: InstallBlock {
+                method: InstallMethod::ContainerPull,
+                source: Some("ghcr.io/hotak92/vct-rl-reranker".into()),
+                r#ref: Some("0.2.10".into()),
+                install_dir: "{VCT_MODULES}/vct-rl-reranker".into(),
+                post_install: vec![],
+                container: Some(ContainerInstallBlock {
+                    image: "ghcr.io/hotak92/vct-rl-reranker".into(),
+                    tag_from_version: true,
+                    registry: Some("ghcr.io".into()),
+                    pull_token_endpoint: "https://example.invalid/x".into(),
+                    pull_token_method: "POST".into(),
+                    rotate_weights: false,
+                    rotate_weights_endpoint: None,
+                }),
+                scope: InstallScope::Global,
+            },
+            secrets: vec![],
+            settings: vec![],
+            runtime: RuntimeBlock {
+                r#type: "container".into(),
+                command: "python".into(),
+                args: vec!["-m".into(), "rl_server.rl_server".into()],
+                platform_command: HashMap::new(),
+                cwd: None,
+                env_from_secrets: vec![],
+                env_from_settings: vec![],
+                env_fixed,
+                env_derived: HashMap::new(),
+                health_check: None,
+                ports: vec![],
+                volumes: vec![],
+                container_name_template: Some("vct-rl-reranker-{project_slug}".into()),
+                image_ref: None,
+                auto_restart: false,
+                gpu_image_variants: None,
+                log_file: None,
+                log_path_template: None,
+                min_gpu_vram_gb: None,
+                gpu_optional: true,
+            },
+            mcp_registration: None,
+            setup_wizard: None,
+            upgrade: None,
+            telemetry: None,
+            uninstall: None,
+            provides: vec![],
+            consumes: vec![],
+            gui: None,
+            db: None,
+        }
     }
 }

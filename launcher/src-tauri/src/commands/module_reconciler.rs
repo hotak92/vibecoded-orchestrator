@@ -172,7 +172,7 @@ fn reconcile_installed_modules_inner(
                      container_name=NULL, last_error indicates pull failure \
                      ({:?}); marking status=broken",
                     row.module_id,
-                    row.project_id,
+                    row.project_id.as_deref().unwrap_or("<global>"),
                     row.last_error.as_deref().unwrap_or(""),
                 );
                 match db.set_module_install_status(&row.id, "broken") {
@@ -196,7 +196,7 @@ fn reconcile_installed_modules_inner(
         eprintln!(
             "[reconciler] {} ({}@{}): on-disk manifest missing at {}; marking status=broken",
             row.module_id,
-            row.project_id,
+            row.project_id.as_deref().unwrap_or("<global>"),
             row.module_version,
             manifest_path.display(),
         );

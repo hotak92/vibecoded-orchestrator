@@ -378,8 +378,20 @@
               "type": "null"
             }
           ]
+        },
+        "scope": {
+          "description": "v0.2.49 Stream A: install scope. `per_project` (default) ⇒ one install row + one container per project. `global` ⇒ one install row machine-wide (project_id IS NULL) + one container named after the bare module id. Per-project routing for global modules happens INSIDE the container at the application layer (e.g. via the `X-VCT-Project-ID` request header for RL Reranker v0.2.10+).",
+          "default": "per_project",
+          "$ref": "#/definitions/InstallScope"
         }
       }
+    },
+    "InstallScope": {
+      "type": "string",
+      "enum": [
+        "per_project",
+        "global"
+      ]
     },
     "InstallMethod": {
       "oneOf": [
