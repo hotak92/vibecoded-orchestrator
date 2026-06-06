@@ -374,6 +374,118 @@ fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
     }
 }
 
+/// v0.2.49: reap a stale `install.py.lock` left behind by a crashed
+/// install.py subprocess.
+///
+/// Background: install.py's v0.2.49 main-entry singleton lock writes
+/// `<vct_root_dir>/install.py.lock` with `<pid>\n<unix_ts>\n` and holds
+/// an OS advisory lock on it for the process lifetime. The launcher
+/// always spawns install.py with `.kill_on_drop(true)` (the `update_at`
+/// path) OR via `.output().await` (every other path — synchronous, no
+/// orphan possible), so under normal shutdown the lock is released
+/// when the launcher exits cleanly.
+///
+/// However, a CRASHED launcher (segfault, OOM-kill, kill -9) cannot
+/// run Rust destructors → leaves the install.py child as an orphan,
+/// which leaves the lockfile in place even after the orphan dies.
+/// The NEXT launcher boot would then hit the singleton lock with a
+/// dead-PID holder and wait 15s before sys.exit(1) — bad UX.
+///
+/// This reaper runs once on launcher startup, BEFORE any other init:
+///   1. Read the PID stored in `<vct_root_dir>/install.py.lock`.
+///   2. If the PID is STILL alive → leave the lockfile alone (legit
+///      concurrent run, e.g. a manual `python install.py --update`
+///      from terminal; the singleton lock will protect us).
+///   3. If the PID is DEAD → unlink the lockfile so the next install
+///      run starts clean.
+///
+/// Soft-fail throughout: any error (missing file, unreadable, malformed
+/// content, unlink failure) logs to stderr and proceeds. The reaper is
+/// defense-in-depth — never blocks launcher boot.
+fn reap_stale_install_py_lock() {
+    let lock_path = paths::vct_root_dir().join("install.py.lock");
+    if !lock_path.exists() {
+        // Common case: no prior install.py run, or last run exited
+        // cleanly and the lockfile was removed by the OS handle close.
+        // (POSIX flock does NOT remove the file on release; the file
+        // persists with the PID payload from the last holder. But the
+        // OS lock IS released, so the next install can re-acquire it
+        // without the reaper getting involved. We only need to reap
+        // when the OS lock is still held by a dead PID.)
+        return;
+    }
+
+    // Read the PID from line 1. The lockfile body is `<pid>\n<unix_ts>\n`
+    // as written by install.py's _install_singleton_lock_or_die.
+    let content = match std::fs::read_to_string(&lock_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[vct] reap_stale_install_py_lock: could not read {}: {} \
+                 (leaving lockfile in place)",
+                lock_path.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    let pid_line = match content.lines().next() {
+        Some(line) => line.trim(),
+        None => {
+            // Empty file — no holder claimed it. Safe to remove.
+            let _ = std::fs::remove_file(&lock_path);
+            eprintln!(
+                "[vct] reap_stale_install_py_lock: removed empty {}",
+                lock_path.display()
+            );
+            return;
+        }
+    };
+
+    let pid: u32 = match pid_line.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            // Malformed first line — can't trust the file. Leave it
+            // alone and surface a diagnostic so the user notices.
+            eprintln!(
+                "[vct] reap_stale_install_py_lock: lockfile {} has \
+                 unparseable PID line {:?}; leaving in place",
+                lock_path.display(),
+                pid_line
+            );
+            return;
+        }
+    };
+
+    if pid_is_alive(pid) {
+        // Legit concurrent install.py run — the singleton lock will
+        // serialise the launcher's own install attempts behind it.
+        return;
+    }
+
+    // PID is dead — orphan lockfile. Remove it so the next install
+    // run starts clean.
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => {
+            eprintln!(
+                "[vct] reaped stale install.py.lock from dead PID {}",
+                pid
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] reap_stale_install_py_lock: could not remove {} \
+                 (dead PID {}): {}",
+                lock_path.display(),
+                pid,
+                e
+            );
+        }
+    }
+}
+
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // v0.2.12 (unified PR-23 + PR-28 dispatch): CLI subcommand dispatch
@@ -384,6 +496,15 @@ pub fn run() {
     if let Some(exit_code) = handle_cli_args() {
         std::process::exit(exit_code);
     }
+
+    // v0.2.49: reap any stale install.py.lock left behind by a crashed
+    // launcher (segfault / OOM-kill / kill -9 — none of which run
+    // Rust destructors, so `.kill_on_drop(true)` can't help). Without
+    // the reaper, the next install.py --update would observe a
+    // dead-PID holder on the lock and wait 15s before sys.exit(1) on
+    // EVERY launcher startup after a crash. Soft-fail; runs before
+    // any DB / Tauri init so a stale lock never blocks boot.
+    reap_stale_install_py_lock();
 
     let _initial_registry = registry::load_service_registry();
 
@@ -2851,5 +2972,104 @@ mod install_path_seed_tests {
         assert_eq!(found, None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.49: tests for the install.py-orphan-lockfile reaper called from
+// `run()` on launcher startup.
+//
+// Coverage:
+//   1. Dead-PID lockfile gets removed.
+//   2. Live-PID lockfile is preserved (legit concurrent run).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod orphan_reaper_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // VCT_STATE_DIR is process-wide; serialise tests that mutate it so
+    // parallel runs don't observe each other. Mirrors the pattern used
+    // by paths.rs's own tests + module_manifest_extract.rs.
+    static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    fn serialize_lock() -> std::sync::MutexGuard<'static, ()> {
+        SERIALIZE.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// A lockfile whose holder PID is dead must be removed so the next
+    /// install.py --update isn't blocked for 15s by a phantom holder.
+    #[test]
+    fn reap_stale_install_py_lock_removes_dead_pid_lockfile() {
+        let _g = serialize_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prior = std::env::var("VCT_STATE_DIR").ok();
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        // Sentinel: a PID that's guaranteed not allocated. Using
+        // `i32::MAX as u32` matches the pid_is_alive() defense-in-
+        // depth rejection (it short-circuits to false), so this is
+        // a deterministic "dead PID" signal cross-OS. The reaper
+        // treats pid_is_alive==false as "dead, reap me".
+        let lock_path = tmp.path().join("install.py.lock");
+        let dead_pid = i32::MAX as u32;
+        let payload = format!("{}\n{}\n", dead_pid, 1_700_000_000_u64);
+        std::fs::write(&lock_path, payload).unwrap();
+        assert!(lock_path.exists(), "precondition: lockfile must exist");
+
+        reap_stale_install_py_lock();
+
+        assert!(
+            !lock_path.exists(),
+            "dead-PID lockfile must be removed; still at {}",
+            lock_path.display()
+        );
+
+        match prior {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+    }
+
+    /// A lockfile whose holder PID is alive must be preserved. This is
+    /// the "legit concurrent install.py run" case (e.g. user kicked
+    /// off `python install.py --update` from a terminal while the
+    /// launcher is also starting up) — the singleton lock will
+    /// serialise the launcher's own install attempts behind it.
+    #[test]
+    fn reap_stale_install_py_lock_leaves_live_pid_lockfile_alone() {
+        let _g = serialize_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prior = std::env::var("VCT_STATE_DIR").ok();
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        // Use OUR pid as the "live holder" — pid_is_alive(self) is
+        // unconditionally true on every supported OS (see
+        // boot_sweep_tests::pid_is_alive_returns_true_for_own_pid).
+        let lock_path = tmp.path().join("install.py.lock");
+        let live_pid = std::process::id();
+        let payload = format!("{}\n{}\n", live_pid, 1_700_000_000_u64);
+        std::fs::write(&lock_path, payload).unwrap();
+        assert!(lock_path.exists(), "precondition: lockfile must exist");
+
+        reap_stale_install_py_lock();
+
+        assert!(
+            lock_path.exists(),
+            "live-PID lockfile must NOT be removed; missing from {}",
+            lock_path.display()
+        );
+        // Body preserved unchanged (reaper is read-only on live holders).
+        let after = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            after.starts_with(&format!("{}\n", live_pid)),
+            "lockfile body must be untouched; got {:?}",
+            after
+        );
+
+        match prior {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
     }
 }
