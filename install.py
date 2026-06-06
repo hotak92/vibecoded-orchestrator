@@ -3058,6 +3058,163 @@ def _vct_state_dir() -> Path:
 import contextlib as _contextlib
 
 
+# ---------------------------------------------------------------------------
+# v0.2.49: main()-entry single-instance lock for `install.py --update`.
+#
+# Background: V44-I's `_install_advisory_lock` is called from EXACTLY ONE
+# narrow site (the orchestrator-root rebind path at ~line 11193). The
+# broader `install.py --update` run is not protected. A bug reported
+# 2026-06-05 (Fabio's machine) showed two concurrent `install.py --update`
+# invocations deadlocking for 13 minutes — one held partial state, the
+# other spun in retry-with-backoff loops until timeout.
+#
+# This module-level pair coordinates the main()-entry guard and the V44-I
+# narrow-block guard on the SAME lock file. On POSIX `fcntl.flock` is
+# reentrant on a single fd held by the same process; on Windows
+# `msvcrt.locking` is NOT reentrant. The flag short-circuits cleanly
+# cross-OS: once main() holds the lock, V44-I yields immediately without
+# trying to re-take the OS lock.
+# ---------------------------------------------------------------------------
+_MAIN_ENTRY_LOCK_HELD: bool = False
+_MAIN_ENTRY_LOCK_HANDLE = None  # kept alive for process lifetime
+
+
+def _install_singleton_lock_or_die(timeout_seconds: float = 15.0):
+    """v0.2.49: acquire the install.py main-entry single-instance lock.
+
+    Closes the 13-minute-deadlock pattern reported 2026-06-05 from
+    Fabio's machine where two concurrent `install.py --update`
+    invocations interleaved on shared state.
+
+    Behaviour:
+      - On success: returns an open file handle. Caller MUST assign it
+        to a module-level variable (_MAIN_ENTRY_LOCK_HANDLE) so the lock
+        is held for the process lifetime; the OS releases it
+        automatically when the process exits and the handle closes.
+        Also sets the module-level flag `_MAIN_ENTRY_LOCK_HELD = True`
+        so the V44-I narrow-block lock yields without re-attempting.
+      - On contention timeout: sys.exit(1) with a clear error to stderr
+        naming the holding PID + when it started + a hint to wait or
+        kill the other process.
+      - Soft-fail (lock file can't be opened — permission error,
+        readonly fs): emits WARNING to stderr, returns None, PROCEEDS
+        without lock. The lock is defense-in-depth, not a hard gate.
+
+    Cross-OS:
+      - POSIX (Linux/macOS): fcntl.flock with LOCK_EX | LOCK_NB; retry
+        with exponential backoff up to timeout_seconds.
+      - Windows: msvcrt.locking(LK_NBLCK, 1) on a 1-byte region at
+        offset 0 of the same lock file; same retry pattern.
+
+    Coordinates with `_install_advisory_lock` (V44-I) by using the
+    same lock file path (vct_root_dir() / "install.py.lock") AND by
+    setting `_MAIN_ENTRY_LOCK_HELD = True` so V44-I's reentrant
+    re-take is a noop on this process. Required because msvcrt.locking
+    on Windows is NOT reentrant — without the flag, V44-I would
+    deadlock against the lock we already hold.
+
+    Writes "<pid>\\n<unix_timestamp>\\n" to the lock file after
+    acquiring so concurrent attempts can name the holding PID in their
+    error messages. Truncates first so stale PIDs from
+    crashed-without-cleanup runs are overwritten.
+    """
+    global _MAIN_ENTRY_LOCK_HELD
+
+    # Resolve lock path via the canonical resolver (mirrors V44-I).
+    try:
+        from vco_lib.paths import vct_root_dir as _vct_root_dir
+        lock_path = _vct_root_dir() / "install.py.lock"
+    except Exception as e:
+        print(
+            f"  WARNING: could not resolve install lock path: {e} "
+            f"(proceeding without main-entry singleton guard)",
+            file=sys.stderr,
+        )
+        return None
+
+    fp = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # a+b creates the file if missing and lets us seek+read+write.
+        fp = open(str(lock_path), "a+b")
+    except Exception as e:
+        print(
+            f"  WARNING: could not open install lock {lock_path}: {e} "
+            f"(proceeding without main-entry singleton guard)",
+            file=sys.stderr,
+        )
+        return None
+
+    deadline = time.monotonic() + timeout_seconds
+    backoff = 0.25
+    acquired = False
+    while time.monotonic() < deadline:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except (BlockingIOError, OSError):
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 2.0)
+
+    if not acquired:
+        # Read the holding PID + start-time from the lock file for the
+        # diagnostic. May be empty (race: holder hasn't written yet) or
+        # stale (crashed without releasing); surface whatever's there.
+        holder_info = "unknown PID"
+        try:
+            fp.seek(0)
+            raw = fp.read(256).decode("utf-8", errors="replace").strip()
+            lines = raw.splitlines()
+            holder_pid = lines[0].strip() if lines else "?"
+            holder_ts = lines[1].strip() if len(lines) > 1 else "?"
+            try:
+                ts_int = int(float(holder_ts))
+                import datetime as _dt
+                started = _dt.datetime.fromtimestamp(ts_int).isoformat(
+                    timespec="seconds"
+                )
+                holder_info = f"PID {holder_pid} (started {started})"
+            except (ValueError, OSError):
+                holder_info = f"PID {holder_pid}"
+        except Exception:
+            pass
+        try:
+            fp.close()
+        except Exception:
+            pass
+        print(
+            f"ERROR: install.py is already running ({holder_info}) on "
+            f"lock {lock_path}; waited {timeout_seconds}s. Wait for the "
+            f"other run to finish, or kill it and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Write holding PID + start timestamp so concurrent attempts can name
+    # the conflict. Truncate first so a stale PID from a crashed-without-
+    # cleanup prior run gets overwritten. seek+truncate within the same
+    # open fd preserves the OS-level advisory lock we just acquired.
+    try:
+        import time as _time
+        fp.seek(0)
+        fp.truncate(0)
+        payload = f"{os.getpid()}\n{int(_time.time())}\n".encode("utf-8")
+        fp.write(payload)
+        fp.flush()
+    except Exception:
+        # Diagnostic-only data; lock is already acquired. Don't fail.
+        pass
+
+    _MAIN_ENTRY_LOCK_HELD = True
+    return fp
+
+
 @_contextlib.contextmanager
 def _install_advisory_lock(timeout_seconds: float = 60.0):
     """v0.2.44 V44-I: cross-OS advisory lock for the duration of the
@@ -3076,7 +3233,20 @@ def _install_advisory_lock(timeout_seconds: float = 60.0):
     Soft-fail: if the lock file cannot be created or locked at all
     (permission errors, filesystem quirks), emit a WARNING and continue
     without the lock. The lock is a defensive measure, not a hard gate.
+
+    v0.2.49: if main() already holds the entry-lock on the SAME file
+    (`_MAIN_ENTRY_LOCK_HELD == True`), this re-take is unnecessary AND
+    would deadlock on Windows (msvcrt.locking is not reentrant). Yield
+    immediately — the process-level entry lock already provides the
+    same exclusion guarantee.
     """
+    # v0.2.49: short-circuit when main() already holds the lock. POSIX
+    # fcntl.flock is reentrant for the same fd in the same process,
+    # but Windows msvcrt.locking is not — re-attempting the lock would
+    # deadlock. The module-level flag is the canonical cross-OS guard.
+    if _MAIN_ENTRY_LOCK_HELD:
+        yield None
+        return
     # Resolve lock path via the canonical resolver (mirrors the Rust
     # `paths::vct_root_dir`). install.py imports vco_lib at module load
     # so this should always succeed; if it doesn't, the unrecoverable
@@ -3813,6 +3983,33 @@ def main() -> int:
     # install.py somewhere without first-install.sh next to it, fail
     # loudly with a clear message instead of half-installing.
     validate_source_repo(PROJECT_ROOT)
+
+    # v0.2.49: main()-entry single-instance lock for --update runs.
+    # Closes the 13-minute-deadlock pattern reported 2026-06-05 from
+    # Fabio's machine where two concurrent `install.py --update`
+    # invocations interleaved on shared state. Wait-then-die with a
+    # 15s timeout — fast enough for accidental double-clicks to
+    # succeed (first instance finishes), but bounded so a genuine
+    # concurrent run gets a clear error.
+    #
+    # The V44-I narrow-block lock at install.py:~11193 coordinates on
+    # the same lockfile via the module-level `_MAIN_ENTRY_LOCK_HELD`
+    # flag (set inside `_install_singleton_lock_or_die` on success).
+    # Without that flag V44-I would re-take the same OS lock and
+    # deadlock on Windows (msvcrt.locking is not reentrant; POSIX
+    # fcntl.flock IS reentrant, so on Linux/macOS it would be a noop
+    # but the flag short-circuits cleanly on both surfaces).
+    #
+    # Gated on "--update" in sys.argv (peeked BEFORE argparse) so the
+    # guard fires only for the deadlock-prone code path. Fresh installs
+    # on a clean dir don't have the same shared-state mutation contention.
+    # Soft-fails to WARNING if the lock file can't be opened
+    # (permission/readonly fs) — same discipline as V44-I.
+    global _MAIN_ENTRY_LOCK_HANDLE
+    if "--update" in sys.argv:
+        _MAIN_ENTRY_LOCK_HANDLE = _install_singleton_lock_or_die(
+            timeout_seconds=15.0
+        )
 
     parser = argparse.ArgumentParser(
         description="VibeCoded Tools — Orchestrator Installer",
