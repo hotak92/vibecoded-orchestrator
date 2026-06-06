@@ -279,6 +279,14 @@ single-writer SQL UPDATEs serialise concurrent writes.
   `resolve_pull_token_endpoint`) follow the same pattern — single
   source in core, `pub(crate) use` re-exports in the launcher.
 
+### PerPullAuth — critical fix: --authfile flag position (v0.2.49)
+
+**Key implementation detail**: The `PerPullAuth::apply_to()` method in the core now uses `REGISTRY_AUTH_FILE` environment variable instead of `--authfile` argv flag. This fixes a critical bug that was latent since v0.2.47: the original implementation put `--authfile` BEFORE the subcommand, producing invalid podman CLI syntax that podman 4.x rejects.
+
+**Why this matters for supervisor fix**: The supervisor's pre-pull-with-auth now inherits the correct env-var approach (position-independent), eliminating the flag-ordering bug that would have plagued the hub-side implementation.
+
+**Full details**: [[refines::Podman --authfile flag position bug (v0.2.47–v0.2.48) → env var fix (v0.2.49)]]
+
 ### Crates now sharing the auth path
 
 | Crate | What it does | What it calls |

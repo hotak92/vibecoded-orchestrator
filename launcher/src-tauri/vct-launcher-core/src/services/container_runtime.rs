@@ -432,19 +432,41 @@ impl PerPullAuth {
     /// `cmd` is `tokio::process::Command`; the same pattern can be
     /// adapted for `std::process::Command` by callers — both honor the
     /// same `.arg(...)` / `.env(...)` surface.
+    // v0.2.49: switched podman branch from argv flag injection to env var.
+    // The v0.2.47 shape (`cmd.arg("--authfile").arg(file.path())`) put the
+    // flag BEFORE the subcommand at every callsite (apply_to runs before
+    // `.args(["pull", &image_ref])`), producing
+    //   podman --authfile X pull image
+    // which podman 4.x rejects with "Error: unknown flag: --authfile".
+    // The flag is subcommand-scoped (`podman pull --authfile X image`),
+    // but every callsite added args in the wrong order. Three releases
+    // (v0.2.47-v0.2.48) shipped with launcher GUI installs silently
+    // failing exit 125 on every cache-miss pull.
+    //
+    // REGISTRY_AUTH_FILE is the env-var sibling of --authfile per podman
+    // release notes since 1.3. It's position-independent on the CLI, so
+    // no callsite reordering is needed. Docker branch already uses
+    // DOCKER_CONFIG env var; podman branch is now symmetric.
+    //
+    // Caller obligation: apply_to MUST run AFTER any cmd.env_clear()
+    // (env vars are last-write-wins). All current callsites verified
+    // safe: install path's pull doesn't env_clear; start path's pre-pull
+    // is a separate Command from the start's `podman run` (which does
+    // env_clear). See test `per_pull_auth_podman_env_var_accepted_by_live_podman`
+    // for the live-podman regression guard.
     pub fn apply_to(&self, cmd: &mut tokio::process::Command, runtime: &str) {
         match (&self.inner, runtime) {
             (PerPullAuthInner::Podman(file), _) => {
-                cmd.arg("--authfile").arg(file.path());
+                cmd.env("REGISTRY_AUTH_FILE", file.path());
             }
             (PerPullAuthInner::Docker(dir), "docker") => {
                 cmd.env("DOCKER_CONFIG", dir.path());
             }
             (PerPullAuthInner::Docker(dir), _) => {
                 // Hybrid case: caller built a Docker-shape guard but is
-                // invoking a non-docker runtime. Treat as podman --
-                // both runtimes will read DOCKER_CONFIG if set, AND the
-                // file is laid out the same way.
+                // invoking a non-docker runtime. DOCKER_CONFIG works on
+                // both runtimes (podman reads it as a fallback), and the
+                // file layout is identical.
                 cmd.env("DOCKER_CONFIG", dir.path());
             }
         }
@@ -1270,28 +1292,40 @@ mod tests {
         assert!(!p2.contains("../"));
     }
 
-    // ─── v0.2.47: PerPullAuth runtime dispatch ──────────────────────
+    // ─── v0.2.47 → v0.2.49: PerPullAuth runtime dispatch ────────────
+    //
+    // v0.2.47 injected `--authfile <path>` as an argv flag. Tests asserted
+    // on `format!("{:?}", cmd).contains("--authfile")` only. v0.2.49 fixed
+    // the podman-authfile-flag-position bug (latent for 3 releases) by
+    // switching to `REGISTRY_AUTH_FILE` env var, which is position-
+    // independent. Updated assertions below check the env-var shape.
 
-    /// Bug-2 regression test: podman runtime → `--authfile <path>` arg
-    /// is appended to the Command.
+    /// v0.2.49 regression test: podman branch → `REGISTRY_AUTH_FILE` env
+    /// var present, no `--authfile` argv flag.
     #[test]
-    fn per_pull_auth_apply_to_podman_uses_authfile_arg() {
+    fn per_pull_auth_apply_to_podman_uses_registry_auth_file_env() {
         let guard = build_per_pull_authfile("ghcr.io", "bot", "tok", "podman")
             .expect("build podman authfile");
         let mut cmd = tokio::process::Command::new("podman");
         guard.apply_to(&mut cmd, "podman");
         let dbg = format!("{:?}", cmd);
         assert!(
-            dbg.contains("--authfile"),
-            "podman branch must include --authfile arg, got: {}",
+            dbg.contains("REGISTRY_AUTH_FILE"),
+            "podman branch must include REGISTRY_AUTH_FILE env var, got: {}",
             dbg
         );
-        // path() returns Some for podman-shape guards.
+        assert!(
+            !dbg.contains("--authfile"),
+            "podman branch must NOT add --authfile to argv (would mis-position \
+             on podman 4.x), got: {}",
+            dbg
+        );
+        // path() still returns Some for podman-shape guards.
         assert!(guard.path().is_some(), "podman guard exposes path()");
     }
 
-    /// Bug-2 regression test: docker runtime → no `--authfile` arg,
-    /// instead `DOCKER_CONFIG=<dir>` env present.
+    /// v0.2.49 regression test: docker runtime → `DOCKER_CONFIG` env
+    /// var present, no `--authfile` argv flag.
     #[test]
     fn per_pull_auth_apply_to_docker_uses_docker_config_env() {
         let guard = build_per_pull_authfile("ghcr.io", "bot", "tok", "docker")
@@ -1316,19 +1350,68 @@ mod tests {
         );
     }
 
-    /// Built-for-podman guard applied to a podman runtime keeps the
-    /// authfile shape. Applied to docker runtime, also lands as
-    /// `--authfile` (no auto-translation). Caller must build the
-    /// runtime-correct guard up front — that's the contract.
+    /// Built-for-podman guard applied to a docker runtime still uses
+    /// `REGISTRY_AUTH_FILE` (the `(Podman, _)` match arm is runtime-
+    /// agnostic, by design). Callers SHOULD build runtime-correct
+    /// guards up front; this is the conservative fallback.
     #[test]
-    fn per_pull_auth_podman_guard_uses_authfile_even_against_docker() {
+    fn per_pull_auth_podman_guard_uses_env_var_even_against_docker() {
         let guard = build_per_pull_authfile("ghcr.io", "bot", "tok", "podman")
             .expect("build podman authfile");
         let mut cmd = tokio::process::Command::new("docker");
         guard.apply_to(&mut cmd, "docker");
         let dbg = format!("{:?}", cmd);
-        // The match arm `(Podman, _)` always uses --authfile, regardless of runtime.
-        assert!(dbg.contains("--authfile"));
+        assert!(
+            dbg.contains("REGISTRY_AUTH_FILE"),
+            "Podman-shape guard always uses REGISTRY_AUTH_FILE regardless of \
+             runtime, got: {}",
+            dbg
+        );
+        assert!(
+            !dbg.contains("--authfile"),
+            "v0.2.49 fix: no --authfile in argv even on the fallback path, \
+             got: {}",
+            dbg
+        );
+    }
+
+    /// v0.2.49 regression test (live podman): verify
+    /// `REGISTRY_AUTH_FILE=X podman --version` is accepted by the real
+    /// podman binary's CLI parser. The original v0.2.47 bug shape
+    /// (`podman --authfile X --version`) would have failed with "Error:
+    /// unknown flag: --authfile" — this test exercises the parser
+    /// end-to-end with the env-var shape to prevent that class of
+    /// regression. Skipped (clean return) on hosts without a podman
+    /// binary on PATH.
+    #[test]
+    fn per_pull_auth_podman_env_var_accepted_by_live_podman() {
+        let Ok(probe) = std::process::Command::new("which").arg("podman").output() else {
+            return;
+        };
+        if !probe.status.success() {
+            return;
+        }
+        let guard = build_per_pull_authfile("ghcr.io", "bot", "tok", "podman")
+            .expect("build podman authfile");
+        let path = guard
+            .path()
+            .expect("podman guard exposes path()")
+            .to_owned();
+        let output = std::process::Command::new("podman")
+            .env("REGISTRY_AUTH_FILE", &path)
+            .arg("--version")
+            .output()
+            .expect("spawn podman --version");
+        assert!(
+            output.status.success(),
+            "podman --version with REGISTRY_AUTH_FILE set must succeed, \
+             stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).starts_with("podman version "),
+            "expected podman version banner"
+        );
     }
 
     #[test]
