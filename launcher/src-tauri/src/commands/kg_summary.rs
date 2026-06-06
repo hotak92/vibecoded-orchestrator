@@ -1274,10 +1274,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn resolve_venv_python_finds_posix_layout() {
-        if cfg!(windows) {
-            return; // POSIX-shaped test.
-        }
         use std::os::unix::fs::PermissionsExt;
         let d = tmpdir("venv-posix");
         let scripts = d.join(".claude").join("scripts");
@@ -1299,10 +1297,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn resolve_venv_python_finds_legacy_mcp_servers_layout() {
-        if cfg!(windows) {
-            return;
-        }
         use std::os::unix::fs::PermissionsExt;
         let d = tmpdir("venv-legacy");
         let scripts = d.join(".claude").join("scripts");
