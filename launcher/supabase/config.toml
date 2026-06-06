@@ -49,6 +49,32 @@ verify_jwt = false
 [functions.rl-artifact-url]
 verify_jwt = false
 
+# v0.2.49 (2026-06-06): default-weights signed-URL gateway. Same auth
+# posture as rl-artifact-url — validates the body's
+# {license_key, machine_id_hash, embedding_source, module_id} and
+# issues a short-lived signed Storage URL for the per-source default
+# .pt weights. Launcher caller sets `Authorization: Bearer <license_key>`
+# (the call site in `module_default_weights.rs::fetch_signed_download_url`
+# wraps `bearer_auth(license_key)` for compat with the validate-tier
+# variant), but the function reads its auth from the body, NOT the
+# header. Without `verify_jwt = false`, every post-install
+# auto-download hits `UNAUTHORIZED_INVALID_JWT_FORMAT` because the
+# license key isn't a Supabase JWT — the gateway pre-gate rejects
+# before the function body runs.
+#
+# Discovered 2026-06-06 dogfooding on martino-X670E-Pro-RS after
+# Bug B + C unblocked the install path end-to-end. Audit log:
+# `module_default_weights_auto_download_deferred` with
+# `rl-latest-weights returned 401 Unauthorized:
+# {"code":"UNAUTHORIZED_INVALID_JWT_FORMAT","message":"Invalid JWT"}`.
+#
+# Same lesson as the v0.2.35 rl-artifact-url discovery: edge functions
+# that DO their own body-level auth must opt out of Supabase's
+# default JWT pre-gate via `verify_jwt = false`, otherwise the
+# pre-gate runs first and rejects on header shape regardless of body.
+[functions.rl-latest-weights]
+verify_jwt = false
+
 # v0.2.36: admin machine-rebind endpoint. Authenticates via the body's
 # `license_key` (vct_admin_*) — possession of the token is the auth
 # boundary, same model as validate-tier's Path A. The endpoint mutates
