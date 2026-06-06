@@ -435,7 +435,11 @@
        by a divider line. Replaces the menubar logo (visual duplicate
        of the Windows titlebar icon) and the statusbar version string. -->
   <div class="rs-brand-footer" aria-label="VCT Launcher brand">
-    <img src="/logo.png" alt="" class="rs-brand-logo" aria-hidden="true" />
+    <!-- logo-512 (512x512) instead of logo.png (64x64): the footer renders
+         at 80px CSS, so the 64px raster was upscaled (+25%, worse on HiDPI
+         scaling) and looked pixelated. The 512px source is crisp at any
+         render size / display scaling. -->
+    <img src="/logo-512.png" alt="" class="rs-brand-logo" aria-hidden="true" />
     <div class="rs-brand-name">VCT Launcher</div>
     {#if appVersion}
       <div class="rs-brand-version">v{appVersion}</div>
