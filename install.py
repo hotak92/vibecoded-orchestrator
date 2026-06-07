@@ -14205,6 +14205,17 @@ def _self_heal_kg_bindings_on_update(
                 # names + their parameter binds — access_level is the
                 # load-bearing field; audit columns get re-introduced via a
                 # proper migration if/when the feature is actually scoped.
+                #
+                # v0.2.49 access-matrix Step A.5: migration 029 adds
+                # `created_at` + `updated_at INTEGER NOT NULL DEFAULT 0`
+                # audit columns. These INSERTs are seed-path writes (the
+                # parity self-heal asserts the system's default; they
+                # are NOT user-driven), so we bind both timestamps to the
+                # SAME value. This preserves the seed-path invariant
+                # `created_at == updated_at` so the Rust-side
+                # `KgAccessRow::is_user_configured` predicate reads
+                # FALSE for rows we land here.
+                _seed_ts_ms = int(time.time() * 1000)
 
                 for proj_id, role, coll_name in binding_rows:
                     if not coll_name:
@@ -14213,9 +14224,11 @@ def _self_heal_kg_bindings_on_update(
                     if (proj_id, coll_name) not in existing_access:
                         cur.execute(
                             "INSERT OR IGNORE INTO kg_collection_access "
-                            "(project_id, collection_name, access_level) "
-                            "VALUES (?, ?, ?)",
-                            (proj_id, coll_name, level),
+                            "(project_id, collection_name, access_level, "
+                            " created_at, updated_at) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (proj_id, coll_name, level,
+                             _seed_ts_ms, _seed_ts_ms),
                         )
                         if cur.rowcount:
                             existing_access.add((proj_id, coll_name))
@@ -14228,9 +14241,11 @@ def _self_heal_kg_bindings_on_update(
                         if (proj_id, dev_name) not in existing_access:
                             cur.execute(
                                 "INSERT OR IGNORE INTO kg_collection_access "
-                                "(project_id, collection_name, access_level) "
-                                "VALUES (?, ?, ?)",
-                                (proj_id, dev_name, "write"),
+                                "(project_id, collection_name, access_level, "
+                                " created_at, updated_at) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                (proj_id, dev_name, "write",
+                                 _seed_ts_ms, _seed_ts_ms),
                             )
                             if cur.rowcount:
                                 existing_access.add((proj_id, dev_name))

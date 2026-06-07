@@ -158,6 +158,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "orchestrator_root_kg_collection setting row in app_state (v0.2.49 access-matrix Phase 1 / item #1). Persists the canonical name of the orchestrator-root shared KG collection (default 'VibeCodedOrchestrator_KnowledgeGraph') so every consumer that needs to ask 'is this the shared root?' can compare against a single source of truth instead of duplicating a hard-coded constant. Closes audit finding S-1 (substring heuristic). White-label installers override the default via install.py at install time. Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md.",
         sql: include_str!("migrations/028_orchestrator_root_kg_collection.sql"),
     },
+    Migration {
+        version: 29,
+        description: "kg_collection_access audit columns created_at + updated_at (v0.2.49 access-matrix Step A.5). ALTER TABLE adds the columns INTEGER NOT NULL DEFAULT 0. Legacy rows backfill to 0 (sentinel for 'pre-audit-trail'); v0.2.49+ INSERTs bind both to wall-clock millis. Required so the plan's is_user_configured(row) := row.updated_at != row.created_at predicate is implementable for future-cycle per-row decisions. Phase 7 force-upgrade migration in this same release doesn't depend on the audit data per user directive 'force-update everything to new default permissions'.",
+        sql: include_str!("migrations/029_kg_collection_access_audit_columns.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

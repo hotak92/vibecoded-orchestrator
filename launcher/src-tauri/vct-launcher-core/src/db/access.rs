@@ -36,6 +36,68 @@ pub struct AdoptionReport {
 
 // ─── KG collection access ────────────────────────────────────────────────
 
+/// v0.2.49 access-matrix Step A.5 — full row shape for
+/// `kg_collection_access`, including the audit columns introduced by
+/// migration 029.
+///
+/// Used by `kg_get_access_row` (Phase 1 helper for Phase 2's
+/// `is_user_configured` predicate) and any other consumer that needs
+/// to read audit data alongside the access level. The plain `String`
+/// return of `kg_get_access` is preserved for backward compatibility
+/// with the many call sites that only need the level.
+///
+/// Field semantics:
+///   - `access_level`: SQL wire value (`"read" | "write" | "none"`).
+///     Phase 2 introduces an `AccessLevel` enum; consumers that want
+///     the typed form go via `AccessLevel::from_str_strict`.
+///   - `created_at`: wall-clock millis at row INSERT. Legacy rows
+///     (pre-migration-029) backfill to 0 — a sentinel that
+///     distinguishes them from any row written by v0.2.49+ code.
+///   - `updated_at`: wall-clock millis at the most recent UPSERT
+///     that touched the row (any change to `access_level`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KgAccessRow {
+    pub project_id: String,
+    pub collection_name: String,
+    pub access_level: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl KgAccessRow {
+    /// v0.2.49 access-matrix Phase 2 core invariant (item #4):
+    /// `is_user_configured(row) := row.updated_at != row.created_at`.
+    ///
+    /// Semantics:
+    ///   - **`false`** when the row is in its seeded state (the seed
+    ///     path set `created_at == updated_at`; no subsequent UPSERT
+    ///     has touched it). The row carries the system's default
+    ///     access value for this (project, collection) pair.
+    ///   - **`true`** when the user (or any non-seed code path) has
+    ///     UPSERTed the row at least once after its initial seed,
+    ///     bumping `updated_at` past `created_at`. The row carries an
+    ///     explicit user-chosen value that the system must not
+    ///     silently override.
+    ///
+    /// Legacy rows (pre-migration-029): both timestamps default to 0
+    /// → predicate reads `false` (= not user-configured). This is
+    /// intentional: the v0.2.49 force-upgrade migration (Step D /
+    /// Phase 7) rewrites every legacy `read` shared-row to `write`
+    /// unconditionally per user directive 2026-06-08 ("force-update
+    /// everything to new default permissions"). After that migration
+    /// runs, the rewritten rows have `updated_at > created_at == 0`,
+    /// so they correctly read as user-configured by this predicate
+    /// for any FUTURE-cycle policy decision (v0.2.50+).
+    ///
+    /// Used by Phase 5 item #15 (F-2c peer-revoke skip):
+    /// `WHERE is_user_configured(row) = false` filters the UPDATE
+    /// loop so the user's explicit downgrades on peers' rows are
+    /// preserved.
+    pub fn is_user_configured(&self) -> bool {
+        self.updated_at != self.created_at
+    }
+}
+
 impl Db {
     pub fn kg_get_access(
         &self,
@@ -54,6 +116,40 @@ impl Db {
             .map_err(|e| format!("kg_get_access: {}", e))
     }
 
+    /// v0.2.49 access-matrix Step A.5 — read the full row including
+    /// audit columns. Phase 2's `is_user_configured` predicate is a
+    /// method on `KgAccessRow`; consumers that need it call this
+    /// getter instead of the plain `kg_get_access` (which only
+    /// returns the level string).
+    ///
+    /// Returns `Ok(None)` when no row exists for the (project_id,
+    /// collection) pair. `Ok(Some(row))` carries the full row shape.
+    pub fn kg_get_access_row(
+        &self,
+        project_id: &str,
+        collection: &str,
+    ) -> Result<Option<KgAccessRow>, String> {
+        let guard = self.lock();
+        guard
+            .query_row(
+                "SELECT project_id, collection_name, access_level, created_at, updated_at
+                   FROM kg_collection_access
+                  WHERE project_id = ?1 AND collection_name = ?2",
+                params![project_id, collection],
+                |r| {
+                    Ok(KgAccessRow {
+                        project_id: r.get(0)?,
+                        collection_name: r.get(1)?,
+                        access_level: r.get(2)?,
+                        created_at: r.get(3)?,
+                        updated_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| format!("kg_get_access_row: {}", e))
+    }
+
     pub fn kg_set_access(
         &self,
         project_id: &str,
@@ -63,17 +159,83 @@ impl Db {
         if !matches!(level, "read" | "write" | "none") {
             return Err(format!("invalid kg access level: {}", level));
         }
+        // v0.2.49 access-matrix Step A.5: bind both audit columns.
+        //
+        // INSERT path (no conflict): `created_at` and `updated_at`
+        // are both set to the same `now` timestamp. This is the
+        // load-bearing property that makes the future
+        // `is_user_configured(row) := row.updated_at != row.created_at`
+        // predicate work correctly: a freshly seeded row reads as
+        // "not user configured" because the two timestamps match.
+        //
+        // UPSERT path (conflict): only `updated_at` is bumped; the
+        // original `created_at` is preserved (via NOT updating it).
+        // This is the user-mutation signal — every UPSERT increments
+        // `updated_at` while leaving `created_at` frozen, making the
+        // predicate flip to "user configured" exactly when the row
+        // is touched after its initial seed.
+        //
+        // CAVEAT: callers that perform a no-op upsert (writing the
+        // same access_level again) DO bump `updated_at`. This is
+        // intentional — the resolver layer (Phase 2) treats
+        // `kg_set_access` as user-driven; system-driven INSERTs
+        // (migrations, boot probes) should use the dedicated
+        // `kg_seed_access` path (added below) to keep the timestamps
+        // equal.
+        let now = chrono::Utc::now().timestamp_millis();
         let guard = self.lock();
         guard
             .execute(
-                "INSERT INTO kg_collection_access (project_id, collection_name, access_level)
-                 VALUES (?1, ?2, ?3)
+                "INSERT INTO kg_collection_access (project_id, collection_name, access_level, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)
                  ON CONFLICT(project_id, collection_name)
-                 DO UPDATE SET access_level = excluded.access_level",
-                params![project_id, collection, level],
+                 DO UPDATE SET access_level = excluded.access_level,
+                               updated_at = excluded.updated_at",
+                params![project_id, collection, level, now],
             )
             .map_err(|e| format!("kg_set_access: {}", e))?;
         Ok(())
+    }
+
+    /// v0.2.49 access-matrix Step A.5 — seed-path INSERT for the
+    /// access matrix. Use this from migrations, boot probes, install.py
+    /// parity self-heal, and any code path that writes "the system's
+    /// default value for this row" rather than "the user's chosen
+    /// value." Both audit timestamps are set to the same value,
+    /// preserving the seed-path invariant
+    /// `created_at == updated_at` so that
+    /// `is_user_configured(row) := row.updated_at != row.created_at`
+    /// reads FALSE for the row.
+    ///
+    /// INSERT OR IGNORE semantics: existing rows are NOT overwritten.
+    /// This protects user-configured downgrades from being silently
+    /// upgraded by a seed-path that doesn't know the user touched the
+    /// row. Callers that want to deliberately overwrite should use
+    /// `kg_set_access` (which bumps `updated_at`, signalling the user
+    /// touched the row).
+    ///
+    /// Returns the number of rows actually inserted (0 when the row
+    /// already exists; 1 when freshly seeded).
+    pub fn kg_seed_access(
+        &self,
+        project_id: &str,
+        collection: &str,
+        level: &str,
+    ) -> Result<usize, String> {
+        if !matches!(level, "read" | "write" | "none") {
+            return Err(format!("invalid kg access level: {}", level));
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "INSERT OR IGNORE INTO kg_collection_access
+                    (project_id, collection_name, access_level, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![project_id, collection, level, now],
+            )
+            .map_err(|e| format!("kg_seed_access: {}", e))?;
+        Ok(n)
     }
 
     pub fn kg_list_access(
@@ -2434,5 +2596,214 @@ mod adopt_populated_tests {
 
         let result = db.adopt_populated_collections_at_boot(&dead_url).await;
         assert!(result.is_err(), "expected Err on unreachable Weaviate, got {:?}", result);
+    }
+}
+
+// ─── Step A.5 access-matrix audit-column tests ────────────────────────────
+//
+// Pin migration 029's contract: the `kg_collection_access` schema has
+// `created_at` + `updated_at INTEGER NOT NULL DEFAULT 0` columns; new
+// INSERTs from `kg_set_access` and `kg_seed_access` bind them with the
+// load-bearing seed-path invariant `created_at == updated_at` on first
+// INSERT.
+
+#[cfg(test)]
+mod access_audit_column_tests {
+    use super::*;
+
+    /// Helper: insert a project row so FK constraints don't reject the
+    /// kg_collection_access INSERT.
+    fn seed_proj(db: &Db, id: &str) {
+        let now: i64 = 1_700_000_000_000;
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+                 VALUES (?1, ?1, ?2, 'base', ?3, ?3, ?1)",
+                params![id, format!("/tmp/{}", id), now],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_029_adds_audit_columns_with_default_zero() {
+        // Fresh in-memory DB applies migrations through 029. Insert a
+        // row with only the 3 canonical columns bound (legacy-shape
+        // INSERT, e.g. raw SQL that pre-dates v0.2.49 callers). The
+        // audit columns default to 0.
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO kg_collection_access (project_id, collection_name, access_level)
+                     VALUES ('p1', 'LegacyKG', 'read')",
+                    [],
+                )
+                .unwrap();
+        }
+        let row = db
+            .kg_get_access_row("p1", "LegacyKG")
+            .expect("read row")
+            .expect("row present");
+        assert_eq!(row.access_level, "read");
+        assert_eq!(row.created_at, 0, "legacy row's created_at must default to 0");
+        assert_eq!(row.updated_at, 0, "legacy row's updated_at must default to 0");
+        assert!(
+            !row.is_user_configured(),
+            "legacy row (created_at == updated_at == 0) must read NOT user-configured",
+        );
+    }
+
+    #[test]
+    fn kg_set_access_first_insert_sets_created_eq_updated() {
+        // Seed-path invariant: the first INSERT into a (project_id,
+        // collection) pair via `kg_set_access` sets both audit
+        // timestamps to the same value. The `is_user_configured`
+        // predicate reads FALSE because the equality holds.
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        db.kg_set_access("p1", "FreshKG", "write").unwrap();
+
+        let row = db
+            .kg_get_access_row("p1", "FreshKG")
+            .expect("read")
+            .expect("present");
+        assert_eq!(row.access_level, "write");
+        assert_eq!(
+            row.created_at, row.updated_at,
+            "first INSERT must set created_at == updated_at; got created={}, updated={}",
+            row.created_at, row.updated_at,
+        );
+        assert!(
+            row.created_at > 0,
+            "v0.2.49+ INSERT must bind a non-zero timestamp",
+        );
+    }
+
+    #[test]
+    fn kg_set_access_upsert_bumps_updated_at_only() {
+        // User-mutation signal: a subsequent INSERT (treated as upsert
+        // via ON CONFLICT) bumps `updated_at` but PRESERVES
+        // `created_at`. The `is_user_configured` predicate flips to
+        // TRUE because the timestamps diverge.
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        db.kg_set_access("p1", "TouchKG", "read").unwrap();
+        let initial = db
+            .kg_get_access_row("p1", "TouchKG")
+            .unwrap()
+            .unwrap();
+        // Sleep enough that `chrono::Utc::now().timestamp_millis()`
+        // returns a strictly larger value. Wall-clock-millisecond
+        // granularity is fine; 2 ms is safely above any clock-resolution
+        // floor we care about.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        db.kg_set_access("p1", "TouchKG", "write").unwrap();
+        let updated = db
+            .kg_get_access_row("p1", "TouchKG")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.created_at, initial.created_at,
+            "upsert must preserve created_at (got created={}, expected={})",
+            updated.created_at, initial.created_at,
+        );
+        assert!(
+            updated.updated_at > initial.updated_at,
+            "upsert must bump updated_at past the previous value; \
+             updated_at went from {} to {}",
+            initial.updated_at, updated.updated_at,
+        );
+        assert!(
+            updated.is_user_configured(),
+            "row post-upsert (created_at != updated_at) must read user-configured",
+        );
+    }
+
+    #[test]
+    fn kg_seed_access_preserves_invariant_on_first_insert() {
+        // The dedicated seed-path setter also sets timestamps equal.
+        // Used by install.py parity self-heal, migrations, boot probes
+        // — code paths that write "the system's default" rather than
+        // "the user's value."
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        let n = db.kg_seed_access("p1", "SeedKG", "write").unwrap();
+        assert_eq!(n, 1, "fresh row should be inserted");
+
+        let row = db
+            .kg_get_access_row("p1", "SeedKG")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.access_level, "write");
+        assert_eq!(
+            row.created_at, row.updated_at,
+            "seed-path INSERT must preserve created_at == updated_at",
+        );
+        assert!(!row.is_user_configured());
+    }
+
+    #[test]
+    fn kg_seed_access_is_idempotent_does_not_clobber_user_row() {
+        // INSERT OR IGNORE semantics: a seed-path call on an existing
+        // row is a no-op. The existing row's audit data + access
+        // level are preserved verbatim — even if the user UPSERTed
+        // it after the original seed.
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        // 1. First seed.
+        db.kg_seed_access("p1", "K", "read").unwrap();
+        // 2. User upserts to a different level (this bumps updated_at,
+        //    flipping `is_user_configured` to TRUE).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        db.kg_set_access("p1", "K", "write").unwrap();
+        let after_user = db.kg_get_access_row("p1", "K").unwrap().unwrap();
+        assert!(after_user.is_user_configured());
+        // 3. Seed-path is called again (e.g. install.py --update re-runs
+        //    parity self-heal). It MUST NOT clobber the user-chosen row.
+        let n = db.kg_seed_access("p1", "K", "read").unwrap();
+        assert_eq!(n, 0, "INSERT OR IGNORE on existing row must be a no-op");
+        let after_reseed = db.kg_get_access_row("p1", "K").unwrap().unwrap();
+        assert_eq!(after_reseed.access_level, "write",
+            "seed-path must NOT downgrade the user's explicit write to read");
+        assert_eq!(
+            after_reseed, after_user,
+            "row must be byte-identical after no-op seed call",
+        );
+    }
+
+    #[test]
+    fn is_user_configured_predicate_legacy_row_reads_false() {
+        // Plan core invariant. A row whose `updated_at == created_at`
+        // (including the legacy default of both being 0) reads as
+        // NOT user-configured. The Phase 7 force-upgrade migration
+        // is therefore safe to rewrite EVERY existing row regardless
+        // of the predicate, because all legacy rows match the
+        // not-configured semantic.
+        let legacy = KgAccessRow {
+            project_id: "p1".into(),
+            collection_name: "K".into(),
+            access_level: "read".into(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(!legacy.is_user_configured());
+
+        let seeded_today = KgAccessRow {
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+            ..legacy.clone()
+        };
+        assert!(!seeded_today.is_user_configured());
+
+        let user_touched = KgAccessRow {
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_001,
+            ..legacy
+        };
+        assert!(user_touched.is_user_configured());
     }
 }

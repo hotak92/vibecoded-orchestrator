@@ -640,11 +640,16 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         self.assertNotIn("multi_candidate_prefix_adopt", ids)
 
 
+# v0.2.49 access-matrix Step A.5: schema mirrors migration 029.
+# created_at / updated_at INTEGER NOT NULL DEFAULT 0 (legacy rows
+# backfill to 0; v0.2.49+ INSERTs bind both).
 _KG_COLLECTION_ACCESS_DDL = """
 CREATE TABLE kg_collection_access (
     project_id      TEXT NOT NULL,
     collection_name TEXT NOT NULL,
     access_level    TEXT NOT NULL,
+    created_at      INTEGER NOT NULL DEFAULT 0,
+    updated_at      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, collection_name)
 )
 """
@@ -693,6 +698,24 @@ def _read_access(db_path: Path) -> list[tuple[str, str, str]]:
     try:
         cur = conn.execute(
             "SELECT project_id, collection_name, access_level "
+            "FROM kg_collection_access ORDER BY project_id, collection_name"
+        )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def _read_access_with_audit(
+    db_path: Path,
+) -> list[tuple[str, str, str, int, int]]:
+    """v0.2.49 access-matrix Step A.5: read full row including audit
+    columns. Used by tests that pin the seed-path invariant
+    (`created_at == updated_at` on first INSERT)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT project_id, collection_name, access_level, "
+            "       created_at, updated_at "
             "FROM kg_collection_access ORDER BY project_id, collection_name"
         )
         return list(cur.fetchall())
@@ -924,6 +947,63 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
             "INSERT raised OperationalError because it referenced "
             "granted_at + updated_at columns that no migration defines.",
         )
+
+    def test_parity_insert_sets_audit_timestamps_equal(self):
+        """v0.2.49 access-matrix Step A.5 (seed-path invariant): the
+        parity self-heal INSERTs are SEED writes (system-driven, not
+        user-driven). Both audit timestamps MUST be set to the SAME
+        value on first INSERT so the Rust-side
+        `KgAccessRow::is_user_configured` predicate reads FALSE for
+        the row.
+
+        This is the load-bearing property that makes the future
+        `is_user_configured(row) := row.updated_at != row.created_at`
+        predicate work correctly for any v0.2.49+ row. Legacy rows
+        (pre-migration-029) have `created_at == updated_at == 0` so
+        they also read as not-user-configured; new rows must
+        preserve the same equality.
+
+        Regression sentinel: if a future install.py change accidentally
+        binds `time.time()*1000` for `updated_at` and `0` for
+        `created_at` (or anything that breaks equality), this test
+        catches it. The Phase 7 force-upgrade migration depends on
+        seed rows reading as NOT user-configured.
+        """
+        _build_launcher_db_with_access(
+            self._db_path,
+            binding_rows=[("p1", "primary", "vcodev_KnowledgeGraph")],
+            access_rows=[],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VCODev_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        access_full = _read_access_with_audit(self._db_path)
+        # Both parity-inserted rows must have created_at == updated_at
+        # AND both must be non-zero (a freshly-seeded v0.2.49+ row).
+        self.assertEqual(
+            len(access_full), 2,
+            f"expected 2 parity-inserted rows, got: {access_full}",
+        )
+        for row in access_full:
+            (_proj_id, _coll, _level, created_at, updated_at) = row
+            self.assertEqual(
+                created_at, updated_at,
+                f"seed-path invariant violated for row {row}: "
+                f"created_at ({created_at}) != updated_at ({updated_at}). "
+                f"Phase 7 force-upgrade migration depends on seed rows "
+                f"reading as NOT user-configured.",
+            )
+            self.assertGreater(
+                created_at, 0,
+                f"v0.2.49+ seed-path INSERT must bind a non-zero "
+                f"timestamp; got row {row}. Zero is the legacy-row "
+                f"sentinel — install.py must not write it.",
+            )
 
     def test_access_matrix_absent_table_does_not_block_binding_heal(self):
         """Older launcher.db schemas may not have `kg_collection_access`.
