@@ -49,6 +49,17 @@
   // lapsed POST-install can't flip the enable bit until they re-activate)
   // and to add a hover tooltip on tiles for unlicensed paid modules.
   import { moduleIsLicenseGated, moduleNeedsLicense } from '$lib/license-gate';
+  // Bug D (v0.2.49): per-project badge helper. Communicates the
+  // per-project state ("installed here" / "installed elsewhere" /
+  // "not installed") on every tile so a project switch no longer
+  // makes modules look like they've disappeared — the row stays
+  // visible, only the badge changes. See `module-per-project-display.ts`
+  // for the resolution contract + why the catalog `kind` field is the
+  // aggregate-install signal we discriminate against.
+  import {
+    resolvePerProjectBadge,
+    perProjectBadgeClass,
+  } from '$lib/module-per-project-display';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -667,6 +678,11 @@
         {@const color = colorFor(m.id)}
         {@const installing = mState.installingId === m.id}
         {@const display = resolveTileDisplay(m, installRow, installing)}
+        <!-- Bug D (v0.2.49): per-project badge resolved alongside the
+             tile-display contract. Hoisted to the top of the {#each}
+             so the inline `{@const}` is valid (Svelte 5 requires
+             const tags to be the immediate child of a block). -->
+        {@const ppBadge = resolvePerProjectBadge(m, installRow)}
         <div class="module-card glass-card" style:--accent="rgb({colorRgb(color)})">
           <div class="card-head">
             <div class="card-icon" style:background="rgba({colorRgb(color)}, 0.12)" style:border-color="rgba({colorRgb(color)}, 0.25)">
@@ -701,6 +717,20 @@
                     Deprecated
                   </span>
                 {/if}
+                <!-- Bug D (v0.2.49): per-project status badge.
+                     Resolved at the top of the {#each} (ppBadge const).
+                     Always rendered so a project switch reads as
+                     "same list, different per-row context" rather
+                     than "modules disappeared". See
+                     module-per-project-display.ts for the palette. -->
+                <span
+                  class="pp-badge {perProjectBadgeClass(ppBadge.kind)}"
+                  title={ppBadge.tooltip}
+                  data-testid="pp-badge"
+                  data-pp-kind={ppBadge.kind}
+                >
+                  {ppBadge.label}
+                </span>
               </div>
               <p class="card-meta">
                 <span class="mono">v{m.version}</span> · {m.category}
@@ -1195,6 +1225,60 @@
     background: rgba(231, 76, 60, 0.16);
     color: #ff8a7e;
     cursor: help;
+  }
+
+  /* Bug D (v0.2.49): per-project status badge family. Shares the same
+     pill geometry as the tier badge so they line up cleanly in the
+     card title row. Colors map to semantic categories:
+       - bundled / included → purple/teal (orchestrator-shipped)
+       - enabled-here → green (active in this project)
+       - disabled-here → muted grey-amber (installed, toggled off)
+       - installed-here → teal (steady-state installed, non-toggleable)
+       - installed-elsewhere → mid-grey (the headline Bug D fix —
+                                          "this module IS installed but
+                                          not in this project")
+       - not-installed → muted (no install anywhere)
+     cursor:help cues that hovering reveals the tooltip with longer
+     copy explaining the badge meaning. */
+  .pp-badge {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: help;
+    white-space: nowrap;
+  }
+
+  .pp-badge.pp-badge-bundled {
+    background: rgba(123, 95, 255, 0.12);
+    color: var(--color-purple, #b29bff);
+  }
+  .pp-badge.pp-badge-included {
+    background: rgba(0, 191, 166, 0.08);
+    color: var(--color-teal);
+  }
+  .pp-badge.pp-badge-enabled {
+    background: rgba(46, 204, 113, 0.16);
+    color: rgb(76, 217, 134);
+  }
+  .pp-badge.pp-badge-disabled {
+    background: rgba(255, 159, 28, 0.12);
+    color: rgb(255, 159, 28);
+  }
+  .pp-badge.pp-badge-installed {
+    background: rgba(0, 191, 166, 0.12);
+    color: var(--color-teal);
+  }
+  .pp-badge.pp-badge-elsewhere {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--color-mid);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+  }
+  .pp-badge.pp-badge-none {
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--color-muted);
   }
 
   /* Bug 16: kind-aware status badges. */
