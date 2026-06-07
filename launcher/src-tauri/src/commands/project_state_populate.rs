@@ -2423,4 +2423,157 @@ mod tests {
 
         std::fs::remove_dir_all(&folder).ok();
     }
+
+    // ─── v0.2.49 item #13 (M-3): global-scope module KG access populate ──
+    // Tests for Option A — manifest field `kg_collections` + populate code
+    // running on `install.scope=global` install. Pre-implementation these
+    // should fail to COMPILE because:
+    //   - `populate_kg_collection_access_for_global_module` doesn't exist
+    //   - `ModuleManifest::kg_collections` field doesn't exist
+    //   - `Db::resolve_default_access_level` doesn't exist
+    //
+    // When main chat Phase 2 lands `resolve_default_access_level` + I add
+    // the manifest field + the populate helper, these tests pass.
+
+    #[test]
+    fn global_module_with_kg_collections_populates_access_for_all_projects() {
+        let _folder = scratch_dir("global-kg-populate");
+        let db = make_db_with_project("p1", "P1");
+        // Add a second project so we can verify access lands on BOTH.
+        let folder2 = if cfg!(windows) { r"C:\tmp\y" } else { "/tmp/y" };
+        let slug2 = db.generate_unique_slug("P2").unwrap();
+        db.insert_project("p2", "P2", folder2, crate::db::models::ProjectHost::Base, &slug2).unwrap();
+
+        let mut report = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &["RLMeta_KnowledgeGraph".to_string()],
+            &db,
+            &mut report,
+        );
+
+        // 1 collection × 2 projects = 2 access rows inserted.
+        assert_eq!(report.kg_access_rows_inserted, 2);
+        assert!(report.warnings.is_empty(), "warnings: {:?}", report.warnings);
+
+        let p1_access = db.kg_get_access("p1", "RLMeta_KnowledgeGraph").unwrap();
+        let p2_access = db.kg_get_access("p2", "RLMeta_KnowledgeGraph").unwrap();
+        // Both projects get the resolver's default (write for own; for
+        // a global-shipped collection neither project owns, the resolver
+        // determines this — likely write per F-2a "default R/W on shared").
+        assert!(p1_access.is_some());
+        assert!(p2_access.is_some());
+    }
+
+    #[test]
+    fn global_module_with_empty_kg_collections_no_access_rows() {
+        let _folder = scratch_dir("global-kg-empty");
+        let db = make_db_with_project("p1", "P1");
+
+        let mut report = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(&[], &db, &mut report);
+
+        assert_eq!(report.kg_access_rows_inserted, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn global_module_kg_collections_idempotent_preserves_user_level() {
+        // End-to-end invariant verification leveraging Step A.5's
+        // `kg_seed_access` non-clobber semantics + `is_user_configured()`:
+        //   1. First install: kg_seed_access writes row with
+        //      created_at == updated_at → is_user_configured FALSE
+        //   2. User downgrades via kg_set_access (mutation path) → UPSERT
+        //      bumps updated_at → is_user_configured TRUE
+        //   3. Second install: kg_seed_access detects existing row,
+        //      returns 0 (preserved), no clobber. Row stays at "none" +
+        //      still flagged user_configured.
+        let _folder = scratch_dir("global-kg-idempotent");
+        let db = make_db_with_project("p1", "P1");
+
+        // First install via the seed path.
+        let mut report1 = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &["RLMeta_KG".to_string()],
+            &db,
+            &mut report1,
+        );
+        assert_eq!(report1.kg_access_rows_inserted, 1);
+        let row_seeded = db.kg_get_access_row("p1", "RLMeta_KG").unwrap().unwrap();
+        assert!(
+            !row_seeded.is_user_configured(),
+            "freshly-seeded row should NOT read as user-configured"
+        );
+
+        // User downgrades to none via kg_set_access (user-mutation path).
+        db.kg_set_access("p1", "RLMeta_KG", "none").unwrap();
+        let row_after_user = db.kg_get_access_row("p1", "RLMeta_KG").unwrap().unwrap();
+        assert!(
+            row_after_user.is_user_configured(),
+            "user mutation via kg_set_access should flip is_user_configured to TRUE"
+        );
+
+        // Second install: kg_seed_access returns 0, row preserved (still 'none').
+        let mut report2 = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &["RLMeta_KG".to_string()],
+            &db,
+            &mut report2,
+        );
+        assert_eq!(
+            report2.kg_access_rows_inserted, 0,
+            "re-install must not clobber a user-configured row"
+        );
+        assert_eq!(
+            db.kg_get_access("p1", "RLMeta_KG").unwrap(),
+            Some("none".to_string()),
+            "user's explicit downgrade preserved"
+        );
+
+        // The user-configured invariant survives the re-install.
+        let row_final = db.kg_get_access_row("p1", "RLMeta_KG").unwrap().unwrap();
+        assert!(
+            row_final.is_user_configured(),
+            "re-install must preserve is_user_configured invariant"
+        );
+    }
+
+    #[test]
+    fn global_module_multiple_kg_collections_populates_all() {
+        let _folder = scratch_dir("global-kg-multi");
+        let db = make_db_with_project("p1", "P1");
+
+        let mut report = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &[
+                "MetaKG_A".to_string(),
+                "MetaKG_B".to_string(),
+                "MetaKG_C".to_string(),
+            ],
+            &db,
+            &mut report,
+        );
+
+        // 3 collections × 1 project = 3 rows.
+        assert_eq!(report.kg_access_rows_inserted, 3);
+        assert!(db.kg_get_access("p1", "MetaKG_A").unwrap().is_some());
+        assert!(db.kg_get_access("p1", "MetaKG_B").unwrap().is_some());
+        assert!(db.kg_get_access("p1", "MetaKG_C").unwrap().is_some());
+    }
+
+    #[test]
+    fn global_module_no_projects_returns_empty_report() {
+        // Edge case: orchestrator boots before any project is registered.
+        // Global module install should not crash.
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        let mut report = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &["MetaKG".to_string()],
+            &db,
+            &mut report,
+        );
+
+        assert_eq!(report.kg_access_rows_inserted, 0);
+        assert!(report.warnings.is_empty());
+    }
 }
