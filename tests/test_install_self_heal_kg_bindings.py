@@ -855,6 +855,76 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
             "equal privilege: canonical row kept, lowercase-c dropped",
         )
 
+    def test_access_matrix_parity_insert_matches_canonical_schema(self):
+        """v0.2.49 Bug O regression: when the parity self-heal backfills
+        missing kg_collection_access rows (for project_kg_bindings rows
+        without a matching access entry), the INSERT must match the
+        actual schema declared by `migrations/001_initial.sql:63-69`
+        — exactly 3 columns: (project_id, collection_name, access_level).
+
+        Pre-Bug-O the INSERT referenced 5 columns (adding `granted_at`
+        and `updated_at` that were planned but never landed in any
+        migration). Discovered 2026-06-07 via Bug N's empirical dogfood
+        validation: the RW pass would activate on any host with case-
+        rebind OR cross-prefix-adopt needs (the common case post-update),
+        the parity loop would attempt the INSERT, and SQLite would raise
+        `OperationalError: table kg_collection_access has no column named
+        granted_at` — every user hit it on every install.py --update.
+
+        Pin: build launcher.db with (a) a case-mismatched binding row
+        (triggers RW pass entry from the RO probe) AND (b) NO matching
+        kg_collection_access row (triggers the parity-insert). Post-fix:
+        the INSERT succeeds, the new row is observable, no exception.
+        Pre-fix: this test would fail with
+        `OperationalError: ... no column named granted_at`.
+        """
+        # Binding row needs a case-rebind → RW pass activates.
+        # No matching access row → parity-insert fires.
+        _build_launcher_db_with_access(
+            self._db_path,
+            binding_rows=[
+                ("p1", "primary", "vcodev_KnowledgeGraph"),
+            ],
+            access_rows=[],  # ← empty: triggers parity-insert
+        )
+        # Weaviate has the canonical-cased class → case-rebind needed.
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VCODev_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        # Pre-Bug-O this would raise OperationalError during the parity
+        # INSERT. Post-fix it returns cleanly.
+        install._self_heal_kg_bindings_on_update(report)
+
+        # The case-rebind happened (RW pass activated).
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "primary", "VCODev_KnowledgeGraph")],
+            "case-rebind path must still work post-Bug-O fix",
+        )
+
+        # Two parity INSERTs happened — schema-matching success:
+        #   1. (p1, VCODev_KnowledgeGraph, write) for the primary binding
+        #   2. (p1, VCODev_Development, write) for the auto-derived
+        #      _Development sibling (install.py L14181 backfill)
+        # The pre-Bug-O code would have raised OperationalError on the
+        # FIRST INSERT and never reached the second.
+        access = _read_access(self._db_path)
+        self.assertEqual(
+            access,
+            [
+                ("p1", "VCODev_Development", "write"),
+                ("p1", "VCODev_KnowledgeGraph", "write"),
+            ],
+            "Bug O regression: parity-insert must succeed against the "
+            "canonical 3-column kg_collection_access schema. Pre-fix the "
+            "INSERT raised OperationalError because it referenced "
+            "granted_at + updated_at columns that no migration defines.",
+        )
+
     def test_access_matrix_absent_table_does_not_block_binding_heal(self):
         """Older launcher.db schemas may not have `kg_collection_access`.
         The binding heal should still complete normally."""

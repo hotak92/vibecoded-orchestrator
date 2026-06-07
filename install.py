@@ -14158,7 +14158,19 @@ def _self_heal_kg_bindings_on_update(
                 binding_rows = cur.fetchall()
 
                 _ROLE_LEVEL = {"primary": "write", "shared": "read", "archive": "read"}
-                now_ms = int(time.time() * 1000)
+                # v0.2.49 Bug O fix: kg_collection_access schema (migrations/
+                # 001_initial.sql:63-69) has exactly 3 columns: project_id,
+                # collection_name, access_level. The legacy granted_at +
+                # updated_at column references here referred to audit columns
+                # that were planned but never landed in any migration — the
+                # INSERT failed with `OperationalError: table
+                # kg_collection_access has no column named granted_at` on
+                # every host whose self-heal RW pass activated. Discovered
+                # 2026-06-07 via Bug N's empirical dogfood validation (RL
+                # chat msg 186). Fixed by dropping the 2 unsupported column
+                # names + their parameter binds — access_level is the
+                # load-bearing field; audit columns get re-introduced via a
+                # proper migration if/when the feature is actually scoped.
 
                 for proj_id, role, coll_name in binding_rows:
                     if not coll_name:
@@ -14167,10 +14179,9 @@ def _self_heal_kg_bindings_on_update(
                     if (proj_id, coll_name) not in existing_access:
                         cur.execute(
                             "INSERT OR IGNORE INTO kg_collection_access "
-                            "(project_id, collection_name, access_level, "
-                            " granted_at, updated_at) "
-                            "VALUES (?, ?, ?, ?, ?)",
-                            (proj_id, coll_name, level, now_ms, now_ms),
+                            "(project_id, collection_name, access_level) "
+                            "VALUES (?, ?, ?)",
+                            (proj_id, coll_name, level),
                         )
                         if cur.rowcount:
                             existing_access.add((proj_id, coll_name))
@@ -14183,10 +14194,9 @@ def _self_heal_kg_bindings_on_update(
                         if (proj_id, dev_name) not in existing_access:
                             cur.execute(
                                 "INSERT OR IGNORE INTO kg_collection_access "
-                                "(project_id, collection_name, access_level, "
-                                " granted_at, updated_at) "
-                                "VALUES (?, ?, ?, ?, ?)",
-                                (proj_id, dev_name, "write", now_ms, now_ms),
+                                "(project_id, collection_name, access_level) "
+                                "VALUES (?, ?, ?)",
+                                (proj_id, dev_name, "write"),
                             )
                             if cur.rowcount:
                                 existing_access.add((proj_id, dev_name))
