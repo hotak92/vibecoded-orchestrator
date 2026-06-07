@@ -1592,6 +1592,15 @@ fn default_setting_type() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeBlock {
     pub r#type: String, // "mcp_stdio" | "mcp_http" | "service" | "cli" | "container"
+    /// v0.2.49: optional. For mcp_stdio / cli, this is the executable to
+    /// spawn. For container / service modules, this used to override the
+    /// container image's CMD — Bug E (the container CMD landing as
+    /// `python -m rl_server.rl_server podman run --rm -p 11450:11450
+    /// {module_image}` and argparse-failing) showed that container/
+    /// service modules should NOT set `command`. When empty (the
+    /// declarative form), the container runtime helper skips the CMD
+    /// override and the image-baked ENTRYPOINT runs unmolested.
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -2105,24 +2114,11 @@ impl ModuleManifest {
     /// flips this to `true` — there is no scenario where the seeding
     /// logic should treat an absent scope as global.
     pub fn install_scope_is_global(&self) -> bool {
-        // TODO(stream-a): replace this body with the real scope read
-        // once `install.scope` lands. Suggested integration:
-        //
-        //     use InstallScope::Global;
-        //     matches!(self.install.scope, Some(Global))
-        //
-        // Until then, the conservative default of `false` (per-project)
-        // preserves pre-v0.2.49 behaviour — no module is treated as
-        // global until it explicitly declares so.
-        //
-        // Defensive fallback: even if the field arrives in some form
-        // we don't expect, falling back to `false` means the install /
-        // uninstall / create_project_v2 hooks just skip the
-        // global-scope seeding step. The user still gets a working
-        // module; only the multi-project enable rows are absent. They
-        // can be backfilled idempotently on the next install or via
-        // a launcher-init hook.
-        false
+        // v0.2.49 integration: Stream A landed `install.scope` as a
+        // non-optional `InstallScope` field with `#[serde(default)] =
+        // PerProject`. Stream B's shim is now wired to read it.
+        // `InstallScope::is_global()` returns `matches!(self, Global)`.
+        self.install.scope.is_global()
     }
 
     /// NEW-3.D (2026-05-28): validate that a `service`/`container` runtime

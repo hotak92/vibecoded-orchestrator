@@ -410,14 +410,24 @@ pub fn build_podman_run_args(
         args.push(format!("{}={}", k, resolved));
     }
 
-    // Positional: image, then command + args (override of image CMD).
+    // Positional: image, then optional command + args (override of image CMD).
     args.push(image.to_string());
 
-    // command + args undergo the same placeholder substitution so author
-    // can use `{project_slug}` in `--log-path /data/logs/rl_events_{project_slug}.jsonl`.
-    args.push(resolve_value(&runtime.command, ctx, &placeholders));
-    for a in &runtime.args {
-        args.push(resolve_value(a, ctx, &placeholders));
+    // v0.2.49: Bug E — pre-v0.2.49 manifests had `command: "podman"` +
+    // `args: ["run", "--rm", "-p", "11450:11450", "{module_image}"]` (the
+    // launcher-side podman invocation mistakenly authored as the
+    // container CMD). The resulting container ran
+    // `<entrypoint> podman run --rm -p 11450:11450 {module_image}`
+    // and argparse-failed. Declarative manifests leave `command` empty
+    // and rely on the image-baked ENTRYPOINT. When `command` is empty,
+    // skip the CMD override entirely so podman uses the image's default.
+    // Placeholders still apply when `command` is non-empty (legacy
+    // override authors can use `{project_slug}` etc.).
+    if !runtime.command.is_empty() {
+        args.push(resolve_value(&runtime.command, ctx, &placeholders));
+        for a in &runtime.args {
+            args.push(resolve_value(a, ctx, &placeholders));
+        }
     }
 
     Ok(args)
@@ -485,9 +495,15 @@ pub fn build_podman_run_args_global(
 
     args.push(image.to_string());
 
-    args.push(resolve_value(&runtime.command, ctx, &placeholders));
-    for a in &runtime.args {
-        args.push(resolve_value(a, ctx, &placeholders));
+    // v0.2.49 Bug E (mirrored from build_podman_run_args): only push a
+    // CMD override when the manifest declares a non-empty `command`.
+    // Declarative manifests with empty command let the image's
+    // ENTRYPOINT run unmolested.
+    if !runtime.command.is_empty() {
+        args.push(resolve_value(&runtime.command, ctx, &placeholders));
+        for a in &runtime.args {
+            args.push(resolve_value(a, ctx, &placeholders));
+        }
     }
 
     Ok(args)
