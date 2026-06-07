@@ -1221,15 +1221,35 @@ pub fn run() {
             // BEFORE W40-B (W40-B may itself rebind, but it tags the
             // change with `manual_override:v0.2.40-prefix-adopt`; the
             // on-write propagation also handles that path).
+            //
+            // v0.2.49 batch 3 (black-screen cold-start fix):
+            // moved off the synchronous setup() path into an async
+            // tokio::spawn. Pre-fix: a slow Weaviate probe (e.g. the
+            // first run after a fresh Weaviate container start, where
+            // /v1/schema can take 1-3 s to respond) would block the
+            // setup closure from returning, which Tauri waits on
+            // before showing the window. Result: a black screen for
+            // the duration of the probe. Post-fix: the probe runs
+            // asynchronously after window paint; the worst-case
+            // user-facing effect of a slow Weaviate is the orphan-
+            // prune backfill being deferred by a few seconds, never
+            // a frozen UI. The reconcile is best-effort + idempotent
+            // by design (next boot retries).
             {
-                use tauri::Manager;
-                if let Some(db) = app.try_state::<db::Db>() {
+                let reconcile_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let Some(db) = reconcile_handle.try_state::<db::Db>()
+                    else {
+                        return;
+                    };
                     let weaviate_url = std::env::var("WEAVIATE_URL")
                         .unwrap_or_else(|_| "http://localhost:8081".to_string());
-                    let reconcile = tauri::async_runtime::block_on(
-                        db.inner().reconcile_kg_collection_access_at_boot(&weaviate_url),
-                    );
-                    match reconcile {
+                    match db
+                        .inner()
+                        .reconcile_kg_collection_access_at_boot(&weaviate_url)
+                        .await
+                    {
                         Ok(dropped) => {
                             if dropped > 0 {
                                 eprintln!(
@@ -1252,7 +1272,7 @@ pub fn run() {
                             );
                         }
                     }
-                }
+                });
             }
 
             // W40-B (v0.2.40, 2026-05-30): cross-prefix KG binding
@@ -1292,9 +1312,29 @@ pub fn run() {
             // Async needed because the function does HTTP probes;
             // wrap in `tauri::async_runtime::block_on` so the
             // synchronous setup closure isn't restructured.
+            //
+            // v0.2.49 batch 3 (black-screen cold-start fix):
+            // moved off the synchronous setup() path into an async
+            // tokio::spawn. Pre-fix: this block alone could dominate
+            // boot wall-clock — it does N+1 HTTP probes to Weaviate
+            // (one /v1/schema fetch + one Aggregate query per
+            // candidate same-suffix class per ambiguous binding row)
+            // PLUS per-project env-file regen. On a host with many
+            // projects + a slow Weaviate, the block_on could sit for
+            // 5-15 s, with the launcher window stuck black. Post-fix:
+            // runs asynchronously after window paint; user sees the
+            // GUI immediately. Idempotency unchanged — re-running
+            // the adopt step is harmless (already-adopted rows are
+            // tagged manual_override:v0.2.40-prefix-adopt and skipped
+            // on the second pass).
             {
-                use tauri::Manager;
-                if let Some(db) = app.try_state::<db::Db>() {
+                let adopt_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let Some(db) = adopt_handle.try_state::<db::Db>()
+                    else {
+                        return;
+                    };
                     // Weaviate URL: honour env override (matches the
                     // contract in the rest of the launcher), default
                     // to canonical localhost:8081.
@@ -1303,16 +1343,10 @@ pub fn run() {
                             "http://localhost:8081".to_string()
                         });
 
-                    // `block_on` keeps the &Db borrow valid throughout
-                    // the call (the async fn doesn't hold the DB lock
-                    // across .await boundaries — verified by the
-                    // function's contract docstring).
-                    let adopt_report =
-                        tauri::async_runtime::block_on(
-                            db.inner().adopt_populated_collections_at_boot(
-                                &weaviate_url,
-                            ),
-                        );
+                    let adopt_report = db
+                        .inner()
+                        .adopt_populated_collections_at_boot(&weaviate_url)
+                        .await;
 
                     match adopt_report {
                         Ok(report) => {
@@ -1404,7 +1438,7 @@ pub fn run() {
                             );
                         }
                     }
-                }
+                });
             }
 
             // v0.2.21 Step 6: bring up the detached vct-hub binary if
