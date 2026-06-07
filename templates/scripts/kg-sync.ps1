@@ -11,6 +11,15 @@
 # provided) or at orch-clone-relative paths. Validate each candidate
 # has `weaviate` importable before activating to avoid picking up an
 # unrelated project venv.
+#
+# v0.2.49 Bug K: pre-fix the validator only checked `import weaviate`
+# (the upstream client lib). That let unrelated project venvs through
+# that had pip-installed weaviate-client themselves but lacked the
+# editable `weaviate_mcp` package (installed by install.py A1,
+# v0.2.38). The post-fix validator gates on BOTH imports in a single
+# subprocess so candidate venvs missing `weaviate_mcp` are rejected
+# (otherwise sync_knowledge_graph.py crashes at
+# `from weaviate_mcp.chunking import Chunker`).
 
 $ErrorActionPreference = "Stop"
 
@@ -20,7 +29,10 @@ $ProjectRoot = Resolve-Path (Join-Path $ScriptDir "..\..")
 function Test-VenvHasKgDeps {
     param([string]$PythonExe)
     if (-not (Test-Path $PythonExe)) { return $false }
-    & $PythonExe -c "import weaviate" 2>$null
+    # v0.2.49 Bug K: validate BOTH `weaviate` (upstream client) AND
+    # `weaviate_mcp` (our editable internal module). Pre-fix only
+    # `weaviate` was checked, letting unrelated venvs through.
+    & $PythonExe -c "import weaviate, weaviate_mcp" 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 
