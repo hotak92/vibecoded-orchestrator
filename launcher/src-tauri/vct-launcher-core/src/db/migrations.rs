@@ -153,6 +153,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module_installs.project_id nullable + partial unique indexes for global-scope installs (v0.2.49 Stream A). NULL project_id == one install per machine, used by modules whose manifest declares install.scope = 'global' (vct-rl-reranker v0.2.10+). Pre-existing rows survive verbatim (the recreate-and-copy mirrors migration 013's pattern). Plan: .claude/context/plans/v0.2.49-global-install-per-project-routing-plan-2026-06-06.md.",
         sql: include_str!("migrations/027_module_installs_nullable_project.sql"),
     },
+    Migration {
+        version: 28,
+        description: "orchestrator_root_kg_collection setting row in app_state (v0.2.49 access-matrix Phase 1 / item #1). Persists the canonical name of the orchestrator-root shared KG collection (default 'VibeCodedOrchestrator_KnowledgeGraph') so every consumer that needs to ask 'is this the shared root?' can compare against a single source of truth instead of duplicating a hard-coded constant. Closes audit finding S-1 (substring heuristic). White-label installers override the default via install.py at install time. Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md.",
+        sql: include_str!("migrations/028_orchestrator_root_kg_collection.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

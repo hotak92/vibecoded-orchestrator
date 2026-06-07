@@ -5418,6 +5418,14 @@ def main() -> int:
     # an out-of-band hint for the binary-outside-clone case.
     _seed_launcher_install_path(PROJECT_ROOT, _deferral_report)
 
+    # v0.2.49 access-matrix Phase 1 (item #2): persist the orchestrator-
+    # root KG collection canonical name from
+    # `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env (if set). When unset,
+    # migration 028's default is authoritative — this call is a no-op.
+    # See `_persist_orchestrator_root_kg_collection` docstring for the
+    # resolution priority + soft-fail semantics.
+    _persist_orchestrator_root_kg_collection(_deferral_report)
+
     # v0.2.6 Bug C1: invoke the desktop-icon step so direct `python install.py`
     # runs get an icon too. first-install.sh-wrapped runs already trigger
     # this script independently; the helper is idempotent so the second
@@ -14789,6 +14797,201 @@ def _seed_launcher_install_path(install_path: Path,
         except Exception:  # noqa: BLE001
             # DeferralReport API drift — log only.
             pass
+
+
+def _persist_orchestrator_root_kg_collection(
+    deferral_report: "DeferralReport",
+) -> None:
+    """v0.2.49 access-matrix Phase 1 (item #2): persist the canonical
+    name of the orchestrator-root shared KG collection into launcher.db
+    `app_state['orchestrator_root_kg_collection']`.
+
+    Migration 028 (in vct-launcher-core) writes a default value of
+    `VibeCodedOrchestrator_KnowledgeGraph` via INSERT-OR-IGNORE on
+    every fresh DB. This helper provides the white-label / dev-clone
+    override path: when an env var `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION`
+    is set at install time, the launcher.db row is upserted to that
+    value (overriding the migration's default).
+
+    Resolution priority (highest → lowest):
+        1. `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env var (white-label
+           or dev-clone override). Trimmed; empty / whitespace-only
+           values are ignored.
+        2. Migration 028's default (`VibeCodedOrchestrator_
+           KnowledgeGraph`). Already written; nothing to do.
+
+    Idempotent: re-running with the same env value is a no-op (the
+    INSERT-OR-REPLACE writes the same row). Re-running with a CHANGED
+    env value (e.g. user reconsidered the white-label name) overwrites
+    — the most recent install wins.
+
+    Soft-fail throughout: launcher.db missing (fresh first-install
+    before vct-hub bootstrap), schema mismatch, or sqlite errors are
+    downgraded to a deferral entry. The migration's default is the
+    safety net.
+
+    Called from the install + update flows alongside
+    `_seed_launcher_install_path`. Position: AFTER the launcher.db
+    schema migrations have run (or after first launcher boot has
+    applied them), so the `app_state` table exists.
+    """
+    import sqlite3  # local import: matches the pattern used by other
+                     # launcher.db touch sites in this file.
+
+    override = os.environ.get("VCT_ORCHESTRATOR_ROOT_KG_COLLECTION", "").strip()
+    if not override:
+        # No override → migration 028's default is authoritative.
+        # Skip the write to avoid touching launcher.db unnecessarily
+        # (matches the Bug N RO-first discipline: don't open RW unless
+        # we have something to do).
+        _log_install_event(
+            "orchestrator_root_kg_collection", "skip",
+            "no override set; migration 028 default is canonical",
+        )
+        return
+
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
+        # launcher.db missing — fresh first-install before vct-hub
+        # has bootstrapped the schema. Migration 028 will write the
+        # default on first launcher boot; this run can't override it
+        # because there's no DB to write to yet. Log + defer.
+        _log_install_event(
+            "orchestrator_root_kg_collection", "skip",
+            f"launcher.db not found at {db_path}; "
+            f"override deferred to first launcher boot",
+            data={"db_path": str(db_path), "override": override},
+        )
+        return
+
+    # Open RO first per the Bug N discipline: check whether the
+    # current row already equals the override (no-op), and check that
+    # the app_state table actually exists (older launcher.db schemas
+    # that pre-date migration 008 won't have it — soft-fail).
+    try:
+        ro_conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        try:
+            ro_cur = ro_conn.cursor()
+            try:
+                ro_cur.execute(
+                    "SELECT value FROM app_state "
+                    "WHERE key = 'orchestrator_root_kg_collection'"
+                )
+                existing_row = ro_cur.fetchone()
+            except sqlite3.OperationalError as oe:
+                if "no such table" in str(oe).lower():
+                    # Pre-migration-008 schema. Skip — the launcher's
+                    # next boot will apply migrations 8 + 28; on a
+                    # subsequent install.py run this code path will
+                    # find the table and apply the override.
+                    _log_install_event(
+                        "orchestrator_root_kg_collection", "skip",
+                        "app_state table absent (pre-migration-008 schema); "
+                        "override deferred to next install.py run",
+                    )
+                    return
+                raise
+        finally:
+            ro_conn.close()
+    except sqlite3.Error as se:
+        _log_install_event(
+            "orchestrator_root_kg_collection", "warn",
+            f"RO probe failed: {type(se).__name__}",
+            data={"db_path": str(db_path), "error": str(se)[:200]},
+        )
+        return
+
+    if existing_row is not None and existing_row[0] == override:
+        # Idempotent path: the row already matches.
+        _log_install_event(
+            "orchestrator_root_kg_collection", "ok",
+            "value already matches override; no write needed",
+            data={"value": override},
+        )
+        return
+
+    # Apply the override. We open RW; if the writer lock is held (e.g.
+    # vct-hub is running, per the Bug N scenario), the 5s timeout will
+    # surface as a deferral entry rather than crashing the install.
+    now_ms = int(time.time() * 1000)
+    try:
+        rw_conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            rw_conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "  value = excluded.value, "
+                "  updated_at = excluded.updated_at",
+                ("orchestrator_root_kg_collection", override, now_ms),
+            )
+            rw_conn.commit()
+        finally:
+            rw_conn.close()
+        _log_install_event(
+            "orchestrator_root_kg_collection", "ok",
+            f"set orchestrator-root KG collection to {override}",
+            data={"value": override},
+        )
+    except sqlite3.OperationalError as oe:
+        # Most likely "database is locked" — vct-hub holds it.
+        msg = str(oe).lower()
+        if "locked" in msg or "busy" in msg:
+            _log_install_event(
+                "orchestrator_root_kg_collection", "warn",
+                "launcher.db is locked; deferring override write",
+                data={"db_path": str(db_path), "override": override},
+            )
+            try:
+                deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id="orchestrator_root_kg_collection_locked",
+                        title=(
+                            "Could not persist orchestrator-root KG "
+                            "collection override (launcher.db locked)"
+                        ),
+                        detected=(
+                            f"install.py tried to set the orchestrator-root "
+                            f"KG collection to '{override}' but launcher.db "
+                            f"at {db_path} was locked (vct-hub likely "
+                            f"holds the writer lock as a detached service). "
+                            f"The override has NOT been applied."
+                        ),
+                        why_deferred=(
+                            "Override application requires exclusive write "
+                            "access. The current row remains at its "
+                            "previous value (likely migration 028's "
+                            "default 'VibeCodedOrchestrator_KnowledgeGraph')."
+                        ),
+                        command_to_apply=(
+                            "# Close the launcher GUI + stop vct-hub, "
+                            "then re-run install.py:\n"
+                            "vct-hub --stop\n"
+                            "python install.py --update"
+                        ),
+                        severity="warning",
+                        kg_node_refs=[],
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # Other OperationalError — re-raise as a soft-fail log.
+        _log_install_event(
+            "orchestrator_root_kg_collection", "warn",
+            f"sqlite operational error: {oe}",
+            data={"db_path": str(db_path), "override": override},
+        )
+    except sqlite3.Error as se:
+        _log_install_event(
+            "orchestrator_root_kg_collection", "warn",
+            f"sqlite error: {type(se).__name__}",
+            data={"db_path": str(db_path), "error": str(se)[:200]},
+        )
 
 
 def _run_desktop_icon_step(args: argparse.Namespace) -> None:
