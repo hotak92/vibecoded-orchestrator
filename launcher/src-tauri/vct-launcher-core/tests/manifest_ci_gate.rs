@@ -563,14 +563,27 @@ fn resolve_image_ref_uses_declared_value() {
     assert_eq!(result, "ghcr.io/example/my-module:pinned-tag");
 }
 
-/// Missing `image_ref` + `tag_from_version=true` synthesizes
-/// `{image}:{version}` as a fully-resolved string.
+/// v0.2.49 Bug B: Missing `image_ref` ALWAYS synthesizes the
+/// canonical template form (NOT a pre-rendered string), regardless of
+/// `tag_from_version`. The downstream free-function
+/// `container_runtime::resolve_image_ref` then substitutes BOTH
+/// placeholders + applies the GPU variant suffix.
+///
+/// Pre-v0.2.49: this returned `"ghcr.io/example/my-module:0.2.7"`
+/// pre-rendered, which silently bypassed the variant-suffix `.replace()`
+/// in the downstream function (no-op on a pre-rendered string).
+/// The start path then ran with bare `:0.2.7` instead of
+/// `:0.2.7-cuda` → manifest unknown 125. See commit a5327309.
 #[test]
 fn resolve_image_ref_synthesizes_with_tag_from_version_true() {
     let rt = make_runtime_block_minimal(); // image_ref = None
     let cib = make_container_install_block(true, None);
     let result = rt.resolve_image_ref(&cib, "0.2.7");
-    assert_eq!(result, "ghcr.io/example/my-module:0.2.7");
+    // v0.2.49: canonical template form, NOT pre-rendered.
+    assert_eq!(
+        result,
+        "{install.container.image}:{install.container.tag}"
+    );
 }
 
 /// Missing `image_ref` + `tag_from_version=false` synthesizes the
@@ -588,12 +601,19 @@ fn resolve_image_ref_synthesizes_template_when_tag_from_version_false() {
     );
 }
 
-/// Empty `image_ref` is treated as missing and synthesizes the default.
+/// v0.2.49 Bug B: Empty `image_ref` is treated as missing and
+/// synthesizes the canonical template form (NOT a pre-rendered
+/// string). Same fix as `_synthesizes_with_tag_from_version_true`
+/// above — see that test's docstring for the bug background.
 #[test]
 fn resolve_image_ref_synthesizes_when_empty() {
     let mut rt = make_runtime_block_minimal();
     rt.image_ref = Some("".into());
     let cib = make_container_install_block(true, None);
     let result = rt.resolve_image_ref(&cib, "1.0.0");
-    assert_eq!(result, "ghcr.io/example/my-module:1.0.0");
+    // v0.2.49: canonical template form, NOT pre-rendered.
+    assert_eq!(
+        result,
+        "{install.container.image}:{install.container.tag}"
+    );
 }

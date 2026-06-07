@@ -279,8 +279,19 @@ class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
         Pre-fix: _rl_client_instance was a bare None-or-RLClient singleton;
         the first call froze ACTIVE_EMBEDDING=qwen3 for the entire process
         lifetime even if the user later flipped to arctic2 via the launcher.
-        Post-fix: the dict _rl_client_instances[embedding] is keyed on the
+
+        v0.2.42 RT-1: the dict _rl_client_instances[<key>] is keyed on the
         current env value, so a flip yields a fresh client.
+
+        v0.2.49 (commit 0ca7ee87): the cache key shape expanded from a
+        bare `active_embedding` string to a `(active_embedding,
+        project_id)` tuple so per-project routing via the
+        ``X-VCT-Project-ID`` header gets a distinct client per project.
+        The mid-session-flip semantics are unchanged for the
+        active_embedding dimension; this test asserts membership via
+        the resolved project_id so it survives both env shapes (hub
+        unreachable → project_id=None → tuple key `(emb, None)`; hub
+        reachable → tuple key `(emb, <uuid>)`).
         """
         import os
         import claude_mcp_servers.weaviate_mcp.server as srv
@@ -300,7 +311,17 @@ class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
                 "qwen3",
                 "First client must carry active_embedding=qwen3",
             )
-            self.assertIn("qwen3", srv._rl_client_instances)
+            # v0.2.49: cache keys are tuples (embedding, project_id).
+            # Assert membership via any-key-with-our-embedding match so
+            # the test passes regardless of whether the hub resolver
+            # returned a project_id (hub-reachable: (emb, uuid))
+            # or fell back (hub-unreachable: (emb, None)).
+            qwen3_keys = [k for k in srv._rl_client_instances if k[0] == "qwen3"]
+            self.assertTrue(
+                qwen3_keys,
+                f"Expected at least one cache entry keyed on 'qwen3', "
+                f"got keys: {list(srv._rl_client_instances.keys())}",
+            )
 
             # Phase 2: mid-session flip to arctic2.
             os.environ["ACTIVE_EMBEDDING"] = "arctic2"
@@ -320,8 +341,12 @@ class RLClientRlUpdateActiveEmbeddingTest(unittest.TestCase):
             )
 
             # Both entries survive in the dict (tombstone pattern).
-            self.assertIn("qwen3", srv._rl_client_instances)
-            self.assertIn("arctic2", srv._rl_client_instances)
+            # v0.2.49: assert via any-key-with-the-embedding match
+            # for both arms, same reason as Phase 1 above.
+            qwen3_keys = [k for k in srv._rl_client_instances if k[0] == "qwen3"]
+            arctic_keys = [k for k in srv._rl_client_instances if k[0] == "arctic2"]
+            self.assertTrue(qwen3_keys, "qwen3 cache entry must survive flip")
+            self.assertTrue(arctic_keys, "arctic2 cache entry must exist after flip")
 
         finally:
             # Restore original env state so we don't leak into adjacent tests.
