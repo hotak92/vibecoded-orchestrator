@@ -4156,15 +4156,105 @@ pub async fn update_orchestrator<R: Runtime>(
     // install.py --update` from terminal), it still emits the
     // deferral so the running launcher's W4 banner picks it up.
     cmd.env("VCT_AUTO_RESTART_LAUNCHER", "1");
+    // v0.2.49 batch 4 (sub-progress label): tell install.py to mirror
+    // _log_install_event calls to stdout as `[VCO-EVENT] <step>
+    // <phase> <detail>` lines. We stream stdout below + forward each
+    // event as sub-progress to the OrchestratorUpdateProgressModal so
+    // the user sees "Seeding Weaviate KG…", "Running migrations…",
+    // etc. instead of a static "Applying updates…" for the full
+    // re-embedding phase (which can take minutes).
+    cmd.env("VCO_PROGRESS_STREAM", "1");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let install_output = cmd
-        .output()
+
+    // v0.2.49 batch 4: spawn + stream stdout instead of .output() so
+    // we can emit sub-progress messages as install.py advances. The
+    // failure path is identical: full stderr is captured into the
+    // buffer for the post-exit error handler. Stdout is also captured
+    // (for parity with the pre-batch-4 behaviour where .output()
+    // populated install_output.stdout); the launcher only used the
+    // exit code anyway, so this is forward-compatible.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut install_child = cmd
+        .spawn()
+        .map_err(|e| format!("install.py --update failed to spawn: {}", e))?;
+
+    let mut install_stdout_buf = Vec::<u8>::new();
+    if let Some(stdout) = install_child.stdout.take() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut reader = BufReader::new(stdout).lines();
+        loop {
+            match reader.next_line().await {
+                Ok(Some(line)) => {
+                    install_stdout_buf.extend_from_slice(line.as_bytes());
+                    install_stdout_buf.push(b'\n');
+                    if let Some(rest) = line.strip_prefix("[VCO-EVENT] ") {
+                        // Format: `<step> <phase> <detail...>`. We
+                        // only react to `start` / `ok` phases for
+                        // progress messages. warn/error/skip stay
+                        // silent on this surface — they're already
+                        // captured in the JSONL log + the failure
+                        // path's stderr.
+                        let mut parts = rest.splitn(3, ' ');
+                        let step = parts.next().unwrap_or("");
+                        let phase = parts.next().unwrap_or("");
+                        let detail = parts.next().unwrap_or("");
+                        if phase == "start" || phase == "ok" {
+                            let sub_msg =
+                                installer_step_to_user_label(step, detail);
+                            if !sub_msg.is_empty() {
+                                // Hold the parent percentage steady at
+                                // ~50% (between the 40% "Applying"
+                                // and the 90% "Starting vct-hub").
+                                // The sub-message is what the user
+                                // reads.
+                                emit_progress(
+                                    &window,
+                                    "install",
+                                    &sub_msg,
+                                    50.0,
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break, // EOF
+                Err(e) => {
+                    eprintln!(
+                        "[vct] update_orchestrator: install.py stdout \
+                         read error: {} (continuing; install.py still \
+                         running)",
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    let install_status = install_child
+        .wait()
         .await
-        .map_err(|e| format!("install.py --update failed: {}", e))?;
+        .map_err(|e| format!("install.py --update wait failed: {}", e))?;
+
+    // Drain stderr (small; we waited for the process to exit first).
+    let mut install_stderr_buf = Vec::<u8>::new();
+    if let Some(mut stderr) = install_child.stderr.take() {
+        use tokio::io::AsyncReadExt;
+        let _ = stderr.read_to_end(&mut install_stderr_buf).await;
+    }
+
+    // Reconstruct an Output-shaped struct so the rest of the function
+    // reads identically to the pre-batch-4 .output() code path.
+    let install_output = std::process::Output {
+        status: install_status,
+        stdout: install_stdout_buf,
+        stderr: install_stderr_buf,
+    };
 
     if !install_output.status.success() {
         let stderr = String::from_utf8_lossy(&install_output.stderr);
@@ -7675,6 +7765,60 @@ fn emit_progress(window: &Window, stage: &str, message: &str, percentage: f32) {
     );
 }
 
+/// v0.2.49 batch 4 (sub-progress label): map an install.py `_log_
+/// install_event` step tag (e.g. `"7c/10"`, `"7d/10"`) to a short
+/// user-facing label for the OrchestratorUpdateProgressModal.
+///
+/// install.py emits events with two-character step tags like `"7/10"`,
+/// `"7b/10"`, `"7c/10"`. The numeric prefix identifies the install
+/// stage; sub-tags (`b`, `c`, `d`, `e`) are micro-steps within a
+/// stage. We map the most user-visible ones (long-running phases the
+/// user otherwise sees as a frozen progress bar) to short labels.
+///
+/// Returns an empty string for unrecognized steps — the caller treats
+/// this as "don't surface a sub-progress for this event," keeping the
+/// previous message in place.
+fn installer_step_to_user_label(step: &str, detail: &str) -> String {
+    // Step prefix is the part before the slash. Sub-tag (letter) is
+    // appended if present, e.g. step="7c/10" → prefix="7", sub="c".
+    let prefix = step.split('/').next().unwrap_or("");
+    let (numeric, suffix): (&str, &str) = {
+        let split_at = prefix
+            .char_indices()
+            .find(|(_, c)| !c.is_ascii_digit())
+            .map(|(i, _)| i)
+            .unwrap_or(prefix.len());
+        (&prefix[..split_at], &prefix[split_at..])
+    };
+
+    match (numeric, suffix) {
+        ("3", "") => "Creating Python virtual environment…".to_string(),
+        ("4", "") => "Installing Python dependencies…".to_string(),
+        ("4", "b") => "Installing Weaviate MCP package…".to_string(),
+        ("5", "") => "Starting containers (Weaviate, Ollama)…".to_string(),
+        ("6", "") => "Waiting for Ollama to be ready…".to_string(),
+        ("7", "") => "Pulling embedding models from Ollama…".to_string(),
+        ("7", "b") => "Configuring Ollama (this can take a minute)…".to_string(),
+        ("7", "c") => "Seeding Weaviate KG (this can take a few minutes)…".to_string(),
+        ("7", "d") => "Running schema migrations…".to_string(),
+        ("7", "e") => "Self-healing KG bindings…".to_string(),
+        ("8", "") => "Deploying vct-hub binary…".to_string(),
+        ("9", "") => "Writing .env file…".to_string(),
+        ("10", "") => "Verifying installation…".to_string(),
+        _ => {
+            // Unknown step: if the detail is short and human-readable
+            // (sub-200 chars), surface it directly rather than dropping
+            // the event. install.py uses fairly user-friendly detail
+            // strings already.
+            if !detail.is_empty() && detail.len() < 200 {
+                detail.to_string()
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
 /// Append one event to `state/logs/install.jsonl` from the launcher
 /// (actor=launcher). Mirrors the Python-side `_log_install_event`
 /// schema. Best-effort: the install log dir might not exist yet, in
@@ -8483,6 +8627,100 @@ mod tests {
             .join(format!("vct-installer-test-{}", uuid::Uuid::new_v4().simple()));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    // v0.2.49 batch 4: installer_step_to_user_label
+    // ─────────────────────────────────────────────
+    // Pin the step-tag → label mapping for the install.py event
+    // stream consumer. Regressions here would degrade the
+    // OrchestratorUpdateProgressModal sub-progress UX (user sees a
+    // frozen 50% bar instead of the current sub-step).
+
+    #[test]
+    fn test_step_label_seeding_weaviate_is_long_running_phase() {
+        // 7c/10 is the Weaviate KG seed step — the longest one in
+        // --update by far (minutes). User must see this label or
+        // they'll think the install hung at 50%.
+        let label = installer_step_to_user_label("7c/10", "all seed sub-steps completed");
+        assert!(
+            label.contains("Seeding Weaviate") || label.contains("KG"),
+            "7c/10 must surface a Weaviate-seed-related label; got: {label}"
+        );
+        assert!(
+            label.contains("few minutes") || label.contains("minute"),
+            "long-running phases should warn the user about duration; got: {label}"
+        );
+    }
+
+    #[test]
+    fn test_step_label_known_steps_have_user_friendly_labels() {
+        // Smoke-test every step we mapped explicitly. None should
+        // return empty (would skip the emit_progress call on the
+        // caller side).
+        for step in &[
+            "3/10", "4/10", "4b/10", "5/10", "6/10", "7/10",
+            "7b/10", "7c/10", "7d/10", "7e/10", "8/10", "9/10", "10/10",
+        ] {
+            let label = installer_step_to_user_label(step, "");
+            assert!(
+                !label.is_empty(),
+                "known step {step} must return a non-empty label",
+            );
+            assert!(
+                label.ends_with('…') || label.ends_with("…"),
+                "labels should end with U+2026 ellipsis for in-progress feel; \
+                 step={step} got: {label}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_step_label_unknown_step_falls_back_to_detail() {
+        // For an unmapped step, install.py's detail string is usually
+        // human-readable. Surface it directly.
+        let label = installer_step_to_user_label(
+            "99/10",
+            "doing something interesting",
+        );
+        assert_eq!(label, "doing something interesting");
+    }
+
+    #[test]
+    fn test_step_label_unknown_step_with_no_detail_returns_empty() {
+        // Empty detail + unknown step → empty label → caller skips
+        // the emit_progress call, modal keeps its prior message.
+        let label = installer_step_to_user_label("99/10", "");
+        assert!(label.is_empty());
+    }
+
+    #[test]
+    fn test_step_label_unknown_step_with_oversized_detail_returns_empty() {
+        // Defensive: an unmapped step with a massive detail (>200 chars)
+        // shouldn't blast the modal with a wall of text. Caller skips.
+        let huge = "x".repeat(500);
+        let label = installer_step_to_user_label("99/10", &huge);
+        assert!(label.is_empty());
+    }
+
+    #[test]
+    fn test_step_label_handles_malformed_step_tags_without_panic() {
+        // install.py emits well-formed tags, but a corrupted stdout
+        // pipe could surface anything. Defensive: no panic on weird
+        // input.
+        assert_eq!(installer_step_to_user_label("", "x"), "x");
+        assert_eq!(installer_step_to_user_label("garbage", "x"), "x");
+        assert_eq!(installer_step_to_user_label("7", ""), "Pulling embedding models from Ollama…");
+        // Multi-digit numeric prefix without slash — splits at first
+        // non-digit (none) → ("99", "") → unknown.
+        assert_eq!(installer_step_to_user_label("99", "fallback"), "fallback");
+        // Non-ASCII suffix shouldn't panic via slicing on a char
+        // boundary.
+        let r = installer_step_to_user_label("7é", "ok");
+        // We don't pin the exact return — just that it returns without
+        // panicking and produces *something* (either a mapped label
+        // for "7" + suffix "é" → unmapped, falling back to detail; or
+        // a recovery path).
+        let _ = r;
     }
 
     #[test]

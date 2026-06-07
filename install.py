@@ -499,6 +499,32 @@ def _log_install_event(step: str, phase: str, detail: str = "",
         with path.open("a", encoding="utf-8") as f:
             f.write(line)
             f.flush()
+
+        # v0.2.49 batch 4: optional stdout mirror so the launcher's
+        # OrchestratorUpdateProgressModal can surface sub-progress while
+        # `install.py --update` is in flight (the modal otherwise sits
+        # at 40% "Applying updates..." for the entire re-embedding
+        # phase — minutes of apparent freeze).
+        #
+        # Gated on VCO_PROGRESS_STREAM=1 so terminal users don't see
+        # the extra noise. Format: `[VCO-EVENT] <step> <phase> <detail>`
+        # — single line, no JSON, the launcher parses it via
+        # str-split on whitespace (cheap, no JSON parse cost on the
+        # hot path).
+        if os.environ.get("VCO_PROGRESS_STREAM") == "1":
+            try:
+                # Strip newlines from detail — multiline stage messages
+                # would break the launcher's line-buffered parser.
+                safe_detail = (detail or "").replace("\n", " ").replace("\r", " ")
+                sys.stdout.write(
+                    f"[VCO-EVENT] {step} {phase} {safe_detail}\n"
+                )
+                sys.stdout.flush()
+            except Exception:
+                # Stdout failure (terminal disconnect, pipe closed) is
+                # not a reason to break the install. The JSONL log
+                # above already succeeded.
+                pass
     except Exception:
         # Per the contract: NEVER let a log failure break the install.
         pass
