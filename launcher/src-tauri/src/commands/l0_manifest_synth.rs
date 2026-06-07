@@ -415,6 +415,7 @@ mod tests {
                     pull_token_endpoint: "https://example/pull-token".into(),
                     pull_token_method: "POST".into(),
                 },
+                scope: crate::manifest::InstallScope::PerProject,
             },
             requirements: Some(L0Requirements {
                 os: vec!["linux".into(), "macos".into(), "windows".into()],

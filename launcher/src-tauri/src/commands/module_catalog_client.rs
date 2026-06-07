@@ -213,6 +213,20 @@ pub struct L0Compatibility {
 pub struct L0Install {
     pub method: String,
     pub container: L0InstallContainer,
+    /// v0.2.49 Stream A integration (Bug D / Path 1, coordinated 2026-06-07).
+    /// The manifest-side `install.scope` field, mirrored into L0 so the
+    /// launcher's tile renderer can branch on per-project vs global
+    /// modules without having to re-read the installed manifest JSON
+    /// (which may not exist yet for "available" tiles).
+    ///
+    /// `#[serde(default)]` so pre-v0.2.49 L0 catalogs (which don't carry
+    /// the field at all) keep deserializing — they default to
+    /// `InstallScope::PerProject`, which matches the legacy install
+    /// behaviour those catalogs were authored against. Publishers
+    /// (e.g. vct-rl-reranker v0.2.10+) populate this field explicitly
+    /// when uploading their L0 catalog JSON via the publisher CI step.
+    #[serde(default)]
+    pub scope: crate::manifest::InstallScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

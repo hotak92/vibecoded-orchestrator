@@ -882,6 +882,7 @@ mod tests {
                     pull_token_endpoint: "https://example.com/pull-token".to_string(),
                     pull_token_method: "POST".to_string(),
                 },
+                scope: crate::manifest::InstallScope::PerProject,
             },
             requirements: None,
             runtime_hints: None,

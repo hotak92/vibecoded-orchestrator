@@ -125,6 +125,32 @@ pub struct ModuleCatalogEntry {
     /// render a "Start" button when `container_name = NULL`.
     #[serde(default)]
     pub runtime_type: String,
+    /// v0.2.49 Stream A integration (Bug D / Path 1, coordinated via
+    /// vct-coordination msg 177 from main chat 2026-06-07).
+    ///
+    /// Exposes the manifest's `install.scope` field as a string so the
+    /// Svelte tile renderer can branch the per-project badge variants
+    /// (Bug D from V3 handoff). Values:
+    ///
+    ///   - `"per_project"` (default) — legacy install model: one install
+    ///     row + one container per project. Tile shows per-project status
+    ///     ("installed in THIS project" / "available", etc.).
+    ///   - `"global"` — v0.2.49+ model: one install row machine-wide
+    ///     (`project_id IS NULL`), one container with bare module-id name,
+    ///     per-project enable toggle via Stream B's `module_settings`
+    ///     entry. Tile shows "installed (available in any project)"
+    ///     when no per-project enable row exists OR shows the
+    ///     enable-toggle directly.
+    ///
+    /// Source: `manifest.install.scope` for `from_manifest` entries.
+    /// L0 entries: populated from `l0.install.scope` when present;
+    /// defaults to `"per_project"` for pre-v0.2.49 L0 catalogs that
+    /// don't carry the field (the `#[serde(default)]` on
+    /// `L0Install.scope` keeps those valid).
+    /// Builtins (launcher, orchestrator, subcomponents): always
+    /// `"per_project"` — those are conceptually per-workspace.
+    #[serde(default)]
+    pub install_scope: String,
 }
 
 impl ModuleCatalogEntry {
@@ -157,6 +183,10 @@ impl ModuleCatalogEntry {
             // NEW-3 (2026-05-28): expose runtime type so the tile can gate
             // the "Start" button on container/service modules.
             runtime_type: m.runtime.r#type.clone(),
+            // v0.2.49 Stream A integration: expose install.scope so the
+            // Svelte tile can render per-project badge variants
+            // correctly for global-scope modules (Bug D).
+            install_scope: m.install.scope.as_str().to_string(),
         }
     }
 
@@ -201,6 +231,12 @@ impl ModuleCatalogEntry {
             // L0 catalog records don't carry runtime metadata; the
             // installed manifest path fills this in when available.
             runtime_type: String::new(),
+            // v0.2.49 Stream A integration: L0Install carries an
+            // optional `scope` field (added in lockstep with the
+            // manifest-side InstallScope). Default "per_project"
+            // preserves pre-v0.2.49 L0 catalogs that don't carry
+            // the field at all.
+            install_scope: l0.install.scope.as_str().to_string(),
         }
     }
 }
@@ -334,6 +370,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         deprecation_eol_date: String::new(),
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
+        install_scope: "per_project".into(),
         runtime_type: String::new(),
     });
 
@@ -390,6 +427,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
         runtime_type: String::new(),
+        install_scope: "per_project".into(),
     });
 
     for comp in components {
@@ -422,6 +460,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
             deprecation_migration_url: String::new(),
             catalog_warning: String::new(),
             runtime_type: String::new(),
+            install_scope: "per_project".into(),
         });
     }
 
@@ -849,6 +888,14 @@ fn synthetic_legacy_entry(legacy: &InstalledLegacyEntry) -> ModuleCatalogEntry {
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
         runtime_type: String::new(),
+        // v0.2.49: synthetic legacy entries fall back to per_project
+        // because we don't have manifest data to determine scope.
+        // If the user is on a legacy install of a now-global-scope
+        // module, the auto-migration in Stream A will rewrite the
+        // install row on next launcher boot; until then the tile
+        // renders with the per_project shape, which matches the
+        // current install row's project_id != NULL state.
+        install_scope: "per_project".into(),
     }
 }
 
@@ -3584,6 +3631,7 @@ mod tests {
                     pull_token_endpoint: "https://example/pull-token".into(),
                     pull_token_method: "POST".into(),
                 },
+                scope: crate::manifest::InstallScope::PerProject,
             },
             requirements: None,
             runtime_hints: None,
@@ -4830,5 +4878,113 @@ mod tests {
         // Minor / major bumps.
         assert!(parse_semver("0.3.0").unwrap() > parse_semver("0.2.99").unwrap());
         assert!(parse_semver("1.0.0").unwrap() > parse_semver("0.99.99").unwrap());
+    }
+
+    // ─── v0.2.49 Bug D / Path 1 (install_scope exposure) ───────────
+
+    /// `ModuleCatalogEntry.install_scope` carries the manifest's
+    /// `install.scope` field as a string so the Svelte tile can render
+    /// per-project badge variants vs global-scope tile variants
+    /// (Bug D). The shape is the wire contract between Rust (this
+    /// crate) and Svelte (`launcher/src/lib/components/`).
+    ///
+    /// Pin the serialized JSON shape so a future renames /
+    /// schema-evolution change breaks loudly here, NOT silently at the
+    /// tile renderer's "unrecognised scope" branch.
+    #[test]
+    fn test_v0249_module_catalog_entry_install_scope_serializes_as_string() {
+        let entry = ModuleCatalogEntry {
+            id: "test".into(),
+            name: "Test".into(),
+            version: "0.1.0".into(),
+            description: String::new(),
+            category: "paid".into(),
+            tags: vec![],
+            license_required: true,
+            license_variant_ids: vec![],
+            min_orchestrator_tier: "pro".into(),
+            compatibility_hosts: vec![],
+            is_licensed: true,
+            manifest_source: "test".into(),
+            kind: "available".into(),
+            parent_id: String::new(),
+            cta_route: String::new(),
+            coming_soon_tier: String::new(),
+            coming_soon_target: String::new(),
+            deprecated: false,
+            deprecation_message: String::new(),
+            deprecation_eol_date: String::new(),
+            deprecation_migration_url: String::new(),
+            catalog_warning: String::new(),
+            runtime_type: String::new(),
+            install_scope: "global".into(),
+        };
+        let json = serde_json::to_value(&entry).expect("serialize");
+        assert_eq!(
+            json["install_scope"], "global",
+            "install_scope must serialize as snake_case string on the \
+             wire so the Svelte tile (Bug D) can branch on it"
+        );
+    }
+
+    /// Bug D's tile renderer treats absent / legacy entries as
+    /// `per_project`. Round-trip pin: a JSON catalog payload missing
+    /// the field deserializes with `install_scope = ""` (the serde
+    /// default), which the tile must treat as equivalent to
+    /// `per_project`. This pins the deserialization path so the
+    /// `#[serde(default)]` annotation stays present.
+    #[test]
+    fn test_v0249_module_catalog_entry_install_scope_missing_field_defaults_empty() {
+        // Construct a minimal JSON payload WITHOUT the install_scope
+        // field — simulating an older launcher version or hand-rolled
+        // payload from a test fixture.
+        let json = serde_json::json!({
+            "id": "test",
+            "name": "Test",
+            "version": "0.1.0",
+            "description": "",
+            "category": "paid",
+            "tags": [],
+            "license_required": true,
+            "license_variant_ids": [],
+            "min_orchestrator_tier": "pro",
+            "compatibility_hosts": [],
+            "is_licensed": true,
+            "manifest_source": "test",
+            "kind": "available",
+        });
+        let entry: ModuleCatalogEntry =
+            serde_json::from_value(json).expect("deserialize without install_scope");
+        // Field is absent → serde fills with `String::default()` = "".
+        // The Svelte tile (Bug D) must treat "" as equivalent to
+        // "per_project" (the safe legacy default).
+        assert_eq!(
+            entry.install_scope, "",
+            "missing install_scope must deserialize as empty string \
+             (then tile renderer treats it as per_project)"
+        );
+    }
+
+    /// Builtin entries (launcher, orchestrator, subcomponents) all
+    /// declare `install_scope = "per_project"` because they're
+    /// conceptually per-workspace. Pin this so a future refactor that
+    /// auto-derives scope from somewhere else doesn't silently flip
+    /// the builtin entries to "global" (which would break the Bug D
+    /// tile renderer's expectations).
+    #[test]
+    fn test_v0249_builtin_catalog_entries_are_per_project_scope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let db = Db::open().expect("open db");
+        let entries = builtin_catalog_entries(&db);
+        std::env::remove_var("VCT_STATE_DIR");
+        assert!(!entries.is_empty(), "builtin catalog must be non-empty");
+        for entry in &entries {
+            assert_eq!(
+                entry.install_scope, "per_project",
+                "builtin entry {} should be per_project, got {}",
+                entry.id, entry.install_scope
+            );
+        }
     }
 }
