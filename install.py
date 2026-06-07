@@ -6392,7 +6392,13 @@ def select_code_embedding_backend(
         - VRAM >   2 GB → Jina v2 base-code (768-dim, code-specialised)
         - else / no GPU → CPU path
       CPU (only reached when GPU path lands below "Jina via Ollama"):
-        - RAM >= 24 GB AND cores >= 8 → qwen3-embedding
+        - RAM > 24 GB AND cores >= 8 → qwen3-embedding
+          (strict-> on RAM since v0.2.49: a host with EXACTLY 24 GB
+          shouldn't tier-up to qwen3 — qwen3-embedding on CPU-only
+          Ollama is ~30s per embedding even at the boundary, confirmed
+          on Fabio's 24 GB Windows box. Cores threshold stays >=8 but
+          now counts PHYSICAL cores via `_probe_cpu_cores` — see its
+          docstring for the SMT-counting fix.)
         - else → Jina
       OpenAI: optional override (caller passes prefer_openai=True), not
               auto-selected — it costs money per embedding.
@@ -6433,7 +6439,12 @@ def select_code_embedding_backend(
         return _CODE_BACKEND_JINA
 
     # CPU path: VRAM <= 2 GB OR no GPU at all.
-    if ram >= 24.0 and cpu_cores >= 8:
+    # v0.2.49: strict-> on RAM (was `>=`). Boundary hosts with exactly
+    # 24 GB shouldn't tier-up to qwen3 — qwen3-embedding on CPU-only
+    # Ollama is ~30s per embedding even at the boundary. cpu_cores
+    # comparison stays `>=8` but now counts PHYSICAL cores (see
+    # `_probe_cpu_cores` docstring for the v0.2.49 SMT-counting fix).
+    if ram > 24.0 and cpu_cores >= 8:
         return _CODE_BACKEND_QWEN3
     return _CODE_BACKEND_JINA
 
@@ -6447,14 +6458,24 @@ def select_kg_embedding_backend(
 ) -> str:
     """Pick a KG / text-embedding backend ID for the detected hardware.
 
-    Spec (2026-05-21):
+    Spec (2026-05-21, revised 2026-06-07 v0.2.49):
       GPU:
-        - VRAM >= 8 GB → qwen3-embedding (1024-dim, our default)
-        - VRAM <  8 GB → snowflake-arctic-embed2 (1024-dim, smaller
+        - VRAM >  8 GB → qwen3-embedding (1024-dim, our default).
+          v0.2.49: strict-> on the 8 GB boundary. An 8 GB card runs
+          qwen3-embedding but co-existing with other GPU workloads
+          (code-embedder, summary inference) at exactly 8 GB crowds
+          VRAM. >8 GB gives headroom.
+        - VRAM <= 8 GB → snowflake-arctic-embed2 (1024-dim, smaller
           working set — still 1024-dim so the schema slot is identical)
         - VRAM <  4 GB OR unsupported → CPU path
       CPU:
-        - RAM >= 24 GB AND cores >= 8 → qwen3-embedding
+        - RAM >  24 GB AND cores >= 8 → qwen3-embedding
+          (v0.2.49: strict-> on RAM, was `>=`. Boundary hosts with
+          exactly 24 GB shouldn't tier-up to qwen3 — qwen3-embedding
+          on CPU-only Ollama is ~30s per embedding at the boundary,
+          confirmed on Fabio's 24 GB Windows box. Cores threshold stays
+          `>=8` but now counts PHYSICAL cores via `_probe_cpu_cores`
+          — see its docstring for the SMT-counting fix.)
         - else → arctic2
       OpenAI: optional, not auto-selected.
 
@@ -6466,7 +6487,8 @@ def select_kg_embedding_backend(
     Args:
         gpu_vram_gb: Detected VRAM (GB). 0.0 means "no usable GPU".
         ram_gb:      System RAM (GB).
-        cores:       Logical CPU cores.
+        cores:       Physical CPU cores (v0.2.49 — was logical/SMT;
+                     see `_probe_cpu_cores` docstring for the switch).
         openai_key_available: True if an OpenAI API key is configured.
         prefer_openai: True when the caller wants OpenAI explicitly.
 
@@ -6480,7 +6502,7 @@ def select_kg_embedding_backend(
     ram = float(ram_gb or 0.0)
     cpu_cores = int(cores or 0)
 
-    if vram >= 8.0:
+    if vram > 8.0:
         return _KG_BACKEND_QWEN3
     if vram >= 4.0:
         # Mid-range GPU: arctic2 runs comfortably without crowding the
@@ -6490,7 +6512,7 @@ def select_kg_embedding_backend(
         return _KG_BACKEND_ARCTIC
 
     # CPU path (or sub-4-GB GPU treated as CPU here).
-    if ram >= 24.0 and cpu_cores >= 8:
+    if ram > 24.0 and cpu_cores >= 8:
         return _KG_BACKEND_QWEN3
     return _KG_BACKEND_ARCTIC
 
@@ -6578,26 +6600,49 @@ def select_summary_backend(
 
 
 def _probe_cpu_cores() -> int:
-    """Best-effort logical CPU-core count, cross-OS.
+    """Best-effort PHYSICAL CPU-core count, cross-OS.
 
-    Prefers `psutil.cpu_count(logical=True)` (most portable, handles
-    cgroup limits on Linux containers). Falls back to `os.cpu_count()`.
-    Returns 0 on any probe failure — the selectors treat 0 as "low-end
-    CPU" (drops to the smaller-model tier), which is the conservative
-    direction (better to under-spec than over-promise).
+    v0.2.49: switched from logical=True (counts SMT threads) to
+    logical=False (counts physical cores) after dogfooding on Fabio's
+    Windows box showed the embedding-model auto-selector tier-up'd to
+    qwen3 on a host where the logical count (16) crossed the >=8
+    threshold even though the actual physical cores (8) were exactly at
+    the boundary — qwen3-embedding on CPU-only Ollama takes ~30s per
+    embedding, so the selector should require margin, not just count
+    HyperThreads. Embedding throughput on CPU is gated by physical
+    arithmetic units, not thread count.
+
+    Prefers `psutil.cpu_count(logical=False)` (returns the PHYSICAL
+    core count; cross-OS, handles cgroup limits on Linux containers,
+    docs explicitly: "the number of physical cores only"). Falls back to
+    `os.cpu_count() // 2` (a conservative estimate assuming SMT, which
+    is true on most modern Intel/AMD desktops + Apple Silicon's
+    performance/efficiency split where logical count overstates
+    embedding-capable cores). Returns 0 on any probe failure — the
+    selectors treat 0 as "low-end CPU" (drops to the smaller-model
+    tier), which is the conservative direction (better to under-spec
+    than over-promise).
     """
     try:
         import psutil  # type: ignore
-        n = psutil.cpu_count(logical=True)
+        n = psutil.cpu_count(logical=False)
         if n and n > 0:
             return int(n)
+        # psutil returns None on some hypervisors / containers when
+        # physical-core probing isn't supported. Fall through to
+        # os.cpu_count() // 2 as a conservative estimate.
     except ImportError:
         pass
     except Exception:
         return 0
     try:
         n = os.cpu_count()
-        return int(n) if n and n > 0 else 0
+        if n and n > 0:
+            # Conservative: assume SMT/HT, halve the logical count.
+            # On non-SMT hardware this under-counts by 2x, which is the
+            # safer direction (we drop to a smaller model tier).
+            return max(1, int(n) // 2)
+        return 0
     except Exception:
         return 0
 
