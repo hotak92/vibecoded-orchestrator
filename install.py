@@ -4681,7 +4681,22 @@ def main() -> int:
                         deferral_report=_deferral_report)
         if not args.skip_models:
             _wait_for_ollama()
-            _pull_ollama_models(_build_ollama_pull_list(embed_config, sysinfo))
+            # v0.2.49 Bug I: pass the canonical embedding-model set so
+            # _pull_ollama_models can fail-fast on load-bearing pulls
+            # rather than silently continuing with a broken KG.
+            _embedding_models_set: set[str] = {
+                m for m in (embed_config.get("embedding_models") or [])
+                if isinstance(m, str) and m
+            }
+            _pull_ollama_models(
+                _build_ollama_pull_list(embed_config, sysinfo),
+                embedding_models=_embedding_models_set,
+            )
+            # v0.2.49 Bug J: probe for dual Ollama instances now that
+            # the launcher-managed one is known to be up; emit an
+            # UPDATE_DEFERRED warning if a personal instance is also
+            # responding so the user sees the divergence post-install.
+            _emit_dual_ollama_deferral(_deferral_report)
 
         # Bug 29: with shared-container reuse, multiple installs hit the same
         # Weaviate. Bootstrap any of THIS project's KG/Development collections
@@ -10376,8 +10391,37 @@ def _wait_for_ollama() -> None:
     )
 
 
-def _pull_ollama_models(models: list[str]) -> None:
-    """Pull required Ollama models."""
+class EmbeddingModelPullError(RuntimeError):
+    """Raised when a load-bearing embedding-model pull fails.
+
+    v0.2.49 Bug I: pre-fix ``_pull_ollama_models`` logged-then-continued on
+    every failure. Embedding models are load-bearing — without the active
+    embedding model in the local Ollama cache, KG sync silently breaks.
+    The function now classifies each model as embedding (fail-fast) or
+    other (best-effort) and raises this exception when one or more
+    load-bearing models fail to pull.
+    """
+
+
+def _pull_ollama_models(
+    models: list[str],
+    embedding_models: set[str] | None = None,
+) -> None:
+    """Pull required Ollama models.
+
+    v0.2.49 Bug I: ``embedding_models`` names the subset of ``models`` that
+    are load-bearing (the active text/code embedding models). If any of
+    them fail to pull, this function raises
+    :class:`EmbeddingModelPullError` AFTER attempting all remaining pulls
+    so the user gets the full picture in one shot rather than a per-model
+    interactive bail. Non-embedding models (summary/chat tiers) remain
+    best-effort and only emit a WARN log + manual-pull hint on failure.
+
+    Backward-compat: callers that don't pass ``embedding_models`` get a
+    heuristic fallback — any model name containing ``"embed"`` in
+    lowercase is treated as load-bearing. Callers that DO pass the set
+    get a precise answer; the heuristic is the safety net.
+    """
     print("[7/10] Pulling Ollama models ... ", flush=True)
     _log_install_event(
         "7/10", "start",
@@ -10386,7 +10430,18 @@ def _pull_ollama_models(models: list[str]) -> None:
     )
     port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
 
+    if embedding_models is None:
+        # Heuristic fallback for callers that don't pass the precise set
+        # (back-compat). Embedding-model names canonically contain
+        # "embed" in lowercase: qwen3-embedding, snowflake-arctic-embed2,
+        # text-embedding-3-small, unclemusclez/jina-embeddings-v2-base-code.
+        embedding_models = {
+            m for m in models
+            if "embed" in m.lower()
+        }
+
     failed: list[str] = []
+    failed_embedding: list[str] = []
     for model in models:
         print(f"  Pulling {model} ... ", end="", flush=True)
         try:
@@ -10410,15 +10465,155 @@ def _pull_ollama_models(models: list[str]) -> None:
                   f"http://localhost:{port}/api/pull "
                   f"-d '{{\"name\": \"{model}\"}}'")
             failed.append(model)
+            if model in embedding_models:
+                failed_embedding.append(model)
 
+    if failed_embedding:
+        _log_install_event(
+            "7/10", "error",
+            f"{len(failed_embedding)} load-bearing embedding-model pull(s) "
+            f"failed; KG sync will be broken until resolved",
+            data={
+                "failed_embedding": failed_embedding,
+                "failed_all": failed,
+            },
+        )
+        raise EmbeddingModelPullError(
+            "Load-bearing embedding model pull(s) failed: "
+            f"{', '.join(failed_embedding)}. The Knowledge Graph cannot "
+            "function without these models — install aborted. Resolve "
+            "manually (curl -X POST http://localhost:" + port + "/api/pull "
+            "-d '{\"name\": \"<model>\"}') then re-run install."
+        )
     if failed:
         _log_install_event(
             "7/10", "warn",
-            f"{len(failed)} model pull(s) failed",
+            f"{len(failed)} non-load-bearing model pull(s) failed",
             data={"failed": failed},
         )
     else:
         _log_install_event("7/10", "ok", "all Ollama models pulled")
+
+
+def _probe_dual_ollama_instances(
+    canonical_port: int = DEFAULT_OLLAMA_PORT,
+    alternate_port: int = 11434,
+    timeout_s: float = 1.0,
+) -> tuple[int, int] | None:
+    """Detect when two separate Ollama daemons are reachable on this host.
+
+    v0.2.49 Bug J: users with personal Ollama installs (default port
+    11434) running alongside the launcher's containerized Ollama (port
+    11435) hit "where did my model go?" confusion because the two
+    instances have independent model caches. This probe returns
+    ``(alternate_port, canonical_port)`` when BOTH respond to
+    ``/api/tags`` within ``timeout_s`` seconds; the caller can then emit
+    a UPDATE_DEFERRED.md warning so the user sees the divergence at
+    install-time AND post-install (the deferral file persists).
+
+    Returns ``None`` when only one or neither responds. Soft-fails on
+    any unexpected error (network stack quirks, IPv6/IPv4 oddities,
+    etc.) — a probe failure must never block install.
+    """
+
+    def _port_responds(port: int) -> bool:
+        try:
+            req = urllib.request.Request(
+                f"http://localhost:{port}/api/tags",
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                # Drain a few bytes so the socket closes cleanly. We
+                # don't care about the body — any 2xx response means
+                # there's a live Ollama on this port.
+                _ = resp.read(64)
+                return 200 <= getattr(resp, "status", 200) < 300
+        except Exception:
+            return False
+
+    try:
+        canonical_alive = _port_responds(canonical_port)
+        alternate_alive = _port_responds(alternate_port)
+    except Exception:
+        return None
+
+    if canonical_alive and alternate_alive and canonical_port != alternate_port:
+        # Order: alternate first (the "surprise" instance), canonical
+        # second. Tests assert this exact shape.
+        return (alternate_port, canonical_port)
+    return None
+
+
+def _emit_dual_ollama_deferral(
+    deferral_report: "DeferralReport",
+    canonical_port: int = DEFAULT_OLLAMA_PORT,
+    alternate_port: int = 11434,
+) -> None:
+    """v0.2.49 Bug J: emit an info-severity deferral when both Ollama
+    instances respond.
+
+    Mirrors the shape of :func:`_emit_orchestrator_root_schema_deferrals`
+    — soft-fail throughout, idempotent on re-runs (the deferral writer
+    deduplicates by ``condition_id``).
+    """
+    try:
+        result = _probe_dual_ollama_instances(
+            canonical_port=canonical_port,
+            alternate_port=alternate_port,
+        )
+    except Exception:
+        return
+    if result is None:
+        return
+
+    alt, canon = result
+    try:
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="dual_ollama_detected",
+                title=(
+                    f"Two Ollama instances reachable "
+                    f"(:{alt} + :{canon})"
+                ),
+                detected=(
+                    f"Both `http://localhost:{alt}` (default Ollama "
+                    f"port) and `http://localhost:{canon}` "
+                    f"(launcher-managed Ollama container) responded to "
+                    f"`/api/tags`.  These are two independent daemons "
+                    f"with separate model caches — a model pulled into "
+                    f"one is NOT visible from the other."
+                ),
+                why_deferred=(
+                    "Cannot auto-resolve: we don't know which instance "
+                    "the user intends as canonical.  Stopping the "
+                    "user's personal Ollama daemon would risk breaking "
+                    "their other tooling; stopping the launcher's "
+                    "container would break VCO.  The user must choose "
+                    "and reconcile."
+                ),
+                command_to_apply=(
+                    f"# VCO uses :{canon} (the launcher-managed "
+                    f"container) as canonical.\n"
+                    f"# If you want VCO to use your personal Ollama "
+                    f"instead, set OLLAMA_PORT={alt} in .claude/env and "
+                    f"re-run install.\n"
+                    f"# If you want to stop the personal instance:\n"
+                    f"#   systemctl --user stop ollama   # Linux\n"
+                    f"#   killall ollama                 # macOS / generic\n"
+                    f"# Then re-run install.py --update to reseed."
+                ),
+                severity="info",
+                kg_node_refs=[],
+            )
+        )
+        _log_install_event(
+            "7/10", "info",
+            f"Bug J: dual-Ollama detected (:{alt} + :{canon}); "
+            f"deferral emitted",
+        )
+    except Exception:
+        # Defensive: never let a deferral emit failure block install.
+        return
 
 
 # ---------------------------------------------------------------------------
