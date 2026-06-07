@@ -3632,7 +3632,7 @@ _rl_client_instance = None  # type: ignore[var-annotated]
 
 
 def _get_rl_client():
-    """Lazy-build one ``RLClient`` per active embedding per process.
+    """Lazy-build one ``RLClient`` per (active embedding, project_id) per process.
 
     v0.2.42 RT-1: keyed by the *current* ``ACTIVE_EMBEDDING`` env value
     rather than a bare singleton.  A mid-session flip (user switches
@@ -3640,6 +3640,14 @@ def _get_rl_client():
     ``active_embedding`` attribute matches the new value — the old
     client stays in the dict as a tombstone for any in-flight requests
     but is never returned to new callers.
+
+    v0.2.49: cache key now includes the resolved project_id so the
+    ``X-VCT-Project-ID`` header attached to outbound rerank/update
+    requests routes to the correct per-project model head in the
+    vct-rl-reranker v0.2.10+ container. project_id is None on
+    hub-unreachable or for free-tier hosts without a hub; the client
+    in that case sends no header and the container falls back to the
+    base model.
 
     Reads ``RL_SERVER_URL`` / ``RL_SERVER_PORT`` at first call via
     ``rl_client.client._resolve_base_url``. When neither is set,
@@ -3649,8 +3657,24 @@ def _get_rl_client():
     # Re-read the env value on every call so a flip is caught immediately.
     current_embedding = os.getenv("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
 
-    if current_embedding in _rl_client_instances:
-        return _rl_client_instances[current_embedding]
+    # v0.2.49: resolve the project_id from the cached ProjectConfig.
+    # Soft-fail: on any resolver exception (hub unreachable / malformed
+    # response / no config) we proceed with project_id=None, which
+    # makes the client send no X-VCT-Project-ID header. The container
+    # then falls back to the base model — the safe, paying-user-not-
+    # cut-off behaviour. RLClient.__init__ sanitises project_id on its
+    # own; passing it through unchecked is also safe.
+    current_project_id: Optional[str] = None
+    try:
+        _cfg = _try_resolve_project_config()
+        if _cfg is not None and getattr(_cfg, "project_id", None):
+            current_project_id = _cfg.project_id
+    except Exception as exc:
+        logger.debug("project_id resolve failed (%s); will send no X-VCT-Project-ID", exc)
+
+    cache_key = (current_embedding, current_project_id)
+    if cache_key in _rl_client_instances:
+        return _rl_client_instances[cache_key]
 
     try:
         from claude_mcp_servers.rl_client import RLClient
@@ -3673,8 +3697,9 @@ def _get_rl_client():
     client = RLClient(
         text_dim=text_dim,
         active_embedding=current_embedding,
+        project_id=current_project_id,
     )
-    _rl_client_instances[current_embedding] = client
+    _rl_client_instances[cache_key] = client
     return client
 
 

@@ -200,7 +200,7 @@ The installer auto-selects three backends — code embeddings, KG / text embeddi
 | GPU, VRAM ≥ 12 GB          | GPU service | `codesage-large-v2` (2048-dim)                              | Best quality. Code-specialised, served from `code_embedding_service`. |
 | GPU, VRAM ≥ 6 GB           | Ollama      | `qwen3-embedding:0.6b` (1024-dim)                           | Generalist; runs comfortably alongside other GPU workloads.        |
 | GPU, VRAM > 2 GB           | Ollama      | `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim)| Code-specialised, low VRAM footprint.                              |
-| CPU, RAM ≥ 24 GB & 8+ cores| Ollama      | `qwen3-embedding:0.6b`                                      | Pure-CPU path on capable workstations.                             |
+| CPU, RAM > 24 GB & 8+ cores¹| Ollama      | `qwen3-embedding:0.6b`                                      | Pure-CPU path on capable workstations. Strict `>` (v0.2.49).       |
 | CPU, otherwise             | Ollama      | `unclemusclez/jina-embeddings-v2-base-code:latest`          | Floor — runs on anything that can run Ollama.                      |
 | OpenAI API (opt-in)        | OpenAI      | `text-embedding-3-small` (1536-dim)                         | Override only; costs per embedding. Configure via `--openai-key`.  |
 
@@ -208,10 +208,10 @@ The installer auto-selects three backends — code embeddings, KG / text embeddi
 
 | Tier                       | Backend | Model                                       | Notes                                                            |
 |----------------------------|---------|---------------------------------------------|------------------------------------------------------------------|
-| GPU, VRAM ≥ 8 GB           | Ollama  | `qwen3-embedding:0.6b` (1024-dim)           | Default; matches the existing KG schema slot `qwen3_embed`.      |
-| GPU, VRAM 4–8 GB           | Ollama  | `snowflake-arctic-embed2:latest` (1024-dim) | Same dims as qwen3 → same schema slot, smaller working set.      |
+| GPU, VRAM > 8 GB           | Ollama  | `qwen3-embedding:0.6b` (1024-dim)           | Default; matches the existing KG schema slot `qwen3_embed`. Strict `>` (v0.2.49). |
+| GPU, VRAM 4–8 GB¹          | Ollama  | `snowflake-arctic-embed2:latest` (1024-dim) | Same dims as qwen3 → same schema slot, smaller working set. Inclusive at 8 GB (v0.2.49). |
 | GPU, VRAM < 4 GB (or unsupported) | Ollama | `snowflake-arctic-embed2:latest`     | Falls through to CPU treatment.                                  |
-| CPU, RAM ≥ 24 GB & 8+ cores| Ollama  | `qwen3-embedding:0.6b`                      | Pure-CPU path on capable workstations.                           |
+| CPU, RAM > 24 GB & 8+ cores¹| Ollama  | `qwen3-embedding:0.6b`                      | Pure-CPU path on capable workstations. Strict `>` (v0.2.49).     |
 | CPU, otherwise             | Ollama  | `snowflake-arctic-embed2:latest`            | Floor for low-RAM / low-core hosts.                              |
 | OpenAI API (opt-in)        | OpenAI  | `text-embedding-3-small` (1536-dim)         | Override only; configure via `--openai-key`.                     |
 
@@ -225,6 +225,8 @@ The installer auto-selects three backends — code embeddings, KG / text embeddi
 | CPU, RAM ≥ 12 GB & 6+ cores             | Ollama           | `gemma4:e4b`       | Pure-CPU fallback.                                                 |
 | Anything below those tiers              | _none_           | _none_             | Summaries skipped; raw KG content still embedded + searchable.     |
 | OpenAI API (opt-in, requires consent)   | OpenAI           | `gpt-4o-mini`      | Off by default; toggle via Preferences → KG Summaries. Cost warning surfaced on enable. |
+
+¹ **v0.2.49 boundary fixes** (2026-06-07): CPU core thresholds now count **physical cores** (not logical/SMT threads); RAM/VRAM boundaries moved from `>=` to `>` at the 24 GB / 8 GB cutoffs to avoid performance cliffs on boundary hardware. See [[embedding-backend-auto-selection-v0249.md]] for rationale.
 
 ## Install options & troubleshooting
 

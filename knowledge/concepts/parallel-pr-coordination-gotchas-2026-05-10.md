@@ -609,6 +609,56 @@ Cheap insurance — add wherever fixture data and a runtime constant must agree.
 
 **Cross-link**: [[uses::Silent-Zero Fallback Antipattern]] — the bug class the V46-A safety triad prevents.
 
+## 12. Cross-stream binding-shape mismatches (v0.2.49 lesson, 2026-06-07)
+
+A 4-stream parallel fanout (A=Rust install scope, B=enable toggle, C=container API, D=GUI license gate) all completed independently with green per-stream gates. Integration merge was clean via `ort` 3-way auto-merge — NO manual conflict resolution needed across 3 overlap files (`modules.rs`, `lib.rs`, `manifest.rs`). Yet integration gates FAILED with 4 test failures on a previously-green tree. Failure mode: not git conflicts, not behavior bugs — **semantic binding-shape mismatches at API seams that 3-way merge cannot detect**.
+
+Three distinct mismatch classes:
+
+### 12a. Optional-vs-required schema mismatch at the shared-struct seam
+
+Stream A added a new field `InstallBlock.scope: InstallScope` (non-optional with `#[serde(default)]`). Stream C's v0.2.10 manifest dropped a legacy field `RuntimeBlock.command: String` (required in the schema, no default). At integration, the launcher tried to parse Stream C's NEW manifest fixture and crashed with `missing field 'command'`. Both streams were internally consistent; neither knew the other was making the same struct-shape assumption from opposite directions.
+
+**Detection**: Stream C's test fixture is `paid-modules/vct-rl-reranker/vct-module.json` — a real fixture file the schema deserialization tests load. The 4 test failures all pointed at `at line N column M, missing field <X>` errors. Files reading the new fixture against the old schema diverged.
+
+**Fix discipline**: every parallel stream that touches a SHARED data struct (manifest, DB row, IPC message) MUST get an explicit "what's the binding-shape contract at integration?" line in its prompt. Two streams updating opposite halves of a struct's optional/required surface is a near-certainty in this fanout shape; pre-specifying the contract closes the seam.
+
+**Recovery (~5 LoC)**: make the dropped field `#[serde(default)]` retroactively in the schema, AND update the consumer (`build_podman_run_args`) to handle the default value gracefully. Then the new fixture parses cleanly. This is also the right schema-level fix for the underlying bug class (Bug E: legacy `command: "podman"` shape was always wrong for declarative manifests).
+
+### 12b. TODO-shim integration debt
+
+Stream B authored a helper `install_scope_is_global()` that returned `false` unconditionally with a `TODO(stream-a)` annotation pointing at the suggested integration. The body said: "Stream A will add `install.scope`; flip this to read it." Worked perfectly for Stream B's tests (they didn't exercise the global-install path). At integration, the helper was still returning `false` → Stream A's new global-install code path never activated for ANY module → seeding hooks silently no-op'd.
+
+**Detection** (only by reading the diff carefully): grep for `TODO(stream-` in every merged branch. Each represents a deferred integration step that NEEDS to be flipped during integration, not later.
+
+**Fix discipline**: enumerate every `TODO(stream-X)` annotation immediately after merging that stream. Flip them ALL before running the next gate. Track them in the integration checklist explicitly, not as ambient code TODOs.
+
+**Recovery (1-line edit)**: `false` → `self.install.scope.is_global()`.
+
+### 12c. JSON-type mismatch at the schema-validated boundary
+
+Stream C wrote a port mapping as `"ports": [{"host": 11450, "container": 11450}]` — integer values. The launcher's `PortMapping` struct declared `host: String` (intentional, so the field can be a `{PLACEHOLDER}` substituted later by the runtime layer). Serde failed deserialization: `invalid type: integer 11450, expected a string`. Pure value-shape mismatch; never caught in Stream C's tests because Stream C doesn't run the launcher-side schema validation.
+
+**Detection**: same as 12a — fixture-loading tests fail with type-mismatch errors at the JSON parse layer. The error message points at the exact line and column.
+
+**Fix discipline**: when a stream owns a fixture file AND a different stream owns the schema that fixture is validated against, the fixture stream needs visibility into the schema's exact type signature. The simplest fix is making fixtures into TYPED CONSTRUCTORS rather than hand-edited JSON — but that's a big rework. The cheaper fix: include the relevant schema struct definition VERBATIM in the prompt of the fixture-authoring stream, so the agent reads the exact type signature before writing the JSON.
+
+**Recovery (1-character edit)**: `11450` → `"11450"` (quote the value).
+
+### Generalisation — the integration agent's job
+
+After parallel merges, the integration phase needs a deliberate pass with three explicit checks:
+
+1. **TODO-shim sweep**: `grep -rn "TODO(stream-" -- '*.{rs,ts,svelte,py}'`. Flip every shim that's now wired by its corresponding stream. Each flip is 1-3 lines and load-bearing.
+2. **Schema-fixture sweep**: re-run schema deserialization tests against every fixture file touched by any stream. The 3-way merge can't detect type-shape drift between fixture and schema.
+3. **Run all gates**: not just per-stream gates, but the integrated tree's full gate suite. The first run-after-merge typically catches the binding-shape mismatches that pre-merge testing missed.
+
+These are CHEAPER than running an adversarial-review Opus pass over the integrated diff (though that's still worth doing for behaviour bugs). They catch the structural mismatches that 3-way merge silently lets through.
+
+**Cost of this lesson**: ~15 minutes of debugging across 4 test failures + 3 small fix commits at integration. Pre-emptive discipline would have been ~5 minutes of upfront contract-pinning in subagent prompts. ROI 3x.
+
+**Cross-link**: this is §6b (parallel agents stubbing each other's APIs → 4 seam-mismatch failure modes) refined for the SPECIFIC case where structs are SHARED across streams. §6b's lesson was "stubs drift from real impls"; §12's lesson is "shared structs accumulate opposite-half assumptions that 3-way merge cannot reconcile."
+
 ## Related
 
 - [[relatedTo::Claude Code Agent Teams]] — worktree isolation as a happy-path feature.

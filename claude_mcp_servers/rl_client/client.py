@@ -51,6 +51,65 @@ _DEFAULT_TIMEOUT = 3.0
 _DEFAULT_HEALTH_TIMEOUT = 1.0
 
 
+# ─── v0.2.49: per-project routing header sanitization ────────────────
+# Stream C's vct-rl-reranker v0.2.10 container reads the
+# ``X-VCT-Project-ID`` header and uses the value VERBATIM as a
+# filesystem path component (``/data/state/projects/<project_id>/``)
+# and a JSONL filename suffix (``rl_events_<project_id>.jsonl``).
+# Path-traversal risk: a malicious / malformed project_id value like
+# ``../etc/passwd`` would land state files outside ``/data/state/``.
+# Stream C's report explicitly flagged this as launcher-side
+# responsibility: the container does not sanitise.
+#
+# This sanitizer is the defensive guard at the launcher → container
+# seam. Accepts a small character set (UUID + alphanumeric + dash +
+# underscore), rejects everything else. Length capped at 64 chars
+# (UUID = 36; slugs we see in practice are <= 32; 64 is a generous
+# headroom that still bounds filesystem path length).
+
+import re
+
+# Match UUID v4 case-insensitive OR alphanumeric/dash/underscore
+# (slugs the launcher generates from project names). Length 1..64.
+# Anchored — partial matches not accepted.
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def sanitize_project_id(value: Optional[str]) -> Optional[str]:
+    """Return ``value`` if it's a safe-for-filesystem project identifier,
+    else ``None``. Used to gate the ``X-VCT-Project-ID`` header sent to
+    the vct-rl-reranker container (v0.2.10+).
+
+    Safe characters: ASCII letters, digits, dash, underscore. Length
+    1..64. Anything else (path separators, control chars, dots, slashes,
+    spaces, NUL, unicode) → None.
+
+    Returning None means "do NOT send the header at all" — the container
+    falls back to the base model. This is the intended fail-mode: a
+    malformed project_id should result in the base model being used,
+    not in an error AND not in the malformed value reaching the
+    container.
+
+    Examples:
+        sanitize_project_id("02fbc934-ada5-433c-b606-d1f56194035a")
+            → "02fbc934-ada5-433c-b606-d1f56194035a"  (UUID v4 OK)
+        sanitize_project_id("orchestrator-root")
+            → "orchestrator-root"  (slug OK)
+        sanitize_project_id("../etc/passwd")
+            → None  (path traversal blocked)
+        sanitize_project_id("project id")
+            → None  (space blocked)
+        sanitize_project_id(None) → None
+        sanitize_project_id("") → None
+        sanitize_project_id("a" * 65) → None  (length cap)
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if not _PROJECT_ID_RE.match(value):
+        return None
+    return value
+
+
 def _deprecation_warning() -> Optional[str]:
     """Build a one-line deprecation banner for inclusion in rerank-adjacent
     responses (v0.2.31 module-deprecation surface, Layer 2 — Claude-visible).
@@ -143,6 +202,7 @@ class RLClient:
         base_url: Optional[str] = None,
         timeout: float = _DEFAULT_TIMEOUT,
         client: Optional[Any] = None,  # httpx.AsyncClient or test mock
+        project_id: Optional[str] = None,
     ) -> None:
         # Allow explicit override of base_url (tests + advanced callers);
         # otherwise derive from env (None → disabled mode).
@@ -155,6 +215,21 @@ class RLClient:
         # Injected client (test mocks); real client lazily constructed.
         self._client = client
         self._owns_client = client is None
+
+        # v0.2.49: per-project routing header. Stored as the sanitized
+        # value (or None if input was unsafe). The header is only sent
+        # when this is non-None; container falls back to base model when
+        # absent, which is the safe behaviour for malformed input.
+        #
+        # See sanitize_project_id() for the accepted character set.
+        self._project_id: Optional[str] = sanitize_project_id(project_id)
+        if project_id and self._project_id is None:
+            logger.warning(
+                "RLClient: rejected unsafe project_id %r; "
+                "X-VCT-Project-ID header will NOT be sent (container "
+                "will fall back to base model)",
+                project_id,
+            )
 
         if self.base_url is None:
             logger.debug(
@@ -473,8 +548,20 @@ class RLClient:
         assert self.base_url is not None  # enabled-mode invariant
         client = await self._ensure_client()
         url = f"{self.base_url}{path}"
+
+        # v0.2.49: per-project routing header. Sent only when the
+        # constructor received a project_id that passed
+        # sanitize_project_id(). The container uses this to look up
+        # per-project fine-tuned model heads; absent → base model.
+        headers: Optional[dict] = None
+        if self._project_id is not None:
+            headers = {"X-VCT-Project-ID": self._project_id}
+
         try:
-            resp = await client.post(url, json=json_body, timeout=timeout)
+            if headers is not None:
+                resp = await client.post(url, json=json_body, headers=headers, timeout=timeout)
+            else:
+                resp = await client.post(url, json=json_body, timeout=timeout)
         except Exception as exc:
             # httpx.ConnectError / TimeoutException / ReadError — all
             # treated as "unreachable" so callers can branch.

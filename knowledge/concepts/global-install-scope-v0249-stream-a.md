@@ -94,6 +94,6 @@ Launcher: 1336 + 4 new auto-migration tests = 1340 passing.
 
 ## Integration notes (for Streams B/C/D)
 
-- Stream B (per-project enable toggle): when global-scope modules ship, `module_settings(project_id, module_id, 'enabled_for_project')` is the gate. Stream B owns this; Stream A leaves a TODO in the uninstall path.
+- **Stream B (per-project enable toggle) — INTEGRATED v0.2.49 commit 39003e28**: `module_settings(project_id, module_id, 'enabled_for_project')` now gates per-project modules. The `install_scope_is_global()` shim in `ModuleManifest` (manifest.rs:2105–2110) now reads the real `self.install.scope` field instead of always returning `false`. The Stream A seeding logic correctly branches on this read: global installs seed one row with `project_id = NULL`, per-project installs seed one row per project. Integration complete.
 - Stream C (container API): the manifest for `vct-rl-reranker` v0.2.10 should set `install.scope = global` and the container should accept `X-VCT-Project-ID`. Stream A's launcher path is ready; the manifest field is the activation gate.
 - Stream D (GUI): `InstalledRowView.project_id: Option<String>` is the wire contract. Render the global tile once across all project tabs (when `project_id == null`); render per-project tiles per-project. `auto_migrate_per_project_to_global` may surface migrations to the GUI via the `module_migrated_to_global_scope` audit-log entry.
