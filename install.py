@@ -13820,6 +13820,133 @@ def _self_heal_kg_bindings_on_update(
         name.lower(): name for name in existing_classes if name
     }
 
+    # v0.2.49 Bug N: detect whether ANY rebind is needed BEFORE opening
+    # launcher.db read-write. vct-hub holds the writer lock permanently
+    # as a detached daemon, so an RW open would always 5s-timeout when
+    # the hub is running — which is the design (per CLAUDE.md hub
+    # section: "outlives launcher GUI"). On hosts where no rebind is
+    # needed (the common case post-v0.2.20: launcher enforces canonical
+    # casing on creation), the detection-only pass yields an empty
+    # rebind list and we return cleanly without ever attempting to
+    # acquire the writer lock.
+    #
+    # RO mode via the URI form (`mode=ro`) does NOT block on the writer
+    # lock — WAL mode allows concurrent readers regardless of writer
+    # state. The SELECT statements always succeed; only UPDATE/DELETE
+    # would error in RO mode.
+    #
+    # If detection finds work to do, we close the RO conn + reopen RW
+    # (existing path below). The 5s timeout there is the right safety
+    # net: actual rebinds are rare enough that the user noticing a
+    # post-install "please close the launcher and re-run" deferral is
+    # acceptable.
+    needs_rebind = False
+    try:
+        ro_conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        try:
+            ro_cur = ro_conn.cursor()
+            # Probe each table the RW pass would touch. THREE distinct
+            # work-paths the RW pass might exercise (any one of them
+            # firing requires acquiring the writer lock):
+            #
+            #   1. Case-rebind (pass 1 of _self_heal): row's
+            #      `collection_name` has a case-different sibling in
+            #      `existing_classes`. Detected by `actual is not None
+            #      and actual != coll_name`.
+            #   2. Cross-prefix adoption (pass 2, v0.2.40 — see
+            #      `_prefix_adopt_kg_bindings_pass`): row's
+            #      `collection_name` is GENUINELY MISSING from Weaviate
+            #      (no case sibling either) AND ends in a known suffix
+            #      from `_KG_BINDING_PREFIX_ADOPT_SUFFIXES`. The RW
+            #      pass probes Weaviate for populated same-suffix
+            #      classes and may rebind to the populated one.
+            #   3. Access-matrix rebind (same case-rebind shape as #1
+            #      but on the kg_collection_access table; same
+            #      detection condition).
+            #
+            # If ANY of the three would do work, we need the RW pass.
+            # Otherwise the no-op path returns cleanly without ever
+            # touching the writer lock.
+            for table, col in (
+                ("project_kg_bindings", "collection_name"),
+                ("kg_collection_access", "collection_name"),
+            ):
+                try:
+                    ro_cur.execute(
+                        f"SELECT {col} FROM {table}"
+                    )
+                except sqlite3.OperationalError as oe:
+                    if "no such table" in str(oe).lower():
+                        # Older launcher.db schema; skip. The RW pass below
+                        # handles the same case via its own try/except.
+                        continue
+                    raise
+                for (coll_name,) in ro_cur.fetchall():
+                    if not coll_name:
+                        continue
+                    if coll_name in existing_classes:
+                        # Canonical match — no rebind needed.
+                        continue
+                    actual = existing_by_lower.get(coll_name.lower())
+                    if actual is not None and actual != coll_name:
+                        # Path #1/#3: case-different sibling exists.
+                        needs_rebind = True
+                        break
+                    # No case sibling. Check path #2 (cross-prefix
+                    # adoption) — only applies to project_kg_bindings,
+                    # not kg_collection_access, and only when the row's
+                    # collection_name ends in a known suffix. We can't
+                    # know from RO mode whether a same-suffix candidate
+                    # is actually populated (that requires a Weaviate
+                    # Aggregate HTTP call per candidate), so be
+                    # conservative: ANY row whose name ends in a known
+                    # suffix AND is missing from Weaviate triggers the
+                    # RW pass. The RW pass will probe + decide.
+                    #
+                    # False-positive cost: an extra RW open (5s timeout
+                    # if hub holds the lock) on hosts where every
+                    # missing-suffix row happens to have zero populated
+                    # cross-prefix candidates. Acceptable since the
+                    # common case (post-v0.2.20 canonical-casing) has
+                    # zero missing rows at all.
+                    if table == "project_kg_bindings":
+                        for suffix in _KG_BINDING_PREFIX_ADOPT_SUFFIXES:
+                            if coll_name.endswith(suffix):
+                                needs_rebind = True
+                                break
+                        if needs_rebind:
+                            break
+                if needs_rebind:
+                    break
+        finally:
+            ro_conn.close()
+    except sqlite3.Error as se:
+        # RO open itself failed (corrupted DB, permission). Fall through
+        # to the RW pass so the existing soft-fail-to-deferral path
+        # handles it consistently — the user-facing outcome is the same
+        # error message either way.
+        _log_install_event(
+            "7e/10", "warn",
+            f"launcher.db RO probe failed ({type(se).__name__}); falling through to RW pass",
+            data={"db_path": str(db_path), "error": str(se)[:200]},
+        )
+        needs_rebind = True
+
+    if not needs_rebind:
+        # Common case: launcher.db is consistent with on-disk Weaviate
+        # casing → no rebind needed → no writer-lock acquisition → no
+        # deferral when the hub is running.
+        _log_install_event(
+            "7e/10", "skip",
+            "launcher.db KG bindings consistent with on-disk Weaviate casing; no self-heal needed",
+            data={"db_path": str(db_path)},
+        )
+        return
+
     # Open launcher.db read-write, BUT in a try/except: any sqlite error
     # (locked, corrupted, schema-drift, permission) soft-fails to a
     # deferral entry. The launcher's own boot will heal the schema; this

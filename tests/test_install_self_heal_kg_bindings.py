@@ -130,10 +130,21 @@ def _build_launcher_db(db_path: Path, rows: list[tuple[str, str, str]]) -> None:
 
     Each row is ``(project_id, role, collection_name)``. Other columns
     get sane defaults (None / '{}' / current millis).
+
+    v0.2.49 Bug N: also sets ``journal_mode = WAL`` to mirror the
+    launcher's production config (`launcher/src-tauri/vct-launcher-core/
+    src/db.rs::init_pragmas`). In WAL mode, RO connections do NOT block
+    on writer transactions — which is the load-bearing property the
+    RO-first detection path in `_self_heal_kg_bindings_on_update`
+    depends on. Without WAL, the default rollback-journal mode causes
+    RO connections to block on writer transactions just like RW ones,
+    making the Bug N regression test indistinguishable from the
+    pre-fix path.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     try:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute(_PROJECT_KG_BINDINGS_DDL)
         now = int(time.time() * 1000)
         for project_id, role, collection_name in rows:
@@ -261,6 +272,138 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         # No deferral entry — there was nothing to heal.
         ids = [e.condition_id for e in report.entries]
         self.assertNotIn("kg_binding_self_healed", ids)
+
+    def test_self_heal_no_op_uses_ro_mode_and_does_not_open_rw(self):
+        """v0.2.49 Bug N regression: when no rebind is needed, the helper
+        opens launcher.db in RO mode for detection, finds no work, and
+        returns cleanly WITHOUT ever opening an RW connection.
+
+        Pre-Bug-N, this helper opened launcher.db in RW mode unconditionally
+        with timeout=5.0. On hosts where vct-hub is running (the design —
+        hub outlives launcher GUI), every `install.py --update` run hit
+        the 5s writer-lock timeout and emitted a
+        `kg_binding_self_heal_db_error` deferral, even when there was
+        literally nothing to heal. RL chat msg 179 (2026-06-07) reported
+        this and recommended Option A: open RO for detection, only reopen
+        RW if mismatches found.
+
+        Reproducing the exact production lock state in a hermetic test is
+        flaky (depends on whether SQLite's connect-time WAL recovery hits
+        the writer lock for that specific filesystem + journal-mode +
+        SQLite version combination). Instead, pin the CONTRACT
+        deterministically: intercept sqlite3.connect calls and assert
+        that for a no-rebind launcher.db, the helper opens RO exactly
+        once and RW exactly zero times. Pre-Bug-N would open RW once and
+        RO zero times. The behavioral difference is observable without
+        depending on lock-timing.
+        """
+        # Pre-seed: exact-match binding (no rebind needed — the common case).
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        # Intercept sqlite3.connect to count RO vs RW calls. The fix
+        # opens RO via `sqlite3.connect("file:<path>?mode=ro", uri=True)`;
+        # the legacy RW path is `sqlite3.connect(str_path)`.
+        ro_calls: list[str] = []
+        rw_calls: list[str] = []
+        real_connect = sqlite3.connect
+
+        def _tracking_connect(*args, **kwargs):
+            dsn = args[0] if args else kwargs.get("database", "")
+            if kwargs.get("uri") and isinstance(dsn, str) and "mode=ro" in dsn:
+                ro_calls.append(dsn)
+            else:
+                rw_calls.append(dsn)
+            return real_connect(*args, **kwargs)
+
+        report = DeferralReport()
+        # `import sqlite3` is local-to-function inside the helper, so
+        # patch sqlite3.connect at the module level — both the helper's
+        # local import and any other consumer in this process will see
+        # the patched callable.
+        with mock.patch("sqlite3.connect", side_effect=_tracking_connect):
+            install._self_heal_kg_bindings_on_update(report)
+
+        # Post-Bug-N contract: exactly one RO open, ZERO RW opens.
+        self.assertEqual(
+            len(ro_calls),
+            1,
+            f"Bug N: helper should open RO connection ONCE for detection. "
+            f"Got {len(ro_calls)} RO calls: {ro_calls}",
+        )
+        self.assertEqual(
+            len(rw_calls),
+            0,
+            f"Bug N regression: helper should NOT open RW connection when "
+            f"detection finds no rebinds needed (would block on the vct-hub "
+            f"writer lock in production). Got {len(rw_calls)} RW calls: "
+            f"{rw_calls}",
+        )
+
+        # And no deferral entry — RO probe found nothing to heal.
+        ids = [e.condition_id for e in report.entries]
+        self.assertNotIn("kg_binding_self_heal_db_error", ids)
+        self.assertNotIn("kg_binding_self_healed", ids)
+
+    def test_self_heal_rebind_path_still_opens_rw(self):
+        """v0.2.49 Bug N: when detection DOES find rebinds, the helper
+        proceeds to open RW + apply them. Inverse pin: the RO-first
+        optimization must not break the rebind-needed path.
+        """
+        # Pre-seed: lowercase-c binding that needs a rebind.
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph")],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        ro_calls: list[str] = []
+        rw_calls: list[str] = []
+        real_connect = sqlite3.connect
+
+        def _tracking_connect(*args, **kwargs):
+            dsn = args[0] if args else kwargs.get("database", "")
+            if kwargs.get("uri") and isinstance(dsn, str) and "mode=ro" in dsn:
+                ro_calls.append(dsn)
+            else:
+                rw_calls.append(dsn)
+            return real_connect(*args, **kwargs)
+
+        report = DeferralReport()
+        # `import sqlite3` is local-to-function inside the helper, so
+        # patch sqlite3.connect at the module level — both the helper's
+        # local import and any other consumer in this process will see
+        # the patched callable.
+        with mock.patch("sqlite3.connect", side_effect=_tracking_connect):
+            install._self_heal_kg_bindings_on_update(report)
+
+        # RO opened for detection, RW opened to apply.
+        self.assertEqual(
+            len(ro_calls), 1,
+            f"expected 1 RO probe, got {len(ro_calls)} calls: {ro_calls}",
+        )
+        self.assertEqual(
+            len(rw_calls), 1,
+            f"expected 1 RW apply, got {len(rw_calls)} calls: {rw_calls}",
+        )
+
+        # Rebind actually happened (delegating to the existing case-rebind path).
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+            "Bug N must not break the rebind path: lowercase-c binding "
+            "should be rewritten to canonical capital-C.",
+        )
 
     def test_self_heal_no_op_when_no_case_sibling(self):
         # Pre-seed launcher.db with capital-C binding, but Weaviate is
