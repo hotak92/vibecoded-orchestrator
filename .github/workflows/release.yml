@@ -1046,19 +1046,19 @@ jobs:
       #   launcher/dist/<target>/vct-launcher[.exe]
       #   launcher/dist/<target>/vct-launcher[.exe].metadata.json
       - name: Download linux-x64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vct-launcher-linux-x64
           path: _dist-artifacts/linux-x64
 
       - name: Download windows-x64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vct-launcher-windows-x64
           path: _dist-artifacts/windows-x64
 
       - name: Download macos-arm64 binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: vct-launcher-macos-arm64
           path: _dist-artifacts/macos-arm64
@@ -1338,7 +1338,7 @@ jobs:
       # ci-deploy.md § "Known limitations".
       - name: Set up Supabase CLI
         if: steps.token_check.outputs.skip != 'true'
-        uses: supabase/setup-cli@v1
+        uses: supabase/setup-cli@v2
         with:
           version: latest
 
