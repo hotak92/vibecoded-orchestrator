@@ -499,9 +499,20 @@ fn parse_schema_response(
 #[command]
 pub async fn schema_migration_status(
     cfg: State<'_, LocalConfig>,
+    db: State<'_, Db>,
 ) -> Result<SchemaMigrationStatusReport, String> {
     let base = resolve_weaviate_url(&cfg);
-    let shared_kg_class = DEFAULT_SHARED_KG_CLASS.to_string();
+    // v0.2.49 access-matrix Phase 2 (item #7, S-1) — read the
+    // persisted canonical name from `app_state` (Step A migration 028)
+    // instead of the hardcoded constant. White-label installs override
+    // the default via `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env at
+    // install time; this getter sees the override.
+    //
+    // Soft-fail: DB error falls back to the compiled-in default so the
+    // health check still runs (it's a display surface, not security).
+    let shared_kg_class = db
+        .get_orchestrator_root_kg_collection()
+        .unwrap_or_else(|_| DEFAULT_SHARED_KG_CLASS.to_string());
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

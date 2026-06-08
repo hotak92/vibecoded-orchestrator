@@ -36,6 +36,66 @@ pub struct AdoptionReport {
 
 // ─── KG collection access ────────────────────────────────────────────────
 
+/// v0.2.49 access-matrix Phase 2 (item #6) — strongly-typed access
+/// level. Wire-stable through `as_str()` / `from_str_strict()` so the
+/// SQL column keeps storing `"read" | "write" | "none"` unchanged.
+///
+/// The enum exists to give Phase 2's resolver (`resolve_default_access_level`)
+/// and Stream A's #13 populate path (`populate_kg_collection_access_for_global_module`)
+/// a misuse-resistant type to pass around. The string-typed
+/// `kg_set_access` / `kg_seed_access` setters remain — most call sites
+/// only need `.as_str()` interop. A future v0.2.50+ sweep can flip
+/// the setters' signatures to take `AccessLevel` directly; deferred
+/// to avoid touching every existing call site in this release.
+///
+/// Variant semantics:
+///   - `Read`: project can SELECT objects from the collection.
+///   - `Write`: project can SELECT + INSERT/UPDATE/DELETE.
+///   - `Denied`: row exists; project is explicitly denied. SQL wire
+///     value is `"none"` (matches the existing `kg_set_access`
+///     validator + the CHECK constraint at migration 001).
+///
+/// "No row exists at all for this (project, collection)" is the
+/// caller's `Option::None` — outside the `AccessLevel` value space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub enum AccessLevel {
+    Read,
+    Write,
+    Denied,
+}
+
+impl AccessLevel {
+    /// Wire-stable SQL value. Used at every call site that needs to
+    /// hand the level to the string-typed `kg_set_access` /
+    /// `kg_seed_access` setters or to bind into a raw SQL parameter.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessLevel::Read => "read",
+            AccessLevel::Write => "write",
+            AccessLevel::Denied => "none",
+        }
+    }
+
+    /// Strict parser — only accepts the canonical SQL wire values.
+    /// Unknown strings (typos, capitalization mismatches, legacy
+    /// values) return Err, never silently default. The misuse-resistant
+    /// half of the wire-stable contract.
+    pub fn from_str_strict(s: &str) -> Result<Self, String> {
+        match s {
+            "read" => Ok(AccessLevel::Read),
+            "write" => Ok(AccessLevel::Write),
+            "none" => Ok(AccessLevel::Denied),
+            other => Err(format!("invalid access level: {:?}", other)),
+        }
+    }
+}
+
+impl std::fmt::Display for AccessLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// v0.2.49 access-matrix Step A.5 — full row shape for
 /// `kg_collection_access`, including the audit columns introduced by
 /// migration 029.
@@ -150,6 +210,106 @@ impl Db {
             .map_err(|e| format!("kg_get_access_row: {}", e))
     }
 
+    /// v0.2.49 access-matrix Phase 2 (item #6) — the centralized
+    /// default-access resolver. Determines the access level that a
+    /// project should have for a collection BY DEFAULT (i.e. when the
+    /// access matrix is freshly seeded, no user override applied).
+    ///
+    /// Single source of truth for the F-2a semantic: "a project owns
+    /// its primary + shared bindings → `Write`; everything else →
+    /// `Denied`." Replaces the three substring-heuristic-based
+    /// classifications previously scattered across `commands::kg`,
+    /// `commands::project_env_settings`, and the install.py seed-path
+    /// blocks.
+    ///
+    /// Consumed by:
+    ///   - Phase 4 item #10 (hub CLI `vct project create` populate path)
+    ///   - Phase 4 item #13 (RL chat's `populate_kg_collection_access_for_global_module`)
+    ///   - install.py parity self-heal seed-path (future v0.2.50 cleanup)
+    ///   - The Phase 7 force-upgrade migration's per-row UPDATE target
+    ///     value (when running, it explicitly sets `Write` for shared
+    ///     rows; the resolver's `Write` return here matches that
+    ///     contract).
+    ///
+    /// **Decision rule** (in evaluation order):
+    /// 1. If `project_kg_bindings` has a row matching (project_id,
+    ///    collection_name) with role `primary` or `shared` → `Write`.
+    ///    These are bindings the project OWNS — full read+write.
+    /// 2. Otherwise → `Denied`. Per-project sharing is opt-in: the
+    ///    user grants `Read` on someone else's collection through the
+    ///    cross-project access matrix UI, not through this default.
+    ///
+    /// Returns `Err` only on actual SQL errors. Non-existence (no
+    /// binding row matching the inputs) returns `Ok(AccessLevel::Denied)`
+    /// — that's the "no relationship known" default.
+    pub fn resolve_default_access_level(
+        &self,
+        project_id: &str,
+        collection: &str,
+    ) -> Result<AccessLevel, String> {
+        let guard = self.lock();
+        let role: Option<String> = guard
+            .query_row(
+                "SELECT role
+                   FROM project_kg_bindings
+                  WHERE project_id = ?1 AND collection_name = ?2
+                  LIMIT 1",
+                params![project_id, collection],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("resolve_default_access_level: {}", e))?;
+        match role.as_deref() {
+            Some("primary") | Some("shared") => Ok(AccessLevel::Write),
+            // 'archive' or any other role → Denied (not auto-write).
+            // Future cycles may add more nuance per role here.
+            _ => Ok(AccessLevel::Denied),
+        }
+    }
+
+    /// v0.2.49 access-matrix Phase 2 (item #5) — V44-C structural-row
+    /// guard relocated into the DB layer. Detects whether
+    /// `(project_id, collection)` identifies the orchestrator-root
+    /// project's primary KG binding. That row is STRUCTURAL: the
+    /// orchestrator-root must retain `write` access to its own
+    /// primary collection or the install breaks (kg-sync etc. would
+    /// refuse to write to the canonical KG).
+    ///
+    /// Returns:
+    ///   - `Ok(true)` if this is the orchestrator-root project + the
+    ///     collection equals that project's `role='primary'`
+    ///     binding name → caller must refuse to write any non-`write`
+    ///     level.
+    ///   - `Ok(false)` otherwise (any other project, any non-primary
+    ///     collection, missing rows) → caller is free to write any
+    ///     valid level.
+    ///   - `Err` only on SQL error.
+    ///
+    /// Pre-v0.2.49 this check lived in `commands::kg::
+    /// kg_set_collection_access_mode` (one guard, one call site).
+    /// Relocating into `db::access` means EVERY caller of the
+    /// `kg_set_access` family — current and future — is guarded by
+    /// construction.
+    pub fn is_orchestrator_root_structural_row(
+        &self,
+        project_id: &str,
+        collection: &str,
+    ) -> Result<bool, String> {
+        let owner = self
+            .get_project(project_id)
+            .map_err(|e| format!("get_project: {}", e))?;
+        let Some(owner_row) = owner else { return Ok(false) };
+        if owner_row.host != crate::db::models::ProjectHost::OrchestratorRoot {
+            return Ok(false);
+        }
+        let bindings = self
+            .list_project_kg_bindings(project_id)
+            .map_err(|e| format!("list_project_kg_bindings: {}", e))?;
+        Ok(bindings
+            .iter()
+            .any(|b| b.role == "primary" && b.collection_name == collection))
+    }
+
     pub fn kg_set_access(
         &self,
         project_id: &str,
@@ -158,6 +318,35 @@ impl Db {
     ) -> Result<(), String> {
         if !matches!(level, "read" | "write" | "none") {
             return Err(format!("invalid kg access level: {}", level));
+        }
+        // v0.2.49 access-matrix Phase 2 (item #5) — V44-C structural
+        // row guard at the DB layer. Pre-relocation this guard lived
+        // in `commands::kg::kg_set_collection_access_mode`; relocating
+        // here means every caller of kg_set_access is guarded by
+        // construction. The guard's contract: the orchestrator-root
+        // project's primary KG collection MUST retain `write` access.
+        // Any attempt to demote it to `read` or `none` is rejected
+        // with a structural-violation error.
+        //
+        // The mutation loop in `commands::kg::kg_set_collection_access_mode`
+        // skips the owner project entirely (it always writes `write`
+        // for the owner before the loop), so this guard doesn't
+        // re-trigger mid-loop. The loop iterates peers; for the
+        // orchestrator-root project specifically, attempting to
+        // demote its structural row from a peer-mode-set call would
+        // surface here. Test
+        // `kg_set_access_refuses_orchestrator_root_structural_demote`
+        // pins this.
+        if level != "write"
+            && self.is_orchestrator_root_structural_row(project_id, collection)?
+        {
+            return Err(format!(
+                "Refusing to change access level for orchestrator-root's \
+                 structural row (collection '{}', level '{}'). The \
+                 orchestrator-root project must retain write access to its \
+                 primary collection.",
+                collection, level,
+            ));
         }
         // v0.2.49 access-matrix Step A.5: bind both audit columns.
         //
@@ -2773,6 +2962,247 @@ mod access_audit_column_tests {
             after_reseed, after_user,
             "row must be byte-identical after no-op seed call",
         );
+    }
+
+    // ─── Phase 2 (Step B) — AccessLevel + resolver + V44-C guard ───────────
+
+    #[test]
+    fn access_level_as_str_wire_stable() {
+        // The SQL column stores "read" / "write" / "none". Enum
+        // variants must round-trip via `as_str()` / `from_str_strict()`
+        // without altering the wire values.
+        assert_eq!(AccessLevel::Read.as_str(), "read");
+        assert_eq!(AccessLevel::Write.as_str(), "write");
+        assert_eq!(AccessLevel::Denied.as_str(), "none");
+        assert_eq!(format!("{}", AccessLevel::Read), "read");
+        assert_eq!(format!("{}", AccessLevel::Write), "write");
+        assert_eq!(format!("{}", AccessLevel::Denied), "none");
+
+        assert_eq!(AccessLevel::from_str_strict("read").unwrap(), AccessLevel::Read);
+        assert_eq!(AccessLevel::from_str_strict("write").unwrap(), AccessLevel::Write);
+        assert_eq!(AccessLevel::from_str_strict("none").unwrap(), AccessLevel::Denied);
+    }
+
+    #[test]
+    fn access_level_from_str_strict_rejects_unknown() {
+        // Misuse-resistance: no silent default for typos, capitalization
+        // mismatches, or legacy values. Each is an Err.
+        for bad in &["READ", "Write", "denied", "rw", "", "yes"] {
+            assert!(
+                AccessLevel::from_str_strict(bad).is_err(),
+                "expected Err for {:?}",
+                bad,
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_default_access_level_write_on_primary() {
+        // Item #6 contract: when (project_id, collection) IS the
+        // project's primary binding, default access is Write.
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        let now: i64 = 1_700_000_000_000;
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO project_kg_bindings
+                        (project_id, role, collection_name, config_json, updated_at)
+                     VALUES ('p1', 'primary', 'P1Primary_KG', '{}', ?1)",
+                    params![now],
+                )
+                .unwrap();
+        }
+        let level = db.resolve_default_access_level("p1", "P1Primary_KG").unwrap();
+        assert_eq!(level, AccessLevel::Write);
+    }
+
+    #[test]
+    fn resolve_default_access_level_write_on_shared() {
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        let now: i64 = 1_700_000_000_000;
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO project_kg_bindings
+                        (project_id, role, collection_name, config_json, updated_at)
+                     VALUES ('p1', 'shared', 'Org_KG', '{}', ?1)",
+                    params![now],
+                )
+                .unwrap();
+        }
+        let level = db.resolve_default_access_level("p1", "Org_KG").unwrap();
+        assert_eq!(level, AccessLevel::Write);
+    }
+
+    #[test]
+    fn resolve_default_access_level_denied_when_no_binding() {
+        // No binding row → no implicit grant. Default is Denied
+        // ("none" on the wire). Cross-project access must be opt-in
+        // by the user via the kg_set_collection_access_mode command.
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        // No binding row inserted for (p1, SomeOtherProjectsKG).
+        let level = db
+            .resolve_default_access_level("p1", "SomeOtherProjectsKG")
+            .unwrap();
+        assert_eq!(level, AccessLevel::Denied);
+    }
+
+    #[test]
+    fn resolve_default_access_level_denied_on_archive_role() {
+        // Future-proofing: archive bindings (and any other non-
+        // primary/shared role) default to Denied. Plan's F-2a rule
+        // says only own-primary + shared get auto-write.
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        let now: i64 = 1_700_000_000_000;
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO project_kg_bindings
+                        (project_id, role, collection_name, config_json, updated_at)
+                     VALUES ('p1', 'archive', 'P1Archive_KG', '{}', ?1)",
+                    params![now],
+                )
+                .unwrap();
+        }
+        let level = db.resolve_default_access_level("p1", "P1Archive_KG").unwrap();
+        assert_eq!(level, AccessLevel::Denied);
+    }
+
+    #[test]
+    fn kg_set_access_refuses_orchestrator_root_structural_demote() {
+        // Item #5 — V44-C guard relocated into kg_set_access. Any
+        // attempt to demote the orchestrator-root's primary structural
+        // row from "write" must be refused at the DB layer, regardless
+        // of caller. Defense in depth for any future caller that
+        // bypasses the command-layer guard.
+        let db = Db::open_in_memory().unwrap();
+        // Seed an orchestrator-root project + its primary binding.
+        let now: i64 = 1_700_000_000_000;
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+                 VALUES ('root', 'Root', '/tmp/root', 'orchestrator_root', ?1, ?1, 'root')",
+                params![now],
+            )
+            .unwrap();
+        guard
+            .execute(
+                "INSERT INTO project_kg_bindings
+                    (project_id, role, collection_name, config_json, updated_at)
+                 VALUES ('root', 'primary', 'RootStructural_KG', '{}', ?1)",
+                params![now],
+            )
+            .unwrap();
+        drop(guard);
+
+        // Sanity: writing "write" succeeds.
+        db.kg_set_access("root", "RootStructural_KG", "write").unwrap();
+
+        // Attempts to demote to "read" or "none" must Err with a
+        // structural-violation message.
+        let err = db
+            .kg_set_access("root", "RootStructural_KG", "read")
+            .unwrap_err();
+        assert!(
+            err.contains("structural"),
+            "expected structural-violation message, got: {}",
+            err,
+        );
+        let err = db
+            .kg_set_access("root", "RootStructural_KG", "none")
+            .unwrap_err();
+        assert!(err.contains("structural"));
+
+        // Non-structural rows on the orchestrator-root project are
+        // unaffected (e.g. setting access to OTHER collections).
+        db.kg_set_access("root", "OtherCollection", "read").unwrap();
+        db.kg_set_access("root", "OtherCollection", "none").unwrap();
+    }
+
+    #[test]
+    fn kg_set_access_does_not_guard_non_root_projects() {
+        // The V44-C guard fires ONLY for orchestrator-root host
+        // projects. A regular base project's primary binding can be
+        // demoted freely (user is in control of their own access).
+        let db = Db::open_in_memory().unwrap();
+        let now: i64 = 1_700_000_000_000;
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+                     VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+                    params![now],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "INSERT INTO project_kg_bindings
+                        (project_id, role, collection_name, config_json, updated_at)
+                     VALUES ('p1', 'primary', 'P1Primary_KG', '{}', ?1)",
+                    params![now],
+                )
+                .unwrap();
+        }
+        // All three levels succeed on a non-orchestrator-root project.
+        db.kg_set_access("p1", "P1Primary_KG", "write").unwrap();
+        db.kg_set_access("p1", "P1Primary_KG", "read").unwrap();
+        db.kg_set_access("p1", "P1Primary_KG", "none").unwrap();
+    }
+
+    #[test]
+    fn is_orchestrator_root_structural_row_distinguishes_correctly() {
+        // Helper-level test for the predicate. Covers the 3 axes:
+        //   - host: orchestrator_root vs base
+        //   - role: primary vs shared/archive
+        //   - collection name match vs miss
+        let db = Db::open_in_memory().unwrap();
+        let now: i64 = 1_700_000_000_000;
+        {
+            let guard = db.lock();
+            // Orchestrator root with a primary + shared binding.
+            guard.execute(
+                "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+                 VALUES ('root', 'Root', '/tmp/root', 'orchestrator_root', ?1, ?1, 'root')",
+                params![now],
+            ).unwrap();
+            guard.execute(
+                "INSERT INTO project_kg_bindings (project_id, role, collection_name, config_json, updated_at)
+                 VALUES ('root', 'primary', 'Structural_KG', '{}', ?1),
+                        ('root', 'shared',  'Shared_KG',     '{}', ?1)",
+                params![now],
+            ).unwrap();
+            // Base project with a primary binding (NOT structural in V44-C sense).
+            guard.execute(
+                "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+                 VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+                params![now],
+            ).unwrap();
+            guard.execute(
+                "INSERT INTO project_kg_bindings (project_id, role, collection_name, config_json, updated_at)
+                 VALUES ('p1', 'primary', 'P1Primary_KG', '{}', ?1)",
+                params![now],
+            ).unwrap();
+        }
+
+        // Orchestrator-root + primary collection name match → true.
+        assert!(db.is_orchestrator_root_structural_row("root", "Structural_KG").unwrap());
+        // Orchestrator-root + shared role → false (not the structural primary).
+        assert!(!db.is_orchestrator_root_structural_row("root", "Shared_KG").unwrap());
+        // Orchestrator-root + unknown collection → false.
+        assert!(!db.is_orchestrator_root_structural_row("root", "Unknown_KG").unwrap());
+        // Base project + primary → false (only orchestrator-root has structural rows).
+        assert!(!db.is_orchestrator_root_structural_row("p1", "P1Primary_KG").unwrap());
+        // Non-existent project → false.
+        assert!(!db.is_orchestrator_root_structural_row("nope", "Whatever").unwrap());
     }
 
     #[test]

@@ -157,33 +157,32 @@ pub async fn kg_list_collections(
             .cloned()
             .unwrap_or_else(|| "none".to_string());
         let node_count = fetch_class_count(&client, &base, &name).await.unwrap_or(0);
-        // Recognize the canonical cross-project KG name shipped by the
-        // orchestrator (VibeCodedOrchestrator_KnowledgeGraph since v0.2.23 B1
-        // — was VibecodedOrchestrator_KnowledgeGraph v0.2.12–v0.2.22, itself
-        // renamed from VibeCodedTools_KnowledgeGraph in v0.2.12 PR-26 /
-        // Group E; both prior names are kept as legacy-detection paths so
-        // pre-flip / pre-rename installs still light up the picker's
-        // "Manage shared KG collection" UI). Falls back to the historical
-        // "shared" substring heuristic + legacy "sharedVCT" name for
-        // back-compat with older installs / custom setups.
+        // v0.2.49 access-matrix Phase 2 (item #7, S-1) — replace the
+        // historical 3-tier substring heuristic with byte-equality
+        // against the persisted canonical name from Step A's
+        // `app_state['orchestrator_root_kg_collection']`. Closes audit
+        // finding S-1: different code paths previously classified
+        // identical collection names differently because they
+        // consulted different constants (helper canonical vs literal
+        // "sharedVCT" vs lowercase("shared") substring).
         //
-        // v0.2.24 B4 (2026-05-22): the canonical + 2 legacy-alias matches
-        // moved into the shared helper
-        // `commands::project_env_settings::is_shared_kg_class_name`,
-        // unifying recognition with
-        // `commands/maintenance.rs::parse_schema_response`. This is a
-        // WIDENING of the prior behaviour (the inline match was strict
-        // `==`; the helper is case-insensitive), in line with the v0.2.23
-        // peer-review-B HIGH-2 fix. The two trailing heuristics
-        // (`"sharedVCT"` + `contains("shared")`) stay inline — they are
-        // not orchestrator-shipped names, just a forgiving display
-        // heuristic for whatever the user happens to have around.
-        let is_shared = crate::commands::project_env_settings::is_shared_kg_class_name(
-            &name,
-            crate::commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION,
-        )
-            || name == "sharedVCT"
-            || name.to_lowercase().contains("shared");
+        // Tradeoff: a user-created collection named e.g. "MyShared_KG"
+        // no longer sorts with the canonical shared root. Acceptable
+        // — and arguably more honest — per the plan's S-1 disposition.
+        // The pre-v0.2.49 heuristic also flagged legacy migration
+        // names (`VibeCodedTools_KnowledgeGraph`,
+        // `VibecodedOrchestrator_KnowledgeGraph`); white-label installs
+        // override the persisted canonical via the
+        // `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env at install time, so
+        // legacy-rename detection migrates to the orchestrator-root
+        // setting row instead of being inferred from substrings.
+        //
+        // Soft-fail: a DB error reading the setting falls back to
+        // `false` (this is a display-sort heuristic, not security).
+        let canonical_root = db
+            .get_orchestrator_root_kg_collection()
+            .unwrap_or_else(|_| String::new());
+        let is_shared = !canonical_root.is_empty() && name == canonical_root;
         out.push(KgCollectionAccess {
             name,
             node_count,
