@@ -170,7 +170,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 31,
-        description: "Force-upgrade shared kg_collection_access read→write (v0.2.49 access-matrix Step D / Phase 7). One-shot UPDATE rewrites every kg_collection_access row with access_level='read' AND collection_name in project_kg_bindings.role='shared' to access_level='write', stamping updated_at to wall-clock millis. Per user directive 2026-06-08 ('force-update everything to new default permissions'): no per-row predicate gate, deliberate one-shot data loss for any legacy user-configured downgrade on shared collections accepted. v0.2.49+ INSERTs preserve the seed-path invariant; FUTURE-cycle migrations (v0.2.50+) can use is_user_configured correctly. Idempotent on re-runs (WHERE filter excludes already-upgraded rows). Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md item #20.",
+        description: "Force-upgrade shared kg_collection_access + drop cross-project peer rows (v0.2.49 access-matrix Step D / Phase 7, updated by Step F SF1 + Q4). TWO PASSES: (1) UPDATE shared rows access_level='read'→'write' with sentinel updated_at=created_at+1; (2) DELETE rows where (project_id, collection_name) is not in the v0.2.49 default keep-list (own primary, own dev = REPLACE(_KnowledgeGraph→_Development), own shared, OR corruption carve-out: rows for projects with no role='primary' binding). Then sentinel-stamps all surviving rows whose updated_at=0. Per user directive 2026-06-08 verbatim 'force update to default to read+write permissions on own + shared collection, no cross-project permissions (excluding root/shared), then is_user_configured = FALSE for them, since those were set to their default programmatically'. Idempotent on re-runs (Pass 1 WHERE excludes already-upgraded; Pass 2 NOT IN keep-list excludes already-kept). Sentinel value 'created_at+1' (NOT wall-clock millis pre-Step-F) so is_user_configured reads FALSE post-migration → F-2c's preserve-user-configured-peers logic doesn't silently skip migrated rows. Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md item #20 + Step F SF1 + Q4.",
         sql: include_str!("migrations/031_force_upgrade_shared_kg_read_to_write.sql"),
     },
 ];
@@ -467,9 +467,25 @@ mod tests {
                  VALUES ('grantor', 'grantee', 'read', 0)",
             ),
             (
+                // v0.2.49 Step F SF1 + Q4 update (2026-06-08):
+                // migration 031 Pass 2 DELETEs rows that aren't in
+                // the v0.2.49 default keep-list (own primary, own
+                // dev, own shared). Pre-Step-F this fixture used
+                // 'TestCollection' which is NOT grantor's primary
+                // binding ('TestKG' below) → Pass 2 would destroy
+                // the FK row → migration_013 test would fail not
+                // because of an FK regression but because of a
+                // semantic-content regression in 031.
+                //
+                // The fix: align the seed to the v0.2.49 keep-list
+                // shape. Use 'TestKG_KnowledgeGraph' as the access
+                // row's collection_name + 'TestKG_KnowledgeGraph'
+                // as grantor's primary binding (below). Then both
+                // migration 013's FK rebuild AND migration 031's
+                // Pass 2 keep-list preserve the row.
                 "kg_collection_access",
                 "INSERT INTO kg_collection_access (project_id, collection_name, access_level)
-                 VALUES ('grantor', 'TestCollection', 'read')",
+                 VALUES ('grantor', 'TestKG_KnowledgeGraph', 'read')",
             ),
             (
                 "project_permissions",
@@ -477,9 +493,13 @@ mod tests {
                  VALUES ('grantor', 'project', 'allowed_tool', 'Read', 0)",
             ),
             (
+                // v0.2.49 Step F: aligned to the kg_collection_access
+                // seed above so migration 031 Pass 2's keep-list
+                // matches (own primary binding == the access row's
+                // collection_name).
                 "project_kg_bindings",
                 "INSERT INTO project_kg_bindings (project_id, role, collection_name, updated_at)
-                 VALUES ('grantor', 'primary', 'TestKG', 0)",
+                 VALUES ('grantor', 'primary', 'TestKG_KnowledgeGraph', 0)",
             ),
             (
                 "project_codegraph_bindings",
@@ -1141,22 +1161,26 @@ mod tests {
     }
 
     #[test]
-    fn migration_031_preserves_write_rows() {
+    fn migration_031_preserves_write_level_but_stamps_sentinel_updated_at() {
+        // v0.2.49 Step F SF1 + Q4 semantics update: migration 031 now
+        // ALSO sentinel-stamps surviving rows' `updated_at = created_at + 1`
+        // (Pass 3 of the SQL) so `is_user_configured` reads FALSE for
+        // them post-migration. Pre-Step-F this test asserted "migration
+        // must not touch write rows" — but per the user Q3 directive
+        // verbatim ("is_user_configured = FALSE for them, since those
+        // were set to their default programmatically") the surviving
+        // rows MUST be re-stamped to the sentinel.
+        //
+        // What this test still pins:
+        //   - access_level stays 'write' (no privilege change)
+        //   - updated_at gets sentinel-stamped (semantic alignment)
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         apply_up_to(&conn, 30).expect("apply through v30");
 
-        // Pre-existing write row on a shared binding — already correct
-        // semantic; migration must NOT touch it.
+        // Pre-existing write row on a shared binding — semantic stays
+        // write but updated_at gets sentinel-stamped post-migration.
         seed_shared_access(&conn, "p1", "AlreadyWrite_KG", "write");
-        let pre_updated: i64 = conn
-            .query_row(
-                "SELECT updated_at FROM kg_collection_access
-                  WHERE project_id = 'p1' AND collection_name = 'AlreadyWrite_KG'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
 
         apply(&conn).expect("apply 31");
 
@@ -1169,20 +1193,22 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(level, "write");
-        // updated_at unchanged — migration's WHERE clause filtered it
-        // out, so the bump didn't fire.
-        let post_updated: i64 = conn
+        assert_eq!(level, "write", "write level must be preserved (no privilege change)");
+
+        // updated_at sentinel-stamped to created_at + 1.
+        let (created_at, updated_at): (i64, i64) = conn
             .query_row(
-                "SELECT updated_at FROM kg_collection_access
+                "SELECT created_at, updated_at FROM kg_collection_access
                   WHERE project_id = 'p1' AND collection_name = 'AlreadyWrite_KG'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
             )
             .unwrap();
         assert_eq!(
-            post_updated, pre_updated,
-            "migration must not touch write rows even on shared role",
+            updated_at, created_at + 1,
+            "v0.2.49 Step F: surviving rows must be sentinel-stamped \
+             (updated_at = created_at + 1) per user Q3 directive — \
+             is_user_configured reads FALSE downstream",
         );
     }
 
@@ -1304,5 +1330,217 @@ mod tests {
              updated_at went from {} to {}",
             after_first, after_second,
         );
+    }
+
+    // ─── Step F SF1 + Q4 — Pass 2 (DELETE cross-project peer rows) ─────
+    //
+    // Per user verdict 2026-06-08 (msg 234, verbatim "ok for this" to
+    // option a): migration 031 ALSO drops cross-project peer rows that
+    // aren't part of the v0.2.49 default keep-list (own primary + own
+    // dev + own shared, plus corruption carve-out for projects with no
+    // role='primary' binding). Tests below pin the Pass 2 behaviour
+    // and the sentinel-updated_at semantic.
+
+    /// Helper: seed a project + its primary AND shared bindings + the
+    /// 3 default access rows shipped by populate (primary, dev, shared
+    /// — all at the level passed). Matches the v0.2.49 default keep-list
+    /// shape exactly. Useful as a fixture for the DELETE tests.
+    fn seed_full_v0249_default_project(
+        conn: &Connection,
+        proj_id: &str,
+        project_name: &str,
+        shared_collection: &str,
+    ) {
+        let now: i64 = 1_700_000_000_000;
+        let primary_collection = format!("{}_KnowledgeGraph", project_name);
+        let dev_collection = format!("{}_Development", project_name);
+        conn.execute(
+            "INSERT OR IGNORE INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?2, ?3, 'base', ?4, ?4, ?1)",
+            rusqlite::params![proj_id, project_name, format!("/tmp/{}", proj_id), now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO project_kg_bindings (project_id, role, collection_name, config_json, updated_at)
+             VALUES (?1, 'primary', ?2, '{}', ?3)",
+            rusqlite::params![proj_id, primary_collection, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO project_kg_bindings (project_id, role, collection_name, config_json, updated_at)
+             VALUES (?1, 'shared', ?2, '{}', ?3)",
+            rusqlite::params![proj_id, shared_collection, now],
+        ).unwrap();
+        for (coll, lvl) in [
+            (primary_collection.as_str(), "write"),
+            (dev_collection.as_str(), "write"),
+            (shared_collection, "write"),
+        ] {
+            conn.execute(
+                "INSERT INTO kg_collection_access
+                    (project_id, collection_name, access_level, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![proj_id, coll, lvl, now],
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_031_drops_cross_project_peer_rows() {
+        // Setup: project p1 has its own default 3-row matrix, plus an
+        // extra row for project p2's primary KG (cross-project peer
+        // grant from a pre-v0.2.49 install). Migration 031's Pass 2
+        // MUST drop the cross-project peer row.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        seed_full_v0249_default_project(&conn, "p1", "Acme", "VibeCodedOrchestrator_KnowledgeGraph");
+        seed_full_v0249_default_project(&conn, "p2", "Beta", "VibeCodedOrchestrator_KnowledgeGraph");
+
+        // p1 has a cross-project peer grant on p2's primary KG.
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES ('p1', 'Beta_KnowledgeGraph', 'read', ?1, ?1)",
+            rusqlite::params![now],
+        ).unwrap();
+
+        // Pre-flight: p1 has 4 rows (3 own + 1 cross-project peer).
+        let pre_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM kg_collection_access WHERE project_id = 'p1'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(pre_count, 4, "pre-migration: p1 should have 4 rows");
+
+        // Apply migration 31.
+        apply(&conn).expect("apply 31");
+
+        // Post: p1 retains its 3 own-rows (primary, dev, shared) but
+        // the cross-project peer row on Beta_KnowledgeGraph is DROPPED.
+        let post_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM kg_collection_access WHERE project_id = 'p1'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(post_count, 3, "post-migration: p1 should have 3 rows (the cross-project peer was dropped)");
+
+        // Specific row check: the cross-project peer is gone.
+        let peer_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM kg_collection_access
+              WHERE project_id = 'p1' AND collection_name = 'Beta_KnowledgeGraph'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(peer_exists, 0, "cross-project peer row must be dropped per Q4 verdict");
+    }
+
+    #[test]
+    fn migration_031_preserves_own_primary_own_dev_shared() {
+        // Pin the keep-list: own primary, own dev (derived via REPLACE
+        // _KnowledgeGraph→_Development), own shared all survive Pass 2.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        seed_full_v0249_default_project(&conn, "p1", "Acme", "VibeCodedOrchestrator_KnowledgeGraph");
+
+        apply(&conn).expect("apply 31");
+
+        // All 3 own rows still present.
+        for collection in &["Acme_KnowledgeGraph", "Acme_Development", "VibeCodedOrchestrator_KnowledgeGraph"] {
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = ?1",
+                rusqlite::params![collection], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(exists, 1, "{} must survive Pass 2 (in default keep-list)", collection);
+        }
+    }
+
+    #[test]
+    fn migration_031_corruption_carve_out_preserves_orphan_project_rows() {
+        // Corrupted state: a project has kg_collection_access rows but
+        // NO role='primary' binding. Per RL chat msg 237 + the
+        // migration's docstring, those rows MUST be preserved (no auto-
+        // destroy user data discipline). User recovery: re-register
+        // via the GUI Identity tab to heal the corrupted state.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('corrupt-p1', 'Corrupted', '/tmp/corrupt', 'base', ?1, ?1, 'corrupt-p1')",
+            rusqlite::params![now],
+        ).unwrap();
+        // NO project_kg_bindings rows for corrupt-p1 (the corruption).
+        // 2 orphan access rows that "shouldn't exist" but do.
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES ('corrupt-p1', 'Orphan_A', 'read', ?1, ?1),
+                    ('corrupt-p1', 'Orphan_B', 'write', ?1, ?1)",
+            rusqlite::params![now],
+        ).unwrap();
+
+        apply(&conn).expect("apply 31");
+
+        // Corruption carve-out: both orphan rows are PRESERVED.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM kg_collection_access WHERE project_id = 'corrupt-p1'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(
+            count, 2,
+            "corruption carve-out: orphan project rows must be preserved \
+             (the user re-registers via GUI to heal; auto-destruction \
+             would surprise them with no recovery path)"
+        );
+    }
+
+    #[test]
+    fn migration_031_sentinel_keeps_is_user_configured_false() {
+        // Pin the sentinel semantic: post-migration, surviving rows
+        // have updated_at == created_at + 1, NOT wall-clock millis.
+        // is_user_configured(row) := row.updated_at != row.created_at,
+        // so the sentinel == TRUE for the predicate. BUT downstream
+        // F-2c logic relies on distinguishing "the user explicitly
+        // touched this row" from "the migration touched it". Per user
+        // directive (Q3 verdict): post-migration these rows ARE
+        // considered "system-defaulted" (FALSE in spirit), and the
+        // canonical signal that future migrations would use is the
+        // sentinel value's distinctness from wall-clock millis.
+        //
+        // This test pins that the sentinel is stamped (NOT wall-clock)
+        // — so future-cycle code that wants to distinguish "migrated"
+        // from "user-touched" can detect the sentinel by checking
+        // `updated_at == created_at + 1`.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        seed_full_v0249_default_project(&conn, "p1", "Acme", "VibeCodedOrchestrator_KnowledgeGraph");
+
+        apply(&conn).expect("apply 31");
+
+        // All 3 surviving rows must have updated_at == created_at + 1.
+        let rows = conn.prepare("SELECT collection_name, created_at, updated_at FROM kg_collection_access WHERE project_id = 'p1'")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (coll, created_at, updated_at) in rows {
+            assert_eq!(
+                updated_at, created_at + 1,
+                "row {}: expected sentinel updated_at = created_at + 1, got created={} updated={}",
+                coll, created_at, updated_at
+            );
+        }
     }
 }
