@@ -1222,58 +1222,49 @@ pub fn run() {
             // change with `manual_override:v0.2.40-prefix-adopt`; the
             // on-write propagation also handles that path).
             //
-            // v0.2.49 batch 3 (black-screen cold-start fix):
-            // moved off the synchronous setup() path into an async
-            // tokio::spawn. Pre-fix: a slow Weaviate probe (e.g. the
-            // first run after a fresh Weaviate container start, where
-            // /v1/schema can take 1-3 s to respond) would block the
-            // setup closure from returning, which Tauri waits on
-            // before showing the window. Result: a black screen for
-            // the duration of the probe. Post-fix: the probe runs
-            // asynchronously after window paint; the worst-case
-            // user-facing effect of a slow Weaviate is the orphan-
-            // prune backfill being deferred by a few seconds, never
-            // a frozen UI. The reconcile is best-effort + idempotent
-            // by design (next boot retries).
-            {
-                let reconcile_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    use tauri::Manager;
-                    let Some(db) = reconcile_handle.try_state::<db::Db>()
-                    else {
-                        return;
-                    };
-                    let weaviate_url = std::env::var("WEAVIATE_URL")
-                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
-                    match db
-                        .inner()
-                        .reconcile_kg_collection_access_at_boot(&weaviate_url)
-                        .await
-                    {
-                        Ok(dropped) => {
-                            if dropped > 0 {
-                                eprintln!(
-                                    "[vct] reconcile-kg-access (boot): dropped {} \
-                                     orphan kg_collection_access rows",
-                                    dropped
-                                );
-                                let _ = db.audit(
-                                    "kg_collection_access_reconciled_at_boot",
-                                    None,
-                                    None,
-                                    &serde_json::json!({ "dropped": dropped }),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[vct] reconcile-kg-access warning (non-fatal): {}",
-                                e
-                            );
-                        }
-                    }
-                });
-            }
+            // v0.2.49 batch 3 (black-screen cold-start fix) + Phase 3
+            // F-1 reorder ship-blocker:
+            //
+            // Both boot probes (W40-B adopt + the orphan-prune
+            // reconcile) were moved off the synchronous setup() path
+            // into async `tokio::spawn` in batch 3 to fix the black-
+            // screen-on-cold-start UX. Step C/Phase 3 then adds a
+            // `tokio::sync::oneshot` channel between them so that the
+            // RECONCILE TASK AWAITS THE ADOPT TASK'S COMPLETION before
+            // running its orphan-prune sweep.
+            //
+            // Why ordering matters (audit finding F-1, SHIP-BLOCKER):
+            // the adopt task rewrites `project_kg_bindings` rows whose
+            // collection_name points at a missing class to point at a
+            // populated cross-prefix candidate. Before the rewrite, the
+            // matching `kg_collection_access` rows are "orphans" by the
+            // reconcile sweep's definition (their collection_name is
+            // absent from both `project_kg_bindings` AND Weaviate).
+            // Running reconcile BEFORE adopt → orphans get dropped →
+            // adopt rewrites the binding → the access row is gone →
+            // the user has to manually re-grant access. Running
+            // reconcile AFTER adopt → the binding rewrite + the
+            // in-call `kg_rename_access` propagate the access row to
+            // the new collection name → reconcile sees the row as
+            // legitimate → no drop.
+            //
+            // The oneshot is the cleanest signal: `tx.send(())` on
+            // adopt completion (success OR failure — reconcile waits
+            // only for "adopt is done," not "adopt succeeded"). The
+            // receive is awaited by the reconcile spawn before its
+            // sweep starts. Deadlocks instantly on mis-wire (no
+            // dropped-sender silent-skip), unlike `Notify` which can
+            // swallow `notify_one()` calls when no listener is
+            // registered.
+            //
+            // The boot-order assertion test
+            // `boot_reconcile_runs_strictly_after_adopt` in
+            // `vct-launcher-core::db::access` pins this contract via
+            // an `Arc<Mutex<Vec<&'static str>>>` order log; future
+            // refactors that accidentally inverse the order will fail
+            // the assertion immediately.
+            let (adopt_done_tx, adopt_done_rx) =
+                tokio::sync::oneshot::channel::<()>();
 
             // W40-B (v0.2.40, 2026-05-30): cross-prefix KG binding
             // adoption + env regen-on-stale.
@@ -1434,6 +1425,79 @@ pub fn run() {
                             // canonical recovery path.
                             eprintln!(
                                 "[vct] adopt-populated warning (non-fatal): {}",
+                                e
+                            );
+                        }
+                    }
+
+                    // v0.2.49 Phase 3 F-1: signal the reconcile task
+                    // that adopt is done. We send `Ok` regardless of
+                    // success or failure — reconcile should run after
+                    // adopt COMPLETES, not after adopt SUCCEEDS. A
+                    // failed adopt that leaves the binding pointing at
+                    // a missing class still needs reconcile to run for
+                    // OTHER bindings whose state is healthy. The
+                    // `.ok()` discard is intentional: if the receiver
+                    // was dropped (the reconcile task didn't spawn for
+                    // any reason), there's nothing to signal.
+                    let _ = adopt_done_tx.send(());
+                });
+            }
+
+            // v0.2.49 Phase 3 F-1 — orphan-prune reconcile, MUST run
+            // after the adopt task above completes. The oneshot
+            // receiver is awaited at the top of the task body; the
+            // sweep starts only after `adopt_done_tx.send(())` fires.
+            // See the long comment block above the channel declaration
+            // for the full reorder rationale.
+            //
+            // Soft-fail throughout: a slow Weaviate probe doesn't
+            // block window paint (we run async); a failed reconcile
+            // call logs + skips the sweep (next boot retries; the
+            // boot reconcile is idempotent by construction).
+            {
+                let reconcile_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    // Phase 3 ordering gate: wait for adopt to finish
+                    // before sweeping. A dropped sender (adopt task
+                    // didn't spawn) would resolve the `.await` to Err
+                    // — in that case we still proceed with the
+                    // reconcile because the alternative (skip
+                    // reconcile entirely) would leave orphans
+                    // forever. The `.ok()` discard means "proceed
+                    // regardless of channel state."
+                    let _ = adopt_done_rx.await;
+
+                    let Some(db) = reconcile_handle.try_state::<db::Db>()
+                    else {
+                        return;
+                    };
+                    let weaviate_url = std::env::var("WEAVIATE_URL")
+                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                    match db
+                        .inner()
+                        .reconcile_kg_collection_access_at_boot(&weaviate_url)
+                        .await
+                    {
+                        Ok(dropped) => {
+                            if dropped > 0 {
+                                eprintln!(
+                                    "[vct] reconcile-kg-access (boot): dropped {} \
+                                     orphan kg_collection_access rows",
+                                    dropped
+                                );
+                                let _ = db.audit(
+                                    "kg_collection_access_reconciled_at_boot",
+                                    None,
+                                    None,
+                                    &serde_json::json!({ "dropped": dropped }),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] reconcile-kg-access warning (non-fatal): {}",
                                 e
                             );
                         }

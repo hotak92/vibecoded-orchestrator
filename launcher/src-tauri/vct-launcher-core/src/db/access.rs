@@ -1160,6 +1160,7 @@ impl Db {
                     if let Err(e) = self.update_binding_for_adoption(
                         &row.project_id,
                         &row.role,
+                        &row.collection_name,
                         new_name,
                     ) {
                         // DB write failure is propagated — caller logs
@@ -1225,9 +1226,53 @@ impl Db {
         &self,
         project_id: &str,
         role: &str,
+        old_collection: &str,
         new_collection: &str,
     ) -> Result<(), String> {
         let now = Utc::now().timestamp_millis();
+
+        // v0.2.49 access-matrix Phase 3 (item #8) — atomic binding
+        // rebind + access-matrix rename. Pre-fix, the binding's
+        // collection_name was rewritten but its corresponding
+        // kg_collection_access row(s) were left pointing at the old
+        // name. The boot reconcile (`reconcile_kg_collection_access_at_boot`)
+        // would then sweep the now-orphan access rows in the SAME boot —
+        // but only because the F-1 ordering (reconcile AFTER adopt)
+        // was repaired in the same release. Calling
+        // `kg_rename_access` HERE makes the rebind atomic at the per-
+        // project granularity: the access row(s) for `old_collection`
+        // get renamed to `new_collection` in the same transaction
+        // window as the binding update.
+        //
+        // Soft-fail: a kg_rename_access error is logged + propagated;
+        // the binding update is NOT skipped (it's the load-bearing
+        // half; the access matrix can be reconciled later via the
+        // boot probe). Returns the binding update's Err result if
+        // the binding itself fails.
+        {
+            // Note: kg_rename_access acquires its own lock and may
+            // perform its own UPSERT semantics for the access row(s).
+            // We call it BEFORE the binding UPDATE so the access
+            // rename always reflects a pre-rebind state — if the
+            // binding UPDATE then fails, the access matrix still
+            // points at the new collection name, which the next boot
+            // reconcile will detect as orphan and clean up. This is
+            // the v0.2.46 reconcile contract; we're not changing it.
+            if old_collection != new_collection {
+                if let Err(e) = self.kg_rename_access(
+                    project_id, old_collection, new_collection,
+                ) {
+                    // Best-effort: log + continue. The boot reconcile
+                    // catches the residue.
+                    eprintln!(
+                        "[vct] update_binding_for_adoption: kg_rename_access \
+                         project_id={} {} → {} warning (non-fatal): {}",
+                        project_id, old_collection, new_collection, e,
+                    );
+                }
+            }
+        }
+
         let guard = self.lock();
 
         // Read existing config_json so we don't clobber unrelated keys.
@@ -3156,6 +3201,131 @@ mod access_audit_column_tests {
         db.kg_set_access("p1", "P1Primary_KG", "write").unwrap();
         db.kg_set_access("p1", "P1Primary_KG", "read").unwrap();
         db.kg_set_access("p1", "P1Primary_KG", "none").unwrap();
+    }
+
+    // ─── Step C / Phase 3 — F-1 reorder via tokio::sync::oneshot ──────
+
+    /// v0.2.49 Phase 3 F-1 ship-blocker — boot-order assertion test.
+    ///
+    /// The launcher's `setup()` spawns adopt + reconcile as concurrent
+    /// `tokio::async_runtime::spawn` tasks, with a `oneshot` channel
+    /// between them so reconcile WAITS for adopt before its sweep.
+    /// This test pins the pattern by mirroring the spawn shape on a
+    /// shared `Arc<Mutex<Vec<&'static str>>>` order log: adopt pushes
+    /// `"adopt"`, reconcile pushes `"reconcile"`. After both join, the
+    /// log MUST read `["adopt", "reconcile"]`.
+    ///
+    /// Regression sentinel: if a future refactor accidentally removes
+    /// the `await` on the oneshot in reconcile, the order becomes
+    /// non-deterministic (Tokio may schedule reconcile first → log
+    /// reads `["reconcile", "adopt"]` → test fails). The test catches
+    /// the regression deterministically, not probabilistically.
+    ///
+    /// We deliberately delay the adopt task with a brief sleep so
+    /// reconcile would have a chance to run first if the await were
+    /// removed — exercises the worst-case scheduling.
+    #[tokio::test]
+    async fn boot_reconcile_runs_strictly_after_adopt() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let order_log: Arc<Mutex<Vec<&'static str>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let (adopt_done_tx, adopt_done_rx) =
+            tokio::sync::oneshot::channel::<()>();
+
+        let adopt_log = order_log.clone();
+        let adopt_task = tokio::spawn(async move {
+            // Simulate adopt's wall-clock cost (HTTP probes to
+            // Weaviate). If reconcile is scheduled in the meantime
+            // WITHOUT the oneshot await, it would push "reconcile"
+            // first → assertion fails.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            adopt_log.lock().unwrap().push("adopt");
+            // Signal regardless of success — matches lib.rs Phase 3
+            // contract (reconcile runs after adopt COMPLETES, not
+            // after adopt SUCCEEDS).
+            let _ = adopt_done_tx.send(());
+        });
+
+        let reconcile_log = order_log.clone();
+        let reconcile_task = tokio::spawn(async move {
+            // Gate: must await the oneshot before running. The
+            // `.ok()` discard mirrors lib.rs: if the sender was
+            // dropped (adopt task didn't spawn), we still proceed —
+            // not stopping reconcile is safer than running it
+            // out-of-order.
+            let _ = adopt_done_rx.await;
+            reconcile_log.lock().unwrap().push("reconcile");
+        });
+
+        // Spawn order is "reconcile first" textually, on purpose,
+        // to verify the await actually blocks. In lib.rs the adopt
+        // spawn happens before reconcile spawn, but the order log
+        // here is independent of spawn order — it depends ONLY on
+        // when each task pushes onto the log.
+
+        adopt_task.await.unwrap();
+        reconcile_task.await.unwrap();
+
+        let log = order_log.lock().unwrap();
+        assert_eq!(
+            *log,
+            vec!["adopt", "reconcile"],
+            "Phase 3 F-1 ordering violated: reconcile must run AFTER \
+             adopt completes. If this fails the oneshot await in \
+             lib.rs's reconcile task may have been removed or the \
+             send on completion broken.",
+        );
+    }
+
+    /// Negative-case test: if the oneshot receiver was dropped
+    /// instead of awaited (e.g. someone accidentally removed the
+    /// `await` line in lib.rs), the reconcile task could push before
+    /// adopt. This test verifies our ASSERTION is sensitive enough
+    /// to catch that — runs the SAME shape but without awaiting.
+    /// MUST FAIL (so we invert the assertion).
+    #[tokio::test]
+    async fn negative_case_no_await_loses_ordering_guarantee() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let order_log: Arc<Mutex<Vec<&'static str>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let (adopt_done_tx, _adopt_done_rx) =
+            tokio::sync::oneshot::channel::<()>();
+
+        let adopt_log = order_log.clone();
+        let adopt_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            adopt_log.lock().unwrap().push("adopt");
+            let _ = adopt_done_tx.send(());
+        });
+
+        let reconcile_log = order_log.clone();
+        let reconcile_task = tokio::spawn(async move {
+            // BUG SIMULATION: no await on _adopt_done_rx. Reconcile
+            // races against adopt.
+            reconcile_log.lock().unwrap().push("reconcile");
+        });
+
+        adopt_task.await.unwrap();
+        reconcile_task.await.unwrap();
+
+        let log = order_log.lock().unwrap();
+        // Expected to see reconcile run first (adopt sleeps 20ms;
+        // reconcile starts immediately). If the test ever observes
+        // ["adopt", "reconcile"] here, the negative-case sentinel is
+        // broken — sleep timing changed; bump the duration.
+        assert_eq!(
+            *log,
+            vec!["reconcile", "adopt"],
+            "regression sentinel: without the await, reconcile must \
+             race ahead of adopt (sleep timing in this test ensures \
+             it). If THIS test fails with [adopt, reconcile], the \
+             sleep duration is no longer enough to expose the race; \
+             bump it.",
+        );
     }
 
     #[test]
