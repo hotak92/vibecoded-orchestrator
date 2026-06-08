@@ -1250,6 +1250,7 @@ mod tests {
             consumes: vec![],
             gui: None,
             db: None,
+            kg_collections: None,
         }
     }
 
@@ -1918,6 +1919,7 @@ mod tests {
             consumes: vec![],
             gui: None,
             db: None,
+            kg_collections: None,
         }
     }
 }

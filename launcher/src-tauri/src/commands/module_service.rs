@@ -2729,6 +2729,7 @@ mod tests {
             consumes: vec![],
             gui: None,
             db: None,
+            kg_collections: None,
         }
     }
 

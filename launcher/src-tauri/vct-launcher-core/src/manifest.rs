@@ -101,6 +101,18 @@ pub struct ModuleManifest {
     /// spec-2026-05-23.md` for the full design rationale.
     #[serde(default)]
     pub db: Option<DbBlock>,
+
+    /// v0.2.49 item #13 (M-3): KG collections this module writes to.
+    /// When set on an `install.scope = "global"` module, every project
+    /// gains a default access row at install time (via
+    /// `populate_kg_collection_access_for_global_module` + the access
+    /// matrix resolver). For per-project modules the field is ignored.
+    ///
+    /// Pre-v0.2.49 manifests deserialize cleanly with this field
+    /// absent (defaults to `None`). An empty `Vec` is semantically
+    /// equivalent to `None` for the populate path (no rows inserted).
+    #[serde(default)]
+    pub kg_collections: Option<Vec<String>>,
 }
 
 // ─── DB (v0.2.31 / 2026-05-23) ──────────────────────────────────────────

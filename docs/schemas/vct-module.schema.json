@@ -210,6 +210,17 @@
           "type": "null"
         }
       ]
+    },
+    "kg_collections": {
+      "description": "v0.2.49 item #13 (M-3): KG collections this module writes to. When set on an `install.scope = \"global\"` module, every project gains a default access row at install time (via `populate_kg_collection_access_for_global_module` + the access matrix resolver). For per-project modules the field is ignored.\n\nPre-v0.2.49 manifests deserialize cleanly with this field absent (defaults to `None`). An empty `Vec` is semantically equivalent to `None` for the populate path (no rows inserted).",
+      "default": null,
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
     }
   },
   "definitions": {

@@ -1524,6 +1524,37 @@ pub async fn install_module_for_project(
             &install_dir.display().to_string(),
         )?
     };
+
+    // v0.2.49 item #13 (M-3): if a global module declares KG collections,
+    // seed access rows for every project at install time. Uses
+    // `kg_seed_access` (INSERT OR IGNORE) so any user-configured
+    // downgrades survive re-installs. Per-project modules don't go
+    // through this path — their access matrix is owned by the
+    // per-project populate at project-create time.
+    if is_global {
+        if let Some(collections) = manifest.kg_collections.as_ref() {
+            if !collections.is_empty() {
+                let mut populate_report =
+                    crate::commands::project_state_populate::PopulateReport::default();
+                crate::commands::project_state_populate::populate_kg_collection_access_for_global_module(
+                    collections,
+                    &db,
+                    &mut populate_report,
+                );
+                db.audit(
+                    "kg_access_seeded_global_module",
+                    None,
+                    Some(&module_id),
+                    &serde_json::json!({
+                        "collections": collections,
+                        "rows_inserted": populate_report.kg_access_rows_inserted,
+                        "warnings": populate_report.warnings,
+                    }),
+                )?;
+            }
+        }
+    }
+
     db.audit(
         "module_install_start",
         Some(&project_id),

@@ -165,6 +165,65 @@ fn populate_kg_collection_access(
     }
 }
 
+/// v0.2.49 item #13 (M-3): populate KG access rows for a global-scope
+/// module's declared KG collections across ALL projects.
+///
+/// Called by `commands/modules.rs::install_module` (Stream A's `is_global`
+/// branch) when `manifest.kg_collections.is_some()`. For each declared
+/// collection, iterates `db.list_projects()` and seeds the resolver's
+/// default access level (`db::access::resolve_default_access_level`).
+///
+/// Idempotency / user-preservation: uses `db.kg_seed_access` (INSERT OR
+/// IGNORE) so a row already present from a prior install is preserved
+/// untouched. User-configured downgrades (`is_user_configured()` TRUE)
+/// survive re-runs of the global install.
+///
+/// Per-project modules do NOT use this path — their access matrix is
+/// seeded by the per-project `populate_kg_collection_access` helper at
+/// project-create time.
+pub fn populate_kg_collection_access_for_global_module(
+    collections: &[String],
+    db: &Db,
+    report: &mut PopulateReport,
+) {
+    if collections.is_empty() {
+        return;
+    }
+    let projects = match db.list_projects() {
+        Ok(rows) => rows,
+        Err(e) => {
+            report.warnings.push(format!("list_projects: {}", e));
+            return;
+        }
+    };
+    for collection in collections {
+        for project in &projects {
+            let level = match db.resolve_default_access_level(&project.id, collection) {
+                Ok(l) => l,
+                Err(e) => {
+                    report.warnings.push(format!(
+                        "resolve_default_access_level({}, {}): {}",
+                        project.id, collection, e
+                    ));
+                    continue;
+                }
+            };
+            match db.kg_seed_access(&project.id, collection, level.as_str()) {
+                Ok(1) => report.kg_access_rows_inserted += 1,
+                Ok(0) => {} // row exists; preserved
+                Ok(other) => report.warnings.push(format!(
+                    "kg_seed_access({}, {}) returned unexpected count: {}",
+                    project.id, collection, other
+                )),
+                Err(e) => report.warnings.push(format!(
+                    "kg_seed_access({}, {}): {}",
+                    project.id, collection, e
+                )),
+            }
+        }
+    }
+}
+
 // ─── Agents ────────────────────────────────────────────────────────────
 
 /// File-stem names (lowercased, no extension) that are NEVER agents and
@@ -2503,6 +2562,14 @@ mod tests {
             !row_seeded.is_user_configured(),
             "freshly-seeded row should NOT read as user-configured"
         );
+
+        // Sleep 2ms to ensure user mutation lands in a distinct millisecond
+        // from the seed write — `is_user_configured` reads
+        // `updated_at != created_at` (both in millis). Without this,
+        // back-to-back calls in test collide on the same ms and the
+        // assertion below would flake. Production callers always separate
+        // seed and user mutation by orders of magnitude more.
+        std::thread::sleep(std::time::Duration::from_millis(2));
 
         // User downgrades to none via kg_set_access (user-mutation path).
         db.kg_set_access("p1", "RLMeta_KG", "none").unwrap();

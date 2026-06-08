@@ -364,6 +364,9 @@ pub fn synthesize_install_manifest_from_l0(
         // Same logic for `db`: migrations apply after extract, never
         // against the synth.
         db: None,
+        // v0.2.49 item #13: `kg_collections` declaration is read post-
+        // extract from the real manifest; synth doesn't carry it.
+        kg_collections: None,
     })
 }
 
