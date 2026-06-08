@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 45 bundled agents, 52 skills, and 28 hooks (most wired in default `.claude/settings.json`; some available but not wired). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 45 bundled agents, 53 skills, and 31 hooks (most wired in default `.claude/settings.json`; some available but not wired). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -139,7 +139,7 @@ Seven agents reference `orchestrator-tools` in their frontmatter as of v0.1.0: `
 
 ## Bundled Skills (`templates/skills/`)
 
-Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`, or list them in an agent's `skills:` frontmatter. Install to `~/.claude/skills/` via `install.py --with-skills` (default-on). 28 skills, split across three model tiers: 5 Opus (deep reasoning), 17 Sonnet (implementation guidance), 6 Haiku (quick checks).
+Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`, or list them in an agent's `skills:` frontmatter. Install to `~/.claude/skills/` via `install.py --with-skills` (default-on). 53 skills, organized across multiple model tiers (Opus for deep reasoning, Sonnet for implementation guidance, Haiku for quick checks).
 
 ### Opus-tier skills (deep reasoning)
 
@@ -207,7 +207,7 @@ Skills are smaller and lighter than agents — they're injected into context as 
 
 ## Hooks (`.claude/hooks/`)
 
-23 shell scripts that fire at well-defined points in the Claude Code lifecycle (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, etc.). 22 are wired in the default `.claude/settings.json`; `code-graph-incremental.sh` ships but is not wired. Two project-wide invariants: every hook checks `VCT_DISABLE_HOOKS=1` as its first action (so you can disable all automation in one shell), and every hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, AWS credentials, and similar before spawning any subprocess.
+31 shell scripts (with `.ps1` Windows siblings) that fire at well-defined points in the Claude Code lifecycle (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, etc.). Most are wired in the default `.claude/settings.json`; `code-graph-incremental.sh` ships but is not wired. Two project-wide invariants: every hook checks `VCT_DISABLE_HOOKS=1` as its first action (so you can disable all automation in one shell), and every hook scrubs `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, AWS credentials, and similar before spawning any subprocess.
 
 Hook input contract (PR #176, 2026-05): hooks receive their event payload as JSON on stdin per Claude Code v2.1.x spec. `session_id`, `tool_name`, and other fields are read from stdin via `python -c 'import json,sys; d=json.loads(sys.stdin.read()); ...'`. Positional args (`$1`, `$2`) are present for backward compatibility but are empty when invoked by Claude Code v2.1.x.
 
@@ -332,6 +332,30 @@ Blocks `vercel ... --token=...` invocations because the Vercel CLI echoes the to
 
 ### `code-graph-incremental.sh` — (available, not wired in default settings.json)
 Incremental code graph analysis on every code file edit. Auto-detects the project from the edited file path and supports Joern CFG/PDG extraction when Joern is on PATH.
+
+### `agent-skill-keyword-suggest.sh` — UserPromptSubmit (blocking)
+Scans the user prompt for keywords declared in agents'/skills' `keywords:` frontmatter and injects a short suggestion as additionalContext. Globs `.claude/agents/*.md` and `.claude/skills/*/SKILL.md` — disabled items live in sibling `.disabled/` directories and naturally fall outside the glob.
+
+### `subagent-start-suggest.sh` — SubagentStart
+Spawn-time mirror of `agent-skill-keyword-suggest.sh`: injects agent/skill suggestions into a freshly-spawned subagent's context so the subagent knows which skills/agents are relevant for its task.
+
+### `session-start-ensure-hub.sh` — SessionStart (startup, background)
+Ensure the `vct-hub` resolver service is running by invoking `vct-hub --start-if-not-running`. Idempotent. Soft-fails throughout — never blocks startup.
+
+### `check-no-fork-bomb.sh` — defense-in-depth detector
+Counts running `lean-ctx` processes and warns if the threshold is exceeded. Backstop for the historical BASH_ENV lean-ctx fork-bomb pattern (now mitigated by design in v0.2.11+).
+
+### `lean-ctx-rewrite.sh` — PreToolUse Bash
+Per-project lean-ctx PreToolUse hook for Bash tool calls. Wraps the user-issued command in `lean-ctx -c '...'` so output is compressed before it returns to Claude. Auto-detects `lean-ctx` commands and steps aside to prevent recursion.
+
+### `embedding-failures-surface.sh` — context injection
+Surfaces embedding-backend failure hints written by `vco_lib/embedding_service.py` to Claude. When no embedding backend is reachable, the service drops a hint file; this hook injects its contents so Claude can diagnose / recover.
+
+### `pre-diagram-path-validation.sh` — PreToolUse (Write/Edit + Bash)
+Defense-in-depth guard for diagrams integration. Rejects `.mmd` / `.excalidraw` writes outside `.claude/diagrams/` to keep the diagram index consistent.
+
+### `post-file-delete.sh` — PostToolUse Bash
+Detects deletes of `.mmd` / `.excalidraw` files under `.claude/diagrams/` and cascades the delete across SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer drop <file>`. Matches `rm` / `unlink` / `mv` / PowerShell `Remove-Item` / `Move-Item`.
 
 ---
 

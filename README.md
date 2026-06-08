@@ -26,7 +26,7 @@ Three concrete pains everyone using Claude Code hits, and what VCO does about ea
 |------|---------------|
 | Claude has no memory between sessions — you re-explain the project every time | A persistent **Knowledge Graph** (markdown nodes + Weaviate vector index) that hooks read on session start and inject into the context window |
 | Claude can't see your codebase structure — it greps blind, misses callers, re-reads the same files | A **Code Graph** built from Tree-sitter AST: modules, classes, functions, APIs, and cross-service calls, queryable by purpose ("find auth middleware") not just name |
-| You set up the same `.claude/` config and hooks in every new project | An installer that drops 23 automation hooks + 28 skills + 29 agents into `.claude/`, wires the MCP servers, and stays out of your way |
+| You set up the same `.claude/` config and hooks in every new project | An installer that drops 31 automation hooks + 53 skills + 45 agents into `.claude/`, wires the MCP servers, and stays out of your way |
 
 You don't change how you use Claude Code. The orchestrator runs in the background through hooks. Open VS Code, talk to Claude, ship code.
 
@@ -63,9 +63,9 @@ If you don't use Claude Code: the KG, code graph, MCP servers, and launcher GUI 
 
 - **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local). Optional OpenAI embeddings.
 - **Code Graph** — Tree-sitter AST analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Optional Joern integration for CFG/PDG metrics.
-- **23 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. Linux/macOS use `.sh`; Windows ships native `.ps1`.
-- **3 MCP servers (default install)** — Weaviate (semantic + graph search), search (academic-paper search via OpenAlex + arXiv), code-embedding (CodeSage-Large-v2 via FastAPI). All local; no per-tool API keys for the default tier. Two more MCP servers (Ollama local LLM + Playwright browser automation) are available as opt-in modules via the launcher Modules page. Ollama as backend infrastructure (Weaviate vectorizer + code-embed CPU fallback) is always present even without the Ollama MCP wrapper.
-- **29 agents + 28 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
+- **31 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. Linux/macOS use `.sh`; Windows ships native `.ps1`. Plus the `vct-hub` background service that resolves per-project config for hooks, MCPs, and scripts.
+- **3 MCP servers (default install)** — Weaviate (semantic + graph search + code graph), search (academic-paper search via OpenAlex + arXiv), coordination (cross-project notes). All local; no per-tool API keys for the default tier. Two more MCP servers (Ollama local LLM + Playwright browser automation) are available as opt-in modules via the launcher Modules page. Ollama runs as backend infrastructure (Weaviate vectorizer + code-embed CPU fallback) even without the Ollama MCP wrapper; the CodeSage code-embedding FastAPI service runs locally on port 11440.
+- **45 agents + 53 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
 - **Workflow plumbing** — session state tracking (`CONTEXT_STATE.md`), plan files, memory management, pre-/post-compact context replay so a `/compact` doesn't lose your thread.
 
 ## How it works
@@ -140,7 +140,7 @@ VCO sits on top of Claude Code rather than replacing your AI assistant. The comp
 | Persistent memory across sessions | No | Yes (Copilot Memory, repo-scoped, 28-day expiry) | Partial (team memory) | Partial (session-bound) | No | No | No | **Yes (KG, no expiry)** |
 | Code graph (AST, callers, APIs) | Partial (file index, opaque) | Partial (vector index) | Yes (Context Engine) | Yes | No | Yes (repomap) | Partial (Tree-sitter, not persisted) | **Yes (persisted graph)** |
 | Bring your own LLM subscription | Partial (chat only) | No | Partial (BYO agent, not LLM) | No | Yes (OpenAI) | Yes (75+ providers) | Yes (30+ providers) | **Yes (Claude)** |
-| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (23 hooks, 28 skills, 29 agents)** |
+| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (31 hooks, 53 skills, 45 agents)** |
 | Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub; €19/mo Pro** |
 | Polished v1 product (vs. alpha) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | **No — alpha** |
 
@@ -241,7 +241,7 @@ Non-interactive / CI: `python install.py --quiet --no-joern --no-containers`
 ```
 vibecoded-orchestrator/
 ├── .claude/
-│   ├── hooks/                 # 23 automation hooks (.sh + .ps1 per hook)
+│   ├── hooks/                 # 31 automation hooks (.sh + .ps1 per hook)
 │   ├── scripts/               # CLI tools for KG and code graph
 │   └── settings.json          # Claude Code configuration
 ├── claude_mcp_servers/
@@ -250,8 +250,8 @@ vibecoded-orchestrator/
 │   └── code_embedding_service/ # CodeSage-Large-v2 via FastAPI (default)
 │   # Opt-in MCPs (launcher → Modules): vct-ollama (local LLM/embeddings/vision)
 ├── templates/
-│   ├── agents/free/           # 29 bundled agents
-│   └── skills/                # 28 bundled skills
+│   ├── agents/free/           # 45 bundled agents
+│   └── skills/                # 53 bundled skills
 ├── infrastructure/
 │   ├── docker-compose.yml     # Weaviate + Ollama
 │   └── docker-compose.gpu.yml # NVIDIA overlay
@@ -266,7 +266,7 @@ The whole repository is AGPL-3.0. The codebase you see here is the Free tier —
 
 | Tier            | Price                | What you get                                                                                  |
 |-----------------|----------------------|-----------------------------------------------------------------------------------------------|
-| **Free**        | €0                   | Full orchestrator: KG, code graph, 23 hooks, 5 MCP servers, 29 agents, 28 skills. AGPL-3.0.   |
+| **Free**        | €0                   | Full orchestrator: KG, code graph, 31 hooks, 3 default MCP servers (+ 2 opt-in), 45 agents, 53 skills. AGPL-3.0.   |
 | **Pro**         | €19/month            | Free + RL-scored retrieval reranking module + coordination layer (Telegram groups + shared decision/task channels). Modules ship as separate signed binaries via the launcher. Self-host the coordination DB at no extra cost, or use our hosted instance for a small additional fee. |
 | **Enterprise**  | Contact us           | Free + commercial AGPL exemption, priority support, custom SLAs. [team@vibecodedtools.com](mailto:team@vibecodedtools.com) |
 

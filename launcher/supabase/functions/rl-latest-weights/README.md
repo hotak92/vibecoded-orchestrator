@@ -18,9 +18,8 @@ the SAME private storage bucket — but serve different intents:
 
 The "first install" path doesn't have a `current_weights_version` to
 compare against, so the always-return-the-head contract is cleaner than
-overloading `rl-latest-version` with a sentinel value. **User decision
-2026-05-30**: option B (write+deploy this dedicated function) was
-chosen over option A (redirect the caller to `rl-latest-version`)
+overloading `rl-latest-version` with a sentinel value. A dedicated
+function was chosen over redirecting the caller to `rl-latest-version`
 because the contracts are different enough that a shared endpoint
 would silently degrade either the poller or the manifest button.
 
@@ -153,8 +152,8 @@ No additional secrets are required — the function reuses everything
 
 ## Deploy
 
-**DEPLOY IS GATED ON USER ACTION** — Agent R4 only wrote the source;
-the user owns the actual deploy.
+**DEPLOY IS GATED ON USER ACTION** — the source ships in this repo;
+the operator owns the actual deploy.
 
 ### Recommended one-liner (from the repo root)
 
@@ -167,8 +166,7 @@ bash launcher/supabase/functions/rl-latest-weights/deploy.sh
 the Supabase CLI defaults to `./supabase/functions/<name>/index.ts`
 and our function source lives at `launcher/supabase/functions/...` —
 running the deploy command from the repo root without the `cd` fails
-with `entrypoint path does not exist (supabase/functions/rl-latest-weights/index.ts)`
-(observed 2026-05-30).
+with `entrypoint path does not exist (supabase/functions/rl-latest-weights/index.ts)`.
 
 ### Manual equivalent (skip the script)
 
@@ -177,9 +175,7 @@ cd launcher
 supabase functions deploy rl-latest-weights
 ```
 
-After deploy, verify with the smoke test below. The corresponding
-launcher caller (`module_default_weights.rs`) has been live since
-v0.2.32 — it has been POSTing to this URL and getting 404s until now.
+After deploy, verify with the smoke test below.
 
 ### First-time CLI setup (only if you haven't run these before)
 
@@ -304,16 +300,8 @@ Same as `rl-latest-version`:
 - `launcher/supabase/migrations/20260516_paid_module_releases.sql` —
   the table this function reads.
 
-## Pre-v0.2.40 history
+## Note
 
-This function's URL was hard-coded in
-`launcher/src-tauri/src/commands/module_default_weights.rs` from
-v0.2.32 (2026-05-24, agent D's manifest-button work), but the function
-itself was never written or deployed. The Rust caller's unit tests
-used in-process HTTP mocks, so the gap wasn't caught locally. The
-v0.2.40 multi-Opus pre-push review flagged this as the highest-risk
-gap (the GUI button would 404 in the wild). Per the user's 2026-05-30
-decision (option B — cleaner contract; the function name matches
-the caller's intent), v0.2.40 ships the source for the function.
-
-The deploy step remains gated on user action (`bash deploy.sh`).
+The deploy step is gated on operator action (`bash deploy.sh`) — the
+source ships in the repo; deployment to Supabase is a separate manual
+step under operator control.

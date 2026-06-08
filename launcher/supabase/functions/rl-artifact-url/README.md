@@ -8,8 +8,8 @@ before each `podman pull` / `docker pull` of the private image.
 ## ⚠️ Supabase has TWO independent "secrets" systems — get this right or nothing works
 
 Before configuring this function, internalize the following. **Confusing
-these two systems cost ~3 hours of production debugging on 2026-05-27**
-and the symptom (edge function returns `service_misconfigured` while the
+these two systems is a common multi-hour debugging trap** and the
+symptom (edge function returns `service_misconfigured` while the
 dashboard shows the secret is "set") is genuinely opaque.
 
 Supabase stores secrets in two unrelated places:
@@ -52,7 +52,7 @@ from the Supabase SQL editor (the function that reads it lives in
 [`launcher/supabase/functions/validate-tier/index.ts`](../validate-tier/index.ts) —
 search for `lookupVaultAdminToken`).
 
-## Architecture (locked decisions 2026-05-16)
+## Architecture
 
 ```
 launcher                      Supabase edge function          GHCR
@@ -90,13 +90,13 @@ The launcher never sees the long-lived service PAT — only short-lived
 | `SUPABASE_SERVICE_ROLE_KEY` | Auto-set by Supabase runtime; authorizes the inter-function call |
 | `GHCR_SERVICE_PAT` | **Manually set.** A GitHub fine-grained PAT scoped to `read:packages` on the paid-image repo. Long-lived (90 days typical); rotate quarterly. NEVER the launcher's pull token — that's what this function GENERATES from this PAT. |
 
-## Optional env vars (v0.2.36+)
+## Optional env vars
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `GHCR_PAID_IMAGE_REPO` | `hotak92/vct-rl-reranker` | Paid-image repo in `<owner>/<image>` form. Set this when migrating from the personal-account image to the org image (see "Org migration" below). Malformed values (no slash, whitespace-only, etc.) are logged via `console.warn` and the default applies. |
 | `GHCR_PAID_TAG_DEFAULT` | `0.1.0` | Fallback tag for the `tag` field in the response. The launcher's `resolve_variant_tag` is the actual source of truth — this default is advisory / used by callers that bypass the launcher logic. |
-| `GHCR_USERNAME` | owner-half of `GHCR_PAID_IMAGE_REPO` | GitHub login the launcher uses for `podman login -u <user>`. Must match the owner of `GHCR_SERVICE_PAT` (the credential owner), NOT necessarily the owner of the package. For the v0.2.36 per-module bot-user architecture, set to the bot user's login (e.g. `vct-bot-rl`) while `GHCR_PAID_IMAGE_REPO` stays at the package path (e.g. `hotak92/vct-rl-reranker`). When unset, falls back to the owner-half of `GHCR_PAID_IMAGE_REPO` (Agent W's original auto-derivation; correct only when package owner IS credential owner). |
+| `GHCR_USERNAME` | owner-half of `GHCR_PAID_IMAGE_REPO` | GitHub login the launcher uses for `podman login -u <user>`. Must match the owner of `GHCR_SERVICE_PAT` (the credential owner), NOT necessarily the owner of the package. For the per-module bot-user architecture, set to the bot user's login (e.g. `vct-bot-rl`) while `GHCR_PAID_IMAGE_REPO` stays at the package path (e.g. `hotak92/vct-rl-reranker`). When unset, falls back to the owner-half of `GHCR_PAID_IMAGE_REPO` (auto-derivation; correct only when package owner IS credential owner). |
 
 To deploy:
 ```bash
@@ -105,9 +105,9 @@ supabase secrets set GHCR_SERVICE_PAT='<your-fine-grained-PAT>'
 supabase functions deploy rl-artifact-url
 ```
 
-## Org migration (v0.2.36 architectural follow-up)
+## Org migration
 
-The v0.2.35-shipped default points at a **personal-account** image
+The default points at a **personal-account** image
 (`hotak92/vct-rl-reranker`). GHCR's `/token` endpoint has a known quirk for
 personal-account packages: it returns the original PAT base64-encoded
 rather than issuing a separate scoped credential (see
@@ -131,7 +131,7 @@ That's all. No `index.ts` edit, no version bump, no launcher change. The
 launcher already reads `image` + `username` from the response and uses
 the resolved username for `podman login -u <user>`.
 
-## Per-module bot-user architecture (v0.2.36)
+## Per-module bot-user architecture
 
 A middle-ground alternative to org migration: keep the image under the
 personal account, but mint the `GHCR_SERVICE_PAT` from a **dedicated bot
@@ -385,8 +385,6 @@ mock and are deferred.
 - `paid-modules/vct-rl-reranker/vct-module.json` — manifest that
   declares this endpoint's URL under
   `install.container.pull_token_endpoint`.
-- `.claude/context/RL_RERANKER_RELEASE_PLAN_2026-05-16.md` — full
-  release plan; this function is Phase 3A.
 - `knowledge/concepts/launcher-packaging-paid-module-distribution.md` —
   architectural rationale for choosing container-pull + signed-URL
   gateway over the original IONOS-static-archive plan.
