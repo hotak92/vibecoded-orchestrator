@@ -107,6 +107,12 @@ def _make_launcher_db(
             project_id TEXT NOT NULL,
             collection_name TEXT NOT NULL,
             access_level TEXT NOT NULL,
+            -- v0.2.49 Step F SF6 (L3-SF1): align test-only DDL with the
+            -- production schema. Migration 029 added these audit columns;
+            -- this fixture hand-rolls its own DDL and omitted them.
+            -- DEFAULT 0 matches migration 029's backfill of legacy rows.
+            created_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (project_id, collection_name)
         );
         CREATE TABLE codegraph_access (

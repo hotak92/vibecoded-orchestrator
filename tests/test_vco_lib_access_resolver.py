@@ -306,3 +306,70 @@ def test_different_reasons_emit_separate_warnings(state_dir: Path, hub_token: st
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 2, f"expected 2 distinct-reason warnings, got {len(warnings)}"
+
+
+# ─── v0.2.49 Step F SF8 (L4-S2) — log rotation ─────────────────────────────
+
+
+def test_rotation_truncates_when_oversized(state_dir: Path, hub_token: str):
+    """Pin SF8: when dropped_writes.jsonl exceeds 1 MiB, the next emit
+    triggers a rotation that truncates the file to the most-recent 100
+    rows. Pre-fix the file grew unbounded.
+    """
+    cache_dir = state_dir / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = cache_dir / "dropped_writes.jsonl"
+
+    # Pre-seed >1 MiB of dummy rows. Empirically each row here is ~180
+    # bytes (depends on the index padding); 7000 rows is comfortably
+    # over the 1 MiB threshold.
+    with jsonl.open("w", encoding="utf-8") as fh:
+        for i in range(7000):
+            fh.write(
+                f'{{"ts":1700000000,"project_id":"p{i:06d}","collection":'
+                f'"VeryLongCollectionNameToBlowUpTheLineSize_KnowledgeGraph_{i:06d}",'
+                f'"reason":"hub_unreachable_simulated_for_size","fail_open":true}}\n'
+            )
+    pre_size = jsonl.stat().st_size
+    assert pre_size > 1_048_576, f"pre-seed must be >1 MiB, got {pre_size}"
+
+    # Trigger an emit (which calls _maybe_rotate_jsonl post-append).
+    err = urllib.error.HTTPError(
+        url="http://127.0.0.1:7700", code=503, msg="X", hdrs=None, fp=None
+    )
+    with patch("urllib.request.urlopen", side_effect=err):
+        access_resolver.check_access_level("rotate_test_project", "RotateTestKG")
+
+    # Post-emit: file truncated to ~100 rows (the tail-keep window).
+    with jsonl.open("r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+    assert (
+        len(lines) <= 101  # 100 tail + 1 just-appended (in case append landed after rotate)
+    ), f"expected <=101 lines post-rotation, got {len(lines)}"
+    # The just-emitted row must survive rotation (it's the tail). Note:
+    # the resolver writes via `json.dumps` which adds spaces around the
+    # `:` separator by default — match the literal output.
+    assert any(
+        "rotate_test_project" in l for l in lines
+    ), "the just-emitted row must survive rotation"
+
+
+def test_rotation_no_op_when_under_threshold(state_dir: Path, hub_token: str):
+    """Pin SF8 idempotence: small file is left untouched by the rotation
+    check. The file must not be rewritten on every emit; that would be
+    pointless I/O.
+    """
+    cache_dir = state_dir / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    jsonl = cache_dir / "dropped_writes.jsonl"
+    # Seed a few small rows.
+    initial_content = '{"ts":1,"project_id":"a","collection":"K","reason":"r","fail_open":true}\n' * 10
+    with jsonl.open("w", encoding="utf-8") as fh:
+        fh.write(initial_content)
+
+    # Call the rotation helper directly — must be no-op below threshold.
+    access_resolver._maybe_rotate_jsonl(jsonl)
+
+    # File content unchanged.
+    with jsonl.open("r", encoding="utf-8") as fh:
+        assert fh.read() == initial_content

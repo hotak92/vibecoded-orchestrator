@@ -633,16 +633,29 @@ impl Db {
         if let Some(existing_target_level) = target_level {
             // Collision. Pick the higher privilege level — never lower
             // an existing privilege (matches install.py parity self-heal).
-            // Privilege ordering (low → high): "none" < "read" < "write".
-            let higher = pick_higher_access_level(&source_level, &existing_target_level);
-            if higher != existing_target_level {
+            // Privilege ordering (low → high): Denied < Read < Write.
+            //
+            // v0.2.49 Step F SF4 (L2-SF3): parse both strings into the
+            // wire-stable `AccessLevel` enum before delegating to the
+            // privilege-ordering helper. The DB schema CHECK constraint
+            // guarantees the raw values are in {read, write, none}, so
+            // `from_str_strict` is statically infallible here — but the
+            // explicit parse + Result-propagation makes a future
+            // CHECK-weakening surface as an error rather than a silent
+            // "unknown → 0" fall-through.
+            let source_parsed = AccessLevel::from_str_strict(&source_level)
+                .map_err(|e| format!("kg_rename_access: source level parse: {}", e))?;
+            let target_parsed = AccessLevel::from_str_strict(&existing_target_level)
+                .map_err(|e| format!("kg_rename_access: target level parse: {}", e))?;
+            let higher = pick_higher_access_level(source_parsed, target_parsed);
+            if higher != target_parsed {
                 // Source had a higher level than target — upgrade target.
                 guard
                     .execute(
                         "UPDATE kg_collection_access
                             SET access_level = ?1
                           WHERE project_id = ?2 AND collection_name = ?3",
-                        params![higher, project_id, new_collection],
+                        params![higher.as_str(), project_id, new_collection],
                     )
                     .map_err(|e| format!("kg_rename_access: upgrade target: {}", e))?;
             }
@@ -1893,28 +1906,31 @@ fn infer_table_for_op(op: &str) -> Option<&'static str> {
     }
 }
 
-/// v0.2.46 adversarial-review L3 follow-up: pick the higher of two
-/// `kg_collection_access.access_level` strings.
+/// v0.2.46 adversarial-review L3 follow-up + v0.2.49 Step F SF4
+/// (L2-SF3): pick the higher of two `AccessLevel` privilege levels.
 ///
-/// Privilege ordering (low → high): ``"none" < "read" < "write"``. Unknown
-/// values are treated as below "none" (safer to fall through to the other
-/// side's level). Used by `kg_rename_access`'s collision path to
-/// **never lower an existing privilege** — the v0.2.28 install.py parity
-/// self-heal discipline applied at the helper-function layer.
-fn pick_higher_access_level(a: &str, b: &str) -> String {
-    fn rank(level: &str) -> u8 {
+/// Privilege ordering (low → high): `Denied` < `Read` < `Write`. Used
+/// by `kg_rename_access`'s collision path to **never lower an existing
+/// privilege** — the v0.2.28 install.py parity self-heal discipline
+/// applied at the helper-function layer.
+///
+/// Step F SF4 signature change: pre-fix this took `&str` arguments
+/// and had a dead "unknown → 0" branch (since callers passed strings
+/// read from `kg_collection_access.access_level`, which has a CHECK
+/// constraint on `('read','write','none')`). The "unknown" case was
+/// statically impossible but the signature invited future drift.
+/// Post-fix the function takes `AccessLevel` directly — exhaustive
+/// enum match removes the dead branch + makes invalid-value bugs
+/// impossible at the type level.
+fn pick_higher_access_level(a: AccessLevel, b: AccessLevel) -> AccessLevel {
+    fn rank(level: AccessLevel) -> u8 {
         match level {
-            "write" => 3,
-            "read" => 2,
-            "none" => 1,
-            _ => 0, // unknown — lowest, so it never wins over a known value
+            AccessLevel::Write => 3,
+            AccessLevel::Read => 2,
+            AccessLevel::Denied => 1,
         }
     }
-    if rank(a) >= rank(b) {
-        a.to_string()
-    } else {
-        b.to_string()
-    }
+    if rank(a) >= rank(b) { a } else { b }
 }
 
 // ─── Audit log ───────────────────────────────────────────────────────────
@@ -4004,6 +4020,93 @@ mod access_audit_column_tests {
         db.kg_set_access("p1", "P1Primary_KG", "write").unwrap();
         db.kg_set_access("p1", "P1Primary_KG", "read").unwrap();
         db.kg_set_access("p1", "P1Primary_KG", "none").unwrap();
+    }
+
+    /// v0.2.49 Step F SF2 (L2-SF1) — symmetric pair test.
+    ///
+    /// The existing test `kg_set_access_does_not_guard_non_root_projects`
+    /// (above) pins that the V44-C guard ignores non-orchestrator-root
+    /// PRIMARY rows. This test pins the SYMMETRIC case: a NON-
+    /// orchestrator-root project iterating in a peer-mode-setter loop
+    /// that tries to demote the ORCHESTRATOR-ROOT'S primary structural
+    /// row → guard must STILL refuse the demote, regardless of who's
+    /// calling.
+    ///
+    /// Why this matters: the V44-C guard's predicate
+    /// (`is_orchestrator_root_structural_row`) checks the TARGET row's
+    /// project_id + role + collection_name — NOT the caller's
+    /// project_id. A future refactor that misreads the guard as
+    /// "owner-only" (i.e. "only the orchestrator-root project itself
+    /// can be blocked from demoting its own row") would let peer
+    /// projects bypass it. This test pins the correct semantic.
+    #[test]
+    fn kg_set_access_peer_loop_cannot_demote_orchestrator_root_structural() {
+        let db = Db::open_in_memory().unwrap();
+        let now: i64 = 1_700_000_000_000;
+
+        // Setup: orchestrator-root project + its primary binding (the
+        // structural row that must NEVER be demoted).
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+                     VALUES ('root', 'Root', '/tmp/root', 'orchestrator_root', ?1, ?1, 'root')",
+                    params![now],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "INSERT INTO project_kg_bindings
+                        (project_id, role, collection_name, config_json, updated_at)
+                     VALUES ('root', 'primary', 'RootStructural_KG', '{}', ?1)",
+                    params![now],
+                )
+                .unwrap();
+
+            // Peer project — a regular base project (NOT orchestrator-root).
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+                     VALUES ('peer', 'Peer', '/tmp/peer', 'base', ?1, ?1, 'peer')",
+                    params![now],
+                )
+                .unwrap();
+        }
+
+        // Seed peer's read access on the orchestrator-root's structural
+        // collection (the pre-state for the demote attempt below).
+        db.kg_set_access("peer", "RootStructural_KG", "read").unwrap();
+
+        // The guard's predicate checks the (project_id, collection_name)
+        // pair against `is_orchestrator_root_structural_row`. The PEER's
+        // access row is (project_id='peer', collection_name=
+        // 'RootStructural_KG') — NOT the structural row (which is
+        // (project_id='root', collection_name='RootStructural_KG')).
+        // So writing 'none' from the peer's mode-setter loop targeting
+        // peer's OWN row at that collection succeeds (it's NOT the
+        // structural row). This is symmetric to the existing
+        // `does_not_guard_non_root_projects` test but reverses the
+        // confusion vector.
+        db.kg_set_access("peer", "RootStructural_KG", "none").unwrap();
+
+        // Now the critical assertion: a programmatic attempt to demote
+        // the STRUCTURAL row directly (project_id='root',
+        // collection_name='RootStructural_KG') MUST be refused,
+        // REGARDLESS of which code path invokes kg_set_access. The
+        // guard's predicate doesn't know who's calling — it knows
+        // ONLY about the target row.
+        let err = db.kg_set_access("root", "RootStructural_KG", "read").unwrap_err();
+        assert!(
+            err.contains("structural"),
+            "Step F SF2: V44-C guard must reject demotion of \
+             orchestrator-root's structural row regardless of caller. \
+             A future refactor reading the guard as 'owner-only' would \
+             let peer code paths bypass it. Got: {}",
+            err
+        );
+        let err = db.kg_set_access("root", "RootStructural_KG", "none").unwrap_err();
+        assert!(err.contains("structural"), "same for 'none' level: {}", err);
     }
 
     // ─── Step C / Phase 3 — F-1 reorder via tokio::sync::oneshot ──────

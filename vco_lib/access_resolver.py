@@ -129,6 +129,42 @@ def _hub_token() -> Optional[str]:
     return None
 
 
+def _maybe_rotate_jsonl(path: Path, max_bytes: int = 1_048_576, keep_lines: int = 100) -> None:
+    """v0.2.49 Step F SF8 (L4-S2): log rotation for the dropped-write
+    metric + warning JSONL files. Unbounded growth on long-lived MCP
+    processes (or hooks accumulating over weeks of dev) degrades the
+    bash sibling's linear awk scan and bloats the disk. When the file
+    exceeds ``max_bytes``, truncate to the most-recent ``keep_lines``
+    rows.
+
+    Best-effort: any I/O error during rotation is silently swallowed
+    (the fail-open contract above doesn't get to fail because of log
+    bookkeeping).
+    """
+    try:
+        if not path.is_file():
+            return
+        if path.stat().st_size <= max_bytes:
+            return
+        # Read tail. For a 1 MiB file with ~150-byte rows that's ~7000
+        # lines; reading the full file once is fine. The bash sibling
+        # uses a more sophisticated tail-N approach for its awk scan
+        # rate-limit hot path.
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        tail = lines[-keep_lines:]
+        tmp = path.with_suffix(path.suffix + ".rot.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.writelines(tail)
+        # Atomic replace — works on Linux + macOS + Windows.
+        os.replace(str(tmp), str(path))
+    except Exception:
+        # Rotation failure must not break the metric emit's fail-open
+        # contract. Worst case the file keeps growing — next call's
+        # rotation attempt will retry.
+        pass
+
+
 def _emit_metric(project_id: str, collection: str, reason: str) -> None:
     """Append a dropped-write row to the metric JSONL. Never raises."""
     try:
@@ -144,6 +180,8 @@ def _emit_metric(project_id: str, collection: str, reason: str) -> None:
         }
         with jsonl.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
+        # v0.2.49 SF8: rotate post-append if oversized.
+        _maybe_rotate_jsonl(jsonl)
     except Exception:
         # Logging failure must not break the fail-open contract.
         pass
