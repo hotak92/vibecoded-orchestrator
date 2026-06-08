@@ -202,6 +202,89 @@ impl Db {
             .map_err(|e| format!("delete: {}", e))?;
         Ok(())
     }
+
+    // ─── folder_missing_at_last_boot (migration 030, v0.2.49 Phase 6 S-4) ─
+    //
+    // The launcher's boot sanity check walks every project row, fs::is_dir-
+    // checks `folder_path`, and stamps this flag on/off accordingly. The
+    // frontend reads the flag via `read_project_folder_missing_flags` and
+    // renders a non-blocking warning banner on the affected project card
+    // ("Folder not found at <path>. Did you move or delete it?"). The
+    // banner is dismissed automatically when the folder reappears on a
+    // subsequent boot (the probe re-checks and clears the flag).
+    //
+    // Soft-fail discipline: this is a UX safety net, not a load-bearing
+    // gate. DB errors at any step return the no-op default (empty list /
+    // unit Ok) so the launcher boots even when the probe can't run.
+
+    /// Read every project's id, folder_path, and current
+    /// `folder_missing_at_last_boot` flag. Used by the boot probe to
+    /// decide which rows need updating (set vs clear vs leave alone).
+    ///
+    /// Returns an empty vec when the DB query fails — the boot probe is
+    /// best-effort and must not abort the launcher on a transient DB
+    /// hiccup.
+    pub fn list_project_folder_paths(&self) -> Result<Vec<(String, String, bool)>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, folder_path, folder_missing_at_last_boot
+                 FROM projects
+                 ORDER BY id ASC",
+            )
+            .map_err(|e| format!("prepare list folder paths: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let folder_path: String = row.get(1)?;
+                let flag: i64 = row.get(2)?;
+                Ok((id, folder_path, flag != 0))
+            })
+            .map_err(|e| format!("query list folder paths: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list folder paths: {}", e))
+    }
+
+    /// Persist the boot probe's verdict for a single project. Idempotent:
+    /// rewriting the same value is a no-op SQL UPDATE (one row, same
+    /// content). Does NOT bump `updated_at` — this column is set by the
+    /// boot probe (system-observed value), not by the user, and bumping
+    /// `updated_at` would falsely mark the row as "recently user-edited"
+    /// for any predicate that cares (e.g. the future is_user_configured
+    /// audit-trail logic).
+    pub fn set_project_folder_missing_flag(
+        &self,
+        id: &str,
+        missing: bool,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        let flag_i: i64 = if missing { 1 } else { 0 };
+        guard
+            .execute(
+                "UPDATE projects SET folder_missing_at_last_boot = ?1 WHERE id = ?2",
+                params![flag_i, id],
+            )
+            .map_err(|e| format!("set folder_missing flag: {}", e))?;
+        Ok(())
+    }
+
+    /// Convenience read: return `true` when the project row's
+    /// `folder_missing_at_last_boot` flag is set. Returns
+    /// `Ok(false)` for an unknown id (the GUI will already have
+    /// filtered it out via `list_projects`); `Err` only on hard
+    /// DB failures.
+    pub fn get_project_folder_missing_flag(&self, id: &str) -> Result<bool, String> {
+        let guard = self.lock();
+        let result: Option<i64> = guard
+            .query_row(
+                "SELECT folder_missing_at_last_boot FROM projects WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("get folder_missing flag: {}", e))?;
+        Ok(result.map(|v| v != 0).unwrap_or(false))
+    }
 }
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {

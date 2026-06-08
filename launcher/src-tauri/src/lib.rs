@@ -1505,6 +1505,63 @@ pub fn run() {
                 });
             }
 
+            // v0.2.49 Phase 6 S-4 — boot folder sanity check. Walks every
+            // `projects` row and Path::is_dir-checks the recorded
+            // `folder_path`, then stamps the `folder_missing_at_last_boot`
+            // column accordingly. The frontend reads the result via
+            // `read_project_folder_missing_flags` and renders a non-
+            // blocking warning banner on each affected project card.
+            //
+            // Runs INDEPENDENTLY of the Stream C adopt/reconcile oneshot
+            // pair above — this probe touches `projects.folder_missing_at_
+            // last_boot`, which is orthogonal to `project_kg_bindings`
+            // and `kg_collection_access`. No ordering coordination is
+            // required between this task and the F-1 ordered pair.
+            //
+            // Soft-fail throughout: DB errors at any step log via
+            // eprintln and skip — the launcher boots even when the
+            // probe can't run. Spawned as a separate tokio task so it
+            // doesn't block window paint; the work itself is bounded
+            // (one fs::is_dir per project row) so it stays well under
+            // the 5 s startup budget.
+            {
+                let folder_probe_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let Some(db) = folder_probe_handle.try_state::<db::Db>()
+                    else {
+                        return;
+                    };
+                    let report = commands::project_folder_health::run_folder_probe(
+                        db.inner(),
+                        commands::project_folder_health::default_folder_check,
+                    );
+                    if report.newly_missing > 0 || report.newly_returned > 0 {
+                        eprintln!(
+                            "[vct] folder-probe: newly_missing={} newly_returned={} \
+                             unchanged_healthy={} unchanged_missing={} update_errors={}",
+                            report.newly_missing,
+                            report.newly_returned,
+                            report.unchanged_healthy,
+                            report.unchanged_missing,
+                            report.update_errors.len(),
+                        );
+                        let _ = db.inner().audit(
+                            "project_folder_health_probe_completed",
+                            None,
+                            None,
+                            &serde_json::json!({
+                                "newly_missing": report.newly_missing,
+                                "newly_returned": report.newly_returned,
+                                "unchanged_healthy": report.unchanged_healthy,
+                                "unchanged_missing": report.unchanged_missing,
+                                "update_errors": report.update_errors,
+                            }),
+                        );
+                    }
+                });
+            }
+
             // v0.2.21 Step 6: bring up the detached vct-hub binary if
             // it isn't already running. `ensure_hub_running` is best-
             // effort — a missing binary or failed spawn drops the
@@ -1927,6 +1984,13 @@ pub fn run() {
             commands::projects_v2::switch_project_host_v2,
             commands::projects_v2::delete_project_v2,
             commands::projects_v2::launch_project_in_editor,
+            // v0.2.49 Phase 6 S-4 — read-only accessor for the boot
+            // folder sanity check's cached verdict. The probe itself
+            // runs once per launcher boot (lib.rs setup async spawn);
+            // this command surfaces the per-row flag + folder_path to
+            // the GUI so ProjectCard.svelte can render a non-blocking
+            // warning banner without an extra round-trip.
+            commands::project_folder_health::read_project_folder_missing_flags,
             // Orchestrator-root view (v0.2.11, 2026-05-15) — exposes the
             // auto-registered `host=orchestrator_root` project row to
             // the UI so Settings / Dashboard can render a card for the

@@ -1,0 +1,45 @@
+-- v0.2.49 access-matrix overhaul, Phase 6 S-4 (boot sanity check).
+--
+-- Adds `folder_missing_at_last_boot` to the `projects` table so the
+-- launcher GUI can render a warning banner on a project card when the
+-- on-disk folder the project was registered against has gone missing
+-- between launcher boots.
+--
+-- Why this lands NOW
+-- ------------------
+-- Project rows in launcher.db carry a `folder_path` string captured at
+-- create-project time. Nothing in the launcher's lifecycle re-validates
+-- that the folder still exists on subsequent boots — users move/delete
+-- folders behind the launcher's back and the broken state stays
+-- invisible until they try to open the project. Bug surface: env
+-- writers, KG sync, codegraph analysis, and bundle update all fail
+-- with confusing errors instead of one clear "your folder is gone"
+-- banner.
+--
+-- Phase 6 S-4 adds a non-blocking boot probe (in lib.rs async setup)
+-- that walks every project row, fs::Path::is_dir-checks the
+-- folder_path, and stamps this flag accordingly. The GUI reads the
+-- flag and renders a non-fatal warning banner on the affected
+-- project card.
+--
+-- Schema change
+-- -------------
+-- SQLite supports `ALTER TABLE ... ADD COLUMN` natively; no
+-- recreate-and-copy needed (unlike migration 013 which had to extend
+-- a CHECK constraint, or migration 027 which made an existing column
+-- nullable).
+--
+-- The column is INTEGER NOT NULL DEFAULT 0 — SQLite stores BOOLEAN
+-- as INTEGER, with 0 = false and 1 = true. All existing rows
+-- backfill to 0 (= "folder healthy") on apply; the boot probe
+-- flips them on the next launcher boot if the folder is actually
+-- missing, so the DEFAULT is the safe-and-quiet starting state.
+--
+-- Idempotency
+-- -----------
+-- The migration runner only applies each version once. Re-running
+-- install.py --update on a host that's already past v30 is a no-op
+-- at the migration layer.
+
+ALTER TABLE projects
+    ADD COLUMN folder_missing_at_last_boot INTEGER NOT NULL DEFAULT 0;

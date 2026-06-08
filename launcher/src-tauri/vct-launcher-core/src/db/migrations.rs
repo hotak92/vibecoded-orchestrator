@@ -163,6 +163,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "kg_collection_access audit columns created_at + updated_at (v0.2.49 access-matrix Step A.5). ALTER TABLE adds the columns INTEGER NOT NULL DEFAULT 0. Legacy rows backfill to 0 (sentinel for 'pre-audit-trail'); v0.2.49+ INSERTs bind both to wall-clock millis. Required so the plan's is_user_configured(row) := row.updated_at != row.created_at predicate is implementable for future-cycle per-row decisions. Phase 7 force-upgrade migration in this same release doesn't depend on the audit data per user directive 'force-update everything to new default permissions'.",
         sql: include_str!("migrations/029_kg_collection_access_audit_columns.sql"),
     },
+    Migration {
+        version: 30,
+        description: "projects.folder_missing_at_last_boot column (v0.2.49 access-matrix Phase 6 S-4). ALTER TABLE adds INTEGER NOT NULL DEFAULT 0 (SQLite-stored BOOLEAN). Set/cleared by the launcher's boot sanity check (lib.rs async spawn) that walks every project row and Path::is_dir-checks folder_path. Frontend reads via the boot-flagged project list command (read_project_folder_missing_flags) and renders a non-blocking warning banner on the affected project card. All existing rows backfill to 0; the boot probe rewrites accurately on the next launcher boot.",
+        sql: include_str!("migrations/030_project_folder_missing_at_last_boot.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
@@ -840,6 +845,106 @@ mod tests {
     /// DB is a no-op the second time.
     #[test]
     fn migration_027_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
+    }
+
+    // ─── v0.2.49 Phase 6 S-4: migration 030 ──────────────────────────────
+
+    /// Pinned schema check: after a fresh `apply()`, the projects table
+    /// must carry a `folder_missing_at_last_boot` column of type INTEGER
+    /// with DEFAULT 0 and NOT NULL.
+    #[test]
+    fn migration_030_adds_folder_missing_flag_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        // Use PRAGMA table_info to verify column shape.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(projects)")
+            .unwrap();
+        let cols: Vec<(String, String, i64, Option<String>, i64)> = stmt
+            .query_map([], |r| {
+                // table_info: cid, name, type, notnull, dflt_value, pk
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let folder_col = cols
+            .iter()
+            .find(|c| c.0 == "folder_missing_at_last_boot")
+            .expect("folder_missing_at_last_boot column must exist after migration 030");
+        assert_eq!(
+            folder_col.1.to_uppercase(),
+            "INTEGER",
+            "column type must be INTEGER (SQLite stores BOOLEAN as INTEGER)"
+        );
+        assert_eq!(folder_col.2, 1, "column must be NOT NULL");
+        assert_eq!(
+            folder_col.3.as_deref(),
+            Some("0"),
+            "column DEFAULT must be 0"
+        );
+    }
+
+    /// Pre-existing rows on upgrade from v29 → v30 backfill the new
+    /// column to 0 (= "folder healthy"). The boot probe later flips
+    /// individual rows if their folder is actually missing.
+    #[test]
+    fn migration_030_backfills_existing_rows_to_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 29).expect("apply up to v29");
+
+        // Seed two pre-030 project rows.
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            rusqlite::params!["p1", "Alpha", "/tmp/alpha", "base", now, "alpha"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            rusqlite::params!["p2", "Beta", "/tmp/beta", "base", now + 1, "beta"],
+        )
+        .unwrap();
+
+        // Apply migration 030.
+        apply(&conn).expect("apply remaining migrations");
+
+        // Both rows must have the new column populated to 0.
+        let mut stmt = conn
+            .prepare("SELECT id, folder_missing_at_last_boot FROM projects ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("p1".to_string(), 0));
+        assert_eq!(rows[1], ("p2".to_string(), 0));
+    }
+
+    /// Migration 030 is idempotent (the migration runner's version
+    /// check guards against double-apply; this test pins the
+    /// behaviour as a regression net in case the runner is ever
+    /// refactored).
+    #[test]
+    fn migration_030_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         apply(&conn).expect("first apply");
