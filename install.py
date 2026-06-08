@@ -10877,6 +10877,29 @@ def _emit_orchestrator_root_env_keys(install_root: Path) -> None:
         "KG_BASE_DIR": str(install_root.resolve()),
     }
 
+    # v0.2.49 SB1: seed VCT_PROJECT_ID alongside the portability keys
+    # so the Phase-8 access-matrix WRITE gate has a project identifier
+    # from the moment .claude/env is written. The gate's empty-PID
+    # branch (claude_mcp_servers/weaviate_mcp/server.py L5995-6049 and
+    # the templates/hooks/post-file-edit.{sh,ps1} _kg_write_allowed
+    # helpers) is the silent-bypass surface that SB1 closes — emitting
+    # VCT_PROJECT_ID here means hooks + the MCP have the identifier
+    # available from install time, not just after the first launcher
+    # boot's apply_project_env pass.
+    #
+    # Resolution is best-effort: if launcher.db isn't there yet (fresh
+    # install, never opened the launcher), we just skip this key — the
+    # gate's empty-PID branch will fire on the first WRITE attempt and
+    # the deferral / metric surfaces guide the user to re-register.
+    # Once they do, the next apply_project_env pass (driven by the
+    # launcher) backfills VCT_PROJECT_ID via the canonical contract.
+    try:
+        pid = _resolve_project_id_by_folder(install_root)
+    except Exception:
+        pid = None
+    if pid:
+        keys["VCT_PROJECT_ID"] = pid
+
     claude_env_path = install_root / ".claude" / "env"
     try:
         written = _write_shell_env_managed_block(claude_env_path, keys)

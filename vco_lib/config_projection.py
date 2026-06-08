@@ -333,6 +333,21 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # had no way to reach the analyzer venv. Emitted alongside
     # VCT_ORCHESTRATOR_ROOT when orchestrator_root is set; same value.
     "VCT_INSTALL_ROOT",
+    # v0.2.49 SB1: the project's launcher.db UUID. Load-bearing for the
+    # Phase-8 access-matrix WRITE gate: hooks + the MCP server read this
+    # env var to identify the project against the hub's
+    # ``GET /api/v1/projects/{id}/access/{collection}`` endpoint. Without
+    # it the gate's empty-PID branch fires and writes proceed via the
+    # silent-bypass path (the SB1 fix: deferral + dropped_writes.jsonl
+    # metric at claude_mcp_servers/weaviate_mcp/server.py and
+    # templates/hooks/post-file-edit.{sh,ps1}).
+    #
+    # Always emitted by ``project_env_from_db`` (canonical DB-resolved
+    # value); the standalone path in
+    # ``vco_lib.project_init._apply_standalone_env`` omits it (no DB →
+    # no UUID → the gate's empty-PID deferral fires at first WRITE and
+    # the user is told to re-register the project via the Launcher GUI).
+    "VCT_PROJECT_ID",
     "VCT_KG_ACCESS_LIST",
     "VCT_CODE_GRAPH_ACCESS_LIST",
     # Diagrams cross-project visibility (v0.2.34, A7). Previously the MCP
@@ -1374,6 +1389,17 @@ def project_env_from_db(
     _set("DEVELOPMENT_COLLECTION", dev_collection)
     _set("DIAGRAMS_COLLECTION", diagrams_collection)
     _set("SHARED_KG_COLLECTION", shared_kg)
+    # v0.2.49 SB1: emit VCT_PROJECT_ID so hooks + the MCP server can
+    # identify this project against the hub's access-matrix endpoint.
+    # The Phase-8 WRITE gate at
+    # ``claude_mcp_servers/weaviate_mcp/server.py::store_knowledge_node``
+    # (and the post-file-edit.{sh,ps1} hooks) read this env var; without
+    # it the gate's empty-PID branch fires (silent allow + deferral +
+    # dropped_writes.jsonl metric). project_id is non-empty here because
+    # the caller (``project_env_from_db``) is keyed by project_id — see
+    # ``_apply_standalone_env`` for the DB-less path that intentionally
+    # OMITS this key.
+    _set("VCT_PROJECT_ID", project_id)
     # Boolean → "true"/"false" (lowercase, matching Rust's
     # `shared_kg_write_disabled_str()` -> bool::to_string()).
     _set("SHARED_KG_WRITE_DISABLED", "true" if shared_kg_write_disabled else "false")

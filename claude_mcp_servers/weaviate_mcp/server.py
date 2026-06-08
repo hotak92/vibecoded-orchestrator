@@ -333,6 +333,201 @@ def _emit_gate_crash_metric(project_id: str, collection: str, exc_str: str) -> N
         pass
 
 
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.49 SB1: gate-skipped (empty VCT_PROJECT_ID) surfaces
+#
+# The Phase-8 WRITE gate has a silent-bypass when VCT_PROJECT_ID is
+# missing from the MCP environment — the gate's empty-PID branch falls
+# through to allow without any audit trail. SB1 closes that hole by
+# adding two visibility surfaces (per the user's 2026-06-08 Q1
+# directive — silent-allow stays the default; remediation lands in
+# UPDATE_DEFERRED.md, not stderr):
+#
+#   1. dropped_writes.jsonl row with reason='gate_skipped_no_project_id'
+#      (audit-trail surface, mirrors gate_crash shape).
+#   2. UPDATE_DEFERRED.md entry with actionable remediation commands
+#      (user-facing surface).
+#
+# Both are idempotent within a server lifetime via a module-level set
+# keyed by session_id so a kg-sync burst doesn't spam either surface.
+# ──────────────────────────────────────────────────────────────────────
+
+_GATE_SKIPPED_SESSIONS_SEEN: set[str] = set()
+"""Per-process dedup set: once a session has had ONE gate_skipped
+emission for empty-PID, further occurrences within the same server
+lifetime are suppressed at the deferral-write level (the
+dropped_writes.jsonl metric still fires per-call because audit-trail
+granularity matters for triage).
+"""
+
+
+def _emit_gate_skipped_metric(collection: str) -> None:
+    """v0.2.49 SB1: emit a dropped-write metric row for the empty-PID
+    branch (VCT_PROJECT_ID missing → gate would silently allow).
+
+    Mirror of ``_emit_gate_crash_metric`` shape; only the ``reason``
+    discriminator differs. Always fires per-call (no dedup) so the
+    JSONL is the authoritative count of how many writes hit the
+    silent-bypass path. The companion deferral writer
+    (``_emit_gate_skipped_deferral``) IS deduped per session — the two
+    surfaces have different consumers / cardinalities by design.
+
+    Never raises; silent on I/O failure so a broken metric path doesn't
+    break the silent-allow contract that the gate's empty-PID branch
+    relies on.
+    """
+    try:
+        import time as _time
+        state_dir = os.environ.get("VCT_STATE_DIR")
+        if state_dir:
+            cache_dir = os.path.join(state_dir, "cache")
+        else:
+            cache_dir = os.path.join(os.path.expanduser("~"), ".vct", "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        jsonl_path = os.path.join(cache_dir, "dropped_writes.jsonl")
+        row = {
+            "ts": int(_time.time()),
+            "project_id": "",  # empty by definition (this branch fires when missing)
+            "collection": collection,
+            "reason": "gate_skipped_no_project_id",
+            "fail_open": True,
+        }
+        with open(jsonl_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:
+        # Metric-emit failure must not break the silent-allow contract.
+        pass
+
+
+def _resolve_project_root_for_deferral() -> Optional[Path]:
+    """Best-effort: locate the project root for SB1's deferral write.
+
+    Resolution order (mirrors the rest of server.py):
+      1. ``$CLAUDE_PROJECT_DIR`` env (set by Claude Code per-workspace)
+      2. ``$KG_BASE_DIR`` env (set by ``.claude/env`` / settings.json)
+      3. ``Path(__file__).resolve().parent.parent.parent`` — the
+         orchestrator's own root when this MCP runs from a clone.
+
+    Returns None when no candidate resolves to an existing directory —
+    the SB1 deferral writer treats that as "skip" (silent-allow is the
+    contract; we don't want a missing project dir to break the write).
+    """
+    try:
+        candidates: list[str] = []
+        workspace = os.environ.get("CLAUDE_PROJECT_DIR", "")
+        if workspace:
+            candidates.append(workspace)
+        kg_base = os.environ.get("KG_BASE_DIR", "")
+        if kg_base:
+            candidates.append(kg_base)
+        # Module-local fallback.
+        try:
+            candidates.append(str(Path(__file__).resolve().parent.parent.parent))
+        except Exception:
+            pass
+        for c in candidates:
+            try:
+                p = Path(c).resolve()
+            except (OSError, RuntimeError):
+                continue
+            if p.is_dir():
+                return p
+    except Exception:
+        # All path resolution paths failed — fall through to None.
+        pass
+    return None
+
+
+def _emit_gate_skipped_deferral(collection: str) -> None:
+    """v0.2.49 SB1: append an UPDATE_DEFERRED.md entry pointing the
+    user at the remediation path for the gate's empty-PID branch.
+
+    Per user Q1 (2026-06-08): silent-allow stays the default for the
+    gate's empty-PID path; the deferral file is the user-facing surface
+    that surfaces the actionable remediation (re-register the project
+    or re-run install.py --update so .claude/env carries
+    VCT_PROJECT_ID).
+
+    Idempotency: deduped per-server-process via
+    ``_GATE_SKIPPED_SESSIONS_SEEN`` — only the FIRST call per session
+    writes; subsequent calls are no-ops. The deferral writer itself is
+    upsert-by-condition_id under the
+    ``vco_lib.deferral_report.DeferralReport`` contract so even a
+    repeat call (cross-process) wouldn't accumulate duplicates within
+    a single UPDATE_DEFERRED.md file.
+
+    Never raises; silent on I/O failure so the silent-allow contract
+    isn't broken by a missing project dir / unwritable file.
+    """
+    # Per-session dedup. The session_id is a stable identifier for the
+    # life of the MCP subprocess; once we've written the deferral once,
+    # further empty-PID writes within the same kg-sync burst are silent.
+    session_key = os.environ.get("VCT_SESSION_ID") or os.environ.get(
+        "CLAUDE_SESSION_ID", ""
+    ) or f"pid:{os.getpid()}"
+    if session_key in _GATE_SKIPPED_SESSIONS_SEEN:
+        return
+    _GATE_SKIPPED_SESSIONS_SEEN.add(session_key)
+
+    project_root = _resolve_project_root_for_deferral()
+    if project_root is None:
+        # Nowhere to write the deferral — skip silently.
+        return
+
+    try:
+        from vco_lib.deferral_report import (
+            DeferralEntry,
+            DeferralReport,
+        )
+    except Exception:
+        # vco_lib not on sys.path — silent skip. The metric still fired.
+        return
+
+    try:
+        report = DeferralReport.read(project_root)
+        # Upsert: DeferralReport.add_entry de-dups on condition_id, so
+        # even if a prior session left the entry behind it gets refreshed
+        # rather than duplicated.
+        entry = DeferralEntry(
+            condition_id="gate_skipped_no_project_id",
+            title=(
+                "Phase-8 access-matrix gate skipped (VCT_PROJECT_ID "
+                "missing from MCP env)"
+            ),
+            detected=(
+                "The MCP server reached store_knowledge_node with no "
+                "VCT_PROJECT_ID env. The Phase-8 WRITE gate cannot "
+                "identify this project against the hub's access matrix, "
+                "so writes are proceeding via the silent-allow path. "
+                "The write itself was permitted; this entry records the "
+                "remediation so future writes go through the gate "
+                f"properly. (target collection: {collection})"
+            ),
+            why_deferred=(
+                "Seeding VCT_PROJECT_ID requires either an orchestrator "
+                "install run (which queries launcher.db for the "
+                "project's UUID) or a Launcher GUI project "
+                "re-registration. Both are user-initiated; the MCP "
+                "server cannot self-heal."
+            ),
+            command_to_apply=(
+                "# Option A — orchestrator-root install / update:\n"
+                "python install.py --update\n"
+                "\n"
+                "# Option B — per-project (pre-v0.2.49 install): re-register the\n"
+                "# project via Launcher GUI → Projects → Identity tab. The\n"
+                "# launcher's apply_project_env pass seeds VCT_PROJECT_ID\n"
+                "# into <project>/.claude/env from launcher.db."
+            ),
+            severity="warning",
+        )
+        report.add_entry(entry)
+        report.write(project_root)
+    except Exception:
+        # Any I/O failure here must not break the silent-allow contract.
+        pass
+
+
 def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
     """v0.2.49 Step F MF7+Q2: return the list of Weaviate collections
     where the project has `access_level == 'write'` per the launcher's
@@ -5993,7 +6188,22 @@ async def store_knowledge_node(
 
         if _access_resolver_available:
             project_id_for_gate = os.environ.get("VCT_PROJECT_ID", "")
-            if project_id_for_gate:
+            if not project_id_for_gate:
+                # v0.2.49 SB1: empty-PID branch was a silent-bypass
+                # (gate effectively disabled). Per the user's 2026-06-08
+                # Q1 directive, silent-allow stays the default; the two
+                # visibility surfaces (metric + deferral) carry the
+                # remediation. The write itself proceeds — the gate
+                # only blocks on explicit "read" / "none" verdicts, not
+                # on missing identity.
+                #
+                # Order is metric-first (always fires) then deferral
+                # (deduped per session) so the JSONL row lands even
+                # when the deferral write hits a missing-project-dir
+                # / unwritable .claude/context branch.
+                _emit_gate_skipped_metric(target_collection_name)
+                _emit_gate_skipped_deferral(target_collection_name)
+            else:
                 try:
                     matrix_level = check_access_level(project_id_for_gate, target_collection_name)
                 except Exception as gate_exc:

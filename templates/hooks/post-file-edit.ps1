@@ -79,12 +79,130 @@ if (-not $EditedFile) { exit 0 }
 # (user-project install). Resolver script lives at
 # templates/scripts/vct_access_check.ps1 and is byte-equivalent to the
 # bash sibling (shipped together by bundle install).
+# v0.2.49 SB1: emit a dropped_writes.jsonl row when the gate falls
+# back to silent-allow because VCT_PROJECT_ID is missing. Mirrors
+# templates/hooks/post-file-edit.sh::_kg_emit_gate_skipped_metric and
+# the existing emit_metric helper in vct_access_check.ps1. Never
+# throws (silent-allow contract must hold).
+function Emit-KgGateSkippedMetric {
+    param([string]$Collection)
+    try {
+        $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else {
+            Join-Path $Env:USERPROFILE ".vct"
+        }
+        $cacheDir = Join-Path $stateDir "cache"
+        if (-not (Test-Path $cacheDir)) {
+            New-Item -ItemType Directory -Path $cacheDir -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        $jsonl = Join-Path $cacheDir "dropped_writes.jsonl"
+        $ts = [int][double]::Parse((Get-Date -UFormat %s))
+        $row = @{
+            ts          = $ts
+            project_id  = ""
+            collection  = $Collection
+            reason      = "gate_skipped_no_project_id"
+            fail_open   = $true
+        } | ConvertTo-Json -Compress
+        Add-Content -Path $jsonl -Value $row -Encoding utf8 -ErrorAction SilentlyContinue
+    } catch {
+        # Metric-emit failure must not break the silent-allow contract.
+    }
+}
+
+# v0.2.49 SB1: write an UPDATE_DEFERRED.md entry directing the user to
+# resolve the empty-VCT_PROJECT_ID condition (run install.py --update
+# OR re-register via Launcher GUI). Per user Q1 (2026-06-08), this is
+# the user-facing surface — no stderr WARNING by default.
+#
+# Idempotent per (session, project) via a sentinel file in
+# .claude/state/. Mirrors the bash sibling's
+# _kg_emit_gate_skipped_deferral exactly.
+function Emit-KgGateSkippedDeferral {
+    param([string]$Collection)
+    $deferred = Join-Path $ProjectRoot ".claude/context/UPDATE_DEFERRED.md"
+    $stateDir = Join-Path $ProjectRoot ".claude/state"
+    $sessionId = if ($Env:VCT_SESSION_ID) { $Env:VCT_SESSION_ID } `
+                 elseif ($Env:CLAUDE_SESSION_ID) { $Env:CLAUDE_SESSION_ID } `
+                 else { [string]$PID }
+    $sentinel = Join-Path $stateDir "gate_skipped_deferral_$sessionId"
+
+    # Per-session dedup. First call writes; subsequent calls in the same
+    # session are silent no-ops.
+    if (Test-Path $sentinel) { return }
+
+    try {
+        if (-not (Test-Path $stateDir)) {
+            New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        Set-Content -Path $sentinel -Value "" -ErrorAction SilentlyContinue
+    } catch { return }
+
+    try {
+        $deferredDir = Split-Path $deferred -Parent
+        if (-not (Test-Path $deferredDir)) {
+            New-Item -ItemType Directory -Path $deferredDir -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+    } catch { return }
+
+    # Idempotent body marker — if a prior session wrote a row for this
+    # condition_id, leave it in place.
+    $marker = "## gate_skipped_no_project_id"
+    if ((Test-Path $deferred) -and (Select-String -Path $deferred -SimpleMatch -Pattern $marker -Quiet -ErrorAction SilentlyContinue)) {
+        return
+    }
+
+    $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    # Append-mode write. Without frontmatter the deferral parser still
+    # finds the entry via "^## <cid> (sev)"; the next install.py
+    # --update pass canonicalises the file with a header.
+    $body = @"
+
+$marker (warning)
+
+**Title**: Phase-8 access-matrix gate skipped (VCT_PROJECT_ID missing from hook env)
+
+**Detected**: The post-file-edit.ps1 hook reached Test-KgWriteAllowed with no VCT_PROJECT_ID. The Phase-8 WRITE gate cannot identify this project against the hub access matrix, so the write was permitted via the silent-allow path. Target collection: $Collection
+
+**Why deferred**: Seeding VCT_PROJECT_ID requires an orchestrator install pass (queries launcher.db for the project UUID) or a Launcher GUI re-registration. The hook cannot self-heal.
+
+**To apply**:
+``````bash
+# Option A — orchestrator-root install / update:
+python install.py --update
+
+# Option B — per-project (pre-v0.2.49 install): re-register the
+# project via Launcher GUI -> Projects -> Identity tab. The
+# launcher's apply_project_env pass seeds VCT_PROJECT_ID into
+# the project-local .claude/env from launcher.db.
+``````
+
+**Detected at**: $ts
+
+---
+"@
+    try {
+        Add-Content -Path $deferred -Value $body -Encoding utf8 -ErrorAction SilentlyContinue
+    } catch {
+        # Silent failure: the silent-allow contract is the priority.
+    }
+}
+
 function Test-KgWriteAllowed {
     param(
         [string]$Project,
         [string]$Collection
     )
-    if (-not $Project) { return $true }    # no project context → allow (legacy path)
+    if (-not $Project) {
+        # v0.2.49 SB1: empty VCT_PROJECT_ID was a silent bypass. Per
+        # user Q1 (2026-06-08), silent-allow stays the default; metric +
+        # deferral are the visibility surfaces. Metric-first so the
+        # JSONL row lands even if the deferral write hits a permission
+        # error.
+        Emit-KgGateSkippedMetric -Collection $Collection
+        Emit-KgGateSkippedDeferral -Collection $Collection
+        return $true   # no project context → allow (legacy path)
+    }
     if (-not $Collection) { return $true } # no collection context → allow
 
     $resolver = $null
