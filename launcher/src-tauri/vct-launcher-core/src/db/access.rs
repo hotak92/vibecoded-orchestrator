@@ -490,6 +490,68 @@ impl Db {
             .map_err(|e| format!("collect: {}", e))
     }
 
+    /// v0.2.49 Step F MF4 (L1-F3): cleanup orphan peer-grant rows when
+    /// a project is deleted.
+    ///
+    /// The FK CASCADE in `001_initial.sql:64` drops rows where
+    /// `project_id = deleted_id` — that's the OWNER's own access rows
+    /// going away with the project. But `kg_collection_access` ALSO
+    /// stores cross-project peer-grant rows: a different (live)
+    /// project holding `read` or `write` on the deleted project's
+    /// collections. Those rows have `project_id = <live_peer>` but
+    /// `collection_name = <deleted_project's_collection>`. The FK
+    /// CASCADE doesn't touch them (cascade is on `projects.id`, not
+    /// on `collection_name`). Result: peer access rows stay stranded
+    /// forever, referencing collections that no longer exist (the
+    /// orchestrator's boot reconcile only sweeps when
+    /// `purge_collections=true`, which is opt-in).
+    ///
+    /// This helper drops all peer-grant rows on a list of
+    /// collection_names, EXCLUDING rows owned by the deleted project
+    /// itself (those are already gone via cascade, or are about to be).
+    ///
+    /// Caller responsibility:
+    ///   - Enumerate the deleted project's collection_names BEFORE
+    ///     the cascade DELETE (via `list_project_kg_bindings`), then
+    ///     pass them here AFTER the delete. Doing it before is OK
+    ///     (the WHERE excludes the deleted project's own rows) but
+    ///     after is safer (no race window).
+    ///   - Audit-log the result count for observability.
+    ///
+    /// Returns the number of peer rows deleted.
+    pub fn delete_orphan_peer_access_for_collections(
+        &self,
+        deleted_project_id: &str,
+        collection_names: &[String],
+    ) -> Result<usize, String> {
+        if collection_names.is_empty() {
+            return Ok(0);
+        }
+        // SQLite: build a comma-separated `?` placeholder list for
+        // the IN clause. `rusqlite::params_from_iter` handles the
+        // value binding.
+        let placeholders = (1..=collection_names.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "DELETE FROM kg_collection_access
+              WHERE project_id != ?1
+                AND collection_name IN ({})",
+            placeholders
+        );
+        let guard = self.lock();
+        let mut all_params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + collection_names.len());
+        all_params.push(&deleted_project_id);
+        for c in collection_names {
+            all_params.push(c);
+        }
+        let n = guard
+            .execute(&sql, all_params.as_slice())
+            .map_err(|e| format!("delete_orphan_peer_access_for_collections: {}", e))?;
+        Ok(n)
+    }
+
     /// v0.2.46 Decision A/B/C cousin — delete a single `kg_collection_access`
     /// row by (project_id, collection_name). Idempotent: missing rows
     /// return 0, never error. Required by `reconcile_kg_collection_access`
@@ -2532,6 +2594,137 @@ mod kg_access_propagation_tests {
         // p2's row untouched.
         assert_eq!(read_access(&db, "p2", "Shared_KG"), Some("read".to_string()));
         assert_eq!(read_access(&db, "p1", "Shared_KG"), None);
+    }
+
+    // ─── Step F MF4 (L1-F3) — delete_orphan_peer_access_for_collections ───
+
+    #[test]
+    fn delete_orphan_peer_drops_other_projects_grants_on_named_collections() {
+        // Scenario: project A is deleted. Its primary collection is
+        // 'A_KnowledgeGraph'. Project B previously had a 'read' grant
+        // on 'A_KnowledgeGraph' (cross-project peer access from a
+        // pre-v0.2.49 install). The FK CASCADE drops A's own rows but
+        // leaves B's grant — orphaned, pointing at a collection that
+        // no longer exists. MF4's helper sweeps these.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "a");
+        seed_project(&db, "b");
+
+        // A's own access row.
+        db.kg_set_access("a", "A_KnowledgeGraph", "write").unwrap();
+        // B's peer-grant row on A's collection.
+        db.kg_set_access("b", "A_KnowledgeGraph", "read").unwrap();
+        // B's OWN access (unrelated; must survive).
+        db.kg_set_access("b", "B_KnowledgeGraph", "write").unwrap();
+
+        // Simulate the FK CASCADE (would happen via db.delete_project("a")):
+        {
+            let guard = db.lock();
+            guard
+                .execute("DELETE FROM kg_collection_access WHERE project_id = 'a'", [])
+                .unwrap();
+        }
+
+        // Pre-MF4: B's peer row is still there.
+        assert_eq!(read_access(&db, "b", "A_KnowledgeGraph"), Some("read".to_string()));
+
+        // MF4 sweep.
+        let n = db
+            .delete_orphan_peer_access_for_collections("a", &["A_KnowledgeGraph".to_string()])
+            .unwrap();
+        assert_eq!(n, 1, "MF4 must drop exactly 1 peer row (B's grant)");
+
+        // B's peer grant on A's collection is gone.
+        assert_eq!(read_access(&db, "b", "A_KnowledgeGraph"), None);
+        // B's own access is unaffected.
+        assert_eq!(
+            read_access(&db, "b", "B_KnowledgeGraph"),
+            Some("write".to_string())
+        );
+    }
+
+    #[test]
+    fn delete_orphan_peer_excludes_deleted_projects_own_rows() {
+        // Edge case: if the caller passes the deleted project's own
+        // collection_names but the deleted project's rows haven't
+        // been cascaded yet (e.g. the sweep runs BEFORE delete_project
+        // by mistake), the helper must NOT count the deleted
+        // project's own rows in its result. The WHERE clause
+        // `project_id != ?1` enforces this.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "a");
+
+        // Only A has rows (no peers).
+        db.kg_set_access("a", "A_KG", "write").unwrap();
+
+        // Call MF4 sweep on A's own collection BEFORE cascading A's
+        // delete. The helper should report 0 deletions (A's own row
+        // is excluded by the WHERE).
+        let n = db
+            .delete_orphan_peer_access_for_collections("a", &["A_KG".to_string()])
+            .unwrap();
+        assert_eq!(n, 0, "deleted project's own rows must be excluded");
+
+        // A's own row is still there (was never deleted by this helper).
+        assert_eq!(read_access(&db, "a", "A_KG"), Some("write".to_string()));
+    }
+
+    #[test]
+    fn delete_orphan_peer_empty_collection_list_is_no_op() {
+        // Defensive: empty input list short-circuits before touching the DB.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "a");
+        db.kg_set_access("a", "A_KG", "write").unwrap();
+
+        let n = db
+            .delete_orphan_peer_access_for_collections("a", &[])
+            .unwrap();
+        assert_eq!(n, 0);
+        // Existing row untouched.
+        assert_eq!(read_access(&db, "a", "A_KG"), Some("write".to_string()));
+    }
+
+    #[test]
+    fn delete_orphan_peer_drops_multiple_peer_rows_across_multiple_collections() {
+        // Scale test: 3 peer projects each with grants on 2 of A's
+        // collections. After A's delete + sweep, all 6 peer rows are gone.
+        let db = Db::open_in_memory().unwrap();
+        for pid in &["a", "b", "c", "d"] {
+            seed_project(&db, pid);
+        }
+
+        // A's own rows.
+        db.kg_set_access("a", "A_KG", "write").unwrap();
+        db.kg_set_access("a", "A_Dev", "write").unwrap();
+
+        // 3 peer projects × 2 collections = 6 peer rows.
+        for pid in &["b", "c", "d"] {
+            db.kg_set_access(pid, "A_KG", "read").unwrap();
+            db.kg_set_access(pid, "A_Dev", "read").unwrap();
+        }
+
+        // Simulate cascade.
+        {
+            let guard = db.lock();
+            guard
+                .execute("DELETE FROM kg_collection_access WHERE project_id = 'a'", [])
+                .unwrap();
+        }
+
+        // Sweep both collections.
+        let n = db
+            .delete_orphan_peer_access_for_collections(
+                "a",
+                &["A_KG".to_string(), "A_Dev".to_string()],
+            )
+            .unwrap();
+        assert_eq!(n, 6, "expected 3 peers × 2 collections = 6 peer rows");
+
+        // No peer rows remain on A's collections.
+        for pid in &["b", "c", "d"] {
+            assert_eq!(read_access(&db, pid, "A_KG"), None);
+            assert_eq!(read_access(&db, pid, "A_Dev"), None);
+        }
     }
 
     // ─── kg_rename_access ─────────────────────────────────────────────

@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use super::modules_api::LauncherDbHandle;
+use vct_launcher_core::db::access::AccessLevel;
 
 pub fn router() -> Router<LauncherDbHandle> {
     Router::new()
@@ -592,9 +593,38 @@ async fn get_collection_access(
         Err(e) => return err500(e),
     }
 
+    // v0.2.49 Step F SB3 (L2-SB2 SHIP-BLOCKER): row-absent fallback
+    // consults `resolve_default_access_level` instead of returning a
+    // literal "none". Pre-fix the literal "none" diverged from the
+    // resolver's F-2a output (Write for own primary/shared bindings)
+    // — so a partial-populate failure could leave a project with no
+    // access row → hub returns "none" → MCP blocks the project's own
+    // KG writes. The resolver is the load-bearing semantic; hub now
+    // exposes the same.
+    //
+    // Step F SF3 (L2-SF2): on the row-present branch, round-trip the
+    // persisted string through `AccessLevel::from_str_strict` →
+    // `as_str()` so any future schema-CHECK weakening (or DB-layer
+    // bug that stores an invalid string) surfaces as 500 here rather
+    // than leaking through to clients. The happy path emits the same
+    // bytes as before (Strict parse on valid input + as_str returns
+    // the original string).
     match h.0.kg_get_access(&project_id, &collection) {
-        Ok(Some(level)) => Json(serde_json::json!({ "level": level })).into_response(),
-        Ok(None) => Json(serde_json::json!({ "level": "none" })).into_response(),
+        Ok(Some(level)) => match AccessLevel::from_str_strict(&level) {
+            Ok(parsed) => Json(serde_json::json!({ "level": parsed.as_str() })).into_response(),
+            Err(e) => err500(format!(
+                "kg_collection_access row for ({}, {}) has invalid \
+                 access_level value '{}': {}. The DB schema CHECK \
+                 should have rejected this — investigate.",
+                project_id, collection, level, e,
+            )),
+        },
+        Ok(None) => match h.0.resolve_default_access_level(&project_id, &collection) {
+            Ok(default_level) => {
+                Json(serde_json::json!({ "level": default_level.as_str() })).into_response()
+            }
+            Err(e) => err500(format!("resolve_default_access_level: {}", e)),
+        },
         Err(e) => err500(e),
     }
 }

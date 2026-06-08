@@ -2575,15 +2575,31 @@ mod tests {
         // seed and user mutation by orders of magnitude more.
         std::thread::sleep(std::time::Duration::from_millis(2));
 
-        // User downgrades to none via kg_set_access (user-mutation path).
-        db.kg_set_access("p1", "RLMeta_KG", "none").unwrap();
+        // User upgrades to write via kg_set_access (user-mutation path).
+        //
+        // IMPORTANT: must use a level DIFFERENT from what kg_seed_access
+        // wrote (the resolver returns `Denied`/`none` for this row since
+        // p1 has no role='primary'/'shared' binding to RLMeta_KG). Per
+        // v0.2.49 Step F SB4 (L1-F4), kg_set_access's UPSERT bumps
+        // `updated_at` ONLY when the access_level actually changes — a
+        // no-op rewrite (writing the same value) preserves the prior
+        // `updated_at`. So if this test wrote `none` (the seeded value),
+        // the predicate would stay FALSE (intended SB4 behaviour: no-op
+        // writes don't flip the user-configured signal).
+        //
+        // To pin the intended "user mutation flips the flag" semantic,
+        // write a DIFFERENT level here. `write` is the natural choice
+        // — it represents "user granted themselves access to a module's
+        // declared collection." That's a real mutation; SB4 bumps
+        // updated_at; predicate flips TRUE.
+        db.kg_set_access("p1", "RLMeta_KG", "write").unwrap();
         let row_after_user = db.kg_get_access_row("p1", "RLMeta_KG").unwrap().unwrap();
         assert!(
             row_after_user.is_user_configured(),
-            "user mutation via kg_set_access should flip is_user_configured to TRUE"
+            "user mutation via kg_set_access (level change) should flip is_user_configured to TRUE"
         );
 
-        // Second install: kg_seed_access returns 0, row preserved (still 'none').
+        // Second install: kg_seed_access returns 0, row preserved (still 'write').
         let mut report2 = PopulateReport::default();
         populate_kg_collection_access_for_global_module(
             &["RLMeta_KG".to_string()],
@@ -2596,8 +2612,9 @@ mod tests {
         );
         assert_eq!(
             db.kg_get_access("p1", "RLMeta_KG").unwrap(),
-            Some("none".to_string()),
-            "user's explicit downgrade preserved"
+            Some("write".to_string()),
+            "user's explicit upgrade preserved (kg_seed_access INSERT OR \
+             IGNORE doesn't clobber existing rows)"
         );
 
         // The user-configured invariant survives the re-install.

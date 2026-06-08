@@ -2267,6 +2267,154 @@ mod hub_access_matrix_wiring_tests {
         }
     }
 
+    // ─── Step F SB3 (L2-SB2) — row-absent fallback consults resolver ─────
+    //
+    // Pre-Step-F the endpoint returned literal "none" for any
+    // row-absent query. That diverged from `resolve_default_access_level`'s
+    // F-2a output ("Write" for own primary/shared bindings). Failure
+    // mode: a partial `populate_kg_collection_access_for_project` failure
+    // left a project with no row → hub returns "none" → MCP correctly
+    // blocks the project's OWN KG writes → silent breakage.
+    //
+    // Post-fix: row-absent calls resolve_default_access_level so the
+    // hub semantically matches what populate WOULD have written.
+
+    #[tokio::test]
+    async fn access_endpoint_row_absent_consults_resolver_for_own_primary() {
+        // Setup: project has a role='primary' binding to
+        // `OwnPrimary_KG`, BUT the kg_collection_access row for that
+        // (project_id, OwnPrimary_KG) pair was never created (e.g.
+        // partial populate failure or pre-v0.2.49 state without the
+        // populate path having run).
+        //
+        // Pre-fix the endpoint returned "none" → MCP would block the
+        // project's own KG writes. Post-fix the endpoint consults
+        // `resolve_default_access_level` → returns "write" (F-2a rule
+        // for role='primary').
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "OwnPrimaryAbsent",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // The cli/projects POST auto-populated 3 default rows
+        // (OwnPrimaryAbsent_KnowledgeGraph at write, etc.). Wipe the
+        // own-primary row + add a primary binding pointing at a
+        // collection that has NO kg_collection_access row, simulating
+        // partial-populate-failure.
+        handle
+            .0
+            .set_project_kg_binding(
+                &pid,
+                "primary",
+                "OwnPrimary_KG",
+                None,
+                None,
+                None,
+                None,
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+
+        // Query the bound collection — kg_collection_access has NO
+        // row for it.
+        let resp = client
+            .get(format!(
+                "{}/projects/{}/access/{}",
+                base, pid, "OwnPrimary_KG"
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "expected 200, got {}", resp.status());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("level").and_then(|v| v.as_str()),
+            Some("write"),
+            "Step F SB3: row-absent on OWN primary binding must return \
+             'write' (resolver F-2a output), NOT 'none' (the pre-fix \
+             literal). Pre-fix this would have silently blocked the \
+             project's own KG writes when populate partially failed."
+        );
+    }
+
+    // ─── Step F SF3 (L2-SF2) — defensive parse round-trip on row-present ──
+
+    /// Step F SF3 (L2-SF2) layered-defense pin.
+    ///
+    /// The endpoint's `AccessLevel::from_str_strict` round-trip is
+    /// defense-in-depth: it surfaces invalid level strings as 500
+    /// rather than leaking them through to clients. BUT the
+    /// `kg_collection_access.access_level` column has a SQL CHECK
+    /// constraint (`CHECK access_level IN ('read','write','none')`),
+    /// so an invalid value can never actually reach the row in
+    /// production — the SQL layer rejects the INSERT first.
+    ///
+    /// This test pins the DEFENSE-IN-DEPTH SHAPE rather than the
+    /// (currently unreachable) panic path: it confirms the SQL CHECK
+    /// constraint exists + correctly rejects an invalid INSERT before
+    /// the endpoint's parse can ever see one. If a future migration
+    /// weakens or drops the CHECK, this test fails — which is the
+    /// signal that the parse round-trip becomes load-bearing.
+    #[tokio::test]
+    async fn access_endpoint_invalid_level_rejected_at_sql_layer() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let _ = base; // unused (we're testing the SQL layer below it)
+
+        let create_resp = reqwest::Client::new()
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "InvalidLevelLayered",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create_resp.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Attempt a raw INSERT with an invalid level. The CHECK
+        // constraint MUST reject it at the SQL layer — that's the
+        // first line of defense and the reason the endpoint's parse
+        // round-trip is currently unreachable in production.
+        let result = {
+            let guard = handle.0.lock();
+            guard.execute(
+                "INSERT INTO kg_collection_access \
+                    (project_id, collection_name, access_level, created_at, updated_at) \
+                 VALUES (?1, 'BadLevel_KG', 'admin', 1700000000000, 1700000000000)",
+                rusqlite::params![pid],
+            )
+        };
+        let err = result.expect_err(
+            "Step F SF3 pin: the SQL CHECK constraint on \
+             kg_collection_access.access_level MUST reject invalid \
+             levels. If this INSERT succeeded, the CHECK was weakened \
+             or dropped, and the endpoint's defensive parse round-trip \
+             (`AccessLevel::from_str_strict`) is now the only line of \
+             defense — verify it still fires (see the handler at \
+             vct-hub/src/project_state_api.rs::get_collection_access)."
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CHECK constraint failed")
+                && msg.contains("access_level"),
+            "expected CHECK constraint failure on access_level, got: {}",
+            msg
+        );
+    }
+
     // ─── Phase 8 follow-up: list-by-level access endpoint (Q2 enrichment) ─
     //
     // The new `GET /projects/{id}/access?level=write` endpoint

@@ -4912,6 +4912,31 @@ pub async fn delete_project_v2(
         )),
     }
 
+    // v0.2.49 Step F MF4 (L1-F3): capture the deleted project's KG
+    // binding collection names BEFORE the cascade DELETE, so we can
+    // sweep cross-project peer-grant rows on those collections
+    // afterward. The FK CASCADE in 001_initial.sql:64 drops rows
+    // where project_id = deleted_id but not rows where
+    // collection_name is one of the deleted project's collections AND
+    // project_id is a different (live) project. Without this sweep,
+    // peer access rows stay stranded forever pointing at collections
+    // that no longer exist (unless `purge_collections=true`, in
+    // which case the boot reconcile cleans up).
+    let deleted_collection_names: Vec<String> = match db.list_project_kg_bindings(&id) {
+        Ok(bindings) => bindings.into_iter().map(|b| b.collection_name).collect(),
+        Err(e) => {
+            // Soft-fail: peer-row cleanup is observability, not
+            // correctness for the delete itself. Log to warnings + skip.
+            report.warnings.push(format!(
+                "could not enumerate KG bindings for peer-row cleanup on \
+                 project {}: {}. Cross-project peer access rows (if any) \
+                 will linger until next boot reconcile.",
+                id, e
+            ));
+            Vec::new()
+        }
+    };
+
     // Step 3 (always): audit + DB delete + change log.
     db.audit(
         "project_delete",
@@ -4929,6 +4954,33 @@ pub async fn delete_project_v2(
     )?;
     db.delete_project(&id)?;
     let _ = db.log_change("projects", "delete", Some(&id), Some(&id));
+
+    // v0.2.49 Step F MF4: now that the project's own rows are gone
+    // via FK CASCADE, sweep cross-project peer-grant rows on the
+    // deleted project's collection_names. Soft-fail with audit-log
+    // emission — the orphan rows are harmless until they accumulate.
+    if !deleted_collection_names.is_empty() {
+        match db.delete_orphan_peer_access_for_collections(&id, &deleted_collection_names) {
+            Ok(0) => { /* no peer grants existed */ }
+            Ok(n) => {
+                let _ = db.audit(
+                    "kg_peer_access_cleanup_on_project_delete",
+                    Some(&id),
+                    None,
+                    &serde_json::json!({
+                        "deleted_peer_rows": n,
+                        "collections": deleted_collection_names,
+                    }),
+                );
+            }
+            Err(e) => report.warnings.push(format!(
+                "could not sweep cross-project peer access rows for \
+                 deleted project {}'s collections: {}. Orphan rows \
+                 (if any) will linger; boot reconcile is the backup.",
+                id, e
+            )),
+        }
+    }
 
     Ok(report)
 }
