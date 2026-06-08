@@ -72,11 +72,14 @@ between v0.2.46–v0.2.49.
   Ombromanto / martino-X670E hostnames, `Desktop/PROGETTI/Claude/` paths,
   tracked `HANDOFF-*.md` files at repo root, and `/home/martino` outside
   intentional sentinels.
-- `.gitignore` patched with 13 new rules (root-level `HANDOFF-*.md`,
+- `.gitignore` patched with 23 new rules (root-level `HANDOFF-*.md`,
   `MEMORY.md`, `.claude/MEMORY.md`, `.claude/PROJECT_REGISTRY.md`,
   `.claude/env`, `.claude/mockups/`, `.claude/rules/`, `.claude/.vco-manifest.json`,
   `.claude/metrics/`, `.claude/settings.json.bak-*`, `.vct/`,
-  `.vct-orchestrator-dev`, `.vscode/tasks.json`, `knowledge/{inbox,daily,_drafts}/`).
+  `.vct-orchestrator-dev`, `.vscode/tasks.json`, `knowledge/{inbox,daily,_drafts}/`,
+  ad-hoc scratch scripts at repo root (`/assemble_pngs.py`, `/decode_canvas_png.py`,
+  `/decode_chunks.py`, `/default_b64_chunk*.txt`), and
+  `claude_mcp_servers/compose.override.{yaml,yml}` + `*.bak-*` backups).
 - `tools/install-vco-dev-pre-push-guard.{sh,ps1}` provides a re-installable
   pre-push hook for private operational VCO checkouts that refuses pushes
   to the public-repo remote.

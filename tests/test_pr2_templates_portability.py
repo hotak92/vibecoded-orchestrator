@@ -608,7 +608,9 @@ class ComposeBuildContextTests(unittest.TestCase):
         # Find the code_embed service block.
         idx = text.find("code_embed:")
         self.assertGreater(idx, 0)
-        block = text[idx:idx + 2000]
+        # 3500-char window — Track B's v0.2.50 multi-arch documentation
+        # block sits between the service header and the profiles: gate.
+        block = text[idx:idx + 3500]
         self.assertIn("profiles:", block)
         self.assertIn("- gpu", block)
 
