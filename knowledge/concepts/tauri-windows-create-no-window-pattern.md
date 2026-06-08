@@ -95,7 +95,7 @@ Script Python regex-based per rolling out su codebase grande:
 - Append `.silent()` dopo la closing paren
 - Aggiungi `use <crate>::process::CommandExt as _;` import a top file (brace-depth aware per multi-line `use crate::foo::{ a, b };` blocks)
 
-Esempio reale: `scripts/add-silent-to-commands.py` in vibecoded-orchestrator. 218 call sites fixati in un singolo run, idempotente per future audit.
+Pattern: uno script di sweep applicato in un singolo run, idempotente per future audit. Esempio reale di order-of-magnitude: codebase Tauri di taglia media-grande, ~200 call sites bonificati in un singolo run.
 
 ## Verifica visiva del fix
 
@@ -124,12 +124,12 @@ Granularity importante: snapshot a >200ms perde flash sub-frame. Per audit compl
 
 ## Storia / scoperte
 
-Scoperto in [[VibeCoded-Orchestrator-Launcher]] 2026-05-26 durante session debug del fork bomb Windows post-install. Audit script ha trovato 208/221 `Command::new` call sites nel launcher senza `CREATE_NO_WINDOW`. 11+ subprocess concorrenti al boot causavano cascata visiva di console flash.
+Scoperto in [[VibeCoded-Orchestrator-Launcher]] durante session debug del fork bomb Windows post-install. L'audit ha trovato che la vasta maggioranza dei `Command::new` call sites del launcher era priva di `CREATE_NO_WINDOW`. Bastavano una decina di subprocess concorrenti al boot per causare cascata visiva di console flash sufficiente a mascherare la GUI principale.
 
-Branch fix `fix/launcher-gui-fork-bomb-windows` in vibecoded-orchestrator usa la versione centralizzata con trait `silent()`.
+Il fix usa la versione centralizzata con trait `silent()`.
 
 ## Riferimenti
 
 - Microsoft docs: https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags (CREATE_NO_WINDOW = 0x08000000)
 - std::os::windows::process::CommandExt: https://doc.rust-lang.org/std/os/windows/process/trait.CommandExt.html
-- VibeCoded Orchestrator launcher: `vct-launcher-core/src/process.rs` (trait), `scripts/add-silent-to-commands.py` (sweep script)
+- VibeCoded Orchestrator launcher: `vct-launcher-core/src/process.rs` (trait).

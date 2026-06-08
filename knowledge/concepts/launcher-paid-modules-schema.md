@@ -1,11 +1,11 @@
 ---
 title: Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
 type: concept
-tags: [launcher, supabase, schema, paid-modules, licensing, commercial, VCT-Launcher, partially-superseded]
+tags: [launcher, supabase, schema, paid-modules, licensing, commercial, partially-superseded]
 created: 2026-04-23T16:20:00Z
 updated: 2026-05-26T00:00:00Z
 status: active
-implementation: "Original migration 004_paid_modules.sql lives in the `pb992/VCT-Launcher` private Supabase project (an earlier launcher exploration). Production project for the launcher is `ovpdtijpdchzlxbojhsg` (the orchestrator's Supabase). The launcher-side mirror of per-module entitlements is `tier_cache.module_licenses` (read via `is_module_licensed_v2`)."
+implementation: "Original migration 004_paid_modules.sql originated in an earlier launcher-exploration Supabase project (`<your-supabase-project-ref>/<your-orchestrator-repo>`). Production project for the launcher is `ovpdtijpdchzlxbojhsg` (the orchestrator's Supabase). The launcher-side mirror of per-module entitlements is `tier_cache.module_licenses` (read via `is_module_licensed_v2`)."
 ---
 
 # Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
@@ -26,7 +26,7 @@ Chosen design: one `profiles.paid_modules JSONB` column keyed by module slug, va
 
 ## Schema
 
-Migration file: `supabase/migrations/004_paid_modules.sql` on `pb992/VCT-Launcher` master.
+Migration file: `supabase/migrations/004_paid_modules.sql` on `<your-supabase-project-ref>/<your-orchestrator-repo>` master.
 
 ### Column
 
@@ -120,5 +120,5 @@ Telegram MCP module active in Claude Code
 - [[relatedTo::validate-module edge function]] (to be created)
 - [[relatedTo::Telegram as Standalone Paid Module]] (first consumer)
 - [[relatedTo::VCT Coordination MCP — Standalone Product]] (future consumer if marketed as paid)
-- Migration file: `pb992/VCT-Launcher:supabase/migrations/004_paid_modules.sql`
-- Webhook: `pb992/VCT-Launcher:supabase/functions/lemon-squeezy-webhook/index.ts`
+- Migration file: `<your-supabase-project-ref>/<your-orchestrator-repo>:supabase/migrations/004_paid_modules.sql`
+- Webhook: `<your-supabase-project-ref>/<your-orchestrator-repo>:supabase/functions/lemon-squeezy-webhook/index.ts`
