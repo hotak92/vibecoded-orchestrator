@@ -288,3 +288,65 @@ knowledge/_drafts/
 claude_mcp_servers/compose.override.yaml
 claude_mcp_servers/compose.override.yml
 claude_mcp_servers/*.bak-*
+# ===========================================================================
+# v0.2.51 cleanup additions (2026-06-09)
+# Post-incident leak-hunt audit found these patterns leaking from VCO_dev
+# operational state into public repo. Add to gitignore so they can't
+# silently propagate again on next install/copy sweep.
+# ===========================================================================
+
+# Supabase CLI scratch state — contains live production project-ref +
+# org_id + project name + pooler URL. Never commit; the maintainer's
+# Supabase project ref is private operational data.
+supabase/.temp/
+
+# Internal maintainer-only docs — release procedures, demo-recording
+# prep, launcher subtree workflow, unreleased licensing wire-up notes.
+# The internal/ README itself says "Not user-facing. Excluded from
+# release archives." — this gitignore enforces that intent.
+/internal/
+
+# VCO_dev private-fork pre-push guard installer scripts. These are
+# helpers for OUR operational checkout, not user-facing tooling.
+/tools/install-vco-dev-pre-push-guard.sh
+/tools/install-vco-dev-pre-push-guard.ps1
+
+# Completed one-off maintenance scripts. Historical operations that
+# already ran; keep out of the public surface to avoid implying they're
+# ongoing tools.
+/scripts/add-silent-to-commands.py
+/scripts/apply-branch-protection-v0.2.42.sh
+/scripts/filter-repo-2026-05-06.sh
+
+# Operations docs — maintainer-only deploy instructions (Supabase CI,
+# release procedures, etc.). User-facing install/troubleshooting docs
+# stay under docs/ directly.
+/docs/operations/
+
+# Release-narrative / version-specific docs that shouldn't survive
+# beyond the release they describe.
+/docs/v0.2.33-l0-deploy.md
+/docs/codeql-triage-v*.md
+/docs/EXCALIDRAW_WAYLAND_TEST.md
+/docs/MAINTAINER_GUIDE.md
+/docs/MIGRATION-0.2.0.md
+
+# Internal CI dev notes (vs user-facing workflow docs which live
+# elsewhere). The .github/workflows/README.md leaked our "Deferred for
+# v0.2.30+" tracking narrative.
+/.github/workflows/README.md
+
+# Operational state generated post-install that must never be tracked.
+# Already partially covered by HANDOFF-*.md / MEMORY.md / CONTEXT_STATE
+# rules above; add the missing ones.
+/UPDATE_DEFERRED.md
+/SELF-HANDOFF-*.md
+/HANDOFF-*-COMPREHENSIVE.md
+/HANDOFF-FROM-*.md
+/HANDOFF-TO-*.md
+/HANDOFF-RL-*.md
+.claude/context/audits/
+.claude/context/plans/
+.claude/context/pre-compact-snapshot.md
+.claude/context/UPDATE_DEFERRED.md
+.claude/context/SELF-HANDOFF-*.md
