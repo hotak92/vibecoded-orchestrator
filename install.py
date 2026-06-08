@@ -21817,6 +21817,93 @@ def _record_npm_pin_drift_deferral(package_key: str,
 
 
 # ---------------------------------------------------------------------------
+# v0.2.51 Bug E: npx fallback for fnm/nvm-style setups.
+#
+# `shutil.which("npx")` handles the common case (apt/brew/winget/NodeSource
+# where npx is symlinked alongside npm on PATH). But on fnm/nvm setups where
+# users may have hand-symlinked just `npm` to ~/.local/bin/, npx is physically
+# present in the same bin dir as the REAL npm but not on PATH.
+#
+# Reported 2026-06-09 from a user's machine: `~/.local/bin/npm` was symlinked
+# to `~/.fnm/node-versions/v20.20.1/installation/bin/npm`. The corresponding
+# `npx` is at `~/.fnm/.../bin/npx` (same dir) — `shutil.which("npx")` failed,
+# Playwright pre-cache + bundled-npm pinning both skipped silently even though
+# the user clearly had a working Node install.
+#
+# Fallback: probe `dirname(realpath(which("npm")))/npx` (and `.cmd` / `.ps1`
+# on Windows). Cross-OS: ``Path.resolve()`` handles symlink chains on every
+# platform; on Windows there's no executable bit so we fall back to
+# ``is_file()``. Same shape as ``_find_lean_ctx_binary``.
+# ---------------------------------------------------------------------------
+
+def _find_npx() -> Optional[str]:
+    """Locate npx with fnm/nvm-style fallback.
+
+    Returns the absolute path to the npx binary, or None if truly absent.
+
+    Strategy:
+      1. ``shutil.which("npx")`` — the common case (npx is on PATH).
+      2. Probe ``dirname(realpath(which("npm")))/npx`` — covers fnm/nvm
+         setups where the user has hand-symlinked just `npm` to a PATH
+         directory but left `npx` next to the REAL `npm` in the version
+         manager's bin dir. Same dir on every Node release since 2017.
+      3. On Windows, also probe `.cmd` and `.ps1` siblings since the npm
+         shim itself is `npm.cmd` and `npx` matches that convention.
+
+    Cross-OS:
+      * POSIX: ``os.access(path, os.X_OK)`` confirms executability.
+      * Windows: executable bit doesn't exist — ``is_file()`` is the
+        relevant check, matching the convention in
+        ``_find_lean_ctx_binary``.
+
+    Never raises — symlink loops, permission errors, hostile paths all
+    fall through to the next candidate or ``None``.
+    """
+    direct = shutil.which("npx")
+    if direct:
+        return direct
+    npm = shutil.which("npm")
+    if not npm:
+        return None
+    try:
+        real_npm = Path(npm).resolve()
+    except OSError:
+        return None
+    is_windows = sys.platform == "win32"
+    candidates: list[Path] = [real_npm.parent / "npx"]
+    if is_windows:
+        candidates.append(real_npm.parent / "npx.cmd")
+        candidates.append(real_npm.parent / "npx.ps1")
+    for cand in candidates:
+        try:
+            if cand.is_file() and (is_windows or os.access(cand, os.X_OK)):
+                return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def _find_npm() -> Optional[str]:
+    """Locate npm with fnm/nvm-style fallback. Mirror of :func:`_find_npx`.
+
+    Reserved for future use — the bundled-npm pin helpers cache npm at
+    module import time via ``_NPM_PATH``, but they could swap in this
+    resolver once we want runtime re-detection (e.g. for ``--update``
+    runs where the user installed Node mid-session). Today's call sites
+    don't need that, so this is a placeholder for symmetry.
+
+    Returns the absolute path to npm, or None if truly absent.
+    """
+    direct = shutil.which("npm")
+    if direct:
+        return direct
+    # No fallback heuristic for npm itself — if `npm` isn't on PATH,
+    # there's nothing to dirname-realpath off. Caller decides whether
+    # to surface an install hint or skip.
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Playwright MCP + Chromium pre-cache
 # ---------------------------------------------------------------------------
 
@@ -21848,13 +21935,19 @@ def _install_playwright_browsers() -> None:
                            "VCT_SKIP_PLAYWRIGHT=1 in env")
         return
 
-    if not shutil.which("npx"):
+    # v0.2.51 Bug E: use _find_npx() instead of shutil.which("npx") so
+    # fnm/nvm setups (where the user symlinked only `npm` to PATH but
+    # left `npx` in the version manager's bin dir) work without manual
+    # PATH fiddling. See _find_npx() docstring for the rationale.
+    npx_path = _find_npx()
+    if not npx_path:
         print("SKIPPED (npx not found)")
         print("  Node.js / npx not detected. Playwright MCP will")
         print("  lazy-install when first invoked. Install Node.js 18+")
         print("  to pre-cache: https://nodejs.org")
         _log_install_event("playwright", "skip",
-                           "npx not on PATH — MCP will lazy-install")
+                           "npx not on PATH and not adjacent to npm — "
+                           "MCP will lazy-install")
         return
 
     print("(this may take ~30s, ~150 MB)")
@@ -21862,7 +21955,7 @@ def _install_playwright_browsers() -> None:
     # 1) Cache the MCP package itself (small).
     try:
         result = subprocess.run(
-            ["npx", "-y", "@playwright/mcp@latest", "--version"],
+            [npx_path, "-y", "@playwright/mcp@latest", "--version"],
             capture_output=True, text=True, timeout=180,
         )
         if result.returncode != 0:
@@ -21886,7 +21979,7 @@ def _install_playwright_browsers() -> None:
     #    `npx playwright install firefox` etc. manually.
     try:
         result = subprocess.run(
-            ["npx", "playwright", "install", "chromium"],
+            [npx_path, "playwright", "install", "chromium"],
             capture_output=True, text=True, timeout=600,
         )
         if result.returncode == 0:
