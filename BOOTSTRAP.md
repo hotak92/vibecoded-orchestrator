@@ -176,7 +176,7 @@ The three orchestrator volumes — `weaviate_data`, `ollama_data`, `code_embed_c
 
 ### When you decide you want the launcher
 
-Install [VCT Launcher](https://github.com/pb992/VCT-Launcher), point it at this folder, and run "Adopt project". The launcher imports the existing setup — KG bindings, hooks, secret references — into its DB without disturbing anything. After that, the launcher manages this project the way Path A describes.
+The launcher binary ships with this repo — run the bundled `start-launcher.{sh,bat,command}`, point it at this folder, and run "Adopt project". The launcher imports the existing setup — KG bindings, hooks, secret references — into its DB without disturbing anything. After that, the launcher manages this project the way Path A describes.
 
 ---
 
