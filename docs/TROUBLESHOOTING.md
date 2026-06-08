@@ -429,7 +429,7 @@ The free Ollama path (`qwen3-embedding:0.6b`) is unaffected; switch back in the 
 
 ## Shared KG looks empty after upgrading from <v0.2.12
 
-In v0.2.12 the bundled shared collection was renamed from `VibeCodedTools_KnowledgeGraph` to `VibecodedOrchestrator_KnowledgeGraph` (PR-26 / Group E). Fresh installs land on the new name; pre-v0.2.12 installs already have data under the old name and `hybrid_search` queries the new (empty) one.
+In v0.2.12 the bundled shared collection was renamed from `VibeCodedTools_KnowledgeGraph` to `VibeCodedOrchestrator_KnowledgeGraph` (PR-26 / Group E). Fresh installs land on the new name; pre-v0.2.12 installs already have data under the old name and `hybrid_search` queries the new (empty) one.
 
 Two paths:
 
