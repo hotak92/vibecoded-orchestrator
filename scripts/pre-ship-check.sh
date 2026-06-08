@@ -399,6 +399,19 @@ else
         "pre-release-gate job not found in release.yml"
 fi
 
+# Gate 21: Pre-tag privacy check (scrubs operational private state from tracked tree).
+if [ -x scripts/check-pre-tag-privacy.sh ]; then
+    if bash scripts/check-pre-tag-privacy.sh > /tmp/preship-privacy.log 2>&1; then
+        gate_pass "pre-tag privacy check (no FABIO-LOCAL / hostname / private-path leaks)"
+    else
+        gate_fail "pre-tag privacy check" \
+            "See /tmp/preship-privacy.log — private operational state leaked into tracked tree"
+    fi
+else
+    gate_fail "pre-tag privacy check script present and executable" \
+        "scripts/check-pre-tag-privacy.sh missing or not executable"
+fi
+
 echo ""
 
 # ── Section 4: Version-pin consistency ───────────────────────────────────────

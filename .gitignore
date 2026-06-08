@@ -243,3 +243,48 @@ vco_lib/import_from_orchestrator.py
 tests/test_import_from_orchestrator.py
 .logo-backup-*/
 .claude/CONTEXT_STATE.md
+
+# === VCO_dev operational leak guard (v0.2.50, 2026-06-08) ===
+# Covers gaps identified in the v0.2.49 gitignore-and-remediation audit.
+# These paths exist in the PRIVATE operational checkout but must NEVER ship in
+# the public repo. The bundle-update flow copies un-gitignored files between
+# clones, so an unguarded path = silent propagation.
+
+# Root-level handoff narrative files (multi-agent / multi-chat coordination)
+/HANDOFF-*.md
+
+# Root-level MEMORY (project-local, not the global ~/.claude/projects/.../memory/)
+/MEMORY.md
+
+# .claude/ per-machine state not already covered above
+.claude/MEMORY.md
+.claude/PROJECT_REGISTRY.md
+.claude/env
+.claude/mockups/
+.claude/rules/
+.claude/.vco-manifest.json
+.claude/metrics/
+.claude/settings.json.bak-*
+
+# VCT operational state outside .claude/
+.vct/
+/.vct-orchestrator-dev
+
+# Knowledge graph private staging directories (drafts not for publication)
+knowledge/inbox/
+knowledge/daily/
+knowledge/_drafts/
+
+# VS Code per-machine tasks (settings.json already covered earlier)
+.vscode/tasks.json
+
+# Ad-hoc scratch scripts that accumulate at repo root
+/assemble_pngs.py
+/decode_canvas_png.py
+/decode_chunks.py
+/default_b64_chunk*.txt
+
+# claude_mcp_servers compose overrides + backups
+claude_mcp_servers/compose.override.yaml
+claude_mcp_servers/compose.override.yml
+claude_mcp_servers/*.bak-*

@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.50] - 2026-06-08
+
+Recovery release after v0.2.49 was tagged from a feature branch instead of
+`main`. v0.2.49's tag points at correct source but main was never advanced
+to it, so the launcher's "Update orchestrator" flow (which uses `git pull`)
+would have pulled v0.2.48 source + mislabeled binaries. v0.2.50 propagates
+the full v0.2.49 source to main + fixes the release workflow bug that
+caused the mislabel + scrubs private operational artifacts that leaked
+between v0.2.46–v0.2.49.
+
+### Recovery + scrub
+
+- **Privacy scrub**: removed FABIO-LOCAL operational block from CLAUDE.md,
+  deleted `HANDOFF-TO-RL-CHAT-2026-06-04-stash-and-branch-state.md` (tracked
+  since v0.2.46), deleted `.claude/context/audits/v0.2.49-license-gating-audit-2026-06-06.md`
+  (force-added in v0.2.49). Mechanical scrub of ~40 files: `/home/martino`,
+  `VCO_dev`, `Ombromanto`, `martino-X670E-Pro-RS`, `Desktop/PROGETTI/Claude/`,
+  `commercial_workflow/` references in comments / tests / KG nodes. No
+  credentials were leaked at any point; all scrubbed content is paths +
+  developer names + private codenames. **Old tags (v0.2.46–v0.2.49) retain
+  the leakage as historical artifacts; we did not rewrite history.**
+
+- **CLAUDE.md → template architecture**: root `CLAUDE.md` is now a thin
+  reference. The full content lives in `templates/ORCHESTRATOR-CLAUDE.md.template`
+  and is materialized by `install.py` at first-install + each `--update`
+  with `{{ORCHESTRATOR_ROOT}}` substitution. Eliminates the source of
+  v0.2.49's hardcoded paths.
+
+### Release-workflow fix
+
+- **`.github/workflows/release.yml::commit-dist-binaries` now reads VERSION
+  from the tag ref** (`${GITHUB_REF#refs/tags/v}`), not from `main`'s
+  `Cargo.toml`. Prevents the v0.2.49 issue where binaries were committed
+  to main labeled "v0.2.48" because the release was tagged from a feature
+  branch whose Cargo.toml said 0.2.49 but main's still said 0.2.48.
+
+### Hardware portability
+
+- **F1**: code-embed Dockerfile is now multi-arch. `Dockerfile` uses a
+  CPU-only PyTorch base; `Dockerfile.cuda` opts in to CUDA. `install.py`
+  picks the right one per detected GPU. Apple Silicon users no longer
+  hit image-pull failure when enabling the code-embed service.
+- **F2/F3**: dropped dead `model_router_claude` rows from
+  `templates/hooks/verify-container-ports.{sh,ps1}` (last `_claude`-suffix
+  leak from the maintainer-machine cleanup that v0.2.15 started).
+- **F4/F5**: dropped `model_router` from systemd + Windows task descriptions.
+- **F6**: `recover_zombie` in `ensure-containers.{sh,ps1}` now guards
+  against running on non-Podman runtimes (prevents spurious `docker rm -f`
+  + recreate on healthy containers).
+- **F7**: dropped `code_embed` block from ROCm overlay (was unreachable
+  due to install.py routing ROCm users to CPU profile).
+- **Launcher embedding-dropdown ↔ MCP slot mapping**: tightened the UI to
+  only offer values the MCP server knows about
+  (`qwen3 | codesage | arctic | ollama | openai`).
+- **`templates/scripts/detect-project.ps1`**: created Windows sibling (UTF-8
+  BOM) for the bash `detect-project.sh` — native-Windows users no longer
+  silently lose multi-codebase auto-detection.
+
+### Pre-tag privacy gate + gitignore hardening
+
+- New `scripts/check-pre-tag-privacy.sh` (Gate 21 in `pre-ship-check.sh`):
+  fails on `FABIO-LOCAL` markers, `commercial_workflow/` references,
+  Ombromanto / martino-X670E hostnames, `Desktop/PROGETTI/Claude/` paths,
+  tracked `HANDOFF-*.md` files at repo root, and `/home/martino` outside
+  intentional sentinels.
+- `.gitignore` patched with 13 new rules (root-level `HANDOFF-*.md`,
+  `MEMORY.md`, `.claude/MEMORY.md`, `.claude/PROJECT_REGISTRY.md`,
+  `.claude/env`, `.claude/mockups/`, `.claude/rules/`, `.claude/.vco-manifest.json`,
+  `.claude/metrics/`, `.claude/settings.json.bak-*`, `.vct/`,
+  `.vct-orchestrator-dev`, `.vscode/tasks.json`, `knowledge/{inbox,daily,_drafts}/`).
+- `tools/install-vco-dev-pre-push-guard.{sh,ps1}` provides a re-installable
+  pre-push hook for private operational VCO checkouts that refuses pushes
+  to the public-repo remote.
+
+### Misc
+
+- `vct-module.json` hook count corrected: 27 → 31 (matches actual
+  `templates/hooks/*.sh` count).
+
 ## [0.2.49] - 2026-06-08
 
 The largest single-tag release to date — a 28-item access-matrix

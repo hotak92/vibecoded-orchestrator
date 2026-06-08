@@ -1072,9 +1072,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Determine version from Cargo.toml (same source as release.yml build job).
-          version="$(grep -m1 '^version = ' launcher/src-tauri/Cargo.toml \
-            | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+          # v0.2.50 fix: read version from the tag being released (GITHUB_REF), not from main's Cargo.toml.
+          # When the release is tagged from a feature branch that hasn't merged to main yet, the Cargo.toml
+          # on main is at the PREVIOUS version, which would cause the commit message to mislabel the binaries.
+          # See knowledge/concepts/release-workflow-version-from-tag-not-main.md for the v0.2.49 incident.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              version="${GITHUB_REF#refs/tags/v}"
+              echo "Resolved version from tag ref: $version"
+          else
+              # workflow_dispatch fallback: read from main's Cargo.toml
+              version="$(grep -m1 '^version = ' launcher/src-tauri/Cargo.toml \
+                | sed -E 's/^version *= *"([^"]+)".*/\1/')"
+              echo "Resolved version from main's Cargo.toml (workflow_dispatch fallback): $version"
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
           changed=0
