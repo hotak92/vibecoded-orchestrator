@@ -6941,6 +6941,179 @@ def _container_runtime_reachable(container_cmd: str) -> bool:
         return False
 
 
+def _try_start_podman_daemon() -> tuple[bool, str]:
+    """v0.2.51 Bug G: auto-start the Podman daemon on a binary-present-but-
+    daemon-stopped condition.
+
+    Per-OS recipes:
+      * Linux: ``systemctl --user start podman.socket`` (rootless). The
+        --user scope mirrors the standard rootless Podman setup. Falls
+        back to a no-op if systemctl is missing (e.g. distros without
+        systemd: musl-based minimal images, Alpine on bare metal).
+      * macOS: ``podman machine start``. Boots the QEMU VM that Podman
+        runs containers in. First-time users need ``podman machine init``
+        first — which we DON'T do automatically (downloads ~500 MB,
+        consents to disk space; out of scope for an auto-start helper).
+      * Windows: ``podman machine start``. Same as macOS (WSL2 VM).
+
+    Returns:
+        Tuple of ``(success, detail)``:
+          * ``success=True``: daemon is now responsive to ``podman info``.
+          * ``success=False``: start command failed or daemon never became
+            responsive within the timeout. ``detail`` carries the failure
+            reason (subprocess stderr or timeout description) for the
+            caller's deferral entry.
+
+    Soft-fails throughout: never raises. The 30-second
+    post-start probe gives the socket time to bind without making the
+    install hang indefinitely on a misconfigured machine.
+
+    Why explicit start instead of waiting for compose-up to fail:
+    compose-up's failure surface is a cryptic "Cannot connect to Podman
+    socket" stderr that takes 10-30s to manifest. Surfacing the start +
+    a clear deferral upfront saves 10-30s and gives the user an
+    actionable next step.
+    """
+    os_name = platform.system()
+
+    if not shutil.which("podman"):
+        return False, "podman binary not on PATH"
+
+    if os_name == "Linux":
+        if not shutil.which("systemctl"):
+            return False, "systemctl not on PATH (distro without systemd)"
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "start", "podman.socket"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, f"systemctl invocation failed: {e}"
+        if result.returncode != 0:
+            return False, (
+                f"systemctl --user start podman.socket exited "
+                f"{result.returncode}: {result.stderr.strip()[:200]}"
+            )
+    elif os_name in ("Darwin", "Windows"):
+        try:
+            result = subprocess.run(
+                ["podman", "machine", "start"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, f"podman machine start failed: {e}"
+        if result.returncode != 0:
+            stderr = result.stderr.strip()[:300]
+            # Common case: "VM does not exist" → user hasn't run
+            # `podman machine init` yet. Pass that hint to the deferral.
+            if "does not exist" in stderr.lower() or "init" in stderr.lower():
+                return False, (
+                    "podman machine not initialized — run `podman machine init` "
+                    f"first. (stderr: {stderr})"
+                )
+            return False, (
+                f"podman machine start exited {result.returncode}: {stderr}"
+            )
+    else:
+        return False, f"unsupported OS '{os_name}'"
+
+    # Post-start probe: give the socket time to bind. systemctl --user
+    # start returns immediately, but the socket may need a beat. Same
+    # for podman machine start (the VM boot completes async).
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if _container_runtime_reachable("podman"):
+            return True, "daemon responsive"
+        time.sleep(1.0)
+
+    return False, "podman daemon did not become responsive within 30s"
+
+
+def _emit_podman_daemon_start_failed_deferral(
+    deferral_report: Any,
+    *,
+    detail: str,
+) -> None:
+    """v0.2.51 Bug G: write a deferral when auto-start of the Podman daemon
+    fails.
+
+    Mirrors the shape of :func:`_emit_launcher_restart_deferral` and other
+    deferral emitters. The launcher GUI renders deferral entries as
+    sticky banners in its post-install summary; this entry is the user's
+    explicit signal that container setup cannot proceed until they start
+    the daemon manually.
+
+    Safe to call with ``deferral_report=None`` (no-op) so callers without
+    a report in scope don't have to wire one through.
+    """
+    if deferral_report is None:
+        return
+
+    os_name = platform.system()
+    if os_name == "Linux":
+        manual_cmd = (
+            "# Start the rootless Podman socket:\n"
+            "systemctl --user start podman.socket\n"
+            "# Verify it's responsive, then re-run:\n"
+            "podman info >/dev/null && python install.py --update"
+        )
+    elif os_name == "Darwin":
+        manual_cmd = (
+            "# First time: initialize the Podman VM (~500 MB download):\n"
+            "podman machine init\n"
+            "# Then start it (~20-30s):\n"
+            "podman machine start\n"
+            "# Verify, then re-run:\n"
+            "podman info >/dev/null && python install.py --update"
+        )
+    elif os_name == "Windows":
+        manual_cmd = (
+            "# Ensure WSL2 is installed first (one-time):\n"
+            "wsl --install\n"
+            "# First time: initialize the Podman machine:\n"
+            "podman machine init\n"
+            "# Then start it:\n"
+            "podman machine start\n"
+            "# Verify, then re-run:\n"
+            "podman info; python install.py --update"
+        )
+    else:
+        manual_cmd = (
+            "# Start the Podman daemon for your platform, then re-run:\n"
+            "podman info && python install.py --update"
+        )
+
+    try:
+        entry = DeferralEntry(
+            condition_id="podman_daemon_start_failed",
+            title="Podman daemon could not be started automatically",
+            detected=(
+                f"install.py attempted to auto-start the Podman daemon "
+                f"(per-OS recipe — systemctl --user start podman.socket on "
+                f"Linux; podman machine start on macOS/Windows) but the "
+                f"start command failed or the daemon never became "
+                f"responsive. Detail: {detail}"
+            ),
+            why_deferred=(
+                "Starting the Podman daemon requires either systemd-user "
+                "(Linux) or an initialized podman machine (macOS/Windows). "
+                "install.py won't run podman machine init unattended "
+                "because it downloads a multi-hundred-MB VM image and the "
+                "user should consent to the disk usage. After manual "
+                "intervention, re-run install.py to complete container setup."
+            ),
+            command_to_apply=manual_cmd,
+            severity="warning",
+            kg_node_refs=[],
+        )
+        deferral_report.add_entry(entry)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "container_runtime", "warn",
+            f"could not emit podman_daemon_start_failed deferral: {exc}",
+        )
+
+
 def _detect_installed_runtime() -> str:
     """Lightweight presence check — returns the FIRST container-runtime
     binary on PATH regardless of whether its daemon is running.
@@ -10306,24 +10479,59 @@ def _start_services(
     # we surface the actionable hint upfront with the OS-correct
     # recovery command, saving 10-30s and giving the user a clearer
     # signal.
+    #
+    # v0.2.51 Bug G: for Podman, ATTEMPT to start the daemon before
+    # giving up. systemctl --user start podman.socket on Linux is safe
+    # to call on a healthy machine (no-op if already started) and
+    # eliminates the most common "binary present but daemon stopped"
+    # failure mode. On macOS/Windows we try `podman machine start` — if
+    # the VM hasn't been initialized yet (first-time user), we emit a
+    # deferral with the manual `podman machine init` recipe rather than
+    # auto-downloading a multi-hundred-MB VM image unattended.
+    # Docker daemon start is NOT automated here — Docker Desktop on
+    # macOS/Windows requires GUI interaction; `sudo systemctl start
+    # docker` on Linux needs sudo+interactive password, which we don't
+    # shoulder for a non-blocking pre-flight check.
     if not _container_runtime_reachable(sysinfo.container_cmd):
-        print(
-            f"  [!] {sysinfo.container_cmd} is installed but its daemon/socket\n"
-            f"      isn't responding to `{sysinfo.container_cmd} info`. The compose-up\n"
-            f"      below will fail. Most common fixes:"
-        )
-        if sysinfo.container_cmd == "docker":
-            print("        Linux:   sudo systemctl start docker")
-            print("        macOS:   open Docker Desktop and wait for it to start")
-            print("        Windows: start Docker Desktop")
+        if sysinfo.container_cmd == "podman":
+            print(
+                "  [!] podman is installed but its daemon/socket isn't "
+                "responding to `podman info`. Attempting auto-start..."
+            )
+            ok, detail = _try_start_podman_daemon()
+            if ok:
+                print("      [OK] Podman daemon is now responsive.")
+            else:
+                print(f"      [!] Auto-start failed: {detail}")
+                _emit_podman_daemon_start_failed_deferral(
+                    deferral_report, detail=detail,
+                )
+                print(
+                    "      A deferral entry has been written to "
+                    "UPDATE_DEFERRED.md with the manual recovery recipe."
+                )
+                print(
+                    "      compose-up below may fail; re-run install.py "
+                    "after starting the daemon manually."
+                )
         else:
-            print("        Linux:   systemctl --user start podman.socket")
-            print("        macOS:   podman machine start")
-            print("        Windows: podman machine start")
-        print(
-            "      Re-run install.py once the runtime is reachable. (Skipping the\n"
-            "      compose-up below would leave the install in a partial state.)"
-        )
+            print(
+                f"  [!] {sysinfo.container_cmd} is installed but its daemon/socket\n"
+                f"      isn't responding to `{sysinfo.container_cmd} info`. The compose-up\n"
+                f"      below will fail. Most common fixes:"
+            )
+            if sysinfo.container_cmd == "docker":
+                print("        Linux:   sudo systemctl start docker")
+                print("        macOS:   open Docker Desktop and wait for it to start")
+                print("        Windows: start Docker Desktop")
+            else:
+                print("        Linux:   systemctl --user start podman.socket")
+                print("        macOS:   podman machine start")
+                print("        Windows: podman machine start")
+            print(
+                "      Re-run install.py once the runtime is reachable. (Skipping the\n"
+                "      compose-up below would leave the install in a partial state.)"
+            )
 
     compose_cmd = _get_compose_command(sysinfo.container_cmd)
 
@@ -21898,14 +22106,24 @@ def _find_npx() -> Optional[str]:
 
     Returns the absolute path to the npx binary, or None if truly absent.
 
-    Strategy:
+    Strategy (each candidate gets the .cmd / .ps1 Windows variants too):
       1. ``shutil.which("npx")`` — the common case (npx is on PATH).
-      2. Probe ``dirname(realpath(which("npm")))/npx`` — covers fnm/nvm
-         setups where the user has hand-symlinked just `npm` to a PATH
-         directory but left `npx` next to the REAL `npm` in the version
-         manager's bin dir. Same dir on every Node release since 2017.
-      3. On Windows, also probe `.cmd` and `.ps1` siblings since the npm
-         shim itself is `npm.cmd` and `npx` matches that convention.
+      2. ``dirname(which("npm"))/npx`` — sibling of the symlink target
+         (covers the case where the user symlinked `npm` to ~/.local/bin/
+         but the same dir also has `npx` as a sibling — common on apt /
+         brew where both ship together).
+      3. ``dirname(realpath(which("npm")))/npx`` — sibling of the REAL
+         npm. For fnm/nvm this lands in
+         ``lib/node_modules/npm/bin/`` because npm itself is a symlink
+         to ``npm-cli.js`` in that dir. The npx shim there is sometimes
+         a broken-without-context cli (it imports node modules
+         relatively); we probe it but it's not always runnable on its
+         own.
+      4. Climb up from the realpath: if real npm lives at
+         ``<root>/lib/node_modules/npm/bin/npm-cli.js``, probe
+         ``<root>/bin/npx`` — the canonical fnm/nvm shim that wraps
+         node + npx-cli.js with the right argv. This is the path that
+         works at runtime on real fnm/nvm setups.
 
     Cross-OS:
       * POSIX: ``os.access(path, os.X_OK)`` confirms executability.
@@ -21922,15 +22140,56 @@ def _find_npx() -> Optional[str]:
     npm = shutil.which("npm")
     if not npm:
         return None
-    try:
-        real_npm = Path(npm).resolve()
-    except OSError:
-        return None
     is_windows = sys.platform == "win32"
-    candidates: list[Path] = [real_npm.parent / "npx"]
-    if is_windows:
-        candidates.append(real_npm.parent / "npx.cmd")
-        candidates.append(real_npm.parent / "npx.ps1")
+
+    # Build candidate base directories. Order matters: prefer the
+    # canonical fnm/nvm shim (case 4) over the broken-on-its-own
+    # ``lib/node_modules/npm/bin/npx`` (case 3) because the former
+    # actually runs.
+    npm_path = Path(npm)
+    candidate_dirs: list[Path] = []
+
+    # Case 2: sibling of the symlink itself (apt / brew layout).
+    candidate_dirs.append(npm_path.parent)
+
+    # Case 4: canonical fnm/nvm installation/bin/ — derive from the real
+    # npm path by climbing out of lib/node_modules/npm/bin.
+    try:
+        real_npm = npm_path.resolve()
+    except OSError:
+        real_npm = None
+    if real_npm is not None:
+        # Look for the well-known lib/node_modules/npm/bin marker and
+        # climb to the installation/bin sibling.
+        parts = real_npm.parts
+        try:
+            idx = parts.index("node_modules")
+            # Need at least 3 levels above node_modules to find install root:
+            #   <root>/lib/node_modules/npm/bin/npm-cli.js
+            # We expect parts[idx-1] == "lib"; climb to parts[:idx-1] / "bin".
+            if idx >= 2 and parts[idx - 1] == "lib":
+                install_root = Path(*parts[:idx - 1])
+                candidate_dirs.append(install_root / "bin")
+        except ValueError:
+            pass
+
+        # Case 3: sibling of the real npm-cli.js. Lower priority because
+        # this shim sometimes doesn't run standalone, but it's the right
+        # answer for distros that ship `npm` as a bare executable
+        # (not the *-cli.js JavaScript shape).
+        candidate_dirs.append(real_npm.parent)
+
+    # Build final candidate list (with platform-specific suffixes).
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for d in candidate_dirs:
+        for name in ("npx", "npx.cmd", "npx.ps1") if is_windows else ("npx",):
+            cand = d / name
+            if cand in seen:
+                continue
+            seen.add(cand)
+            candidates.append(cand)
+
     for cand in candidates:
         try:
             if cand.is_file() and (is_windows or os.access(cand, os.X_OK)):
