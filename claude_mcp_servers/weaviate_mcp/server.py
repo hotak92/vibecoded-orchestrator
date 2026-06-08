@@ -561,14 +561,16 @@ def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
         port = os.environ.get("VCT_HUB_PORT")
         if not port:
             try:
-                port = open(os.path.join(state_dir, "hub.port"), encoding="utf-8").read().strip()
+                with open(os.path.join(state_dir, "hub.port"), encoding="utf-8") as fh:
+                    port = fh.read().strip()
             except OSError:
                 port = "7700"
 
         token = os.environ.get("VCT_HUB_TOKEN")
         if not token:
             try:
-                token = open(os.path.join(state_dir, "hub.token"), encoding="utf-8").read().strip()
+                with open(os.path.join(state_dir, "hub.token"), encoding="utf-8") as fh:
+                    token = fh.read().strip()
             except OSError:
                 return []  # no token → can't query
 
