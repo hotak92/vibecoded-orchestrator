@@ -213,7 +213,7 @@ Disable the LS license in the LS dashboard. The validator re-checks within 24 ho
 `LS_ADMIN_TEST_LICENSE` GitHub Actions secret holds a real LS test-mode admin key. Tests run against the live `validate-tier` endpoint (test-mode recognizes test keys). One code path, exercised in both prod and CI. Path A is exercised by the pure-function Deno test suite (`variant_map_test.ts`) — no live Supabase project required because lookup is pure given the JSON input.
 
 ### Tier Cache (Launcher)
-`launcher/src-tauri/src/db/migrations/005_tier_cache_admin.sql` extends the SQLite CHECK constraint on `tier_cache.tier` to include `'admin'` so the Rust launcher can persist admin tier responses from either path (the wire response is identical). → See also [01-launcher.md](01-launcher.md#tier-cache-offline-safe-3-day-grace).
+`launcher/src-tauri/vct-launcher-core/src/db/migrations/005_tier_cache_admin.sql` extends the SQLite CHECK constraint on `tier_cache.tier` to include `'admin'` so the Rust launcher can persist admin tier responses from either path (the wire response is identical). → See also [01-launcher.md](01-launcher.md#tier-cache-offline-safe-3-day-grace).
 
 ---
 
@@ -312,7 +312,7 @@ Enforced by the collection layer; the queue schema stores only what the `collect
 Scans staged files (or full tracked tree with `--all`) for blocklisted token patterns. Exits non-zero with instructions. Wire as a pre-commit hook via `ln -sf ../../scripts/check-no-secrets.sh .git/hooks/pre-commit`.
 
 ### Env scrubbing in hooks
-All 23 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
+All 31 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS credentials, `TELEGRAM_BOT_TOKEN`, etc. before spawning subprocesses. See `SECURITY.md`.
 
 ### Supabase key rotation runbook
 Secrets rotation runbook (maintainer docs): (1) Roll key in Supabase dashboard, (2) write to `~/.vct-secrets/shared/supabase_token`, (3) `supabase secrets set`, (4) update Vercel env, (5) restart local services. Old key valid ~24 h (zero-downtime window).
