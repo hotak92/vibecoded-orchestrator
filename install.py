@@ -3105,6 +3105,63 @@ _MAIN_ENTRY_LOCK_HELD: bool = False
 _MAIN_ENTRY_LOCK_HANDLE = None  # kept alive for process lifetime
 
 
+def _release_main_entry_lock_atexit() -> None:
+    """v0.2.51 Bug F: close the singleton-lock file cleanly at exit.
+
+    Without this, Python emits a noisy ``ResourceWarning: unclosed file
+    <_io.BufferedRandom name='/.../install.py.lock'>`` to stderr every
+    time install.py exits — the lock handle is intentionally kept open
+    for the process lifetime, but the interpreter's GC-on-shutdown sees
+    an unreleased file and warns.
+
+    Behaviour:
+      - Releases the OS-level lock (fcntl.LOCK_UN on POSIX,
+        msvcrt.LK_UNLCK on Windows). The process is about to exit so the
+        OS would do this anyway, but doing it explicitly silences any
+        late-stage warnings from the lock subsystem.
+      - Closes the file handle. Suppresses every conceivable error —
+        atexit handlers MUST NOT raise; raising here would mask the
+        actual reason the process is exiting (could be normal exit, SIGINT,
+        unhandled exception during install).
+      - Idempotent: safe to call even if the handle is None or already
+        closed (the lock was never acquired, or it was released earlier).
+
+    Registered once at module import via :func:`atexit.register`. Pairs
+    with :func:`_install_singleton_lock_or_die` which opens the handle
+    and stores it in ``_MAIN_ENTRY_LOCK_HANDLE``.
+    """
+    global _MAIN_ENTRY_LOCK_HANDLE
+    fp = _MAIN_ENTRY_LOCK_HANDLE
+    if fp is None:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            try:
+                fp.seek(0)
+                msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    except Exception:
+        # Soft-fail by design. atexit handlers must not raise.
+        pass
+    try:
+        fp.close()
+    except Exception:
+        pass
+    _MAIN_ENTRY_LOCK_HANDLE = None
+
+
+import atexit as _atexit
+_atexit.register(_release_main_entry_lock_atexit)
+
+
 def _install_singleton_lock_or_die(timeout_seconds: float = 15.0):
     """v0.2.49: acquire the install.py main-entry single-instance lock.
 
