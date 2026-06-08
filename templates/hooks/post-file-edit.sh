@@ -70,11 +70,59 @@ except Exception:
 
 [ -z "$EDITED_FILE" ] && exit 0
 
+# v0.2.49 Phase 8 (item #22): access-matrix gate for KG writes.
+#
+# Before kicking off any kg-sync subprocess, check if this project has
+# write access to the target collection. The check is fail-open: if the
+# hub is unreachable / the project isn't registered / the response is
+# malformed, the gate returns "write" + emits a WARNING + logs a
+# dropped-write-metric row, then the sync proceeds. This is DELIBERATE
+# (closed-circuit would brick all KG writes during launcher restart).
+#
+# When the gate returns "read" or "none", we SKIP the sync silently +
+# the user gets the WARNING from the resolver client about the deny.
+#
+# The resolver script lives at templates/scripts/vct_access_check.sh
+# (orchestrator-root) and is byte-identical to .claude/scripts/
+# vct_access_check.sh in user projects (template-drift gate enforces).
+_kg_write_allowed() {
+    local proj="${1:-}"
+    local coll="${2:-}"
+    [ -z "$proj" ] && return 0   # no project context → allow (legacy path)
+    [ -z "$coll" ] && return 0   # no collection context → allow
+    local checker=""
+    if [ -x "$PROJECT_ROOT/templates/scripts/vct_access_check.sh" ]; then
+        checker="$PROJECT_ROOT/templates/scripts/vct_access_check.sh"
+    elif [ -x "$PROJECT_ROOT/.claude/scripts/vct_access_check.sh" ]; then
+        checker="$PROJECT_ROOT/.claude/scripts/vct_access_check.sh"
+    else
+        # Resolver not on disk → allow (pre-v0.2.49 install, or
+        # post-update where the script hasn't been bundled yet).
+        return 0
+    fi
+    local level
+    level=$("$checker" "$proj" "$coll" 2>/dev/null || echo "write")
+    [ "$level" = "write" ]
+}
+
+# Resolve project_id once for the access checks below.
+VCT_PROJECT_ID="${VCT_PROJECT_ID:-}"
+if [ -z "$VCT_PROJECT_ID" ] && [ -f "$PROJECT_ROOT/.claude/env" ]; then
+    # Best-effort grep for VCT_PROJECT_ID=… in .claude/env (sourced
+    # form, not as a bash source — we don't want to inherit other env).
+    VCT_PROJECT_ID=$(grep -E '^[[:space:]]*VCT_PROJECT_ID=' "$PROJECT_ROOT/.claude/env" 2>/dev/null \
+        | head -1 | sed -E 's/^[[:space:]]*VCT_PROJECT_ID=//; s/^"//; s/"$//')
+fi
+
 # 1. Auto-sync knowledge graph files (background side-effect).
 if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
     REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
     cd "$PROJECT_ROOT"
-    .claude/scripts/kg-sync "$REL_PATH" &
+    # v0.2.49 Phase 8: gate the sync on access-matrix write permission.
+    # KG_COLLECTION is the target Weaviate class for primary-KG writes.
+    if _kg_write_allowed "$VCT_PROJECT_ID" "${KG_COLLECTION:-}"; then
+        .claude/scripts/kg-sync "$REL_PATH" &
+    fi
 
     EDIT_COUNT_FILE="$PROJECT_ROOT/.claude/logs/.kg_edit_count"
     mkdir -p "$PROJECT_ROOT/.claude/logs"
@@ -97,7 +145,11 @@ DOCS_DIR="$PROJECT_ROOT/docs"
 if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
     cd "$PROJECT_ROOT"
-    .claude/scripts/kg-sync "$REL_PATH" &
+    # v0.2.49 Phase 8: gate docs sync on access-matrix write permission
+    # against DEVELOPMENT_COLLECTION (the docs/ target).
+    if _kg_write_allowed "$VCT_PROJECT_ID" "${DEVELOPMENT_COLLECTION:-}"; then
+        .claude/scripts/kg-sync "$REL_PATH" &
+    fi
 fi
 
 # 2b. Auto-index diagrams (Phase 1.5 — Mermaid + Excalidraw).

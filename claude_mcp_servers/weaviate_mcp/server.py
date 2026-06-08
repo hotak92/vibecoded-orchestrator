@@ -5842,6 +5842,53 @@ async def store_knowledge_node(
                     "file_written": False,
                 }, indent=2)
 
+        # v0.2.49 Phase 8 (item #21): access-matrix write gate.
+        #
+        # Consults the launcher's vct-hub for the project's access level
+        # on `target_collection_name`. Fail-open: hub unreachable / 404 /
+        # malformed → resolver returns "write" + emits WARNING + logs
+        # dropped-write metric. Only "read" or "none" actually blocks the
+        # write here.
+        #
+        # The asymmetric SHARED_KG_WRITE_DISABLED gate above remains the
+        # PER-PROJECT-OVERRIDE for shared writes; this matrix gate is the
+        # FINE-GRAINED per-(project, collection) policy. They compose:
+        # SHARED_KG_WRITE_DISABLED fires first (coarse opt-out), then the
+        # matrix check fires for everything else (per-collection write
+        # permission per the launcher's GUI access matrix).
+        try:
+            from vco_lib.access_resolver import check_access_level
+            project_id_for_gate = os.environ.get("VCT_PROJECT_ID", "")
+            if project_id_for_gate:
+                matrix_level = check_access_level(project_id_for_gate, target_collection_name)
+                if matrix_level != "write":
+                    return json.dumps({
+                        "status": "error",
+                        "error": (
+                            f"Access matrix denies write on '{target_collection_name}' "
+                            f"(level={matrix_level}). Adjust via launcher GUI → "
+                            f"Identity → Manage access, or set the project's row to "
+                            f"'write' for this collection."
+                        ),
+                        "target_collection": target_collection_name,
+                        "matrix_level": matrix_level,
+                        "scope": scope,
+                        "file_written": False,
+                    }, indent=2)
+        except ImportError:
+            # vco_lib.access_resolver not on path → MCP server is running
+            # against a pre-v0.2.49 install. Skip the gate (fail-open at
+            # the import level, mirroring the resolver's own fail-open
+            # contract). The user gets the legacy "matrix is read-only"
+            # behavior.
+            pass
+        except Exception as gate_exc:
+            # Defensive: if the gate itself crashes, fall through and let
+            # the write proceed. The resolver's fail-open contract should
+            # already cover the common cases (hub unreachable etc.); this
+            # only catches bugs IN the resolver.
+            logger.warning(f"access matrix gate crashed; falling open: {gate_exc}")
+
         collection = client.collections.get(target_collection_name)
 
         # --- Auto-correct file_path before anything else -------------------------
