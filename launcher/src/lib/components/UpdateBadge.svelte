@@ -33,9 +33,28 @@
 
   // v0.2.16 (W4 / 0.5): copy + action per kind. Drives both popover
   // header text and primary button label/handler.
+  // v0.2.51 (Bug A): added 'merge_resolved_incomplete' kind — highest
+  // priority. Calls the new `resume_orchestrator_update` Tauri command
+  // via `updater.resumeUpdate()`.
   const kindCopy = $derived.by(() => {
     const us = orchState.updateStatus;
     switch (upd.kind) {
+      case 'merge_resolved_incomplete': {
+        const op = us?.resume_operation || 'update';
+        const branch = us?.resume_branch || 'main';
+        return {
+          title: 'Continue Update',
+          desc:
+            `A previous orchestrator ${op} on \`${branch}\` was halted at a ` +
+            `conflict and resolved outside the launcher. The source is merged ` +
+            `but \`install.py --update\` and the binary refresh never ran — ` +
+            `last_installed_version is still v${us?.installed_version || '?'} ` +
+            `while source is v${us?.source_version || '?'}. Click Continue ` +
+            `Update to finish the install.`,
+          buttonLabel: 'Continue Update',
+          actionKey: 'resume' as const,
+        };
+      }
       case 'binary_stale':
         return {
           title: 'Restart Launcher',
@@ -68,7 +87,7 @@
           title: 'Up to date',
           desc: 'No pending updates detected.',
           buttonLabel: '',
-          actionKey: null as null | 'restart' | 'install' | 'fetch_install',
+          actionKey: null as null | 'restart' | 'install' | 'fetch_install' | 'resume',
         };
     }
   });
@@ -122,6 +141,12 @@
       case 'fetch_install':
         await updater.runUpdate();
         break;
+      case 'resume':
+        // v0.2.51 Bug A: re-enter the post-merge tail of update_orchestrator
+        // (install.py --update + binary refresh + auto-restart). The Rust
+        // command audit-logs and refuses if conflict markers still present.
+        await updater.resumeUpdate();
+        break;
     }
   }
 
@@ -153,6 +178,7 @@
     <button
       class="update-trigger"
       class:updating={upd.updating}
+      class:kind-resume={upd.kind === 'merge_resolved_incomplete'}
       class:kind-binary={upd.kind === 'binary_stale'}
       class:kind-install={upd.kind === 'install_stale'}
       class:kind-remote={upd.kind === 'remote_ahead'}
@@ -237,6 +263,29 @@
   .update-trigger.kind-binary:hover {
     background: rgba(255, 79, 160, 0.08);
     border-color: rgba(255, 79, 160, 0.7);
+  }
+  /* v0.2.51 Bug A: merge_resolved_incomplete uses purple — distinct from
+     binary_stale's pink (= "restart") and the default teal (= "available")
+     so the user can tell at a glance "this is the conflict-recovery one,
+     not the routine update one". */
+  .update-trigger.kind-resume {
+    border-color: rgba(123, 95, 255, 0.55);
+    color: var(--color-purple, #7b5fff);
+    /* Subtle pulse animation to draw the eye — this state is rarely
+       expected and easy to miss otherwise. */
+    animation: resume-pulse 2.4s ease-in-out infinite;
+  }
+  .update-trigger.kind-resume:hover {
+    background: rgba(123, 95, 255, 0.1);
+    border-color: rgba(123, 95, 255, 0.75);
+  }
+  @keyframes resume-pulse {
+    0%, 100% {
+      box-shadow: 0 0 0 0 rgba(123, 95, 255, 0.35);
+    }
+    50% {
+      box-shadow: 0 0 0 6px rgba(123, 95, 255, 0);
+    }
   }
 
   @keyframes spin {
