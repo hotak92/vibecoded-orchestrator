@@ -37,6 +37,7 @@
     ProjectStateSnapshot,
   } from '$lib/types/project-state';
   import type { ProjectView } from '$lib/types/launcher';
+  import { buildOwnAccessPayload } from './cross-project-access-payloads';
 
   let { projectId }: { projectId: string } = $props();
 
@@ -138,46 +139,57 @@
   // ─── KG collection access change ─────────────────────────────────
   //
   // The backend exposes `kg_set_collection_access_mode` (mode-based, fans
-  // out to every project's row). For the SINGLE-row case the per-project
-  // tab really wants ("set MY access to this collection to read|write|none"),
-  // we model it as a 'private' (only this project gets the level) flip:
-  // owner_project_id = this project, mode = 'private' means "only owner
-  // has access, everyone else gets 'none'". That's the right semantic
-  // when we control the collection (e.g. this project's own KG); for
-  // collections owned by other projects we use the per-row primitive
-  // (kg_set_access) — exposed below.
+  // out to every project's row). v0.2.49 access-matrix Phase 5 item #14
+  // (F-2b) extended the mode set with a fourth value, `'none'`, so the
+  // GUI's "Remove access" button can revoke the project's OWN access
+  // without round-tripping through `'private'` + a follow-up. The two
+  // mutator paths this dropdown drives now map cleanly:
   //
-  // Defensive read: kg_set_collection_access_mode rewrites EVERY project's
-  // row for the collection, which is too coarse for this tab's "edit my
-  // own access" use case. Instead we toggle just this project's row by
-  // round-tripping the OWN-collection bound: ON for the current project,
-  // OFF for "none". We do that by writing a tiny inline command — but
-  // the existing register table only has the mode setter. So PR-8 uses
-  // the mode setter restricted to mode='private' (owner = current project,
-  // project_ids = []) to express "only this project has access at the
-  // chosen level", with the level coming from a manual edit of the
-  // collection's row level afterwards.
+  //   - "Grant write" (from current state `none`)  → mode='private'
+  //     Owner gets write; every peer that is NOT user-configured gets
+  //     `none`. User-configured peer rows are preserved (item #15 /
+  //     F-2c invariant).
+  //   - "Remove access" (from current state `read|write`) → mode='none'
+  //     Owner gets `none` (cuts hooks + MCP read path on its own KG);
+  //     every peer that is NOT user-configured gets `none` too.
+  //     User-configured peer rows are preserved.
   //
-  // For UX simplicity, we surface the level as a read/write/none dropdown
-  // that flips THIS project's `kg_collection_access` row directly via the
-  // existing mode-set machinery. To avoid fanning out to every project
-  // we treat it as a single-row edit: send mode='private', owner=this
-  // project, then override level via a follow-up call to the per-row
-  // primitive — but that primitive is not exposed as a Tauri command (see
-  // lib.rs comment). So we keep things honest: this dropdown switches
-  // between "private" (owner gets access) and "none" (owner explicitly
-  // denied). Read vs write is encoded in the owner-row level which
-  // mode-set always writes as "write". To get "read" on the owner row,
-  // user goes through the regular KG dashboard's per-collection sharing
-  // controls — which is the established flow today.
+  // The structural-row guard in `kg_set_collection_access_mode` still
+  // refuses to flip the orchestrator-root project's primary collection
+  // away from `shared` — those modes would break the install.
   //
-  // PR-8 is GUI plumbing for the CROSS-project access model; per-collection
-  // owner level remains the KG dashboard's job. We surface the current
-  // owner-level here read-only so the user knows where to look.
+  // ──────────────────────────────────────────────────────────────────
+  //
+  // v0.2.49 access-matrix Phase 5 item #18 — orthogonality with Stream B:
+  //
+  // This surface (cross-project KG access matrix) is INDEPENDENT of the
+  // per-project module-enable toggle that Stream B owns. The two are
+  // distinct gates layered on top of a single global module install:
+  //
+  //   - `project_modules.enabled` (Stream B's per-project toggle, set
+  //     via `set_project_module_enabled` Tauri command from the
+  //     project's Modules tab): turns the module's hooks/agents/skills
+  //     on or off for THIS project. When the flag is FALSE the module
+  //     is invisible to this project even though it's installed
+  //     globally.
+  //   - `kg_collection_access` (THIS surface, set via
+  //     `kg_set_collection_access_mode`): independently of whether
+  //     any module is enabled, controls which projects can read/write
+  //     which Weaviate KG collections. The launcher's KG MCP and
+  //     hooks consult this matrix on every call.
+  //
+  // The two gates can hold any combination of states. Disabling a
+  // module on this project does NOT touch its access-matrix rows;
+  // revoking access on a collection does NOT disable any module. The
+  // gates are AND-ed at the consumer site (e.g. a hook needs BOTH the
+  // module-enabled flag AND read access on the target collection to
+  // fire), which lets a user disable a module without losing the
+  // access state they may want to re-apply later — and vice versa.
   async function setOwnAccess(name: string, mode: 'private' | 'none') {
-    // 'private' = current project gets write; everyone else 'none'.
-    // 'none' = current project explicitly 'none' (cuts launcher's own
-    //          MCP server's read path; rare but supported).
+    // 'private' = current project gets write; peers default to 'none'
+    //             (subject to is_user_configured() preservation).
+    // 'none'    = current project explicitly 'none' (cuts launcher's own
+    //             hooks + MCP read path).
     if (mode === 'none') {
       const ok = confirm(
         `Set access to '${name}' to 'none' for this project? \n\n` +
@@ -186,17 +198,15 @@
       if (!ok) return;
     }
     try {
+      // v0.2.49 Phase 5 item #14 (F-2b): pass the user-selected mode
+      // through directly instead of the pre-v0.2.49 dead ternary
+      // `mode === 'private' ? 'private' : 'private'` which always
+      // resolved to 'private' and made "Remove access" a no-op. The
+      // payload-build lives in a pure helper so vitest can pin the
+      // shape without needing a DOM.
       await invoke('kg_set_collection_access_mode', {
-        req: {
-          owner_project_id: projectId,
-          collection: name,
-          mode: mode === 'private' ? 'private' : 'private',
-          project_ids: [],
-        },
+        req: buildOwnAccessPayload(projectId, name, mode),
       });
-      // For 'none' we need a follow-up — but per-row primitive isn't
-      // wired as a Tauri command. So we just refresh and let the user
-      // see whichever row the mode-setter produced.
       toast.success(`Access updated for ${name}`);
       await loadKg();
     } catch (e) {
@@ -379,10 +389,16 @@
         </tbody>
       </table>
       <p class="ps-hint">
-        The launcher's KG MCP server respects these levels — a collection at
-        <code>none</code> returns no results for this project even if Weaviate
-        still has the data. Default for a project's own KG is <code>write</code>;
-        default for the shared cross-project KG is <code>read</code>.
+        Three levels are enforced by the launcher (not by Weaviate):
+        <code>write</code> grants this project full read+write,
+        <code>read</code> grants read-only, and <code>none</code> denies
+        the collection entirely — the KG MCP server and hooks return
+        no results for this project even when Weaviate still has the
+        data. v0.2.49 default: a project's own primary + shared
+        bindings default to <code>write</code>; every other collection
+        defaults to <code>none</code> until you grant access. Use
+        <a href="/kg" class="ps-link">KG dashboard</a> for granular
+        per-collection sharing across projects.
       </p>
     {/if}
   </div>

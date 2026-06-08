@@ -564,23 +564,70 @@ impl Db {
         }
     }
 
+    /// v0.2.49 access-matrix Phase 5 item #16 (M-1): VCO-managed
+    /// collection-name predicate. Returns true when the collection name
+    /// matches one of the orchestrator's well-known suffix patterns
+    /// (per-project KG + Development + Diagrams + the five code-graph
+    /// entity classes).
+    ///
+    /// Used by `reconcile_kg_collection_access` to scope the orphan-drop
+    /// loop: a row is only a candidate for dropping when its collection
+    /// name is either named by an active binding OR matches a VCO
+    /// suffix. Names that don't match (user-created Weaviate classes
+    /// for their own experiments, classes belonging to other tools that
+    /// happen to share the Weaviate instance, etc.) MUST be preserved
+    /// unconditionally — they're outside VCO's stewardship.
+    ///
+    /// Suffix list mirrors the schema-creation paths in
+    /// `vco_lib/weaviate_schema.py`: per-project bindings produce
+    /// `<Prefix>_KnowledgeGraph` + `<Prefix>_Development` +
+    /// `<Prefix>_Diagrams`, while code-graph analysis produces the five
+    /// `<Prefix>_Code{Module,Class,Function,API,Interaction}` classes.
+    /// Bare-name code classes (`CodeFunction` etc.) are intentionally
+    /// NOT matched here — those are legacy pre-multi-project data and
+    /// dropping their access rows could surprise a user who's still
+    /// keeping them around for migration.
+    fn is_vco_managed_collection_name(name: &str) -> bool {
+        const VCO_SUFFIXES: &[&str] = &[
+            "_KnowledgeGraph",
+            "_Development",
+            "_Diagrams",
+            "_CodeModule",
+            "_CodeClass",
+            "_CodeFunction",
+            "_CodeAPI",
+            "_CodeInteraction",
+        ];
+        VCO_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
+    }
+
     /// v0.2.46 Decision A/B/C cousin — boot-time reconciliation of
     /// `kg_collection_access` against current binding rows + Weaviate
     /// schema.
     ///
-    /// For each access-matrix row, drop it iff BOTH:
+    /// **v0.2.49 access-matrix Phase 5 item #16 (M-1)**: the orphan-drop
+    /// loop is scoped to VCO-managed collections only. A row is dropped
+    /// iff ALL three hold:
     /// 1. The collection name doesn't appear as a `collection_name` in
     ///    ANY `project_kg_bindings` row for ANY project on this machine
     ///    (= no binding owns it), AND
     /// 2. The collection name doesn't appear in `existing_classes` (=
-    ///    Weaviate doesn't have it either).
+    ///    Weaviate doesn't have it either), AND
+    /// 3. The collection name matches a VCO-managed suffix pattern
+    ///    (`_KnowledgeGraph`, `_Development`, `_Diagrams`, or one of the
+    ///    five code-graph entity suffixes) — i.e. only VCO's own
+    ///    collections are subject to orphan-drop.
     ///
-    /// Preserves rows where EITHER condition holds:
+    /// Preserves rows where ANY condition fails:
     /// - The class exists in Weaviate but no local binding names it
     ///   (peer-access to a peer's collection; user may have manually
     ///   granted this via the access-matrix GUI).
     /// - A binding names the collection but Weaviate doesn't have it
     ///   yet (binding owns the lazy-create expectation).
+    /// - The collection name doesn't match a VCO-managed suffix —
+    ///   user's own Weaviate classes (their experiments, other tools'
+    ///   collections) are outside VCO's stewardship and MUST NOT be
+    ///   touched by boot reconcile. Item #16's invariant.
     ///
     /// Idempotent: a second call after a successful reconcile finds no
     /// rows matching the drop predicate.
@@ -628,7 +675,15 @@ impl Db {
         for (project_id, collection_name) in &access_rows {
             let has_binding = binding_collections.contains(collection_name);
             let has_class = existing_classes.contains(collection_name);
-            if !has_binding && !has_class {
+            // v0.2.49 Phase 5 item #16 (M-1): only orphan-drop rows
+            // whose collection name is VCO-managed. User-created
+            // classes that happen to have an access row (e.g. from a
+            // pre-v0.2.49 install that wrote a row before the scope
+            // tightened) are preserved unconditionally — orphan-drop
+            // is VCO's invariant maintenance, not user-collection
+            // garbage collection.
+            let is_vco_managed = Self::is_vco_managed_collection_name(collection_name);
+            if !has_binding && !has_class && is_vco_managed {
                 guard
                     .execute(
                         "DELETE FROM kg_collection_access
@@ -2307,6 +2362,12 @@ mod kg_access_propagation_tests {
     }
 
     // ─── reconcile_kg_collection_access (boot helper) ─────────────────
+    //
+    // v0.2.49 Phase 5 item #16 (M-1) update: the existing tests below
+    // use VCO-managed collection names (`*_KnowledgeGraph`) so the
+    // orphan-drop predicate matches. Tests for the M-1 scope-narrowing
+    // (drop ONLY VCO-managed names; preserve user-unrelated classes
+    // unconditionally) are added at the bottom of this module.
 
     /// reconcile drops rows whose `collection_name` doesn't match any
     /// binding for any project AND doesn't appear in the supplied
@@ -2318,13 +2379,13 @@ mod kg_access_propagation_tests {
         let db = Db::open_in_memory().unwrap();
         seed_project(&db, "p1");
         seed_project(&db, "p2");
-        // p1 owns Foo_KG (its binding); p2 grants read access on it.
+        // p1 owns Foo_KnowledgeGraph (its binding); p2 grants read access on it.
         let folder = format!("/tmp/test-kg-access/orphan");
         let _ = folder; // suppress unused
         db.set_project_kg_binding(
             "p1",
             "primary",
-            "Foo_KG",
+            "Foo_KnowledgeGraph",
             None,
             None,
             None,
@@ -2332,23 +2393,32 @@ mod kg_access_propagation_tests {
             &serde_json::Value::Null,
         )
         .unwrap();
-        db.kg_set_access("p1", "Foo_KG", "write").unwrap();
-        db.kg_set_access("p2", "Foo_KG", "read").unwrap();
+        db.kg_set_access("p1", "Foo_KnowledgeGraph", "write").unwrap();
+        db.kg_set_access("p2", "Foo_KnowledgeGraph", "read").unwrap();
         // p2 ALSO grants read on a stale name — no binding, no Weaviate class.
-        db.kg_set_access("p2", "StaleOrphan_KG", "read").unwrap();
+        // Name uses the `_KnowledgeGraph` suffix so M-1's VCO-managed
+        // predicate matches (item #16); user-unrelated names are
+        // exercised by `reconcile_preserves_user_unrelated_collections`.
+        db.kg_set_access("p2", "StaleOrphan_KnowledgeGraph", "read").unwrap();
 
-        // Pretend Weaviate has only Foo_KG (no StaleOrphan_KG).
+        // Pretend Weaviate has only Foo_KnowledgeGraph (no StaleOrphan).
         let existing: std::collections::HashSet<String> =
-            ["Foo_KG".to_string()].into_iter().collect();
+            ["Foo_KnowledgeGraph".to_string()].into_iter().collect();
 
         let dropped = db.reconcile_kg_collection_access(&existing).unwrap();
-        assert_eq!(dropped, 1, "must drop StaleOrphan_KG");
+        assert_eq!(dropped, 1, "must drop StaleOrphan_KnowledgeGraph");
 
         // Live rows preserved.
-        assert_eq!(read_access(&db, "p1", "Foo_KG"), Some("write".to_string()));
-        assert_eq!(read_access(&db, "p2", "Foo_KG"), Some("read".to_string()));
+        assert_eq!(
+            read_access(&db, "p1", "Foo_KnowledgeGraph"),
+            Some("write".to_string())
+        );
+        assert_eq!(
+            read_access(&db, "p2", "Foo_KnowledgeGraph"),
+            Some("read".to_string())
+        );
         // Orphan dropped.
-        assert_eq!(read_access(&db, "p2", "StaleOrphan_KG"), None);
+        assert_eq!(read_access(&db, "p2", "StaleOrphan_KnowledgeGraph"), None);
     }
 
     #[test]
@@ -2360,14 +2430,17 @@ mod kg_access_propagation_tests {
         // "drop everything without a binding".
         let db = Db::open_in_memory().unwrap();
         seed_project(&db, "p1");
-        db.kg_set_access("p1", "PeerOrch_KG", "read").unwrap();
+        db.kg_set_access("p1", "PeerOrch_KnowledgeGraph", "read").unwrap();
 
         let existing: std::collections::HashSet<String> =
-            ["PeerOrch_KG".to_string()].into_iter().collect();
+            ["PeerOrch_KnowledgeGraph".to_string()].into_iter().collect();
 
         let dropped = db.reconcile_kg_collection_access(&existing).unwrap();
         assert_eq!(dropped, 0);
-        assert_eq!(read_access(&db, "p1", "PeerOrch_KG"), Some("read".to_string()));
+        assert_eq!(
+            read_access(&db, "p1", "PeerOrch_KnowledgeGraph"),
+            Some("read".to_string())
+        );
     }
 
     #[test]
@@ -2380,7 +2453,7 @@ mod kg_access_propagation_tests {
         db.set_project_kg_binding(
             "p1",
             "primary",
-            "LazyClass_KG",
+            "LazyClass_KnowledgeGraph",
             None,
             None,
             None,
@@ -2388,21 +2461,24 @@ mod kg_access_propagation_tests {
             &serde_json::Value::Null,
         )
         .unwrap();
-        db.kg_set_access("p1", "LazyClass_KG", "write").unwrap();
+        db.kg_set_access("p1", "LazyClass_KnowledgeGraph", "write").unwrap();
 
         // Weaviate is empty.
         let existing: std::collections::HashSet<String> = Default::default();
 
         let dropped = db.reconcile_kg_collection_access(&existing).unwrap();
         assert_eq!(dropped, 0, "binding-named collection must NOT be dropped even when absent from Weaviate");
-        assert_eq!(read_access(&db, "p1", "LazyClass_KG"), Some("write".to_string()));
+        assert_eq!(
+            read_access(&db, "p1", "LazyClass_KnowledgeGraph"),
+            Some("write".to_string())
+        );
     }
 
     #[test]
     fn reconcile_idempotent_second_call_is_noop() {
         let db = Db::open_in_memory().unwrap();
         seed_project(&db, "p1");
-        db.kg_set_access("p1", "Orphan_KG", "read").unwrap();
+        db.kg_set_access("p1", "Orphan_KnowledgeGraph", "read").unwrap();
         let existing: std::collections::HashSet<String> = Default::default();
         assert_eq!(db.reconcile_kg_collection_access(&existing).unwrap(), 1);
         // Second call: orphan gone, no further work.
@@ -2414,6 +2490,102 @@ mod kg_access_propagation_tests {
         let db = Db::open_in_memory().unwrap();
         let existing: std::collections::HashSet<String> = Default::default();
         assert_eq!(db.reconcile_kg_collection_access(&existing).unwrap(), 0);
+    }
+
+    // ─── v0.2.49 Phase 5 item #16 (M-1): VCO-managed scope-narrowing ──
+    //
+    // The boot reconcile MUST NOT drop access rows for collections
+    // outside VCO's stewardship (user-created Weaviate classes, classes
+    // belonging to other tools that share the Weaviate instance). The
+    // scope is: collection names matching VCO suffix patterns ONLY.
+
+    /// All eight VCO suffix patterns must be subject to orphan-drop
+    /// when they're truly orphaned. This guards against a future
+    /// refactor that accidentally narrows the suffix list and leaves
+    /// real orphans behind.
+    #[test]
+    fn reconcile_drops_only_vco_managed_collections() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        // One orphan row per VCO-managed suffix.
+        let vco_managed_names = [
+            "Foo_KnowledgeGraph",
+            "Foo_Development",
+            "Foo_Diagrams",
+            "Foo_CodeModule",
+            "Foo_CodeClass",
+            "Foo_CodeFunction",
+            "Foo_CodeAPI",
+            "Foo_CodeInteraction",
+        ];
+        for name in &vco_managed_names {
+            db.kg_set_access("p1", name, "read").unwrap();
+        }
+
+        // Weaviate is empty + no bindings exist → every VCO-managed
+        // row is an orphan that the M-1 predicate matches.
+        let existing: std::collections::HashSet<String> = Default::default();
+        let dropped = db.reconcile_kg_collection_access(&existing).unwrap();
+        assert_eq!(
+            dropped,
+            vco_managed_names.len(),
+            "every VCO-managed orphan must be dropped",
+        );
+        for name in &vco_managed_names {
+            assert_eq!(
+                read_access(&db, "p1", name),
+                None,
+                "row '{}' must have been dropped",
+                name,
+            );
+        }
+    }
+
+    /// Rows pointing to collections OUTSIDE VCO's stewardship (the
+    /// user's own experiments, other tools' Weaviate classes) MUST be
+    /// preserved by boot reconcile — even when they're absent from
+    /// both Weaviate and the binding table. M-1's "VCO doesn't garbage-
+    /// collect user data" invariant.
+    #[test]
+    fn reconcile_preserves_user_unrelated_collections() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        // Names the user (or another tool) may have created that the
+        // launcher knows nothing about. None of these match a VCO
+        // suffix → none must be dropped.
+        let user_unrelated_names = [
+            "MyExperiment",
+            "Custom_Collection",
+            "OtherTool_Data",
+            "PostgresMigration",
+            "TestCollection123",
+            "Foo_Bar",  // ends with _Bar, not a VCO suffix
+            "Foo_KG",   // legacy / non-VCO name pattern
+            "Article",  // bare name without prefix
+        ];
+        for name in &user_unrelated_names {
+            db.kg_set_access("p1", name, "read").unwrap();
+        }
+
+        // Weaviate empty + no bindings → would be orphans under the
+        // pre-v0.2.49 reconcile. Under M-1 they're preserved because
+        // the name doesn't match a VCO suffix.
+        let existing: std::collections::HashSet<String> = Default::default();
+        let dropped = db.reconcile_kg_collection_access(&existing).unwrap();
+        assert_eq!(
+            dropped, 0,
+            "no user-unrelated row may be dropped (M-1 invariant)",
+        );
+        for name in &user_unrelated_names {
+            assert_eq!(
+                read_access(&db, "p1", name),
+                Some("read".to_string()),
+                "user-unrelated row '{}' must be preserved",
+                name,
+            );
+        }
     }
 }
 
