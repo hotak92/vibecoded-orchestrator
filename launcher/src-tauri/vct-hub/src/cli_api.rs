@@ -1918,3 +1918,166 @@ mod cli_kg_integration_tests {
         assert_eq!(rows[0].operation, "cli.codegraph.search");
     }
 }
+
+// ─── v0.2.49 access-matrix Phase 4 (items #9 + #10) — hub-side wiring ─────
+//
+// Two HTTP-level integration tests that hit the real axum routers (cli_api
+// for project create, project_state_api for kg-binding) on a random local
+// port. No Weaviate dependency — the access-matrix propagation is purely
+// DB-side, so these run on any machine.
+
+#[cfg(test)]
+mod hub_access_matrix_wiring_tests {
+    use super::*;
+    use axum::Router;
+    use std::sync::Arc;
+
+    /// Spin up cli_api + project_state_api on a shared random port. The
+    /// in-memory DB is shared via `LauncherDbHandle` between the routers
+    /// so assertions can read the same state both routers wrote to.
+    async fn spawn_test_hub_with_state_api() -> (String, LauncherDbHandle) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let handle = LauncherDbHandle(Arc::new(db));
+        let app: Router = Router::new()
+            .nest("/api/v1", super::router().with_state(handle.clone()))
+            .nest(
+                "/api/v1",
+                crate::project_state_api::router().with_state(handle.clone()),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}/api/v1", addr), handle)
+    }
+
+    /// Item #10 — `vct project create` (POST /cli/projects) seeds the
+    /// default `kg_collection_access` rows for the newly-created project.
+    /// Pre-Phase-4 the access matrix was empty for CLI-created projects,
+    /// so the read-gate rejected every KG access until the user manually
+    /// granted via the GUI. This test pins the hub-side contract.
+    #[tokio::test]
+    async fn vct_project_create_via_cli_populates_access() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "AccessMatrixDemo",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "create failed: {}", resp.status());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id");
+
+        let access = handle.0.kg_list_access(pid).expect("kg_list_access");
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(
+            by_collection.get("AccessMatrixDemo_KnowledgeGraph"),
+            Some(&"write"),
+            "own primary KG must default to write"
+        );
+        assert_eq!(
+            by_collection.get("AccessMatrixDemo_Development"),
+            Some(&"write"),
+            "own dev collection must default to write"
+        );
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            Some(&"read"),
+            "shared KG must default to read"
+        );
+    }
+
+    /// Item #9 — POST /projects/{id}/kg-binding routes through
+    /// `set_project_kg_binding_with_root_sync`, which propagates the
+    /// collection_name change into `kg_collection_access`. Pre-Phase-4
+    /// the hub endpoint used plain `set_project_kg_binding` which left
+    /// the access matrix stale on every rebind via this surface.
+    #[tokio::test]
+    async fn hub_http_set_kg_binding_propagates_access() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        // Create a project via the CLI route — populates default access
+        // rows, including write at "Acme_KnowledgeGraph".
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "Acme",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(create.status().is_success());
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Seed a primary binding at the old collection name (the
+        // populate flow doesn't write bindings — that's the launcher
+        // Tauri populate's responsibility). We need an existing binding
+        // so the with_root_sync path's `old_primary` capture sees the
+        // OLD collection_name.
+        handle
+            .0
+            .set_project_kg_binding(
+                &pid,
+                "primary",
+                "Acme_KnowledgeGraph",
+                None,
+                None,
+                None,
+                None,
+                &serde_json::Value::Null,
+            )
+            .expect("seed binding");
+
+        // Hit the hub HTTP endpoint to rebind primary to a new
+        // collection name. This is the call path item #9 wired through
+        // `_with_root_sync`.
+        let resp = client
+            .post(format!("{}/projects/{}/kg-binding", base, pid))
+            .json(&serde_json::json!({
+                "role": "primary",
+                "collection_name": "Renamed_KnowledgeGraph",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(
+            resp.status().is_success(),
+            "kg-binding write failed: {}",
+            resp.status()
+        );
+
+        // Access matrix must have followed the rename.
+        let access = handle.0.kg_list_access(&pid).expect("kg_list_access");
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(
+            by_collection.get("Acme_KnowledgeGraph"),
+            None,
+            "old access row must be gone — pre-Phase-4 this would still be 'write'"
+        );
+        assert_eq!(
+            by_collection.get("Renamed_KnowledgeGraph"),
+            Some(&"write"),
+            "new access row must exist with the old write level preserved"
+        );
+    }
+}

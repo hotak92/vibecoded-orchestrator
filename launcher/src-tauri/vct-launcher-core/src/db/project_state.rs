@@ -1168,66 +1168,53 @@ impl Db {
             .execute_batch("COMMIT")
             .map_err(|e| format!("set_project_kg_binding_with_root_sync: COMMIT: {}", e))?;
 
-        // v0.2.46 Decision A/B/C cousin — propagate the collection rename
-        // into `kg_collection_access`. Same `guard` lock is still held;
-        // these are post-transaction writes that auto-commit individually.
+        // v0.2.49 access-matrix Phase 4 (item #12): delegate the
+        // access-row rename to `Db::kg_rename_access`. The COMMIT above
+        // released the transaction; explicitly drop the guard here so
+        // the lock is available when `kg_rename_access` re-acquires it.
+        //
+        // Pre-Phase-4 the propagation was inline (avoiding the lock
+        // re-acquire) but had a subtle bug: on collision (target row
+        // already exists), it unconditionally DELETEd the source row
+        // and left the target's `access_level` UNCHANGED. When the
+        // source had a HIGHER privilege than the existing target, that
+        // silently downgraded the user's effective access. The
+        // canonical helper picks the higher of (source, target) and
+        // upgrades target before dropping source (v0.2.46
+        // adversarial-review L3 invariant: "never lower an existing
+        // privilege"). Centralizing here means every caller benefits
+        // from L3 by construction.
+        //
         // Soft-fail per-call: if the access-matrix rename hiccups, the
-        // binding write already succeeded — caller logs at WARN. The boot
-        // reconcile (Db::reconcile_kg_collection_access) catches any stale
-        // rows on the next launcher start.
-        let rename_in_access = |old: &str, new: &str| {
-            if old == new {
-                return; // no work
-            }
-            // Inline the rename logic instead of calling self.kg_rename_access
-            // (which would acquire its own lock — we already hold one).
-            let source_exists: bool = guard
-                .query_row(
-                    "SELECT 1 FROM kg_collection_access
-                      WHERE project_id = ?1 AND collection_name = ?2",
-                    params![project_id, old],
-                    |_| Ok(()),
-                )
-                .optional()
-                .ok()
-                .flatten()
-                .is_some();
-            if !source_exists {
-                return;
-            }
-            let target_exists: bool = guard
-                .query_row(
-                    "SELECT 1 FROM kg_collection_access
-                      WHERE project_id = ?1 AND collection_name = ?2",
-                    params![project_id, new],
-                    |_| Ok(()),
-                )
-                .optional()
-                .ok()
-                .flatten()
-                .is_some();
-            if target_exists {
-                let _ = guard.execute(
-                    "DELETE FROM kg_collection_access
-                      WHERE project_id = ?1 AND collection_name = ?2",
-                    params![project_id, old],
-                );
-            } else {
-                let _ = guard.execute(
-                    "UPDATE kg_collection_access
-                        SET collection_name = ?1
-                      WHERE project_id = ?2 AND collection_name = ?3",
-                    params![new, project_id, old],
-                );
-            }
-        };
+        // binding write already succeeded — log at WARN. The boot
+        // reconcile (Db::reconcile_kg_collection_access) catches any
+        // stale rows on the next launcher start.
+        drop(guard);
 
         if let Some(prev) = &old_primary {
-            rename_in_access(prev, collection_name);
+            if prev != collection_name {
+                if let Err(e) = self.kg_rename_access(project_id, prev, collection_name) {
+                    eprintln!(
+                        "[vct] warning: set_project_kg_binding_with_root_sync: \
+                         kg_rename_access(primary, {} → {}): {}",
+                        prev, collection_name, e
+                    );
+                }
+            }
         }
         if should_mirror {
             if let Some(prev_shared) = &old_shared {
-                rename_in_access(prev_shared, collection_name);
+                if prev_shared != collection_name {
+                    if let Err(e) =
+                        self.kg_rename_access(project_id, prev_shared, collection_name)
+                    {
+                        eprintln!(
+                            "[vct] warning: set_project_kg_binding_with_root_sync: \
+                             kg_rename_access(shared mirror, {} → {}): {}",
+                            prev_shared, collection_name, e
+                        );
+                    }
+                }
             }
         }
 
@@ -2491,6 +2478,72 @@ mod tests {
         // No row was created (we only RENAME existing rows, never SEED).
         assert_eq!(db.kg_get_access("p1", "OldPrimary_KG").unwrap(), None);
         assert_eq!(db.kg_get_access("p1", "NewPrimary_KG").unwrap(), None);
+    }
+
+    /// v0.2.49 access-matrix Phase 4 (item #12): pin the L3 invariant
+    /// on the binding-rebind surface. Pre-Phase-4 the inline rename in
+    /// `set_project_kg_binding_with_root_sync` unconditionally DELETEd
+    /// the source row on collision and left the target's access_level
+    /// UNCHANGED — when source.level > target.level, this silently
+    /// downgraded the user's effective access. Post-Phase-4 the
+    /// delegation to `Db::kg_rename_access` picks the higher of
+    /// (source, target) and upgrades the target before dropping the
+    /// source.
+    ///
+    /// Scenario: a binding's previous collection_name had access
+    /// level "write", a row already exists at the new collection_name
+    /// with level "read" (e.g. a leftover from a prior rebind cycle).
+    /// After the rebind, the new collection_name's row MUST be
+    /// "write", not "read".
+    #[test]
+    fn project_state_rename_preserves_higher_access_level() {
+        let db = make_db();
+        seed_project(&db, "p1", "Peer Project");
+        // Populate the slug column so is_orchestrator_root_structural_row
+        // (called from kg_set_access on level!=write) can decode the row.
+        // seed_project leaves slug NULL because most existing tests in
+        // this module exercise paths that don't dereference slug.
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "UPDATE projects SET slug = ?1 WHERE id = ?2",
+                    params!["peer-project", "p1"],
+                )
+                .unwrap();
+        }
+        db.set_project_kg_binding(
+            "p1", "primary", "OldPrimary_KG", None, None, None, None, &JsonValue::Null,
+        )
+        .unwrap();
+        // Source has write; pre-existing target at lower privilege.
+        db.kg_set_access("p1", "OldPrimary_KG", "write").unwrap();
+        db.kg_set_access("p1", "NewPrimary_KG", "read").unwrap();
+
+        db.set_project_kg_binding_with_root_sync(
+            "p1",
+            "peer-project",
+            "primary",
+            "NewPrimary_KG",
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .unwrap();
+
+        // Source row gone.
+        assert_eq!(db.kg_get_access("p1", "OldPrimary_KG").unwrap(), None);
+        // Target row UPGRADED from "read" to "write" — never silently
+        // downgrade the user's effective privilege on collision.
+        assert_eq!(
+            db.kg_get_access("p1", "NewPrimary_KG").unwrap(),
+            Some("write".to_string()),
+            "L3 invariant: post-Phase-4 delegation to kg_rename_access \
+             upgrades target to source's higher privilege; pre-Phase-4 \
+             inline rename would have silently kept 'read' here"
+        );
     }
 
     #[test]
