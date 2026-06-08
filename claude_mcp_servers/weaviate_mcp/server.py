@@ -289,6 +289,112 @@ def _large_result(data: dict, indent: int = 2) -> str:
     """
     return json.dumps(data, indent=indent)
 
+
+# ─── v0.2.49 Step F Phase 8 helpers ─────────────────────────────────────
+# Helpers consumed by `store_knowledge_node`'s access-matrix gate block
+# (Phase 8 / item #21). Lifted here from inline to keep the gate readable.
+
+
+def _emit_gate_crash_metric(project_id: str, collection: str, exc_str: str) -> None:
+    """v0.2.49 Step F MF6: emit a dropped-write metric row when the
+    access-matrix gate itself crashes (not just the resolver's expected
+    fail-open path).
+
+    The resolver's fail-open contract handles network / 4xx / 5xx /
+    malformed responses without raising. If an exception DOES reach this
+    helper, it means a bug in `vco_lib.access_resolver` or its caller —
+    the user needs to know the gate is degraded.
+
+    Mirror of `_emit_metric` in vco_lib/access_resolver.py. Never raises;
+    silent on I/O failure so a broken metric path doesn't break the
+    fail-open contract on top of a broken resolver.
+    """
+    try:
+        import time as _time
+        state_dir = os.environ.get("VCT_STATE_DIR")
+        if state_dir:
+            cache_dir = os.path.join(state_dir, "cache")
+        else:
+            cache_dir = os.path.join(os.path.expanduser("~"), ".vct", "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        jsonl_path = os.path.join(cache_dir, "dropped_writes.jsonl")
+        row = {
+            "ts": int(_time.time()),
+            "project_id": project_id,
+            "collection": collection,
+            "reason": "gate_crash",
+            "exception": exc_str[:500],  # cap to bound JSONL row size
+            "fail_open": True,
+        }
+        with open(jsonl_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:
+        # Metric-emit failure must not break the fail-open contract.
+        pass
+
+
+def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
+    """v0.2.49 Step F MF7+Q2: return the list of Weaviate collections
+    where the project has `access_level == 'write'` per the launcher's
+    access matrix. Used by `store_knowledge_node`'s deny-branch to
+    enrich the error response with actionable remediation.
+
+    Source: vct-hub `GET /api/v1/projects/{id}/access?level=write`
+    endpoint. This endpoint lands in the SAME v0.2.49 cycle (main
+    chat's lane, sibling to the matrix `/access/{collection}` endpoint
+    that this server.py already consumes via vco_lib.access_resolver).
+
+    Until that endpoint lands in main chat's branch, this function
+    returns an empty list — the caller's remediation string falls back
+    to a generic "re-register the project / open Manage access" hint.
+
+    Never raises: the deny-branch can't crash on enrichment. On any
+    failure (hub unreachable, endpoint missing, malformed response),
+    return [].
+    """
+    if not project_id:
+        return []
+    try:
+        # Discover hub port + token via existing patterns.
+        import urllib.request  # local import — keep top-of-module lean
+        import urllib.error
+
+        state_dir = os.environ.get("VCT_STATE_DIR") or os.path.join(
+            os.path.expanduser("~"), ".vct"
+        )
+
+        port = os.environ.get("VCT_HUB_PORT")
+        if not port:
+            try:
+                port = open(os.path.join(state_dir, "hub.port"), encoding="utf-8").read().strip()
+            except OSError:
+                port = "7700"
+
+        token = os.environ.get("VCT_HUB_TOKEN")
+        if not token:
+            try:
+                token = open(os.path.join(state_dir, "hub.token"), encoding="utf-8").read().strip()
+            except OSError:
+                return []  # no token → can't query
+
+        url = f"http://127.0.0.1:{port}/api/v1/projects/{project_id}/access?level=write"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            if resp.status != 200:
+                return []
+            body = json.loads(resp.read().decode("utf-8"))
+            # Expected shape (per main chat's new endpoint, mirrors
+            # the /access/{collection} pattern): {"collections": [str, ...]}
+            collections = body.get("collections")
+            if isinstance(collections, list):
+                return [c for c in collections if isinstance(c, str)]
+            return []
+    except Exception:
+        # Any failure → empty list → generic remediation. Never raise
+        # back to the deny-branch caller.
+        return []
+
 # Initialize FastMCP server
 mcp = FastMCP(
     "weaviate-kg",
@@ -5856,38 +5962,91 @@ async def store_knowledge_node(
         # SHARED_KG_WRITE_DISABLED fires first (coarse opt-out), then the
         # matrix check fires for everything else (per-collection write
         # permission per the launcher's GUI access matrix).
+        #
+        # Step F fixes (MF5 + MF6 + MF7+Q2):
+        # - MF5: the ImportError catch is split out from the broad try/
+        #   except so it only catches the resolver-not-installed case
+        #   (pre-v0.2.49 path), not transitive ImportErrors raised by a
+        #   future modification of vco_lib.access_resolver's own imports
+        #   (e.g. if it ever adds `from requests import ...`).
+        # - MF6: a resolver bug that surfaces as an exception emits a
+        #   dropped_writes.jsonl row with reason='gate_crash' so the
+        #   silent fail-open becomes visible.
+        # - MF7+Q2: on deny, the response carries `writable_collections`
+        #   (the project's other write-permission rows) so the LLM /
+        #   user has actionable signal — "you can write to X, Y, Z;
+        #   adjust GUI to enable target_collection."
+        _access_resolver_available = False
         try:
-            from vco_lib.access_resolver import check_access_level
+            from vco_lib.access_resolver import check_access_level  # noqa: F401
+            _access_resolver_available = True
+        except ImportError as imp_err:
+            # MF5: ONLY treat "the access_resolver module itself isn't on
+            # the path" as the pre-v0.2.49 path. Any other ImportError
+            # (e.g. a transitive import inside the resolver failing
+            # because of a future dependency change) is a real bug, not
+            # legacy-path — re-raise it so it's visible in logs.
+            if "access_resolver" not in str(imp_err):
+                raise
+            # Pre-v0.2.49 install path: skip the gate, fall through to
+            # the legacy "matrix is read-only" behavior.
+
+        if _access_resolver_available:
             project_id_for_gate = os.environ.get("VCT_PROJECT_ID", "")
             if project_id_for_gate:
-                matrix_level = check_access_level(project_id_for_gate, target_collection_name)
+                try:
+                    matrix_level = check_access_level(project_id_for_gate, target_collection_name)
+                except Exception as gate_exc:
+                    # MF6: resolver bug → emit dropped-write metric so
+                    # the silent fail-open becomes visible. Don't break
+                    # the fail-open contract on top of an already-broken
+                    # resolver; log + metric + continue with write.
+                    logger.warning(
+                        "access matrix gate crashed; falling open: %s", gate_exc
+                    )
+                    _emit_gate_crash_metric(project_id_for_gate, target_collection_name, str(gate_exc))
+                    matrix_level = "write"  # fail-open
+
                 if matrix_level != "write":
+                    # MF7+Q2: enrich the deny response with the list of
+                    # collections the project DOES have write access to,
+                    # so the LLM / user has actionable remediation
+                    # instead of just "denied."
+                    #
+                    # Source: hub's GET /api/v1/projects/{id}/access?level=write
+                    # endpoint (lands in this same v0.2.49 cycle — main
+                    # chat's lane). Until that endpoint exists, this
+                    # helper returns an empty list and the response
+                    # falls back to the generic remediation string.
+                    writable_collections = _fetch_writable_collections_for_project(
+                        project_id_for_gate
+                    )
+                    if writable_collections:
+                        remediation = (
+                            f"You currently have write access on: "
+                            f"{', '.join(writable_collections)}. "
+                            f"To gain write access to '{target_collection_name}', "
+                            f"adjust via Launcher GUI → Identity → Manage access."
+                        )
+                    else:
+                        remediation = (
+                            "No collections currently have write access for this "
+                            "project — re-register the project via Launcher GUI → "
+                            "Projects, or adjust the access matrix in the Identity tab."
+                        )
                     return json.dumps({
                         "status": "error",
                         "error": (
                             f"Access matrix denies write on '{target_collection_name}' "
-                            f"(level={matrix_level}). Adjust via launcher GUI → "
-                            f"Identity → Manage access, or set the project's row to "
-                            f"'write' for this collection."
+                            f"(level={matrix_level}). {remediation}"
                         ),
                         "target_collection": target_collection_name,
                         "matrix_level": matrix_level,
+                        "writable_collections": writable_collections,
+                        "remediation": remediation,
                         "scope": scope,
                         "file_written": False,
                     }, indent=2)
-        except ImportError:
-            # vco_lib.access_resolver not on path → MCP server is running
-            # against a pre-v0.2.49 install. Skip the gate (fail-open at
-            # the import level, mirroring the resolver's own fail-open
-            # contract). The user gets the legacy "matrix is read-only"
-            # behavior.
-            pass
-        except Exception as gate_exc:
-            # Defensive: if the gate itself crashes, fall through and let
-            # the write proceed. The resolver's fail-open contract should
-            # already cover the common cases (hub unreachable etc.); this
-            # only catches bugs IN the resolver.
-            logger.warning(f"access matrix gate crashed; falling open: {gate_exc}")
 
         collection = client.collections.get(target_collection_name)
 
