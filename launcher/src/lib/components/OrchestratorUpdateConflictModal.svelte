@@ -301,14 +301,21 @@
 </div>
 
 <style>
-  /* v0.2.24.1 cosmetic pass: VCT color tokens (matches divergence modal). */
+  /* v0.2.24.1 cosmetic pass: VCT color tokens (matches divergence modal).
+   * v0.2.51 fix: anchor to viewport top + safe margin + outer scroll so
+   * the modal header never clips above the window in short viewports.
+   * The backdrop itself becomes the scroll container (align-items:
+   * flex-start), so tall modals push the bottom out of view but the
+   * header stays reachable. */
   .cfl-backdrop {
     position: fixed;
     inset: 0;
     background: rgba(5, 11, 31, 0.82); /* --color-bg at 82% */
     display: flex;
-    align-items: center;
+    align-items: flex-start;       /* anchor to top, not vertical center */
     justify-content: center;
+    padding: 16px;                  /* safe margin from window edges */
+    overflow-y: auto;               /* scroll when modal taller than viewport */
     z-index: 350;
   }
   .cfl-modal {
@@ -318,8 +325,8 @@
     padding: 20px;
     max-width: 640px;
     width: 92%;
-    max-height: 90vh;
-    overflow-y: auto;
+    /* Moderate top offset scales with viewport, never zero. */
+    margin-top: clamp(0px, 6vh, 64px);
     color: var(--color-text);
   }
   .cfl-modal h3 {
