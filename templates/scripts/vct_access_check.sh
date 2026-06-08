@@ -185,17 +185,40 @@ elif [[ "$http_status" -ne 200 ]]; then
 fi
 
 # Parse {"level": "..."} from response body.
+#
+# v0.2.49 Step F MF8 (L4-S3): split the "malformed" reason into two
+# distinct values to match the py/ps1 siblings + enable cross-client
+# metric aggregation. Pre-fix bash emitted a single `hub_malformed_response`
+# value that conflated JSON-parse failures and unrecognized-level
+# values. The siblings (vco_lib/access_resolver.py + vct_access_check.ps1)
+# emit `hub_malformed_json` vs `hub_malformed_level` separately, so
+# aggregating `dropped_writes.jsonl` across clients saw 3 keys for
+# 2 failure modes.
 response=$(cat "$tmpfile" 2>/dev/null || true)
 level=""
+parser_used=""
 if command -v jq >/dev/null 2>&1; then
     level=$(printf '%s' "$response" | jq -r '.level // empty' 2>/dev/null || true)
+    parser_used="jq"
 elif command -v python3 >/dev/null 2>&1; then
     level=$(printf '%s' "$response" | python3 -c \
         'import sys, json; d=json.load(sys.stdin); print(d.get("level",""))' 2>/dev/null || true)
+    parser_used="python3"
 fi
 
-if [[ -z "$level" ]] || ! [[ "$level" =~ ^(read|write|none)$ ]]; then
-    fail_open "hub_malformed_response"
+# If parser emitted empty AND there was a non-empty response body,
+# parse failed → hub_malformed_json. If parser emitted a value that
+# isn't in {read, write, none} → hub_malformed_level.
+if [[ -z "$level" ]]; then
+    # Non-empty body but parser produced nothing → JSON parse failed.
+    if [[ -n "$response" ]]; then
+        fail_open "hub_malformed_json"
+    else
+        fail_open "hub_malformed_json"
+    fi
+fi
+if ! [[ "$level" =~ ^(read|write|none)$ ]]; then
+    fail_open "hub_malformed_level"
 fi
 
 printf '%s\n' "$level"

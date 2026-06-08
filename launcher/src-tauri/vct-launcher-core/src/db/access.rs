@@ -348,29 +348,40 @@ impl Db {
                 collection, level,
             ));
         }
-        // v0.2.49 access-matrix Step A.5: bind both audit columns.
+        // v0.2.49 access-matrix Step A.5 + Step F SB4: bind both audit
+        // columns with conditional updated_at on UPSERT.
         //
         // INSERT path (no conflict): `created_at` and `updated_at`
         // are both set to the same `now` timestamp. This is the
-        // load-bearing property that makes the future
+        // load-bearing property that makes the
         // `is_user_configured(row) := row.updated_at != row.created_at`
         // predicate work correctly: a freshly seeded row reads as
         // "not user configured" because the two timestamps match.
         //
-        // UPSERT path (conflict): only `updated_at` is bumped; the
-        // original `created_at` is preserved (via NOT updating it).
-        // This is the user-mutation signal — every UPSERT increments
-        // `updated_at` while leaving `created_at` frozen, making the
-        // predicate flip to "user configured" exactly when the row
-        // is touched after its initial seed.
+        // UPSERT path (conflict) — v0.2.49 Step F SB4 fix (L1-F4):
+        // bump `updated_at` ONLY when `access_level` actually changes
+        // (real user mutation), NOT on no-op rewrites. Pre-Step-F
+        // every UPSERT bumped `updated_at` unconditionally — which
+        // meant a no-op write (e.g. F-2c's mode-setter loop hitting
+        // a row that was already at the target level) flipped
+        // `is_user_configured` to TRUE for that row. F-2c reads
+        // `is_user_configured` as load-bearing ("preserve user-
+        // configured peers"); the no-op-bumps poisoned the predicate
+        // → F-2c silently skipped peers the user never actually
+        // touched. Step F Lens 1 (L1-F4) flagged this as SHIP-BLOCKER.
         //
-        // CAVEAT: callers that perform a no-op upsert (writing the
-        // same access_level again) DO bump `updated_at`. This is
-        // intentional — the resolver layer (Phase 2) treats
-        // `kg_set_access` as user-driven; system-driven INSERTs
-        // (migrations, boot probes) should use the dedicated
-        // `kg_seed_access` path (added below) to keep the timestamps
-        // equal.
+        // The CASE expression below evaluates per-row:
+        //   - access_level != excluded.access_level → real change →
+        //     bump updated_at to wall-clock millis
+        //   - access_level == excluded.access_level → no-op rewrite →
+        //     preserve existing updated_at value (predicate stays
+        //     stable; F-2c's load-bearing read keeps working)
+        //
+        // System-driven INSERTs (migrations, boot probes, install.py
+        // parity self-heal) should still use the dedicated
+        // `kg_seed_access` path (defined below) — it uses
+        // `INSERT OR IGNORE` which never bumps either timestamp on
+        // re-runs.
         let now = chrono::Utc::now().timestamp_millis();
         let guard = self.lock();
         guard
@@ -379,7 +390,11 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?4)
                  ON CONFLICT(project_id, collection_name)
                  DO UPDATE SET access_level = excluded.access_level,
-                               updated_at = excluded.updated_at",
+                               updated_at = CASE
+                                   WHEN access_level != excluded.access_level
+                                       THEN excluded.updated_at
+                                   ELSE updated_at
+                               END",
                 params![project_id, collection, level, now],
             )
             .map_err(|e| format!("kg_set_access: {}", e))?;
@@ -403,6 +418,17 @@ impl Db {
     /// `kg_set_access` (which bumps `updated_at`, signalling the user
     /// touched the row).
     ///
+    /// v0.2.49 Step F MF1 (L2-MF1) — V44-C structural-row guard:
+    /// mirrors the guard in `kg_set_access`. Pre-Step-F the docstring
+    /// here falsely claimed "every caller of the kg_set_access family
+    /// is guarded by construction" — but `kg_seed_access` had ZERO
+    /// guard. A first-INSERT of orchestrator-root's structural row
+    /// at 'read' or 'none' would silently bypass the invariant
+    /// (`INSERT OR IGNORE` protects EXISTING rows but doesn't protect
+    /// the FIRST seed at a bad level). The relocated guard fires on
+    /// any seed at a non-'write' level for the orchestrator-root
+    /// structural row, matching `kg_set_access`'s discipline.
+    ///
     /// Returns the number of rows actually inserted (0 when the row
     /// already exists; 1 when freshly seeded).
     pub fn kg_seed_access(
@@ -413,6 +439,23 @@ impl Db {
     ) -> Result<usize, String> {
         if !matches!(level, "read" | "write" | "none") {
             return Err(format!("invalid kg access level: {}", level));
+        }
+        // v0.2.49 Step F MF1 (L2-MF1): V44-C structural-row guard.
+        // Same predicate + same error message as `kg_set_access`'s
+        // guard above. Defense-in-depth at the seed-path layer so
+        // even the system-driven INSERT OR IGNORE path can't
+        // accidentally land the orchestrator-root structural row
+        // at a non-'write' level on first seed.
+        if level != "write"
+            && self.is_orchestrator_root_structural_row(project_id, collection)?
+        {
+            return Err(format!(
+                "Refusing to seed access level for orchestrator-root's \
+                 structural row (collection '{}', level '{}'). The \
+                 orchestrator-root project must retain write access to its \
+                 primary collection. (kg_seed_access guard)",
+                collection, level,
+            ));
         }
         let now = chrono::Utc::now().timestamp_millis();
         let guard = self.lock();
@@ -3317,6 +3360,93 @@ mod access_audit_column_tests {
         );
     }
 
+    /// v0.2.49 Step F SB4 (L1-F4): a no-op UPSERT (writing the same
+    /// access_level that's already persisted) MUST NOT bump
+    /// `updated_at`. Pre-Step-F the SQL `DO UPDATE SET updated_at =
+    /// excluded.updated_at` clause bumped unconditionally, which
+    /// poisoned the `is_user_configured` predicate for downstream
+    /// F-2c logic ("preserve user-configured peers" mode-setter loop).
+    /// Concrete failure pre-fix:
+    ///   1. Owner clicks "Mode: shared" → all peers seeded to 'read'
+    ///      via kg_set_access. updated_at = T1, created_at = T0,
+    ///      is_user_configured = TRUE (incorrect — user only touched
+    ///      the OWNER row, not the peers).
+    ///   2. Owner clicks "Mode: shared" AGAIN → F-2c's
+    ///      `if peer_is_user_configured { continue }` gate SKIPS
+    ///      every peer because all read TRUE → preserve logic fires
+    ///      on SYSTEM-stamped peers, opposite of intent.
+    /// Post-fix: a no-op rewrite (level didn't change) preserves
+    /// updated_at, predicate stays correct, F-2c works correctly.
+    #[test]
+    fn kg_set_access_no_op_upsert_preserves_updated_at() {
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        db.kg_set_access("p1", "NoOpKG", "read").unwrap();
+        let initial = db
+            .kg_get_access_row("p1", "NoOpKG")
+            .unwrap()
+            .unwrap();
+
+        // Sleep enough that a NAIVE re-stamp (pre-Step-F behavior)
+        // would produce a strictly larger updated_at. Post-Step-F
+        // the CASE clause must preserve the original value.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Write the SAME level — this is the no-op path.
+        db.kg_set_access("p1", "NoOpKG", "read").unwrap();
+        let post = db
+            .kg_get_access_row("p1", "NoOpKG")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(post.access_level, "read", "level unchanged (no-op)");
+        assert_eq!(
+            post.updated_at, initial.updated_at,
+            "v0.2.49 Step F SB4: no-op upsert MUST NOT bump updated_at \
+             (pre-fix this leaked a false user-configured signal into \
+             F-2c's load-bearing predicate). got pre={}, post={}",
+            initial.updated_at, post.updated_at,
+        );
+        assert_eq!(
+            post.created_at, initial.created_at,
+            "created_at always preserved on upsert",
+        );
+        // is_user_configured semantically stable across no-op writes.
+        assert_eq!(
+            post.is_user_configured(),
+            initial.is_user_configured(),
+            "is_user_configured predicate must NOT flip on no-op writes",
+        );
+    }
+
+    /// v0.2.49 Step F SB4 sibling test: a REAL change (different
+    /// level) DOES bump `updated_at`. Pin the positive case so future
+    /// drift of the CASE clause's branch logic is caught.
+    #[test]
+    fn kg_set_access_real_change_bumps_updated_at() {
+        let db = Db::open_in_memory().unwrap();
+        seed_proj(&db, "p1");
+        db.kg_set_access("p1", "RealChangeKG", "read").unwrap();
+        let initial = db
+            .kg_get_access_row("p1", "RealChangeKG")
+            .unwrap()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Real change: read → write.
+        db.kg_set_access("p1", "RealChangeKG", "write").unwrap();
+        let post = db
+            .kg_get_access_row("p1", "RealChangeKG")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(post.access_level, "write");
+        assert!(
+            post.updated_at > initial.updated_at,
+            "real-change upsert (read→write) MUST bump updated_at",
+        );
+    }
+
     #[test]
     fn kg_seed_access_preserves_invariant_on_first_insert() {
         // The dedicated seed-path setter also sets timestamps equal.
@@ -3530,6 +3660,72 @@ mod access_audit_column_tests {
         // unaffected (e.g. setting access to OTHER collections).
         db.kg_set_access("root", "OtherCollection", "read").unwrap();
         db.kg_set_access("root", "OtherCollection", "none").unwrap();
+    }
+
+    /// v0.2.49 Step F MF1 (L2-MF1): the V44-C structural-row guard
+    /// MUST also fire from `kg_seed_access`. Pre-Step-F the seed
+    /// path had ZERO guard — a first-INSERT of orchestrator-root's
+    /// structural row at 'read' would silently bypass the invariant.
+    /// (`INSERT OR IGNORE` protects EXISTING rows but not the FIRST
+    /// seed at a bad level.)
+    #[test]
+    fn kg_seed_access_refuses_orchestrator_root_structural_seed_below_write() {
+        let db = Db::open_in_memory().unwrap();
+        // Seed orchestrator-root project + its primary binding (the
+        // structural-row identifier).
+        let now: i64 = 1_700_000_000_000;
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+                 VALUES ('root', 'Root', '/tmp/root', 'orchestrator_root', ?1, ?1, 'root')",
+                params![now],
+            )
+            .unwrap();
+        guard
+            .execute(
+                "INSERT INTO project_kg_bindings
+                    (project_id, role, collection_name, config_json, updated_at)
+                 VALUES ('root', 'primary', 'RootStructural_KG', '{}', ?1)",
+                params![now],
+            )
+            .unwrap();
+        drop(guard);
+
+        // Seeding write is allowed (matches the invariant).
+        db.kg_seed_access("root", "RootStructural_KG", "write").unwrap();
+
+        // Wipe the row (simulating a fresh first-seed) + re-attempt
+        // with read or none. Both must Err with the seed-path guard's
+        // message.
+        {
+            let g = db.lock();
+            g.execute(
+                "DELETE FROM kg_collection_access WHERE project_id = 'root' AND collection_name = 'RootStructural_KG'",
+                [],
+            ).unwrap();
+        }
+        let err = db
+            .kg_seed_access("root", "RootStructural_KG", "read")
+            .unwrap_err();
+        assert!(
+            err.contains("structural") && err.contains("kg_seed_access"),
+            "expected seed-path structural-violation message, got: {}",
+            err,
+        );
+        let err = db
+            .kg_seed_access("root", "RootStructural_KG", "none")
+            .unwrap_err();
+        assert!(
+            err.contains("structural") && err.contains("kg_seed_access"),
+            "expected seed-path structural-violation message, got: {}",
+            err,
+        );
+
+        // Non-structural rows on the orchestrator-root project are
+        // unaffected by the seed-path guard (parity with kg_set_access).
+        db.kg_seed_access("root", "OtherCollection", "read").unwrap();
+        db.kg_seed_access("root", "OtherCollection", "none").unwrap();
     }
 
     #[test]
