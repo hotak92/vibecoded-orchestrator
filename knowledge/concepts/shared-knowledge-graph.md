@@ -10,8 +10,8 @@ status: active
 # Shared Knowledge Graph (Cross-Project)
 
 The vibecoded orchestrator ships with a **cross-project shared KG** — a single
-Weaviate collection (`VibecodedOrchestrator_KnowledgeGraph`, renamed from
-`VibeCodedTools_KnowledgeGraph` in v0.2.12 / PR-26 Group E) seeded at install
+Weaviate collection (`VibeCodedOrchestrator_KnowledgeGraph`, renamed from
+`VibeCodedTools_KnowledgeGraph` in v0.2.12) seeded at install
 time from `vibecoded-orchestrator/knowledge/`. Every project on the machine
 queries both its own per-project KG **and** the shared KG by default; results
 are merged, de-duped, and re-ranked together. Users with data still under the
@@ -64,7 +64,7 @@ detection + per-file upsert in `sync_knowledge_graph.py`).
 
 - **Read is unconditional.** Every project tri-write block (VS Code settings,
   `.claude/env`, `.claude/settings.json`) carries
-  `SHARED_KG_COLLECTION=VibeCodedTools_KnowledgeGraph` and the MCP server's
+  `SHARED_KG_COLLECTION=VibeCodedOrchestrator_KnowledgeGraph` and the MCP server's
   read paths (`hybrid_search`, `semantic_graph_search`) ALWAYS include it.
   This is non-negotiable: knowledge accumulation across projects is the
   headline value prop of the orchestrator.
@@ -80,7 +80,7 @@ detection + per-file upsert in `sync_knowledge_graph.py`).
 Nothing to do. `hybrid_search`, `semantic_graph_search`, `kg-search`, and
 `code-graph-query` all transparently include the shared collection in their
 search scope when configured. Results carry a `collection` field (e.g.
-`VibeCodedTools_KnowledgeGraph` vs `MyProject`) so callers can disambiguate
+`VibeCodedOrchestrator_KnowledgeGraph` vs `MyProject`) so callers can disambiguate
 when needed.
 
 ## Writing to the shared KG
@@ -108,7 +108,7 @@ sidecar files:
 | Collection                       | Sidecar                                                                     |
 |----------------------------------|-----------------------------------------------------------------------------|
 | `KG_COLLECTION` (per-project)    | `$KG_BASE_DIR/knowledge/.node_formats.json` (or `cwd/knowledge/...`)         |
-| `VibeCodedTools_KnowledgeGraph`  | `<orchestrator>/knowledge/.node_formats.json` (override via `SHARED_KG_NODE_FORMATS`) |
+| `VibeCodedOrchestrator_KnowledgeGraph`  | `<orchestrator>/knowledge/.node_formats.json` (override via `SHARED_KG_NODE_FORMATS`) |
 
 `_format_result_by_tier` reads the result's `collection` field and routes the
 sidecar lookup accordingly via `_load_node_formats_for_collection(name)`.
@@ -145,7 +145,7 @@ auto-adopt** it. Reason: the orchestrator's `sync_knowledge_graph.py` runs an
 exists under the active project's `knowledge/` dir. Two installs sharing one
 collection would silently delete each other's nodes on the next sync.
 
-vco always creates its own `VibeCodedTools_KnowledgeGraph` (or skips creation if
+vco always creates its own `VibeCodedOrchestrator_KnowledgeGraph` (or skips creation if
 that exact name already exists). Power-users who really want to share across
 machines can override `SHARED_KG_COLLECTION` per-project to point at their own
 team-shared name; they accept responsibility for managing the orphan-prune

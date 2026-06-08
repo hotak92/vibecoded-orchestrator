@@ -23,7 +23,7 @@ CodeSage-Large-v2 is GPU-only in practice — at 1.3B parameters with a transfor
 
 ## Where the orchestrator uses it
 
-- **Code embedding service**: `claude_mcp_servers/code_embedding_service/server.py` is a small FastAPI server that wraps CodeSage-Large-v2 via `sentence-transformers`. It listens on port 11438 and exposes `/health` and `/embed` endpoints.
+- **Code embedding service**: `claude_mcp_servers/code_embedding_service/server.py` is a small FastAPI server that wraps CodeSage-Large-v2 via `sentence-transformers`. It listens on port 11440 and exposes `/health` and `/embed` endpoints.
 - **Backend selector**: the service reads `CODE_EMBED_BACKEND` (`gpu` for CodeSage, `ollama` for the jina fallback), `CODE_EMBED_MODEL` (default `codesage/codesage-large-v2`), and `CODE_EMBED_DEVICE` (default `cuda` if available).
 - **Weaviate code-graph collections**: `CodeFunction`, `CodeClass`, `CodeModule`, `CodeAPI`, `CodeInteraction` register the named vector `codesage_embed` (2048-dim) sourced from this service.
 - **Install bootstrap**: `install.py` defaults to the GPU CodeSage path on hosts that pass the GPU detection check; CPU-only hosts switch to the jina fallback automatically.
