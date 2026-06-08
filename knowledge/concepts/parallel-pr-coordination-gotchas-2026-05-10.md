@@ -60,7 +60,7 @@ The agent runs in the parent's main process (no isolation flag) but is constrain
 
 ## 1c. Stale-branch-state base re-use (recurrence, 2026-05-28)
 
-**Symptom**: 6 v0.2.38 agents spawned with `isolation: "worktree"` from the dogfooding fork's parent session all branched off `8df070a` (v0.2.21 era, ~10 weeks old) while the fork's `main` was at `adc6966` (v0.2.37). V38-A edited `rl_service.rs` (a v0.2.21-era filename — current main has `module_service.rs`); V38-MCP's diff was against `server.py` line 2648 while current main is at line 3284 (600+ line drift). All 6 commits unmergeable.
+**Symptom**: 6 v0.2.38 agents spawned with `isolation: "worktree"` from the parent session of a private fork all branched off `8df070a` (v0.2.21 era, ~10 weeks old) while the fork's `main` was at `adc6966` (v0.2.37). V38-A edited `rl_service.rs` (a v0.2.21-era filename — current main has `module_service.rs`); V38-MCP's diff was against `server.py` line 2648 while current main is at line 3284 (600+ line drift). All 6 commits unmergeable.
 
 **Mechanism (new variant — distinct from §1b)**: when the parent session has accumulated `worktree-agent-*` branch refs from EARLIER fanouts in the same session, and those branches were created at an older HEAD, `git worktree add <path>` (without an explicit `<commit-ish>`) may re-use the last-known parent of the worktree-prefix namespace. The harness creates each new worktree branch as `worktree-agent-<id>`, and a leftover entry in `.git/refs/heads/worktree-agent-<old-id>` at SHA `8df070a` apparently seeded the resolution. Whether this is git behavior or harness behavior is unclear; what IS clear: **without an explicit base, the result is non-deterministic across sessions**.
 
@@ -329,27 +329,27 @@ Each broken-wire passed:
 
 ## 8. Shared working tree between concurrent chats (diagrams v0.2.34 lesson, 2026-05-25)
 
-A separate orchestrator chat working on v0.2.33 (release tagging, RL chat coordination, CHANGELOG entry) used the SAME `/home/.../vibecoded-orchestrator/` working directory as my Phases 0–3 chat — without us realising at first. Detection: my `git status` showed `M CHANGELOG.md` that I hadn't touched. Their working-tree edits and mine commingled in the same checkout.
+Two concurrent Claude Code sessions used the SAME `/home/.../vibecoded-orchestrator/` working directory — one on v0.2.33 release work (tagging, CHANGELOG entry), the other on parallel Phase 0–3 feature work — without realising the overlap at first. Detection: one session's `git status` showed `M CHANGELOG.md` it had not touched. Working-tree edits commingled in the same checkout.
 
 **Risks**:
-- Accidentally `git add .` and commit the OTHER chat's uncommitted work.
-- Both chats edit the same file at the same time → second write clobbers first (no merge conflict; the editor doesn't know).
+- Accidentally `git add .` and commit the OTHER session's uncommitted work.
+- Both sessions edit the same file at the same time → second write clobbers first (no merge conflict; the editor doesn't know).
 - Worktrees DO solve this for explicit branches, but the parent checkout is shared.
 
 **Workaround that worked**:
 - Always `git add <specific files>`, never `git add .` or `git add -A`.
-- Before each commit, `git diff --cached --name-only` and verify the list matches only what YOU touched.
-- For files genuinely needed by both chats (CHANGELOG.md — they're adding v0.2.33 section, I'm adding [Unreleased] entry): coordinate via shared planning doc, do the edits in non-overlapping regions of the file, commit independently.
+- Before each commit, `git diff --cached --name-only` and verify the list matches only what the session touched.
+- For files genuinely needed by both sessions (e.g. CHANGELOG.md when one adds a new version block and the other adds an `[Unreleased]` entry): coordinate via a shared planning doc, do the edits in non-overlapping regions, commit independently.
 
-**Better future fix**: each chat does ALL its work in an explicit worktree (`/tmp/vco-wt-<chat-tag>`), never in the main checkout. The shared `/home/.../vibecoded-orchestrator/` becomes integration-only, modified only when a chat explicitly merges.
+**Better future fix**: each session does ALL its work in an explicit worktree (`/tmp/vco-wt-<session-tag>`), never in the main checkout. The shared `/home/.../vibecoded-orchestrator/` becomes integration-only, modified only when a session explicitly merges.
 
 ### 8b. Silent branch-HEAD slip mid-session (v0.2.47 lesson, 2026-06-04)
 
-Stronger version of §8: not just shared working tree, but shared `HEAD`. While one chat works a feature branch (`rl/citation-detection-mcp-side`), another chat ran `git checkout main` for its own work. Subsequent `git commit` calls from the first chat landed on `main` (whichever branch HEAD was on at commit-time), NOT on the intended feature branch — even though the feature branch was the last one the first chat explicitly checked out.
+Stronger version of §8: not just shared working tree, but shared `HEAD`. While one session works a feature branch (e.g. `feature/citation-detection-mcp-side`), another session runs `git checkout main` for its own work. Subsequent `git commit` calls from the first session land on `main` (whichever branch HEAD was on at commit-time), NOT on the intended feature branch — even though the feature branch was the last one the first session explicitly checked out.
 
-**Symptom**: `git log main --oneline -3` shows a commit you intended for the feature branch interleaved with the OTHER chat's commits. `git branch --show-current` returns `main` even though you remember checking out `rl/...`.
+**Symptom**: `git log main --oneline -3` shows a commit intended for the feature branch interleaved with the OTHER session's commits. `git branch --show-current` returns `main` even though the first session remembered checking out `feature/...`.
 
-**Mechanism**: `HEAD` is a single pointer in `.git/HEAD`. There is no per-process / per-chat-instance `HEAD`. When chat A runs `git checkout main`, chat B's next `git commit` lands on main — chat B has no way to detect the swap except by re-reading `.git/HEAD` (i.e. `git branch --show-current`) immediately before every commit.
+**Mechanism**: `HEAD` is a single pointer in `.git/HEAD`. There is no per-process / per-session `HEAD`. When session A runs `git checkout main`, session B's next `git commit` lands on main — session B has no way to detect the swap except by re-reading `.git/HEAD` (i.e. `git branch --show-current`) immediately before every commit.
 
 **Detection**: ALWAYS pair every `git commit` with a preceding `git branch --show-current` check. The branch name in the output is the only ground truth.
 
@@ -358,9 +358,9 @@ Stronger version of §8: not just shared working tree, but shared `HEAD`. While 
 2. Reset main back to where the other chat was: `git checkout main && git reset --hard <pre-misplaced-sha>` — undoes the misplaced commit from main's history.
 3. Switch back to the feature branch and continue.
 
-This is a destructive `reset --hard` on `main`, BUT (a) you authored the misplaced commit yourself only seconds earlier, (b) the cherry-pick already captured its content on the feature branch, and (c) the misplaced commit was never pushed. The CLAUDE.md "don't auto-destroy" rule doesn't apply when the destroyed work is preserved on another local branch with a different SHA.
+This is a destructive `reset --hard` on `main`, BUT (a) the misplaced commit was authored seconds earlier in the same session, (b) the cherry-pick already captured its content on the feature branch, and (c) the misplaced commit was never pushed. The CLAUDE.md "don't auto-destroy" rule doesn't apply when the destroyed work is preserved on another local branch with a different SHA.
 
-**Prevention** (cheap, do it always): before every `git commit` in a long-running session, run `git -C <repo> branch --show-current` and assert it matches the branch you intended. Treat the check as part of the commit ritual, not optional. In a Bash session that may have been mid-`cd` or mid-`git checkout` by another chat, the check is the only ground truth.
+**Prevention** (cheap, do it always): before every `git commit` in a long-running session, run `git -C <repo> branch --show-current` and assert it matches the intended branch. Treat the check as part of the commit ritual, not optional. In a Bash session that may have been mid-`cd` or mid-`git checkout` by another session, the check is the only ground truth.
 
 ## 9. MCP tool-call PreToolUse matchers (diagrams v0.2.34 lesson, 2026-05-25)
 
@@ -516,7 +516,7 @@ AssertionError: ['VibeCodedOrchestrator_KnowledgeGraph', ...] != ['Alpha_Knowled
 
 — even though the test set `KG_COLLECTION=Alpha_KnowledgeGraph` in its env and reimported the module.
 
-**Mechanism**: production code calls `_try_resolve_project_config()` → `vco_lib.project_config.resolve(...)` → HTTP call to the running `vct-hub` on the dev machine. The hub returns a populated `ProjectConfig` for THIS project (the active dogfooding install), which wins over `os.getenv(...)` in the code that constructs module constants (`KG_COLLECTION`, `SHARED_KG_COLLECTION`, etc.). The test's env-injection is invisible because the resolver returned a value first.
+**Mechanism**: production code calls `_try_resolve_project_config()` → `vco_lib.project_config.resolve(...)` → HTTP call to the running `vct-hub` on the dev machine. The hub returns a populated `ProjectConfig` for THIS project (the active local install), which wins over `os.getenv(...)` in the code that constructs module constants (`KG_COLLECTION`, `SHARED_KG_COLLECTION`, etc.). The test's env-injection is invisible because the resolver returned a value first.
 
 **Detection**: any test that ASSERTS on module-level "resolved" constants and FAILS with values matching live config — not the injected ones — is hitting this pattern. CI doesn't see this because CI doesn't run a vct-hub. Dev-machine-only failures.
 
@@ -536,7 +536,7 @@ AssertionError: ['VibeCodedOrchestrator_KnowledgeGraph', ...] != ['Alpha_Knowled
 
 **Cross-link**: [[uses::Launcher / Hub Single-Writer Principle]] — the hub being a local service that the tests can hit is the same property that makes the single-writer principle work. The trade-off is that the hub's "single source of truth" semantics need test-mode escape hatches.
 
-**v0.2.46 reinforcement (2026-06-04)**: hit again during the KG/Dev/access auto-heal work. **21 pre-existing test failures** on the dogfood box that ALL traced to the same root cause: env-var-fallback tests losing to live hub resolution. v0.2.47 RL-6c had landed the gate at `weaviate_mcp/server.py::_try_resolve_project_config` but NOT at `vco_lib.project_config.resolve()` itself — so CLI-side callers (`templates/scripts/get_node_info.py`, `templates/scripts/search_knowledge.py`, etc.) bypassed the guard entirely.
+**v0.2.46 reinforcement (2026-06-04)**: hit again during the KG/Dev/access auto-heal work. **21 pre-existing test failures** on a dev machine running a live hub that ALL traced to the same root cause: env-var-fallback tests losing to live hub resolution. v0.2.47 RL-6c had landed the gate at `weaviate_mcp/server.py::_try_resolve_project_config` but NOT at `vco_lib.project_config.resolve()` itself — so CLI-side callers (`templates/scripts/get_node_info.py`, `templates/scripts/search_knowledge.py`, etc.) bypassed the guard entirely.
 
 **v0.2.46 fix completes the pattern**: the gate now lives **inside `vco_lib.project_config.resolve()`** (at the top, before any HTTP probe). Every consumer of the resolver inherits the short-circuit — `_try_resolve_project_config` wrappers can be simplified or even removed in a future cleanup. The autouse `tests/conftest.py` fixture sets `VCT_DISABLE_HUB_RESOLVER=1` for the whole orchestrator suite via per-file opt-out (the v0.2.47 RL-6c shape — tests that explicitly want to exercise the resolver like `test_project_config.py`, `test_caller_migration_step18.py`, `test_project_resolution.py` are listed in `_RESOLVER_OPT_OUT_FILES`).
 
@@ -605,7 +605,7 @@ Cheap insurance — add wherever fixture data and a runtime constant must agree.
 2. In the SAME commit as the refactor: extend each guard to inspect the new home of the property being protected.
 3. Don't trust "the old guard still passes" — if the refactor moved the code, the old guard is checking the wrong location.
 
-**Why this matters more than other refactor disciplines**: regression guards are the residue of post-incident lessons. The 4-release-cycle v0.2.42→v0.2.45 re-embed bug burned weeks of dogfood time + customer trust. A vacuous guard isn't just useless — it's actively misleading (CI is green, but the original bug class is unguarded). The guard has to FOLLOW the code it guards, or it stops being a guard.
+**Why this matters more than other refactor disciplines**: regression guards are the residue of post-incident lessons. The 4-release-cycle v0.2.42→v0.2.45 re-embed bug burned weeks of dev time + early-user trust. A vacuous guard isn't just useless — it's actively misleading (CI is green, but the original bug class is unguarded). The guard has to FOLLOW the code it guards, or it stops being a guard.
 
 **Cross-link**: [[uses::Silent-Zero Fallback Antipattern]] — the bug class the V46-A safety triad prevents.
 

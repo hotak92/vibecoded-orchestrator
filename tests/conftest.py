@@ -7,7 +7,7 @@ below forces ``VCT_DISABLE_HUB_RESOLVER=1`` for every test EXCEPT those
 in the opt-out list (which explicitly exercise the hub-resolver path).
 
 **Why this is needed**: on developer machines where the launcher's
-``vct-hub`` is running (this dogfood box, every contributor's local
+``vct-hub`` is running (the maintainer box, every contributor's local
 setup), tests that monkey-patch ``KG_COLLECTION`` /
 ``SHARED_KG_COLLECTION`` / ``VCT_KG_ACCESS_LIST`` env vars were silently
 losing to the hub-resolved values — both ``_try_resolve_project_config()``

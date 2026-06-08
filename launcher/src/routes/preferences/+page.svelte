@@ -2620,7 +2620,7 @@
                  didn't surface it. Adding it next to the decided mode
                  makes the "why CUDA vs CPU" decision auditable from the
                  Preferences card — critical for diagnosing the
-                 dogfooded RTX 4080 SUPER bug class. -->
+                 observed RTX 4080 SUPER bug class. -->
             <div class="pr-hw-row"><span class="pr-hw-label">VRAM</span>
               <span class="pr-hw-value">{formatHwField('vram_gb', hwDiff.after)}</span></div>
             <!-- v0.2.34 (Agent B): the DECIDED GPU mode is the field that
@@ -2628,7 +2628,7 @@
                  it explicitly (vs just the derived `use_gpu` boolean
                  below) lets the user verify the install will pick the
                  right variant BEFORE clicking Install. The
-                 dogfooded 2026-05-25 bug had `has_nvidia_gpu:true` but
+                 observed 2026-05-25 bug had `has_nvidia_gpu:true` but
                  `gpu_mode_decided` defaulted to Cpu because of a
                  v0.2.20-era schema gap; this row would have made the
                  mismatch visible at a glance. -->

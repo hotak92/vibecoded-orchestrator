@@ -160,7 +160,7 @@ fn to_view(row: TierCacheRow) -> TierCacheView {
 //      MAC the algorithm picked → every event broke machine binding.
 //   2. Python's `uuid.getnode()` and Rust's `mac_address::get_mac_address()`
 //      didn't always pick the SAME NIC on the same machine — observed on
-//      Fabio's Win11 laptop (2 NICs, Python picked USB Ethernet, Rust
+//      a contributor's Win11 laptop (2 NICs, Python picked USB Ethernet, Rust
 //      picked Wi-Fi → different hashes → `machine_mismatch` errors).
 //   3. Hardware repairs / mainboard swaps that replace the integrated NIC
 //      look identical to a brand-new machine from the licence server's
@@ -2759,7 +2759,7 @@ mod tests {
 
     // -----------------------------------------------------------------
     // v0.2.48: synthetic orchestrator placeholder for the License
-    // Manager modal's empty state. Pins the fix for the Fabio-reported
+    // Manager modal's empty state. Pins the fix for the contributor-reported
     // bug where clearing the orchestrator key stranded the modal on
     // the "no paid-module license keys yet" empty branch with no way
     // back. The fix: always include a `__orchestrator__` row in the

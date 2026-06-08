@@ -10,7 +10,7 @@
 --   That's the correct discipline for the auto-bind path on first
 --   admin auth — once bound, never silently rebind.
 --
---   But the v0.2.35 dogfooding revealed a recovery gap: when an admin
+--   But the v0.2.35 post-update validation revealed a recovery gap: when an admin
 --   reinstalls their OS or swaps laptop, the Vault entry's
 --   `machine_id_hash` is non-NULL and pinned to the old machine.
 --   Every subsequent `/validate-tier` returns `machine_mismatch`,

@@ -35,7 +35,7 @@ interface UIState {
   // `showLicenseManager` — NOT `showLicense`, `showModal`,
   // `showKeyManager` or any short variant. Pre-push collision audit A3
   // (`.claude/context/reviews/v0240-pre-push-2026-05-30/discovery-A3-fabio-branch-collision-audit.md`)
-  // identified that Fabio's parallel branch (orchestrator-update-progress
+  // identified that another contributor's parallel branch (orchestrator-update-progress
   // modal) is likely to add `showOrchestratorUpdateProgress` to this
   // same UIState interface in a future PR. The `showLicenseManager`
   // name was reserved by the A3 audit guidance to keep rebase
@@ -43,7 +43,7 @@ interface UIState {
   // ambiguity, distinct enough that grep/sed across the codebase won't
   // hit both flags.
   showLicenseManager: boolean;
-  // v0.2.40 (Fabio branch feat/orchestrator-update-progress-modal):
+  // v0.2.40 (contributor branch feat/orchestrator-update-progress-modal):
   // full-screen blocking overlay shown while the self-update of the
   // orchestrator is in flight (any of: update_orchestrator, apply_pending_install,
   // restart_launcher). Name was reserved by the A3 collision audit — see the
@@ -147,7 +147,7 @@ function createUIStore() {
       update((s) => ({ ...s, showLicenseManager: true })),
     closeLicenseManager: () =>
       update((s) => ({ ...s, showLicenseManager: false })),
-    // v0.2.40 (Fabio): orchestrator self-update progress overlay. Opened
+    // v0.2.40 (contributor): orchestrator self-update progress overlay. Opened
     // by UpdateBadge.svelte right before invoking any of the three updater
     // store actions (runUpdate / applyPendingInstall / runRestart). Closed
     // by OrchestratorUpdateProgressModal.svelte itself after the completion

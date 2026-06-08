@@ -1,6 +1,6 @@
 # Paid-module publisher CI helpers
 
-v0.2.33 (Agent F, C2) introduced two CI artifacts for paid-module publishers (`vct-rl-reranker`, future `vct-mao`, future paid modules). Both close the gap that broke v0.2.32 dogfooding — a launcher install of RL v0.2.7 showed the wrong version on the catalog tile because the manifest silently failed to parse, with no upstream gate to catch the drift.
+v0.2.33 (Agent F, C2) introduced two CI artifacts for paid-module publishers (`vct-rl-reranker`, future `vct-mao`, future paid modules). Both close the gap that broke v0.2.32 post-update validation — a launcher install of RL v0.2.7 showed the wrong version on the catalog tile because the manifest silently failed to parse, with no upstream gate to catch the drift.
 
 The two artifacts are independent — adopt either or both.
 

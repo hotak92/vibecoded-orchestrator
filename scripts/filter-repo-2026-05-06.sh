@@ -10,7 +10,7 @@
 #   §2.a — REAL privacy leak. `launcher/.mcp.json` and `.mcp.json`,
 #          added in launcher subtree squash, deleted in HEAD by
 #          commit 9775a14 ("pre-public scrub"). The squash + add
-#          commits are still reachable in history. Leaks Fabio's
+#          commits are still reachable in history. Leaks contributor's
 #          Windows username `fabio`, his C:\Users\fabio layout,
 #          and personal Weaviate collection names.
 #

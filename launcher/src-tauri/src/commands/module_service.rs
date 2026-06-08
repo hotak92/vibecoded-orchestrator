@@ -599,10 +599,10 @@ pub async fn start_global_container_after_install(
 /// install rows into a single global row when the on-disk manifest now
 /// declares `install.scope = "global"`.
 ///
-/// Trigger: launcher boot. Per the v0.2.49 plan (user decision: "no
-/// prompt, no legacy support — me + Fabio are the only users"), the
-/// migration applies destructively on first launch after the manifest
-/// flip:
+/// Trigger: launcher boot. Per the v0.2.49 plan (deliberate scope
+/// decision: no interactive prompt, no legacy support — the pre-v0.2.49
+/// install population was small enough to migrate destructively), the
+/// migration applies on first launch after the manifest flip:
 ///
 ///   1. For each installed module whose on-disk extracted manifest
 ///      declares `install.scope = "global"`.
@@ -1411,7 +1411,7 @@ pub async fn apply_weights_update(
 /// Background fine-tune step. Calls `/finetune` on the container, polls
 /// `/finetune_status` until done, then `signal_rotate_weights`.
 ///
-/// IMPORTANT contract pinned by the dogfooding install (server contract changed
+/// IMPORTANT contract pinned by the maintainer install (server contract changed
 /// during release): the terminal state from `/finetune_status` is
 /// `"done"` (NOT `"complete"`). The launcher previously polled for
 /// `"complete"`; the server's now-shipped v0.1.1 (private repo c9039e4)

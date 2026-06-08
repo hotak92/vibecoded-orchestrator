@@ -22,14 +22,14 @@
   import ActivationModal from '$lib/components/ActivationModal.svelte';
   // v0.2.40 L1: per-paid-module license manager modal. Opened via
   // `ui.openLicenseManager()`. Mount + close pattern mirrors
-  // `InstallWizard` (the wiring guide we sent Fabio). Namespacing
+  // `InstallWizard` (the wiring guide we sent to a contributor). Namespacing
   // discipline per the A3 collision audit: the store flag is
-  // `showLicenseManager` (NOT `showLicense` / `showModal`) so Fabio's
+  // `showLicenseManager` (NOT `showLicense` / `showModal`) so another contributor's
   // parallel orchestrator-update-progress branch doesn't collide on
   // rebase. See `.claude/context/reviews/v0240-pre-push-2026-05-30
   // /discovery-A3-fabio-branch-collision-audit.md`.
   import LicenseManagerModal from '$lib/components/LicenseManagerModal.svelte';
-  // v0.2.43 (Fabio branch feat/orchestrator-update-progress-modal): full-
+  // v0.2.43 (contributor branch feat/orchestrator-update-progress-modal): full-
   // screen blocking overlay for the orchestrator self-update flow. Mount +
   // close pattern mirrors `InstallWizard` and the L1 `LicenseManagerModal`
   // sibling above. Opened by `ui.openOrchestratorUpdateProgress()` from
@@ -309,13 +309,13 @@
 
   <!-- v0.2.40 L1: per-paid-module license manager. Opened via
        `ui.openLicenseManager()`. The flag name is `showLicenseManager`
-       per the A3 collision-audit guidance (avoids overlap with Fabio's
+       per the A3 collision-audit guidance (avoids overlap with another contributor's
        in-progress orchestrator-update-progress modal flag). Same
        open/close shape as InstallWizard above. -->
   {#if uiState.showLicenseManager}
     <LicenseManagerModal onClose={() => ui.closeLicenseManager()} />
   {/if}
-  <!-- v0.2.43 (Fabio): full-screen blocking overlay during self-update.
+  <!-- v0.2.43 (contributor): full-screen blocking overlay during self-update.
        Opened by `ui.openOrchestratorUpdateProgress()` from
        UpdateBadge.handleAction right before invoking any updater action
        (runUpdate / applyPendingInstall / runRestart). The modal subscribes

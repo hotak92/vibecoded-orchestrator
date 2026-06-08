@@ -8,7 +8,7 @@
 // every error toast so the user can review them later from the bell in
 // the RightSidebar, copy the text, or dismiss them.
 //
-// Auto-resolution (mixed strategy, per Fabio 2026-06-05):
+// Auto-resolution (mixed strategy, per a contributor 2026-06-05):
 //   1. Dedup by `key`: two errors with the same key collapse into one
 //      entry with a `count` ("×3") instead of stacking duplicates.
 //   2. Auto-clear on success: when a SUCCESS toast fires with the same

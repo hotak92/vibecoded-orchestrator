@@ -208,7 +208,7 @@ def _make_path_with_noop_python3(stub_dir: Path) -> str:
     """Build a PATH value that resolves ``python3`` to a no-op shim
     (exit-0 immediately, no I/O). This isolates the wrapper's
     fall-through path from the host's real ``python3`` — which on
-    dogfood machines has the orchestrator's editable ``weaviate_mcp``
+    maintainer machines have the orchestrator's editable ``weaviate_mcp``
     installed AND a working Weaviate, so a fall-through would
     actually run a real sync (and timeout the test).
 

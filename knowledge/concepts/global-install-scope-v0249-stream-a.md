@@ -62,7 +62,9 @@ On every launcher boot, `auto_migrate_per_project_to_global` runs BEFORE the res
 5. Insert one global row + audit-log `module_migrated_to_global_scope`.
 6. Best-effort start the global container (failures land in `last_error`; resume sweep retries on next boot).
 
-Per the v0.2.49 decision: no user prompt, no legacy support. The only existing users are the maintainer + Fabio.
+Per the v0.2.49 decision: no user prompt, no legacy support. The
+deliberate scope decision was that the existing pre-v0.2.49 install
+population was small enough to migrate without an interactive prompt.
 
 ## Backwards compat
 

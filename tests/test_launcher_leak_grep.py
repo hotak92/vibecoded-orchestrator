@@ -122,7 +122,7 @@ def test_allows_github_runner_macos_path():
 def test_detects_windows_dev_path_leak():
     """Windows path leak — the audit's highest-signal item.
 
-    `marti` (Fabio's Windows username) and `OneDrive\\Desktop\\...`
+    `marti` (a contributor's Windows username sentinel) and `OneDrive\\Desktop\\...`
     were the leaking strings before PR-4. The CI grep must catch
     them whether they appear at line-start, after whitespace, or
     embedded in a longer panic-message context.

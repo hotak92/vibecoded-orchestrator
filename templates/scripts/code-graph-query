@@ -11,7 +11,7 @@
 # but `query_code_graph.py` requires `claude_mcp_servers` on PYTHONPATH).
 #
 # Bug history:
-#   - 2026-05-27 (user_project_x dogfooding): query_code_graph.py crashed
+#   - 2026-05-27 (post-update validation): query_code_graph.py crashed
 #     with `ModuleNotFoundError: No module named 'weaviate_mcp'` because
 #     the wrapper activated a venv but never put claude_mcp_servers/ on
 #     PYTHONPATH. The launcher exports VCT_ORCHESTRATOR_ROOT for this

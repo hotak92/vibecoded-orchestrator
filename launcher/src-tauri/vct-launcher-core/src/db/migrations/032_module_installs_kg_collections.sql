@@ -34,7 +34,7 @@
 -- since v0.2.49 changes the install schema enough that reinstall is
 -- the recovery anyway).
 --
--- For the orchestrator's own development cycle: the dogfood box's
+-- For the orchestrator's own development cycle: the maintainer install's
 -- vct-rl-reranker install (which doesn't currently declare
 -- kg_collections per its v0.2.10 manifest) gets NULL and is correctly
 -- skipped by the MF3 populate. No action needed.

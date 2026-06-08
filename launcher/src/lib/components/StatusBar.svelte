@@ -3,7 +3,7 @@
 
   let appCount = $derived($currentUser?.apps?.length ?? 0);
 
-  // v0.2.43 (Fabio branch feat/launcher-logo-circular-white):
+  // v0.2.43 (contributor branch feat/launcher-logo-circular-white):
   // version string moved to the right-sidebar brand footer
   // (RightSidebar.svelte `.rs-brand-footer`) so the statusbar
   // is no longer a duplicate display surface. StatusBar now

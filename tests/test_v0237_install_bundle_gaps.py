@@ -283,7 +283,7 @@ class EnsureCollectionExistsChunkingPropsTests(unittest.TestCase):
 
     def test_chunking_props_patched_when_missing(self):
         """Legacy collection (no chunking props) → all 3 chunking
-        props added via add_property. This is the dogfooded bug: every
+        props added via add_property. This is the observed bug: every
         sync against a pre-v0.2.16 collection used to fail with `no
         such prop with name 'chunk_num'` until the user dropped &
         recreated the collection manually."""

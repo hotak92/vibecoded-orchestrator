@@ -316,7 +316,7 @@ def test_parity_settings_json_format_2_space_indent_no_trailing_newline(
 
 def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     """Round-trip a realistic settings.json containing user-set keys
-    (KG_BASE_DIR — observed in real-world dogfooding) plus a hooks block.
+    (KG_BASE_DIR — observed in real-world validation) plus a hooks block.
 
     Asserts:
       * The realistic shape survives an apply.
@@ -327,7 +327,7 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     test, but the actual shape we see in the wild."""
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir()
-    # Realistic snapshot from a dogfooding install (modulo path values).
+    # Realistic snapshot from a real install (modulo path values).
     settings_path.write_text(json.dumps({
         "env": {
             "PROJECT_NAME": "VCODev",

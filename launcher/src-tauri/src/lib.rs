@@ -597,7 +597,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        // v0.2.43 (Fabio): persist window size/position/maximized state
+        // v0.2.43 (contributor): persist window size/position/maximized state
         // across launches. Auto-restores on startup, auto-saves on
         // resize/move/close. Combined with `maximized: true` in
         // tauri.conf.json `windows[]`, first launch opens maximized;

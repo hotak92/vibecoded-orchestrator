@@ -15,7 +15,7 @@
 // with just an "Install" button — visually identical to a module never
 // installed anywhere.
 //
-// User report (Fabio, 2026-06-07, V5 handoff §2):
+// User report (a contributor, 2026-06-07, V5 handoff §2):
 //   "when another project is selected modules disappear. They
 //    shouldn't, as they should be present/available for every
 //    installed project and this should be clear in the GUI too."

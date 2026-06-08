@@ -98,7 +98,7 @@
   async function handleAction() {
     popoverOpen = false;
     if (kindCopy.actionKey === null) return;
-    // v0.2.40 (Fabio): open the full-screen blocking progress overlay
+    // v0.2.40 (contributor): open the full-screen blocking progress overlay
     // BEFORE invoking the updater action. The overlay subscribes to
     // `$orchestrator.progress` (already populated by the install_progress
     // Tauri listener) and stays up across the entire flow:

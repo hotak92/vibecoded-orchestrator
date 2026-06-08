@@ -292,14 +292,14 @@
 
   const currentPath = $derived($page.url.pathname);
 
-  // ─── v0.2.43 (Fabio): collapsible sidebar groups ──────────────────────
+  // ─── v0.2.43 (contributor): collapsible sidebar groups ──────────────────────
   // Each group header (Workspace / Knowledge / Team / System / …) toggles
   // a $state record of `{ groupLabel: boolean }` (true = expanded). State
   // is persisted to localStorage under SIDEBAR_COLLAPSE_KEY so the user's
   // layout survives reload + restart. Default: all groups expanded.
   //
   // We intentionally store the collapsed state ONLY in localStorage (not
-  // launcher.db) per Fabio's preference 2026-06-01: simpler, no schema
+  // launcher.db) per a contributor's preference 2026-06-01: simpler, no schema
   // migration, sufficient for a UI preference. If the user wipes WebView
   // storage all groups default back to expanded — acceptable UX cost.
   const SIDEBAR_COLLAPSE_KEY = 'vct.sidebar.collapsedGroups';
@@ -432,7 +432,7 @@
     gap: 0;
   }
 
-  /* v0.2.43 (Fabio): group header is now a button that toggles
+  /* v0.2.43 (contributor): group header is now a button that toggles
      collapsed state. Visually still looks like a label (small caps,
      muted) but reveals affordance via a rotating chevron and hover
      background. */

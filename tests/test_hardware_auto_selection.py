@@ -14,7 +14,7 @@ Boundary semantics:
   - Most "X+" thresholds in the spec → inclusive `>=` in the code.
   - The 2 GB GPU code boundary is strict `>` (per spec "code, VRAM > 2 GB"
     → Jina; "≤ 2 GB" → CPU path).
-  - **v0.2.49 strict-`>` boundaries** (after dogfooding on Fabio's
+  - **v0.2.49 strict-`>` boundaries** (after post-update validation on a contributor's
     24 GB Windows box, Bug M — qwen3-embedding on CPU-only Ollama
     was ~30s per embedding at the 24 GB boundary):
       * KG embedding: VRAM `>` 8 GB → qwen3 (was `>=`)
@@ -106,7 +106,7 @@ class TestCodeEmbeddingSelector:
         """v0.2.49: strict-> on RAM boundary. EXACTLY 24 GB → jina.
 
         Pre-v0.2.49 this tier-up'd to qwen3 at the 24 GB boundary, but
-        dogfooding on Fabio's 24 GB Windows box (Bug M) showed
+        post-update validation on a contributor's 24 GB Windows box (Bug M) showed
         qwen3-embedding on CPU-only Ollama is ~30s per embedding at
         the boundary. The strict-> rule moves 24 GB hosts to the
         lighter tier.
@@ -203,7 +203,7 @@ class TestKgEmbeddingSelector:
         """4 GB <= VRAM <= 8 GB → arctic2 (same dims, smaller footprint).
 
         v0.2.49: inclusive at 8 GB now (was strict-< 8 GB). The 8 GB
-        boundary tier-up to qwen3 required strict-> after dogfooding
+        boundary tier-up to qwen3 required strict-> after post-update validation
         showed boundary cards crowd VRAM when co-loading other models.
         """
         got = select_kg_embedding_backend(
@@ -232,7 +232,7 @@ class TestKgEmbeddingSelector:
         """v0.2.49: strict-> on RAM boundary. EXACTLY 24 GB → arctic.
 
         Pre-v0.2.49 this tier-up'd to qwen3 at the 24 GB boundary, but
-        dogfooding on Fabio's 24 GB Windows box (Bug M) showed
+        post-update validation on a contributor's 24 GB Windows box (Bug M) showed
         qwen3-embedding on CPU-only Ollama is ~30s per embedding at
         the boundary — unusable for KG indexing. The strict-> rule
         moves 24 GB hosts to arctic + jina (low_resource profile).

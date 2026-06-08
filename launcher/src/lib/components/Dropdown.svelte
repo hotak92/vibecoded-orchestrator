@@ -87,7 +87,7 @@
     // propagation) settles before we toggle `open`. Without the defer,
     // certain combinations of `bind:value` + parent effects + Svelte 5
     // batching could end up with `open` remaining `true` after a pick.
-    // Dogfooded 2026-05-26 in DiagramsTab's "Add diagram" type selector.
+    // Validated 2026-05-26 in DiagramsTab's "Add diagram" type selector.
     queueMicrotask(() => {
       close();
       triggerEl?.focus();

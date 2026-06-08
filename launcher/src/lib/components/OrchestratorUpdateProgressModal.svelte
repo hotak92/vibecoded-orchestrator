@@ -2,7 +2,7 @@
   // SPDX-License-Identifier: AGPL-3.0-or-later
   //
   // OrchestratorUpdateProgressModal — full-screen blocking overlay for
-  // the orchestrator self-update flow (Fabio branch, v0.2.43-targeting).
+  // the orchestrator self-update flow (contributor branch, v0.2.43-targeting).
   //
   // Why this exists:
   //

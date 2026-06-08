@@ -9,7 +9,7 @@
 // the result was that rows with status='error' (and the reconciler's
 // 'broken' status added in v0.2.33) only offered an "Uninstall" CTA.
 // The user had to uninstall first before they could try again, which is
-// unintuitive — especially in the dogfooding flow where an install
+// unintuitive — especially in the post-update validation flow where an install
 // failure mid-pipeline is the common case the retry button should fix.
 //
 // The Rust backend (Agent A's v0.2.34 UPSERT fix in commands/modules.rs)

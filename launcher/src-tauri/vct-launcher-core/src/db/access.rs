@@ -974,7 +974,7 @@ impl Db {
     /// Pre-v0.2.46, saving `Role=primary` for the orchestrator-root
     /// project did NOT touch the `Role=shared` row, leaving the two
     /// out-of-sync. The v0.2.40 W40-B research doc §4b documented this
-    /// as the canonical drift class on VCO_dev's dogfood machine.
+    /// as the canonical drift class on the maintainer's dev machine.
     ///
     /// v0.2.46 fixes this at write-time via
     /// `set_project_kg_binding_with_root_sync` in `project_state.rs`.

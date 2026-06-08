@@ -74,7 +74,7 @@ def test_install_ps1_winget_invocation_is_silent() -> None:
     Without --accept-source-agreements + --accept-package-agreements, winget
     interactively prompts for ToS acceptance which hangs forever in a
     .bat-spawned PowerShell window (same root cause as the silent-prompt bug
-    Fabio fixed in fix/installer-windows-args-propagation).
+    a contributor fixed in fix/installer-windows-args-propagation).
     """
     content = _install_ps1()
     assert "winget install Microsoft.EdgeWebView2Runtime" in content, (

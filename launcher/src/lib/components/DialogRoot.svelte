@@ -90,7 +90,7 @@
   // microtask) AND isOpen=false (we just closed) AND prevOpen=true and
   // takes the third branch — close()+showModal() — which fires onclose
   // again, etc. Infinite loop, each iteration painting a new dialog
-  // frame, hence "milioni di finestre" (Fabio, 2026-05-25).
+  // frame, hence "milioni di finestre" (a contributor's testing, 2026-05-25).
   //
   // The guard: a non-reactive `inFlight` flag that suppresses re-entry
   // while we're inside a showModal/close transition. Critically, we

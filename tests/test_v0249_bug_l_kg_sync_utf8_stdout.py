@@ -85,7 +85,7 @@ def test_emoji_print_does_not_crash_when_stdout_is_cp1252():
     script-top, then asserting the reconfigure runs + a subsequent
     emoji print survives.
 
-    This is the actual failure mode Fabio reported: stdout was cp1252,
+    This is the actual failure mode a contributor reported: stdout was cp1252,
     the script crashed with UnicodeEncodeError on `print(f"❌ ...")`.
     """
     script = _project_root() / "templates" / "scripts" / "sync_knowledge_graph.py"

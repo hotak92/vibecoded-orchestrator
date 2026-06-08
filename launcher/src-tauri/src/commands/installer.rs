@@ -835,7 +835,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     //
     //    v0.2.21 (Stream A Design B extension): fetch from the canonical
     //    public AGPL upstream via the `vco_upstream` remote, NOT from
-    //    `origin`. Private forks (the maintainer's dogfooding install,
+    //    `origin`. Private forks (the maintainer's maintainer install,
     //    customer mirrors) have
     //    `origin` pointing at the fork; pre-fix the GUI's "Update
     //    orchestrator" banner silently never lit up because `origin`
@@ -1524,7 +1524,7 @@ where
 ///
 ///   1. **v0.2.20-style schema gap**: the persisted row predates a new
 ///      snapshot field, serde defaults the missing field, and the install
-///      flow reads stale data (the dogfooded RTX 4080 SUPER bug —
+///      flow reads stale data (the observed RTX 4080 SUPER bug —
 ///      `gpu_mode_decided` missing → defaulted to `Cpu` → CUDA host
 ///      pulled `-cpu` variant).
 ///   2. **Hardware change between launcher updates**: user added a GPU,
@@ -12918,7 +12918,7 @@ MemAvailable:   23456789 kB
     // ------------------------------------------------------------------
     // v0.2.34 (Agent B): hardware-snapshot freshness invariant.
     //
-    // Coverage for bug #5 of the v0.2.34 backlog (dogfooded RTX 4080 SUPER
+    // Coverage for bug #5 of the v0.2.34 backlog (observed RTX 4080 SUPER
     // bug — persisted snapshot had `has_nvidia_gpu:true` but missing
     // `gpu_mode_decided` because v0.2.20 added the field without
     // backfilling existing snapshots; serde defaulted to `Cpu` → CUDA
@@ -12940,7 +12940,7 @@ MemAvailable:   23456789 kB
         use crate::commands::gpu_policy::GpuMode;
 
         /// Build a `SystemDetection` fixture that mimics the RTX 4080
-        /// SUPER host the dogfooding pass produced — `has_nvidia_gpu`
+        /// SUPER host the validation pass produced — `has_nvidia_gpu`
         /// true, 16 GB VRAM (well above the 8 GB threshold).
         fn rtx4080_super_fixture() -> SystemDetection {
             SystemDetection {
@@ -13030,7 +13030,7 @@ MemAvailable:   23456789 kB
         /// (Test a) Snapshot missing `gpu_mode_decided` → install-time
         /// re-detect populates it before `gpu_mode` is read.
         ///
-        /// Reproduces the dogfooded production bug: persisted row is the
+        /// Reproduces the observed production bug: persisted row is the
         /// v0.2.20-era partial schema (no `gpu_mode_decided`), install
         /// flow reads it, serde defaults missing field to `Cpu`. After
         /// `resolve_fresh_or_last_known_snapshot_with_probe` runs with

@@ -47,7 +47,7 @@ The pragmatic v0.2.36 ship is:
 This shipping decision is also explicit in the agent summary returned to
 the main chat. The embedded `ExcalidrawEditor.svelte` (broken in
 Wayland+webkit2gtk per docs/EXCALIDRAW_WAYLAND_TEST.md and shown in the
-dogfooding screenshot as enormous-icon garbage) **is preserved on disk
+screenshot as enormous-icon garbage) **is preserved on disk
 for now** so we don't break any deep-linked tests, but the DiagramsTab
 "Draw Excalidraw" button no longer routes to it.
 

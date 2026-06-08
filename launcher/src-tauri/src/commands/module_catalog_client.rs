@@ -61,7 +61,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const L0_TTL_SECONDS: u64 = 15 * 60;
 
 /// Short TTL applied when the L0 response contains zero modules
-/// (v0.2.34 — dogfooded 2026-05-25 "stale-on-empty-modules trap"). An
+/// (v0.2.34 — validated 2026-05-25 "stale-on-empty-modules trap"). An
 /// empty catalog is almost always transient: the user opened the
 /// Modules tab BEFORE a publisher pushed their entry, or the edge
 /// function returned nothing during a brief outage. Keeping the empty
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn ttl_for_returns_short_ttl_on_empty_modules() {
-        // v0.2.34 dogfood fix: empty envelope must NOT use the long
+        // v0.2.34 fix: empty envelope must NOT use the long
         // 15min TTL. The publication-window bug (user opens Modules
         // tab BEFORE publisher pushes their L0 entry) only resolves
         // when the empty response expires quickly.

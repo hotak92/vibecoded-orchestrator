@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """v0.2.49: tests for install.py's main()-entry single-instance lock.
 
-Closes the 13-minute-deadlock pattern reported 2026-06-05 from Fabio's
+Closes the 13-minute-deadlock pattern reported 2026-06-05 from a contributor's
 machine where two concurrent `install.py --update` invocations
 interleaved on shared state.
 

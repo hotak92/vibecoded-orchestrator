@@ -122,7 +122,7 @@
   <div class="accent-strip" aria-hidden="true"></div>
   <!-- Left: Logo + project selector -->
   <div class="menu-left">
-    <!-- v0.2.43 (Fabio branch feat/launcher-logo-circular-white):
+    <!-- v0.2.43 (contributor branch feat/launcher-logo-circular-white):
          brand logo moved from here to the StatusBar footer (see
          StatusBar.svelte `.status-brand`). The Windows titlebar already
          carries the embedded .ico icon — duplicating it here was visually

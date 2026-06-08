@@ -1597,7 +1597,7 @@ pub async fn install_module_for_project(
     //
     // v0.2.34 (Agent B): the persisted snapshot MUST be fresh +
     // structurally complete here, otherwise a partial schema (e.g. the
-    // dogfooded v0.2.20 → v0.2.21 upgrade path where `gpu_mode_decided`
+    // the v0.2.20 → v0.2.21 upgrade path where `gpu_mode_decided`
     // was added without backfilling existing snapshots) would let an
     // RTX 4080 SUPER host serde-default to `GpuMode::Cpu` and pull the
     // `-cpu` image variant. `ensure_fresh_hardware_snapshot_for_install`

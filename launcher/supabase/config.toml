@@ -44,7 +44,7 @@ verify_jwt = false
 # ≥ pro BEFORE issuing a GHCR pull token, so the auth boundary is at
 # the body level (not JWT). Without `verify_jwt = false`, every
 # launcher install attempt hits `UNAUTHORIZED_NO_AUTH_HEADER` before
-# the function body even runs — discovered during v0.2.35 dogfooding
+# the function body even runs — discovered during v0.2.35 post-update validation
 # 2026-05-26. Source-controlled so the next deploy re-applies it.
 [functions.rl-artifact-url]
 verify_jwt = false
@@ -62,7 +62,7 @@ verify_jwt = false
 # license key isn't a Supabase JWT — the gateway pre-gate rejects
 # before the function body runs.
 #
-# Discovered 2026-06-06 during maintainer dogfooding after
+# Discovered 2026-06-06 during post-update validation after
 # Bug B + C unblocked the install path end-to-end. Audit log:
 # `module_default_weights_auto_download_deferred` with
 # `rl-latest-weights returned 401 Unauthorized:

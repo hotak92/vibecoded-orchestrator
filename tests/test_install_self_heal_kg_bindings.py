@@ -887,7 +887,7 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
 
         Pre-Bug-O the INSERT referenced 5 columns (adding `granted_at`
         and `updated_at` that were planned but never landed in any
-        migration). Discovered 2026-06-07 via Bug N's empirical dogfood
+        migration). Discovered 2026-06-07 via Bug N's empirical post-update validation
         validation: the RW pass would activate on any host with case-
         rebind OR cross-prefix-adopt needs (the common case post-update),
         the parity loop would attempt the INSERT, and SQLite would raise

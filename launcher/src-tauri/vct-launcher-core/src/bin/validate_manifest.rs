@@ -16,7 +16,7 @@
 //! `strict_manifest_mode()` plumbing the runtime parser uses — no
 //! special wiring required.
 //!
-//! Why this exists: v0.2.32 dogfooding shipped a manifest schema bug
+//! Why this exists: v0.2.32 validation shipped a manifest schema bug
 //! where the RL chat's v0.2.7 manifest declared a `tauri_command` step
 //! kind that the launcher's `ActionDescriptor` enum didn't know about.
 //! The parse silently failed → the catalog tile showed a stale v0.1.1

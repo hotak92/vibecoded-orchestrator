@@ -15,7 +15,7 @@ export const UUID_RE =
 // Vault-admin token regex — Path A admin licenses (`vct_admin_` prefix +
 // URL-safe base64 body). Mirrors the same check in
 // `validate-tier/index.ts::isValidVaultAdminToken`. Discovered missing
-// 2026-05-26 during v0.2.35 dogfooding: an admin-tier user reached the
+// 2026-05-26 during v0.2.35 post-update validation: an admin-tier user reached the
 // pull-token gateway with their `vct_admin_*` token and got `400
 // license_key_invalid_format` because this validator was UUID-only.
 // validate-tier accepts both shapes; rl-artifact-url MUST also accept

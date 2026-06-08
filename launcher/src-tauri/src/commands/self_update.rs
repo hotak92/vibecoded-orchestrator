@@ -1096,7 +1096,7 @@ pub fn get_auto_check_enabled() -> bool {
 // v0.2.35 Agent K — running-version display + post-update binary-lag warning
 // ---------------------------------------------------------------------------
 //
-// Problem (dogfooded against v0.2.34 ship): the orchestrator's
+// Problem (observed against v0.2.34 ship): the orchestrator's
 // "Update orchestrator" flow does a `git pull` then restarts into whatever
 // binary lives at `launcher/dist/<arch>/vct-launcher`. After tagging a
 // release on `main`, CI runs the `chore(binary): refresh vct-launcher +

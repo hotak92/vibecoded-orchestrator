@@ -3090,7 +3090,7 @@ import contextlib as _contextlib
 # Background: V44-I's `_install_advisory_lock` is called from EXACTLY ONE
 # narrow site (the orchestrator-root rebind path at ~line 11193). The
 # broader `install.py --update` run is not protected. A bug reported
-# 2026-06-05 (Fabio's machine) showed two concurrent `install.py --update`
+# 2026-06-05 (a contributor's machine) showed two concurrent `install.py --update`
 # invocations deadlocking for 13 minutes — one held partial state, the
 # other spun in retry-with-backoff loops until timeout.
 #
@@ -3109,7 +3109,7 @@ def _install_singleton_lock_or_die(timeout_seconds: float = 15.0):
     """v0.2.49: acquire the install.py main-entry single-instance lock.
 
     Closes the 13-minute-deadlock pattern reported 2026-06-05 from
-    Fabio's machine where two concurrent `install.py --update`
+    a contributor's machine where two concurrent `install.py --update`
     invocations interleaved on shared state.
 
     Behaviour:
@@ -4012,7 +4012,7 @@ def main() -> int:
 
     # v0.2.49: main()-entry single-instance lock for --update runs.
     # Closes the 13-minute-deadlock pattern reported 2026-06-05 from
-    # Fabio's machine where two concurrent `install.py --update`
+    # a contributor's machine where two concurrent `install.py --update`
     # invocations interleaved on shared state. Wait-then-die with a
     # 15s timeout — fast enough for accidental double-clicks to
     # succeed (first instance finishes), but bounded so a genuine
@@ -6460,7 +6460,7 @@ def select_code_embedding_backend(
           (strict-> on RAM since v0.2.49: a host with EXACTLY 24 GB
           shouldn't tier-up to qwen3 — qwen3-embedding on CPU-only
           Ollama is ~30s per embedding even at the boundary, confirmed
-          on Fabio's 24 GB Windows box. Cores threshold stays >=8 but
+          on a contributor's 24 GB Windows box. Cores threshold stays >=8 but
           now counts PHYSICAL cores via `_probe_cpu_cores` — see its
           docstring for the SMT-counting fix.)
         - else → Jina
@@ -6537,7 +6537,7 @@ def select_kg_embedding_backend(
           (v0.2.49: strict-> on RAM, was `>=`. Boundary hosts with
           exactly 24 GB shouldn't tier-up to qwen3 — qwen3-embedding
           on CPU-only Ollama is ~30s per embedding at the boundary,
-          confirmed on Fabio's 24 GB Windows box. Cores threshold stays
+          confirmed on a contributor's 24 GB Windows box. Cores threshold stays
           `>=8` but now counts PHYSICAL cores via `_probe_cpu_cores`
           — see its docstring for the SMT-counting fix.)
         - else → arctic2
@@ -6667,8 +6667,8 @@ def _probe_cpu_cores() -> int:
     """Best-effort PHYSICAL CPU-core count, cross-OS.
 
     v0.2.49: switched from logical=True (counts SMT threads) to
-    logical=False (counts physical cores) after dogfooding on Fabio's
-    Windows box showed the embedding-model auto-selector tier-up'd to
+    logical=False (counts physical cores) after post-update validation on a
+    contributor's Windows box showed the embedding-model auto-selector tier-up'd to
     qwen3 on a host where the logical count (16) crossed the >=8
     threshold even though the actual physical cores (8) were exactly at
     the boundary — qwen3-embedding on CPU-only Ollama takes ~30s per
@@ -11949,7 +11949,7 @@ def _seed_weaviate_shared_kg_only(
     #
     # When this is the orchestrator clone itself, the per-project KG and the
     # shared KG are the same logical collection. Names can legitimately differ
-    # due to legacy migrations (e.g. the dogfooding install's
+    # due to legacy migrations (e.g. the maintainer install's
     # `VCODev_KnowledgeGraph` survives from an older migration while
     # SHARED_KG_COLLECTION points at
     # the canonical VibeCodedOrchestrator_KnowledgeGraph).
@@ -11974,7 +11974,7 @@ def _seed_weaviate_shared_kg_only(
         # post-V44-G1 reassigned current_kg_collection. Otherwise once G1
         # picks the same value for both env and resolved, the orphan check
         # always sees canonical == current_kg_collection and the notice is
-        # silently masked (Reader-4 FN1 against the dogfooding install's actual state).
+        # silently masked (Reader-4 FN1 against the maintainer install's actual state).
         orphan_kg = orphan_candidate_kg or current_kg_collection
 
         # Diagnostic: report row counts on both physical collections.
@@ -12585,7 +12585,7 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # Weaviate file_path entries to on-disk presence — files that don't exist
     # on disk at all are always safe to remove regardless of the partial-sync
     # changelist. The _sync_all gate caused the 192 orphan accumulation on
-    # the dogfooding install's KG (v0.2.43 post-update audit).
+    # the maintainer install's KG (v0.2.43 post-update audit).
     if not seed_errors and current_kg_collection:
         _prune_stale_kg_rows(current_kg_collection, weaviate_url)
 
@@ -13894,7 +13894,7 @@ def _self_heal_kg_bindings_on_update(
 
     Fixes Finding 4 of the post-v0.2.22 handoff: a `project_kg_bindings`
     row whose `collection_name` differs only in casing from a class that
-    actually exists in Weaviate. Symptom in production: the dogfooding install's shared
+    actually exists in Weaviate. Symptom in production: the maintainer install's shared
     binding pointed at `VibecodedOrchestrator_KnowledgeGraph` (lowercase
     c) but Weaviate had `VibeCodedOrchestrator_KnowledgeGraph` (capital
     C, 892 objects live).
@@ -14324,7 +14324,7 @@ def _self_heal_kg_bindings_on_update(
                 # INSERT failed with `OperationalError: table
                 # kg_collection_access has no column named granted_at` on
                 # every host whose self-heal RW pass activated. Discovered
-                # 2026-06-07 via Bug N's empirical dogfood validation (RL
+                # 2026-06-07 via Bug N's empirical post-update validation (RL
                 # chat msg 186). Fixed by dropping the 2 unsupported column
                 # names + their parameter binds — access_level is the
                 # load-bearing field; audit columns get re-introduced via a
@@ -16240,7 +16240,7 @@ def _check_search_mcp_env_obsolete(
 # it determines which named-vector Weaviate column is queried).
 #
 # Removed in PR-43 (post-PR-23): RL_SERVER_URL (varies per user setup —
-# the dogfooding install runs a dedicated port-11442 service, MAO uses 11439, etc.),
+# the maintainer install runs a dedicated port-11442 service, MAO uses 11439, etc.),
 # EMBEDDING_MODEL (users may want per-project override; if it's in this
 # global allowlist, the per-project .claude/settings.json env value gets
 # overridden the WRONG WAY due to Claude Code's precedence).
@@ -19914,7 +19914,7 @@ def _ensure_env_template(env_path: Path, project_name: str = "<project>",
         # `_ensure_env_template(env, project_name="Acme")` always
         # produced `KG_COLLECTION=Acme_KnowledgeGraph`. Reading
         # os.environ would leak the caller's shell env into the
-        # generated file (observed in tests where the dogfooding install's
+        # generated file (observed in tests where the maintainer install's
         # KG_COLLECTION was active in the shell).
         "KG_COLLECTION": f"{sanitized}_KnowledgeGraph",
         "DEVELOPMENT_COLLECTION": f"{sanitized}_Development",

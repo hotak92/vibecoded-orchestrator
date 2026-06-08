@@ -4,7 +4,7 @@
 //
 // Why these tests live here
 // ─────────────────────────
-// User report (Fabio, V5 handoff): "when another project is selected
+// User report (a contributor, V5 handoff): "when another project is selected
 // modules disappear." The fix is two-part:
 //   1. The catalog LIST is sourced from `$modules.catalog` (global).
 //      This was already correct pre-fix — `mState.catalog` populates

@@ -3033,7 +3033,7 @@ mod tests {
 
     #[test]
     fn l0_none_l1_placeholder_resolves_to_default_const() {
-        // Root cause scenario from v0.2.41 dogfooding:
+        // Root cause scenario from v0.2.41 validation:
         //   L0 override absent (cache miss) AND L1 manifest carries placeholder.
         // Previously: would POST to "https://example/pull-token" → connection
         // error, fall through to anonymous pull, GHCR 401 with no useful message.

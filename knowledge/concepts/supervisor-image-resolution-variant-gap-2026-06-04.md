@@ -319,10 +319,10 @@ ship a fix only to the surface that triggered the user-reported bug;
 the structural fix is single-source-of-truth in core." v0.2.49 is that
 structural fix.
 
-## v0.2.49 post-Phase3 dogfooding audit (2026-06-06 evening)
+## v0.2.49 post-Phase3 validation audit (2026-06-06 evening)
 
 **Context**: while validating Phase 3 + the b4830e04 REGISTRY_AUTH_FILE
-fix end-to-end on the RL chat's dogfood box, the install path was
+fix end-to-end on a live RL Reranker install, the install path was
 confirmed green (`pull_token_resolved → module_install_done`) but the
 start path immediately failed with `manifest unknown` 125 on bare tag
 `:0.2.9`. Two NEW bugs surfaced that v0.2.46/v0.2.47/v0.2.49-Phase3 all
@@ -424,5 +424,3 @@ absent) is much lower than the cost of a 3-release latent bug.
 - [[refines::Pre-install catalog architecture — L0 public endpoint + post-install on-disk manifest]]
   — L0 catalog drives the variant list; the v0.2.49 publisher contract
   closes the publisher-side gap that the b4830e04 fix paired with
-- `.claude/context/plans/v0.2.49-remaining-rl-install-bugs-2026-06-06.md`
-  — fix plan

@@ -21,7 +21,7 @@
   import { moduleActionForKind, detectModuleErrorAfterAction } from '$lib/module-status-display';
   import Dropdown from '$lib/components/Dropdown.svelte';
 
-  // v0.2.43 (Fabio branch feat/launcher-logo-circular-white): brand
+  // v0.2.43 (contributor branch feat/launcher-logo-circular-white): brand
   // footer at the bottom of the right sidebar (logo + "VCT Launcher" +
   // version). Replaces the menubar logo (moved here) AND the
   // statusbar version string (also moved here to avoid duplication).
@@ -526,7 +526,7 @@
     </div>
   {/if}
 
-  <!-- v0.2.43 (Fabio): brand footer. Sits at the bottom of the right
+  <!-- v0.2.43 (contributor): brand footer. Sits at the bottom of the right
        sidebar with margin-top:auto, separated from the content above
        by a divider line. Replaces the menubar logo (visual duplicate
        of the Windows titlebar icon) and the statusbar version string. -->
@@ -555,7 +555,7 @@
     flex-direction: column;
   }
 
-  /* v0.2.43 (Fabio): brand footer at the bottom of the right sidebar.
+  /* v0.2.43 (contributor): brand footer at the bottom of the right sidebar.
      `margin-top: auto` pushes it down while the content above stays
      packed at the top. A 1px top border mirrors the existing
      `.sidebar-divider` style for visual continuity. */

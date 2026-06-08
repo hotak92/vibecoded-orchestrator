@@ -704,7 +704,7 @@ _RL_MONITOR_TIMEOUT: float = 600.0           # 10 min hard ceiling
 # arctic2's medium preset (target=2500). Either way ample signal for the
 # max-over-chunks cosine to discriminate cited-vs-not.
 #
-# Tunable via env so dogfood / Pro users can experiment. Pre-v0.2.47.5
+# Tunable via env so CPU / Pro users can experiment. Pre-v0.2.47.5
 # this was a 200-char default which was way too low (typical Claude
 # preamble like "Sure! Let me look that up..." would have passed).
 _RL_MIN_ANSWER_TOKENS_FOR_CITATION: int = int(

@@ -4525,7 +4525,7 @@ mod tests {
     /// Full smoke test: load the actual v0.2.7 RL manifest from
     /// `paid-modules/vct-rl-reranker/vct-module.json` and assert it
     /// parses cleanly via `ModuleManifest::from_json`. This is THE
-    /// regression test for the v0.2.32 dogfooding bug — pre-D, the
+    /// regression test for the v0.2.32 manifest-validation bug — pre-D, the
     /// manifest rejected at line 242 (`tauri_command` step kind)
     /// because the launcher's `ActionDescriptor` enum didn't have the
     /// variant. Post-D, it parses cleanly and the catalog tile can
@@ -4739,7 +4739,7 @@ mod tests {
 
     // ─── v0.2.34: validate_install_dir hardening (Agent A) ──────────
     //
-    // The dogfood install of RL Reranker v0.2.7 on 2026-05-25 surfaced
+    // A test install of RL Reranker v0.2.7 on 2026-05-25 surfaced
     // a guard-vs-bootstrap ordering bug: `~/.vct/modules/` is created
     // lazily by container_pull LATER in the install flow, so on a
     // fresh machine both the candidate install_dir AND the allowed
@@ -4749,14 +4749,14 @@ mod tests {
     // incomparable with the canonicalized candidate ancestor — every
     // first install failed with a spurious "escapes allowed root"
     // error. These tests pin down the four corners of the matrix:
-    //   1. neither exists yet (the dogfood failure case);
+    //   1. neither exists yet (the failure case);
     //   2. root exists, candidate doesn't (typical second install);
     //   3. both exist (typical reinstall path);
     //   4. candidate escapes root (security guarantee preserved).
 
     #[test]
     fn validate_install_dir_succeeds_when_neither_root_nor_candidate_exists() {
-        // The reproducer for the v0.2.34 dogfood bug. The temp dir is
+        // The reproducer for the v0.2.34 manifest-fallback bug. The temp dir is
         // created so its parent canonicalises; we then point both
         // `allowed_root` and `candidate` AT NON-EXISTENT subpaths of
         // it. Pre-fix this asserted err; post-fix it must succeed.
