@@ -429,8 +429,25 @@ async fn set_kg_binding(
     Path(project_id): Path<String>,
     Json(body): Json<SetKgBindingBody>,
 ) -> impl IntoResponse {
-    match h.0.set_project_kg_binding(
+    // v0.2.49 access-matrix Phase 4 (item #9 / M-7): route through
+    // `_with_root_sync` so the hub-driven binding write picks up the
+    // orchestrator-root primary↔shared mirror AND the atomic
+    // kg_collection_access rename. The plain `set_project_kg_binding`
+    // bypasses both — leaving the access matrix stale whenever a
+    // collection_name changes via this endpoint, and silently breaking
+    // the orchestrator-root self-heal when the hub is the writer (e.g.
+    // CLI-driven flows). The `_with_root_sync` variant needs the
+    // project's slug to detect the orchestrator-root case, so we look
+    // it up first; failing the lookup before any DB write is the right
+    // failure mode (caller sees 400, no half-state).
+    let project_slug = match h.0.get_project(&project_id) {
+        Ok(Some(row)) => row.slug,
+        Ok(None) => return err400(format!("project {} not found", project_id)),
+        Err(e) => return err400(format!("project lookup: {}", e)),
+    };
+    match h.0.set_project_kg_binding_with_root_sync(
         &project_id,
+        &project_slug,
         &body.role,
         &body.collection_name,
         body.embedding_model.as_deref(),
