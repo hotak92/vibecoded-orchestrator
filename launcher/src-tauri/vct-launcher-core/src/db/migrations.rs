@@ -168,6 +168,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "projects.folder_missing_at_last_boot column (v0.2.49 access-matrix Phase 6 S-4). ALTER TABLE adds INTEGER NOT NULL DEFAULT 0 (SQLite-stored BOOLEAN). Set/cleared by the launcher's boot sanity check (lib.rs async spawn) that walks every project row and Path::is_dir-checks folder_path. Frontend reads via the boot-flagged project list command (read_project_folder_missing_flags) and renders a non-blocking warning banner on the affected project card. All existing rows backfill to 0; the boot probe rewrites accurately on the next launcher boot.",
         sql: include_str!("migrations/030_project_folder_missing_at_last_boot.sql"),
     },
+    Migration {
+        version: 31,
+        description: "Force-upgrade shared kg_collection_access read→write (v0.2.49 access-matrix Step D / Phase 7). One-shot UPDATE rewrites every kg_collection_access row with access_level='read' AND collection_name in project_kg_bindings.role='shared' to access_level='write', stamping updated_at to wall-clock millis. Per user directive 2026-06-08 ('force-update everything to new default permissions'): no per-row predicate gate, deliberate one-shot data loss for any legacy user-configured downgrade on shared collections accepted. v0.2.49+ INSERTs preserve the seed-path invariant; FUTURE-cycle migrations (v0.2.50+) can use is_user_configured correctly. Idempotent on re-runs (WHERE filter excludes already-upgraded rows). Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md item #20.",
+        sql: include_str!("migrations/031_force_upgrade_shared_kg_read_to_write.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
@@ -1004,6 +1009,300 @@ mod tests {
         assert_eq!(
             global_remaining, 1,
             "global rows untouched by per-project delete"
+        );
+    }
+
+    // ─── Migration 031: force-upgrade shared read→write ──────────────────
+    //
+    // Step D / Phase 7 of the v0.2.49 access-matrix overhaul. Force-
+    // upgrades every kg_collection_access row with access_level='read'
+    // whose collection_name is on a project_kg_bindings row with
+    // role='shared'. Per user directive 2026-06-08 ("force-update
+    // everything to new default permissions"), no per-row predicate
+    // gate is applied — legacy explicit downgrades on shared
+    // collections are deliberately overwritten as part of the v0.2.49
+    // semantic flip.
+
+    /// Helper: seed a project + a shared kg binding + an access row
+    /// with the given access_level. Returns the (project_id,
+    /// collection_name) tuple so the test can assert post-migration.
+    fn seed_shared_access(
+        conn: &Connection,
+        proj_id: &str,
+        coll_name: &str,
+        access_level: &str,
+    ) {
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?1, ?2, 'base', ?3, ?3, ?1)",
+            rusqlite::params![proj_id, format!("/tmp/{}", proj_id), now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_kg_bindings
+                (project_id, role, collection_name, config_json, updated_at)
+             VALUES (?1, 'shared', ?2, '{}', ?3)",
+            rusqlite::params![proj_id, coll_name, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            rusqlite::params![proj_id, coll_name, access_level, now],
+        )
+        .unwrap();
+    }
+
+    /// Helper: seed a project + a PRIMARY kg binding + an access row.
+    /// Used to verify the migration does NOT touch non-shared roles.
+    fn seed_primary_access(
+        conn: &Connection,
+        proj_id: &str,
+        coll_name: &str,
+        access_level: &str,
+    ) {
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?1, ?2, 'base', ?3, ?3, ?1)",
+            rusqlite::params![proj_id, format!("/tmp/{}", proj_id), now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_kg_bindings
+                (project_id, role, collection_name, config_json, updated_at)
+             VALUES (?1, 'primary', ?2, '{}', ?3)",
+            rusqlite::params![proj_id, coll_name, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            rusqlite::params![proj_id, coll_name, access_level, now],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_031_upgrades_shared_read_rows_to_write() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        // Apply through 030 first — same shape as the launcher's
+        // staged-rollout case (user on v0.2.48, hasn't yet applied 31).
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        // Seed: 1 shared-read row that should be upgraded.
+        seed_shared_access(&conn, "p1", "Shared_KG", "read");
+
+        // Pre-flight: verify state is what we think it is.
+        let pre_level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre_level, "read");
+
+        // Apply migration 31.
+        apply(&conn).expect("apply 31");
+
+        // Post: upgraded to write.
+        let post_level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(post_level, "write");
+
+        // Post: updated_at bumped past created_at — is_user_configured
+        // flips to TRUE for the rewritten row (matches the audit-trail
+        // semantic per the migration's docstring).
+        let (created_at, updated_at): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert!(
+            updated_at > created_at,
+            "migration must bump updated_at past created_at; got created={} updated={}",
+            created_at, updated_at,
+        );
+    }
+
+    #[test]
+    fn migration_031_preserves_write_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        // Pre-existing write row on a shared binding — already correct
+        // semantic; migration must NOT touch it.
+        seed_shared_access(&conn, "p1", "AlreadyWrite_KG", "write");
+        let pre_updated: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'AlreadyWrite_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        apply(&conn).expect("apply 31");
+
+        // Level unchanged.
+        let level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'AlreadyWrite_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(level, "write");
+        // updated_at unchanged — migration's WHERE clause filtered it
+        // out, so the bump didn't fire.
+        let post_updated: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'AlreadyWrite_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post_updated, pre_updated,
+            "migration must not touch write rows even on shared role",
+        );
+    }
+
+    #[test]
+    fn migration_031_preserves_none_rows_on_shared() {
+        // The migration only upgrades READ→WRITE on shared. NONE rows
+        // on shared (e.g. user explicitly revoked access via the
+        // CrossProjectAccessTab UI) are intentionally not upgraded.
+        // The plan-level user directive was "force-update everything
+        // to new DEFAULT permissions" — the default flip is read→write;
+        // explicit none stays explicit none.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        seed_shared_access(&conn, "p1", "ExplicitNone_KG", "none");
+
+        apply(&conn).expect("apply 31");
+
+        let level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'ExplicitNone_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(level, "none", "migration must not touch explicit none");
+    }
+
+    #[test]
+    fn migration_031_does_not_touch_primary_role_rows() {
+        // Primary bindings are the project's OWN collections; access
+        // for the OWNER is always write per the structural-row
+        // contract (V44-C). Non-owner reads on a primary are a
+        // legitimate distinct semantic (cross-project access matrix
+        // grant). Migration must not conflate.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        // Seed: project p1 with a PRIMARY binding to P1Primary_KG,
+        // and a cross-project read grant from p2 to that same
+        // collection. The grant from p2 is on a 'primary' role from
+        // p1's perspective — not shared. Migration must NOT upgrade.
+        seed_primary_access(&conn, "p1", "P1Primary_KG", "write");
+        // p2 has a read grant on p1's primary. Insert directly
+        // (no shared binding from p2).
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p2', 'p2', '/tmp/p2', 'base', ?1, ?1, 'p2')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES ('p2', 'P1Primary_KG', 'read', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply 31");
+
+        // p2's read on p1's primary must remain read.
+        let p2_level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p2' AND collection_name = 'P1Primary_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_level, "read",
+            "cross-project read on a non-shared role must NOT be auto-upgraded",
+        );
+    }
+
+    #[test]
+    fn migration_031_is_idempotent_on_re_apply() {
+        // Run migration 31 twice via raw SQL (simulating a defensive
+        // re-application — the runner itself would only run it once
+        // via _schema_migrations). The second application must be a
+        // no-op (WHERE access_level='read' filter excludes the
+        // already-upgraded rows).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply all"); // includes 31
+
+        seed_shared_access(&conn, "p1", "Shared_KG", "read");
+        // First explicit raw re-apply (NOT through the runner, which
+        // would skip).
+        conn.execute_batch(MIGRATIONS[30].sql).expect("re-apply 31");
+        let after_first: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Sleep enough that strftime returns a strictly larger value.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Second explicit raw re-apply.
+        conn.execute_batch(MIGRATIONS[30].sql).expect("re-apply 31 again");
+        let after_second: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_second, after_first,
+            "second re-apply must be a no-op (WHERE excludes upgraded rows); \
+             updated_at went from {} to {}",
+            after_first, after_second,
         );
     }
 }
