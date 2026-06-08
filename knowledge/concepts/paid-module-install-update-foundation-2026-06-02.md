@@ -29,7 +29,7 @@ status: active
 # Paid-module install + update foundation (v0.2.45)
 
 v0.2.45 is a hotfix release whose primary motivation was the 3 root causes
-surfaced on VCO_dev when the user clicked "Update orchestrator" on
+surfaced during dogfooding when the user clicked "Update orchestrator" on
 the v0.2.43 launcher post-v0.2.44 ship (2026-06-02 ~01:34 UTC).
 Beyond fixing those bugs, V45-C through V45-F install the **contracts that
 every future paid module relies on**. Per user directive 2026-06-02: "RL

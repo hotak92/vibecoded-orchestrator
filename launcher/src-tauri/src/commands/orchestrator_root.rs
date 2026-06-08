@@ -544,8 +544,8 @@ mod tests {
     #[test]
     fn strip_windows_verbatim_drive_form() {
         assert_eq!(
-            strip_windows_verbatim_prefix(r"\\?\C:\Users\martino\repo"),
-            r"C:\Users\martino\repo"
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\user\repo"),
+            r"C:\Users\user\repo"
         );
     }
 
@@ -561,16 +561,16 @@ mod tests {
     #[test]
     fn strip_windows_verbatim_noop_on_posix_paths() {
         assert_eq!(
-            strip_windows_verbatim_prefix("/home/martino/repo"),
-            "/home/martino/repo"
+            strip_windows_verbatim_prefix("/home/user/repo"),
+            "/home/user/repo"
         );
     }
 
     #[test]
     fn strip_windows_verbatim_noop_on_plain_windows_paths() {
         assert_eq!(
-            strip_windows_verbatim_prefix(r"C:\Users\martino\repo"),
-            r"C:\Users\martino\repo"
+            strip_windows_verbatim_prefix(r"C:\Users\user\repo"),
+            r"C:\Users\user\repo"
         );
     }
 

@@ -206,7 +206,7 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 ///     machines competing with first-install's final container-restart
 ///     phase caused false negatives.
 ///   - 2026-05-23: raised to 15s on Windows after a fresh-install launcher
-///     boot on Ombromanto (Win11) fired the "No container runtime found"
+///     boot on a contributor's Win11 machine fired the "No container runtime found"
 ///     modal despite Docker Desktop being healthy. The Hyper-V VM that
 ///     hosts Docker on Windows can take 3-10s to respond to `docker
 ///     --version` on cold cache; 5s is too tight as a worst-case ceiling.
@@ -300,7 +300,7 @@ async fn version_probe(binary: &PathBuf) -> bool {
 ///   - originally 5s — `docker info` on a real Linux daemon answers in
 ///     <1s, so 5s was a wide-enough ceiling.
 ///   - 2026-05-23: raised to 15s on Windows after `daemon_usable_probe`
-///     spuriously failed in fresh-install testing on Ombromanto (Win11)
+///     spuriously failed in fresh-install testing on a contributor's Win11 machine
 ///     even with Docker Desktop healthy. `docker info` on Windows queries
 ///     the Hyper-V VM via named pipe + gathers daemon metadata (images,
 ///     networks, plugins); cold-cache or VM-under-load this can take

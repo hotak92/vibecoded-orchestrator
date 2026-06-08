@@ -219,7 +219,7 @@ def _try_resolve_project_config():
         # to different projects. Pre-fix: every project's MCP resolved to
         # whichever workspace server.py physically lives in (the global
         # ~/.claude.json registration's path), causing telemetry mislabeling
-        # and wrong KG collection routing for any non-VCO_dev project.
+        # and wrong KG collection routing for any non-default project.
         _workspace = os.environ.get('CLAUDE_PROJECT_DIR', '')
         if _workspace and Path(_workspace).is_dir():
             _project_root = Path(_workspace).resolve()

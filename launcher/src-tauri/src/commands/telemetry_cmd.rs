@@ -1,7 +1,7 @@
 //! Telemetry consent + dashboard commands.
 //!
 //! The actual collector lives Python-side in the orchestrator
-//! (`commercial_workflow/telemetry/`). The launcher owns the consent UI
+//! (telemetry subsystem). The launcher owns the consent UI
 //! surface and the dashboard view. Consent flags are stored in
 //! `~/.vibecoded/config.json` so Python and Rust both read the same file.
 

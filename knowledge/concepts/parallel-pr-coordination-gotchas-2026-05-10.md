@@ -32,15 +32,15 @@ Three load-bearing failure modes surfaced during a session that opened 5+ parall
 
 ## 1b. Harness `isolation: "worktree"` branches off the WRONG repo when parent cwd is a fork
 
-**Symptom (added 2026-05-23)**: spawning an agent with `isolation: "worktree"` while the parent Claude session's cwd is a private fork (e.g. `VCO_dev`) creates the agent's worktree under `<parent-cwd>/.claude/worktrees/agent-<id>` branched from VCO_dev's HEAD — even when the prompt explicitly says "work in the public repo at `/home/.../vibecoded-orchestrator/`". The agent dutifully does the work but commits against VCO_dev's git history. When the parent then tries `git cherry-pick <agent-sha>` from the public repo, git returns `fatal: bad revision` because the two repos are separate `.git/` stores.
+**Symptom (added 2026-05-23)**: spawning an agent with `isolation: "worktree"` while the parent Claude session's cwd is a private fork creates the agent's worktree under `<parent-cwd>/.claude/worktrees/agent-<id>` branched from the fork's HEAD — even when the prompt explicitly says "work in the public repo at `/home/<user>/code/vibecoded-orchestrator/`". The agent dutifully does the work but commits against the fork's git history. When the parent then tries `git cherry-pick <agent-sha>` from the public repo, git returns `fatal: bad revision` because the two repos are separate `.git/` stores.
 
-**Detection**: in the agent's worktree, run `git log --oneline -2`. Does the HEAD's parent commit match what the public repo's HEAD is? If not (e.g. parent is `0936829 chore(VCO_dev): post-v0.2.21-install state` while public is `ecee838`), the agent branched off the wrong repo.
+**Detection**: in the agent's worktree, run `git log --oneline -2`. Does the HEAD's parent commit match what the public repo's HEAD is? If not (e.g. parent is `0936829 chore(fork): post-v0.2.21-install state` while public is `ecee838`), the agent branched off the wrong repo.
 
 **Mechanism**: `isolation: "worktree"` calls `git worktree add` against the parent process's cwd. The parent's cwd determines which `.git/` directory the worktree clones from. If the user opens Claude Code in a private fork, every agent inherits that fork's history — there's no way for the agent's prompt to override the parent's cwd.
 
 **Workaround (the pattern that worked all session)**: don't use harness `isolation: "worktree"` when the parent cwd ≠ target repo. Instead, the parent runs:
 ```bash
-cd /home/martino/Desktop/PROGETTI/vibecoded-orchestrator   # the TARGET repo
+cd /home/<user>/code/vibecoded-orchestrator   # the TARGET repo
 git worktree add /tmp/vco-wt-<task-tag> -b <branch> HEAD
 ```
 …then spawns the agent WITHOUT `isolation: "worktree"` + tells it in the prompt: "Use this exact worktree path: `/tmp/vco-wt-<task-tag>/`. Verify on entry: `cd <path> && git log --oneline -2` must show <expected base commit>. If not, STOP and report. DO NOT run any `git worktree add` yourself."
@@ -60,7 +60,7 @@ The agent runs in the parent's main process (no isolation flag) but is constrain
 
 ## 1c. Stale-branch-state base re-use (recurrence, 2026-05-28)
 
-**Symptom**: 6 v0.2.38 agents spawned with `isolation: "worktree"` from VCO_dev's parent session all branched off `8df070a` (v0.2.21 era, ~10 weeks old) while VCO_dev's `main` was at `adc6966` (v0.2.37). V38-A edited `rl_service.rs` (a v0.2.21-era filename — current main has `module_service.rs`); V38-MCP's diff was against `server.py` line 2648 while current main is at line 3284 (600+ line drift). All 6 commits unmergeable.
+**Symptom**: 6 v0.2.38 agents spawned with `isolation: "worktree"` from the dogfooding fork's parent session all branched off `8df070a` (v0.2.21 era, ~10 weeks old) while the fork's `main` was at `adc6966` (v0.2.37). V38-A edited `rl_service.rs` (a v0.2.21-era filename — current main has `module_service.rs`); V38-MCP's diff was against `server.py` line 2648 while current main is at line 3284 (600+ line drift). All 6 commits unmergeable.
 
 **Mechanism (new variant — distinct from §1b)**: when the parent session has accumulated `worktree-agent-*` branch refs from EARLIER fanouts in the same session, and those branches were created at an older HEAD, `git worktree add <path>` (without an explicit `<commit-ish>`) may re-use the last-known parent of the worktree-prefix namespace. The harness creates each new worktree branch as `worktree-agent-<id>`, and a leftover entry in `.git/refs/heads/worktree-agent-<old-id>` at SHA `8df070a` apparently seeded the resolution. Whether this is git behavior or harness behavior is unclear; what IS clear: **without an explicit base, the result is non-deterministic across sessions**.
 
@@ -422,15 +422,15 @@ If the merge commit was already made (because git accepted it), `git commit --am
 
 ## 11. Discovery sub-step pattern decouples blocked items in large fanouts (v0.2.40 lesson, 2026-05-30)
 
-For the v0.2.40 16-item ship plan, three items had unknown architecture that would have blocked their fanout: (a) is the Supabase `rl-latest-weights` edge function deployed? (b) what did the orphan `RlRerankerDashboardWidget.svelte` originally do? (c) what is Fabio's `feat/orchestrator-update-progress-modal` branch going to touch?
+For the v0.2.40 16-item ship plan, three items had unknown architecture that would have blocked their fanout: (a) is the Supabase `rl-latest-weights` edge function deployed? (b) what did the orphan `RlRerankerDashboardWidget.svelte` originally do? (c) what is the parallel UI branch (`feat/orchestrator-update-progress-modal`) going to touch?
 
 Pattern applied: spawn 3 READ-ONLY **discovery agents** in PARALLEL, before any code-changing agents in the same dimension. Each writes a concise (~120-line) findings doc to `.claude/context/reviews/<release>-pre-push-<date>/discovery-<id>-<topic>.md`. Outcome:
 
 - A1 (Supabase): found function never deployed; surfaced clean A-vs-B decision (redirect vs deploy).
 - A2 (widget): found mount site (RL config tab), 3 missing getter Tauri commands, ~50 LoC rewire scope (refuting the "just delete" instinct).
-- A3 (Fabio): mapped his expected file surface; identified ONLY L1 (license) has a real Svelte-store collision; produced exact namespacing guidance (`showLicenseManager`, NOT `showLicense` / `showModal`).
+- A3 (parallel UI branch): mapped the expected file surface; identified ONLY L1 (license) has a real Svelte-store collision; produced exact namespacing guidance (`showLicenseManager`, NOT `showLicense` / `showModal`).
 
-All 3 discoveries completed in ~5-10 min wall-clock each, in parallel — total <15 min. Their outputs were inlined directly into the subsequent code-agent prompts (e.g. L1's agent prompt explicitly cites A3's `showLicenseManager` constraint). Without the discoveries, L1 might have used the wrong store flag name and collided with Fabio's branch at integration time.
+All 3 discoveries completed in ~5-10 min wall-clock each, in parallel — total <15 min. Their outputs were inlined directly into the subsequent code-agent prompts (e.g. L1's agent prompt explicitly cites A3's `showLicenseManager` constraint). Without the discoveries, L1 might have used the wrong store flag name and collided with the parallel UI branch at integration time.
 
 **Key property**: discovery agents are MUCH cheaper than code agents (no test writing, no commits, no build steps). When in doubt about an item's scope, spawn a discovery first; it's free insurance. Cost ratio is roughly 1:5 (discovery vs code) for typical scopes, so even 2-3 discoveries that "find nothing surprising" are cheaper than 1 code-agent rework.
 
@@ -516,7 +516,7 @@ AssertionError: ['VibeCodedOrchestrator_KnowledgeGraph', ...] != ['Alpha_Knowled
 
 — even though the test set `KG_COLLECTION=Alpha_KnowledgeGraph` in its env and reimported the module.
 
-**Mechanism**: production code calls `_try_resolve_project_config()` → `vco_lib.project_config.resolve(...)` → HTTP call to the running `vct-hub` on the dev machine. The hub returns a populated `ProjectConfig` for THIS project (VCO_dev), which wins over `os.getenv(...)` in the code that constructs module constants (`KG_COLLECTION`, `SHARED_KG_COLLECTION`, etc.). The test's env-injection is invisible because the resolver returned a value first.
+**Mechanism**: production code calls `_try_resolve_project_config()` → `vco_lib.project_config.resolve(...)` → HTTP call to the running `vct-hub` on the dev machine. The hub returns a populated `ProjectConfig` for THIS project (the active dogfooding install), which wins over `os.getenv(...)` in the code that constructs module constants (`KG_COLLECTION`, `SHARED_KG_COLLECTION`, etc.). The test's env-injection is invisible because the resolver returned a value first.
 
 **Detection**: any test that ASSERTS on module-level "resolved" constants and FAILS with values matching live config — not the injected ones — is hitting this pattern. CI doesn't see this because CI doesn't run a vct-hub. Dev-machine-only failures.
 

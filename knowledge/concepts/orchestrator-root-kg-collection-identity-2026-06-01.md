@@ -102,7 +102,7 @@ parallel-install split-brain), and uid-aware skip in _check_dual_clone
 | v0.2.28 | `manual_override` sentinel `"v0.2.28-recovery"` | Sentinel written but no guard read it. |
 | v0.2.29/30 | settings.json env preservation | Fixed env wipe but install.py still wrote both collections. |
 | v0.2.42 | CI-10 content-hash diff gate | Made re-seeding visible but didn't prevent it on divergent collections. |
-| v0.2.43 | V0243-0 string-equality guard | `KG_COLLECTION == SHARED_KG_COLLECTION` never true for VCO_dev's legacy-migrated state. |
+| v0.2.43 | V0243-0 string-equality guard | `KG_COLLECTION == SHARED_KG_COLLECTION` never true for legacy-migrated dogfooding installs. |
 | **v0.2.44** | **adopt-and-route** | Architectural fix: detect orchestrator-root as a category, rebind to single canonical. |
 
 ## Related

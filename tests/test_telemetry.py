@@ -66,9 +66,9 @@ class PIIScrubTests(unittest.TestCase):
         self._home_ctx.__exit__(None, None, None)
 
     def test_scrubs_linux_home_path(self) -> None:
-        out = self.collector_mod._scrub_pii("/home/martino/Desktop/code.py")
+        out = self.collector_mod._scrub_pii("/home/testuser123/Desktop/code.py")
         self.assertIn("<user>", out)
-        self.assertNotIn("martino", out)
+        self.assertNotIn("testuser123", out)
 
     def test_scrubs_macos_home_path(self) -> None:
         out = self.collector_mod._scrub_pii("/Users/alice/Projects/app.ts")
@@ -118,11 +118,11 @@ class PIIScrubTests(unittest.TestCase):
         self.assertIn("<ip>", out)
 
     def test_scrub_args_dict_keeps_keys(self) -> None:
-        out = self.collector_mod._scrub_args({"file": "/home/martino/x.py", "mode": "r"})
+        out = self.collector_mod._scrub_args({"file": "/home/testuser123/x.py", "mode": "r"})
         self.assertIn("file=", out)
         self.assertIn("mode=", out)
         self.assertIn("<user>", out)
-        self.assertNotIn("martino", out)
+        self.assertNotIn("testuser123", out)
 
     def test_scrub_args_truncates(self) -> None:
         long_val = "x" * 2000
@@ -211,7 +211,7 @@ class ConsentGatingTests(unittest.TestCase):
 
     def test_instinct_blocked_without_consent(self) -> None:
         ok = self.collector_mod.collect_instinct_event(
-            tool_name="Read", args={"path": "/home/martino/x.py"}, outcome="ok",
+            tool_name="Read", args={"path": "/home/testuser123/x.py"}, outcome="ok",
         )
         self.assertFalse(ok)
 
@@ -219,7 +219,7 @@ class ConsentGatingTests(unittest.TestCase):
         self._write_consent(instinct_data=True)
         ok = self.collector_mod.collect_instinct_event(
             tool_name="Read",
-            args={"path": "/home/martino/x.py", "token": "ghp_ABCDEFG1234567890abcdef"},
+            args={"path": "/home/testuser123/x.py", "token": "ghp_ABCDEFG1234567890abcdef"},
             outcome="ok",
             session_id="abc-123",
         )
@@ -229,7 +229,7 @@ class ConsentGatingTests(unittest.TestCase):
         payload = rows[0]["payload"]["payload"]
         self.assertIn("<user>", payload["args_summary"])
         self.assertIn("<token>", payload["args_summary"])
-        self.assertNotIn("martino", payload["args_summary"])
+        self.assertNotIn("testuser123", payload["args_summary"])
         self.assertNotIn("ghp_", payload["args_summary"])
         # session_id is hashed, not raw.
         self.assertNotEqual(payload["session_id_hash"], "abc-123")

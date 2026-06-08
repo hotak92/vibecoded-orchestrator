@@ -12,7 +12,7 @@ The Vibecoded Orchestrator is AGPL-3.0. Paid modules (`vct-rl-reranker`, future:
 
 The defenses today (`.gitignore` blocking `paid-modules/`, nested-repo isolation, `ci.yml :: launcher-leak-check`) are robust **only if** every new module respects the same conventions. This doc is the per-module pre-flight that ensures they do.
 
-Historical source: the v0.2.22 private-leak-audit (internal — lives in VCO_dev). This doc codifies its Section E "Per-module dev checklist" as a permanent public contract.
+Historical source: the v0.2.22 private-leak-audit (internal, not public). This doc codifies its Section E "Per-module dev checklist" as a permanent public contract.
 
 ---
 
@@ -22,8 +22,8 @@ Two distinct trees, one-way client→server boundary, never circular.
 
 ### Private side — paid module proper
 
-- Path: `paid-modules/<module-id>/` inside the developer's VCO_dev clone.
-- Git: **standalone nested git repo** with its own remote on a private GitHub repo (e.g. `git@github.com:hotak92/<module-id>.git`). NOT a submodule of VCO_dev. NOT tracked by VCO_dev's parent git tree.
+- Path: `paid-modules/<module-id>/` inside the developer's private orchestrator clone.
+- Git: **standalone nested git repo** with its own remote on a private GitHub repo (e.g. `git@github.com:hotak92/<module-id>.git`). NOT a submodule of the orchestrator. NOT tracked by the orchestrator's parent git tree.
 - Contents: model code, training code, fine-tune scripts, model weights, the private `Dockerfile`, the private CI workflow, `vct-module.json` manifest.
 - Container image: published to a private GHCR repo (e.g. `ghcr.io/hotak92/<module-id>`).
 
@@ -212,8 +212,8 @@ When you add a new paid module, the relevant filename patterns from "Files that 
 Follow this procedure in order. Each step is independently verifiable; do not skip any.
 
 1. **Reserve the module id**. Pick a stable kebab-case identifier (`vct-coordination`, `mao`, `telegram-module`). This becomes the directory name in `paid-modules/<id>/`, the public adapter `claude_mcp_servers/<id>_client/`, the container image ref `ghcr.io/<owner>/<id>`, and the module-id string constant referenced from the launcher.
-2. **Create the private repo first**. Initialize `paid-modules/<id>/` as a standalone git repo with its own private GitHub remote. Verify `git remote -v` shows the private URL, not VCO_dev's.
-3. **Update `.gitignore` in BOTH repos** (public AGPL repo and VCO_dev) to add `claude_mcp_servers/<id>_server/` (defense-in-depth) — do this BEFORE writing any code.
+2. **Create the private repo first**. Initialize `paid-modules/<id>/` as a standalone git repo with its own private GitHub remote. Verify `git remote -v` shows the private URL, not the orchestrator's.
+3. **Update `.gitignore` in BOTH repos** (public AGPL repo and your private orchestrator clone) to add `claude_mcp_servers/<id>_server/` (defense-in-depth) — do this BEFORE writing any code.
 4. **Scaffold the public adapter**. Create `claude_mcp_servers/<id>_client/` with the whitelist files only (`__init__.py`, `client.py`, `schemas.py`, optionally `telemetry_writer.py`). The adapter must work in graceful-degraded mode when the paid container is absent.
 5. **Extend the CI leak-check**. Add the new module's forbidden filename patterns (e.g. `coordination_server.py`, `mao_engine.py`) to the `BAD_NAMES` regex in `.github/workflows/ci.yml`. Add an integration test under `tests/` that asserts the new adapter's no-server path returns the expected error.
 6. **Keep the manifest private**. The `vct-module.json` for the new module stays at `paid-modules/<id>/vct-module.json`. Do NOT add a copy to `launcher/bundled_manifests/`.
@@ -248,7 +248,7 @@ If any of the five fails, the commit does not ship until it's fixed.
 
 ## Cross-references
 
-- **v0.2.22 private-leak-audit** (internal, lives in VCO_dev — not in this public repo) — the historical source for this checklist's Section E. Mentions specific findings from the `vct-rl-reranker` audit on 2026-05-20; the per-module dev checklist there is the direct ancestor of this doc.
+- **v0.2.22 private-leak-audit** (internal, not in this public repo) — the historical source for this checklist's Section E. Mentions specific findings from the `vct-rl-reranker` audit on 2026-05-20; the per-module dev checklist there is the direct ancestor of this doc.
 - **`LICENSE`** (`<orchestrator-root>/LICENSE`) — AGPL-3.0-or-later. Every source file the orchestrator ships inherits this license; preserving the public/private split is what keeps paid-module source out of scope.
 - **GTM plan, Phase 1.7** — license headers + `NOTICE` file workstream. Coordinated separately; the public adapter files must carry the AGPL header so a casual reader sees that the adapter ships under AGPL while the corresponding paid container does not.
 - **`docs/REPO_CLEANLINESS.md`** — adjacent policy doc on the tracked / machine-local split. The principles overlap with this checklist's section on `.gitignore` discipline.

@@ -8,8 +8,8 @@ transcript files it needs to poll for Claude's post-search answer.
 Pre-v0.2.31 the slug rule was inlined as
 ``str(workspace).replace("/", "-")`` — which missed ``_`` → ``-``
 substitution and caused a 97.7% orphan-citation rate on workspaces
-whose absolute paths contained underscores. See
-``.claude/context/plans/rl-citation-monitor-bug-report-2026-05-23.md``.
+whose absolute paths contained underscores (``project_a``, ``project_b``,
+…). See ``.claude/context/plans/rl-citation-monitor-bug-report-2026-05-23.md``.
 
 v0.2.31 routes the lookup through ``vct-hub`` (canonical source of
 truth, computes the slug via the launcher's
@@ -95,7 +95,7 @@ class ResolveClaudeSessionDirTest(unittest.TestCase):
 
         This is the v0.2.31 bug-fix: the pre-fix inline computation
         only handled ``/`` → ``-`` and broke for any underscored
-        workspace path.
+        workspace path (``project_a``, ``project_b``).
         """
         # Make the hub resolver return None (e.g. HubUnreachable on
         # a free-tier install without the launcher GUI running). The
@@ -105,8 +105,8 @@ class ResolveClaudeSessionDirTest(unittest.TestCase):
             # fake ~/.claude/projects/<correct-slug>/ directory so the
             # helper's `.exists()` check passes.
             fake_home = Path(td)
-            workspace = Path("/home/user/Desktop/PROGETTI/VCO_dev")
-            expected_slug = "-home-user-Desktop-PROGETTI-VCO-dev"
+            workspace = Path("/home/user/code/project_a")
+            expected_slug = "-home-user-code-project-a"
             (fake_home / ".claude" / "projects" / expected_slug).mkdir(
                 parents=True
             )

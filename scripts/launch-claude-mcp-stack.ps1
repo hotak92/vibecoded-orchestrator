@@ -100,12 +100,21 @@ function Get-EnvOrDefault {
     return $value
 }
 
-# Default working dir: matches the bash default's semantic on Windows.
-# Bash uses ${HOME}/Desktop/PROGETTI/Claude/claude_mcp_servers; on Windows
-# $env:USERPROFILE is the rough HOME equivalent. The systemd unit / Task
-# XML always sets VCT_STACK_WORKING_DIR explicitly so this default rarely
-# fires.
-$script:DefaultWorkingDir = Join-Path $env:USERPROFILE "Desktop\PROGETTI\Claude\claude_mcp_servers"
+# Default working dir: portable fallback. Prefer VCT_ORCHESTRATOR_ROOT
+# (set by the launcher / install.py); otherwise derive from this script's
+# location (this script lives in <orchestrator>/scripts/, so the parent
+# is the orchestrator root). The systemd unit / Task XML always sets
+# VCT_STACK_WORKING_DIR explicitly so this default rarely fires.
+if ($env:VCT_ORCHESTRATOR_ROOT) {
+    $script:DefaultStackRoot = $env:VCT_ORCHESTRATOR_ROOT
+} elseif ($PSScriptRoot) {
+    $script:DefaultStackRoot = Split-Path -Parent $PSScriptRoot
+} elseif ($MyInvocation.MyCommand.Path) {
+    $script:DefaultStackRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+} else {
+    $script:DefaultStackRoot = $env:USERPROFILE
+}
+$script:DefaultWorkingDir = Join-Path $script:DefaultStackRoot "claude_mcp_servers"
 $script:VctStackWorkingDir       = Get-EnvOrDefault 'VCT_STACK_WORKING_DIR' $script:DefaultWorkingDir
 $script:VctStackLogFile          = Get-EnvOrDefault 'VCT_STACK_LOG_FILE' (Join-Path $env:TEMP 'claude-mcp-containers.log')
 $script:VctStackCdiTimeout       = [int](Get-EnvOrDefault 'VCT_STACK_CDI_TIMEOUT' '30')

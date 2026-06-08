@@ -1054,7 +1054,7 @@ fn sanitize_diagrams_class_prefix(project_name: &str) -> String {
 /// against Claude Code 2.1.143):
 ///
 ///   * ``/`` → ``-``  (path separator)
-///   * ``_`` → ``-``  (e.g. ``VCO_dev`` → ``VCO-dev``)
+///   * ``_`` → ``-``  (e.g. ``project_a`` → ``project-a``)
 ///   * ``.`` → ``-``  (e.g. ``.claude/worktrees`` → ``-claude-worktrees``)
 ///
 /// Returns ``~/.claude/projects/<slug>/`` as a ``PathBuf``. The returned
@@ -1243,21 +1243,21 @@ mod tests {
         // v0.2.31 regression test: the citation-monitor bug was caused
         // by an inline slug computation that only handled `/` → `-`.
         // Claude Code's actual rule ALSO converts `_` (and `.`) → `-`.
-        // Underscored workspace paths were the root cause of the
-        // 97.7% orphan-citation rate.
-        let p = StdPath::new("/home/user/Desktop/PROGETTI/VCO_dev");
+        // Underscored workspace paths (project_a, project_b) were the
+        // root cause of the 97.7% orphan-citation rate.
+        let p = StdPath::new("/home/user/code/project_a");
         let dir = claude_session_dir_for(p);
         assert_eq!(
             dir.file_name().unwrap().to_str().unwrap(),
-            "-home-user-Desktop-PROGETTI-VCO-dev",
+            "-home-user-code-project-a",
             "slug must replace both '/' and '_' with '-'",
         );
 
-        let p2 = StdPath::new("/home/user/Desktop/PROGETTI/Some_Workspace");
+        let p2 = StdPath::new("/home/user/code/project_b");
         let dir2 = claude_session_dir_for(p2);
         assert_eq!(
             dir2.file_name().unwrap().to_str().unwrap(),
-            "-home-user-Desktop-PROGETTI-Some-Workspace",
+            "-home-user-code-project-b",
         );
     }
 
@@ -1267,11 +1267,11 @@ mod tests {
         // implementation. Pin the non-regression to ensure the new
         // helper's behaviour matches the old inline string-replace for
         // the cases that were never broken.
-        let p = StdPath::new("/home/user/Desktop/PROGETTI/vibecoded-orchestrator");
+        let p = StdPath::new("/home/user/code/vibecoded-orchestrator");
         let dir = claude_session_dir_for(p);
         assert_eq!(
             dir.file_name().unwrap().to_str().unwrap(),
-            "-home-user-Desktop-PROGETTI-vibecoded-orchestrator",
+            "-home-user-code-vibecoded-orchestrator",
         );
     }
 
@@ -1279,14 +1279,14 @@ mod tests {
     fn claude_session_dir_handles_dots() {
         // Verified against `~/.claude/projects/` on Linux: worktree
         // paths under `.claude/` are stored with `.` → `-` substitution
-        // (e.g. `/home/u/VCO_dev/.claude/worktrees/foo` becomes
-        // `-home-u-VCO-dev--claude-worktrees-foo`). The double-dash is
+        // (e.g. `/home/u/project_a/.claude/worktrees/foo` becomes
+        // `-home-u-project-a--claude-worktrees-foo`). The double-dash is
         // a natural consequence of the rule, not a separate special-case.
-        let p = StdPath::new("/home/u/VCO_dev/.claude/worktrees/foo");
+        let p = StdPath::new("/home/u/project_a/.claude/worktrees/foo");
         let dir = claude_session_dir_for(p);
         assert_eq!(
             dir.file_name().unwrap().to_str().unwrap(),
-            "-home-u-VCO-dev--claude-worktrees-foo",
+            "-home-u-project-a--claude-worktrees-foo",
         );
     }
 

@@ -46,9 +46,9 @@ describe('shouldShowFolderMissingBanner', () => {
 describe('folderMissingBannerCopy', () => {
   it('embeds the folder path verbatim so users can copy it', () => {
     const copy = folderMissingBannerCopy(
-      mkFlag({ folder_path: '/home/martino/projects/gone' }),
+      mkFlag({ folder_path: '/home/user/projects/gone' }),
     );
-    expect(copy).toContain('/home/martino/projects/gone');
+    expect(copy).toContain('/home/user/projects/gone');
   });
 
   it('uses a clear "moved or deleted" prompt — pinned wording', () => {

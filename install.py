@@ -4312,8 +4312,8 @@ def main() -> int:
                              "version and the project's venv needs to follow.")
     # v0.2.10 (Bug L2 — cross-OS boot-service materialization). The
     # compose-project working directory may not match the install path
-    # (the canonical example: install at ~/.../VCO_dev but compose lives
-    # at ~/.../Claude/claude_mcp_servers). When set, this is the highest-
+    # (the canonical example: install at ~/code/orch but compose lives
+    # at ~/code/claude/claude_mcp_servers). When set, this is the highest-
     # priority signal for _resolve_compose_working_dir; otherwise we
     # probe a running container's working_dir label, then fall back to
     # install-path probes.
@@ -9099,6 +9099,98 @@ def _materialize_orchestrator_self_claude_dir(
     if _is_orchestrator_root_install():
         _refresh_orchestrator_self_vco_manifest(install_root)
 
+    # v0.2.50 Track A: also materialize the orchestrator's own CLAUDE.md
+    # from templates/ORCHESTRATOR-CLAUDE.md.template. Idempotent — runs on
+    # every install + --update. Preserves user content outside the AUTO
+    # markers; replaces the AUTO block with freshly rendered template.
+    _materialize_orchestrator_self_claude_md(install_root)
+
+
+def _materialize_orchestrator_self_claude_md(install_root: Path) -> None:
+    """v0.2.50 Track A: render templates/ORCHESTRATOR-CLAUDE.md.template
+    to ``<install_root>/CLAUDE.md``.
+
+    The template uses ``{{ORCHESTRATOR_ROOT}}`` for the resolved install
+    root path. The rendered content is wrapped in HTML comment markers
+    (``<!-- BEGIN: AUTO -->`` / ``<!-- END: AUTO -->``) so that on
+    ``--update`` re-runs, only the AUTO block is replaced — user-added
+    content OUTSIDE those markers is preserved.
+
+    Idempotent:
+    - First run (no CLAUDE.md or CLAUDE.md without AUTO markers): writes
+      the rendered template as the entire file.
+    - Subsequent runs (CLAUDE.md has AUTO markers): replaces only the
+      block between BEGIN/END AUTO; preserves content before/after.
+
+    Soft-fail: any error here is logged but does not abort the install.
+    A missing CLAUDE.md is not fatal — the orchestrator still runs.
+    """
+    template_path = install_root / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
+    target_path = install_root / "CLAUDE.md"
+
+    print("[4c/10] Materializing orchestrator CLAUDE.md from template ... ",
+          end="", flush=True)
+    _log_install_event("4c/10", "start",
+                       "rendering CLAUDE.md from ORCHESTRATOR-CLAUDE.md.template")
+
+    if not template_path.is_file():
+        print("SKIP (template missing)")
+        _log_install_event(
+            "4c/10", "skip",
+            f"template not found at {template_path}",
+        )
+        return
+
+    try:
+        rendered = template_path.read_text(encoding="utf-8")
+        # Placeholder substitution.
+        rendered = rendered.replace("{{ORCHESTRATOR_ROOT}}", str(install_root))
+
+        if target_path.is_file():
+            existing = target_path.read_text(encoding="utf-8")
+            begin_marker = "<!-- BEGIN: AUTO"
+            end_marker = "<!-- END: AUTO -->"
+            begin_idx = existing.find(begin_marker)
+            end_idx = existing.find(end_marker)
+            if begin_idx >= 0 and end_idx > begin_idx:
+                # Preserve content outside AUTO markers; replace AUTO block.
+                prefix = existing[:begin_idx]
+                suffix = existing[end_idx + len(end_marker):]
+                merged = prefix + rendered.rstrip() + suffix
+                # Avoid no-op writes that would still bump mtime.
+                if merged != existing:
+                    target_path.write_text(merged, encoding="utf-8")
+                print("OK (AUTO block updated)")
+                _log_install_event(
+                    "4c/10", "ok",
+                    "CLAUDE.md AUTO block updated; user content preserved",
+                )
+            else:
+                # No AUTO markers in existing file — write rendered as-is.
+                # (Existing content is replaced because the AUTO markers are
+                # the contract for "preserve me"; without them, the template
+                # is the source of truth.)
+                target_path.write_text(rendered, encoding="utf-8")
+                print("OK (full rewrite — no AUTO markers found)")
+                _log_install_event(
+                    "4c/10", "ok",
+                    "CLAUDE.md fully rewritten (no AUTO markers in prior version)",
+                )
+        else:
+            # Fresh install — write rendered as-is.
+            target_path.write_text(rendered, encoding="utf-8")
+            print("OK (created)")
+            _log_install_event(
+                "4c/10", "ok",
+                "CLAUDE.md created from template",
+            )
+    except OSError as e:
+        print(f"FAILED ({e})")
+        _log_install_event(
+            "4c/10", "warn",
+            f"failed to materialize CLAUDE.md: {e}",
+        )
+
 
 def _refresh_orchestrator_self_vco_manifest(install_root: Path) -> None:
     """V0243-4: rewrite `<install_root>/.claude/.vco-manifest.json` with
@@ -11857,8 +11949,9 @@ def _seed_weaviate_shared_kg_only(
     #
     # When this is the orchestrator clone itself, the per-project KG and the
     # shared KG are the same logical collection. Names can legitimately differ
-    # due to legacy migrations (e.g. VCO_dev's VCODev_KnowledgeGraph survives
-    # from the Claude/→VCO_dev migration while SHARED_KG_COLLECTION points at
+    # due to legacy migrations (e.g. the dogfooding install's
+    # `VCODev_KnowledgeGraph` survives from an older migration while
+    # SHARED_KG_COLLECTION points at
     # the canonical VibeCodedOrchestrator_KnowledgeGraph).
     #
     # Strategy: pick SHARED_KG_COLLECTION as canonical (predictable, matches
@@ -11881,7 +11974,7 @@ def _seed_weaviate_shared_kg_only(
         # post-V44-G1 reassigned current_kg_collection. Otherwise once G1
         # picks the same value for both env and resolved, the orphan check
         # always sees canonical == current_kg_collection and the notice is
-        # silently masked (Reader-4 FN1 against VCO_dev's actual state).
+        # silently masked (Reader-4 FN1 against the dogfooding install's actual state).
         orphan_kg = orphan_candidate_kg or current_kg_collection
 
         # Diagnostic: report row counts on both physical collections.
@@ -12492,7 +12585,7 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     # Weaviate file_path entries to on-disk presence — files that don't exist
     # on disk at all are always safe to remove regardless of the partial-sync
     # changelist. The _sync_all gate caused the 192 orphan accumulation on
-    # VCO_dev's KG (v0.2.43 post-update audit).
+    # the dogfooding install's KG (v0.2.43 post-update audit).
     if not seed_errors and current_kg_collection:
         _prune_stale_kg_rows(current_kg_collection, weaviate_url)
 
@@ -13801,7 +13894,7 @@ def _self_heal_kg_bindings_on_update(
 
     Fixes Finding 4 of the post-v0.2.22 handoff: a `project_kg_bindings`
     row whose `collection_name` differs only in casing from a class that
-    actually exists in Weaviate. Symptom in production: VCO_dev's shared
+    actually exists in Weaviate. Symptom in production: the dogfooding install's shared
     binding pointed at `VibecodedOrchestrator_KnowledgeGraph` (lowercase
     c) but Weaviate had `VibeCodedOrchestrator_KnowledgeGraph` (capital
     C, 892 objects live).
@@ -16147,7 +16240,7 @@ def _check_search_mcp_env_obsolete(
 # it determines which named-vector Weaviate column is queried).
 #
 # Removed in PR-43 (post-PR-23): RL_SERVER_URL (varies per user setup —
-# VCO_dev runs a dedicated port-11442 service, MAO uses 11439, etc.),
+# the dogfooding install runs a dedicated port-11442 service, MAO uses 11439, etc.),
 # EMBEDDING_MODEL (users may want per-project override; if it's in this
 # global allowlist, the per-project .claude/settings.json env value gets
 # overridden the WRONG WAY due to Claude Code's precedence).
@@ -19821,7 +19914,7 @@ def _ensure_env_template(env_path: Path, project_name: str = "<project>",
         # `_ensure_env_template(env, project_name="Acme")` always
         # produced `KG_COLLECTION=Acme_KnowledgeGraph`. Reading
         # os.environ would leak the caller's shell env into the
-        # generated file (observed in tests where VCO_dev's
+        # generated file (observed in tests where the dogfooding install's
         # KG_COLLECTION was active in the shell).
         "KG_COLLECTION": f"{sanitized}_KnowledgeGraph",
         "DEVELOPMENT_COLLECTION": f"{sanitized}_Development",

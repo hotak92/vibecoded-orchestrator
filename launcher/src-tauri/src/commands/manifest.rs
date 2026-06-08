@@ -12,7 +12,7 @@
 //!      `copy_orchestrator_to_sync` path, or a `--lightweight` rewrite):
 //!      `.git/` history reflects the *source repo's* tag history at copy
 //!      time, NOT the contents that were copied across. A user whose
-//!      VCO_dev clone was at `v0.2.4-baseline` got "v0.2.4" reported back
+//!      orchestrator clone was at `v0.2.4-baseline` got "v0.2.4" reported back
 //!      even after install.py + the bundled vct-module.json had already
 //!      moved them to v0.2.7. Result: the launcher's update banner read
 //!      "update available, current v0.2.4" and never went away.

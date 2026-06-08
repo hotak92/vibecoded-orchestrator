@@ -148,17 +148,17 @@ class AgentSubsTests(unittest.TestCase):
         """Most realistic case: project lives next to (not inside) the
         orchestrator clone. Both placeholders MUST resolve to distinct
         absolute paths so agents can reference each independently."""
-        orch = Path("/home/user/Desktop/PROGETTI/vibecoded-orchestrator")
-        proj = Path("/home/user/Desktop/PROGETTI/MyProject")
+        orch = Path("/home/user/code/orch")
+        proj = Path("/home/user/code/proj")
         subs = project_init._agent_subs(orch, project_root=proj)
         self.assertNotEqual(subs["{{ORCHESTRATOR_ROOT}}"], subs["{{PROJECT_ROOT}}"])
         self.assertEqual(
             subs["{{ORCHESTRATOR_ROOT}}"],
-            "/home/user/Desktop/PROGETTI/vibecoded-orchestrator",
+            "/home/user/code/orch",
         )
         self.assertEqual(
             subs["{{PROJECT_ROOT}}"],
-            "/home/user/Desktop/PROGETTI/MyProject",
+            "/home/user/code/proj",
         )
 
 

@@ -9,7 +9,7 @@
 //!
 //! Why this matters: the launcher binary path doesn't determine state
 //! location — `~/.vct/` is shared globally. A dev launcher run from
-//! `~/Desktop/PROGETTI/VCO_dev/` and a production launcher installed at
+//! `~/code/orch/` and a production launcher installed at
 //! `~/.local/bin/` would otherwise see the same projects, the same
 //! KG bindings, the same secrets, etc. — easy to clobber a real project
 //! while testing in-development changes.

@@ -38,7 +38,7 @@ set -u
 # ---------------------------------------------------------------------------
 # Configuration. Override via env if you need to:
 #   - VCT_STACK_WORKING_DIR   — directory containing compose.yaml
-#                                 (default: ${HOME}/Desktop/PROGETTI/Claude/claude_mcp_servers)
+#                                 (default: ${VCT_ORCHESTRATOR_ROOT:-<script_dir>/..}/claude_mcp_servers)
 #   - VCT_STACK_LOG_FILE      — log path (default: /tmp/claude-mcp-containers.log)
 #   - VCT_STACK_CDI_TIMEOUT   — seconds to wait for CDI yaml (default: 30)
 #   - VCT_STACK_RUNTIME_FILE  — explicit runtime.txt path. When set, this
@@ -64,7 +64,13 @@ set -u
 #                                 (PR-10A) were silently ignored at boot.
 # ---------------------------------------------------------------------------
 
-VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-${HOME}/Desktop/PROGETTI/Claude/claude_mcp_servers}"
+# Default working dir: portable fallback. Prefer VCT_ORCHESTRATOR_ROOT
+# (set by the launcher / install.py), otherwise derive from this script's
+# location (this script lives in <orchestrator>/scripts/, so .. is the
+# orchestrator root). systemd units / launchctl jobs always set
+# VCT_STACK_WORKING_DIR explicitly so this default rarely fires.
+_VCT_DEFAULT_STACK_ROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.."
+VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-${VCT_ORCHESTRATOR_ROOT:-${_VCT_DEFAULT_STACK_ROOT}}/claude_mcp_servers}"
 VCT_STACK_LOG_FILE="${VCT_STACK_LOG_FILE:-/tmp/claude-mcp-containers.log}"
 VCT_STACK_CDI_TIMEOUT="${VCT_STACK_CDI_TIMEOUT:-30}"
 # NOTE (PR-12 Bug B): VCT_STACK_RUNTIME_FILE is no longer eagerly defaulted
@@ -365,8 +371,8 @@ wait_for_cdi() {
 # v0.2.10 (Bug L1): the original wrapper unconditionally emitted
 # `-f <overlay>` whenever gpu_mode=gpu, on the assumption that VCO's own
 # overlay-file pattern (`infrastructure/podman-compose.gpu.yml`) was
-# universal. The user's actual Claude orchestrator stack at
-# ~/Desktop/PROGETTI/Claude/claude_mcp_servers/compose.yaml has its GPU
+# universal. Some orchestrator stacks (notably those whose
+# `claude_mcp_servers/compose.yaml` declares GPU devices INLINE) have GPU
 # devices declared INLINE in the ollama / code_embed service blocks
 # (`devices: - nvidia.com/gpu=all`) — no overlay file exists. The
 # previous behaviour broke on that layout because podman-compose would

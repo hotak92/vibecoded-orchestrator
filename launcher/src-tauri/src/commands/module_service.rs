@@ -1411,7 +1411,7 @@ pub async fn apply_weights_update(
 /// Background fine-tune step. Calls `/finetune` on the container, polls
 /// `/finetune_status` until done, then `signal_rotate_weights`.
 ///
-/// IMPORTANT contract pinned by VCO_dev (server contract changed
+/// IMPORTANT contract pinned by the dogfooding install (server contract changed
 /// during release): the terminal state from `/finetune_status` is
 /// `"done"` (NOT `"complete"`). The launcher previously polled for
 /// `"complete"`; the server's now-shipped v0.1.1 (private repo c9039e4)

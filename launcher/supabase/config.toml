@@ -62,7 +62,7 @@ verify_jwt = false
 # license key isn't a Supabase JWT — the gateway pre-gate rejects
 # before the function body runs.
 #
-# Discovered 2026-06-06 dogfooding on martino-X670E-Pro-RS after
+# Discovered 2026-06-06 during maintainer dogfooding after
 # Bug B + C unblocked the install path end-to-end. Audit log:
 # `module_default_weights_auto_download_deferred` with
 # `rl-latest-weights returned 401 Unauthorized:

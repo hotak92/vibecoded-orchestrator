@@ -25,7 +25,7 @@ A way to index **additional read-only filesystem paths** into a project's
 codegraph collection from the launcher's Identity tab — without making
 those paths launcher projects.
 
-**Canonical use case**: a user working in VCO_dev wants their `hybrid_search`
+**Canonical use case**: a user working in a private fork wants their `hybrid_search`
 + `search_code_graph` queries to see entries from a sibling
 `vibecoded-orchestrator/` public-repo clone, but doesn't want to register
 that clone as a launcher project (which would create `.claude/` state in it

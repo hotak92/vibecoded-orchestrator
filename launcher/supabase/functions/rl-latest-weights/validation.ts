@@ -24,7 +24,7 @@ export const UUID_RE =
 // `rl-artifact-url/validation.ts::VAULT_ADMIN_TOKEN_RE` and
 // `validate-tier/index.ts::isValidVaultAdminToken`.
 //
-// v0.2.49 (2026-06-06): added after dogfooding on martino-X670E-Pro-RS
+// v0.2.49 (2026-06-06): added after maintainer dogfooding
 // hit `license_key_invalid_format` here when the launcher submitted a
 // `vct_admin_TU...` token (the user's admin license). Same root cause
 // + fix as the v0.2.35 `rl-artifact-url` validator gap (see

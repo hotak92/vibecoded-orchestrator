@@ -43,7 +43,7 @@ Note the **two divergences** from the install path:
 `audit_log` confirms install pulled correctly:
 ```
 [pull_token_resolved] effective_tag_with_variant: 0.2.8-cuda, username: vct-bot-rl
-[module_install_done] install_dir: /home/martino/.vct/modules/vct-rl-reranker
+[module_install_done] install_dir: ~/.vct/modules/vct-rl-reranker
 [module_container_start_failed] ...trying to pull ghcr.io/.../vct-rl-reranker:0.2.8...
 ```
 
@@ -424,9 +424,5 @@ absent) is much lower than the cost of a 3-release latent bug.
 - [[refines::Pre-install catalog architecture — L0 public endpoint + post-install on-disk manifest]]
   — L0 catalog drives the variant list; the v0.2.49 publisher contract
   closes the publisher-side gap that the b4830e04 fix paired with
-- HANDOFF-TO-MAIN-VCO-CHAT-2026-06-06-V2-RL-INSTALL-VALIDATION.md
-  (repo root) — full operational report
 - `.claude/context/plans/v0.2.49-remaining-rl-install-bugs-2026-06-06.md`
   — fix plan
-- `.claude/context/SELF-HANDOFF-RL-CHAT-2026-06-06-EVENING.md` —
-  resume notes for the next RL chat session

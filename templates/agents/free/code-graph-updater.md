@@ -61,7 +61,7 @@ You will receive:
 
 ### Tools Available
 
-- **analyze_code_graph.py**: Script at `commercial_workflow/scripts/analyze_code_graph.py`
+- **analyze_code_graph.py**: Script at `.claude/scripts/code-graph-analyze`
   - Use with `--files <file1> <file2>` for incremental updates
   - Use with `--project <name>` to specify project
   - Handles AST parsing, Weaviate updates, embedding generation

@@ -128,7 +128,7 @@ function createOrchestratorStore() {
      * Bug A (v0.2.5): probes `get_known_install_path` FIRST. That command
      * walks app_state + the launcher binary's ancestor tree looking for a
      * real install — so a user who installed VCO at, say,
-     * `/home/x/Desktop/PROGETTI/VCO_dev/` is no longer told "Not installed"
+     * `/home/x/code/orch/` is no longer told "Not installed"
      * because the hard-coded `$HOME/vibecoded-orchestrator` happens to be
      * empty. Falls back to `get_default_install_path` (used as a SUGGESTION
      * for the install wizard pre-fill, NOT as the probed location) when no

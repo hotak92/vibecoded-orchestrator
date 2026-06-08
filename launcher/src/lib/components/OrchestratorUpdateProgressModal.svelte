@@ -28,12 +28,12 @@
   //     populated by the `install_progress` Tauri listener at
   //     `stores/orchestrator.ts:108`). We DO NOT subscribe to the channel
   //     ourselves — dual listeners would split the event stream and were
-  //     called out as a footgun in Martino's wiring note. Reading the
+  //     called out as a footgun in the wiring note. Reading the
   //     reactive store is enough.
   //   - Progress bar reuses the `cgr-progress-fill` 4px-track style from
   //     `CodeGraphReanalysisModal.svelte:265-270` (teal 0.8 → 1.0 on
   //     complete, 0.2s ease width transition). Battle-tested look.
-  //   - Above the bar, a "Martino-style" orbital logo: dual counter-
+  //   - Above the bar, a "orbital-ring" orbital logo: dual counter-
   //     rotating rings + a pulsing core with a VECTOR robot monogram
   //     (inline SVG — crisp on HiDPI, unlike the old /logo.png raster).
   //     A conic-gradient arc behind the rings tracks the REAL `fillPct`
@@ -209,7 +209,7 @@
   aria-label={a11yLabel}
 >
   <div class="oup-card">
-    <!-- Martino-style orbital logo. Dual counter-rotating rings + pulsing
+    <!-- orbital-ring orbital logo. Dual counter-rotating rings + pulsing
          core with a VECTOR robot monogram (crisp on HiDPI, unlike the old
          /logo.png raster which looked soft). On `completed` the rings turn
          solid teal; on `failed` they turn pink. The conic ring underneath
@@ -329,7 +329,7 @@
     gap: 12px;
   }
 
-  /* -------- Martino-style orbital logo -------- */
+  /* -------- orbital-ring orbital logo -------- */
 
   .oup-logo-wrap {
     position: relative;

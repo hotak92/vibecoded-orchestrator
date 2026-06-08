@@ -1,7 +1,7 @@
 // validate-tier — Lemon Squeezy license validation + machine binding.
 //
 // Called by the orchestrator's Python validator on every startup
-// (commercial_workflow/license/validator.py → _remote_validate).
+// (the license validator's `_remote_validate` entry point).
 //
 // Request:
 //   POST /functions/v1/validate-tier

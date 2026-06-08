@@ -16,7 +16,7 @@ create table if not exists public.profiles (
   apps        text[]      not null default '{}',
   -- Orchestrator tier is set by the webhook based on the LS variant_id.
   -- Free users have no row entry change (default 'free'). Paid tiers gate
-  -- feature access in commercial_workflow/license/validator.py.
+  -- feature access in the license validator.
   orchestrator_tier text   not null default 'free'
                            check (orchestrator_tier in ('free','pro','mao','enterprise')),
   created_at  timestamptz not null default now(),

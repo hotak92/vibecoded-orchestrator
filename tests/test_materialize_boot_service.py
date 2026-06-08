@@ -364,7 +364,7 @@ def test_probe_ps_returns_none_on_failure(monkeypatch):
 
 def test_probe_ps_parses_label(monkeypatch, tmp_path):
     monkeypatch.setattr(install.shutil, "which", lambda _: "/usr/bin/podman")
-    label = "/home/u/Desktop/PROGETTI/Claude/claude_mcp_servers"
+    label = "/home/u/code/orch/claude_mcp_servers"
     def run(*a, **kw):
         return types.SimpleNamespace(returncode=0, stdout=label + "\n", stderr="")
     monkeypatch.setattr(install.subprocess, "run", run)

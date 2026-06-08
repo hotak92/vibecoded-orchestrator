@@ -25,7 +25,7 @@ const ORCHESTRATOR_REPO: &str = "https://github.com/hotak92/vibecoded-orchestrat
 /// it discovers an install via the exe-walk strategy. The wizard's
 /// `checkStatus()` uses this to avoid the hard-coded `$HOME/...` default
 /// (which produced a false-negative "Not installed" banner when users
-/// installed somewhere else, e.g. `/home/x/Desktop/PROGETTI/VCO_dev`).
+/// installed somewhere else, e.g. `/home/<user>/code/vco/`).
 pub(crate) const APP_STATE_KEY_INSTALL_PATH: &str = "launcher.install_path";
 
 /// v0.2.37 canonical resolver (2026-05-27): single source of truth for
@@ -835,7 +835,8 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     //
     //    v0.2.21 (Stream A Design B extension): fetch from the canonical
     //    public AGPL upstream via the `vco_upstream` remote, NOT from
-    //    `origin`. Private forks (VCO_dev, customer mirrors) have
+    //    `origin`. Private forks (the maintainer's dogfooding install,
+    //    customer mirrors) have
     //    `origin` pointing at the fork; pre-fix the GUI's "Update
     //    orchestrator" banner silently never lit up because `origin`
     //    didn't advance. `ensure_upstream_remote` is idempotent — it
@@ -1228,8 +1229,7 @@ pub fn detect_existing_install_root() -> Option<String> {
 //
 // The wizard's `checkStatus()` previously probed only `$HOME/vibecoded-
 // orchestrator`, producing a false "Not installed" banner for users who
-// installed VCO at a custom location (real-world example:
-// `/home/martino/Desktop/PROGETTI/VCO_dev/`).
+// installed VCO at a custom location (e.g. `/home/<user>/code/vco/`).
 //
 // `get_known_install_path` is the FE entry point for "where is the
 // install on this machine?". It tries two strategies in order:
@@ -4005,8 +4005,8 @@ pub async fn update_orchestrator<R: Runtime>(
     );
     // v0.2.29 (2026-05-23, post-v0.2.28 bugfix): add `--autostash` to the
     // rebase path. Without it, ANY uncommitted change in the working tree
-    // outside the user-editable allowlist (typical for VCO_dev-style
-    // forks with WIP, or any user with in-progress local edits) causes
+    // outside the user-editable allowlist (typical for private-fork
+    // checkouts with WIP, or any user with in-progress local edits) causes
     // `git pull --rebase` to abort with "cannot pull with rebase: You
     // have unstaged changes". The pre-merge step only handles
     // allowlisted paths; everything else needs autostash. Git stashes
@@ -4598,7 +4598,7 @@ async fn read_remote_sha(repo: &Path, branch: &str) -> Option<String> {
 /// upstream/branch --name-only`, which lists files different between
 /// the two tips regardless of whether the difference is genuine upstream
 /// change or just a local-only addition. Forks that track paths the
-/// public repo doesn't (e.g. VCO_dev's `other_projects_knowledge/`)
+/// public repo doesn't (e.g. a private fork's `other_projects_knowledge/`)
 /// would see ALL their local-only paths show up as "diverged files" in
 /// the modal — confusing because those files can't possibly merge-
 /// conflict (upstream has no version of them at all). The rewrite
@@ -4771,8 +4771,8 @@ fn serialize_orchestrator_non_ff_error(
     // v0.2.27: added `local_only_files` so the modal can render
     // "files only on your clone" as a separate (collapsible) section
     // instead of mixing them into the merge-conflict-candidate list.
-    // Forks that track paths the public repo doesn't (e.g. VCO_dev's
-    // `other_projects_knowledge/`) no longer see those paths flagged
+    // Forks that track paths the public repo doesn't (e.g. a private
+    // fork's `other_projects_knowledge/`) no longer see those paths flagged
     // as "diverged" in the modal.
     format!(
         "{{\"event\":\"orchestrator_update_non_ff\",\"branch\":\"{}\",\"local_sha\":{},\"remote_sha\":{},\"diverged_files\":{},\"local_only_files\":{},\"git_stderr\":\"{}\"}}",

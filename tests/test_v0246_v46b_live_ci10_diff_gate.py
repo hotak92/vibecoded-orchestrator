@@ -19,7 +19,7 @@ ONLY structural defense against this class of bug.
 
 Cross-references:
 - knowledge/concepts/silent-zero-fallback-antipattern.md § "Real instance #3"
-- ~/.claude/projects/-home-martino-Desktop-PROGETTI-VCO-dev/memory/feedback_live_smoke_after_mcp_merge.md
+- feedback_live_smoke_after_mcp_merge.md (per-user auto-memory note)
 """
 from __future__ import annotations
 

@@ -164,10 +164,10 @@ def test_podman_subcommand_cpu_no_overlay(tmp_path: Path):
 
 # ---------------------------------------------------------------------------
 # v0.2.10 L1 — inline-GPU fall-through when the overlay file is missing.
-# This is the canonical case for the user's Claude orchestrator stack at
-# ~/Desktop/PROGETTI/Claude/claude_mcp_servers/compose.yaml, which has
-# GPU devices declared inline (devices: - nvidia.com/gpu=all) on the
-# ollama / code_embed service blocks. No overlay file exists there.
+# This is the canonical case for orchestrator stacks whose
+# `claude_mcp_servers/compose.yaml` declares GPU devices INLINE
+# (devices: - nvidia.com/gpu=all) on the ollama / code_embed service
+# blocks. No overlay file exists in that layout.
 # ---------------------------------------------------------------------------
 
 

@@ -525,7 +525,7 @@ pub struct AffectedProject {
 /// multi-version comparison data the user wants to keep.
 #[derive(Debug, Clone, Serialize)]
 pub struct OrphanCollectionGroup {
-    /// The non-canonical prefix (e.g. "VCO_dev", "Vibecoded_orchestrator").
+    /// The non-canonical prefix (e.g. "My_Project", "Vibecoded_orchestrator").
     pub prefix: String,
     /// The project the orphan most likely belongs to. May be heuristic
     /// (case-insensitive normalised-name match).
@@ -533,7 +533,7 @@ pub struct OrphanCollectionGroup {
     /// The project's name as the user sees it in the launcher.
     pub matched_project_name: String,
     /// The project's CURRENT canonical prefix (what new analyses will
-    /// write to). Useful in the UI to render "VCO_dev (orphan) →
+    /// write to). Useful in the UI to render "My_Project (orphan) →
     /// VibeCodedOrchestrator (current)".
     pub current_prefix: String,
     /// Per-suffix collection list. Same shape as the legacy

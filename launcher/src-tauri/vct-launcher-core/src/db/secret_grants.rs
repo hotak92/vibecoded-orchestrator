@@ -227,7 +227,7 @@ mod tests {
     fn insert_then_has_grant() {
         let db = Db::open_in_memory().unwrap();
         let inserted = db
-            .insert_secret_grant("per_project", "A", "u", "K", "B", Some("martino"), None)
+            .insert_secret_grant("per_project", "A", "u", "K", "B", Some("test_user"), None)
             .unwrap();
         assert!(inserted);
         assert!(db

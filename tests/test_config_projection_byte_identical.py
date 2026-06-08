@@ -311,12 +311,12 @@ def test_parity_settings_json_format_2_space_indent_no_trailing_newline(
     )
 
 
-# ─── Real-world fixture: realistic VCO_dev-like settings.json ───────────
+# ─── Real-world fixture: realistic project-a-like settings.json ────────
 
 
 def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     """Round-trip a realistic settings.json containing user-set keys
-    (KG_BASE_DIR — observed in production VCO_dev) plus a hooks block.
+    (KG_BASE_DIR — observed in real-world dogfooding) plus a hooks block.
 
     Asserts:
       * The realistic shape survives an apply.
@@ -327,7 +327,7 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
     test, but the actual shape we see in the wild."""
     settings_path = tmp_path / ".claude" / "settings.json"
     settings_path.parent.mkdir()
-    # Realistic snapshot from VCO_dev (modulo path values).
+    # Realistic snapshot from a dogfooding install (modulo path values).
     settings_path.write_text(json.dumps({
         "env": {
             "PROJECT_NAME": "VCODev",
@@ -335,7 +335,7 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
             "KG_COLLECTION": "VCODev_KnowledgeGraph",
             "SHARED_KG_COLLECTION": "VibeCodedTools_KnowledgeGraph",
             "DEVELOPMENT_COLLECTION": "VCODev_Development",
-            "KG_BASE_DIR": "/home/user/Desktop/PROGETTI/VCO_dev",
+            "KG_BASE_DIR": "/home/user/code/project-a",
         },
         "hooks": {
             "PreToolUse": [
@@ -362,7 +362,7 @@ def test_parity_realistic_settings_round_trip(tmp_path: Path) -> None:
 
     parsed = json.loads(first)
     # User-added key survived.
-    assert parsed["env"]["KG_BASE_DIR"] == "/home/user/Desktop/PROGETTI/VCO_dev"
+    assert parsed["env"]["KG_BASE_DIR"] == "/home/user/code/project-a"
     # Sibling top-level blocks survived.
     assert "hooks" in parsed
     assert parsed["permissions"] == {"allow": ["Read(/)", "Bash(*)"]}

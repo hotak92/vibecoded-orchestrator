@@ -5,7 +5,7 @@ tags: [launcher, supabase, schema, paid-modules, licensing, commercial, VCT-Laun
 created: 2026-04-23T16:20:00Z
 updated: 2026-05-26T00:00:00Z
 status: active
-implementation: "Original migration 004_paid_modules.sql lives in the `pb992/VCT-Launcher` private Supabase project (Fabio's earlier exploration). Production project for the launcher is `ovpdtijpdchzlxbojhsg` (the orchestrator's Supabase). The launcher-side mirror of per-module entitlements is `tier_cache.module_licenses` (read via `is_module_licensed_v2`)."
+implementation: "Original migration 004_paid_modules.sql lives in the `pb992/VCT-Launcher` private Supabase project (an earlier launcher exploration). Production project for the launcher is `ovpdtijpdchzlxbojhsg` (the orchestrator's Supabase). The launcher-side mirror of per-module entitlements is `tier_cache.module_licenses` (read via `is_module_licensed_v2`)."
 ---
 
 # Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
@@ -73,7 +73,7 @@ Prevents clients from writing to `paid_modules` directly — only service-role R
 
 ### `lemon-squeezy-webhook` (extended 2026-04-22)
 
-Added `PAID_MODULES_MAP` dict (parallel to `VARIANT_MAP` / `ORCHESTRATOR_TIER_MAP`). On `order_created`, if the variant_id matches a paid-module entry, calls `upsert_paid_module()` via service-role RPC. **Pending Fabio**: 3 Telegram variant IDs to populate `PAID_MODULES_MAP` after LS product creation with "enable license keys" toggle.
+Added `PAID_MODULES_MAP` dict (parallel to `VARIANT_MAP` / `ORCHESTRATOR_TIER_MAP`). On `order_created`, if the variant_id matches a paid-module entry, calls `upsert_paid_module()` via service-role RPC. **Pending (launcher-side)**: 3 Telegram variant IDs to populate `PAID_MODULES_MAP` after LS product creation with "enable license keys" toggle.
 
 ### `validate-module` edge function (written, deploy pending)
 
@@ -85,7 +85,7 @@ Added `PAID_MODULES_MAP` dict (parallel to `VARIANT_MAP` / `ORCHESTRATOR_TIER_MA
 4. Calls `upsert_paid_module()` with activation metadata.
 5. Returns `{valid: true, expires_at, tier}`.
 
-**Pending Fabio**: `supabase functions deploy validate-module`. See [[relatedTo::validate-module edge function]] for the full contract.
+**Pending (launcher-side)**: `supabase functions deploy validate-module`. See [[relatedTo::validate-module edge function]] for the full contract.
 
 ### Launcher Rust side (`src-tauri/src/commands/modules.rs`)
 
@@ -109,8 +109,8 @@ Telegram MCP module active in Claude Code
 
 ## Deferred / open
 
-- `validate-module` deploy (Fabio)
-- 3 Telegram variant IDs to populate `PAID_MODULES_MAP` (Fabio)
+- `validate-module` deploy (launcher-side)
+- 3 Telegram variant IDs to populate `PAID_MODULES_MAP` (launcher-side)
 - Multi-machine license slot enforcement (schema supports `machines` array; runtime logic not yet in `validate-module`)
 - Module uninstall → should it call `remove_paid_module()` or just keep the license for re-install? Current decision: keep (user paid for it; let them reinstall freely)
 
@@ -122,4 +122,3 @@ Telegram MCP module active in Claude Code
 - [[relatedTo::VCT Coordination MCP — Standalone Product]] (future consumer if marketed as paid)
 - Migration file: `pb992/VCT-Launcher:supabase/migrations/004_paid_modules.sql`
 - Webhook: `pb992/VCT-Launcher:supabase/functions/lemon-squeezy-webhook/index.ts`
-- Fabio handoff: `.claude/context/fabio-update-2026-04-22-telegram-module.md`

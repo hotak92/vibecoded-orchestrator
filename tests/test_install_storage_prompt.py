@@ -217,7 +217,7 @@ def test_detect_uses_user_relative_paths_not_hardcoded():
     """The probe table MUST use either `~/...` (POSIX) or `%VAR%\\...`
     (Windows) heads, never hardcoded absolute paths.
 
-    This is a regression guard: an earlier draft hardcoded /home/martino.
+    This is a regression guard: an earlier draft hardcoded an absolute home dir.
     Any contributor adding a new probe must use Path.expanduser()-style
     paths (POSIX) or environment-variable-anchored paths (Windows) so
     the detection works for every user across every OS.

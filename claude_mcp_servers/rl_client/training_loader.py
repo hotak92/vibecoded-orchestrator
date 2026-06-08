@@ -58,7 +58,7 @@ _DEFAULT_QWEN3 = Path.home() / ".claude" / "retrieval_rl_data" / "rl_events_qwen
 # Default cohort alias map (NEW-7 from v0.2.38 backlog 2026-05-28).
 # Keys are canonical slugs; values are the legacy aliases that should map to
 # each canonical slug.  Applied to the ``project`` field at load time so the
-# offline trainer sees a single cohort label regardless of which VCO_dev
+# offline trainer sees a single cohort label regardless of which project
 # alias the event was written with.
 # ---------------------------------------------------------------------------
 _DEFAULT_COHORT_ALIASES: dict[str, list[str]] = {
