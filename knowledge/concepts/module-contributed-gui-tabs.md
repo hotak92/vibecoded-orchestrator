@@ -332,6 +332,8 @@ The module declares its host-side log-path convention in one place:
 }
 ```
 
+(Generic example: any per-project log-path convention works — the module declares its template, the launcher substitutes per project.)
+
 **Closed-set tokens** inside the template:
 - `{project_slug}` — the project's slug (DB column).
 - `{project_id}` — the project's UUID.
@@ -398,17 +400,17 @@ Resolves to a `JsonValue::Array` of strings — one path per project the referen
 }
 ```
 
-For 3 selected projects with slugs `claude` / `vco-dev` / `artup`, the rendered request body is:
+For 3 selected projects with slugs `project-a` / `project-b` / `project-c`, the rendered request body is:
 
 ```json
 {
   "mode": "offline",
   "event_log_paths": [
-    "/data/logs/rl_events_claude.jsonl",
-    "/data/logs/rl_events_vco-dev.jsonl",
-    "/data/logs/rl_events_artup.jsonl"
+    "/data/logs/rl_events_project-a.jsonl",
+    "/data/logs/rl_events_project-b.jsonl",
+    "/data/logs/rl_events_project-c.jsonl"
   ],
-  "include_project_ids": ["uuid-claude", "uuid-vco-dev", "uuid-artup"]
+  "include_project_ids": ["uuid-project-a", "uuid-project-b", "uuid-project-c"]
 }
 ```
 

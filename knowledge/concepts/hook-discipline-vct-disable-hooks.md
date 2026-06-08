@@ -24,9 +24,9 @@ fi
 
 Coverage: every shell hook in the orchestrator. Verified in CI by `pytest tests/test_hooks_disable_guard.py` which greps each hook for the guard and asserts presence. Adding a new hook without the guard fails CI.
 
-**Coverage history (2026-05-08)**: All 23 hooks have the guard. `verify-container-ports.sh` guard implemented in commit 5b95685 (last hook to be added).
+**Coverage**: all 31 shell hooks under `.claude/hooks/` carry the guard.
 
-**Pre-fork audit item #12 enforcement (2026-05-08)**: New CI gate `check_hook_set_directives.py` enforces that any hook using `set -e` MUST also enable `pipefail` (i.e., `set -euo pipefail`). This caught 7 violations across hooks that didn't have both directives. The CI gate ensures no new hooks violate this pattern.
+**`set -e` / `pipefail` discipline**: CI gate `check_hook_set_directives.py` enforces that any hook using `set -e` MUST also enable `pipefail` (i.e., `set -euo pipefail`). New hooks that violate the pattern fail the gate.
 
 ## How it works
 

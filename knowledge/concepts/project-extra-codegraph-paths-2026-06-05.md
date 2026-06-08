@@ -1,8 +1,7 @@
 ---
-title: Project-extra codegraph paths (v0.2.47)
+title: Project-extra codegraph paths
 type: concept
 tags:
-  - v0.2.47
   - codegraph
   - launcher
   - multi-codebase
@@ -16,8 +15,6 @@ status: active
 ---
 
 # Project-extra codegraph paths
-
-**Shipped**: v0.2.47 (alongside the [[supervisor-image-resolution-variant-gap-2026-06-04|supervisor image-auth fix]])
 
 ## What it is
 
@@ -44,7 +41,7 @@ Four surfaces co-evolve:
 | Hook | `code-graph-incremental.sh` (and `.ps1` sibling) | First-match-wins ordering: own-repo → extras → siblings → no-op. Edits under extras re-index into the CURRENT project's prefix |
 | Analyzer CLI | `--extra-path <DIR>` (repeatable) + `--since-commit <SHA>` | Walks all source roots in ONE pass; `visited_uuids` is the UNION across primary repo + all extras. Schema adds `project_source` property to all 5 code collections |
 
-## The critical invariant (§14.2 of the v0.2.47 plan)
+## The critical invariant
 
 **`--prune-stale` runs MUST visit every file currently meant to be in the
 project's codegraph in ONE invocation.** Multi-pass with `--prune-stale`
@@ -96,7 +93,7 @@ path primitives):
 The hub resolver returns the canonical form so hooks can substring-match
 against `EDITED_FILE` directly.
 
-## Hook ordering (§5a of plan)
+## Hook ordering
 
 `code-graph-incremental.sh` (and `.ps1`) check order, **first match wins**:
 
@@ -112,9 +109,9 @@ against `EDITED_FILE` directly.
 extras-claimed file doesn't get re-routed to a sibling project's
 codegraph.
 
-Pre-v0.2.47 hubs lack the field → resolver exits 4 ("field not found")
+Older hub binaries that lack the field → resolver exits 4 ("field not found")
 → `EXTRAS_LIST` stays empty → no-op fall-through to sibling detection.
-Backwards-compatible.
+Backwards-compatible by construction.
 
 ## What's NOT in scope
 
@@ -144,7 +141,6 @@ Every transition records to `audit_log`:
 - [[refines::Multi-codebase code graph detection]] — extends the existing
   sibling-detection pattern with a new explicit-path source
 - [[refines::Pre-install catalog architecture — L0 public endpoint + post-install on-disk manifest]] — uses the same hub-resolver field-addition pattern (additive, default-empty, schema_version unchanged)
-- [[implements::v0.2.47 spec at .claude/context/plans/project-extra-codegraph-paths-2026-06-05.md]]
 
 ## Implementation files
 
@@ -167,7 +163,7 @@ Every transition records to `audit_log`:
 - `tests/test_analyze_code_graph_extras.py` — 12 tests, including the
   critical-invariant lock-in `test_visited_uuids_is_single_shared_set`
 - `tests/test_code_graph_incremental_hook.sh` — 11 tests, all 4 ordering
-  branches + pre-v0.2.47 hub fallback
+  branches + older-hub fallback
 - `tests/test_vct_project_config_extras.sh` — 9 tests, bash resolver
   `--field code_graph_extra_paths` rendering
 - `tests/test_project_config.py::CodeGraphExtraPathsTest` — 8 tests,

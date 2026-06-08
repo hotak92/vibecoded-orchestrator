@@ -68,7 +68,7 @@ Context nearing limit
 - Logs to `.claude/logs/container-health.log`.
 
 **ensure-code-embed-service.sh** (background)
-- Checks if the code-embedding FastAPI server (port 11438) is up; starts it if not.
+- Checks if the code-embedding FastAPI server (port 11440) is up; starts it if not.
 
 **session-start-kg-loader.sh**
 - Prints key KG resource paths (CONTEXT_STATE.md, active plan file, knowledge/ root).
@@ -112,7 +112,7 @@ Context nearing limit
 - Appends tool name, arguments hash, and timestamp to `.claude/logs/YYYY-MM-DD_tool_usage.jsonl`.
 
 **SSRF guard** (matcher: `Bash(*)`)
-- Scans Bash commands for HTTP requests to private IP ranges; blocks unless target is a whitelisted localhost service (Weaviate 8081, Ollama 11435, code-embed 11438, SearXNG 8888, etc.).
+- Scans Bash commands for HTTP requests to private IP ranges; blocks unless target is a whitelisted localhost service (Weaviate 8081, Ollama 11435, code-embed 11440, SearXNG 8888, etc.).
 
 **Shell injection scan** (matcher: `Bash(*)`)
 - Scans for dangerous patterns: `curl | sh`, `eval $(curl ...)`, `base64 | sh`.
