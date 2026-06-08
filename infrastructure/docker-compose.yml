@@ -78,7 +78,13 @@ services:
   code_embed:
     build:
       context: ${VCT_CODE_EMBED_BUILD_CONTEXT:-../claude_mcp_servers/code_embedding_service}
-      dockerfile: Dockerfile
+      # v0.2.50 portability fix (audit F1): the default `Dockerfile` is now
+      # CPU multi-arch (linux/amd64 + linux/arm64); NVIDIA hosts opt into
+      # the CUDA build via `CODE_EMBED_DOCKERFILE=Dockerfile.cuda` in their
+      # `.env`. install.py writes that variable automatically when
+      # nvidia-smi succeeds. Apple Silicon + AMD ROCm + CPU-only hosts
+      # leave the variable unset and get the multi-arch CPU image.
+      dockerfile: ${CODE_EMBED_DOCKERFILE:-Dockerfile}
     # Renamed `vct_code_embed` → `vco_code_embed` in v0.2.15 for naming
     # consistency with the rest of the vco_* stack. `vct_code_embed` is
     # kept in `vco_lib.containers.HISTORICAL_ALIASES["code_embed"]` so

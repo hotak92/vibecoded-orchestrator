@@ -227,6 +227,20 @@ function Invoke-WrapperOrCompose {
 # ---------------------------------------------------------------------------
 function Invoke-ZombieRecovery {
     param([string]$Name)
+
+    # v0.2.50 audit F6 (2026-06-08): the zombie state-DB-desync failure
+    # mode is Podman-specific (rootless conmon vanishes without writing
+    # the exit event). On Docker the centralised daemon manages State.*
+    # honestly; the PID-alive cross-check at the caller can fire
+    # spuriously (Docker PIDs live in a VM on macOS/Windows; even on
+    # Linux Docker the host-side State.Pid is semantically different
+    # from podman's). Running runc delete + `docker rm --force` on a
+    # healthy Docker container produces noisy unnecessary recreate
+    # cycles. Mirror verify-container-ports.ps1::Test-ContainerPidAlive.
+    if ($Runtime -ne "podman") {
+        return $true
+    }
+
     $containerId = ""
     try {
         $containerId = (& $Runtime inspect $Name --format '{{.Id}}' 2>$null | Out-String).Trim()
@@ -275,6 +289,12 @@ $started = 0
 $recovered = 0
 $needsCompose = $false
 $needsGpuWrapper = $false
+# v0.2.50 audit F6 (2026-06-08): zombie detection (running status with
+# dead PID per Get-Process) is Podman-specific. On Docker the State.Pid
+# value carries different host-side semantics (containerd PID, VM PID on
+# macOS/Windows). Skip the PID-alive cross-check for non-podman runtimes
+# and trust Docker's State.Status.
+$ZombieDetectionEnabled = ($Runtime -eq "podman")
 foreach ($container in $VcoRequiredContainers) {
     $status = "missing"
     try {
@@ -283,6 +303,10 @@ foreach ($container in $VcoRequiredContainers) {
     } catch { $status = "missing" }
 
     if ($status -eq "running") {
+        if (-not $ZombieDetectionEnabled) {
+            # Docker / rootful runtime: trust State.Status=running.
+            continue
+        }
         $containerPid = "0"
         try {
             $containerPid = (& $Runtime inspect $container --format '{{.State.Pid}}' 2>$null | Out-String).Trim()
@@ -292,6 +316,10 @@ foreach ($container in $VcoRequiredContainers) {
         if (Invoke-ZombieRecovery -Name $container) { $recovered++ }
         continue
     } elseif ($status -eq "stopping") {
+        if (-not $ZombieDetectionEnabled) {
+            # Docker / rootful runtime: trust State.Status=stopping.
+            continue
+        }
         $containerPid = "0"
         try {
             $containerPid = (& $Runtime inspect $container --format '{{.State.Pid}}' 2>$null | Out-String).Trim()

@@ -59,21 +59,20 @@ services:
     # No `deploy.resources.reservations.devices` here — that block is
     # NVIDIA-only and would conflict with the device passthrough above.
 
-  code_embed:
-    # ROCm passthrough for code_embed too. CodeSage-Large-v2 via
-    # sentence-transformers can run on ROCm-built torch if the upstream
-    # image is built with the rocm wheel. Today the orchestrator's
-    # code_embed image is CUDA-only; ROCm users will get the Ollama-based
-    # code embedding fallback automatically until a -rocm tag exists.
-    # The block below stages the device passthrough so a future image
-    # bump lights up without further changes.
-    devices:
-      - /dev/kfd
-      - /dev/dri
-    group_add:
-      - video
-      - render
-    cap_add:
-      - SYS_PTRACE
-    environment:
-      HSA_OVERRIDE_GFX_VERSION: "10.3.0"
+  # code_embed: intentionally NOT defined in this ROCm overlay.
+  #
+  # v0.2.50 audit F7 (2026-06-08): the previous version of this file
+  # included a `code_embed:` block with ROCm device passthrough but no
+  # `image:` override — meaning compose would inherit the (now CPU-
+  # multi-arch) base `Dockerfile` from the parent compose, AND ALSO
+  # pretend to pass ROCm devices to a CPU-only image. The block was
+  # never reached in practice because install.py's profile picker
+  # routes ROCm users to the `cpu` embedding profile (where code_embed
+  # runs as Ollama+jina-v2-base-code via Ollama, not via this
+  # service). Keeping the orphan block invited a footgun for users
+  # who manually applied `--profile gpu` against the ROCm overlay
+  # — they'd get a CPU image with mysteriously-passed AMD devices.
+  #
+  # Mirrors `docker-compose.amd-rocm.yml`, which already omits this
+  # service for the same reason (see its inline note: "code_embed has
+  # no ROCm build path today (CodeSage runs on CUDA or CPU only)").

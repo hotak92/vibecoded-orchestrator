@@ -98,8 +98,13 @@ WATCH=(
     "vct_code_embed|11440|tcp|"
     "code_embed|11440|tcp|"
     "code_embed_claude|11440|tcp|"
-    # Model router (sibling service; not in containers registry — single name)
-    "model_router_claude|11436|tcp|"
+    # NOTE: v0.2.50 audit F2 (2026-06-08) — the `model_router_claude|11436`
+    # row that previously lived here was a maintainer-machine leak (same
+    # shape as the `_claude` suffix family v0.2.15 already cleaned up
+    # for weaviate/ollama/code_embed). There is no canonical
+    # `vco_model_router` service in compose or install.py; the model-
+    # router runs only on the maintainer's host. Drop the row to stop
+    # this hook from polling port 11436 on every install.
 )
 
 VERBOSE="${VCT_PORT_WATCHDOG_VERBOSE:-0}"

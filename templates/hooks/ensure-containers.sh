@@ -215,6 +215,20 @@ bring_up_via_wrapper() {
 # ---------------------------------------------------------------------------
 recover_zombie() {
     local name="$1"
+
+    # v0.2.50 audit F6 (2026-06-08): the zombie-state-DB-desync failure
+    # mode is Podman-specific (rootless conmon vanishes without writing
+    # the exit event). On Docker the centralised daemon manages State.*
+    # honestly; the PID-alive /proc check at the caller can fire
+    # spuriously (Docker PIDs live in a VM on macOS/Windows; even on
+    # Linux Docker the host-side State.Pid is semantically different
+    # from podman's). Running runc delete + `docker rm --force` on a
+    # healthy Docker container produces noisy unnecessary recreate
+    # cycles. Mirror the guard in verify-container-ports.sh:130.
+    if [ "${RUNTIME:-podman}" != "podman" ]; then
+        return 0
+    fi
+
     local container_id
     container_id="$($RUNTIME inspect "$name" --format '{{.Id}}' 2>/dev/null || echo "")"
 
@@ -258,9 +272,22 @@ started=0
 recovered=0
 needs_compose=false
 needs_gpu_wrapper=false
+# v0.2.50 audit F6 (2026-06-08): zombie detection (running status with
+# dead PID per /proc) is Podman-specific. On Docker the State.Pid value
+# carries different host-side semantics (containerd PID, VM PID on
+# macOS/Windows), and `/proc/$pid` is unreliable. Skip the PID-alive
+# cross-check for non-podman runtimes; trust Docker's State.Status.
+ZOMBIE_DETECTION_ENABLED=true
+if [ "${RUNTIME:-podman}" != "podman" ]; then
+    ZOMBIE_DETECTION_ENABLED=false
+fi
 for container in "${VCO_REQUIRED_CONTAINERS[@]}"; do
     status=$($RUNTIME inspect "$container" --format '{{.State.Status}}' 2>/dev/null || echo "missing")
     if [ "$status" = "running" ]; then
+        if [ "$ZOMBIE_DETECTION_ENABLED" = "false" ]; then
+            # Docker / rootful runtime: trust State.Status=running.
+            continue
+        fi
         # Liveness probe — guard against zombie state where podman thinks
         # the container is up but the PID is dead (post-OOM, conmon-killed).
         pid=$($RUNTIME inspect "$container" --format '{{.State.Pid}}' 2>/dev/null || echo "0")
@@ -274,6 +301,11 @@ for container in "${VCO_REQUIRED_CONTAINERS[@]}"; do
         fi
         continue
     elif [ "$status" = "stopping" ]; then
+        if [ "$ZOMBIE_DETECTION_ENABLED" = "false" ]; then
+            # Docker / rootful runtime: trust State.Status=stopping; let
+            # the runtime finish its own teardown.
+            continue
+        fi
         # `stopping` with a dead conmon is the other zombie shape. Treat
         # the same as the running-but-dead-pid case.
         pid=$($RUNTIME inspect "$container" --format '{{.State.Pid}}' 2>/dev/null || echo "0")

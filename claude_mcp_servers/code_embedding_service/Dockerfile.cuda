@@ -1,0 +1,41 @@
+# CUDA code-embedding image — opt-in for NVIDIA hosts only.
+#
+# v0.2.50 portability fix (audit F1, 2026-06-08): split out from the
+# default `Dockerfile` so non-NVIDIA hosts (Apple Silicon, AMD ROCm,
+# CPU-only) can build the service from a multi-arch CPU base without
+# hitting CUDA-image-pull failures.
+#
+# How install.py picks the right one:
+#   - nvidia-smi detected → writes `CODE_EMBED_DOCKERFILE=Dockerfile.cuda`
+#     into the rendered `.env`. compose then builds from THIS file.
+#   - Any other host (AMD / Apple Silicon / CPU-only / unknown) →
+#     `CODE_EMBED_DOCKERFILE` left unset; compose defaults to
+#     `Dockerfile` (the CPU multi-arch sibling).
+#
+# Manual override is supported — set CODE_EMBED_DOCKERFILE in your `.env`
+# (or shell env) to either filename to force a specific variant. Useful
+# when running CI on a non-GPU host but you want to validate the CUDA
+# image build path.
+#
+# Runtime semantics: server.py does
+# `device = "cuda" if torch.cuda.is_available() else "cpu"`, so this
+# image will silently fall back to CPU if started on a host without
+# nvidia driver passthrough. The compose `--profile gpu` gate is the
+# layer that makes "image starts == GPU is wired up" the default.
+FROM docker.io/pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime
+
+WORKDIR /app
+
+# Install Python dependencies (sentence-transformers pulls torch but base image has it)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY server.py .
+
+# Redirect ALL HuggingFace state (model weights + modules cache) to mounted volume.
+# This ensures custom model code (trust_remote_code=True) is also cached persistently.
+ENV HF_HOME=/cache
+
+EXPOSE 11440
+
+CMD ["python", "server.py"]

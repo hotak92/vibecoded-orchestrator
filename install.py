@@ -4600,6 +4600,12 @@ def main() -> int:
 
     # Step 3: Determine embedding configuration
     embed_config = _choose_embedding_config(sysinfo, args)
+    # v0.2.50 portability fix (audit F1, 2026-06-08): stash the resolved
+    # GPU vendor on embed_config so `_write_env_config` can pick the right
+    # CODE_EMBED_DOCKERFILE variant for the code-embed image build.
+    # NVIDIA hosts → Dockerfile.cuda. Anyone else (AMD ROCm / Apple
+    # Silicon / CPU-only / unknown) → default Dockerfile (CPU multi-arch).
+    embed_config["gpu_vendor"] = sysinfo.gpu_vendor or ""
     print(f"\n  Embedding mode: {embed_config['description']}")
 
     # Step 3b (PR-28, Group G, v0.2.12): storage-location prompt. Runs
@@ -19916,6 +19922,14 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace, joern_availa
         f"CODE_EMBED_MODEL={embed_config['code_model']}",
         f"CODE_EMBED_DIMS={embed_config['code_dims']}",
         f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
+        # v0.2.50 audit F1 (2026-06-08): per-arch Dockerfile selection
+        # for the code-embed image build. NVIDIA hosts opt into the CUDA
+        # base image; everyone else (AMD ROCm, Apple Silicon, CPU-only)
+        # uses the multi-arch CPU default. The compose file reads this
+        # via ${CODE_EMBED_DOCKERFILE:-Dockerfile}. Only emitted when
+        # NVIDIA was detected — leaves CPU/AMD/Metal hosts on the default.
+        *([f"CODE_EMBED_DOCKERFILE=Dockerfile.cuda"]
+          if embed_config.get("gpu_vendor") == "nvidia" else []),
         # ACTIVE_EMBEDDING: maps to the named-vector slot the MCP server
         # reads/writes. Per-profile so low-resource/openai installs don't
         # cross-write qwen3 vectors into a slot labelled for a different

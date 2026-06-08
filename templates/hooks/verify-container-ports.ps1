@@ -75,8 +75,13 @@ $watch = @(
     @{ Name = "vct_code_embed";      Port = 11440; Kind = "tcp";  Endpoint = "" }
     @{ Name = "code_embed";          Port = 11440; Kind = "tcp";  Endpoint = "" }
     @{ Name = "code_embed_claude";   Port = 11440; Kind = "tcp";  Endpoint = "" }
-    # Model router (sibling service; not in containers registry — single name)
-    @{ Name = "model_router_claude"; Port = 11436; Kind = "tcp";  Endpoint = "" }
+    # NOTE: v0.2.50 audit F3 (2026-06-08) — the `model_router_claude;11436`
+    # row that previously lived here was a maintainer-machine leak (same
+    # shape as the `_claude` suffix family v0.2.15 already cleaned up
+    # for weaviate/ollama/code_embed). There is no canonical
+    # `vco_model_router` service in compose or install.py; the model-
+    # router runs only on the maintainer's host. Drop the row to stop
+    # this hook from polling port 11436 on every install.
 )
 
 $verbose = ($env:VCT_PORT_WATCHDOG_VERBOSE -eq "1")
