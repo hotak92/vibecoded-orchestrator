@@ -1365,6 +1365,95 @@ impl Db {
             .map_err(|e| format!("update: {}", e))?;
         Ok(())
     }
+
+    /// v0.2.49 access-matrix Phase 4 (item #10): seed the default
+    /// kg_collection_access rows for a newly-created project.
+    ///
+    /// Centralizes the logic previously embedded in the launcher-side
+    /// `commands::project_state_populate::populate_kg_collection_access`
+    /// so every project-create surface (Tauri command, hub `vct project
+    /// create` CLI, future automation) can call ONE consistent helper.
+    ///
+    /// Writes three rows (each idempotent via INSERT OR IGNORE — pre-
+    /// existing user-configured rows are preserved):
+    ///   1. `<Sanitized>_KnowledgeGraph` → "write"  (project's own KG)
+    ///   2. `<Sanitized>_Development`    → "write"  (project's docs)
+    ///   3. `LAST_RESORT_SHARED_KG_COLLECTION` → "read"  (cross-project shared)
+    ///
+    /// Where `<Sanitized>` is `sanitize_kg_collection(project_name)`
+    /// (matches launcher-side `commands::projects_v2::sanitize_kg_collection`
+    /// byte-for-byte; see `sanitize_kg_collection_local` below).
+    ///
+    /// Why default-grant on the own collections + shared: the read-gate
+    /// `require_kg_read` (commands::kg::require_kg_read + hub::cli_api)
+    /// rejects every access to a collection the project doesn't have an
+    /// explicit row for. Pre-PR-3 the access matrix was permanently empty
+    /// for fresh projects, so every search/read of the project's own KG
+    /// or the shared bundled KG failed until the user manually granted
+    /// via the GUI access matrix.
+    ///
+    /// Returns the number of rows actually inserted (0..=3). Pre-existing
+    /// rows are not counted; user-configured downgrades are preserved.
+    /// Errors on rows fail the call (caller sees the SQL error and can
+    /// log a warning); the partial state is committed up to the failure
+    /// point (each kg_seed_access is its own statement).
+    pub fn populate_kg_collection_access_for_project(
+        &self,
+        project_id: &str,
+        project_name: &str,
+    ) -> Result<usize, String> {
+        let pascal = sanitize_kg_collection_local(project_name);
+        let primary_collection = format!("{}_KnowledgeGraph", pascal);
+        let dev_collection = format!("{}_Development", pascal);
+        // Resolve the canonical shared KG name from `app_state` (Phase 1
+        // item #3 single-source-of-truth). White-label installers override
+        // this at install time via `set_orchestrator_root_kg_collection`.
+        let shared_collection = self.get_orchestrator_root_kg_collection()?;
+
+        let mut inserted = 0usize;
+        inserted += self.kg_seed_access(project_id, &primary_collection, "write")?;
+        inserted += self.kg_seed_access(project_id, &dev_collection, "write")?;
+        inserted += self.kg_seed_access(project_id, &shared_collection, "read")?;
+        Ok(inserted)
+    }
+}
+
+/// v0.2.49 access-matrix Phase 4 (item #10) — local copy of
+/// `commands::projects_v2::sanitize_kg_collection`. Kept here so
+/// `populate_kg_collection_access_for_project` works from inside
+/// vct-launcher-core without taking a dep on the launcher crate.
+///
+/// MUST stay byte-equivalent to the launcher-side version. A future
+/// refactor can either hoist sanitize_kg_collection into a shared util
+/// module or have the launcher delegate to this one; deferred to keep
+/// the diff bounded.
+///
+/// Convert a project display name into a Weaviate-collection-safe id.
+/// Weaviate collections must start with [A-Z] and contain only
+/// alphanumerics — strip everything else and Title-case.
+pub(crate) fn sanitize_kg_collection_local(name: &str) -> String {
+    let mut out = String::new();
+    let mut next_upper = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if next_upper {
+                out.extend(ch.to_uppercase());
+                next_upper = false;
+            } else {
+                out.push(ch);
+            }
+        } else {
+            next_upper = true;
+        }
+    }
+    if out.is_empty() {
+        return "Project".to_string();
+    }
+    // Weaviate requires leading letter, not digit.
+    if out.chars().next().unwrap().is_ascii_digit() {
+        out.insert(0, 'P');
+    }
+    out
 }
 
 /// Extract the recognized suffix from a binding collection name. We
@@ -3577,5 +3666,213 @@ mod access_audit_column_tests {
             ..legacy
         };
         assert!(user_touched.is_user_configured());
+    }
+}
+
+// ─── Tests: populate_kg_collection_access_for_project (Phase 4 #10) ───────
+//
+// Centralized seed helper used by both the launcher-side `create_project_v2`
+// path (via `populate_kg_collection_access` delegation) and the hub-side
+// `vct project create` CLI path. These tests pin the contract independent
+// of either caller.
+
+#[cfg(test)]
+mod populate_access_for_project_tests {
+    use super::sanitize_kg_collection_local;
+    use crate::db::Db;
+
+    fn seed_project(db: &Db, project_id: &str) {
+        let now = 1_700_000_000_000_i64;
+        let folder = format!("/tmp/test-populate-access/{}", project_id);
+        let guard = db.lock();
+        guard
+            .execute(
+                "INSERT OR IGNORE INTO projects \
+                 (id, name, folder_path, host, slug, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'base', ?1, ?4, ?4)",
+                rusqlite::params![project_id, project_id, folder, now],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn populate_writes_three_default_rows() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        let inserted = db
+            .populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        // 3 default rows: own primary (write), own dev (write), shared (read).
+        assert_eq!(inserted, 3);
+
+        let access = db.kg_list_access("p1").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(by_collection.get("Acme_KnowledgeGraph"), Some(&"write"));
+        assert_eq!(by_collection.get("Acme_Development"), Some(&"write"));
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            Some(&"read")
+        );
+    }
+
+    #[test]
+    fn populate_is_idempotent_preserves_user_configured_levels() {
+        // After the first populate seeds the defaults, the user
+        // explicitly downgrades the shared collection to "none". A
+        // second populate call MUST NOT clobber the user-configured row.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        let first = db
+            .populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        assert_eq!(first, 3);
+
+        // User downgrades shared.
+        db.kg_set_access("p1", "VibeCodedOrchestrator_KnowledgeGraph", "none")
+            .unwrap();
+
+        let second = db
+            .populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        // Zero rows inserted: every default already exists (INSERT OR
+        // IGNORE no-op). User's downgrade survives.
+        assert_eq!(second, 0);
+
+        let access = db.kg_list_access("p1").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            Some(&"none"),
+            "user-set 'none' must NOT be reset to default 'read'"
+        );
+    }
+
+    #[test]
+    fn populate_handles_sanitization_of_project_name() {
+        // Project names with spaces / punctuation must be sanitized to
+        // a Weaviate-safe collection prefix matching the launcher-side
+        // `sanitize_kg_collection`.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        db.populate_kg_collection_access_for_project("p1", "my project name")
+            .unwrap();
+
+        let access = db.kg_list_access("p1").unwrap();
+        let collections: std::collections::HashSet<&str> =
+            access.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(collections.contains("MyProjectName_KnowledgeGraph"));
+        assert!(collections.contains("MyProjectName_Development"));
+    }
+
+    #[test]
+    fn populate_writes_per_project_scoped_rows() {
+        // Two distinct projects get distinct sets of rows; calling
+        // populate for p1 must not write rows under p2's project_id.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        seed_project(&db, "p2");
+
+        db.populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        assert_eq!(db.kg_list_access("p1").unwrap().len(), 3);
+        assert_eq!(
+            db.kg_list_access("p2").unwrap().len(),
+            0,
+            "p1's populate must not touch p2"
+        );
+
+        db.populate_kg_collection_access_for_project("p2", "Beta")
+            .unwrap();
+        assert_eq!(db.kg_list_access("p2").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn populate_respects_orchestrator_root_kg_collection_override() {
+        // White-label scenario: install.py persists a branded shared
+        // collection name. populate must use the persisted name as the
+        // shared row's collection, not the bundled default.
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        db.set_orchestrator_root_kg_collection("WhiteLabel_KnowledgeGraph")
+            .unwrap();
+
+        db.populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+
+        let access = db.kg_list_access("p1").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        // Shared row points at the branded name…
+        assert_eq!(
+            by_collection.get("WhiteLabel_KnowledgeGraph"),
+            Some(&"read")
+        );
+        // …NOT the bundled default.
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            None
+        );
+    }
+
+    /// Item #10 integration test target: hub-side `vct project create`
+    /// populates access. Asserts the core-helper contract on the same
+    /// surface a hub caller would observe (insert_project → populate).
+    /// The actual hub HTTP endpoint test lives in
+    /// `vct-hub::cli_api::cli_project_create_tests` (see the
+    /// `vct_project_create_via_cli_populates_access` test there).
+    #[test]
+    fn vct_project_create_via_cli_populates_access() {
+        let db = Db::open_in_memory().unwrap();
+        // Mirror the hub's create_project flow exactly: insert_project
+        // + populate. This is the call pair the cli_api endpoint
+        // performs (with audit between them).
+        let pid = "test-cli-create";
+        db.insert_project(
+            pid,
+            "CliCreated",
+            "/tmp/cli-created",
+            crate::db::models::ProjectHost::Base,
+            "cli-created",
+        )
+        .unwrap();
+        let inserted = db
+            .populate_kg_collection_access_for_project(pid, "CliCreated")
+            .unwrap();
+        assert_eq!(inserted, 3);
+
+        let access = db.kg_list_access(pid).unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(by_collection.get("CliCreated_KnowledgeGraph"), Some(&"write"));
+        assert_eq!(by_collection.get("CliCreated_Development"), Some(&"write"));
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            Some(&"read")
+        );
+    }
+
+    #[test]
+    fn sanitize_local_matches_launcher_side_canonical_cases() {
+        // Pin sanitize_kg_collection_local's output for the cases the
+        // launcher-side test covers, ensuring we don't drift from the
+        // launcher's `commands::projects_v2::sanitize_kg_collection`.
+        assert_eq!(sanitize_kg_collection_local("Acme"), "Acme");
+        assert_eq!(sanitize_kg_collection_local("my project"), "MyProject");
+        assert_eq!(sanitize_kg_collection_local("foo-bar_baz"), "FooBarBaz");
+        assert_eq!(sanitize_kg_collection_local(""), "Project");
+        assert_eq!(sanitize_kg_collection_local("123abc"), "P123abc");
     }
 }

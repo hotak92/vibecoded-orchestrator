@@ -149,6 +149,27 @@ async fn create_project(
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // v0.2.49 access-matrix Phase 4 (item #10): seed the default
+    // kg_collection_access rows for the newly-created project. Without
+    // this call, projects created via `vct project create` would have
+    // an empty access matrix until the launcher GUI's bundle-populate
+    // path ran — meaning the read-gate would reject every KG access
+    // (including the project's own KG) until the user manually granted
+    // via the GUI access matrix. Mirrors the launcher-side Tauri
+    // `create_project_v2` flow, which calls
+    // `populate_project_state_from_filesystem` to seed the same rows.
+    //
+    // Soft-fail: the access matrix is recoverable by the launcher GUI
+    // (re-onboarding from the same folder re-triggers the populate path,
+    // which is idempotent). A failure here is logged but doesn't reject
+    // the project create — matching the existing post-insert audit which
+    // is also fire-and-forget.
+    if let Err(e) = h.0.populate_kg_collection_access_for_project(&row.id, &row.name) {
+        eprintln!(
+            "[vct-hub] warning: populate_kg_collection_access_for_project({}, {}): {}",
+            row.id, row.name, e
+        );
+    }
     let _ = h.0.audit(
         "project_create",
         Some(&row.id),

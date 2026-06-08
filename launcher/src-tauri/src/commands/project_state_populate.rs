@@ -136,61 +136,31 @@ fn populate_kg_collection_access(
     db: &Db,
     report: &mut PopulateReport,
 ) {
-    let pascal = sanitize_kg_collection(project_name);
-    let primary_collection = format!("{}_KnowledgeGraph", pascal);
-    let dev_collection = format!("{}_Development", pascal);
-    // Single source of truth — see project_env_settings.rs. Renamed from
-    // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E.
-    let shared_collection = LAST_RESORT_SHARED_KG_COLLECTION;
-
-    // Project's OWN primary KG: write access by default. The project's
-    // hooks + MCP server need to write to this — the .claude/env carries
-    // KG_COLLECTION pointing here.
-    grant_default_access(db, project_id, &primary_collection, "write", report);
-
-    // Project's OWN development collection: write access by default.
-    // Same rationale — the development collection is the project's
-    // private workspace for in-flight notes.
-    grant_default_access(db, project_id, &dev_collection, "write", report);
-
-    // Cross-project SHARED KG: read access by default. Writes to the
-    // shared KG are gated separately via `SHARED_KG_WRITE_DISABLED` env
-    // (asymmetric semantic since 2026-05-01) — the access-matrix row
-    // is purely a read-gate. Users who want to grant write access can
-    // flip the level via the GUI access matrix; users who want to
-    // bottle up writes flip `SHARED_KG_WRITE_DISABLED=true` via the
-    // shared-KG toggle (which doesn't touch this row).
-    grant_default_access(db, project_id, shared_collection, "read", report);
-}
-
-fn grant_default_access(
-    db: &Db,
-    project_id: &str,
-    collection: &str,
-    level: &str,
-    report: &mut PopulateReport,
-) {
-    // Idempotency: preserve any user-set level by short-circuiting when
-    // a row already exists for this (project, collection). The `kg_set_access`
-    // helper would otherwise upsert and clobber.
-    match db.kg_get_access(project_id, collection) {
-        Ok(Some(_)) => {
-            // User-set or previously-defaulted row already exists.
-            // Leave alone.
-        }
-        Ok(None) => {
-            if let Err(e) = db.kg_set_access(project_id, collection, level) {
-                report
-                    .warnings
-                    .push(format!("kg_set_access({}): {}", collection, e));
-            } else {
-                report.kg_access_rows_inserted += 1;
-            }
-        }
+    // v0.2.49 access-matrix Phase 4 (item #10): delegate to the
+    // centralized core helper so this surface and the hub's
+    // `vct project create` path stay in lock-step. The core helper:
+    //   - sanitizes `project_name` (own KG/dev names)
+    //   - resolves the canonical shared KG name from `app_state`
+    //     (Phase 1 single-source-of-truth)
+    //   - writes three rows via `kg_seed_access` (INSERT OR IGNORE):
+    //     own primary → "write", own dev → "write", shared → "read"
+    //   - returns the count of rows actually inserted (user-configured
+    //     rows are preserved; INSERT OR IGNORE is the idempotent
+    //     primitive replacing the prior get-then-set check).
+    //
+    // The launcher-side wrapper still owns:
+    //   - `PopulateReport.kg_access_rows_inserted` accounting (for the
+    //     `create_project_v2` summary log).
+    //   - Warning emission on SQL errors (preserves prior soft-fail
+    //     contract — project creation never fails over an access-matrix
+    //     hiccup).
+    match db.populate_kg_collection_access_for_project(project_id, project_name) {
+        Ok(n) => report.kg_access_rows_inserted += n,
         Err(e) => {
-            report
-                .warnings
-                .push(format!("kg_get_access({}): {}", collection, e));
+            report.warnings.push(format!(
+                "populate_kg_collection_access_for_project({}, {}): {}",
+                project_id, project_name, e
+            ));
         }
     }
 }
