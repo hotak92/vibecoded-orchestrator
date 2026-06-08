@@ -2417,6 +2417,13 @@ pub fn run() {
             commands::installer::merge_orchestrator_with_upstream,
             commands::installer::rebase_orchestrator_onto_upstream,
             commands::installer::abort_orchestrator_merge_or_rebase,
+            // v0.2.51 Bug A: resume an orchestrator-update flow that
+            // halted at a merge/rebase conflict. The user resolved the
+            // conflict in their editor (or via CLI) and the launcher
+            // re-enters the post-pull tail (install.py --update + binary
+            // refresh + auto-restart). Without this, the modal's
+            // "Resolve manually" path silently abandoned the update.
+            commands::installer::resume_orchestrator_update,
             // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
             // "Pulled-but-not-installed" banner state (source updated
             // via `git pull` outside the launcher; install-manifest

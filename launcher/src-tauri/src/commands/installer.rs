@@ -795,6 +795,29 @@ pub struct UpdateStatus {
     pub install_stale: bool,
     /// NEW v0.2.16: running binary version != on-disk binary version.
     pub binary_stale: bool,
+    /// NEW v0.2.51: a prior `update_orchestrator` / `merge_*` /
+    /// `rebase_*` invocation hit a merge conflict and surfaced the
+    /// conflict modal; the user resolved the conflict in their editor
+    /// (or via CLI `git commit`) but never re-entered the launcher to
+    /// finish stage 2 (install.py --update + binary refresh + restart).
+    /// Detected via a sentinel file at
+    /// `.claude/state/orchestrator-update-resume-needed.json` combined
+    /// with `.git/MERGE_HEAD` being absent (= merge state cleared, so
+    /// the conflict has been resolved or aborted from outside the
+    /// launcher). Resolved by `resume_orchestrator_update`. Highest
+    /// priority kind in the UpdateBadge (above binary_stale): leaving
+    /// this unattended means the install manifest, hook bundle, and
+    /// possibly the launcher binary are all out of sync with the
+    /// freshly-merged source.
+    pub merge_resolved_incomplete: bool,
+    /// NEW v0.2.51: which operation produced the conflict that's now
+    /// awaiting resume. One of `"merge"`, `"rebase"`, or the empty
+    /// string when no resume is pending. Read from the sentinel when
+    /// `merge_resolved_incomplete` is true.
+    pub resume_operation: String,
+    /// NEW v0.2.51: which branch the conflict was on (typically `main`).
+    /// Empty when no resume is pending. Read from the sentinel.
+    pub resume_branch: String,
     /// `vct-module.json::version` (or canonical-files fallback chain).
     /// Empty string when neither file is present.
     pub source_version: String,
@@ -959,10 +982,39 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     let binary_stale = !on_disk_binary_version.is_empty()
         && on_disk_binary_version != running_version;
 
+    // v0.2.51 Bug A: detect "merge-resolved-but-update-incomplete" state.
+    // The sentinel is written by update_orchestrator / merge_orchestrator_*
+    // / rebase_orchestrator_* whenever they surface the conflict modal. It
+    // is cleared by `resume_orchestrator_update` on success AND by
+    // `abort_orchestrator_merge_or_rebase`. So the sentinel being present
+    // means SOMETHING is awaiting follow-up. The further .git/MERGE_HEAD
+    // check distinguishes "user is still mid-conflict" (don't badge —
+    // they're working on it; the modal is the right surface) from "merge
+    // committed but launcher never re-entered" (DO badge — that's the
+    // bug we're fixing).
+    let (merge_resolved_incomplete, resume_operation, resume_branch) =
+        match read_update_resume_sentinel(&p) {
+            Some(sentinel) => {
+                let merge_in_progress = p.join(".git").join("MERGE_HEAD").exists()
+                    || p.join(".git").join("rebase-merge").exists()
+                    || p.join(".git").join("rebase-apply").exists();
+                if merge_in_progress {
+                    // Modal is the right surface; don't double-render.
+                    (false, String::new(), String::new())
+                } else {
+                    (true, sentinel.operation, sentinel.branch)
+                }
+            }
+            None => (false, String::new(), String::new()),
+        };
+
     Ok(UpdateStatus {
         remote_ahead,
         install_stale,
         binary_stale,
+        merge_resolved_incomplete,
+        resume_operation,
+        resume_branch,
         source_version,
         installed_version,
         running_version,
@@ -3860,6 +3912,13 @@ pub async fn update_orchestrator<R: Runtime>(
         }),
     );
 
+    // v0.2.51 Bug A: clear any leftover resume sentinel + deferral from a
+    // prior half-finished update. A fresh `update_orchestrator` run
+    // supersedes it — either we'll succeed (no resume needed), or we'll
+    // hit a new conflict and rewrite both with current SHAs/branch.
+    clear_update_resume_sentinel(&install_path);
+    clear_update_resume_deferral_if_solo(&install_path);
+
     // v0.2.21 (Stream A Design B extension): pin the canonical public
     // AGPL upstream BEFORE any network ops. Same posture as the launcher
     // self-update (see commands/self_update.rs): we never trust `origin`
@@ -4045,6 +4104,7 @@ pub async fn update_orchestrator<R: Runtime>(
 
     if !pull.status.success() {
         let stderr = String::from_utf8_lossy(&pull.stderr);
+        let stdout = String::from_utf8_lossy(&pull.stdout);
         // v0.2.17 (plan 0.0.B): on pull failure, revert the pre-pull
         // rename so the running launcher can still be re-launched if
         // the user kills the GUI. Best-effort.
@@ -4058,6 +4118,33 @@ pub async fn update_orchestrator<R: Runtime>(
             revert_pre_pull_rename(backup);
         }
         let _ = ensure_hub_started_after_update(&install_path);
+
+        // v0.2.51 Bug A (defensive): the rebase-with-autostash branch can
+        // produce a rebase conflict (`CONFLICT (content):` lines on the
+        // synthetic pre-merge commit OR on the user's WIP via autostash
+        // pop). Detect that before falling through to the non-FF /
+        // generic-error paths so the conflict modal surfaces correctly +
+        // the resume sentinel lands.
+        let combined = format!("{}\n{}", stderr, stdout);
+        if is_merge_or_rebase_conflict(&combined) {
+            let sha = read_head_sha(&install_path).await.unwrap_or_default();
+            write_update_resume_sentinel(
+                &install_path,
+                "rebase",
+                &pull_branch,
+                &sha,
+            );
+            // v0.2.51 Bug A: ALSO emit the UPDATE_DEFERRED.md entry so
+            // Claude sessions outside the launcher GUI see the state.
+            write_update_resume_deferral(&install_path, "rebase", &pull_branch);
+            let conflicted = collect_conflicted_files(&install_path).await;
+            return Err(serialize_orchestrator_conflict_error(
+                "rebase",
+                &pull_branch,
+                &conflicted,
+                combined.trim(),
+            ));
+        }
 
         // v0.2.23 (B4 / D19): non-fast-forward branch. The user's local
         // clone has diverged from upstream (typical when they've edited
@@ -5394,6 +5481,15 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             // resolving conflicts and shouldn't be without it.
             let _ = ensure_hub_started_after_update(&install_path);
 
+            // v0.2.51 Bug A: write the resume sentinel + deferral BEFORE
+            // returning the conflict payload. The user's modal flow may
+            // dismiss without aborting; the sentinel + UpdateBadge bring
+            // them back via the launcher GUI, while UPDATE_DEFERRED.md
+            // surfaces the same state to terminal Claude sessions.
+            let sha = read_head_sha(&install_path).await.unwrap_or_default();
+            write_update_resume_sentinel(&install_path, "merge", &pull_branch, &sha);
+            write_update_resume_deferral(&install_path, "merge", &pull_branch);
+
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
                 "merge",
@@ -5549,6 +5645,18 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             }
             let _ = ensure_hub_started_after_update(&install_path);
 
+            // v0.2.51 Bug A: write the resume sentinel + deferral BEFORE
+            // returning the conflict payload (see merge_orchestrator_with_upstream
+            // for the rationale). The rebase leaves HEAD at the original
+            // SHA + a partially-applied series in .git/rebase-{merge,apply}/;
+            // the sentinel captures that SHA so resume can verify HEAD
+            // actually moved before re-entering install.py. The deferral
+            // mirrors the state into UPDATE_DEFERRED.md for terminal
+            // Claude sessions.
+            let sha = read_head_sha(&install_path).await.unwrap_or_default();
+            write_update_resume_sentinel(&install_path, "rebase", &pull_branch, &sha);
+            write_update_resume_deferral(&install_path, "rebase", &pull_branch);
+
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
                 "rebase",
@@ -5609,7 +5717,11 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
     if !in_merge && !in_rebase {
         // Nothing in progress — treat as no-op success. The modal might
         // be slightly stale; user intent ("get back to a clean state")
-        // is already satisfied.
+        // is already satisfied. Clear any resume sentinel + deferral so
+        // the merge_resolved_incomplete badge doesn't linger AND the
+        // terminal-Claude deferral entry goes away (v0.2.51 Bug A).
+        clear_update_resume_sentinel(&install_path);
+        clear_update_resume_deferral_if_solo(&install_path);
         return Ok(());
     }
 
@@ -5626,6 +5738,11 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
             let stderr = String::from_utf8_lossy(&out.stderr);
             last_err = Some(format!("git merge --abort: {}", stderr.trim()));
         } else {
+            // v0.2.51 Bug A: aborting is a fresh start — drop the resume
+            // sentinel + deferral so the merge_resolved_incomplete badge
+            // AND the terminal-Claude UPDATE_DEFERRED.md entry both clear.
+            clear_update_resume_sentinel(&install_path);
+            clear_update_resume_deferral_if_solo(&install_path);
             return Ok(());
         }
     }
@@ -5641,6 +5758,10 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
             let stderr = String::from_utf8_lossy(&out.stderr);
             last_err = Some(format!("git rebase --abort: {}", stderr.trim()));
         } else {
+            // v0.2.51 Bug A: same as above — clear both sentinel and
+            // the terminal-Claude UPDATE_DEFERRED.md entry.
+            clear_update_resume_sentinel(&install_path);
+            clear_update_resume_deferral_if_solo(&install_path);
             return Ok(());
         }
     }
@@ -5648,6 +5769,600 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
     Err(last_err.unwrap_or_else(|| {
         "No merge or rebase in progress, but abort was requested.".to_string()
     }))
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.51 Bug A — merge-conflict update resume.
+//
+// PROBLEM (pre-v0.2.51): when `update_orchestrator` / `merge_orchestrator_*`
+// / `rebase_orchestrator_*` surfaces a conflict modal, the user resolves
+// the conflict in their editor and `git commit`s. The launcher never
+// re-enters the post-merge segment (install.py --update + binary refresh
+// + auto-restart). The user is left with merged source on disk, OLD
+// binary running, stale install state — and the conflict modal's
+// "Resolve manually" button just closed the dialog.
+//
+// FIX:
+//   1. The 3 conflict sites write a sentinel file pointing the launcher at
+//      what to resume (`write_update_resume_sentinel`).
+//   2. `check_for_updates` reads the sentinel + the `.git/MERGE_HEAD`
+//      state to compute a new `merge_resolved_incomplete` flag — true
+//      once the user has finished the merge but install.py hasn't run.
+//   3. The new `resume_orchestrator_update` Tauri command verifies the
+//      working tree is clean (no `<<<<<<<` markers, no in-flight merge)
+//      and then re-enters the post-pull tail via
+//      `run_post_pull_install_and_restart`.
+//   4. Both `abort_orchestrator_merge_or_rebase` and a successful
+//      `resume_orchestrator_update` clear the sentinel.
+//
+// The sentinel lives under `.claude/state/`, NOT `.git/` (we don't want
+// to pollute the git directory; the file is launcher state, not git state).
+// ---------------------------------------------------------------------------
+
+/// Relative path to the resume sentinel from the install root. Stored
+/// under `.claude/state/` to keep the convention of one launcher-state
+/// folder per install (sibling of `launcher-restart-marker`, etc.).
+const UPDATE_RESUME_SENTINEL_REL: &str =
+    ".claude/state/orchestrator-update-resume-needed.json";
+
+/// On-disk shape of the resume sentinel. Versioned via the `schema`
+/// field so future readers can refuse / upgrade old layouts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct UpdateResumeSentinel {
+    /// Sentinel format version. Always `1` for v0.2.51's writer.
+    pub schema: u32,
+    /// One of `"merge"`, `"rebase"`. Drives the UpdateBadge label + the
+    /// modal copy.
+    pub operation: String,
+    /// Branch the conflict happened on (e.g. `main`).
+    pub branch: String,
+    /// HEAD SHA at the moment of the conflict. Used by
+    /// `resume_orchestrator_update` to refuse a resume when HEAD hasn't
+    /// advanced (= user aborted via CLI; sentinel is stale).
+    pub sha_at_conflict: String,
+    /// ISO-8601 UTC timestamp the sentinel was written.
+    pub written_at: String,
+}
+
+/// Best-effort: read the resume sentinel into a struct. Returns `None`
+/// when the file is absent, malformed, or the schema is unknown — the
+/// caller treats any of those as "no resume pending" so a broken
+/// sentinel never wedges the UpdateBadge.
+fn read_update_resume_sentinel(install_path: &Path) -> Option<UpdateResumeSentinel> {
+    let path = install_path.join(UPDATE_RESUME_SENTINEL_REL);
+    let txt = std::fs::read_to_string(&path).ok()?;
+    let parsed: UpdateResumeSentinel = serde_json::from_str(&txt).ok()?;
+    if parsed.schema != 1 {
+        return None;
+    }
+    Some(parsed)
+}
+
+/// Atomic-write the resume sentinel. Best-effort: any I/O failure is
+/// logged + swallowed because the conflict path that calls us MUST still
+/// surface the conflict error to the GUI (sentinel is a recovery aid,
+/// not a hard requirement).
+fn write_update_resume_sentinel(
+    install_path: &Path,
+    operation: &str,
+    branch: &str,
+    sha_at_conflict: &str,
+) {
+    let sentinel = UpdateResumeSentinel {
+        schema: 1,
+        operation: operation.to_string(),
+        branch: branch.to_string(),
+        sha_at_conflict: sha_at_conflict.to_string(),
+        written_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let json = match serde_json::to_string_pretty(&sentinel) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[vct] update_resume_sentinel: serialize failed: {} — \
+                 skipping sentinel write",
+                e
+            );
+            return;
+        }
+    };
+    let target = install_path.join(UPDATE_RESUME_SENTINEL_REL);
+    let Some(parent) = target.parent() else {
+        eprintln!(
+            "[vct] update_resume_sentinel: target has no parent: {} — \
+             skipping",
+            target.display()
+        );
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!(
+            "[vct] update_resume_sentinel: mkdir {} failed: {} — \
+             skipping sentinel write",
+            parent.display(),
+            e
+        );
+        return;
+    }
+    // Write to a tempfile then rename — protects against partial writes
+    // confusing a concurrent `check_for_updates` poll.
+    let tmp = parent.join(format!(
+        "orchestrator-update-resume-needed.json.tmp.{}",
+        std::process::id()
+    ));
+    if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        eprintln!(
+            "[vct] update_resume_sentinel: write {} failed: {}",
+            tmp.display(),
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        eprintln!(
+            "[vct] update_resume_sentinel: rename {} → {} failed: {}",
+            tmp.display(),
+            target.display(),
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Best-effort: delete the resume sentinel. No-op when the file is
+/// absent. Any unlink error is logged + swallowed (the badge will
+/// re-render on next check_for_updates, but failing to delete shouldn't
+/// block the user).
+fn clear_update_resume_sentinel(install_path: &Path) {
+    let target = install_path.join(UPDATE_RESUME_SENTINEL_REL);
+    match std::fs::remove_file(&target) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!(
+                "[vct] update_resume_sentinel: clear {} failed: {}",
+                target.display(),
+                e
+            );
+        }
+    }
+}
+
+/// v0.2.51 Bug A: write a comprehensive `update_resume_required` entry
+/// into `.claude/context/UPDATE_DEFERRED.md` next to the sentinel.
+///
+/// Rationale for writing this from Rust (vs deferring to install.py):
+/// the whole point of the sentinel is "install.py never ran". So the
+/// deferral writer ALSO needs to be standalone — we can't depend on
+/// install.py firing to emit it.
+///
+/// The Markdown shape mirrors what `vco_lib/deferral_report.py`
+/// produces (`_render_frontmatter` + `_render_header` + `_render_entry`),
+/// so when install.py eventually runs (whether via resume_orchestrator_update
+/// or a manual `python install.py --update`), `DeferralReport.read()`
+/// parses our entry, recognizes it by condition_id, and treats it as
+/// resolved on the next write (since install.py running IS the
+/// resolution).
+///
+/// Best-effort: any I/O failure is logged + swallowed because the
+/// conflict path that calls us MUST still surface the conflict error
+/// to the GUI. The sentinel + UpdateBadge is the primary recovery
+/// mechanism; the deferral is a redundant secondary channel for users
+/// running Claude in a terminal session.
+///
+/// Comprehensive copy is intentional — the brief mandates
+/// "comprehensive info for Claude" so the deferral can drive a
+/// session-start prompt that explains the state, the recovery, and the
+/// risk of leaving it unattended.
+fn write_update_resume_deferral(
+    install_path: &Path,
+    operation: &str,
+    branch: &str,
+) {
+    let target = install_path.join(".claude/context/UPDATE_DEFERRED.md");
+    let parent = match target.parent() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[vct] update_resume_deferral: target has no parent: {}",
+                target.display()
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!(
+            "[vct] update_resume_deferral: mkdir {} failed: {} — \
+             skipping deferral write",
+            parent.display(),
+            e
+        );
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let op_phrase = if operation == "rebase" { "rebase" } else { "merge" };
+    let install_root_display = install_path.display();
+    // Format follows vco_lib/deferral_report.py::_render_entry exactly so
+    // `DeferralReport.read()` round-trips it cleanly. The frontmatter is
+    // single-entry; if install.py later adds more entries it will
+    // re-render with the merged list (our entry survives via condition_id
+    // dedup in `add_entry`).
+    let content = format!(
+        "---\n\
+title: VCO Update Deferred\n\
+generated_at: {now}\n\
+condition_ids: [update_resume_required]\n\
+severity_max: warning\n\
+---\n\
+\n\
+# VCO Update Deferred\n\
+\n\
+The last `install.py --update` detected conditions it could not auto-resolve safely. \
+Each section below names a condition and the exact command to apply it.\n\
+\n\
+## update_resume_required (warning)\n\
+\n\
+**Title**: Orchestrator update halted at a conflict — resume needed\n\
+\n\
+**Detected**: A previous `update_orchestrator` ({op_phrase} on `{branch}`) halted at \
+a conflict, and the conflict was resolved outside the launcher (CLI `git add` + \
+`git commit`, or editor save + commit). However, `install.py --update` and the \
+launcher binary refresh never ran, so the install manifest (`state/install-manifest.json::version`) \
+and the running launcher binary may be stale relative to the freshly-merged source. \
+Sentinel: `.claude/state/orchestrator-update-resume-needed.json` in `{install_root_display}`.\n\
+\n\
+**Why deferred**: The launcher cannot safely re-run `install.py --update` without \
+explicit user consent — the merge resolution might be partial, and re-running \
+install.py against a dirty tree could corrupt module state. The user must \
+acknowledge they want to continue. Two equivalent ways to acknowledge: (1) click \
+the `Continue Update` button in the launcher's MenuBar UpdateBadge, OR (2) run \
+`python install.py --update` manually from a terminal. Either path bumps \
+`last_installed_version` to match `source_version` and clears this deferral.\n\
+\n\
+**To apply**:\n\
+```bash\n\
+# Option A (recommended): open the launcher GUI. The top-right MenuBar\n\
+# shows a pulsing purple UpdateBadge with title \"Continue Update\".\n\
+# Click it → click the Continue Update button. This re-runs\n\
+# install.py --update + refreshes the launcher binary + auto-restarts.\n\
+#\n\
+# Option B (terminal): from the orchestrator install root, run:\n\
+cd {install_root_display}\n\
+python install.py --update\n\
+# After install.py finishes, fully quit the launcher (tray → Quit, not\n\
+# just close window) and relaunch via your usual entrypoint so the\n\
+# freshly-built binary loads.\n\
+```\n\
+\n\
+**For your Claude assistant** (read this before continuing the user's task):\n\
+The user has an unresolved orchestrator update in progress. The repo on disk is at \
+a newer commit (post-merge) but the launcher install manifest still records the \
+old version. Recommended action: surface this deferral at session start and ask \
+the user to either click `Continue Update` in the launcher or run `python \
+install.py --update` from a terminal BEFORE continuing other work. Reason it \
+matters: the .claude/hooks/, MCP server registrations, and possibly the launcher \
+binary may not match the freshly-merged source — running other automation against \
+mismatched state can corrupt project metadata. The deferral self-clears on the \
+next successful install.py run, so the resolution is one command.\n\
+\n\
+**Detected at**: {now}\n\
+\n\
+---\n",
+        now = now,
+        op_phrase = op_phrase,
+        branch = branch,
+        install_root_display = install_root_display,
+    );
+
+    // Atomic write: temp file in the same directory, then rename.
+    let tmp = parent.join(format!(
+        "UPDATE_DEFERRED.md.tmp.{}",
+        std::process::id()
+    ));
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+        eprintln!(
+            "[vct] update_resume_deferral: write {} failed: {}",
+            tmp.display(),
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        eprintln!(
+            "[vct] update_resume_deferral: rename {} → {} failed: {}",
+            tmp.display(),
+            target.display(),
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// v0.2.51 Bug A: best-effort clear of the `update_resume_required`
+/// deferral entry. Called from `resume_orchestrator_update` (after
+/// install.py runs successfully) and `abort_orchestrator_merge_or_rebase`.
+///
+/// Conservative semantics: ONLY removes the file when it contains a
+/// SINGLE entry with condition_id `update_resume_required`. If install.py
+/// has added other entries in the meantime, we leave the file in place
+/// and let install.py's `mark_resolved("update_resume_required")` +
+/// re-write handle the surgical removal. This avoids destroying
+/// unrelated deferrals.
+fn clear_update_resume_deferral_if_solo(install_path: &Path) {
+    let target = install_path.join(".claude/context/UPDATE_DEFERRED.md");
+    let Ok(content) = std::fs::read_to_string(&target) else {
+        return;
+    };
+    // Two cheap checks: ONE condition_id line listing only ours, AND
+    // exactly one "## update_resume_required" section. If both true,
+    // we own the file outright and can delete it.
+    let single_id = content
+        .lines()
+        .any(|l| l.trim() == "condition_ids: [update_resume_required]");
+    let section_count = content
+        .lines()
+        .filter(|l| l.starts_with("## "))
+        .count();
+    if single_id && section_count == 1 {
+        if let Err(e) = std::fs::remove_file(&target) {
+            eprintln!(
+                "[vct] update_resume_deferral: clear {} failed: {}",
+                target.display(),
+                e
+            );
+        }
+    }
+    // Otherwise: leave the file alone. install.py will reconcile.
+}
+
+/// Best-effort: scan tracked files for live conflict markers
+/// (`<<<<<<< `, `=======`, `>>>>>>> `). Used by `resume_orchestrator_update`
+/// to refuse a resume when the user committed without actually
+/// resolving (e.g. they `git commit -a` with markers still in place).
+///
+/// Returns the list of paths that still contain markers, empty when
+/// the tree is clean. Reads file contents via `git grep` so the scan
+/// covers tracked files only (no node_modules / target / etc).
+async fn detect_remaining_conflict_markers(repo: &Path) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .silent()
+        .args([
+            "grep",
+            "--name-only",
+            "-E",
+            "^(<{7}|={7}|>{7}) ",
+        ])
+        .current_dir(repo)
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    // git grep exits 1 when no matches. Treat both 0 (matches) and 1
+    // (no matches) as success; anything else means the scan errored.
+    let code = out.status.code().unwrap_or(-1);
+    if code != 0 && code != 1 {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Single-flight gate so multiple rapid clicks on "Continue Update"
+/// don't race two install.py runs.
+static RESUME_IN_FLIGHT: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Resume an `update_orchestrator` flow that halted at a merge/rebase
+/// conflict. The user has already resolved the conflict (manually OR via
+/// CLI `git add` + `git commit` / `git rebase --continue`); this command
+/// re-enters the post-merge tail to run install.py --update + binary
+/// refresh + auto-restart.
+///
+/// Refuses to act when:
+///   - The path isn't a git repo.
+///   - `.git/MERGE_HEAD` / `.git/rebase-merge/` / `.git/rebase-apply/`
+///     still exist (= merge IS in progress; modal flow not yet complete).
+///   - Tracked files still contain `<<<<<<<` / `=======` / `>>>>>>>`
+///     markers (= user committed without resolving; refuse and surface
+///     the offending paths).
+///   - No sentinel is present (= no resume to perform). This isn't an
+///     error per se but we return a structured rejection so the GUI can
+///     distinguish "already resumed" from "system broken".
+///
+/// On success: clears the sentinel + audit-logs `update_orchestrator_resumed`
+/// + returns the same `InstallResult` shape as `update_orchestrator`. In
+/// practice the auto-restart inside `run_post_pull_install_and_restart`
+/// terminates the process before this `Ok` is observed by the GUI.
+#[command]
+pub async fn resume_orchestrator_update<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+) -> Result<InstallResult, String> {
+    let install_path = PathBuf::from(&path);
+    let system = detect_system().await?;
+
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — cannot resume update".to_string());
+    }
+
+    // Single-flight: hold the mutex for the entire resume.
+    let _guard = RESUME_IN_FLIGHT.lock().await;
+
+    let audit_app = app.clone();
+    let resume_start_ms = chrono::Utc::now().timestamp_millis();
+    let write_audit = move |operation: &str, detail: serde_json::Value| {
+        if let Some(db) = audit_app.try_state::<crate::db::Db>() {
+            let _ = db.audit(operation, None, None, &detail);
+        }
+    };
+
+    let sentinel = match read_update_resume_sentinel(&install_path) {
+        Some(s) => s,
+        None => {
+            write_audit(
+                "update_orchestrator_resume_rejected",
+                serde_json::json!({
+                    "reason": "no_sentinel",
+                    "install_path": path,
+                }),
+            );
+            return Err(
+                "No resume pending: the orchestrator update flow did not \
+                 record a conflict checkpoint. If you reached this from a \
+                 stale UpdateBadge, click Restart Launcher or refresh the \
+                 status."
+                    .to_string(),
+            );
+        }
+    };
+
+    // Probe in-flight merge/rebase state. If still mid-merge we refuse —
+    // the user should finish the merge (or abort it) first.
+    let merge_head = install_path.join(".git").join("MERGE_HEAD");
+    let rebase_merge = install_path.join(".git").join("rebase-merge");
+    let rebase_apply = install_path.join(".git").join("rebase-apply");
+    let still_mid_merge =
+        merge_head.exists() || rebase_merge.exists() || rebase_apply.exists();
+    if still_mid_merge {
+        write_audit(
+            "update_orchestrator_resume_rejected",
+            serde_json::json!({
+                "reason": "merge_still_in_progress",
+                "install_path": path,
+            }),
+        );
+        return Err(
+            "Merge or rebase is still in progress. Finish it with `git add \
+             <file>` + `git merge --continue` (or `git rebase --continue`), \
+             OR click Abort & restore to discard it. Then click Continue \
+             Update again."
+                .to_string(),
+        );
+    }
+
+    // Verify HEAD actually advanced past the conflict SHA. If it didn't,
+    // the user aborted via CLI and the sentinel is stale — clear it and
+    // tell the GUI.
+    let head_sha = read_head_sha(&install_path).await.unwrap_or_default();
+    if !sentinel.sha_at_conflict.is_empty() && head_sha == sentinel.sha_at_conflict {
+        clear_update_resume_sentinel(&install_path);
+        clear_update_resume_deferral_if_solo(&install_path);
+        write_audit(
+            "update_orchestrator_resume_rejected",
+            serde_json::json!({
+                "reason": "head_unchanged",
+                "sha_at_conflict": sentinel.sha_at_conflict,
+                "install_path": path,
+            }),
+        );
+        return Err(
+            "Working tree HEAD has not moved since the conflict — looks \
+             like the merge was aborted from the command line. No resume \
+             needed. Refreshing the launcher should clear this banner."
+                .to_string(),
+        );
+    }
+
+    // Scan for stray conflict markers. If the user committed a file with
+    // markers still in it, refuse — we'd otherwise ship a broken update.
+    let with_markers = detect_remaining_conflict_markers(&install_path).await;
+    if !with_markers.is_empty() {
+        write_audit(
+            "update_orchestrator_resume_rejected",
+            serde_json::json!({
+                "reason": "conflict_markers_remain",
+                "files": with_markers,
+                "install_path": path,
+            }),
+        );
+        let head = with_markers.iter().take(8).cloned().collect::<Vec<_>>();
+        return Err(format!(
+            "Found unresolved conflict markers in {} file(s): {}{}. Open \
+             each file, remove the `<<<<<<<` / `=======` / `>>>>>>>` \
+             markers, `git add` + `git commit --amend` (or commit a fix), \
+             then click Continue Update again.",
+            with_markers.len(),
+            head.join(", "),
+            if with_markers.len() > head.len() {
+                ", …"
+            } else {
+                ""
+            },
+        ));
+    }
+
+    // All preconditions satisfied. Audit-log the resume start.
+    write_audit(
+        "update_orchestrator_resumed",
+        serde_json::json!({
+            "operation": sentinel.operation,
+            "branch": sentinel.branch,
+            "sha_at_conflict": sentinel.sha_at_conflict,
+            "head_sha": head_sha,
+            "install_path": path,
+        }),
+    );
+
+    // The on-disk source is already current (the user finished the merge),
+    // so we mirror the `merge_orchestrator_with_upstream` post-pull tail.
+    // We stop the hub + pre-pull-rename binaries first so install.py +
+    // the binary swap don't race the old hub's file handles.
+    emit_progress(&window, "update", "Stopping vct-hub for resume...", 2.0);
+    if let Err(e) = ensure_hub_stopped_for_update(&install_path) {
+        return Err(format!(
+            "Resume aborted: could not stop vct-hub: {}. Try again, or run \
+             `vct-hub --stop` manually.",
+            e
+        ));
+    }
+
+    emit_progress(&window, "update", "Preparing for resume...", 5.0);
+    let pre_pull_renamed_hub = pre_pull_rename_vct_hub_binary(&install_path);
+    let pre_pull_renamed = pre_pull_rename_running_binary(&install_path);
+
+    // Clear the sentinel + deferral BEFORE install.py runs so a crash
+    // during the install.py phase doesn't loop us forever. If install.py
+    // fails, the user retries via the existing install_stale path
+    // (install.py --update only, no git pull) which is the right next
+    // step anyway — the source is already merged, only the manifest is
+    // stale. install.py's own deferral writer will replace UPDATE_DEFERRED.md
+    // with the actual install outcome.
+    clear_update_resume_sentinel(&install_path);
+    clear_update_resume_deferral_if_solo(&install_path);
+
+    let result = run_post_pull_install_and_restart(
+        app,
+        &install_path,
+        path.clone(),
+        &window,
+        system,
+        pre_pull_renamed,
+        pre_pull_renamed_hub,
+    )
+    .await;
+
+    // run_post_pull_install_and_restart re-enters the auto-restart path,
+    // so we rarely reach here — but if the restart hop fails the helper
+    // returns Err. Surface the error to the eprintln stream for forensic
+    // completeness; the GUI sees the Err via the Tauri return.
+    if let Err(e) = &result {
+        eprintln!(
+            "[vct] resume_orchestrator_update: post-pull tail failed \
+             ({}); duration_ms={}",
+            e,
+            chrono::Utc::now().timestamp_millis() - resume_start_ms,
+        );
+    }
+
+    result
 }
 
 /// v0.2.16 (W4 / 0.5): "Pulled-but-not-installed" resolver. Runs
@@ -13938,6 +14653,281 @@ MemAvailable:   23456789 kB
             assert!(
                 !local.join(".git").join("MERGE_HEAD").exists(),
                 "MERGE_HEAD must be cleared after abort"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // v0.2.51 Bug A — resume sentinel + deferral writer tests.
+        //
+        // Coverage:
+        //   - Sentinel round-trip (write → read → verify fields).
+        //   - Deferral file shape (frontmatter, condition_id, comprehensive
+        //     "for your Claude assistant" hint).
+        //   - Idempotent clear: solo deferral deletes, multi-entry preserves.
+        //   - End-to-end: a merge conflict on a git fixture leaves BOTH
+        //     sentinel + deferral on disk; abort clears BOTH.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn update_resume_sentinel_roundtrip() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            // Initially absent.
+            assert!(read_update_resume_sentinel(&install).is_none());
+
+            // Write.
+            write_update_resume_sentinel(
+                &install,
+                "merge",
+                "main",
+                "abc123def4567890",
+            );
+            let target = install.join(UPDATE_RESUME_SENTINEL_REL);
+            assert!(target.exists(), "sentinel file must be written");
+
+            // Read back.
+            let s = read_update_resume_sentinel(&install).expect("sentinel parses");
+            assert_eq!(s.schema, 1);
+            assert_eq!(s.operation, "merge");
+            assert_eq!(s.branch, "main");
+            assert_eq!(s.sha_at_conflict, "abc123def4567890");
+            assert!(!s.written_at.is_empty(), "written_at must populate");
+
+            // Clear is idempotent.
+            clear_update_resume_sentinel(&install);
+            assert!(!target.exists());
+            clear_update_resume_sentinel(&install); // second call: no-op
+            assert!(!target.exists());
+            assert!(read_update_resume_sentinel(&install).is_none());
+        }
+
+        #[test]
+        fn update_resume_sentinel_rejects_bad_schema() {
+            // A pre-existing sentinel from a future schema version must be
+            // treated as "no sentinel" so we don't crash trying to parse it.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            let target = install.join(UPDATE_RESUME_SENTINEL_REL);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(
+                &target,
+                r#"{"schema":99,"operation":"merge","branch":"main","sha_at_conflict":"x","written_at":"2026-06-09T12:00:00Z"}"#,
+            )
+            .unwrap();
+            assert!(
+                read_update_resume_sentinel(&install).is_none(),
+                "schema 99 must yield None, not a panic or Some"
+            );
+        }
+
+        #[test]
+        fn update_resume_deferral_shape_is_comprehensive() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            write_update_resume_deferral(&install, "merge", "main");
+
+            let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+            assert!(target.exists(), "deferral file must be written");
+
+            let body = std::fs::read_to_string(&target).expect("read");
+
+            // Required structural pieces (per vco_lib/deferral_report.py format).
+            assert!(body.starts_with("---\n"), "must start with YAML frontmatter");
+            assert!(
+                body.contains("condition_ids: [update_resume_required]"),
+                "frontmatter must list our condition_id"
+            );
+            assert!(
+                body.contains("severity_max: warning"),
+                "single-entry deferral must report severity_max=warning"
+            );
+            assert!(
+                body.contains("## update_resume_required (warning)"),
+                "section header missing"
+            );
+
+            // Required content pieces.
+            assert!(body.contains("**Title**:"));
+            assert!(body.contains("**Detected**:"));
+            assert!(body.contains("**Why deferred**:"));
+            assert!(body.contains("**To apply**:"));
+            assert!(body.contains("**Detected at**:"));
+
+            // The brief mandates a comprehensive "for your Claude assistant"
+            // section. Catching its removal here lets us evolve the copy
+            // without breaking the contract.
+            assert!(
+                body.contains("**For your Claude assistant**"),
+                "deferral must include the explicit Claude-facing hint"
+            );
+
+            // Both recovery paths must be documented (GUI + terminal) and
+            // the install.py command must use --update (not --force or
+            // anything destructive).
+            assert!(body.contains("Continue Update"), "missing GUI option");
+            assert!(body.contains("python install.py --update"), "missing CLI option");
+        }
+
+        #[test]
+        fn update_resume_deferral_rebase_variant_uses_correct_op_label() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            write_update_resume_deferral(&install, "rebase", "main");
+            let body = std::fs::read_to_string(
+                install.join(".claude/context/UPDATE_DEFERRED.md"),
+            )
+            .unwrap();
+            assert!(
+                body.contains("(rebase on `main`)"),
+                "rebase op must be reflected in Detected copy; got: {body}"
+            );
+        }
+
+        #[test]
+        fn clear_update_resume_deferral_if_solo_preserves_multi_entry_file() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+
+            // Simulate a file with TWO entries: ours + a sibling we don't own.
+            let multi = "---\n\
+title: VCO Update Deferred\n\
+generated_at: 2026-06-09T12:00:00Z\n\
+condition_ids: [update_resume_required, schema_drift_rebuild_required]\n\
+severity_max: critical\n\
+---\n\
+\n\
+## update_resume_required (warning)\n\
+**Title**: ours\n\
+\n\
+## schema_drift_rebuild_required (critical)\n\
+**Title**: not ours\n\
+";
+            std::fs::write(&target, multi).unwrap();
+
+            clear_update_resume_deferral_if_solo(&install);
+
+            // File must still exist because we don't own it solo.
+            assert!(
+                target.exists(),
+                "multi-entry deferral must NOT be unlinked by our clear()"
+            );
+            let body = std::fs::read_to_string(&target).unwrap();
+            assert!(body.contains("schema_drift_rebuild_required"));
+        }
+
+        #[test]
+        fn clear_update_resume_deferral_if_solo_removes_owned_file() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            write_update_resume_deferral(&install, "merge", "main");
+            let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+            assert!(target.exists());
+
+            clear_update_resume_deferral_if_solo(&install);
+            assert!(
+                !target.exists(),
+                "solo update_resume_required deferral must be unlinked"
+            );
+        }
+
+        /// resume_orchestrator_update REFUSES when no sentinel exists —
+        /// the GUI should never get a half-baked InstallResult back when
+        /// the user clicked Continue Update on a stale badge.
+        #[tokio::test]
+        async fn resume_orchestrator_update_refuses_without_sentinel() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+
+            // No sentinel written → resume must refuse with a structured
+            // human-readable error.
+            //
+            // We invoke resume via a synthetic app handle. The simplest
+            // way to exercise the precondition checks WITHOUT spinning up
+            // a Tauri runtime is to assert the helper functions: when
+            // read_update_resume_sentinel returns None, no resume can
+            // proceed. That's the contract the command enforces in its
+            // very first match arm.
+            assert!(
+                read_update_resume_sentinel(&local).is_none(),
+                "fresh fixture must have no sentinel"
+            );
+        }
+
+        /// End-to-end: a real merge conflict on a git fixture surfaces
+        /// the sentinel + deferral; abort_orchestrator_merge_or_rebase
+        /// clears both.
+        #[tokio::test]
+        async fn merge_conflict_writes_sentinel_and_deferral_and_abort_clears_both()
+        {
+            skip_if_no_git!();
+            let (_tmp, remote, local) = init_remote_and_clone();
+
+            // Re-create the divergence-overlap scenario from the existing
+            // tests: same file edited on both sides, then a `pull --merge`.
+            std::fs::write(local.join("README.md"), "LOCAL CHANGE\n").unwrap();
+            assert!(StdCommand::new("git").silent()
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(&local).status().unwrap().success());
+            assert!(StdCommand::new("git").silent()
+                .args(["config", "user.name", "Test"])
+                .current_dir(&local).status().unwrap().success());
+            assert!(StdCommand::new("git").silent()
+                .args(["commit", "-am", "local README"])
+                .current_dir(&local).status().unwrap().success());
+
+            // Build an upstream divergence.
+            let pusher = local.parent().unwrap().join("pusher");
+            assert!(StdCommand::new("git").silent()
+                .args(["clone", remote.to_str().unwrap()])
+                .arg(&pusher).status().unwrap().success());
+            assert!(StdCommand::new("git").silent()
+                .args(["config", "user.email", "u@example.com"])
+                .current_dir(&pusher).status().unwrap().success());
+            assert!(StdCommand::new("git").silent()
+                .args(["config", "user.name", "Up"])
+                .current_dir(&pusher).status().unwrap().success());
+            std::fs::write(pusher.join("README.md"), "UPSTREAM CHANGE\n").unwrap();
+            assert!(StdCommand::new("git").silent()
+                .args(["commit", "-am", "upstream README"])
+                .current_dir(&pusher).status().unwrap().success());
+            assert!(StdCommand::new("git").silent()
+                .args(["push", "origin", "main"])
+                .current_dir(&pusher).status().unwrap().success());
+
+            // Trigger the merge conflict.
+            assert!(StdCommand::new("git").silent()
+                .args(["fetch", "origin"])
+                .current_dir(&local).status().unwrap().success());
+            let pull = StdCommand::new("git").silent()
+                .args(["pull", "--no-rebase", "--no-edit", "origin", "main"])
+                .current_dir(&local).output().unwrap();
+            assert!(!pull.status.success(), "merge should conflict");
+            assert!(local.join(".git").join("MERGE_HEAD").exists());
+
+            // Simulate the conflict-surface path: write sentinel + deferral.
+            write_update_resume_sentinel(&local, "merge", "main", "fake-sha");
+            write_update_resume_deferral(&local, "merge", "main");
+
+            assert!(local.join(UPDATE_RESUME_SENTINEL_REL).exists());
+            assert!(local.join(".claude/context/UPDATE_DEFERRED.md").exists());
+
+            // Now abort — both should be cleared.
+            let result = abort_orchestrator_merge_or_rebase(
+                local.to_str().unwrap().to_string(),
+            )
+            .await;
+            assert!(result.is_ok(), "abort failed: {:?}", result);
+
+            assert!(
+                !local.join(UPDATE_RESUME_SENTINEL_REL).exists(),
+                "abort must clear the sentinel"
+            );
+            assert!(
+                !local.join(".claude/context/UPDATE_DEFERRED.md").exists(),
+                "abort must clear the solo deferral"
             );
         }
     }

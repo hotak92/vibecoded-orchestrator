@@ -16731,6 +16731,114 @@ def _emit_binary_swap_locked_deferral(
         )
 
 
+def _emit_update_resume_required_deferral(
+    deferral_report: Any,
+    *,
+    install_root: Path,
+    operation: str = "merge",
+    branch: str = "main",
+    source_version: Optional[str] = None,
+    installed_version: Optional[str] = None,
+) -> None:
+    """v0.2.51 Bug A: emit ``update_resume_required`` when the launcher
+    detected a "merge resolved but install.py not run" state.
+
+    Background
+    ----------
+    The launcher's "Update orchestrator" flow runs:
+      1. ``git fetch`` + ``git pull`` (or merge/rebase via the conflict-
+         recovery commands).
+      2. ``install.py --update`` against the freshly-pulled tree.
+      3. Binary refresh of ``launcher/src-tauri/target/release/vct-launcher``.
+      4. Auto-restart so the new binary loads.
+
+    Pre-v0.2.51, step 1 could halt at a merge/rebase conflict and the
+    "Resolve manually" modal button just closed the dialog. The user
+    resolved the conflict in their editor + ``git commit``-ed but the
+    launcher never re-entered steps 2-4. Result: merged source on disk,
+    stale install manifest, old binary still running.
+
+    v0.2.51 fix
+    -----------
+    The Rust ``update_orchestrator`` / ``merge_orchestrator_*`` /
+    ``rebase_orchestrator_*`` commands now write a sentinel at
+    ``.claude/state/orchestrator-update-resume-needed.json`` whenever they
+    surface the conflict modal. The launcher's MenuBar UpdateBadge polls
+    ``check_for_updates``; when sentinel-present AND ``.git/MERGE_HEAD``
+    is gone, the badge surfaces "Continue Update" → calls the new
+    ``resume_orchestrator_update`` Tauri command to re-enter steps 2-4.
+
+    This deferral entry mirrors that state into ``UPDATE_DEFERRED.md`` so
+    the same condition is visible to Claude sessions that don't have the
+    launcher GUI open. Claude reads UPDATE_DEFERRED.md at session start
+    (the deferral writer injects a reminder block into CLAUDE.md too) and
+    can prompt the user before any other work.
+
+    Self-clears: when ``resume_orchestrator_update`` succeeds it deletes
+    the sentinel; the next ``install.py --update --apply-deferred`` run
+    treats this entry as resolved and removes it (no auto-apply needed —
+    install.py itself ran during the resume).
+
+    Safe to call with ``deferral_report=None`` (no-op).
+    """
+    if deferral_report is None:
+        return
+
+    sv = source_version or "(unknown)"
+    iv = installed_version or "(unknown)"
+    op_phrase = "merge" if operation == "merge" else "rebase"
+
+    try:
+        entry = DeferralEntry(
+            condition_id="update_resume_required",
+            title="Orchestrator update halted at a conflict — resume needed",
+            detected=(
+                f"A previous `update_orchestrator` ({op_phrase} on "
+                f"`{branch}`) was halted at a conflict, the conflict was "
+                f"resolved outside the launcher (CLI `git add` + "
+                f"`git commit`), but `install.py --update` and the binary "
+                f"refresh never ran. Source on disk is v{sv}; last "
+                f"install ran v{iv}. The launcher binary may also be "
+                f"stale relative to the merged source.\n\n"
+                f"Sentinel: `.claude/state/orchestrator-update-resume-needed.json` "
+                f"in `{install_root}`."
+            ),
+            why_deferred=(
+                "install.py cannot detect this state proactively at "
+                "session start — the sentinel is launcher state, not "
+                "install state. The user must either click `Continue "
+                "Update` in the launcher's MenuBar UpdateBadge (which "
+                "runs `resume_orchestrator_update` → install.py --update "
+                "+ binary refresh + auto-restart) OR run `python "
+                "install.py --update` manually from a terminal to finish "
+                "the install. Either path bumps `last_installed_version` "
+                "to match `source_version` and clears this deferral."
+            ),
+            command_to_apply=(
+                "# Option A (recommended): open the launcher, click the\n"
+                "# Continue Update button in the top-right MenuBar badge.\n"
+                "# This re-runs install.py + refreshes the binary + restarts.\n"
+                "#\n"
+                "# Option B (terminal): from the orchestrator install root,\n"
+                f"cd {install_root}\n"
+                "python install.py --update\n"
+                "# After install.py finishes, restart the launcher manually\n"
+                "# (tray → Quit, then relaunch via your usual entrypoint) so\n"
+                "# the freshly-built binary loads."
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/update-resume-required-bug-a-v0251.md",
+            ],
+        )
+        deferral_report.add_entry(entry)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "update_resume_required", "warn",
+            f"could not emit update_resume_required deferral: {exc}",
+        )
+
+
 def _maybe_emit_running_stale_deferral(
     install_root: Path,
     *,
