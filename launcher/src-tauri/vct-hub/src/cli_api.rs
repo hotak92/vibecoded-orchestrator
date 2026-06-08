@@ -202,8 +202,25 @@ async fn rename_project(
             Ok(s) => s,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
+        // v0.2.49 access-matrix Step F SB2 fix (L1-F1): capture the
+        // OLD project name BEFORE the rename so we can pass it to
+        // `propagate_kg_access_on_rename` below. Pre-fix this hub CLI
+        // surface NEVER called the propagate helper, leaving orphan
+        // kg_collection_access rows referencing the OLD sanitized
+        // collection name after every CLI-driven rename. The Tauri
+        // sibling at `commands/projects_v2.rs::rename_project_v2`
+        // captures the pre-rename name + propagates — this surface
+        // now mirrors that discipline via the lifted helper.
+        let old_name = project.name.clone();
         if let Err(e) = h.0.rename_project(&project.id, &req.new_name, Some(&new_slug)) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // v0.2.49 Step F SB2: propagate the rename into the access
+        // matrix via the lifted free fn. Warnings are best-effort
+        // logged (no GUI/CLI surface here for them — the boot
+        // reconcile is the backup).
+        for warn in h.0.propagate_kg_access_on_rename(&project.id, &old_name, &req.new_name) {
+            eprintln!("[vct-hub] rename access propagation warning: {}", warn);
         }
         let _ = h.0.audit(
             "project_rename",
@@ -1995,8 +2012,10 @@ mod hub_access_matrix_wiring_tests {
         );
         assert_eq!(
             by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
-            Some(&"read"),
-            "shared KG must default to read"
+            Some(&"write"),
+            "v0.2.49 Step F SB2 (L2-SB1): shared KG default is 'write' \
+             (was 'read' pre-fix; aligns with resolver's F-2a output \
+             + Step D's force-upgrade migration target)"
         );
     }
 

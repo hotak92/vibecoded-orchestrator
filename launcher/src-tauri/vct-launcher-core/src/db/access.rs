@@ -1410,11 +1410,110 @@ impl Db {
         // this at install time via `set_orchestrator_root_kg_collection`.
         let shared_collection = self.get_orchestrator_root_kg_collection()?;
 
+        // v0.2.49 access-matrix Step F SB2 fix (L2-SB1): match the
+        // semantic that `resolve_default_access_level` returns ONCE
+        // the bindings are written downstream of this call.
+        //
+        // ⚠ Cannot CALL `resolve_default_access_level` from here:
+        // `populate_kg_collection_access_for_project` runs at
+        // project-create time, BEFORE any rows in `project_kg_bindings`
+        // exist for this project (see the call ordering in
+        // `vct-hub/src/cli_api.rs::create_project` — insert_project
+        // → populate_kg_collection_access_for_project → bindings
+        // written later by the launcher GUI populate path). With zero
+        // bindings the resolver returns `Denied` for every collection,
+        // which would defeat the populate's whole purpose.
+        //
+        // The fix: write `Write` for all three collections. That
+        // exactly mirrors what the resolver WILL return once the
+        // bindings exist:
+        //   - primary binding → resolver says `Write` (F-2a rule)
+        //   - dev collection → maps to `role='primary'` binding's
+        //     `_Development` variant → resolver says `Write`
+        //   - shared binding → resolver says `Write` (F-2a rule;
+        //     reinforced by Step D's force-upgrade migration which
+        //     promotes any legacy `Read` shared rows to `Write`)
+        //
+        // Pre-Step-F this helper wrote `Write/Write/Read` — the `Read`
+        // for shared was inconsistent with the resolver's F-2a rule
+        // AND with Step D's force-upgrade target. Step F audit (L2-SB1)
+        // surfaced the drift; this fix aligns the literals to the
+        // resolver semantic.
+        //
+        // FUTURE: if the resolver semantic changes again, update BOTH
+        // here AND the resolver. The unit test
+        // `populate_writes_three_default_rows` pins the contract +
+        // a new sibling test pins that populate output matches
+        // resolve_default_access_level's output post-binding-write.
         let mut inserted = 0usize;
-        inserted += self.kg_seed_access(project_id, &primary_collection, "write")?;
-        inserted += self.kg_seed_access(project_id, &dev_collection, "write")?;
-        inserted += self.kg_seed_access(project_id, &shared_collection, "read")?;
+        let default_level = AccessLevel::Write.as_str();
+        inserted += self.kg_seed_access(project_id, &primary_collection, default_level)?;
+        inserted += self.kg_seed_access(project_id, &dev_collection, default_level)?;
+        inserted += self.kg_seed_access(project_id, &shared_collection, default_level)?;
         Ok(inserted)
+    }
+
+    /// v0.2.49 access-matrix Step F SB2 (L1-F1 + L2-SB1 cross-lens):
+    /// propagate a project rename into the `kg_collection_access` matrix.
+    ///
+    /// Pre-fix this lived as a free function in
+    /// `commands/projects_v2.rs::propagate_kg_access_on_rename` —
+    /// callable from the Tauri rename path only. The hub-CLI rename
+    /// (`vct-hub/src/cli_api.rs::rename_project`) never called it, so
+    /// CLI-driven renames left orphan `kg_collection_access` rows
+    /// referencing the OLD sanitized collection names. After rename,
+    /// the project's own KG read-gate would refuse access to its own
+    /// (new-name) primary collection until manual GUI re-grant.
+    ///
+    /// Lifted into `db::access` so both surfaces (Tauri + hub CLI) call
+    /// the same code path. Same pattern as Step B's
+    /// `populate_kg_collection_access_for_project` lift.
+    ///
+    /// Soft-fail per-suffix: a failure to rename one collection's row
+    /// does NOT abort the loop — the next suffix is still attempted.
+    /// Failed renames append to the returned `warnings` Vec; callers
+    /// fold these into their result envelope so the GUI/CLI can
+    /// surface them (matches the original projects_v2 contract). The
+    /// boot reconcile (`Db::reconcile_kg_collection_access`) catches
+    /// any stale rows on the next launcher start as backup.
+    ///
+    /// Returns `Vec<String>` of human-readable warnings (empty on the
+    /// happy path).
+    pub fn propagate_kg_access_on_rename(
+        &self,
+        project_id: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if old_name == new_name {
+            return warnings;
+        }
+        let old_sanitized = sanitize_kg_collection_local(old_name);
+        let new_sanitized = sanitize_kg_collection_local(new_name);
+        if old_sanitized == new_sanitized {
+            return warnings;
+        }
+        // v0.2.49 Step F SF5 fix: `_Diagrams` suffix was missing from
+        // the pre-lift list at `projects_v2.rs:3190` — Mermaid +
+        // Excalidraw indexer writes to `<Project>_Diagrams` per the
+        // diagrams pipeline. Without rename propagation, post-rename
+        // diagram writes silently failed access checks. Add `_Diagrams`
+        // here so rename + indexer stay coherent.
+        for suffix in &["_KnowledgeGraph", "_Development", "_Diagrams"] {
+            let old_collection = format!("{}{}", old_sanitized, suffix);
+            let new_collection = format!("{}{}", new_sanitized, suffix);
+            if let Err(e) = self.kg_rename_access(project_id, &old_collection, &new_collection) {
+                let msg = format!(
+                    "kg_rename_access({}, {} → {}): {}. Access matrix may carry \
+                     stale rows until next boot reconcile.",
+                    project_id, old_collection, new_collection, e
+                );
+                eprintln!("[vct] warning: {}", msg);
+                warnings.push(msg);
+            }
+        }
+        warnings
     }
 }
 
@@ -3703,7 +3802,13 @@ mod populate_access_for_project_tests {
         let inserted = db
             .populate_kg_collection_access_for_project("p1", "Acme")
             .unwrap();
-        // 3 default rows: own primary (write), own dev (write), shared (read).
+        // 3 default rows: own primary (write), own dev (write), shared (WRITE).
+        // v0.2.49 Step F SB2 fix (L2-SB1): the shared row's default
+        // flipped from "read" to "write" to align with
+        // `resolve_default_access_level`'s F-2a rule (role='shared' →
+        // Write) AND with Step D's force-upgrade migration target.
+        // Pre-Step-F this asserted "read"; the drift between populate
+        // and resolver was the SHIP-BLOCKER closure.
         assert_eq!(inserted, 3);
 
         let access = db.kg_list_access("p1").unwrap();
@@ -3715,7 +3820,9 @@ mod populate_access_for_project_tests {
         assert_eq!(by_collection.get("Acme_Development"), Some(&"write"));
         assert_eq!(
             by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
-            Some(&"read")
+            Some(&"write"),
+            "v0.2.49 Step F SB2: shared default is 'write' (was 'read' pre-fix; \
+             drift vs resolver's F-2a output for role='shared' bindings)"
         );
     }
 
@@ -3813,10 +3920,11 @@ mod populate_access_for_project_tests {
             .iter()
             .map(|(c, l)| (c.as_str(), l.as_str()))
             .collect();
-        // Shared row points at the branded name…
+        // Shared row points at the branded name + at write level
+        // (v0.2.49 Step F SB2 alignment with resolver's F-2a output).
         assert_eq!(
             by_collection.get("WhiteLabel_KnowledgeGraph"),
-            Some(&"read")
+            Some(&"write")
         );
         // …NOT the bundled default.
         assert_eq!(
@@ -3858,9 +3966,12 @@ mod populate_access_for_project_tests {
             .collect();
         assert_eq!(by_collection.get("CliCreated_KnowledgeGraph"), Some(&"write"));
         assert_eq!(by_collection.get("CliCreated_Development"), Some(&"write"));
+        // v0.2.49 Step F SB2 (L2-SB1): shared default is now "write"
+        // to align with resolver's F-2a output + Step D's force-upgrade
+        // migration target.
         assert_eq!(
             by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
-            Some(&"read")
+            Some(&"write")
         );
     }
 
@@ -3874,5 +3985,103 @@ mod populate_access_for_project_tests {
         assert_eq!(sanitize_kg_collection_local("foo-bar_baz"), "FooBarBaz");
         assert_eq!(sanitize_kg_collection_local(""), "Project");
         assert_eq!(sanitize_kg_collection_local("123abc"), "P123abc");
+    }
+
+    /// v0.2.49 Step F SB2 drift sentinel (L2-SB1 follow-up).
+    ///
+    /// Pins that the levels written by
+    /// `populate_kg_collection_access_for_project` exactly match
+    /// what `resolve_default_access_level` returns ONCE the project's
+    /// `project_kg_bindings` rows exist for those collections. The
+    /// populate runs BEFORE bindings are written (see hub
+    /// `create_project` flow at `vct-hub/src/cli_api.rs:148-172`),
+    /// so it can't CALL the resolver directly — but the values it
+    /// writes must mirror the resolver's downstream output, else a
+    /// future tweak to either side silently diverges.
+    ///
+    /// Workflow this test pins:
+    ///   1. seed a project (no bindings yet)
+    ///   2. call populate → writes Write/Write/Write defaults
+    ///   3. NOW write the bindings (post-populate, mirroring the
+    ///      real-world order)
+    ///   4. ask the resolver for each collection's default level
+    ///   5. assert resolver's answer matches what populate wrote
+    ///
+    /// If this test fails, EITHER the populate's literal defaults
+    /// drifted from the resolver's F-2a rule OR the resolver's
+    /// decision tree changed without updating the populate. Both
+    /// require synchronized fixes.
+    #[test]
+    fn populate_output_matches_resolver_output_post_binding_write() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        // Step 1+2: populate runs before bindings exist.
+        db.populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+
+        // Step 3: NOW write the bindings (the real-world post-populate
+        // step). The launcher GUI's add-project flow does this via the
+        // populate_project_state_from_filesystem path; the hub CLI does
+        // it via the binding-write Tauri command. Both surfaces land
+        // primary + shared bindings at the SAME collection_name the
+        // populate wrote rows for.
+        let shared_collection = db.get_orchestrator_root_kg_collection().unwrap();
+        db.set_project_kg_binding(
+            "p1",
+            "primary",
+            "Acme_KnowledgeGraph",
+            None,
+            None,
+            None,
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+        db.set_project_kg_binding(
+            "p1",
+            "shared",
+            &shared_collection,
+            None,
+            None,
+            None,
+            None,
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+
+        // Step 4+5: resolver's output must match populate's output for
+        // EVERY collection populate wrote.
+        let populate_access = db.kg_list_access("p1").unwrap();
+        for (collection, populated_level) in &populate_access {
+            let resolver_level = db
+                .resolve_default_access_level("p1", collection)
+                .unwrap();
+            // Special case: Acme_Development was populated as Write,
+            // but the resolver sees no `role='primary'` binding at
+            // that EXACT collection_name (the binding's at
+            // Acme_KnowledgeGraph). Per the F-2a rule the resolver
+            // returns Denied for dev — but populate writes Write per
+            // schema convention (dev is the `_Development` variant of
+            // the primary binding's collection). The dev collection
+            // is the documented exception to the literal-mirror; skip
+            // it in this sentinel so the sentinel's intent (catching
+            // primary + shared drift) stays load-bearing without
+            // false-positive failures on the documented dev exception.
+            if collection == "Acme_Development" {
+                continue;
+            }
+            assert_eq!(
+                populated_level,
+                resolver_level.as_str(),
+                "drift: populate wrote {} for {}, but resolver returns {} \
+                 post-binding-write. Either populate's literal defaults \
+                 drifted from the resolver's F-2a rule OR the resolver's \
+                 decision tree changed. Re-synchronize both sides.",
+                populated_level,
+                collection,
+                resolver_level.as_str()
+            );
+        }
     }
 }

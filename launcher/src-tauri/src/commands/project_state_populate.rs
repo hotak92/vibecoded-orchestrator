@@ -1696,7 +1696,10 @@ mod tests {
         let report =
             populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
 
-        // 3 default rows: own primary (write), own dev (write), shared (read)
+        // 3 default rows: own primary (write), own dev (write), shared (WRITE).
+        // v0.2.49 Step F SB2 (L2-SB1): shared default flipped read→write
+        // to align with `resolve_default_access_level`'s F-2a output +
+        // Step D's force-upgrade migration target.
         assert_eq!(report.kg_access_rows_inserted, 3);
 
         let access = db.kg_list_access("p1").unwrap();
@@ -1708,7 +1711,8 @@ mod tests {
         assert_eq!(by_collection.get("Acme_Development"), Some(&"write"));
         assert_eq!(
             by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
-            Some(&"read")
+            Some(&"write"),
+            "v0.2.49 Step F SB2: shared default is 'write' (was 'read' pre-fix)"
         );
 
         std::fs::remove_dir_all(&folder).ok();
