@@ -7,7 +7,7 @@
   "version": "1.0.0",
   "description": "Inter-app message hub. Apps register with the hub on startup, exchange async messages, and declare data they expose. Runs as part of the launcher binary on localhost:7700; this manifest enables the UI to show its status in the module dashboard.",
   "publisher": "VibeCoded Tools",
-  "repository": "https://github.com/pb992/VCT-Launcher",
+  "repository": "https://github.com/hotak92/vibecoded-orchestrator",
 
   "category": "core",
   "tags": ["hub", "inter-app", "http"],

@@ -283,7 +283,7 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         hub outlives launcher GUI), every `install.py --update` run hit
         the 5s writer-lock timeout and emitted a
         `kg_binding_self_heal_db_error` deferral, even when there was
-        literally nothing to heal. RL chat msg 179 (2026-06-07) reported
+        literally nothing to heal. A v0.2.49 access-matrix follow-up reported
         this and recommended Option A: open RO for detection, only reopen
         RW if mismatches found.
 

@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.51] - 2026-06-09
+
+A **public-repo cleanup release** triggered by a critical UX regression discovered during v0.2.50 dogfooding (merge-conflict update flow had no resume path), plus a comprehensive sweep of leftover operational state and stale documentation. Heavy on subtraction: 99 files changed (+3511 / -7150 = net **-3639 LoC**). Subagent-parallel: 5 worktree-isolated Opus agents (Bug A + W1 KG + W2 docs + W3 UI + W4 installer) merged via 4 zero-conflict merges.
+
+### Added
+
+- **Bug A — `resume_orchestrator_update` Tauri command** + sentinel-driven detection of "merge-resolved-but-install-incomplete" state. When a `update_orchestrator` flow hits a merge conflict and the user resolves it manually, the GUI now persists the in-progress state to `.claude/state/orchestrator-update-resume-needed.json` + writes a `update_resume_required` entry to `UPDATE_DEFERRED.md`. A pulsing purple MenuBar badge ("Continue Update") becomes visible across sessions, and a "Continue Update" button is added to `OrchestratorUpdateConflictModal`. Backed by a Rust single-flight `tokio::Mutex` + 8 new unit tests + `templates/ORCHESTRATOR-CLAUDE.md.template` SESSION-START guidance so Claude surfaces the deferral to the user at session start.
+- **Bug G — auto-install + auto-start prereqs** (`install.py`, `install.sh`, `install.ps1`, `first-install.*`): when missing, the first-install flow now offers to install `node`/`npm`/`npx`, `python3.11+`, and `podman` via the platform package manager (`apt`/`dnf`/`pacman`/`brew`/`winget`). Availability check is by binary, not by daemon state — a stopped Podman daemon is auto-started (`systemctl --user start podman.socket` / `podman machine start`) rather than failing the install. GPU drivers stay manual (correctly out of scope).
+- **Restored `prompt-engineering-2026.md` as 3 split nodes** (<300 LoC each): `prompt-engineering-fundamentals.md`, `prompt-engineering-multi-agent.md`, `prompt-engineering-mcp-tool-design.md`. Refreshed model-version references to current Claude 4.7/4.6/4.5.
+- **`launcher/static/logo-512.png`** — the 512×512 brand logo asset referenced by `RightSidebar.svelte` was never committed in v0.2.43 when the code reference was added. Now present (copied from `launcher/src-tauri/icons/icon.png`); the broken-image placeholder in the lower-right sidebar disappears.
+- **KG node** `update-resume-required-bug-a-v0251.md` documenting the design.
+
+### Changed
+
+- **Bug B — modal-anchor consistency across all hand-rolled modals**: `OrchestratorUpdateDivergenceModal`, `OrchestratorUpdateConflictModal`, `OrchestratorUpdateProgressModal` now anchor flush to viewport-top (`align-items: flex-start` + `padding: 16px` + scrollable body) instead of vertically-centered (which clipped above the window-top on short viewports). The other 15 `*Modal.svelte` files delegate to `DialogRoot` + native `<dialog>` and were already correctly positioned.
+- **Bug D — count drift**: stale `27 hooks` / `52 skills` / `45 agents` references corrected to verified `31 hooks` / `53 skills` / `45 agents` across `README.md`, `BOOTSTRAP.md`, `docs/features/INDEX.md`, `docs/features/03-agents-skills-hooks.md`, `docs/features/06-license-and-commercial.md`, `docs/GETTING_STARTED.md`, `templates/ORCHESTRATOR-CLAUDE.md.template`, KG `hook-discipline-vct-disable-hooks.md`.
+- **Bug E — npx fallback for fnm/nvm setups**: `install.py`'s `shutil.which("npx")` probe now falls through to `dirname(realpath(which("npm")))/npx` when the direct lookup fails. Affects ~5% of users with hand-managed Node installations (fnm/nvm/asdf) where `npm` is symlinked but `npx` isn't. Empirically verified: returns the correct fnm path + `npx --version` succeeds on the reproducer.
+- **KG collection name canonicalization**: stale `VibeCodedTools_KnowledgeGraph` → `VibeCodedOrchestrator_KnowledgeGraph` (with lowercase-c "Vibecoded" typo fix) in `docs/CONFIGURATION.md`, `docs/GETTING_STARTED.md`, `docs/TROUBLESHOOTING.md`, `docs/USER_GUIDE_TABS.md`, KG `shared-knowledge-graph.md`.
+- **Port `11438` → `11440`** (code-embed service): documented port matches the actual default in 3 KG nodes (`orchestrator-hook-system.md`, `codesage-large-v2.md`) + cross-references.
+- **`templates/CLAUDE.md.template` line 18**: the literal label `VCO_dev` (maintainer's private operational checkout) → `VibeCoded Orchestrator`. This template materializes into every user's `.claude/CLAUDE.md` at install, so every user installed since v0.2.43 had `VCO_dev` propagated into their project. Now fixed for new installs; existing installs self-correct on next `install.py --update`.
+- **Public-scrub of `kg-summary-three-tier-pipeline.md` + `agentic-llm-workflows.md`**: VCO-specific narrative paragraphs stripped while preserving the generic AI/ML concept content. VCO_dev's private knowledge graph retains the full version.
+
+### Fixed
+
+- **Bug F — `install.py.lock` ResourceWarning**: lockfile handle now wrapped in `contextlib.contextmanager` + `atexit` registration. `python -W error::ResourceWarning install.py --update` succeeds cleanly.
+- **`chunking-strategies-llm-rag.md`** — dropped the final "Claude Orchestrator Implementation" section referencing the nonexistent `orchestrator/context/embedding.py` and `EMBED_CHUNK_SIZE` constant.
+- **`KNOWN_ISSUES.md`** — refreshed from v0.2.18-era pin to current v0.2.50+ state; resolved issues marked closed; still-relevant issues retained with current verification notes.
+- **`docs/features/01-launcher.md`** — updated "Eight migrations as of v0.1.0" → "032 (v0.2.49)"; Machine ID binding description updated to current v0.2.36+ algorithm.
+- **`docs/license/USER_FLOW.md`** — algorithm description synced to `docs/license/MACHINE_BINDING.md` (was contradicting it).
+- **`docs/macos-install.md`** — wrong-org git URL corrected.
+
+### Removed
+
+#### File deletes (post-install artifact + maintainer-only sweep)
+- `supabase/.temp/` (9 files) — Supabase CLI scratch state with project-ref / org_id / pooler URL. Now gitignored.
+- `internal/` (6 files) — README, RELEASING, LAUNCHER_SUBTREE, demo_script, license/INTEGRATION, license/VARIANT_IDS. The directory's own README self-flagged it "Not user-facing. Excluded from release archives." — this release enforces that intent.
+- `tools/install-vco-dev-pre-push-guard.{sh,ps1}` — VCO_dev private-fork pre-push guards (not user-facing helpers).
+- `scripts/{add-silent-to-commands.py, apply-branch-protection-v0.2.42.sh, filter-repo-2026-05-06.sh}` — completed one-off operations.
+- `docs/operations/supabase-ci-deploy.md` — maintainer-only deploy guide.
+- 7 release-narrative / maintainer-only docs: `docs/codeql-triage-v0.2.42.md`, `docs/EXCALIDRAW_WAYLAND_TEST.md`, `docs/MAINTAINER_GUIDE.md`, `docs/MIGRATION-0.2.0.md`, `docs/v0.2.33-l0-deploy.md`, `.github/workflows/README.md`, `launcher/docs/SECURITY_PORTING_GUIDE.md` (the last one also leaked the dual-repo architecture).
+
+#### KG node deletes (28 nodes off-scope or operational/release-narrative)
+- 11 devdoc/release-narrative nodes (`config-projection-contract-2026-05-24`, `global-install-scope-v0249-stream-a`, `orchestrator-root-kg-collection-identity-2026-06-01`, `paid-module-install-update-foundation-2026-06-02`, `parallel-pr-coordination-gotchas-2026-05-10`, `supervisor-image-resolution-variant-gap-2026-06-04`, `install-pipeline-self-healing-v0213`, `mcp-simplification-v0211`, `cross-os-hook-portability`, plus 2 borderline)
+- 15 founder/marketing nodes off-scope for an AGPL orchestrator (`build-vs-buy-decision-framework-2026`, `churn-taxonomy-classification`, `gdpr-eu-vat-lite`, `landing-page-conversion-audit`, `merchant-of-record-vs-stripe`, `north-star-metric-selection`, `saas-metrics-math-and-benchmarks`, `saas-trial-conversion-playbook`, `sales-funnel-stage-modeling`, `seo-2026-aio-eeat`, `social-platform-algorithms-2026`, `sow-statement-of-work-anatomy`, `solo-saas-pricing-tiers-2026`, `portfolio-triage-burning-watching`, `sliding-window-cohort-analysis`)
+- 3 designer/brand nodes (`ai-image-generation-workflows-2026`, `ai-image-prompt-anatomy`, `color-theory-for-ui`)
+- 1 cross-project pollution (`online-speed-envelope-learning` — sim-racing AI mod content unrelated to VCO)
+- 1 deprecated upstream (`ollama-mcp-server`)
+
+### Security / Privacy
+
+- Scrubbed `pb992/VCT-Launcher` references (co-maintainer's private fork, not a public repo) from `BOOTSTRAP.md`, `docs/features/07-architecture.md`, `launcher/bundled_manifests/vct-hub-api.json`.
+- Scrubbed Lemon Squeezy product names (`Transcrypt`, `Arzillibus`, `ConvertiFacile` — maintainer's other personal products) from `launcher/docs/SETUP.md` dev-mode activation examples; replaced with `DemoProduct1/2/3`.
+- Scrubbed personal-narrative leakage in `CHANGELOG.md` (`instambul_map`, `SD15` → "an external user project" / "a long-lived legacy project"); preserved technical context.
+- Scrubbed chat-role narrative ("RL chat", "main VCO chat") from 6 Rust inline comments + 1 TypeScript comment + 1 GHA workflow + 1 pytest test description; replaced with neutral architectural language ("v0.2.49 access-matrix follow-up", "module-author workflows", etc.).
+- Scrubbed dated release-narrative paragraphs from `launcher/supabase/functions/rl-{artifact-url,latest-weights}/README.md` while keeping the architectural Vault-vs-Edge-Function-Secrets explainer.
+- Scrubbed `VCO_dev` operational-checkout name from launcher docs + `templates/CLAUDE.md.template` (which propagates into user installs).
+
+**Architectural identifiers KEPT** (verified public per release audit 2026-06-09): `ovpdtijpdchzlxbojhsg.supabase.co` (public licensing/RL/telemetry endpoint, hardcoded in 8+ source files), `ghcr.io/hotak92/vct-rl-reranker` (active GHCR image), `github.com/hotak92/vibecoded-orchestrator` (public repo URL), UUID `9ca4bd72-7f5e-4d18-ae8d-c00d1e2e2480` (test fixture license key in 5+ validation tests).
+
+### Build / CI / Gates
+
+- **`.gitignore`** extended with 18 new patterns covering categories above + operational state files (`UPDATE_DEFERRED.md`, `SELF-HANDOFF-*.md`, more `HANDOFF-*` variants, `.claude/context/{audits,plans,pre-compact-snapshot}/`). Prevents regression of any pattern this release deleted.
+- All ship gates GREEN: `npm run check` (0 errors), `cargo check` (clean, only pre-existing dead-code warnings), `cargo test --lib` (**1378 passed / 0 failed**, +8 new Bug A tests), `pytest tests/` (**3661 passed / 59 skipped**), `python -m py_compile install.py`, `bash -n install.sh`, Gate 21 privacy check, all PASS.
+
 ## [0.2.50] - 2026-06-08
 
 Recovery release after v0.2.49 was tagged from a feature branch instead of
@@ -1443,7 +1507,7 @@ A **comprehensive paid-module + install-pipeline + telemetry + KG-hygiene releas
 
 ## [0.2.37] — 2026-05-27
 
-A **multi-axis hotfix release** — closes 7 distinct user-visible regressions discovered during v0.2.36 dogfooding (1 fresh-install of `instambul_map` exposed 5 install-bundle gaps; 1 fresh-3rd-party admin install exposed 2 launcher-side state bugs). 7 parallel Opus agents (V37-A/B/C/D/E/F/G) on isolated worktrees + per-branch diff review during integration.
+A **multi-axis hotfix release** — closes 7 distinct user-visible regressions discovered during v0.2.36 dogfooding (1 fresh-install of an external user project exposed 5 install-bundle gaps; 1 fresh-3rd-party admin install exposed 2 launcher-side state bugs). 7 parallel Opus agents (V37-A/B/C/D/E/F/G) on isolated worktrees + per-branch diff review during integration.
 
 ### Fixed — paid-module install pipeline (BLOCKER series)
 
@@ -1453,9 +1517,9 @@ A **multi-axis hotfix release** — closes 7 distinct user-visible regressions d
 
 - **`rl-artifact-url` GHCR token-exchange used hardcoded `vct-paid-module` username instead of env-driven** (Agent V37-B, Issue 4a): backport of the 2026-05-27 in-place Supabase hotfix into the repo. The Basic-auth header to GHCR's `/token` endpoint at line 270 used the legacy `GHCR_BASIC_AUTH_USERNAME` constant ("vct-paid-module"). GHCR validates that the Basic-auth username matches the PAT owner for personal-account packages — synthetic literals get 403 DENIED. Replaced with `resolveGhcrUsername()` (the v0.2.36 env-driven resolver, already used for the response field). The diagnostic `console.error([rl-artifact-url DIAG] ...)` line + `// touched <timestamp>` comment from the 2026-05-27 forced-redeploy cycle were removed. Dead `GHCR_BASIC_AUTH_USERNAME` const deleted. 3 new Deno tests pin the Basic-auth header round-trip.
 
-### Fixed — install-bundle bootstrap gaps (`instambul_map` dogfood findings)
+### Fixed — install-bundle bootstrap gaps (external-project dogfood findings)
 
-- **`.claude/env` missing `VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR` / `VCT_INSTALL_ROOT` exports** (Agent V37-C Gap 6a + Agent V37-E Finding F1 + F6): two complementary fixes for the root cause that broke every freshly-installed project's wrapper scripts. (1) Agent V37-C threaded `orchestrator_root` through `vco_lib.project_init.install_project_bundle` → `_apply_canonical_env_via_config_projection` → `project_env_from_db` on the Python side. (2) Agent V37-E added `--orchestrator-root <path>` to the Rust `apply_project_env_via_python` subprocess call (sourced from `app_state["launcher.install_path"]` → `find_local_repo_root` fallback). (3) Agent V37-E also fixed `update_project_v2` to invoke `apply_project_env_via_python` after `run_install_bundle_update` so existing projects backfill the env keys on every bundle update — closes the staleness gap that left SD15-shaped long-lived projects missing keys added by later launcher versions.
+- **`.claude/env` missing `VCT_ORCHESTRATOR_ROOT` / `VCT_INFRASTRUCTURE_DIR` / `VCT_INSTALL_ROOT` exports** (Agent V37-C Gap 6a + Agent V37-E Finding F1 + F6): two complementary fixes for the root cause that broke every freshly-installed project's wrapper scripts. (1) Agent V37-C threaded `orchestrator_root` through `vco_lib.project_init.install_project_bundle` → `_apply_canonical_env_via_config_projection` → `project_env_from_db` on the Python side. (2) Agent V37-E added `--orchestrator-root <path>` to the Rust `apply_project_env_via_python` subprocess call (sourced from `app_state["launcher.install_path"]` → `find_local_repo_root` fallback). (3) Agent V37-E also fixed `update_project_v2` to invoke `apply_project_env_via_python` after `run_install_bundle_update` so existing projects backfill the env keys on every bundle update — closes the staleness gap that left long-lived projects missing keys added by later launcher versions.
 
 - **`kg-sync` / `kg-migrate` / `kg-search` / `kg-info` / `code-graph-query` wrappers had no venv fallback** (Agent V37-C Gap 6b): the 5 sibling wrappers only probed `$PROJECT_ROOT/.venv` / `$PROJECT_ROOT/claude_mcp_servers/.venv` and failed with `weaviate-client not installed` when neither existed. `code-graph-analyze` (the canonical wrapper) already had the correct fallback to `$VCT_INSTALL_ROOT/.venv` with `weaviate-client` import validation. Backported the canonical pattern to all 5 siblings (sh + ps1 — also created new `kg-migrate.ps1` for Windows parity, previously missing).
 
@@ -1479,7 +1543,7 @@ A **multi-axis hotfix release** — closes 7 distinct user-visible regressions d
 
 - **`install.py` seeds `<install>/.vct/install_path_seed.txt`** (Agent V37-E): on first install OR lightweight reinstall, install.py writes the resolved install path to a seed file. Launcher boot consumes via new `consume_install_path_seed_if_present` (in `lib.rs`) which writes the value to `app_state["launcher.install_path"]` and deletes the seed. Closes the chicken-and-egg gap where install.py finished but launcher.db didn't know the install path until the first launcher boot's walk-up resolver happened to succeed.
 
-- **`refresh_all_projects_env_with_db` Tauri command + boot hook** (Agent V37-E, F1 Step 4): after the install-path-seed consumer runs at boot, the launcher re-applies `apply_project_env_via_python` for every project in launcher.db. Legacy SD15-shaped projects with stale `.claude/env` self-heal on the first boot post-upgrade — no manual operator action.
+- **`refresh_all_projects_env_with_db` Tauri command + boot hook** (Agent V37-E, F1 Step 4): after the install-path-seed consumer runs at boot, the launcher re-applies `apply_project_env_via_python` for every project in launcher.db. Legacy long-lived projects with stale `.claude/env` self-heal on the first boot post-upgrade — no manual operator action.
 
 ### Documentation
 
@@ -3700,7 +3764,7 @@ Keep-a-Changelog discipline going forward.
 
 ## [0.2.4] — 2026-05-12
 
-Same-day follow-up to 0.2.3. Three bugs surfaced while adding SD15 (a
+Same-day follow-up to 0.2.3. Three bugs surfaced while adding a long-lived legacy project (a
 project registered by a pre-v0.2.0 orchestrator) via the v0.2.3
 launcher.
 

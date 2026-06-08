@@ -4414,7 +4414,7 @@ mod tests {
     //   - `ActionDescriptor::TauriCommand { command, args }` — chained_action
     //     step kind that the RL v0.2.7 manifest uses (was a hard parse
     //     failure on v0.2.32 because the variant didn't exist).
-    //   - `stop_on_failure` alias for `rollback_on_step_failure` — RL chat
+    //   - `stop_on_failure` alias for `rollback_on_step_failure` — module-author
     //     shipped v0.2.7 with the alias spelling before the canonical name
     //     was settled.
     //   - `ConfigControl::Unsupported` — forward-compat fallback for

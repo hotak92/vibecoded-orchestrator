@@ -69,7 +69,7 @@
 // on every project — wrong, since "installed once = available to
 // all" is global-scope's contract.
 //
-// RL chat landed the field on `ModuleCatalogEntry` (commit d0f7c03d:
+// The field was landed on `ModuleCatalogEntry` (commit d0f7c03d:
 // `feat(catalog): expose install.scope on ModuleCatalogEntry +
 // L0Install`) which now flows through to the TS type as
 // `install_scope?: 'per_project' | 'global' | ''`. The amendment
@@ -82,7 +82,7 @@
 // the original `installed-elsewhere` behavior.
 //
 // Resolution path documented in vct-coordination 2026-06-07 +
-// HANDOFF-TO-MAIN-VCO-CHAT-2026-06-07-V5 + RL chat msg 181 ack.
+// the v0.2.49 paid-module access-matrix integration ack.
 
 import type { ModuleCatalogEntry, ModuleInstallRow } from '$lib/types/launcher';
 

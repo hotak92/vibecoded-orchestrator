@@ -224,7 +224,7 @@ impl Db {
     ///
     /// Consumed by:
     ///   - Phase 4 item #10 (hub CLI `vct project create` populate path)
-    ///   - Phase 4 item #13 (RL chat's `populate_kg_collection_access_for_global_module`)
+    ///   - Phase 4 item #13 (`populate_kg_collection_access_for_global_module`)
     ///   - install.py parity self-heal seed-path (future v0.2.50 cleanup)
     ///   - The Phase 7 force-upgrade migration's per-row UPDATE target
     ///     value (when running, it explicitly sets `Write` for shared

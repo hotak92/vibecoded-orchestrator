@@ -4,7 +4,7 @@
 #   1. validate-manifest:  every committed paid-module fixture round-trips
 #                          through ModuleManifest::from_json in strict mode.
 #                          Catches the v0.2.32-class regression where the
-#                          RL chat's v0.2.7 manifest declared `tauri_command`
+#                          the v0.2.7 module manifest declared `tauri_command`
 #                          but the launcher's ActionDescriptor enum didn't
 #                          recognise it — the manifest parsed silently as
 #                          a failure, the catalog fell back to a stale v0.1.1
