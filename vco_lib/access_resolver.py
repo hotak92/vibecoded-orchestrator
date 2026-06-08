@@ -91,11 +91,19 @@ _WARN_WINDOW_SECONDS = 300.0  # 5 min, mirrors bash sibling
 
 
 def _state_dir() -> Path:
-    """Resolve $VCT_STATE_DIR or default ~/.vct."""
+    """Resolve $VCT_STATE_DIR or default to the canonical vct_root_dir.
+
+    Delegates to `vco_lib.paths.vct_root_dir()` for the default. The
+    consolidation test at `tests/test_vct_root_dir_consolidation.py`
+    requires production code to route through the single source of
+    truth in `paths.py` rather than reconstructing the home-relative
+    ".vct" path inline. Pre-fix this function had the inline form.
+    """
     s = os.environ.get("VCT_STATE_DIR")
     if s:
         return Path(s)
-    return Path.home() / ".vct"
+    from vco_lib.paths import vct_root_dir
+    return vct_root_dir()
 
 
 def _hub_port() -> int:
