@@ -28,7 +28,7 @@ class TestDocstringExamples:
     the spec."""
 
     def test_sd15(self):
-        assert canonical_class_prefix("SD15") == "SD15"
+        assert canonical_class_prefix("MyProject") == "MyProject"
 
     def test_camel_case_preserves_underscore(self):
         # Crucial: existing schema-on-disk for underscored-CamelCase
@@ -253,7 +253,7 @@ class TestDeterminism:
             "VibeCoded Orchestrator",
             "Camel_Case",
             "Foo-Bar",
-            "SD15",
+            "MyProject",
         ]:
             once = canonical_class_prefix(inp)
             twice = canonical_class_prefix(once)

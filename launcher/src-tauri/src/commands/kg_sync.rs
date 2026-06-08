@@ -934,7 +934,7 @@ async fn run_subprocess(
 /// LOGS BEFORE attempting the write — they're optimistic. The terminal
 /// `📊 KG: N succeeded, M failed` is the only authoritative source. When
 /// the subprocess crashed, we can't trust the optimistic value and
-/// MUST NOT persist it (the SD15 incident on 2026-05-12 reported
+/// MUST NOT persist it (the 2026-05-12 sync incident reported
 /// `kg_succeeded: 17, kg_failed: 0` despite the very first insert
 /// crashing with HTTP 422 — all 17 came from the per-line log lines,
 /// zero of which actually committed).
@@ -1447,7 +1447,7 @@ mod tests {
 
     #[test]
     fn reconcile_resets_kg_succeeded_to_zero_when_summary_missing() {
-        // SD15 incident replay: 17 optimistic increments from `🔄 Syncing
+        // 2026-05-12 sync-crash replay: 17 optimistic increments from `🔄 Syncing
         // node:` markers, subprocess crashed on first insert (422), no
         // `📊 KG: ... succeeded, ... failed` summary ever landed.
         // Expectation: succeeded=0, failed=total.

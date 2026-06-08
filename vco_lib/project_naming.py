@@ -110,8 +110,8 @@ def canonical_class_prefix(project_name: str) -> str:
           in-word special character that becomes an underscore.
 
     Examples:
-        >>> canonical_class_prefix("SD15")
-        'SD15'
+        >>> canonical_class_prefix("MyProject")
+        'MyProject'
         >>> canonical_class_prefix("Camel_Case")
         'Camel_Case'
         >>> canonical_class_prefix("VibeCoded Orchestrator")

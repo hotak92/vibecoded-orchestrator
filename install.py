@@ -5408,7 +5408,7 @@ def main() -> int:
     # launcher binary lives outside the clone (e.g. `~/bin/`,
     # PATH-installed wrapper, etc.), which historically caused
     # `ProjectEnvSettings::populate` to omit `VCT_ORCHESTRATOR_ROOT`
-    # from `.claude/env` — see the instambul_map incident.
+    # from `.claude/env` — see the user_project_x incident.
     #
     # Approach: write the install_path to a seed file at
     # `<install>/.vct/install_path_seed.txt`. On first launcher boot
@@ -14850,7 +14850,7 @@ def _seed_launcher_install_path(install_path: Path,
     wrapper at `~/bin/vct-launcher` pointing at a clone in `~/dev/`).
     `ProjectEnvSettings::populate` then returns `orchestrator_root=None`
     and `VCT_ORCHESTRATOR_ROOT` is OMITTED from `.claude/env` — which
-    bit the instambul_map user.
+    bit the user_project_x user.
 
     Seeding the resolver out-of-band closes this gap: install.py knows
     where it's running, so it just records the absolute path. On first

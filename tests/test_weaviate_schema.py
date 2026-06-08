@@ -170,7 +170,7 @@ class IsCodeCollectionTests(unittest.TestCase):
             self.assertTrue(ws.is_code_collection(n))
 
     def test_per_project_prefixes_match(self):
-        for n in ("MyProject_CodeFunction", "SD15_CodeAPI",
+        for n in ("MyProject_CodeFunction", "MyProject_CodeAPI",
                   "Vibecoded_orchestrator_CodeInteraction"):
             self.assertTrue(ws.is_code_collection(n))
 
@@ -439,9 +439,9 @@ class EnumerateTests(unittest.TestCase):
         self._all_classes = [
             "ClaudeOrchestrator_KnowledgeGraph",
             "ClaudeOrchestrator_Development",
-            "SD15_KnowledgeGraph",
-            "SD15_CodeFunction",
-            "SD15_CodeClass",
+            "MyProject_KnowledgeGraph",
+            "MyProject_CodeFunction",
+            "MyProject_CodeClass",
             "CodeFunction",  # bare name (legacy)
             "Vibecoded_orchestrator_CodeInteraction",
             "VibeCodedOrchestrator_KnowledgeGraph",  # shared KG (canonical)
@@ -458,42 +458,42 @@ class EnumerateTests(unittest.TestCase):
         # Must include both per-project KG/Dev classes and the shared KG.
         self.assertIn("ClaudeOrchestrator_KnowledgeGraph", found)
         self.assertIn("ClaudeOrchestrator_Development", found)
-        self.assertIn("SD15_KnowledgeGraph", found)
+        self.assertIn("MyProject_KnowledgeGraph", found)
         self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", found)
         # Must NOT include code collections or unrelated names.
-        self.assertNotIn("SD15_CodeFunction", found)
+        self.assertNotIn("MyProject_CodeFunction", found)
         self.assertNotIn("Random_OtherCollection", found)
 
     def test_enumerate_kg_per_project(self):
-        found = ws.enumerate_kg_collections(project_name="SD15")
-        # SD15_KnowledgeGraph exists in the listed; Development doesn't.
-        self.assertIn("SD15_KnowledgeGraph", found)
+        found = ws.enumerate_kg_collections(project_name="MyProject")
+        # MyProject_KnowledgeGraph exists in the listed; Development doesn't.
+        self.assertIn("MyProject_KnowledgeGraph", found)
         # Dev is absent in our fixture, so it must NOT appear (filtered out).
-        self.assertNotIn("SD15_Development", found)
+        self.assertNotIn("MyProject_Development", found)
         # Shared KG always part of per-project triple (if listed).
         self.assertIn("VibeCodedOrchestrator_KnowledgeGraph", found)
 
     def test_enumerate_code_all_projects(self):
         found = ws.enumerate_code_collections(project_name=None)
         # Per-project code classes + bare-name legacy class included.
-        self.assertIn("SD15_CodeFunction", found)
-        self.assertIn("SD15_CodeClass", found)
+        self.assertIn("MyProject_CodeFunction", found)
+        self.assertIn("MyProject_CodeClass", found)
         self.assertIn("Vibecoded_orchestrator_CodeInteraction", found)
         self.assertIn("CodeFunction", found)
         # KG and unrelated NOT included.
-        self.assertNotIn("SD15_KnowledgeGraph", found)
+        self.assertNotIn("MyProject_KnowledgeGraph", found)
         self.assertNotIn("Random_OtherCollection", found)
 
     def test_enumerate_code_per_project(self):
-        found = ws.enumerate_code_collections(project_name="SD15")
+        found = ws.enumerate_code_collections(project_name="MyProject")
         # Project-prefixed code classes that actually exist.
-        self.assertIn("SD15_CodeFunction", found)
-        self.assertIn("SD15_CodeClass", found)
+        self.assertIn("MyProject_CodeFunction", found)
+        self.assertIn("MyProject_CodeClass", found)
         # Bare-name code classes that exist also included.
         self.assertIn("CodeFunction", found)
         # Project-prefixed code classes NOT in the listed set are excluded.
-        self.assertNotIn("SD15_CodeAPI", found)
-        # Non-SD15 code classes NOT included.
+        self.assertNotIn("MyProject_CodeAPI", found)
+        # Non-MyProject code classes NOT included.
         self.assertNotIn("Vibecoded_orchestrator_CodeInteraction", found)
 
 

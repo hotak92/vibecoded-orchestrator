@@ -1661,8 +1661,8 @@ _DEFAULT_RESTART_CONTAINER: str = "__resolve_lazily__"
 # Pre-v0.2.0 orchestrators created KG/Dev collections with different schema
 # shapes than the current code expects:
 #
-#   * Case-only name conflicts: old `SD15_development` (lowercase d) vs new
-#     `SD15_Development` (capital D). Weaviate stores class names case-
+#   * Case-only name conflicts: old `MyProject_development` (lowercase d) vs new
+#     `MyProject_Development` (capital D). Weaviate stores class names case-
 #     sensitively but rejects POSTs of "similar" classes with HTTP 422
 #     `class already exists: found similar class "<actual>"`.
 #

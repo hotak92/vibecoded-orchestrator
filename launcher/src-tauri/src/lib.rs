@@ -660,7 +660,7 @@ pub fn run() {
             // pointing at a clone in `~/dev/`). `ProjectEnvSettings::populate`
             // then returns `orchestrator_root=None` and
             // `VCT_ORCHESTRATOR_ROOT` is OMITTED from `.claude/env` —
-            // exactly the bug that hit instambul_map / SD15 pre-v0.2.37.
+            // exactly the bug that hit user_project_x / user_project_y pre-v0.2.37.
             //
             // install.py knows the install path with certainty (it's
             // PROJECT_ROOT), so it records it out-of-band; this hook
@@ -2979,7 +2979,7 @@ mod boot_sweep_tests {
 // Companion to `install.py::_seed_launcher_install_path`. The seed file
 // is the out-of-band channel that primes the launcher's DB cache for
 // the canonical orchestrator-root resolver, closing the
-// "binary-outside-clone" gap that produced the SD15 / instambul_map
+// "binary-outside-clone" gap that produced the user_project_y / user_project_x
 // "missing VCT_ORCHESTRATOR_ROOT" bug.
 
 #[cfg(test)]

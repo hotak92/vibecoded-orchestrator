@@ -52,7 +52,7 @@ Locked design decisions (from the v0.2.18 plan):
 CLI entry::
 
     python -m vco_lib.embedding_enrichment enrich \\
-        --collection SD15_KnowledgeGraph \\
+        --collection MyProject_KnowledgeGraph \\
         --new-slot arctic2_embed \\
         [--project-root /path/to/project] \\
         [--dry-run] \\
@@ -62,7 +62,7 @@ CLI entry::
 Output (``--json``):
 
     {
-      "collection": "SD15_KnowledgeGraph",
+      "collection": "MyProject_KnowledgeGraph",
       "new_slot": "arctic2_embed",
       "total": 1234,
       "enriched": 1199,
@@ -443,7 +443,7 @@ def enrich_collection_vectors(
 
     Args:
         collection_name: Weaviate class name (e.g.
-            ``"SD15_KnowledgeGraph"``, ``"SD15_CodeFunction"``).
+            ``"MyProject_KnowledgeGraph"``, ``"MyProject_CodeFunction"``).
         new_slot: Target named-vector slot (e.g. ``"arctic2_embed"``,
             ``"openai_text_embed"``, ``"openai_code_embed"``,
             ``"jina_embed"``).
@@ -888,7 +888,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     enrich.add_argument(
         "--collection", required=True,
-        help="Weaviate class name to enrich (e.g. SD15_KnowledgeGraph)",
+        help="Weaviate class name to enrich (e.g. MyProject_KnowledgeGraph)",
     )
     enrich.add_argument(
         "--new-slot", required=True,

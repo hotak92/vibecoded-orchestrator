@@ -5784,7 +5784,7 @@ pub async fn apply_pending_install(
 /// available MUST use `resolve_orchestrator_root(db)` instead, so the
 /// DB cache stays warm and `ProjectEnvSettings::populate` can emit
 /// `VCT_ORCHESTRATOR_ROOT` even when the binary lives outside the
-/// clone (the bug that hit instambul_map pre-v0.2.37).
+/// clone (the bug that hit user_project_x pre-v0.2.37).
 ///
 /// Privacy note (2026-05-06): no `env!("CARGO_MANIFEST_DIR")` or
 /// `option_env!("VCT_REPO_ROOT")` fallback. Both bake the build-host's

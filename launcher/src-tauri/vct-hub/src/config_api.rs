@@ -2130,7 +2130,7 @@ kg_tier_full = 0.8
         assert_eq!(sanitize_diagrams_class_prefix("Foo"), "Foo");
         assert_eq!(sanitize_diagrams_class_prefix("foo"), "Foo");
         assert_eq!(sanitize_diagrams_class_prefix("VCODev"), "VCODev");
-        assert_eq!(sanitize_diagrams_class_prefix("SD15"), "SD15");
+        assert_eq!(sanitize_diagrams_class_prefix("MyProject"), "MyProject");
 
         // Non-alphanumeric inputs (THE bug being fixed — these are the
         // cases pre-cr-b2 returned divergent results for, silently
@@ -2169,7 +2169,7 @@ kg_tier_full = 0.8
         assert_eq!(sanitize_diagrams_class_prefix("_only_"), "Only");
 
         // Idempotency: sanitiser output must be a fixed point.
-        for input in &["FooBar", "VCODev", "SD15", "MyProjectV2"] {
+        for input in &["FooBar", "VCODev", "MyProject", "MyProjectV2"] {
             let once = sanitize_diagrams_class_prefix(input);
             let twice = sanitize_diagrams_class_prefix(&once);
             assert_eq!(once, twice, "Not idempotent for {:?}", input);

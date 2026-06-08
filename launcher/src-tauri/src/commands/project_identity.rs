@@ -1959,7 +1959,7 @@ mod tests {
         // Ensure normalisation doesn't collapse different projects together.
         assert_ne!(
             normalise_prefix_for_match("Camel_Case"),
-            normalise_prefix_for_match("SD15")
+            normalise_prefix_for_match("MyProject")
         );
         assert_ne!(
             normalise_prefix_for_match("VibeCodedOrchestrator"),

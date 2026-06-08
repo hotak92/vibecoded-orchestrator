@@ -23,7 +23,7 @@
 //! ```
 //!
 //! ```json
-//! {"collection":"SD15_KnowledgeGraph","new_slot":"arctic2_embed",
+//! {"collection":"MyProject_KnowledgeGraph","new_slot":"arctic2_embed",
 //!  "total":1000,"enriched":995,"skipped":0,"failed":5,"failures":[...]}
 //! ```
 //!
@@ -168,7 +168,7 @@ fn resolve_python_for_vco_lib() -> Option<PathBuf> {
 /// Run an enrichment pass against one Weaviate collection.
 ///
 /// * `collection_name` — Weaviate class name to enrich (e.g.
-///   `"SD15_KnowledgeGraph"`).
+///   `"MyProject_KnowledgeGraph"`).
 /// * `new_slot` — Named-vector slot to populate (e.g.
 ///   `"arctic2_embed"`). Must be in the slot catalog AND in the live
 ///   schema (run `migrate-collections` first if not).

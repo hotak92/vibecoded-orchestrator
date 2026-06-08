@@ -693,7 +693,7 @@ pub fn populate(
         // fallback path takes over).
         //
         // v0.2.37: was `find_local_repo_root().ok()` — the uncached
-        // walk-up resolver. That bit instambul_map: when the launcher
+        // walk-up resolver. That bit user_project_x: when the launcher
         // binary lived at `~/bin/vct-launcher` and the clone at
         // `~/dev/vco/`, the walk-up returned None and
         // `VCT_ORCHESTRATOR_ROOT` was OMITTED from `.claude/env`

@@ -1453,7 +1453,7 @@ pub async fn update_project_v2(
     //    this release stayed pinned to whatever `.claude/env` their
     //    `create_project_v2` call wrote at the time. Combined with
     //    Finding F1 (apply_project_env_via_python now passes
-    //    --orchestrator-root), this closes the SD15-style "missing
+    //    --orchestrator-root), this closes the user-project-style "missing
     //    VCT_ORCHESTRATOR_ROOT" gap on every bundle update — existing
     //    projects self-heal the next time the user clicks Update.
     //
@@ -1787,7 +1787,7 @@ fn apply_project_env_via_python(
     // silently omitted those two keys (the production writer surface
     // since Phase 0.B Part 2 migrated away from the Rust
     // `write_project_env_files`). This is the actual root cause of
-    // the instambul_map / SD15 "missing VCT_ORCHESTRATOR_ROOT" bug.
+    // the user_project_x / the "missing VCT_ORCHESTRATOR_ROOT" bug.
     //
     // Resolution order matches the canonical Rust resolver:
     //   1. `resolve_orchestrator_root(db)` — DB cache (sticky after
@@ -3526,7 +3526,7 @@ pub struct RefreshProjectEnvResult {
 ///
 /// Used by:
 ///   * The launcher's first-boot setup hook (post seed consumption)
-///     — re-renders env for every project so the SD15-style
+///     — re-renders env for every project so the user-project-style
 ///     "missing exports" state is healed automatically.
 ///   * The launcher GUI's "Refresh all projects" admin action, if a
 ///     user wants to force a manual refresh after a manual edit to
@@ -9506,7 +9506,7 @@ export BY_HAND_KEY=\"user_typed\"
     // `VCT_ORCHESTRATOR_ROOT` + `VCT_INFRASTRUCTURE_DIR` when the apply
     // call receives `orchestrator_root is not None` — so the launcher
     // was silently asking the Python writer NOT to emit those keys.
-    // This is the actual root cause of the SD15 / instambul_map bug.
+    // This is the actual root cause of the user_project_y / user_project_x bug.
     //
     // These tests pin the contract on the `build_config_projection_apply_args`
     // helper: when the Rust resolver hands us a `Some(path)`, the flag
@@ -9686,7 +9686,7 @@ export BY_HAND_KEY=\"user_typed\"
             settings.orchestrator_root.as_ref(),
             Some(&install),
             "populate must return the DB-cached install path as \
-             orchestrator_root (instambul_map / SD15 bugfix). \
+             orchestrator_root (user_project_x / user_project_y bugfix). \
              Got: {:?}",
             settings.orchestrator_root,
         );
@@ -9728,7 +9728,7 @@ export BY_HAND_KEY=\"user_typed\"
     // `apply_project_env_via_python` call. If a future refactor
     // accidentally drops this call, this test fails LOUDLY with the
     // exact regression message — which is much louder than the silent
-    // SD15 "missing VCT_ORCHESTRATOR_ROOT" the F6 fix targets.
+    // the "missing VCT_ORCHESTRATOR_ROOT" the F6 fix targets.
     #[test]
     fn update_project_v2_calls_apply_project_env_via_python() {
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -9759,7 +9759,7 @@ export BY_HAND_KEY=\"user_typed\"
             "F6 regression: update_project_v2 no longer calls \
              apply_project_env_via_python. Pre-v0.2.37 this was the \
              cause of stale `.claude/env` on bundle update (the \
-             SD15 missing-VCT_ORCHESTRATOR_ROOT bug). If you \
+             missing-VCT_ORCHESTRATOR_ROOT bug). If you \
              intentionally removed the call, update this test with \
              the rationale and audit ALL bundle-update users."
         );

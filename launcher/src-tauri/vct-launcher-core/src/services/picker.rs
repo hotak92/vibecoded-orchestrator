@@ -632,7 +632,7 @@ mod tests {
         assert!(is_canonical_collection("ChatMessages"));
         // Suffix match — orchestrator-prefixed collection.
         assert!(is_canonical_collection("ClaudeOrchestrator_CodeFunction"));
-        assert!(is_canonical_collection("SD15_KnowledgeGraph"));
+        assert!(is_canonical_collection("MyProject_KnowledgeGraph"));
         assert!(is_canonical_collection("MyProject_development"));
         // Non-canonical: no exact match, no underscore suffix match.
         assert!(!is_canonical_collection("RandomClass"));

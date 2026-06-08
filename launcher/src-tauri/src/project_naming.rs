@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn smoke_sd15() {
-        assert_eq!(canonical_class_prefix("SD15").unwrap(), "SD15");
+        assert_eq!(canonical_class_prefix("MyProject").unwrap(), "MyProject");
     }
 
     #[test]
@@ -275,7 +275,7 @@ mod tests {
         let inputs = [
             "VibeCodedOrchestrator",
             "Camel_Case",
-            "SD15",
+            "MyProject",
             "Foo_Bar",
         ];
         for inp in inputs {

@@ -42,9 +42,9 @@ check_pattern() {
     local exclude_pattern="${3:-}"
     local hits
     if [ -n "$exclude_pattern" ]; then
-        hits=$(git grep -l -E "$pattern" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:CHANGELOG.md' 2>/dev/null | grep -Ev "$exclude_pattern" || true)
+        hits=$(git grep -l -E "$pattern" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/pre-ship-check.sh' ':!:CHANGELOG.md' 2>/dev/null | grep -Ev "$exclude_pattern" || true)
     else
-        hits=$(git grep -l -E "$pattern" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:CHANGELOG.md' 2>/dev/null || true)
+        hits=$(git grep -l -E "$pattern" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/pre-ship-check.sh' ':!:CHANGELOG.md' 2>/dev/null || true)
     fi
     if [ -n "$hits" ]; then
         echo "::error::pre-tag privacy gate: $description"

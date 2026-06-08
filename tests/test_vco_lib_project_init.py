@@ -431,7 +431,7 @@ class SchemaIncompatibleTests(unittest.TestCase):
         self.assertIn("single-vector", reason)
 
     def test_missing_named_vector_slot_is_incompatible(self):
-        # SD15_KnowledgeGraph case: pre-2026-04 schema has ollama_embed +
+        # MyProject_KnowledgeGraph case: pre-2026-04 schema has ollama_embed +
         # qwen3_embed but missing openai_embed slot. New code's
         # sync_knowledge_graph.py writes a single named vector and Weaviate
         # rejects mismatched slot sets with HTTP 422.
@@ -495,13 +495,13 @@ class ExtractSimilarClassNameTests(unittest.TestCase):
 
     def test_extracts_from_canonical_422(self):
         body = (
-            'POST /v1/schema (SD15_Development) → HTTP 422: '
+            'POST /v1/schema (MyProject_Development) → HTTP 422: '
             '{"error":[{"message":"class already exists: found similar '
-            'class \\"SD15_development\\""}]}'
+            'class \\"MyProject_development\\""}]}'
         )
         self.assertEqual(
             project_init._extract_similar_class_name(body),
-            "SD15_development",
+            "MyProject_development",
         )
 
     def test_extracts_with_dotted_names(self):
@@ -517,20 +517,20 @@ class ExtractSimilarClassNameTests(unittest.TestCase):
         a RuntimeError string. That means the inner JSON's `\\"` escape
         becomes `\\\\"` in the final str — TWO backslashes before the quote.
 
-        Regression test for v0.2.4 SD15 ship: the single-backslash regex
+        Regression test for v0.2.4 first ship: the single-backslash regex
         matched the canonical_422 test above but missed the bytes-repr
         form, so case-conflict recovery silently failed for the real bug
         it was written to fix. Lesson: tests should match the EXACT
         error string produced by the runtime, not the simplified form.
         """
         body = (
-            "RuntimeError: POST /v1/schema (SD15_Development) → HTTP 422: "
+            "RuntimeError: POST /v1/schema (MyProject_Development) → HTTP 422: "
             "b'{\"error\":[{\"message\":\"class already exists: found similar "
-            "class \\\\\"SD15_development\\\\\"\"}]}\\n'"
+            "class \\\\\"MyProject_development\\\\\"\"}]}\\n'"
         )
         self.assertEqual(
             project_init._extract_similar_class_name(body),
-            "SD15_development",
+            "MyProject_development",
         )
 
     def test_returns_none_on_unrelated_message(self):
@@ -659,33 +659,33 @@ class BootstrapCollectionsRegenTests(unittest.TestCase):
         self.assertEqual(result["errors"], [])
 
     def test_case_only_conflict_drops_old_and_creates_new(self):
-        # SD15 case: existence-probe says None (no exact-name match),
-        # but POST returns 422 "found similar class 'SD15_development'".
+        # MyProject case: existence-probe says None (no exact-name match),
+        # but POST returns 422 "found similar class 'MyProject_development'".
         # Recovery: drop the old-cased class, recreate with the target name.
-        target_kg = project_init.kg_class_definition("SD15_KnowledgeGraph")
+        target_kg = project_init.kg_class_definition("MyProject_KnowledgeGraph")
         # Fetcher: KG already exists at-target so it's marked exists; Dev
         # doesn't exist (None); Shared also exists at-target.
         def fetcher(name, weaviate_url=None):
-            if name == "SD15_KnowledgeGraph":
+            if name == "MyProject_KnowledgeGraph":
                 return target_kg
-            if name == "SD15_Development":
+            if name == "MyProject_Development":
                 return None  # We pretend it's missing, then 422 on POST.
             # Shared KG exists at-target.
             if name == project_init._SHARED_KG_NAME:
                 return project_init.kg_class_definition(project_init._SHARED_KG_NAME)
             return None
 
-        # First call to _create_class for SD15_Development raises a
-        # "similar class" error; the recovery call for SD15_development
+        # First call to _create_class for MyProject_Development raises a
+        # "similar class" error; the recovery call for MyProject_development
         # then succeeds.
         create_calls: list[str] = []
         def create_side_effect(payload, weaviate_url=None):
             create_calls.append(payload["class"])
-            if payload["class"] == "SD15_Development" and len(create_calls) == 1:
+            if payload["class"] == "MyProject_Development" and len(create_calls) == 1:
                 raise RuntimeError(
-                    'POST /v1/schema (SD15_Development) → HTTP 422: '
+                    'POST /v1/schema (MyProject_Development) → HTTP 422: '
                     '{"error":[{"message":"class already exists: found '
-                    'similar class \\"SD15_development\\""}]}'
+                    'similar class \\"MyProject_development\\""}]}'
                 )
             # Subsequent calls (recovery + others) succeed silently.
             return None
@@ -703,19 +703,19 @@ class BootstrapCollectionsRegenTests(unittest.TestCase):
                         project_init, "_snapshot_collection_for_rebuild",
                         return_value={"object_count": 0, "sample_uuids": []},
                     ):
-                        result = project_init.bootstrap_collections("SD15")
+                        result = project_init.bootstrap_collections("MyProject")
 
         # Regen envelope flags case-conflict with the lowercase old name.
         regens = {r["collection"]: r for r in result["regenerated"]}
-        self.assertIn("SD15_Development", regens)
-        self.assertEqual(regens["SD15_Development"]["reason"], "case-conflict")
-        self.assertEqual(regens["SD15_Development"]["dropped_name"],
-                         "SD15_development")
+        self.assertIn("MyProject_Development", regens)
+        self.assertEqual(regens["MyProject_Development"]["reason"], "case-conflict")
+        self.assertEqual(regens["MyProject_Development"]["dropped_name"],
+                         "MyProject_development")
         # The lowercase collection got dropped during recovery.
-        self.assertIn("SD15_development", delete_targets)
+        self.assertIn("MyProject_development", delete_targets)
         # create_class was retried with the target name after the drop.
         # The first attempt failed with 422; the second (post-drop) succeeded.
-        self.assertGreaterEqual(create_calls.count("SD15_Development"), 2)
+        self.assertGreaterEqual(create_calls.count("MyProject_Development"), 2)
         self.assertEqual(result["errors"], [])
 
     def test_dry_run_reports_would_regenerate_without_mutating(self):

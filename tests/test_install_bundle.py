@@ -904,7 +904,7 @@ class DeferralCommandPortabilityTests(unittest.TestCase):
 
 class DeferralFileListCapTests(unittest.TestCase):
     """Item 3 / Gap 2 (deferral-ux-polish 2026-05-13): the file-list cap in
-    `_format_file_list_md` was 20, which silently truncated SD15's 36-file
+    `_format_file_list_md` was 20, which silently truncated a real user's 36-file
     deferral. Bumped to 100 so realistic preserve/skip lists land inline.
     """
 
@@ -959,7 +959,7 @@ class DeferralReconcileTests(unittest.TestCase):
         return self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
 
     def test_force_update_clears_stale_skipped_existing_deferral(self):
-        """The SD15 smoking-gun bug: first-install preserves files →
+        """The Smoking-gun bug: first-install preserves files →
         UPDATE_DEFERRED.md written with bundle_skipped_existing_files. User
         then runs --update --force which overwrites every preserved file.
         Pre-fix: the deferral .md still exists with the stale entry,
@@ -1087,7 +1087,7 @@ class DeferralReconcileTests(unittest.TestCase):
 
         # Manually inject a stale bundle_skipped_existing_files entry into
         # the deferral file (simulates a prior fresh-install run that left
-        # it behind — the SD15 starting condition).
+        # it behind — the user-project starting condition).
         from vco_lib.deferral_report import DeferralEntry, DeferralReport as DR
         report = DR.read(self.proj)
         report.add_entry(DeferralEntry(

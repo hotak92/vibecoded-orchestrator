@@ -66,7 +66,7 @@ fn load_fixture() -> Fixture {
     );
     assert!(
         !fix.cases.is_empty(),
-        "Fixture has no success cases — at minimum should pin SD15 and Camel_Case"
+        "Fixture has no success cases — at minimum should pin MyProject and Camel_Case"
     );
     fix
 }
