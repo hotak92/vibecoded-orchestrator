@@ -2266,4 +2266,229 @@ mod hub_access_matrix_wiring_tests {
             );
         }
     }
+
+    // ─── Phase 8 follow-up: list-by-level access endpoint (Q2 enrichment) ─
+    //
+    // The new `GET /projects/{id}/access?level=write` endpoint
+    // consumed by the MCP server's deny-branch enrichment in
+    // `weaviate_mcp/server.py::store_knowledge_node` to render a
+    // self-resolving error response that names the collections
+    // the project CAN write to. Per user Q2 directive 2026-06-08:
+    // "in that warning tell Claude also where it has the permission
+    // to write to".
+
+    #[tokio::test]
+    async fn list_access_by_level_returns_writable_collections() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "ListByLevel",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Note: `cli/projects` POST auto-populates the access matrix
+        // via `populate_kg_collection_access_for_project` (SB2 path).
+        // The project starts with 3 default Write rows:
+        //   - ListByLevel_KnowledgeGraph
+        //   - ListByLevel_Development
+        //   - VibeCodedOrchestrator_KnowledgeGraph
+        // Add ON TOP of those: 2 more write + 1 read + 1 none.
+        handle.0.kg_set_access(&pid, "Writable_A", "write").unwrap();
+        handle.0.kg_set_access(&pid, "Writable_B", "write").unwrap();
+        handle.0.kg_set_access(&pid, "Readonly_C", "read").unwrap();
+        handle.0.kg_set_access(&pid, "Denied_D", "none").unwrap();
+
+        let resp = client
+            .get(format!("{}/projects/{}/access?level=write", base, pid))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "expected 200, got {}", resp.status());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let collections: Vec<&str> = body
+            .get("collections")
+            .and_then(|v| v.as_array())
+            .expect("collections array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        // Total writables: 3 from auto-populate + 2 explicit = 5.
+        // Sorted ascending by collection_name.
+        // Must NOT include Readonly_C or Denied_D.
+        assert_eq!(
+            collections,
+            vec![
+                "ListByLevel_Development",
+                "ListByLevel_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
+                "Writable_A",
+                "Writable_B",
+            ],
+            "list-by-level must return ONLY the requested-level rows + \
+             must NOT leak read/none rows into the writable list (the \
+             whole point of the enrichment is to tell the LLM where it \
+             CAN write, not just which rows exist). Also composes with \
+             SB2's auto-populate path (the 3 default rows shipped \
+             with project create)."
+        );
+        // Negative-case sentinel: explicit read/none rows MUST NOT appear.
+        assert!(
+            !collections.contains(&"Readonly_C"),
+            "read row leaked into writable list — silent privilege \
+             escalation regression"
+        );
+        assert!(
+            !collections.contains(&"Denied_D"),
+            "none row leaked into writable list — silent privilege \
+             escalation regression"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_access_by_level_filters_to_requested_level() {
+        // Same setup as the writable test, but query for read+none too.
+        // Pins that every level is correctly filtered.
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "ListByLevelAll",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // As in the prior test: cli/projects auto-populates 3 default
+        // Write rows: ListByLevelAll_KnowledgeGraph,
+        // ListByLevelAll_Development, VibeCodedOrchestrator_KnowledgeGraph.
+        handle.0.kg_set_access(&pid, "Alpha_W", "write").unwrap();
+        handle.0.kg_set_access(&pid, "Beta_R", "read").unwrap();
+        handle.0.kg_set_access(&pid, "Gamma_N", "none").unwrap();
+
+        for (level, expected) in &[
+            // write filter sees 3 auto-populated + 1 explicit = 4 rows.
+            (
+                "write",
+                vec![
+                    "Alpha_W",
+                    "ListByLevelAll_Development",
+                    "ListByLevelAll_KnowledgeGraph",
+                    "VibeCodedOrchestrator_KnowledgeGraph",
+                ],
+            ),
+            ("read", vec!["Beta_R"]),
+            ("none", vec!["Gamma_N"]),
+        ] {
+            let resp = client
+                .get(format!("{}/projects/{}/access?level={}", base, pid, level))
+                .send()
+                .await
+                .expect("send");
+            let body: serde_json::Value = resp.json().await.expect("json");
+            let collections: Vec<&str> = body
+                .get("collections")
+                .and_then(|v| v.as_array())
+                .expect("collections array")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(
+                &collections, expected,
+                "filter broke for level={}: got {:?}, expected {:?}",
+                level, collections, expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_access_by_level_rejects_invalid_level() {
+        // Strict allowlist: anything outside {read, write, none} → 400.
+        // Pre-fix a client could pass `?level=admin` (typo OR malicious)
+        // and silently get an empty array because no rows match — that
+        // would mask the bug. 400 makes the bug visible.
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "InvalidLevelReject",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        for bogus in &["admin", "WRITE", "rw", "", "writes"] {
+            let resp = client
+                .get(format!("{}/projects/{}/access?level={}", base, pid, bogus))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(
+                resp.status().as_u16(),
+                400,
+                "level='{}' must return 400, not silently empty",
+                bogus
+            );
+            let body: serde_json::Value = resp.json().await.expect("json");
+            assert!(
+                body.get("error")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.contains("invalid level"))
+                    .unwrap_or(false),
+                "expected 'invalid level' error for '{}', got: {:?}",
+                bogus,
+                body
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_access_by_level_404_for_unknown_project() {
+        // Same posture as the singular access endpoint: 404 on
+        // unknown project_id so the client's fail-open path has a
+        // diagnostic signal rather than silently returning an empty
+        // array.
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!(
+                "{}/projects/nonexistent-pid/access?level=write",
+                base
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status().as_u16(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert!(
+            body.get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("project not found"))
+                .unwrap_or(false),
+            "expected 'project not found' error, got: {:?}",
+            body
+        );
+    }
 }

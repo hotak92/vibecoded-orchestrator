@@ -9,7 +9,7 @@
 //! is deferred — same security posture as `modules_api.rs`.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, patch, post},
@@ -51,6 +51,17 @@ pub fn router() -> Router<LauncherDbHandle> {
         .route(
             "/projects/{project_id}/access/{collection}",
             get(get_collection_access),
+        )
+        // v0.2.49 access-matrix Step F (NEW for Q2 user directive):
+        // list-writable variant of the access endpoint. Consumed by
+        // the MCP server's deny-branch enrichment to tell the LLM
+        // caller WHICH collections the project DOES have write access
+        // to (so the deny response is self-resolving instead of
+        // opaque). Query param `level=write` is required; future
+        // expansion could add `level=read` if a use case emerges.
+        .route(
+            "/projects/{project_id}/access",
+            get(list_collection_access_by_level),
         )
 }
 
@@ -584,6 +595,115 @@ async fn get_collection_access(
     match h.0.kg_get_access(&project_id, &collection) {
         Ok(Some(level)) => Json(serde_json::json!({ "level": level })).into_response(),
         Ok(None) => Json(serde_json::json!({ "level": "none" })).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+// ─── List-by-level variant (v0.2.49 Step F, Q2 enrichment) ──────────────
+
+#[derive(Debug, Deserialize)]
+struct AccessLevelQuery {
+    level: String,
+}
+
+/// v0.2.49 access-matrix Step F (Q2 enrichment) — list-writable
+/// variant of the access endpoint.
+///
+/// Returns the collections this project has access to at the
+/// requested level. Consumed by the MCP server's deny-branch
+/// enrichment in `claude_mcp_servers/weaviate_mcp/server.py::
+/// store_knowledge_node` to render a self-resolving error
+/// response ("you can write to: X, Y, Z; to gain write on Foo,
+/// adjust via Launcher → Identity → Manage access") instead of
+/// the opaque pre-fix "Access matrix denies write" message.
+///
+/// Per user Q2 directive (verbatim, 2026-06-08): "in that
+/// warning tell Claude also where it has the permission to
+/// write to".
+///
+/// Response shape:
+///
+/// ```json
+/// { "collections": ["Foo_KnowledgeGraph", "Foo_Development", "VibeCodedOrchestrator_KnowledgeGraph"] }
+/// ```
+///
+/// Behaviour:
+///   - `?level=write` → collections where `access_level = 'write'`
+///   - `?level=read`  → collections where `access_level = 'read'`
+///   - `?level=none`  → collections where `access_level = 'none'`
+///     (explicit denies — useful for debugging the matrix, not
+///     consumed by the WRITE gate at present)
+///   - Any other value (or missing) → 400 with allowlist error
+///
+/// Sorted ascending by `collection_name` (matches `kg_list_access`
+/// underlying sort). Empty array if the project has no rows at
+/// that level (a fresh project pre-populate, or a project all of
+/// whose collections are at a different level).
+///
+/// Error cases:
+///   - `400 Bad Request` when `level` is missing or not in
+///     `{read, write, none}`.
+///   - `404 Not Found` when project_id is unknown. Caller's
+///     fail-open path takes over (same posture as the singular
+///     access endpoint).
+///   - `500 Internal Server Error` on DB error.
+///
+/// Auth: bearer token via the `auth` middleware (same posture as
+/// every `/api/v1/*` route except `/health`).
+///
+/// Latency: one indexed SQLite query against `kg_collection_access`
+/// (filtered by `project_id` + `access_level`). Sub-millisecond on
+/// warm cache. Clients on the deny path use a 2-second timeout
+/// because this fires from inside `store_knowledge_node`'s error
+/// branch — adding 5+ seconds of latency to an already-failed
+/// write would be poor UX. Endpoint itself is fast enough that
+/// the tight client timeout is conservative.
+async fn list_collection_access_by_level(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Query(q): Query<AccessLevelQuery>,
+) -> impl IntoResponse {
+    // Validate level against the AccessLevel enum's wire-stable values.
+    // Strict allowlist — anything else is a client bug surfaced as 400,
+    // not silently mapped to "none" (which would mask the bug).
+    if !matches!(q.level.as_str(), "read" | "write" | "none") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "invalid level '{}': must be one of 'read', 'write', 'none'",
+                    q.level
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    // Pre-check: project must exist. Same posture as
+    // `get_collection_access` — 404 lets the caller fail-open with a
+    // diagnostic signal.
+    match h.0.get_project(&project_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("project not found: {}", project_id)
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => return err500(e),
+    }
+
+    match h.0.kg_list_access(&project_id) {
+        Ok(rows) => {
+            let collections: Vec<String> = rows
+                .into_iter()
+                .filter_map(|(coll, lvl)| if lvl == q.level { Some(coll) } else { None })
+                .collect();
+            Json(serde_json::json!({ "collections": collections })).into_response()
+        }
         Err(e) => err500(e),
     }
 }
