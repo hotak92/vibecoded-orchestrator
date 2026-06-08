@@ -3145,6 +3145,64 @@ pub fn b12_repair_stale_kg_collection(
     Ok(B12Outcome::Repaired { canonical_kg })
 }
 
+/// v0.2.49 access-matrix Phase 4 (item #11): propagate a project rename
+/// into `kg_collection_access` rows whose collection_name derives from
+/// the project name.
+///
+/// Two name-derived collections track the rename:
+///   - `<Sanitized>_KnowledgeGraph` (own primary KG)
+///   - `<Sanitized>_Development`    (own dev collection)
+///
+/// Where `<Sanitized>` is `sanitize_kg_collection(project_name)`. The
+/// shared KG collection name is project-name-INDEPENDENT (resolved from
+/// `app_state` / `LAST_RESORT_SHARED_KG_COLLECTION`), so its access row
+/// is unaffected by rename.
+///
+/// Behaviour:
+///   - If `old_name == new_name` or the sanitized prefixes coincide
+///     (e.g. "Acme" → "ACME" both sanitize to "Acme") → no rename calls
+///     are issued (preserves idempotence and avoids spurious renames).
+///   - `kg_rename_access` honors the "never lower an existing
+///     privilege" invariant on collision (v0.2.46 adversarial-review
+///     L3), so pre-existing rows at the new collection name are
+///     preserved if the user had configured them.
+///   - Per-binding soft-fail: a failing rename surfaces as a warning;
+///     the boot reconcile (`Db::reconcile_kg_collection_access`)
+///     catches any stale rows on the next launcher start.
+///
+/// Returns warnings (empty on the happy path) for the caller to fold
+/// into `RenameProjectResult.warnings`.
+fn propagate_kg_access_on_rename(
+    db: &Db,
+    project_id: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if old_name == new_name {
+        return warnings;
+    }
+    let old_sanitized = sanitize_kg_collection(old_name);
+    let new_sanitized = sanitize_kg_collection(new_name);
+    if old_sanitized == new_sanitized {
+        return warnings;
+    }
+    for suffix in &["_KnowledgeGraph", "_Development"] {
+        let old_collection = format!("{}{}", old_sanitized, suffix);
+        let new_collection = format!("{}{}", new_sanitized, suffix);
+        if let Err(e) = db.kg_rename_access(project_id, &old_collection, &new_collection) {
+            let msg = format!(
+                "kg_rename_access({}, {} → {}): {}. Access matrix may carry \
+                 stale rows until next boot reconcile.",
+                project_id, old_collection, new_collection, e
+            );
+            eprintln!("[vct] warning: {}", msg);
+            warnings.push(msg);
+        }
+    }
+    warnings
+}
+
 #[command]
 pub async fn rename_project_v2(
     id: String,
@@ -3167,7 +3225,14 @@ pub async fn rename_project_v2(
     // the auto-heal is bypassed entirely. Match the create-time
     // reject at line 350+ for symmetry (host='orchestrator_root' is
     // a reserved value with a single fixed slug).
-    if let Some(row) = db.get_project(&id).ok().flatten() {
+    // v0.2.49 access-matrix Phase 4 (item #11): capture the OLD project
+    // name BEFORE rename so we can rewrite the kg_collection_access rows
+    // to track the new project-name-derived collection names. The fetch
+    // happens once here (and the orchestrator-root guard reuses the same
+    // result) — the alternative would be a second `get_project` after
+    // rename, which is correct but redundant.
+    let pre_rename_row = db.get_project(&id).ok().flatten();
+    if let Some(row) = &pre_rename_row {
         if row.host == ProjectHost::OrchestratorRoot {
             return Err(
                 "Cannot rename the orchestrator-root project: its slug \
@@ -3182,6 +3247,7 @@ pub async fn rename_project_v2(
             );
         }
     }
+    let old_name = pre_rename_row.as_ref().map(|r| r.name.clone());
 
     // Generate a fresh slug derived from the new name so URLs track
     // renames. The old slug becomes invalid; existing bookmarks 404
@@ -3194,6 +3260,15 @@ pub async fn rename_project_v2(
         .ok_or_else(|| format!("project {} not found after rename", id))?;
     let count = db.list_module_installs_for_project(&id)?.len() as u32;
     let mut warnings: Vec<String> = Vec::new();
+
+    // v0.2.49 access-matrix Phase 4 (item #11): propagate the project-name
+    // change into `kg_collection_access`. See `propagate_kg_access_on_rename`
+    // for the full contract + soft-fail discipline. Returned warnings
+    // (if any) flow into `RenameProjectResult.warnings` for the GUI to
+    // surface, matching the env-refresh failure surface below.
+    if let Some(old) = &old_name {
+        warnings.extend(propagate_kg_access_on_rename(&db, &id, old, &new_name));
+    }
 
     // B9 (2026-05-01): re-run env writers after DB rename so every
     // surface reflects the new KG_COLLECTION, DEVELOPMENT_COLLECTION,
@@ -6504,6 +6579,129 @@ mod tests {
                    "RenameProjectResult.warnings must capture the env-refresh failure");
         assert!(warnings[0].contains("rename env refresh"),
                 "warning must identify the failing surface: {:?}", warnings[0]);
+    }
+
+    // ─── v0.2.49 access-matrix Phase 4 (item #11) — rename propagation ───
+
+    /// `propagate_kg_access_on_rename` rewrites the own-primary and
+    /// own-dev access rows from the old project name to the new name
+    /// when the rename changes the sanitized prefix. Pre-Phase-4 these
+    /// rows became orphans on rename, and the newly-derived collection
+    /// names had no access grant — so `require_kg_read` rejected every
+    /// KG access for the project until manual repair via the GUI.
+    #[test]
+    fn rename_project_v2_renames_access_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+
+        // Seed the access matrix as `create_project_v2` would (the
+        // populate path writes 3 rows: own primary write, own dev write,
+        // shared read).
+        db.populate_kg_collection_access_for_project(&pid, "Acme").unwrap();
+        assert_eq!(db.kg_list_access(&pid).unwrap().len(), 3);
+
+        // Mimic the rename: DB row renamed, then propagate.
+        db.rename_project(&pid, "Beta", Some("beta")).unwrap();
+        let warnings = propagate_kg_access_on_rename(&db, &pid, "Acme", "Beta");
+        assert!(warnings.is_empty(), "happy path emits no warnings: {:?}", warnings);
+
+        // Old name's rows are gone; new name's rows hold the prior levels.
+        let access = db.kg_list_access(&pid).unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> =
+            access.iter().map(|(c, l)| (c.as_str(), l.as_str())).collect();
+        assert_eq!(by_collection.get("Acme_KnowledgeGraph"), None);
+        assert_eq!(by_collection.get("Acme_Development"), None);
+        assert_eq!(by_collection.get("Beta_KnowledgeGraph"), Some(&"write"));
+        assert_eq!(by_collection.get("Beta_Development"), Some(&"write"));
+        // Shared row untouched (project-name-INDEPENDENT collection name).
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            Some(&"read")
+        );
+    }
+
+    #[test]
+    fn rename_preserves_user_configured_levels_on_collision() {
+        // Pre-rename, a user has manually configured an entry under
+        // BOTH the old name's prefix AND the new name's prefix (the
+        // latter could come from a prior re-onboard cycle). The rename
+        // must merge without lowering the existing privilege at the
+        // target name.
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+
+        // Old name: write (from default populate).
+        db.kg_set_access(&pid, "Acme_KnowledgeGraph", "write").unwrap();
+        // New name's row pre-exists at "read" (user downgraded earlier).
+        db.kg_set_access(&pid, "Beta_KnowledgeGraph", "read").unwrap();
+
+        let _ = propagate_kg_access_on_rename(&db, &pid, "Acme", "Beta");
+
+        let access = db.kg_list_access(&pid).unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> =
+            access.iter().map(|(c, l)| (c.as_str(), l.as_str())).collect();
+        // Old row gone.
+        assert_eq!(by_collection.get("Acme_KnowledgeGraph"), None);
+        // New row UPGRADED to write (source had higher privilege). This
+        // matches the v0.2.46-L3 "never lower an existing privilege"
+        // invariant baked into `kg_rename_access`.
+        assert_eq!(
+            by_collection.get("Beta_KnowledgeGraph"),
+            Some(&"write"),
+            "L3 invariant: rename must upgrade target to source's higher \
+             privilege, never silently downgrade"
+        );
+    }
+
+    #[test]
+    fn rename_no_op_when_sanitized_prefix_unchanged() {
+        // "Acme Corp" and "Acme-Corp" both sanitize to "AcmeCorp" —
+        // the rename is display-only (separator change), no collection
+        // name changes. Propagation MUST NOT issue rename calls (no
+        // spurious work; rows survive untouched).
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme Corp", "/tmp/acme", ProjectHost::Base, "acme-corp").unwrap();
+        db.populate_kg_collection_access_for_project(&pid, "Acme Corp").unwrap();
+
+        let warnings = propagate_kg_access_on_rename(&db, &pid, "Acme Corp", "Acme-Corp");
+        assert!(warnings.is_empty());
+
+        // Rows still exist under the unchanged sanitized prefix
+        // ("AcmeCorp_*"); no spurious "Acme Corp_*" or "Acme-Corp_*"
+        // entries were created.
+        let access = db.kg_list_access(&pid).unwrap();
+        let by_collection: std::collections::HashSet<&str> =
+            access.iter().map(|(c, _)| c.as_str()).collect();
+        assert!(by_collection.contains("AcmeCorp_KnowledgeGraph"));
+        assert!(by_collection.contains("AcmeCorp_Development"));
+        assert_eq!(by_collection.len(), 3, "no new rows created on no-op rename");
+    }
+
+    #[test]
+    fn rename_does_not_touch_shared_kg_row() {
+        // The shared KG collection name is project-name-INDEPENDENT —
+        // propagation MUST leave its access row alone.
+        let db = Db::open_in_memory().unwrap();
+        let pid = uuid::Uuid::new_v4().to_string();
+        db.insert_project(&pid, "Acme", "/tmp/acme", ProjectHost::Base, "acme").unwrap();
+        db.populate_kg_collection_access_for_project(&pid, "Acme").unwrap();
+
+        // Capture the shared row before rename.
+        let before = db
+            .kg_get_access(&pid, "VibeCodedOrchestrator_KnowledgeGraph")
+            .unwrap();
+        assert_eq!(before.as_deref(), Some("read"));
+
+        propagate_kg_access_on_rename(&db, &pid, "Acme", "Beta");
+
+        let after = db
+            .kg_get_access(&pid, "VibeCodedOrchestrator_KnowledgeGraph")
+            .unwrap();
+        assert_eq!(after.as_deref(), Some("read"),
+                   "shared row must not be touched by project-name rename");
     }
 
     // ─── PR 4 (2026-05-01): bundle install + bootstrap collections ─────
