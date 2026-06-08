@@ -499,6 +499,32 @@ def _log_install_event(step: str, phase: str, detail: str = "",
         with path.open("a", encoding="utf-8") as f:
             f.write(line)
             f.flush()
+
+        # v0.2.49 batch 4: optional stdout mirror so the launcher's
+        # OrchestratorUpdateProgressModal can surface sub-progress while
+        # `install.py --update` is in flight (the modal otherwise sits
+        # at 40% "Applying updates..." for the entire re-embedding
+        # phase — minutes of apparent freeze).
+        #
+        # Gated on VCO_PROGRESS_STREAM=1 so terminal users don't see
+        # the extra noise. Format: `[VCO-EVENT] <step> <phase> <detail>`
+        # — single line, no JSON, the launcher parses it via
+        # str-split on whitespace (cheap, no JSON parse cost on the
+        # hot path).
+        if os.environ.get("VCO_PROGRESS_STREAM") == "1":
+            try:
+                # Strip newlines from detail — multiline stage messages
+                # would break the launcher's line-buffered parser.
+                safe_detail = (detail or "").replace("\n", " ").replace("\r", " ")
+                sys.stdout.write(
+                    f"[VCO-EVENT] {step} {phase} {safe_detail}\n"
+                )
+                sys.stdout.flush()
+            except Exception:
+                # Stdout failure (terminal disconnect, pipe closed) is
+                # not a reason to break the install. The JSONL log
+                # above already succeeded.
+                pass
     except Exception:
         # Per the contract: NEVER let a log failure break the install.
         pass
@@ -3058,6 +3084,163 @@ def _vct_state_dir() -> Path:
 import contextlib as _contextlib
 
 
+# ---------------------------------------------------------------------------
+# v0.2.49: main()-entry single-instance lock for `install.py --update`.
+#
+# Background: V44-I's `_install_advisory_lock` is called from EXACTLY ONE
+# narrow site (the orchestrator-root rebind path at ~line 11193). The
+# broader `install.py --update` run is not protected. A bug reported
+# 2026-06-05 (Fabio's machine) showed two concurrent `install.py --update`
+# invocations deadlocking for 13 minutes — one held partial state, the
+# other spun in retry-with-backoff loops until timeout.
+#
+# This module-level pair coordinates the main()-entry guard and the V44-I
+# narrow-block guard on the SAME lock file. On POSIX `fcntl.flock` is
+# reentrant on a single fd held by the same process; on Windows
+# `msvcrt.locking` is NOT reentrant. The flag short-circuits cleanly
+# cross-OS: once main() holds the lock, V44-I yields immediately without
+# trying to re-take the OS lock.
+# ---------------------------------------------------------------------------
+_MAIN_ENTRY_LOCK_HELD: bool = False
+_MAIN_ENTRY_LOCK_HANDLE = None  # kept alive for process lifetime
+
+
+def _install_singleton_lock_or_die(timeout_seconds: float = 15.0):
+    """v0.2.49: acquire the install.py main-entry single-instance lock.
+
+    Closes the 13-minute-deadlock pattern reported 2026-06-05 from
+    Fabio's machine where two concurrent `install.py --update`
+    invocations interleaved on shared state.
+
+    Behaviour:
+      - On success: returns an open file handle. Caller MUST assign it
+        to a module-level variable (_MAIN_ENTRY_LOCK_HANDLE) so the lock
+        is held for the process lifetime; the OS releases it
+        automatically when the process exits and the handle closes.
+        Also sets the module-level flag `_MAIN_ENTRY_LOCK_HELD = True`
+        so the V44-I narrow-block lock yields without re-attempting.
+      - On contention timeout: sys.exit(1) with a clear error to stderr
+        naming the holding PID + when it started + a hint to wait or
+        kill the other process.
+      - Soft-fail (lock file can't be opened — permission error,
+        readonly fs): emits WARNING to stderr, returns None, PROCEEDS
+        without lock. The lock is defense-in-depth, not a hard gate.
+
+    Cross-OS:
+      - POSIX (Linux/macOS): fcntl.flock with LOCK_EX | LOCK_NB; retry
+        with exponential backoff up to timeout_seconds.
+      - Windows: msvcrt.locking(LK_NBLCK, 1) on a 1-byte region at
+        offset 0 of the same lock file; same retry pattern.
+
+    Coordinates with `_install_advisory_lock` (V44-I) by using the
+    same lock file path (vct_root_dir() / "install.py.lock") AND by
+    setting `_MAIN_ENTRY_LOCK_HELD = True` so V44-I's reentrant
+    re-take is a noop on this process. Required because msvcrt.locking
+    on Windows is NOT reentrant — without the flag, V44-I would
+    deadlock against the lock we already hold.
+
+    Writes "<pid>\\n<unix_timestamp>\\n" to the lock file after
+    acquiring so concurrent attempts can name the holding PID in their
+    error messages. Truncates first so stale PIDs from
+    crashed-without-cleanup runs are overwritten.
+    """
+    global _MAIN_ENTRY_LOCK_HELD
+
+    # Resolve lock path via the canonical resolver (mirrors V44-I).
+    try:
+        from vco_lib.paths import vct_root_dir as _vct_root_dir
+        lock_path = _vct_root_dir() / "install.py.lock"
+    except Exception as e:
+        print(
+            f"  WARNING: could not resolve install lock path: {e} "
+            f"(proceeding without main-entry singleton guard)",
+            file=sys.stderr,
+        )
+        return None
+
+    fp = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # a+b creates the file if missing and lets us seek+read+write.
+        fp = open(str(lock_path), "a+b")
+    except Exception as e:
+        print(
+            f"  WARNING: could not open install lock {lock_path}: {e} "
+            f"(proceeding without main-entry singleton guard)",
+            file=sys.stderr,
+        )
+        return None
+
+    deadline = time.monotonic() + timeout_seconds
+    backoff = 0.25
+    acquired = False
+    while time.monotonic() < deadline:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except (BlockingIOError, OSError):
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 2.0)
+
+    if not acquired:
+        # Read the holding PID + start-time from the lock file for the
+        # diagnostic. May be empty (race: holder hasn't written yet) or
+        # stale (crashed without releasing); surface whatever's there.
+        holder_info = "unknown PID"
+        try:
+            fp.seek(0)
+            raw = fp.read(256).decode("utf-8", errors="replace").strip()
+            lines = raw.splitlines()
+            holder_pid = lines[0].strip() if lines else "?"
+            holder_ts = lines[1].strip() if len(lines) > 1 else "?"
+            try:
+                ts_int = int(float(holder_ts))
+                import datetime as _dt
+                started = _dt.datetime.fromtimestamp(ts_int).isoformat(
+                    timespec="seconds"
+                )
+                holder_info = f"PID {holder_pid} (started {started})"
+            except (ValueError, OSError):
+                holder_info = f"PID {holder_pid}"
+        except Exception:
+            pass
+        try:
+            fp.close()
+        except Exception:
+            pass
+        print(
+            f"ERROR: install.py is already running ({holder_info}) on "
+            f"lock {lock_path}; waited {timeout_seconds}s. Wait for the "
+            f"other run to finish, or kill it and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Write holding PID + start timestamp so concurrent attempts can name
+    # the conflict. Truncate first so a stale PID from a crashed-without-
+    # cleanup prior run gets overwritten. seek+truncate within the same
+    # open fd preserves the OS-level advisory lock we just acquired.
+    try:
+        import time as _time
+        fp.seek(0)
+        fp.truncate(0)
+        payload = f"{os.getpid()}\n{int(_time.time())}\n".encode("utf-8")
+        fp.write(payload)
+        fp.flush()
+    except Exception:
+        # Diagnostic-only data; lock is already acquired. Don't fail.
+        pass
+
+    _MAIN_ENTRY_LOCK_HELD = True
+    return fp
+
+
 @_contextlib.contextmanager
 def _install_advisory_lock(timeout_seconds: float = 60.0):
     """v0.2.44 V44-I: cross-OS advisory lock for the duration of the
@@ -3076,7 +3259,20 @@ def _install_advisory_lock(timeout_seconds: float = 60.0):
     Soft-fail: if the lock file cannot be created or locked at all
     (permission errors, filesystem quirks), emit a WARNING and continue
     without the lock. The lock is a defensive measure, not a hard gate.
+
+    v0.2.49: if main() already holds the entry-lock on the SAME file
+    (`_MAIN_ENTRY_LOCK_HELD == True`), this re-take is unnecessary AND
+    would deadlock on Windows (msvcrt.locking is not reentrant). Yield
+    immediately — the process-level entry lock already provides the
+    same exclusion guarantee.
     """
+    # v0.2.49: short-circuit when main() already holds the lock. POSIX
+    # fcntl.flock is reentrant for the same fd in the same process,
+    # but Windows msvcrt.locking is not — re-attempting the lock would
+    # deadlock. The module-level flag is the canonical cross-OS guard.
+    if _MAIN_ENTRY_LOCK_HELD:
+        yield None
+        return
     # Resolve lock path via the canonical resolver (mirrors the Rust
     # `paths::vct_root_dir`). install.py imports vco_lib at module load
     # so this should always succeed; if it doesn't, the unrecoverable
@@ -3814,6 +4010,33 @@ def main() -> int:
     # loudly with a clear message instead of half-installing.
     validate_source_repo(PROJECT_ROOT)
 
+    # v0.2.49: main()-entry single-instance lock for --update runs.
+    # Closes the 13-minute-deadlock pattern reported 2026-06-05 from
+    # Fabio's machine where two concurrent `install.py --update`
+    # invocations interleaved on shared state. Wait-then-die with a
+    # 15s timeout — fast enough for accidental double-clicks to
+    # succeed (first instance finishes), but bounded so a genuine
+    # concurrent run gets a clear error.
+    #
+    # The V44-I narrow-block lock at install.py:~11193 coordinates on
+    # the same lockfile via the module-level `_MAIN_ENTRY_LOCK_HELD`
+    # flag (set inside `_install_singleton_lock_or_die` on success).
+    # Without that flag V44-I would re-take the same OS lock and
+    # deadlock on Windows (msvcrt.locking is not reentrant; POSIX
+    # fcntl.flock IS reentrant, so on Linux/macOS it would be a noop
+    # but the flag short-circuits cleanly on both surfaces).
+    #
+    # Gated on "--update" in sys.argv (peeked BEFORE argparse) so the
+    # guard fires only for the deadlock-prone code path. Fresh installs
+    # on a clean dir don't have the same shared-state mutation contention.
+    # Soft-fails to WARNING if the lock file can't be opened
+    # (permission/readonly fs) — same discipline as V44-I.
+    global _MAIN_ENTRY_LOCK_HANDLE
+    if "--update" in sys.argv:
+        _MAIN_ENTRY_LOCK_HANDLE = _install_singleton_lock_or_die(
+            timeout_seconds=15.0
+        )
+
     parser = argparse.ArgumentParser(
         description="VibeCoded Tools — Orchestrator Installer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4220,6 +4443,15 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # VCT_NON_INTERACTIVE env var: install.ps1 (line ~97) documents that
+    # this env var should trigger non-interactive mode, but install.py
+    # never honored it — only --yes / --quiet / non-TTY did. The .bat ->
+    # .ps1 -> .py chain sets the env var as a fallback when args don't
+    # propagate cleanly; lift it into args.yes here so all downstream
+    # gates (args.yes checks) see a consistent state.
+    if not args.yes and os.environ.get("VCT_NON_INTERACTIVE"):
+        args.yes = True
+
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
     # icon step (post-install-launcher.sh) and exit. Skips Python version
     # checks, venv creation, etc. because the user already has a working
@@ -4475,7 +4707,22 @@ def main() -> int:
                         deferral_report=_deferral_report)
         if not args.skip_models:
             _wait_for_ollama()
-            _pull_ollama_models(_build_ollama_pull_list(embed_config, sysinfo))
+            # v0.2.49 Bug I: pass the canonical embedding-model set so
+            # _pull_ollama_models can fail-fast on load-bearing pulls
+            # rather than silently continuing with a broken KG.
+            _embedding_models_set: set[str] = {
+                m for m in (embed_config.get("embedding_models") or [])
+                if isinstance(m, str) and m
+            }
+            _pull_ollama_models(
+                _build_ollama_pull_list(embed_config, sysinfo),
+                embedding_models=_embedding_models_set,
+            )
+            # v0.2.49 Bug J: probe for dual Ollama instances now that
+            # the launcher-managed one is known to be up; emit an
+            # UPDATE_DEFERRED warning if a personal instance is also
+            # responding so the user sees the divergence post-install.
+            _emit_dual_ollama_deferral(_deferral_report)
 
         # Bug 29: with shared-container reuse, multiple installs hit the same
         # Weaviate. Bootstrap any of THIS project's KG/Development collections
@@ -5170,6 +5417,14 @@ def main() -> int:
     # common case (binary lives inside the clone). The seed is purely
     # an out-of-band hint for the binary-outside-clone case.
     _seed_launcher_install_path(PROJECT_ROOT, _deferral_report)
+
+    # v0.2.49 access-matrix Phase 1 (item #2): persist the orchestrator-
+    # root KG collection canonical name from
+    # `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env (if set). When unset,
+    # migration 028's default is authoritative — this call is a no-op.
+    # See `_persist_orchestrator_root_kg_collection` docstring for the
+    # resolution priority + soft-fail semantics.
+    _persist_orchestrator_root_kg_collection(_deferral_report)
 
     # v0.2.6 Bug C1: invoke the desktop-icon step so direct `python install.py`
     # runs get an icon too. first-install.sh-wrapped runs already trigger
@@ -6195,7 +6450,13 @@ def select_code_embedding_backend(
         - VRAM >   2 GB → Jina v2 base-code (768-dim, code-specialised)
         - else / no GPU → CPU path
       CPU (only reached when GPU path lands below "Jina via Ollama"):
-        - RAM >= 24 GB AND cores >= 8 → qwen3-embedding
+        - RAM > 24 GB AND cores >= 8 → qwen3-embedding
+          (strict-> on RAM since v0.2.49: a host with EXACTLY 24 GB
+          shouldn't tier-up to qwen3 — qwen3-embedding on CPU-only
+          Ollama is ~30s per embedding even at the boundary, confirmed
+          on Fabio's 24 GB Windows box. Cores threshold stays >=8 but
+          now counts PHYSICAL cores via `_probe_cpu_cores` — see its
+          docstring for the SMT-counting fix.)
         - else → Jina
       OpenAI: optional override (caller passes prefer_openai=True), not
               auto-selected — it costs money per embedding.
@@ -6236,7 +6497,12 @@ def select_code_embedding_backend(
         return _CODE_BACKEND_JINA
 
     # CPU path: VRAM <= 2 GB OR no GPU at all.
-    if ram >= 24.0 and cpu_cores >= 8:
+    # v0.2.49: strict-> on RAM (was `>=`). Boundary hosts with exactly
+    # 24 GB shouldn't tier-up to qwen3 — qwen3-embedding on CPU-only
+    # Ollama is ~30s per embedding even at the boundary. cpu_cores
+    # comparison stays `>=8` but now counts PHYSICAL cores (see
+    # `_probe_cpu_cores` docstring for the v0.2.49 SMT-counting fix).
+    if ram > 24.0 and cpu_cores >= 8:
         return _CODE_BACKEND_QWEN3
     return _CODE_BACKEND_JINA
 
@@ -6250,14 +6516,24 @@ def select_kg_embedding_backend(
 ) -> str:
     """Pick a KG / text-embedding backend ID for the detected hardware.
 
-    Spec (2026-05-21):
+    Spec (2026-05-21, revised 2026-06-07 v0.2.49):
       GPU:
-        - VRAM >= 8 GB → qwen3-embedding (1024-dim, our default)
-        - VRAM <  8 GB → snowflake-arctic-embed2 (1024-dim, smaller
+        - VRAM >  8 GB → qwen3-embedding (1024-dim, our default).
+          v0.2.49: strict-> on the 8 GB boundary. An 8 GB card runs
+          qwen3-embedding but co-existing with other GPU workloads
+          (code-embedder, summary inference) at exactly 8 GB crowds
+          VRAM. >8 GB gives headroom.
+        - VRAM <= 8 GB → snowflake-arctic-embed2 (1024-dim, smaller
           working set — still 1024-dim so the schema slot is identical)
         - VRAM <  4 GB OR unsupported → CPU path
       CPU:
-        - RAM >= 24 GB AND cores >= 8 → qwen3-embedding
+        - RAM >  24 GB AND cores >= 8 → qwen3-embedding
+          (v0.2.49: strict-> on RAM, was `>=`. Boundary hosts with
+          exactly 24 GB shouldn't tier-up to qwen3 — qwen3-embedding
+          on CPU-only Ollama is ~30s per embedding at the boundary,
+          confirmed on Fabio's 24 GB Windows box. Cores threshold stays
+          `>=8` but now counts PHYSICAL cores via `_probe_cpu_cores`
+          — see its docstring for the SMT-counting fix.)
         - else → arctic2
       OpenAI: optional, not auto-selected.
 
@@ -6269,7 +6545,8 @@ def select_kg_embedding_backend(
     Args:
         gpu_vram_gb: Detected VRAM (GB). 0.0 means "no usable GPU".
         ram_gb:      System RAM (GB).
-        cores:       Logical CPU cores.
+        cores:       Physical CPU cores (v0.2.49 — was logical/SMT;
+                     see `_probe_cpu_cores` docstring for the switch).
         openai_key_available: True if an OpenAI API key is configured.
         prefer_openai: True when the caller wants OpenAI explicitly.
 
@@ -6283,7 +6560,7 @@ def select_kg_embedding_backend(
     ram = float(ram_gb or 0.0)
     cpu_cores = int(cores or 0)
 
-    if vram >= 8.0:
+    if vram > 8.0:
         return _KG_BACKEND_QWEN3
     if vram >= 4.0:
         # Mid-range GPU: arctic2 runs comfortably without crowding the
@@ -6293,7 +6570,7 @@ def select_kg_embedding_backend(
         return _KG_BACKEND_ARCTIC
 
     # CPU path (or sub-4-GB GPU treated as CPU here).
-    if ram >= 24.0 and cpu_cores >= 8:
+    if ram > 24.0 and cpu_cores >= 8:
         return _KG_BACKEND_QWEN3
     return _KG_BACKEND_ARCTIC
 
@@ -6381,26 +6658,49 @@ def select_summary_backend(
 
 
 def _probe_cpu_cores() -> int:
-    """Best-effort logical CPU-core count, cross-OS.
+    """Best-effort PHYSICAL CPU-core count, cross-OS.
 
-    Prefers `psutil.cpu_count(logical=True)` (most portable, handles
-    cgroup limits on Linux containers). Falls back to `os.cpu_count()`.
-    Returns 0 on any probe failure — the selectors treat 0 as "low-end
-    CPU" (drops to the smaller-model tier), which is the conservative
-    direction (better to under-spec than over-promise).
+    v0.2.49: switched from logical=True (counts SMT threads) to
+    logical=False (counts physical cores) after dogfooding on Fabio's
+    Windows box showed the embedding-model auto-selector tier-up'd to
+    qwen3 on a host where the logical count (16) crossed the >=8
+    threshold even though the actual physical cores (8) were exactly at
+    the boundary — qwen3-embedding on CPU-only Ollama takes ~30s per
+    embedding, so the selector should require margin, not just count
+    HyperThreads. Embedding throughput on CPU is gated by physical
+    arithmetic units, not thread count.
+
+    Prefers `psutil.cpu_count(logical=False)` (returns the PHYSICAL
+    core count; cross-OS, handles cgroup limits on Linux containers,
+    docs explicitly: "the number of physical cores only"). Falls back to
+    `os.cpu_count() // 2` (a conservative estimate assuming SMT, which
+    is true on most modern Intel/AMD desktops + Apple Silicon's
+    performance/efficiency split where logical count overstates
+    embedding-capable cores). Returns 0 on any probe failure — the
+    selectors treat 0 as "low-end CPU" (drops to the smaller-model
+    tier), which is the conservative direction (better to under-spec
+    than over-promise).
     """
     try:
         import psutil  # type: ignore
-        n = psutil.cpu_count(logical=True)
+        n = psutil.cpu_count(logical=False)
         if n and n > 0:
             return int(n)
+        # psutil returns None on some hypervisors / containers when
+        # physical-core probing isn't supported. Fall through to
+        # os.cpu_count() // 2 as a conservative estimate.
     except ImportError:
         pass
     except Exception:
         return 0
     try:
         n = os.cpu_count()
-        return int(n) if n and n > 0 else 0
+        if n and n > 0:
+            # Conservative: assume SMT/HT, halve the logical count.
+            # On non-SMT hardware this under-counts by 2x, which is the
+            # safer direction (we drop to a smaller model tier).
+            return max(1, int(n) // 2)
+        return 0
     except Exception:
         return 0
 
@@ -9990,21 +10290,34 @@ def _start_services(
         cmd.extend(services_to_start)
         print(f"  Starting only: {', '.join(services_to_start)}")
 
-    # 15 min cap: first-run pulls of weaviate + ollama images can take a while
-    # on slow links, but a hung daemon should not block us forever.
+    # 15 min default cap: first-run pulls of weaviate + ollama images can
+    # take a while on slow links, but a hung daemon should not block us
+    # forever. Configurable via VCT_INSTALL_DOCKER_TIMEOUT (seconds) — bump
+    # for slow domestic links + cold cache (2026-05-23 observed: weaviate
+    # 1.28.4 pull alone is ~250MB and can hit the 15min wall on residential
+    # DSL while the daemon is still healthy and pulling in the background).
+    docker_timeout = 900
+    timeout_env = os.environ.get("VCT_INSTALL_DOCKER_TIMEOUT", "").strip()
+    if timeout_env:
+        try:
+            docker_timeout = max(60, int(timeout_env))
+        except ValueError:
+            pass
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=str(infra_dir), timeout=900,
+            cmd, capture_output=True, text=True, cwd=str(infra_dir), timeout=docker_timeout,
         )
     except subprocess.TimeoutExpired:
-        print("  FAIL (timed out after 15 min)")
+        timeout_min = docker_timeout // 60
+        print(f"  FAIL (timed out after {timeout_min} min)")
         print(f"  Container daemon may be hung. Try manually:")
         print(f"    cd {infra_dir}")
         print(f"    {' '.join(compose_cmd)} up -d")
+        print(f"  Or bump the timeout: VCT_INSTALL_DOCKER_TIMEOUT=1800 python install.py ...")
         _log_install_event(
             "5/10", "error",
-            "compose up timed out after 15 min",
-            data={"runtime": sysinfo.container_cmd},
+            f"compose up timed out after {timeout_min} min",
+            data={"runtime": sysinfo.container_cmd, "timeout_sec": docker_timeout},
         )
         sys.exit(1)
     if result.returncode != 0:
@@ -10112,8 +10425,37 @@ def _wait_for_ollama() -> None:
     )
 
 
-def _pull_ollama_models(models: list[str]) -> None:
-    """Pull required Ollama models."""
+class EmbeddingModelPullError(RuntimeError):
+    """Raised when a load-bearing embedding-model pull fails.
+
+    v0.2.49 Bug I: pre-fix ``_pull_ollama_models`` logged-then-continued on
+    every failure. Embedding models are load-bearing — without the active
+    embedding model in the local Ollama cache, KG sync silently breaks.
+    The function now classifies each model as embedding (fail-fast) or
+    other (best-effort) and raises this exception when one or more
+    load-bearing models fail to pull.
+    """
+
+
+def _pull_ollama_models(
+    models: list[str],
+    embedding_models: set[str] | None = None,
+) -> None:
+    """Pull required Ollama models.
+
+    v0.2.49 Bug I: ``embedding_models`` names the subset of ``models`` that
+    are load-bearing (the active text/code embedding models). If any of
+    them fail to pull, this function raises
+    :class:`EmbeddingModelPullError` AFTER attempting all remaining pulls
+    so the user gets the full picture in one shot rather than a per-model
+    interactive bail. Non-embedding models (summary/chat tiers) remain
+    best-effort and only emit a WARN log + manual-pull hint on failure.
+
+    Backward-compat: callers that don't pass ``embedding_models`` get a
+    heuristic fallback — any model name containing ``"embed"`` in
+    lowercase is treated as load-bearing. Callers that DO pass the set
+    get a precise answer; the heuristic is the safety net.
+    """
     print("[7/10] Pulling Ollama models ... ", flush=True)
     _log_install_event(
         "7/10", "start",
@@ -10122,7 +10464,18 @@ def _pull_ollama_models(models: list[str]) -> None:
     )
     port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
 
+    if embedding_models is None:
+        # Heuristic fallback for callers that don't pass the precise set
+        # (back-compat). Embedding-model names canonically contain
+        # "embed" in lowercase: qwen3-embedding, snowflake-arctic-embed2,
+        # text-embedding-3-small, unclemusclez/jina-embeddings-v2-base-code.
+        embedding_models = {
+            m for m in models
+            if "embed" in m.lower()
+        }
+
     failed: list[str] = []
+    failed_embedding: list[str] = []
     for model in models:
         print(f"  Pulling {model} ... ", end="", flush=True)
         try:
@@ -10146,15 +10499,155 @@ def _pull_ollama_models(models: list[str]) -> None:
                   f"http://localhost:{port}/api/pull "
                   f"-d '{{\"name\": \"{model}\"}}'")
             failed.append(model)
+            if model in embedding_models:
+                failed_embedding.append(model)
 
+    if failed_embedding:
+        _log_install_event(
+            "7/10", "error",
+            f"{len(failed_embedding)} load-bearing embedding-model pull(s) "
+            f"failed; KG sync will be broken until resolved",
+            data={
+                "failed_embedding": failed_embedding,
+                "failed_all": failed,
+            },
+        )
+        raise EmbeddingModelPullError(
+            "Load-bearing embedding model pull(s) failed: "
+            f"{', '.join(failed_embedding)}. The Knowledge Graph cannot "
+            "function without these models — install aborted. Resolve "
+            "manually (curl -X POST http://localhost:" + port + "/api/pull "
+            "-d '{\"name\": \"<model>\"}') then re-run install."
+        )
     if failed:
         _log_install_event(
             "7/10", "warn",
-            f"{len(failed)} model pull(s) failed",
+            f"{len(failed)} non-load-bearing model pull(s) failed",
             data={"failed": failed},
         )
     else:
         _log_install_event("7/10", "ok", "all Ollama models pulled")
+
+
+def _probe_dual_ollama_instances(
+    canonical_port: int = DEFAULT_OLLAMA_PORT,
+    alternate_port: int = 11434,
+    timeout_s: float = 1.0,
+) -> tuple[int, int] | None:
+    """Detect when two separate Ollama daemons are reachable on this host.
+
+    v0.2.49 Bug J: users with personal Ollama installs (default port
+    11434) running alongside the launcher's containerized Ollama (port
+    11435) hit "where did my model go?" confusion because the two
+    instances have independent model caches. This probe returns
+    ``(alternate_port, canonical_port)`` when BOTH respond to
+    ``/api/tags`` within ``timeout_s`` seconds; the caller can then emit
+    a UPDATE_DEFERRED.md warning so the user sees the divergence at
+    install-time AND post-install (the deferral file persists).
+
+    Returns ``None`` when only one or neither responds. Soft-fails on
+    any unexpected error (network stack quirks, IPv6/IPv4 oddities,
+    etc.) — a probe failure must never block install.
+    """
+
+    def _port_responds(port: int) -> bool:
+        try:
+            req = urllib.request.Request(
+                f"http://localhost:{port}/api/tags",
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                # Drain a few bytes so the socket closes cleanly. We
+                # don't care about the body — any 2xx response means
+                # there's a live Ollama on this port.
+                _ = resp.read(64)
+                return 200 <= getattr(resp, "status", 200) < 300
+        except Exception:
+            return False
+
+    try:
+        canonical_alive = _port_responds(canonical_port)
+        alternate_alive = _port_responds(alternate_port)
+    except Exception:
+        return None
+
+    if canonical_alive and alternate_alive and canonical_port != alternate_port:
+        # Order: alternate first (the "surprise" instance), canonical
+        # second. Tests assert this exact shape.
+        return (alternate_port, canonical_port)
+    return None
+
+
+def _emit_dual_ollama_deferral(
+    deferral_report: "DeferralReport",
+    canonical_port: int = DEFAULT_OLLAMA_PORT,
+    alternate_port: int = 11434,
+) -> None:
+    """v0.2.49 Bug J: emit an info-severity deferral when both Ollama
+    instances respond.
+
+    Mirrors the shape of :func:`_emit_orchestrator_root_schema_deferrals`
+    — soft-fail throughout, idempotent on re-runs (the deferral writer
+    deduplicates by ``condition_id``).
+    """
+    try:
+        result = _probe_dual_ollama_instances(
+            canonical_port=canonical_port,
+            alternate_port=alternate_port,
+        )
+    except Exception:
+        return
+    if result is None:
+        return
+
+    alt, canon = result
+    try:
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="dual_ollama_detected",
+                title=(
+                    f"Two Ollama instances reachable "
+                    f"(:{alt} + :{canon})"
+                ),
+                detected=(
+                    f"Both `http://localhost:{alt}` (default Ollama "
+                    f"port) and `http://localhost:{canon}` "
+                    f"(launcher-managed Ollama container) responded to "
+                    f"`/api/tags`.  These are two independent daemons "
+                    f"with separate model caches — a model pulled into "
+                    f"one is NOT visible from the other."
+                ),
+                why_deferred=(
+                    "Cannot auto-resolve: we don't know which instance "
+                    "the user intends as canonical.  Stopping the "
+                    "user's personal Ollama daemon would risk breaking "
+                    "their other tooling; stopping the launcher's "
+                    "container would break VCO.  The user must choose "
+                    "and reconcile."
+                ),
+                command_to_apply=(
+                    f"# VCO uses :{canon} (the launcher-managed "
+                    f"container) as canonical.\n"
+                    f"# If you want VCO to use your personal Ollama "
+                    f"instead, set OLLAMA_PORT={alt} in .claude/env and "
+                    f"re-run install.\n"
+                    f"# If you want to stop the personal instance:\n"
+                    f"#   systemctl --user stop ollama   # Linux\n"
+                    f"#   killall ollama                 # macOS / generic\n"
+                    f"# Then re-run install.py --update to reseed."
+                ),
+                severity="info",
+                kg_node_refs=[],
+            )
+        )
+        _log_install_event(
+            "7/10", "info",
+            f"Bug J: dual-Ollama detected (:{alt} + :{canon}); "
+            f"deferral emitted",
+        )
+    except Exception:
+        # Defensive: never let a deferral emit failure block install.
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -10383,6 +10876,29 @@ def _emit_orchestrator_root_env_keys(install_root: Path) -> None:
         "VCT_INFRASTRUCTURE_DIR": str(infra_dir.resolve()),
         "KG_BASE_DIR": str(install_root.resolve()),
     }
+
+    # v0.2.49 SB1: seed VCT_PROJECT_ID alongside the portability keys
+    # so the Phase-8 access-matrix WRITE gate has a project identifier
+    # from the moment .claude/env is written. The gate's empty-PID
+    # branch (claude_mcp_servers/weaviate_mcp/server.py L5995-6049 and
+    # the templates/hooks/post-file-edit.{sh,ps1} _kg_write_allowed
+    # helpers) is the silent-bypass surface that SB1 closes — emitting
+    # VCT_PROJECT_ID here means hooks + the MCP have the identifier
+    # available from install time, not just after the first launcher
+    # boot's apply_project_env pass.
+    #
+    # Resolution is best-effort: if launcher.db isn't there yet (fresh
+    # install, never opened the launcher), we just skip this key — the
+    # gate's empty-PID branch will fire on the first WRITE attempt and
+    # the deferral / metric surfaces guide the user to re-register.
+    # Once they do, the next apply_project_env pass (driven by the
+    # launcher) backfills VCT_PROJECT_ID via the canonical contract.
+    try:
+        pid = _resolve_project_id_by_folder(install_root)
+    except Exception:
+        pid = None
+    if pid:
+        keys["VCT_PROJECT_ID"] = pid
 
     claude_env_path = install_root / ".claude" / "env"
     try:
@@ -13361,6 +13877,133 @@ def _self_heal_kg_bindings_on_update(
         name.lower(): name for name in existing_classes if name
     }
 
+    # v0.2.49 Bug N: detect whether ANY rebind is needed BEFORE opening
+    # launcher.db read-write. vct-hub holds the writer lock permanently
+    # as a detached daemon, so an RW open would always 5s-timeout when
+    # the hub is running — which is the design (per CLAUDE.md hub
+    # section: "outlives launcher GUI"). On hosts where no rebind is
+    # needed (the common case post-v0.2.20: launcher enforces canonical
+    # casing on creation), the detection-only pass yields an empty
+    # rebind list and we return cleanly without ever attempting to
+    # acquire the writer lock.
+    #
+    # RO mode via the URI form (`mode=ro`) does NOT block on the writer
+    # lock — WAL mode allows concurrent readers regardless of writer
+    # state. The SELECT statements always succeed; only UPDATE/DELETE
+    # would error in RO mode.
+    #
+    # If detection finds work to do, we close the RO conn + reopen RW
+    # (existing path below). The 5s timeout there is the right safety
+    # net: actual rebinds are rare enough that the user noticing a
+    # post-install "please close the launcher and re-run" deferral is
+    # acceptable.
+    needs_rebind = False
+    try:
+        ro_conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        try:
+            ro_cur = ro_conn.cursor()
+            # Probe each table the RW pass would touch. THREE distinct
+            # work-paths the RW pass might exercise (any one of them
+            # firing requires acquiring the writer lock):
+            #
+            #   1. Case-rebind (pass 1 of _self_heal): row's
+            #      `collection_name` has a case-different sibling in
+            #      `existing_classes`. Detected by `actual is not None
+            #      and actual != coll_name`.
+            #   2. Cross-prefix adoption (pass 2, v0.2.40 — see
+            #      `_prefix_adopt_kg_bindings_pass`): row's
+            #      `collection_name` is GENUINELY MISSING from Weaviate
+            #      (no case sibling either) AND ends in a known suffix
+            #      from `_KG_BINDING_PREFIX_ADOPT_SUFFIXES`. The RW
+            #      pass probes Weaviate for populated same-suffix
+            #      classes and may rebind to the populated one.
+            #   3. Access-matrix rebind (same case-rebind shape as #1
+            #      but on the kg_collection_access table; same
+            #      detection condition).
+            #
+            # If ANY of the three would do work, we need the RW pass.
+            # Otherwise the no-op path returns cleanly without ever
+            # touching the writer lock.
+            for table, col in (
+                ("project_kg_bindings", "collection_name"),
+                ("kg_collection_access", "collection_name"),
+            ):
+                try:
+                    ro_cur.execute(
+                        f"SELECT {col} FROM {table}"
+                    )
+                except sqlite3.OperationalError as oe:
+                    if "no such table" in str(oe).lower():
+                        # Older launcher.db schema; skip. The RW pass below
+                        # handles the same case via its own try/except.
+                        continue
+                    raise
+                for (coll_name,) in ro_cur.fetchall():
+                    if not coll_name:
+                        continue
+                    if coll_name in existing_classes:
+                        # Canonical match — no rebind needed.
+                        continue
+                    actual = existing_by_lower.get(coll_name.lower())
+                    if actual is not None and actual != coll_name:
+                        # Path #1/#3: case-different sibling exists.
+                        needs_rebind = True
+                        break
+                    # No case sibling. Check path #2 (cross-prefix
+                    # adoption) — only applies to project_kg_bindings,
+                    # not kg_collection_access, and only when the row's
+                    # collection_name ends in a known suffix. We can't
+                    # know from RO mode whether a same-suffix candidate
+                    # is actually populated (that requires a Weaviate
+                    # Aggregate HTTP call per candidate), so be
+                    # conservative: ANY row whose name ends in a known
+                    # suffix AND is missing from Weaviate triggers the
+                    # RW pass. The RW pass will probe + decide.
+                    #
+                    # False-positive cost: an extra RW open (5s timeout
+                    # if hub holds the lock) on hosts where every
+                    # missing-suffix row happens to have zero populated
+                    # cross-prefix candidates. Acceptable since the
+                    # common case (post-v0.2.20 canonical-casing) has
+                    # zero missing rows at all.
+                    if table == "project_kg_bindings":
+                        for suffix in _KG_BINDING_PREFIX_ADOPT_SUFFIXES:
+                            if coll_name.endswith(suffix):
+                                needs_rebind = True
+                                break
+                        if needs_rebind:
+                            break
+                if needs_rebind:
+                    break
+        finally:
+            ro_conn.close()
+    except sqlite3.Error as se:
+        # RO open itself failed (corrupted DB, permission). Fall through
+        # to the RW pass so the existing soft-fail-to-deferral path
+        # handles it consistently — the user-facing outcome is the same
+        # error message either way.
+        _log_install_event(
+            "7e/10", "warn",
+            f"launcher.db RO probe failed ({type(se).__name__}); falling through to RW pass",
+            data={"db_path": str(db_path), "error": str(se)[:200]},
+        )
+        needs_rebind = True
+
+    if not needs_rebind:
+        # Common case: launcher.db is consistent with on-disk Weaviate
+        # casing → no rebind needed → no writer-lock acquisition → no
+        # deferral when the hub is running.
+        _log_install_event(
+            "7e/10", "skip",
+            "launcher.db KG bindings consistent with on-disk Weaviate casing; no self-heal needed",
+            data={"db_path": str(db_path)},
+        )
+        return
+
     # Open launcher.db read-write, BUT in a try/except: any sqlite error
     # (locked, corrupted, schema-drift, permission) soft-fails to a
     # deferral entry. The launcher's own boot will heal the schema; this
@@ -13572,7 +14215,30 @@ def _self_heal_kg_bindings_on_update(
                 binding_rows = cur.fetchall()
 
                 _ROLE_LEVEL = {"primary": "write", "shared": "read", "archive": "read"}
-                now_ms = int(time.time() * 1000)
+                # v0.2.49 Bug O fix: kg_collection_access schema (migrations/
+                # 001_initial.sql:63-69) has exactly 3 columns: project_id,
+                # collection_name, access_level. The legacy granted_at +
+                # updated_at column references here referred to audit columns
+                # that were planned but never landed in any migration — the
+                # INSERT failed with `OperationalError: table
+                # kg_collection_access has no column named granted_at` on
+                # every host whose self-heal RW pass activated. Discovered
+                # 2026-06-07 via Bug N's empirical dogfood validation (RL
+                # chat msg 186). Fixed by dropping the 2 unsupported column
+                # names + their parameter binds — access_level is the
+                # load-bearing field; audit columns get re-introduced via a
+                # proper migration if/when the feature is actually scoped.
+                #
+                # v0.2.49 access-matrix Step A.5: migration 029 adds
+                # `created_at` + `updated_at INTEGER NOT NULL DEFAULT 0`
+                # audit columns. These INSERTs are seed-path writes (the
+                # parity self-heal asserts the system's default; they
+                # are NOT user-driven), so we bind both timestamps to the
+                # SAME value. This preserves the seed-path invariant
+                # `created_at == updated_at` so the Rust-side
+                # `KgAccessRow::is_user_configured` predicate reads
+                # FALSE for rows we land here.
+                _seed_ts_ms = int(time.time() * 1000)
 
                 for proj_id, role, coll_name in binding_rows:
                     if not coll_name:
@@ -13582,9 +14248,10 @@ def _self_heal_kg_bindings_on_update(
                         cur.execute(
                             "INSERT OR IGNORE INTO kg_collection_access "
                             "(project_id, collection_name, access_level, "
-                            " granted_at, updated_at) "
+                            " created_at, updated_at) "
                             "VALUES (?, ?, ?, ?, ?)",
-                            (proj_id, coll_name, level, now_ms, now_ms),
+                            (proj_id, coll_name, level,
+                             _seed_ts_ms, _seed_ts_ms),
                         )
                         if cur.rowcount:
                             existing_access.add((proj_id, coll_name))
@@ -13598,9 +14265,10 @@ def _self_heal_kg_bindings_on_update(
                             cur.execute(
                                 "INSERT OR IGNORE INTO kg_collection_access "
                                 "(project_id, collection_name, access_level, "
-                                " granted_at, updated_at) "
+                                " created_at, updated_at) "
                                 "VALUES (?, ?, ?, ?, ?)",
-                                (proj_id, dev_name, "write", now_ms, now_ms),
+                                (proj_id, dev_name, "write",
+                                 _seed_ts_ms, _seed_ts_ms),
                             )
                             if cur.rowcount:
                                 existing_access.add((proj_id, dev_name))
@@ -14167,6 +14835,201 @@ def _seed_launcher_install_path(install_path: Path,
         except Exception:  # noqa: BLE001
             # DeferralReport API drift — log only.
             pass
+
+
+def _persist_orchestrator_root_kg_collection(
+    deferral_report: "DeferralReport",
+) -> None:
+    """v0.2.49 access-matrix Phase 1 (item #2): persist the canonical
+    name of the orchestrator-root shared KG collection into launcher.db
+    `app_state['orchestrator_root_kg_collection']`.
+
+    Migration 028 (in vct-launcher-core) writes a default value of
+    `VibeCodedOrchestrator_KnowledgeGraph` via INSERT-OR-IGNORE on
+    every fresh DB. This helper provides the white-label / dev-clone
+    override path: when an env var `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION`
+    is set at install time, the launcher.db row is upserted to that
+    value (overriding the migration's default).
+
+    Resolution priority (highest → lowest):
+        1. `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env var (white-label
+           or dev-clone override). Trimmed; empty / whitespace-only
+           values are ignored.
+        2. Migration 028's default (`VibeCodedOrchestrator_
+           KnowledgeGraph`). Already written; nothing to do.
+
+    Idempotent: re-running with the same env value is a no-op (the
+    INSERT-OR-REPLACE writes the same row). Re-running with a CHANGED
+    env value (e.g. user reconsidered the white-label name) overwrites
+    — the most recent install wins.
+
+    Soft-fail throughout: launcher.db missing (fresh first-install
+    before vct-hub bootstrap), schema mismatch, or sqlite errors are
+    downgraded to a deferral entry. The migration's default is the
+    safety net.
+
+    Called from the install + update flows alongside
+    `_seed_launcher_install_path`. Position: AFTER the launcher.db
+    schema migrations have run (or after first launcher boot has
+    applied them), so the `app_state` table exists.
+    """
+    import sqlite3  # local import: matches the pattern used by other
+                     # launcher.db touch sites in this file.
+
+    override = os.environ.get("VCT_ORCHESTRATOR_ROOT_KG_COLLECTION", "").strip()
+    if not override:
+        # No override → migration 028's default is authoritative.
+        # Skip the write to avoid touching launcher.db unnecessarily
+        # (matches the Bug N RO-first discipline: don't open RW unless
+        # we have something to do).
+        _log_install_event(
+            "orchestrator_root_kg_collection", "skip",
+            "no override set; migration 028 default is canonical",
+        )
+        return
+
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
+        # launcher.db missing — fresh first-install before vct-hub
+        # has bootstrapped the schema. Migration 028 will write the
+        # default on first launcher boot; this run can't override it
+        # because there's no DB to write to yet. Log + defer.
+        _log_install_event(
+            "orchestrator_root_kg_collection", "skip",
+            f"launcher.db not found at {db_path}; "
+            f"override deferred to first launcher boot",
+            data={"db_path": str(db_path), "override": override},
+        )
+        return
+
+    # Open RO first per the Bug N discipline: check whether the
+    # current row already equals the override (no-op), and check that
+    # the app_state table actually exists (older launcher.db schemas
+    # that pre-date migration 008 won't have it — soft-fail).
+    try:
+        ro_conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=5.0,
+        )
+        try:
+            ro_cur = ro_conn.cursor()
+            try:
+                ro_cur.execute(
+                    "SELECT value FROM app_state "
+                    "WHERE key = 'orchestrator_root_kg_collection'"
+                )
+                existing_row = ro_cur.fetchone()
+            except sqlite3.OperationalError as oe:
+                if "no such table" in str(oe).lower():
+                    # Pre-migration-008 schema. Skip — the launcher's
+                    # next boot will apply migrations 8 + 28; on a
+                    # subsequent install.py run this code path will
+                    # find the table and apply the override.
+                    _log_install_event(
+                        "orchestrator_root_kg_collection", "skip",
+                        "app_state table absent (pre-migration-008 schema); "
+                        "override deferred to next install.py run",
+                    )
+                    return
+                raise
+        finally:
+            ro_conn.close()
+    except sqlite3.Error as se:
+        _log_install_event(
+            "orchestrator_root_kg_collection", "warn",
+            f"RO probe failed: {type(se).__name__}",
+            data={"db_path": str(db_path), "error": str(se)[:200]},
+        )
+        return
+
+    if existing_row is not None and existing_row[0] == override:
+        # Idempotent path: the row already matches.
+        _log_install_event(
+            "orchestrator_root_kg_collection", "ok",
+            "value already matches override; no write needed",
+            data={"value": override},
+        )
+        return
+
+    # Apply the override. We open RW; if the writer lock is held (e.g.
+    # vct-hub is running, per the Bug N scenario), the 5s timeout will
+    # surface as a deferral entry rather than crashing the install.
+    now_ms = int(time.time() * 1000)
+    try:
+        rw_conn = sqlite3.connect(str(db_path), timeout=5.0)
+        try:
+            rw_conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "  value = excluded.value, "
+                "  updated_at = excluded.updated_at",
+                ("orchestrator_root_kg_collection", override, now_ms),
+            )
+            rw_conn.commit()
+        finally:
+            rw_conn.close()
+        _log_install_event(
+            "orchestrator_root_kg_collection", "ok",
+            f"set orchestrator-root KG collection to {override}",
+            data={"value": override},
+        )
+    except sqlite3.OperationalError as oe:
+        # Most likely "database is locked" — vct-hub holds it.
+        msg = str(oe).lower()
+        if "locked" in msg or "busy" in msg:
+            _log_install_event(
+                "orchestrator_root_kg_collection", "warn",
+                "launcher.db is locked; deferring override write",
+                data={"db_path": str(db_path), "override": override},
+            )
+            try:
+                deferral_report.add_entry(
+                    DeferralEntry(
+                        condition_id="orchestrator_root_kg_collection_locked",
+                        title=(
+                            "Could not persist orchestrator-root KG "
+                            "collection override (launcher.db locked)"
+                        ),
+                        detected=(
+                            f"install.py tried to set the orchestrator-root "
+                            f"KG collection to '{override}' but launcher.db "
+                            f"at {db_path} was locked (vct-hub likely "
+                            f"holds the writer lock as a detached service). "
+                            f"The override has NOT been applied."
+                        ),
+                        why_deferred=(
+                            "Override application requires exclusive write "
+                            "access. The current row remains at its "
+                            "previous value (likely migration 028's "
+                            "default 'VibeCodedOrchestrator_KnowledgeGraph')."
+                        ),
+                        command_to_apply=(
+                            "# Close the launcher GUI + stop vct-hub, "
+                            "then re-run install.py:\n"
+                            "vct-hub --stop\n"
+                            "python install.py --update"
+                        ),
+                        severity="warning",
+                        kg_node_refs=[],
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # Other OperationalError — re-raise as a soft-fail log.
+        _log_install_event(
+            "orchestrator_root_kg_collection", "warn",
+            f"sqlite operational error: {oe}",
+            data={"db_path": str(db_path), "override": override},
+        )
+    except sqlite3.Error as se:
+        _log_install_event(
+            "orchestrator_root_kg_collection", "warn",
+            f"sqlite error: {type(se).__name__}",
+            data={"db_path": str(db_path), "error": str(se)[:200]},
+        )
 
 
 def _run_desktop_icon_step(args: argparse.Namespace) -> None:

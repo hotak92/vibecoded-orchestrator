@@ -11,9 +11,17 @@ Spec source: 2026-05-21 user spec. README hardware table lists the
 exact tier → model mapping (Code / KG / Summaries sections).
 
 Boundary semantics:
-  - All "X+" thresholds in the spec → inclusive `>=` in the code.
+  - Most "X+" thresholds in the spec → inclusive `>=` in the code.
   - The 2 GB GPU code boundary is strict `>` (per spec "code, VRAM > 2 GB"
     → Jina; "≤ 2 GB" → CPU path).
+  - **v0.2.49 strict-`>` boundaries** (after dogfooding on Fabio's
+    24 GB Windows box, Bug M — qwen3-embedding on CPU-only Ollama
+    was ~30s per embedding at the 24 GB boundary):
+      * KG embedding: VRAM `>` 8 GB → qwen3 (was `>=`)
+      * KG embedding: RAM `>` 24 GB AND cores >= 8 → qwen3 (was `>=`)
+      * Code embedding: RAM `>` 24 GB AND cores >= 8 → qwen3 (was `>=`)
+  - **v0.2.49 cores counting**: `_probe_cpu_cores` now returns
+    PHYSICAL cores (was logical/SMT). See its docstring.
 """
 
 from __future__ import annotations
@@ -87,17 +95,32 @@ class TestCodeEmbeddingSelector:
         assert got == _CODE_BACKEND_JINA
 
     def test_no_gpu_high_ram_high_cores_picks_qwen3(self) -> None:
-        """CPU + RAM >= 24 GB AND cores >= 8 → qwen3-embedding."""
+        """CPU + RAM > 24 GB AND cores >= 8 → qwen3-embedding."""
         got = select_code_embedding_backend(
             gpu_vram_gb=0.0, ram_gb=32.0, cores=12,
             openai_key_available=False,
         )
         assert got == _CODE_BACKEND_QWEN3
 
-    def test_no_gpu_exactly_24gb_ram_exactly_8_cores_picks_qwen3(self) -> None:
-        """Boundary: exactly 24 GB RAM AND exactly 8 cores still qualifies."""
+    def test_no_gpu_exactly_24gb_ram_picks_jina(self) -> None:
+        """v0.2.49: strict-> on RAM boundary. EXACTLY 24 GB → jina.
+
+        Pre-v0.2.49 this tier-up'd to qwen3 at the 24 GB boundary, but
+        dogfooding on Fabio's 24 GB Windows box (Bug M) showed
+        qwen3-embedding on CPU-only Ollama is ~30s per embedding at
+        the boundary. The strict-> rule moves 24 GB hosts to the
+        lighter tier.
+        """
         got = select_code_embedding_backend(
             gpu_vram_gb=0.0, ram_gb=24.0, cores=8,
+            openai_key_available=False,
+        )
+        assert got == _CODE_BACKEND_JINA
+
+    def test_no_gpu_above_24gb_picks_qwen3(self) -> None:
+        """v0.2.49: strict-> means 24.1 GB qualifies for qwen3."""
+        got = select_code_embedding_backend(
+            gpu_vram_gb=0.0, ram_gb=24.1, cores=8,
             openai_key_available=False,
         )
         assert got == _CODE_BACKEND_QWEN3
@@ -111,7 +134,7 @@ class TestCodeEmbeddingSelector:
         assert got == _CODE_BACKEND_JINA
 
     def test_no_gpu_low_ram_high_cores_falls_to_jina(self) -> None:
-        """Cores qualify but RAM < 24 GB → fall through to Jina."""
+        """Cores qualify but RAM <= 24 GB → fall through to Jina."""
         got = select_code_embedding_backend(
             gpu_vram_gb=0.0, ram_gb=16.0, cores=16,
             openai_key_available=False,
@@ -160,18 +183,29 @@ class TestCodeEmbeddingSelector:
 class TestKgEmbeddingSelector:
     """select_kg_embedding_backend"""
 
-    @pytest.mark.parametrize("vram", [8.0, 12.0, 24.0])
-    def test_gpu_8gb_plus_picks_qwen3(self, vram: float) -> None:
-        """VRAM >= 8 GB → qwen3-embedding (1024-dim)."""
+    @pytest.mark.parametrize("vram", [8.1, 12.0, 24.0])
+    def test_gpu_above_8gb_picks_qwen3(self, vram: float) -> None:
+        """VRAM > 8 GB → qwen3-embedding (1024-dim).
+
+        v0.2.49: strict-> on the 8 GB boundary. EXACTLY 8 GB now lands
+        in arctic (see test_gpu_exactly_8gb_picks_arctic below). The
+        margin matters when other GPU workloads (code embedder, summary
+        inference) share VRAM at the 8 GB boundary.
+        """
         got = select_kg_embedding_backend(
             gpu_vram_gb=vram, ram_gb=32.0, cores=8,
             openai_key_available=False,
         )
         assert got == _KG_BACKEND_QWEN3
 
-    @pytest.mark.parametrize("vram", [4.0, 6.0, 7.9])
+    @pytest.mark.parametrize("vram", [4.0, 6.0, 7.9, 8.0])
     def test_gpu_4_to_8gb_picks_arctic(self, vram: float) -> None:
-        """4 GB <= VRAM < 8 GB → arctic2 (same dims, smaller footprint)."""
+        """4 GB <= VRAM <= 8 GB → arctic2 (same dims, smaller footprint).
+
+        v0.2.49: inclusive at 8 GB now (was strict-< 8 GB). The 8 GB
+        boundary tier-up to qwen3 required strict-> after dogfooding
+        showed boundary cards crowd VRAM when co-loading other models.
+        """
         got = select_kg_embedding_backend(
             gpu_vram_gb=vram, ram_gb=16.0, cores=8,
             openai_key_available=False,
@@ -187,15 +221,32 @@ class TestKgEmbeddingSelector:
         assert got == _KG_BACKEND_ARCTIC
 
     def test_no_gpu_high_ram_high_cores_picks_qwen3(self) -> None:
+        """CPU + RAM > 24 GB AND cores >= 8 → qwen3-embedding."""
         got = select_kg_embedding_backend(
             gpu_vram_gb=0.0, ram_gb=32.0, cores=16,
             openai_key_available=False,
         )
         assert got == _KG_BACKEND_QWEN3
 
-    def test_no_gpu_exactly_24gb_ram_exactly_8_cores_picks_qwen3(self) -> None:
+    def test_no_gpu_exactly_24gb_ram_picks_arctic(self) -> None:
+        """v0.2.49: strict-> on RAM boundary. EXACTLY 24 GB → arctic.
+
+        Pre-v0.2.49 this tier-up'd to qwen3 at the 24 GB boundary, but
+        dogfooding on Fabio's 24 GB Windows box (Bug M) showed
+        qwen3-embedding on CPU-only Ollama is ~30s per embedding at
+        the boundary — unusable for KG indexing. The strict-> rule
+        moves 24 GB hosts to arctic + jina (low_resource profile).
+        """
         got = select_kg_embedding_backend(
             gpu_vram_gb=0.0, ram_gb=24.0, cores=8,
+            openai_key_available=False,
+        )
+        assert got == _KG_BACKEND_ARCTIC
+
+    def test_no_gpu_above_24gb_picks_qwen3(self) -> None:
+        """v0.2.49: strict-> means 24.1 GB qualifies for qwen3."""
+        got = select_kg_embedding_backend(
+            gpu_vram_gb=0.0, ram_gb=24.1, cores=8,
             openai_key_available=False,
         )
         assert got == _KG_BACKEND_QWEN3

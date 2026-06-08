@@ -7,7 +7,11 @@
 
 use std::path::PathBuf;
 
-use sha2::{Digest, Sha256};
+// v0.2.49: `Sha256` / `Digest` are now only used inside the in-file
+// `#[cfg(test)]` test block (the production `machine_id_hash` impl moved
+// to `vct-launcher-core::licensing`). Local `use` statements inside the
+// test module bring them in directly; this top-level `use` would be a
+// dead import.
 use tauri::{command, State};
 
 use crate::db::models::TierCacheRow;
@@ -58,7 +62,11 @@ fn validate_tier_url() -> String {
     std::env::var("VCT_VALIDATE_TIER_URL").unwrap_or_else(|_| DEFAULT_VALIDATE_TIER_URL.to_string())
 }
 
-pub(crate) const LICENSE_MODULE_ID: &str = "licensing";
+// v0.2.49: `LICENSE_MODULE_ID` lives in `vct-launcher-core::licensing`
+// now (shared with the hub-side supervisor for the Phase 3 auth port).
+// Re-exported here so the ~30 existing call sites in this file and the
+// rest of `commands::` keep their unqualified imports working.
+pub(crate) use vct_launcher_core::licensing::LICENSE_MODULE_ID;
 // L1.M (v0.2.40): the legacy `LICENSE_KEY_NAME = "VIBECODED_LICENSE_KEY"`
 // const was REMOVED. Every call site now uses
 // `keychain_username_for(ORCHESTRATOR_MODULE_ID)` (canonical
@@ -72,24 +80,16 @@ const GRACE_PERIOD_MS: i64 = 3 * 24 * 3600 * 1000;
 /// Returns `Ok(Some(key))` when present, `Ok(None)` when the user has
 /// not activated (free tier), and `Err` on keychain access failure.
 ///
-/// Shared between `license_refresh` (this module) and
-/// `installer_engine::request_pull_token` (Phase 3A pull-token flow,
-/// v0.2.35) so both call sites agree on the canonical credential
-/// location. Previously `request_pull_token` read
-/// `~/.vibecoded/license_cache.json` and POSTed its body verbatim —
-/// that body has no `license_key` field, the keychain does.
+/// v0.2.49: the implementation now lives in
+/// `vct-launcher-core::licensing::read_license_key_from_keychain` so
+/// the launcher GUI AND the hub-side supervisor (Phase 3 auth port)
+/// read from the same canonical keychain row. Same scope, same
+/// service-name, same username — both crates resolve to byte-identical
+/// `SHA(service_name(LICENSE_MODULE_ID))` lookups. This thin wrapper is
+/// preserved as `pub(crate)` so the ~30 in-crate call sites keep their
+/// unqualified imports working without a sweep.
 pub(crate) fn read_license_key_from_keychain() -> Result<Option<String>, String> {
-    // L1.M (v0.2.40): canonical per-module username (was the legacy
-    // `LICENSE_KEY_NAME = "VIBECODED_LICENSE_KEY"`). The one-time
-    // migration in `ensure_legacy_orchestrator_row_migrated` rewrites
-    // the keychain entry from the legacy username to the canonical one
-    // at launcher boot, so by the time this reader is called the value
-    // lives at `license_key____orchestrator__`.
-    secrets::get(
-        SecretScope::Global,
-        LICENSE_MODULE_ID,
-        &keychain_username_for(ORCHESTRATOR_MODULE_ID),
-    )
+    vct_launcher_core::licensing::read_license_key_from_keychain()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -195,157 +195,28 @@ fn to_view(row: TierCacheRow) -> TierCacheView {
 // instance_name and any "instance_limit" surfaced by the new hash is
 // resolved at vibecodedtools.it/account.
 
-/// Test-only override env var. When set, `machine_id_hash()` uses the
-/// override value verbatim (as the bytes to hash). Production code MUST
-/// NOT set this; the existence of the var in the environment overrides
-/// whatever the host actually reports. Documented as a test seam so
-/// reviewers don't grep for it and think it's a security backdoor.
-pub(crate) const MACHINE_ID_OVERRIDE_ENV: &str = "VCT_MACHINE_ID_OVERRIDE";
-
-/// Read the platform-stable host identifier as a `String` (the raw input
-/// to the sha256 hash). Returns `None` only when every supported source
-/// fails on the current OS — that's the trigger for the deterministic
-/// all-zero fallback shipped pre-v0.2.36 (preserves behaviour on
-/// pathological hosts so the validator path still reports SOMETHING
-/// rather than panicking).
-///
-/// Cross-platform compilation: each `#[cfg(target_os = "...")]` branch
-/// is independent. The Windows branch uses `winreg` (only enabled in the
-/// Windows target dep block); the macOS branch shells out via std
-/// (no extra dep); the Linux branch is a plain file read.
-fn read_platform_host_id() -> Option<String> {
-    // Test override always wins, regardless of OS. Empty value treated
-    // as "not set" so a stray export with an empty rhs doesn't accidentally
-    // change the hash to sha256("").
-    if let Ok(v) = std::env::var(MACHINE_ID_OVERRIDE_ENV) {
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-
-    // Each cfg block is a final expression — only one is compiled per
-    // target, and the surrounding function's return type carries through.
-    // Avoids the explicit `return` (which clippy flags as "unneeded
-    // return statement" when only one branch survives cfg-stripping).
-    #[cfg(target_os = "windows")]
-    {
-        read_windows_machine_guid()
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        read_macos_platform_uuid()
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        read_linux_machine_id()
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        // BSDs / Solaris / unknown: no stable algorithm we trust. Fall
-        // through to the deterministic sentinel hash. The user can still
-        // set `VCT_MACHINE_ID_OVERRIDE` (handled above) to pin a value.
-        None
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn read_windows_machine_guid() -> Option<String> {
-    // HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid is a REG_SZ value
-    // (GUID string) set by Windows during install. Survives NIC changes,
-    // user-account changes, and even motherboard replacement (it's
-    // registry-resident, not hardware-derived). Only an OS reinstall or
-    // explicit registry edit changes it.
-    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
-    use winreg::RegKey;
-
-    // KEY_WOW64_64KEY would normally be needed for 32-bit processes
-    // reading 64-bit registry; the launcher binary is 64-bit so the
-    // default view is the 64-bit hive. KEY_READ alone is sufficient.
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let subkey = hklm
-        .open_subkey_with_flags(r"SOFTWARE\Microsoft\Cryptography", KEY_READ)
-        .ok()?;
-    let guid: String = subkey.get_value("MachineGuid").ok()?;
-    let trimmed = guid.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn read_macos_platform_uuid() -> Option<String> {
-    // `ioreg -rd1 -c IOPlatformExpertDevice` dumps the IOPlatformExpertDevice
-    // entry; the line `"IOPlatformUUID" = "<HWUUID>"` is what we want.
-    // Shelling out is the simplest path — `ioreg` is part of the base
-    // system on every macOS install (no extra dep, no IOKit FFI).
-    let output = std::process::Command::new("ioreg")
-        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    for line in stdout.lines() {
-        // Format we look for:  "IOPlatformUUID" = "ABC-DEF-...-XYZ"
-        if let Some(rest) = line.split_once("\"IOPlatformUUID\"") {
-            // Take the substring after the first `=` and strip surrounding quotes/whitespace.
-            if let Some(after_eq) = rest.1.split_once('=') {
-                let raw = after_eq.1.trim();
-                let unquoted = raw.trim_matches('"').trim();
-                if !unquoted.is_empty() {
-                    return Some(unquoted.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn read_linux_machine_id() -> Option<String> {
-    // /etc/machine-id is the systemd standard (set at install or first
-    // boot; 32-char hex). Fallback to /var/lib/dbus/machine-id covers
-    // pre-systemd and non-systemd distros that still ship dbus.
-    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Stable, one-way machine identifier sent to `/validate-tier` and
-/// `/rebind-admin-token`. Returns 64-char lowercase hex (sha256). Never
-/// returns the raw OS identifier — the hash is the only thing that
-/// crosses the wire.
-///
-/// Mirrors `VCThelpers/license/validator.py::_machine_id_hash`.
-///
-/// Fallback semantics: if every platform source fails, hashes a fixed
-/// "no-host-id" sentinel so the function still returns a well-formed
-/// 64-char hex string (preserves the rebind-admin-token regex contract
-/// `^[0-9a-f]{64}$`). Server-side, all such hosts will collide on the
-/// same hash — acceptable degraded behaviour, surfaces as a
-/// machine-mismatch the user can resolve via rebind.
-pub(crate) fn machine_id_hash() -> String {
-    let id = read_platform_host_id().unwrap_or_else(|| {
-        // Sentinel for "no platform identifier available". Distinct from
-        // a real hash so a forensic check against `admin_auth_log` can
-        // recognise the degraded path.
-        "vct-no-platform-host-id-v0.2.36".to_string()
-    });
-    let mut hasher = Sha256::new();
-    hasher.update(id.as_bytes());
-    hex::encode(hasher.finalize())
-}
+// v0.2.49: `MACHINE_ID_OVERRIDE_ENV` const + `read_platform_host_id` +
+// the per-OS readers (`read_windows_machine_guid`,
+// `read_macos_platform_uuid`, `read_linux_machine_id`) + `machine_id_hash`
+// moved verbatim into `vct-launcher-core::licensing` so the hub-side
+// supervisor's pre-pull-with-auth flow can call the same helpers. The
+// wire-contract invariants (64-char lowercase hex, deterministic hash,
+// sentinel-on-fallback, empty-override-is-no-override) are preserved by
+// the move — see the unit tests in
+// `vct-launcher-core/src/licensing.rs::tests`.
+//
+// Public re-exports kept here so existing `pub(crate)` call sites in
+// the launcher binary (this module + the test block below + the L1
+// admin-rebind helpers) keep their unqualified imports working. The
+// `winreg` direct dep on the launcher's Cargo.toml is now dead code on
+// Windows targets but kept in place to avoid touching launcher deps
+// during the Phase 3 cutover; a follow-on cleanup can drop it once
+// downstream review confirms no other launcher-only call sites remain.
+// `MACHINE_ID_OVERRIDE_ENV` is consumed by the `#[cfg(test)]` block in
+// this file via `use super::*` — the `unused_imports` lint runs in
+// parent scope and doesn't see that, so allow it.
+#[allow(unused_imports)]
+pub(crate) use vct_launcher_core::licensing::{machine_id_hash, MACHINE_ID_OVERRIDE_ENV};
 
 // ---------------------------------------------------------------------------
 // Bug #22 (v0.2.31): token-gateway license cache file.
@@ -2007,6 +1878,10 @@ pub async fn list_module_license_validations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // v0.2.49: local hash imports for the env-driven machine_id_hash
+    // tests below — production impl lives in core, the tests still pin
+    // wire-contract invariants from this side too.
+    use sha2::{Digest, Sha256};
 
     /// Endpoint safety: URL must be HTTPS. (No more "must contain
     /// vibecodedtools.it" / "must not contain supabase.co" — those guards
@@ -2216,8 +2091,13 @@ mod tests {
     fn no_local_bypass_paths_in_licensing_or_validator() {
         // We can't import the Python validator from Rust — instead we
         // walk the file and grep its source. Same for licensing.rs.
+        // v0.2.49: also scans the promoted `vct-launcher-core::licensing`
+        // module — both halves of the moved code must remain
+        // bypass-free.
         let repo_root = super::super::installer::find_local_repo_root().expect("repo root");
         let licensing_rs = repo_root.join("launcher/src-tauri/src/commands/licensing.rs");
+        let core_licensing_rs =
+            repo_root.join("launcher/src-tauri/vct-launcher-core/src/licensing.rs");
         let validator_py = repo_root.join("VCThelpers/license/validator.py");
 
         let forbidden = [
@@ -2231,7 +2111,7 @@ mod tests {
             "maintainer_signing_key",
         ];
 
-        for path in [&licensing_rs, &validator_py] {
+        for path in [&licensing_rs, &core_licensing_rs, &validator_py] {
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
                 Err(_) => continue,

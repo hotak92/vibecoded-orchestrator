@@ -7,6 +7,195 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.49] - 2026-06-08
+
+The largest single-tag release to date — a 28-item access-matrix
+overhaul (10 phases) that closes the asymmetric semantic where the
+`kg_collection_access` matrix was a read-gate only. WRITES previously
+flowed through `WEAVIATE_URL` blindly, bypassing the access policy the
+user could see in the launcher GUI. v0.2.49 makes it a true two-way
+gate: every WRITE-path consumer now consults the hub at write time.
+
+Plus 4 SHIP-BLOCKERs, 8 MUST-FIXes, and 9 SHOULD-FIXes from a 4-lens
+adversarial Opus review (Step F) — all closed in-tag per the no-defer
+release discipline. Plus Fabio's 10-commit UI polish, the Windows-
+parity follow-up that closes the OS-specific WRITE-gate bypass, and
+the in-cycle carry-over fixes from Bug K through SB1.
+
+### Phase 1 (Steps A + A.5) — Foundation
+
+- **`app_state.orchestrator_root_kg_collection`** is now the canonical
+  name for the shared orchestrator KG (default
+  `VibeCodedOrchestrator_KnowledgeGraph`, overridable via
+  `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env at install.py time).
+  Migration 028 adds the persistence; every consumer that asks "is
+  this the shared root?" calls
+  `db.get_orchestrator_root_kg_collection()` and byte-compares.
+- **`kg_collection_access` audit columns** (`created_at` +
+  `updated_at INTEGER NOT NULL DEFAULT 0`, migration 029). Legacy rows
+  backfill to 0; v0.2.49+ INSERTs bind both to wall-clock millis. The
+  `is_user_configured(row) := row.updated_at != row.created_at`
+  predicate is now implementable.
+- **`Db::kg_seed_access`** — system-driven INSERT OR IGNORE setter
+  that preserves user-configured rows on re-runs. Distinct from
+  `kg_set_access` (user mutation, bumps `updated_at`). Seed paths use
+  `kg_seed_access`; UI mutations use `kg_set_access`.
+
+### Phase 2 (Step B) — Centralized resolver
+
+- **`AccessLevel` enum** (`Read | Write | Denied`) with wire-stable
+  `as_str()` returning `"read" | "write" | "none"`. Replaces ad-hoc
+  string literals across the launcher.
+- **`Db::resolve_default_access_level`** — F-2a default: row with
+  role `primary` or `shared` → `Write`; otherwise → `Denied`. Single
+  source of truth.
+- **V44-C structural-row guard relocated** into `Db::kg_set_access` +
+  `Db::is_orchestrator_root_structural_row` helper. The
+  orchestrator-root primary row can no longer lose write access via
+  any code path.
+- **`is_shared` substring heuristic eliminated** — replaced with byte
+  equality against `db.get_orchestrator_root_kg_collection()`.
+
+### Phase 3 (Step C) — F-1 SHIP-BLOCKER boot-order fix
+
+- **`tokio::sync::oneshot` channel** between adopt + reconcile in
+  `lib.rs::setup`. Adopt sends `()` on completion; reconcile awaits
+  before its orphan-prune sweep. Pre-fix, scheduler race could drop
+  access rows BEFORE adopt rewrote bindings → silent data loss for
+  users with renamed collections.
+- **`Db::update_binding_for_adoption`** now also calls
+  `Db::kg_rename_access` BEFORE the binding UPDATE.
+
+### Phase 4 (Stream W1 + RL chat #13) — Call-site wiring
+
+- **Hub `set_kg_binding`** routes through `_with_root_sync` (M-7).
+- **Hub CLI `vct project create`** calls
+  `Db::populate_kg_collection_access_for_project`. Pre-v0.2.49 CLI-
+  created projects had an empty access matrix.
+- **`rename_project_v2`** propagates rename to `kg_collection_access`
+  rows.
+- **`ModuleManifest.kg_collections: Option<Vec<String>>`** field —
+  global-scope modules' declared collections land access rows for
+  every project (M-3).
+
+### Phase 5 (Stream W2) — UI
+
+- **F-2b**: "Remove access" button → `mode='none'`.
+- **F-2c**: peer-revoke mutation loop skips rows where
+  `is_user_configured()` is TRUE.
+- **M-1**: boot reconcile scoped to VCO-managed suffixes only.
+- **M-4**: hint text rewrite.
+
+### Phase 6 (Stream W3) — Boot folder sanity
+
+- **`projects.folder_missing_at_last_boot`** column (migration 030).
+- **Boot probe** flags projects whose folder went missing.
+- **`ProjectCard.svelte`** non-blocking warning banner.
+
+### Phase 7 (Step D) — Force-upgrade migration
+
+- **Migration 031** unconditionally upgrades shared
+  `kg_collection_access` rows from `read` to `write` per the user
+  directive "force-update everything to new default permissions".
+  Per Step F's SF1 + Q4 verdicts, migration 031 also:
+  - Drops cross-project peer-grant rows that aren't in the v0.2.49
+    default keep-list (own primary + own dev + own shared, with a
+    corruption carve-out for projects lacking a `role='primary'`
+    binding).
+  - Sentinel-stamps surviving rows with `updated_at = created_at + 1`
+    so `is_user_configured` reads FALSE post-migration.
+
+### Phase 8 (Stream W4) — WRITE-path gate
+
+- **Hub endpoint** `GET /api/v1/projects/{id}/access/{collection}`
+  returns `{"level": ...}`. With Step F's SB3 fix, row-absent
+  consults `resolve_default_access_level`; row-present round-trips
+  through `AccessLevel::from_str_strict` defensively (SF3).
+- **Hub endpoint companion** `GET /api/v1/projects/{id}/access?level=write`
+  returns the project's writable collections (Q2 enrichment).
+- **`templates/scripts/vct_access_check.{sh,ps1}`** + matching
+  Python sibling `vco_lib/access_resolver.py` — resolver clients. Hub
+  discovery mirrors `vct_project_config`; 5s HTTP timeout; fail-open
+  on every error class. PID-scoped rate-limit on hook callers
+  (ephemeral); process-scoped on the long-running MCP (no log spam).
+- **Hooks**: `templates/hooks/post-file-edit.{sh,ps1}` gate both
+  kg-sync paths.
+- **MCP server**: `store_knowledge_node` consults the matrix; deny-
+  branch response carries `writable_collections` populated from the
+  hub for self-resolving errors.
+
+### Step F — adversarial review closures (post-Phase-8)
+
+A 4-lens read-only Opus adversarial review surfaced 28 findings; all
+4 SHIP-BLOCKERs, 8 MUST-FIXes, and 9 SHOULD-FIXes closed in-tag per
+the no-defer release discipline.
+
+**SHIP-BLOCKERs**:
+- **SB1**: empty `VCT_PROJECT_ID` silently bypassed the WRITE-path
+  gate. Fix: install.py + project_init.py unconditionally seed
+  `VCT_PROJECT_ID=<uuid>` in `.claude/env`. Gate's empty-PID branch
+  emits `UPDATE_DEFERRED.md` entry (per user directive: no stderr
+  WARNING; deferral file IS the actionable surface) + a
+  `dropped_writes.jsonl` row with `reason=gate_skipped_no_project_id`.
+- **SB2**: `populate_kg_collection_access_for_project` lifted into
+  `db::access`; hub CLI `rename_project` now calls
+  `propagate_kg_access_on_rename` (was Tauri-only); `_Diagrams`
+  suffix added to propagate list.
+- **SB3**: hub endpoint row-absent consults
+  `resolve_default_access_level` (was literal `"none"`). Unifies
+  three "absent row" defaults across resolver/hub/MCP surfaces.
+- **SB4**: `kg_set_access` no-op UPSERT no longer bumps `updated_at`.
+  Conditional CASE clause: only on real level change. Pre-fix
+  unconditional bump poisoned `is_user_configured` for F-2c logic.
+
+**MUST-FIXes**: V44-C guard in `kg_seed_access` (MF1); `maintenance.rs`
+byte-equality (MF2); per-project populate iterates
+`list_global_module_installs` for back-fill (MF3 v2 — DB-storage
+refactor); peer-row cleanup on `delete_project_v2` (MF4); narrow
+`ImportError`/`Exception` catches + gate-crash metric in MCP server
+(MF5/MF6); `store_knowledge_node` docstring + deny-branch enrichment
+with `writable_collections` (MF7); bash reason-string split aligned
+to py/ps1 (MF8).
+
+**SHOULD-FIXes**: migration 031 sentinel + cross-project peer drop
+(SF1 + Q4); symmetric V44-C test (SF2); defensive `AccessLevel`
+round-trip in hub endpoint (SF3); `pick_higher_access_level` takes
+`AccessLevel` (SF4); rename propagate `_Diagrams` (SF5, inline in
+SB2); test fixture DDL aligned to migration 029 (SF6); live-binary
+tests for `vct_access_check.{sh,ps1}` (SF7); log rotation on
+`dropped_writes.jsonl` (SF8).
+
+### Fabio integration — 10 commits across 6 UI branches
+
+- Boot splash (orbital rings + vector logo).
+- Update modal restyle (Martino-style orbital logo).
+- Error-notification bell in MenuBar (fixes v0.2.48's sidebar-
+  clipping placement).
+- Module action buttons on every surface.
+- Module install/update failure detection from reloaded catalog kind.
+- 5 UI polish fixes across routes + sidebar HiDPI logo + audit page
+  header alignment.
+- Brand reference doc (`.claude/references/VCO_BRAND_REFERENCE.md`) +
+  CLAUDE.md UI/visual directive.
+
+### Other v0.2.49 carry-over fixes
+
+- **install.py self-heal**: parity-insert matches canonical
+  `kg_collection_access` schema (Bug O) + RO-mode probe pattern
+  (Bug N).
+- **kg-sync**: rejects venvs missing `weaviate_mcp` + cross-OS python
+  binary detection (Bug K).
+- **Install streaming**: `install.py` progress events stream to
+  `OrchestratorUpdateProgressModal`.
+- **Embedding-selector tier boundaries**: strict-greater-than on
+  RAM/VRAM + physical-core check.
+- **3 SHIP-BLOCKERs from adversarial review** closed in commit
+  `3a706434`.
+- **`PerPullAuth` flag-position bug** trio — uses
+  `REGISTRY_AUTH_FILE` env, not `--authfile` flag.
+- **Single-instance lock** for `install.py --update`.
+- **Orphan `install.py` reaper** on launcher startup.
+
 ## [0.2.48] - 2026-06-05
 
 Three-fix release closing the gap that broke v0.2.47's `Update orchestrator`

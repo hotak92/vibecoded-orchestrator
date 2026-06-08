@@ -102,6 +102,73 @@ pub fn resolve_container_name(template: &str, project_slug: &str) -> Result<Stri
     Ok(out)
 }
 
+/// v0.2.49 Stream A: resolve a GLOBAL container name. For global-scope
+/// installs the container name is the bare `module_id` — no
+/// `{project_slug}` suffix, no per-project naming, exactly one container
+/// per machine. Strips a trailing `-{project_slug}` if the manifest's
+/// `container_name_template` carries one (most manifests do), so a
+/// per-project module flipped to `install.scope = "global"` produces a
+/// clean bare-id container name without requiring the manifest author
+/// to author a separate template.
+///
+/// Rules:
+///   * `"vct-rl-reranker-{project_slug}"` → `"vct-rl-reranker"`
+///   * `"vct-rl-reranker"` → `"vct-rl-reranker"` (idempotent)
+///   * `"custom-{project_slug}-suffix"` → error (the `{project_slug}`
+///     isn't trailing; can't safely strip without changing semantics).
+///     Authors of global modules should drop the placeholder explicitly.
+pub fn resolve_global_container_name(
+    template: &str,
+    module_id: &str,
+) -> Result<String, String> {
+    // Strip a trailing `-{project_slug}` only — anywhere else and the
+    // template is ambiguous for global scope.
+    let stripped = template
+        .strip_suffix("-{project_slug}")
+        .or_else(|| template.strip_suffix("_{project_slug}"))
+        .unwrap_or(template);
+
+    if stripped.contains("{project_slug}") {
+        return Err(format!(
+            "container_name_template '{}' contains {{project_slug}} in a \
+             non-trailing position; cannot safely resolve for install.scope='global'. \
+             Drop the placeholder in your manifest, or move it to a trailing \
+             `-{{project_slug}}` suffix.",
+            template
+        ));
+    }
+
+    if stripped.contains('{') && stripped.contains('}') {
+        return Err(format!(
+            "container_name_template '{}' has unresolved placeholders → '{}'",
+            template, stripped
+        ));
+    }
+
+    if stripped.is_empty() {
+        // Fallback to the bare module id — authoring slip; better than
+        // returning an empty container name to podman.
+        return Ok(module_id.to_string());
+    }
+    Ok(stripped.to_string())
+}
+
+/// v0.2.49 Stream A: placeholder map for a GLOBAL container. Mirrors
+/// [`rl_placeholders`] but uses a fixed `"global"` literal for
+/// `{project_slug}` (so volume / log paths like
+/// `/data/state/{project_slug}/...` resolve to `/data/state/global/...`
+/// instead of erroring on the unresolved placeholder). `RL_SERVER_PORT`
+/// still comes from the caller — every container needs ONE listen port
+/// (allocated machine-wide for global modules vs per-project for
+/// per-project modules).
+pub fn rl_placeholders_global(rl_port: u16) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("{RL_SERVER_PORT}".to_string(), rl_port.to_string());
+    m.insert("{project_slug}".to_string(), "global".to_string());
+    m.insert("{ollama_port}".to_string(), DEFAULT_OLLAMA_PORT.to_string());
+    m
+}
+
 /// Resolve `{install.container.image}` + `{install.container.tag}` against
 /// the manifest's `install.container` block. The tag is chosen via the
 /// same rule `container_pull` uses (`tag_from_version` →
@@ -343,17 +410,125 @@ pub fn build_podman_run_args(
         args.push(format!("{}={}", k, resolved));
     }
 
-    // Positional: image, then command + args (override of image CMD).
+    // Positional: image, then optional command + args (override of image CMD).
     args.push(image.to_string());
 
-    // command + args undergo the same placeholder substitution so author
-    // can use `{project_slug}` in `--log-path /data/logs/rl_events_{project_slug}.jsonl`.
-    args.push(resolve_value(&runtime.command, ctx, &placeholders));
-    for a in &runtime.args {
-        args.push(resolve_value(a, ctx, &placeholders));
+    // v0.2.49: Bug E — pre-v0.2.49 manifests had `command: "podman"` +
+    // `args: ["run", "--rm", "-p", "11450:11450", "{module_image}"]` (the
+    // launcher-side podman invocation mistakenly authored as the
+    // container CMD). The resulting container ran
+    // `<entrypoint> podman run --rm -p 11450:11450 {module_image}`
+    // and argparse-failed. Declarative manifests leave `command` empty
+    // and rely on the image-baked ENTRYPOINT. When `command` is empty,
+    // skip the CMD override entirely so podman uses the image's default.
+    // Placeholders still apply when `command` is non-empty (legacy
+    // override authors can use `{project_slug}` etc.).
+    if !runtime.command.is_empty() {
+        args.push(resolve_value(&runtime.command, ctx, &placeholders));
+        for a in &runtime.args {
+            args.push(resolve_value(a, ctx, &placeholders));
+        }
     }
 
     Ok(args)
+}
+
+/// v0.2.49 Stream A: build the full `podman run` argv for a GLOBAL
+/// container — no per-project state. Sibling of
+/// [`build_podman_run_args`] used by the global supervisor + global
+/// install path.
+///
+/// Differences vs `build_podman_run_args`:
+///   * Takes no `ProjectRow` — there's no project for a global install.
+///   * Uses [`rl_placeholders_global`], which substitutes `"global"` for
+///     `{project_slug}` (so volume paths like
+///     `/data/state/{project_slug}/...` resolve to a stable global dir).
+///   * `rl_port` is the machine-wide allocated port (one per global
+///     module — the container listens on this single port for every
+///     project's requests).
+pub fn build_podman_run_args_global(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+) -> Result<Vec<String>, String> {
+    let runtime = &manifest.runtime;
+    if !matches!(runtime.r#type.as_str(), "container" | "service") {
+        return Err(format!(
+            "build_podman_run_args_global: runtime.type must be 'container' or 'service', got '{}'",
+            runtime.r#type
+        ));
+    }
+
+    let placeholders = rl_placeholders_global(rl_port);
+    let mut args: Vec<String> = Vec::new();
+    args.push("run".into());
+    args.push("-d".into());
+    args.push("--name".into());
+    args.push(container_name.to_string());
+
+    if runtime.auto_restart {
+        args.push("--restart=unless-stopped".into());
+    }
+
+    for port in &runtime.ports {
+        args.push("-p".into());
+        args.push(build_port_arg(port, &placeholders)?);
+    }
+
+    for vol in &runtime.volumes {
+        args.push("-v".into());
+        args.push(build_volume_arg(vol, ctx, &placeholders));
+    }
+
+    for (k, v) in &runtime.env_fixed {
+        let resolved = resolve_value(v, ctx, &placeholders);
+        args.push("-e".into());
+        args.push(format!("{}={}", k, resolved));
+    }
+    for (k, v) in &runtime.env_derived {
+        let resolved = resolve_value(v, ctx, &placeholders);
+        args.push("-e".into());
+        args.push(format!("{}={}", k, resolved));
+    }
+
+    args.push(image.to_string());
+
+    // v0.2.49 Bug E (mirrored from build_podman_run_args): only push a
+    // CMD override when the manifest declares a non-empty `command`.
+    // Declarative manifests with empty command let the image's
+    // ENTRYPOINT run unmolested.
+    if !runtime.command.is_empty() {
+        args.push(resolve_value(&runtime.command, ctx, &placeholders));
+        for a in &runtime.args {
+            args.push(resolve_value(a, ctx, &placeholders));
+        }
+    }
+
+    Ok(args)
+}
+
+/// v0.2.49 Stream A: best-effort `mkdir -p` for each volume's host path
+/// for a GLOBAL container. Sibling of [`ensure_volume_host_dirs`] that
+/// substitutes `"global"` for `{project_slug}`.
+pub async fn ensure_volume_host_dirs_global(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    rl_port: u16,
+) {
+    let placeholders = rl_placeholders_global(rl_port);
+    for vol in &manifest.runtime.volumes {
+        let host_resolved = resolve_value(&vol.host, ctx, &placeholders);
+        let path = PathBuf::from(&host_resolved);
+        if let Err(e) = tokio::fs::create_dir_all(&path).await {
+            eprintln!(
+                "[container_runtime] global mkdir -p {} failed (will let podman surface the error): {}",
+                path.display(),
+                e
+            );
+        }
+    }
 }
 
 /// Replace `[^A-Za-z0-9._-]` with `_` so a hostile string can never
@@ -432,19 +607,41 @@ impl PerPullAuth {
     /// `cmd` is `tokio::process::Command`; the same pattern can be
     /// adapted for `std::process::Command` by callers — both honor the
     /// same `.arg(...)` / `.env(...)` surface.
+    // v0.2.49: switched podman branch from argv flag injection to env var.
+    // The v0.2.47 shape (`cmd.arg("--authfile").arg(file.path())`) put the
+    // flag BEFORE the subcommand at every callsite (apply_to runs before
+    // `.args(["pull", &image_ref])`), producing
+    //   podman --authfile X pull image
+    // which podman 4.x rejects with "Error: unknown flag: --authfile".
+    // The flag is subcommand-scoped (`podman pull --authfile X image`),
+    // but every callsite added args in the wrong order. Three releases
+    // (v0.2.47-v0.2.48) shipped with launcher GUI installs silently
+    // failing exit 125 on every cache-miss pull.
+    //
+    // REGISTRY_AUTH_FILE is the env-var sibling of --authfile per podman
+    // release notes since 1.3. It's position-independent on the CLI, so
+    // no callsite reordering is needed. Docker branch already uses
+    // DOCKER_CONFIG env var; podman branch is now symmetric.
+    //
+    // Caller obligation: apply_to MUST run AFTER any cmd.env_clear()
+    // (env vars are last-write-wins). All current callsites verified
+    // safe: install path's pull doesn't env_clear; start path's pre-pull
+    // is a separate Command from the start's `podman run` (which does
+    // env_clear). See test `per_pull_auth_podman_env_var_accepted_by_live_podman`
+    // for the live-podman regression guard.
     pub fn apply_to(&self, cmd: &mut tokio::process::Command, runtime: &str) {
         match (&self.inner, runtime) {
             (PerPullAuthInner::Podman(file), _) => {
-                cmd.arg("--authfile").arg(file.path());
+                cmd.env("REGISTRY_AUTH_FILE", file.path());
             }
             (PerPullAuthInner::Docker(dir), "docker") => {
                 cmd.env("DOCKER_CONFIG", dir.path());
             }
             (PerPullAuthInner::Docker(dir), _) => {
                 // Hybrid case: caller built a Docker-shape guard but is
-                // invoking a non-docker runtime. Treat as podman --
-                // both runtimes will read DOCKER_CONFIG if set, AND the
-                // file is laid out the same way.
+                // invoking a non-docker runtime. DOCKER_CONFIG works on
+                // both runtimes (podman reads it as a fallback), and the
+                // file layout is identical.
                 cmd.env("DOCKER_CONFIG", dir.path());
             }
         }
@@ -559,6 +756,391 @@ pub async fn ensure_volume_host_dirs(
     }
 }
 
+// ─── Pull-token gateway HTTP core (v0.2.49) ────────────────────────────
+//
+// Why these live in core (v0.2.49 Phase 3 hub-supervisor auth port):
+// pre-v0.2.49 `installer_engine::request_pull_token` was launcher-private
+// — `vct-hub`'s `module_supervisor::start_container_for_module` couldn't
+// reach it. The supervisor therefore had no way to pre-pull the variant-
+// correct image with proper credentials before `podman run`, falling
+// through to anonymous-pull-401 on private GHCR packages. See
+// `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`.
+//
+// The HTTP body of `request_pull_token` is portable (license_key +
+// machine_id_hash POST to the gateway URL); the only launcher-coupled
+// parts were the keychain read and `machine_id_hash` — both now in
+// `vct-launcher-core::licensing`. The whole flow can move to core.
+
+/// Hard-coded fallback for the pull-token gateway URL. Used when the
+/// resolved endpoint (L0 override → L1 manifest → env override) is
+/// empty or matches a known placeholder pattern. Mirrors the launcher's
+/// `installer_engine::RL_ARTIFACT_URL_DEFAULT_ENDPOINT`.
+pub const RL_ARTIFACT_URL_DEFAULT_ENDPOINT: &str =
+    "https://ovpdtijpdchzlxbojhsg.supabase.co/functions/v1/rl-artifact-url";
+
+/// Historical exact-match placeholder string still found in some
+/// pre-publish manifests. Preserved for backwards-compat with
+/// v0.2.42-and-earlier publish artifacts. `pub` so the launcher's
+/// existing test suite (which compared the launcher-private copy
+/// against the well-known placeholder value pre-v0.2.49) can keep its
+/// assertions targeting this single source of truth.
+pub const PULL_TOKEN_ENDPOINT_PLACEHOLDER: &str = "https://example/pull-token";
+
+/// Pull-token gateway response (deserialised from the edge function's
+/// JSON body). Mirrors `installer_engine::PullTokenResponse` — moved
+/// to core because the request helper now lives here. Field set kept
+/// IDENTICAL so the launcher's existing wrapper deserialises into the
+/// same struct.
+#[derive(Debug, serde::Deserialize)]
+pub struct PullTokenResponse {
+    pub pull_token: String,
+    /// The GitHub username the pull_token authenticates as. Passed to
+    /// `podman/docker login -u`. Optional so a v0.2.36 launcher remains
+    /// compatible with the pre-v0.2.36 server response shape.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub expires_in_s: u64,
+    /// Server-returned image tag (v0.2.46 V46-E C1). When `Some` and
+    /// non-empty, the caller compares against the client-resolved tag
+    /// and may adjust on patch-level drift.
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+/// Returns true if `raw` matches a known placeholder URL pattern. Pure
+/// function — used by `resolve_pull_token_endpoint` to substitute the
+/// hardcoded default. See the launcher's v0.2.45 V45-D + v0.2.42 W8 +
+/// v0.2.42 P3-P1-1 history for the families recognised here:
+///
+///   1. Exact `PULL_TOKEN_ENDPOINT_PLACEHOLDER` (back-compat).
+///   2. Bare `example` host (no TLD).
+///   3. RFC-2606 `example.{com,net,org,invalid,test}` exact-host.
+///   4. Bare `placeholder`, `placeholder.<anything>`, `<anything>.placeholder`.
+///
+/// `pub` so the launcher's existing test suite (which exercised every
+/// branch of the placeholder family against the pre-v0.2.49 launcher-
+/// private copy) can re-export and continue asserting the same
+/// invariants from this single source of truth.
+pub fn is_pull_token_placeholder(raw: &str) -> bool {
+    if raw == PULL_TOKEN_ENDPOINT_PLACEHOLDER {
+        return true;
+    }
+    let host_start = if let Some(rest) = raw.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        rest
+    } else {
+        return false;
+    };
+    let host = host_start.split('/').next().unwrap_or("");
+    let host_no_port = host.split(':').next().unwrap_or("");
+
+    if matches!(
+        host_no_port,
+        "example"
+            | "example.com"
+            | "example.net"
+            | "example.org"
+            | "example.invalid"
+            | "example.test"
+    ) {
+        return true;
+    }
+
+    let lower = host_no_port.to_lowercase();
+    if lower == "placeholder"
+        || lower.starts_with("placeholder.")
+        || lower.ends_with(".placeholder")
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Resolve the effective pull-token endpoint URL. Empty / placeholder
+/// inputs are replaced with `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` and an
+/// operator-visible warning is logged. Any other non-empty string is
+/// returned as-is.
+pub fn resolve_pull_token_endpoint(raw: &str) -> &str {
+    if raw.is_empty() || is_pull_token_placeholder(raw) {
+        eprintln!(
+            "[container_runtime] pull_token_endpoint is {:?}; \
+             substituting default RL_ARTIFACT_URL_DEFAULT_ENDPOINT. \
+             Fix the module manifest to remove this warning.",
+            raw
+        );
+        RL_ARTIFACT_URL_DEFAULT_ENDPOINT
+    } else {
+        raw
+    }
+}
+
+/// Map a non-2xx pull-token gateway response into a user-readable
+/// string. Same body shape the launcher's
+/// `installer_engine::format_pull_token_error` handles — moved to core
+/// so the hub-side caller doesn't need to re-derive the mapping.
+pub fn format_pull_token_error(status: u16, body: &serde_json::Value) -> String {
+    let code = body
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown_error");
+    let detail = body
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    match (status, code) {
+        (400, _) => format!(
+            "pull-token gateway rejected the request shape ({}). \
+             This is a launcher bug — please report it. detail={}",
+            code, detail
+        ),
+        (401, "license_invalid") => {
+            "your license key is invalid or has been revoked. \
+             Open Settings → License → Refresh; if the problem persists, \
+             contact support."
+                .to_string()
+        }
+        (401, "license_expired") => {
+            "your license has expired. Renew on the dashboard, then \
+             open Settings → License → Refresh."
+                .to_string()
+        }
+        (401, "tier_insufficient") => {
+            let required = body
+                .get("required_tier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pro");
+            let got = body.get("got").and_then(|v| v.as_str()).unwrap_or("free");
+            format!(
+                "this module requires the {} tier; your license validates as {}. \
+                 Upgrade on the dashboard, then open Settings → License → Refresh.",
+                required, got
+            )
+        }
+        (401, _) => format!(
+            "license check failed at the pull-token gateway: {} ({})",
+            code, detail
+        ),
+        (500, _) => format!(
+            "pull-token gateway is temporarily unavailable ({}). \
+             Try again in a few minutes; if it persists, check Services tab.",
+            detail
+        ),
+        (s, c) => format!("pull-token gateway returned HTTP {}: {} ({})", s, c, detail),
+    }
+}
+
+/// HTTP-only pull-token request. `license_key` and `machine_hash` are
+/// passed in by the caller (each crate reads them via
+/// `vct_launcher_core::licensing::read_license_key_from_keychain()` +
+/// `vct_launcher_core::licensing::machine_id_hash()` respectively — the
+/// helper does NOT pull from the keychain itself so it stays free of
+/// any test-only / Tauri-only coupling).
+///
+/// Endpoint resolution precedence (highest-first):
+///   1. `VCT_RL_PULL_TOKEN_ENDPOINT` env var (operator escape hatch;
+///      non-empty after trim).
+///   2. `l0_pull_token_endpoint` (when supplied — the L0 catalog override).
+///   3. `container.pull_token_endpoint` (the manifest's value).
+///   4. `RL_ARTIFACT_URL_DEFAULT_ENDPOINT` (substituted in for empty /
+///      placeholder values via `resolve_pull_token_endpoint`).
+///
+/// 15s timeout — same as launcher's pre-v0.2.49 path.
+///
+/// v0.2.49 Phase 3: the launcher's
+/// `installer_engine::request_pull_token` is now a 5-line wrapper that
+/// reads the keychain + computes the machine hash, then calls this
+/// helper. The hub-side supervisor calls it via the same wrapper
+/// pattern. Both wrappers see byte-identical request bodies for the
+/// same `(license_key, machine_hash, endpoint)` triple.
+pub async fn request_pull_token_http(
+    container: &crate::manifest::ContainerInstallBlock,
+    l0_pull_token_endpoint: Option<&str>,
+    license_key: &str,
+    machine_hash: &str,
+) -> Result<PullTokenResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("build http client: {}", e))?;
+
+    let method = container
+        .pull_token_method
+        .parse::<reqwest::Method>()
+        .unwrap_or(reqwest::Method::POST);
+
+    let endpoint_string: String;
+    let endpoint: &str = match std::env::var("VCT_RL_PULL_TOKEN_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(env_url) => {
+            eprintln!(
+                "[container_runtime] VCT_RL_PULL_TOKEN_ENDPOINT set; \
+                 using env override for pull-token endpoint: {}",
+                env_url
+            );
+            endpoint_string = env_url;
+            &endpoint_string
+        }
+        None => {
+            let raw_endpoint = l0_pull_token_endpoint.unwrap_or(&container.pull_token_endpoint);
+            resolve_pull_token_endpoint(raw_endpoint)
+        }
+    };
+
+    let resp = client
+        .request(method, endpoint)
+        .json(&serde_json::json!({
+            "license_key": license_key,
+            "machine_id_hash": machine_hash,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("POST {}: {}", endpoint, e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        let parsed: PullTokenResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("parse pull-token response: {}", e))?;
+        return Ok(parsed);
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Err(format_pull_token_error(status.as_u16(), &body))
+}
+
+/// Convenience wrapper around [`request_pull_token_http`] that reads
+/// the license key + machine_id_hash via the shared
+/// `vct_launcher_core::licensing` helpers. Both launcher and hub call
+/// this directly (the v0.2.47 launcher inlined the same three lines —
+/// promoting them here is a strict de-duplication).
+pub async fn request_pull_token(
+    container: &crate::manifest::ContainerInstallBlock,
+    l0_pull_token_endpoint: Option<&str>,
+) -> Result<PullTokenResponse, String> {
+    let license_key = crate::licensing::read_license_key_from_keychain()
+        .map_err(|e| format!("keychain read failed: {}", e))?
+        .ok_or_else(|| {
+            "no license activated — open Settings → License → Activate to enter your key"
+                .to_string()
+        })?;
+    let machine_hash = crate::licensing::machine_id_hash();
+    request_pull_token_http(container, l0_pull_token_endpoint, &license_key, &machine_hash).await
+}
+
+// ─── Pre-pull-with-auth (v0.2.49) ──────────────────────────────────────
+
+/// Pre-pull the variant-correct image with proper auth context BEFORE
+/// the supervisor's `podman run`. Used by both the launcher-side
+/// `start_container_for_module` and the hub-side
+/// `module_supervisor::start_container_for_module` so a cache-evicted
+/// host doesn't fall through to `podman run`'s anonymous-pull-401 path.
+///
+/// Soft-fails on every error — the caller logs and proceeds to
+/// `podman run`. If the image is already in the local cache, `run`
+/// succeeds without the pre-pull. If the image is missing AND pre-pull
+/// failed, `run` will surface the anonymous-pull failure itself; we
+/// don't double-report.
+///
+/// Algorithm:
+///   1. Fast-path: `<runtime> image exists <image_ref>` → if Ok, return.
+///   2. Request a pull token via the shared
+///      `request_pull_token(container, None)` (uses
+///      `vct_launcher_core::licensing` for the keychain read +
+///      machine_id_hash so launcher and hub agree byte-for-byte).
+///   3. Build a per-pull auth guard (`build_per_pull_authfile`).
+///   4. Apply the guard to a `<runtime> pull` command and execute.
+///   5. Return Ok on exit-0; Err on non-zero or pull-token failure.
+///
+/// `runtime` matches the launcher's `detect_container_runtime()` /
+/// hub's local copy: `"podman"` or `"docker"`. Other values pass through
+/// to `PerPullAuth::apply_to`'s catch-all (podman-shape `--authfile`).
+pub async fn pre_pull_with_auth_for_start(
+    manifest: &crate::manifest::ModuleManifest,
+    runtime: &str,
+    image_ref: &str,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let container = manifest
+        .install
+        .container
+        .as_ref()
+        .ok_or_else(|| "install.container block missing".to_string())?;
+
+    // Fast-path: image already in local cache → no pull needed.
+    let inspect = Command::new(runtime)
+        .args(["image", "exists", image_ref])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    if let Ok(s) = inspect {
+        if s.success() {
+            return Ok(());
+        }
+    }
+
+    // Image not in cache. Request a pull token (mirrors the install
+    // path's flow) and use a per-pull authfile.
+    let token_result = request_pull_token(container, None).await;
+    let registry = container.registry.clone().unwrap_or_else(|| {
+        image_ref
+            .split_once('/')
+            .map(|(host, _)| host.to_string())
+            .unwrap_or_else(|| "docker.io".to_string())
+    });
+    let guard_opt = match token_result {
+        Ok(tok) => {
+            let user = tok.username.as_deref().unwrap_or("vct-paid-module");
+            Some(build_per_pull_authfile(&registry, user, &tok.pull_token, runtime)?)
+        }
+        Err(e) => {
+            // No token → anonymous pull. Will 401 on private images.
+            // Same soft-fail discipline the launcher had pre-v0.2.49.
+            eprintln!(
+                "[container_runtime] pre-pull: pull-token gateway returned {}; \
+                 anonymous pull attempt (will 401 on private images).",
+                e
+            );
+            None
+        }
+    };
+
+    let mut pull_cmd = Command::new(runtime);
+    if let Some(g) = guard_opt.as_ref() {
+        g.apply_to(&mut pull_cmd, runtime);
+    }
+    let pull_status = pull_cmd
+        .args(["pull", image_ref])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
+
+    if !pull_status.success() {
+        return Err(format!(
+            "{} pull failed (exit {}) for {}",
+            runtime,
+            pull_status.code().unwrap_or(-1),
+            image_ref
+        ));
+    }
+    Ok(())
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -620,6 +1202,7 @@ mod tests {
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
                 }),
+                scope: crate::manifest::InstallScope::PerProject,
             },
             secrets: vec![],
             settings: vec![],
@@ -667,6 +1250,7 @@ mod tests {
             consumes: vec![],
             gui: None,
             db: None,
+            kg_collections: None,
         }
     }
 
@@ -885,28 +1469,40 @@ mod tests {
         assert!(!p2.contains("../"));
     }
 
-    // ─── v0.2.47: PerPullAuth runtime dispatch ──────────────────────
+    // ─── v0.2.47 → v0.2.49: PerPullAuth runtime dispatch ────────────
+    //
+    // v0.2.47 injected `--authfile <path>` as an argv flag. Tests asserted
+    // on `format!("{:?}", cmd).contains("--authfile")` only. v0.2.49 fixed
+    // the podman-authfile-flag-position bug (latent for 3 releases) by
+    // switching to `REGISTRY_AUTH_FILE` env var, which is position-
+    // independent. Updated assertions below check the env-var shape.
 
-    /// Bug-2 regression test: podman runtime → `--authfile <path>` arg
-    /// is appended to the Command.
+    /// v0.2.49 regression test: podman branch → `REGISTRY_AUTH_FILE` env
+    /// var present, no `--authfile` argv flag.
     #[test]
-    fn per_pull_auth_apply_to_podman_uses_authfile_arg() {
+    fn per_pull_auth_apply_to_podman_uses_registry_auth_file_env() {
         let guard = build_per_pull_authfile("ghcr.io", "bot", "tok", "podman")
             .expect("build podman authfile");
         let mut cmd = tokio::process::Command::new("podman");
         guard.apply_to(&mut cmd, "podman");
         let dbg = format!("{:?}", cmd);
         assert!(
-            dbg.contains("--authfile"),
-            "podman branch must include --authfile arg, got: {}",
+            dbg.contains("REGISTRY_AUTH_FILE"),
+            "podman branch must include REGISTRY_AUTH_FILE env var, got: {}",
             dbg
         );
-        // path() returns Some for podman-shape guards.
+        assert!(
+            !dbg.contains("--authfile"),
+            "podman branch must NOT add --authfile to argv (would mis-position \
+             on podman 4.x), got: {}",
+            dbg
+        );
+        // path() still returns Some for podman-shape guards.
         assert!(guard.path().is_some(), "podman guard exposes path()");
     }
 
-    /// Bug-2 regression test: docker runtime → no `--authfile` arg,
-    /// instead `DOCKER_CONFIG=<dir>` env present.
+    /// v0.2.49 regression test: docker runtime → `DOCKER_CONFIG` env
+    /// var present, no `--authfile` argv flag.
     #[test]
     fn per_pull_auth_apply_to_docker_uses_docker_config_env() {
         let guard = build_per_pull_authfile("ghcr.io", "bot", "tok", "docker")
@@ -931,19 +1527,68 @@ mod tests {
         );
     }
 
-    /// Built-for-podman guard applied to a podman runtime keeps the
-    /// authfile shape. Applied to docker runtime, also lands as
-    /// `--authfile` (no auto-translation). Caller must build the
-    /// runtime-correct guard up front — that's the contract.
+    /// Built-for-podman guard applied to a docker runtime still uses
+    /// `REGISTRY_AUTH_FILE` (the `(Podman, _)` match arm is runtime-
+    /// agnostic, by design). Callers SHOULD build runtime-correct
+    /// guards up front; this is the conservative fallback.
     #[test]
-    fn per_pull_auth_podman_guard_uses_authfile_even_against_docker() {
+    fn per_pull_auth_podman_guard_uses_env_var_even_against_docker() {
         let guard = build_per_pull_authfile("ghcr.io", "bot", "tok", "podman")
             .expect("build podman authfile");
         let mut cmd = tokio::process::Command::new("docker");
         guard.apply_to(&mut cmd, "docker");
         let dbg = format!("{:?}", cmd);
-        // The match arm `(Podman, _)` always uses --authfile, regardless of runtime.
-        assert!(dbg.contains("--authfile"));
+        assert!(
+            dbg.contains("REGISTRY_AUTH_FILE"),
+            "Podman-shape guard always uses REGISTRY_AUTH_FILE regardless of \
+             runtime, got: {}",
+            dbg
+        );
+        assert!(
+            !dbg.contains("--authfile"),
+            "v0.2.49 fix: no --authfile in argv even on the fallback path, \
+             got: {}",
+            dbg
+        );
+    }
+
+    /// v0.2.49 regression test (live podman): verify
+    /// `REGISTRY_AUTH_FILE=X podman --version` is accepted by the real
+    /// podman binary's CLI parser. The original v0.2.47 bug shape
+    /// (`podman --authfile X --version`) would have failed with "Error:
+    /// unknown flag: --authfile" — this test exercises the parser
+    /// end-to-end with the env-var shape to prevent that class of
+    /// regression. Skipped (clean return) on hosts without a podman
+    /// binary on PATH.
+    #[test]
+    fn per_pull_auth_podman_env_var_accepted_by_live_podman() {
+        let Ok(probe) = std::process::Command::new("which").arg("podman").output() else {
+            return;
+        };
+        if !probe.status.success() {
+            return;
+        }
+        let guard = build_per_pull_authfile("ghcr.io", "bot", "tok", "podman")
+            .expect("build podman authfile");
+        let path = guard
+            .path()
+            .expect("podman guard exposes path()")
+            .to_owned();
+        let output = std::process::Command::new("podman")
+            .env("REGISTRY_AUTH_FILE", &path)
+            .arg("--version")
+            .output()
+            .expect("spawn podman --version");
+        assert!(
+            output.status.success(),
+            "podman --version with REGISTRY_AUTH_FILE set must succeed, \
+             stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).starts_with("podman version "),
+            "expected podman version banner"
+        );
     }
 
     #[test]
@@ -973,5 +1618,308 @@ mod tests {
             DEDUP_SENTINEL,
             "vct-launcher-core::services::container_runtime::v0.2.47"
         );
+    }
+
+    // ─── v0.2.49: pull-token gateway HTTP core ─────────────────────────
+
+    /// v0.2.49: empty endpoint string → substituted with the default
+    /// const. Mirrors the launcher's pre-v0.2.49
+    /// `installer_engine::resolve_pull_token_endpoint` test.
+    #[test]
+    fn v0249_resolve_pull_token_endpoint_empty_string_substitutes_default() {
+        assert_eq!(resolve_pull_token_endpoint(""), RL_ARTIFACT_URL_DEFAULT_ENDPOINT);
+    }
+
+    /// v0.2.49: known placeholder shapes are substituted; legitimate
+    /// URLs pass through verbatim. Exercises the full
+    /// `is_pull_token_placeholder` family the launcher v0.2.45 V45-D +
+    /// v0.2.42 W8 / P3-P1-1 chain hardened against.
+    #[test]
+    fn v0249_resolve_pull_token_endpoint_placeholder_family_substituted() {
+        for placeholder in [
+            "https://example/pull-token",
+            "https://example.com/x",
+            "https://example.invalid/x",
+            "https://placeholder.supabase.co/x",
+            "https://Placeholder.supabase.co/x",
+            "https://foo.placeholder/x",
+        ] {
+            assert_eq!(
+                resolve_pull_token_endpoint(placeholder),
+                RL_ARTIFACT_URL_DEFAULT_ENDPOINT,
+                "placeholder {} must be substituted",
+                placeholder
+            );
+        }
+    }
+
+    /// v0.2.49: legitimate user-controlled URL passes through.
+    #[test]
+    fn v0249_resolve_pull_token_endpoint_legit_url_passes_through() {
+        let real = "https://abc123.supabase.co/functions/v1/rl-artifact-url";
+        assert_eq!(resolve_pull_token_endpoint(real), real);
+        let staging = "https://staging.example.com/x";
+        assert_eq!(resolve_pull_token_endpoint(staging), staging);
+    }
+
+    /// v0.2.49: `format_pull_token_error` maps the 401 license_invalid
+    /// code into a user-actionable message. Pins one branch of the
+    /// matcher; the full matrix lives in the launcher's
+    /// `installer_engine::tests` which now exercises the same shared
+    /// helper via re-export.
+    #[test]
+    fn v0249_format_pull_token_error_401_license_invalid() {
+        let body = serde_json::json!({ "error": "license_invalid" });
+        let msg = format_pull_token_error(401, &body);
+        assert!(
+            msg.contains("license key is invalid"),
+            "expected license-invalid message, got: {}",
+            msg
+        );
+    }
+
+    /// v0.2.49: `format_pull_token_error` covers a generic 5xx with an
+    /// "unavailable / try again" message.
+    #[test]
+    fn v0249_format_pull_token_error_500_generic() {
+        let body = serde_json::json!({ "error": "internal", "detail": "db down" });
+        let msg = format_pull_token_error(500, &body);
+        assert!(
+            msg.contains("temporarily unavailable") || msg.contains("Try again"),
+            "expected unavailable / try-again message, got: {}",
+            msg
+        );
+    }
+
+    /// v0.2.49: `PullTokenResponse` deserialises the canonical JSON
+    /// shape the launcher's installer_engine produced pre-v0.2.49. Pins
+    /// wire compat across the move.
+    #[test]
+    fn v0249_pull_token_response_deserialises_v_canonical_shape() {
+        let raw = r#"{
+            "pull_token": "ghp_abcdef",
+            "username": "vct-bot-rl",
+            "expires_in_s": 900,
+            "tag": "0.2.8-cuda"
+        }"#;
+        let parsed: PullTokenResponse = serde_json::from_str(raw).expect("parse");
+        assert_eq!(parsed.pull_token, "ghp_abcdef");
+        assert_eq!(parsed.username.as_deref(), Some("vct-bot-rl"));
+        assert_eq!(parsed.expires_in_s, 900);
+        assert_eq!(parsed.tag.as_deref(), Some("0.2.8-cuda"));
+    }
+
+    /// v0.2.49: `PullTokenResponse` tolerates missing optional fields
+    /// (forward-compat with pre-v0.2.36 server shape that omitted
+    /// `username` + pre-v0.2.46 shape that omitted `tag`).
+    #[test]
+    fn v0249_pull_token_response_optional_fields_default() {
+        let raw = r#"{ "pull_token": "tok" }"#;
+        let parsed: PullTokenResponse = serde_json::from_str(raw).expect("parse minimal");
+        assert_eq!(parsed.pull_token, "tok");
+        assert!(parsed.username.is_none());
+        assert_eq!(parsed.expires_in_s, 0);
+        assert!(parsed.tag.is_none());
+    }
+
+    /// v0.2.49 wire-contract: `request_pull_token_http` is reachable
+    /// from this module's public API. A future refactor that renames
+    /// the function or changes its arity would break the assignment.
+    /// Type-level check only; never invoked.
+    #[allow(dead_code)]
+    fn _v0249_request_pull_token_http_signature_check() {
+        async fn _typecheck(
+            c: &crate::manifest::ContainerInstallBlock,
+            l: Option<&str>,
+            k: &str,
+            h: &str,
+        ) -> Result<PullTokenResponse, String> {
+            request_pull_token_http(c, l, k, h).await
+        }
+        let _ = _typecheck;
+    }
+
+    /// v0.2.49 wire-contract: `pre_pull_with_auth_for_start` is
+    /// reachable from this module's public API. Paired with the
+    /// hub-side test that asserts the same symbol is reachable from
+    /// the hub crate.
+    #[allow(dead_code)]
+    fn _v0249_pre_pull_with_auth_for_start_signature_check() {
+        async fn _typecheck(
+            m: &crate::manifest::ModuleManifest,
+            r: &str,
+            i: &str,
+        ) -> Result<(), String> {
+            pre_pull_with_auth_for_start(m, r, i).await
+        }
+        let _ = _typecheck;
+    }
+
+    // ─── v0.2.49 Stream A: global container helpers ──────────────────────
+
+    /// Trailing `-{project_slug}` is stripped.
+    #[test]
+    fn v0249_resolve_global_container_name_strips_trailing_project_slug() {
+        let result =
+            resolve_global_container_name("vct-rl-reranker-{project_slug}", "vct-rl-reranker")
+                .expect("resolve");
+        assert_eq!(result, "vct-rl-reranker");
+    }
+
+    /// Trailing `_{project_slug}` is also stripped (underscore variant).
+    #[test]
+    fn v0249_resolve_global_container_name_strips_underscore_variant() {
+        let result =
+            resolve_global_container_name("my_module_{project_slug}", "my-module").expect("resolve");
+        assert_eq!(result, "my_module");
+    }
+
+    /// Template without `{project_slug}` passes through unchanged.
+    #[test]
+    fn v0249_resolve_global_container_name_idempotent_on_bare_name() {
+        let result =
+            resolve_global_container_name("vct-rl-reranker", "vct-rl-reranker").expect("resolve");
+        assert_eq!(result, "vct-rl-reranker");
+    }
+
+    /// `{project_slug}` in non-trailing position is rejected — the
+    /// resolver refuses to silently mangle the name.
+    #[test]
+    fn v0249_resolve_global_container_name_rejects_non_trailing_placeholder() {
+        let result = resolve_global_container_name(
+            "prefix-{project_slug}-suffix",
+            "vct-rl-reranker",
+        );
+        assert!(result.is_err());
+    }
+
+    /// Unresolved non-`{project_slug}` placeholders are rejected.
+    #[test]
+    fn v0249_resolve_global_container_name_rejects_unresolved_placeholders() {
+        let result = resolve_global_container_name("name-{module_id}", "vct-rl-reranker");
+        assert!(result.is_err());
+    }
+
+    /// `rl_placeholders_global` substitutes `"global"` for `{project_slug}`.
+    #[test]
+    fn v0249_rl_placeholders_global_uses_fixed_slug() {
+        let placeholders = rl_placeholders_global(11443);
+        assert_eq!(placeholders.get("{project_slug}").map(|s| s.as_str()), Some("global"));
+        assert_eq!(placeholders.get("{RL_SERVER_PORT}").map(|s| s.as_str()), Some("11443"));
+    }
+
+    /// `build_podman_run_args_global` rejects non-container runtime types
+    /// — mirrors the per-project builder's contract.
+    #[test]
+    fn v0249_build_podman_run_args_global_rejects_cli_runtime() {
+        let mut manifest = make_rl_manifest_global_for_test();
+        manifest.runtime.r#type = "cli".into();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let result = build_podman_run_args_global(&manifest, &ctx, 11443, "vct-rl-reranker", "img");
+        assert!(result.is_err());
+    }
+
+    /// `build_podman_run_args_global` produces a `podman run` argv that
+    /// includes the bare container name (no slug suffix) and the
+    /// expected `-d` + `--name` flags.
+    #[test]
+    fn v0249_build_podman_run_args_global_uses_bare_container_name() {
+        let manifest = make_rl_manifest_global_for_test();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/x/y:0.2.10",
+        )
+        .expect("build");
+        assert_eq!(args[0], "run");
+        assert_eq!(args[1], "-d");
+        assert_eq!(args[2], "--name");
+        assert_eq!(args[3], "vct-rl-reranker");
+        // Image lives somewhere in the argv (after env flags).
+        assert!(args.iter().any(|a| a == "ghcr.io/x/y:0.2.10"));
+    }
+
+    /// Local fixture: minimal RL-shaped manifest with
+    /// `install.scope = global` for the v0.2.49 Stream A tests above.
+    fn make_rl_manifest_global_for_test() -> crate::manifest::ModuleManifest {
+        use crate::manifest::{
+            Compatibility, ContainerInstallBlock, InstallBlock, InstallMethod, InstallScope,
+            LicenseBlock, ModuleCategory, ModuleManifest, Requirements, RuntimeBlock,
+        };
+        use std::collections::HashMap;
+
+        let mut env_fixed = HashMap::new();
+        env_fixed.insert("RL_SERVER_PORT".into(), "11443".into());
+
+        ModuleManifest {
+            manifest_version: 1,
+            id: "vct-rl-reranker".into(),
+            name: "RL Reranker".into(),
+            version: "0.2.10".into(),
+            description: "".into(),
+            publisher: None,
+            homepage: None,
+            repository: None,
+            icon: None,
+            category: ModuleCategory::PaidIndependent,
+            tags: vec![],
+            compatibility: Compatibility::default(),
+            license: LicenseBlock::default(),
+            requirements: Requirements::default(),
+            install: InstallBlock {
+                method: InstallMethod::ContainerPull,
+                source: Some("ghcr.io/hotak92/vct-rl-reranker".into()),
+                r#ref: Some("0.2.10".into()),
+                install_dir: "{VCT_MODULES}/vct-rl-reranker".into(),
+                post_install: vec![],
+                container: Some(ContainerInstallBlock {
+                    image: "ghcr.io/hotak92/vct-rl-reranker".into(),
+                    tag_from_version: true,
+                    registry: Some("ghcr.io".into()),
+                    pull_token_endpoint: "https://example.invalid/x".into(),
+                    pull_token_method: "POST".into(),
+                    rotate_weights: false,
+                    rotate_weights_endpoint: None,
+                }),
+                scope: InstallScope::Global,
+            },
+            secrets: vec![],
+            settings: vec![],
+            runtime: RuntimeBlock {
+                r#type: "container".into(),
+                command: "python".into(),
+                args: vec!["-m".into(), "rl_server.rl_server".into()],
+                platform_command: HashMap::new(),
+                cwd: None,
+                env_from_secrets: vec![],
+                env_from_settings: vec![],
+                env_fixed,
+                env_derived: HashMap::new(),
+                health_check: None,
+                ports: vec![],
+                volumes: vec![],
+                container_name_template: Some("vct-rl-reranker-{project_slug}".into()),
+                image_ref: None,
+                auto_restart: false,
+                gpu_image_variants: None,
+                log_file: None,
+                log_path_template: None,
+                min_gpu_vram_gb: None,
+                gpu_optional: true,
+            },
+            mcp_registration: None,
+            setup_wizard: None,
+            upgrade: None,
+            telemetry: None,
+            uninstall: None,
+            provides: vec![],
+            consumes: vec![],
+            gui: None,
+            db: None,
+            kg_collections: None,
+        }
     }
 }

@@ -77,7 +77,67 @@ impl Db {
     pub fn app_state_set_bool(&self, key: &str, value: bool) -> Result<(), String> {
         self.app_state_set(key, if value { "true" } else { "false" })
     }
+
+    /// v0.2.49 access-matrix Phase 1 (item #3): read the persisted
+    /// canonical name of the orchestrator-root shared KG collection.
+    ///
+    /// Returns the value from the `app_state` row written by migration
+    /// 028 (or whatever later override install.py wrote — see Phase 1
+    /// item #2). Migration 028 INSERT-OR-IGNORE's a default of
+    /// `VibeCodedOrchestrator_KnowledgeGraph`, so this getter always
+    /// returns `Some(_)` on a launcher that's applied migrations through
+    /// version 28+.
+    ///
+    /// The fallback default is duplicated here defensively for the case
+    /// where the row was manually deleted (an unsupported but possible
+    /// state — e.g. someone hand-edited the DB). Callers should treat
+    /// `Ok(name)` as authoritative without re-checking.
+    ///
+    /// Closes audit finding S-1: every consumer that asks "is this
+    /// collection the orchestrator-root shared one?" calls this helper
+    /// and compares by byte-equality, instead of duplicating the
+    /// `LAST_RESORT_SHARED_KG_COLLECTION` constant across crates.
+    pub fn get_orchestrator_root_kg_collection(&self) -> Result<String, String> {
+        Ok(self
+            .app_state_get(ORCHESTRATOR_ROOT_KG_COLLECTION_KEY)?
+            .unwrap_or_else(|| {
+                DEFAULT_ORCHESTRATOR_ROOT_KG_COLLECTION.to_string()
+            }))
+    }
+
+    /// v0.2.49 access-matrix Phase 1 (item #2 backend): set the
+    /// persisted canonical name of the orchestrator-root shared KG
+    /// collection. Called by install.py at install time (via a hub or
+    /// Tauri command) and by white-label installers that need a
+    /// branded collection name.
+    ///
+    /// Idempotent upsert. Empty / whitespace-only values are refused
+    /// (returns Err) to prevent accidentally clearing the canonical
+    /// pointer to the empty string.
+    pub fn set_orchestrator_root_kg_collection(&self, name: &str) -> Result<(), String> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "set_orchestrator_root_kg_collection: refuses empty value"
+                    .to_string(),
+            );
+        }
+        self.app_state_set(ORCHESTRATOR_ROOT_KG_COLLECTION_KEY, trimmed)
+    }
 }
+
+/// `app_state` key for the persisted orchestrator-root shared KG
+/// collection name (migration 028 / Phase 1 / v0.2.49 access-matrix).
+pub const ORCHESTRATOR_ROOT_KG_COLLECTION_KEY: &str =
+    "orchestrator_root_kg_collection";
+
+/// Default value persisted by migration 028's INSERT OR IGNORE. Kept
+/// here (rather than only in the SQL) so the Rust-side getter can
+/// fall back to it for the unsupported "row manually deleted" state.
+/// MUST be byte-identical to the literal in
+/// `migrations/028_orchestrator_root_kg_collection.sql`.
+pub const DEFAULT_ORCHESTRATOR_ROOT_KG_COLLECTION: &str =
+    "VibeCodedOrchestrator_KnowledgeGraph";
 
 #[cfg(test)]
 mod tests {
@@ -142,5 +202,103 @@ mod tests {
         assert_eq!(db.app_state_get_bool("legacy_flag").unwrap(), Some(true));
         db.app_state_set("legacy_flag", "0").unwrap();
         assert_eq!(db.app_state_get_bool("legacy_flag").unwrap(), Some(false));
+    }
+
+    // ─── v0.2.49 access-matrix Phase 1 (items #1, #3) ─────────────────────
+    // Tests for migration 028 + the orchestrator_root_kg_collection getter
+    // / setter pair. The migration_creates_orchestrator_root_collection_
+    // setting test asserts the SQL-level INSERT-OR-IGNORE behaviour
+    // independently of the Rust helpers, so we'd catch a divergence
+    // between the SQL default value and the Rust DEFAULT constant.
+
+    #[test]
+    fn migration_creates_orchestrator_root_collection_setting() {
+        // Fresh in-memory DB applies every migration including 028.
+        // The setting row should exist with the canonical default value.
+        let db = Db::open_in_memory().expect("in-memory db");
+        let row = db
+            .app_state_get(ORCHESTRATOR_ROOT_KG_COLLECTION_KEY)
+            .expect("read app_state");
+        assert_eq!(
+            row.as_deref(),
+            Some(DEFAULT_ORCHESTRATOR_ROOT_KG_COLLECTION),
+            "migration 028 must seed the canonical default value into \
+             app_state on every fresh install",
+        );
+    }
+
+    #[test]
+    fn get_orchestrator_root_kg_collection_returns_default_when_row_present() {
+        // The convenience getter wraps the raw app_state_get; on a
+        // fresh DB it returns the migration-seeded value.
+        let db = Db::open_in_memory().expect("in-memory db");
+        let v = db
+            .get_orchestrator_root_kg_collection()
+            .expect("get orchestrator-root collection");
+        assert_eq!(v, DEFAULT_ORCHESTRATOR_ROOT_KG_COLLECTION);
+    }
+
+    #[test]
+    fn get_orchestrator_root_kg_collection_falls_back_when_row_deleted() {
+        // Unsupported state: someone hand-edited the DB and deleted
+        // the row. The getter still returns the compiled-in default
+        // (defensive fallback) — callers don't have to special-case
+        // None.
+        let db = Db::open_in_memory().expect("in-memory db");
+        let guard = db.lock();
+        guard
+            .execute(
+                "DELETE FROM app_state WHERE key = ?1",
+                params![ORCHESTRATOR_ROOT_KG_COLLECTION_KEY],
+            )
+            .expect("delete row");
+        drop(guard);
+        let v = db
+            .get_orchestrator_root_kg_collection()
+            .expect("get with row deleted");
+        assert_eq!(v, DEFAULT_ORCHESTRATOR_ROOT_KG_COLLECTION);
+    }
+
+    #[test]
+    fn set_orchestrator_root_kg_collection_persists_white_label_name() {
+        // install.py / a white-label installer overrides the canonical
+        // name. Subsequent reads return the override; the original
+        // canonical default is no longer observable.
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.set_orchestrator_root_kg_collection("AcmeCorp_KnowledgeGraph")
+            .expect("white-label override");
+        let v = db.get_orchestrator_root_kg_collection().expect("read");
+        assert_eq!(v, "AcmeCorp_KnowledgeGraph");
+    }
+
+    #[test]
+    fn set_orchestrator_root_kg_collection_refuses_empty_and_whitespace() {
+        // Empty value would silently break every consumer that
+        // compares collection names by byte-equality. The setter
+        // hard-fails so the bad write never lands.
+        let db = Db::open_in_memory().expect("in-memory db");
+        assert!(
+            db.set_orchestrator_root_kg_collection("").is_err(),
+            "empty value must be refused",
+        );
+        assert!(
+            db.set_orchestrator_root_kg_collection("   ").is_err(),
+            "whitespace-only value must be refused",
+        );
+        // Original default still in place — the failed write did
+        // nothing.
+        let v = db.get_orchestrator_root_kg_collection().expect("read");
+        assert_eq!(v, DEFAULT_ORCHESTRATOR_ROOT_KG_COLLECTION);
+    }
+
+    #[test]
+    fn set_orchestrator_root_kg_collection_trims_surrounding_whitespace() {
+        // Defensive: install.py might pipe through a path-quoted name
+        // with trailing newline / whitespace. Trim before persisting.
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.set_orchestrator_root_kg_collection("  MyCustom_KG  \n")
+            .expect("trim + persist");
+        let v = db.get_orchestrator_root_kg_collection().expect("read");
+        assert_eq!(v, "MyCustom_KG");
     }
 }

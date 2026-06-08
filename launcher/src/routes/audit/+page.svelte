@@ -415,7 +415,6 @@
   .lede {
     font-size: 13px;
     color: var(--color-mid);
-    max-width: 720px;
   }
 
   .audit-intro {
@@ -426,7 +425,6 @@
     border: 1px solid rgba(0, 191, 166, 0.18);
     border-radius: 12px;
     color: var(--color-text);
-    max-width: 760px;
   }
   .audit-intro h3 {
     font-size: 13px;
@@ -642,7 +640,17 @@
     font-family: 'JetBrains Mono', 'Fira Code', monospace;
     font-size: 11px;
     color: var(--color-muted);
-    word-break: break-all;
+    /* Long JSON details (e.g. a Windows folder_path with doubled
+       backslashes) previously used `word-break: break-all`, which wrapped
+       into a tall multi-line cell and — because every other column is
+       `vertical-align: top` — left those columns stranded at the top-left
+       while the detail sprawled down the row. Clamp the column to a single
+       truncated line instead; the full value is still available via the
+       cell's `title` tooltip on hover. */
+    max-width: 520px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   td.empty {
     text-align: center;

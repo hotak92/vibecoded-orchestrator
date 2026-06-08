@@ -9,7 +9,7 @@ members = ["vct-launcher-core", "vct-hub"]
 
 [package]
 name = "vct-launcher-temp"
-version = "0.2.48"
+version = "0.2.49"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -215,13 +215,15 @@ libloading = "0.8"
 # lean (no compilation cost).
 #
 # v0.2.36: `winreg` reads HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
-# in `commands/licensing.rs::machine_id_hash` for platform-stable machine
-# binding. Tiny dep (~15 KB compiled), already in our lockfile
-# transitively via Tauri's Windows path — promoting to a direct dep
-# follows the same pattern as `windows-sys` above.
+# in `machine_id_hash` for platform-stable machine binding.
+# v0.2.49 Phase 3: `machine_id_hash` + per-OS host-id readers moved to
+# `vct-launcher-core::licensing`. The `winreg` direct dep migrated with
+# them (declared in `vct-launcher-core/Cargo.toml` under `cfg(windows)`).
+# Dropped from the launcher binary's direct deps since no in-crate code
+# references `winreg::` after the port — verified by grep over
+# `launcher/src-tauri/src/` and `launcher/src-tauri/vct-hub/src/`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
-winreg = "0.55"
 
 # Release-profile privacy + size hardening (PR-4, 2026-05-06).
 #

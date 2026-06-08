@@ -157,33 +157,32 @@ pub async fn kg_list_collections(
             .cloned()
             .unwrap_or_else(|| "none".to_string());
         let node_count = fetch_class_count(&client, &base, &name).await.unwrap_or(0);
-        // Recognize the canonical cross-project KG name shipped by the
-        // orchestrator (VibeCodedOrchestrator_KnowledgeGraph since v0.2.23 B1
-        // — was VibecodedOrchestrator_KnowledgeGraph v0.2.12–v0.2.22, itself
-        // renamed from VibeCodedTools_KnowledgeGraph in v0.2.12 PR-26 /
-        // Group E; both prior names are kept as legacy-detection paths so
-        // pre-flip / pre-rename installs still light up the picker's
-        // "Manage shared KG collection" UI). Falls back to the historical
-        // "shared" substring heuristic + legacy "sharedVCT" name for
-        // back-compat with older installs / custom setups.
+        // v0.2.49 access-matrix Phase 2 (item #7, S-1) — replace the
+        // historical 3-tier substring heuristic with byte-equality
+        // against the persisted canonical name from Step A's
+        // `app_state['orchestrator_root_kg_collection']`. Closes audit
+        // finding S-1: different code paths previously classified
+        // identical collection names differently because they
+        // consulted different constants (helper canonical vs literal
+        // "sharedVCT" vs lowercase("shared") substring).
         //
-        // v0.2.24 B4 (2026-05-22): the canonical + 2 legacy-alias matches
-        // moved into the shared helper
-        // `commands::project_env_settings::is_shared_kg_class_name`,
-        // unifying recognition with
-        // `commands/maintenance.rs::parse_schema_response`. This is a
-        // WIDENING of the prior behaviour (the inline match was strict
-        // `==`; the helper is case-insensitive), in line with the v0.2.23
-        // peer-review-B HIGH-2 fix. The two trailing heuristics
-        // (`"sharedVCT"` + `contains("shared")`) stay inline — they are
-        // not orchestrator-shipped names, just a forgiving display
-        // heuristic for whatever the user happens to have around.
-        let is_shared = crate::commands::project_env_settings::is_shared_kg_class_name(
-            &name,
-            crate::commands::project_env_settings::LAST_RESORT_SHARED_KG_COLLECTION,
-        )
-            || name == "sharedVCT"
-            || name.to_lowercase().contains("shared");
+        // Tradeoff: a user-created collection named e.g. "MyShared_KG"
+        // no longer sorts with the canonical shared root. Acceptable
+        // — and arguably more honest — per the plan's S-1 disposition.
+        // The pre-v0.2.49 heuristic also flagged legacy migration
+        // names (`VibeCodedTools_KnowledgeGraph`,
+        // `VibecodedOrchestrator_KnowledgeGraph`); white-label installs
+        // override the persisted canonical via the
+        // `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env at install time, so
+        // legacy-rename detection migrates to the orchestrator-root
+        // setting row instead of being inferred from substrings.
+        //
+        // Soft-fail: a DB error reading the setting falls back to
+        // `false` (this is a display-sort heuristic, not security).
+        let canonical_root = db
+            .get_orchestrator_root_kg_collection()
+            .unwrap_or_else(|_| String::new());
+        let is_shared = !canonical_root.is_empty() && name == canonical_root;
         out.push(KgCollectionAccess {
             name,
             node_count,
@@ -852,20 +851,32 @@ pub async fn kg_promote_to_shared(
 
 // ─── High-level access mode (collection) ────────────────────────────────
 //
-// The UI presents three modes: shared / projects / private. The DB stores
-// per-(project, collection) access levels (read|write|none). This wrapper
-// maps the UI mode onto rows for a given owner project + selected projects:
+// The UI presents four modes: shared / projects / private / none. The DB
+// stores per-(project, collection) access levels (read|write|none). This
+// wrapper maps the UI mode onto rows for a given owner project + selected
+// projects:
 //
 //   shared:   write row for owner; read row for every other project that exists
 //   projects: write row for owner; read row for each id in `project_ids`;
 //             none for the rest
 //   private:  write row for owner only; none for everyone else
+//   none:     v0.2.49 access-matrix Phase 5 (item #14, F-2b) — owner row
+//             gets `none` (cuts the owner's own KG MCP read path);
+//             peers default to `none`. Used by the GUI's "Remove access"
+//             button so revoking the project's own access is distinct
+//             from re-granting itself via `private`.
+//
+// All peer mutations (everything inside the loop iterating `all_projects`)
+// are subject to the v0.2.49 Phase 5 item #15 (F-2c) filter: peer rows
+// where `is_user_configured()` returns true are NOT touched. This
+// preserves user-chosen peer-level downgrades against subsequent
+// owner-side mode changes.
 
 #[derive(Debug, Deserialize)]
 pub struct CollectionAccessModeReq {
     pub owner_project_id: String,
     pub collection: String,
-    pub mode: String, // shared | projects | private
+    pub mode: String, // shared | projects | private | none
     #[serde(default)]
     pub project_ids: Vec<String>,
 }
@@ -875,7 +886,10 @@ pub async fn kg_set_collection_access_mode(
     req: CollectionAccessModeReq,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
+    if !matches!(
+        req.mode.as_str(),
+        "shared" | "projects" | "private" | "none"
+    ) {
         return Err(format!("invalid mode: {}", req.mode));
     }
     // v0.2.44 V44-C: structural-row guard.
@@ -910,12 +924,42 @@ pub async fn kg_set_collection_access_mode(
             }
         }
     }
-    // Owner always has write
-    db.kg_set_access(&req.owner_project_id, &req.collection, "write")?;
+    // v0.2.49 access-matrix Phase 5 item #14 (F-2b): owner row depends
+    // on mode. For modes shared/projects/private the owner retains
+    // `write` on its own collection. For mode='none' (the GUI's
+    // "Remove access" payload) the owner is explicitly set to `none` —
+    // this cuts the project's hooks + MCP read path on its own KG.
+    // The orchestrator-root structural-row guard above already rejects
+    // mode='none' before we reach this write, so we never attempt to
+    // demote the structural row here.
+    let owner_level = if req.mode == "none" { "none" } else { "write" };
+    db.kg_set_access(&req.owner_project_id, &req.collection, owner_level)?;
 
+    // v0.2.49 access-matrix Phase 5 item #15 (F-2c): the peer-mutation
+    // loop only touches rows where `is_user_configured()` reads FALSE
+    // (i.e. seed-path rows with `created_at == updated_at`). Rows the
+    // user has explicitly downgraded/upgraded through any prior
+    // mutation are preserved unconditionally. This honours the
+    // "explicit user choice wins over later owner-side mode set"
+    // invariant from the v0.2.49 access-matrix overhaul.
+    //
+    // Soft-fail on the row-read step: a DB error when reading a peer's
+    // access row is treated as "row is not user-configured" so the
+    // loop still applies the mode-derived default. The conservative
+    // alternative (skip on any read error) would silently drop
+    // mutations and surface as "mode change didn't take effect."
     let all_projects = db.list_projects()?;
     for p in all_projects.iter() {
         if p.id == req.owner_project_id {
+            continue;
+        }
+        let peer_is_user_configured = db
+            .kg_get_access_row(&p.id, &req.collection)
+            .ok()
+            .flatten()
+            .map(|row| row.is_user_configured())
+            .unwrap_or(false);
+        if peer_is_user_configured {
             continue;
         }
         let level = match req.mode.as_str() {
@@ -927,7 +971,9 @@ pub async fn kg_set_collection_access_mode(
                     "none"
                 }
             }
-            _ => "none", // private
+            // private | none — every peer that isn't user-configured
+            // gets `none`.
+            _ => "none",
         };
         db.kg_set_access(&p.id, &req.collection, level)?;
     }
@@ -1394,6 +1440,248 @@ mod tests {
             )
             .is_none(),
             "mode='private' on a base project's primary must be allowed",
+        );
+    }
+
+    // ── v0.2.49 access-matrix Phase 5 items #14 + #15 ──────────────────
+    //
+    // Items #14 (F-2b) and #15 (F-2c simplified) extend
+    // `kg_set_collection_access_mode` with:
+    //   - acceptance of `mode='none'` (the GUI's "Remove access" payload
+    //     for revoking the project's OWN access to a collection), and
+    //   - a peer-row filter that skips rows where `is_user_configured()`
+    //     returns true (`created_at != updated_at`).
+    //
+    // The Tauri command takes `State<'_, Db>` + is `async`, neither of
+    // which can be constructed in a unit test. These tests replicate the
+    // command's mutation loop against a fresh in-memory DB so the
+    // assertions sign the exact contract the production code depends on.
+
+    /// Helper: replicates the v0.2.49 Phase 5 mutation loop body. Each
+    /// (peer_id, level) mutation is gated by `is_user_configured` — if
+    /// the peer's existing row reads as user-configured the mutation is
+    /// skipped. Owner mutation honours item #14's mode='none' rule.
+    /// Returns `Ok(())`; per-write errors propagate.
+    fn apply_mode_to_db(
+        db: &Db,
+        owner_project_id: &str,
+        collection: &str,
+        mode: &str,
+        project_ids: &[String],
+    ) -> Result<(), String> {
+        // Owner row (item #14): mode='none' → 'none'; else 'write'.
+        let owner_level = if mode == "none" { "none" } else { "write" };
+        db.kg_set_access(owner_project_id, collection, owner_level)?;
+
+        // Peer rows (item #15): skip user-configured rows; otherwise
+        // apply mode-derived default.
+        for p in db.list_projects()? {
+            if p.id == owner_project_id {
+                continue;
+            }
+            let peer_is_user_configured = db
+                .kg_get_access_row(&p.id, collection)
+                .ok()
+                .flatten()
+                .map(|row| row.is_user_configured())
+                .unwrap_or(false);
+            if peer_is_user_configured {
+                continue;
+            }
+            let level = match mode {
+                "shared" => "read",
+                "projects" => {
+                    if project_ids.iter().any(|x| x == &p.id) {
+                        "read"
+                    } else {
+                        "none"
+                    }
+                }
+                _ => "none", // private | none
+            };
+            db.kg_set_access(&p.id, collection, level)?;
+        }
+        Ok(())
+    }
+
+    /// Seed a non-root project with a primary KG binding so the
+    /// structural-row guard doesn't fire (it scopes itself to host =
+    /// OrchestratorRoot only).
+    fn seed_base_project_with_binding(
+        db: &Db,
+        project_id: &str,
+        name: &str,
+        collection: &str,
+    ) {
+        db.insert_project(
+            project_id,
+            name,
+            &format!("/tmp/{}", name),
+            ProjectHost::Base,
+            name,
+        )
+        .expect("insert base project");
+        db.set_project_kg_binding(
+            project_id,
+            "primary",
+            collection,
+            None,
+            None,
+            None,
+            None,
+            &JsonValue::Null,
+        )
+        .expect("set base primary");
+    }
+
+    /// Insert a base project without a binding (acts as a generic peer).
+    fn seed_base_project(db: &Db, project_id: &str) {
+        db.insert_project(
+            project_id,
+            project_id,
+            &format!("/tmp/{}", project_id),
+            ProjectHost::Base,
+            project_id,
+        )
+        .expect("insert base project");
+    }
+
+    // ── Item #14 (F-2b): mode='none' fans out 'none' to every peer ──
+    //
+    // The new payload represents the GUI's "Remove access" action: owner
+    // explicitly gets `none` (cuts launcher's hooks + MCP read path),
+    // and every peer that the owner-side mutation would touch defaults
+    // to `none` too. Peers that are user-configured are NOT touched
+    // (item #15 invariant), so this test seeds only seed-path peers.
+    #[test]
+    fn mode_none_sets_all_peers_to_none_only_for_default_rows() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let collection = "OwnerProject_KnowledgeGraph";
+        let owner_id = "owner-uuid".to_string();
+        seed_base_project_with_binding(&db, &owner_id, "OwnerProject", collection);
+        seed_base_project(&db, "peer-a");
+        seed_base_project(&db, "peer-b");
+
+        // Seed peer rows via `kg_seed_access` so `is_user_configured`
+        // reads FALSE for both. Owner row starts at 'write' (its own).
+        db.kg_set_access(&owner_id, collection, "write").unwrap();
+        db.kg_seed_access("peer-a", collection, "read").unwrap();
+        db.kg_seed_access("peer-b", collection, "read").unwrap();
+
+        // Apply mode='none'.
+        apply_mode_to_db(&db, &owner_id, collection, "none", &[]).unwrap();
+
+        // Owner row: 'none' (item #14).
+        assert_eq!(
+            db.kg_get_access(&owner_id, collection).unwrap(),
+            Some("none".to_string()),
+            "mode='none' must set owner row to 'none' (item #14)",
+        );
+        // Peer rows: 'none' (seed-path rows are touched by the mutation loop).
+        assert_eq!(
+            db.kg_get_access("peer-a", collection).unwrap(),
+            Some("none".to_string()),
+            "seed-path peer must be set to 'none' under mode='none'",
+        );
+        assert_eq!(
+            db.kg_get_access("peer-b", collection).unwrap(),
+            Some("none".to_string()),
+            "seed-path peer must be set to 'none' under mode='none'",
+        );
+    }
+
+    // ── Item #15 (F-2c): peer-revoke skips user-configured rows ──
+    //
+    // The mutation loop must NOT touch a peer row when
+    // `is_user_configured()` returns true. This preserves any explicit
+    // user choice (granting peer access, downgrading peer access)
+    // against subsequent owner-side mode changes.
+    #[test]
+    fn peer_revoke_skips_user_configured_rows() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let collection = "OwnerProject_KnowledgeGraph";
+        let owner_id = "owner-uuid".to_string();
+        seed_base_project_with_binding(&db, &owner_id, "OwnerProject", collection);
+        seed_base_project(&db, "peer-default");
+        seed_base_project(&db, "peer-user-touched");
+
+        // Owner starts at 'write'. One peer is seed-path; the other was
+        // user-configured (we simulate that by sleeping enough to bump
+        // `updated_at` past `created_at` — but since the simulation must
+        // be deterministic, we use `kg_set_access` twice: the first
+        // INSERT sets both timestamps equal, the second UPSERT bumps
+        // only `updated_at`). The UPSERT's `updated_at` is `now()` —
+        // we need it to exceed `created_at`, so a small sleep is
+        // unavoidable on systems where `now()` has millisecond
+        // resolution. To keep the test deterministic without sleeping,
+        // use `kg_seed_access` for the default row (timestamps equal
+        // by construction) and `kg_set_access` followed by a forced
+        // timestamp bump for the user-touched row.
+        db.kg_set_access(&owner_id, collection, "write").unwrap();
+        db.kg_seed_access("peer-default", collection, "read").unwrap();
+        // User-touched peer: write an explicit row via kg_set_access,
+        // then nudge `updated_at` forward by 1ms so the predicate flips
+        // to TRUE (since `kg_set_access` writes
+        // `created_at == updated_at` on INSERT, we need the row to
+        // already exist before the touch).
+        db.kg_seed_access("peer-user-touched", collection, "read")
+            .unwrap();
+        {
+            // Bump updated_at by +1ms to flip is_user_configured to true.
+            // This mirrors a real "user touched the row" event without
+            // requiring the test to sleep.
+            let guard = db.lock();
+            guard
+                .execute(
+                    "UPDATE kg_collection_access
+                        SET updated_at = updated_at + 1
+                      WHERE project_id = ?1 AND collection_name = ?2",
+                    rusqlite::params!["peer-user-touched", collection],
+                )
+                .expect("bump updated_at");
+        }
+
+        // Confirm the predicate state before applying the mutation.
+        let touched_row = db
+            .kg_get_access_row("peer-user-touched", collection)
+            .unwrap()
+            .expect("touched row must exist");
+        assert!(
+            touched_row.is_user_configured(),
+            "test precondition: touched row must read as user-configured \
+             (created_at={}, updated_at={})",
+            touched_row.created_at,
+            touched_row.updated_at,
+        );
+        let default_row = db
+            .kg_get_access_row("peer-default", collection)
+            .unwrap()
+            .expect("default row must exist");
+        assert!(
+            !default_row.is_user_configured(),
+            "test precondition: default row must read as NOT user-configured \
+             (created_at={}, updated_at={})",
+            default_row.created_at,
+            default_row.updated_at,
+        );
+
+        // Apply mode='private' — this would normally fan 'none' to
+        // every peer. Item #15 says the user-touched peer must remain
+        // untouched.
+        apply_mode_to_db(&db, &owner_id, collection, "private", &[]).unwrap();
+
+        // Default peer: was 'read', now 'none' (loop touched it).
+        assert_eq!(
+            db.kg_get_access("peer-default", collection).unwrap(),
+            Some("none".to_string()),
+            "seed-path peer must be re-written by the mutation loop",
+        );
+        // User-touched peer: must still be 'read' (loop skipped it).
+        assert_eq!(
+            db.kg_get_access("peer-user-touched", collection).unwrap(),
+            Some("read".to_string()),
+            "user-configured peer must NOT be touched by the mutation \
+             loop (F-2c invariant)",
         );
     }
 }

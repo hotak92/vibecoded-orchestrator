@@ -15,9 +15,28 @@
 
 import type { OrchestratorTier } from "../_shared/variant_map.ts";
 
-// License key UUID regex — same shape validate-tier / rl-latest-version accept.
+// License key UUID regex — Lemon Squeezy paid-tier customers.
 export const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Vault-admin token regex — Path A admin licenses (`vct_admin_` prefix +
+// URL-safe base64 body). Mirrors the same check in
+// `rl-artifact-url/validation.ts::VAULT_ADMIN_TOKEN_RE` and
+// `validate-tier/index.ts::isValidVaultAdminToken`.
+//
+// v0.2.49 (2026-06-06): added after dogfooding on martino-X670E-Pro-RS
+// hit `license_key_invalid_format` here when the launcher submitted a
+// `vct_admin_TU...` token (the user's admin license). Same root cause
+// + fix as the v0.2.35 `rl-artifact-url` validator gap (see
+// `rl-artifact-url/validation.ts:15-22` for the original
+// dogfooding-discovered narrative). rl-latest-weights needed the same
+// treatment so the same credential works through both endpoints.
+export const VAULT_ADMIN_TOKEN_RE = /^vct_admin_[A-Za-z0-9_-]+$/;
+
+/** Accepts either a Lemon Squeezy UUID or a Vault-admin `vct_admin_*` token. */
+export function isValidLicenseKeyShape(s: string): boolean {
+  return UUID_RE.test(s) || VAULT_ADMIN_TOKEN_RE.test(s);
+}
 
 // Minimum machine-id-hash length (SHA-256 hex would be 64; we accept
 // ≥16 to allow for shorter dev hashes during testing). Matches the
@@ -90,7 +109,7 @@ export function validateRequestBody(body: unknown): ValidationOk | ValidationFai
   }
   const b = body as Record<string, unknown>;
 
-  if (typeof b.license_key !== "string" || !UUID_RE.test(b.license_key)) {
+  if (typeof b.license_key !== "string" || !isValidLicenseKeyShape(b.license_key)) {
     return { ok: false, error: "license_key_invalid_format" };
   }
   if (

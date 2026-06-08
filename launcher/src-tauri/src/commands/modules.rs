@@ -125,6 +125,32 @@ pub struct ModuleCatalogEntry {
     /// render a "Start" button when `container_name = NULL`.
     #[serde(default)]
     pub runtime_type: String,
+    /// v0.2.49 Stream A integration (Bug D / Path 1, coordinated via
+    /// vct-coordination msg 177 from main chat 2026-06-07).
+    ///
+    /// Exposes the manifest's `install.scope` field as a string so the
+    /// Svelte tile renderer can branch the per-project badge variants
+    /// (Bug D from V3 handoff). Values:
+    ///
+    ///   - `"per_project"` (default) — legacy install model: one install
+    ///     row + one container per project. Tile shows per-project status
+    ///     ("installed in THIS project" / "available", etc.).
+    ///   - `"global"` — v0.2.49+ model: one install row machine-wide
+    ///     (`project_id IS NULL`), one container with bare module-id name,
+    ///     per-project enable toggle via Stream B's `module_settings`
+    ///     entry. Tile shows "installed (available in any project)"
+    ///     when no per-project enable row exists OR shows the
+    ///     enable-toggle directly.
+    ///
+    /// Source: `manifest.install.scope` for `from_manifest` entries.
+    /// L0 entries: populated from `l0.install.scope` when present;
+    /// defaults to `"per_project"` for pre-v0.2.49 L0 catalogs that
+    /// don't carry the field (the `#[serde(default)]` on
+    /// `L0Install.scope` keeps those valid).
+    /// Builtins (launcher, orchestrator, subcomponents): always
+    /// `"per_project"` — those are conceptually per-workspace.
+    #[serde(default)]
+    pub install_scope: String,
 }
 
 impl ModuleCatalogEntry {
@@ -157,6 +183,10 @@ impl ModuleCatalogEntry {
             // NEW-3 (2026-05-28): expose runtime type so the tile can gate
             // the "Start" button on container/service modules.
             runtime_type: m.runtime.r#type.clone(),
+            // v0.2.49 Stream A integration: expose install.scope so the
+            // Svelte tile can render per-project badge variants
+            // correctly for global-scope modules (Bug D).
+            install_scope: m.install.scope.as_str().to_string(),
         }
     }
 
@@ -201,6 +231,12 @@ impl ModuleCatalogEntry {
             // L0 catalog records don't carry runtime metadata; the
             // installed manifest path fills this in when available.
             runtime_type: String::new(),
+            // v0.2.49 Stream A integration: L0Install carries an
+            // optional `scope` field (added in lockstep with the
+            // manifest-side InstallScope). Default "per_project"
+            // preserves pre-v0.2.49 L0 catalogs that don't carry
+            // the field at all.
+            install_scope: l0.install.scope.as_str().to_string(),
         }
     }
 }
@@ -334,6 +370,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         deprecation_eol_date: String::new(),
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
+        install_scope: "per_project".into(),
         runtime_type: String::new(),
     });
 
@@ -390,6 +427,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
         runtime_type: String::new(),
+        install_scope: "per_project".into(),
     });
 
     for comp in components {
@@ -422,6 +460,7 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
             deprecation_migration_url: String::new(),
             catalog_warning: String::new(),
             runtime_type: String::new(),
+            install_scope: "per_project".into(),
         });
     }
 
@@ -849,6 +888,14 @@ fn synthetic_legacy_entry(legacy: &InstalledLegacyEntry) -> ModuleCatalogEntry {
         deprecation_migration_url: String::new(),
         catalog_warning: String::new(),
         runtime_type: String::new(),
+        // v0.2.49: synthetic legacy entries fall back to per_project
+        // because we don't have manifest data to determine scope.
+        // If the user is on a legacy install of a now-global-scope
+        // module, the auto-migration in Stream A will rewrite the
+        // install row on next launcher boot; until then the tile
+        // renders with the per_project shape, which matches the
+        // current install row's project_id != NULL state.
+        install_scope: "per_project".into(),
     }
 }
 
@@ -1450,16 +1497,88 @@ pub async fn install_module_for_project(
     }
 
     // 5. Insert pending row
+    //
+    // v0.2.49 Stream A: branch on `install.scope`. Global-scope modules
+    // (e.g. RL Reranker v0.2.10+) get a single machine-wide row with
+    // project_id=NULL via `insert_global_module_install`. Per-project
+    // modules retain the v0.2.20–v0.2.48 path. The `is_global` flag
+    // threads through every status / lifecycle write below so the right
+    // accessor is selected.
     let install_id = Uuid::new_v4().to_string();
     let ctx = PlaceholderCtx::new(&module_id);
     let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
-    let row = db.insert_module_install(
-        &install_id,
-        &project_id,
-        &module_id,
-        &manifest.version,
-        &install_dir.display().to_string(),
-    )?;
+    let is_global = manifest.install.scope.is_global();
+    let row = if is_global {
+        db.insert_global_module_install(
+            &install_id,
+            &module_id,
+            &manifest.version,
+            &install_dir.display().to_string(),
+        )?
+    } else {
+        db.insert_module_install(
+            &install_id,
+            &project_id,
+            &module_id,
+            &manifest.version,
+            &install_dir.display().to_string(),
+        )?
+    };
+
+    // v0.2.49 Step F MF3 (migration 032): persist the manifest's
+    // `kg_collections` declaration into the launcher DB at install
+    // time. Read by `populate_kg_collection_access_for_project` on
+    // every new-project create to back-fill access rows for already-
+    // installed global modules (the inverse of item #13 below). The
+    // launcher DB is the authoritative state — downstream consumers
+    // never re-parse the on-disk manifest from the hot path.
+    //
+    // Wired for BOTH global + per-project installs so per-project
+    // modules that might declare kg_collections in the future are
+    // covered. Soft-fail per the helper's contract (the audit log
+    // captures any error; install proceeds).
+    if let Err(e) = db.set_module_kg_collections(
+        &row.id,
+        manifest.kg_collections.as_deref(),
+    ) {
+        db.audit(
+            "module_kg_collections_persist_failed",
+            Some(&project_id),
+            Some(&module_id),
+            &serde_json::json!({"install_id": row.id, "error": e}),
+        )?;
+    }
+
+    // v0.2.49 item #13 (M-3): if a global module declares KG collections,
+    // seed access rows for every project at install time. Uses
+    // `kg_seed_access` (INSERT OR IGNORE) so any user-configured
+    // downgrades survive re-installs. Per-project modules don't go
+    // through this path — their access matrix is owned by the
+    // per-project populate at project-create time.
+    if is_global {
+        if let Some(collections) = manifest.kg_collections.as_ref() {
+            if !collections.is_empty() {
+                let mut populate_report =
+                    crate::commands::project_state_populate::PopulateReport::default();
+                crate::commands::project_state_populate::populate_kg_collection_access_for_global_module(
+                    collections,
+                    &db,
+                    &mut populate_report,
+                );
+                db.audit(
+                    "kg_access_seeded_global_module",
+                    None,
+                    Some(&module_id),
+                    &serde_json::json!({
+                        "collections": collections,
+                        "rows_inserted": populate_report.kg_access_rows_inserted,
+                        "warnings": populate_report.warnings,
+                    }),
+                )?;
+            }
+        }
+    }
+
     db.audit(
         "module_install_start",
         Some(&project_id),
@@ -1526,12 +1645,20 @@ pub async fn install_module_for_project(
                         .collect::<Vec<_>>()
                         .join("; ");
                     let msg = format!("manifest validation failed: {}", error_summary);
-                    db.set_module_status(
-                        &project_id,
-                        &module_id,
-                        ModuleStatus::Error,
-                        Some(msg.clone()),
-                    )?;
+                    if is_global {
+                        db.set_global_module_status(
+                            &module_id,
+                            ModuleStatus::Error,
+                            Some(msg.clone()),
+                        )?;
+                    } else {
+                        db.set_module_status(
+                            &project_id,
+                            &module_id,
+                            ModuleStatus::Error,
+                            Some(msg.clone()),
+                        )?;
+                    }
                     return Err(format!("Install rejected for module {}: {}", module_id, msg));
                 }
                 for w in warnings.iter().filter(|w| w.severity == WarningSeverity::Deprecation) {
@@ -1550,13 +1677,26 @@ pub async fn install_module_for_project(
                     );
                 }
             }
-            db.set_module_status(&project_id, &module_id, ModuleStatus::Installed, None)?;
-            db.audit(
-                "module_install_done",
-                Some(&project_id),
-                Some(&module_id),
-                &serde_json::json!({ "install_dir": resolved_dir.display().to_string() }),
-            )?;
+            if is_global {
+                db.set_global_module_status(&module_id, ModuleStatus::Installed, None)?;
+                db.audit(
+                    "module_install_done",
+                    None,
+                    Some(&module_id),
+                    &serde_json::json!({
+                        "install_dir": resolved_dir.display().to_string(),
+                        "scope": "global",
+                    }),
+                )?;
+            } else {
+                db.set_module_status(&project_id, &module_id, ModuleStatus::Installed, None)?;
+                db.audit(
+                    "module_install_done",
+                    Some(&project_id),
+                    Some(&module_id),
+                    &serde_json::json!({ "install_dir": resolved_dir.display().to_string() }),
+                )?;
+            }
 
             // v0.2.34 Agent E (Phase 4 generalisation): reconcile this
             // module's MCP tool-allowlist defaults into
@@ -1567,6 +1707,27 @@ pub async fn install_module_for_project(
             // error here is logged but doesn't break the install
             // (defaults can be reconciled again on next install/update).
             reconcile_module_tool_allowlist(&manifest, &module_id, &db);
+
+            // v0.2.49 Stream B: when a global-scope module finishes
+            // installing, seed `enabled=true` rows in `module_settings`
+            // for every existing project so the module is on by default
+            // across the host. The seeding loop is a no-op for
+            // per-project-scope modules (the legacy default) — the
+            // helper short-circuits via `install_scope_is_global()`.
+            //
+            // Soft-fail throughout: the helper logs per-row failures
+            // and returns the success count. We audit the count for
+            // forensic trace.
+            if manifest.install_scope_is_global() {
+                let seeded = crate::commands::module_enabled
+                    ::seed_enabled_rows_for_new_global_module(&db, &manifest, &module_id);
+                let _ = db.audit(
+                    "module_global_enable_seeded_on_install",
+                    Some(&project_id),
+                    Some(&module_id),
+                    &serde_json::json!({ "projects_seeded": seeded }),
+                );
+            }
 
             // v0.2.43 V0243-17: post-install assertion — if the manifest
             // declares mcp_registration.tool_allowlist, at least 1 row
@@ -1643,12 +1804,22 @@ pub async fn install_module_for_project(
                 == crate::manifest::InstallMethod::ContainerPull
                 && matches!(manifest.runtime.r#type.as_str(), "container" | "service")
             {
-                match crate::commands::module_service::start_container_after_install(
-                    &manifest,
-                    &project,
-                    &db,
-                )
-                .await
+                // v0.2.49 Stream A: select global vs per-project start
+                // path. The global path doesn't take a ProjectRow; the
+                // container has no `{project_slug}` substitution and
+                // listens on the machine-wide `GLOBAL_RL_PORT`.
+                let start_result = if is_global {
+                    crate::commands::module_service::start_global_container_after_install(
+                        &manifest, &db,
+                    )
+                    .await
+                } else {
+                    crate::commands::module_service::start_container_after_install(
+                        &manifest, &project, &db,
+                    )
+                    .await
+                };
+                match start_result
                 {
                     Ok(name) => {
                         // v0.2.40 R5: first-install auto-download of
@@ -1755,11 +1926,15 @@ pub async fn install_module_for_project(
                         // module_installs.last_error so the GUI tile renders a
                         // clear failure state instead of "installed but no
                         // container" silent-fail.
-                        let _ = db.set_module_last_error(
-                            &project_id,
-                            &module_id,
-                            Some(&e),
-                        );
+                        if is_global {
+                            let _ = db.set_global_module_last_error(&module_id, Some(&e));
+                        } else {
+                            let _ = db.set_module_last_error(
+                                &project_id,
+                                &module_id,
+                                Some(&e),
+                            );
+                        }
                         // v0.2.45 V45-E: ALSO flip status to 'error' so V44-G4
                         // auto-retry can heal the row on the next
                         // orchestrator-update. Pre-v0.2.45 the status stayed
@@ -1777,25 +1952,37 @@ pub async fn install_module_for_project(
                         // (Reinstall / auto-retry) instead of stranding the
                         // row in a half-state that only manual GUI clicks
                         // can recover from.
-                        let _ = db.set_module_status(
-                            &project_id,
-                            &module_id,
-                            ModuleStatus::Error,
-                            Some(e.clone()),
-                        );
+                        if is_global {
+                            let _ = db.set_global_module_status(
+                                &module_id,
+                                ModuleStatus::Error,
+                                Some(e.clone()),
+                            );
+                        } else {
+                            let _ = db.set_module_status(
+                                &project_id,
+                                &module_id,
+                                ModuleStatus::Error,
+                                Some(e.clone()),
+                            );
+                        }
                         let _ = app.emit(
                             "module://container-start-failed",
                             serde_json::json!({
-                                "project_id": project_id,
+                                "project_id": if is_global { None } else { Some(&project_id) },
                                 "module_id": module_id,
+                                "scope": if is_global { "global" } else { "per_project" },
                                 "error": e,
                             }),
                         );
                         let _ = db.audit(
                             "module_container_start_failed",
-                            Some(&project_id),
+                            if is_global { None } else { Some(&project_id) },
                             Some(&module_id),
-                            &serde_json::json!({ "error": e }),
+                            &serde_json::json!({
+                                "error": e,
+                                "scope": if is_global { "global" } else { "per_project" },
+                            }),
                         );
                         None
                     }
@@ -1807,9 +1994,10 @@ pub async fn install_module_for_project(
             let _ = app.emit(
                 "module://install-complete",
                 serde_json::json!({
-                    "project_id": project_id,
+                    "project_id": if is_global { None } else { Some(&project_id) },
                     "module_id": module_id,
                     "success": true,
+                    "scope": if is_global { "global" } else { "per_project" },
                     "container_name": resolved_container_name,
                 }),
             );
@@ -1820,18 +2008,27 @@ pub async fn install_module_for_project(
             })
         }
         Err(e) => {
-            db.set_module_status(
-                &project_id,
-                &module_id,
-                ModuleStatus::Error,
-                Some(e.clone()),
-            )?;
+            if is_global {
+                db.set_global_module_status(
+                    &module_id,
+                    ModuleStatus::Error,
+                    Some(e.clone()),
+                )?;
+            } else {
+                db.set_module_status(
+                    &project_id,
+                    &module_id,
+                    ModuleStatus::Error,
+                    Some(e.clone()),
+                )?;
+            }
             let _ = app.emit(
                 "module://install-complete",
                 serde_json::json!({
-                    "project_id": project_id,
+                    "project_id": if is_global { None } else { Some(&project_id) },
                     "module_id": module_id,
                     "success": false,
+                    "scope": if is_global { "global" } else { "per_project" },
                     "error": e,
                 }),
             );
@@ -2122,6 +2319,16 @@ pub async fn uninstall_module_v2(
     purge_data: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
+    // v0.2.49 Stream A: check for a GLOBAL row first. If a module is
+    // installed as global (project_id IS NULL), the per-project lookup
+    // returns None even when the module is plainly installed; we route
+    // through the global accessor instead. The caller may pass any
+    // project_id (typically the current one); for global rows it's
+    // informational only — global uninstalls are machine-wide.
+    if let Some(global_row) = db.get_global_module_install(&module_id)? {
+        return uninstall_global_module(global_row, module_id, purge_data, &db).await;
+    }
+
     let row = db
         .get_module_install(&project_id, &module_id)?
         .ok_or_else(|| format!("module {} not installed for project {}", module_id, project_id))?;
@@ -2268,6 +2475,16 @@ pub async fn uninstall_module_v2(
             module_id, e
         );
     }
+    // v0.2.49 Stream B: drop every per-project `enabled_for_project`
+    // row for this module so a future reinstall starts clean (no stale
+    // `false` lingering for a project that disabled the module). We
+    // call this unconditionally — the helper short-circuits to 0 deletes
+    // when the module had no rows (project-scope modules don't get the
+    // toggle), so there's no need to gate on `install_scope_is_global()`
+    // here. Idempotent and safe even when the manifest is missing (which
+    // is why `clear_module_settings` above already runs unconditionally).
+    let cleared_enable_rows = crate::commands::module_enabled
+        ::clear_enabled_rows_for_uninstalled_module(&db, &module_id);
     db.audit(
         "module_uninstall",
         Some(&project_id),
@@ -2279,6 +2496,164 @@ pub async fn uninstall_module_v2(
             "deregister_mcp": uninstall_block.deregister_mcp,
             "clear_secrets": uninstall_block.clear_secrets,
             "manifest_found": manifest_opt.is_some(),
+            "cleared_enabled_for_project_rows": cleared_enable_rows,
+        }),
+    )?;
+    Ok(())
+}
+
+/// v0.2.49 Stream A: uninstall a GLOBAL-scope module.
+///
+/// Mirrors `uninstall_module_v2` for the per-project case but routes
+/// every DB read/write through the global accessors AND removes the
+/// single bare-id container instead of N per-project containers. Audit
+/// log uses `project_id = None` to flag the global scope.
+async fn uninstall_global_module(
+    row: crate::db::models::ModuleInstallRow,
+    module_id: String,
+    purge_data: bool,
+    db: &Db,
+) -> Result<(), String> {
+    // Look up the manifest. On miss, fall back to legacy hardcoded
+    // behaviour (mirrors the per-project path).
+    let manifest_opt = match install_path_manifest_lookup(db, &module_id) {
+        Ok((m, _)) => Some(m),
+        Err(e) => {
+            eprintln!(
+                "[uninstall] manifest for {} not in catalog ({}); falling back to legacy \
+                 hardcoded behaviour (remove install_dir, no MCP deregister, no secret wipe).",
+                module_id, e,
+            );
+            None
+        }
+    };
+
+    let uninstall_block: UninstallBlock = manifest_opt
+        .as_ref()
+        .and_then(|m| m.uninstall.clone())
+        .unwrap_or_else(default_uninstall_block);
+
+    // Stop + remove the single global container (when present) BEFORE
+    // dropping the install row.
+    if let Some(container_name) = row.container_name.as_deref() {
+        if !container_name.is_empty() {
+            if let Err(e) = crate::commands::module_service::stop_container_for_project(
+                container_name,
+            )
+            .await
+            {
+                eprintln!(
+                    "[uninstall] global stop_container_for_project({}) failed: {}",
+                    container_name, e
+                );
+            }
+        }
+    }
+
+    let install_path = PathBuf::from(&row.install_path);
+    let ctx = PlaceholderCtx::new(&module_id).with_install_dir(install_path.clone());
+
+    if uninstall_block.remove_install_dir && install_path.exists() {
+        let preserved =
+            stash_preserve_paths(&install_path, &uninstall_block.preserve_paths, &ctx).await;
+        if let Err(e) = tokio::fs::remove_dir_all(&install_path).await {
+            eprintln!(
+                "[uninstall] global remove_dir_all {}: {}",
+                install_path.display(),
+                e
+            );
+        }
+        if !preserved.is_empty() {
+            if let Err(e) = restore_preserved_paths(&install_path, preserved).await {
+                eprintln!(
+                    "[uninstall] global restore_preserved_paths failed: {}",
+                    e
+                );
+            }
+        }
+    } else if !uninstall_block.remove_install_dir {
+        eprintln!(
+            "[uninstall] manifest.uninstall.remove_install_dir=false; leaving {} on disk.",
+            install_path.display(),
+        );
+    }
+
+    // MCP deregistration — same surface as per-project path.
+    if uninstall_block.deregister_mcp {
+        if let Some(mcp) = manifest_opt
+            .as_ref()
+            .and_then(|m| m.mcp_registration.as_ref())
+        {
+            if let Some(home) = directories::UserDirs::new() {
+                let target = home.home_dir().join(".claude.json");
+                if let Err(e) =
+                    crate::mcp_registration::deregister_mcp(&target, &mcp.mcp_name)
+                {
+                    eprintln!(
+                        "[uninstall] global deregister_mcp({}) failed: {}",
+                        mcp.mcp_name, e
+                    );
+                }
+            }
+        }
+    }
+
+    // Secret cleanup — global secrets only (per-project secrets are
+    // never attached to global modules). v0.2.49 Stream A scope: skip
+    // per-project secret cleanup for global modules; future iteration
+    // may add a sweep across every project_id when clear_secrets=true.
+    if uninstall_block.clear_secrets {
+        if let Some(manifest) = manifest_opt.as_ref() {
+            for decl in &manifest.secrets {
+                if decl.scope.as_str() == "global" {
+                    if let Err(e) =
+                        secrets::delete(SecretScope::Global, &module_id, &decl.key)
+                    {
+                        eprintln!(
+                            "[uninstall] global secrets::delete({}/{}) failed: {}",
+                            module_id, decl.key, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if purge_data {
+        let data_dir = crate::paths::vct_root_dir().join("data").join(&module_id);
+        if data_dir.exists() {
+            let _ = tokio::fs::remove_dir_all(&data_dir).await;
+        }
+    }
+
+    db.delete_global_module_install(&module_id)?;
+    // module_settings for global modules: the `(project_id, module_id)`
+    // settings can still exist per-project (Stream B's per-project
+    // enable toggle). Clearing them on uninstall is delegated to
+    // Stream B's path — global uninstall here drops the install row +
+    // container only.
+    //
+    // TODO(stream-B): on global uninstall, sweep
+    // `module_settings(project_id, module_id, 'enabled_for_project')`
+    // for every project — but that's Stream B's surface.
+    if let Err(e) = db.clear_mcp_tool_defaults_for_module(&module_id) {
+        eprintln!(
+            "[uninstall] global clear_mcp_tool_defaults_for_module({}) failed: {}",
+            module_id, e
+        );
+    }
+    db.audit(
+        "module_uninstall",
+        None,
+        Some(&module_id),
+        &serde_json::json!({
+            "purge_data": purge_data,
+            "remove_install_dir": uninstall_block.remove_install_dir,
+            "preserve_paths_count": uninstall_block.preserve_paths.len(),
+            "deregister_mcp": uninstall_block.deregister_mcp,
+            "clear_secrets": uninstall_block.clear_secrets,
+            "manifest_found": manifest_opt.is_some(),
+            "scope": "global",
         }),
     )?;
     Ok(())
@@ -3311,6 +3686,7 @@ mod tests {
                     pull_token_endpoint: "https://example/pull-token".into(),
                     pull_token_method: "POST".into(),
                 },
+                scope: crate::manifest::InstallScope::PerProject,
             },
             requirements: None,
             runtime_hints: None,
@@ -4557,5 +4933,113 @@ mod tests {
         // Minor / major bumps.
         assert!(parse_semver("0.3.0").unwrap() > parse_semver("0.2.99").unwrap());
         assert!(parse_semver("1.0.0").unwrap() > parse_semver("0.99.99").unwrap());
+    }
+
+    // ─── v0.2.49 Bug D / Path 1 (install_scope exposure) ───────────
+
+    /// `ModuleCatalogEntry.install_scope` carries the manifest's
+    /// `install.scope` field as a string so the Svelte tile can render
+    /// per-project badge variants vs global-scope tile variants
+    /// (Bug D). The shape is the wire contract between Rust (this
+    /// crate) and Svelte (`launcher/src/lib/components/`).
+    ///
+    /// Pin the serialized JSON shape so a future renames /
+    /// schema-evolution change breaks loudly here, NOT silently at the
+    /// tile renderer's "unrecognised scope" branch.
+    #[test]
+    fn test_v0249_module_catalog_entry_install_scope_serializes_as_string() {
+        let entry = ModuleCatalogEntry {
+            id: "test".into(),
+            name: "Test".into(),
+            version: "0.1.0".into(),
+            description: String::new(),
+            category: "paid".into(),
+            tags: vec![],
+            license_required: true,
+            license_variant_ids: vec![],
+            min_orchestrator_tier: "pro".into(),
+            compatibility_hosts: vec![],
+            is_licensed: true,
+            manifest_source: "test".into(),
+            kind: "available".into(),
+            parent_id: String::new(),
+            cta_route: String::new(),
+            coming_soon_tier: String::new(),
+            coming_soon_target: String::new(),
+            deprecated: false,
+            deprecation_message: String::new(),
+            deprecation_eol_date: String::new(),
+            deprecation_migration_url: String::new(),
+            catalog_warning: String::new(),
+            runtime_type: String::new(),
+            install_scope: "global".into(),
+        };
+        let json = serde_json::to_value(&entry).expect("serialize");
+        assert_eq!(
+            json["install_scope"], "global",
+            "install_scope must serialize as snake_case string on the \
+             wire so the Svelte tile (Bug D) can branch on it"
+        );
+    }
+
+    /// Bug D's tile renderer treats absent / legacy entries as
+    /// `per_project`. Round-trip pin: a JSON catalog payload missing
+    /// the field deserializes with `install_scope = ""` (the serde
+    /// default), which the tile must treat as equivalent to
+    /// `per_project`. This pins the deserialization path so the
+    /// `#[serde(default)]` annotation stays present.
+    #[test]
+    fn test_v0249_module_catalog_entry_install_scope_missing_field_defaults_empty() {
+        // Construct a minimal JSON payload WITHOUT the install_scope
+        // field — simulating an older launcher version or hand-rolled
+        // payload from a test fixture.
+        let json = serde_json::json!({
+            "id": "test",
+            "name": "Test",
+            "version": "0.1.0",
+            "description": "",
+            "category": "paid",
+            "tags": [],
+            "license_required": true,
+            "license_variant_ids": [],
+            "min_orchestrator_tier": "pro",
+            "compatibility_hosts": [],
+            "is_licensed": true,
+            "manifest_source": "test",
+            "kind": "available",
+        });
+        let entry: ModuleCatalogEntry =
+            serde_json::from_value(json).expect("deserialize without install_scope");
+        // Field is absent → serde fills with `String::default()` = "".
+        // The Svelte tile (Bug D) must treat "" as equivalent to
+        // "per_project" (the safe legacy default).
+        assert_eq!(
+            entry.install_scope, "",
+            "missing install_scope must deserialize as empty string \
+             (then tile renderer treats it as per_project)"
+        );
+    }
+
+    /// Builtin entries (launcher, orchestrator, subcomponents) all
+    /// declare `install_scope = "per_project"` because they're
+    /// conceptually per-workspace. Pin this so a future refactor that
+    /// auto-derives scope from somewhere else doesn't silently flip
+    /// the builtin entries to "global" (which would break the Bug D
+    /// tile renderer's expectations).
+    #[test]
+    fn test_v0249_builtin_catalog_entries_are_per_project_scope() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let db = Db::open().expect("open db");
+        let entries = builtin_catalog_entries(&db);
+        std::env::remove_var("VCT_STATE_DIR");
+        assert!(!entries.is_empty(), "builtin catalog must be non-empty");
+        for entry in &entries {
+            assert_eq!(
+                entry.install_scope, "per_project",
+                "builtin entry {} should be per_project, got {}",
+                entry.id, entry.install_scope
+            );
+        }
     }
 }

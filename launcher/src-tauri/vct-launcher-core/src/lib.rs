@@ -11,6 +11,12 @@
 pub mod bundled_versions;
 pub mod config;
 pub mod db;
+// v0.2.49: shared license + machine-binding helpers used by the launcher
+// GUI AND vct-hub. Promoted out of the launcher crate so the hub-side
+// supervisor (Phase 3 auth port) can call the same keychain read +
+// machine_id_hash as the install path. See knowledge/concepts/
+// supervisor-image-resolution-variant-gap-2026-06-04.md.
+pub mod licensing;
 pub mod manifest;
 pub mod orchestrator_manifest;
 pub mod paths;

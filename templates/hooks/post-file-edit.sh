@@ -70,11 +70,149 @@ except Exception:
 
 [ -z "$EDITED_FILE" ] && exit 0
 
+# v0.2.49 Phase 8 (item #22): access-matrix gate for KG writes.
+#
+# Before kicking off any kg-sync subprocess, check if this project has
+# write access to the target collection. The check is fail-open: if the
+# hub is unreachable / the project isn't registered / the response is
+# malformed, the gate returns "write" + emits a WARNING + logs a
+# dropped-write-metric row, then the sync proceeds. This is DELIBERATE
+# (closed-circuit would brick all KG writes during launcher restart).
+#
+# When the gate returns "read" or "none", we SKIP the sync silently +
+# the user gets the WARNING from the resolver client about the deny.
+#
+# The resolver script lives at templates/scripts/vct_access_check.sh
+# (orchestrator-root) and is byte-identical to .claude/scripts/
+# vct_access_check.sh in user projects (template-drift gate enforces).
+# v0.2.49 SB1: emit a `dropped_writes.jsonl` row when the gate falls
+# back to silent-allow because VCT_PROJECT_ID is empty. Mirrors the
+# Python-side `_emit_gate_skipped_metric` shape and the existing
+# `emit_metric` helper in vct_access_check.sh. Never fails the caller.
+_kg_emit_gate_skipped_metric() {
+    local coll="${1:-}"
+    local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+    local cache_dir="$state_dir/cache"
+    local jsonl="$cache_dir/dropped_writes.jsonl"
+    mkdir -p "$cache_dir" 2>/dev/null || return 0
+    local ts
+    ts=$(date +%s 2>/dev/null) || ts=0
+    printf '{"ts":%d,"project_id":"","collection":"%s","reason":"gate_skipped_no_project_id","fail_open":true}\n' \
+        "$ts" "$coll" \
+        >> "$jsonl" 2>/dev/null || true
+}
+
+# v0.2.49 SB1: write an UPDATE_DEFERRED.md entry directing the user to
+# resolve the empty-VCT_PROJECT_ID condition (re-run install.py
+# --update OR re-register via Launcher GUI). Per the user's 2026-06-08
+# Q1 directive, this is the user-facing surface — silent-allow remains
+# the default at the gate, no stderr WARNING is emitted.
+#
+# Idempotency: deduped per (session, project) via a sentinel file in
+# .claude/state/ so a kg-sync burst doesn't accumulate duplicate
+# blocks. The condition_id token matches the Python sibling so even
+# cross-process duplicates upsert under the
+# vco_lib.deferral_report contract when --apply-deferred eventually
+# runs.
+_kg_emit_gate_skipped_deferral() {
+    local coll="${1:-}"
+    local deferred="$PROJECT_ROOT/.claude/context/UPDATE_DEFERRED.md"
+    local state_dir="$PROJECT_ROOT/.claude/state"
+    local session_id="${VCT_SESSION_ID:-${CLAUDE_SESSION_ID:-$$}}"
+    local sentinel="$state_dir/gate_skipped_deferral_${session_id}"
+
+    # Per-session dedup. The first call writes; subsequent calls within
+    # the same session are no-ops.
+    [ -f "$sentinel" ] && return 0
+    mkdir -p "$state_dir" 2>/dev/null || return 0
+    : > "$sentinel" 2>/dev/null || true
+
+    mkdir -p "$(dirname "$deferred")" 2>/dev/null || return 0
+
+    # Idempotent body marker — if a prior session already wrote a row
+    # for this condition_id, leave it in place rather than duplicating
+    # the section header.
+    local marker="## gate_skipped_no_project_id"
+    if [ -f "$deferred" ] && grep -q "^$marker" "$deferred" 2>/dev/null; then
+        return 0
+    fi
+
+    local ts
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || ts="unknown"
+
+    # Append-mode write. If the file doesn't exist, this creates a
+    # naked entry with no frontmatter — vco_lib.deferral_report.read()
+    # treats absent frontmatter as an empty header (the section parser
+    # still picks up the entry via `^## <cid> (sev)`). The next
+    # install.py --update pass calls DeferralReport.read() then write()
+    # which canonicalises the file with frontmatter.
+    {
+        printf '\n%s (warning)\n\n' "$marker"
+        printf '**Title**: Phase-8 access-matrix gate skipped (VCT_PROJECT_ID missing from hook env)\n\n'
+        printf '**Detected**: The post-file-edit.sh hook reached _kg_write_allowed with no VCT_PROJECT_ID. The Phase-8 WRITE gate cannot identify this project against the hub access matrix, so the write was permitted via the silent-allow path. Target collection: %s\n\n' "$coll"
+        printf '**Why deferred**: Seeding VCT_PROJECT_ID requires an orchestrator install pass (queries launcher.db for the project UUID) or a Launcher GUI re-registration. The hook cannot self-heal.\n\n'
+        printf '**To apply**:\n'
+        printf '```bash\n'
+        printf '# Option A — orchestrator-root install / update:\n'
+        printf 'python install.py --update\n\n'
+        printf '# Option B — per-project (pre-v0.2.49 install): re-register the\n'
+        printf '# project via Launcher GUI -> Projects -> Identity tab. The\n'
+        printf "# launcher's apply_project_env pass seeds VCT_PROJECT_ID into\n"
+        printf '# the project-local .claude/env from launcher.db.\n'
+        printf '```\n\n'
+        printf '**Detected at**: %s\n\n' "$ts"
+        printf -- '---\n'
+    } >> "$deferred" 2>/dev/null || true
+}
+
+_kg_write_allowed() {
+    local proj="${1:-}"
+    local coll="${2:-}"
+    if [ -z "$proj" ]; then
+        # v0.2.49 SB1: empty VCT_PROJECT_ID was previously a silent
+        # bypass — gate effectively disabled. Per user Q1 (2026-06-08),
+        # silent-allow stays the default; the metric (audit trail) +
+        # the deferral (user-facing remediation) are the two
+        # visibility surfaces. Order is metric-first so the JSONL row
+        # lands even if the deferral write hits a permission error.
+        _kg_emit_gate_skipped_metric "$coll"
+        _kg_emit_gate_skipped_deferral "$coll"
+        return 0
+    fi
+    [ -z "$coll" ] && return 0   # no collection context → allow
+    local checker=""
+    if [ -x "$PROJECT_ROOT/templates/scripts/vct_access_check.sh" ]; then
+        checker="$PROJECT_ROOT/templates/scripts/vct_access_check.sh"
+    elif [ -x "$PROJECT_ROOT/.claude/scripts/vct_access_check.sh" ]; then
+        checker="$PROJECT_ROOT/.claude/scripts/vct_access_check.sh"
+    else
+        # Resolver not on disk → allow (pre-v0.2.49 install, or
+        # post-update where the script hasn't been bundled yet).
+        return 0
+    fi
+    local level
+    level=$("$checker" "$proj" "$coll" 2>/dev/null || echo "write")
+    [ "$level" = "write" ]
+}
+
+# Resolve project_id once for the access checks below.
+VCT_PROJECT_ID="${VCT_PROJECT_ID:-}"
+if [ -z "$VCT_PROJECT_ID" ] && [ -f "$PROJECT_ROOT/.claude/env" ]; then
+    # Best-effort grep for VCT_PROJECT_ID=… in .claude/env (sourced
+    # form, not as a bash source — we don't want to inherit other env).
+    VCT_PROJECT_ID=$(grep -E '^[[:space:]]*VCT_PROJECT_ID=' "$PROJECT_ROOT/.claude/env" 2>/dev/null \
+        | head -1 | sed -E 's/^[[:space:]]*VCT_PROJECT_ID=//; s/^"//; s/"$//')
+fi
+
 # 1. Auto-sync knowledge graph files (background side-effect).
 if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
     REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
     cd "$PROJECT_ROOT"
-    .claude/scripts/kg-sync "$REL_PATH" &
+    # v0.2.49 Phase 8: gate the sync on access-matrix write permission.
+    # KG_COLLECTION is the target Weaviate class for primary-KG writes.
+    if _kg_write_allowed "$VCT_PROJECT_ID" "${KG_COLLECTION:-}"; then
+        .claude/scripts/kg-sync "$REL_PATH" &
+    fi
 
     EDIT_COUNT_FILE="$PROJECT_ROOT/.claude/logs/.kg_edit_count"
     mkdir -p "$PROJECT_ROOT/.claude/logs"
@@ -97,7 +235,11 @@ DOCS_DIR="$PROJECT_ROOT/docs"
 if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     REL_PATH="${EDITED_FILE#$PROJECT_ROOT/}"
     cd "$PROJECT_ROOT"
-    .claude/scripts/kg-sync "$REL_PATH" &
+    # v0.2.49 Phase 8: gate docs sync on access-matrix write permission
+    # against DEVELOPMENT_COLLECTION (the docs/ target).
+    if _kg_write_allowed "$VCT_PROJECT_ID" "${DEVELOPMENT_COLLECTION:-}"; then
+        .claude/scripts/kg-sync "$REL_PATH" &
+    fi
 fi
 
 # 2b. Auto-index diagrams (Phase 1.5 — Mermaid + Excalidraw).

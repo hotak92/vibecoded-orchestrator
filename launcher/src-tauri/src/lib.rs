@@ -374,6 +374,118 @@ fn handle_set_storage_config_cli(rest: &[String]) -> i32 {
     }
 }
 
+/// v0.2.49: reap a stale `install.py.lock` left behind by a crashed
+/// install.py subprocess.
+///
+/// Background: install.py's v0.2.49 main-entry singleton lock writes
+/// `<vct_root_dir>/install.py.lock` with `<pid>\n<unix_ts>\n` and holds
+/// an OS advisory lock on it for the process lifetime. The launcher
+/// always spawns install.py with `.kill_on_drop(true)` (the `update_at`
+/// path) OR via `.output().await` (every other path — synchronous, no
+/// orphan possible), so under normal shutdown the lock is released
+/// when the launcher exits cleanly.
+///
+/// However, a CRASHED launcher (segfault, OOM-kill, kill -9) cannot
+/// run Rust destructors → leaves the install.py child as an orphan,
+/// which leaves the lockfile in place even after the orphan dies.
+/// The NEXT launcher boot would then hit the singleton lock with a
+/// dead-PID holder and wait 15s before sys.exit(1) — bad UX.
+///
+/// This reaper runs once on launcher startup, BEFORE any other init:
+///   1. Read the PID stored in `<vct_root_dir>/install.py.lock`.
+///   2. If the PID is STILL alive → leave the lockfile alone (legit
+///      concurrent run, e.g. a manual `python install.py --update`
+///      from terminal; the singleton lock will protect us).
+///   3. If the PID is DEAD → unlink the lockfile so the next install
+///      run starts clean.
+///
+/// Soft-fail throughout: any error (missing file, unreadable, malformed
+/// content, unlink failure) logs to stderr and proceeds. The reaper is
+/// defense-in-depth — never blocks launcher boot.
+fn reap_stale_install_py_lock() {
+    let lock_path = paths::vct_root_dir().join("install.py.lock");
+    if !lock_path.exists() {
+        // Common case: no prior install.py run, or last run exited
+        // cleanly and the lockfile was removed by the OS handle close.
+        // (POSIX flock does NOT remove the file on release; the file
+        // persists with the PID payload from the last holder. But the
+        // OS lock IS released, so the next install can re-acquire it
+        // without the reaper getting involved. We only need to reap
+        // when the OS lock is still held by a dead PID.)
+        return;
+    }
+
+    // Read the PID from line 1. The lockfile body is `<pid>\n<unix_ts>\n`
+    // as written by install.py's _install_singleton_lock_or_die.
+    let content = match std::fs::read_to_string(&lock_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[vct] reap_stale_install_py_lock: could not read {}: {} \
+                 (leaving lockfile in place)",
+                lock_path.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    let pid_line = match content.lines().next() {
+        Some(line) => line.trim(),
+        None => {
+            // Empty file — no holder claimed it. Safe to remove.
+            let _ = std::fs::remove_file(&lock_path);
+            eprintln!(
+                "[vct] reap_stale_install_py_lock: removed empty {}",
+                lock_path.display()
+            );
+            return;
+        }
+    };
+
+    let pid: u32 = match pid_line.parse() {
+        Ok(p) => p,
+        Err(_) => {
+            // Malformed first line — can't trust the file. Leave it
+            // alone and surface a diagnostic so the user notices.
+            eprintln!(
+                "[vct] reap_stale_install_py_lock: lockfile {} has \
+                 unparseable PID line {:?}; leaving in place",
+                lock_path.display(),
+                pid_line
+            );
+            return;
+        }
+    };
+
+    if pid_is_alive(pid) {
+        // Legit concurrent install.py run — the singleton lock will
+        // serialise the launcher's own install attempts behind it.
+        return;
+    }
+
+    // PID is dead — orphan lockfile. Remove it so the next install
+    // run starts clean.
+    match std::fs::remove_file(&lock_path) {
+        Ok(()) => {
+            eprintln!(
+                "[vct] reaped stale install.py.lock from dead PID {}",
+                pid
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] reap_stale_install_py_lock: could not remove {} \
+                 (dead PID {}): {}",
+                lock_path.display(),
+                pid,
+                e
+            );
+        }
+    }
+}
+
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // v0.2.12 (unified PR-23 + PR-28 dispatch): CLI subcommand dispatch
@@ -384,6 +496,15 @@ pub fn run() {
     if let Some(exit_code) = handle_cli_args() {
         std::process::exit(exit_code);
     }
+
+    // v0.2.49: reap any stale install.py.lock left behind by a crashed
+    // launcher (segfault / OOM-kill / kill -9 — none of which run
+    // Rust destructors, so `.kill_on_drop(true)` can't help). Without
+    // the reaper, the next install.py --update would observe a
+    // dead-PID holder on the lock and wait 15s before sys.exit(1) on
+    // EVERY launcher startup after a crash. Soft-fail; runs before
+    // any DB / Tauri init so a stale lock never blocks boot.
+    reap_stale_install_py_lock();
 
     let _initial_registry = registry::load_service_registry();
 
@@ -1100,39 +1221,50 @@ pub fn run() {
             // BEFORE W40-B (W40-B may itself rebind, but it tags the
             // change with `manual_override:v0.2.40-prefix-adopt`; the
             // on-write propagation also handles that path).
-            {
-                use tauri::Manager;
-                if let Some(db) = app.try_state::<db::Db>() {
-                    let weaviate_url = std::env::var("WEAVIATE_URL")
-                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
-                    let reconcile = tauri::async_runtime::block_on(
-                        db.inner().reconcile_kg_collection_access_at_boot(&weaviate_url),
-                    );
-                    match reconcile {
-                        Ok(dropped) => {
-                            if dropped > 0 {
-                                eprintln!(
-                                    "[vct] reconcile-kg-access (boot): dropped {} \
-                                     orphan kg_collection_access rows",
-                                    dropped
-                                );
-                                let _ = db.audit(
-                                    "kg_collection_access_reconciled_at_boot",
-                                    None,
-                                    None,
-                                    &serde_json::json!({ "dropped": dropped }),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[vct] reconcile-kg-access warning (non-fatal): {}",
-                                e
-                            );
-                        }
-                    }
-                }
-            }
+            //
+            // v0.2.49 batch 3 (black-screen cold-start fix) + Phase 3
+            // F-1 reorder ship-blocker:
+            //
+            // Both boot probes (W40-B adopt + the orphan-prune
+            // reconcile) were moved off the synchronous setup() path
+            // into async `tokio::spawn` in batch 3 to fix the black-
+            // screen-on-cold-start UX. Step C/Phase 3 then adds a
+            // `tokio::sync::oneshot` channel between them so that the
+            // RECONCILE TASK AWAITS THE ADOPT TASK'S COMPLETION before
+            // running its orphan-prune sweep.
+            //
+            // Why ordering matters (audit finding F-1, SHIP-BLOCKER):
+            // the adopt task rewrites `project_kg_bindings` rows whose
+            // collection_name points at a missing class to point at a
+            // populated cross-prefix candidate. Before the rewrite, the
+            // matching `kg_collection_access` rows are "orphans" by the
+            // reconcile sweep's definition (their collection_name is
+            // absent from both `project_kg_bindings` AND Weaviate).
+            // Running reconcile BEFORE adopt → orphans get dropped →
+            // adopt rewrites the binding → the access row is gone →
+            // the user has to manually re-grant access. Running
+            // reconcile AFTER adopt → the binding rewrite + the
+            // in-call `kg_rename_access` propagate the access row to
+            // the new collection name → reconcile sees the row as
+            // legitimate → no drop.
+            //
+            // The oneshot is the cleanest signal: `tx.send(())` on
+            // adopt completion (success OR failure — reconcile waits
+            // only for "adopt is done," not "adopt succeeded"). The
+            // receive is awaited by the reconcile spawn before its
+            // sweep starts. Deadlocks instantly on mis-wire (no
+            // dropped-sender silent-skip), unlike `Notify` which can
+            // swallow `notify_one()` calls when no listener is
+            // registered.
+            //
+            // The boot-order assertion test
+            // `boot_reconcile_runs_strictly_after_adopt` in
+            // `vct-launcher-core::db::access` pins this contract via
+            // an `Arc<Mutex<Vec<&'static str>>>` order log; future
+            // refactors that accidentally inverse the order will fail
+            // the assertion immediately.
+            let (adopt_done_tx, adopt_done_rx) =
+                tokio::sync::oneshot::channel::<()>();
 
             // W40-B (v0.2.40, 2026-05-30): cross-prefix KG binding
             // adoption + env regen-on-stale.
@@ -1171,9 +1303,29 @@ pub fn run() {
             // Async needed because the function does HTTP probes;
             // wrap in `tauri::async_runtime::block_on` so the
             // synchronous setup closure isn't restructured.
+            //
+            // v0.2.49 batch 3 (black-screen cold-start fix):
+            // moved off the synchronous setup() path into an async
+            // tokio::spawn. Pre-fix: this block alone could dominate
+            // boot wall-clock — it does N+1 HTTP probes to Weaviate
+            // (one /v1/schema fetch + one Aggregate query per
+            // candidate same-suffix class per ambiguous binding row)
+            // PLUS per-project env-file regen. On a host with many
+            // projects + a slow Weaviate, the block_on could sit for
+            // 5-15 s, with the launcher window stuck black. Post-fix:
+            // runs asynchronously after window paint; user sees the
+            // GUI immediately. Idempotency unchanged — re-running
+            // the adopt step is harmless (already-adopted rows are
+            // tagged manual_override:v0.2.40-prefix-adopt and skipped
+            // on the second pass).
             {
-                use tauri::Manager;
-                if let Some(db) = app.try_state::<db::Db>() {
+                let adopt_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let Some(db) = adopt_handle.try_state::<db::Db>()
+                    else {
+                        return;
+                    };
                     // Weaviate URL: honour env override (matches the
                     // contract in the rest of the launcher), default
                     // to canonical localhost:8081.
@@ -1182,16 +1334,10 @@ pub fn run() {
                             "http://localhost:8081".to_string()
                         });
 
-                    // `block_on` keeps the &Db borrow valid throughout
-                    // the call (the async fn doesn't hold the DB lock
-                    // across .await boundaries — verified by the
-                    // function's contract docstring).
-                    let adopt_report =
-                        tauri::async_runtime::block_on(
-                            db.inner().adopt_populated_collections_at_boot(
-                                &weaviate_url,
-                            ),
-                        );
+                    let adopt_report = db
+                        .inner()
+                        .adopt_populated_collections_at_boot(&weaviate_url)
+                        .await;
 
                     match adopt_report {
                         Ok(report) => {
@@ -1283,7 +1429,137 @@ pub fn run() {
                             );
                         }
                     }
-                }
+
+                    // v0.2.49 Phase 3 F-1: signal the reconcile task
+                    // that adopt is done. We send `Ok` regardless of
+                    // success or failure — reconcile should run after
+                    // adopt COMPLETES, not after adopt SUCCEEDS. A
+                    // failed adopt that leaves the binding pointing at
+                    // a missing class still needs reconcile to run for
+                    // OTHER bindings whose state is healthy. The
+                    // `.ok()` discard is intentional: if the receiver
+                    // was dropped (the reconcile task didn't spawn for
+                    // any reason), there's nothing to signal.
+                    let _ = adopt_done_tx.send(());
+                });
+            }
+
+            // v0.2.49 Phase 3 F-1 — orphan-prune reconcile, MUST run
+            // after the adopt task above completes. The oneshot
+            // receiver is awaited at the top of the task body; the
+            // sweep starts only after `adopt_done_tx.send(())` fires.
+            // See the long comment block above the channel declaration
+            // for the full reorder rationale.
+            //
+            // Soft-fail throughout: a slow Weaviate probe doesn't
+            // block window paint (we run async); a failed reconcile
+            // call logs + skips the sweep (next boot retries; the
+            // boot reconcile is idempotent by construction).
+            {
+                let reconcile_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    // Phase 3 ordering gate: wait for adopt to finish
+                    // before sweeping. A dropped sender (adopt task
+                    // didn't spawn) would resolve the `.await` to Err
+                    // — in that case we still proceed with the
+                    // reconcile because the alternative (skip
+                    // reconcile entirely) would leave orphans
+                    // forever. The `.ok()` discard means "proceed
+                    // regardless of channel state."
+                    let _ = adopt_done_rx.await;
+
+                    let Some(db) = reconcile_handle.try_state::<db::Db>()
+                    else {
+                        return;
+                    };
+                    let weaviate_url = std::env::var("WEAVIATE_URL")
+                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                    match db
+                        .inner()
+                        .reconcile_kg_collection_access_at_boot(&weaviate_url)
+                        .await
+                    {
+                        Ok(dropped) => {
+                            if dropped > 0 {
+                                eprintln!(
+                                    "[vct] reconcile-kg-access (boot): dropped {} \
+                                     orphan kg_collection_access rows",
+                                    dropped
+                                );
+                                let _ = db.audit(
+                                    "kg_collection_access_reconciled_at_boot",
+                                    None,
+                                    None,
+                                    &serde_json::json!({ "dropped": dropped }),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] reconcile-kg-access warning (non-fatal): {}",
+                                e
+                            );
+                        }
+                    }
+                });
+            }
+
+            // v0.2.49 Phase 6 S-4 — boot folder sanity check. Walks every
+            // `projects` row and Path::is_dir-checks the recorded
+            // `folder_path`, then stamps the `folder_missing_at_last_boot`
+            // column accordingly. The frontend reads the result via
+            // `read_project_folder_missing_flags` and renders a non-
+            // blocking warning banner on each affected project card.
+            //
+            // Runs INDEPENDENTLY of the Stream C adopt/reconcile oneshot
+            // pair above — this probe touches `projects.folder_missing_at_
+            // last_boot`, which is orthogonal to `project_kg_bindings`
+            // and `kg_collection_access`. No ordering coordination is
+            // required between this task and the F-1 ordered pair.
+            //
+            // Soft-fail throughout: DB errors at any step log via
+            // eprintln and skip — the launcher boots even when the
+            // probe can't run. Spawned as a separate tokio task so it
+            // doesn't block window paint; the work itself is bounded
+            // (one fs::is_dir per project row) so it stays well under
+            // the 5 s startup budget.
+            {
+                let folder_probe_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager;
+                    let Some(db) = folder_probe_handle.try_state::<db::Db>()
+                    else {
+                        return;
+                    };
+                    let report = commands::project_folder_health::run_folder_probe(
+                        db.inner(),
+                        commands::project_folder_health::default_folder_check,
+                    );
+                    if report.newly_missing > 0 || report.newly_returned > 0 {
+                        eprintln!(
+                            "[vct] folder-probe: newly_missing={} newly_returned={} \
+                             unchanged_healthy={} unchanged_missing={} update_errors={}",
+                            report.newly_missing,
+                            report.newly_returned,
+                            report.unchanged_healthy,
+                            report.unchanged_missing,
+                            report.update_errors.len(),
+                        );
+                        let _ = db.inner().audit(
+                            "project_folder_health_probe_completed",
+                            None,
+                            None,
+                            &serde_json::json!({
+                                "newly_missing": report.newly_missing,
+                                "newly_returned": report.newly_returned,
+                                "unchanged_healthy": report.unchanged_healthy,
+                                "unchanged_missing": report.unchanged_missing,
+                                "update_errors": report.update_errors,
+                            }),
+                        );
+                    }
+                });
             }
 
             // v0.2.21 Step 6: bring up the detached vct-hub binary if
@@ -1415,6 +1691,21 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 use tauri::Manager;
                 let db = rl_resume_handle.state::<crate::db::Db>();
+                // v0.2.49 Stream A: ALWAYS run the global auto-migration
+                // before the resume sweep. Idempotent — re-running after
+                // a successful migration is a no-op. Resolves manifests
+                // through `find_installed_manifest` so only modules with
+                // a post-install extract see the migration; modules
+                // without an extracted manifest stay untouched.
+                crate::commands::module_service::auto_migrate_per_project_to_global(
+                    &db,
+                    |module_id: &str| {
+                        crate::commands::modules::find_installed_manifest(&db, module_id)
+                            .ok()
+                            .map(|(m, _path)| m)
+                    },
+                )
+                .await;
                 crate::commands::module_service::resume_containers_on_startup(&db).await;
             });
             // Daily weights-update poll. license_reader closure returns
@@ -1693,6 +1984,13 @@ pub fn run() {
             commands::projects_v2::switch_project_host_v2,
             commands::projects_v2::delete_project_v2,
             commands::projects_v2::launch_project_in_editor,
+            // v0.2.49 Phase 6 S-4 — read-only accessor for the boot
+            // folder sanity check's cached verdict. The probe itself
+            // runs once per launcher boot (lib.rs setup async spawn);
+            // this command surfaces the per-row flag + folder_path to
+            // the GUI so ProjectCard.svelte can render a non-blocking
+            // warning banner without an extra round-trip.
+            commands::project_folder_health::read_project_folder_missing_flags,
             // Orchestrator-root view (v0.2.11, 2026-05-15) — exposes the
             // auto-registered `host=orchestrator_root` project row to
             // the UI so Settings / Dashboard can render a card for the
@@ -1909,6 +2207,13 @@ pub fn run() {
             commands::diagrams_cmd::seed_project_mcp_tool_grants,
             commands::diagrams_cmd::set_project_module_enabled,
             commands::diagrams_cmd::list_project_modules,
+            // v0.2.49 Stream B: per-project enable toggle for global-
+            // scope modules. The Svelte renderer calls
+            // `module_set_enabled_for_project` from the per-project
+            // Modules panel; `module_is_enabled_for_project` hydrates
+            // the toggle UI on mount. See `module_enabled.rs`.
+            commands::module_enabled::module_set_enabled_for_project,
+            commands::module_enabled::module_is_enabled_for_project,
             // Phase 1.5.7 wire-up: DiagramsTab calls
             // `is_project_module_active` on mount to decide whether to
             // render the diagrams UI or the "module disabled" overlay.
@@ -2851,5 +3156,104 @@ mod install_path_seed_tests {
         assert_eq!(found, None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.49: tests for the install.py-orphan-lockfile reaper called from
+// `run()` on launcher startup.
+//
+// Coverage:
+//   1. Dead-PID lockfile gets removed.
+//   2. Live-PID lockfile is preserved (legit concurrent run).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod orphan_reaper_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // VCT_STATE_DIR is process-wide; serialise tests that mutate it so
+    // parallel runs don't observe each other. Mirrors the pattern used
+    // by paths.rs's own tests + module_manifest_extract.rs.
+    static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    fn serialize_lock() -> std::sync::MutexGuard<'static, ()> {
+        SERIALIZE.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// A lockfile whose holder PID is dead must be removed so the next
+    /// install.py --update isn't blocked for 15s by a phantom holder.
+    #[test]
+    fn reap_stale_install_py_lock_removes_dead_pid_lockfile() {
+        let _g = serialize_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prior = std::env::var("VCT_STATE_DIR").ok();
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        // Sentinel: a PID that's guaranteed not allocated. Using
+        // `i32::MAX as u32` matches the pid_is_alive() defense-in-
+        // depth rejection (it short-circuits to false), so this is
+        // a deterministic "dead PID" signal cross-OS. The reaper
+        // treats pid_is_alive==false as "dead, reap me".
+        let lock_path = tmp.path().join("install.py.lock");
+        let dead_pid = i32::MAX as u32;
+        let payload = format!("{}\n{}\n", dead_pid, 1_700_000_000_u64);
+        std::fs::write(&lock_path, payload).unwrap();
+        assert!(lock_path.exists(), "precondition: lockfile must exist");
+
+        reap_stale_install_py_lock();
+
+        assert!(
+            !lock_path.exists(),
+            "dead-PID lockfile must be removed; still at {}",
+            lock_path.display()
+        );
+
+        match prior {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
+    }
+
+    /// A lockfile whose holder PID is alive must be preserved. This is
+    /// the "legit concurrent install.py run" case (e.g. user kicked
+    /// off `python install.py --update` from a terminal while the
+    /// launcher is also starting up) — the singleton lock will
+    /// serialise the launcher's own install attempts behind it.
+    #[test]
+    fn reap_stale_install_py_lock_leaves_live_pid_lockfile_alone() {
+        let _g = serialize_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prior = std::env::var("VCT_STATE_DIR").ok();
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+
+        // Use OUR pid as the "live holder" — pid_is_alive(self) is
+        // unconditionally true on every supported OS (see
+        // boot_sweep_tests::pid_is_alive_returns_true_for_own_pid).
+        let lock_path = tmp.path().join("install.py.lock");
+        let live_pid = std::process::id();
+        let payload = format!("{}\n{}\n", live_pid, 1_700_000_000_u64);
+        std::fs::write(&lock_path, payload).unwrap();
+        assert!(lock_path.exists(), "precondition: lockfile must exist");
+
+        reap_stale_install_py_lock();
+
+        assert!(
+            lock_path.exists(),
+            "live-PID lockfile must NOT be removed; missing from {}",
+            lock_path.display()
+        );
+        // Body preserved unchanged (reaper is read-only on live holders).
+        let after = std::fs::read_to_string(&lock_path).unwrap();
+        assert!(
+            after.starts_with(&format!("{}\n", live_pid)),
+            "lockfile body must be untouched; got {:?}",
+            after
+        );
+
+        match prior {
+            Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
     }
 }

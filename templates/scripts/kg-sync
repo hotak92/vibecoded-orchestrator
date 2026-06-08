@@ -11,21 +11,40 @@
 # clone. We also validate each candidate has `weaviate` importable so an
 # unrelated project venv at SCRIPT_DIR/../../.venv doesn't get picked up
 # by accident.
+#
+# v0.2.49 Bug K: the v0.2.37 validator only checked `import weaviate`
+# (the upstream client lib). That let unrelated project venvs through
+# that had pip-installed weaviate-client themselves but lacked the
+# editable `weaviate_mcp` package (installed by install.py A1, v0.2.38
+# — see sync_knowledge_graph.py line 52:
+# `from weaviate_mcp.chunking import TokenCounter, Chunker`). The post-
+# fix validator gates on BOTH imports in a single subprocess. The
+# wrapper also gained Windows-shape python detection
+# (`$v/Scripts/python.exe` under Git Bash / WSL2) and stopped relying
+# on `source bin/activate` (which doesn't exist in Windows venv
+# layouts) — we now invoke the venv's python binary directly,
+# exporting VIRTUAL_ENV so subprocesses still see the venv as active.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Validate a venv has the KG-sync deps installed.
-# Without this gate, an unrelated venv (e.g. the project's own venv at
-# SCRIPT_DIR/../../.venv post bundle install) would be activated and
-# sync_knowledge_graph would crash with `ModuleNotFoundError: weaviate`.
+# Validate a venv has BOTH `weaviate` (the upstream client) AND
+# `weaviate_mcp` (our internal editable module installed by install.py
+# A1, v0.2.38) importable. v0.2.49 Bug K: pre-fix this only checked
+# `weaviate` — which let unrelated project venvs through that had pip-
+# installed the upstream lib but lacked weaviate_mcp, causing
+# sync_knowledge_graph.py to crash at `from weaviate_mcp.chunking
+# import Chunker`. Gate on both imports so the picker rejects venvs
+# that can't actually run the script.
 venv_has_kg_deps() {
     local v="$1"
     local py=""
     if [ -x "$v/bin/python" ]; then py="$v/bin/python"
     elif [ -x "$v/bin/python3" ]; then py="$v/bin/python3"
+    elif [ -x "$v/Scripts/python.exe" ]; then py="$v/Scripts/python.exe"  # Windows (Git Bash / WSL2)
+    elif [ -x "$v/Scripts/python3.exe" ]; then py="$v/Scripts/python3.exe"
     else return 1
     fi
-    "$py" -c "import weaviate" 2>/dev/null
+    "$py" -c "import weaviate, weaviate_mcp" 2>/dev/null
 }
 
 # Probe candidate venvs. Launcher-provided $VCT_INSTALL_ROOT canonical
@@ -49,8 +68,28 @@ for c in "${CANDIDATES[@]}"; do
     fi
 done
 
+# v0.2.49 Bug K: invoke the venv's python binary directly rather than
+# `source bin/activate`. The source-then-python pattern was POSIX-only
+# — Windows venvs (incl. those used under Git Bash / WSL2) don't have
+# a `bin/activate` script. Direct invocation works on every OS, and
+# exporting VIRTUAL_ENV keeps any spawned subprocesses informed that a
+# venv is active (some libraries probe $VIRTUAL_ENV directly).
 if [ -n "$VENV_PATH" ]; then
-    source "$VENV_PATH/bin/activate"
+    export VIRTUAL_ENV="$VENV_PATH"
+    if [ -x "$VENV_PATH/bin/python" ]; then
+        VENV_PYTHON="$VENV_PATH/bin/python"
+    elif [ -x "$VENV_PATH/Scripts/python.exe" ]; then
+        VENV_PYTHON="$VENV_PATH/Scripts/python.exe"
+    elif [ -x "$VENV_PATH/bin/python3" ]; then
+        VENV_PYTHON="$VENV_PATH/bin/python3"
+    elif [ -x "$VENV_PATH/Scripts/python3.exe" ]; then
+        VENV_PYTHON="$VENV_PATH/Scripts/python3.exe"
+    else
+        echo "kg-sync: WARNING: VENV_PATH=$VENV_PATH has no python binary at conventional paths" >&2
+        VENV_PYTHON="python3"
+    fi
+else
+    VENV_PYTHON="python3"
 fi
 
-python "$SCRIPT_DIR/sync_knowledge_graph.py" "$@"
+"$VENV_PYTHON" "$SCRIPT_DIR/sync_knowledge_graph.py" "$@"

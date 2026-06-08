@@ -112,6 +112,17 @@ fn default_schema_version() -> u8 {
     RESOLVER_PROTOCOL_VERSION
 }
 
+/// v0.2.49 Stream B — serde `default = ...` helper for additive boolean
+/// fields whose safe missing-row default is `true` (e.g. the per-
+/// project module enable toggle). Mirrors `default_schema_version`'s
+/// forward-compat rationale: the response struct is Serialize-only in
+/// production, but this helper keeps the Deserialize-friendly fallback
+/// available for tests / cross-launcher integration code.
+#[allow(dead_code)]
+fn default_true_bool() -> bool {
+    true
+}
+
 // ─── Router ──────────────────────────────────────────────────────
 
 pub fn router() -> Router<LauncherDbHandle> {
@@ -299,6 +310,31 @@ struct ProjectConfigResponse {
     rl_use_global: bool,
     rl_online_training_disabled: bool,
     rl_global_training_source_flag: bool,
+    /// v0.2.49 Stream B — per-project enable toggle for the RL Reranker.
+    /// The RL Reranker is a global-scope module (one install on the
+    /// host, visible across every project); this flag is the per-project
+    /// gate that decides whether the MCP client should issue rerank
+    /// requests. Source: `module_settings(project_id, "vct-rl-reranker",
+    /// "enabled_for_project")`. Default `true` when no row exists
+    /// (fail-open: a corrupted setting never silently disables the
+    /// reranker).
+    ///
+    /// Consumer: `claude_mcp_servers/weaviate_mcp/server.py::
+    /// _rl_cache_and_rerank` reads this through
+    /// `ProjectConfig.rl_reranker_enabled_for_project` and short-circuits
+    /// the rerank path when `false` — the search returns base cosine
+    /// order instead. The server-side telemetry path
+    /// (`/data/logs/rl_events_<slug>.jsonl`) is untouched: that file
+    /// is written by the RL container itself, not by the MCP, so
+    /// disabling the client gate cannot drop training events.
+    ///
+    /// Additive field — pre-v0.2.49 Python clients see an unknown field
+    /// and ignore it; the parser back-fills with `true` (the safe
+    /// default) for pre-v0.2.49 hubs paired with v0.2.49+ clients.
+    /// `schema_version` stays at 1 because the field is defaultable
+    /// client-side.
+    #[serde(default = "default_true_bool")]
+    rl_reranker_enabled_for_project: bool,
     /// v0.2.31 — absolute path to Claude Code's per-workspace session-
     /// transcript directory (``~/.claude/projects/<slug>/``). The
     /// launcher computes this once from ``projects.folder_path`` using
@@ -541,6 +577,24 @@ async fn project_config(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // v0.2.49 Stream B — per-project enable toggle for the RL Reranker
+    // (a global-scope module: one install on the host, visible across
+    // every project). Default `true` when no row exists; matches the
+    // DB-layer reader's fail-open contract
+    // (`Db::module_is_enabled_for_project` in vct-launcher-core).
+    //
+    // The MCP's `_rl_cache_and_rerank` gate consumes this field via
+    // `ProjectConfig.rl_reranker_enabled_for_project` to decide whether
+    // to call the rerank endpoint. When `false`, the MCP falls back to
+    // base cosine ordering — no error, no missing-event log entry on
+    // the server side (training logs are SERVER-driven by the RL
+    // container's own JSONL writer; the client gate only suppresses
+    // outbound requests).
+    let rl_reranker_enabled_for_project = h
+        .0
+        .module_is_enabled_for_project(&project.id, "vct-rl-reranker")
+        .unwrap_or(true);
+
     // 8. Resolve binding roles.
     let primary_kg = kg_bindings
         .iter()
@@ -766,6 +820,7 @@ async fn project_config(
         rl_use_global,
         rl_online_training_disabled,
         rl_global_training_source_flag,
+        rl_reranker_enabled_for_project,
         claude_session_dir,
         retrieval_tuning,
         code_graph_extra_paths,
@@ -2419,6 +2474,90 @@ kg_tier_full = 0.8
         assert_eq!(
             obj.get("rl_use_global").and_then(|v| v.as_bool()),
             Some(true)
+        );
+    }
+
+    /// v0.2.49 Stream B — RL Reranker per-project enable toggle.
+    ///
+    /// A project with no row in ``module_settings`` for
+    /// ``vct-rl-reranker / enabled_for_project`` reads back as `true`.
+    /// This is the fail-open default — a freshly registered project
+    /// must NOT silently disable a global module it hasn't opted out
+    /// of. Mirrors the DB-layer reader's contract.
+    #[tokio::test]
+    async fn config_emits_rl_reranker_enabled_default_true() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-enable-default", "myproject");
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-rl-enable-default/config",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "default missing-row must read true; body={}",
+            body,
+        );
+    }
+
+    /// v0.2.49 Stream B — write → fetch round-trip for the RL enable
+    /// toggle. Setting `false` via the canonical key flips the response;
+    /// flipping back to `true` flips it again. Pins the contract between
+    /// the Tauri setter (`module_set_enabled_for_project`) and the hub
+    /// reader so a key-rename on one side immediately fails here.
+    #[tokio::test]
+    async fn config_emits_rl_reranker_enabled_from_module_settings() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-enable-set", "myproject");
+
+        // Disable the RL reranker for this project.
+        h.0.module_set_enabled_for_project(
+            "p-rl-enable-set",
+            "vct-rl-reranker",
+            false,
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-rl-enable-set/config",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "explicit disable must surface; body={}",
+            body,
+        );
+
+        // Re-enable.
+        h.0.module_set_enabled_for_project(
+            "p-rl-enable-set",
+            "vct-rl-reranker",
+            true,
+        )
+        .unwrap();
+        let resp = reqwest::get(format!(
+            "{}/projects/p-rl-enable-set/config",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(true),
         );
     }
 

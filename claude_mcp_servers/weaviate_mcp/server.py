@@ -289,6 +289,309 @@ def _large_result(data: dict, indent: int = 2) -> str:
     """
     return json.dumps(data, indent=indent)
 
+
+# ─── v0.2.49 Step F Phase 8 helpers ─────────────────────────────────────
+# Helpers consumed by `store_knowledge_node`'s access-matrix gate block
+# (Phase 8 / item #21). Lifted here from inline to keep the gate readable.
+
+
+def _emit_gate_crash_metric(project_id: str, collection: str, exc_str: str) -> None:
+    """v0.2.49 Step F MF6: emit a dropped-write metric row when the
+    access-matrix gate itself crashes (not just the resolver's expected
+    fail-open path).
+
+    The resolver's fail-open contract handles network / 4xx / 5xx /
+    malformed responses without raising. If an exception DOES reach this
+    helper, it means a bug in `vco_lib.access_resolver` or its caller —
+    the user needs to know the gate is degraded.
+
+    Mirror of `_emit_metric` in vco_lib/access_resolver.py. Never raises;
+    silent on I/O failure so a broken metric path doesn't break the
+    fail-open contract on top of a broken resolver.
+    """
+    try:
+        import time as _time
+        state_dir = os.environ.get("VCT_STATE_DIR")
+        if state_dir:
+            cache_dir = os.path.join(state_dir, "cache")
+        else:
+            cache_dir = os.path.join(os.path.expanduser("~"), ".vct", "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        jsonl_path = os.path.join(cache_dir, "dropped_writes.jsonl")
+        row = {
+            "ts": int(_time.time()),
+            "project_id": project_id,
+            "collection": collection,
+            "reason": "gate_crash",
+            "exception": exc_str[:500],  # cap to bound JSONL row size
+            "fail_open": True,
+        }
+        with open(jsonl_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:
+        # Metric-emit failure must not break the fail-open contract.
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.49 SB1: gate-skipped (empty VCT_PROJECT_ID) surfaces
+#
+# The Phase-8 WRITE gate has a silent-bypass when VCT_PROJECT_ID is
+# missing from the MCP environment — the gate's empty-PID branch falls
+# through to allow without any audit trail. SB1 closes that hole by
+# adding two visibility surfaces (per the user's 2026-06-08 Q1
+# directive — silent-allow stays the default; remediation lands in
+# UPDATE_DEFERRED.md, not stderr):
+#
+#   1. dropped_writes.jsonl row with reason='gate_skipped_no_project_id'
+#      (audit-trail surface, mirrors gate_crash shape).
+#   2. UPDATE_DEFERRED.md entry with actionable remediation commands
+#      (user-facing surface).
+#
+# Both are idempotent within a server lifetime via a module-level set
+# keyed by session_id so a kg-sync burst doesn't spam either surface.
+# ──────────────────────────────────────────────────────────────────────
+
+_GATE_SKIPPED_SESSIONS_SEEN: set[str] = set()
+"""Per-process dedup set: once a session has had ONE gate_skipped
+emission for empty-PID, further occurrences within the same server
+lifetime are suppressed at the deferral-write level (the
+dropped_writes.jsonl metric still fires per-call because audit-trail
+granularity matters for triage).
+"""
+
+
+def _emit_gate_skipped_metric(collection: str) -> None:
+    """v0.2.49 SB1: emit a dropped-write metric row for the empty-PID
+    branch (VCT_PROJECT_ID missing → gate would silently allow).
+
+    Mirror of ``_emit_gate_crash_metric`` shape; only the ``reason``
+    discriminator differs. Always fires per-call (no dedup) so the
+    JSONL is the authoritative count of how many writes hit the
+    silent-bypass path. The companion deferral writer
+    (``_emit_gate_skipped_deferral``) IS deduped per session — the two
+    surfaces have different consumers / cardinalities by design.
+
+    Never raises; silent on I/O failure so a broken metric path doesn't
+    break the silent-allow contract that the gate's empty-PID branch
+    relies on.
+    """
+    try:
+        import time as _time
+        state_dir = os.environ.get("VCT_STATE_DIR")
+        if state_dir:
+            cache_dir = os.path.join(state_dir, "cache")
+        else:
+            cache_dir = os.path.join(os.path.expanduser("~"), ".vct", "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        jsonl_path = os.path.join(cache_dir, "dropped_writes.jsonl")
+        row = {
+            "ts": int(_time.time()),
+            "project_id": "",  # empty by definition (this branch fires when missing)
+            "collection": collection,
+            "reason": "gate_skipped_no_project_id",
+            "fail_open": True,
+        }
+        with open(jsonl_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception:
+        # Metric-emit failure must not break the silent-allow contract.
+        pass
+
+
+def _resolve_project_root_for_deferral() -> Optional[Path]:
+    """Best-effort: locate the project root for SB1's deferral write.
+
+    Resolution order (mirrors the rest of server.py):
+      1. ``$CLAUDE_PROJECT_DIR`` env (set by Claude Code per-workspace)
+      2. ``$KG_BASE_DIR`` env (set by ``.claude/env`` / settings.json)
+      3. ``Path(__file__).resolve().parent.parent.parent`` — the
+         orchestrator's own root when this MCP runs from a clone.
+
+    Returns None when no candidate resolves to an existing directory —
+    the SB1 deferral writer treats that as "skip" (silent-allow is the
+    contract; we don't want a missing project dir to break the write).
+    """
+    try:
+        candidates: list[str] = []
+        workspace = os.environ.get("CLAUDE_PROJECT_DIR", "")
+        if workspace:
+            candidates.append(workspace)
+        kg_base = os.environ.get("KG_BASE_DIR", "")
+        if kg_base:
+            candidates.append(kg_base)
+        # Module-local fallback.
+        try:
+            candidates.append(str(Path(__file__).resolve().parent.parent.parent))
+        except Exception:
+            pass
+        for c in candidates:
+            try:
+                p = Path(c).resolve()
+            except (OSError, RuntimeError):
+                continue
+            if p.is_dir():
+                return p
+    except Exception:
+        # All path resolution paths failed — fall through to None.
+        pass
+    return None
+
+
+def _emit_gate_skipped_deferral(collection: str) -> None:
+    """v0.2.49 SB1: append an UPDATE_DEFERRED.md entry pointing the
+    user at the remediation path for the gate's empty-PID branch.
+
+    Per user Q1 (2026-06-08): silent-allow stays the default for the
+    gate's empty-PID path; the deferral file is the user-facing surface
+    that surfaces the actionable remediation (re-register the project
+    or re-run install.py --update so .claude/env carries
+    VCT_PROJECT_ID).
+
+    Idempotency: deduped per-server-process via
+    ``_GATE_SKIPPED_SESSIONS_SEEN`` — only the FIRST call per session
+    writes; subsequent calls are no-ops. The deferral writer itself is
+    upsert-by-condition_id under the
+    ``vco_lib.deferral_report.DeferralReport`` contract so even a
+    repeat call (cross-process) wouldn't accumulate duplicates within
+    a single UPDATE_DEFERRED.md file.
+
+    Never raises; silent on I/O failure so the silent-allow contract
+    isn't broken by a missing project dir / unwritable file.
+    """
+    # Per-session dedup. The session_id is a stable identifier for the
+    # life of the MCP subprocess; once we've written the deferral once,
+    # further empty-PID writes within the same kg-sync burst are silent.
+    session_key = os.environ.get("VCT_SESSION_ID") or os.environ.get(
+        "CLAUDE_SESSION_ID", ""
+    ) or f"pid:{os.getpid()}"
+    if session_key in _GATE_SKIPPED_SESSIONS_SEEN:
+        return
+    _GATE_SKIPPED_SESSIONS_SEEN.add(session_key)
+
+    project_root = _resolve_project_root_for_deferral()
+    if project_root is None:
+        # Nowhere to write the deferral — skip silently.
+        return
+
+    try:
+        from vco_lib.deferral_report import (
+            DeferralEntry,
+            DeferralReport,
+        )
+    except Exception:
+        # vco_lib not on sys.path — silent skip. The metric still fired.
+        return
+
+    try:
+        report = DeferralReport.read(project_root)
+        # Upsert: DeferralReport.add_entry de-dups on condition_id, so
+        # even if a prior session left the entry behind it gets refreshed
+        # rather than duplicated.
+        entry = DeferralEntry(
+            condition_id="gate_skipped_no_project_id",
+            title=(
+                "Phase-8 access-matrix gate skipped (VCT_PROJECT_ID "
+                "missing from MCP env)"
+            ),
+            detected=(
+                "The MCP server reached store_knowledge_node with no "
+                "VCT_PROJECT_ID env. The Phase-8 WRITE gate cannot "
+                "identify this project against the hub's access matrix, "
+                "so writes are proceeding via the silent-allow path. "
+                "The write itself was permitted; this entry records the "
+                "remediation so future writes go through the gate "
+                f"properly. (target collection: {collection})"
+            ),
+            why_deferred=(
+                "Seeding VCT_PROJECT_ID requires either an orchestrator "
+                "install run (which queries launcher.db for the "
+                "project's UUID) or a Launcher GUI project "
+                "re-registration. Both are user-initiated; the MCP "
+                "server cannot self-heal."
+            ),
+            command_to_apply=(
+                "# Option A — orchestrator-root install / update:\n"
+                "python install.py --update\n"
+                "\n"
+                "# Option B — per-project (pre-v0.2.49 install): re-register the\n"
+                "# project via Launcher GUI → Projects → Identity tab. The\n"
+                "# launcher's apply_project_env pass seeds VCT_PROJECT_ID\n"
+                "# into <project>/.claude/env from launcher.db."
+            ),
+            severity="warning",
+        )
+        report.add_entry(entry)
+        report.write(project_root)
+    except Exception:
+        # Any I/O failure here must not break the silent-allow contract.
+        pass
+
+
+def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
+    """v0.2.49 Step F MF7+Q2: return the list of Weaviate collections
+    where the project has `access_level == 'write'` per the launcher's
+    access matrix. Used by `store_knowledge_node`'s deny-branch to
+    enrich the error response with actionable remediation.
+
+    Source: vct-hub `GET /api/v1/projects/{id}/access?level=write`
+    endpoint. This endpoint lands in the SAME v0.2.49 cycle (main
+    chat's lane, sibling to the matrix `/access/{collection}` endpoint
+    that this server.py already consumes via vco_lib.access_resolver).
+
+    Until that endpoint lands in main chat's branch, this function
+    returns an empty list — the caller's remediation string falls back
+    to a generic "re-register the project / open Manage access" hint.
+
+    Never raises: the deny-branch can't crash on enrichment. On any
+    failure (hub unreachable, endpoint missing, malformed response),
+    return [].
+    """
+    if not project_id:
+        return []
+    try:
+        # Discover hub port + token via existing patterns.
+        import urllib.request  # local import — keep top-of-module lean
+        import urllib.error
+
+        state_dir = os.environ.get("VCT_STATE_DIR") or os.path.join(
+            os.path.expanduser("~"), ".vct"
+        )
+
+        port = os.environ.get("VCT_HUB_PORT")
+        if not port:
+            try:
+                with open(os.path.join(state_dir, "hub.port"), encoding="utf-8") as fh:
+                    port = fh.read().strip()
+            except OSError:
+                port = "7700"
+
+        token = os.environ.get("VCT_HUB_TOKEN")
+        if not token:
+            try:
+                with open(os.path.join(state_dir, "hub.token"), encoding="utf-8") as fh:
+                    token = fh.read().strip()
+            except OSError:
+                return []  # no token → can't query
+
+        url = f"http://127.0.0.1:{port}/api/v1/projects/{project_id}/access?level=write"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            if resp.status != 200:
+                return []
+            body = json.loads(resp.read().decode("utf-8"))
+            # Expected shape (per main chat's new endpoint, mirrors
+            # the /access/{collection} pattern): {"collections": [str, ...]}
+            collections = body.get("collections")
+            if isinstance(collections, list):
+                return [c for c in collections if isinstance(c, str)]
+            return []
+    except Exception:
+        # Any failure → empty list → generic remediation. Never raise
+        # back to the deny-branch caller.
+        return []
+
 # Initialize FastMCP server
 mcp = FastMCP(
     "weaviate-kg",
@@ -3632,7 +3935,7 @@ _rl_client_instance = None  # type: ignore[var-annotated]
 
 
 def _get_rl_client():
-    """Lazy-build one ``RLClient`` per active embedding per process.
+    """Lazy-build one ``RLClient`` per (active embedding, project_id) per process.
 
     v0.2.42 RT-1: keyed by the *current* ``ACTIVE_EMBEDDING`` env value
     rather than a bare singleton.  A mid-session flip (user switches
@@ -3640,6 +3943,14 @@ def _get_rl_client():
     ``active_embedding`` attribute matches the new value — the old
     client stays in the dict as a tombstone for any in-flight requests
     but is never returned to new callers.
+
+    v0.2.49: cache key now includes the resolved project_id so the
+    ``X-VCT-Project-ID`` header attached to outbound rerank/update
+    requests routes to the correct per-project model head in the
+    vct-rl-reranker v0.2.10+ container. project_id is None on
+    hub-unreachable or for free-tier hosts without a hub; the client
+    in that case sends no header and the container falls back to the
+    base model.
 
     Reads ``RL_SERVER_URL`` / ``RL_SERVER_PORT`` at first call via
     ``rl_client.client._resolve_base_url``. When neither is set,
@@ -3649,8 +3960,24 @@ def _get_rl_client():
     # Re-read the env value on every call so a flip is caught immediately.
     current_embedding = os.getenv("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
 
-    if current_embedding in _rl_client_instances:
-        return _rl_client_instances[current_embedding]
+    # v0.2.49: resolve the project_id from the cached ProjectConfig.
+    # Soft-fail: on any resolver exception (hub unreachable / malformed
+    # response / no config) we proceed with project_id=None, which
+    # makes the client send no X-VCT-Project-ID header. The container
+    # then falls back to the base model — the safe, paying-user-not-
+    # cut-off behaviour. RLClient.__init__ sanitises project_id on its
+    # own; passing it through unchecked is also safe.
+    current_project_id: Optional[str] = None
+    try:
+        _cfg = _try_resolve_project_config()
+        if _cfg is not None and getattr(_cfg, "project_id", None):
+            current_project_id = _cfg.project_id
+    except Exception as exc:
+        logger.debug("project_id resolve failed (%s); will send no X-VCT-Project-ID", exc)
+
+    cache_key = (current_embedding, current_project_id)
+    if cache_key in _rl_client_instances:
+        return _rl_client_instances[cache_key]
 
     try:
         from claude_mcp_servers.rl_client import RLClient
@@ -3673,8 +4000,9 @@ def _get_rl_client():
     client = RLClient(
         text_dim=text_dim,
         active_embedding=current_embedding,
+        project_id=current_project_id,
     )
-    _rl_client_instances[current_embedding] = client
+    _rl_client_instances[cache_key] = client
     return client
 
 
@@ -4277,6 +4605,42 @@ async def _rl_cache_and_rerank(
     except ImportError:
         # VCThelpers not available (pure free install) → free tier behavior.
         _rl_enabled = False
+
+    # v0.2.49 Stream B — per-project enable toggle. After the tier
+    # check, consult the hub-resolved
+    # `rl_reranker_enabled_for_project` flag: when the user has
+    # explicitly disabled the RL reranker for THIS project (via the
+    # launcher GUI's per-project Modules panel), skip the rerank
+    # request even when the license tier would permit it. The
+    # server-side telemetry path is unaffected — the RL container's
+    # local JSONL writer still records every retrieval event the
+    # container observes (which, with this gate ON, is none from this
+    # project). Reads through `_try_resolve_project_config` so the
+    # hub-down branch falls open (enabled): never silently disable a
+    # paying user's reranker because the hub crashed mid-session.
+    if _rl_enabled:
+        try:
+            _pc = _try_resolve_project_config()
+            if _pc is not None and not getattr(
+                _pc, "rl_reranker_enabled_for_project", True
+            ):
+                logger.debug(
+                    "RL retrieval gated off for this project (per-project "
+                    "enable toggle is OFF) — using Weaviate order"
+                )
+                _rl_enabled = False
+        except Exception as exc:
+            # Conservative: log + leave _rl_enabled untouched. The
+            # hub-down branch ALREADY falls open via the None return
+            # path above; only an exception in the getattr/path could
+            # land here. Mirrors the rest of the resolver call sites
+            # in this file (silent fall-through to env-fallback / safe
+            # default).
+            logger.debug(
+                "RL per-project enable resolver raised (%s); leaving "
+                "gate at tier-decision value",
+                exc,
+            )
 
     # Rerank gate: Pro/MAO tier with at least one node → spawn monitor
     # + call RL server. Free tier OR empty all_nodes → skip rerank but
@@ -5780,6 +6144,121 @@ async def store_knowledge_node(
                     "scope": scope,
                     "file_written": False,
                 }, indent=2)
+
+        # v0.2.49 Phase 8 (item #21): access-matrix write gate.
+        #
+        # Consults the launcher's vct-hub for the project's access level
+        # on `target_collection_name`. Fail-open: hub unreachable / 404 /
+        # malformed → resolver returns "write" + emits WARNING + logs
+        # dropped-write metric. Only "read" or "none" actually blocks the
+        # write here.
+        #
+        # The asymmetric SHARED_KG_WRITE_DISABLED gate above remains the
+        # PER-PROJECT-OVERRIDE for shared writes; this matrix gate is the
+        # FINE-GRAINED per-(project, collection) policy. They compose:
+        # SHARED_KG_WRITE_DISABLED fires first (coarse opt-out), then the
+        # matrix check fires for everything else (per-collection write
+        # permission per the launcher's GUI access matrix).
+        #
+        # Step F fixes (MF5 + MF6 + MF7+Q2):
+        # - MF5: the ImportError catch is split out from the broad try/
+        #   except so it only catches the resolver-not-installed case
+        #   (pre-v0.2.49 path), not transitive ImportErrors raised by a
+        #   future modification of vco_lib.access_resolver's own imports
+        #   (e.g. if it ever adds `from requests import ...`).
+        # - MF6: a resolver bug that surfaces as an exception emits a
+        #   dropped_writes.jsonl row with reason='gate_crash' so the
+        #   silent fail-open becomes visible.
+        # - MF7+Q2: on deny, the response carries `writable_collections`
+        #   (the project's other write-permission rows) so the LLM /
+        #   user has actionable signal — "you can write to X, Y, Z;
+        #   adjust GUI to enable target_collection."
+        _access_resolver_available = False
+        try:
+            from vco_lib.access_resolver import check_access_level  # noqa: F401
+            _access_resolver_available = True
+        except ImportError as imp_err:
+            # MF5: ONLY treat "the access_resolver module itself isn't on
+            # the path" as the pre-v0.2.49 path. Any other ImportError
+            # (e.g. a transitive import inside the resolver failing
+            # because of a future dependency change) is a real bug, not
+            # legacy-path — re-raise it so it's visible in logs.
+            if "access_resolver" not in str(imp_err):
+                raise
+            # Pre-v0.2.49 install path: skip the gate, fall through to
+            # the legacy "matrix is read-only" behavior.
+
+        if _access_resolver_available:
+            project_id_for_gate = os.environ.get("VCT_PROJECT_ID", "")
+            if not project_id_for_gate:
+                # v0.2.49 SB1: empty-PID branch was a silent-bypass
+                # (gate effectively disabled). Per the user's 2026-06-08
+                # Q1 directive, silent-allow stays the default; the two
+                # visibility surfaces (metric + deferral) carry the
+                # remediation. The write itself proceeds — the gate
+                # only blocks on explicit "read" / "none" verdicts, not
+                # on missing identity.
+                #
+                # Order is metric-first (always fires) then deferral
+                # (deduped per session) so the JSONL row lands even
+                # when the deferral write hits a missing-project-dir
+                # / unwritable .claude/context branch.
+                _emit_gate_skipped_metric(target_collection_name)
+                _emit_gate_skipped_deferral(target_collection_name)
+            else:
+                try:
+                    matrix_level = check_access_level(project_id_for_gate, target_collection_name)
+                except Exception as gate_exc:
+                    # MF6: resolver bug → emit dropped-write metric so
+                    # the silent fail-open becomes visible. Don't break
+                    # the fail-open contract on top of an already-broken
+                    # resolver; log + metric + continue with write.
+                    logger.warning(
+                        "access matrix gate crashed; falling open: %s", gate_exc
+                    )
+                    _emit_gate_crash_metric(project_id_for_gate, target_collection_name, str(gate_exc))
+                    matrix_level = "write"  # fail-open
+
+                if matrix_level != "write":
+                    # MF7+Q2: enrich the deny response with the list of
+                    # collections the project DOES have write access to,
+                    # so the LLM / user has actionable remediation
+                    # instead of just "denied."
+                    #
+                    # Source: hub's GET /api/v1/projects/{id}/access?level=write
+                    # endpoint (lands in this same v0.2.49 cycle — main
+                    # chat's lane). Until that endpoint exists, this
+                    # helper returns an empty list and the response
+                    # falls back to the generic remediation string.
+                    writable_collections = _fetch_writable_collections_for_project(
+                        project_id_for_gate
+                    )
+                    if writable_collections:
+                        remediation = (
+                            f"You currently have write access on: "
+                            f"{', '.join(writable_collections)}. "
+                            f"To gain write access to '{target_collection_name}', "
+                            f"adjust via Launcher GUI → Identity → Manage access."
+                        )
+                    else:
+                        remediation = (
+                            "No collections currently have write access for this "
+                            "project — re-register the project via Launcher GUI → "
+                            "Projects, or adjust the access matrix in the Identity tab."
+                        )
+                    return json.dumps({
+                        "status": "error",
+                        "error": (
+                            f"Access matrix denies write on '{target_collection_name}' "
+                            f"(level={matrix_level}). {remediation}"
+                        ),
+                        "target_collection": target_collection_name,
+                        "matrix_level": matrix_level,
+                        "writable_collections": writable_collections,
+                        "remediation": remediation,
+                        "scope": scope,
+                        "file_written": False,
+                    }, indent=2)
 
         collection = client.collections.get(target_collection_name)
 

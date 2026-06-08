@@ -12,11 +12,18 @@
   import { goto } from '$app/navigation';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { ui } from '$lib/stores/ui';
+  import { invoke, tauriAvailable } from '$lib/tauri';
   import Toast from '$lib/components/Toast.svelte';
+  import ProjectCard from '$lib/components/ProjectCard.svelte';
   import UpdateAllProjectsModal from '$lib/components/UpdateAllProjectsModal.svelte';
+  import {
+    buildFolderMissingMap,
+    type ProjectFolderFlag,
+  } from '$lib/project-folder-health';
 
   onMount(() => {
     void projects.load();
+    void loadFolderHealth();
   });
 
   const store = $derived($projects);
@@ -25,6 +32,27 @@
   // 0.2.x backlog #4 (2026-05-10): "Update all" modal state. Driven by
   // a $state boolean — see UpdateAllProjectsModal for the lifecycle.
   let updateAllOpen = $state(false);
+
+  // v0.2.49 Phase 6 S-4 — boot-probe verdict per project. Populated on
+  // mount via `read_project_folder_missing_flags`. The boot probe itself
+  // runs once per launcher boot in lib.rs setup, so this is just a
+  // cheap one-shot read; we don't poll. Soft-fail: when the command
+  // is unavailable (CLI / pre-v0.2.49 launcher) we render every card
+  // as healthy and skip the banner.
+  let folderMissingMap = $state<Record<string, boolean>>({});
+
+  async function loadFolderHealth() {
+    if (!tauriAvailable()) return;
+    try {
+      const flags = await invoke<ProjectFolderFlag[]>('read_project_folder_missing_flags');
+      folderMissingMap = buildFolderMissingMap(flags);
+    } catch {
+      // Soft-fail: no banner is correct fallback when the command
+      // is missing or the DB read fails. The eprintln side of the
+      // probe will surface the issue server-side.
+      folderMissingMap = {};
+    }
+  }
 
   function open(id: string) {
     projects.select(id);
@@ -74,30 +102,12 @@
   {:else}
     <div class="pl-grid">
       {#each store.projects as p (p.id)}
-        <div
-          class="pl-card"
-          class:active={active?.id === p.id}
-          role="button"
-          tabindex="0"
-          onclick={() => open(p.id)}
-          onkeydown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              open(p.id);
-            }
-          }}
-        >
-          <header class="pl-card-head">
-            <h3>{p.name}</h3>
-            {#if active?.id === p.id}
-              <span class="pl-card-badge">ACTIVE</span>
-            {/if}
-          </header>
-          <p class="pl-card-path"><code>{p.folder_path}</code></p>
-          <p class="pl-card-meta">
-            <span>{p.host?.toUpperCase() ?? 'BASE'}</span>
-          </p>
-        </div>
+        <ProjectCard
+          project={p}
+          active={active?.id === p.id}
+          folderMissing={folderMissingMap[p.id] === true}
+          onOpen={open}
+        />
       {/each}
     </div>
   {/if}
@@ -148,48 +158,8 @@
     grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 12px;
   }
-  .pl-card {
-    background: rgba(255,255,255,0.04);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 8px;
-    padding: 14px 16px;
-    cursor: pointer;
-    transition: background 0.15s, border-color 0.15s;
-    display: flex; flex-direction: column; gap: 6px;
-  }
-  .pl-card:hover {
-    background: rgba(255,255,255,0.08);
-    border-color: rgba(255,255,255,0.15);
-  }
-  .pl-card.active {
-    border-color: rgba(0,191,166,0.4);
-    background: rgba(0,191,166,0.05);
-  }
-  .pl-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-  .pl-card-head h3 {
-    margin: 0; font-size: 15px;
-    flex: 1 1 auto; min-width: 0;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .pl-card-badge {
-    background: rgba(0,191,166,0.15); color: rgb(0,191,166);
-    border: 1px solid rgba(0,191,166,0.3);
-    padding: 2px 8px; border-radius: 10px; font-size: 10px;
-    font-weight: 600; letter-spacing: 0.04em;
-    flex-shrink: 0;
-  }
-  .pl-card-path {
-    margin: 0; font-size: 11px; color: #888;
-    word-break: break-all;
-  }
-  .pl-card-path code {
-    background: rgba(255,255,255,0.05); padding: 1px 5px;
-    border-radius: 3px; font-family: ui-monospace, monospace;
-  }
-  .pl-card-meta { margin: 0; font-size: 11px; color: #aaa; }
-  .pl-card-meta span {
-    background: rgba(255,255,255,0.05); padding: 2px 8px;
-    border-radius: 10px; font-size: 10px; font-weight: 600;
-    letter-spacing: 0.04em;
-  }
+  /* v0.2.49 Phase 6 S-4: card chrome moved into ProjectCard.svelte
+     (component scope, with the folder-missing warning banner). The
+     .pl-card* selectors that used to live here are gone — the page
+     just provides the grid layout now. */
 </style>

@@ -210,6 +210,17 @@
           "type": "null"
         }
       ]
+    },
+    "kg_collections": {
+      "description": "v0.2.49 item #13 (M-3): KG collections this module writes to. When set on an `install.scope = \"global\"` module, every project gains a default access row at install time (via `populate_kg_collection_access_for_global_module` + the access matrix resolver). For per-project modules the field is ignored.\n\nPre-v0.2.49 manifests deserialize cleanly with this field absent (defaults to `None`). An empty `Vec` is semantically equivalent to `None` for the populate path (no rows inserted).",
+      "default": null,
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
     }
   },
   "definitions": {
@@ -378,6 +389,15 @@
               "type": "null"
             }
           ]
+        },
+        "scope": {
+          "description": "v0.2.49 (Stream A): install scope — per-project (default) or global. Per-project modules get one install row + one container per project (current behaviour). Global modules get one install row machine-wide (`project_id IS NULL`) and one container named after the bare module id (no `-{project_slug}` suffix); per-project routing happens INSIDE the container via headers (e.g. the v0.2.10 RL Reranker reads `X-VCT-Project-ID` from incoming requests).\n\n`#[serde(default)]` keeps pre-v0.2.49 manifests valid — they deserialize as `per_project` (the default), preserving the established install path.\n\nSee `.claude/context/plans/v0.2.49-global-install-per-project- routing-plan-2026-06-06.md` for the architectural rationale.",
+          "default": "per_project",
+          "allOf": [
+            {
+              "$ref": "#/definitions/InstallScope"
+            }
+          ]
         }
       }
     },
@@ -492,6 +512,14 @@
           ]
         }
       }
+    },
+    "InstallScope": {
+      "description": "v0.2.49 (Stream A): install scope discriminator.\n\n* `PerProject` (default) — one install row + one container per project. The container name follows the manifest's `runtime.container_name_template` with `{project_slug}` substitution. This is the v0.2.20–v0.2.48 install model. * `Global` — exactly one install row per machine (`module_installs.project_id IS NULL`) and exactly one container named after the bare module id (no slug suffix). Per-project personalization happens at the application layer inside the container (e.g. the v0.2.10 RL Reranker reads `X-VCT-Project-ID` from request headers and routes to per-project model heads).\n\nSerde: `#[serde(rename_all = \"snake_case\")]` so manifests declare `\"per_project\"` / `\"global\"` on the wire.",
+      "type": "string",
+      "enum": [
+        "per_project",
+        "global"
+      ]
     },
     "SecretDecl": {
       "type": "object",
@@ -613,7 +641,6 @@
     "RuntimeBlock": {
       "type": "object",
       "required": [
-        "command",
         "type"
       ],
       "properties": {
@@ -621,6 +648,8 @@
           "type": "string"
         },
         "command": {
+          "description": "v0.2.49: optional. For mcp_stdio / cli, this is the executable to spawn. For container / service modules, this used to override the container image's CMD — Bug E (the container CMD landing as `python -m rl_server.rl_server podman run --rm -p 11450:11450 {module_image}` and argparse-failing) showed that container/ service modules should NOT set `command`. When empty (the declarative form), the container runtime helper skips the CMD override and the image-baked ENTRYPOINT runs unmolested.",
+          "default": "",
           "type": "string"
         },
         "args": {

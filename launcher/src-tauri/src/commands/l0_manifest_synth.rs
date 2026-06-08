@@ -100,7 +100,7 @@ use crate::commands::module_catalog_client::L0CatalogModule;
 
 use crate::manifest::{
     Compatibility, ContainerInstallBlock, GpuImageVariants, InstallBlock, InstallMethod,
-    LicenseBlock, ModuleCategory, ModuleManifest, Requirements, RuntimeBlock,
+    InstallScope, LicenseBlock, ModuleCategory, ModuleManifest, Requirements, RuntimeBlock,
 };
 
 /// Synthesise a thin `ModuleManifest` from an L0 catalog record so the
@@ -249,6 +249,12 @@ pub fn synthesize_install_manifest_from_l0(
         install_dir: "{VCT_MODULES}/{MODULE_ID}".into(),
         post_install: Vec::new(),
         container: Some(container_block),
+        // v0.2.49 Stream A: synth defaults to per-project. The L0
+        // catalog slice today carries only install-time metadata; the
+        // post-pull extracted manifest is the source of truth for
+        // `install.scope`. Default keeps pre-v0.2.49 behaviour for
+        // every module whose extracted manifest hasn't shipped yet.
+        scope: InstallScope::PerProject,
     };
 
     // ─── Runtime block ──────────────────────────────────────────────
@@ -358,6 +364,9 @@ pub fn synthesize_install_manifest_from_l0(
         // Same logic for `db`: migrations apply after extract, never
         // against the synth.
         db: None,
+        // v0.2.49 item #13: `kg_collections` declaration is read post-
+        // extract from the real manifest; synth doesn't carry it.
+        kg_collections: None,
     })
 }
 
@@ -409,6 +418,7 @@ mod tests {
                     pull_token_endpoint: "https://example/pull-token".into(),
                     pull_token_method: "POST".into(),
                 },
+                scope: crate::manifest::InstallScope::PerProject,
             },
             requirements: Some(L0Requirements {
                 os: vec!["linux".into(), "macos".into(), "windows".into()],

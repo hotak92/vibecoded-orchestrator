@@ -469,21 +469,27 @@ fn parse_schema_response(
                 temporal_props_missing: missing,
             });
         }
-        // v0.2.23 review-B HIGH-2 (2026-05-21): case-insensitive match
-        // against the canonical name AND both legacy aliases. Pre-fix the
-        // strict `name == shared_kg_class` check reported "not yet created"
-        // for users on v0.2.12–v0.2.22 lowercase-c installs even when their
-        // shared KG class existed — the launcher's Services panel then
-        // misleadingly suggested running migrations.
+        // v0.2.49 Step F MF2 (L2-MF2): byte-equality recognition.
         //
-        // v0.2.24 B4 (2026-05-22): consolidated into the shared helper
-        // `commands::project_env_settings::is_shared_kg_class_name`. Same
-        // recognition contract; one source of truth shared with
-        // `commands/kg.rs::kg_list_collections`.
-        if crate::commands::project_env_settings::is_shared_kg_class_name(
-            name,
-            shared_kg_class,
-        ) {
+        // Pre-Step-F this site used the case-insensitive + legacy-alias
+        // helper `is_shared_kg_class_name`. After Step A's
+        // `orchestrator_root_kg_collection` app_state persistence
+        // landed, `shared_kg_class` is the authoritative canonical
+        // name — case-sensitive + the exact value the user (or
+        // white-label install) configured. The case-insensitive
+        // recognition was a v0.2.23 backward-compat for the lowercase-c
+        // legacy installs (v0.2.12–v0.2.22); after Step A's persistence,
+        // every install has a canonical-cased value in `app_state`.
+        // Sibling site `commands/kg.rs:182-185` is already on
+        // byte-equality post-Step-B; this site closes the L2-MF2
+        // asymmetry by following suit.
+        //
+        // Trade-off accepted: legacy lowercase-c installs that haven't
+        // run install.py's Step A persistence yet will report
+        // `shared_kg_exists=false` on this surface, matching kg.rs's
+        // pre-existing strictness. That's a v0.2.50+ migration path if
+        // any user reports it.
+        if name == shared_kg_class {
             shared_kg_exists = Some(true);
             shared_kg_index_null = Some(
                 cls.get("invertedIndexConfig")
@@ -499,9 +505,20 @@ fn parse_schema_response(
 #[command]
 pub async fn schema_migration_status(
     cfg: State<'_, LocalConfig>,
+    db: State<'_, Db>,
 ) -> Result<SchemaMigrationStatusReport, String> {
     let base = resolve_weaviate_url(&cfg);
-    let shared_kg_class = DEFAULT_SHARED_KG_CLASS.to_string();
+    // v0.2.49 access-matrix Phase 2 (item #7, S-1) — read the
+    // persisted canonical name from `app_state` (Step A migration 028)
+    // instead of the hardcoded constant. White-label installs override
+    // the default via `VCT_ORCHESTRATOR_ROOT_KG_COLLECTION` env at
+    // install time; this getter sees the override.
+    //
+    // Soft-fail: DB error falls back to the compiled-in default so the
+    // health check still runs (it's a display surface, not security).
+    let shared_kg_class = db
+        .get_orchestrator_root_kg_collection()
+        .unwrap_or_else(|_| DEFAULT_SHARED_KG_CLASS.to_string());
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))

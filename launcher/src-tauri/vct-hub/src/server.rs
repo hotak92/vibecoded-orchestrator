@@ -19,7 +19,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use super::{
     api, auth, cli_api, config_api, db, lifecycle_api, mcp_tool_grants_api, module_db_api,
-    modules_api, project_state_api, rl_events_api, secrets_api, weaviate_probe,
+    module_supervisor, modules_api, project_state_api, rl_events_api, secrets_api, weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -160,8 +160,10 @@ pub async fn start_hub_server() -> Result<u16, String> {
         )
         // Inject the launcher_state as a request extension so the
         // module_db_api middleware can pull it without going through
-        // axum's State<>-typed router.
-        .layer(axum::Extension(launcher_state))
+        // axum's State<>-typed router. Clone here so the v0.2.49
+        // resume-on-boot task below (which spawns AFTER router build)
+        // can still own its own handle.
+        .layer(axum::Extension(launcher_state.clone()))
         .layer(axum::middleware::from_fn(auth::require_auth))
         .layer(axum::Extension(auth_state))
         .layer(cors);
@@ -181,19 +183,45 @@ pub async fn start_hub_server() -> Result<u16, String> {
         }
     });
 
-    // v0.2.40 F4 (2026-05-30): the hub-side resume-containers sweep
-    // that lived here was a dead stub — its manifest resolver was
-    // hardcoded `Box::new(|_id| None)`, so the `resume_containers_on_
-    // startup` loop in `module_supervisor` skipped every row. The
-    // launcher-side path at `commands::module_service::resume_
-    // containers_on_startup` (invoked from `lib.rs::setup()`) is what
-    // actually keeps containers alive on boot. Phase 3+ would wire a
-    // hub-side catalog resolver and cut the launcher hook over to a
-    // no-op; until that work lands the stub here masqueraded as live
-    // coverage. Removed per multi-Opus pre-push review highest-risk
-    // gap #4. `module_supervisor::resume_containers_on_startup` and
-    // its `ManifestResolver` type remain in place for that Phase 3+
-    // wiring (tests in `module_supervisor.rs` still exercise them).
+    // v0.2.49 Phase 3 (hub-side supervisor auth port): the resume sweep
+    // is now PRODUCTION-WIRED. The pre-v0.2.49 comment here said "Phase
+    // 3+ would wire a hub-side catalog resolver and cut the launcher
+    // hook over to a no-op; until that work lands the stub here
+    // masqueraded as live coverage" — this is that work.
+    //
+    // What changed vs v0.2.40 F4:
+    //   * The hardcoded `Box::new(|_id| None)` resolver is gone.
+    //     `module_supervisor::real_manifest_resolver()` reads the
+    //     on-disk catalog (`<vct_root_dir>/modules/<id>/vct-module.json`
+    //     + `<vct_root_dir>/bundled_manifests/*.json`) and returns the
+    //     first match for a requested module_id.
+    //   * Both `resume_containers_on_startup` and `lifecycle_api::
+    //     module_start` are now live — the supervisor is a self-
+    //     sufficient code path for both boot-time and on-demand
+    //     container starts.
+    //
+    // Precedence with the launcher-side resume:
+    //   The launcher-side `commands::module_service::resume_containers_
+    //   on_startup` (invoked from `lib.rs::setup()`) is preserved as a
+    //   FALLBACK. Both layers are idempotent — they check `is_container_
+    //   running` before starting — so a double-resume on a host where
+    //   both the launcher and the hub boot in quick succession is a
+    //   no-op for the second runner. The launcher-side path covers the
+    //   edge case where the hub isn't running yet at launcher boot
+    //   (rare on the same machine since the launcher itself spawns
+    //   `vct-hub`, but possible during upgrade flows).
+    //
+    // Spawned as a detached task so server boot doesn't block on the
+    // sweep (which shells out to podman/docker per row). The launcher_db
+    // handle is cloned (cheap Arc) so the task owns its reference.
+    let resume_db = launcher_state.clone();
+    tokio::spawn(async move {
+        module_supervisor::resume_containers_on_startup(
+            &resume_db.0,
+            module_supervisor::real_manifest_resolver(),
+        )
+        .await;
+    });
 
     println!("[vct-hub] API server running on http://127.0.0.1:{}", actual_port);
     Ok(actual_port)

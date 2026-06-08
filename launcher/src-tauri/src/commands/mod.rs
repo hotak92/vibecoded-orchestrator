@@ -86,6 +86,11 @@ pub mod module_db;
 pub mod module_default_weights;
 pub mod module_deprecation;
 pub mod module_dispatch;
+// v0.2.49 Stream B: per-project enable toggle for global-scope modules.
+// Closes the gap where `vct-rl-reranker`-shape modules (one install on
+// the host, visible across every project) had no way to be silenced
+// per-project. See `module_enabled.rs` for the full design notes.
+pub mod module_enabled;
 pub mod module_gui;
 // v0.2.33 Agent C (L0b): post-install manifest extraction +
 // startup reconciler. `module_manifest_extract` runs after
@@ -131,6 +136,12 @@ pub mod project_identity;
 pub mod project_codegraph_extras;
 pub mod projects_v2;
 pub mod project_env_settings;
+// v0.2.49 Phase 6 S-4 — boot sanity check that walks every project row,
+// verifies the registered folder_path still exists on disk, and stamps
+// the `folder_missing_at_last_boot` column. Exposes a Tauri read command
+// (`read_project_folder_missing_flags`) the frontend consumes to render
+// a non-blocking warning banner on each affected project card.
+pub mod project_folder_health;
 pub mod project_state_cmd;
 pub mod project_state_populate;
 pub mod restart;

@@ -1,7 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { isAuthenticated, authLoading } from '$lib/stores/auth';
-  import { goto } from '$app/navigation';
+  import { goto, afterNavigate } from '$app/navigation';
   import { page } from '$app/stores';
   import { ui } from '$lib/stores/ui';
   import { orchestrator } from '$lib/stores/orchestrator';
@@ -67,6 +67,19 @@
 
   const uiState = $derived($ui);
 
+  // Scroll-reset on navigation. The chrome shell keeps a single scrolling
+  // container (`.main-content`); SvelteKit's client-side router does NOT
+  // reset its scrollTop between routes (the element persists across
+  // navigations), so arriving on a new page inherited the previous page's
+  // scroll offset — e.g. landing mid-way down /preferences/secrets.
+  // afterNavigate fires after the new page's DOM is committed; we snap the
+  // container back to the top. Hash links (in-page anchors) are left alone.
+  let mainEl = $state<HTMLElement | null>(null);
+  afterNavigate((nav) => {
+    if (nav.to?.url.hash) return;
+    if (mainEl) mainEl.scrollTop = 0;
+  });
+
   // Local mirrors so the modals can keep their `bind:open` ergonomics. We
   // reflect ui-store state into these and propagate user-driven closes
   // back into the store.
@@ -120,6 +133,21 @@
   });
 
   onMount(() => {
+    // Hide the boot splash (#vct-splash in app.html) now that the Svelte app
+    // has mounted. The splash is plain inline HTML/CSS rendered by the WebView
+    // before this code runs, so cold-start reads as "Avvio in corso…" instead
+    // of a black/frozen WebView while the backend's blocking boot probes run.
+    // We add `.vct-splash-hide` (opacity→0 over 280ms) then remove the node
+    // after the fade so it never intercepts pointer events. Wrapped in a guard
+    // because the element is absent in unit/SSR contexts.
+    {
+      const splash = document.getElementById('vct-splash');
+      if (splash) {
+        splash.classList.add('vct-splash-hide');
+        setTimeout(() => splash.remove(), 320);
+      }
+    }
+
     // Check onboarding / changelog gates once per app load.
     //
     // Bug 14 fix (2026-05-05): the `onboarding_complete` flag now lives in
@@ -247,7 +275,7 @@
     <MenuBar />
     <div class="app-body">
       <Sidebar />
-      <main class="main-content">
+      <main class="main-content" bind:this={mainEl}>
         {@render children()}
       </main>
     </div>

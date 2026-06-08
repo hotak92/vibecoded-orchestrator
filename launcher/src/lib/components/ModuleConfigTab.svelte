@@ -60,6 +60,21 @@
   // lands here; the placeholder explains the situation + invites
   // an update.
   import UnsupportedControl from '$lib/components/module-controls/UnsupportedControl.svelte';
+  // v0.2.49 Stream D: license-gate banner + grayed-out treatment for
+  // paid modules when the orchestrator-tier license is missing/expired.
+  // The user's locked-in spec is "tab visible, banner at top, all
+  // controls inert + opacity 0.5". The gate predicate lives in
+  // $lib/license-gate so consumer surfaces (catalog tile, config tab,
+  // weights reset button, per-project enable toggle) share one source
+  // of truth.
+  import { license } from '$lib/stores/license';
+  import { modules } from '$lib/stores/modules';
+  import { ui } from '$lib/stores/ui';
+  import {
+    bannerCopy,
+    licenseStatus,
+    moduleIsLicenseGated,
+  } from '$lib/license-gate';
 
   // ─── Schema types ──────────────────────────────────────────────────────
   //
@@ -88,6 +103,34 @@
 
   const projectId = $derived($selectedProject?.id ?? '');
   const hasProject = $derived(projectId !== '');
+
+  // ─── v0.2.49 Stream D: license gating ──────────────────────────────────
+  //
+  // Look up the catalog entry for this moduleId to determine whether it
+  // is a paid module. If the orchestrator-tier license is missing/expired
+  // AND the module needs one, the entire tab renders with a banner at
+  // the top + every control disabled + opacity 0.5 + pointer-events none.
+  //
+  // Defensive defaults:
+  //   - Catalog not yet loaded → entry is null → `moduleIsLicenseGated`
+  //     returns false → controls behave normally (we don't flash a
+  //     license gate on a still-loading tab).
+  //   - License store not yet loaded → cache is null → for paid modules
+  //     `isLicenseActive(null)` returns false → tab is gated (safer to
+  //     gate during load than to flash editable controls).
+  const catalogEntry = $derived(
+    $modules.catalog.find((m) => m.id === moduleId) ?? null,
+  );
+  const licenseCache = $derived($license.cache);
+  const licenseGated = $derived(
+    moduleIsLicenseGated(catalogEntry, licenseCache),
+  );
+  const licenseStatusValue = $derived(licenseStatus(licenseCache));
+  const gateCopy = $derived(bannerCopy(licenseStatusValue));
+
+  function openLicenseManager() {
+    ui.openLicenseManager();
+  }
 
   // ─── v0.2.32 L3: per-section project picker ────────────────────────────
   //
@@ -263,6 +306,32 @@
         await projects.load();
       } catch (e) {
         console.warn('[ModuleConfigTab] projects.load failed:', e);
+      }
+    }
+
+    // v0.2.49 Stream D: hydrate the catalog + license stores so the
+    // license-gate predicate has data on first paint. Both calls are
+    // idempotent + cheap (the catalog is cached for 15min in the DB;
+    // license_get_tier reads the same cache the menu bar already
+    // hit at app start). Soft-fail — if either errors, the catalog
+    // entry stays null + the gate stays inactive (license_required
+    // modules will still render their controls in that fallback
+    // case; the Rust install-side enforcement is the authoritative
+    // gate, this is the UX-affordance).
+    if (tauriAvailable()) {
+      try {
+        if ($modules.catalog.length === 0) {
+          await modules.loadCatalog();
+        }
+      } catch (e) {
+        console.warn('[ModuleConfigTab] modules.loadCatalog failed:', e);
+      }
+      try {
+        if (!$license.cache) {
+          await license.load();
+        }
+      } catch (e) {
+        console.warn('[ModuleConfigTab] license.load failed:', e);
       }
     }
 
@@ -636,11 +705,36 @@
   }
 </script>
 
-<div class="tab">
+<div class="tab" class:license-gated={licenseGated}>
   <header class="tab-header">
     <h1>{configTab.title}</h1>
     {#if configTab.description}
       <p class="tab-description">{configTab.description}</p>
+    {/if}
+    {#if licenseGated}
+      <!-- v0.2.49 Stream D: license-gating banner. Rendered ABOVE the
+           project-picker banner so the user reads the most blocking
+           condition first. The banner is OUTSIDE the gated wrapper
+           below so its action button stays focusable + clickable. -->
+      <div
+        class="banner license-banner"
+        role="alert"
+        aria-live="polite"
+        data-testid="license-gate-banner"
+      >
+        <div class="license-banner-content">
+          <strong class="license-banner-title">{gateCopy.title}</strong>
+          <span class="license-banner-description">{gateCopy.description}</span>
+        </div>
+        <button
+          type="button"
+          class="license-banner-action"
+          onclick={openLicenseManager}
+          data-testid="license-gate-open-manager"
+        >
+          {gateCopy.actionLabel}
+        </button>
+      </div>
     {/if}
     {#if !hasProject}
       <div class="banner warning">
@@ -650,12 +744,26 @@
     {/if}
   </header>
 
+  <!-- v0.2.49 Stream D: gated wrapper. The `inert` ARIA attribute is
+       belt-and-suspenders alongside `pointer-events: none` (CSS) and
+       the native `disabled` attribute propagated to every control
+       below via the `sectionDisabled` chain. Native `inert` (HTML5,
+       supported by all three Tauri webviews as of 2024) blocks focus
+       AND pointer events; the CSS rule below adds the visual gray
+       treatment. -->
+  <div
+    class="tab-body"
+    class:gated-body={licenseGated}
+    inert={licenseGated ? true : undefined}
+    aria-disabled={licenseGated ? 'true' : undefined}
+  >
+
   {#each configTab.sections as section, sectionIdx}
     {@const collapsed = collapsedSections[sectionIdx] === true}
     {@const requiresPicker = sectionRequiresProject[sectionIdx] === true}
     {@const sectionPid = effectiveProjectId(sectionIdx)}
     {@const sectionHasProject = sectionHasEffectiveProject(sectionIdx)}
-    {@const sectionDisabled = !sectionHasProject}
+    {@const sectionDisabled = !sectionHasProject || licenseGated}
     {@const hasDynamic = sectionHasDynamicControl(section.controls)}
     {@const refreshNonce = sectionRefreshNonces[sectionIdx] ?? 0}
     {@const unsupportedCount = sectionUnsupportedControlCount(section.controls)}
@@ -689,7 +797,10 @@
             class="section-refresh"
             onclick={() => refreshSection(sectionIdx)}
             aria-label={`Refresh ${section.title}`}
-            title="Refresh dynamic values in this section"
+            title={licenseGated
+              ? 'License required to refresh dynamic values'
+              : 'Refresh dynamic values in this section'}
+            disabled={licenseGated}
           >
             ↻
           </button>
@@ -714,6 +825,7 @@
               {:else}
                 <select
                   value={sectionPid}
+                  disabled={licenseGated}
                   onchange={(e) =>
                     onSectionProjectChange(
                       sectionIdx,
@@ -942,6 +1054,8 @@
       {/if}
     </section>
   {/each}
+  </div>
+  <!-- /tab-body — v0.2.49 Stream D -->
 
   {#if pendingConfirm}
     <div
@@ -1000,6 +1114,91 @@
     border: 1px solid rgba(241, 196, 15, 0.30);
     color: #f1c40f;
     font-size: 13px;
+  }
+
+  /* v0.2.49 Stream D: license-gating banner + grayed-out tab body.
+     The user's locked-in spec is "tab visible, banner at top, all
+     controls visible but inert + opacity 0.5". CSS treatment:
+       - `.gated-body` carries `opacity: 0.5` + `pointer-events: none`
+         + native HTML `inert` attribute (applied by the template) so
+         every nested control is unfocusable + unclickable.
+       - The banner itself is OUTSIDE `.gated-body` so its action
+         button stays focusable and clickable — clicking it opens
+         the License Manager modal, which is the recovery path.
+     Cross-OS notes:
+       - `opacity` + `pointer-events: none` are universally supported
+         by all three Tauri webviews (WebKit / WebView2 / WebKitGTK).
+       - `inert` is supported in WebKit 16+ (macOS Ventura), WebView2
+         (Edge Chromium), and WebKitGTK 2.40+. On older WebKitGTK the
+         pointer-events:none + native disabled attributes still
+         block interaction; only focus traversal degrades. */
+  .license-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin: 12px 0 16px 0;
+    padding: 14px 16px;
+    border-radius: 8px;
+    background: rgba(231, 76, 60, 0.08);
+    border: 1px solid rgba(231, 76, 60, 0.35);
+    color: var(--color-text, #e8edf6);
+    font-size: 13px;
+    flex-wrap: wrap;
+  }
+
+  .license-banner-content {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1 1 280px;
+    min-width: 0;
+  }
+
+  .license-banner-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #ff7868;
+  }
+
+  .license-banner-description {
+    color: var(--color-muted, #9aa3b2);
+    font-size: 12.5px;
+    line-height: 1.4;
+  }
+
+  .license-banner-action {
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: 1px solid rgba(231, 76, 60, 0.5);
+    background: rgba(231, 76, 60, 0.18);
+    color: #ffd0c8;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+
+  .license-banner-action:hover {
+    background: rgba(231, 76, 60, 0.32);
+    border-color: rgba(231, 76, 60, 0.7);
+  }
+
+  .license-banner-action:focus-visible {
+    outline: 2px solid #ff7868;
+    outline-offset: 2px;
+  }
+
+  .gated-body {
+    opacity: 0.5;
+    pointer-events: none;
+    /* User-select off so the gray text doesn't invite copy-paste
+       tinkering. Read-only display feels more deliberate. */
+    user-select: none;
+    /* Slight desaturation reinforces the "inactive" affordance on
+       colourful elements (badges, status chips, primary buttons). */
+    filter: saturate(0.6);
   }
 
   .config-section {

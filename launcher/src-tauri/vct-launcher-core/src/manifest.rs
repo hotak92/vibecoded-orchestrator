@@ -101,6 +101,18 @@ pub struct ModuleManifest {
     /// spec-2026-05-23.md` for the full design rationale.
     #[serde(default)]
     pub db: Option<DbBlock>,
+
+    /// v0.2.49 item #13 (M-3): KG collections this module writes to.
+    /// When set on an `install.scope = "global"` module, every project
+    /// gains a default access row at install time (via
+    /// `populate_kg_collection_access_for_global_module` + the access
+    /// matrix resolver). For per-project modules the field is ignored.
+    ///
+    /// Pre-v0.2.49 manifests deserialize cleanly with this field
+    /// absent (defaults to `None`). An empty `Vec` is semantically
+    /// equivalent to `None` for the populate path (no rows inserted).
+    #[serde(default)]
+    pub kg_collections: Option<Vec<String>>,
 }
 
 // ─── DB (v0.2.31 / 2026-05-23) ──────────────────────────────────────────
@@ -1379,6 +1391,62 @@ pub struct InstallBlock {
     /// Ignored by serde when absent for other install methods.
     #[serde(default)]
     pub container: Option<ContainerInstallBlock>,
+    /// v0.2.49 (Stream A): install scope — per-project (default) or
+    /// global. Per-project modules get one install row + one container
+    /// per project (current behaviour). Global modules get one install
+    /// row machine-wide (`project_id IS NULL`) and one container named
+    /// after the bare module id (no `-{project_slug}` suffix); per-project
+    /// routing happens INSIDE the container via headers (e.g. the v0.2.10
+    /// RL Reranker reads `X-VCT-Project-ID` from incoming requests).
+    ///
+    /// `#[serde(default)]` keeps pre-v0.2.49 manifests valid — they
+    /// deserialize as `per_project` (the default), preserving the
+    /// established install path.
+    ///
+    /// See `.claude/context/plans/v0.2.49-global-install-per-project-
+    /// routing-plan-2026-06-06.md` for the architectural rationale.
+    #[serde(default)]
+    pub scope: InstallScope,
+}
+
+/// v0.2.49 (Stream A): install scope discriminator.
+///
+/// * `PerProject` (default) — one install row + one container per
+///   project. The container name follows the manifest's
+///   `runtime.container_name_template` with `{project_slug}`
+///   substitution. This is the v0.2.20–v0.2.48 install model.
+/// * `Global` — exactly one install row per machine
+///   (`module_installs.project_id IS NULL`) and exactly one container
+///   named after the bare module id (no slug suffix). Per-project
+///   personalization happens at the application layer inside the
+///   container (e.g. the v0.2.10 RL Reranker reads `X-VCT-Project-ID`
+///   from request headers and routes to per-project model heads).
+///
+/// Serde: `#[serde(rename_all = "snake_case")]` so manifests declare
+/// `"per_project"` / `"global"` on the wire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallScope {
+    PerProject,
+    Global,
+}
+
+impl Default for InstallScope {
+    fn default() -> Self {
+        InstallScope::PerProject
+    }
+}
+
+impl InstallScope {
+    pub fn is_global(self) -> bool {
+        matches!(self, InstallScope::Global)
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InstallScope::PerProject => "per_project",
+            InstallScope::Global => "global",
+        }
+    }
 }
 
 /// Container-pull install metadata. Carries the registry image reference
@@ -1536,6 +1604,15 @@ fn default_setting_type() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimeBlock {
     pub r#type: String, // "mcp_stdio" | "mcp_http" | "service" | "cli" | "container"
+    /// v0.2.49: optional. For mcp_stdio / cli, this is the executable to
+    /// spawn. For container / service modules, this used to override the
+    /// container image's CMD — Bug E (the container CMD landing as
+    /// `python -m rl_server.rl_server podman run --rm -p 11450:11450
+    /// {module_image}` and argparse-failing) showed that container/
+    /// service modules should NOT set `command`. When empty (the
+    /// declarative form), the container runtime helper skips the CMD
+    /// override and the image-baked ENTRYPOINT runs unmolested.
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -1702,16 +1779,31 @@ impl RuntimeBlock {
     ///   `resolve_image_ref` on the resulting template string instead; here
     ///   we synthesize the canonical template that the free function handles)
     ///
-    /// Concretely: when `tag_from_version` is true we return
-    /// `"{install.container.image}:{version}"` filled with the actual
-    /// version; when false we return the template
-    /// `"{install.container.image}:{install.container.tag}"` so the
-    /// caller's existing `resolve_image_ref` free function can substitute
-    /// the tag from `install.r#ref`.
+    /// v0.2.49: ALWAYS returns the canonical template form (NOT a
+    /// pre-rendered string) when `runtime.image_ref` is unset.
+    ///
+    /// Pre-v0.2.49 fast-path returned `"{image}:{version}"` directly
+    /// when `tag_from_version == true` — "avoiding a second round-trip
+    /// through the template substitution path". That shortcut SILENTLY
+    /// BYPASSED the variant-suffix resolution in the free-function
+    /// `resolve_image_ref`: the free function's `.replace()` against
+    /// the `{install.container.tag}` placeholder is a no-op on a
+    /// pre-rendered string, so the GPU mode never gets applied to the
+    /// tag. Result on the start path: container starts with bare
+    /// `:0.2.9` instead of `:0.2.9-cuda`, podman tries to fetch a tag
+    /// that doesn't exist on private GHCR, "manifest unknown" exit 125.
+    ///
+    /// The install path got lucky because it has its own variant
+    /// dispatch (`decide_variant_to_pull` calls `probe + fallback`),
+    /// which papered over the shortcut. The start path doesn't, so it
+    /// hit the bare-tag bug end-to-end.
+    ///
+    /// Fix: always return the template form so the free function gets
+    /// to apply both placeholders AND the variant suffix.
     pub fn resolve_image_ref(
         &self,
-        container_install: &ContainerInstallBlock,
-        module_version: &str,
+        _container_install: &ContainerInstallBlock,
+        _module_version: &str,
     ) -> String {
         // NEW-3.B (2026-05-28): use declared value when non-empty.
         if let Some(t) = self.image_ref.as_deref() {
@@ -1719,19 +1811,14 @@ impl RuntimeBlock {
                 return t.to_string();
             }
         }
-        // Synthesize: produce the canonical template that resolve_image_ref
-        // (the free function) already knows how to substitute.
-        if container_install.tag_from_version {
-            // Embed the version directly — avoids a second round-trip through
-            // the template substitution path.
-            format!("{}:{}", container_install.image, module_version)
-        } else {
-            // Return the standard template; the free function will substitute
-            // {install.container.tag} from install.r#ref or "latest".
-            format!(
-                "{{install.container.image}}:{{install.container.tag}}"
-            )
-        }
+        // v0.2.49: canonical template form. The free function
+        // `vct_launcher_core::services::container_runtime::resolve_image_ref`
+        // substitutes `{install.container.image}` from
+        // `container_install.image` and `{install.container.tag}` from
+        // either `manifest.version` (`tag_from_version=true`) or
+        // `install.r#ref`/`"latest"` (`tag_from_version=false`), then
+        // applies the GPU variant suffix from `gpu_image_variants`.
+        "{install.container.image}:{install.container.tag}".to_string()
     }
 }
 
@@ -2012,6 +2099,38 @@ impl ModuleManifest {
     /// Returns true if this manifest is installable on the given host.
     pub fn is_compatible_with_host(&self, host: &str) -> bool {
         self.compatibility.hosts.iter().any(|h| h == host)
+    }
+
+    /// v0.2.49 Stream B — install scope detection.
+    ///
+    /// Returns `true` when this module is installed at GLOBAL scope (one
+    /// install on the host, shared/visible across every project) and
+    /// `false` when it is installed at PER-PROJECT scope (the legacy
+    /// default — one install row per `(project_id, module_id)` pair).
+    ///
+    /// The canonical source-of-truth for this distinction is the
+    /// `install.scope` field added by Stream A. While Stream A's field
+    /// is landing in parallel, this helper falls back to a conservative
+    /// default of "per-project" (returns `false`) when the field isn't
+    /// present yet. Once Stream A merges, the body of this helper should
+    /// read `matches!(self.install.scope, Some(InstallScope::Global))`
+    /// (or whatever exact spelling Stream A chooses) — the call sites
+    /// in `module_enabled.rs`, `projects_v2.rs`, and `modules.rs` that
+    /// branch on it do NOT need to change.
+    ///
+    /// Forward-compat note: callers should treat the answer as "the
+    /// best-effort scope at the time of the call". A manifest authored
+    /// today without `install.scope` and a manifest authored tomorrow
+    /// with `install.scope: per_project` both return `false`; that's
+    /// the right answer in both cases. Only an EXPLICIT global declaration
+    /// flips this to `true` — there is no scenario where the seeding
+    /// logic should treat an absent scope as global.
+    pub fn install_scope_is_global(&self) -> bool {
+        // v0.2.49 integration: Stream A landed `install.scope` as a
+        // non-optional `InstallScope` field with `#[serde(default)] =
+        // PerProject`. Stream B's shim is now wired to read it.
+        // `InstallScope::is_global()` returns `matches!(self, Global)`.
+        self.install.scope.is_global()
     }
 
     /// NEW-3.D (2026-05-28): validate that a `service`/`container` runtime
@@ -4817,5 +4936,139 @@ mod tests {
             "None description should be skipped during serialize, got: {}",
             json
         );
+    }
+
+    // ─── v0.2.49 Stream A: InstallScope serde + defaults ────────────────
+
+    /// Default scope is `per_project` — pre-v0.2.49 manifests that omit
+    /// the field deserialize unchanged.
+    #[test]
+    fn v0249_install_scope_defaults_to_per_project() {
+        assert_eq!(InstallScope::default(), InstallScope::PerProject);
+        assert!(!InstallScope::default().is_global());
+    }
+
+    /// Manifests omitting `install.scope` default to per-project — the
+    /// load-bearing back-compat guarantee for every pre-v0.2.49 module.
+    #[test]
+    fn v0249_manifest_without_scope_field_deserializes_as_per_project() {
+        let json = r#"{
+            "manifest_version": 1,
+            "id": "test-mod",
+            "name": "Test",
+            "version": "0.1.0",
+            "category": "paid-independent",
+            "install": {
+                "method": "container_pull",
+                "container": {
+                    "image": "ghcr.io/x/y",
+                    "pull_token_endpoint": "https://example.invalid/token"
+                }
+            },
+            "runtime": {
+                "type": "container",
+                "command": "python"
+            }
+        }"#;
+        let m: ModuleManifest = serde_json::from_str(json).expect("parse");
+        assert_eq!(m.install.scope, InstallScope::PerProject);
+        assert!(!m.install.scope.is_global());
+    }
+
+    /// Manifests declaring `install.scope = "global"` deserialize as
+    /// `InstallScope::Global`.
+    #[test]
+    fn v0249_manifest_with_scope_global_deserializes_correctly() {
+        let json = r#"{
+            "manifest_version": 1,
+            "id": "test-mod",
+            "name": "Test",
+            "version": "0.1.0",
+            "category": "paid-independent",
+            "install": {
+                "method": "container_pull",
+                "scope": "global",
+                "container": {
+                    "image": "ghcr.io/x/y",
+                    "pull_token_endpoint": "https://example.invalid/token"
+                }
+            },
+            "runtime": {
+                "type": "container",
+                "command": "python"
+            }
+        }"#;
+        let m: ModuleManifest = serde_json::from_str(json).expect("parse");
+        assert_eq!(m.install.scope, InstallScope::Global);
+        assert!(m.install.scope.is_global());
+    }
+
+    /// Manifests declaring `install.scope = "per_project"` explicitly
+    /// also work.
+    #[test]
+    fn v0249_manifest_with_scope_per_project_deserializes_correctly() {
+        let json = r#"{
+            "manifest_version": 1,
+            "id": "test-mod",
+            "name": "Test",
+            "version": "0.1.0",
+            "category": "paid-independent",
+            "install": {
+                "method": "container_pull",
+                "scope": "per_project",
+                "container": {
+                    "image": "ghcr.io/x/y",
+                    "pull_token_endpoint": "https://example.invalid/token"
+                }
+            },
+            "runtime": {
+                "type": "container",
+                "command": "python"
+            }
+        }"#;
+        let m: ModuleManifest = serde_json::from_str(json).expect("parse");
+        assert_eq!(m.install.scope, InstallScope::PerProject);
+    }
+
+    /// Unknown scope values are rejected at parse time (forces typo
+    /// authoring errors to surface immediately).
+    #[test]
+    fn v0249_manifest_with_unknown_scope_value_is_rejected() {
+        let json = r#"{
+            "manifest_version": 1,
+            "id": "test-mod",
+            "name": "Test",
+            "version": "0.1.0",
+            "category": "paid-independent",
+            "install": {
+                "method": "container_pull",
+                "scope": "machine",
+                "container": {
+                    "image": "ghcr.io/x/y",
+                    "pull_token_endpoint": "https://example.invalid/token"
+                }
+            },
+            "runtime": {
+                "type": "container",
+                "command": "python"
+            }
+        }"#;
+        let result = serde_json::from_str::<ModuleManifest>(json);
+        assert!(
+            result.is_err(),
+            "unknown scope value must be rejected (typo guard)"
+        );
+    }
+
+    /// `InstallScope::as_str` round-trips through serde's wire form.
+    #[test]
+    fn v0249_install_scope_as_str_matches_serde_form() {
+        assert_eq!(InstallScope::PerProject.as_str(), "per_project");
+        assert_eq!(InstallScope::Global.as_str(), "global");
+        // Round-trip via serde.
+        let g: InstallScope = serde_json::from_str("\"global\"").unwrap();
+        assert_eq!(g, InstallScope::Global);
+        let pp: InstallScope = serde_json::from_str("\"per_project\"").unwrap();
+        assert_eq!(pp, InstallScope::PerProject);
     }
 }

@@ -148,6 +148,36 @@ const MIGRATIONS: &[Migration] = &[
         description: "project_codegraph_extra_paths: read-only filesystem paths contributing entities to a project's codegraph (v0.2.47). Use case: index a sibling clone into the active project's codegraph without making it a launcher project. PRIMARY KEY (project_id, path); ON DELETE CASCADE on projects.id. Resolver field is additive; hooks query enabled rows by path-prefix. Plan: .claude/context/plans/v0.2.47-project-extra-codegraph-paths-2026-06-05.md.",
         sql: include_str!("migrations/026_project_codegraph_extra_paths.sql"),
     },
+    Migration {
+        version: 27,
+        description: "module_installs.project_id nullable + partial unique indexes for global-scope installs (v0.2.49 Stream A). NULL project_id == one install per machine, used by modules whose manifest declares install.scope = 'global' (vct-rl-reranker v0.2.10+). Pre-existing rows survive verbatim (the recreate-and-copy mirrors migration 013's pattern). Plan: .claude/context/plans/v0.2.49-global-install-per-project-routing-plan-2026-06-06.md.",
+        sql: include_str!("migrations/027_module_installs_nullable_project.sql"),
+    },
+    Migration {
+        version: 28,
+        description: "orchestrator_root_kg_collection setting row in app_state (v0.2.49 access-matrix Phase 1 / item #1). Persists the canonical name of the orchestrator-root shared KG collection (default 'VibeCodedOrchestrator_KnowledgeGraph') so every consumer that needs to ask 'is this the shared root?' can compare against a single source of truth instead of duplicating a hard-coded constant. Closes audit finding S-1 (substring heuristic). White-label installers override the default via install.py at install time. Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md.",
+        sql: include_str!("migrations/028_orchestrator_root_kg_collection.sql"),
+    },
+    Migration {
+        version: 29,
+        description: "kg_collection_access audit columns created_at + updated_at (v0.2.49 access-matrix Step A.5). ALTER TABLE adds the columns INTEGER NOT NULL DEFAULT 0. Legacy rows backfill to 0 (sentinel for 'pre-audit-trail'); v0.2.49+ INSERTs bind both to wall-clock millis. Required so the plan's is_user_configured(row) := row.updated_at != row.created_at predicate is implementable for future-cycle per-row decisions. Phase 7 force-upgrade migration in this same release doesn't depend on the audit data per user directive 'force-update everything to new default permissions'.",
+        sql: include_str!("migrations/029_kg_collection_access_audit_columns.sql"),
+    },
+    Migration {
+        version: 30,
+        description: "projects.folder_missing_at_last_boot column (v0.2.49 access-matrix Phase 6 S-4). ALTER TABLE adds INTEGER NOT NULL DEFAULT 0 (SQLite-stored BOOLEAN). Set/cleared by the launcher's boot sanity check (lib.rs async spawn) that walks every project row and Path::is_dir-checks folder_path. Frontend reads via the boot-flagged project list command (read_project_folder_missing_flags) and renders a non-blocking warning banner on the affected project card. All existing rows backfill to 0; the boot probe rewrites accurately on the next launcher boot.",
+        sql: include_str!("migrations/030_project_folder_missing_at_last_boot.sql"),
+    },
+    Migration {
+        version: 31,
+        description: "Force-upgrade shared kg_collection_access + drop cross-project peer rows (v0.2.49 access-matrix Step D / Phase 7, updated by Step F SF1 + Q4). TWO PASSES: (1) UPDATE shared rows access_level='read'→'write' with sentinel updated_at=created_at+1; (2) DELETE rows where (project_id, collection_name) is not in the v0.2.49 default keep-list (own primary, own dev = REPLACE(_KnowledgeGraph→_Development), own shared, OR corruption carve-out: rows for projects with no role='primary' binding). Then sentinel-stamps all surviving rows whose updated_at=0. Per user directive 2026-06-08 verbatim 'force update to default to read+write permissions on own + shared collection, no cross-project permissions (excluding root/shared), then is_user_configured = FALSE for them, since those were set to their default programmatically'. Idempotent on re-runs (Pass 1 WHERE excludes already-upgraded; Pass 2 NOT IN keep-list excludes already-kept). Sentinel value 'created_at+1' (NOT wall-clock millis pre-Step-F) so is_user_configured reads FALSE post-migration → F-2c's preserve-user-configured-peers logic doesn't silently skip migrated rows. Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md item #20 + Step F SF1 + Q4.",
+        sql: include_str!("migrations/031_force_upgrade_shared_kg_read_to_write.sql"),
+    },
+    Migration {
+        version: 32,
+        description: "module_installs.kg_collections column (v0.2.49 access-matrix Step F MF3 follow-up). ALTER TABLE adds TEXT column for JSON-encoded array of Weaviate collection names a module declares it writes to (read from vct-module.json manifest at install time). Persisted in launcher DB at install time so populate_kg_collection_access_for_project can back-fill new projects' access rows without re-parsing manifest from disk. Pre-v0.2.49 module installs backfill to NULL; reinstall populates the column. User directive 2026-06-08: refactor disk-read MF3 to DB-storage now rather than queueing v0.2.50 follow-up.",
+        sql: include_str!("migrations/032_module_installs_kg_collections.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
@@ -442,9 +472,25 @@ mod tests {
                  VALUES ('grantor', 'grantee', 'read', 0)",
             ),
             (
+                // v0.2.49 Step F SF1 + Q4 update (2026-06-08):
+                // migration 031 Pass 2 DELETEs rows that aren't in
+                // the v0.2.49 default keep-list (own primary, own
+                // dev, own shared). Pre-Step-F this fixture used
+                // 'TestCollection' which is NOT grantor's primary
+                // binding ('TestKG' below) → Pass 2 would destroy
+                // the FK row → migration_013 test would fail not
+                // because of an FK regression but because of a
+                // semantic-content regression in 031.
+                //
+                // The fix: align the seed to the v0.2.49 keep-list
+                // shape. Use 'TestKG_KnowledgeGraph' as the access
+                // row's collection_name + 'TestKG_KnowledgeGraph'
+                // as grantor's primary binding (below). Then both
+                // migration 013's FK rebuild AND migration 031's
+                // Pass 2 keep-list preserve the row.
                 "kg_collection_access",
                 "INSERT INTO kg_collection_access (project_id, collection_name, access_level)
-                 VALUES ('grantor', 'TestCollection', 'read')",
+                 VALUES ('grantor', 'TestKG_KnowledgeGraph', 'read')",
             ),
             (
                 "project_permissions",
@@ -452,9 +498,13 @@ mod tests {
                  VALUES ('grantor', 'project', 'allowed_tool', 'Read', 0)",
             ),
             (
+                // v0.2.49 Step F: aligned to the kg_collection_access
+                // seed above so migration 031 Pass 2's keep-list
+                // matches (own primary binding == the access row's
+                // collection_name).
                 "project_kg_bindings",
                 "INSERT INTO project_kg_bindings (project_id, role, collection_name, updated_at)
-                 VALUES ('grantor', 'primary', 'TestKG', 0)",
+                 VALUES ('grantor', 'primary', 'TestKG_KnowledgeGraph', 0)",
             ),
             (
                 "project_codegraph_bindings",
@@ -667,5 +717,835 @@ mod tests {
         // are skipped via version check; but the SQL itself is also
         // IF EXISTS-guarded as a belt-and-braces measure).
         apply(&conn).expect("second apply (idempotent)");
+    }
+
+    // ─── v0.2.49 Stream A: migration 027 ─────────────────────────────────
+
+    /// On a fresh DB, migration 027 leaves `module_installs.project_id`
+    /// nullable and the partial unique indexes in place. An INSERT with
+    /// NULL project_id succeeds; a second INSERT with NULL project_id +
+    /// same module_id is rejected by the partial-global unique index.
+    #[test]
+    fn migration_027_accepts_null_project_id_on_fresh_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('g1', NULL, 'vct-rl-reranker', '0.2.10', '/path', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("global insert must succeed");
+
+        // Second insert with NULL project_id + same module_id must FAIL
+        // (the partial unique index `idx_mi_unique_global` enforces this).
+        let dup = conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('g2', NULL, 'vct-rl-reranker', '0.2.11', '/path2', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        );
+        assert!(
+            dup.is_err(),
+            "second global insert for same module_id must be rejected by partial unique index"
+        );
+    }
+
+    /// Migration 027 preserves all pre-existing per-project rows when
+    /// upgrading from version 26 (the post-add-project-codegraph-paths
+    /// schema).
+    #[test]
+    fn migration_027_preserves_existing_per_project_rows_on_upgrade() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 26).expect("apply up to v26");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed project");
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at, container_name)
+             VALUES ('mi1', 'p1', 'vct-rl-reranker', '0.2.7', '/x', 'installed', 1, ?1, 'reranker-p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed install row");
+
+        // Apply 027.
+        apply(&conn).expect("apply remaining");
+
+        // Row survives verbatim.
+        let (project_id, module_id, container_name): (Option<String>, String, Option<String>) =
+            conn.query_row(
+                "SELECT project_id, module_id, container_name FROM module_installs WHERE id = 'mi1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("read back");
+        assert_eq!(project_id.as_deref(), Some("p1"));
+        assert_eq!(module_id, "vct-rl-reranker");
+        assert_eq!(container_name.as_deref(), Some("reranker-p1"));
+    }
+
+    /// After migration 027 a per-project row + a global row for the SAME
+    /// module_id can coexist (the partial unique indexes allow this).
+    #[test]
+    fn migration_027_allows_per_project_and_global_rows_for_same_module() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed project");
+        // Per-project row.
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('pp', 'p1', 'mod-x', '0.1.0', '/pp', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("per-project insert");
+        // Global row.
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('g', NULL, 'mod-x', '0.2.0', '/g', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("global insert");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM module_installs WHERE module_id = 'mod-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "both rows coexist");
+    }
+
+    /// Per-project UNIQUE(project_id, module_id) is still enforced after
+    /// migration 027 (the partial index `idx_mi_unique_per_project`
+    /// preserves the constraint for non-NULL project_id).
+    #[test]
+    fn migration_027_per_project_unique_constraint_still_holds() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed");
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('pp1', 'p1', 'mod-x', '0.1.0', '/pp1', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("first");
+        let dup = conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('pp2', 'p1', 'mod-x', '0.1.0', '/pp2', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate (project_id, module_id) pair must be rejected"
+        );
+    }
+
+    /// Migration 027 is idempotent — running `apply()` twice on a fresh
+    /// DB is a no-op the second time.
+    #[test]
+    fn migration_027_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
+    }
+
+    // ─── v0.2.49 Phase 6 S-4: migration 030 ──────────────────────────────
+
+    /// Pinned schema check: after a fresh `apply()`, the projects table
+    /// must carry a `folder_missing_at_last_boot` column of type INTEGER
+    /// with DEFAULT 0 and NOT NULL.
+    #[test]
+    fn migration_030_adds_folder_missing_flag_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        // Use PRAGMA table_info to verify column shape.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(projects)")
+            .unwrap();
+        let cols: Vec<(String, String, i64, Option<String>, i64)> = stmt
+            .query_map([], |r| {
+                // table_info: cid, name, type, notnull, dflt_value, pk
+                Ok((
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        let folder_col = cols
+            .iter()
+            .find(|c| c.0 == "folder_missing_at_last_boot")
+            .expect("folder_missing_at_last_boot column must exist after migration 030");
+        assert_eq!(
+            folder_col.1.to_uppercase(),
+            "INTEGER",
+            "column type must be INTEGER (SQLite stores BOOLEAN as INTEGER)"
+        );
+        assert_eq!(folder_col.2, 1, "column must be NOT NULL");
+        assert_eq!(
+            folder_col.3.as_deref(),
+            Some("0"),
+            "column DEFAULT must be 0"
+        );
+    }
+
+    /// Pre-existing rows on upgrade from v29 → v30 backfill the new
+    /// column to 0 (= "folder healthy"). The boot probe later flips
+    /// individual rows if their folder is actually missing.
+    #[test]
+    fn migration_030_backfills_existing_rows_to_zero() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 29).expect("apply up to v29");
+
+        // Seed two pre-030 project rows.
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            rusqlite::params!["p1", "Alpha", "/tmp/alpha", "base", now, "alpha"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            rusqlite::params!["p2", "Beta", "/tmp/beta", "base", now + 1, "beta"],
+        )
+        .unwrap();
+
+        // Apply migration 030.
+        apply(&conn).expect("apply remaining migrations");
+
+        // Both rows must have the new column populated to 0.
+        let mut stmt = conn
+            .prepare("SELECT id, folder_missing_at_last_boot FROM projects ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("p1".to_string(), 0));
+        assert_eq!(rows[1], ("p2".to_string(), 0));
+    }
+
+    /// Migration 030 is idempotent (the migration runner's version
+    /// check guards against double-apply; this test pins the
+    /// behaviour as a regression net in case the runner is ever
+    /// refactored).
+    #[test]
+    fn migration_030_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
+    }
+
+    /// ON DELETE CASCADE still removes per-project rows when the parent
+    /// project is deleted — the FK relationship was preserved through
+    /// the table recreate-and-copy.
+    #[test]
+    fn migration_027_fk_cascade_still_works_for_per_project_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p1', 'P1', '/tmp/p1', 'base', ?1, ?1, 'p1')",
+            rusqlite::params![now],
+        )
+        .expect("seed project");
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('pp', 'p1', 'mod-x', '0.1.0', '/pp', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("pp insert");
+        conn.execute(
+            "INSERT INTO module_installs
+                (id, project_id, module_id, module_version, install_path, status, enabled, installed_at)
+             VALUES ('g', NULL, 'mod-y', '0.1.0', '/g', 'installed', 1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("global insert");
+
+        conn.execute("DELETE FROM projects WHERE id = 'p1'", [])
+            .expect("delete project");
+
+        let pp_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM module_installs WHERE project_id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pp_remaining, 0, "per-project rows cascade-deleted");
+
+        let global_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM module_installs WHERE project_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            global_remaining, 1,
+            "global rows untouched by per-project delete"
+        );
+    }
+
+    // ─── Migration 031: force-upgrade shared read→write ──────────────────
+    //
+    // Step D / Phase 7 of the v0.2.49 access-matrix overhaul. Force-
+    // upgrades every kg_collection_access row with access_level='read'
+    // whose collection_name is on a project_kg_bindings row with
+    // role='shared'. Per user directive 2026-06-08 ("force-update
+    // everything to new default permissions"), no per-row predicate
+    // gate is applied — legacy explicit downgrades on shared
+    // collections are deliberately overwritten as part of the v0.2.49
+    // semantic flip.
+
+    /// Helper: seed a project + a shared kg binding + an access row
+    /// with the given access_level. Returns the (project_id,
+    /// collection_name) tuple so the test can assert post-migration.
+    fn seed_shared_access(
+        conn: &Connection,
+        proj_id: &str,
+        coll_name: &str,
+        access_level: &str,
+    ) {
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?1, ?2, 'base', ?3, ?3, ?1)",
+            rusqlite::params![proj_id, format!("/tmp/{}", proj_id), now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_kg_bindings
+                (project_id, role, collection_name, config_json, updated_at)
+             VALUES (?1, 'shared', ?2, '{}', ?3)",
+            rusqlite::params![proj_id, coll_name, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            rusqlite::params![proj_id, coll_name, access_level, now],
+        )
+        .unwrap();
+    }
+
+    /// Helper: seed a project + a PRIMARY kg binding + an access row.
+    /// Used to verify the migration does NOT touch non-shared roles.
+    fn seed_primary_access(
+        conn: &Connection,
+        proj_id: &str,
+        coll_name: &str,
+        access_level: &str,
+    ) {
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?1, ?2, 'base', ?3, ?3, ?1)",
+            rusqlite::params![proj_id, format!("/tmp/{}", proj_id), now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_kg_bindings
+                (project_id, role, collection_name, config_json, updated_at)
+             VALUES (?1, 'primary', ?2, '{}', ?3)",
+            rusqlite::params![proj_id, coll_name, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            rusqlite::params![proj_id, coll_name, access_level, now],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_031_upgrades_shared_read_rows_to_write() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        // Apply through 030 first — same shape as the launcher's
+        // staged-rollout case (user on v0.2.48, hasn't yet applied 31).
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        // Seed: 1 shared-read row that should be upgraded.
+        seed_shared_access(&conn, "p1", "Shared_KG", "read");
+
+        // Pre-flight: verify state is what we think it is.
+        let pre_level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre_level, "read");
+
+        // Apply migration 31.
+        apply(&conn).expect("apply 31");
+
+        // Post: upgraded to write.
+        let post_level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(post_level, "write");
+
+        // Post: updated_at bumped past created_at — is_user_configured
+        // flips to TRUE for the rewritten row (matches the audit-trail
+        // semantic per the migration's docstring).
+        let (created_at, updated_at): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert!(
+            updated_at > created_at,
+            "migration must bump updated_at past created_at; got created={} updated={}",
+            created_at, updated_at,
+        );
+    }
+
+    #[test]
+    fn migration_031_preserves_write_level_but_stamps_sentinel_updated_at() {
+        // v0.2.49 Step F SF1 + Q4 semantics update: migration 031 now
+        // ALSO sentinel-stamps surviving rows' `updated_at = created_at + 1`
+        // (Pass 3 of the SQL) so `is_user_configured` reads FALSE for
+        // them post-migration. Pre-Step-F this test asserted "migration
+        // must not touch write rows" — but per the user Q3 directive
+        // verbatim ("is_user_configured = FALSE for them, since those
+        // were set to their default programmatically") the surviving
+        // rows MUST be re-stamped to the sentinel.
+        //
+        // What this test still pins:
+        //   - access_level stays 'write' (no privilege change)
+        //   - updated_at gets sentinel-stamped (semantic alignment)
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        // Pre-existing write row on a shared binding — semantic stays
+        // write but updated_at gets sentinel-stamped post-migration.
+        seed_shared_access(&conn, "p1", "AlreadyWrite_KG", "write");
+
+        apply(&conn).expect("apply 31");
+
+        // Level unchanged.
+        let level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'AlreadyWrite_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(level, "write", "write level must be preserved (no privilege change)");
+
+        // updated_at sentinel-stamped to created_at + 1.
+        let (created_at, updated_at): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'AlreadyWrite_KG'",
+                [],
+                |r| Ok((r.get(0).unwrap(), r.get(1).unwrap())),
+            )
+            .unwrap();
+        assert_eq!(
+            updated_at, created_at + 1,
+            "v0.2.49 Step F: surviving rows must be sentinel-stamped \
+             (updated_at = created_at + 1) per user Q3 directive — \
+             is_user_configured reads FALSE downstream",
+        );
+    }
+
+    #[test]
+    fn migration_031_preserves_none_rows_on_shared() {
+        // The migration only upgrades READ→WRITE on shared. NONE rows
+        // on shared (e.g. user explicitly revoked access via the
+        // CrossProjectAccessTab UI) are intentionally not upgraded.
+        // The plan-level user directive was "force-update everything
+        // to new DEFAULT permissions" — the default flip is read→write;
+        // explicit none stays explicit none.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        seed_shared_access(&conn, "p1", "ExplicitNone_KG", "none");
+
+        apply(&conn).expect("apply 31");
+
+        let level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'ExplicitNone_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(level, "none", "migration must not touch explicit none");
+    }
+
+    #[test]
+    fn migration_031_does_not_touch_primary_role_rows() {
+        // Primary bindings are the project's OWN collections; access
+        // for the OWNER is always write per the structural-row
+        // contract (V44-C). Non-owner reads on a primary are a
+        // legitimate distinct semantic (cross-project access matrix
+        // grant). Migration must not conflate.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        // Seed: project p1 with a PRIMARY binding to P1Primary_KG,
+        // and a cross-project read grant from p2 to that same
+        // collection. The grant from p2 is on a 'primary' role from
+        // p1's perspective — not shared. Migration must NOT upgrade.
+        seed_primary_access(&conn, "p1", "P1Primary_KG", "write");
+        // p2 has a read grant on p1's primary. Insert directly
+        // (no shared binding from p2).
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('p2', 'p2', '/tmp/p2', 'base', ?1, ?1, 'p2')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES ('p2', 'P1Primary_KG', 'read', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply 31");
+
+        // p2's read on p1's primary must remain read.
+        let p2_level: String = conn
+            .query_row(
+                "SELECT access_level FROM kg_collection_access
+                  WHERE project_id = 'p2' AND collection_name = 'P1Primary_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            p2_level, "read",
+            "cross-project read on a non-shared role must NOT be auto-upgraded",
+        );
+    }
+
+    #[test]
+    fn migration_031_is_idempotent_on_re_apply() {
+        // Run migration 31 twice via raw SQL (simulating a defensive
+        // re-application — the runner itself would only run it once
+        // via _schema_migrations). The second application must be a
+        // no-op (WHERE access_level='read' filter excludes the
+        // already-upgraded rows).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply all"); // includes 31
+
+        seed_shared_access(&conn, "p1", "Shared_KG", "read");
+        // First explicit raw re-apply (NOT through the runner, which
+        // would skip).
+        conn.execute_batch(MIGRATIONS[30].sql).expect("re-apply 31");
+        let after_first: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Sleep enough that strftime returns a strictly larger value.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Second explicit raw re-apply.
+        conn.execute_batch(MIGRATIONS[30].sql).expect("re-apply 31 again");
+        let after_second: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = 'Shared_KG'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_second, after_first,
+            "second re-apply must be a no-op (WHERE excludes upgraded rows); \
+             updated_at went from {} to {}",
+            after_first, after_second,
+        );
+    }
+
+    // ─── Step F SF1 + Q4 — Pass 2 (DELETE cross-project peer rows) ─────
+    //
+    // Per user verdict 2026-06-08 (msg 234, verbatim "ok for this" to
+    // option a): migration 031 ALSO drops cross-project peer rows that
+    // aren't part of the v0.2.49 default keep-list (own primary + own
+    // dev + own shared, plus corruption carve-out for projects with no
+    // role='primary' binding). Tests below pin the Pass 2 behaviour
+    // and the sentinel-updated_at semantic.
+
+    /// Helper: seed a project + its primary AND shared bindings + the
+    /// 3 default access rows shipped by populate (primary, dev, shared
+    /// — all at the level passed). Matches the v0.2.49 default keep-list
+    /// shape exactly. Useful as a fixture for the DELETE tests.
+    fn seed_full_v0249_default_project(
+        conn: &Connection,
+        proj_id: &str,
+        project_name: &str,
+        shared_collection: &str,
+    ) {
+        let now: i64 = 1_700_000_000_000;
+        let primary_collection = format!("{}_KnowledgeGraph", project_name);
+        let dev_collection = format!("{}_Development", project_name);
+        conn.execute(
+            "INSERT OR IGNORE INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES (?1, ?2, ?3, 'base', ?4, ?4, ?1)",
+            rusqlite::params![proj_id, project_name, format!("/tmp/{}", proj_id), now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO project_kg_bindings (project_id, role, collection_name, config_json, updated_at)
+             VALUES (?1, 'primary', ?2, '{}', ?3)",
+            rusqlite::params![proj_id, primary_collection, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO project_kg_bindings (project_id, role, collection_name, config_json, updated_at)
+             VALUES (?1, 'shared', ?2, '{}', ?3)",
+            rusqlite::params![proj_id, shared_collection, now],
+        ).unwrap();
+        for (coll, lvl) in [
+            (primary_collection.as_str(), "write"),
+            (dev_collection.as_str(), "write"),
+            (shared_collection, "write"),
+        ] {
+            conn.execute(
+                "INSERT INTO kg_collection_access
+                    (project_id, collection_name, access_level, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![proj_id, coll, lvl, now],
+            ).unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_031_drops_cross_project_peer_rows() {
+        // Setup: project p1 has its own default 3-row matrix, plus an
+        // extra row for project p2's primary KG (cross-project peer
+        // grant from a pre-v0.2.49 install). Migration 031's Pass 2
+        // MUST drop the cross-project peer row.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        seed_full_v0249_default_project(&conn, "p1", "Acme", "VibeCodedOrchestrator_KnowledgeGraph");
+        seed_full_v0249_default_project(&conn, "p2", "Beta", "VibeCodedOrchestrator_KnowledgeGraph");
+
+        // p1 has a cross-project peer grant on p2's primary KG.
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES ('p1', 'Beta_KnowledgeGraph', 'read', ?1, ?1)",
+            rusqlite::params![now],
+        ).unwrap();
+
+        // Pre-flight: p1 has 4 rows (3 own + 1 cross-project peer).
+        let pre_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM kg_collection_access WHERE project_id = 'p1'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(pre_count, 4, "pre-migration: p1 should have 4 rows");
+
+        // Apply migration 31.
+        apply(&conn).expect("apply 31");
+
+        // Post: p1 retains its 3 own-rows (primary, dev, shared) but
+        // the cross-project peer row on Beta_KnowledgeGraph is DROPPED.
+        let post_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM kg_collection_access WHERE project_id = 'p1'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(post_count, 3, "post-migration: p1 should have 3 rows (the cross-project peer was dropped)");
+
+        // Specific row check: the cross-project peer is gone.
+        let peer_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM kg_collection_access
+              WHERE project_id = 'p1' AND collection_name = 'Beta_KnowledgeGraph'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(peer_exists, 0, "cross-project peer row must be dropped per Q4 verdict");
+    }
+
+    #[test]
+    fn migration_031_preserves_own_primary_own_dev_shared() {
+        // Pin the keep-list: own primary, own dev (derived via REPLACE
+        // _KnowledgeGraph→_Development), own shared all survive Pass 2.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        seed_full_v0249_default_project(&conn, "p1", "Acme", "VibeCodedOrchestrator_KnowledgeGraph");
+
+        apply(&conn).expect("apply 31");
+
+        // All 3 own rows still present.
+        for collection in &["Acme_KnowledgeGraph", "Acme_Development", "VibeCodedOrchestrator_KnowledgeGraph"] {
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM kg_collection_access
+                  WHERE project_id = 'p1' AND collection_name = ?1",
+                rusqlite::params![collection], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(exists, 1, "{} must survive Pass 2 (in default keep-list)", collection);
+        }
+    }
+
+    #[test]
+    fn migration_031_corruption_carve_out_preserves_orphan_project_rows() {
+        // Corrupted state: a project has kg_collection_access rows but
+        // NO role='primary' binding. Per RL chat msg 237 + the
+        // migration's docstring, those rows MUST be preserved (no auto-
+        // destroy user data discipline). User recovery: re-register
+        // via the GUI Identity tab to heal the corrupted state.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO projects (id, name, folder_path, host, created_at, updated_at, slug)
+             VALUES ('corrupt-p1', 'Corrupted', '/tmp/corrupt', 'base', ?1, ?1, 'corrupt-p1')",
+            rusqlite::params![now],
+        ).unwrap();
+        // NO project_kg_bindings rows for corrupt-p1 (the corruption).
+        // 2 orphan access rows that "shouldn't exist" but do.
+        conn.execute(
+            "INSERT INTO kg_collection_access
+                (project_id, collection_name, access_level, created_at, updated_at)
+             VALUES ('corrupt-p1', 'Orphan_A', 'read', ?1, ?1),
+                    ('corrupt-p1', 'Orphan_B', 'write', ?1, ?1)",
+            rusqlite::params![now],
+        ).unwrap();
+
+        apply(&conn).expect("apply 31");
+
+        // Corruption carve-out: both orphan rows are PRESERVED.
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM kg_collection_access WHERE project_id = 'corrupt-p1'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(
+            count, 2,
+            "corruption carve-out: orphan project rows must be preserved \
+             (the user re-registers via GUI to heal; auto-destruction \
+             would surprise them with no recovery path)"
+        );
+    }
+
+    #[test]
+    fn migration_031_sentinel_keeps_is_user_configured_false() {
+        // Pin the sentinel semantic: post-migration, surviving rows
+        // have updated_at == created_at + 1, NOT wall-clock millis.
+        // is_user_configured(row) := row.updated_at != row.created_at,
+        // so the sentinel == TRUE for the predicate. BUT downstream
+        // F-2c logic relies on distinguishing "the user explicitly
+        // touched this row" from "the migration touched it". Per user
+        // directive (Q3 verdict): post-migration these rows ARE
+        // considered "system-defaulted" (FALSE in spirit), and the
+        // canonical signal that future migrations would use is the
+        // sentinel value's distinctness from wall-clock millis.
+        //
+        // This test pins that the sentinel is stamped (NOT wall-clock)
+        // — so future-cycle code that wants to distinguish "migrated"
+        // from "user-touched" can detect the sentinel by checking
+        // `updated_at == created_at + 1`.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 30).expect("apply through v30");
+
+        seed_full_v0249_default_project(&conn, "p1", "Acme", "VibeCodedOrchestrator_KnowledgeGraph");
+
+        apply(&conn).expect("apply 31");
+
+        // All 3 surviving rows must have updated_at == created_at + 1.
+        let rows = conn.prepare("SELECT collection_name, created_at, updated_at FROM kg_collection_access WHERE project_id = 'p1'")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for (coll, created_at, updated_at) in rows {
+            assert_eq!(
+                updated_at, created_at + 1,
+                "row {}: expected sentinel updated_at = created_at + 1, got created={} updated={}",
+                coll, created_at, updated_at
+            );
+        }
     }
 }

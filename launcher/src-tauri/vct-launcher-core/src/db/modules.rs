@@ -6,6 +6,52 @@ use rusqlite::{params, OptionalExtension};
 use super::models::{ModuleInstallRow, ModuleStatus};
 use super::Db;
 
+/// v0.2.49 Stream A: shared row → `ModuleInstallRow` projector.
+///
+/// Centralizes the 11-column projection (id, project_id, module_id,
+/// module_version, install_path, status, enabled, installed_at,
+/// last_started_at, last_error, container_name) so every accessor that
+/// reads `module_installs` produces a byte-identical `ModuleInstallRow`.
+///
+/// Post-027: `project_id` is nullable and projects as `Option<String>`.
+/// Pre-027 callers (which expected `String`) won't compile against the
+/// updated `ModuleInstallRow.project_id` field — the type change forces
+/// every caller through the option-aware path, which is the
+/// architectural guarantee Stream A needs.
+fn row_to_install_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModuleInstallRow> {
+    let status_s: String = row.get(5)?;
+    let enabled_i: i32 = row.get(6)?;
+    // v0.2.49 Step F MF3 follow-up (migration 032): kg_collections is a
+    // TEXT column holding a JSON-encoded array. NULL → empty Vec (the
+    // common case for modules whose manifest doesn't declare the field).
+    // Malformed JSON → also empty Vec (defensive; the column SHOULD be
+    // written by `set_module_kg_collections` which serializes a Vec).
+    //
+    // Index 11 is the new column position; SELECTs that don't query the
+    // column (e.g. v0.2.48-era SELECTs that only fetched 0..=10) need to
+    // be updated to include kg_collections OR use a separate row decoder.
+    let kg_collections: Vec<String> = row
+        .get::<_, Option<String>>(11)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Ok(ModuleInstallRow {
+        id: row.get(0)?,
+        project_id: row.get::<_, Option<String>>(1)?,
+        module_id: row.get(2)?,
+        module_version: row.get(3)?,
+        install_path: row.get(4)?,
+        status: ModuleStatus::from_str(&status_s).unwrap_or(ModuleStatus::Error),
+        enabled: enabled_i != 0,
+        installed_at: row.get(7)?,
+        last_started_at: row.get(8)?,
+        last_error: row.get(9)?,
+        container_name: row.get(10).ok().flatten(),
+        kg_collections,
+    })
+}
+
 impl Db {
     /// Insert (or upsert) a pending `module_installs` row for the
     /// `(project_id, module_id)` pair.
@@ -55,11 +101,15 @@ impl Db {
     ) -> Result<ModuleInstallRow, String> {
         let now = Utc::now().timestamp_millis();
         let guard = self.lock();
-        // ON CONFLICT clause references the UNIQUE constraint on
-        // (project_id, module_id) declared in 001_initial.sql. Every
-        // install-time column is reset to the new value so a retried/
-        // upgraded install row is indistinguishable from a fresh
-        // first install.
+        // ON CONFLICT clause now targets the partial unique index
+        // `idx_mi_unique_per_project` (migration 027). Pre-027 it
+        // referenced the table-level `UNIQUE(project_id, module_id)`;
+        // post-027 the table-level constraint is gone — superseded by
+        // a partial unique index gated on `project_id IS NOT NULL`. The
+        // ON CONFLICT clause references the same column tuple by name,
+        // which SQLite resolves to the partial index. Every install-time
+        // column is reset to the new value so a retried/upgraded install
+        // row is indistinguishable from a fresh first install.
         guard
             .execute(
                 "INSERT INTO module_installs
@@ -67,7 +117,7 @@ impl Db {
                   status, enabled, installed_at, last_started_at, last_error,
                   container_name)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'installing', 1, ?6, NULL, NULL, NULL)
-                 ON CONFLICT(project_id, module_id) DO UPDATE SET
+                 ON CONFLICT(project_id, module_id) WHERE project_id IS NOT NULL DO UPDATE SET
                      module_version  = excluded.module_version,
                      install_path    = excluded.install_path,
                      status          = excluded.status,
@@ -79,38 +129,74 @@ impl Db {
                 params![id, project_id, module_id, module_version, install_path, now],
             )
             .map_err(|e| format!("insert module_install: {}", e))?;
-        // Re-read so the caller sees the actual row (the `id` column
-        // is preserved on conflict; the requested `id` is ignored
-        // when a row already exists). All other columns now match
-        // the INSERT-side values per the DO UPDATE SET above.
+        // Re-read so the caller sees the actual row.
         let row = guard
             .query_row(
                 "SELECT id, project_id, module_id, module_version, install_path,
                         status, enabled, installed_at, last_started_at, last_error,
-                        container_name
+                        container_name, kg_collections
                    FROM module_installs
                   WHERE project_id = ?1 AND module_id = ?2",
                 params![project_id, module_id],
-                |row| {
-                    let status_s: String = row.get(5)?;
-                    let enabled_i: i32 = row.get(6)?;
-                    Ok(ModuleInstallRow {
-                        id: row.get(0)?,
-                        project_id: row.get(1)?,
-                        module_id: row.get(2)?,
-                        module_version: row.get(3)?,
-                        install_path: row.get(4)?,
-                        status: ModuleStatus::from_str(&status_s)
-                            .unwrap_or(ModuleStatus::Error),
-                        enabled: enabled_i != 0,
-                        installed_at: row.get(7)?,
-                        last_started_at: row.get(8)?,
-                        last_error: row.get(9)?,
-                        container_name: row.get(10).ok().flatten(),
-                    })
-                },
+                |row| row_to_install_row(row),
             )
             .map_err(|e| format!("read back module_install after upsert: {}", e))?;
+        Ok(row)
+    }
+
+    /// v0.2.49 Stream A: insert (or upsert) a GLOBAL install row —
+    /// `project_id IS NULL`, exactly one row per machine for this module.
+    ///
+    /// Mirrors `insert_module_install`'s upsert semantics (so retries,
+    /// version upgrades, and reinstalls all flow through the same path)
+    /// but targets the partial unique index `idx_mi_unique_global`
+    /// (migration 027) instead of `idx_mi_unique_per_project`. The
+    /// `WHERE project_id IS NULL` clause on the conflict target reflects
+    /// the partial-index predicate — SQLite requires this match for the
+    /// index to drive the conflict resolution.
+    ///
+    /// Returns the row as it lives in the DB after the upsert. The `id`
+    /// column is preserved across conflicts (matches the per-project
+    /// `insert_module_install` contract).
+    pub fn insert_global_module_install(
+        &self,
+        id: &str,
+        module_id: &str,
+        module_version: &str,
+        install_path: &str,
+    ) -> Result<ModuleInstallRow, String> {
+        let now = Utc::now().timestamp_millis();
+        let guard = self.lock();
+        guard
+            .execute(
+                "INSERT INTO module_installs
+                 (id, project_id, module_id, module_version, install_path,
+                  status, enabled, installed_at, last_started_at, last_error,
+                  container_name)
+                 VALUES (?1, NULL, ?2, ?3, ?4, 'installing', 1, ?5, NULL, NULL, NULL)
+                 ON CONFLICT(module_id) WHERE project_id IS NULL DO UPDATE SET
+                     module_version  = excluded.module_version,
+                     install_path    = excluded.install_path,
+                     status          = excluded.status,
+                     enabled         = excluded.enabled,
+                     installed_at    = excluded.installed_at,
+                     last_started_at = excluded.last_started_at,
+                     last_error      = excluded.last_error,
+                     container_name  = excluded.container_name",
+                params![id, module_id, module_version, install_path, now],
+            )
+            .map_err(|e| format!("insert global module_install: {}", e))?;
+        let row = guard
+            .query_row(
+                "SELECT id, project_id, module_id, module_version, install_path,
+                        status, enabled, installed_at, last_started_at, last_error,
+                        container_name, kg_collections
+                   FROM module_installs
+                  WHERE project_id IS NULL AND module_id = ?1",
+                params![module_id],
+                |row| row_to_install_row(row),
+            )
+            .map_err(|e| format!("read back global module_install after upsert: {}", e))?;
         Ok(row)
     }
 
@@ -143,13 +229,69 @@ impl Db {
         Ok(())
     }
 
+    /// v0.2.49 Step F MF3 follow-up (migration 032): persist a module's
+    /// declared `kg_collections` (from the manifest) into the install row.
+    ///
+    /// Called by the install dispatch in `commands::modules::install_module`
+    /// immediately after `insert_module_install` / `insert_global_module_install`
+    /// returns. The manifest's `kg_collections` field is in scope at that
+    /// point (the install code already parsed the manifest); this setter
+    /// denormalizes it into the launcher DB so downstream consumers
+    /// (specifically `populate_kg_collection_access_for_project`'s
+    /// global-module back-fill loop) don't have to re-parse the on-disk
+    /// manifest from the hot path.
+    ///
+    /// Encoding: JSON-serialized array of strings. NULL when `collections`
+    /// is None (matches the manifest's `Option<Vec<String>>` shape). Empty
+    /// JSON array `"[]"` is also acceptable (semantically equivalent for
+    /// the consumer).
+    ///
+    /// Idempotent: re-calling with the same collections is a no-op
+    /// (UPDATE with identical value). Re-calling with DIFFERENT
+    /// collections (e.g. module update changed the manifest declaration)
+    /// overwrites verbatim — the manifest is the authoritative source
+    /// of truth.
+    pub fn set_module_kg_collections(
+        &self,
+        install_id: &str,
+        collections: Option<&[String]>,
+    ) -> Result<(), String> {
+        let json = match collections {
+            Some(c) => Some(
+                serde_json::to_string(c)
+                    .map_err(|e| format!("serialize kg_collections: {}", e))?,
+            ),
+            None => None,
+        };
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs SET kg_collections = ?1 WHERE id = ?2",
+                params![json, install_id],
+            )
+            .map_err(|e| format!("set kg_collections: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "module_install not found for id={}",
+                install_id
+            ));
+        }
+        Ok(())
+    }
+
     /// List every (project_id, module_id, container_name) triple where
     /// container_name is non-null. Used by the launcher's startup hook
     /// to enumerate per-project containers that need re-checking after
     /// a quit-relaunch cycle.
+    ///
+    /// v0.2.49 Stream A: `project_id` is now `Option<String>` because
+    /// global-scope install rows carry `project_id = NULL`. Callers that
+    /// previously assumed `project_id: String` must now branch on `None`
+    /// for global-scope rows. The container_name column is still
+    /// `String` (non-null + non-empty per the WHERE clause).
     pub fn list_module_installs_with_containers(
         &self,
-    ) -> Result<Vec<(String, String, String)>, String> {
+    ) -> Result<Vec<(Option<String>, String, String)>, String> {
         let guard = self.lock();
         let mut stmt = guard
             .prepare(
@@ -161,7 +303,7 @@ impl Db {
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                 ))
@@ -204,7 +346,7 @@ impl Db {
     /// to call `start_container_after_install`.
     pub fn list_module_installs_needing_start(
         &self,
-    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+    ) -> Result<Vec<(Option<String>, String, Option<String>)>, String> {
         let guard = self.lock();
         let mut stmt = guard
             .prepare(
@@ -216,7 +358,7 @@ impl Db {
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                 ))
@@ -399,26 +541,149 @@ impl Db {
                  FROM module_installs
                  WHERE project_id = ?1 AND module_id = ?2",
                 params![project_id, module_id],
-                |row| {
-                    let status_s: String = row.get(5)?;
-                    let enabled_i: i32 = row.get(6)?;
-                    Ok(ModuleInstallRow {
-                        id: row.get(0)?,
-                        project_id: row.get(1)?,
-                        module_id: row.get(2)?,
-                        module_version: row.get(3)?,
-                        install_path: row.get(4)?,
-                        status: ModuleStatus::from_str(&status_s).unwrap_or(ModuleStatus::Error),
-                        enabled: enabled_i != 0,
-                        installed_at: row.get(7)?,
-                        last_started_at: row.get(8)?,
-                        last_error: row.get(9)?,
-                        container_name: row.get(10).ok().flatten(),
-                    })
-                },
+                |row| row_to_install_row(row),
             )
             .optional()
             .map_err(|e| format!("get module_install: {}", e))
+    }
+
+    /// v0.2.49 Stream A: read the GLOBAL install row for a module
+    /// (`project_id IS NULL`). Returns `None` when no global row exists
+    /// — caller should fall back to per-project rows in that case.
+    pub fn get_global_module_install(
+        &self,
+        module_id: &str,
+    ) -> Result<Option<ModuleInstallRow>, String> {
+        let guard = self.lock();
+        guard
+            .query_row(
+                "SELECT id, project_id, module_id, module_version, install_path,
+                        status, enabled, installed_at, last_started_at, last_error,
+                        container_name
+                 FROM module_installs
+                 WHERE project_id IS NULL AND module_id = ?1",
+                params![module_id],
+                |row| row_to_install_row(row),
+            )
+            .optional()
+            .map_err(|e| format!("get global module_install: {}", e))
+    }
+
+    /// v0.2.49 Stream A: delete the GLOBAL install row for a module.
+    /// Returns `Ok(())` whether or not the row existed (matches
+    /// `delete_module_install`'s contract).
+    pub fn delete_global_module_install(&self, module_id: &str) -> Result<(), String> {
+        let guard = self.lock();
+        guard
+            .execute(
+                "DELETE FROM module_installs WHERE project_id IS NULL AND module_id = ?1",
+                params![module_id],
+            )
+            .map_err(|e| format!("delete global module_install: {}", e))?;
+        Ok(())
+    }
+
+    /// v0.2.49 Stream A: write `last_error` on a GLOBAL install row
+    /// without touching `status`. Sibling of
+    /// [`Db::set_module_last_error`] for per-project rows. Used by the
+    /// resume sweep when a global container's auto-start fails.
+    pub fn set_global_module_last_error(
+        &self,
+        module_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs SET last_error = ?1
+                  WHERE project_id IS NULL AND module_id = ?2",
+                params![error, module_id],
+            )
+            .map_err(|e| format!("set_global_module_last_error: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "global module_install not found for module={}",
+                module_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// v0.2.49 Stream A: flip status on a GLOBAL install row. Sibling
+    /// of [`Db::set_module_status`] for per-project rows.
+    pub fn set_global_module_status(
+        &self,
+        module_id: &str,
+        status: ModuleStatus,
+        error: Option<String>,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        let started_at = if status == ModuleStatus::Running {
+            Some(Utc::now().timestamp_millis())
+        } else {
+            None
+        };
+        guard
+            .execute(
+                "UPDATE module_installs
+                    SET status = ?1,
+                        last_error = ?2,
+                        last_started_at = COALESCE(?3, last_started_at)
+                  WHERE project_id IS NULL AND module_id = ?4",
+                params![status.as_str(), error, started_at, module_id],
+            )
+            .map_err(|e| format!("set_global_module_status: {}", e))?;
+        Ok(())
+    }
+
+    /// v0.2.49 Stream A: persist the resolved container name on a GLOBAL
+    /// install row. Sibling of [`Db::set_module_container_name`] for
+    /// per-project rows.
+    pub fn set_global_module_container_name(
+        &self,
+        module_id: &str,
+        container_name: &str,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs SET container_name = ?1
+                  WHERE project_id IS NULL AND module_id = ?2",
+                params![container_name, module_id],
+            )
+            .map_err(|e| format!("set global container_name: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "global module_install not found for module={}",
+                module_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// v0.2.49 Stream A: list every per-project row for a given module
+    /// id. Used by the auto-migration path that converts a module from
+    /// per-project to global scope (delete N per-project rows + spawn 1
+    /// global row).
+    pub fn list_per_project_installs_for_module(
+        &self,
+        module_id: &str,
+    ) -> Result<Vec<ModuleInstallRow>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, project_id, module_id, module_version, install_path,
+                        status, enabled, installed_at, last_started_at, last_error,
+                        container_name, kg_collections
+                   FROM module_installs
+                  WHERE project_id IS NOT NULL AND module_id = ?1",
+            )
+            .map_err(|e| format!("prepare list_per_project_installs_for_module: {}", e))?;
+        let rows = stmt
+            .query_map(params![module_id], |row| row_to_install_row(row))
+            .map_err(|e| format!("query list_per_project_installs_for_module: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_per_project_installs_for_module: {}", e))
     }
 
     pub fn list_module_installs_for_project(
@@ -435,26 +700,30 @@ impl Db {
             )
             .map_err(|e| format!("prepare: {}", e))?;
         let rows = stmt
-            .query_map(params![project_id], |row| {
-                let status_s: String = row.get(5)?;
-                let enabled_i: i32 = row.get(6)?;
-                Ok(ModuleInstallRow {
-                    id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    module_id: row.get(2)?,
-                    module_version: row.get(3)?,
-                    install_path: row.get(4)?,
-                    status: ModuleStatus::from_str(&status_s).unwrap_or(ModuleStatus::Error),
-                    enabled: enabled_i != 0,
-                    installed_at: row.get(7)?,
-                    last_started_at: row.get(8)?,
-                    last_error: row.get(9)?,
-                    container_name: row.get(10).ok().flatten(),
-                })
-            })
+            .query_map(params![project_id], |row| row_to_install_row(row))
             .map_err(|e| format!("query: {}", e))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect: {}", e))
+    }
+
+    /// v0.2.49 Stream A: list every GLOBAL install row (project_id IS NULL).
+    pub fn list_global_module_installs(&self) -> Result<Vec<ModuleInstallRow>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, project_id, module_id, module_version, install_path,
+                        status, enabled, installed_at, last_started_at, last_error,
+                        container_name, kg_collections
+                   FROM module_installs
+                  WHERE project_id IS NULL
+                  ORDER BY installed_at DESC",
+            )
+            .map_err(|e| format!("prepare list_global_module_installs: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| row_to_install_row(row))
+            .map_err(|e| format!("query list_global_module_installs: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_global_module_installs: {}", e))
     }
 
     pub fn delete_module_install(
@@ -489,30 +758,14 @@ impl Db {
             .prepare(
                 "SELECT id, project_id, module_id, module_version, install_path,
                         status, enabled, installed_at, last_started_at, last_error,
-                        container_name
+                        container_name, kg_collections
                    FROM module_installs
                   WHERE status = ?1
                   ORDER BY installed_at DESC",
             )
             .map_err(|e| format!("prepare list_module_installs_with_status: {}", e))?;
         let rows = stmt
-            .query_map(params![status], |row| {
-                let status_s: String = row.get(5)?;
-                let enabled_i: i32 = row.get(6)?;
-                Ok(ModuleInstallRow {
-                    id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    module_id: row.get(2)?,
-                    module_version: row.get(3)?,
-                    install_path: row.get(4)?,
-                    status: ModuleStatus::from_str(&status_s).unwrap_or(ModuleStatus::Error),
-                    enabled: enabled_i != 0,
-                    installed_at: row.get(7)?,
-                    last_started_at: row.get(8)?,
-                    last_error: row.get(9)?,
-                    container_name: row.get(10).ok().flatten(),
-                })
-            })
+            .query_map(params![status], |row| row_to_install_row(row))
             .map_err(|e| format!("query list_module_installs_with_status: {}", e))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect list_module_installs_with_status: {}", e))
@@ -1181,5 +1434,284 @@ mod tests {
             Some("already in error state"),
             "last_error must be preserved (no double-touch)"
         );
+    }
+
+    // ─── v0.2.49 Stream A: global install row tests ─────────────────────
+
+    /// Inserting a global row produces `project_id = None`.
+    #[test]
+    fn v0249_global_install_row_has_null_project_id() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let row = db
+            .insert_global_module_install(
+                "install-global-1",
+                "vct-rl-reranker",
+                "0.2.10",
+                "/home/test/.vct/modules/vct-rl-reranker",
+            )
+            .expect("global insert must succeed");
+        assert_eq!(row.id, "install-global-1");
+        assert!(row.project_id.is_none(), "global row must have project_id=None");
+        assert_eq!(row.module_id, "vct-rl-reranker");
+        assert_eq!(row.status, ModuleStatus::Installing);
+    }
+
+    /// `insert_global_module_install` is an upsert: second call returns
+    /// the same id, fresh status, version refreshed.
+    #[test]
+    fn v0249_global_install_row_upserts_on_retry() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let first = db
+            .insert_global_module_install(
+                "install-global-1",
+                "vct-rl-reranker",
+                "0.2.9",
+                "/home/test/.vct/modules/vct-rl-reranker",
+            )
+            .expect("first global insert");
+        db.set_global_module_status(
+            "vct-rl-reranker",
+            ModuleStatus::Error,
+            Some("pull failed".into()),
+        )
+        .expect("flip to error");
+
+        // Retry with new version — must succeed via upsert, preserve id.
+        let retried = db
+            .insert_global_module_install(
+                "install-global-2-IGNORED",
+                "vct-rl-reranker",
+                "0.2.10",
+                "/home/test/.vct/modules/vct-rl-reranker",
+            )
+            .expect("retry upsert");
+        assert_eq!(retried.id, first.id, "id must be preserved across upsert");
+        assert_eq!(retried.module_version, "0.2.10", "version refreshed");
+        assert_eq!(retried.status, ModuleStatus::Installing);
+        assert!(retried.last_error.is_none(), "last_error cleared");
+    }
+
+    /// At most ONE global row per module_id — second distinct insert is
+    /// not allowed (the partial unique index on `WHERE project_id IS NULL`
+    /// enforces this).
+    #[test]
+    fn v0249_global_install_row_unique_per_module() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.insert_global_module_install(
+            "install-global-1",
+            "vct-rl-reranker",
+            "0.2.10",
+            "/p1",
+        )
+        .expect("first global insert");
+        // Second insert with same module_id → upsert (not a new row).
+        // Distinct module_id → independent row.
+        let r2 = db
+            .insert_global_module_install(
+                "install-global-2",
+                "vct-rl-reranker",
+                "0.2.11",
+                "/p2",
+            )
+            .expect("same module_id upserts");
+        // Only one row total for this module_id.
+        let rows = db.list_global_module_installs().expect("list");
+        assert_eq!(rows.len(), 1, "exactly one global row for one module_id");
+        assert_eq!(r2.module_version, "0.2.11");
+    }
+
+    /// Global row + per-project row for the SAME module coexist (the
+    /// auto-migration creates this state transiently before deleting the
+    /// per-project rows).
+    #[test]
+    fn v0249_global_and_per_project_rows_coexist() {
+        let (db, pid) = open_db_with_project();
+        db.insert_module_install(
+            "install-pp-1",
+            &pid,
+            "vct-rl-reranker",
+            "0.2.7",
+            "/per-project",
+        )
+        .expect("per-project insert");
+        db.insert_global_module_install(
+            "install-global-1",
+            "vct-rl-reranker",
+            "0.2.10",
+            "/global",
+        )
+        .expect("global insert");
+
+        // Both must be visible via their respective lookups.
+        let pp = db
+            .get_module_install(&pid, "vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pp.project_id.as_deref(), Some(pid.as_str()));
+        assert_eq!(pp.module_version, "0.2.7");
+
+        let g = db
+            .get_global_module_install("vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        assert!(g.project_id.is_none());
+        assert_eq!(g.module_version, "0.2.10");
+
+        // list_per_project_installs_for_module returns ONLY the
+        // per-project row (not the global one).
+        let per_proj_rows = db
+            .list_per_project_installs_for_module("vct-rl-reranker")
+            .expect("list per-project");
+        assert_eq!(per_proj_rows.len(), 1);
+        assert!(per_proj_rows[0].project_id.is_some());
+    }
+
+    /// `delete_global_module_install` removes ONLY the global row.
+    #[test]
+    fn v0249_delete_global_module_install_leaves_per_project_rows() {
+        let (db, pid) = open_db_with_project();
+        db.insert_module_install(
+            "install-pp-1",
+            &pid,
+            "vct-rl-reranker",
+            "0.2.7",
+            "/per-project",
+        )
+        .expect("per-project insert");
+        db.insert_global_module_install(
+            "install-global-1",
+            "vct-rl-reranker",
+            "0.2.10",
+            "/global",
+        )
+        .expect("global insert");
+
+        db.delete_global_module_install("vct-rl-reranker")
+            .expect("delete global");
+
+        assert!(
+            db.get_global_module_install("vct-rl-reranker")
+                .unwrap()
+                .is_none(),
+            "global row gone"
+        );
+        assert!(
+            db.get_module_install(&pid, "vct-rl-reranker")
+                .unwrap()
+                .is_some(),
+            "per-project row preserved"
+        );
+    }
+
+    /// `list_module_installs_needing_start` returns BOTH global and
+    /// per-project rows (the supervisor's resume sweep needs both).
+    #[test]
+    fn v0249_list_needing_start_returns_global_and_per_project() {
+        let (db, pid) = open_db_with_project();
+        // Per-project installed row.
+        db.insert_module_install("install-pp-1", &pid, "mod-pp", "0.1.0", "/pp")
+            .expect("pp insert");
+        db.set_module_status(&pid, "mod-pp", ModuleStatus::Installed, None)
+            .expect("flip pp installed");
+        // Global installed row.
+        db.insert_global_module_install("install-g-1", "mod-g", "0.1.0", "/g")
+            .expect("g insert");
+        db.set_global_module_status("mod-g", ModuleStatus::Installed, None)
+            .expect("flip g installed");
+
+        let rows = db.list_module_installs_needing_start().expect("list");
+        let module_ids: Vec<&str> = rows.iter().map(|(_, m, _)| m.as_str()).collect();
+        assert!(module_ids.contains(&"mod-pp"), "per-project row included");
+        assert!(module_ids.contains(&"mod-g"), "global row included");
+        for (pid_opt, mod_id, _) in rows {
+            if mod_id == "mod-g" {
+                assert!(pid_opt.is_none(), "global row projects project_id=None");
+            } else if mod_id == "mod-pp" {
+                assert!(pid_opt.is_some(), "per-project row projects project_id=Some");
+            }
+        }
+    }
+
+    /// `set_global_module_container_name` writes only to the global row.
+    #[test]
+    fn v0249_set_global_container_name_writes_only_global_row() {
+        let (db, pid) = open_db_with_project();
+        db.insert_module_install("install-pp", &pid, "vct-rl-reranker", "0.2.7", "/pp")
+            .expect("pp insert");
+        db.set_module_container_name(&pid, "vct-rl-reranker", "per-proj-container")
+            .expect("set pp container");
+        db.insert_global_module_install("install-g", "vct-rl-reranker", "0.2.10", "/g")
+            .expect("g insert");
+
+        db.set_global_module_container_name("vct-rl-reranker", "global-container")
+            .expect("set global container");
+
+        let pp_row = db
+            .get_module_install(&pid, "vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        let g_row = db
+            .get_global_module_install("vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pp_row.container_name.as_deref(), Some("per-proj-container"));
+        assert_eq!(g_row.container_name.as_deref(), Some("global-container"));
+    }
+
+    /// `set_global_module_last_error` writes only to the global row.
+    #[test]
+    fn v0249_set_global_last_error_writes_only_global_row() {
+        let (db, pid) = open_db_with_project();
+        db.insert_module_install("install-pp", &pid, "vct-rl-reranker", "0.2.7", "/pp")
+            .expect("pp insert");
+        db.insert_global_module_install("install-g", "vct-rl-reranker", "0.2.10", "/g")
+            .expect("g insert");
+
+        db.set_global_module_last_error(
+            "vct-rl-reranker",
+            Some("global pull failed"),
+        )
+        .expect("set global last_error");
+
+        let pp_row = db
+            .get_module_install(&pid, "vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        let g_row = db
+            .get_global_module_install("vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+        assert!(pp_row.last_error.is_none(), "per-project last_error untouched");
+        assert_eq!(g_row.last_error.as_deref(), Some("global pull failed"));
+    }
+
+    /// `list_per_project_installs_for_module` filters out global rows.
+    #[test]
+    fn v0249_list_per_project_excludes_global() {
+        let (db, pid_a) = open_db_with_project();
+        let pid_b = "test-proj-b".to_string();
+        db.insert_project(
+            &pid_b,
+            "B",
+            "/tmp/b",
+            crate::db::models::ProjectHost::Base,
+            "test-proj-b",
+        )
+        .expect("seed B");
+
+        db.insert_module_install("install-pp-a", &pid_a, "vct-rl-reranker", "0.2.7", "/a")
+            .expect("pp a");
+        db.insert_module_install("install-pp-b", &pid_b, "vct-rl-reranker", "0.2.7", "/b")
+            .expect("pp b");
+        db.insert_global_module_install("install-g", "vct-rl-reranker", "0.2.10", "/g")
+            .expect("global");
+
+        let pp_rows = db
+            .list_per_project_installs_for_module("vct-rl-reranker")
+            .expect("list pp");
+        assert_eq!(pp_rows.len(), 2, "two per-project rows, global excluded");
+        for r in &pp_rows {
+            assert!(r.project_id.is_some());
+        }
     }
 }

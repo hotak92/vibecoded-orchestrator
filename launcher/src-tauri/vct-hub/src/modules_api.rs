@@ -141,7 +141,9 @@ struct StatusQuery {
 
 #[derive(Debug, Serialize)]
 struct InstalledRowView {
-    project_id: String,
+    /// v0.2.49 Stream A: nullable to expose global installs to GUI.
+    /// `None` ⇒ global install (one row per machine).
+    project_id: Option<String>,
     module_id: String,
     module_version: String,
     status: String,
@@ -755,7 +757,10 @@ pub(crate) fn resolve_secret_for_subprocess_env(
 
 // ─── Manifest scanning (shared with commands::modules) ──────────────────
 
-fn scan_manifests() -> Vec<(std::path::PathBuf, vct_launcher_core::manifest::ModuleManifest)> {
+// v0.2.49 Phase 3: hoisted to `pub(crate)` so `lifecycle_api::module_start`
+// + `server.rs::start_hub_server`'s resume-on-boot manifest resolver can
+// reuse it without duplicating the filesystem walk.
+pub(crate) fn scan_manifests() -> Vec<(std::path::PathBuf, vct_launcher_core::manifest::ModuleManifest)> {
     let mut out = Vec::new();
     let vct_root = vct_launcher_core::paths::vct_root_dir();
     for subdir in [

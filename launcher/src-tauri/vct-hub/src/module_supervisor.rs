@@ -171,6 +171,35 @@ pub async fn start_container_for_module_with_gpu_mode(
 
     let podman = detect_container_runtime().await?;
 
+    // v0.2.49 Phase 3: pre-pull the variant-correct image with the
+    // shared `vct_launcher_core::services::container_runtime::
+    // pre_pull_with_auth_for_start` helper — same byte-for-byte flow
+    // the launcher-side `start_container_for_module_with_gpu_mode`
+    // runs. Closes Bug 2 from
+    // `knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md`:
+    // the supervisor no longer falls through to anonymous `podman pull`
+    // on cache-miss for private GHCR packages. Soft-fail: if pre-pull
+    // returns an error, log and let `podman run` make the final call —
+    // the cache may have the image already, in which case `run`
+    // succeeds without needing the registry. Gated on
+    // `manifest.install.method == ContainerPull` AND `gpu_mode.is_some()`
+    // — legacy single-tag modules + cases where the caller has no
+    // GpuMode source (no persisted hardware snapshot yet) skip the
+    // pre-pull and fall through to the historical bare-tag path.
+    if gpu_mode.is_some() && manifest.install.method == InstallMethod::ContainerPull {
+        if let Err(e) =
+            vct_launcher_core::services::container_runtime::pre_pull_with_auth_for_start(
+                manifest, &podman, &image,
+            )
+            .await
+        {
+            eprintln!(
+                "[module_supervisor] pre-pull for start failed (continuing — cache may suffice): {}",
+                e
+            );
+        }
+    }
+
     let _ = Command::new(&podman).silent()
         .args(["rm", "-f", &container_name])
         .stdout(Stdio::null())
@@ -341,6 +370,35 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 /// catalog cache.
 pub type ManifestResolver = Box<dyn Fn(&str) -> Option<ModuleManifest> + Send + Sync>;
 
+/// v0.2.49 Phase 3 production resolver. Walks the on-disk catalog the
+/// hub already maintains (`<vct_root_dir>/modules/<id>/vct-module.json`
+/// AND `<vct_root_dir>/bundled_manifests/*.json`) and returns the first
+/// manifest whose `id` matches the requested module_id.
+///
+/// Soft-fail: a missing / unparseable manifest returns `None`, matching
+/// the `ManifestResolver` contract used by `resume_containers_on_startup`.
+/// The caller logs the miss and skips the row.
+///
+/// Why a hub-local resolver (and not delegating to `commands::modules.rs`):
+/// the launcher's catalog scanner depends on Tauri State + the
+/// launcher's own paths module, neither reachable from this crate.
+/// Re-using `modules_api::scan_manifests` keeps the lookup logic
+/// in one place AND keeps the cross-crate boundary clean.
+pub fn lookup_manifest_by_id(module_id: &str) -> Option<ModuleManifest> {
+    super::modules_api::scan_manifests()
+        .into_iter()
+        .find(|(_, m)| m.id == module_id)
+        .map(|(_, m)| m)
+}
+
+/// v0.2.49 Phase 3: production `ManifestResolver` boxed for injection
+/// into [`resume_containers_on_startup`]. Wraps [`lookup_manifest_by_id`].
+/// Production callers (`server.rs::start_hub_server`) inject this;
+/// tests pass a custom closure that returns from an in-memory map.
+pub fn real_manifest_resolver() -> ManifestResolver {
+    Box::new(|id: &str| lookup_manifest_by_id(id))
+}
+
 /// Injection point for the NULL-container-name branch's container-start
 /// step. Production callers pass [`real_start_after_install`] (which
 /// wraps [`start_container_after_install`] and therefore shells out to
@@ -442,7 +500,7 @@ pub async fn resume_containers_on_startup_with_starter(
             return;
         }
     };
-    for (project_id, module_id, container_name_opt) in rows {
+    for (project_id_opt, module_id, container_name_opt) in rows {
         // Load the manifest first — both the runtime-type gate AND the
         // restart paths need it.
         let manifest = match resolve_manifest(&module_id) {
@@ -458,12 +516,7 @@ pub async fn resume_containers_on_startup_with_starter(
             }
         };
 
-        // Runtime-type gate: mirrors the install-time auto-start gate
-        // in `modules.rs` (NEW-3 widening, v0.2.38). Only modules that
-        // are container_pull-installed AND declare a long-running
-        // (`container` | `service`) runtime should be auto-resumed.
-        // Older / non-container modules (git_clone, local) and
-        // on-demand runtime types are excluded by this branch.
+        // Runtime-type gate (NEW-3 widening, v0.2.38).
         let is_container_distributed =
             manifest.install.method == InstallMethod::ContainerPull
                 && matches!(manifest.runtime.r#type.as_str(), "container" | "service");
@@ -471,9 +524,7 @@ pub async fn resume_containers_on_startup_with_starter(
             continue;
         }
 
-        // Existing path: known container_name → probe + restart if not
-        // running. Skip the work entirely when the container is
-        // already up.
+        // Short-circuit if container already running.
         if let Some(ref container_name) = container_name_opt {
             let running = is_container_running(container_name).await.unwrap_or(false);
             if running {
@@ -481,87 +532,221 @@ pub async fn resume_containers_on_startup_with_starter(
             }
         }
 
-        // Resolve project + rl_port once for both branches below.
-        let project = match db.get_project(&project_id) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                eprintln!(
-                    "[module_supervisor] resume: project {} not found, skipping",
-                    project_id
-                );
-                continue;
+        // v0.2.49 Stream A: branch on project_id presence.
+        //
+        // * `project_id IS NULL` ⇒ GLOBAL row. The hub's supervisor
+        //   currently delegates global container start to the launcher
+        //   via the lifecycle proxy (see launcher/src/commands/
+        //   module_service.rs::start_global_container_for_module).
+        //   When the hub runs WITHOUT the launcher (detached service),
+        //   the global row resume path falls through to a stub-log;
+        //   `start_after_install` only handles per-project rows.
+        //   Future iteration: extend `StartAfterInstall` with a global
+        //   shape OR factor the global start helper into
+        //   container_runtime.rs and call it here directly.
+        //
+        //   For v0.2.49 Stream A the hub's resume still issues the
+        //   start for global rows via direct podman invocation through
+        //   the shared `container_runtime` helpers — see the closure
+        //   below. The launcher's resume sweep does the same for
+        //   global rows; both code paths produce byte-identical
+        //   container args via the shared helpers (DEDUP_SENTINEL
+        //   asserts this).
+        match project_id_opt {
+            None => {
+                // GLOBAL path — hub side.
+                if let Err(e) =
+                    start_global_container_supervisor(&manifest, &module_id).await
+                {
+                    eprintln!(
+                        "[module_supervisor] resume: start_global_container_supervisor({}): {}",
+                        module_id, e
+                    );
+                    let _ = db.set_global_module_last_error(&module_id, Some(&e));
+                } else {
+                    // Persist the resolved container name back to the row
+                    // so subsequent resumes short-circuit on the
+                    // running-probe path.
+                    let name_template = manifest
+                        .runtime
+                        .resolve_container_name_template(&manifest.id);
+                    if let Ok(name) =
+                        vct_launcher_core::services::container_runtime::resolve_global_container_name(
+                            &name_template,
+                            &module_id,
+                        )
+                    {
+                        let _ = db.set_global_module_container_name(&module_id, &name);
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "[module_supervisor] resume: get_project({}): {}",
-                    project_id, e
-                );
-                continue;
-            }
-        };
-
-        match container_name_opt {
-            Some(_container_name) => {
-                // Existing path: name was previously resolved + persisted;
-                // restart with the same name. `start_container_for_module`
-                // re-resolves from the manifest (via NEW-3.B defaulting
-                // helpers if needed), which will produce the same name
-                // for the same `(module_id, project_slug)` pair.
-                let rl_port = match ensure_project_rl_port(db, &project) {
-                    Ok(p) => p,
+            Some(project_id) => {
+                // PER-PROJECT path.
+                let project = match db.get_project(&project_id) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        eprintln!(
+                            "[module_supervisor] resume: project {} not found, skipping",
+                            project_id
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         eprintln!(
-                            "[module_supervisor] resume: ensure_rl_port({}): {}",
+                            "[module_supervisor] resume: get_project({}): {}",
                             project_id, e
                         );
                         continue;
                     }
                 };
-                let ctx = PlaceholderCtx::new(&module_id);
-                if let Err(e) =
-                    start_container_for_module(&manifest, &ctx, &project, rl_port).await
-                {
-                    eprintln!(
-                        "[module_supervisor] resume: start_container_for_module({}, {}): {}",
-                        project_id, module_id, e
-                    );
-                }
-            }
-            None => {
-                // v0.2.40 (NEW-3.E) path: container_name=NULL means the
-                // install-time auto-start path either failed or never ran
-                // (e.g. install predates v0.2.39 NEW-3.B's defaulting
-                // helpers). Route through `start_container_after_install`
-                // — same path install-time auto-start uses post-v0.2.39.
-                // This both starts the container AND persists the
-                // resolved container_name back to the DB row so the
-                // existing-path branch picks it up on subsequent
-                // resumes.
-                //
-                // v0.2.46: invoked via the injected `start_after_install`
-                // so tests can substitute a deterministic stub instead of
-                // requiring a real podman + cached image on the test host.
-                // Production code goes through `real_start_after_install`,
-                // which is byte-equivalent to calling
-                // `start_container_after_install` directly.
-                if let Err(e) =
-                    start_after_install(&manifest, &project, db).await
-                {
-                    eprintln!(
-                        "[module_supervisor] resume: start_container_after_install({}, {}): {}",
-                        project_id, module_id, e
-                    );
-                    // Mirror NEW-3.C: surface the failure to last_error so
-                    // the GUI tile can render a clear failure state. Status
-                    // intentionally stays 'installed' (the install
-                    // succeeded; only the post-boot container start
-                    // failed). Soft-fail: ignore the DB write error here
-                    // too — it's already a degraded path.
-                    let _ = db.set_module_last_error(&project_id, &module_id, Some(&e));
+
+                match container_name_opt {
+                    Some(_container_name) => {
+                        let rl_port = match ensure_project_rl_port(db, &project) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                eprintln!(
+                                    "[module_supervisor] resume: ensure_rl_port({}): {}",
+                                    project_id, e
+                                );
+                                continue;
+                            }
+                        };
+                        let ctx = PlaceholderCtx::new(&module_id);
+                        if let Err(e) =
+                            start_container_for_module(&manifest, &ctx, &project, rl_port).await
+                        {
+                            eprintln!(
+                                "[module_supervisor] resume: start_container_for_module({}, {}): {}",
+                                project_id, module_id, e
+                            );
+                        }
+                    }
+                    None => {
+                        if let Err(e) =
+                            start_after_install(&manifest, &project, db).await
+                        {
+                            eprintln!(
+                                "[module_supervisor] resume: start_container_after_install({}, {}): {}",
+                                project_id, module_id, e
+                            );
+                            let _ =
+                                db.set_module_last_error(&project_id, &module_id, Some(&e));
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// v0.2.49 Stream A: hub-side global container start. Mirrors the
+/// launcher's `start_global_container_for_module` byte-for-byte via the
+/// shared `container_runtime` helpers — see the
+/// `DEDUP_SENTINEL` assertion in core for the de-duplication contract.
+///
+/// Returns `Ok(container_name)` on success; the caller persists the
+/// container_name to the DB row. Returns `Err(...)` on any podman error
+/// or missing manifest field.
+pub async fn start_global_container_supervisor(
+    manifest: &ModuleManifest,
+    module_id: &str,
+) -> Result<String, String> {
+    use vct_launcher_core::services::container_runtime::{
+        build_podman_run_args_global, ensure_volume_host_dirs_global, resolve_global_container_name,
+        resolve_image_ref,
+    };
+
+    /// Fixed RL listen port — kept in sync with the launcher's
+    /// `GLOBAL_RL_PORT` constant. If the launcher's constant changes,
+    /// update this one too (the hub doesn't depend on the launcher
+    /// crate, so the constant is duplicated here).
+    const GLOBAL_RL_PORT: u16 = 11443;
+
+    let runtime = &manifest.runtime;
+    if !matches!(runtime.r#type.as_str(), "container" | "service") {
+        return Err(format!(
+            "start_global_container_supervisor called for non-container runtime '{}'",
+            runtime.r#type
+        ));
+    }
+
+    let name_template = runtime.resolve_container_name_template(&manifest.id);
+    let container_name = resolve_global_container_name(&name_template, module_id)?;
+    let image_template = runtime.resolve_image_ref(
+        manifest.install.container.as_ref().ok_or_else(|| {
+            "install.container block missing — required for container/service modules".to_string()
+        })?,
+        &manifest.version,
+    );
+
+    let gpu_mode = read_persisted_gpu_mode_for_supervisor();
+    let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
+
+    let podman = detect_container_runtime().await?;
+
+    if gpu_mode.is_some() && manifest.install.method == InstallMethod::ContainerPull {
+        if let Err(e) =
+            vct_launcher_core::services::container_runtime::pre_pull_with_auth_for_start(
+                manifest, &podman, &image,
+            )
+            .await
+        {
+            eprintln!(
+                "[module_supervisor] global pre-pull for start failed (continuing — cache may suffice): {}",
+                e
+            );
+        }
+    }
+
+    let _ = Command::new(&podman)
+        .silent()
+        .args(["rm", "-f", &container_name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    let ctx = PlaceholderCtx::new(&manifest.id);
+    ensure_volume_host_dirs_global(manifest, &ctx, GLOBAL_RL_PORT).await;
+
+    let args =
+        build_podman_run_args_global(manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image)?;
+
+    let mut cmd = Command::new(&podman).silent();
+    cmd.args(&args);
+    cmd.env_clear();
+    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+        .await
+        .map_err(|_| format!("{} run timed out after 60s for {}", podman, container_name))?
+        .map_err(|e| format!("spawn {} run: {}", podman, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} run failed (exit {}) for {}: {}",
+            podman,
+            output.status.code().unwrap_or(-1),
+            container_name,
+            stderr.chars().take(500).collect::<String>()
+        ));
+    }
+
+    Ok(container_name)
 }
 
 /// Helper used by the hub-side test fixtures to assert state without a
@@ -637,6 +822,7 @@ mod tests {
                     rotate_weights: false,
                     rotate_weights_endpoint: None,
                 }),
+                scope: vct_launcher_core::manifest::InstallScope::PerProject,
             },
             secrets: vec![],
             settings: vec![],
@@ -700,6 +886,12 @@ mod tests {
             consumes: vec![],
             gui: None,
             db: None,
+            // v0.2.49 access-matrix item #13 (RL chat) — global-scope
+            // modules can declare KG collections that get auto-seeded
+            // into kg_collection_access for every project. The
+            // rl-reranker test fixture is a CONSUMER, not a producer,
+            // so it declares none.
+            kg_collections: None,
         }
     }
 
@@ -1323,5 +1515,257 @@ mod tests {
             "module_supervisor::DEDUP_SENTINEL must equal the core constant — \
              a mismatch indicates accidental local-shadow re-introduction"
         );
+    }
+
+    // ─── v0.2.49 Phase 3: hub-side manifest resolver ───────────────────
+
+    /// v0.2.49 Phase 3 helper: `VCT_STATE_DIR`-scoped guard used by the
+    /// manifest-resolver tests below.
+    struct VctStateDirGuard {
+        _td: tempfile::TempDir,
+        previous: Option<String>,
+    }
+
+    impl VctStateDirGuard {
+        fn new() -> Self {
+            use std::sync::{Mutex, OnceLock};
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let _g = LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let td = tempfile::tempdir().expect("tempdir");
+            let previous = std::env::var("VCT_STATE_DIR").ok();
+            std::env::set_var("VCT_STATE_DIR", td.path());
+            drop(_g);
+            Self { _td: td, previous }
+        }
+
+        fn vct_root(&self) -> std::path::PathBuf {
+            self._td.path().to_path_buf()
+        }
+    }
+
+    impl Drop for VctStateDirGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+                None => std::env::remove_var("VCT_STATE_DIR"),
+            }
+        }
+    }
+
+    /// Write a minimal valid manifest JSON to
+    /// `<vct_root>/bundled_manifests/<module_id>.json`.
+    fn write_manifest(vct_root: &std::path::Path, module_id: &str) {
+        let dir = vct_root.join("bundled_manifests");
+        std::fs::create_dir_all(&dir).expect("mkdir bundled_manifests");
+        let path = dir.join(format!("{}.json", module_id));
+        let json = serde_json::json!({
+            "manifest_version": 1,
+            "id": module_id,
+            "name": module_id,
+            "version": "0.0.1",
+            "description": "test",
+            "category": "paid-independent",
+            "compatibility": { "hosts": [] },
+            "license": { "required": false },
+            "requirements": {},
+            "install": {
+                "method": "container_pull",
+                "install_dir": format!("/tmp/{}", module_id),
+                "post_install": [],
+                "container": {
+                    "image": format!("ghcr.io/test/{}", module_id),
+                    "tag_from_version": true,
+                    "pull_token_endpoint": "https://example.invalid/x",
+                    "pull_token_method": "POST",
+                    "rotate_weights": false
+                }
+            },
+            "secrets": [],
+            "settings": [],
+            "runtime": {
+                "type": "container",
+                "command": "echo",
+                "args": [],
+                "env_fixed": {},
+                "env_derived": {},
+                "env_from_secrets": [],
+                "env_from_settings": [],
+                "ports": [],
+                "volumes": [],
+                "auto_restart": false,
+                "gpu_optional": true
+            },
+            "provides": [],
+            "consumes": []
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).expect("write manifest");
+    }
+
+    /// v0.2.49: `lookup_manifest_by_id` walks the on-disk catalog and
+    /// returns the manifest whose `id` matches. Pins the production
+    /// resolver wiring used by `server.rs` + `lifecycle_api::module_start`.
+    #[test]
+    fn v0249_lookup_manifest_by_id_finds_bundled() {
+        let g = VctStateDirGuard::new();
+        write_manifest(&g.vct_root(), "vct-test-module-49a");
+        let m = lookup_manifest_by_id("vct-test-module-49a")
+            .expect("manifest must be found by id");
+        assert_eq!(m.id, "vct-test-module-49a");
+        assert_eq!(m.runtime.r#type, "container");
+    }
+
+    /// v0.2.49: `lookup_manifest_by_id` returns `None` for an
+    /// unknown id (must not panic, must not pick a wrong manifest).
+    #[test]
+    fn v0249_lookup_manifest_by_id_returns_none_for_unknown() {
+        let _g = VctStateDirGuard::new();
+        // Empty catalog directory; nothing to find.
+        assert!(
+            lookup_manifest_by_id("vct-no-such-module").is_none(),
+            "unknown module_id must return None"
+        );
+    }
+
+    /// v0.2.49: `real_manifest_resolver()` is a thin closure-wrapping
+    /// of `lookup_manifest_by_id`. Pins that both paths agree on the
+    /// same lookup.
+    #[test]
+    fn v0249_real_manifest_resolver_matches_lookup_by_id() {
+        let g = VctStateDirGuard::new();
+        write_manifest(&g.vct_root(), "vct-test-module-49b");
+        let resolver = real_manifest_resolver();
+        let via_resolver = resolver("vct-test-module-49b").expect("resolver finds it");
+        let via_lookup = lookup_manifest_by_id("vct-test-module-49b").expect("lookup finds it");
+        assert_eq!(via_resolver.id, via_lookup.id);
+        assert_eq!(via_resolver.runtime.r#type, via_lookup.runtime.r#type);
+    }
+
+    /// v0.2.49: pre_pull_with_auth_for_start signature parity — the
+    /// supervisor's `start_container_for_module_with_gpu_mode` calls
+    /// the shared core helper. We can't assert behaviour without a
+    /// real podman, but we CAN assert the shared symbol is reachable
+    /// from this crate (a refactor that accidentally removed the
+    /// re-export OR renamed the function would fail compilation here).
+    #[allow(dead_code)]
+    fn _v0249_pre_pull_with_auth_for_start_reachable_from_hub() {
+        async fn _typecheck(
+            m: &ModuleManifest,
+            r: &str,
+            i: &str,
+        ) -> Result<(), String> {
+            vct_launcher_core::services::container_runtime::pre_pull_with_auth_for_start(m, r, i)
+                .await
+        }
+        let _ = _typecheck;
+    }
+
+    // ─── v0.2.49 Stream A: global resume path ───────────────────────────
+
+    /// Resume sweep handles a GLOBAL install row (project_id=NULL): the
+    /// resolver is invoked, the gate passes (service + container_pull),
+    /// and the global path is taken. Whether the start succeeds or fails
+    /// depends on the test host's container runtime + cached image
+    /// availability — assert only on the deterministic side effects
+    /// (resolver invocation + no panic).
+    ///
+    /// Note: the manifest id MUST match the install row's module_id, or
+    /// `make_manifest`'s hardcoded id leaks downstream. We use the fixture
+    /// manifest's id ("vct-rl-reranker") for the install row.
+    #[test]
+    fn v0249_resume_global_install_row_invokes_resolver_for_global_path() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let db = Db::open_in_memory().expect("DB");
+
+            db.insert_global_module_install(
+                "install-id-global-1",
+                "vct-rl-reranker",
+                "0.2.10",
+                "/tmp/vct-rl-reranker",
+            )
+            .expect("global insert");
+            db.set_global_module_status(
+                "vct-rl-reranker",
+                ModuleStatus::Installed,
+                None,
+            )
+            .expect("set global installed");
+
+            let mut manifests = std::collections::HashMap::new();
+            manifests.insert(
+                "vct-rl-reranker".to_string(),
+                make_manifest_for_gate("service", InstallMethod::ContainerPull),
+            );
+            let (resolver, visited) = tracking_resolver(manifests);
+
+            // Smoke: resume must not panic on a global row.
+            resume_containers_on_startup(&db, resolver).await;
+
+            // Resolver was invoked even for global rows.
+            assert!(
+                visited
+                    .lock()
+                    .unwrap()
+                    .contains(&"vct-rl-reranker".to_string()),
+                "resolver must be invoked for global rows too"
+            );
+
+            // The global row is still there (no DB corruption).
+            let g_row = db
+                .get_global_module_install("vct-rl-reranker")
+                .expect("get global")
+                .expect("global row exists");
+            assert_eq!(g_row.module_id, "vct-rl-reranker");
+            assert!(g_row.project_id.is_none(), "still NULL project_id");
+        });
+    }
+
+    /// Resume sweep: a global row with `git_clone` install method is
+    /// SKIPPED by the gate (same behaviour as per-project rows). The
+    /// resolver IS still invoked (gate runs after resolution).
+    #[test]
+    fn v0249_resume_global_row_with_git_clone_skipped_by_gate() {
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let db = Db::open_in_memory().expect("DB");
+            db.insert_global_module_install(
+                "install-g",
+                "vct-rl-reranker",
+                "0.2.10",
+                "/tmp/x",
+            )
+            .expect("insert global");
+            db.set_global_module_status(
+                "vct-rl-reranker",
+                ModuleStatus::Installed,
+                None,
+            )
+            .expect("installed");
+
+            let mut manifests = std::collections::HashMap::new();
+            manifests.insert(
+                "vct-rl-reranker".to_string(),
+                make_manifest_for_gate("service", InstallMethod::GitClone),
+            );
+            let (resolver, visited) = tracking_resolver(manifests);
+
+            resume_containers_on_startup(&db, resolver).await;
+
+            assert!(visited.lock().unwrap().contains(&"vct-rl-reranker".to_string()));
+
+            // last_error must NOT be set — the gate rejected before reaching
+            // the start path.
+            let g_row = db
+                .get_global_module_install("vct-rl-reranker")
+                .unwrap()
+                .unwrap();
+            assert!(
+                g_row.last_error.is_none(),
+                "git_clone global row must NOT trigger start path (no last_error)"
+            );
+        });
     }
 }

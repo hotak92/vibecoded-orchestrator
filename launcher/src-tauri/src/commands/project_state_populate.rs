@@ -136,61 +136,90 @@ fn populate_kg_collection_access(
     db: &Db,
     report: &mut PopulateReport,
 ) {
-    let pascal = sanitize_kg_collection(project_name);
-    let primary_collection = format!("{}_KnowledgeGraph", pascal);
-    let dev_collection = format!("{}_Development", pascal);
-    // Single source of truth — see project_env_settings.rs. Renamed from
-    // "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 / Group E.
-    let shared_collection = LAST_RESORT_SHARED_KG_COLLECTION;
-
-    // Project's OWN primary KG: write access by default. The project's
-    // hooks + MCP server need to write to this — the .claude/env carries
-    // KG_COLLECTION pointing here.
-    grant_default_access(db, project_id, &primary_collection, "write", report);
-
-    // Project's OWN development collection: write access by default.
-    // Same rationale — the development collection is the project's
-    // private workspace for in-flight notes.
-    grant_default_access(db, project_id, &dev_collection, "write", report);
-
-    // Cross-project SHARED KG: read access by default. Writes to the
-    // shared KG are gated separately via `SHARED_KG_WRITE_DISABLED` env
-    // (asymmetric semantic since 2026-05-01) — the access-matrix row
-    // is purely a read-gate. Users who want to grant write access can
-    // flip the level via the GUI access matrix; users who want to
-    // bottle up writes flip `SHARED_KG_WRITE_DISABLED=true` via the
-    // shared-KG toggle (which doesn't touch this row).
-    grant_default_access(db, project_id, shared_collection, "read", report);
+    // v0.2.49 access-matrix Phase 4 (item #10): delegate to the
+    // centralized core helper so this surface and the hub's
+    // `vct project create` path stay in lock-step. The core helper:
+    //   - sanitizes `project_name` (own KG/dev names)
+    //   - resolves the canonical shared KG name from `app_state`
+    //     (Phase 1 single-source-of-truth)
+    //   - writes three rows via `kg_seed_access` (INSERT OR IGNORE):
+    //     own primary → "write", own dev → "write", shared → "read"
+    //   - returns the count of rows actually inserted (user-configured
+    //     rows are preserved; INSERT OR IGNORE is the idempotent
+    //     primitive replacing the prior get-then-set check).
+    //
+    // The launcher-side wrapper still owns:
+    //   - `PopulateReport.kg_access_rows_inserted` accounting (for the
+    //     `create_project_v2` summary log).
+    //   - Warning emission on SQL errors (preserves prior soft-fail
+    //     contract — project creation never fails over an access-matrix
+    //     hiccup).
+    match db.populate_kg_collection_access_for_project(project_id, project_name) {
+        Ok(n) => report.kg_access_rows_inserted += n,
+        Err(e) => {
+            report.warnings.push(format!(
+                "populate_kg_collection_access_for_project({}, {}): {}",
+                project_id, project_name, e
+            ));
+        }
+    }
 }
 
-fn grant_default_access(
+/// v0.2.49 item #13 (M-3): populate KG access rows for a global-scope
+/// module's declared KG collections across ALL projects.
+///
+/// Called by `commands/modules.rs::install_module` (Stream A's `is_global`
+/// branch) when `manifest.kg_collections.is_some()`. For each declared
+/// collection, iterates `db.list_projects()` and seeds the resolver's
+/// default access level (`db::access::resolve_default_access_level`).
+///
+/// Idempotency / user-preservation: uses `db.kg_seed_access` (INSERT OR
+/// IGNORE) so a row already present from a prior install is preserved
+/// untouched. User-configured downgrades (`is_user_configured()` TRUE)
+/// survive re-runs of the global install.
+///
+/// Per-project modules do NOT use this path — their access matrix is
+/// seeded by the per-project `populate_kg_collection_access` helper at
+/// project-create time.
+pub fn populate_kg_collection_access_for_global_module(
+    collections: &[String],
     db: &Db,
-    project_id: &str,
-    collection: &str,
-    level: &str,
     report: &mut PopulateReport,
 ) {
-    // Idempotency: preserve any user-set level by short-circuiting when
-    // a row already exists for this (project, collection). The `kg_set_access`
-    // helper would otherwise upsert and clobber.
-    match db.kg_get_access(project_id, collection) {
-        Ok(Some(_)) => {
-            // User-set or previously-defaulted row already exists.
-            // Leave alone.
-        }
-        Ok(None) => {
-            if let Err(e) = db.kg_set_access(project_id, collection, level) {
-                report
-                    .warnings
-                    .push(format!("kg_set_access({}): {}", collection, e));
-            } else {
-                report.kg_access_rows_inserted += 1;
-            }
-        }
+    if collections.is_empty() {
+        return;
+    }
+    let projects = match db.list_projects() {
+        Ok(rows) => rows,
         Err(e) => {
-            report
-                .warnings
-                .push(format!("kg_get_access({}): {}", collection, e));
+            report.warnings.push(format!("list_projects: {}", e));
+            return;
+        }
+    };
+    for collection in collections {
+        for project in &projects {
+            let level = match db.resolve_default_access_level(&project.id, collection) {
+                Ok(l) => l,
+                Err(e) => {
+                    report.warnings.push(format!(
+                        "resolve_default_access_level({}, {}): {}",
+                        project.id, collection, e
+                    ));
+                    continue;
+                }
+            };
+            match db.kg_seed_access(&project.id, collection, level.as_str()) {
+                Ok(1) => report.kg_access_rows_inserted += 1,
+                Ok(0) => {} // row exists; preserved
+                Ok(other) => report.warnings.push(format!(
+                    "kg_seed_access({}, {}) returned unexpected count: {}",
+                    project.id, collection, other
+                )),
+                Err(e) => report.warnings.push(format!(
+                    "kg_seed_access({}, {}): {}",
+                    project.id, collection, e
+                )),
+            }
         }
     }
 }
@@ -1667,7 +1696,10 @@ mod tests {
         let report =
             populate_project_state_from_filesystem("p1", "Acme", &folder, &db);
 
-        // 3 default rows: own primary (write), own dev (write), shared (read)
+        // 3 default rows: own primary (write), own dev (write), shared (WRITE).
+        // v0.2.49 Step F SB2 (L2-SB1): shared default flipped read→write
+        // to align with `resolve_default_access_level`'s F-2a output +
+        // Step D's force-upgrade migration target.
         assert_eq!(report.kg_access_rows_inserted, 3);
 
         let access = db.kg_list_access("p1").unwrap();
@@ -1679,7 +1711,8 @@ mod tests {
         assert_eq!(by_collection.get("Acme_Development"), Some(&"write"));
         assert_eq!(
             by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
-            Some(&"read")
+            Some(&"write"),
+            "v0.2.49 Step F SB2: shared default is 'write' (was 'read' pre-fix)"
         );
 
         std::fs::remove_dir_all(&folder).ok();
@@ -2452,5 +2485,183 @@ mod tests {
         assert!(snap.codegraph_binding.is_some());
 
         std::fs::remove_dir_all(&folder).ok();
+    }
+
+    // ─── v0.2.49 item #13 (M-3): global-scope module KG access populate ──
+    // Tests for Option A — manifest field `kg_collections` + populate code
+    // running on `install.scope=global` install. Pre-implementation these
+    // should fail to COMPILE because:
+    //   - `populate_kg_collection_access_for_global_module` doesn't exist
+    //   - `ModuleManifest::kg_collections` field doesn't exist
+    //   - `Db::resolve_default_access_level` doesn't exist
+    //
+    // When main chat Phase 2 lands `resolve_default_access_level` + I add
+    // the manifest field + the populate helper, these tests pass.
+
+    #[test]
+    fn global_module_with_kg_collections_populates_access_for_all_projects() {
+        let _folder = scratch_dir("global-kg-populate");
+        let db = make_db_with_project("p1", "P1");
+        // Add a second project so we can verify access lands on BOTH.
+        let folder2 = if cfg!(windows) { r"C:\tmp\y" } else { "/tmp/y" };
+        let slug2 = db.generate_unique_slug("P2").unwrap();
+        db.insert_project("p2", "P2", folder2, crate::db::models::ProjectHost::Base, &slug2).unwrap();
+
+        let mut report = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &["RLMeta_KnowledgeGraph".to_string()],
+            &db,
+            &mut report,
+        );
+
+        // 1 collection × 2 projects = 2 access rows inserted.
+        assert_eq!(report.kg_access_rows_inserted, 2);
+        assert!(report.warnings.is_empty(), "warnings: {:?}", report.warnings);
+
+        let p1_access = db.kg_get_access("p1", "RLMeta_KnowledgeGraph").unwrap();
+        let p2_access = db.kg_get_access("p2", "RLMeta_KnowledgeGraph").unwrap();
+        // Both projects get the resolver's default (write for own; for
+        // a global-shipped collection neither project owns, the resolver
+        // determines this — likely write per F-2a "default R/W on shared").
+        assert!(p1_access.is_some());
+        assert!(p2_access.is_some());
+    }
+
+    #[test]
+    fn global_module_with_empty_kg_collections_no_access_rows() {
+        let _folder = scratch_dir("global-kg-empty");
+        let db = make_db_with_project("p1", "P1");
+
+        let mut report = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(&[], &db, &mut report);
+
+        assert_eq!(report.kg_access_rows_inserted, 0);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn global_module_kg_collections_idempotent_preserves_user_level() {
+        // End-to-end invariant verification leveraging Step A.5's
+        // `kg_seed_access` non-clobber semantics + `is_user_configured()`:
+        //   1. First install: kg_seed_access writes row with
+        //      created_at == updated_at → is_user_configured FALSE
+        //   2. User downgrades via kg_set_access (mutation path) → UPSERT
+        //      bumps updated_at → is_user_configured TRUE
+        //   3. Second install: kg_seed_access detects existing row,
+        //      returns 0 (preserved), no clobber. Row stays at "none" +
+        //      still flagged user_configured.
+        let _folder = scratch_dir("global-kg-idempotent");
+        let db = make_db_with_project("p1", "P1");
+
+        // First install via the seed path.
+        let mut report1 = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &["RLMeta_KG".to_string()],
+            &db,
+            &mut report1,
+        );
+        assert_eq!(report1.kg_access_rows_inserted, 1);
+        let row_seeded = db.kg_get_access_row("p1", "RLMeta_KG").unwrap().unwrap();
+        assert!(
+            !row_seeded.is_user_configured(),
+            "freshly-seeded row should NOT read as user-configured"
+        );
+
+        // Sleep 2ms to ensure user mutation lands in a distinct millisecond
+        // from the seed write — `is_user_configured` reads
+        // `updated_at != created_at` (both in millis). Without this,
+        // back-to-back calls in test collide on the same ms and the
+        // assertion below would flake. Production callers always separate
+        // seed and user mutation by orders of magnitude more.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // User upgrades to write via kg_set_access (user-mutation path).
+        //
+        // IMPORTANT: must use a level DIFFERENT from what kg_seed_access
+        // wrote (the resolver returns `Denied`/`none` for this row since
+        // p1 has no role='primary'/'shared' binding to RLMeta_KG). Per
+        // v0.2.49 Step F SB4 (L1-F4), kg_set_access's UPSERT bumps
+        // `updated_at` ONLY when the access_level actually changes — a
+        // no-op rewrite (writing the same value) preserves the prior
+        // `updated_at`. So if this test wrote `none` (the seeded value),
+        // the predicate would stay FALSE (intended SB4 behaviour: no-op
+        // writes don't flip the user-configured signal).
+        //
+        // To pin the intended "user mutation flips the flag" semantic,
+        // write a DIFFERENT level here. `write` is the natural choice
+        // — it represents "user granted themselves access to a module's
+        // declared collection." That's a real mutation; SB4 bumps
+        // updated_at; predicate flips TRUE.
+        db.kg_set_access("p1", "RLMeta_KG", "write").unwrap();
+        let row_after_user = db.kg_get_access_row("p1", "RLMeta_KG").unwrap().unwrap();
+        assert!(
+            row_after_user.is_user_configured(),
+            "user mutation via kg_set_access (level change) should flip is_user_configured to TRUE"
+        );
+
+        // Second install: kg_seed_access returns 0, row preserved (still 'write').
+        let mut report2 = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &["RLMeta_KG".to_string()],
+            &db,
+            &mut report2,
+        );
+        assert_eq!(
+            report2.kg_access_rows_inserted, 0,
+            "re-install must not clobber a user-configured row"
+        );
+        assert_eq!(
+            db.kg_get_access("p1", "RLMeta_KG").unwrap(),
+            Some("write".to_string()),
+            "user's explicit upgrade preserved (kg_seed_access INSERT OR \
+             IGNORE doesn't clobber existing rows)"
+        );
+
+        // The user-configured invariant survives the re-install.
+        let row_final = db.kg_get_access_row("p1", "RLMeta_KG").unwrap().unwrap();
+        assert!(
+            row_final.is_user_configured(),
+            "re-install must preserve is_user_configured invariant"
+        );
+    }
+
+    #[test]
+    fn global_module_multiple_kg_collections_populates_all() {
+        let _folder = scratch_dir("global-kg-multi");
+        let db = make_db_with_project("p1", "P1");
+
+        let mut report = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &[
+                "MetaKG_A".to_string(),
+                "MetaKG_B".to_string(),
+                "MetaKG_C".to_string(),
+            ],
+            &db,
+            &mut report,
+        );
+
+        // 3 collections × 1 project = 3 rows.
+        assert_eq!(report.kg_access_rows_inserted, 3);
+        assert!(db.kg_get_access("p1", "MetaKG_A").unwrap().is_some());
+        assert!(db.kg_get_access("p1", "MetaKG_B").unwrap().is_some());
+        assert!(db.kg_get_access("p1", "MetaKG_C").unwrap().is_some());
+    }
+
+    #[test]
+    fn global_module_no_projects_returns_empty_report() {
+        // Edge case: orchestrator boots before any project is registered.
+        // Global module install should not crash.
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        let mut report = PopulateReport::default();
+        populate_kg_collection_access_for_global_module(
+            &["MetaKG".to_string()],
+            &db,
+            &mut report,
+        );
+
+        assert_eq!(report.kg_access_rows_inserted, 0);
+        assert!(report.warnings.is_empty());
     }
 }

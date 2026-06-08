@@ -130,10 +130,21 @@ def _build_launcher_db(db_path: Path, rows: list[tuple[str, str, str]]) -> None:
 
     Each row is ``(project_id, role, collection_name)``. Other columns
     get sane defaults (None / '{}' / current millis).
+
+    v0.2.49 Bug N: also sets ``journal_mode = WAL`` to mirror the
+    launcher's production config (`launcher/src-tauri/vct-launcher-core/
+    src/db.rs::init_pragmas`). In WAL mode, RO connections do NOT block
+    on writer transactions — which is the load-bearing property the
+    RO-first detection path in `_self_heal_kg_bindings_on_update`
+    depends on. Without WAL, the default rollback-journal mode causes
+    RO connections to block on writer transactions just like RW ones,
+    making the Bug N regression test indistinguishable from the
+    pre-fix path.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     try:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.execute(_PROJECT_KG_BINDINGS_DDL)
         now = int(time.time() * 1000)
         for project_id, role, collection_name in rows:
@@ -261,6 +272,138 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         # No deferral entry — there was nothing to heal.
         ids = [e.condition_id for e in report.entries]
         self.assertNotIn("kg_binding_self_healed", ids)
+
+    def test_self_heal_no_op_uses_ro_mode_and_does_not_open_rw(self):
+        """v0.2.49 Bug N regression: when no rebind is needed, the helper
+        opens launcher.db in RO mode for detection, finds no work, and
+        returns cleanly WITHOUT ever opening an RW connection.
+
+        Pre-Bug-N, this helper opened launcher.db in RW mode unconditionally
+        with timeout=5.0. On hosts where vct-hub is running (the design —
+        hub outlives launcher GUI), every `install.py --update` run hit
+        the 5s writer-lock timeout and emitted a
+        `kg_binding_self_heal_db_error` deferral, even when there was
+        literally nothing to heal. RL chat msg 179 (2026-06-07) reported
+        this and recommended Option A: open RO for detection, only reopen
+        RW if mismatches found.
+
+        Reproducing the exact production lock state in a hermetic test is
+        flaky (depends on whether SQLite's connect-time WAL recovery hits
+        the writer lock for that specific filesystem + journal-mode +
+        SQLite version combination). Instead, pin the CONTRACT
+        deterministically: intercept sqlite3.connect calls and assert
+        that for a no-rebind launcher.db, the helper opens RO exactly
+        once and RW exactly zero times. Pre-Bug-N would open RW once and
+        RO zero times. The behavioral difference is observable without
+        depending on lock-timing.
+        """
+        # Pre-seed: exact-match binding (no rebind needed — the common case).
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        # Intercept sqlite3.connect to count RO vs RW calls. The fix
+        # opens RO via `sqlite3.connect("file:<path>?mode=ro", uri=True)`;
+        # the legacy RW path is `sqlite3.connect(str_path)`.
+        ro_calls: list[str] = []
+        rw_calls: list[str] = []
+        real_connect = sqlite3.connect
+
+        def _tracking_connect(*args, **kwargs):
+            dsn = args[0] if args else kwargs.get("database", "")
+            if kwargs.get("uri") and isinstance(dsn, str) and "mode=ro" in dsn:
+                ro_calls.append(dsn)
+            else:
+                rw_calls.append(dsn)
+            return real_connect(*args, **kwargs)
+
+        report = DeferralReport()
+        # `import sqlite3` is local-to-function inside the helper, so
+        # patch sqlite3.connect at the module level — both the helper's
+        # local import and any other consumer in this process will see
+        # the patched callable.
+        with mock.patch("sqlite3.connect", side_effect=_tracking_connect):
+            install._self_heal_kg_bindings_on_update(report)
+
+        # Post-Bug-N contract: exactly one RO open, ZERO RW opens.
+        self.assertEqual(
+            len(ro_calls),
+            1,
+            f"Bug N: helper should open RO connection ONCE for detection. "
+            f"Got {len(ro_calls)} RO calls: {ro_calls}",
+        )
+        self.assertEqual(
+            len(rw_calls),
+            0,
+            f"Bug N regression: helper should NOT open RW connection when "
+            f"detection finds no rebinds needed (would block on the vct-hub "
+            f"writer lock in production). Got {len(rw_calls)} RW calls: "
+            f"{rw_calls}",
+        )
+
+        # And no deferral entry — RO probe found nothing to heal.
+        ids = [e.condition_id for e in report.entries]
+        self.assertNotIn("kg_binding_self_heal_db_error", ids)
+        self.assertNotIn("kg_binding_self_healed", ids)
+
+    def test_self_heal_rebind_path_still_opens_rw(self):
+        """v0.2.49 Bug N: when detection DOES find rebinds, the helper
+        proceeds to open RW + apply them. Inverse pin: the RO-first
+        optimization must not break the rebind-needed path.
+        """
+        # Pre-seed: lowercase-c binding that needs a rebind.
+        _build_launcher_db(
+            self._db_path,
+            rows=[("p1", "shared", "VibecodedOrchestrator_KnowledgeGraph")],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VibeCodedOrchestrator_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        ro_calls: list[str] = []
+        rw_calls: list[str] = []
+        real_connect = sqlite3.connect
+
+        def _tracking_connect(*args, **kwargs):
+            dsn = args[0] if args else kwargs.get("database", "")
+            if kwargs.get("uri") and isinstance(dsn, str) and "mode=ro" in dsn:
+                ro_calls.append(dsn)
+            else:
+                rw_calls.append(dsn)
+            return real_connect(*args, **kwargs)
+
+        report = DeferralReport()
+        # `import sqlite3` is local-to-function inside the helper, so
+        # patch sqlite3.connect at the module level — both the helper's
+        # local import and any other consumer in this process will see
+        # the patched callable.
+        with mock.patch("sqlite3.connect", side_effect=_tracking_connect):
+            install._self_heal_kg_bindings_on_update(report)
+
+        # RO opened for detection, RW opened to apply.
+        self.assertEqual(
+            len(ro_calls), 1,
+            f"expected 1 RO probe, got {len(ro_calls)} calls: {ro_calls}",
+        )
+        self.assertEqual(
+            len(rw_calls), 1,
+            f"expected 1 RW apply, got {len(rw_calls)} calls: {rw_calls}",
+        )
+
+        # Rebind actually happened (delegating to the existing case-rebind path).
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "shared", "VibeCodedOrchestrator_KnowledgeGraph")],
+            "Bug N must not break the rebind path: lowercase-c binding "
+            "should be rewritten to canonical capital-C.",
+        )
 
     def test_self_heal_no_op_when_no_case_sibling(self):
         # Pre-seed launcher.db with capital-C binding, but Weaviate is
@@ -497,11 +640,16 @@ class SelfHealCaseMismatchTests(unittest.TestCase):
         self.assertNotIn("multi_candidate_prefix_adopt", ids)
 
 
+# v0.2.49 access-matrix Step A.5: schema mirrors migration 029.
+# created_at / updated_at INTEGER NOT NULL DEFAULT 0 (legacy rows
+# backfill to 0; v0.2.49+ INSERTs bind both).
 _KG_COLLECTION_ACCESS_DDL = """
 CREATE TABLE kg_collection_access (
     project_id      TEXT NOT NULL,
     collection_name TEXT NOT NULL,
     access_level    TEXT NOT NULL,
+    created_at      INTEGER NOT NULL DEFAULT 0,
+    updated_at      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project_id, collection_name)
 )
 """
@@ -550,6 +698,24 @@ def _read_access(db_path: Path) -> list[tuple[str, str, str]]:
     try:
         cur = conn.execute(
             "SELECT project_id, collection_name, access_level "
+            "FROM kg_collection_access ORDER BY project_id, collection_name"
+        )
+        return list(cur.fetchall())
+    finally:
+        conn.close()
+
+
+def _read_access_with_audit(
+    db_path: Path,
+) -> list[tuple[str, str, str, int, int]]:
+    """v0.2.49 access-matrix Step A.5: read full row including audit
+    columns. Used by tests that pin the seed-path invariant
+    (`created_at == updated_at` on first INSERT)."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT project_id, collection_name, access_level, "
+            "       created_at, updated_at "
             "FROM kg_collection_access ORDER BY project_id, collection_name"
         )
         return list(cur.fetchall())
@@ -711,6 +877,133 @@ class SelfHealAccessMatrixTests(unittest.TestCase):
             [("p1", "VibeCodedOrchestrator_KnowledgeGraph", "read")],
             "equal privilege: canonical row kept, lowercase-c dropped",
         )
+
+    def test_access_matrix_parity_insert_matches_canonical_schema(self):
+        """v0.2.49 Bug O regression: when the parity self-heal backfills
+        missing kg_collection_access rows (for project_kg_bindings rows
+        without a matching access entry), the INSERT must match the
+        actual schema declared by `migrations/001_initial.sql:63-69`
+        — exactly 3 columns: (project_id, collection_name, access_level).
+
+        Pre-Bug-O the INSERT referenced 5 columns (adding `granted_at`
+        and `updated_at` that were planned but never landed in any
+        migration). Discovered 2026-06-07 via Bug N's empirical dogfood
+        validation: the RW pass would activate on any host with case-
+        rebind OR cross-prefix-adopt needs (the common case post-update),
+        the parity loop would attempt the INSERT, and SQLite would raise
+        `OperationalError: table kg_collection_access has no column named
+        granted_at` — every user hit it on every install.py --update.
+
+        Pin: build launcher.db with (a) a case-mismatched binding row
+        (triggers RW pass entry from the RO probe) AND (b) NO matching
+        kg_collection_access row (triggers the parity-insert). Post-fix:
+        the INSERT succeeds, the new row is observable, no exception.
+        Pre-fix: this test would fail with
+        `OperationalError: ... no column named granted_at`.
+        """
+        # Binding row needs a case-rebind → RW pass activates.
+        # No matching access row → parity-insert fires.
+        _build_launcher_db_with_access(
+            self._db_path,
+            binding_rows=[
+                ("p1", "primary", "vcodev_KnowledgeGraph"),
+            ],
+            access_rows=[],  # ← empty: triggers parity-insert
+        )
+        # Weaviate has the canonical-cased class → case-rebind needed.
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VCODev_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        # Pre-Bug-O this would raise OperationalError during the parity
+        # INSERT. Post-fix it returns cleanly.
+        install._self_heal_kg_bindings_on_update(report)
+
+        # The case-rebind happened (RW pass activated).
+        bindings = _read_bindings(self._db_path)
+        self.assertEqual(
+            bindings,
+            [("p1", "primary", "VCODev_KnowledgeGraph")],
+            "case-rebind path must still work post-Bug-O fix",
+        )
+
+        # Two parity INSERTs happened — schema-matching success:
+        #   1. (p1, VCODev_KnowledgeGraph, write) for the primary binding
+        #   2. (p1, VCODev_Development, write) for the auto-derived
+        #      _Development sibling (install.py L14181 backfill)
+        # The pre-Bug-O code would have raised OperationalError on the
+        # FIRST INSERT and never reached the second.
+        access = _read_access(self._db_path)
+        self.assertEqual(
+            access,
+            [
+                ("p1", "VCODev_Development", "write"),
+                ("p1", "VCODev_KnowledgeGraph", "write"),
+            ],
+            "Bug O regression: parity-insert must succeed against the "
+            "canonical 3-column kg_collection_access schema. Pre-fix the "
+            "INSERT raised OperationalError because it referenced "
+            "granted_at + updated_at columns that no migration defines.",
+        )
+
+    def test_parity_insert_sets_audit_timestamps_equal(self):
+        """v0.2.49 access-matrix Step A.5 (seed-path invariant): the
+        parity self-heal INSERTs are SEED writes (system-driven, not
+        user-driven). Both audit timestamps MUST be set to the SAME
+        value on first INSERT so the Rust-side
+        `KgAccessRow::is_user_configured` predicate reads FALSE for
+        the row.
+
+        This is the load-bearing property that makes the future
+        `is_user_configured(row) := row.updated_at != row.created_at`
+        predicate work correctly for any v0.2.49+ row. Legacy rows
+        (pre-migration-029) have `created_at == updated_at == 0` so
+        they also read as not-user-configured; new rows must
+        preserve the same equality.
+
+        Regression sentinel: if a future install.py change accidentally
+        binds `time.time()*1000` for `updated_at` and `0` for
+        `created_at` (or anything that breaks equality), this test
+        catches it. The Phase 7 force-upgrade migration depends on
+        seed rows reading as NOT user-configured.
+        """
+        _build_launcher_db_with_access(
+            self._db_path,
+            binding_rows=[("p1", "primary", "vcodev_KnowledgeGraph")],
+            access_rows=[],
+        )
+        self._server, self._port = _start_stub_weaviate(
+            classes=["VCODev_KnowledgeGraph"]
+        )
+        self._set_weaviate_url(self._port)
+
+        report = DeferralReport()
+        install._self_heal_kg_bindings_on_update(report)
+
+        access_full = _read_access_with_audit(self._db_path)
+        # Both parity-inserted rows must have created_at == updated_at
+        # AND both must be non-zero (a freshly-seeded v0.2.49+ row).
+        self.assertEqual(
+            len(access_full), 2,
+            f"expected 2 parity-inserted rows, got: {access_full}",
+        )
+        for row in access_full:
+            (_proj_id, _coll, _level, created_at, updated_at) = row
+            self.assertEqual(
+                created_at, updated_at,
+                f"seed-path invariant violated for row {row}: "
+                f"created_at ({created_at}) != updated_at ({updated_at}). "
+                f"Phase 7 force-upgrade migration depends on seed rows "
+                f"reading as NOT user-configured.",
+            )
+            self.assertGreater(
+                created_at, 0,
+                f"v0.2.49+ seed-path INSERT must bind a non-zero "
+                f"timestamp; got row {row}. Zero is the legacy-row "
+                f"sentinel — install.py must not write it.",
+            )
 
     def test_access_matrix_absent_table_does_not_block_binding_heal(self):
         """Older launcher.db schemas may not have `kg_collection_access`.

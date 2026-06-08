@@ -207,3 +207,94 @@ export function statusBadgeLabel(status: ModuleStatus): string {
       return 'Files missing';
   }
 }
+
+/**
+ * Catalog-card action contract — single source of truth for "which action
+ * button does an actionable module-catalog `kind` expose, and which store
+ * method performs it".
+ *
+ * Why this exists: the `/modules` ModuleCatalog tile wired per-status
+ * buttons (Retry / Update / Start) inline, but the Home Library grid
+ * (routes/+page.svelte) and the right detail panel (RightSidebar.svelte)
+ * rendered the SAME status badge ("Reinstall needed", "Update available")
+ * as a dead, non-interactive label — so a user seeing "RL Reranker —
+ * Reinstall needed" on Home had no way to act on it there. This helper
+ * lets every surface derive the same {label, method} from the catalog
+ * `kind`, so the action button is consistent everywhere and a future
+ * `kind` can't regress one surface silently.
+ *
+ * NOT Pro-gated: an actionable kind (broken/error/update_available) is by
+ * definition an already-installed module that already passed the license
+ * gate at install time, so reinstall/retry/update needs no fresh tier
+ * check (and `install_module_for_project` / `update_module_for_project`
+ * enforce tier server-side anyway as a backstop). The only requirement is
+ * that a project is selected, because install/update are per-project.
+ * The license gate stays where it belongs — on the not-yet-installed
+ * `available` kind, handled separately by the install flow.
+ *
+ * Returns `null` for kinds that have no catalog-level action (bundled,
+ * installed-and-current, subcomponent, coming_soon, available — the last
+ * goes through the install/activate flow, not this repair path).
+ */
+export type ModuleCatalogActionMethod = 'install' | 'update';
+
+export interface ModuleCatalogAction {
+  /** Button label shown to the user. */
+  label: string;
+  /** `modules` store method to invoke (both take (projectId, moduleId)). */
+  method: ModuleCatalogActionMethod;
+}
+
+export function moduleActionForKind(
+  kind: string | null | undefined,
+): ModuleCatalogAction | null {
+  switch (kind) {
+    case 'broken':
+      // Reconciler found the on-disk manifest missing — same UPSERT-safe
+      // command as a retry, different verb the user understands.
+      return { label: 'Reinstall', method: 'install' };
+    case 'error':
+      return { label: 'Retry install', method: 'install' };
+    case 'update_available':
+      return { label: 'Update', method: 'update' };
+    default:
+      return null;
+  }
+}
+
+/**
+ * Detect whether a just-attempted install/update actually failed.
+ *
+ * Why this exists (2026-06-06, found via live test): the backend
+ * `install_module_for_project` / `update_module_for_project` commands
+ * resolve with a row whose `status` is still `'installed'` and
+ * `last_error` is `null` even when the container START failed afterwards
+ * (e.g. RL reranker: docker run exit 125, unauthorized). The real error
+ * only materialises one tick later, when `loadCatalog()` recomputes the
+ * catalog entry's `kind` to `'error'`/`'broken'`. So inspecting the
+ * resolved row alone (the previous fix) misses the failure on Windows/
+ * Docker — the row is clean. Callers must instead RELOAD the catalog and
+ * pass the fresh entries here.
+ *
+ * @param moduleId       the module that was just installed/updated
+ * @param catalog        the freshly reloaded catalog entries (after loadCatalog)
+ * @param installedRows  the freshly reloaded installed rows (carry last_error)
+ * @returns a human-readable error message if the module ended up in an
+ *          error/broken state, otherwise `null` (success).
+ */
+export function detectModuleErrorAfterAction(
+  moduleId: string,
+  catalog: ReadonlyArray<{ id: string; kind: string }>,
+  installedRows: ReadonlyArray<{ module_id: string; last_error: string | null; status?: string }>,
+): string | null {
+  const entry = catalog.find((m) => m.id === moduleId);
+  const row = installedRows.find((r) => r.module_id === moduleId);
+  const kindIsError = entry?.kind === 'error' || entry?.kind === 'broken';
+  const rowIsError =
+    row?.status === 'error' || row?.status === 'broken' || !!row?.last_error;
+  if (!kindIsError && !rowIsError) return null;
+  return (
+    row?.last_error ??
+    `install did not complete (status: ${entry?.kind ?? row?.status ?? 'unknown'})`
+  );
+}

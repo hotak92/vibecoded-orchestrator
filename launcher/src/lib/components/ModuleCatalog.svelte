@@ -38,12 +38,29 @@
     resolveTileDisplay,
     truncateLastError,
     statusBadgeLabel,
+    detectModuleErrorAfterAction,
   } from '$lib/module-status-display';
   // v0.2.35 Agent M (2026-05-26): preflight modal shown when the
   // install-pipeline preflight (`check_container_runtime_available`)
   // returns `available: false`. Runs on every Install click — see the
   // handleInstall flow below for the gating logic.
   import InstallPreflightRuntimeModal from '$lib/components/InstallPreflightRuntimeModal.svelte';
+  // v0.2.49 Stream D: license-gate helper. Used to gate the per-project
+  // enable toggle on installed paid modules (so a user whose license
+  // lapsed POST-install can't flip the enable bit until they re-activate)
+  // and to add a hover tooltip on tiles for unlicensed paid modules.
+  import { moduleIsLicenseGated, moduleNeedsLicense } from '$lib/license-gate';
+  // Bug D (v0.2.49): per-project badge helper. Communicates the
+  // per-project state ("installed here" / "installed elsewhere" /
+  // "not installed") on every tile so a project switch no longer
+  // makes modules look like they've disappeared — the row stays
+  // visible, only the badge changes. See `module-per-project-display.ts`
+  // for the resolution contract + why the catalog `kind` field is the
+  // aggregate-install signal we discriminate against.
+  import {
+    resolvePerProjectBadge,
+    perProjectBadgeClass,
+  } from '$lib/module-per-project-display';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -335,8 +352,23 @@
   // without re-triggering the runtime preflight (we just confirmed it).
   async function runInstall(m: ModuleCatalogEntry) {
     if (!project) return;
+    // Shared dedup/auto-resolve key with the bell inbox: a later success
+    // for the same module action clears the stored error.
+    const toastKey = `module:${m.id}:install`;
     try {
       await modules.install(project.id, m.id);
+      // The resolved row can be misleadingly clean (status='installed',
+      // last_error=null) even when the container START failed — the real
+      // failure only surfaces after the catalog recomputes `kind`. Reload
+      // both surfaces, then inspect (see detectModuleErrorAfterAction).
+      await modules.loadCatalog();
+      await modules.loadInstalled(project.id);
+      const errMsg = detectModuleErrorAfterAction(m.id, $modules.catalog, $modules.installed);
+      if (errMsg) {
+        toast.error(`${m.name}: ${errMsg}`, { key: toastKey });
+      } else {
+        toast.success(`${m.name} installed`, { key: toastKey });
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       // If the error looks like a missing-secret error from the Rust side,
@@ -344,7 +376,7 @@
       if (msg.toLowerCase().includes('secret') || msg.toLowerCase().includes('keychain')) {
         openSecretsPrompt = m;
       } else {
-        alert(`Install failed: ${msg}`);
+        toast.error(`Install failed: ${msg}`, { key: toastKey });
       }
     }
   }
@@ -387,11 +419,22 @@
       alert('Select a project from the menu bar first.');
       return;
     }
+    const toastKey = `module:${m.id}:update`;
     try {
       await modules.update(project.id, m.id);
+      // Same caveat as runInstall: re-read catalog + installed and inspect
+      // the recomputed kind — the resolved row can be misleadingly clean.
+      await modules.loadCatalog();
+      await modules.loadInstalled(project.id);
+      const errMsg = detectModuleErrorAfterAction(m.id, $modules.catalog, $modules.installed);
+      if (errMsg) {
+        toast.error(`${m.name}: ${errMsg}`, { key: toastKey });
+      } else {
+        toast.success(`${m.name} updated`, { key: toastKey });
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      alert(`Update failed: ${msg}`);
+      toast.error(`Update failed: ${msg}`, { key: toastKey });
     }
   }
 
@@ -662,6 +705,11 @@
         {@const color = colorFor(m.id)}
         {@const installing = mState.installingId === m.id}
         {@const display = resolveTileDisplay(m, installRow, installing)}
+        <!-- Bug D (v0.2.49): per-project badge resolved alongside the
+             tile-display contract. Hoisted to the top of the {#each}
+             so the inline `{@const}` is valid (Svelte 5 requires
+             const tags to be the immediate child of a block). -->
+        {@const ppBadge = resolvePerProjectBadge(m, installRow)}
         <div class="module-card glass-card" style:--accent="rgb({colorRgb(color)})">
           <div class="card-head">
             <div class="card-icon" style:background="rgba({colorRgb(color)}, 0.12)" style:border-color="rgba({colorRgb(color)}, 0.25)">
@@ -671,7 +719,19 @@
               <div class="card-title-row">
                 <h3 class="card-name">{m.name}</h3>
                 {#if m.license_required}
-                  <span class="tier-badge">
+                  <!-- v0.2.49 Stream D: enriched tier badge tooltip when
+                       the module is paid AND the user lacks a valid
+                       license. Catches the "I clicked Install and got a
+                       weird Activate dialog" surprise by signalling the
+                       gate before the user clicks. -->
+                  {@const badgeGated = moduleNeedsLicense(m) && !m.is_licensed}
+                  <span
+                    class="tier-badge"
+                    class:tier-gated={badgeGated}
+                    title={badgeGated
+                      ? `${tierLabel(m.min_orchestrator_tier === 'free' ? 'pro' : m.min_orchestrator_tier)} license required to install or configure this module.`
+                      : `${tierLabel(m.min_orchestrator_tier === 'free' ? 'pro' : m.min_orchestrator_tier)} tier`}
+                  >
                     {tierLabel(m.min_orchestrator_tier === 'free' ? 'pro' : m.min_orchestrator_tier)}
                   </span>
                 {:else}
@@ -684,6 +744,20 @@
                     Deprecated
                   </span>
                 {/if}
+                <!-- Bug D (v0.2.49): per-project status badge.
+                     Resolved at the top of the {#each} (ppBadge const).
+                     Always rendered so a project switch reads as
+                     "same list, different per-row context" rather
+                     than "modules disappeared". See
+                     module-per-project-display.ts for the palette. -->
+                <span
+                  class="pp-badge {perProjectBadgeClass(ppBadge.kind)}"
+                  title={ppBadge.tooltip}
+                  data-testid="pp-badge"
+                  data-pp-kind={ppBadge.kind}
+                >
+                  {ppBadge.label}
+                </span>
               </div>
               <p class="card-meta">
                 <span class="mono">v{m.version}</span> · {m.category}
@@ -748,10 +822,27 @@
               {/if}
             {:else if display.kind === 'installed'}
               <!-- Installed: toggle + (optional Update) + (optional Start) + Uninstall -->
-              <label class="enabled-toggle">
+              <!-- v0.2.49 Stream D: per-tile license gate for the enable
+                   toggle. If the module is paid AND the orchestrator-tier
+                   license is missing/expired, disable the toggle so a
+                   user whose license lapsed POST-install can't flip the
+                   enable bit until they re-activate. Update + Uninstall
+                   buttons stay clickable — Update needs to be reachable
+                   so a user can pull a fix that doesn't itself need the
+                   license, and Uninstall is always a reversible exit. -->
+              {@const tileLicenseGated = moduleIsLicenseGated(m, $license.cache)}
+              <label
+                class="enabled-toggle"
+                class:license-gated={tileLicenseGated}
+                title={tileLicenseGated
+                  ? 'License required to change enable state. Re-activate the license to manage this module.'
+                  : undefined}
+              >
                 <input
                   type="checkbox"
                   checked={display.install_row.enabled}
+                  disabled={tileLicenseGated}
+                  aria-disabled={tileLicenseGated ? 'true' : undefined}
                   onchange={(e) => handleToggleEnabled(m, (e.target as HTMLInputElement).checked)}
                   aria-label="Enable or disable {m.name}"
                 />
@@ -1152,6 +1243,71 @@
     cursor: help;
   }
 
+  /* v0.2.49 Stream D: tier badge for unlicensed paid modules. Subtle
+     red-tinted variant to signal "this is gated" without screaming —
+     the actual blocking happens in the Install button → Activate
+     license flow below. cursor:help cues the title-attribute
+     tooltip is the next step. */
+  .tier-badge.tier-gated {
+    background: rgba(231, 76, 60, 0.16);
+    color: #ff8a7e;
+    cursor: help;
+  }
+
+  /* Bug D (v0.2.49): per-project status badge family. Shares the same
+     pill geometry as the tier badge so they line up cleanly in the
+     card title row. Colors map to semantic categories:
+       - bundled / included → purple/teal (orchestrator-shipped)
+       - enabled-here → green (active in this project)
+       - disabled-here → muted grey-amber (installed, toggled off)
+       - installed-here → teal (steady-state installed, non-toggleable)
+       - installed-elsewhere → mid-grey (the headline Bug D fix —
+                                          "this module IS installed but
+                                          not in this project")
+       - not-installed → muted (no install anywhere)
+     cursor:help cues that hovering reveals the tooltip with longer
+     copy explaining the badge meaning. */
+  .pp-badge {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: help;
+    white-space: nowrap;
+  }
+
+  .pp-badge.pp-badge-bundled {
+    background: rgba(123, 95, 255, 0.12);
+    color: var(--color-purple, #b29bff);
+  }
+  .pp-badge.pp-badge-included {
+    background: rgba(0, 191, 166, 0.08);
+    color: var(--color-teal);
+  }
+  .pp-badge.pp-badge-enabled {
+    background: rgba(46, 204, 113, 0.16);
+    color: rgb(76, 217, 134);
+  }
+  .pp-badge.pp-badge-disabled {
+    background: rgba(255, 159, 28, 0.12);
+    color: rgb(255, 159, 28);
+  }
+  .pp-badge.pp-badge-installed {
+    background: rgba(0, 191, 166, 0.12);
+    color: var(--color-teal);
+  }
+  .pp-badge.pp-badge-elsewhere {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--color-mid);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+  }
+  .pp-badge.pp-badge-none {
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--color-muted);
+  }
+
   /* Bug 16: kind-aware status badges. */
   .status-badge {
     font-size: 10px;
@@ -1269,6 +1425,19 @@
 
   .enabled-toggle input {
     accent-color: var(--color-teal);
+  }
+
+  /* v0.2.49 Stream D: gated state for the per-project enable toggle on
+     installed paid modules whose license has lapsed. cursor:help cues
+     the tooltip; opacity + saturate match the Configure-tab body gating
+     so the GUI feels consistent across surfaces. */
+  .enabled-toggle.license-gated {
+    opacity: 0.55;
+    cursor: help;
+    filter: saturate(0.6);
+  }
+  .enabled-toggle.license-gated input {
+    cursor: not-allowed;
   }
 
   .mono {

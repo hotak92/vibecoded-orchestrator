@@ -33,12 +33,15 @@
   //   - Progress bar reuses the `cgr-progress-fill` 4px-track style from
   //     `CodeGraphReanalysisModal.svelte:265-270` (teal 0.8 → 1.0 on
   //     complete, 0.2s ease width transition). Battle-tested look.
-  //   - Above the bar, the robot logo "fills" from the bottom using the
-  //     Fay-FAB clip-path technique (`DownloadProgressFab.tsx` in
-  //     FrameAboutYou-Tauri): two stacked <img>, base grayscale dim,
-  //     top color with `clip-path: inset(${100-pct}% 0 0 0)`. As the
-  //     percentage rises, the colored logo emerges from the bottom
-  //     like a fluid level.
+  //   - Above the bar, a "Martino-style" orbital logo: dual counter-
+  //     rotating rings + a pulsing core with a VECTOR robot monogram
+  //     (inline SVG — crisp on HiDPI, unlike the old /logo.png raster).
+  //     A conic-gradient arc behind the rings tracks the REAL `fillPct`
+  //     (from install_progress events) so the only progress-coupled bit
+  //     stays honest — it visualises the genuine percentage the bar also
+  //     shows, never a fabricated one. On completed/failed the rings stop
+  //     spinning and recolor (teal/pink). Replaces the earlier Fay-FAB
+  //     clip-path fill (two stacked <img>) which used a soft raster logo.
   //
   // Lifecycle:
   //
@@ -148,9 +151,6 @@
       ? 100
       : Math.max(0, Math.min(100, orchState.progress?.percentage ?? 0))
   );
-  // Clip-path inset for the colored logo on top of the grayscale base.
-  // 0% percentage → clipTop 100% (no color); 100% → clipTop 0 (fully colored).
-  const clipTop = $derived(100 - fillPct);
 
   // Modal title depends on which updater action is in flight. We read
   // `upd.kind` while the popover was open — UpdateBadge resets it when
@@ -209,27 +209,35 @@
   aria-label={a11yLabel}
 >
   <div class="oup-card">
-    <!-- Logo "fill" stack — two robot logos, top color clipped from the
-         top so the bottom `fillPct%` emerges as the update progresses. -->
-    <div class="oup-logo-wrap">
-      <img
-        src="/logo.png"
-        alt=""
+    <!-- Martino-style orbital logo. Dual counter-rotating rings + pulsing
+         core with a VECTOR robot monogram (crisp on HiDPI, unlike the old
+         /logo.png raster which looked soft). On `completed` the rings turn
+         solid teal; on `failed` they turn pink. The conic ring underneath
+         is the only progress-coupled bit: its sweep tracks the REAL fillPct
+         (from install_progress events) so the animation never fakes data —
+         it just visualises the genuine percentage the bar also shows. -->
+    <div
+      class="oup-logo-wrap"
+      class:is-complete={phase === 'completed'}
+      class:is-failed={phase === 'failed'}
+    >
+      <!-- progress-coupled conic sweep (real fillPct, not decorative) -->
+      <div
+        class="oup-progress-arc"
+        style="background: conic-gradient(var(--arc-color) {fillPct * 3.6}deg, rgba(255,255,255,0.05) 0deg);"
         aria-hidden="true"
-        draggable="false"
-        class="oup-logo-base"
-      />
-      <img
-        src="/logo.png"
-        alt=""
-        aria-hidden="true"
-        draggable="false"
-        class="oup-logo-fill"
-        style="clip-path: inset({clipTop}% 0 0 0);"
-      />
-      {#if phase === 'running'}
-        <span class="oup-logo-pulse" aria-hidden="true"></span>
-      {/if}
+      ></div>
+      <div class="oup-ring" aria-hidden="true"></div>
+      <div class="oup-ring inner" aria-hidden="true"></div>
+      <div class="oup-core" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="5" y="7" width="14" height="11" rx="3.2" stroke="currentColor" stroke-width="1.8"/>
+          <line x1="12" y1="3.4" x2="12" y2="6.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          <circle cx="12" cy="2.6" r="1.2" fill="#ff4fa0"/>
+          <circle cx="9.4" cy="12.2" r="1.5" fill="currentColor"/>
+          <circle cx="14.6" cy="12.2" r="1.5" fill="#7b5fff"/>
+        </svg>
+      </div>
     </div>
 
     <!-- Title — which of the three updater actions is in flight. -->
@@ -321,47 +329,97 @@
     gap: 12px;
   }
 
-  /* -------- Logo stack — Fay FAB clip-path pattern -------- */
+  /* -------- Martino-style orbital logo -------- */
 
   .oup-logo-wrap {
     position: relative;
     width: 128px;
     height: 128px;
-    filter: drop-shadow(0 8px 24px rgba(0, 191, 166, 0.35));
     margin-bottom: 4px;
+    /* per-phase accent color, consumed by rings + core monogram + arc */
+    --arc-color: #00bfa6;
+    color: #00bfa6;
+    filter: drop-shadow(0 8px 24px rgba(0, 191, 166, 0.35));
+  }
+  .oup-logo-wrap.is-complete { --arc-color: #00bfa6; color: #00bfa6; }
+  .oup-logo-wrap.is-failed {
+    --arc-color: #ff4fa0;
+    color: #ff4fa0;
+    filter: drop-shadow(0 8px 24px rgba(255, 79, 160, 0.35));
   }
 
-  .oup-logo-base,
-  .oup-logo-fill {
+  /* Progress-coupled conic sweep — tracks REAL fillPct (set inline). The
+     mask carves it into a thin ring so it reads as a progress arc, not a
+     filled pie. width transition lives on the inline style update. */
+  .oup-progress-arc {
     position: absolute;
     inset: 0;
-    width: 100%;
-    height: 100%;
-    user-select: none;
-    -webkit-user-drag: none;
-    pointer-events: none;
-  }
-  .oup-logo-base {
-    filter: grayscale(1);
-    opacity: 0.25;
-  }
-  .oup-logo-fill {
-    /* Smooth fill transition. 320ms reads as "fluid level rising"; matches
-       the bar's 0.2s ease but slightly longer so the logo follows. */
-    transition: clip-path 320ms cubic-bezier(0.22, 1, 0.36, 1);
-  }
-  .oup-logo-pulse {
-    position: absolute;
-    inset: -8px;
     border-radius: 50%;
-    background: rgba(0, 191, 166, 0.15);
-    animation: oup-pulse 2s ease-out infinite;
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+    transition: background 0.25s ease;
     pointer-events: none;
   }
+
+  .oup-ring {
+    position: absolute;
+    inset: 12px;
+    border-radius: 50%;
+    border: 2px solid rgba(123, 95, 255, 0.16);
+    pointer-events: none;
+  }
+  .oup-ring::after {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: currentColor;
+    border-right-color: #7b5fff;
+    animation: oup-spin 1.4s cubic-bezier(0.65, 0, 0.35, 1) infinite;
+  }
+  .oup-ring.inner { inset: 30px; border-color: rgba(0, 191, 166, 0.12); }
+  .oup-ring.inner::after {
+    border-top-color: #7b5fff;
+    border-left-color: currentColor;
+    border-right-color: transparent;
+    animation: oup-spin-rev 2s linear infinite;
+  }
+
+  .oup-core {
+    position: absolute;
+    inset: 44px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #2b3370, #161a3a);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 0 24px rgba(0, 191, 166, 0.5), inset 0 0 12px rgba(0, 0, 0, 0.6);
+    animation: oup-pulse 2.2s ease-in-out infinite;
+    pointer-events: none;
+  }
+  .oup-core svg { width: 22px; height: 22px; display: block; }
+
+  /* On the terminal phases the rings stop spinning (work is done/failed). */
+  .oup-logo-wrap.is-complete .oup-ring::after,
+  .oup-logo-wrap.is-failed .oup-ring::after,
+  .oup-logo-wrap.is-complete .oup-ring.inner::after,
+  .oup-logo-wrap.is-failed .oup-ring.inner::after {
+    animation-play-state: paused;
+    border-top-color: currentColor;
+    border-right-color: currentColor;
+    border-left-color: currentColor;
+  }
+
+  @keyframes oup-spin     { to { transform: rotate(360deg); } }
+  @keyframes oup-spin-rev { to { transform: rotate(-360deg); } }
   @keyframes oup-pulse {
-    0%   { transform: scale(0.95); opacity: 0.6; }
-    70%  { transform: scale(1.15); opacity: 0; }
-    100% { transform: scale(1.15); opacity: 0; }
+    0%, 100% { box-shadow: 0 0 18px rgba(0, 191, 166, 0.45), inset 0 0 12px rgba(0, 0, 0, 0.6); }
+    50%      { box-shadow: 0 0 34px rgba(0, 191, 166, 0.6),  inset 0 0 12px rgba(0, 0, 0, 0.6); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .oup-ring::after, .oup-ring.inner::after, .oup-core { animation: none; }
   }
 
   /* -------- Title + stage -------- */

@@ -149,6 +149,27 @@ async fn create_project(
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
+    // v0.2.49 access-matrix Phase 4 (item #10): seed the default
+    // kg_collection_access rows for the newly-created project. Without
+    // this call, projects created via `vct project create` would have
+    // an empty access matrix until the launcher GUI's bundle-populate
+    // path ran — meaning the read-gate would reject every KG access
+    // (including the project's own KG) until the user manually granted
+    // via the GUI access matrix. Mirrors the launcher-side Tauri
+    // `create_project_v2` flow, which calls
+    // `populate_project_state_from_filesystem` to seed the same rows.
+    //
+    // Soft-fail: the access matrix is recoverable by the launcher GUI
+    // (re-onboarding from the same folder re-triggers the populate path,
+    // which is idempotent). A failure here is logged but doesn't reject
+    // the project create — matching the existing post-insert audit which
+    // is also fire-and-forget.
+    if let Err(e) = h.0.populate_kg_collection_access_for_project(&row.id, &row.name) {
+        eprintln!(
+            "[vct-hub] warning: populate_kg_collection_access_for_project({}, {}): {}",
+            row.id, row.name, e
+        );
+    }
     let _ = h.0.audit(
         "project_create",
         Some(&row.id),
@@ -181,8 +202,25 @@ async fn rename_project(
             Ok(s) => s,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         };
+        // v0.2.49 access-matrix Step F SB2 fix (L1-F1): capture the
+        // OLD project name BEFORE the rename so we can pass it to
+        // `propagate_kg_access_on_rename` below. Pre-fix this hub CLI
+        // surface NEVER called the propagate helper, leaving orphan
+        // kg_collection_access rows referencing the OLD sanitized
+        // collection name after every CLI-driven rename. The Tauri
+        // sibling at `commands/projects_v2.rs::rename_project_v2`
+        // captures the pre-rename name + propagates — this surface
+        // now mirrors that discipline via the lifted helper.
+        let old_name = project.name.clone();
         if let Err(e) = h.0.rename_project(&project.id, &req.new_name, Some(&new_slug)) {
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        // v0.2.49 Step F SB2: propagate the rename into the access
+        // matrix via the lifted free fn. Warnings are best-effort
+        // logged (no GUI/CLI surface here for them — the boot
+        // reconcile is the backup).
+        for warn in h.0.propagate_kg_access_on_rename(&project.id, &old_name, &req.new_name) {
+            eprintln!("[vct-hub] rename access propagation warning: {}", warn);
         }
         let _ = h.0.audit(
             "project_rename",
@@ -1895,5 +1933,710 @@ mod cli_kg_integration_tests {
             "no audit row written for cli.codegraph.search"
         );
         assert_eq!(rows[0].operation, "cli.codegraph.search");
+    }
+}
+
+// ─── v0.2.49 access-matrix Phase 4 (items #9 + #10) — hub-side wiring ─────
+//
+// Two HTTP-level integration tests that hit the real axum routers (cli_api
+// for project create, project_state_api for kg-binding) on a random local
+// port. No Weaviate dependency — the access-matrix propagation is purely
+// DB-side, so these run on any machine.
+
+#[cfg(test)]
+mod hub_access_matrix_wiring_tests {
+    use super::*;
+    use axum::Router;
+    use std::sync::Arc;
+
+    /// Spin up cli_api + project_state_api on a shared random port. The
+    /// in-memory DB is shared via `LauncherDbHandle` between the routers
+    /// so assertions can read the same state both routers wrote to.
+    async fn spawn_test_hub_with_state_api() -> (String, LauncherDbHandle) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let handle = LauncherDbHandle(Arc::new(db));
+        let app: Router = Router::new()
+            .nest("/api/v1", super::router().with_state(handle.clone()))
+            .nest(
+                "/api/v1",
+                crate::project_state_api::router().with_state(handle.clone()),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}/api/v1", addr), handle)
+    }
+
+    /// Item #10 — `vct project create` (POST /cli/projects) seeds the
+    /// default `kg_collection_access` rows for the newly-created project.
+    /// Pre-Phase-4 the access matrix was empty for CLI-created projects,
+    /// so the read-gate rejected every KG access until the user manually
+    /// granted via the GUI. This test pins the hub-side contract.
+    #[tokio::test]
+    async fn vct_project_create_via_cli_populates_access() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "AccessMatrixDemo",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "create failed: {}", resp.status());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id");
+
+        let access = handle.0.kg_list_access(pid).expect("kg_list_access");
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(
+            by_collection.get("AccessMatrixDemo_KnowledgeGraph"),
+            Some(&"write"),
+            "own primary KG must default to write"
+        );
+        assert_eq!(
+            by_collection.get("AccessMatrixDemo_Development"),
+            Some(&"write"),
+            "own dev collection must default to write"
+        );
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            Some(&"write"),
+            "v0.2.49 Step F SB2 (L2-SB1): shared KG default is 'write' \
+             (was 'read' pre-fix; aligns with resolver's F-2a output \
+             + Step D's force-upgrade migration target)"
+        );
+    }
+
+    /// Item #9 — POST /projects/{id}/kg-binding routes through
+    /// `set_project_kg_binding_with_root_sync`, which propagates the
+    /// collection_name change into `kg_collection_access`. Pre-Phase-4
+    /// the hub endpoint used plain `set_project_kg_binding` which left
+    /// the access matrix stale on every rebind via this surface.
+    #[tokio::test]
+    async fn hub_http_set_kg_binding_propagates_access() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        // Create a project via the CLI route — populates default access
+        // rows, including write at "Acme_KnowledgeGraph".
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "Acme",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(create.status().is_success());
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Seed a primary binding at the old collection name (the
+        // populate flow doesn't write bindings — that's the launcher
+        // Tauri populate's responsibility). We need an existing binding
+        // so the with_root_sync path's `old_primary` capture sees the
+        // OLD collection_name.
+        handle
+            .0
+            .set_project_kg_binding(
+                &pid,
+                "primary",
+                "Acme_KnowledgeGraph",
+                None,
+                None,
+                None,
+                None,
+                &serde_json::Value::Null,
+            )
+            .expect("seed binding");
+
+        // Hit the hub HTTP endpoint to rebind primary to a new
+        // collection name. This is the call path item #9 wired through
+        // `_with_root_sync`.
+        let resp = client
+            .post(format!("{}/projects/{}/kg-binding", base, pid))
+            .json(&serde_json::json!({
+                "role": "primary",
+                "collection_name": "Renamed_KnowledgeGraph",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(
+            resp.status().is_success(),
+            "kg-binding write failed: {}",
+            resp.status()
+        );
+
+        // Access matrix must have followed the rename.
+        let access = handle.0.kg_list_access(&pid).expect("kg_list_access");
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(
+            by_collection.get("Acme_KnowledgeGraph"),
+            None,
+            "old access row must be gone — pre-Phase-4 this would still be 'write'"
+        );
+        assert_eq!(
+            by_collection.get("Renamed_KnowledgeGraph"),
+            Some(&"write"),
+            "new access row must exist with the old write level preserved"
+        );
+    }
+
+    // ─── Phase 8 / Stream W4 — GET /projects/{id}/access/{collection} ────
+    //
+    // The WRITE-path gate endpoint consumed by:
+    //   - .claude/hooks/post-file-edit.sh (via vct_access_check.sh)
+    //   - claude_mcp_servers/weaviate_mcp/server.py (via vco_lib/access_resolver.py)
+    //
+    // Contract pinned by these tests: response shape `{ "level":
+    // "read" | "write" | "none" }`, 404 on unknown project, default
+    // "none" on row absent (no relationship established).
+
+    #[tokio::test]
+    async fn access_endpoint_returns_existing_row_level() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        // Set up: create a project with an explicit access row.
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "AccessEndpointTest",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(create.status().is_success());
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Explicitly write a "read" level row.
+        handle
+            .0
+            .kg_set_access(&pid, "Test_KnowledgeGraph", "read")
+            .expect("set access");
+
+        let resp = client
+            .get(format!(
+                "{}/projects/{}/access/{}",
+                base, pid, "Test_KnowledgeGraph"
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert!(
+            resp.status().is_success(),
+            "expected 200, got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(body.get("level").and_then(|v| v.as_str()), Some("read"));
+    }
+
+    #[tokio::test]
+    async fn access_endpoint_returns_none_when_row_absent() {
+        // Default for "no relationship established" — caller MUST
+        // see this as a deny signal (the F-2a resolver returns
+        // AccessLevel::Denied which maps to "none" on the wire). A
+        // bug that returned "write" here would silently grant access
+        // to every collection on every project.
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "AccessEndpointAbsent",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(create.status().is_success());
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Query a collection the project has NO row for.
+        let resp = client
+            .get(format!(
+                "{}/projects/{}/access/{}",
+                base, pid, "NeverWritten_KnowledgeGraph"
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "expected 200 with default level");
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("level").and_then(|v| v.as_str()),
+            Some("none"),
+            "row-absent must default to 'none', NOT 'write' — \
+             silent-allow would be a security regression"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_endpoint_returns_404_for_unknown_project() {
+        // Unknown project_id is a diagnostic signal (caller might be
+        // racing a project create/delete window). Clients fail-open
+        // on 404 same as on transport errors, so this is observability
+        // not a behavioral change.
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!(
+                "{}/projects/nonexistent-project-id/access/Some_KG",
+                base
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status().as_u16(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert!(
+            body.get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("project not found"))
+                .unwrap_or(false),
+            "expected 'project not found' error, got: {:?}",
+            body,
+        );
+    }
+
+    #[tokio::test]
+    async fn access_endpoint_distinguishes_write_from_read() {
+        // Pin the wire-stable mapping: AccessLevel::Write → "write"
+        // on the wire. A regression that mapped Write → "rw" or
+        // "Write" capitalization would break every client that does
+        // byte-equality on the string.
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "AccessLevelMap",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        for level in &["read", "write", "none"] {
+            handle
+                .0
+                .kg_set_access(&pid, "WireMap_KG", level)
+                .expect("set");
+            let resp = client
+                .get(format!("{}/projects/{}/access/{}", base, pid, "WireMap_KG"))
+                .send()
+                .await
+                .expect("send");
+            let body: serde_json::Value = resp.json().await.expect("json");
+            assert_eq!(
+                body.get("level").and_then(|v| v.as_str()),
+                Some(*level),
+                "wire-stable mapping broke for level {}",
+                level,
+            );
+        }
+    }
+
+    // ─── Step F SB3 (L2-SB2) — row-absent fallback consults resolver ─────
+    //
+    // Pre-Step-F the endpoint returned literal "none" for any
+    // row-absent query. That diverged from `resolve_default_access_level`'s
+    // F-2a output ("Write" for own primary/shared bindings). Failure
+    // mode: a partial `populate_kg_collection_access_for_project` failure
+    // left a project with no row → hub returns "none" → MCP correctly
+    // blocks the project's OWN KG writes → silent breakage.
+    //
+    // Post-fix: row-absent calls resolve_default_access_level so the
+    // hub semantically matches what populate WOULD have written.
+
+    #[tokio::test]
+    async fn access_endpoint_row_absent_consults_resolver_for_own_primary() {
+        // Setup: project has a role='primary' binding to
+        // `OwnPrimary_KG`, BUT the kg_collection_access row for that
+        // (project_id, OwnPrimary_KG) pair was never created (e.g.
+        // partial populate failure or pre-v0.2.49 state without the
+        // populate path having run).
+        //
+        // Pre-fix the endpoint returned "none" → MCP would block the
+        // project's own KG writes. Post-fix the endpoint consults
+        // `resolve_default_access_level` → returns "write" (F-2a rule
+        // for role='primary').
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "OwnPrimaryAbsent",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // The cli/projects POST auto-populated 3 default rows
+        // (OwnPrimaryAbsent_KnowledgeGraph at write, etc.). Wipe the
+        // own-primary row + add a primary binding pointing at a
+        // collection that has NO kg_collection_access row, simulating
+        // partial-populate-failure.
+        handle
+            .0
+            .set_project_kg_binding(
+                &pid,
+                "primary",
+                "OwnPrimary_KG",
+                None,
+                None,
+                None,
+                None,
+                &serde_json::Value::Null,
+            )
+            .unwrap();
+
+        // Query the bound collection — kg_collection_access has NO
+        // row for it.
+        let resp = client
+            .get(format!(
+                "{}/projects/{}/access/{}",
+                base, pid, "OwnPrimary_KG"
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "expected 200, got {}", resp.status());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("level").and_then(|v| v.as_str()),
+            Some("write"),
+            "Step F SB3: row-absent on OWN primary binding must return \
+             'write' (resolver F-2a output), NOT 'none' (the pre-fix \
+             literal). Pre-fix this would have silently blocked the \
+             project's own KG writes when populate partially failed."
+        );
+    }
+
+    // ─── Step F SF3 (L2-SF2) — defensive parse round-trip on row-present ──
+
+    /// Step F SF3 (L2-SF2) layered-defense pin.
+    ///
+    /// The endpoint's `AccessLevel::from_str_strict` round-trip is
+    /// defense-in-depth: it surfaces invalid level strings as 500
+    /// rather than leaking them through to clients. BUT the
+    /// `kg_collection_access.access_level` column has a SQL CHECK
+    /// constraint (`CHECK access_level IN ('read','write','none')`),
+    /// so an invalid value can never actually reach the row in
+    /// production — the SQL layer rejects the INSERT first.
+    ///
+    /// This test pins the DEFENSE-IN-DEPTH SHAPE rather than the
+    /// (currently unreachable) panic path: it confirms the SQL CHECK
+    /// constraint exists + correctly rejects an invalid INSERT before
+    /// the endpoint's parse can ever see one. If a future migration
+    /// weakens or drops the CHECK, this test fails — which is the
+    /// signal that the parse round-trip becomes load-bearing.
+    #[tokio::test]
+    async fn access_endpoint_invalid_level_rejected_at_sql_layer() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let _ = base; // unused (we're testing the SQL layer below it)
+
+        let create_resp = reqwest::Client::new()
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "InvalidLevelLayered",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create_resp.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Attempt a raw INSERT with an invalid level. The CHECK
+        // constraint MUST reject it at the SQL layer — that's the
+        // first line of defense and the reason the endpoint's parse
+        // round-trip is currently unreachable in production.
+        let result = {
+            let guard = handle.0.lock();
+            guard.execute(
+                "INSERT INTO kg_collection_access \
+                    (project_id, collection_name, access_level, created_at, updated_at) \
+                 VALUES (?1, 'BadLevel_KG', 'admin', 1700000000000, 1700000000000)",
+                rusqlite::params![pid],
+            )
+        };
+        let err = result.expect_err(
+            "Step F SF3 pin: the SQL CHECK constraint on \
+             kg_collection_access.access_level MUST reject invalid \
+             levels. If this INSERT succeeded, the CHECK was weakened \
+             or dropped, and the endpoint's defensive parse round-trip \
+             (`AccessLevel::from_str_strict`) is now the only line of \
+             defense — verify it still fires (see the handler at \
+             vct-hub/src/project_state_api.rs::get_collection_access)."
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CHECK constraint failed")
+                && msg.contains("access_level"),
+            "expected CHECK constraint failure on access_level, got: {}",
+            msg
+        );
+    }
+
+    // ─── Phase 8 follow-up: list-by-level access endpoint (Q2 enrichment) ─
+    //
+    // The new `GET /projects/{id}/access?level=write` endpoint
+    // consumed by the MCP server's deny-branch enrichment in
+    // `weaviate_mcp/server.py::store_knowledge_node` to render a
+    // self-resolving error response that names the collections
+    // the project CAN write to. Per user Q2 directive 2026-06-08:
+    // "in that warning tell Claude also where it has the permission
+    // to write to".
+
+    #[tokio::test]
+    async fn list_access_by_level_returns_writable_collections() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "ListByLevel",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Note: `cli/projects` POST auto-populates the access matrix
+        // via `populate_kg_collection_access_for_project` (SB2 path).
+        // The project starts with 3 default Write rows:
+        //   - ListByLevel_KnowledgeGraph
+        //   - ListByLevel_Development
+        //   - VibeCodedOrchestrator_KnowledgeGraph
+        // Add ON TOP of those: 2 more write + 1 read + 1 none.
+        handle.0.kg_set_access(&pid, "Writable_A", "write").unwrap();
+        handle.0.kg_set_access(&pid, "Writable_B", "write").unwrap();
+        handle.0.kg_set_access(&pid, "Readonly_C", "read").unwrap();
+        handle.0.kg_set_access(&pid, "Denied_D", "none").unwrap();
+
+        let resp = client
+            .get(format!("{}/projects/{}/access?level=write", base, pid))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "expected 200, got {}", resp.status());
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let collections: Vec<&str> = body
+            .get("collections")
+            .and_then(|v| v.as_array())
+            .expect("collections array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        // Total writables: 3 from auto-populate + 2 explicit = 5.
+        // Sorted ascending by collection_name.
+        // Must NOT include Readonly_C or Denied_D.
+        assert_eq!(
+            collections,
+            vec![
+                "ListByLevel_Development",
+                "ListByLevel_KnowledgeGraph",
+                "VibeCodedOrchestrator_KnowledgeGraph",
+                "Writable_A",
+                "Writable_B",
+            ],
+            "list-by-level must return ONLY the requested-level rows + \
+             must NOT leak read/none rows into the writable list (the \
+             whole point of the enrichment is to tell the LLM where it \
+             CAN write, not just which rows exist). Also composes with \
+             SB2's auto-populate path (the 3 default rows shipped \
+             with project create)."
+        );
+        // Negative-case sentinel: explicit read/none rows MUST NOT appear.
+        assert!(
+            !collections.contains(&"Readonly_C"),
+            "read row leaked into writable list — silent privilege \
+             escalation regression"
+        );
+        assert!(
+            !collections.contains(&"Denied_D"),
+            "none row leaked into writable list — silent privilege \
+             escalation regression"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_access_by_level_filters_to_requested_level() {
+        // Same setup as the writable test, but query for read+none too.
+        // Pins that every level is correctly filtered.
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "ListByLevelAll",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // As in the prior test: cli/projects auto-populates 3 default
+        // Write rows: ListByLevelAll_KnowledgeGraph,
+        // ListByLevelAll_Development, VibeCodedOrchestrator_KnowledgeGraph.
+        handle.0.kg_set_access(&pid, "Alpha_W", "write").unwrap();
+        handle.0.kg_set_access(&pid, "Beta_R", "read").unwrap();
+        handle.0.kg_set_access(&pid, "Gamma_N", "none").unwrap();
+
+        for (level, expected) in &[
+            // write filter sees 3 auto-populated + 1 explicit = 4 rows.
+            (
+                "write",
+                vec![
+                    "Alpha_W",
+                    "ListByLevelAll_Development",
+                    "ListByLevelAll_KnowledgeGraph",
+                    "VibeCodedOrchestrator_KnowledgeGraph",
+                ],
+            ),
+            ("read", vec!["Beta_R"]),
+            ("none", vec!["Gamma_N"]),
+        ] {
+            let resp = client
+                .get(format!("{}/projects/{}/access?level={}", base, pid, level))
+                .send()
+                .await
+                .expect("send");
+            let body: serde_json::Value = resp.json().await.expect("json");
+            let collections: Vec<&str> = body
+                .get("collections")
+                .and_then(|v| v.as_array())
+                .expect("collections array")
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(
+                &collections, expected,
+                "filter broke for level={}: got {:?}, expected {:?}",
+                level, collections, expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_access_by_level_rejects_invalid_level() {
+        // Strict allowlist: anything outside {read, write, none} → 400.
+        // Pre-fix a client could pass `?level=admin` (typo OR malicious)
+        // and silently get an empty array because no rows match — that
+        // would mask the bug. 400 makes the bug visible.
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "InvalidLevelReject",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        for bogus in &["admin", "WRITE", "rw", "", "writes"] {
+            let resp = client
+                .get(format!("{}/projects/{}/access?level={}", base, pid, bogus))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(
+                resp.status().as_u16(),
+                400,
+                "level='{}' must return 400, not silently empty",
+                bogus
+            );
+            let body: serde_json::Value = resp.json().await.expect("json");
+            assert!(
+                body.get("error")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.contains("invalid level"))
+                    .unwrap_or(false),
+                "expected 'invalid level' error for '{}', got: {:?}",
+                bogus,
+                body
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_access_by_level_404_for_unknown_project() {
+        // Same posture as the singular access endpoint: 404 on
+        // unknown project_id so the client's fail-open path has a
+        // diagnostic signal rather than silently returning an empty
+        // array.
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!(
+                "{}/projects/nonexistent-pid/access?level=write",
+                base
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status().as_u16(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert!(
+            body.get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("project not found"))
+                .unwrap_or(false),
+            "expected 'project not found' error, got: {:?}",
+            body
+        );
     }
 }

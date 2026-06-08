@@ -114,14 +114,24 @@ gate_warn() {
 }
 
 check_workflow_last_run() {
-    # Returns 0 if the most recent completed run for the workflow is "success",
-    # 1 otherwise.  $1 = workflow filename (e.g. ci.yml), $2 = friendly name.
+    # Returns 0 if the most recent completed run of the workflow ON MAIN
+    # is "success", 1 otherwise.  $1 = workflow filename (e.g. ci.yml),
+    # $2 = friendly name.
+    #
+    # v0.2.49 fix: pre-fix this queried the most-recent completed run
+    # across ALL branches — which meant a failing Dependabot PR (e.g.
+    # `dependabot/npm_and_yarn/launcher/vite-8.0.14`) would block the
+    # tag even though main itself was green. The release-discipline
+    # rule applies to the release branch + main, not "any branch in
+    # the repo". Filter by `--branch main` so the check matches the
+    # rule's actual scope.
     local wf="$1"
     local name="$2"
     local conclusion
     conclusion="$(gh run list \
         --repo "$REPO" \
         --workflow "$wf" \
+        --branch main \
         --status completed \
         --limit 1 \
         --json conclusion \
@@ -131,7 +141,7 @@ check_workflow_last_run() {
     elif [ "$conclusion" = "unknown" ] || [ -z "$conclusion" ]; then
         gate_warn "$name" "Could not fetch run status (is gh authenticated? try: gh auth status)"
     else
-        gate_fail "$name" "Last run conclusion: $conclusion"
+        gate_fail "$name" "Last run conclusion on main: $conclusion"
     fi
 }
 

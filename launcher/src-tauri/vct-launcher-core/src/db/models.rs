@@ -114,7 +114,16 @@ impl ModuleStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleInstallRow {
     pub id: String,
-    pub project_id: String,
+    /// v0.2.49 Stream A: nullable to support `install.scope = "global"`.
+    /// `None` ⇒ global install (exactly one row per machine for this
+    /// module; per-project routing happens inside the container). `Some(_)`
+    /// ⇒ per-project install (the v0.2.20–v0.2.48 behaviour).
+    ///
+    /// The DB column was made nullable by migration 027 (Stream A,
+    /// v0.2.49). Backwards compat: pre-v0.2.49 callers that constructed
+    /// rows with `project_id: "some-uuid".into()` now need to use
+    /// `Some("some-uuid".into())`.
+    pub project_id: Option<String>,
     pub module_id: String,
     pub module_version: String,
     pub install_path: String,
@@ -137,6 +146,20 @@ pub struct ModuleInstallRow {
     /// added in Step 24 commit b.
     #[serde(default)]
     pub container_name: Option<String>,
+
+    /// v0.2.49 Step F MF3 follow-up (migration 032): Weaviate collection
+    /// names this module declares it writes to, denormalized from the
+    /// manifest's `kg_collections` field at install time. Empty Vec when
+    /// the manifest doesn't declare the field (the common case — most
+    /// modules don't expose any KG).
+    ///
+    /// Read by `populate_kg_collection_access_for_project` to back-fill
+    /// access rows on every new project create (the inverse of item #13
+    /// which seeds existing projects at module-install time). Storing
+    /// in the launcher DB avoids re-parsing the on-disk manifest from
+    /// the hot path; survives manifest file deletion / corruption.
+    #[serde(default)]
+    pub kg_collections: Vec<String>,
 }
 
 // `WeightsStateRow` removed in v0.2.31 (Agent J): launcher-side

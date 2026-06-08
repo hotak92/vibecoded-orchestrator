@@ -38,7 +38,17 @@ export interface ProjectView {
 
 export interface ModuleInstallRow {
   id: string;
-  project_id: string;
+  /**
+   * v0.2.49 Stream A: nullable to support `install.scope = "global"`.
+   * `null` ⇒ global install (exactly one row per machine for this
+   * module; per-project routing happens INSIDE the container). A
+   * non-null string ⇒ per-project install (the v0.2.20–v0.2.48
+   * behaviour). Stream D's GUI work consumes this nullability to
+   * render the right module-tile chrome (the global tile shows once
+   * across all projects; the per-project tile shows on each
+   * project's Modules tab).
+   */
+  project_id: string | null;
   module_id: string;
   module_version: string;
   install_path: string;
@@ -414,6 +424,22 @@ export interface ModuleCatalogEntry {
    * modules. Empty/absent for builtins and L0-only entries.
    */
   runtime_type?: string;
+  /**
+   * v0.2.49 Stream A (Bug D unblocker): the module's `install.scope`
+   * field as declared in its manifest. `"global"` means installed once
+   * per host with per-project opt-out via the enable toggle (Stream B);
+   * `"per_project"` means each project gets its own install (legacy
+   * shape, retained as future-proofing for modules with truly per-
+   * project container state). Empty string for legacy payloads from
+   * pre-v0.2.49 launchers — the renderer treats `""` ≡ `"per_project"`
+   * for back-compat.
+   *
+   * Drives the per-project badge variant for catalog tiles: a
+   * `scope='global'` module that's installed-anywhere renders as
+   * `enabled-globally` (not `installed-elsewhere`) since "installed
+   * once = available to all" is the contract.
+   */
+  install_scope?: 'per_project' | 'global' | '';
 }
 
 /**

@@ -1,6 +1,6 @@
 [package]
 name = "vct-launcher-core"
-version = "0.2.48"
+version = "0.2.49"
 edition = "2021"
 description = "Shared library for vct-launcher and vct-hub binaries — db, manifest, secrets, paths, config, services::runtime/picker, state, types, registry."
 authors = ["VibeCoded Tools"]
@@ -69,8 +69,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Regex (used by manifest validation patterns + PII scrub)
 regex = "1"
 
-# MAC address for machine binding (matches Python validator.py)
-mac_address = "1"
 hex = "0.4"
 
 # Platform hostname
@@ -116,8 +114,15 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 libc = "0.2"
 
 # Windows-specific (pid_is_alive uses OpenProcess + CloseHandle)
+# v0.2.49: `winreg` reads HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+# in `licensing::machine_id_hash` for platform-stable machine binding.
+# Promoted from launcher/src-tauri/Cargo.toml because the helper now lives
+# in core (shared between launcher GUI and vct-hub for the Phase 3
+# supervisor auth port). Tiny dep (~15 KB compiled), already in the
+# lockfile transitively via Tauri's Windows path.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+winreg = "0.55"
 
 # v0.2.42 W4-TEST-7: serial_test allows daemon_usable_probe_* tests to run
 # serially (they spawn subprocess fakes and flake under parallelism).
