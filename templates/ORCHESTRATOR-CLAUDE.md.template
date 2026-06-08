@@ -20,7 +20,7 @@ This block appears on every new project until you remove it. It's NOT for you to
 
 2. **Once you understand the project**, offer the scoping choice. Use AskUserQuestion (or plain prose if AskUserQuestion isn't available). Suggested phrasing:
 
-   > VCO ships with 45 agents, 52 skills, and 27 hooks pre-registered for this project. Most of them are off-topic for what you've described. Want me to scope this project — disable the agents/skills that don't apply to your stack, leaving just the relevant ones? Pros: cleaner Agents/Skills tabs, less noise in `@agent-*` autocomplete, faster mental model of what's available. Cons: if the project's scope expands later, you'll have to re-enable items manually (one click each from the launcher's per-project Agents/Skills tabs). If you'd rather keep everything visible and triage on demand, that's also a valid choice — just say "keep all" and I'll skip this.
+   > VCO ships with 45 agents, 53 skills, and 31 hooks pre-registered for this project. Most of them are off-topic for what you've described. Want me to scope this project — disable the agents/skills that don't apply to your stack, leaving just the relevant ones? Pros: cleaner Agents/Skills tabs, less noise in `@agent-*` autocomplete, faster mental model of what's available. Cons: if the project's scope expands later, you'll have to re-enable items manually (one click each from the launcher's per-project Agents/Skills tabs). If you'd rather keep everything visible and triage on demand, that's also a valid choice — just say "keep all" and I'll skip this.
 
 3. **If the user says yes**, do it via the launcher's enabled-toggle APIs (NOT by deleting files):
    - Tauri commands `set_project_agent_enabled` / `set_project_skill_enabled` / `set_project_hook_enabled` (callable from the launcher GUI's per-project tabs).
@@ -35,7 +35,7 @@ This block appears on every new project until you remove it. It's NOT for you to
    ```
    The script strips ALL `BEGIN: SETUP-ONLY` blocks at once — fine in practice because by the time the user has done the scoping pass, the other two SETUP-ONLY blocks ("First-Run Setup" and "Verifying Installation") have also served their purpose.
 
-**Why this block exists**: every project that gets VCO installed inherits the full agent/skill catalog, but a project's actual domain rarely needs all 45+52 of them. Disabling the off-topic ones at project-start time is a 30-second improvement to every future session's mental model — and the user almost always forgets to do it unless prompted explicitly. The nudge here makes it a deliberate first-session choice rather than a deferred housekeeping task that never happens.
+**Why this block exists**: every project that gets VCO installed inherits the full agent/skill catalog, but a project's actual domain rarely needs all 45+53 of them. Disabling the off-topic ones at project-start time is a 30-second improvement to every future session's mental model — and the user almost always forgets to do it unless prompted explicitly. The nudge here makes it a deliberate first-session choice rather than a deferred housekeeping task that never happens.
 <!-- END: SETUP-ONLY -->
 
 # VibeCoded Orchestrator — Project Instructions
@@ -118,8 +118,9 @@ These rules apply to YOU (Claude) working inside any project that has VCO instal
 
 **Before answering any non-trivial question:**
 1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
-2. For architecture/system questions → check `docs/features/` (per-area design notes: MCPs + agents, code graph, KG, RL retrieval, install flow, etc.) if the project has one.
-3. For any other project question → search the KG / code graph **before** generating a response.
+2. **Check `.claude/context/UPDATE_DEFERRED.md`** if present (added v0.2.51) — it lists conditions the last `install.py --update` could not auto-resolve. **If you find a `update_resume_required` entry**, the user's previous orchestrator update halted at a merge conflict, the conflict was resolved outside the launcher, but `install.py --update` and the launcher binary refresh never ran. **Surface this at session start before any other work** and tell the user: "Your previous orchestrator update is incomplete. Either click the **Continue Update** button in the launcher's MenuBar (top-right purple badge), OR run `python install.py --update` from the install root. Then quit + relaunch the launcher so the freshly-built binary loads." Reason it matters: `.claude/hooks/`, MCP server registrations, and the launcher binary may not match the freshly-merged source; running other automation against mismatched state can corrupt project metadata. The deferral self-clears on the next successful install.py run.
+3. For architecture/system questions → check `docs/features/` (per-area design notes: MCPs + agents, code graph, KG, RL retrieval, install flow, etc.) if the project has one.
+4. For any other project question → search the KG / code graph **before** generating a response.
 
 **Never explain project state from memory.** If you don't know something with certainty, look it up first.
 
@@ -742,7 +743,7 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 
 If you're seeing this orchestrator for the first time, here's the 60-second mental model:
 
-- **What it is**: an infrastructure layer for Claude Code that adds persistent memory (KG), semantic code search (code graph), and ~27 hooks that run automatically. You keep using Claude Code the way you already do; the orchestrator works in the background via hooks and MCP servers.
+- **What it is**: an infrastructure layer for Claude Code that adds persistent memory (KG), semantic code search (code graph), and ~31 hooks that run automatically. You keep using Claude Code the way you already do; the orchestrator works in the background via hooks and MCP servers.
 - **What runs locally**: Weaviate (vector DB) on `:8081`, Ollama (local LLM + embeddings) on `:11435`. Both started automatically by the `SessionStart` hook if not already running.
 - **Free vs Pro**: this repo is fully functional standalone. Optional paid modules (RL retrieval reranking, MAO multi-agent runtime, specialist agent packs) activate only when a license key is present. Without a key, retrieval falls back to cosine ordering — nothing breaks.
 

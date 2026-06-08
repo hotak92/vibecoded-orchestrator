@@ -23,7 +23,7 @@
 //   * `dev_paid_modules_paths(db)` — the dev-affordance, gated behind
 //     the env var `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH=1`. Walks
 //     `<install_root>/paid-modules/*/vct-module.json`. Only useful for
-//     module-author workflows (RL chat developing v0.2.8 locally
+//     module-author workflows (module-author developing v0.2.8 locally
 //     before publishing the GHCR image). Real-user installs don't
 //     have this directory, so the env-var gate is the right knob:
 //     unset by default, set by the dev when they want to work

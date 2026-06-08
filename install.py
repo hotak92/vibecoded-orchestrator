@@ -3105,6 +3105,63 @@ _MAIN_ENTRY_LOCK_HELD: bool = False
 _MAIN_ENTRY_LOCK_HANDLE = None  # kept alive for process lifetime
 
 
+def _release_main_entry_lock_atexit() -> None:
+    """v0.2.51 Bug F: close the singleton-lock file cleanly at exit.
+
+    Without this, Python emits a noisy ``ResourceWarning: unclosed file
+    <_io.BufferedRandom name='/.../install.py.lock'>`` to stderr every
+    time install.py exits — the lock handle is intentionally kept open
+    for the process lifetime, but the interpreter's GC-on-shutdown sees
+    an unreleased file and warns.
+
+    Behaviour:
+      - Releases the OS-level lock (fcntl.LOCK_UN on POSIX,
+        msvcrt.LK_UNLCK on Windows). The process is about to exit so the
+        OS would do this anyway, but doing it explicitly silences any
+        late-stage warnings from the lock subsystem.
+      - Closes the file handle. Suppresses every conceivable error —
+        atexit handlers MUST NOT raise; raising here would mask the
+        actual reason the process is exiting (could be normal exit, SIGINT,
+        unhandled exception during install).
+      - Idempotent: safe to call even if the handle is None or already
+        closed (the lock was never acquired, or it was released earlier).
+
+    Registered once at module import via :func:`atexit.register`. Pairs
+    with :func:`_install_singleton_lock_or_die` which opens the handle
+    and stores it in ``_MAIN_ENTRY_LOCK_HANDLE``.
+    """
+    global _MAIN_ENTRY_LOCK_HANDLE
+    fp = _MAIN_ENTRY_LOCK_HANDLE
+    if fp is None:
+        return
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            try:
+                fp.seek(0)
+                msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    except Exception:
+        # Soft-fail by design. atexit handlers must not raise.
+        pass
+    try:
+        fp.close()
+    except Exception:
+        pass
+    _MAIN_ENTRY_LOCK_HANDLE = None
+
+
+import atexit as _atexit
+_atexit.register(_release_main_entry_lock_atexit)
+
+
 def _install_singleton_lock_or_die(timeout_seconds: float = 15.0):
     """v0.2.49: acquire the install.py main-entry single-instance lock.
 
@@ -6884,6 +6941,179 @@ def _container_runtime_reachable(container_cmd: str) -> bool:
         return False
 
 
+def _try_start_podman_daemon() -> tuple[bool, str]:
+    """v0.2.51 Bug G: auto-start the Podman daemon on a binary-present-but-
+    daemon-stopped condition.
+
+    Per-OS recipes:
+      * Linux: ``systemctl --user start podman.socket`` (rootless). The
+        --user scope mirrors the standard rootless Podman setup. Falls
+        back to a no-op if systemctl is missing (e.g. distros without
+        systemd: musl-based minimal images, Alpine on bare metal).
+      * macOS: ``podman machine start``. Boots the QEMU VM that Podman
+        runs containers in. First-time users need ``podman machine init``
+        first — which we DON'T do automatically (downloads ~500 MB,
+        consents to disk space; out of scope for an auto-start helper).
+      * Windows: ``podman machine start``. Same as macOS (WSL2 VM).
+
+    Returns:
+        Tuple of ``(success, detail)``:
+          * ``success=True``: daemon is now responsive to ``podman info``.
+          * ``success=False``: start command failed or daemon never became
+            responsive within the timeout. ``detail`` carries the failure
+            reason (subprocess stderr or timeout description) for the
+            caller's deferral entry.
+
+    Soft-fails throughout: never raises. The 30-second
+    post-start probe gives the socket time to bind without making the
+    install hang indefinitely on a misconfigured machine.
+
+    Why explicit start instead of waiting for compose-up to fail:
+    compose-up's failure surface is a cryptic "Cannot connect to Podman
+    socket" stderr that takes 10-30s to manifest. Surfacing the start +
+    a clear deferral upfront saves 10-30s and gives the user an
+    actionable next step.
+    """
+    os_name = platform.system()
+
+    if not shutil.which("podman"):
+        return False, "podman binary not on PATH"
+
+    if os_name == "Linux":
+        if not shutil.which("systemctl"):
+            return False, "systemctl not on PATH (distro without systemd)"
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "start", "podman.socket"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, f"systemctl invocation failed: {e}"
+        if result.returncode != 0:
+            return False, (
+                f"systemctl --user start podman.socket exited "
+                f"{result.returncode}: {result.stderr.strip()[:200]}"
+            )
+    elif os_name in ("Darwin", "Windows"):
+        try:
+            result = subprocess.run(
+                ["podman", "machine", "start"],
+                capture_output=True, text=True, timeout=120,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, f"podman machine start failed: {e}"
+        if result.returncode != 0:
+            stderr = result.stderr.strip()[:300]
+            # Common case: "VM does not exist" → user hasn't run
+            # `podman machine init` yet. Pass that hint to the deferral.
+            if "does not exist" in stderr.lower() or "init" in stderr.lower():
+                return False, (
+                    "podman machine not initialized — run `podman machine init` "
+                    f"first. (stderr: {stderr})"
+                )
+            return False, (
+                f"podman machine start exited {result.returncode}: {stderr}"
+            )
+    else:
+        return False, f"unsupported OS '{os_name}'"
+
+    # Post-start probe: give the socket time to bind. systemctl --user
+    # start returns immediately, but the socket may need a beat. Same
+    # for podman machine start (the VM boot completes async).
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if _container_runtime_reachable("podman"):
+            return True, "daemon responsive"
+        time.sleep(1.0)
+
+    return False, "podman daemon did not become responsive within 30s"
+
+
+def _emit_podman_daemon_start_failed_deferral(
+    deferral_report: Any,
+    *,
+    detail: str,
+) -> None:
+    """v0.2.51 Bug G: write a deferral when auto-start of the Podman daemon
+    fails.
+
+    Mirrors the shape of :func:`_emit_launcher_restart_deferral` and other
+    deferral emitters. The launcher GUI renders deferral entries as
+    sticky banners in its post-install summary; this entry is the user's
+    explicit signal that container setup cannot proceed until they start
+    the daemon manually.
+
+    Safe to call with ``deferral_report=None`` (no-op) so callers without
+    a report in scope don't have to wire one through.
+    """
+    if deferral_report is None:
+        return
+
+    os_name = platform.system()
+    if os_name == "Linux":
+        manual_cmd = (
+            "# Start the rootless Podman socket:\n"
+            "systemctl --user start podman.socket\n"
+            "# Verify it's responsive, then re-run:\n"
+            "podman info >/dev/null && python install.py --update"
+        )
+    elif os_name == "Darwin":
+        manual_cmd = (
+            "# First time: initialize the Podman VM (~500 MB download):\n"
+            "podman machine init\n"
+            "# Then start it (~20-30s):\n"
+            "podman machine start\n"
+            "# Verify, then re-run:\n"
+            "podman info >/dev/null && python install.py --update"
+        )
+    elif os_name == "Windows":
+        manual_cmd = (
+            "# Ensure WSL2 is installed first (one-time):\n"
+            "wsl --install\n"
+            "# First time: initialize the Podman machine:\n"
+            "podman machine init\n"
+            "# Then start it:\n"
+            "podman machine start\n"
+            "# Verify, then re-run:\n"
+            "podman info; python install.py --update"
+        )
+    else:
+        manual_cmd = (
+            "# Start the Podman daemon for your platform, then re-run:\n"
+            "podman info && python install.py --update"
+        )
+
+    try:
+        entry = DeferralEntry(
+            condition_id="podman_daemon_start_failed",
+            title="Podman daemon could not be started automatically",
+            detected=(
+                f"install.py attempted to auto-start the Podman daemon "
+                f"(per-OS recipe — systemctl --user start podman.socket on "
+                f"Linux; podman machine start on macOS/Windows) but the "
+                f"start command failed or the daemon never became "
+                f"responsive. Detail: {detail}"
+            ),
+            why_deferred=(
+                "Starting the Podman daemon requires either systemd-user "
+                "(Linux) or an initialized podman machine (macOS/Windows). "
+                "install.py won't run podman machine init unattended "
+                "because it downloads a multi-hundred-MB VM image and the "
+                "user should consent to the disk usage. After manual "
+                "intervention, re-run install.py to complete container setup."
+            ),
+            command_to_apply=manual_cmd,
+            severity="warning",
+            kg_node_refs=[],
+        )
+        deferral_report.add_entry(entry)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "container_runtime", "warn",
+            f"could not emit podman_daemon_start_failed deferral: {exc}",
+        )
+
+
 def _detect_installed_runtime() -> str:
     """Lightweight presence check — returns the FIRST container-runtime
     binary on PATH regardless of whether its daemon is running.
@@ -10249,24 +10479,59 @@ def _start_services(
     # we surface the actionable hint upfront with the OS-correct
     # recovery command, saving 10-30s and giving the user a clearer
     # signal.
+    #
+    # v0.2.51 Bug G: for Podman, ATTEMPT to start the daemon before
+    # giving up. systemctl --user start podman.socket on Linux is safe
+    # to call on a healthy machine (no-op if already started) and
+    # eliminates the most common "binary present but daemon stopped"
+    # failure mode. On macOS/Windows we try `podman machine start` — if
+    # the VM hasn't been initialized yet (first-time user), we emit a
+    # deferral with the manual `podman machine init` recipe rather than
+    # auto-downloading a multi-hundred-MB VM image unattended.
+    # Docker daemon start is NOT automated here — Docker Desktop on
+    # macOS/Windows requires GUI interaction; `sudo systemctl start
+    # docker` on Linux needs sudo+interactive password, which we don't
+    # shoulder for a non-blocking pre-flight check.
     if not _container_runtime_reachable(sysinfo.container_cmd):
-        print(
-            f"  [!] {sysinfo.container_cmd} is installed but its daemon/socket\n"
-            f"      isn't responding to `{sysinfo.container_cmd} info`. The compose-up\n"
-            f"      below will fail. Most common fixes:"
-        )
-        if sysinfo.container_cmd == "docker":
-            print("        Linux:   sudo systemctl start docker")
-            print("        macOS:   open Docker Desktop and wait for it to start")
-            print("        Windows: start Docker Desktop")
+        if sysinfo.container_cmd == "podman":
+            print(
+                "  [!] podman is installed but its daemon/socket isn't "
+                "responding to `podman info`. Attempting auto-start..."
+            )
+            ok, detail = _try_start_podman_daemon()
+            if ok:
+                print("      [OK] Podman daemon is now responsive.")
+            else:
+                print(f"      [!] Auto-start failed: {detail}")
+                _emit_podman_daemon_start_failed_deferral(
+                    deferral_report, detail=detail,
+                )
+                print(
+                    "      A deferral entry has been written to "
+                    "UPDATE_DEFERRED.md with the manual recovery recipe."
+                )
+                print(
+                    "      compose-up below may fail; re-run install.py "
+                    "after starting the daemon manually."
+                )
         else:
-            print("        Linux:   systemctl --user start podman.socket")
-            print("        macOS:   podman machine start")
-            print("        Windows: podman machine start")
-        print(
-            "      Re-run install.py once the runtime is reachable. (Skipping the\n"
-            "      compose-up below would leave the install in a partial state.)"
-        )
+            print(
+                f"  [!] {sysinfo.container_cmd} is installed but its daemon/socket\n"
+                f"      isn't responding to `{sysinfo.container_cmd} info`. The compose-up\n"
+                f"      below will fail. Most common fixes:"
+            )
+            if sysinfo.container_cmd == "docker":
+                print("        Linux:   sudo systemctl start docker")
+                print("        macOS:   open Docker Desktop and wait for it to start")
+                print("        Windows: start Docker Desktop")
+            else:
+                print("        Linux:   systemctl --user start podman.socket")
+                print("        macOS:   podman machine start")
+                print("        Windows: podman machine start")
+            print(
+                "      Re-run install.py once the runtime is reachable. (Skipping the\n"
+                "      compose-up below would leave the install in a partial state.)"
+            )
 
     compose_cmd = _get_compose_command(sysinfo.container_cmd)
 
@@ -16731,6 +16996,114 @@ def _emit_binary_swap_locked_deferral(
         )
 
 
+def _emit_update_resume_required_deferral(
+    deferral_report: Any,
+    *,
+    install_root: Path,
+    operation: str = "merge",
+    branch: str = "main",
+    source_version: Optional[str] = None,
+    installed_version: Optional[str] = None,
+) -> None:
+    """v0.2.51 Bug A: emit ``update_resume_required`` when the launcher
+    detected a "merge resolved but install.py not run" state.
+
+    Background
+    ----------
+    The launcher's "Update orchestrator" flow runs:
+      1. ``git fetch`` + ``git pull`` (or merge/rebase via the conflict-
+         recovery commands).
+      2. ``install.py --update`` against the freshly-pulled tree.
+      3. Binary refresh of ``launcher/src-tauri/target/release/vct-launcher``.
+      4. Auto-restart so the new binary loads.
+
+    Pre-v0.2.51, step 1 could halt at a merge/rebase conflict and the
+    "Resolve manually" modal button just closed the dialog. The user
+    resolved the conflict in their editor + ``git commit``-ed but the
+    launcher never re-entered steps 2-4. Result: merged source on disk,
+    stale install manifest, old binary still running.
+
+    v0.2.51 fix
+    -----------
+    The Rust ``update_orchestrator`` / ``merge_orchestrator_*`` /
+    ``rebase_orchestrator_*`` commands now write a sentinel at
+    ``.claude/state/orchestrator-update-resume-needed.json`` whenever they
+    surface the conflict modal. The launcher's MenuBar UpdateBadge polls
+    ``check_for_updates``; when sentinel-present AND ``.git/MERGE_HEAD``
+    is gone, the badge surfaces "Continue Update" → calls the new
+    ``resume_orchestrator_update`` Tauri command to re-enter steps 2-4.
+
+    This deferral entry mirrors that state into ``UPDATE_DEFERRED.md`` so
+    the same condition is visible to Claude sessions that don't have the
+    launcher GUI open. Claude reads UPDATE_DEFERRED.md at session start
+    (the deferral writer injects a reminder block into CLAUDE.md too) and
+    can prompt the user before any other work.
+
+    Self-clears: when ``resume_orchestrator_update`` succeeds it deletes
+    the sentinel; the next ``install.py --update --apply-deferred`` run
+    treats this entry as resolved and removes it (no auto-apply needed —
+    install.py itself ran during the resume).
+
+    Safe to call with ``deferral_report=None`` (no-op).
+    """
+    if deferral_report is None:
+        return
+
+    sv = source_version or "(unknown)"
+    iv = installed_version or "(unknown)"
+    op_phrase = "merge" if operation == "merge" else "rebase"
+
+    try:
+        entry = DeferralEntry(
+            condition_id="update_resume_required",
+            title="Orchestrator update halted at a conflict — resume needed",
+            detected=(
+                f"A previous `update_orchestrator` ({op_phrase} on "
+                f"`{branch}`) was halted at a conflict, the conflict was "
+                f"resolved outside the launcher (CLI `git add` + "
+                f"`git commit`), but `install.py --update` and the binary "
+                f"refresh never ran. Source on disk is v{sv}; last "
+                f"install ran v{iv}. The launcher binary may also be "
+                f"stale relative to the merged source.\n\n"
+                f"Sentinel: `.claude/state/orchestrator-update-resume-needed.json` "
+                f"in `{install_root}`."
+            ),
+            why_deferred=(
+                "install.py cannot detect this state proactively at "
+                "session start — the sentinel is launcher state, not "
+                "install state. The user must either click `Continue "
+                "Update` in the launcher's MenuBar UpdateBadge (which "
+                "runs `resume_orchestrator_update` → install.py --update "
+                "+ binary refresh + auto-restart) OR run `python "
+                "install.py --update` manually from a terminal to finish "
+                "the install. Either path bumps `last_installed_version` "
+                "to match `source_version` and clears this deferral."
+            ),
+            command_to_apply=(
+                "# Option A (recommended): open the launcher, click the\n"
+                "# Continue Update button in the top-right MenuBar badge.\n"
+                "# This re-runs install.py + refreshes the binary + restarts.\n"
+                "#\n"
+                "# Option B (terminal): from the orchestrator install root,\n"
+                f"cd {install_root}\n"
+                "python install.py --update\n"
+                "# After install.py finishes, restart the launcher manually\n"
+                "# (tray → Quit, then relaunch via your usual entrypoint) so\n"
+                "# the freshly-built binary loads."
+            ),
+            severity="warning",
+            kg_node_refs=[
+                "knowledge/concepts/update-resume-required-bug-a-v0251.md",
+            ],
+        )
+        deferral_report.add_entry(entry)
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "update_resume_required", "warn",
+            f"could not emit update_resume_required deferral: {exc}",
+        )
+
+
 def _maybe_emit_running_stale_deferral(
     install_root: Path,
     *,
@@ -21817,6 +22190,144 @@ def _record_npm_pin_drift_deferral(package_key: str,
 
 
 # ---------------------------------------------------------------------------
+# v0.2.51 Bug E: npx fallback for fnm/nvm-style setups.
+#
+# `shutil.which("npx")` handles the common case (apt/brew/winget/NodeSource
+# where npx is symlinked alongside npm on PATH). But on fnm/nvm setups where
+# users may have hand-symlinked just `npm` to ~/.local/bin/, npx is physically
+# present in the same bin dir as the REAL npm but not on PATH.
+#
+# Reported 2026-06-09 from a user's machine: `~/.local/bin/npm` was symlinked
+# to `~/.fnm/node-versions/v20.20.1/installation/bin/npm`. The corresponding
+# `npx` is at `~/.fnm/.../bin/npx` (same dir) — `shutil.which("npx")` failed,
+# Playwright pre-cache + bundled-npm pinning both skipped silently even though
+# the user clearly had a working Node install.
+#
+# Fallback: probe `dirname(realpath(which("npm")))/npx` (and `.cmd` / `.ps1`
+# on Windows). Cross-OS: ``Path.resolve()`` handles symlink chains on every
+# platform; on Windows there's no executable bit so we fall back to
+# ``is_file()``. Same shape as ``_find_lean_ctx_binary``.
+# ---------------------------------------------------------------------------
+
+def _find_npx() -> Optional[str]:
+    """Locate npx with fnm/nvm-style fallback.
+
+    Returns the absolute path to the npx binary, or None if truly absent.
+
+    Strategy (each candidate gets the .cmd / .ps1 Windows variants too):
+      1. ``shutil.which("npx")`` — the common case (npx is on PATH).
+      2. ``dirname(which("npm"))/npx`` — sibling of the symlink target
+         (covers the case where the user symlinked `npm` to ~/.local/bin/
+         but the same dir also has `npx` as a sibling — common on apt /
+         brew where both ship together).
+      3. ``dirname(realpath(which("npm")))/npx`` — sibling of the REAL
+         npm. For fnm/nvm this lands in
+         ``lib/node_modules/npm/bin/`` because npm itself is a symlink
+         to ``npm-cli.js`` in that dir. The npx shim there is sometimes
+         a broken-without-context cli (it imports node modules
+         relatively); we probe it but it's not always runnable on its
+         own.
+      4. Climb up from the realpath: if real npm lives at
+         ``<root>/lib/node_modules/npm/bin/npm-cli.js``, probe
+         ``<root>/bin/npx`` — the canonical fnm/nvm shim that wraps
+         node + npx-cli.js with the right argv. This is the path that
+         works at runtime on real fnm/nvm setups.
+
+    Cross-OS:
+      * POSIX: ``os.access(path, os.X_OK)`` confirms executability.
+      * Windows: executable bit doesn't exist — ``is_file()`` is the
+        relevant check, matching the convention in
+        ``_find_lean_ctx_binary``.
+
+    Never raises — symlink loops, permission errors, hostile paths all
+    fall through to the next candidate or ``None``.
+    """
+    direct = shutil.which("npx")
+    if direct:
+        return direct
+    npm = shutil.which("npm")
+    if not npm:
+        return None
+    is_windows = sys.platform == "win32"
+
+    # Build candidate base directories. Order matters: prefer the
+    # canonical fnm/nvm shim (case 4) over the broken-on-its-own
+    # ``lib/node_modules/npm/bin/npx`` (case 3) because the former
+    # actually runs.
+    npm_path = Path(npm)
+    candidate_dirs: list[Path] = []
+
+    # Case 2: sibling of the symlink itself (apt / brew layout).
+    candidate_dirs.append(npm_path.parent)
+
+    # Case 4: canonical fnm/nvm installation/bin/ — derive from the real
+    # npm path by climbing out of lib/node_modules/npm/bin.
+    try:
+        real_npm = npm_path.resolve()
+    except OSError:
+        real_npm = None
+    if real_npm is not None:
+        # Look for the well-known lib/node_modules/npm/bin marker and
+        # climb to the installation/bin sibling.
+        parts = real_npm.parts
+        try:
+            idx = parts.index("node_modules")
+            # Need at least 3 levels above node_modules to find install root:
+            #   <root>/lib/node_modules/npm/bin/npm-cli.js
+            # We expect parts[idx-1] == "lib"; climb to parts[:idx-1] / "bin".
+            if idx >= 2 and parts[idx - 1] == "lib":
+                install_root = Path(*parts[:idx - 1])
+                candidate_dirs.append(install_root / "bin")
+        except ValueError:
+            pass
+
+        # Case 3: sibling of the real npm-cli.js. Lower priority because
+        # this shim sometimes doesn't run standalone, but it's the right
+        # answer for distros that ship `npm` as a bare executable
+        # (not the *-cli.js JavaScript shape).
+        candidate_dirs.append(real_npm.parent)
+
+    # Build final candidate list (with platform-specific suffixes).
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for d in candidate_dirs:
+        for name in ("npx", "npx.cmd", "npx.ps1") if is_windows else ("npx",):
+            cand = d / name
+            if cand in seen:
+                continue
+            seen.add(cand)
+            candidates.append(cand)
+
+    for cand in candidates:
+        try:
+            if cand.is_file() and (is_windows or os.access(cand, os.X_OK)):
+                return str(cand)
+        except OSError:
+            continue
+    return None
+
+
+def _find_npm() -> Optional[str]:
+    """Locate npm with fnm/nvm-style fallback. Mirror of :func:`_find_npx`.
+
+    Reserved for future use — the bundled-npm pin helpers cache npm at
+    module import time via ``_NPM_PATH``, but they could swap in this
+    resolver once we want runtime re-detection (e.g. for ``--update``
+    runs where the user installed Node mid-session). Today's call sites
+    don't need that, so this is a placeholder for symmetry.
+
+    Returns the absolute path to npm, or None if truly absent.
+    """
+    direct = shutil.which("npm")
+    if direct:
+        return direct
+    # No fallback heuristic for npm itself — if `npm` isn't on PATH,
+    # there's nothing to dirname-realpath off. Caller decides whether
+    # to surface an install hint or skip.
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Playwright MCP + Chromium pre-cache
 # ---------------------------------------------------------------------------
 
@@ -21848,13 +22359,19 @@ def _install_playwright_browsers() -> None:
                            "VCT_SKIP_PLAYWRIGHT=1 in env")
         return
 
-    if not shutil.which("npx"):
+    # v0.2.51 Bug E: use _find_npx() instead of shutil.which("npx") so
+    # fnm/nvm setups (where the user symlinked only `npm` to PATH but
+    # left `npx` in the version manager's bin dir) work without manual
+    # PATH fiddling. See _find_npx() docstring for the rationale.
+    npx_path = _find_npx()
+    if not npx_path:
         print("SKIPPED (npx not found)")
         print("  Node.js / npx not detected. Playwright MCP will")
         print("  lazy-install when first invoked. Install Node.js 18+")
         print("  to pre-cache: https://nodejs.org")
         _log_install_event("playwright", "skip",
-                           "npx not on PATH — MCP will lazy-install")
+                           "npx not on PATH and not adjacent to npm — "
+                           "MCP will lazy-install")
         return
 
     print("(this may take ~30s, ~150 MB)")
@@ -21862,7 +22379,7 @@ def _install_playwright_browsers() -> None:
     # 1) Cache the MCP package itself (small).
     try:
         result = subprocess.run(
-            ["npx", "-y", "@playwright/mcp@latest", "--version"],
+            [npx_path, "-y", "@playwright/mcp@latest", "--version"],
             capture_output=True, text=True, timeout=180,
         )
         if result.returncode != 0:
@@ -21886,7 +22403,7 @@ def _install_playwright_browsers() -> None:
     #    `npx playwright install firefox` etc. manually.
     try:
         result = subprocess.run(
-            ["npx", "playwright", "install", "chromium"],
+            [npx_path, "playwright", "install", "chromium"],
             capture_output=True, text=True, timeout=600,
         )
         if result.returncode == 0:

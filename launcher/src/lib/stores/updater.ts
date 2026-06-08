@@ -20,10 +20,20 @@ import { orchestrator } from './orchestrator';
 
 const SEEN_KEY = 'vct.update.seen_version';
 
-/** v0.2.16 (W4 / 0.5): which of the three update signals to render.
- *  Priority order: 'binary_stale' > 'install_stale' > 'remote_ahead'.
+/** v0.2.16 (W4 / 0.5): which of the four update signals to render.
+ *  Priority order (v0.2.51):
+ *    'merge_resolved_incomplete' > 'binary_stale' > 'install_stale' > 'remote_ahead'.
+ *  `merge_resolved_incomplete` is HIGHEST priority because every other
+ *  flag is meaningless until install.py finishes against the freshly-
+ *  merged source: a binary refresh against a non-installed source would
+ *  ship a launcher that doesn't match its own manifest.
  *  `null` when no signal is true. */
-export type UpdateKind = 'binary_stale' | 'install_stale' | 'remote_ahead' | null;
+export type UpdateKind =
+  | 'merge_resolved_incomplete'
+  | 'binary_stale'
+  | 'install_stale'
+  | 'remote_ahead'
+  | null;
 
 /**
  * v0.2.23 (B4 / D19): structured payload returned by `update_orchestrator`
@@ -82,13 +92,25 @@ function saveSeen(v: string | null) {
   else localStorage.removeItem(SEEN_KEY);
 }
 
-function pickKind(status: { remote_ahead: boolean; install_stale: boolean; binary_stale: boolean } | null): UpdateKind {
+function pickKind(status: {
+  remote_ahead: boolean;
+  install_stale: boolean;
+  binary_stale: boolean;
+  merge_resolved_incomplete?: boolean;
+} | null): UpdateKind {
   if (!status) return null;
-  // Priority order: binary > install > remote.
-  // binary_stale wins because restart is fastest + a newer binary can
-  // change every other code path; install_stale next (without an
-  // install.py pass, `.claude/` config drifts); remote_ahead last (the
-  // most "fully behind" but lowest urgency).
+  // v0.2.51 Bug A: merge_resolved_incomplete is HIGHEST priority. When
+  // a prior conflict-resolution path was abandoned, every downstream
+  // signal is misleading until install.py finishes against the freshly-
+  // merged source. Re-entering via resume_orchestrator_update is the
+  // ONLY correct next step.
+  //
+  // Then: binary > install > remote (unchanged from v0.2.16).
+  // - binary_stale wins because restart is fastest + a newer binary can
+  //   change every other code path.
+  // - install_stale next: without an install.py pass, `.claude/` drifts.
+  // - remote_ahead last: "fully behind" but lowest urgency.
+  if (status.merge_resolved_incomplete) return 'merge_resolved_incomplete';
   if (status.binary_stale) return 'binary_stale';
   if (status.install_stale) return 'install_stale';
   if (status.remote_ahead) return 'remote_ahead';
@@ -252,6 +274,48 @@ function createUpdaterStore() {
           ...s,
           updating: false,
           error: e instanceof Error ? e.message : String(e),
+        }));
+      }
+    },
+
+    /**
+     * v0.2.51 (Bug A): resolve `merge_resolved_incomplete` — call the new
+     * `resume_orchestrator_update` Tauri command, which verifies the
+     * working tree is clean (no leftover conflict markers, no in-flight
+     * merge state) and then re-enters the post-merge tail of
+     * `update_orchestrator` (install.py --update + binary refresh +
+     * auto-restart). The Rust side audit-logs `update_orchestrator_resumed`
+     * for forensic clarity.
+     *
+     * On success the launcher auto-restarts mid-call; in practice we
+     * rarely reach the success branch here. Errors surface as toast +
+     * popover error string (the user can see e.g. "found unresolved
+     * conflict markers in N files").
+     */
+    async resumeUpdate(): Promise<void> {
+      if (!tauriAvailable()) return;
+      update((s) => ({ ...s, updating: true, error: null, nonFf: null }));
+      try {
+        const o = get(orchestrator);
+        await invoke('resume_orchestrator_update', { path: o.installPath });
+        update((s) => ({
+          ...s,
+          updating: false,
+          available: false,
+          kind: null,
+          dismissed: false,
+          nonFf: null,
+        }));
+        // Re-check so merge_resolved_incomplete clears + any newer flags
+        // (binary_stale typically — the swap just landed) surface.
+        await orchestrator.checkStatus();
+      } catch (e) {
+        const raw = e instanceof Error ? e.message : String(e);
+        update((s) => ({
+          ...s,
+          updating: false,
+          error: raw,
+          nonFf: null,
         }));
       }
     },

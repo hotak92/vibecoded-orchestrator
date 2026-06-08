@@ -17,7 +17,7 @@
 //! special wiring required.
 //!
 //! Why this exists: v0.2.32 validation shipped a manifest schema bug
-//! where the RL chat's v0.2.7 manifest declared a `tauri_command` step
+//! where the the v0.2.7 module manifest declared a `tauri_command` step
 //! kind that the launcher's `ActionDescriptor` enum didn't know about.
 //! The parse silently failed → the catalog tile showed a stale v0.1.1
 //! placeholder for weeks. With this CI gate, the same class of bug

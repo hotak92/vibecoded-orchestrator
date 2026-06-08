@@ -407,26 +407,8 @@ If retrieval accuracy < 80%:
 4. Add metadata filtering
 5. Use re-ranking layer
 
-## Claude Orchestrator Implementation
-
-Our system uses two chunking approaches, both calibrated to the snowflake-arctic-embed2 model (~2000 token context window):
-
-**Char-based chunking** (RL similarity, general embedding, document ingestion):
-- Chunk size: 6000 chars (~1500 tokens, 75% of model budget)
-- Overlap: 300 chars (~5%)
-- Constants centralized in `orchestrator/context/embedding.py` (`EMBED_CHUNK_SIZE`, `EMBED_CHUNK_OVERLAP`)
-- Used by: `retrieval_rl.py`, `embedding.py`, `synthetic_rl_data.py`, `ingestion.py`
-
-**Token-based chunking** (KG node storage in Weaviate):
-- Target: 1500 tokens, max: 2000 tokens (model limit)
-- Sentence-boundary splitting for higher quality
-- Implemented in `weaviate_mcp/chunking.py` (Chunker class)
-
-We use 5% overlap rather than the 10-20% industry recommendation because our RL cosine path takes **max** similarity over all chunks — a single matching chunk dominates the signal regardless of boundary effects. Higher overlap would only increase embedding compute without improving the max-based score.
-
 [[relatedTo::RAG - Retrieval-Augmented Generation]]
 [[relatedTo::Semantic Search and Embeddings]]
-[[relatedTo::Claude Orchestrator RL Retrieval]]
 [[implements::Document Processing Pipeline]]
 [[uses::LangChain]]
 [[uses::LlamaIndex]]

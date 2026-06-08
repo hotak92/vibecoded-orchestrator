@@ -886,7 +886,7 @@ mod tests {
             consumes: vec![],
             gui: None,
             db: None,
-            // v0.2.49 access-matrix item #13 (RL chat) — global-scope
+            // v0.2.49 access-matrix item #13 — global-scope
             // modules can declare KG collections that get auto-seeded
             // into kg_collection_access for every project. The
             // rl-reranker test fixture is a CONSUMER, not a producer,

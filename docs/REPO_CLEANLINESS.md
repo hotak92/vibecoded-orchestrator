@@ -62,7 +62,7 @@ source code or upstream-verified content:
 | `launcher/dist/*/THIRD_PARTY_LICENSES.txt`, `README.md` | Bundle metadata |
 | `vendor/lean-ctx/<arch>/lean-ctx{,.exe}` | Third-party binary, verified against upstream SHA256 (see `vendor/lean-ctx/VERSION.md`) |
 | `docs/**/*.png`, `knowledge/**/*.png` | Documentation diagrams, screenshots |
-| `scripts/check-install.sh` regex matching `/home/martino` etc. | Deliberate self-test for path-leak audit class |
+| `scripts/check-install.sh` regex matching `/home/<username>` etc. | Deliberate self-test for path-leak audit class |
 | `tests/test_telemetry.py` fake `ghp_…` tokens | Test fixtures for the PII scrubber — verifies it removes them |
 
 ## 3. The PNG / `vct-secrets/` rule conflict (background)

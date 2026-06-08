@@ -293,7 +293,13 @@
 </div>
 
 <style>
-  /* Full-screen opaque blocking overlay. */
+  /* Full-screen opaque blocking overlay.
+   *
+   * v0.2.51 fix: anchor to viewport top + safe padding + overflow-y:auto
+   * so the card never clips above the window in short viewports. Without
+   * this, align-items:center pushes a tall card up past y=0 and the
+   * progress logo + title fall outside the visible area on small windows
+   * (matches the pattern shared with the conflict + divergence modals). */
   .oup-overlay {
     position: fixed;
     inset: 0;
@@ -301,8 +307,10 @@
     background: rgba(5, 11, 31, 0.92);
     backdrop-filter: blur(8px);
     display: flex;
-    align-items: center;
+    align-items: flex-start;        /* anchor to top, not vertical center */
     justify-content: center;
+    padding: 16px;                  /* safe margin from window edges */
+    overflow-y: auto;               /* scroll when card taller than viewport */
     pointer-events: auto;
     animation: oup-overlay-in 200ms ease-out;
     transition: opacity var(--fade-ms, 400ms) ease-out;
@@ -317,6 +325,11 @@
   .oup-card {
     max-width: 480px;
     min-width: 340px;
+    /* Moderate top offset scales with viewport, never zero. */
+    margin-top: clamp(0px, 8vh, 80px);
+    /* Bottom safe margin so the card doesn't kiss the viewport edge
+     * when overflow-y kicks in. */
+    margin-bottom: 16px;
     padding: 36px 32px 28px;
     background: rgba(13, 23, 53, 0.95);
     border: 1px solid rgba(0, 191, 166, 0.25);

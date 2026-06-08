@@ -9,7 +9,11 @@ set -euo pipefail
 #      Auto-install is INTERACTIVE: we prompt before invoking sudo or
 #      brew; pass --non-interactive (or --quiet) to disable auto-install
 #      and just fail with an install hint.
-#   3. Re-checks for Python after install, then exec's `python install.py`.
+#   3. v0.2.51 (Bug G): same pattern for Node.js (>= 18) and Podman.
+#      Detection-only fail when they're truly absent + non-interactive;
+#      interactive prompt + auto-install when stdin is a TTY. GPU drivers
+#      stay manual (out of scope for this script).
+#   4. Re-checks for everything after install, then exec's `python install.py`.
 #
 # Why a shell wrapper instead of bootstrapping in Python: chicken-and-egg
 # — install.py needs Python to run. We could ship a standalone bootstrap
@@ -195,6 +199,254 @@ attempt_install_python() {
 }
 
 # ---------------------------------------------------------------------------
+# v0.2.51 Bug G: Node.js detection + auto-install
+#
+# Node 18+ is needed for:
+#   - The Playwright MCP (npx -y @playwright/mcp@latest)
+#   - The bundled-npm pinning helpers (@anthropic-ai/claude-code, etc.)
+#   - The Tauri launcher build path (npm during cargo tauri build)
+#
+# Detection: probe a few PATH candidates (node + version >= 18). fnm/nvm
+# setups: install.py's _find_npx() handles the case where `npm` is on
+# PATH but `npx` is only in the fnm bin dir; this script just verifies
+# `node` exists since the version is what matters for the pre-flight gate.
+#
+# Auto-install via the same package manager we already use for Python:
+# apt/dnf/pacman on Linux, brew on macOS. winget on Windows is handled
+# by install.ps1.
+# ---------------------------------------------------------------------------
+find_node() {
+    # Returns 0 + prints "node|<version>" if node >= 18 is on PATH;
+    # returns 1 otherwise. We probe node directly rather than npm/npx
+    # because the orchestrator's gating constraint is the Node runtime
+    # version, not which front-ends ship alongside it.
+    local cmd version major
+    for cmd in node nodejs; do
+        if command -v "$cmd" &>/dev/null; then
+            # Strip leading 'v' from "v20.11.1" → "20.11.1"; tolerate broken
+            # interpreters by suppressing stderr (set -e shouldn't abort).
+            version=$("$cmd" --version 2>/dev/null | sed 's/^v//') || continue
+            if [ -z "$version" ]; then continue; fi
+            major=${version%%.*}
+            # Accept Node >= 18. Older majors lack the fetch() / built-in
+            # fs/promises shape that the bundled MCPs assume.
+            if [ "$major" -ge 18 ] 2>/dev/null; then
+                echo "$cmd|$version"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+print_node_manual_hint() {
+    echo "" >&2
+    echo "Install Node.js 18+ manually, then re-run ./install.sh:" >&2
+    case "${OSTYPE:-}" in
+        linux*)
+            echo "  Ubuntu/Debian: sudo apt install nodejs npm" >&2
+            echo "  Fedora:        sudo dnf install nodejs npm" >&2
+            echo "  Arch:          sudo pacman -S nodejs npm" >&2
+            echo "  Or via fnm:    curl -fsSL https://fnm.vercel.app/install | bash" >&2
+            ;;
+        darwin*)
+            echo "  macOS (brew):  brew install node" >&2
+            echo "  Or download:   https://nodejs.org/" >&2
+            ;;
+        *)
+            echo "  Download:      https://nodejs.org/" >&2
+            ;;
+    esac
+}
+
+attempt_install_node_linux() {
+    if command -v apt-get &>/dev/null; then
+        echo "Detected apt (Debian/Ubuntu). Will run:"
+        echo "  sudo apt-get install nodejs npm"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            # Note: Debian/Ubuntu's `nodejs` package is sometimes older than
+            # 18 on long-LTS distros. The post-install re-probe will catch
+            # that and surface the NodeSource hint.
+            sudo apt-get install -y nodejs npm
+            return 0
+        fi
+    elif command -v dnf &>/dev/null; then
+        echo "Detected dnf (Fedora/RHEL). Will run:"
+        echo "  sudo dnf install nodejs npm"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            sudo dnf install -y nodejs npm
+            return 0
+        fi
+    elif command -v pacman &>/dev/null; then
+        echo "Detected pacman (Arch). Will run:"
+        echo "  sudo pacman -S nodejs npm"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            sudo pacman -S --noconfirm nodejs npm
+            return 0
+        fi
+    else
+        echo "ERROR: No supported package manager found (apt/dnf/pacman)." >&2
+        return 1
+    fi
+    return 1
+}
+
+attempt_install_node_macos() {
+    # Re-probe brew the same way as attempt_install_macos (canonical
+    # Homebrew prefixes); user may have installed brew between the
+    # Python check and now.
+    if ! command -v brew >/dev/null 2>&1; then
+        for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+            if [ -x "$candidate" ]; then
+                eval "$("$candidate" shellenv)"
+                break
+            fi
+        done
+    fi
+    if ! command -v brew &>/dev/null; then
+        echo "ERROR: Homebrew not found." >&2
+        echo "       Install Homebrew first: https://brew.sh" >&2
+        echo "       Then: brew install node" >&2
+        return 1
+    fi
+    echo "Detected Homebrew. Will run:"
+    echo "  brew install node"
+    if prompt_yes "Proceed?"; then
+        brew install node
+        return 0
+    fi
+    return 1
+}
+
+attempt_install_node() {
+    case "${OSTYPE:-}" in
+        linux*)        attempt_install_node_linux ;;
+        darwin*)       attempt_install_node_macos ;;
+        msys*|cygwin*) echo "ERROR: Use install.ps1 on Windows." >&2; return 1 ;;
+        *)             echo "ERROR: Unknown OS '${OSTYPE:-unknown}'; auto-install unsupported." >&2; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# v0.2.51 Bug G: Podman detection + auto-install
+#
+# install.py also has Podman install logic (see _prompt_install_container_runtime).
+# Why duplicate here: install.py runs AFTER Python is verified, but the
+# user can have Podman missing at THIS layer too — surfacing it pre-Python
+# saves a round-trip if the user wants to install both in the same sudo
+# session. install.py's logic is the canonical fallback; this is opportunistic
+# pre-flight.
+#
+# Daemon-start (systemctl --user start podman.socket / podman machine start)
+# is install.py's responsibility — done after settings.json is written
+# because the resolved storage paths may affect the rootless socket config.
+# ---------------------------------------------------------------------------
+find_podman() {
+    # Detection-only: returns 0 if `podman` binary is on PATH, regardless
+    # of whether the daemon/socket is currently responsive. install.py's
+    # daemon-start step handles the running-state check.
+    command -v podman &>/dev/null
+}
+
+find_container_runtime() {
+    # Returns 0 if EITHER podman OR docker is on PATH (binary present).
+    # Prefer podman per the project convention (no license, native on
+    # Linux). Docker presence is acceptable — install.py will use it.
+    find_podman && return 0
+    command -v docker &>/dev/null
+}
+
+print_podman_manual_hint() {
+    echo "" >&2
+    echo "Install Podman manually, then re-run ./install.sh:" >&2
+    case "${OSTYPE:-}" in
+        linux*)
+            echo "  Ubuntu/Debian: sudo apt install podman" >&2
+            echo "  Fedora:        sudo dnf install podman" >&2
+            echo "  Arch:          sudo pacman -S podman" >&2
+            ;;
+        darwin*)
+            echo "  macOS (brew):  brew install podman" >&2
+            echo "  Then:          podman machine init && podman machine start" >&2
+            ;;
+        *)
+            echo "  Download:      https://podman.io/getting-started/installation" >&2
+            ;;
+    esac
+}
+
+attempt_install_podman_linux() {
+    if command -v apt-get &>/dev/null; then
+        echo "Detected apt (Debian/Ubuntu). Will run:"
+        echo "  sudo apt-get install podman"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            sudo apt-get install -y podman
+            return 0
+        fi
+    elif command -v dnf &>/dev/null; then
+        echo "Detected dnf (Fedora/RHEL). Will run:"
+        echo "  sudo dnf install podman"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            sudo dnf install -y podman
+            return 0
+        fi
+    elif command -v pacman &>/dev/null; then
+        echo "Detected pacman (Arch). Will run:"
+        echo "  sudo pacman -S podman"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            sudo pacman -S --noconfirm podman
+            return 0
+        fi
+    else
+        echo "ERROR: No supported package manager found (apt/dnf/pacman)." >&2
+        return 1
+    fi
+    return 1
+}
+
+attempt_install_podman_macos() {
+    if ! command -v brew >/dev/null 2>&1; then
+        for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+            if [ -x "$candidate" ]; then
+                eval "$("$candidate" shellenv)"
+                break
+            fi
+        done
+    fi
+    if ! command -v brew &>/dev/null; then
+        echo "ERROR: Homebrew not found." >&2
+        echo "       Install Homebrew first: https://brew.sh" >&2
+        echo "       Then: brew install podman" >&2
+        return 1
+    fi
+    echo "Detected Homebrew. Will run:"
+    echo "  brew install podman"
+    if prompt_yes "Proceed?"; then
+        brew install podman
+        if [ $? -eq 0 ]; then
+            # podman machine init + start are interactive and can take
+            # 1-2 minutes (downloads a VM image). Defer to install.py
+            # which has the deferral pattern + the platform-specific
+            # daemon-start logic.
+            echo ""
+            echo "Podman installed. The macOS VM ('podman machine') will be"
+            echo "initialized by install.py later in this run."
+        fi
+        return 0
+    fi
+    return 1
+}
+
+attempt_install_podman() {
+    case "${OSTYPE:-}" in
+        linux*)        attempt_install_podman_linux ;;
+        darwin*)       attempt_install_podman_macos ;;
+        msys*|cygwin*) echo "ERROR: Use install.ps1 on Windows." >&2; return 1 ;;
+        *)             echo "ERROR: Unknown OS '${OSTYPE:-unknown}'; auto-install unsupported." >&2; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------------------
 PYTHON=$(find_python || true)
@@ -228,6 +480,79 @@ if [ -z "$PYTHON" ]; then
 fi
 
 echo "Using Python: $PYTHON ($("$PYTHON" --version))"
+
+# ---------------------------------------------------------------------------
+# v0.2.51 Bug G: Node.js + Podman pre-flight (best-effort).
+#
+# These are NOT install-blockers — install.py soft-fails when they're
+# missing (Playwright skips, container setup gets a clear prompt). But
+# if the user is at this prompt anyway, offering to install in the same
+# sudo session is a strict UX win.
+#
+# Non-interactive mode (--yes / --quiet / CI / no TTY): skip silently
+# and let install.py handle the downstream consequences.
+# ---------------------------------------------------------------------------
+if NODE_INFO=$(find_node); then
+    NODE_VERSION="${NODE_INFO#*|}"
+    echo "Found Node.js: $NODE_VERSION"
+else
+    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+        echo "Node.js 18+ not detected (non-interactive — skipping auto-install)."
+        echo "  Playwright MCP + Tauri launcher build will be limited until installed."
+    else
+        echo "Node.js 18+ not detected."
+        if prompt_yes "Install Node.js now? (Playwright MCP + launcher build need it)"; then
+            if attempt_install_node; then
+                echo "Re-checking for Node.js..."
+                if NODE_INFO=$(find_node); then
+                    NODE_VERSION="${NODE_INFO#*|}"
+                    echo "Found Node.js: $NODE_VERSION"
+                else
+                    echo "WARN: Node.js install appeared to succeed but `node --version` still reports < 18 or not found." >&2
+                    echo "      Open a new shell or update PATH; install.py will surface a deferral if needed." >&2
+                    print_node_manual_hint
+                fi
+            else
+                print_node_manual_hint
+                echo "Continuing install — Node.js is non-blocking."
+            fi
+        else
+            echo "Skipped — install.py will note missing Node.js in its summary."
+        fi
+    fi
+fi
+
+if find_container_runtime; then
+    if find_podman; then
+        echo "Found container runtime: podman ($(podman --version 2>/dev/null | head -1))"
+    else
+        echo "Found container runtime: docker ($(docker --version 2>/dev/null | head -1))"
+    fi
+else
+    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+        echo "No container runtime detected (non-interactive — skipping auto-install)."
+        echo "  install.py will surface a prompt later in this run."
+    else
+        echo "No container runtime (podman or docker) detected."
+        if prompt_yes "Install Podman now? (recommended over Docker — no license, native)"; then
+            if attempt_install_podman; then
+                echo "Re-checking for podman..."
+                if find_podman; then
+                    echo "Found podman: $(podman --version 2>/dev/null | head -1)"
+                else
+                    echo "WARN: Podman install appeared to succeed but `podman` not on PATH." >&2
+                    echo "      Open a new shell; install.py will re-probe + surface a deferral if needed." >&2
+                    print_podman_manual_hint
+                fi
+            else
+                print_podman_manual_hint
+                echo "Continuing — install.py will prompt again if no runtime is present."
+            fi
+        else
+            echo "Skipped — install.py will prompt again later."
+        fi
+    fi
+fi
 
 # Change to script directory
 cd "$(dirname "$0")"

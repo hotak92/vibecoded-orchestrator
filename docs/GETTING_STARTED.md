@@ -4,15 +4,31 @@ This guide walks you through installing the orchestrator, configuring your first
 
 ## Prerequisites
 
+The `install.sh` / `install.ps1` / `first-install.*` wrappers auto-install missing prerequisites (Python 3.11+, Node.js 18+, Podman) interactively via the platform package manager. They will prompt before invoking sudo / brew / winget — pass `--yes` or `--non-interactive` to skip prompts (auto-install is disabled in that mode; missing tools just get logged and `install.py` skips the dependent feature). GPU drivers are NEVER auto-installed (out of scope for an unattended installer).
+
+What gets auto-installed when missing:
+
 - **Python 3.11 or newer** (3.12 recommended; 3.13 supported). Older versions fail at the install.py sentinel — we use stdlib `tomllib`, which is 3.11+.
   - Linux: `sudo apt install python3.12 python3.12-venv` (or `sudo dnf install python3.12`, `sudo pacman -S python`)
   - macOS: `brew install python@3.12`
   - Windows: `winget install Python.Python.3.12`
   - Or: <https://python.org/downloads/>
-  - The `install.sh` / `install.ps1` wrappers can do this for you interactively if Python is missing.
-- Docker or Podman (for Weaviate + Ollama containers)
+- **Node.js 18+** (needed by Playwright MCP and the Tauri launcher build path)
+  - Linux: `sudo apt install nodejs npm` (Ubuntu/Debian), `sudo dnf install nodejs npm` (Fedora), `sudo pacman -S nodejs npm` (Arch)
+  - macOS: `brew install node`
+  - Windows: `winget install OpenJS.NodeJS.LTS`
+  - Or: <https://nodejs.org/>
+  - Note: on fnm/nvm setups where you've hand-symlinked just `npm` to `~/.local/bin/`, the installer now finds `npx` via `dirname(realpath(npm))/npx` automatically — no manual PATH fiddling needed.
+- **Podman** (preferred — no commercial license, native on Linux/macOS/Windows). Docker is accepted as an alternative if already installed.
+  - Linux: `sudo apt install podman` (Ubuntu/Debian), `sudo dnf install podman` (Fedora), `sudo pacman -S podman` (Arch)
+  - macOS: `brew install podman`, then `podman machine init && podman machine start`
+  - Windows: `winget install RedHat.Podman` (requires WSL2: `wsl --install`)
+
+Auto-start behaviour for the Podman daemon (v0.2.51+): if Podman is installed but the daemon/socket is not responding, `install.py` attempts `systemctl --user start podman.socket` (Linux) or `podman machine start` (macOS/Windows) before giving up. If the start fails (e.g. machine not yet initialized), a deferral entry is written to `.claude/context/UPDATE_DEFERRED.md` with the exact manual command to run — no destructive auto-init.
+
+Other prerequisites (not auto-installed; you need them yourself):
+
 - Claude Code CLI (`npm install -g @anthropic-ai/claude-code`) with a Claude Max subscription
-- Node.js 18+
 
 ## Install
 
@@ -63,7 +79,7 @@ python3 install.py
 3. Starts Weaviate and Ollama in containers and waits for them to be ready
 4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain is CodeSage → qwen3 → Jina, picked at construction time)
 5. Writes `.env`, `.claude/settings.json` (canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is touched only for VS Code editor preferences (Pylance/watcher excludes); `.vscode/tasks.json` is written so VS Code auto-starts `vct-hub` on `folderOpen`
-6. Copies 45 agent templates into `.claude/agents/` and 52 skill templates into `.claude/skills/`; renders 27 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
+6. Copies 45 agent templates into `.claude/agents/` and 53 skill templates into `.claude/skills/`; renders 31 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
 7. Registers MCP servers in `~/.claude.json`: `weaviate-kg`, `search` (search_papers only), and `playwright` (the latter via `npx -y @playwright/mcp@latest`; opt out with `VCT_SKIP_PLAYWRIGHT=1`). The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama. The `vct-ollama` MCP is **not** registered by default — install via launcher → Modules if you want local LLM tool surfaces
 8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
@@ -115,7 +131,7 @@ When install adopts an existing Weaviate, it must not pollute the host with bare
 3. **Skips creation of any collection that already exists** under the resolved name.
 4. **Skips a `Development` collection entirely** if the host already has any `<X>_development` (the host's namespacing wins).
 5. **Announces every proposed creation and waits for confirmation** in interactive mode. Pass `--yes` for non-interactive runs.
-6. **Does not auto-adopt cross-project shared KGs** like an existing `ClaudeKnowledgeGraph`. The orchestrator runs an orphan-prune sync that deletes entries whose `file_path` no longer exists in the active project, so two installs sharing one collection would silently delete each other's entries. vco always creates its own `VibecodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12; existing installs can use the launcher's Identity tab picker to designate the old class as canonical).
+6. **Does not auto-adopt cross-project shared KGs** like an existing `ClaudeKnowledgeGraph`. The orchestrator runs an orphan-prune sync that deletes entries whose `file_path` no longer exists in the active project, so two installs sharing one collection would silently delete each other's entries. vco always creates its own `VibeCodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12; existing installs can use the launcher's Identity tab picker to designate the old class as canonical).
 
 When install starts its own Weaviate (no adoption), bare `KnowledgeGraph` / `Development` defaults are kept — there's nothing else in the instance to namespace against.
 
@@ -130,7 +146,7 @@ python install.py --skip-collections      # bootstrap-only opt-out (still seeds)
 
 #### Gating writes to the shared cross-project KG
 
-Set `SHARED_KG_WRITE_DISABLED=true` in `.env` (or in the install environment) to refuse `store_knowledge_node(scope="shared")` calls from this project. Reads of `VibecodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12) remain on (asymmetric model since 2026-05-01: every project always reads the shared KG; the gate is write-only). Legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases.
+Set `SHARED_KG_WRITE_DISABLED=true` in `.env` (or in the install environment) to refuse `store_knowledge_node(scope="shared")` calls from this project. Reads of `VibeCodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12) remain on (asymmetric model since 2026-05-01: every project always reads the shared KG; the gate is write-only). Legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases.
 
 #### Lock file: `~/.vct/services.toml`
 

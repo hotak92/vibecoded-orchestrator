@@ -12,7 +12,7 @@ Logs queries to:
 import json
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 # Log files
@@ -39,7 +39,7 @@ class QueryLogger:
     ):
         """Log a search query"""
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": "search",
             "source": source,
             "project": project or "claude-orchestrator",
@@ -67,7 +67,7 @@ class QueryLogger:
     ):
         """Log a store operation"""
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": "store",
             "source": source,
             "project": project or "claude-orchestrator",
@@ -92,7 +92,7 @@ class QueryLogger:
     ):
         """Log a delete operation"""
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": "delete",
             "source": "weaviate-mcp",
             "project": project or "claude-orchestrator",
@@ -130,7 +130,7 @@ class ToolUsageLogger:
     ):
         """Log kg-search usage"""
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": "kg-search",
             "project": project or "claude-orchestrator",
             "query": query,
@@ -152,7 +152,7 @@ class ToolUsageLogger:
     ):
         """Log kg-info usage"""
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": "kg-info",
             "project": project or "claude-orchestrator",
             "node_title": node_title,
@@ -173,7 +173,7 @@ class ToolUsageLogger:
     ):
         """Log kg-sync usage"""
         entry = {
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "tool": "kg-sync",
             "project": project or "claude-orchestrator",
             "file_path": file_path,

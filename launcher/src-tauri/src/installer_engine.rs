@@ -4119,7 +4119,7 @@ mod tests {
         //   - tag_mismatch = true when server_tag != client_resolved_tag
         //   - mismatch_class reflects the classification result
         //   - endpoint + effective_tag_with_variant included (v0.2.46
-        //     follow-up — RL chat enhancement: lets future debugging
+        //     follow-up — follow-up enhancement: lets future debugging
         //     answer "what URL? what tag was actually pulled?" via a
         //     single SQL query against audit_log)
         let db = crate::db::Db::open_in_memory().expect("in-memory db");

@@ -122,9 +122,9 @@ npx supabase functions deploy lemon-squeezy-webhook --no-verify-jwt
 ## Dev Mode
 
 Without LS products configured, you can test activation with codes:
-- `test-transcrypt` → activates Transcrypt
-- `test-arzillibus` → activates Arzillibus
-- `test-convertifacile` → activates ConvertiFacile
+- `test-demo1` → activates DemoProduct1
+- `test-demo2` → activates DemoProduct2
+- `test-demo3` → activates DemoProduct3
 - etc.
 
 Enter these in: Avatar menu → Activation Codes

@@ -13,11 +13,23 @@
   //   2. Or click "Abort & restore" to bail cleanly via
   //      `abort_orchestrator_merge_or_rebase` (runs `git merge --abort`
   //      or `git rebase --abort` as appropriate).
+  //   3. v0.2.51 (Bug A): click "Continue Update" once the working tree
+  //      is clean to re-enter the post-merge tail (install.py --update
+  //      + binary refresh + auto-restart) via the new
+  //      `resume_orchestrator_update` Tauri command.
   //
   // We do NOT auto-resolve. The user has legitimate local changes
   // (KG nodes, CLAUDE.md tweaks) that an "ours" / "theirs" auto-pick
   // would silently destroy.
+  //
+  // v0.2.51 polling: while the modal is open we poll `check_for_updates`
+  // every ~2 s. Once the result reports `merge_resolved_incomplete: true`
+  // (sentinel present + .git/MERGE_HEAD gone) the "Continue Update"
+  // button becomes active. The user can keep the modal open while they
+  // resolve in their editor — no need to re-trigger the flow from the
+  // badge afterwards.
 
+  import { onMount, onDestroy } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
 
@@ -42,6 +54,53 @@
   let aborting = $state(false);
   let aborted = $state(false);
   let error = $state<string | null>(null);
+
+  // v0.2.51 Bug A: poll for "merge resolved but install.py not run" state.
+  // Source of truth: the Rust `check_for_updates` command's
+  // `merge_resolved_incomplete` flag (sentinel present + no in-flight
+  // merge state). 2s cadence balances responsiveness (user notices the
+  // button activate within seconds of `git commit`) against load (10
+  // git probes/minute is cheap).
+  let resumeReady = $state(false);
+  let resuming = $state(false);
+  let resumed = $state(false);
+  let pollHandle: ReturnType<typeof setInterval> | null = null;
+
+  type CheckForUpdatesResult = {
+    merge_resolved_incomplete?: boolean;
+    resume_operation?: string;
+    resume_branch?: string;
+  };
+
+  async function probeResumeReady() {
+    try {
+      const us = await invoke<CheckForUpdatesResult>('check_for_updates', {
+        path: installPath,
+      });
+      // Only flip true; we never flip back to false because the user may
+      // have toggled between resolved/unresolved repeatedly. Once the
+      // tree is clean, give them the button.
+      if (us && us.merge_resolved_incomplete) {
+        resumeReady = true;
+      }
+    } catch {
+      // Best-effort: stale check is fine, errors don't matter to UX here.
+    }
+  }
+
+  onMount(() => {
+    // Immediate probe so a refresh-of-an-already-resolved tree shows the
+    // button without a 2-second wait.
+    void probeResumeReady();
+    pollHandle = setInterval(probeResumeReady, 2000);
+  });
+
+  onDestroy(() => {
+    if (pollHandle !== null) {
+      clearInterval(pollHandle);
+      pollHandle = null;
+    }
+  });
 
   const operationLabel = $derived(
     payload.operation === 'merge' ? 'Merge' : 'Rebase'
@@ -95,10 +154,38 @@
   }
 
   function dismiss() {
-    if (aborting) return;
-    // Closing without aborting leaves the working tree conflicted —
-    // surface a hint so the user knows what state they're in.
+    if (aborting || resuming) return;
+    // v0.2.51 Bug A: closing without aborting OR resuming used to
+    // silently abandon the update. The launcher MenuBar now shows a
+    // persistent "Continue Update" badge in this state (driven by the
+    // resume sentinel + check_for_updates poll), so dismissing here is
+    // safe — the user can always come back via the badge.
     onClose();
+  }
+
+  async function continueUpdate() {
+    if (resuming || resumed) return;
+    if (!resumeReady) return;
+    resuming = true;
+    error = null;
+    try {
+      // resume_orchestrator_update audit-logs, refuses on stale/dirty
+      // state, then re-enters install.py --update + binary refresh +
+      // auto-restart. The auto-restart kills the launcher mid-call —
+      // in practice we never reach the `resumed = true` line, but it's
+      // there for crash-recovery paths where the restart hop fails.
+      await invoke<unknown>('resume_orchestrator_update', { path: installPath });
+      resumed = true;
+      toast.success('Update resumed — install.py is running.');
+      setTimeout(onClose, 600);
+    } catch (e) {
+      // The Rust command returns human-readable errors for the bad-state
+      // cases (still mid-merge, leftover markers, no sentinel). Surface
+      // verbatim — they're written FOR the user.
+      error = `Continue Update failed: ${e}`;
+    } finally {
+      resuming = false;
+    }
   }
 </script>
 
@@ -122,7 +209,11 @@
         Open the files below in your editor, resolve the conflicts manually,
         then run <code>git add &lt;file&gt;</code> +
         <code>git {payload.operation} --continue</code> in the orchestrator
-        directory (<code>{installPath}</code>).
+        directory (<code>{installPath}</code>). Once the working tree is
+        clean, the <strong>Continue Update</strong> button below activates —
+        click it to finish the install (runs
+        <code>install.py --update</code>, refreshes the launcher binary,
+        and restarts).
       </li>
       <li>
         Click <strong>Abort &amp; restore</strong> to bail out. This runs
@@ -131,6 +222,12 @@
         started.
       </li>
     </ol>
+
+    {#if resumeReady}
+      <div class="cfl-ready">
+        Working tree is clean — ready to continue the update.
+      </div>
+    {/if}
 
     <div class="cfl-files">
       <div class="cfl-files-title">
@@ -170,33 +267,55 @@
     <div class="cfl-actions">
       <button
         class="cfl-btn"
-        disabled={aborting}
+        disabled={aborting || resuming}
         onclick={dismiss}
         title={dismissBtnTitle}
       >
-        Resolve manually
+        {resumeReady
+          ? 'Resolve manually then click Continue Update'
+          : 'Resolve manually (close this dialog)'}
       </button>
       <button
         class="cfl-btn cfl-btn-warn"
-        disabled={aborting || aborted}
+        disabled={aborting || aborted || resuming}
         onclick={abort}
         title={abortBtnTitle}
       >
         {aborting ? 'Aborting…' : 'Abort & restore'}
+      </button>
+      <!-- v0.2.51 Bug A: Continue Update is the primary positive action.
+           Activates once polling detects the working tree is clean
+           (resume sentinel present + no .git/MERGE_HEAD). -->
+      <button
+        class="cfl-btn cfl-btn-primary"
+        disabled={!resumeReady || aborting || aborted || resuming || resumed}
+        onclick={continueUpdate}
+        title={resumeReady
+          ? 'Run install.py --update + binary refresh + auto-restart.'
+          : 'Activates once the working tree is clean. Resolve the conflicts (or `git merge --continue`) first.'}
+      >
+        {resuming ? 'Continuing…' : resumed ? 'Resumed' : 'Continue Update'}
       </button>
     </div>
   </div>
 </div>
 
 <style>
-  /* v0.2.24.1 cosmetic pass: VCT color tokens (matches divergence modal). */
+  /* v0.2.24.1 cosmetic pass: VCT color tokens (matches divergence modal).
+   * v0.2.51 fix: anchor to viewport top + safe margin + outer scroll so
+   * the modal header never clips above the window in short viewports.
+   * The backdrop itself becomes the scroll container (align-items:
+   * flex-start), so tall modals push the bottom out of view but the
+   * header stays reachable. */
   .cfl-backdrop {
     position: fixed;
     inset: 0;
     background: rgba(5, 11, 31, 0.82); /* --color-bg at 82% */
     display: flex;
-    align-items: center;
+    align-items: flex-start;       /* anchor to top, not vertical center */
     justify-content: center;
+    padding: 16px;                  /* safe margin from window edges */
+    overflow-y: auto;               /* scroll when modal taller than viewport */
     z-index: 350;
   }
   .cfl-modal {
@@ -206,8 +325,8 @@
     padding: 20px;
     max-width: 640px;
     width: 92%;
-    max-height: 90vh;
-    overflow-y: auto;
+    /* Moderate top offset scales with viewport, never zero. */
+    margin-top: clamp(0px, 6vh, 64px);
     color: var(--color-text);
   }
   .cfl-modal h3 {
@@ -340,5 +459,28 @@
   .cfl-btn-warn:hover:not(:disabled) {
     background: rgba(255, 79, 160, 0.3);
     border-color: var(--color-pink);
+  }
+  /* v0.2.51 Bug A: primary action for the resume path. Teal (success-y)
+     to differentiate from the warning-pink abort button. */
+  .cfl-btn-primary {
+    background: rgba(0, 191, 166, 0.18);
+    border-color: rgba(0, 191, 166, 0.5);
+    color: var(--color-text);
+  }
+  .cfl-btn-primary:hover:not(:disabled) {
+    background: rgba(0, 191, 166, 0.32);
+    border-color: var(--color-teal, #00bfa6);
+  }
+
+  /* v0.2.51 Bug A: "tree is clean — ready to continue" hint shown above
+     the actions row once polling detects the resume sentinel. */
+  .cfl-ready {
+    padding: 8px 10px;
+    background: rgba(0, 191, 166, 0.1);
+    border: 1px solid rgba(0, 191, 166, 0.3);
+    border-radius: 4px;
+    color: var(--color-teal, #00bfa6);
+    font-size: 11px;
+    margin: 10px 0;
   }
 </style>

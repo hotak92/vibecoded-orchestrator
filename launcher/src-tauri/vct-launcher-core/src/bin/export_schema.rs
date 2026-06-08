@@ -6,7 +6,7 @@
 //! this binary, diffs the output against the committed copy at
 //! `docs/schemas/vct-module.schema.json`, and fails the PR if they
 //! diverge. This forces PR authors who touch `manifest.rs` to also
-//! refresh the schema artifact — both repos (launcher + RL chat / future
+//! refresh the schema artifact — both repos (launcher + paid-module / future
 //! paid modules) consume the SAME schema for validation, so drift kills
 //! everyone downstream.
 //!

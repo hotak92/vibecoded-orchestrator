@@ -20,7 +20,7 @@ The composition contract is one-directional: Launcher writes, Orchestrator reads
 The Launcher writes its IPC port to `~/.vct/hub.port`; the Orchestrator and CLI tools query `http://localhost:<port>/` for per-project module enablement status and to resolve per-project secrets without touching the keychain directly.
 
 ### Launcher as git subtree (`launcher/`)
-The `launcher/` directory is a `git subtree` of `pb992/VCT-Launcher`, branch `feature/orchestrator-hub`. A single `git clone` gives contributors the full Tauri source without `--recursive`. Direct edits to `launcher/` should originate in the VCT-Launcher repo and flow in via `git subtree pull --prefix=launcher vct-launcher feature/orchestrator-hub --squash`.
+The `launcher/` directory is bundled into this repo as a `git subtree`. A single `git clone` gives contributors the full Tauri source without `--recursive`. Direct edits to `launcher/` should land in this repo via normal PRs; upstream subtree pulls (when applicable) use `git subtree pull --prefix=launcher <remote> <branch> --squash`.
 
 ### Two-way per-project env write
 When the Launcher creates or reconfigures a project, it writes the same env values to two files simultaneously: `.claude/settings.json` `env` block (canonical, all surfaces, propagated to MCP subprocesses) and `.claude/env` (POSIX shell-sourceable). Both writes are read-merge-write to avoid clobbering existing content. See `docs/CLAUDE_CODE_COMPATIBILITY.md`. v0.2.12 (PR-27, 2026-05-16) dropped a historical third surface (`.vscode/settings.json` `claude-code.env`) that did not propagate to MCP subprocesses on Linux.

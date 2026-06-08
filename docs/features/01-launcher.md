@@ -186,7 +186,7 @@ Five tiers: `free`, `pro`, `mao`, `enterprise`, `admin`. The `admin` tier was ad
 POSTs `{license_key, machine_id_hash}` to the configured `validate-tier` endpoint (8s timeout). On 401 drops immediately to `free`; on other errors keeps existing cached tier and records the error.
 
 ### Machine ID Binding
-`machine_id_hash()` derives SHA-256 of the 6-byte MAC zero-padded to 8 bytes (high 2 bytes set to zero, low 6 bytes = the MAC). Same algorithm as `VCThelpers/license/validator.py::_machine_id_hash`, which uses `uuid.getnode().to_bytes(8, "big")`. Used for server-side machine binding.
+`machine_id_hash()` returns SHA-256 of a platform-stable host identifier as a 64-char lowercase hex string. Source by OS: Windows `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`; macOS `IOPlatformUUID` via `ioreg -rd1 -c IOPlatformExpertDevice`; Linux `/etc/machine-id` (fallback `/var/lib/dbus/machine-id`). Same algorithm as `VCThelpers/license/validator.py::_machine_id_hash`. The MAC-based algorithm (`uuid.getnode()`) was retired in v0.2.36 because laptops with shifting NICs broke the binding; see `docs/license/MACHINE_BINDING.md` for the rationale. Only the hash is sent to the validation endpoint; the raw host id never leaves the process.
 
 ### License Activate / Deactivate
 `license_activate` writes the key to the OS keychain under `vct.global.licensing.VIBECODED_LICENSE_KEY`, audits the action (key prefix only), then calls `license_refresh`. `license_deactivate` deletes the keychain entry and resets tier to `free`.
@@ -315,7 +315,7 @@ One SQLite file (`~/.vct/launcher.db`) is the entire persistent state of the lau
 All persistent launcher state lives in a single SQLite file. No server process, no network dependency.
 
 ### Migration System
-`db/migrations.rs` runs numbered SQL migrations at startup. Eight migrations as of v0.1.0: `001_initial.sql` (projects, module_installs, tier_cache, audit_log), `002_project_state.sql` (agents/skills/hooks/permissions/secrets/KG/codegraph bindings), `003_project_slug.sql` (slug column), `004_audit_actor.sql` (OS `$USER` actor column), `005_tier_cache_admin.sql` (extends tier CHECK to include `'admin'`), `006_code_graph_build_status.sql` (code-graph build state per project), `007_secret_active_state.sql` (secret-ref active flag), `008_app_state.sql` (per-app launch state for ecosystem apps).
+`db/migrations.rs` runs numbered SQL migrations at startup. As of v0.2.49 the schema is at migration **032**, with major beats including: `001_initial.sql` (projects, module_installs, tier_cache, audit_log), `002_project_state.sql` (agents/skills/hooks/permissions/secrets/KG/codegraph bindings), `003_project_slug.sql` (slug column), `004_audit_actor.sql` (OS `$USER` actor column), `005_tier_cache_admin.sql` (extends tier CHECK to include `'admin'`), `010_project_mcp_servers.sql` (per-project MCP server registry), `011_kg_syncs.sql` + `012_kg_summaries.sql` (KG sync + summary state), `019_module_db_migrations.sql` (per-module DB migration registry), `024_license_keys.sql` (per-paid-module license keys), `025_rl_events.sql` (RL retrieval telemetry), `029_kg_collection_access_audit_columns.sql` + `031_force_upgrade_shared_kg_read_to_write.sql` (KG access matrix), `032_module_installs_kg_collections.sql` (per-module KG collection bindings). Each migration is idempotent and gated on schema version.
 
 ### In-Memory DB for Tests
 `Db::open_in_memory()` provides an in-memory SQLite instance used by unit tests without touching the user's real database.

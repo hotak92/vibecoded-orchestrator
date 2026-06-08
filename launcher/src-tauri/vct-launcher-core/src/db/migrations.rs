@@ -1463,7 +1463,7 @@ mod tests {
     #[test]
     fn migration_031_corruption_carve_out_preserves_orphan_project_rows() {
         // Corrupted state: a project has kg_collection_access rows but
-        // NO role='primary' binding. Per RL chat msg 237 + the
+        // NO role='primary' binding. Per the v0.2.49 access-matrix follow-up + the
         // migration's docstring, those rows MUST be preserved (no auto-
         // destroy user data discipline). User recovery: re-register
         // via the GUI Identity tab to heal the corrupted state.

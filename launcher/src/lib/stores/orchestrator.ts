@@ -64,6 +64,21 @@ export interface UpdateStatus {
   remote_ahead: boolean;
   install_stale: boolean;
   binary_stale: boolean;
+  /** v0.2.51 (Bug A): a prior `update_orchestrator` / `merge_*` / `rebase_*`
+   *  surfaced a conflict modal and the user resolved the conflict outside
+   *  the launcher (CLI `git add` + `git commit`) without re-entering the
+   *  install flow. Detected via a sentinel file at
+   *  `.claude/state/orchestrator-update-resume-needed.json` AND absence of
+   *  `.git/MERGE_HEAD`. Highest-priority kind in the UpdateBadge — leaving
+   *  this unattended ships a stale install manifest, hook bundle, and
+   *  possibly a stale launcher binary.
+   *  Optional for backwards-compat with pre-v0.2.51 Rust returns. */
+  merge_resolved_incomplete?: boolean;
+  /** v0.2.51: which operation hit the conflict. One of `"merge"`,
+   *  `"rebase"`, or empty string when no resume is pending. */
+  resume_operation?: string;
+  /** v0.2.51: branch the conflict happened on (typically `main`). */
+  resume_branch?: string;
   source_version: string;
   installed_version: string;
   running_version: string;
@@ -173,7 +188,10 @@ function createOrchestratorStore() {
         // "is there something to do?".
         const updateStatus = await safeInvoke<UpdateStatus>('check_for_updates', { path: currentPath });
         const updateAvailable = updateStatus
-          ? (updateStatus.remote_ahead || updateStatus.install_stale || updateStatus.binary_stale)
+          ? (updateStatus.remote_ahead
+              || updateStatus.install_stale
+              || updateStatus.binary_stale
+              || !!updateStatus.merge_resolved_incomplete)
           : false;
         update((s) => ({
           ...s,

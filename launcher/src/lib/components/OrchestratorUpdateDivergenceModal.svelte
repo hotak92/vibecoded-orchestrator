@@ -471,6 +471,9 @@
 <style>
   /* v0.2.27 rewrite: sticky bottom action row + separated file
    * categories + own stderr block + retry-aware button states.
+   * v0.2.51 fix: anchor modal to viewport top with safe margin so the
+   * header never clips above the window in short viewports. The body
+   * still scrolls internally via .dvg-body's overflow-y: auto.
    * All colors resolve to --color-* tokens defined in app.css. */
   .dvg-backdrop {
     position: fixed;
@@ -489,14 +492,22 @@
 
   .dvg-modal {
     position: fixed;
-    top: 50%;
+    top: 0;
     left: 50%;
-    transform: translate(-50%, -50%);
+    transform: translateX(-50%);
+    /* Moderate top offset, scales with viewport but never less than
+     * 16px and never more than 80px — keeps header well below the
+     * window chrome on tall windows, and flush near the top with a
+     * safe margin on short ones. */
+    margin-top: clamp(16px, 8vh, 80px);
+    /* Never exceed viewport minus the top offset + a bottom safe
+     * margin (16px). When the modal is shorter than this, it stays at
+     * its natural height; when it's taller, internal body scrolls. */
+    max-height: calc(100vh - clamp(32px, 8vh, 96px) - 16px);
     background: var(--color-bg2);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-card, 12px);
     width: min(640px, 92vw);
-    max-height: 90vh;
     display: flex;
     flex-direction: column;
     color: var(--color-text);
