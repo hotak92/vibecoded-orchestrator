@@ -1493,6 +1493,60 @@ impl Db {
         inserted += self.kg_seed_access(project_id, &primary_collection, default_level)?;
         inserted += self.kg_seed_access(project_id, &dev_collection, default_level)?;
         inserted += self.kg_seed_access(project_id, &shared_collection, default_level)?;
+
+        // v0.2.49 access-matrix Step F MF3 (L1-F2): back-fill access rows
+        // for every ALREADY-INSTALLED global-scope module's declared
+        // `kg_collections`. Inverse of item #13:
+        //
+        //   - item #13 runs at module-install time + iterates ALL
+        //     existing projects to seed their access rows for THIS
+        //     module's collections.
+        //   - MF3 runs at project-create time + iterates ALL existing
+        //     global module installs to seed THIS project's access rows
+        //     for their collections.
+        //
+        // Together they close the symmetry: a new project gets the same
+        // initial access state regardless of whether it was created
+        // BEFORE or AFTER a global module install.
+        //
+        // Access level for module collections: literal `Write`. The
+        // resolver `resolve_default_access_level` can't be consulted
+        // because module collections aren't in `project_kg_bindings`
+        // (they're declared in the module's manifest, not as project
+        // bindings) — the resolver would return `Denied`. The Write
+        // semantic matches user directive 2026-06-08 "default R/W on
+        // own + shared" + treats module collections as
+        // shared-infrastructure (every project that installed the module
+        // can write to its collection).
+        //
+        // v0.2.49 Step F MF3-v2 refactor: source of truth for the
+        // module's declared collections is `module_installs.kg_collections`
+        // (migration 032 — TEXT column, JSON-encoded array). Set at
+        // install time by `commands::modules::install_module` calling
+        // `Db::set_module_kg_collections` immediately after the install
+        // row lands. Pre-v0.2.49 module installs have NULL → empty Vec
+        // → skipped (caught by the `if collections.is_empty()` guard).
+        //
+        // No filesystem I/O on this hot path: the launcher DB is the
+        // authoritative state per the orchestrator's single-writer
+        // discipline.
+        let global_installs = self
+            .list_global_module_installs()
+            .unwrap_or_default();
+        for install in &global_installs {
+            if install.kg_collections.is_empty() {
+                continue; // module declares no KG collections
+            }
+            for coll in &install.kg_collections {
+                // Best-effort: per-collection seed errors don't abort
+                // the rest. The boot reconcile path catches any partial
+                // populate failure.
+                if let Ok(n) = self.kg_seed_access(project_id, coll, default_level) {
+                    inserted += n;
+                }
+            }
+        }
+
         Ok(inserted)
     }
 
@@ -4279,5 +4333,214 @@ mod populate_access_for_project_tests {
                 resolver_level.as_str()
             );
         }
+    }
+
+    /// v0.2.49 Step F MF3-v2 refactor (L1-F2): populate back-fills
+    /// access rows for every already-installed global-scope module's
+    /// declared `kg_collections` (now sourced from the launcher DB
+    /// column `module_installs.kg_collections`, migration 032).
+    ///
+    /// Inverse of item #13's "install seeds all projects" — this is
+    /// "new project gets rows for already-installed globals."
+    ///
+    /// v1 → v2 refactor (user directive 2026-06-08): instead of reading
+    /// `vct-module.json` from disk at populate time, the module's
+    /// declared collections are denormalized into the launcher DB at
+    /// install time via `Db::set_module_kg_collections`. The launcher
+    /// DB is the single source of truth per the orchestrator's
+    /// single-writer discipline. No filesystem I/O on the hot path.
+    ///
+    /// Flow:
+    ///   1. Insert a global module install (sets `kg_collections=NULL`).
+    ///   2. Set kg_collections via `db.set_module_kg_collections(install_id, Some(&["RLMeta_KG", "RLMeta_Telemetry"]))`.
+    ///   3. Insert a new project.
+    ///   4. Call populate → 3 own (primary/dev/shared) + 2 module = 5.
+    #[test]
+    fn populate_backfills_global_module_kg_collections() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        // Insert a global module install. `kg_collections` defaults to
+        // empty Vec (column NULL → decoded as empty per row_to_install_row).
+        let install_row = db
+            .insert_global_module_install(
+                "install-1",
+                "vct-rl-meta",
+                "0.1.0",
+                "/tmp/does-not-matter-for-v2",
+            )
+            .unwrap();
+        // Now persist kg_collections via the dedicated setter.
+        db.set_module_kg_collections(
+            &install_row.id,
+            Some(&[
+                "RLMeta_KG".to_string(),
+                "RLMeta_Telemetry".to_string(),
+            ]),
+        )
+        .unwrap();
+
+        // Populate for p1.
+        let inserted = db
+            .populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        // 3 own rows + 2 module rows = 5.
+        assert_eq!(
+            inserted, 5,
+            "expected 3 own (primary/dev/shared) + 2 from rl-meta global module"
+        );
+
+        let access = db.kg_list_access("p1").unwrap();
+        let by_collection: std::collections::HashMap<&str, &str> = access
+            .iter()
+            .map(|(c, l)| (c.as_str(), l.as_str()))
+            .collect();
+        assert_eq!(by_collection.get("Acme_KnowledgeGraph"), Some(&"write"));
+        assert_eq!(by_collection.get("Acme_Development"), Some(&"write"));
+        assert_eq!(
+            by_collection.get("VibeCodedOrchestrator_KnowledgeGraph"),
+            Some(&"write")
+        );
+        // The 2 module collections were back-filled at "write".
+        assert_eq!(by_collection.get("RLMeta_KG"), Some(&"write"));
+        assert_eq!(by_collection.get("RLMeta_Telemetry"), Some(&"write"));
+    }
+
+    /// Pre-v0.2.49 global module installs have `kg_collections = NULL`
+    /// in the DB column (migration 032 default). The row decoder
+    /// resolves NULL to an empty `Vec<String>`, and the populate loop's
+    /// `if install.kg_collections.is_empty() { continue }` guard skips
+    /// them. Asserts no module rows seeded for an install whose
+    /// kg_collections is the default (never set via the setter).
+    #[test]
+    fn populate_skips_global_module_with_null_kg_collections() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        // Insert a global install but DON'T call set_module_kg_collections.
+        // Column stays NULL → decoded as empty Vec → populate loop skips.
+        db.insert_global_module_install(
+            "install-no-kg",
+            "vct-rl-reranker",
+            "0.2.10",
+            "/tmp/does-not-matter",
+        )
+        .unwrap();
+
+        let inserted = db
+            .populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        assert_eq!(inserted, 3); // only own-project rows
+    }
+
+    /// `set_module_kg_collections(install_id, Some(&[]))` sets the
+    /// column to JSON `"[]"`. The populate loop's empty-Vec guard
+    /// treats this identically to NULL — no module rows seeded.
+    /// Pins that the empty-array case is semantically equivalent to
+    /// "module declares no collections" (NOT a "wipe" signal).
+    #[test]
+    fn populate_skips_global_module_with_empty_kg_collections_array() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        let install_row = db
+            .insert_global_module_install(
+                "install-empty",
+                "vct-rl-reranker",
+                "0.2.10",
+                "/tmp/does-not-matter",
+            )
+            .unwrap();
+        // Explicitly set to empty array.
+        db.set_module_kg_collections(&install_row.id, Some(&[]))
+            .unwrap();
+
+        let inserted = db
+            .populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        assert_eq!(inserted, 3); // only own-project rows
+    }
+
+    /// User has already explicitly denied access to one of the
+    /// module's declared kg_collections (pre-existing access row at
+    /// 'none'). A re-run of populate (e.g. on next project create
+    /// path or via some re-onboarding flow) MUST NOT clobber the
+    /// user's choice. The `kg_seed_access` INSERT OR IGNORE semantic
+    /// is the load-bearing primitive here.
+    #[test]
+    fn populate_preserves_user_configured_module_collection() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+
+        let install_row = db
+            .insert_global_module_install(
+                "install-1",
+                "vct-rl-meta",
+                "0.1.0",
+                "/tmp/does-not-matter",
+            )
+            .unwrap();
+        db.set_module_kg_collections(
+            &install_row.id,
+            Some(&["RLMeta_KG".to_string()]),
+        )
+        .unwrap();
+
+        // First populate seeds RLMeta_KG at "write".
+        db.populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        assert_eq!(
+            db.kg_get_access("p1", "RLMeta_KG").unwrap(),
+            Some("write".into())
+        );
+
+        // User downgrades to "none".
+        db.kg_set_access("p1", "RLMeta_KG", "none").unwrap();
+
+        // Re-run populate. INSERT OR IGNORE preserves the user's row.
+        let inserted = db
+            .populate_kg_collection_access_for_project("p1", "Acme")
+            .unwrap();
+        assert_eq!(inserted, 0, "all rows existed; no re-seed");
+        assert_eq!(
+            db.kg_get_access("p1", "RLMeta_KG").unwrap(),
+            Some("none".into())
+        );
+    }
+
+    /// Cross-cutting test: `set_module_kg_collections` followed by
+    /// `list_global_module_installs` correctly round-trips the
+    /// collections list through the JSON column. Pins the row-decoder
+    /// + setter contract directly (not through populate).
+    #[test]
+    fn set_module_kg_collections_roundtrips_through_list() {
+        let db = Db::open_in_memory().unwrap();
+        let install_row = db
+            .insert_global_module_install(
+                "install-roundtrip",
+                "vct-test",
+                "0.1.0",
+                "/tmp/test",
+            )
+            .unwrap();
+        // Fresh row: kg_collections is empty Vec (column NULL).
+        assert!(install_row.kg_collections.is_empty());
+
+        // Set it.
+        let collections = vec!["Foo_KG".to_string(), "Bar_KG".to_string()];
+        db.set_module_kg_collections(&install_row.id, Some(&collections))
+            .unwrap();
+
+        // Re-read via list_global_module_installs.
+        let listed = db.list_global_module_installs().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kg_collections, collections);
+
+        // Setter is idempotent: re-applying same collections is a no-op
+        // semantically (UPDATE writes same JSON).
+        db.set_module_kg_collections(&install_row.id, Some(&collections))
+            .unwrap();
+        let listed2 = db.list_global_module_installs().unwrap();
+        assert_eq!(listed2[0].kg_collections, collections);
     }
 }

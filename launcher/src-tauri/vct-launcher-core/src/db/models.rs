@@ -146,6 +146,20 @@ pub struct ModuleInstallRow {
     /// added in Step 24 commit b.
     #[serde(default)]
     pub container_name: Option<String>,
+
+    /// v0.2.49 Step F MF3 follow-up (migration 032): Weaviate collection
+    /// names this module declares it writes to, denormalized from the
+    /// manifest's `kg_collections` field at install time. Empty Vec when
+    /// the manifest doesn't declare the field (the common case — most
+    /// modules don't expose any KG).
+    ///
+    /// Read by `populate_kg_collection_access_for_project` to back-fill
+    /// access rows on every new project create (the inverse of item #13
+    /// which seeds existing projects at module-install time). Storing
+    /// in the launcher DB avoids re-parsing the on-disk manifest from
+    /// the hot path; survives manifest file deletion / corruption.
+    #[serde(default)]
+    pub kg_collections: Vec<String>,
 }
 
 // `WeightsStateRow` removed in v0.2.31 (Agent J): launcher-side

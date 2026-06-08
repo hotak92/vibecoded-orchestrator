@@ -173,6 +173,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "Force-upgrade shared kg_collection_access + drop cross-project peer rows (v0.2.49 access-matrix Step D / Phase 7, updated by Step F SF1 + Q4). TWO PASSES: (1) UPDATE shared rows access_level='read'→'write' with sentinel updated_at=created_at+1; (2) DELETE rows where (project_id, collection_name) is not in the v0.2.49 default keep-list (own primary, own dev = REPLACE(_KnowledgeGraph→_Development), own shared, OR corruption carve-out: rows for projects with no role='primary' binding). Then sentinel-stamps all surviving rows whose updated_at=0. Per user directive 2026-06-08 verbatim 'force update to default to read+write permissions on own + shared collection, no cross-project permissions (excluding root/shared), then is_user_configured = FALSE for them, since those were set to their default programmatically'. Idempotent on re-runs (Pass 1 WHERE excludes already-upgraded; Pass 2 NOT IN keep-list excludes already-kept). Sentinel value 'created_at+1' (NOT wall-clock millis pre-Step-F) so is_user_configured reads FALSE post-migration → F-2c's preserve-user-configured-peers logic doesn't silently skip migrated rows. Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md item #20 + Step F SF1 + Q4.",
         sql: include_str!("migrations/031_force_upgrade_shared_kg_read_to_write.sql"),
     },
+    Migration {
+        version: 32,
+        description: "module_installs.kg_collections column (v0.2.49 access-matrix Step F MF3 follow-up). ALTER TABLE adds TEXT column for JSON-encoded array of Weaviate collection names a module declares it writes to (read from vct-module.json manifest at install time). Persisted in launcher DB at install time so populate_kg_collection_access_for_project can back-fill new projects' access rows without re-parsing manifest from disk. Pre-v0.2.49 module installs backfill to NULL; reinstall populates the column. User directive 2026-06-08: refactor disk-read MF3 to DB-storage now rather than queueing v0.2.50 follow-up.",
+        sql: include_str!("migrations/032_module_installs_kg_collections.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.

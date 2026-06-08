@@ -1,0 +1,46 @@
+-- v0.2.49 access-matrix Step F MF3 (L1-F2): persist a global module's
+-- declared `kg_collections` (from its vct-module.json manifest) into the
+-- launcher's authoritative state.
+--
+-- Pre-fix MF3 read the manifest file from disk at every project-create
+-- (to know which collections to back-fill access rows for). That coupled
+-- the access-matrix hot path to filesystem I/O + manifest parsing — a
+-- brittle dependency for a path that runs on every new-project event.
+--
+-- Post-fix: the manifest's `kg_collections` array is denormalized into a
+-- column on `module_installs` at install time, where it's already in
+-- scope (insert_global_module_install + insert_module_install receive
+-- the parsed manifest). MF3 then reads the column directly, no I/O.
+--
+-- Column shape: TEXT, JSON-encoded array of collection names. NULL
+-- when the module's manifest doesn't declare the field. Empty JSON
+-- array '[]' when the manifest declares the field but the list is
+-- empty (semantically equivalent to NULL for the populate path).
+--
+-- Why JSON column vs. separate join table:
+--   - kg_collections is read+write atomically with the install row
+--     (set once at install_module, read on every project-create).
+--     A separate table would require a join + per-row INSERT/DELETE
+--     on every install/uninstall — overhead with no schema-modeling
+--     benefit (the list is module-owned, not user-editable).
+--   - Other manifest-derived denormalizations (`container_name`, etc.)
+--     are already TEXT columns; this matches the existing pattern.
+--
+-- Backfill: ALTER TABLE adds NULL for every existing row. Future
+-- module installs populate the column. Modules installed pre-v0.2.49
+-- (and pre-this-migration) will have NULL; their kg_collections
+-- back-fill on a NEW project create won't happen until the user
+-- reinstalls the module (which is the post-v0.2.49 expected path
+-- since v0.2.49 changes the install schema enough that reinstall is
+-- the recovery anyway).
+--
+-- For the orchestrator's own development cycle: the dogfood box's
+-- vct-rl-reranker install (which doesn't currently declare
+-- kg_collections per its v0.2.10 manifest) gets NULL and is correctly
+-- skipped by the MF3 populate. No action needed.
+--
+-- Plan: .claude/context/plans/v0.2.49-access-matrix-overhaul-2026-06-08.md
+-- Step F MF3 follow-up. User directive 2026-06-08: refactor MF3 from
+-- disk-read to DB-storage now rather than queuing a v0.2.50 follow-up.
+
+ALTER TABLE module_installs ADD COLUMN kg_collections TEXT;

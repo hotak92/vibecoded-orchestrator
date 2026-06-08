@@ -21,6 +21,21 @@ use super::Db;
 fn row_to_install_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModuleInstallRow> {
     let status_s: String = row.get(5)?;
     let enabled_i: i32 = row.get(6)?;
+    // v0.2.49 Step F MF3 follow-up (migration 032): kg_collections is a
+    // TEXT column holding a JSON-encoded array. NULL → empty Vec (the
+    // common case for modules whose manifest doesn't declare the field).
+    // Malformed JSON → also empty Vec (defensive; the column SHOULD be
+    // written by `set_module_kg_collections` which serializes a Vec).
+    //
+    // Index 11 is the new column position; SELECTs that don't query the
+    // column (e.g. v0.2.48-era SELECTs that only fetched 0..=10) need to
+    // be updated to include kg_collections OR use a separate row decoder.
+    let kg_collections: Vec<String> = row
+        .get::<_, Option<String>>(11)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
     Ok(ModuleInstallRow {
         id: row.get(0)?,
         project_id: row.get::<_, Option<String>>(1)?,
@@ -33,6 +48,7 @@ fn row_to_install_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModuleInstall
         last_started_at: row.get(8)?,
         last_error: row.get(9)?,
         container_name: row.get(10).ok().flatten(),
+        kg_collections,
     })
 }
 
@@ -118,7 +134,7 @@ impl Db {
             .query_row(
                 "SELECT id, project_id, module_id, module_version, install_path,
                         status, enabled, installed_at, last_started_at, last_error,
-                        container_name
+                        container_name, kg_collections
                    FROM module_installs
                   WHERE project_id = ?1 AND module_id = ?2",
                 params![project_id, module_id],
@@ -174,7 +190,7 @@ impl Db {
             .query_row(
                 "SELECT id, project_id, module_id, module_version, install_path,
                         status, enabled, installed_at, last_started_at, last_error,
-                        container_name
+                        container_name, kg_collections
                    FROM module_installs
                   WHERE project_id IS NULL AND module_id = ?1",
                 params![module_id],
@@ -208,6 +224,56 @@ impl Db {
             return Err(format!(
                 "module_install not found for project={} module={}",
                 project_id, module_id
+            ));
+        }
+        Ok(())
+    }
+
+    /// v0.2.49 Step F MF3 follow-up (migration 032): persist a module's
+    /// declared `kg_collections` (from the manifest) into the install row.
+    ///
+    /// Called by the install dispatch in `commands::modules::install_module`
+    /// immediately after `insert_module_install` / `insert_global_module_install`
+    /// returns. The manifest's `kg_collections` field is in scope at that
+    /// point (the install code already parsed the manifest); this setter
+    /// denormalizes it into the launcher DB so downstream consumers
+    /// (specifically `populate_kg_collection_access_for_project`'s
+    /// global-module back-fill loop) don't have to re-parse the on-disk
+    /// manifest from the hot path.
+    ///
+    /// Encoding: JSON-serialized array of strings. NULL when `collections`
+    /// is None (matches the manifest's `Option<Vec<String>>` shape). Empty
+    /// JSON array `"[]"` is also acceptable (semantically equivalent for
+    /// the consumer).
+    ///
+    /// Idempotent: re-calling with the same collections is a no-op
+    /// (UPDATE with identical value). Re-calling with DIFFERENT
+    /// collections (e.g. module update changed the manifest declaration)
+    /// overwrites verbatim — the manifest is the authoritative source
+    /// of truth.
+    pub fn set_module_kg_collections(
+        &self,
+        install_id: &str,
+        collections: Option<&[String]>,
+    ) -> Result<(), String> {
+        let json = match collections {
+            Some(c) => Some(
+                serde_json::to_string(c)
+                    .map_err(|e| format!("serialize kg_collections: {}", e))?,
+            ),
+            None => None,
+        };
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs SET kg_collections = ?1 WHERE id = ?2",
+                params![json, install_id],
+            )
+            .map_err(|e| format!("set kg_collections: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "module_install not found for id={}",
+                install_id
             ));
         }
         Ok(())
@@ -608,7 +674,7 @@ impl Db {
             .prepare(
                 "SELECT id, project_id, module_id, module_version, install_path,
                         status, enabled, installed_at, last_started_at, last_error,
-                        container_name
+                        container_name, kg_collections
                    FROM module_installs
                   WHERE project_id IS NOT NULL AND module_id = ?1",
             )
@@ -647,7 +713,7 @@ impl Db {
             .prepare(
                 "SELECT id, project_id, module_id, module_version, install_path,
                         status, enabled, installed_at, last_started_at, last_error,
-                        container_name
+                        container_name, kg_collections
                    FROM module_installs
                   WHERE project_id IS NULL
                   ORDER BY installed_at DESC",
@@ -692,7 +758,7 @@ impl Db {
             .prepare(
                 "SELECT id, project_id, module_id, module_version, install_path,
                         status, enabled, installed_at, last_started_at, last_error,
-                        container_name
+                        container_name, kg_collections
                    FROM module_installs
                   WHERE status = ?1
                   ORDER BY installed_at DESC",

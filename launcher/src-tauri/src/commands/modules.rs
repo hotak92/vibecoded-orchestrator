@@ -1525,6 +1525,30 @@ pub async fn install_module_for_project(
         )?
     };
 
+    // v0.2.49 Step F MF3 (migration 032): persist the manifest's
+    // `kg_collections` declaration into the launcher DB at install
+    // time. Read by `populate_kg_collection_access_for_project` on
+    // every new-project create to back-fill access rows for already-
+    // installed global modules (the inverse of item #13 below). The
+    // launcher DB is the authoritative state — downstream consumers
+    // never re-parse the on-disk manifest from the hot path.
+    //
+    // Wired for BOTH global + per-project installs so per-project
+    // modules that might declare kg_collections in the future are
+    // covered. Soft-fail per the helper's contract (the audit log
+    // captures any error; install proceeds).
+    if let Err(e) = db.set_module_kg_collections(
+        &row.id,
+        manifest.kg_collections.as_deref(),
+    ) {
+        db.audit(
+            "module_kg_collections_persist_failed",
+            Some(&project_id),
+            Some(&module_id),
+            &serde_json::json!({"install_id": row.id, "error": e}),
+        )?;
+    }
+
     // v0.2.49 item #13 (M-3): if a global module declares KG collections,
     // seed access rows for every project at install time. Uses
     // `kg_seed_access` (INSERT OR IGNORE) so any user-configured
