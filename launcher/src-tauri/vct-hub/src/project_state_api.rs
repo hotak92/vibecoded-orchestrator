@@ -44,6 +44,14 @@ pub fn router() -> Router<LauncherDbHandle> {
         .route("/projects/{project_id}/secrets/{secret_key}", delete(delete_secret))
         .route("/projects/{project_id}/kg-binding", post(set_kg_binding))
         .route("/projects/{project_id}/codegraph-binding", post(set_codegraph_binding))
+        // v0.2.49 access-matrix Phase 8 (Stream W4) — WRITE-path gate.
+        // Hooks + MCP server consult this endpoint before allowing a
+        // write into a Weaviate collection. Returns the project's
+        // effective access level for the collection.
+        .route(
+            "/projects/{project_id}/access/{collection}",
+            get(get_collection_access),
+        )
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -494,5 +502,88 @@ async fn set_codegraph_binding(
     ) {
         Ok(row) => Json(row).into_response(),
         Err(e) => err400(e),
+    }
+}
+
+// ─── Access matrix (v0.2.49 Phase 8, Stream W4) ───────────────────────────
+
+/// v0.2.49 access-matrix Phase 8 / Stream W4 — WRITE-path gate
+/// endpoint. Returns the project's effective access level for a
+/// specific Weaviate collection.
+///
+/// Consumed by:
+///   - `.claude/hooks/post-file-edit.sh` (KG sync write path, bash
+///     resolver client at `templates/scripts/vct_access_check.sh`)
+///   - `claude_mcp_servers/weaviate_mcp/server.py::store_knowledge_node`
+///     (via `vco_lib/access_resolver.py`)
+///
+/// Both clients fail-open on transport errors (hub unreachable,
+/// timeout, auth fail) — that's a deliberate degradation contract,
+/// NOT enforced at this endpoint. The endpoint itself returns the
+/// authoritative answer when reachable + correctly authed.
+///
+/// Response shape:
+///
+/// ```json
+/// { "level": "read" | "write" | "none" }
+/// ```
+///
+/// Sources the level from `db::access::kg_get_access(project_id,
+/// collection)`. Semantics:
+///   - **Row exists**: return its `access_level` verbatim.
+///   - **Row absent**: return `"none"`. The plan's F-2a default
+///     ("a project owns its primary + shared bindings → Write;
+///     everything else → Denied") manifests at the resolver layer
+///     (`db::access::resolve_default_access_level`), but the
+///     access-matrix WRITE-path gate consults persisted state only
+///     — projects MUST have an explicit access row written by either
+///     the project-create populate path, the M-3 global-module
+///     populate path, or a user-driven UI mutation. A missing row
+///     means "no relationship has been established" → deny.
+///
+/// Error cases:
+///   - `404 Not Found` when the project_id is unknown. Caller
+///     should NOT cache; project might be created by a subsequent
+///     request.
+///   - `500 Internal Server Error` on a DB error. Caller's
+///     fail-open path takes over.
+///
+/// Auth: bearer token (via `auth` middleware applied at the router
+/// composition site in `lib.rs`/`server.rs`). 401 on missing/wrong
+/// token, same as every other `/api/v1/*` route except `/health`.
+///
+/// Latency: pure in-process SQLite query against an indexed PK
+/// (`project_id`, `collection_name`). Sub-millisecond on a warm
+/// page cache; ~5ms cold. Clients use a 5-second timeout but the
+/// real ceiling is bounded by hub crate concurrency, not query
+/// time.
+async fn get_collection_access(
+    State(h): State<LauncherDbHandle>,
+    Path((project_id, collection)): Path<(String, String)>,
+) -> impl IntoResponse {
+    // Pre-check: project must exist. Returning a default `none` for
+    // an unknown project would let callers race a created-then-
+    // deleted project window without noticing. 404 is the right
+    // failure mode; clients fail-open on it (same as transport
+    // failures) so this is just a diagnostic signal, not a behavior
+    // change.
+    match h.0.get_project(&project_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("project not found: {}", project_id)
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => return err500(e),
+    }
+
+    match h.0.kg_get_access(&project_id, &collection) {
+        Ok(Some(level)) => Json(serde_json::json!({ "level": level })).into_response(),
+        Ok(None) => Json(serde_json::json!({ "level": "none" })).into_response(),
+        Err(e) => err500(e),
     }
 }

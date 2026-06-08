@@ -2080,4 +2080,171 @@ mod hub_access_matrix_wiring_tests {
             "new access row must exist with the old write level preserved"
         );
     }
+
+    // ─── Phase 8 / Stream W4 — GET /projects/{id}/access/{collection} ────
+    //
+    // The WRITE-path gate endpoint consumed by:
+    //   - .claude/hooks/post-file-edit.sh (via vct_access_check.sh)
+    //   - claude_mcp_servers/weaviate_mcp/server.py (via vco_lib/access_resolver.py)
+    //
+    // Contract pinned by these tests: response shape `{ "level":
+    // "read" | "write" | "none" }`, 404 on unknown project, default
+    // "none" on row absent (no relationship established).
+
+    #[tokio::test]
+    async fn access_endpoint_returns_existing_row_level() {
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        // Set up: create a project with an explicit access row.
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "AccessEndpointTest",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(create.status().is_success());
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Explicitly write a "read" level row.
+        handle
+            .0
+            .kg_set_access(&pid, "Test_KnowledgeGraph", "read")
+            .expect("set access");
+
+        let resp = client
+            .get(format!(
+                "{}/projects/{}/access/{}",
+                base, pid, "Test_KnowledgeGraph"
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert!(
+            resp.status().is_success(),
+            "expected 200, got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(body.get("level").and_then(|v| v.as_str()), Some("read"));
+    }
+
+    #[tokio::test]
+    async fn access_endpoint_returns_none_when_row_absent() {
+        // Default for "no relationship established" — caller MUST
+        // see this as a deny signal (the F-2a resolver returns
+        // AccessLevel::Denied which maps to "none" on the wire). A
+        // bug that returned "write" here would silently grant access
+        // to every collection on every project.
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "AccessEndpointAbsent",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        assert!(create.status().is_success());
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        // Query a collection the project has NO row for.
+        let resp = client
+            .get(format!(
+                "{}/projects/{}/access/{}",
+                base, pid, "NeverWritten_KnowledgeGraph"
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert!(resp.status().is_success(), "expected 200 with default level");
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert_eq!(
+            body.get("level").and_then(|v| v.as_str()),
+            Some("none"),
+            "row-absent must default to 'none', NOT 'write' — \
+             silent-allow would be a security regression"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_endpoint_returns_404_for_unknown_project() {
+        // Unknown project_id is a diagnostic signal (caller might be
+        // racing a project create/delete window). Clients fail-open
+        // on 404 same as on transport errors, so this is observability
+        // not a behavioral change.
+        let (base, _handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!(
+                "{}/projects/nonexistent-project-id/access/Some_KG",
+                base
+            ))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status().as_u16(), 404);
+        let body: serde_json::Value = resp.json().await.expect("json");
+        assert!(
+            body.get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("project not found"))
+                .unwrap_or(false),
+            "expected 'project not found' error, got: {:?}",
+            body,
+        );
+    }
+
+    #[tokio::test]
+    async fn access_endpoint_distinguishes_write_from_read() {
+        // Pin the wire-stable mapping: AccessLevel::Write → "write"
+        // on the wire. A regression that mapped Write → "rw" or
+        // "Write" capitalization would break every client that does
+        // byte-equality on the string.
+        let (base, handle) = spawn_test_hub_with_state_api().await;
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{}/cli/projects", base))
+            .json(&serde_json::json!({
+                "name": "AccessLevelMap",
+                "folder_path": ".",
+                "host": "base",
+            }))
+            .send()
+            .await
+            .expect("send");
+        let body: serde_json::Value = create.json().await.expect("json");
+        let pid = body.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+
+        for level in &["read", "write", "none"] {
+            handle
+                .0
+                .kg_set_access(&pid, "WireMap_KG", level)
+                .expect("set");
+            let resp = client
+                .get(format!("{}/projects/{}/access/{}", base, pid, "WireMap_KG"))
+                .send()
+                .await
+                .expect("send");
+            let body: serde_json::Value = resp.json().await.expect("json");
+            assert_eq!(
+                body.get("level").and_then(|v| v.as_str()),
+                Some(*level),
+                "wire-stable mapping broke for level {}",
+                level,
+            );
+        }
+    }
 }
