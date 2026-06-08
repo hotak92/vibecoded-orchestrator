@@ -166,25 +166,37 @@ def test_emit_gate_skipped_deferral_silent_when_no_project_dir(
     """No resolvable project root → skip silently. The silent-allow
     contract must hold even when the deferral write target can't be
     located.
+
+    Test-isolation note: we monkeypatch the resolver to return None
+    rather than relying on env-var clearing alone. The resolver's
+    third fallback (``Path(__file__).resolve().parent.parent.parent``)
+    walks UP from server.py and lands on the real orchestrator repo
+    root — so a naive env-clear test would write
+    UPDATE_DEFERRED.md into the developer's working tree and dirty
+    pytest runs. Monkeypatching the resolver:
+      (a) directly exercises the documented "resolver returned None
+          → skip silently" branch the test claims to cover,
+      (b) keeps the working tree clean during ``pytest tests/``.
     """
     _reset_seen_set()
-    # Clear all project-root hints.
+    # Clear all project-root hints (defensive — also catches a future
+    # resolver refactor that consults env directly without going
+    # through ``_resolve_project_root_for_deferral``).
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     monkeypatch.delenv("KG_BASE_DIR", raising=False)
     monkeypatch.setenv("VCT_SESSION_ID", "no-dir-session")
 
-    # Also need to monkeypatch the module-level fallback so it doesn't
-    # find a real project root via __file__ resolution. We do that by
-    # pointing CLAUDE_PROJECT_DIR at a non-existent path explicitly so
-    # the resolver function's "is_dir()" guard rejects each candidate.
-    nonexistent = tmp_path / "definitely-does-not-exist"
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(nonexistent))
-    monkeypatch.setenv("KG_BASE_DIR", str(nonexistent))
+    # Force the resolver to return None, exercising the
+    # ``project_root is None → return`` branch of
+    # ``_emit_gate_skipped_deferral`` without touching the real repo.
+    monkeypatch.setattr(srv, "_resolve_project_root_for_deferral", lambda: None)
 
-    # The Path(__file__).parent.parent.parent fallback DOES find a real
-    # directory (the repo root), so we can't fully assert "no write"
-    # here without intrusive mocking — but we can assert no exception.
     srv._emit_gate_skipped_deferral("Coll")  # no-throw assertion
+
+    # Belt-and-braces: assert the deferral was NOT written anywhere
+    # the test could have polluted (tmp_path is the only writable
+    # location reachable from this test).
+    assert not (tmp_path / ".claude" / "context" / "UPDATE_DEFERRED.md").exists()
 
 
 # ─── _resolve_project_root_for_deferral ────────────────────────────────
