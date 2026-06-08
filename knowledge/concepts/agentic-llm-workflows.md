@@ -26,10 +26,8 @@ Pattern for using multiple LLM agents with specialized roles and different model
 Enable cost-effective, high-quality AI workflows by routing tasks to appropriate models based on complexity, while using specialized agents for different roles.
 
 ## Links
-- [[implements::Claude Workflow]] - Implementation of this concept
 - [[implements::Model Strategy]] - Cost optimization approach
 - [[implements::Agent Orchestration]] - Coordination patterns
-- [[uses::Claude Orchestrator]] - Uses this workflow
 
 ## Core Principles
 
@@ -103,7 +101,7 @@ Efficient context sharing between agents:
 
 - **Concise handoffs**: 300-500 tokens between agents
 - **File references**: Use paths instead of full content
-- **State tracking**: CONTEXT_STATE.md for current task
+- **State tracking**: a single working-memory doc per task
 - **Cleanup**: Archive completed work
 
 ## Benefits
@@ -145,8 +143,8 @@ Automatic triggers for quality gates:
 
 ### Skills
 User-invoked workflows:
-- `/task` - Complete task workflow
-- `/context` - Context management
+- Top-level task skill (kick off a full implementation flow)
+- Context-management skill (compact / re-inject working memory)
 - Custom skills per project
 
 ## Best Practices
@@ -158,7 +156,7 @@ User-invoked workflows:
 4. Parallel work: Spawn multiple agents
 
 ### Context Efficiency
-1. Keep CONTEXT_STATE.md under 325 lines
+1. Keep per-task working-memory documents short (a few hundred lines max)
 2. Archive completed work
 3. Use file references, not full content
 4. Limit command output verbosity
