@@ -3,40 +3,19 @@
 Tracking polish-grade items that ship with the launcher but are worth
 flagging for early adopters and the next iteration.
 
-## v0.2.18 known caveats
+## Current caveats
 
-- [ ] **Codegraph enrichment is CodeFunction-only when triggered from the
-      GUI's "Save embedding choices" flow.** The multi-class sweep across
-      the four sibling code collections (CodeModule, CodeClass, CodeAPI,
-      CodeInteraction) is wired through the Python enrichment module but
-      not yet exposed from the launcher button — only the Function pass
-      auto-runs. Workaround: run
-      `python -m vco_lib.embedding_enrichment --collection CodeClass`
-      (and similarly for the other three) from the project root to backfill
-      the sibling collections after switching embed slots. Full GUI parity
-      is tracked for v0.2.19.
-
-- [ ] **macOS support remains Tier-2 in v0.2.18** — carries the same
+- [ ] **macOS support remains Tier-2** — carries the
       Tier-2 caveats documented under "Install / first-run" below
       (Bash 3.2 quirks, Finder exec-bit stripping, `.command` quarantine
       attribute, manual Homebrew bootstrap). The Tauri auto-restart
       flow's macOS-specific runtime path is still verified-by-CI-only.
-      Linux remains the recommended platform.
+      Linux remains the recommended platform. (needs verification post-v0.2.50)
 
 - [ ] **Launcher binaries remain unsigned on Windows + macOS** —
       SmartScreen and Gatekeeper warnings persist; Apple notarization
-      enrollment is still pending. Same workarounds as v0.2.17:
-      see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
-
-## Visual / UX
-
-- [ ] **Tauri visual QA of per-project accent** — verify by running
-      `npm run tauri:dev`, creating 3 projects, switching between them
-      in the MenuBar selector, and confirming the 5px strip color +
-      tinted project-name pill change distinctly per project (Wong 2011
-      colorblind-safe palette). Browser preview confirms the CSS
-      plumbing; only the bundled WebKit render path remains untested
-      end-to-end. Delete this entry after manual verification.
+      enrollment is still pending. Workarounds in
+      [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md#first-install-issues).
 
 ## Install / first-run
 
@@ -48,18 +27,17 @@ flagging for early adopters and the next iteration.
       validated; the macOS path beyond `first-install.command` reaching `install.sh` is
       not. Linux is the recommended platform for v0.2.x; macOS Tier-2.
 
-- [ ] **v0.2.17 Update Orchestrator auto-restart path is verified-by-CI-only on macOS** —
+- [ ] **Update-orchestrator auto-restart path is verified-by-CI-only on macOS** —
       the Rust `pid_is_alive` (using `kill(pid, 0)` + `std::io::Error::last_os_error()`),
       `pre_pull_rename_running_binary` (Windows no-op on macOS), `sweep_stale_binary_siblings`,
       and `restart_launcher` spawn-detached paths all compile cleanly on macOS-arm64 in CI
       and pass cargo's link step. The cargo test suite that exercises these paths runs on
-      Linux only (CI matrix), so the macOS-specific runtime behavior of v0.2.17's
-      auto-restart flow has not been hand-verified. Risk surface: `kill(pid, 0)` semantics
+      Linux only (CI matrix), so the macOS-specific runtime behavior of the auto-restart
+      flow has not been hand-verified. Risk surface: `kill(pid, 0)` semantics
       + errno-via-`last_os_error()` are POSIX-portable and well-documented, but
       `std::process::Command::pre_exec(setsid)` behavior across XNU + Tauri's GUI lifecycle
       hasn't been exercised end-to-end on macOS. Expected to work; flag to retest before
-      promoting macOS off Tier-2. Windows verification is being handled separately by a
-      tester with a Windows-x64 machine.
+      promoting macOS off Tier-2. (needs verification post-v0.2.50)
 
 - [ ] **Launcher binary not yet code-signed (Windows + macOS)** — Windows shows SmartScreen "Windows
       protected your PC"; macOS Gatekeeper shows "damaged and can't be opened". Both are expected for

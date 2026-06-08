@@ -11,7 +11,7 @@
 >
 > **Always verify a generated diagram against the source code before sharing it or making decisions from it.** Report surprising omissions or wrong edges so the pipeline can improve; do not silently work around them.
 
-**Phase 3 of the diagrams-integration plan** (`.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md`). Status: shipped pre-alpha in v0.2.34.
+**Phase 3 of the diagrams-integration plan** (maintainer-side internal notes). Status: shipped pre-alpha in v0.2.34.
 
 Turns a subgraph rooted at one code symbol into a Mermaid `flowchart TD`, writes it under `.claude/diagrams/codegraph/`, and indexes it so `hybrid_search` can find it later. Pairs with the `/codegraph-diagram` slash skill — same arguments, same output.
 
@@ -86,4 +86,4 @@ The same CLI is wrapped by the `/codegraph-diagram` slash skill (`.claude/skills
 
 - `vco rebuild-diagram-index` — re-index the whole `.claude/diagrams/` tree after model upgrades or schema migrations.
 - `code-graph-query` — interactive querying of the same Weaviate collections this command consumes. Useful for discovering the right `seed_symbol` before rendering.
-- Phase 3 of `.claude/context/plans/diagrams-integration-excalidraw-mermaid-2026-05-24.md` — design rationale.
+- `knowledge/concepts/` nodes tagged `diagrams-integration` for design rationale.

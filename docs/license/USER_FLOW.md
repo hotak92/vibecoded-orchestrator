@@ -17,8 +17,12 @@
 
 ## Re-activation (same machine)
 
-`machine_id_hash` is a SHA-256 of the MAC address — stable across reboots,
-re-installs, even fresh OS installs as long as the network card is the same.
+`machine_id_hash` is a SHA-256 of a platform-stable host identifier
+(Windows `MachineGuid`, macOS `IOPlatformUUID`, Linux `/etc/machine-id`) —
+stable across reboots and reinstalls of the OS provided the underlying
+identifier survives. The MAC-based algorithm was retired in v0.2.36 because
+laptops with shifting NICs broke the binding; see
+[MACHINE_BINDING.md](MACHINE_BINDING.md) for the rationale.
 LS dedupes activations by `instance_name`, so re-running activation on the
 same machine is a no-op (returns `machine_count` unchanged).
 

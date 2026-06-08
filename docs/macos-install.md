@@ -177,7 +177,7 @@ Cross-compiling from the arm64 runner with `--target x86_64-apple-darwin` is tec
 If you have an Intel Mac and need a build, the build script `scripts/build-bundled-launcher.sh` runs identically on Intel Darwin — you can build locally:
 
 ```bash
-git clone https://github.com/vibecoded-tools/vibecoded-orchestrator
+git clone https://github.com/hotak92/vibecoded-orchestrator
 cd vibecoded-orchestrator
 # Install Rust toolchain + Node 20+ + pnpm first.
 bash scripts/build-bundled-launcher.sh
