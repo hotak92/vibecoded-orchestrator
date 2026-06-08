@@ -4,15 +4,31 @@ This guide walks you through installing the orchestrator, configuring your first
 
 ## Prerequisites
 
+The `install.sh` / `install.ps1` / `first-install.*` wrappers auto-install missing prerequisites (Python 3.11+, Node.js 18+, Podman) interactively via the platform package manager. They will prompt before invoking sudo / brew / winget — pass `--yes` or `--non-interactive` to skip prompts (auto-install is disabled in that mode; missing tools just get logged and `install.py` skips the dependent feature). GPU drivers are NEVER auto-installed (out of scope for an unattended installer).
+
+What gets auto-installed when missing:
+
 - **Python 3.11 or newer** (3.12 recommended; 3.13 supported). Older versions fail at the install.py sentinel — we use stdlib `tomllib`, which is 3.11+.
   - Linux: `sudo apt install python3.12 python3.12-venv` (or `sudo dnf install python3.12`, `sudo pacman -S python`)
   - macOS: `brew install python@3.12`
   - Windows: `winget install Python.Python.3.12`
   - Or: <https://python.org/downloads/>
-  - The `install.sh` / `install.ps1` wrappers can do this for you interactively if Python is missing.
-- Docker or Podman (for Weaviate + Ollama containers)
+- **Node.js 18+** (needed by Playwright MCP and the Tauri launcher build path)
+  - Linux: `sudo apt install nodejs npm` (Ubuntu/Debian), `sudo dnf install nodejs npm` (Fedora), `sudo pacman -S nodejs npm` (Arch)
+  - macOS: `brew install node`
+  - Windows: `winget install OpenJS.NodeJS.LTS`
+  - Or: <https://nodejs.org/>
+  - Note: on fnm/nvm setups where you've hand-symlinked just `npm` to `~/.local/bin/`, the installer now finds `npx` via `dirname(realpath(npm))/npx` automatically — no manual PATH fiddling needed.
+- **Podman** (preferred — no commercial license, native on Linux/macOS/Windows). Docker is accepted as an alternative if already installed.
+  - Linux: `sudo apt install podman` (Ubuntu/Debian), `sudo dnf install podman` (Fedora), `sudo pacman -S podman` (Arch)
+  - macOS: `brew install podman`, then `podman machine init && podman machine start`
+  - Windows: `winget install RedHat.Podman` (requires WSL2: `wsl --install`)
+
+Auto-start behaviour for the Podman daemon (v0.2.51+): if Podman is installed but the daemon/socket is not responding, `install.py` attempts `systemctl --user start podman.socket` (Linux) or `podman machine start` (macOS/Windows) before giving up. If the start fails (e.g. machine not yet initialized), a deferral entry is written to `.claude/context/UPDATE_DEFERRED.md` with the exact manual command to run — no destructive auto-init.
+
+Other prerequisites (not auto-installed; you need them yourself):
+
 - Claude Code CLI (`npm install -g @anthropic-ai/claude-code`) with a Claude Max subscription
-- Node.js 18+
 
 ## Install
 

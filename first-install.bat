@@ -34,9 +34,11 @@ echo   VibeCoded Tools - First-Time Installer (Windows)
 echo ===============================================
 echo.
 echo This will:
-echo   - Install Python 3.11+ via winget if missing
-echo   - Detect Podman/Docker; print install URLs if neither is present
-echo   - Detect NVIDIA/CUDA drivers; recommend install if missing
+echo   - Auto-install Python 3.11+, Node.js 18+, and Podman via winget if missing
+echo     (interactive prompt before any winget invocation)
+echo   - Auto-start the Podman machine (podman machine start) if installed but stopped
+echo     (deferral written to UPDATE_DEFERRED.md if start fails or machine not initialized)
+echo   - Detect NVIDIA/CUDA drivers and print install hints (drivers stay manual)
 echo   - Set up the orchestrator (~5-10 min)
 echo.
 

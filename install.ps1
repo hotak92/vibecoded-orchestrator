@@ -311,6 +311,107 @@ function Attempt-Install-Python {
 }
 
 # ---------------------------------------------------------------------------
+# v0.2.51 Bug G: Node.js detection + auto-install (Windows)
+#
+# Node 18+ is needed by Playwright MCP and the Tauri launcher build path.
+# winget package ID: OpenJS.NodeJS.LTS (currently 20.x; tracks the LTS).
+# ---------------------------------------------------------------------------
+function Find-Node {
+    # Returns the major version (int) if Node >= 18 is on PATH, $null otherwise.
+    $nodeCmd = Get-Command "node" -ErrorAction SilentlyContinue
+    if (-not $nodeCmd) { return $null }
+    $rawVersion = & node --version 2>$null
+    if (-not $rawVersion) { return $null }
+    # "v20.11.1" → 20
+    $trimmed = $rawVersion.TrimStart('v')
+    $parts = $trimmed.Split('.')
+    if ($parts.Length -lt 1) { return $null }
+    try {
+        $major = [int]$parts[0]
+    } catch {
+        return $null
+    }
+    if ($major -ge 18) { return @{ Major = $major; Version = $trimmed } }
+    return $null
+}
+
+function Print-Node-Manual-Hint {
+    Write-Host ""
+    Write-Host "Install Node.js 18+ manually, then re-run install.ps1:" -ForegroundColor Yellow
+    Write-Host "  winget:           winget install OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements"
+    Write-Host "  nodejs.org:       https://nodejs.org/"
+}
+
+function Attempt-Install-Node {
+    $winget = Get-Command "winget" -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-Host "ERROR: winget not found." -ForegroundColor Red
+        Print-Node-Manual-Hint
+        return $false
+    }
+    Write-Host "Detected winget. Will run:"
+    Write-Host "  winget install OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements"
+    if (-not (Prompt-Yes "Proceed?")) { return $false }
+
+    & winget install OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: winget install failed (exit $LASTEXITCODE)." -ForegroundColor Red
+        Print-Node-Manual-Hint
+        return $false
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
+# v0.2.51 Bug G: Podman detection + auto-install (Windows)
+#
+# Note: Podman on Windows requires WSL2. winget install RedHat.Podman
+# DOES install the podman client but DOES NOT install/enable WSL2.
+# install.py's _prompt_install_container_runtime emits a clear hint for
+# the WSL2 prerequisite when only the binary is present; we just get
+# the binary on PATH here.
+# ---------------------------------------------------------------------------
+function Find-Podman {
+    return ([bool](Get-Command "podman" -ErrorAction SilentlyContinue))
+}
+
+function Find-Container-Runtime {
+    if (Find-Podman) { return "podman" }
+    if (Get-Command "docker" -ErrorAction SilentlyContinue) { return "docker" }
+    return $null
+}
+
+function Print-Podman-Manual-Hint {
+    Write-Host ""
+    Write-Host "Install Podman manually, then re-run install.ps1:" -ForegroundColor Yellow
+    Write-Host "  winget:           winget install RedHat.Podman --silent --accept-package-agreements --accept-source-agreements"
+    Write-Host "  podman.io:        https://podman.io/getting-started/installation"
+    Write-Host "  Note: Podman on Windows requires WSL2: https://learn.microsoft.com/windows/wsl/install"
+}
+
+function Attempt-Install-Podman {
+    $winget = Get-Command "winget" -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-Host "ERROR: winget not found." -ForegroundColor Red
+        Print-Podman-Manual-Hint
+        return $false
+    }
+    Write-Host "Detected winget. Will run:"
+    Write-Host "  winget install RedHat.Podman --silent --accept-package-agreements --accept-source-agreements"
+    Write-Host "  Note: Podman on Windows requires WSL2. Install WSL2 first if you haven't:"
+    Write-Host "        https://learn.microsoft.com/windows/wsl/install"
+    if (-not (Prompt-Yes "Proceed?")) { return $false }
+
+    & winget install RedHat.Podman --silent --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: winget install failed (exit $LASTEXITCODE)." -ForegroundColor Red
+        Print-Podman-Manual-Hint
+        return $false
+    }
+    return $true
+}
+
+# ---------------------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------------------
 $py = Find-Python
@@ -356,6 +457,76 @@ $pyVersion = if ($pythonArgs.Count -gt 0) {
     & $pythonCmd --version
 }
 Write-Host "Using Python: $pythonCmd $pyVersion"
+
+# ---------------------------------------------------------------------------
+# v0.2.51 Bug G: Node.js + Podman pre-flight (best-effort).
+#
+# install.py soft-fails when they're missing, but offering to install in
+# the same session is a strict UX win. Non-interactive mode skips silently.
+# ---------------------------------------------------------------------------
+$nodeInfo = Find-Node
+if ($nodeInfo) {
+    Write-Host "Found Node.js: v$($nodeInfo.Version)"
+} else {
+    if ($nonInteractiveMode) {
+        Write-Host "Node.js 18+ not detected (non-interactive - skipping auto-install)."
+        Write-Host "  Playwright MCP + Tauri launcher build will be limited until installed."
+    } else {
+        Write-Host "Node.js 18+ not detected."
+        if (Prompt-Yes "Install Node.js now? (Playwright MCP + launcher build need it)") {
+            if (Attempt-Install-Node) {
+                Write-Host "Re-checking for Node.js..."
+                # winget installs may not refresh PATH for the current shell.
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + `
+                            [System.Environment]::GetEnvironmentVariable("Path", "User")
+                $nodeInfo = Find-Node
+                if ($nodeInfo) {
+                    Write-Host "Found Node.js: v$($nodeInfo.Version)"
+                } else {
+                    Write-Host "WARN: Node.js install appeared to succeed but `node --version` still reports < 18 or not found." -ForegroundColor Yellow
+                    Write-Host "      Open a new PowerShell window; install.py will surface a deferral if needed."
+                    Print-Node-Manual-Hint
+                }
+            } else {
+                Print-Node-Manual-Hint
+                Write-Host "Continuing - Node.js is non-blocking."
+            }
+        } else {
+            Write-Host "Skipped - install.py will note missing Node.js in its summary."
+        }
+    }
+}
+
+$rt = Find-Container-Runtime
+if ($rt) {
+    Write-Host "Found container runtime: $rt"
+} else {
+    if ($nonInteractiveMode) {
+        Write-Host "No container runtime detected (non-interactive - skipping auto-install)."
+        Write-Host "  install.py will surface a prompt later in this run."
+    } else {
+        Write-Host "No container runtime (podman or docker) detected."
+        if (Prompt-Yes "Install Podman now? (recommended over Docker - no license, native)") {
+            if (Attempt-Install-Podman) {
+                Write-Host "Re-checking for Podman..."
+                $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + `
+                            [System.Environment]::GetEnvironmentVariable("Path", "User")
+                if (Find-Podman) {
+                    Write-Host "Found podman."
+                } else {
+                    Write-Host "WARN: Podman install appeared to succeed but podman not on PATH." -ForegroundColor Yellow
+                    Write-Host "      Open a new PowerShell window; install.py will re-probe + surface a deferral if needed."
+                    Print-Podman-Manual-Hint
+                }
+            } else {
+                Print-Podman-Manual-Hint
+                Write-Host "Continuing - install.py will prompt again if no runtime is present."
+            }
+        } else {
+            Write-Host "Skipped - install.py will prompt again later."
+        }
+    }
+}
 
 # Change to script directory
 Set-Location (Split-Path -Parent $MyInvocation.MyCommand.Path)
