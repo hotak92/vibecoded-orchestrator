@@ -34,6 +34,27 @@
 # window — rate-limited via $VCT_STATE_DIR/cache/access_check_warn.jsonl.
 # Set VCO_HOOK_DEBUG=1 to bypass rate limit.
 #
+# ── Rate-limit scope (cross-client documentation) ──────────────────────
+#
+# This script keys its rate-limit on "$$:$reason" (PID-scoped). Every
+# hook invocation is a fresh bash process, so PID-scoped means EACH
+# hook firing emits at least one WARNING per failure reason. This is
+# INTENTIONAL — for ephemeral hook callers we want the user to SEE the
+# degraded state every time it occurs, not have it silently suppressed
+# by a long-lived rate-limit window. vct_access_check.ps1 mirrors this
+# PID-scoped behaviour exactly.
+#
+# Contrast: vco_lib/access_resolver.py (consumed by the long-running
+# MCP server claude_mcp_servers/weaviate_mcp/server.py) uses a
+# process-scoped rate-limit (just "$reason", no PID prefix) so a single
+# MCP process doesn't spam WARNINGs every 5 minutes for the same
+# persistent failure.
+#
+# The divergence is by design: hook invocations are episodic and
+# user-visible; MCP processes are long-lived and emit through Python
+# logging. If you find yourself thinking "should I align these?" the
+# answer is no — read this paragraph again.
+#
 # Dropped-write metric: every fail-open emission appends a row to
 # $VCT_STATE_DIR/cache/dropped_writes.jsonl with timestamp + project_id
 # + collection + reason. Caller can ingest this for observability.

@@ -27,6 +27,27 @@ unacceptable UX. Every fail-open emission:
 2. Appends a row to ``$VCT_STATE_DIR/cache/dropped_writes.jsonl`` so
    the dropped-write metric is observable.
 
+Rate-limit scope (cross-client documentation)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This module keys its rate-limit on ``reason`` alone (process-scoped:
+one WARNING per reason per 5 min per Python process). The consumer
+is the long-running MCP server
+``claude_mcp_servers/weaviate_mcp/server.py`` — emitting a WARNING
+every 5 minutes for the same persistent failure would spam the user's
+log indefinitely.
+
+Contrast: ``templates/scripts/vct_access_check.sh`` and
+``templates/scripts/vct_access_check.ps1`` (consumed by ephemeral
+hook subprocesses) key their rate-limit on ``"$PID:$reason"``. Every
+hook invocation is a fresh process, so PID-scoped means each hook
+firing emits at least one WARNING — INTENTIONAL because hook callers
+are episodic and user-visible; we want the degraded state seen every
+time it occurs, not silently suppressed.
+
+The divergence is by design. If you find yourself thinking "should I
+align these?" the answer is no — read this paragraph again.
+
 Public API
 ~~~~~~~~~~
 

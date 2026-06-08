@@ -60,6 +60,76 @@ $DocsDir = Join-Path $ProjectRoot "docs"
 
 if (-not $EditedFile) { exit 0 }
 
+# v0.2.49 Phase 8 (item #22): access-matrix gate for KG writes.
+#
+# Before kicking off any kg-sync subprocess (or upload_docs.py), check
+# if this project has write access to the target Weaviate collection.
+# The check is fail-open: if the hub is unreachable / the project
+# isn't registered / the response is malformed, the resolver returns
+# "write" + emits a WARNING + logs a dropped-write-metric row, then
+# the sync proceeds. This is DELIBERATE (closed-circuit would brick
+# all KG writes during launcher restart).
+#
+# When the gate returns "read" or "none", we SKIP the sync silently +
+# the user gets the WARNING from the resolver client about the deny.
+#
+# Mirrors templates/hooks/post-file-edit.sh's _kg_write_allowed shell
+# function. Resolver discovery: templates/scripts/vct_access_check.ps1
+# (orchestrator-root) → .claude/scripts/vct_access_check.ps1
+# (user-project install). Resolver script lives at
+# templates/scripts/vct_access_check.ps1 and is byte-equivalent to the
+# bash sibling (shipped together by bundle install).
+function Test-KgWriteAllowed {
+    param(
+        [string]$Project,
+        [string]$Collection
+    )
+    if (-not $Project) { return $true }    # no project context → allow (legacy path)
+    if (-not $Collection) { return $true } # no collection context → allow
+
+    $resolver = $null
+    $candidates = @(
+        (Join-Path $ProjectRoot "templates/scripts/vct_access_check.ps1"),
+        (Join-Path $ProjectRoot ".claude/scripts/vct_access_check.ps1")
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { $resolver = $c; break }
+    }
+    if (-not $resolver) {
+        # Resolver not on disk → allow (pre-v0.2.49 install, or post-
+        # update where the script hasn't been bundled yet). Matches the
+        # bash sibling's same fallthrough.
+        return $true
+    }
+
+    try {
+        $level = & pwsh -NoProfile -File $resolver $Project $Collection 2>$null
+        if ($null -eq $level) { return $true }  # fail-open on null
+        $level = ([string]$level).Trim()
+    } catch {
+        return $true  # fail-open on any invocation error
+    }
+    return ($level -eq 'write')
+}
+
+# Resolve project_id once for the access checks below. Same env-then-
+# grep-.claude/env fallback as the bash sibling.
+$VctProjectId = $Env:VCT_PROJECT_ID
+if (-not $VctProjectId) {
+    $envFile = Join-Path $ProjectRoot ".claude/env"
+    if (Test-Path $envFile) {
+        try {
+            $envLines = Get-Content -LiteralPath $envFile -ErrorAction Stop
+            foreach ($line in $envLines) {
+                if ($line -match '^\s*VCT_PROJECT_ID\s*=\s*"?([^"]+)"?\s*$') {
+                    $VctProjectId = $Matches[1].Trim()
+                    break
+                }
+            }
+        } catch { }
+    }
+}
+
 # 1. Knowledge graph auto-sync (background side-effect).
 if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase)) {
     $relPath = $EditedFile
@@ -67,12 +137,16 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
         $relPath = $EditedFile.Substring($ProjectRoot.Length).TrimStart('\','/')
     }
 
-    $kgSyncPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-sync.ps1"
-    $kgSyncSh = Join-Path $ProjectRoot ".claude/scripts/kg-sync"
-    if (Test-Path $kgSyncPs1) {
-        Start-Process -FilePath "pwsh" -ArgumentList @('-NoProfile','-File',$kgSyncPs1,$relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
-    } elseif ((Test-Path $kgSyncSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-        Start-Process -FilePath "bash" -ArgumentList @($kgSyncSh, $relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+    # v0.2.49 Phase 8: gate the sync on access-matrix write permission.
+    # KG_COLLECTION is the target Weaviate class for primary-KG writes.
+    if (Test-KgWriteAllowed -Project $VctProjectId -Collection $Env:KG_COLLECTION) {
+        $kgSyncPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-sync.ps1"
+        $kgSyncSh = Join-Path $ProjectRoot ".claude/scripts/kg-sync"
+        if (Test-Path $kgSyncPs1) {
+            Start-Process -FilePath "pwsh" -ArgumentList @('-NoProfile','-File',$kgSyncPs1,$relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+        } elseif ((Test-Path $kgSyncSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
+            Start-Process -FilePath "bash" -ArgumentList @($kgSyncSh, $relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+        }
     }
 
     # Duplicate detection every 10 edits.
@@ -103,10 +177,14 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
 # at the USER's venv which doesn't have vco_lib + weaviate-client).
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
 if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and ($EditedFile -like "*.md")) {
-    $venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-    $uploadScript = Join-Path $ProjectRoot ".claude/scripts/upload_docs.py"
-    if ($venvPy -and (Test-Path $uploadScript)) {
-        Start-Process -FilePath $venvPy -ArgumentList @($uploadScript, $EditedFile) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+    # v0.2.49 Phase 8: gate docs sync on access-matrix write permission
+    # against DEVELOPMENT_COLLECTION (the docs/ target).
+    if (Test-KgWriteAllowed -Project $VctProjectId -Collection $Env:DEVELOPMENT_COLLECTION) {
+        $venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+        $uploadScript = Join-Path $ProjectRoot ".claude/scripts/upload_docs.py"
+        if ($venvPy -and (Test-Path $uploadScript)) {
+            Start-Process -FilePath $venvPy -ArgumentList @($uploadScript, $EditedFile) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+        }
     }
 }
 
