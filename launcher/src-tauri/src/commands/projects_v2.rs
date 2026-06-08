@@ -7967,12 +7967,12 @@ mod tests {
     fn strip_canonical_keys_from_env_text_keeps_user_keys() {
         let input = "\
 # vibecoded-orchestrator per-project .env
-KG_COLLECTION=MediaLibrary_KnowledgeGraph
+KG_COLLECTION=SomeProject_KnowledgeGraph
 USER_API_KEY=secret123
-PROJECT_NAME=MediaLibrary
+PROJECT_NAME=SomeProject
 SOME_USER_VAR=hello
 # OLLAMA_URL=http://localhost:11435
-DEVELOPMENT_COLLECTION=MediaLibrary_Development
+DEVELOPMENT_COLLECTION=SomeProject_Development
 ACTIVE_EMBEDDING=qwen3
 ";
         let (out, removed) = strip_canonical_keys_from_env_text(input);
@@ -8019,8 +8019,8 @@ ACTIVE_EMBEDDING=qwen3
     fn strip_canonical_keys_from_claude_env_text_handles_export_form() {
         let input = "\
 # vco-managed-begin
-export KG_COLLECTION=\"MediaLibrary_KnowledgeGraph\"
-export PROJECT_NAME=\"MediaLibrary\"
+export KG_COLLECTION=\"SomeProject_KnowledgeGraph\"
+export PROJECT_NAME=\"SomeProject\"
 export VCT_ORCHESTRATOR_ROOT=\"/some/path\"
 export VCT_INFRASTRUCTURE_DIR=\"/some/path/infrastructure\"
 # vco-managed-end
@@ -8054,8 +8054,8 @@ export USER_PROJECT_VAR=\"keep me\"
         parent.insert(
             "env".to_string(),
             serde_json::json!({
-                "KG_COLLECTION": "MediaLibrary_KnowledgeGraph",
-                "PROJECT_NAME": "MediaLibrary",
+                "KG_COLLECTION": "SomeProject_KnowledgeGraph",
+                "PROJECT_NAME": "SomeProject",
                 "USER_OPENAI_API_BASE": "https://internal.example.com",
                 "ACTIVE_EMBEDDING": "qwen3",
             }),

@@ -6,8 +6,8 @@
    *
    * v0.2.16 (W4 / 0.11): introduces this page as the "advanced"
    * counterpart to the GUI defaults (which filter to tracked projects).
-   * User direction 2026-05-18: dead-project data (MediaLibrary_*,
-   * TestInstall_*, ARTup_*, etc.) should STAY in Weaviate (so the user
+   * User direction 2026-05-18: dead-project data (orphaned per-project
+   * collections from removed projects) should STAY in Weaviate (so the user
    * can re-import the project later) but should NOT clutter every
    * day-to-day surface. This page is the explicit "show me the
    * everything" view, gated by a Preferences link.
@@ -183,8 +183,8 @@
       <h2>Untracked collections (no project currently linked)</h2>
       <p class="hint">
         These prefixes have data in Weaviate but no matching project in
-        the launcher. Likely dead-project leftovers (MediaLibrary_*,
-        TestInstall_*, ARTup_*, etc.) — safe to delete unless you plan
+        the launcher. Likely dead-project leftovers from removed
+        projects (e.g. TestInstall_*) — safe to delete unless you plan
         to re-import the project. Deleting the prefix removes only the
         five code-graph classes (CodeModule / CodeClass / CodeFunction
         / CodeAPI / CodeInteraction). KG / Development / other class

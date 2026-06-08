@@ -5,7 +5,7 @@ Covers:
   - No matching suffix → []
   - Single legacy candidate matches THIS project → 1 entry
   - Multiple candidates → all returned, deterministic order
-  - Different-project class is filtered out (Foo project + Agape class)
+  - Different-project class is filtered out (Foo project + Quux class)
   - Weaviate unreachable → [] (no exception)
   - Substring-prefix similarity (FooBar project + Foo_KnowledgeGraph)
   - Exact canonical class is NOT a candidate
@@ -111,7 +111,7 @@ class LevenshteinTests(unittest.TestCase):
 
     def test_close_project_names(self):
         self.assertLessEqual(project_init._levenshtein("Foo", "FoO"), 1)
-        self.assertLessEqual(project_init._levenshtein("Artup", "ARTup"), 3)
+        self.assertLessEqual(project_init._levenshtein("Quux", "QUUX"), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +140,7 @@ class SimilarPrefixTests(unittest.TestCase):
 
     def test_levenshtein_above_threshold(self):
         self.assertFalse(
-            project_init._is_similar_prefix("Foo", "Agape"),
+            project_init._is_similar_prefix("Foo", "Quux"),
             "totally different names should not match",
         )
 
@@ -269,22 +269,22 @@ class DetectLegacyKgTests(unittest.TestCase):
         self.assertEqual(result[1]["suffix"], "_KnowledgeGraph")
 
     def test_other_project_classes_filtered_out(self):
-        # CRITICAL: project "Foo" + Weaviate has Agape_KnowledgeGraph,
-        # ARTup_KnowledgeGraph, SD15_KnowledgeGraph from other projects.
+        # CRITICAL: project "Foo" + Weaviate has Quux_KnowledgeGraph,
+        # Bazquux_KnowledgeGraph, Quuux_KnowledgeGraph from other projects.
         # Must return EMPTY — never claim other-project data is "legacy".
         with mock.patch.object(
             project_init, "_http_request",
             side_effect=_make_http_request_mock(
                 [
-                    "Agape_KnowledgeGraph",
-                    "ARTup_KnowledgeGraph",
-                    "SD15_KnowledgeGraph",
+                    "Quux_KnowledgeGraph",
+                    "Bazquux_KnowledgeGraph",
+                    "Quuux_KnowledgeGraph",
                     "Foo_KnowledgeGraph",  # canonical for Foo
                 ],
                 counts={
-                    "Agape_KnowledgeGraph": 999,
-                    "ARTup_KnowledgeGraph": 999,
-                    "SD15_KnowledgeGraph": 999,
+                    "Quux_KnowledgeGraph": 999,
+                    "Bazquux_KnowledgeGraph": 999,
+                    "Quuux_KnowledgeGraph": 999,
                 },
             ),
         ):
@@ -399,8 +399,8 @@ class DetectLegacyCodegraphTests(unittest.TestCase):
         with mock.patch.object(
             project_init, "_http_request",
             side_effect=_make_http_request_mock(
-                ["Agape_CodeFunction", "ARTup_CodeModule"],
-                counts={"Agape_CodeFunction": 50, "ARTup_CodeModule": 50},
+                ["Quux_CodeFunction", "Bazquux_CodeModule"],
+                counts={"Quux_CodeFunction": 50, "Bazquux_CodeModule": 50},
             ),
         ):
             result = project_init._detect_legacy_codegraph_collections("Foo", URL)

@@ -1101,7 +1101,7 @@ class MultiClassInvocationTests(_BaseEnrichmentTest):
                 f"bare {suffix} should be code-shaped",
             )
             # Per-project prefixed.
-            for prefix in ("MyProj_", "ARTup_", "VCODev_"):
+            for prefix in ("MyProj_", "OtherProj_", "ThirdProj_"):
                 name = f"{prefix}{suffix}"
                 self.assertTrue(
                     is_code_collection(name),

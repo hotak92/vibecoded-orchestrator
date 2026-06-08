@@ -996,7 +996,7 @@ fn list_diagram_grantor_names_for_grantee(
 /// underscores, capitalises first char) and is only used when the
 /// codegraph binding row hasn't been written yet. The two functions
 /// are deliberately distinct — codegraph keeps underscores because
-/// its on-disk schema convention does (``SimRacing_AI_CodeFunction``),
+/// its on-disk schema convention does (``Camel_Case_CodeFunction``),
 /// diagrams strips them because ``sanitize_for_weaviate_class`` does.
 fn sanitize_diagrams_class_prefix(project_name: &str) -> String {
     const FALLBACK: &str = "vct";
@@ -1243,8 +1243,8 @@ mod tests {
         // v0.2.31 regression test: the citation-monitor bug was caused
         // by an inline slug computation that only handled `/` → `-`.
         // Claude Code's actual rule ALSO converts `_` (and `.`) → `-`.
-        // Underscored workspace paths (VCO_dev, AI_hive) were the
-        // root cause of the 97.7% orphan-citation rate.
+        // Underscored workspace paths were the root cause of the
+        // 97.7% orphan-citation rate.
         let p = StdPath::new("/home/user/Desktop/PROGETTI/VCO_dev");
         let dir = claude_session_dir_for(p);
         assert_eq!(
@@ -1253,11 +1253,11 @@ mod tests {
             "slug must replace both '/' and '_' with '-'",
         );
 
-        let p2 = StdPath::new("/home/user/Desktop/PROGETTI/AI_hive");
+        let p2 = StdPath::new("/home/user/Desktop/PROGETTI/Some_Workspace");
         let dir2 = claude_session_dir_for(p2);
         assert_eq!(
             dir2.file_name().unwrap().to_str().unwrap(),
-            "-home-user-Desktop-PROGETTI-AI-hive",
+            "-home-user-Desktop-PROGETTI-Some-Workspace",
         );
     }
 

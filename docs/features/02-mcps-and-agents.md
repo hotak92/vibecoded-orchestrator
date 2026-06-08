@@ -88,7 +88,7 @@ Use `search_code_graph` first to discover entity names, then `query_code_structu
 </details>
 
 ### RL Reranking (ambient, opt-in)
-When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcement-learning reranker before being returned. When it's not, free-tier installs see plain cosine-ordered results — no error, no warning. The RL server (`rl_server.py` in MultiagentOrchestrator) is a **Pro-tier component** and is not in the OSS bundle.
+When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcement-learning reranker before being returned. When it's not, free-tier installs see plain cosine-ordered results — no error, no warning. The RL server is a **Pro-tier component** shipped as a signed binary via CDN; it is not in the OSS bundle.
 
 ### Env Vars (Weaviate MCP)
 

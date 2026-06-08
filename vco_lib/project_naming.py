@@ -15,7 +15,7 @@ name:
   1. `vco_lib.project_init.sanitize_for_weaviate_class` ── splits on
      `[^A-Za-z0-9]+` (treats underscore as a separator), PascalCases
      each segment, concatenates.
-       "SimRacing_AI"           -> "SimRacingAI"   (loses the underscore)
+       "Camel_Case"             -> "CamelCase"    (loses the underscore)
        "VibeCoded Orchestrator" -> "VibeCodedOrchestrator"
        "Foo-Bar"                -> "FooBar"
 
@@ -23,7 +23,7 @@ name:
      non-`[A-Za-z0-9_]` with `_`, then title-cases the first character.
      Crucially this PRESERVES underscores, replaces dashes with
      underscores, and replaces spaces with underscores too:
-       "SimRacing_AI"           -> "SimRacing_AI"  (preserved)
+       "Camel_Case"             -> "Camel_Case"   (preserved)
        "VibeCoded Orchestrator" -> "VibeCoded_Orchestrator"  (space->_)
        "Foo-Bar"                -> "Foo_Bar"       (dash->_)
 
@@ -42,10 +42,10 @@ collision (`VibeCoded_Orchestrator` ≈ `Vibecoded_orchestrator`) caused
 
 The canonical sanitizer here matches schema-on-disk observed across
 existing `base`-host installs (where Python-side `_sanitize_collection_prefix`
-output is the de-facto truth — Weaviate already has `SimRacing_AI_*`
+output is the de-facto truth — Weaviate already has `Camel_Case_*`
 classes). Drop-spaces (no underscore insertion) was chosen over the
 Rust-style "PascalCase + drop-separators" because the latter loses the
-underscore from `SimRacing_AI` and produces case-collision risk.
+underscore from underscored project names and produces case-collision risk.
 
 This module is the SINGLE source of truth. `analyze_code_graph.py` imports
 from here; the legacy `_sanitize_collection_prefix` is kept only as a
@@ -86,7 +86,7 @@ def canonical_class_prefix(project_name: str) -> str:
         3. Replace remaining non-``[A-Za-z0-9_]`` characters with a single
            underscore. So ``"Foo-Bar"`` becomes ``"Foo_Bar"`` (dash → ``_``).
            Underscores already present in the input are preserved verbatim
-           — ``"SimRacing_AI"`` stays ``"SimRacing_AI"``.
+           — ``"Camel_Case"`` stays ``"Camel_Case"``.
         4. Verify the first character is a letter (Weaviate requirement
            for class names). Names that sanitize to a leading-digit /
            leading-symbol form raise ``ValueError`` rather than silently
@@ -112,8 +112,8 @@ def canonical_class_prefix(project_name: str) -> str:
     Examples:
         >>> canonical_class_prefix("SD15")
         'SD15'
-        >>> canonical_class_prefix("SimRacing_AI")
-        'SimRacing_AI'
+        >>> canonical_class_prefix("Camel_Case")
+        'Camel_Case'
         >>> canonical_class_prefix("VibeCoded Orchestrator")
         'VibeCodedOrchestrator'
         >>> canonical_class_prefix("foo bar")
@@ -152,15 +152,15 @@ def canonical_class_prefix(project_name: str) -> str:
         raise ValueError(f"project_name {project_name!r} has no word parts")
 
     # Step 2: PascalCase each part — uppercase first char, preserve the
-    # rest verbatim. "SimRacing" stays "SimRacing"; "ai" becomes "Ai";
+    # rest verbatim. "CamelCase" stays "CamelCase"; "ai" becomes "Ai";
     # "Foo-Bar" stays "Foo-Bar" (separator-handling happens in step 3).
     pascal_parts = [p[:1].upper() + p[1:] for p in parts]
     pascal = "".join(pascal_parts)
 
     # Step 3: replace any remaining non-[A-Za-z0-9_] with a single
     # underscore. Underscores already in the input pass through unchanged
-    # (the negated class includes `_`), so "SimRacing_AI" stays
-    # "SimRacing_AI". Dashes and other punctuation become underscores:
+    # (the negated class includes `_`), so "Camel_Case" stays
+    # "Camel_Case". Dashes and other punctuation become underscores:
     # "Foo-Bar" → "Foo_Bar". Multiple consecutive special chars become
     # multiple underscores — we intentionally do NOT collapse runs to one
     # underscore, since collapsing would mask intent ("Foo--Bar" vs

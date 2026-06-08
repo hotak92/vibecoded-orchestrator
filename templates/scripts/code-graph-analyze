@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #
 # Once the bundle install lands the script in a USER PROJECT's
 # `.claude/scripts/`, `$SCRIPT_DIR/../../.venv` resolves to the
-# project's OWN venv (e.g. /home/me/MediaLibrary/.venv) — which
+# project's OWN venv (e.g. /home/me/my-project/.venv) — which
 # typically has the project's own deps but NOT weaviate-client +
 # the analyzer deps. So we must:
 #
@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #     "weaviate-client not installed" because example/Code had
 #     neither .venv nor claude_mcp_servers/.venv → added
 #     VCT_INSTALL_ROOT fallbacks.
-#   - 2026-05-07: MediaLibrary codegraph build failed with
+#   - 2026-05-07: a user project's codegraph build failed with
 #     `ModuleNotFoundError: weaviate` because the project HAS its
 #     own `.venv/` (used by its own runtime) which the script
 #     activated before getting to VCT_INSTALL_ROOT → reorder +

@@ -3,7 +3,7 @@
   "_format_version": 1,
   "cases": [
     ["SD15", "SD15"],
-    ["SimRacing_AI", "SimRacing_AI"],
+    ["Camel_Case", "Camel_Case"],
     ["VibeCoded Orchestrator", "VibeCodedOrchestrator"],
     ["VCO_dev", "VCO_dev"],
     ["VibeCoded_Tools", "VibeCoded_Tools"],

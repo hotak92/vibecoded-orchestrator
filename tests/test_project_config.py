@@ -662,14 +662,14 @@ class ClaudeSessionDirSlugTest(unittest.TestCase):
 
     def test_handles_underscores(self) -> None:
         # Primary bug-fix regression: workspace paths with underscores
-        # (VCO_dev, AI_hive) must produce slugs with `-` not `_`.
+        # must produce slugs with `-` not `_`.
         self.assertEqual(
-            claude_session_dir_for(Path("/home/user/VCO_dev")).name,
-            "-home-user-VCO-dev",
+            claude_session_dir_for(Path("/home/user/Some_Project")).name,
+            "-home-user-Some-Project",
         )
         self.assertEqual(
-            claude_session_dir_for(Path("/home/user/AI_hive")).name,
-            "-home-user-AI-hive",
+            claude_session_dir_for(Path("/home/user/Some_Workspace")).name,
+            "-home-user-Some-Workspace",
         )
 
     def test_passthrough_without_underscores(self) -> None:

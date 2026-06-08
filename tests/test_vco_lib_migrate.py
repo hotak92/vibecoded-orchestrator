@@ -196,7 +196,7 @@ class SchemaDeltaTests(unittest.TestCase):
         self.assertEqual(project_init._classify_action(delta), "copy")
 
     def test_two_deltas_missing_slot_and_null_state(self):
-        # SD15_KnowledgeGraph / ARTup_KnowledgeGraph: missing openai slot
+        # SD15_KnowledgeGraph / OtherProj_KnowledgeGraph: missing openai slot
         # + indexNullState.
         actual = _missing_openai_slot_and_null_state()
         target = project_init.kg_class_definition("SD15_KnowledgeGraph")

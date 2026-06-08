@@ -3146,7 +3146,7 @@ def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
     Caps at `cap` entries with a "... and N more" trailer when oversize so
     the deferral .md doesn't grow unbounded for large preserve / skip lists.
 
-    Item 3 (Gap 2, 2026-05-13): cap bumped from 20 to 100. The SD15
+    Item 3 (Gap 2, 2026-05-13): cap bumped from 20 to 100. The
     smoking-gun case had 36 preserved files; the old 20-cap silently hid
     the tail. A 100-cap covers every realistic install (the entire
     orchestrator bundle is currently ~114 files) while still bounding
@@ -4468,8 +4468,8 @@ def _cleanup_legacy_bash_env_in_project(folder: Path) -> dict:
 # absolute paths. PR-27 (v0.2.12, 2026-05-16) removed that write because
 # the `claude-code.env` channel did NOT propagate to MCP subprocesses on
 # Linux Claude Code 2.1.143 — the canonical channel since then is
-# `.claude/settings.json` `env`. But existing projects (SD15, VCO_dev,
-# any pre-v0.2.12 install) still have the legacy MCP_* keys in their
+# `.claude/settings.json` `env`. But existing pre-v0.2.12 installs
+# still have the legacy MCP_* keys in their
 # `.vscode/settings.json`. The keys are INERT (don't propagate), but
 # they:
 #   1. Confuse audits — anyone grepping for MCP path config finds a
@@ -5201,7 +5201,7 @@ def _is_similar_prefix(
 
     The substring rule catches the common "VCO" → "VCODev" case (project
     renamed by appending "Dev"). The Levenshtein rule catches small typos
-    or capitalisation drift ("Artup" vs "ARTup", "Foo" vs "FoO").
+    or capitalisation drift ("Quux" vs "QUUX", "Foo" vs "FoO").
 
     Returns False on identical match (caller filters that case separately
     — the canonical name is NOT a "legacy" candidate).
@@ -5296,7 +5296,7 @@ def _detect_legacy_collections_with_suffixes(
             continue
 
         # Conservative prefix-similarity check.  Without this we'd
-        # mistakenly suggest migrating Agape_KnowledgeGraph just because
+        # mistakenly suggest migrating Quux_KnowledgeGraph just because
         # the user added a project called "Foo".
         if not _is_similar_prefix(cand_prefix, canonical_prefix):
             continue
@@ -7440,8 +7440,9 @@ def _backfill_kg_collection_env_in_project(
 #       wheels)
 #     - Chromium renderer holding the full DOM for the file tree
 #   Result: systemd-oomd killed VS Code's Chromium scope at 86.46%
-#   memory pressure. Reproduced across SD15 (47 GB), Claude (32 GB,
-#   76k files), VCO_dev (cargo target/ 33 GB). Local fix in each case
+#   memory pressure. Reproduced across multiple multi-GB project trees
+#   (47 GB scientific stack, 32 GB / 76k-file legacy clone, 33 GB cargo
+#   target). Local fix in each case
 #   was to add the canonical files.watcherExclude + python.analysis.*
 #   blocks. PR-7 ships those as launcher-managed defaults so every
 #   project the launcher registers (and `install-bundle --update`s)
@@ -7555,7 +7556,7 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
     PR-7 (v0.2.11): without these excludes, opening a large workspace
     (>10 GB / >50k files — typical for ML projects with venvs, cargo
     target/, model weights) in VS Code triggers OOM kills (verified
-    live on Claude/, SD15/, VCO_dev/ on 2026-05-16). The launcher now
+    live on multiple large project trees on 2026-05-16). The launcher now
     ships the canonical exclude block as a backfill — existing projects
     catch up on `install-bundle --update`.
 

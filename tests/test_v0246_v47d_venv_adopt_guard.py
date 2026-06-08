@@ -5,8 +5,8 @@
 Closes the HIGH-severity finding from
 ``.claude/context/audits/venv-architecture-audit-2026-06-03.md``: the
 lightweight re-install path silently called ``shutil.rmtree(.venv)`` on
-Python-version mismatch, which for ARTup-class projects (9+ GB
-scientific stacks) would destroy hours-to-days of `pip install` work.
+Python-version mismatch, which for projects with large 3rd-party
+scientific stacks (9+ GB) would destroy hours-to-days of `pip install` work.
 
 V47-D wires a guard inside ``_venv_triage`` that downgrades the
 destructive ``"recreate"`` action to a new ``"skip-no-manifest"``

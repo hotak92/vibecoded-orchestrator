@@ -14,7 +14,7 @@
     ["Foo--Bar", "FooBar"],
     ["  spaced  out  ", "SpacedOut"],
     ["My_Project", "MyProject"],
-    ["SimRacing_AI", "SimRacingAI"],
+    ["Camel_Case", "CamelCase"],
     ["VibeCoded Orchestrator", "VibeCodedOrchestrator"],
     ["vibecoded-orchestrator", "VibecodedOrchestrator"],
     ["snake_case_name", "SnakeCaseName"],
@@ -25,7 +25,7 @@
     ["ab", "Ab"],
     ["a b c", "ABC"]
   ],
-  "_comment_cases": "All entries above MUST produce the listed output across all three layers. Note that this rule is INTENTIONALLY DIFFERENT from canonical_class_prefix (project_naming.json) — that one preserves underscores ('SimRacing_AI' stays 'SimRacing_AI'), this one drops them ('SimRacing_AI' → 'SimRacingAI'). The two rules coexist by historical accident: canonical_class_prefix is used for code-graph collections (CodeFunction/CodeClass/etc.) where the on-disk schema convention keeps underscores; sanitize_for_weaviate_class is used for KG/Dev/Diagrams collections where it doesn't. See knowledge/concepts/canonical-class-prefix-design.md for the history of the two-sanitiser split.",
+  "_comment_cases": "All entries above MUST produce the listed output across all three layers. Note that this rule is INTENTIONALLY DIFFERENT from canonical_class_prefix (project_naming.json) — that one preserves underscores ('Camel_Case' stays 'Camel_Case'), this one drops them ('Camel_Case' → 'CamelCase'). The two rules coexist by historical accident: canonical_class_prefix is used for code-graph collections (CodeFunction/CodeClass/etc.) where the on-disk schema convention keeps underscores; sanitize_for_weaviate_class is used for KG/Dev/Diagrams collections where it doesn't. See knowledge/concepts/canonical-class-prefix-design.md for the history of the two-sanitiser split.",
   "fallback_cases": [
     ["", "vct"],
     ["---", "vct"],

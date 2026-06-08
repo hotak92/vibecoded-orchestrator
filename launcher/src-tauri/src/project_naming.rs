@@ -93,7 +93,7 @@ pub fn canonical_class_prefix(project_name: &str) -> Result<String, CanonicalPre
     //
     // PascalCase each part: uppercase first char, preserve rest. This
     // is what gives "foo bar" → "FooBar" (not "Foobar"). For the
-    // single-token case ("SimRacing_AI") we still capitalize the
+    // single-token case ("Camel_Case") we still capitalize the
     // first char of the token, which is already "S" — idempotent.
     let mut pascal = String::with_capacity(stripped.len());
     for part in stripped.split_whitespace() {
@@ -176,10 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn smoke_simracing_ai_preserves_underscore() {
+    fn smoke_camel_case_preserves_underscore() {
         assert_eq!(
-            canonical_class_prefix("SimRacing_AI").unwrap(),
-            "SimRacing_AI"
+            canonical_class_prefix("Camel_Case").unwrap(),
+            "Camel_Case"
         );
     }
 
@@ -274,7 +274,7 @@ mod tests {
     fn idempotent_on_already_valid_input() {
         let inputs = [
             "VibeCodedOrchestrator",
-            "SimRacing_AI",
+            "Camel_Case",
             "SD15",
             "Foo_Bar",
         ];
@@ -309,15 +309,15 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn boundary_simracing_ai_preserves_single_underscore() {
-        // Documented Phase-chat suspicion: Rust → "SimRacing_AI_KnowledgeGraph"
-        // (correct), Python → "SimRacingAI_KnowledgeGraph" (wrong claim).
-        // Both implementations actually produce "SimRacing_AI"; this
+    fn boundary_camel_case_preserves_single_underscore() {
+        // Documented Phase-chat suspicion: Rust → "Camel_Case_KnowledgeGraph"
+        // (correct), Python → "CamelCase_KnowledgeGraph" (wrong claim).
+        // Both implementations actually produce "Camel_Case"; this
         // test pins it so a regression to either of the two legacy
         // sanitizers (which DID drop the underscore) fails here.
         assert_eq!(
-            canonical_class_prefix("SimRacing_AI").unwrap(),
-            "SimRacing_AI"
+            canonical_class_prefix("Camel_Case").unwrap(),
+            "Camel_Case"
         );
     }
 

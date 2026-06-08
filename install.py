@@ -2356,8 +2356,8 @@ def _log_project_name_pin_diff(
     PROJECT_NAME differs from what folder-name derivation WOULD produce.
 
     Pure informational — no action taken, just visibility. Helps surface
-    pre-V47-F installs that pinned a name like ``ARTup`` while sitting in
-    a folder like ``python/``. Soft-fails to no-op if either side can't
+    pre-V47-F installs that pinned a non-canonical project name while
+    sitting in a folder like ``python/``. Soft-fails to no-op if either side can't
     be read.
 
     Called from the update path (existing-project branch) to confirm the
@@ -2450,8 +2450,8 @@ def _venv_triage(install_path: Path,
     v0.2.46 V47-D (Gap D, this commit): wire the actual guard logic.
     When `.venv` exists but `.vco-manifest.json` does NOT — i.e. VCO has
     no manifest record proving it owns this venv — the venv is treated
-    as a 3rd-party environment (ARTup-class projects with 9+ GB
-    scientific stacks). In that case:
+    as a 3rd-party environment (e.g. projects with 9+ GB scientific
+    Python stacks). In that case:
 
       * A would-be "recreate" (Python-version mismatch) is downgraded
         to "skip-no-manifest" UNLESS adopt_project_mode == "replace-all"
@@ -2531,7 +2531,7 @@ def _venv_triage(install_path: Path,
         # proving VCO owns this venv, OR (b) the user has explicitly
         # opted in via --adopt-project-replace-all or --rebuild-venv.
         # Otherwise this would silently destroy a user's 3rd-party
-        # environment (e.g. ARTup's 9.2 GB scientific stack) on a
+        # environment (e.g. a large 3rd-party scientific stack) on a
         # Python-version-drift adopt — the HIGH finding from the
         # venv-architecture audit (2026-06-03).
         if not has_manifest and adopt_project_mode != "replace-all" \
@@ -5007,8 +5007,8 @@ def main() -> int:
         # v0.2.46 V47-F (Gap F): informational log when PROJECT_NAME differs
         # from folder-name derivation. Pure visibility — the existing project
         # KEEPS whatever PROJECT_NAME it already has (non-destructive rule).
-        # Helps surface pre-V47-F installs that pinned a name like "ARTup"
-        # while sitting in a folder like "python/".
+        # Helps surface pre-V47-F installs that pinned a non-canonical
+        # project name while sitting in a folder like "python/".
         _log_project_name_pin_diff(PROJECT_ROOT, "")
         # A3 (2026-05-28): reconcile any canonical env keys added since the
         # user's original install. Additive-only: user-set values preserved,
@@ -5408,7 +5408,7 @@ def main() -> int:
     # launcher binary lives outside the clone (e.g. `~/bin/`,
     # PATH-installed wrapper, etc.), which historically caused
     # `ProjectEnvSettings::populate` to omit `VCT_ORCHESTRATOR_ROOT`
-    # from `.claude/env` — see the instambul_map / SD15 incident.
+    # from `.claude/env` — see the instambul_map incident.
     #
     # Approach: write the install_path to a seed file at
     # `<install>/.vct/install_path_seed.txt`. On first launcher boot
@@ -8843,8 +8843,8 @@ def _materialize_orchestrator_self_claude_dir(
 
     # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, redirect
     # the entire materialization to a sibling .vco-new tree. This catches
-    # the ARTup-style case where the user symlinked .claude to a shared
-    # workflow tree — VCO refuses to touch it.
+    # the symlinked-claude-dir case where the user pointed .claude at a
+    # shared workflow tree — VCO refuses to touch it.
     if is_symlink_blocking(claude_dir):
         vco_new_claude = compute_vco_new_path(claude_dir)
         if deferral_report is not None:
@@ -9514,8 +9514,8 @@ def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
             # 1. Exact canonical names (single-tenant install).
             # 2. Suffix-pattern names (multi-project orchestrator setup
             #    where each project namespaces its collections — e.g.
-            #    `ARTup_CodeFunction`, `ClaudeKnowledgeGraph`,
-            #    `SD15_KnowledgeGraph`). The `_KnowledgeGraph` /
+            #    `MyProject_CodeFunction`, `ClaudeKnowledgeGraph`,
+            #    `OtherProject_KnowledgeGraph`). The `_KnowledgeGraph` /
             #    `_CodeFunction` / `_CodeClass` / `_CodeModule` suffixes
             #    are ours by construction and don't appear in foreign
             #    Weaviates.
@@ -9950,11 +9950,12 @@ def _build_orchestrator_volume_names() -> tuple[str, ...]:
     historical container-name aliases from vco_lib.containers (which now
     centralises the maintainer-machine-leak fix from v0.2.15).
 
-    The maintainer's `_ARTup` per-project-suffix names are kept inline
-    here (they were never canonical VCO names — they were specific to a
-    co-installed sibling project on the maintainer's machine — but
-    detecting them on existing installs is still useful to surface in
-    the storage-config picker).
+    The list below intentionally returns only canonical and centrally-
+    tracked historical aliases. Multi-project orchestrator setups that
+    historically used per-project suffix names (e.g. `weaviate_<proj>`,
+    `ollama_<proj>`) are detected dynamically via the
+    `HISTORICAL_ALIASES` list in `vco_lib.containers` rather than
+    hard-coded here.
     """
     from vco_lib.containers import HISTORICAL_ALIASES
 
@@ -9962,11 +9963,12 @@ def _build_orchestrator_volume_names() -> tuple[str, ...]:
     historical: list[str] = []
     for service in ("weaviate", "ollama", "code_embed"):
         historical.extend(HISTORICAL_ALIASES[service])
-    # Sibling-project maintainer-era names. Not in vco_lib.containers
-    # because they're not container names this project ever shipped —
-    # they were per-workspace named volumes from a co-installed sibling
-    # repo. Kept here for storage-config detection only.
-    sibling_legacy = ("weaviate_ARTup", "ollama_ARTup")
+    # Per-project-suffix volume names (used by some multi-project
+    # orchestrator setups). The list is intentionally empty here:
+    # downstream callers detect such names dynamically when they hit
+    # the storage-config picker rather than relying on a hard-coded
+    # allowlist.
+    sibling_legacy: tuple[str, ...] = ()
 
     seen: set[str] = set()
     out: list[str] = []
@@ -14755,7 +14757,7 @@ def _seed_launcher_install_path(install_path: Path,
     wrapper at `~/bin/vct-launcher` pointing at a clone in `~/dev/`).
     `ProjectEnvSettings::populate` then returns `orchestrator_root=None`
     and `VCT_ORCHESTRATOR_ROOT` is OMITTED from `.claude/env` — which
-    bit the instambul_map / SD15 user.
+    bit the instambul_map user.
 
     Seeding the resolver out-of-band closes this gap: install.py knows
     where it's running, so it just records the absolute path. On first
@@ -16124,8 +16126,8 @@ def _check_search_mcp_env_obsolete(
 # PASSWORD, AUTH, *_KEY) are silently dropped from any written entry, AND
 # per-project keys (KG_COLLECTION, PROJECT_NAME, etc.) are NEVER written —
 # those live in each project's .claude/settings.json env (launcher-managed)
-# instead. Empirical verification 2026-05-16: SD15's MCP subprocess at
-# PID 104741 picked up its KG_COLLECTION from .claude/settings.json env,
+# instead. Empirical verification 2026-05-16: a long-lived project's MCP
+# subprocess picked up its KG_COLLECTION from .claude/settings.json env,
 # confirming the per-project env channel is sufficient.
 # ---------------------------------------------------------------------------
 

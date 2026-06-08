@@ -142,8 +142,8 @@ pub fn get_project_identity_with_db(
     // yet) uses `canonical_class_prefix` — the same single-source-of-
     // truth sanitizer the Python analyze script uses (bug 0.7, v0.2.15).
     // The previous `sanitize_kg_collection` fallback produced a
-    // different prefix for `SimRacing_AI` (→ `SimRacingAI`) than the
-    // analyze script (→ `SimRacing_AI`), wedging the codegraph build
+    // different prefix for `Camel_Case` (→ `CamelCase`) than the
+    // analyze script (→ `Camel_Case`), wedging the codegraph build
     // on Weaviate's case-insensitive class-name collision.
     //
     // If `canonical_class_prefix` rejects the name (empty / leading
@@ -1932,12 +1932,12 @@ mod tests {
 
     #[test]
     fn split_codegraph_class_name_preserves_underscored_prefix() {
-        // SimRacing_AI's class name is SimRacing_AI_CodeFunction. The
+        // An underscored-name project's class is "Foo_Bar_CodeFunction". The
         // splitter must return the FULL underscored prefix, not just
-        // "AI" (which would be the wrong split if we used find('_')).
-        let (prefix, suffix) = split_codegraph_class_name("SimRacing_AI_CodeFunction")
+        // "Bar" (which would be the wrong split if we used find('_')).
+        let (prefix, suffix) = split_codegraph_class_name("Foo_Bar_CodeFunction")
             .expect("must split correctly");
-        assert_eq!(prefix, "SimRacing_AI");
+        assert_eq!(prefix, "Foo_Bar");
         assert_eq!(suffix, "CodeFunction");
     }
 
@@ -1958,19 +1958,19 @@ mod tests {
     fn normalise_prefix_for_match_distinguishes_genuinely_different_names() {
         // Ensure normalisation doesn't collapse different projects together.
         assert_ne!(
-            normalise_prefix_for_match("SimRacing_AI"),
+            normalise_prefix_for_match("Camel_Case"),
             normalise_prefix_for_match("SD15")
         );
         assert_ne!(
             normalise_prefix_for_match("VibeCodedOrchestrator"),
             normalise_prefix_for_match("ClaudeOrchestrator")
         );
-        // SimRacing_AI and SimRacingAI normalise the same (the
+        // Camel_Case and CamelCase normalise the same (the
         // underscore is informational only) — that's the intended
         // tolerance for project-rename matching.
         assert_eq!(
-            normalise_prefix_for_match("SimRacing_AI"),
-            normalise_prefix_for_match("SimRacingAI")
+            normalise_prefix_for_match("Camel_Case"),
+            normalise_prefix_for_match("CamelCase")
         );
     }
 

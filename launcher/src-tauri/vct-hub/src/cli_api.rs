@@ -604,7 +604,7 @@ async fn detect_orchestrator_kg_collections(
 /// Detect which of the canonical code-graph classes (`CodeModule`,
 /// `CodeClass`, ...) are actually present on Weaviate. The orchestrator
 /// stores these per-project with a namespace prefix
-/// (e.g. `ARTup_CodeFunction`). We surface BOTH the bare canonical name
+/// (e.g. `MyProject_CodeFunction`). We surface BOTH the bare canonical name
 /// and any prefixed variant so callers can search across all projects.
 async fn detect_codegraph_collections(
     client: &reqwest::Client,
@@ -1141,7 +1141,7 @@ mod cli_kg_tests {
     #[test]
     fn class_name_validation_accepts_canonical_and_namespaced() {
         assert!(is_valid_class_name("CodeFunction"));
-        assert!(is_valid_class_name("ARTup_CodeFunction"));
+        assert!(is_valid_class_name("MyProject_CodeFunction"));
         // Canonical v0.2.23 B1 capital-C casing.
         assert!(is_valid_class_name("VibeCodedOrchestrator_KnowledgeGraph"));
         // v0.2.12–v0.2.22 lowercase-c casing — still a valid class name
@@ -1167,8 +1167,8 @@ mod cli_kg_tests {
     #[test]
     fn entity_type_collapses_namespaced_variants() {
         assert_eq!(entity_type_for("CodeFunction"), "CodeFunction");
-        assert_eq!(entity_type_for("ARTup_CodeFunction"), "CodeFunction");
-        assert_eq!(entity_type_for("Bali_MultiagentOrchestrator_CodeAPI"), "CodeAPI");
+        assert_eq!(entity_type_for("MyProject_CodeFunction"), "CodeFunction");
+        assert_eq!(entity_type_for("Foo_Bar_CodeAPI"), "CodeAPI");
         assert_eq!(entity_type_for("RandomClass"), "Unknown");
     }
 
@@ -1180,17 +1180,17 @@ mod cli_kg_tests {
             "CodeFunction".to_string(),
             "CodeAPI".to_string(),
             "CodeInteraction".to_string(),
-            "ARTup_CodeFunction".to_string(),
-            "ARTup_CodeAPI".to_string(),
+            "MyProject_CodeFunction".to_string(),
+            "MyProject_CodeAPI".to_string(),
         ];
         let kept = filter_codegraph_by_scope(all, "code");
         assert!(kept.contains(&"CodeModule".to_string()));
         assert!(kept.contains(&"CodeClass".to_string()));
         assert!(kept.contains(&"CodeFunction".to_string()));
-        assert!(kept.contains(&"ARTup_CodeFunction".to_string()));
+        assert!(kept.contains(&"MyProject_CodeFunction".to_string()));
         assert!(!kept.contains(&"CodeAPI".to_string()));
         assert!(!kept.contains(&"CodeInteraction".to_string()));
-        assert!(!kept.contains(&"ARTup_CodeAPI".to_string()));
+        assert!(!kept.contains(&"MyProject_CodeAPI".to_string()));
     }
 
     #[test]
@@ -1200,12 +1200,12 @@ mod cli_kg_tests {
             "CodeFunction".to_string(),
             "CodeAPI".to_string(),
             "CodeInteraction".to_string(),
-            "ARTup_CodeAPI".to_string(),
+            "MyProject_CodeAPI".to_string(),
         ];
         let kept = filter_codegraph_by_scope(all, "interaction");
         assert!(kept.contains(&"CodeAPI".to_string()));
         assert!(kept.contains(&"CodeInteraction".to_string()));
-        assert!(kept.contains(&"ARTup_CodeAPI".to_string()));
+        assert!(kept.contains(&"MyProject_CodeAPI".to_string()));
         assert!(!kept.contains(&"CodeModule".to_string()));
         assert!(!kept.contains(&"CodeFunction".to_string()));
         assert_eq!(kept.len(), 3);

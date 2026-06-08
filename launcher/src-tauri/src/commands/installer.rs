@@ -2043,9 +2043,7 @@ pub const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
     // Historical project-suffixed names (Bug 31 — generate `external: true`
     // mapping to keep the user's existing data without recreating volumes)
     "weaviate_claude",
-    "weaviate_ARTup",
     "ollama_claude",
-    "ollama_ARTup",
     "vct_code_embed",
 ];
 
@@ -9108,7 +9106,7 @@ mod tests {
         fs::create_dir_all(p.join(".venv")).unwrap();
         fs::write(
             p.join(".env"),
-            "# my env\nKG_COLLECTION=AgapeKnowledgeGraph\nFOO=bar\n",
+            "# my env\nKG_COLLECTION=FooKnowledgeGraph\nFOO=bar\n",
         )
         .unwrap();
         assert!(install_root_complete_at(&p));

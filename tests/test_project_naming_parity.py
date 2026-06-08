@@ -90,9 +90,9 @@ def test_fixture_has_coverage_for_known_collision_cases() -> None:
     future fixture-trim doesn't accidentally drop the regression-
     pinning rows."""
     cases = {inp: out for inp, out in _FIXTURE["cases"]}
-    # The escalation case: base-host SimRacing_AI must produce
-    # SimRacing_AI (preserved underscore), NOT SimRacingAI.
-    assert cases.get("SimRacing_AI") == "SimRacing_AI"
+    # The escalation case: base-host Camel_Case must produce
+    # Camel_Case (preserved underscore), NOT CamelCase.
+    assert cases.get("Camel_Case") == "Camel_Case"
     # The original wedge case: "VibeCoded Orchestrator" must produce
     # VibeCodedOrchestrator (no underscore), matching the schema
     # already on disk.

@@ -70,7 +70,7 @@ Command::new("git").silent().arg("status").output()?;
 
 ## Fix alternativo inline (verboso, sconsigliato per >20 sites)
 
-Pattern usato da [[FrameAboutYou-Tauri]]:
+Pattern inline alternativo:
 
 ```rust
 let mut cmd = Command::new("git");
@@ -126,11 +126,10 @@ Granularity importante: snapshot a >200ms perde flash sub-frame. Per audit compl
 
 Scoperto in [[VibeCoded-Orchestrator-Launcher]] 2026-05-26 durante session debug del fork bomb Windows post-install. Audit script ha trovato 208/221 `Command::new` call sites nel launcher senza `CREATE_NO_WINDOW`. 11+ subprocess concorrenti al boot causavano cascata visiva di console flash.
 
-Pattern già usato in [[FrameAboutYou-Tauri]] (sister project Fabio) inline. Branch fix `fix/launcher-gui-fork-bomb-windows` in vibecoded-orchestrator usa la versione centralizzata con trait `silent()`.
+Branch fix `fix/launcher-gui-fork-bomb-windows` in vibecoded-orchestrator usa la versione centralizzata con trait `silent()`.
 
 ## Riferimenti
 
 - Microsoft docs: https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags (CREATE_NO_WINDOW = 0x08000000)
 - std::os::windows::process::CommandExt: https://doc.rust-lang.org/std/os/windows/process/trait.CommandExt.html
-- FrameAboutYou-Tauri: `src-tauri/src/peer_discovery.rs:399`, `printer.rs:163/202/223`
 - VibeCoded Orchestrator launcher: `vct-launcher-core/src/process.rs` (trait), `scripts/add-silent-to-commands.py` (sweep script)

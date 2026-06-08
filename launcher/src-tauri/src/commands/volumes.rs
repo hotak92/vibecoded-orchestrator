@@ -1167,7 +1167,7 @@ mod tests {
     fn override_yaml_for_external_legacy_uses_external_true() {
         let map = vec![
             ("weaviate_data".to_string(), "weaviate_claude".to_string()),
-            ("ollama_data".to_string(), "ollama_ARTup".to_string()),
+            ("ollama_data".to_string(), "ollama_legacy".to_string()),
         ];
         let body = generate_override_yaml(&OverrideShape::ExternalLegacy(map));
         // Every canonical name aliased via external: true + name: <legacy>.
@@ -1175,7 +1175,7 @@ mod tests {
         assert!(body.contains("    external: true"));
         assert!(body.contains("    name: weaviate_claude"));
         assert!(body.contains("ollama_data:"));
-        assert!(body.contains("    name: ollama_ARTup"));
+        assert!(body.contains("    name: ollama_legacy"));
         // No bind-mount directives — would conflict with external: true.
         assert!(!body.contains("type: none"));
         assert!(!body.contains("o: bind"));
@@ -1231,7 +1231,7 @@ mod tests {
     fn volume_role_classifies_known_names() {
         assert_eq!(volume_role("weaviate_data"), "weaviate");
         assert_eq!(volume_role("weaviate_claude"), "weaviate");
-        assert_eq!(volume_role("weaviate_ARTup"), "weaviate");
+        assert_eq!(volume_role("weaviate_legacy"), "weaviate");
         assert_eq!(volume_role("ollama_data"), "ollama");
         assert_eq!(volume_role("ollama_claude"), "ollama");
         assert_eq!(volume_role("code_embed_cache"), "code_embed");

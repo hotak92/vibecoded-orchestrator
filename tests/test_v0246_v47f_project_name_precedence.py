@@ -84,7 +84,7 @@ def _bare_args(**kwargs) -> SimpleNamespace:
 
 def test_cli_flag_overrides_everything(tmp_path):
     """--project-name beats vscode/.claude/env/.env/folder."""
-    install_path = tmp_path / "python"  # bad folder name like ARTup's
+    install_path = tmp_path / "python"  # bad folder name (e.g. python/)
     install_path.mkdir()
     _write_vscode_settings(install_path, "FromVSCode")
     _write_claude_env(install_path, "FromClaudeEnv")
@@ -123,13 +123,13 @@ def test_vscode_settings_overrides_claude_env_and_dotenv(tmp_path):
     """vscode beats .claude/env and .env when no CLI flag."""
     install_path = tmp_path / "python"
     install_path.mkdir()
-    _write_vscode_settings(install_path, "ARTup")
+    _write_vscode_settings(install_path, "MyProj")
     _write_claude_env(install_path, "FromClaudeEnv")
     _write_dotenv(install_path, "FromDotenv")
 
     args = _bare_args()
     result = install_py._resolve_project_name_for_adopt(install_path, args)
-    assert result == "ARTup"
+    assert result == "MyProj"
 
 
 def test_vscode_settings_env_layout_fallback(tmp_path):
@@ -211,10 +211,10 @@ def test_dotenv_overrides_folder_name(tmp_path):
     """.env PROJECT_NAME wins over folder-name fallback."""
     install_path = tmp_path / "python"  # would derive 'Python'
     install_path.mkdir()
-    _write_dotenv(install_path, "ARTup")
+    _write_dotenv(install_path, "MyProj")
     args = _bare_args()
     result = install_py._resolve_project_name_for_adopt(install_path, args)
-    assert result == "ARTup"
+    assert result == "MyProj"
 
 
 def test_dotenv_skips_blank_value(tmp_path):
@@ -345,7 +345,7 @@ def test_existing_project_name_preserved_on_update(tmp_path):
          is never called and folder-name re-derivation cannot happen.
     """
     # Build a representative existing-VCO-project fixture.
-    project = tmp_path / "python"  # ARTup-style: bad folder name
+    project = tmp_path / "python"  # bad folder name fixture
     project.mkdir()
 
     # Existing manifest (= project is registered with VCO).
@@ -359,9 +359,9 @@ def test_existing_project_name_preserved_on_update(tmp_path):
     # Existing .env with the user-pinned PROJECT_NAME and KG_COLLECTION.
     env_path = project / ".env"
     env_text_before = (
-        "PROJECT_NAME=ARTup\n"
-        "KG_COLLECTION=ARTup_KnowledgeGraph\n"
-        "DEVELOPMENT_COLLECTION=ARTup_Development\n"
+        "PROJECT_NAME=MyProj\n"
+        "KG_COLLECTION=MyProj_KnowledgeGraph\n"
+        "DEVELOPMENT_COLLECTION=MyProj_Development\n"
         "SHARED_KG_COLLECTION=VibeCodedOrchestrator_KnowledgeGraph\n"
         "SHARED_KG_WRITE_DISABLED=false\n"
         "SHARED_KG_OPT_OUT=false\n"
@@ -378,7 +378,7 @@ def test_existing_project_name_preserved_on_update(tmp_path):
         "OLLAMA_PORT=11435\n"
         "CODE_EMBED_URL=http://localhost:11440\n"
         "CODE_EMBED_PORT=11440\n"
-        "CODE_GRAPH_PROJECT=ARTup\n"
+        "CODE_GRAPH_PROJECT=MyProj\n"
     )
     env_path.write_text(env_text_before)
 
@@ -407,15 +407,15 @@ def test_existing_project_name_preserved_on_update(tmp_path):
     kg_after = _extract(env_text_after, "KG_COLLECTION")
 
     # CRITICAL: must be byte-identical pre/post.
-    assert project_name_before == "ARTup"
-    assert project_name_after == "ARTup", (
+    assert project_name_before == "MyProj"
+    assert project_name_after == "MyProj", (
         f"NON-DESTRUCTIVENESS RULE VIOLATED: PROJECT_NAME changed from "
         f"{project_name_before!r} to {project_name_after!r}. _reconcile_env_keys "
         f"or some other update-path code overwrote an existing user-pinned "
         f"PROJECT_NAME. V47-F is broken."
     )
-    assert kg_before == "ARTup_KnowledgeGraph"
-    assert kg_after == "ARTup_KnowledgeGraph", (
+    assert kg_before == "MyProj_KnowledgeGraph"
+    assert kg_after == "MyProj_KnowledgeGraph", (
         f"NON-DESTRUCTIVENESS RULE VIOLATED: KG_COLLECTION changed from "
         f"{kg_before!r} to {kg_after!r}. V47-F is broken."
     )
@@ -441,7 +441,7 @@ def test_resolve_helper_not_invoked_for_existing_manifest(tmp_path):
     claude = install_path / ".claude"
     claude.mkdir()
     (claude / ".vco-manifest.json").write_text("{}")
-    _write_dotenv(install_path, "ARTup")
+    _write_dotenv(install_path, "MyProj")
 
     # The helper itself MUST return the .env value (it doesn't know about
     # the manifest gate — the dispatch caller enforces that). The contract
@@ -449,7 +449,7 @@ def test_resolve_helper_not_invoked_for_existing_manifest(tmp_path):
     # to NOT call it on existing projects is on the caller.
     args = _bare_args()
     result = install_py._resolve_project_name_for_adopt(install_path, args)
-    assert result == "ARTup"
+    assert result == "MyProj"
 
 
 # ---------------------------------------------------------------------------
@@ -458,12 +458,12 @@ def test_resolve_helper_not_invoked_for_existing_manifest(tmp_path):
 
 
 def test_log_emitted_when_envname_differs_from_folder(tmp_path, capsys, monkeypatch):
-    """When .env PROJECT_NAME=ARTup but folder is 'python', the
+    """When .env PROJECT_NAME=MyProj but folder is 'python', the
     informational log line must be emitted.
     """
     project = tmp_path / "python"
     project.mkdir()
-    _write_dotenv(project, "ARTup")
+    _write_dotenv(project, "MyProj")
 
     # Stub _resolve_project_id_by_folder to None so we fall through to
     # the .env reader path.
@@ -475,7 +475,7 @@ def test_log_emitted_when_envname_differs_from_folder(tmp_path, capsys, monkeypa
 
     install_py._log_project_name_pin_diff(project, "")
     captured = capsys.readouterr()
-    assert "ARTup" in captured.out
+    assert "MyProj" in captured.out
     assert "Python" in captured.out  # folder-sanitized
     assert "python" in captured.out  # folder raw
 

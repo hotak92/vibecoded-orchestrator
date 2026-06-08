@@ -434,7 +434,7 @@ def main() -> None:
         help=(
             "Override the knowledge directory (default: <project_root>/knowledge). "
             "Use an absolute path or one relative to cwd. "
-            "Example: --knowledge-dir /path/to/MultiagentOrchestrator/knowledge"
+            "Example: --knowledge-dir /path/to/your-project/knowledge"
         ),
     )
     args = parser.parse_args()

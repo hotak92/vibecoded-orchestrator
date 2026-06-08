@@ -210,11 +210,11 @@ docs/ADMIN_LICENSE.md
 
 # ─── RL module (Pro-tier IP — NEVER in public AGPL repo) ────────────
 # Actual model architecture, training loop, weights, and v2 log
-# schema migration live in MultiagentOrchestrator. This VCO_dev
-# clone has them in the working tree (untracked) for development
+# schema migration are maintained in a separate private upstream
+# and shipped as signed binary via CDN, NOT as source. A development
+# checkout may have them in the working tree (untracked) for
 # convenience. Explicit gitignore so `git add -A` or a stray
-# subagent commit can't accidentally publish them. Pro/MAO ships
-# the RL module as signed binary via CDN, NOT as source.
+# subagent commit can't accidentally publish them.
 #
 # `rl_kg_search.py` (a thin client that CALLS the RL server) is the
 # only RL-named file legitimately tracked — it's a consumer, not

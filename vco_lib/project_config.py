@@ -1150,7 +1150,7 @@ def claude_session_dir_for(workspace_path: Path) -> Path:
     past — most recently the RL citation-monitor at
     ``claude_mcp_servers/weaviate_mcp/server.py`` only handled ``/`` →
     ``-``, causing zero-citation telemetry on workspaces whose absolute
-    paths contained underscores (``VCO_dev``, ``AI_hive``, …). This
+    paths contained underscores. This
     helper exists so the rule lives in exactly one place.
 
     The spec requires AT MINIMUM ``/`` + ``_`` → ``-`` to fix the

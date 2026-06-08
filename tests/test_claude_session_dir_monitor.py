@@ -8,8 +8,8 @@ transcript files it needs to poll for Claude's post-search answer.
 Pre-v0.2.31 the slug rule was inlined as
 ``str(workspace).replace("/", "-")`` — which missed ``_`` → ``-``
 substitution and caused a 97.7% orphan-citation rate on workspaces
-whose absolute paths contained underscores (``VCO_dev``, ``AI_hive``,
-…). See ``.claude/context/plans/rl-citation-monitor-bug-report-2026-05-23.md``.
+whose absolute paths contained underscores. See
+``.claude/context/plans/rl-citation-monitor-bug-report-2026-05-23.md``.
 
 v0.2.31 routes the lookup through ``vct-hub`` (canonical source of
 truth, computes the slug via the launcher's
@@ -95,7 +95,7 @@ class ResolveClaudeSessionDirTest(unittest.TestCase):
 
         This is the v0.2.31 bug-fix: the pre-fix inline computation
         only handled ``/`` → ``-`` and broke for any underscored
-        workspace path (``VCO_dev``, ``AI_hive``).
+        workspace path.
         """
         # Make the hub resolver return None (e.g. HubUnreachable on
         # a free-tier install without the launcher GUI running). The
@@ -151,8 +151,8 @@ class ResolveClaudeSessionDirTest(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as td:
             fake_home = Path(td)
-            workspace = Path("/home/user/AI_hive")
-            expected_slug = "-home-user-AI-hive"
+            workspace = Path("/home/user/Some_Workspace")
+            expected_slug = "-home-user-Some-Workspace"
             (fake_home / ".claude" / "projects" / expected_slug).mkdir(
                 parents=True
             )

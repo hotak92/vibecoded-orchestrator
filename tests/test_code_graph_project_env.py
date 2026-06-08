@@ -183,15 +183,15 @@ class BackfillInProjectTests(unittest.TestCase):
             self.assertEqual(data["env"]["CODE_GRAPH_PROJECT"], "ExplicitOverride")
 
     def test_derives_name_from_kg_collection(self):
-        # KG_COLLECTION "ARTup_KnowledgeGraph" → derived basename "ARTup".
+        # KG_COLLECTION "SomeProject_KnowledgeGraph" → derived basename "SomeProject".
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)
             self._write_proj_settings(
-                folder, {"KG_COLLECTION": "ARTup_KnowledgeGraph"},
+                folder, {"KG_COLLECTION": "SomeProject_KnowledgeGraph"},
             )
             result = project_init._backfill_code_graph_project_env_in_project(folder)
             self.assertEqual(result["action"], "backfilled")
-            self.assertEqual(result["resolved_name"], "ARTup")
+            self.assertEqual(result["resolved_name"], "SomeProject")
 
     def test_derives_name_from_existing_project_name_field(self):
         # PROJECT_NAME present but CODE_GRAPH_PROJECT missing → CGP picks

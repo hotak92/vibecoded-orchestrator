@@ -403,11 +403,11 @@ class CrossPrefixSelfHealTests(unittest.TestCase):
         self._server, self._port = _start_stub_weaviate(
             classes=[
                 "VCODev_KnowledgeGraph",
-                "ARTup_KnowledgeGraph",
+                "OtherProj_KnowledgeGraph",
             ],
             counts={
                 "VCODev_KnowledgeGraph": 1033,
-                "ARTup_KnowledgeGraph": 442,
+                "OtherProj_KnowledgeGraph": 442,
             },
         )
         self._set_weaviate_url(self._port)
@@ -430,13 +430,13 @@ class CrossPrefixSelfHealTests(unittest.TestCase):
                      if e.condition_id == "multi_candidate_prefix_adopt")
         # Both candidates and their row counts must be listed.
         self.assertIn("VCODev_KnowledgeGraph", multi.detected)
-        self.assertIn("ARTup_KnowledgeGraph", multi.detected)
+        self.assertIn("OtherProj_KnowledgeGraph", multi.detected)
         self.assertIn("1033", multi.detected)
         self.assertIn("442", multi.detected)
         # Sorted by row count descending — VCODev listed first.
         self.assertLess(
             multi.detected.index("VCODev_KnowledgeGraph"),
-            multi.detected.index("ARTup_KnowledgeGraph"),
+            multi.detected.index("OtherProj_KnowledgeGraph"),
         )
         # command_to_apply contains SQL for both alternatives, marked
         # with the v0.2.40 sentinel.

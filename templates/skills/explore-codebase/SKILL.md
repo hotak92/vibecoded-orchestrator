@@ -16,7 +16,7 @@ Structured onboarding for unfamiliar codebases. Produces a concise architecture 
 ```
 /explore-codebase                           # explore current directory
 /explore-codebase /path/to/project
-/explore-codebase MultiagentOrchestrator    # named project (searches known paths)
+/explore-codebase MyProject                 # named project (searches known paths)
 ```
 
 ## Exploration Sequence

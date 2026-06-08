@@ -66,7 +66,7 @@ fn load_fixture() -> Fixture {
     );
     assert!(
         !fix.cases.is_empty(),
-        "Fixture has no success cases — at minimum should pin SD15 and SimRacing_AI"
+        "Fixture has no success cases — at minimum should pin SD15 and Camel_Case"
     );
     fix
 }
@@ -143,9 +143,9 @@ fn fixture_pins_known_collision_cases() {
         .collect();
 
     assert_eq!(
-        map.get("SimRacing_AI"),
-        Some(&"SimRacing_AI"),
-        "Fixture must pin 'SimRacing_AI' → 'SimRacing_AI' (the base-host \
+        map.get("Camel_Case"),
+        Some(&"Camel_Case"),
+        "Fixture must pin 'Camel_Case' → 'Camel_Case' (the base-host \
          escalation case for v0.2.15)"
     );
     assert_eq!(

@@ -1230,7 +1230,7 @@ Hotfix release closing 3 root causes surfaced on VCO_dev during the post-v0.2.44
 
 ### Added
 
-- **launcher (Fabio branch `feat/orchestrator-update-progress-modal`)**: full-screen blocking progress overlay during orchestrator self-update. Subscribes to `$orchestrator.progress` (already populated by the existing `install_progress` Tauri listener at `stores/orchestrator.ts:108`, no duplicate channel listener). Reuses `cgr-progress-fill` 4 px-track style from `CodeGraphReanalysisModal.svelte` for the bar; adds a robot-logo "fill" animation above the bar (two stacked `<img>` from `/logo.png` with `clip-path: inset(N% 0 0 0)` rising as percentage grows — pattern from FrameAboutYou-Tauri `DownloadProgressFab.tsx`). Covers all three updater flows: `runUpdate` (remote-ahead), `applyPendingInstall` (install-stale), `runRestart` (binary-stale). Held at 100 % for 1.8 s + 400 ms fade-out on success; sticky on error with a `Dismiss` button that clears `updater.error` and closes the overlay. Modal mounted in `+layout.svelte` (pattern mirrors `InstallWizard` / `LicenseManagerModal`), gated by new flag `showOrchestratorUpdateProgress` in `stores/ui.ts` + `openOrchestratorUpdateProgress()` / `closeOrchestratorUpdateProgress()` actions. Flag name reserved by A3 collision audit (2026-05-30) to avoid clashing with `showLicenseManager`. UpdateBadge.svelte now calls the open action right before invoking any updater action so the overlay covers the full lifecycle even after the badge popover closes. Cross-OS automatic (DOM + CSS in Tauri WebView).
+- **launcher (Fabio branch `feat/orchestrator-update-progress-modal`)**: full-screen blocking progress overlay during orchestrator self-update. Subscribes to `$orchestrator.progress` (already populated by the existing `install_progress` Tauri listener at `stores/orchestrator.ts:108`, no duplicate channel listener). Reuses `cgr-progress-fill` 4 px-track style from `CodeGraphReanalysisModal.svelte` for the bar; adds a robot-logo "fill" animation above the bar (two stacked `<img>` from `/logo.png` with `clip-path: inset(N% 0 0 0)` rising as percentage grows — clip-path-mask fill pattern). Covers all three updater flows: `runUpdate` (remote-ahead), `applyPendingInstall` (install-stale), `runRestart` (binary-stale). Held at 100 % for 1.8 s + 400 ms fade-out on success; sticky on error with a `Dismiss` button that clears `updater.error` and closes the overlay. Modal mounted in `+layout.svelte` (pattern mirrors `InstallWizard` / `LicenseManagerModal`), gated by new flag `showOrchestratorUpdateProgress` in `stores/ui.ts` + `openOrchestratorUpdateProgress()` / `closeOrchestratorUpdateProgress()` actions. Flag name reserved by A3 collision audit (2026-05-30) to avoid clashing with `showLicenseManager`. UpdateBadge.svelte now calls the open action right before invoking any updater action so the overlay covers the full lifecycle even after the badge popover closes. Cross-OS automatic (DOM + CSS in Tauri WebView).
 
 ## [0.2.43] — 2026-05-31
 
@@ -1785,7 +1785,7 @@ A general-purpose **paid-module lifecycle release**: every step from licensed-di
 
 ### Added (continued — post-tag-prep additions)
 
-- **Citation-monitor fix routed through vct-hub** (Agent H). `claude_mcp_servers/weaviate_mcp/server.py:2644` was computing the Claude session-jsonl directory slug as `str(workspace).replace('/', '-')`. Claude Code's actual slug rule ALSO converts `_` → `-` (and `.` → `-`), so any workspace path containing underscores (`VCO_dev`, `AI_hive`) looked at a non-existent directory and the monitor timed out without writing the citation event. 97.7% orphan-citation rate at `~/.claude/retrieval_rl_data/rl_events.jsonl` is fixed. New `claude_session_dir_for(workspace_path)` helper in `vco_lib/project_config.py` + `vct-hub/src/config_api.rs` implementing the FULL slug rule. vct-hub's `/api/v1/projects/{id}/config` response gains a `claude_session_dir` field. MCP server gets `_resolve_claude_session_dir()` helper preferring hub resolution + falling back to local slug (with COMPLETE rule). 7 new regression tests (4 Python slug, 2 Python resolver, 4 MCP-side, 4 Rust). v0.2.28's asyncio strong-ref discipline left untouched.
+- **Citation-monitor fix routed through vct-hub** (Agent H). `claude_mcp_servers/weaviate_mcp/server.py:2644` was computing the Claude session-jsonl directory slug as `str(workspace).replace('/', '-')`. Claude Code's actual slug rule ALSO converts `_` → `-` (and `.` → `-`), so any workspace path containing underscores looked at a non-existent directory and the monitor timed out without writing the citation event. 97.7% orphan-citation rate at `~/.claude/retrieval_rl_data/rl_events.jsonl` is fixed. New `claude_session_dir_for(workspace_path)` helper in `vco_lib/project_config.py` + `vct-hub/src/config_api.rs` implementing the FULL slug rule. vct-hub's `/api/v1/projects/{id}/config` response gains a `claude_session_dir` field. MCP server gets `_resolve_claude_session_dir()` helper preferring hub resolution + falling back to local slug (with COMPLETE rule). 7 new regression tests (4 Python slug, 2 Python resolver, 4 MCP-side, 4 Rust). v0.2.28's asyncio strong-ref discipline left untouched.
 - **Module-shipped DB migrations capability — Layer 1** (Agent I). Modules can now declare their own SQLite schema in `vct-module.json`:
   ```jsonc
   "db": { "migrations_dir": "db/", "namespace": "rl" }
@@ -2399,7 +2399,7 @@ core (this repo) only knows how to talk to it.
   (default `false`) (W4 / plan 0.11). The GUI legacy-collections
   wizard + Code Graph dashboard now filter Weaviate collections by
   currently-tracked projects, hiding dead-project leftovers
-  (`MediaLibrary_*`, `ARTup_*`, `Agape_*`, etc.). Data stays in
+  (orphaned per-project collections from removed projects). Data stays in
   Weaviate for potential re-import; the advanced
   `/preferences/weaviate-untracked` route surfaces the full
   inventory.
@@ -2575,7 +2575,7 @@ support to the install-time legacy-volume probes.
   already have `Foo_Bar_*` collections from the old sanitizer, the
   launcher wizard will flag them as orphans and offer cleanup OR
   re-analyze. No data loss without explicit user consent.
-- `SimRacing_AI` and `SD15` project class names are unchanged.
+- Underscored-CamelCase and digit-suffixed project class names are unchanged.
 
 ## [0.2.14] — 2026-05-17
 
@@ -3915,9 +3915,9 @@ file, in the background.
 Single-commit cycle focused on closing the add-project KG-sync gap and
 elevating background-task status from pills to full-width banners.
 
-Originated from the SimRacing_AI revival (2026-05-12): user added a
+Originated from a user-project revival (2026-05-12): user added a
 project with ~58 pre-existing `knowledge/**/*.md` nodes via the launcher
-GUI, but `SimRacingAI_KnowledgeGraph` stayed empty until a manual
+GUI, but the project's `_KnowledgeGraph` collection stayed empty until a manual
 `.claude/scripts/kg-sync --all`. The launcher add-project flow now
 handles this automatically — same lifecycle pattern as the existing
 code-graph build.

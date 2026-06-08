@@ -206,7 +206,7 @@ If planning for a specific project, search its documentation and conversations.
 Ask Claude Code: "Search [ProjectName]_development for [topic]"
 
 **Examples**:
-- "Search ARTup_development for authentication architecture"
+- "Search MyProject_development for authentication architecture"
 - "Search ClaudeOrchestrator_development for MCP integration patterns"
 
 **Returns**: Documentation from that project's `docs/` directory

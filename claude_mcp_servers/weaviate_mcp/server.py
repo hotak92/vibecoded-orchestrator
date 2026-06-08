@@ -2928,7 +2928,7 @@ async def _get_all_code_embeddings(text: str) -> dict[str, list[float]]:
 def _scheme_for_collection(collection_name: str) -> str:
     """Return the vector scheme key ('kg' or 'code') for a collection.
 
-    Strips any project prefix (e.g. 'MultiagentOrchestrator_CodeFunction' -> 'CodeFunction')
+    Strips any project prefix (e.g. 'MyProject_CodeFunction' -> 'CodeFunction')
     before checking CODE_SCHEME_COLLECTIONS.
     """
     # Strip project prefix: everything after last '_' that matches a known base name
@@ -3433,8 +3433,7 @@ async def _resolve_claude_session_dir(workspace_path: Path) -> "Path | None":
     here in v0.2.30 and earlier. That half-rule caused the 97.7%
     orphan-citation rate documented in the v0.2.31 bug report
     (``.claude/context/plans/rl-citation-monitor-bug-report-2026-05-23.md``)
-    for any workspace whose absolute path contained underscores
-    (``VCO_dev``, ``AI_hive``, …).
+    for any workspace whose absolute path contained underscores.
 
     Returns the resolved :class:`Path` (which may or may not exist on
     disk — caller checks ``.exists()``), or ``None`` if the resolved

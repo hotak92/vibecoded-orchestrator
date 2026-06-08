@@ -30,11 +30,12 @@ class TestDocstringExamples:
     def test_sd15(self):
         assert canonical_class_prefix("SD15") == "SD15"
 
-    def test_simracing_ai_preserves_underscore(self):
-        # Crucial: existing schema-on-disk for SimRacing_AI uses the
-        # underscore form. The Rust-style sanitize_kg_collection would
-        # strip it to SimRacingAI — that's the bug 0.7 we're fixing.
-        assert canonical_class_prefix("SimRacing_AI") == "SimRacing_AI"
+    def test_camel_case_preserves_underscore(self):
+        # Crucial: existing schema-on-disk for underscored-CamelCase
+        # project names uses the underscore form. The Rust-style
+        # sanitize_kg_collection would strip it to CamelCase — that's
+        # the bug 0.7 we're fixing.
+        assert canonical_class_prefix("Camel_Case") == "Camel_Case"
 
     def test_vibecoded_orchestrator_drops_space(self):
         # The space goes; the O remains uppercase. Word boundary is
@@ -137,9 +138,9 @@ class TestPreservation:
     def test_underscore_preserved_in_multi_segment(self):
         # The trick case: underscore-separated parts pass through
         # whitespace-split as one token, so we ONLY uppercase the
-        # first char of the whole token. "SimRacing_AI" → "SimRacing_AI"
-        # (NOT "SimRacingAI" and NOT "Simracing_Ai").
-        assert canonical_class_prefix("SimRacing_AI") == "SimRacing_AI"
+        # first char of the whole token. "Camel_Case" → "Camel_Case"
+        # (NOT "CamelCase" and NOT "Camel_case").
+        assert canonical_class_prefix("Camel_Case") == "Camel_Case"
 
     def test_dash_to_underscore_preserves_case(self):
         # Dashes get underscore-substituted, but they do NOT cause
@@ -170,15 +171,15 @@ class TestVsLegacy:
     """Pin the deliberate divergences from the two legacy sanitizers
     so that an accidental "revert to old behaviour" PR fails loudly."""
 
-    def test_simracing_ai_diverges_from_rust(self):
+    def test_camel_case_diverges_from_rust(self):
         # Rust sanitize_kg_collection strips the underscore and
-        # title-cases each surviving segment: SimRacing_AI → SimRacingAI.
-        # We deliberately diverge: SimRacing_AI → SimRacing_AI.
-        result = canonical_class_prefix("SimRacing_AI")
-        assert result != "SimRacingAI", (
+        # title-cases each surviving segment: Camel_Case → CamelCase.
+        # We deliberately diverge: Camel_Case → Camel_Case.
+        result = canonical_class_prefix("Camel_Case")
+        assert result != "CamelCase", (
             "Regressed to legacy Rust sanitize_kg_collection — "
             "would lose underscores in project names like "
-            "'SimRacing_AI', breaking existing code-graph schemas "
+            "'Camel_Case', breaking existing code-graph schemas "
             "on `base`-host installs"
         )
 
@@ -250,7 +251,7 @@ class TestDeterminism:
         # name, with no further normalization possible).
         for inp in [
             "VibeCoded Orchestrator",
-            "SimRacing_AI",
+            "Camel_Case",
             "Foo-Bar",
             "SD15",
         ]:
@@ -284,13 +285,13 @@ class TestUnderscoreBoundaryCases:
     cases for the Rust port; these Python-side tests give a focused
     first-line signal without the JSON loader."""
 
-    def test_simracing_ai_preserves_single_underscore(self):
-        # Documented Phase-chat suspicion: Rust → "SimRacing_AI"
-        # (correct), Python → "SimRacingAI" (wrong claim). Both
-        # implementations actually produce "SimRacing_AI"; this test
+    def test_camel_case_preserves_single_underscore(self):
+        # Documented Phase-chat suspicion: Rust → "Camel_Case"
+        # (correct), Python → "CamelCase" (wrong claim). Both
+        # implementations actually produce "Camel_Case"; this test
         # pins it so a regression to either of the two legacy
         # sanitizers (which DID drop the underscore) fails here.
-        assert canonical_class_prefix("SimRacing_AI") == "SimRacing_AI"
+        assert canonical_class_prefix("Camel_Case") == "Camel_Case"
 
     def test_double_underscore_preserved_verbatim(self):
         # Each underscore passes through the regex unchanged (the

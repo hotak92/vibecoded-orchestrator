@@ -23,7 +23,7 @@ retrieval event::
     {
         "event":      "retrieval",
         "ts":         "2026-02-26T12:00:00+00:00",   # ISO-8601 UTC
-        "project":    "MultiagentOrchestrator",
+        "project":    "MyProject",
         "task_id":    "abc123",                       # links to citation event
         "session_id": "sess_xyz",                     # optional
         "task_type":  "implementation",
@@ -45,7 +45,7 @@ citation event::
     {
         "event":       "citation",
         "ts":          "2026-02-26T12:01:30+00:00",
-        "project":     "MultiagentOrchestrator",
+        "project":     "MyProject",
         "task_id":     "abc123",
         "task_type":   "implementation",
         "citations":   {"Foo": true, "Bar": false},   # None = inconclusive

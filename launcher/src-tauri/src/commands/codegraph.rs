@@ -335,7 +335,7 @@ pub async fn codegraph_load_graph(
 
     // Resolve the project's code-graph collection prefix from the
     // launcher DB. Code-graph entities are namespaced per project
-    // (e.g. `Agape_CodeFunction`, `VideoFrames_CodeModule`) so we MUST
+    // (e.g. `MyProject_CodeFunction`, `VideoFrames_CodeModule`) so we MUST
     // prefix the class name with the project's binding. Querying the
     // bare class names returns 0 results — that was the visible bug
     // reported 2026-04-28: codegraph dashboard rendered empty even
