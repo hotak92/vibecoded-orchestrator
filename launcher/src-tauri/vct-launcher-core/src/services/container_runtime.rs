@@ -423,7 +423,17 @@ pub fn build_podman_run_args(
     // skip the CMD override entirely so podman uses the image's default.
     // Placeholders still apply when `command` is non-empty (legacy
     // override authors can use `{project_slug}` etc.).
-    if !runtime.command.is_empty() {
+    //
+    // v0.2.52 V52-D.1: even when `command` is non-empty, detect the
+    // pre-v0.2.49 footgun pattern at runtime so a stale catalog row /
+    // legacy image that ships the broken manifest still produces a
+    // working container. See `is_runtime_pathological` for the full
+    // list of indicators. When the runtime is pathological, log a
+    // warning and DROP the CMD override (fall back to the image's
+    // ENTRYPOINT) — same effect as the v0.2.49 empty-command branch.
+    let runtime_skip_cmd = runtime.command.is_empty()
+        || is_runtime_pathological(&runtime.command, &runtime.args, Some(&manifest.id));
+    if !runtime_skip_cmd {
         args.push(resolve_value(&runtime.command, ctx, &placeholders));
         for a in &runtime.args {
             args.push(resolve_value(a, ctx, &placeholders));
@@ -499,7 +509,14 @@ pub fn build_podman_run_args_global(
     // CMD override when the manifest declares a non-empty `command`.
     // Declarative manifests with empty command let the image's
     // ENTRYPOINT run unmolested.
-    if !runtime.command.is_empty() {
+    //
+    // v0.2.52 V52-D.1: also drop the CMD override when the manifest
+    // declares a pathological runtime (`command: "podman"` /
+    // unsubstituted `{module_image}` in args / etc.). See
+    // `is_runtime_pathological` for the full indicator set.
+    let runtime_skip_cmd = runtime.command.is_empty()
+        || is_runtime_pathological(&runtime.command, &runtime.args, Some(&manifest.id));
+    if !runtime_skip_cmd {
         args.push(resolve_value(&runtime.command, ctx, &placeholders));
         for a in &runtime.args {
             args.push(resolve_value(a, ctx, &placeholders));
@@ -507,6 +524,104 @@ pub fn build_podman_run_args_global(
     }
 
     Ok(args)
+}
+
+/// v0.2.52 V52-D.1: detect the pre-v0.2.49 Bug E manifest pattern that
+/// turned `runtime.command` + `runtime.args` into a literal podman
+/// invocation embedded as the container CMD. Returns `true` when the
+/// runtime block is unsafe to honour and the caller should drop the
+/// CMD override (falling back to the image's ENTRYPOINT).
+///
+/// ## Indicators (any → pathological)
+///
+/// 1. `command` is the bare name of a container runtime —
+///    `podman` / `docker` — which strongly implies the manifest author
+///    pasted the launcher-side invocation into the container-side
+///    command. A legit module's `runtime.command` would be
+///    `python` / `node` / `<custom binary>`, never the orchestrator.
+///
+/// 2. `command` is a generic shell (`sh` / `bash`) **without** a `-c`
+///    flag in `args`. A legit shell invocation always uses
+///    `sh -c "..."` so the first arg should be `-c`. Without `-c` the
+///    container would just open an interactive shell that dies
+///    immediately under podman's `-d` (non-tty) mode — almost
+///    certainly not the publisher's intent.
+///
+/// 3. Any element of `args` contains an unsubstituted `{module_image}`
+///    placeholder. The launcher never substitutes `{module_image}`
+///    (it's the launcher-side variable for the image tag passed to
+///    `podman run` — i.e. the positional image arg, not a CMD arg).
+///    Its presence anywhere in the CMD override means the manifest
+///    author copy-pasted the wrong substitution context.
+///
+/// ## Logging
+///
+/// When pathological, emit a single `eprintln!` warning naming the
+/// module so operators can spot stale catalog rows in launcher logs.
+/// We don't return an error: the v0.2.49 contract is that broken
+/// manifests degrade to "ignore CMD override, hope ENTRYPOINT works"
+/// rather than fail the start — most images have a valid ENTRYPOINT
+/// even when the manifest's CMD is garbage.
+///
+/// The function is `pub(crate)` so the reaper (V52-D.2) can reuse the
+/// same indicator set when scanning existing containers' Config.Cmd
+/// for the same pathology.
+pub fn is_runtime_pathological(
+    command: &str,
+    args: &[String],
+    module_id: Option<&str>,
+) -> bool {
+    let cmd_trim = command.trim();
+
+    // Indicator 1: command is a container runtime binary name.
+    if matches!(cmd_trim, "podman" | "docker") {
+        eprintln!(
+            "[container_runtime] WARN: module {} declares runtime.command='{}' \
+             which is a container-runtime binary name. This is the pre-v0.2.49 \
+             Bug E manifest pattern. Dropping CMD override; using image ENTRYPOINT. \
+             Publisher should rebuild the image with runtime.command='' \
+             (and rely on the image's ENTRYPOINT) OR set command to the actual \
+             in-container binary (e.g. 'python', 'node').",
+            module_id.unwrap_or("<unknown>"),
+            cmd_trim,
+        );
+        return true;
+    }
+
+    // Indicator 2: shell without -c flag.
+    if matches!(cmd_trim, "sh" | "bash") {
+        // Look for `-c` anywhere in args. A legit shell invocation
+        // always includes -c; without it the shell would exit
+        // immediately under -d mode.
+        let has_dash_c = args.iter().any(|a| a == "-c");
+        if !has_dash_c {
+            eprintln!(
+                "[container_runtime] WARN: module {} declares runtime.command='{}' \
+                 without a '-c' arg. A detached shell with no command exits \
+                 immediately. Dropping CMD override; using image ENTRYPOINT.",
+                module_id.unwrap_or("<unknown>"),
+                cmd_trim,
+            );
+            return true;
+        }
+    }
+
+    // Indicator 3: unsubstituted {module_image} placeholder in args.
+    // The launcher never substitutes {module_image} (it's a launcher-
+    // side variable for the positional image arg, not a CMD-side one).
+    if args.iter().any(|a| a.contains("{module_image}")) {
+        eprintln!(
+            "[container_runtime] WARN: module {} declares runtime.args containing \
+             unsubstituted '{{module_image}}' placeholder. This is the pre-v0.2.49 \
+             Bug E pattern. Dropping CMD override; using image ENTRYPOINT. \
+             Publisher should rebuild the image with the actual in-container CMD \
+             (or empty `command` to rely on the image's ENTRYPOINT).",
+            module_id.unwrap_or("<unknown>"),
+        );
+        return true;
+    }
+
+    false
 }
 
 /// v0.2.49 Stream A: best-effort `mkdir -p` for each volume's host path
@@ -1921,5 +2036,193 @@ mod tests {
             db: None,
             kg_collections: None,
         }
+    }
+
+    // ─── V52-D.1 manifest-runtime-pathological detection ─────────────
+
+    #[test]
+    fn v0252_d1_pathological_runtime_command_podman_detected() {
+        // The empirical v0.2.9 manifest: `runtime.command = "podman"`
+        // with `runtime.args = ["run", "--rm", "-p", "11450:11450", "{module_image}"]`.
+        // Both indicators present.
+        assert!(is_runtime_pathological(
+            "podman",
+            &[
+                "run".into(),
+                "--rm".into(),
+                "-p".into(),
+                "11450:11450".into(),
+                "{module_image}".into(),
+            ],
+            Some("vct-rl-reranker"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_command_docker_detected() {
+        assert!(is_runtime_pathological(
+            "docker",
+            &["run".into(), "{module_image}".into()],
+            Some("evil-module"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_command_podman_with_whitespace_detected() {
+        // Authoring slip: trailing whitespace in command field.
+        assert!(is_runtime_pathological(
+            "  podman  ",
+            &["run".into()],
+            Some("vct-rl-reranker"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_unsub_module_image_in_args_detected() {
+        // Even if command is "python" (not a runtime binary), the
+        // presence of {module_image} in args means the manifest author
+        // copy-pasted the wrong substitution context.
+        assert!(is_runtime_pathological(
+            "python",
+            &["-m".into(), "rl_server".into(), "{module_image}".into()],
+            Some("vct-rl-reranker"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_shell_without_dash_c_detected() {
+        // `sh` with no `-c` arg → would exit immediately under
+        // detached mode. Likely an authoring mistake.
+        assert!(is_runtime_pathological(
+            "sh",
+            &["echo".into(), "hello".into()],
+            Some("dodgy-module"),
+        ));
+        assert!(is_runtime_pathological(
+            "bash",
+            &[],
+            Some("dodgy-module"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_shell_with_dash_c_allowed() {
+        // Legit `sh -c "..."` invocation passes (the -c arg signals
+        // intent).
+        assert!(!is_runtime_pathological(
+            "sh",
+            &["-c".into(), "python -m rl_server".into()],
+            Some("ok-module"),
+        ));
+        assert!(!is_runtime_pathological(
+            "bash",
+            &["-c".into(), "exec /app/start.sh".into()],
+            Some("ok-module"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_legit_command_passes() {
+        // The canonical legit shape: `python -m <module>` with no
+        // {module_image} placeholder. Must NOT be flagged.
+        assert!(!is_runtime_pathological(
+            "python",
+            &["-m".into(), "rl_server.rl_server".into()],
+            Some("vct-rl-reranker"),
+        ));
+        assert!(!is_runtime_pathological(
+            "node",
+            &["server.js".into()],
+            Some("some-node-module"),
+        ));
+        assert!(!is_runtime_pathological(
+            "/app/start",
+            &[],
+            Some("absolute-binary-module"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_empty_command_passes() {
+        // Empty command means "use the image ENTRYPOINT" — this is
+        // the v0.2.49 declarative-manifest shape. Not pathological;
+        // the empty-command branch in build_podman_run_args handles
+        // it separately (skip CMD override). This test pins that
+        // `is_runtime_pathological` returns false so we don't double-
+        // log the warning.
+        assert!(!is_runtime_pathological("", &[], Some("declarative-module")));
+        assert!(!is_runtime_pathological("", &[], None));
+    }
+
+    /// End-to-end: a manifest with the pre-v0.2.49 Bug E shape produces
+    /// a `podman run` argv with NO CMD override. The image ENTRYPOINT
+    /// runs unmolested — same effect as if the broken manifest had
+    /// `command: ""`. This is the user-facing fix: stale catalog rows
+    /// no longer produce restart-looping containers.
+    #[test]
+    fn v0252_d1_build_podman_run_args_strips_pathological_cmd_override() {
+        let mut manifest = make_manifest(true, true);
+        // Inject the empirical v0.2.9 broken shape.
+        manifest.runtime.command = "podman".into();
+        manifest.runtime.args = vec![
+            "run".into(),
+            "--rm".into(),
+            "-p".into(),
+            "11450:11450".into(),
+            "{module_image}".into(),
+        ];
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9",
+        )
+        .expect("build args");
+        // The positional image arg is the LAST element — no CMD
+        // override appended after it.
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("ghcr.io/hotak92/vct-rl-reranker:0.2.9"),
+            "build_podman_run_args must NOT append the pathological CMD; \
+             expected image as last arg, got args={:?}",
+            args,
+        );
+        // Defensive: no element contains "{module_image}" — the
+        // launcher must not pass the unsubstituted placeholder to
+        // podman.
+        assert!(
+            args.iter().all(|a| !a.contains("{module_image}")),
+            "no arg may carry an unsubstituted {{module_image}} placeholder; got {:?}",
+            args,
+        );
+    }
+
+    /// Sibling test for the GLOBAL builder — same pathology-stripping
+    /// behaviour.
+    #[test]
+    fn v0252_d1_build_podman_run_args_global_strips_pathological_cmd_override() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.command = "podman".into();
+        manifest.runtime.args = vec!["run".into(), "{module_image}".into()];
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9",
+        )
+        .expect("build args global");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("ghcr.io/hotak92/vct-rl-reranker:0.2.9"),
+            "global builder must also strip pathological CMD; got args={:?}",
+            args,
+        );
+        assert!(args.iter().all(|a| !a.contains("{module_image}")));
     }
 }
