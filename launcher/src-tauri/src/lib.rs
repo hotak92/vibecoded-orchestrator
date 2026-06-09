@@ -1624,6 +1624,22 @@ pub fn run() {
                 commands::licensing::backfill_license_key_from_legacy_file(&db_ref);
             }
 
+            // v0.2.52 V52-AD: RL reranker auto-enable boot probe. When
+            // `rl_events` count has crossed 500 AND the global toggle
+            // is still `false` (the install-time default), emit
+            // `vct-rl-auto-enable-available` so the renderer can prompt
+            // the user to navigate to /preferences/modules. Soft-fail:
+            // a missing rl_events table (pre-migration-025 DB) just
+            // skips the emit. The user can always navigate manually.
+            {
+                use tauri::Manager;
+                let db_ref = app.state::<crate::db::Db>();
+                commands::module_enabled::probe_rl_auto_enable_at_boot(
+                    &db_ref,
+                    &app.handle(),
+                );
+            }
+
             // System tray (v1.1)
             if let Err(e) = tray::setup(&app.handle()) {
                 eprintln!("[vct] tray setup failed: {}", e);

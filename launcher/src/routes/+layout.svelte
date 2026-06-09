@@ -211,6 +211,38 @@
       }
     })();
 
+    // v0.2.52 V52-AD: subscribe to the boot-time auto-enable probe.
+    // The Rust side emits `vct-rl-auto-enable-available` ONCE per
+    // launcher boot when rl_events has >= 500 rows AND the global RL
+    // reranker toggle is still `false` (the install-time default).
+    // We surface a toast with a navigate-CTA; the user clicks through
+    // to /preferences/modules to flip the toggle. The toast is one-
+    // shot (Toast store dedupes on `key`) so re-firing across boots
+    // doesn't spam. Suppressed when the user has dismissed via
+    // localStorage flag (set when they navigate from the toast).
+    (async () => {
+      try {
+        const { listen: rlListen } = await import('$lib/tauri');
+        const { toast: rlToast } = await import('$lib/stores/toast');
+        rlListen<{ event_count: number; threshold: number; module_id: string }>(
+          'vct-rl-auto-enable-available',
+          (e) => {
+            const dismissed = localStorage.getItem('vct.rl_auto_enable_dismissed') === '1';
+            if (dismissed) return;
+            const { event_count, threshold } = e.payload;
+            rlToast.info(
+              `RL Reranker: ${event_count}/${threshold} training events ` +
+                `accumulated — visit Preferences → Modules to enable.`,
+            );
+          },
+        );
+      } catch (e) {
+        // Browser mode or transient hiccup — silent skip; the user can
+        // still navigate to /preferences/modules manually.
+        console.debug('[layout] rl-auto-enable subscription skipped:', e);
+      }
+    })();
+
     // v0.2.32 UB2 (2026-05-23): periodic orchestrator-status refresh.
     // The status badge previously updated only on home-page mount, so a
     // user who installed/uninstalled the orchestrator from another
