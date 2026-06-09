@@ -4569,6 +4569,65 @@ async def _rl_cache_and_rerank(
     query_emb: list[float] | None = None,
 ) -> list[dict]:
     """
+    V52-J Edit 2 (2026-06-09): thin adapter that delegates to the canonical
+    rerank-and-emit pipeline in ``claude_mcp_servers.rl_client.search_pipeline``.
+
+    The pre-v0.2.52 body (tier gate + per-project toggle + rerank + telemetry +
+    citation cache populate, all inline) has been moved verbatim into
+    ``search_pipeline.rerank_and_emit()`` so every KG-search entry point
+    (MCP ``hybrid_search`` / ``semantic_graph_search``, the CLI scripts
+    ``rl_kg_search.py`` and ``search_knowledge.py``, PreToolUse hooks that
+    invoke those CLIs) shares one canonical chokepoint instead of each
+    re-implementing the orchestration. See ``search_pipeline.py`` module
+    docstring for full rationale.
+
+    The legacy body lives one definition below as
+    ``_rl_cache_and_rerank_LEGACY_v0251`` for one commit so we can compare
+    behaviour at review time; deleted in the follow-up commit. Call sites
+    (4 of them in this file, search ``_rl_cache_and_rerank``) only care
+    about the returned ``list[dict]`` — they don't see the RerankResult
+    diagnostic fields (``rl_used``, ``emit_success``) at all.
+    """
+    # Lazy import keeps the rl_client → server.py edge from becoming a
+    # circular dep at module-load time (search_pipeline lazy-imports back
+    # into this module to reach _rl_node_content_cache et al).
+    from claude_mcp_servers.rl_client.search_pipeline import (
+        RerankRequest,
+        rerank_and_emit,
+    )
+
+    req = RerankRequest(
+        query=query,
+        candidates=all_nodes,
+        limit=limit,
+        query_emb=query_emb,
+        embedding_source=EMBEDDING_SOURCE,
+        embedding_dim=_embedding_dim_for(EMBEDDING_MODEL),
+        embedding_model=EMBEDDING_MODEL,
+        task_id=task_id,
+        task_type="mcp_interactive",
+        failure_mode=failure_mode,
+        failed_collections=failed_collections or [],
+    )
+    result = await rerank_and_emit(req)
+    return result.ranked
+
+
+async def _rl_cache_and_rerank_LEGACY_v0251(
+    task_id: str,
+    query: str,
+    all_nodes: list[dict],
+    limit: int,
+    *,
+    failure_mode: str | None = None,
+    failed_collections: list[str] | None = None,
+    query_emb: list[float] | None = None,
+) -> list[dict]:
+    """
+    LEGACY (pre-v0.2.52). Kept for one commit so reviewers can diff the
+    refactored canonical path in ``search_pipeline.rerank_and_emit`` against
+    the original behaviour. Deleted in the follow-up commit.
+
     Rerank nodes via rl_server and spawn a background monitor for online training.
 
     Returns reranked top-k from rl_server, or the first `limit` nodes (Weaviate order)

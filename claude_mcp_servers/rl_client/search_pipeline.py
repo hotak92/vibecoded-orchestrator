@@ -175,7 +175,10 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     try:
         ev = RetrievalEvent(
             query=req.query,
-            query_emb=req.query_emb or [],
+            # Pass None through verbatim (do NOT coerce to []) — the
+            # writer + offline trainer distinguish "no embedding
+            # available" (None) from "zero-length embedding" (bug).
+            query_emb=req.query_emb,
             embedding_source=req.embedding_source,
             embedding_dim=req.embedding_dim,
             embedding_model=req.embedding_model,

@@ -56,7 +56,14 @@ class RetrievalEvent:
 
     # ---- mandatory fields ----
     query: str
-    query_emb: list[float]
+    # query_emb is the vector that drove the search. None is allowed
+    # explicitly (rather than []) so the writer can pass it through to
+    # the v3 envelope as null — the offline trainer distinguishes
+    # "embedding genuinely unavailable" (None) from "zero-length
+    # embedding" (which would be a bug). Pre-V52-J server.py passed
+    # None on the failure-mode / per-project-disabled paths; preserve
+    # that contract.
+    query_emb: Optional[list[float]]
     embedding_source: str
     embedding_dim: int
     embedding_model: str
@@ -112,16 +119,46 @@ def emit_rl_event(
     embedding) writer cache; no point duplicating).
     """
     # ---- validation ----
+    # Validation tiers (V52-J Edit 2 refinement 2026-06-09):
+    #   STRICT (raise EmitValidationError) — empty query (= no telemetry
+    #     value at all) or empty task_id (= writer can't dedupe). These
+    #     are genuinely caller-correctable bugs.
+    #   SOFT (logger.debug + still write) — empty query_emb in
+    #     happy-path mode, or query_emb length != embedding_dim. The
+    #     writer's _build_v3_retrieval_event handles None query_emb
+    #     gracefully (just omits the field from the v3 envelope), so
+    #     the historical "log_retrieval ALWAYS fires" guarantee from
+    #     server.py:_rl_cache_and_rerank's pre-V52-J body holds.
+    #   SKIPPED — failure_mode set OR nodes empty. Degraded-mode events
+    #     legitimately lack a useful query_emb (the offline trainer
+    #     filters non-None failure_mode out of training-pair
+    #     construction but still uses them as query-distribution +
+    #     failure-rate signals).
     if not ev.query:
         raise EmitValidationError("RetrievalEvent.query is empty")
-    if not ev.query_emb:
-        raise EmitValidationError("RetrievalEvent.query_emb is empty")
-    if ev.embedding_dim and len(ev.query_emb) != ev.embedding_dim:
-        raise EmitValidationError(
-            f"query_emb length {len(ev.query_emb)} != embedding_dim {ev.embedding_dim}"
-        )
     if not ev.task_id:
         raise EmitValidationError("RetrievalEvent.task_id is empty")
+    _is_degraded = bool(ev.failure_mode) or not ev.nodes
+    if not _is_degraded:
+        # Soft-warn on missing / mismatched query_emb. Do NOT raise —
+        # the writer is robust enough to handle it and dropping the
+        # write would silently lose telemetry that production paths
+        # depend on. Surface as DEBUG so noisy free-tier installs
+        # don't flood logs. ``ev.query_emb is None`` is meaningfully
+        # different from ``len(ev.query_emb) == 0`` (former = "no
+        # embedding available", latter = "zero-length embedding" =
+        # caller bug).
+        if ev.query_emb is None or len(ev.query_emb) == 0:
+            logger.debug(
+                "emit_rl_event: happy-path event has empty query_emb "
+                "(task_id=%s); writing anyway", ev.task_id,
+            )
+        elif ev.embedding_dim and len(ev.query_emb) != ev.embedding_dim:
+            logger.debug(
+                "emit_rl_event: query_emb length %d != embedding_dim %d "
+                "(task_id=%s); writing anyway",
+                len(ev.query_emb), ev.embedding_dim, ev.task_id,
+            )
 
     # ---- writer resolution ----
     if writer_factory is None:
@@ -139,6 +176,8 @@ def emit_rl_event(
     session_id = resolve_session_id(ev.session_id)
 
     # ---- write ----
+    # Preserve None vs [] distinction on query_emb (see RetrievalEvent
+    # docstring) — list(None) would TypeError, so guard explicitly.
     try:
         writer.log_retrieval(
             task_id=ev.task_id,
@@ -146,7 +185,7 @@ def emit_rl_event(
             query=ev.query,
             nodes=ev.nodes,
             session_id=session_id,
-            query_emb=list(ev.query_emb),
+            query_emb=(list(ev.query_emb) if ev.query_emb is not None else None),
             failure_mode=ev.failure_mode,
             failed_collections=list(ev.failed_collections),
         )
