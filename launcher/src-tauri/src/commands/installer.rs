@@ -6365,6 +6365,430 @@ pub async fn resume_orchestrator_update<R: Runtime>(
     result
 }
 
+// ---------------------------------------------------------------------------
+// v0.2.52 V52-A / V52-B — one-click conflict resolution from the modal.
+//
+// PROBLEM (post-v0.2.51): the v0.2.51 modal exposed only "Resolve manually"
+// (close + come back via the MenuBar Continue Update badge) and "Abort &
+// restore". User feedback 2026-06-09 said the manual-edit step is friction
+// for the common case where the conflict is on KG nodes the user is happy
+// to keep local OR happy to accept upstream wholesale.
+//
+// FIX (V52-B): two new Tauri commands that the modal calls when the user
+// picks the corresponding button. Each one:
+//   1. Validates state (in mid-merge/rebase, sentinel present).
+//   2. Runs `git checkout --ours` or `git checkout --theirs` against every
+//      conflicted file. Orientation flips between merge and rebase — see
+//      the resolve_checkout_flag helper for details.
+//   3. `git add` + `git commit` (merge) or `git rebase --continue` (rebase).
+//   4. Delegates to `resume_orchestrator_update` for the post-merge tail
+//      (install.py --update + binary refresh + auto-restart). The resume
+//      function's own preconditions (sentinel present, HEAD advanced,
+//      no markers, no in-flight merge state) all pass by construction
+//      after the commit/continue above.
+//
+// V52-A is the modal-side guarantee: the modal removes "Resolve manually"
+// and ONLY exposes Abort / Keep local / Accept upstream. Window-X or
+// Escape are treated as Abort, not silent dismiss.
+// ---------------------------------------------------------------------------
+
+/// Strategy passed in from the modal: which side of a conflict to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictResolutionSide {
+    /// Keep the user's local content; discard upstream.
+    KeepLocal,
+    /// Accept upstream content; discard the user's local changes.
+    AcceptUpstream,
+}
+
+/// Translate a `(side, operation)` pair into the `git checkout` flag to
+/// pass. Critical: git swaps "ours" and "theirs" between merge and rebase.
+///
+/// * **Merge**: HEAD is "ours" (the local branch we merged INTO), MERGE_HEAD
+///   is "theirs" (the upstream branch being merged IN).
+/// * **Rebase**: HEAD is "ours" (the upstream branch we're rebasing ONTO,
+///   from git's POV after the rebase reparents HEAD onto upstream),
+///   the commits being replayed are "theirs" (the user's local commits).
+///
+/// So:
+///   * KeepLocal during merge  → `--ours`   (HEAD = local)
+///   * KeepLocal during rebase → `--theirs` (replayed commits = local)
+///   * AcceptUpstream during merge  → `--theirs`
+///   * AcceptUpstream during rebase → `--ours`
+///
+/// Reference: `git checkout --help`, "MERGES" section, plus the
+/// `core.attributesFile` discussion under `git-rebase`.
+fn resolve_checkout_flag(side: ConflictResolutionSide, operation: &str) -> &'static str {
+    let is_rebase = operation.eq_ignore_ascii_case("rebase");
+    match (side, is_rebase) {
+        (ConflictResolutionSide::KeepLocal, false) => "--ours",
+        (ConflictResolutionSide::KeepLocal, true) => "--theirs",
+        (ConflictResolutionSide::AcceptUpstream, false) => "--theirs",
+        (ConflictResolutionSide::AcceptUpstream, true) => "--ours",
+    }
+}
+
+/// Shared implementation for both `keep_local_and_continue_update` and
+/// `accept_upstream_and_continue_update`. Performs the conflict resolution
+/// (checkout + add + commit/continue) then delegates to
+/// `resume_orchestrator_update` for the post-merge tail.
+///
+/// The two public commands are thin wrappers that pick the side enum
+/// variant; centralising the body here keeps git invocation, audit logging,
+/// and error handling in lockstep between them.
+async fn resolve_conflict_and_resume<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+    side: ConflictResolutionSide,
+) -> Result<InstallResult, String> {
+    let install_path = PathBuf::from(&path);
+
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — cannot resolve conflict".to_string());
+    }
+
+    let audit_app = app.clone();
+    let write_audit = move |operation: &str, detail: serde_json::Value| {
+        if let Some(db) = audit_app.try_state::<crate::db::Db>() {
+            let _ = db.audit(operation, None, None, &detail);
+        }
+    };
+
+    // Refuse if there's no sentinel. The conflict modal only opens when a
+    // merge/rebase produced one; absence here means the user clicked the
+    // button on a stale view (e.g. they aborted via CLI between modal
+    // open and click).
+    let sentinel = match read_update_resume_sentinel(&install_path) {
+        Some(s) => s,
+        None => {
+            write_audit(
+                "update_orchestrator_one_click_rejected",
+                serde_json::json!({
+                    "reason": "no_sentinel",
+                    "side": format!("{:?}", side),
+                    "install_path": path,
+                }),
+            );
+            return Err(
+                "No active conflict found. The merge or rebase may have \
+                 already been aborted from the command line. Refresh the \
+                 launcher and try the update again."
+                    .to_string(),
+            );
+        }
+    };
+
+    // Require the merge/rebase to still be in flight. If the user has
+    // already finished it (via CLI), the right path is the standard
+    // Continue Update flow, not these one-click resolvers.
+    let merge_head = install_path.join(".git").join("MERGE_HEAD");
+    let rebase_merge = install_path.join(".git").join("rebase-merge");
+    let rebase_apply = install_path.join(".git").join("rebase-apply");
+    let in_merge = merge_head.exists();
+    let in_rebase = rebase_merge.exists() || rebase_apply.exists();
+    if !in_merge && !in_rebase {
+        write_audit(
+            "update_orchestrator_one_click_rejected",
+            serde_json::json!({
+                "reason": "no_merge_in_progress",
+                "side": format!("{:?}", side),
+                "sentinel_operation": sentinel.operation,
+                "install_path": path,
+            }),
+        );
+        return Err(
+            "No merge or rebase is currently in progress. If you resolved \
+             the conflict from the command line, click Continue Update \
+             instead. Otherwise refresh the launcher and try again."
+                .to_string(),
+        );
+    }
+
+    // Cross-check the sentinel's stored operation against the on-disk
+    // state. They should agree; mismatch means someone tampered with
+    // either git or the sentinel. Refuse rather than guess.
+    let live_operation = if in_merge { "merge" } else { "rebase" };
+    if !sentinel.operation.eq_ignore_ascii_case(live_operation) {
+        write_audit(
+            "update_orchestrator_one_click_rejected",
+            serde_json::json!({
+                "reason": "operation_mismatch",
+                "sentinel_operation": sentinel.operation,
+                "live_operation": live_operation,
+                "side": format!("{:?}", side),
+                "install_path": path,
+            }),
+        );
+        return Err(format!(
+            "Conflict modal expected a `{}` in progress but the working \
+             tree shows a `{}` instead. Refresh the launcher.",
+            sentinel.operation, live_operation,
+        ));
+    }
+
+    // Collect conflicted files BEFORE any checkout — once we run
+    // `git checkout --ours/--theirs`, git clears the conflict state
+    // for that path and it no longer appears in `--diff-filter=U`.
+    let conflicted = collect_conflicted_files(&install_path).await;
+    if conflicted.is_empty() {
+        // No files to resolve — but we ARE in mid-merge per the earlier
+        // probe. This shouldn't happen in normal flow; treat as a
+        // probable git-state corruption and refuse with a useful message
+        // rather than silently committing an empty resolution.
+        write_audit(
+            "update_orchestrator_one_click_rejected",
+            serde_json::json!({
+                "reason": "no_conflicted_files",
+                "live_operation": live_operation,
+                "side": format!("{:?}", side),
+                "install_path": path,
+            }),
+        );
+        return Err(
+            "Merge or rebase is in progress but git reports no conflicted \
+             files. Run `git status` in the install directory and either \
+             finish or abort the merge manually."
+                .to_string(),
+        );
+    }
+
+    let flag = resolve_checkout_flag(side, live_operation);
+    emit_progress(
+        &window,
+        "update",
+        &format!(
+            "Resolving {} conflict(s) ({})...",
+            conflicted.len(),
+            match side {
+                ConflictResolutionSide::KeepLocal => "keeping local versions",
+                ConflictResolutionSide::AcceptUpstream => "accepting upstream versions",
+            },
+        ),
+        10.0,
+    );
+
+    write_audit(
+        "update_orchestrator_one_click_started",
+        serde_json::json!({
+            "side": format!("{:?}", side),
+            "operation": live_operation,
+            "flag": flag,
+            "conflicted_files": conflicted,
+            "install_path": path,
+        }),
+    );
+
+    // 1. `git checkout <flag> -- <files>`. Splitting into per-file
+    //    invocations keeps the error story per-path (and avoids
+    //    blowing past argv length limits on Windows when there are
+    //    many conflicted files).
+    for file in &conflicted {
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .args(["checkout", flag, "--", file])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| {
+                format!(
+                    "git checkout {} -- {} failed to spawn: {}",
+                    flag, file, e,
+                )
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            write_audit(
+                "update_orchestrator_one_click_failed",
+                serde_json::json!({
+                    "stage": "checkout",
+                    "file": file,
+                    "flag": flag,
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git checkout {} -- {} failed: {}. The working tree is \
+                 still in the conflicted state — you can retry, pick the \
+                 other side, or click Abort & restore.",
+                flag,
+                file,
+                stderr.trim(),
+            ));
+        }
+    }
+
+    // 2. `git add <files>`. Same per-file split for the same reason.
+    for file in &conflicted {
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .args(["add", "--", file])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git add -- {} failed to spawn: {}", file, e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            write_audit(
+                "update_orchestrator_one_click_failed",
+                serde_json::json!({
+                    "stage": "add",
+                    "file": file,
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git add -- {} failed after checkout {}: {}. Inspect the \
+                 working tree manually.",
+                file,
+                flag,
+                stderr.trim(),
+            ));
+        }
+    }
+
+    // 3. Finish the merge/rebase. Different verb depending on operation:
+    //    - merge: `git commit --no-edit` (the merge commit message is
+    //      already staged by the prior `git merge` / `git pull`).
+    //    - rebase: `git rebase --continue` (advances to the next replayed
+    //      commit; needs an empty editor on the message file).
+    //
+    //    `GIT_EDITOR=true` is the cross-OS way to short-circuit the
+    //    interactive editor: `true` exits 0 immediately, which git
+    //    treats as "user accepted the existing message". Same trick
+    //    is used in the orchestrator's own scripts.
+    emit_progress(
+        &window,
+        "update",
+        if in_merge {
+            "Finalising merge commit..."
+        } else {
+            "Continuing rebase..."
+        },
+        20.0,
+    );
+
+    if in_merge {
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .env("GIT_EDITOR", "true")
+            .args(["commit", "--no-edit"])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git commit failed to spawn: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            write_audit(
+                "update_orchestrator_one_click_failed",
+                serde_json::json!({
+                    "stage": "commit",
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git commit failed after staging the resolution: {}. \
+                 Inspect the working tree manually.",
+                stderr.trim(),
+            ));
+        }
+    } else {
+        // Rebase. `--continue` will pause if there are MORE conflicted
+        // commits to replay — in that case the caller (the modal) will
+        // see a fresh conflict modal pop and can resolve again.
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .env("GIT_EDITOR", "true")
+            .args(["rebase", "--continue"])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git rebase --continue failed to spawn: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            write_audit(
+                "update_orchestrator_one_click_failed",
+                serde_json::json!({
+                    "stage": "rebase_continue",
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git rebase --continue failed after staging the \
+                 resolution: {}. The rebase may have more conflicts on a \
+                 later commit; inspect with `git status`.",
+                stderr.trim(),
+            ));
+        }
+    }
+
+    write_audit(
+        "update_orchestrator_one_click_resolved",
+        serde_json::json!({
+            "side": format!("{:?}", side),
+            "operation": live_operation,
+            "flag": flag,
+            "resolved_count": conflicted.len(),
+            "install_path": path,
+        }),
+    );
+
+    // 4. Delegate to the existing resume command. Its preconditions are
+    //    all satisfied by construction:
+    //      * sentinel still present (we never cleared it).
+    //      * HEAD has advanced past `sha_at_conflict` (the commit/continue
+    //        above produced a new HEAD).
+    //      * No `.git/MERGE_HEAD` / `rebase-merge` / `rebase-apply` (those
+    //        clear after a successful commit/continue).
+    //      * No conflict markers in any tracked file (checkout --ours/--theirs
+    //        replaced the markered content wholesale; we never asked the user
+    //        to edit anything).
+    //
+    //    resume_orchestrator_update will stop the hub, pre-pull rename
+    //    binaries, clear the sentinel + deferral, then run install.py
+    //    --update + binary refresh + auto-restart.
+    resume_orchestrator_update(app, path, window).await
+}
+
+/// V52-B: keep local versions of every conflicted file, then continue the
+/// update (install.py --update + binary refresh + auto-restart).
+///
+/// Modal tooltip: "Discards upstream changes for the conflicting files;
+/// keeps everything you've added locally. Good for: nodes you've heavily
+/// customized."
+///
+/// User-locked default behavior (2026-06-09): when ALL conflicted files
+/// live under `knowledge/`, the modal auto-highlights this button. The
+/// auto-highlight is a UI hint only — the command itself doesn't filter
+/// by path; it operates on every conflicted file unconditionally.
+#[command]
+pub async fn keep_local_and_continue_update<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+) -> Result<InstallResult, String> {
+    resolve_conflict_and_resume(app, path, window, ConflictResolutionSide::KeepLocal).await
+}
+
+/// V52-B: accept upstream versions of every conflicted file, then continue
+/// the update (install.py --update + binary refresh + auto-restart).
+///
+/// Modal tooltip: "Discards your local changes for the conflicting files;
+/// takes the public release version. Good for: KG nodes you didn't really
+/// need."
+#[command]
+pub async fn accept_upstream_and_continue_update<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+) -> Result<InstallResult, String> {
+    resolve_conflict_and_resume(app, path, window, ConflictResolutionSide::AcceptUpstream).await
+}
+
 /// v0.2.16 (W4 / 0.5): "Pulled-but-not-installed" resolver. Runs
 /// `install.py --update` against an existing install_path WITHOUT a
 /// preceding `git pull`. Distinct from `update_orchestrator` (which

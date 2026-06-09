@@ -2424,6 +2424,15 @@ pub fn run() {
             // refresh + auto-restart). Without this, the modal's
             // "Resolve manually" path silently abandoned the update.
             commands::installer::resume_orchestrator_update,
+            // v0.2.52 V52-B: one-click conflict resolution from the
+            // OrchestratorUpdateConflictModal. "Keep local" runs
+            // `git checkout --ours` on every conflicted file then
+            // commits + delegates to resume_orchestrator_update.
+            // "Accept upstream" is the symmetric `--theirs` variant.
+            // Orientation flips between merge and rebase — the helper
+            // `resolve_checkout_flag` in installer.rs handles that.
+            commands::installer::keep_local_and_continue_update,
+            commands::installer::accept_upstream_and_continue_update,
             // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
             // "Pulled-but-not-installed" banner state (source updated
             // via `git pull` outside the launcher; install-manifest
