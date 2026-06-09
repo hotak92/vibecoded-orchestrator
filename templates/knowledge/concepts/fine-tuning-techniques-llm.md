@@ -1,7 +1,7 @@
 ---
 title: Fine-Tuning Techniques for Open-Source LLMs
 type: concept
-tags: [fine-tuning, LoRA, QLoRA, PEFT, adapter-tuning, LLM, optimization, 2025]
+tags: [fine-tuning, LoRA, QLoRA, PEFT, adapter-tuning, LLM, optimization, 2025, mid-level-architecture]
 created: 2026-02-27T00:00:00Z
 updated: 2026-04-05T14:33:25Z
 valid_from: 2025-01-01T00:00:00Z

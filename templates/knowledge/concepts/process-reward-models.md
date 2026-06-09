@@ -1,7 +1,7 @@
 ---
 title: Process Reward Models
 type: concept
-tags: [ai, llm, alignment, reasoning, math, reward-model, rlhf, verification]
+tags: [ai, llm, alignment, reasoning, math, reward-model, rlhf, verification, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:33:46Z
 status: active

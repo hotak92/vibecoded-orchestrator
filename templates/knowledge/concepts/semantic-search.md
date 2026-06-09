@@ -1,7 +1,7 @@
 ---
 title: Semantic Search
 type: concept
-tags: [AI, search, embeddings, vector-database, retrieval, NLP, information-retrieval]
+tags: [AI, search, embeddings, vector-database, retrieval, NLP, information-retrieval, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
 updated: 2026-05-16T20:30:00Z
 status: active

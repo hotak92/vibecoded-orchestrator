@@ -1,7 +1,7 @@
 ---
 title: Tree-of-Thought
 type: concept
-tags: [AI, prompting, reasoning, LLM, planning, search, NeurIPS-2023]
+tags: [AI, prompting, reasoning, LLM, planning, search, NeurIPS-2023, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:34:01Z
 status: active

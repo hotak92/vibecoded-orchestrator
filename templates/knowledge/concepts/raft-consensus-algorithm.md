@@ -1,7 +1,7 @@
 ---
 title: Raft Consensus Algorithm
 type: concept
-tags: [distributed-systems, consensus, fault-tolerance, replication, algorithms]
+tags: [distributed-systems, consensus, fault-tolerance, replication, algorithms, low-level-implementation]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:33:47Z
 status: active

@@ -1,7 +1,7 @@
 ---
 title: RAG Pattern
 type: concept
-tags: [AI, RAG, retrieval, LLM, pattern, knowledge-base, embedding]
+tags: [AI, RAG, retrieval, LLM, pattern, knowledge-base, embedding, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:33:48Z
 status: active

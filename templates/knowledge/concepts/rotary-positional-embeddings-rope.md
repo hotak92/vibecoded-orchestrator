@@ -1,7 +1,7 @@
 ---
 title: Rotary Positional Embeddings (RoPE)
 type: concept
-tags: [AI, positional-encoding, transformer, attention, RoPE, context-length, LLM]
+tags: [AI, positional-encoding, transformer, attention, RoPE, context-length, LLM, low-level-implementation]
 created: 2026-03-30T00:00:00Z
 updated: 2026-04-05T14:33:50Z
 status: active

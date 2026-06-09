@@ -1,7 +1,7 @@
 ---
 title: Actor-Critic
 type: concept
-tags: [AI, reinforcement-learning, actor-critic, PPO, A2C, TD3, DDPG, policy-gradient, multi-agent]
+tags: [AI, reinforcement-learning, actor-critic, PPO, A2C, TD3, DDPG, policy-gradient, multi-agent, mid-level-architecture]
 created: 2026-03-30T00:00:00Z
 updated: 2026-04-05T14:33:07Z
 status: active

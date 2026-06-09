@@ -1,7 +1,7 @@
 ---
 title: GraphRAG Pattern
 type: concept
-tags: [AI, RAG, knowledge-graph, retrieval, NLP, Microsoft, graph-traversal]
+tags: [AI, RAG, knowledge-graph, retrieval, NLP, Microsoft, graph-traversal, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:33:26Z
 status: active

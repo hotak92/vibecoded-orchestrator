@@ -1,7 +1,7 @@
 ---
 title: Reinforcement Learning
 type: concept
-tags: [AI, RL, machine-learning, policy, reward, Q-learning, training]
+tags: [AI, RL, machine-learning, policy, reward, Q-learning, training, high-level-plan]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:33:48Z
 status: active

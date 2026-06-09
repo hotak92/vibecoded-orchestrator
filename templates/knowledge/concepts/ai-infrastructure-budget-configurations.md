@@ -1,7 +1,7 @@
 ---
 title: AI Infrastructure Budget Configurations
 type: concept
-tags: [hardware, budget, configuration, optimization, decision-framework]
+tags: [hardware, budget, configuration, optimization, decision-framework, mid-level-architecture]
 created: 2026-02-12T20:00:00Z
 updated: 2026-04-05T14:33:10Z
 valid_from: 2026-02-12T00:00:00Z

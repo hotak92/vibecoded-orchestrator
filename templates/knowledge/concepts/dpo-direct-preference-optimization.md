@@ -1,7 +1,7 @@
 ---
 title: DPO - Direct Preference Optimization
 type: concept
-tags: [AI, alignment, DPO, preference-optimization, LLM, training, fine-tuning]
+tags: [AI, alignment, DPO, preference-optimization, LLM, training, fine-tuning, mid-level-architecture]
 created: 2026-03-29T00:00:00Z
 updated: 2026-04-05T14:33:22Z
 status: active

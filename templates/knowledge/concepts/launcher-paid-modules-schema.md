@@ -1,7 +1,7 @@
 ---
 title: Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
 type: concept
-tags: [launcher, supabase, schema, paid-modules, licensing, commercial, partially-superseded]
+tags: [launcher, supabase, schema, paid-modules, licensing, commercial, partially-superseded, low-level-implementation]
 created: 2026-04-23T16:20:00Z
 updated: 2026-05-26T00:00:00Z
 status: active

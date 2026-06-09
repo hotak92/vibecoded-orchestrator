@@ -1,7 +1,7 @@
 ---
 title: FlashAttention
 type: concept
-tags: [ai, attention, transformer, gpu, memory-efficiency, inference, training, optimization]
+tags: [ai, attention, transformer, gpu, memory-efficiency, inference, training, optimization, low-level-implementation]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:33:25Z
 status: active

@@ -1,7 +1,7 @@
 ---
 title: Orchestrator Update Resume — Bug A (v0.2.51)
 type: concept
-tags: [installer, launcher, update-flow, recovery, bug-fix, v0251]
+tags: [installer, launcher, update-flow, recovery, bug-fix, v0251, low-level-implementation]
 created: 2026-06-09T00:00:00Z
 updated: 2026-06-09T00:00:00Z
 valid_from: 2026-06-09T00:00:00Z

@@ -1,7 +1,7 @@
 ---
 title: Bayesian Inference
 type: concept
-tags: [statistics, Bayesian, probabilistic-reasoning, uncertainty, variational-inference, multi-agent]
+tags: [statistics, Bayesian, probabilistic-reasoning, uncertainty, variational-inference, multi-agent, mid-level-architecture]
 created: 2026-03-30T00:00:00Z
 updated: 2026-04-05T14:33:15Z
 status: active

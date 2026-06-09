@@ -1,7 +1,7 @@
 ---
 title: Reward Shaping & Intrinsic Reward Design in RL
 type: concept
-tags: [AI, reinforcement-learning, reward-engineering, intrinsic-motivation, learning-guidance]
+tags: [AI, reinforcement-learning, reward-engineering, intrinsic-motivation, learning-guidance, mid-level-architecture]
 created: 2026-02-27T00:00:00Z
 updated: 2026-04-05T14:33:49Z
 valid_from: 2026-02-27T00:00:00Z

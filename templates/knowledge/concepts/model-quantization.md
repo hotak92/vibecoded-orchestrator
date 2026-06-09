@@ -1,7 +1,7 @@
 ---
 title: Model Quantization
 type: concept
-tags: [AI, quantization, inference, VRAM, optimization, PTQ, QAT, precision]
+tags: [AI, quantization, inference, VRAM, optimization, PTQ, QAT, precision, high-level-plan]
 created: 2026-03-31T12:00:00Z
 updated: 2026-04-05T14:33:36Z
 status: active

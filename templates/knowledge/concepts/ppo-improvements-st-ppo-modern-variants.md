@@ -1,7 +1,7 @@
 ---
 title: PPO Improvements - ST-PPO and Modern Variants
 type: concept
-tags: [AI, reinforcement-learning, policy-optimization, LLM-training, multi-turn-reasoning]
+tags: [AI, reinforcement-learning, policy-optimization, LLM-training, multi-turn-reasoning, low-level-implementation]
 created: 2026-02-27T00:00:00Z
 updated: 2026-04-05T14:33:45Z
 valid_from: 2026-02-27T00:00:00Z

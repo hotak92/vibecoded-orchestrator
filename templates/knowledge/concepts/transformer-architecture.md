@@ -1,7 +1,7 @@
 ---
 title: Transformer Architecture
 type: concept
-tags: [ai, transformer, attention, deep-learning, architecture, neural-network, NLP]
+tags: [ai, transformer, attention, deep-learning, architecture, neural-network, NLP, mid-level-architecture]
 created: 2026-03-30T00:00:00Z
 updated: 2026-04-05T14:34:01Z
 status: active

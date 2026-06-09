@@ -1,7 +1,7 @@
 ---
 title: Tauri Windows CREATE_NO_WINDOW subprocess pattern
 type: concept
-tags: [tauri, windows, rust, subprocess, GUI, console-flash, fork-bomb, windows_subsystem]
+tags: [tauri, windows, rust, subprocess, GUI, console-flash, fork-bomb, windows_subsystem, low-level-implementation]
 created: 2026-05-26T15:00:00Z
 updated: 2026-05-26T15:00:00Z
 valid_from: 2026-05-26T00:00:00Z
