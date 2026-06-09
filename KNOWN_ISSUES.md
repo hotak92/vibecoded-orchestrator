@@ -57,11 +57,16 @@ flagging for early adopters and the next iteration.
       install. No change planned for v1.0 — container runtimes on those platforms require user consent
       GUI steps that can't be scripted portably.
 
-- [ ] **Cosmetic warnings during seed (non-blocking)** — `AuthlibDeprecationWarning` from a
+- [x] **Cosmetic warnings during seed (non-blocking)** — `AuthlibDeprecationWarning` from a
       transitive dep of `weaviate-client`, and several "No abstraction level tag" /
       "Tag 'LoRA' uses camelCase" vocabulary warnings from the bundled seed nodes in
       `knowledge/concepts/`. None affect correctness; the install completes successfully.
-      Vocabulary cleanup of seed nodes is on the v0.2.x chore backlog.
+      *Resolved in v0.2.52: targeted ``warnings.filterwarnings`` for the authlib
+      noise (4 scripts), abstraction-level tags added to 31 concept nodes,
+      and 10 camelCase tag renames (LoRA→lora, IaC→iac, ComfyUI→comfyui, …).
+      Regression-pinned by ``tests/test_no_authlib_deprecation_warning.py``,
+      ``tests/test_kg_seed_nodes_have_abstraction_tags.py``, and
+      ``tests/test_kg_seed_nodes_use_kebab_case_tags.py``.*
 
 - [ ] **First-install grew by ~150 MB for Playwright MCP** — the default-enabled
       `playwright` MCP entry pre-caches Chromium during `install.py` so the first
