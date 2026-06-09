@@ -1713,6 +1713,155 @@ def _csharp_methods_for_class(
 
 
 
+def _strip_string_literals(content_clean: str) -> str:
+    """V52-O.11.I (v0.2.52, 2026-06-09): replace the *contents* of every
+    single-line single-quoted, double-quoted, and backtick-quoted string
+    with same-length whitespace so downstream regex scans don't match
+    against text that LOOKS like code but is actually string content.
+
+    Audit example: ``let s = "fn foo() {}";`` produces a false-positive
+    function row for a function named ``foo`` in the Rust/JS/Java/C#
+    parsers. The string-stripped version reads as
+    ``let s = "          ";`` and the regex correctly finds no ``fn`` to
+    match.
+
+    Line-number preservation: each stripped string is replaced with the
+    same number of bytes (padded with spaces, with newlines preserved as
+    newlines on the rare multi-line case where an escape sequence
+    happens to include one). This keeps downstream ``content[:m.start()]
+    .count('\\n') + 1`` line calculations correct.
+
+    Quote semantics:
+      - ``'..'`` and ``".."`` handle escape sequences (``\\"``, ``\\'``).
+      - Backtick-quoted (JS template literals) — single-line only,
+        no ``${}`` interpolation handling. A template literal containing
+        ``${expr}`` collapses to blanks too, which is correct (we want
+        to mask the literal text, not the embedded code).
+
+    Caller is expected to have already stripped comments. Multi-line
+    raw strings (Rust ``r#"..."#``, Python triple-quotes — those are
+    handled by ``_strip_triple_quoted``) are out of scope.
+
+    The implementation uses a single regex sweep instead of three passes
+    so overlapping quote characters inside another quote type don't
+    confuse the order-of-stripping (e.g. ``" 'embedded' "`` must NOT
+    re-trigger the single-quote pass after the double-quote pass).
+    """
+    # Combined alternation: try each quote type in turn. The regex engine
+    # picks the leftmost match each iteration, which is what we want.
+    pattern = re.compile(
+        r'"(?:\\.|[^"\\])*"'      # double-quoted (escape-aware)
+        r"|'(?:\\.|[^'\\])*'"     # single-quoted (escape-aware)
+        r"|`(?:\\.|[^`\\])*`",    # backtick (template literal)
+    )
+
+    def _blank(match: "re.Match[str]") -> str:
+        # Replace the matched string (inclusive of quotes) with spaces of
+        # the same length, but preserve any newlines inside (escape
+        # sequences like ``"\n"`` are written as a literal ``\``+``n`` in
+        # source, so they don't actually contain a newline — we still
+        # play it safe and preserve embedded newlines).
+        text = match.group(0)
+        return ''.join(ch if ch == '\n' else ' ' for ch in text)
+
+    return pattern.sub(_blank, content_clean)
+
+
+
+
+def _is_rust_test_fn(content: str, fn_offset: int) -> bool:
+    """V52-O.11.J (v0.2.52, 2026-06-09): return True if the Rust ``fn``
+    starting at ``content[fn_offset:]`` is gated by a ``#[cfg(test)]``,
+    ``#[test]``, or ``#[cfg(any(test, ...))]`` attribute on an
+    immediately-preceding line (test-only code, not production).
+
+    Pre-V52-O.11.J the Rust parser indexed every function the regex
+    matched into ``CodeFunction``, including unit-test helpers and
+    ``#[test]``-annotated test functions. That pollutes search results
+    (``query_code_structure(callers, ...)`` returns test fixtures), wastes
+    embedding budget, and conflates production behaviour with test
+    scaffolding. After V52-O.11.J the analyzer skips them.
+
+    Detection algorithm:
+      1. Walk backwards from ``fn_offset`` over whitespace and
+         line-continuation characters until we find the start of the line
+         that contains the ``fn`` keyword (the "fn line").
+      2. Walk backwards from the start of the fn line through one OR more
+         immediately-preceding lines that are EITHER blank OR start with
+         ``#[`` (Rust attributes). Stop at the first line that is neither.
+      3. Across all the attribute lines collected, look for ``cfg(test)``,
+         ``cfg(any(test``, ``cfg(all(test``, or bare ``[test]``.
+
+    Args:
+        content: The source (or content_no_strings — string-literal
+            content can't contain ``#[cfg(test)]`` because attributes
+            don't appear inside strings, so either input works).
+        fn_offset: Byte offset where the matched ``fn`` (or its prefix
+            modifier) starts.
+
+    Returns:
+        True if a test-gating attribute is found on a preceding attribute
+        line, False otherwise.
+    """
+    # Find start-of-line for the fn-offset.
+    line_start = content.rfind('\n', 0, fn_offset) + 1
+    # ``rfind`` returns -1 if no newline; +1 makes it 0 — correct for
+    # offset at very start of file.
+
+    # Walk backwards collecting preceding attribute lines.
+    # Each iteration: find the line PRECEDING ``line_start`` and check
+    # whether it's blank or an attribute. Stop at the first non-attribute
+    # non-blank line.
+    cursor = line_start
+    attr_lines: list[str] = []
+    # Cap the scan at 16 lines back to bound worst case (test fns rarely
+    # have more than 2-3 attribute lines).
+    for _ in range(16):
+        if cursor <= 0:
+            break
+        # ``cursor`` points at start of "current" line (which we've
+        # already classified or want to skip past). Find the line BEFORE
+        # this one.
+        # Previous newline ends the previous line.
+        prev_nl = content.rfind('\n', 0, cursor - 1)
+        prev_line_start = prev_nl + 1  # 0 if rfind returned -1
+        prev_line = content[prev_line_start: cursor - 1]
+        stripped = prev_line.strip()
+        if not stripped:
+            # Blank line — keep walking (Rust allows blank lines between
+            # attributes and the fn declaration, though it's unusual).
+            cursor = prev_line_start
+            continue
+        if stripped.startswith('#['):
+            attr_lines.append(stripped)
+            cursor = prev_line_start
+            continue
+        # Non-blank, non-attribute line: stop scanning.
+        break
+
+    # Inspect collected attribute lines for any test gate.
+    for attr in attr_lines:
+        # Normalise: collapse whitespace so ``#[ cfg ( test ) ]`` etc.
+        # all reduce to the same pattern.
+        compact = re.sub(r'\s+', '', attr)
+        # ``#[test]`` (bare test attribute)
+        if '#[test]' in compact:
+            return True
+        # ``#[cfg(test)]`` — direct test cfg
+        if '#[cfg(test)]' in compact:
+            return True
+        # ``#[cfg(any(test, ...))]`` and ``#[cfg(all(test, ...))]``
+        if '#[cfg(any(test,' in compact or '#[cfg(all(test,' in compact:
+            return True
+        # cfg(...) where test appears later in the predicate
+        if '#[cfg(' in compact and ('(test,' in compact or ',test)' in compact or ',test,' in compact):
+            return True
+
+    return False
+
+
+
+
 def _shape_for_insert(embedding: Optional[Any]) -> Optional[Any]:
     """Shape ``embedding`` for ``collection.data.insert(vector=)``.
 
@@ -2515,7 +2664,6 @@ class CodeGraphAnalyzer:
         # exists on all 5 code collections so pre-v0.2.47 installs that picked
         # up the new analyzer pick up the property on the next analyze run.
         # Idempotent + soft-fail per collection.
-        self._ensure_project_source_property()
 
         # v0.2.52 (V52-O.4) schema migration: ensure `file_path` property
         # exists on CodeFunction + CodeClass so pre-V52-O.4 installs pick up
@@ -2734,45 +2882,6 @@ class CodeGraphAnalyzer:
                     f"Plan C language-property migration on {label} skipped: {e}"
                 )
 
-    def _ensure_project_source_property(self):
-        """v0.2.47 (extras) schema migration: add `project_source` to all 5
-        code collections so pre-v0.2.47 installs with existing data start
-        recording provenance on the next analyze run. The property is
-        nullable — pre-migration rows show NULL until they're touched by a
-        re-analyze. Idempotent + soft-fail per collection.
-        """
-        collections = [
-            ("CodeModule",      self.modules_collection),
-            ("CodeClass",       self.classes_collection),
-            ("CodeFunction",    self.functions_collection),
-            ("CodeAPI",         self.apis_collection),
-            ("CodeInteraction", self.interactions_collection),
-        ]
-        desc = (
-            "Absolute path of the source root that produced this row "
-            "(primary repo OR extra-path)"
-        )
-        for label, coll in collections:
-            if coll is None:
-                continue
-            try:
-                config = coll.config.get()
-                existing_props = {p.name for p in config.properties}
-                if "project_source" in existing_props:
-                    continue
-                coll.config.add_property(
-                    Property(
-                        name="project_source",
-                        data_type=DataType.TEXT,
-                        description=desc,
-                        skip_vectorization=True,
-                    )
-                )
-                print(f"   Added project_source property to {label} schema (v0.2.47)")
-            except Exception as e:
-                logger.debug(
-                    f"v0.2.47 project_source migration on {label} skipped: {e}"
-                )
 
     def _ensure_file_path_property(self):
         """v0.2.52 (V52-O.4) schema migration: add `file_path` to CodeFunction
@@ -4521,6 +4630,13 @@ class CodeGraphAnalyzer:
 
         for m in func_pattern.finditer(content_clean):
             fname, args_str = m.group(1), m.group(2)
+            # V52-O.11.J (v0.2.52, 2026-06-09): skip functions gated by
+            # `#[cfg(test)]` / `#[test]` / `#[cfg(any(test, ...))]` /
+            # `#[cfg(all(test, ...))]` — test functions are not production
+            # code and indexing them confuses the offline trainer + bloats
+            # the CodeFunction collection. Audit a79152.
+            if _is_rust_test_fn(content_clean, m.start()):
+                continue
             is_async = bool(re.search(rf'async\s+fn\s+{re.escape(fname)}', content_clean))
             start_line = content_clean[:m.start()].count('\n') + 1
             end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)

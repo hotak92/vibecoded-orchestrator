@@ -56,6 +56,29 @@ COLLECTIONS=(
     "${PROJECT_NAME}_CodeInteraction"
 )
 
+# V52-O.11.L (v0.2.52, 2026-06-09): also drop legacy snapshot collections
+# left behind by v0.2.43-era code-graph exploration work. Audit found
+# these lurking — they're not produced by any current analyzer code path,
+# they bloat Weaviate disk + memory, and they show up in collection
+# listings polluting the operator's mental model. Drop on first reset.
+LEGACY_COLLECTIONS=(
+    "Vco_v0243_A_install_CodeFunction"
+    "Vco_v0243_A_install_CodeClass"
+    "Vco_v0243_A_install_CodeModule"
+    "Vco_v0243_A_install_CodeAPI"
+    "Vco_v0243_A_install_CodeInteraction"
+    "Vco_v0243_B_rust_CodeFunction"
+    "Vco_v0243_B_rust_CodeClass"
+    "Vco_v0243_B_rust_CodeModule"
+    "Vco_v0243_B_rust_CodeAPI"
+    "Vco_v0243_B_rust_CodeInteraction"
+    "Vco_v0243_C_cleanup_CodeFunction"
+    "Vco_v0243_C_cleanup_CodeClass"
+    "Vco_v0243_C_cleanup_CodeModule"
+    "Vco_v0243_C_cleanup_CodeAPI"
+    "Vco_v0243_C_cleanup_CodeInteraction"
+)
+
 # --- Arg parsing -----------------------------------------------------------
 
 DRY_RUN=0
@@ -88,6 +111,12 @@ echo "Weaviate:        http://${WEAVIATE_HOST}:${WEAVIATE_PORT}"
 echo
 echo "Will DROP the following Weaviate collections:"
 for c in "${COLLECTIONS[@]}"; do
+    echo "  - $c"
+done
+echo
+echo "Will also DROP these v0.2.43-era legacy snapshot collections"
+echo "(left behind by old code-graph exploration work — V52-O.11.L):"
+for c in "${LEGACY_COLLECTIONS[@]}"; do
     echo "  - $c"
 done
 echo
@@ -162,14 +191,30 @@ echo "Using Python: $PYTHON"
 
 WEAVIATE_HOST="$WEAVIATE_HOST" WEAVIATE_PORT="$WEAVIATE_PORT" \
 COLLS="${COLLECTIONS[*]}" \
+LEGACY_COLLS="${LEGACY_COLLECTIONS[*]}" \
+WEAVIATE_GRPC_PORT="${WEAVIATE_GRPC_PORT:-50052}" \
 "$PYTHON" - <<'PY'
 import os, sys
 import weaviate
+# VCO uses non-standard Weaviate gRPC port 50052 (per CLAUDE.md). The default
+# weaviate-python-client `connect_to_local()` assumes 50051 — fails when the
+# Weaviate container is mapped to 50052 instead (V52-O.2 bug found 2026-06-09
+# during the operator-approved rewalk: gRPC ping refused on 50051).
 host = os.environ.get("WEAVIATE_HOST", "localhost")
 port = int(os.environ.get("WEAVIATE_PORT", "8081"))
+grpc_port = int(os.environ.get("WEAVIATE_GRPC_PORT", "50052"))
 colls = os.environ.get("COLLS", "").split()
-client = weaviate.connect_to_local(host=host, port=port)
+legacy_colls = os.environ.get("LEGACY_COLLS", "").split()
+client = weaviate.connect_to_custom(
+    http_host=host,
+    http_port=port,
+    http_secure=False,
+    grpc_host=host,
+    grpc_port=grpc_port,
+    grpc_secure=False,
+)
 try:
+    # Drop current-name collections first.
     for coll in colls:
         try:
             if client.collections.exists(coll):
@@ -179,6 +224,22 @@ try:
                 print(f"  skip {coll} (not present)")
         except Exception as e:
             print(f"  ERROR dropping {coll}: {e}", file=sys.stderr)
+    # V52-O.11.L: also drop legacy v0.2.43-era snapshot collections.
+    # These are NOT produced by any current analyzer path; they're
+    # debris from an old code-graph exploration cycle. Most installs
+    # won't have them — the ``not present`` branch is the common path
+    # and emits a single info line each.
+    if legacy_colls:
+        print("  --- legacy v0.2.43-era snapshots ---")
+    for coll in legacy_colls:
+        try:
+            if client.collections.exists(coll):
+                client.collections.delete(coll)
+                print(f"  dropped legacy {coll}")
+            else:
+                print(f"  skip legacy {coll} (not present)")
+        except Exception as e:
+            print(f"  ERROR dropping legacy {coll}: {e}", file=sys.stderr)
 finally:
     client.close()
 PY
