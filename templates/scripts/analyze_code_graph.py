@@ -4439,8 +4439,21 @@ class CodeGraphAnalyzer:
             struct_info[name] = start_line
 
         # Functions: fn name(...)
+        # V52-O.11.G (v0.2.52, 2026-06-09): expand prefix regex to capture the
+        # full Rust modifier set — `pub`, `pub(crate)`, `pub(super)`,
+        # `pub(in path)`, `async`, `unsafe`, `const`, `extern "ABI"`,
+        # `default` — in any order, any combination. Pre-V52-O.11.G this
+        # regex only matched `pub` + `async`, silently dropping every
+        # `unsafe fn`, `const fn`, `extern "C" fn`, `pub(crate) fn`, and
+        # `default fn` in the codebase. Mirrors the modifier-set used in
+        # `_rust_methods_for_struct`'s inner method pattern (V52-O.11.F).
         func_pattern = re.compile(
-            r'(?:pub\s+)?(?:async\s+)?fn\s+([\w]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)',
+            # Zero or more modifier tokens, any order. Each token is one of:
+            #   pub | pub(crate) | pub(super) | pub(in path::to::mod)
+            #   async | unsafe | const | extern | extern "ABI" | default
+            r'(?:(?:pub(?:\s*\([^)]*\))?|async|unsafe|const|default'
+            r'|extern(?:\s+"[^"]*")?)\s+)*'
+            r'fn\s+([\w]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)',
             re.MULTILINE
         )
 
