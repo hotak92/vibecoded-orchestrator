@@ -2241,6 +2241,15 @@ pub fn run() {
             // the toggle UI on mount. See `module_enabled.rs`.
             commands::module_enabled::module_set_enabled_for_project,
             commands::module_enabled::module_is_enabled_for_project,
+            // v0.2.52 V52-AD: host-wide (global) enable toggle that
+            // shares the `module_settings` table with the per-project
+            // toggle above. NULL `project_id` row == host default.
+            // Reader cascade: per-project → global → fail-open true.
+            // Settings → Modules tab in the renderer binds to these.
+            commands::module_enabled::module_set_global_enabled,
+            commands::module_enabled::module_is_global_enabled,
+            commands::module_enabled::module_effective_enabled,
+            commands::module_enabled::rl_events_count,
             // Phase 1.5.7 wire-up: DiagramsTab calls
             // `is_project_module_active` on mount to decide whether to
             // render the diagrams UI or the "module disabled" overlay.

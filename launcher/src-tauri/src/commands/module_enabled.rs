@@ -139,6 +139,129 @@ pub async fn module_is_enabled_for_project(
     db.module_is_enabled_for_project(&project_id, &module_id)
 }
 
+// ─── v0.2.52 V52-AD — GLOBAL (host-wide) toggle commands ───────────────
+//
+// Sibling commands to `module_set_enabled_for_project` /
+// `module_is_enabled_for_project`, but acting on the NULL-project row
+// added by migration 034. Reuses the same audit event + renderer
+// notification machinery, with `project_id` set to the sentinel string
+// "__global__" in the event payload so consumers can distinguish a
+// per-project flip from a global flip.
+//
+// The Svelte renderer's Settings → Modules tab binds its "Default ON / OFF"
+// switch to `module_set_global_enabled`; the per-project Modules panel
+// keeps using `module_set_enabled_for_project` exactly as before. Both
+// surfaces fire the same `module:enabled-for-project-changed` event so a
+// single global flip redraws every project's RL panel without polling.
+
+/// Sentinel value used in the event payload's `project_id` field when
+/// the change applies host-wide (no per-project row written). Distinct
+/// enough from any UUID-shaped real project_id that a Svelte switch on
+/// `event.project_id === '__global__'` reliably picks the global case.
+pub const GLOBAL_PROJECT_SENTINEL: &str = "__global__";
+
+/// Set the GLOBAL (host-wide) enable flag for a module. The row is
+/// stored in `module_settings` with `project_id IS NULL` (migration
+/// 034). Per-project overrides take precedence at read time — see
+/// `Db::module_effective_enabled`.
+///
+/// Auth/permission model: same as the per-project setter — local-only
+/// Tauri command surface, audit log captures every flip.
+#[command]
+pub async fn module_set_global_enabled(
+    module_id: String,
+    enabled: bool,
+    db: State<'_, Db>,
+    app: AppHandle,
+) -> Result<(), String> {
+    // Empty module_id is almost always a bug in the caller. Reject up
+    // front rather than writing an orphan row.
+    if module_id.trim().is_empty() {
+        return Err("module_id must not be empty".to_string());
+    }
+
+    db.module_set_global_enabled(&module_id, enabled)?;
+
+    db.audit(
+        "module_global_enabled_changed",
+        None, // No project_id for a global flip.
+        Some(&module_id),
+        &serde_json::json!({
+            "enabled": enabled,
+            "scope": "global",
+        }),
+    )?;
+
+    // Reuse the per-project event channel — the renderer already
+    // subscribes for redraw. project_id = "__global__" lets consumers
+    // distinguish a global flip from a per-project one.
+    let payload = ModuleEnabledChangedEvent {
+        project_id: GLOBAL_PROJECT_SENTINEL.to_string(),
+        module_id: module_id.clone(),
+        enabled,
+    };
+    if let Err(e) = app.emit(MODULE_ENABLED_EVENT, payload) {
+        eprintln!(
+            "[module_enabled] emit({}) failed for global flip ({}): {}",
+            MODULE_ENABLED_EVENT, module_id, e
+        );
+    }
+
+    Ok(())
+}
+
+/// Read the GLOBAL (host-wide) enable flag for a module. Returns
+/// `Some(bool)` when the row exists, `None` when no global row has been
+/// written yet. The renderer's Settings → Modules tab uses `None` to
+/// render an "(default — system fallback)" indicator vs an explicit
+/// "(default ON / OFF by user choice)".
+#[command]
+pub async fn module_is_global_enabled(
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<Option<bool>, String> {
+    db.module_global_enabled(&module_id)
+}
+
+/// Read the effective enable flag for a (project, module) pair using
+/// the v0.2.52 V52-AD cascade (per-project → global → fail-open true).
+/// This is the value the hub resolver emits as
+/// `rl_reranker_enabled_for_project`; the renderer reads it to display
+/// the "Effective state" indicator above the per-project + global
+/// switches.
+#[command]
+pub async fn module_effective_enabled(
+    project_id: String,
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    db.module_effective_enabled(&project_id, &module_id)
+}
+
+// ─── v0.2.52 V52-AD — RL training-data accumulator query ───────────────
+//
+// The "auto-enable trigger" use case (user-stated 2026-06-09): once
+// 500+ retrieval events have accumulated in `rl_events`, prompt the
+// user to enable the RL reranker. This command reports the current
+// count so the Settings → Modules tab can render a progress indicator
+// and an "Enable now" button when the threshold is met.
+
+/// Count rows in `rl_events`. Used by the Settings → Modules tab to
+/// decide whether to show the "Enough training data — enable RL?"
+/// prompt. Counts both `retrieval` and `citation` event types
+/// (training reads both via the offline_trainer's join).
+///
+/// Returns a single integer. Soft-fail at the renderer layer: a
+/// transient DB error renders as "—" rather than blocking the tab.
+#[command]
+pub async fn rl_events_count(db: State<'_, Db>) -> Result<i64, String> {
+    let guard = db.lock();
+    let n: i64 = guard
+        .query_row("SELECT COUNT(*) FROM rl_events", [], |r| r.get(0))
+        .map_err(|e| format!("rl_events_count: {}", e))?;
+    Ok(n)
+}
+
 // ─── Seeding helpers (called from project_create / install / uninstall) ──
 
 /// Resolve the manifest for an installed (project_id, module_id) pair and
