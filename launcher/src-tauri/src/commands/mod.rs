@@ -160,4 +160,10 @@ pub mod secrets_import;
 pub mod self_update;
 pub mod storage_ux;
 pub mod telemetry_cmd;
+// V52-AI (v0.2.52): MCP fork-bomb mitigation. Lockfile at
+// <vct_root>/.update-in-progress.json that MCP servers + ensure-containers
+// hooks read to decide whether to skip startup during an active update.
+// Without this gate, Windows users saw ~97 python + ~77 node MCP
+// processes spawn in a respawn loop, requiring manual taskkill.
+pub mod update_gate;
 pub mod volumes;
