@@ -50,6 +50,7 @@ import json
 import logging
 import re
 import asyncio
+import functools
 import uuid
 from typing import Any, Optional, List, Dict
 from pathlib import Path
@@ -2633,6 +2634,12 @@ def _reset_weaviate_client_cache() -> None:
     Called from search-tool exception handlers when WeaviateUnreachable
     is detected so transient port-binding glitches recover automatically
     on the next user-driven retry.
+
+    V52-I Fix A (2026-06-09): also clears the per-collection
+    `valid_until` schema cache (`_collection_has_valid_until.cache_clear`)
+    because schema-altering events (drop+recreate, additive migrate)
+    typically coincide with client-cache resets. The reset is a no-op
+    when the cache function isn't yet defined (during module init).
     """
     global weaviate_client
     if weaviate_client is not None:
@@ -2641,6 +2648,14 @@ def _reset_weaviate_client_cache() -> None:
         except Exception:
             pass
         weaviate_client = None
+    # Forward-reference safe: `_reset_valid_until_cache` is defined later
+    # in this module but resolution happens at CALL time, not def time.
+    try:
+        _reset_valid_until_cache()
+    except NameError:
+        # Module still being initialized — cache function not yet bound.
+        # Fine: there's nothing cached yet anyway.
+        pass
 
 
 # v0.2.18: Lazy + cached EmbeddingService accessor.
@@ -4789,6 +4804,69 @@ async def search_single_collection(collection_name: str, query: str, limit: int,
         return []
 
 
+# V52-I Fix A (2026-06-09): per-collection cache of whether `valid_until`
+# property exists. The MCP fans hybrid_search / semantic_graph_search across
+# {project KG, shared KG, peer KGs, _Development, _Diagrams} but only the
+# *_Development collections AND the per-project KG (via sync_knowledge_graph
+# additive migrate path) are guaranteed to have `valid_until`. Shared KG and
+# both Diagrams classes are MISSING the property on existing installs (see
+# gap matrix in V52-I plan). Attaching the stale filter to those collections
+# triggers a Weaviate schema error → MCP records a false-positive
+# `partial_fan_out_schema_missing` telemetry event (30 events in corpus).
+#
+# This cache lets `_stale_filter_for(collection_name)` ask "does this
+# collection actually have the property?" once and reuse the answer for
+# the lifetime of the MCP subprocess. lru_cache(maxsize=64) is plenty —
+# even a power user with 10 peer projects sits at <20 distinct collections.
+#
+# Fix B (companion in vco_lib/project_init.py + the migrate script) closes
+# the gap on FRESH installs by adding the props at create-time. Fix A is
+# the defensive runtime layer that protects existing installs without
+# requiring a schema migration.
+@functools.lru_cache(maxsize=64)
+def _collection_has_valid_until(collection_name: str) -> bool:
+    """Return True iff the collection's Weaviate schema has a `valid_until`
+    property. Cached for the MCP subprocess lifetime.
+
+    Conservative on probe failure: returns False so callers SKIP the stale
+    filter (preferring "some stale nodes leak through" over "every query
+    against this collection schema-fails"). Probe failures are logged at
+    DEBUG so they don't spam under normal operation.
+
+    Why probe instead of attempting+rescuing the filter: Weaviate raises
+    the schema error from inside `near_vector` / `bm25`, which would
+    require wrapping every fan-out call site in retry logic. The probe is
+    a single cheap `collection.config.get()` per collection, called once.
+    """
+    if not collection_name:
+        return False
+    try:
+        client = get_weaviate_client()
+        coll = client.collections.get(collection_name)
+        config = coll.config.get()
+        return any(p.name == "valid_until" for p in (config.properties or []))
+    except Exception as exc:  # noqa: BLE001 — soft-fail intentional
+        logger.debug(
+            "_collection_has_valid_until: probe failed for '%s' (%s); "
+            "treating as missing-property",
+            collection_name, exc,
+        )
+        return False
+
+
+def _reset_valid_until_cache() -> None:
+    """Clear the `valid_until` schema cache.
+
+    Called from `_reset_weaviate_client_cache` after schema-altering
+    operations (drop+recreate, migrate scripts) so the next search re-probes
+    against the current schema state. Safe to call unconditionally.
+    """
+    try:
+        _collection_has_valid_until.cache_clear()
+    except Exception:  # noqa: BLE001 — defensive; cache_clear shouldn't fail
+        pass
+
+
 def _stale_filter(include_stale: bool = False):
     """Filter that excludes nodes whose `valid_until` is in the past.
 
@@ -4814,6 +4892,14 @@ def _stale_filter(include_stale: bool = False):
     rebuilt. See `sync_knowledge_graph.py::ensure_collection_exists` and
     `analyze_code_graph.py::_inverted_index_config`.
 
+    NOTE (V52-I, 2026-06-09): prefer `_stale_filter_for(collection_name)`
+    at all NEW call sites. This bare `_stale_filter` assumes every
+    collection in the fan-out has `valid_until` — that's true for
+    *_Development and per-project KG (via sync-script migrate) but NOT
+    for shared KG or *_Diagrams on existing installs. Sites that fan out
+    across heterogeneous collections must use `_stale_filter_for` to
+    avoid `partial_fan_out_schema_missing` false-positives.
+
     Pass a datetime object (not ISO string) — the Python client serializes
     to valueDate, which the date-typed property requires.
     """
@@ -4824,6 +4910,29 @@ def _stale_filter(include_stale: bool = False):
         Filter.by_property("valid_until").is_none(True)
         | Filter.by_property("valid_until").greater_than(now)
     )
+
+
+def _stale_filter_for(collection_name: str, include_stale: bool = False):
+    """Schema-aware variant of `_stale_filter`.
+
+    Returns None (caller treats as "no filter") when either:
+      - `include_stale=True` (explicit caller override), OR
+      - the collection's schema doesn't have `valid_until` (per the cache
+        in `_collection_has_valid_until`).
+
+    Otherwise returns the same `Filter` shape as `_stale_filter`. Use
+    this at every fan-out call site that searches across heterogeneous
+    collections (project KG + shared KG + Diagrams + Development) — the
+    bare `_stale_filter` is unsafe there because shared KG and Diagrams
+    collections lack `valid_until` on existing installs.
+
+    V52-I Fix A (2026-06-09).
+    """
+    if include_stale:
+        return None
+    if not _collection_has_valid_until(collection_name):
+        return None
+    return _stale_filter(include_stale=False)
 
 
 @mcp.tool()
@@ -4908,8 +5017,14 @@ async def _semantic_graph_search_body(
 
     fetch_limit = limit * _RL_OVERFETCH
 
-    # Stale-filter applied at query time, before RL rerank + result counting.
-    stale = _stale_filter(include_stale=include_stale)
+    # V52-I Fix A (2026-06-09): stale-filter is now computed PER-COLLECTION
+    # via `_stale_filter_for(coll_name, include_stale=...)` — see the
+    # for-loop body below. The single-shot `stale = _stale_filter(...)`
+    # pattern broke when shared KG / peer KGs / Diagrams collections lacked
+    # `valid_until` (Weaviate emits a schema error, which the fan-out's
+    # except classifier records as `partial_fan_out_schema_missing` —
+    # 30 false-positives in our corpus). Per-collection gating eliminates
+    # that. `include_stale` flows through unchanged.
 
     # Determine all collections to search. Mirrors hybrid_search: project KG +
     # shared KG (when configured) + peer-project KGs from the launcher's
@@ -4975,6 +5090,10 @@ async def _semantic_graph_search_body(
         # only apply when the loop never runs.)
         query_vector = None
         query_target = ""
+        # V52-I Fix A: per-collection schema-aware stale filter — skip when
+        # the collection's schema lacks `valid_until` (shared KG / Diagrams
+        # on existing installs). See `_collection_has_valid_until` cache.
+        stale = _stale_filter_for(coll_name, include_stale=include_stale)
         try:
             if EMBEDDING_SOURCE == "weaviate":
                 nt_kwargs = dict(query=query, limit=fetch_limit, return_metadata=["distance"])
@@ -5265,12 +5384,26 @@ async def _hybrid_search_single_collection(
     fetch_limit: int,
     weaviate_filter,
     date_filter,
+    include_stale: bool = False,
 ) -> dict:
-    """Run hybrid (semantic + keyword) search on one collection, return combined dict keyed by (title, chunk)."""
+    """Run hybrid (semantic + keyword) search on one collection, return combined dict keyed by (title, chunk).
+
+    V52-I Fix A (2026-06-09): the stale-filter (valid_until > now | is_none)
+    is applied here, gated by `_stale_filter_for(coll_name)` — the gate
+    returns None when this collection's schema lacks `valid_until`
+    (shared KG + *_Diagrams on existing installs), avoiding the
+    schema error that produced 30 false-positive partial-fan-out events.
+    """
     client = get_weaviate_client()
     coll = client.collections.get(coll_name)
 
     effective_filter = weaviate_filter
+    # V52-I Fix A: schema-aware stale filter — only attach when the
+    # collection actually has `valid_until`. See `_stale_filter_for`
+    # docstring + the module-level _collection_has_valid_until cache.
+    stale = _stale_filter_for(coll_name, include_stale=include_stale)
+    if stale is not None:
+        effective_filter = (effective_filter & stale) if effective_filter else stale
     if date_filter is not None:
         effective_filter = (effective_filter & date_filter) if effective_filter else date_filter
 
@@ -5554,7 +5687,8 @@ async def _hybrid_search_body(
 ) -> str:
     """Implementation body for hybrid_search. Extracted so the public tool
     can wrap the entire query path with v2 loud-fail handling."""
-    # Build type/tag filter
+    # Build type/tag filter (NON-stale terms only; stale is mixed in
+    # per-collection below — see V52-I Fix A).
     filters = []
     if node_type:
         filters.append(Filter.by_property("node_type").equal(node_type))
@@ -5562,17 +5696,20 @@ async def _hybrid_search_body(
         for tag in tags:
             filters.append(Filter.by_property("tags").contains_any([tag]))
 
-    # Stale-filter — exclude archived/expired nodes BEFORE rerank+counting.
-    # Caller passes `include_stale=True` to disable (audits, history queries).
-    stale = _stale_filter(include_stale=include_stale)
-    if stale is not None:
-        filters.append(stale)
-
     weaviate_filter = None
     if filters:
         weaviate_filter = filters[0]
         for f in filters[1:]:
             weaviate_filter = weaviate_filter & f
+
+    # V52-I Fix A (2026-06-09): the stale-filter is applied PER-COLLECTION
+    # inside `_hybrid_search_single_collection` via `_stale_filter_for`,
+    # NOT pre-combined here. Reason: not every collection in the fan-out
+    # has `valid_until` (shared KG + *_Diagrams on existing installs lack
+    # it). Pre-combining the stale clause produced 30 false-positive
+    # `partial_fan_out_schema_missing` telemetry events. The per-collection
+    # path lets each collection get the filter only if its schema supports
+    # it. `include_stale` flows through unchanged.
 
     # Optional date filter
     date_filter = None
@@ -5638,7 +5775,8 @@ async def _hybrid_search_body(
     for coll_name in collections_to_search:
         try:
             coll_combined = await _hybrid_search_single_collection(
-                coll_name, query, fetch_limit, weaviate_filter, date_filter
+                coll_name, query, fetch_limit, weaviate_filter, date_filter,
+                include_stale=include_stale,
             )
             for key, item in coll_combined.items():
                 if key not in merged or item["combined_score"] > merged[key]["combined_score"]:
