@@ -105,6 +105,7 @@ if _sys.platform == "win32":
         pass
 
 import argparse
+import datetime
 import json
 import os
 import platform
@@ -17255,6 +17256,176 @@ def _is_windows_sharing_violation(exc: OSError) -> bool:
     return getattr(exc, "winerror", None) == 32
 
 
+def _try_invoke_windows_stage1_updater(
+    install_root: Path,
+    *,
+    launcher_pid: Optional[int],
+) -> Optional[Path]:
+    """v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): CLI parity for the
+    Windows stage1 updater handoff.
+
+    When the user runs ``python install.py --update`` from a terminal
+    (NOT via the launcher GUI), the launcher GUI's Tauri command
+    ``prepare_windows_update_handoff`` is unreachable. This Python-side
+    helper provides equivalent behaviour:
+
+    1. Check we're on Windows. POSIX → no-op (the rename pattern in
+       ``_refresh_dist_binary_after_rebuild`` already handles binary
+       swap correctly via inode ref-counting).
+    2. Check the launcher is running. ``launcher_pid`` comes from
+       ``$VCT_LAUNCHER_PID`` (set by the Tauri caller) or — when CLI-
+       invoked — from a process scan. If no launcher is running, no
+       handoff is needed; install.py overwrites the dist binary directly.
+    3. Resolve ``launcher/dist/windows-x64/vct-updater.exe``. If missing
+       (orchestrator clone predates v0.2.52), return None — caller falls
+       back to the existing ``launcher_binary_swap_failed_locked``
+       deferral path.
+    4. Build the lock JSON describing the binaries that need swapping.
+       Mirror of the Rust ``UpdateLock`` struct in
+       ``commands/update_handoff.rs``.
+    5. Write the lock atomically (``<vct_root>/update.lock.json.tmp``
+       + rename onto canonical name).
+    6. Spawn ``vct-updater.exe`` DETACHED via ``CREATE_NEW_PROCESS_GROUP``
+       + ``DETACHED_PROCESS`` flags. The updater polls the launcher PID
+       until it exits, then performs ``MoveFileExW`` for each entry.
+
+    Returns the lock file path on success, None on any failure
+    (including non-Windows, no launcher running, updater missing,
+    spawn error). Soft-fail throughout: caller treats None as
+    "fall back to legacy deferral path".
+
+    Args:
+        install_root: Repository root containing ``launcher/dist/``.
+        launcher_pid: Running launcher PID, or None if unknown. When
+            None, we attempt a best-effort scan but skip handoff if
+            we can't find a running launcher (it may have already exited).
+    """
+    if not platform.system().lower().startswith("win"):
+        return None
+
+    # Resolve dist directory + updater binary.
+    dist_dir = install_root / "launcher" / "dist" / "windows-x64"
+    updater_path = dist_dir / "vct-updater.exe"
+    if not updater_path.is_file():
+        _log_install_event(
+            "stage1_updater", "skip",
+            f"vct-updater.exe not found at {updater_path} — falling back "
+            "to launcher_restart_required deferral path",
+        )
+        return None
+
+    # Determine launcher PID. If the caller didn't pass one, no handoff
+    # is needed (install.py is in its standard "running launcher will
+    # restart later" mode; the deferral path covers this).
+    if launcher_pid is None or launcher_pid <= 0:
+        _log_install_event(
+            "stage1_updater", "skip",
+            "no launcher PID provided — handoff not needed "
+            "(install.py overwrites dist binary directly or emits deferral)",
+        )
+        return None
+
+    # Build the swap list. Only include candidates that have a
+    # `<target>.new` staged sibling on disk. If neither is staged, the
+    # handoff has nothing to do and we fall back.
+    swap_targets: list[Path] = []
+    for fname in ["vct-launcher.exe", "vct-hub.exe"]:
+        target = dist_dir / fname
+        staged = target.with_suffix(target.suffix + ".new")
+        if staged.is_file():
+            swap_targets.append(target)
+
+    if not swap_targets:
+        _log_install_event(
+            "stage1_updater", "skip",
+            "no <target>.new staged binaries — handoff not needed",
+        )
+        return None
+
+    # Resolve vct_root_dir for the lock file location. Mirror of
+    # vco_lib.paths.vct_root_dir().
+    try:
+        from vco_lib.paths import vct_root_dir as _vct_root
+        vct_root = _vct_root()
+    except Exception:  # noqa: BLE001 — soft-fail
+        # Fallback: ~/.vct (the canonical default).
+        home = Path.home()
+        vct_root = home / ".vct"
+
+    try:
+        vct_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log_install_event(
+            "stage1_updater", "warn",
+            f"could not create vct_root_dir {vct_root}: {exc}",
+        )
+        return None
+
+    lock_path = vct_root / "update.lock.json"
+
+    # Build lock contents. Keep struct shape identical to the Rust
+    # commands/update_handoff::UpdateLock — same field names, same JSON
+    # so the Rust vct-updater binary can parse it.
+    lock_payload: dict[str, Any] = {
+        "parent_pid": int(launcher_pid),
+        "swaps": [{"target": str(t)} for t in swap_targets],
+        "relaunch": str(dist_dir / "vct-launcher.exe"),
+        "started_at": datetime.datetime.utcnow().replace(
+            tzinfo=datetime.timezone.utc,
+        ).isoformat(),
+    }
+
+    # Atomic write.
+    tmp_path = lock_path.with_suffix(".json.tmp")
+    try:
+        tmp_path.write_text(json.dumps(lock_payload, indent=2), encoding="utf-8")
+        os.replace(tmp_path, lock_path)
+    except OSError as exc:
+        _log_install_event(
+            "stage1_updater", "warn",
+            f"could not write lock file {lock_path}: {exc}",
+        )
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    # Spawn the updater DETACHED so it survives this Python process
+    # exiting. The flags mirror the Rust side:
+    #   - CREATE_NEW_PROCESS_GROUP (0x00000200)
+    #   - DETACHED_PROCESS (0x00000008)
+    # On Windows, subprocess.Popen supports these via creationflags.
+    try:
+        creation_flags = 0x00000200 | 0x00000008  # NEW_PROCESS_GROUP | DETACHED
+        subprocess.Popen(
+            [str(updater_path), str(lock_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+            close_fds=True,
+        )
+    except OSError as exc:
+        # Clean up the lock — no updater is running to honor it.
+        _log_install_event(
+            "stage1_updater", "warn",
+            f"could not spawn vct-updater.exe: {exc} — cleaning lock",
+        )
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    _log_install_event(
+        "stage1_updater", "ok",
+        f"stage1 handoff initiated: lock={lock_path}, swaps={len(swap_targets)}, "
+        f"parent_pid={launcher_pid}",
+    )
+    return lock_path
+
+
 def _emit_launcher_restart_deferral(
     deferral_report: Any,
     *,
@@ -17797,23 +17968,84 @@ def _refresh_dist_binary_after_rebuild(
                     f"to {backup_path}, new binary written to {dist_path}",
                 )
             except OSError as rename_exc:
-                # Both direct overwrite AND rename failed. Emit the
-                # binary-swap-locked deferral so the GUI tells the user
-                # to fully quit + retry from terminal.
-                _log_install_event(
-                    "refresh_dist_binary", "error",
-                    f"Windows binary-swap failed; both overwrite ({exc}) "
-                    f"and rename ({rename_exc}) hit ERROR_SHARING_VIOLATION. "
-                    f"Emitting launcher_binary_swap_failed_locked deferral.",
-                )
-                _emit_binary_swap_locked_deferral(
-                    deferral_report,
-                    new_binary_path=dist_path,
-                    error_detail=(
-                        f"overwrite={exc!r}; rename={rename_exc!r}"
-                    ),
-                )
-                return None
+                # v0.2.52 V52-AH (Fabio bug 1): both direct overwrite
+                # AND rename failed. Before giving up with the
+                # `launcher_binary_swap_failed_locked` deferral, try
+                # staging the new binary at `<dist_path>.new` so the
+                # stage1 updater (vct-updater.exe) can swap it after
+                # the running launcher exits.
+                staged_new = dist_path.with_suffix(dist_path.suffix + ".new")
+                try:
+                    shutil.copy2(src, staged_new)
+                    _log_install_event(
+                        "refresh_dist_binary", "ok",
+                        f"Windows binary lock detected; staged new binary at "
+                        f"{staged_new} for stage1 updater handoff "
+                        f"(overwrite={exc!r}; rename={rename_exc!r})",
+                    )
+                    # Try the stage1 handoff. If we have a launcher PID,
+                    # spawn vct-updater.exe; otherwise fall back to the
+                    # legacy `launcher_binary_swap_failed_locked` flow.
+                    old_pid_str = os.environ.get("VCT_LAUNCHER_PID", "").strip()
+                    launcher_pid: Optional[int] = None
+                    if old_pid_str:
+                        try:
+                            launcher_pid = int(old_pid_str)
+                        except ValueError:
+                            launcher_pid = None
+                    lock_path = _try_invoke_windows_stage1_updater(
+                        install_root, launcher_pid=launcher_pid,
+                    )
+                    if lock_path is not None:
+                        # Handoff initiated. Treat the swap as "logically
+                        # succeeded" — the new bytes are on disk at
+                        # <dist_path>.new and the updater will rename
+                        # them onto the canonical path after the launcher
+                        # exits. We deliberately do NOT emit
+                        # launcher_restart_required here because the
+                        # updater itself will relaunch.
+                        swap_succeeded = True
+                        _log_install_event(
+                            "refresh_dist_binary", "ok",
+                            f"stage1 updater handoff initiated "
+                            f"(lock={lock_path}); deferral suppressed",
+                        )
+                    else:
+                        # No handoff possible (no PID, no updater binary,
+                        # spawn failure). Fall back to the legacy deferral.
+                        _log_install_event(
+                            "refresh_dist_binary", "warn",
+                            "stage1 updater handoff not available; "
+                            "emitting launcher_binary_swap_failed_locked",
+                        )
+                        _emit_binary_swap_locked_deferral(
+                            deferral_report,
+                            new_binary_path=dist_path,
+                            error_detail=(
+                                f"overwrite={exc!r}; rename={rename_exc!r}; "
+                                f"staged_at={staged_new}"
+                            ),
+                        )
+                        return None
+                except OSError as stage_exc:
+                    # Couldn't even write the .new sibling — disk full,
+                    # permissions, etc. Fall back to the legacy deferral.
+                    _log_install_event(
+                        "refresh_dist_binary", "error",
+                        f"Windows binary-swap failed; both overwrite ({exc}) "
+                        f"and rename ({rename_exc}) hit ERROR_SHARING_VIOLATION, "
+                        f"and staging .new copy failed ({stage_exc}). "
+                        f"Emitting launcher_binary_swap_failed_locked deferral.",
+                    )
+                    _emit_binary_swap_locked_deferral(
+                        deferral_report,
+                        new_binary_path=dist_path,
+                        error_detail=(
+                            f"overwrite={exc!r}; rename={rename_exc!r}; "
+                            f"stage_new={stage_exc!r}"
+                        ),
+                    )
+                    return None
         else:
             _log_install_event(
                 "refresh_dist_binary", "warn",
