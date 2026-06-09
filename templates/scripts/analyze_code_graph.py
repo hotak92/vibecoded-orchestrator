@@ -249,10 +249,24 @@ _COMMON_IGNORE_DIRS: frozenset = frozenset({
     '__pycache__', '.pytest_cache',
     # Generic build outputs
     'build', 'dist',
+    'out',                  # generic build output (alongside 'build', 'dist')
     # JS/TS dependency cache
     'node_modules',
     # v0.2.16 — git-worktree clones under .claude/worktrees/agent-*/
     'worktrees',
+    # v0.2.52 (V52-O.1) — JS/TS framework codegen + cache dirs. SvelteKit
+    # in particular produces a `.svelte-kit/output/` tree full of Rollup
+    # chunks that look like JS source to the analyzer; in real-world
+    # measurements 93% of CodeFunction rows on a SvelteKit project came
+    # from chunk-*.js files. Adding the framework codegen + cache dirs
+    # here prevents this entire pollution class.
+    '.svelte-kit',          # SvelteKit codegen (output/, generated/)
+    '.next',                # Next.js
+    '.nuxt',                # Nuxt
+    '.cache',               # generic framework cache
+    '.parcel-cache',        # Parcel
+    '.turbo',               # Turborepo
+    '.angular',             # Angular cache
 })
 
 
