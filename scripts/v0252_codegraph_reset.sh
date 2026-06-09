@@ -3,12 +3,9 @@
 #
 # V52-O.2 — Code-graph collection reset + re-walk helper.
 #
-# Drops the five polluted VibeCodedOrchestrator_Code* collections in
-# Weaviate and re-walks both source roots (VCO_dev primary repo +
-# vibecoded-orchestrator public clone as --extra-path) with the V52-O.1
-# (ignore-set), V52-O.3 (UUID5 cross-root dedup), and V52-O.4
-# (file_path property) fixes from chore/v0252-codegraph-indexer-fix
-# already applied.
+# Drops the five polluted Code* collections in Weaviate and re-walks
+# one or two source roots with the V52-O.1 (ignore-set), V52-O.3 (UUID5
+# cross-root dedup), and V52-O.4 (file_path property) fixes applied.
 #
 # DESTRUCTIVE — requires explicit user confirmation (or --yes for
 # automation). A --dry-run flag prints what would happen without
@@ -19,25 +16,35 @@
 #   scripts/v0252_codegraph_reset.sh --dry-run  # show plan, no changes
 #   scripts/v0252_codegraph_reset.sh --yes      # skip prompt (CI / scripts)
 #
+# Configuration (env-driven; sensible defaults for fresh installs):
+#   V52_PRIMARY_REPO    — primary repo to walk (default: this script's repo root)
+#   V52_EXTRA_PATH      — optional extra-path (default: unset, walks primary only)
+#   V52_PROJECT_NAME    — project name used to derive collection prefix
+#                         (default: VibeCodedOrchestrator)
+#   WEAVIATE_HOST       — default localhost
+#   WEAVIATE_HTTP_PORT  — default 8081
+#   WEAVIATE_GRPC_PORT  — default 50052 (NOT the upstream-default 50051;
+#                         see knowledge/tools/weaviate-grpc-port-50052-gotcha.md)
+#
 # Prereqs:
 #   - Weaviate running at http://localhost:8081 (default port).
 #   - .claude/scripts/code-graph-analyze available + executable.
-#   - VCO_dev clone present at the expected primary path.
-#   - vibecoded-orchestrator public clone present at the expected
-#     extra-path (this script's directory's parent, by default).
 
 set -euo pipefail
 
 # --- Config ----------------------------------------------------------------
 
-# Primary repo to walk (VCO_dev) — operational private fork.
-PRIMARY_REPO="${V52_PRIMARY_REPO:-/home/martino/Desktop/PROGETTI/VCO_dev}"
-
-# Extra-path (vibecoded-orchestrator public clone). Default = the script's
-# repo root, so running from inside the public clone "just works".
+# Primary repo to walk. Default: this script's repo root (i.e. the
+# checkout the operator runs the script from). Override with
+# V52_PRIMARY_REPO env var when an out-of-tree repo is the intended target.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_EXTRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
-EXTRA_PATH="${V52_EXTRA_PATH:-$DEFAULT_EXTRA_PATH}"
+DEFAULT_PRIMARY_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+PRIMARY_REPO="${V52_PRIMARY_REPO:-$DEFAULT_PRIMARY_REPO}"
+
+# Optional extra-path (e.g. dual-clone setups where the operator wants
+# to walk an additional source tree in the same rewalk). Unset by
+# default; set V52_EXTRA_PATH to enable.
+EXTRA_PATH="${V52_EXTRA_PATH:-}"
 
 # Project name used to derive the collection prefix.
 PROJECT_NAME="${V52_PROJECT_NAME:-VibeCodedOrchestrator}"
@@ -105,7 +112,7 @@ echo "================================================================="
 echo "V52-O.2 — Code-graph collection reset + re-walk"
 echo "================================================================="
 echo "Primary repo:    $PRIMARY_REPO"
-echo "Extra-path:      $EXTRA_PATH"
+echo "Extra-path:      ${EXTRA_PATH:-(none — single-root walk)}"
 echo "Project name:    $PROJECT_NAME"
 echo "Weaviate:        http://${WEAVIATE_HOST}:${WEAVIATE_PORT}"
 echo
@@ -138,9 +145,9 @@ if [ ! -d "$PRIMARY_REPO" ]; then
     exit 3
 fi
 
-if [ ! -d "$EXTRA_PATH" ]; then
-    echo "ERROR: extra-path not found at $EXTRA_PATH" >&2
-    echo "       Set V52_EXTRA_PATH env var to override." >&2
+if [ -n "$EXTRA_PATH" ] && [ ! -d "$EXTRA_PATH" ]; then
+    echo "ERROR: V52_EXTRA_PATH set to '$EXTRA_PATH' but directory not found" >&2
+    echo "       Unset V52_EXTRA_PATH to walk PRIMARY_REPO only." >&2
     exit 3
 fi
 
@@ -170,11 +177,14 @@ echo "Dropping collections..."
 # Locate a Python with the weaviate client. Prefer the orchestrator's MCP
 # venv (the analyzer ships with weaviate-client v4), then the system python.
 PYTHON=""
-for candidate in \
-    "$PRIMARY_REPO/claude_mcp_servers/.venv/bin/python" \
-    "$EXTRA_PATH/claude_mcp_servers/.venv/bin/python" \
-    "$(command -v python3)" \
-    "$(command -v python)"; do
+# Candidate list: primary repo's venv first, then optional extra-path
+# venv (skipped if EXTRA_PATH is empty), then system python.
+CANDIDATES=("$PRIMARY_REPO/claude_mcp_servers/.venv/bin/python")
+if [ -n "$EXTRA_PATH" ]; then
+    CANDIDATES+=("$EXTRA_PATH/claude_mcp_servers/.venv/bin/python")
+fi
+CANDIDATES+=("$(command -v python3)" "$(command -v python)")
+for candidate in "${CANDIDATES[@]}"; do
     if [ -x "$candidate" ] && "$candidate" -c "import weaviate" 2>/dev/null; then
         PYTHON="$candidate"
         break
@@ -247,13 +257,22 @@ PY
 # --- Re-walk both source roots --------------------------------------------
 
 echo
-echo "Re-walking primary repo + extra-path..."
+if [ -n "$EXTRA_PATH" ]; then
+    echo "Re-walking primary repo + extra-path..."
+else
+    echo "Re-walking primary repo..."
+fi
 echo "(this re-creates schemas + populates rows)"
 echo
 
-"$ANALYZER" "$PRIMARY_REPO" \
-    --project "$PROJECT_NAME" \
-    --extra-path "$EXTRA_PATH"
+if [ -n "$EXTRA_PATH" ]; then
+    "$ANALYZER" "$PRIMARY_REPO" \
+        --project "$PROJECT_NAME" \
+        --extra-path "$EXTRA_PATH"
+else
+    "$ANALYZER" "$PRIMARY_REPO" \
+        --project "$PROJECT_NAME"
+fi
 
 echo
 echo "================================================================="
