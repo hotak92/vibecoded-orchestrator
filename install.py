@@ -17370,9 +17370,11 @@ def _try_invoke_windows_stage1_updater(
         "parent_pid": int(launcher_pid),
         "swaps": [{"target": str(t)} for t in swap_targets],
         "relaunch": str(dist_dir / "vct-launcher.exe"),
-        "started_at": datetime.datetime.utcnow().replace(
-            tzinfo=datetime.timezone.utc,
-        ).isoformat(),
+        # Timezone-aware UTC timestamp. The launcher's boot recovery
+        # (Rust commands::update_handoff::poll_update_lock_on_boot)
+        # parses this via chrono::DateTime::parse_from_rfc3339 to
+        # detect stale locks (>10 min old).
+        "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
     # Atomic write.
