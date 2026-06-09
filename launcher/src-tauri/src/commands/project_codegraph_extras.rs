@@ -664,6 +664,43 @@ pub async fn sync_project_codegraph_extra_path(
         sha.as_deref(),
     );
 
+    // V52-Z (v0.2.52): also upsert `code_graph_builds` so the launcher's
+    // "last successful build" UI reflects extra-path activity. Without
+    // this the UI shows the last PRIMARY-folder analyzer run timestamp
+    // even when an extra-path sync was the most recent activity (the
+    // launcher.db audit log already records the path-level event, but
+    // the GUI reads the timestamp from `code_graph_builds`).
+    //
+    // Schema constraint: `code_graph_builds` is PRIMARY KEY on
+    // project_id (one row per project) → we UPSERT, overwriting the
+    // previous row. This intentionally loses the primary-vs-extra
+    // discrimination at this layer; if/when V52-O.5 introduces a
+    // history table with a `source` discriminator column, this call
+    // site is the second of two that need to migrate over.
+    //
+    // Best-effort: a failing upsert MUST NOT fail the user-visible
+    // sync (the data is already in Weaviate; the row write is
+    // bookkeeping). Errors flow through eprintln! via the helper's
+    // signature contract.
+    let started_at_ms = now - duration_ms as i64;
+    if let Err(e) = db.upsert_code_graph_build(
+        &project_id,
+        "success",
+        Some(started_at_ms),
+        Some(now),
+        Some(duration_ms as i64),
+        report.files_analyzed as u32,
+        None,           // languages: not surfaced by AnalyzerFinalReport here
+        false,          // joern_used: extra-path sync doesn't pass --cfg/--pdg
+        None,           // error_message: success path
+        None,           // log_tail: not captured for the row-level UI
+    ) {
+        eprintln!(
+            "[vct] warning: V52-Z code_graph_builds upsert failed for project {}: {}",
+            project_id, e
+        );
+    }
+
     let outcome = SyncOutcome {
         files_scanned: report.files_analyzed,
         entities_indexed: report.modules + report.classes + report.functions + report.apis,
@@ -769,6 +806,32 @@ pub async fn reindex_project_codegraph_after_extras_change(
             &e.path,
             now,
             sha.as_deref(),
+        );
+    }
+
+    // V52-Z (v0.2.52): also upsert `code_graph_builds`. The reindex
+    // walks the primary repo PLUS every extra in one invocation, so
+    // this row represents the union-of-roots build. The UI's "last
+    // successful build" timestamp now updates on every reindex (vs.
+    // only on the legacy `run_build_task` primary-only path). See the
+    // matching write in `sync_project_codegraph_extra_path` for the
+    // single-path case + the design rationale.
+    let started_at_ms = now - duration_ms as i64;
+    if let Err(e) = db.upsert_code_graph_build(
+        &project_id,
+        "success",
+        Some(started_at_ms),
+        Some(now),
+        Some(duration_ms as i64),
+        report.files_analyzed as u32,
+        None,           // languages: not surfaced here
+        false,          // joern_used: reindex doesn't pass --cfg/--pdg
+        None,
+        None,
+    ) {
+        eprintln!(
+            "[vct] warning: V52-Z code_graph_builds upsert failed for project {}: {}",
+            project_id, e
         );
     }
 
