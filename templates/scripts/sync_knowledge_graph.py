@@ -72,6 +72,25 @@ if str(_VCO_LIB_PARENT) not in sys.path:
     sys.path.insert(0, str(_VCO_LIB_PARENT))
 # VCO-REWIRE-END: orchestrator-root-resolution
 
+# v0.2.52 (Known Issue 6, Sub-issue A): silence
+# ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` from
+# ``weaviate-client``'s transitive ``authlib`` dep during module import.
+# Without this filter the warning lands in the user's terminal on every
+# fresh ``install.py`` KG-seed run, which is alarming (and is the warning
+# user-reported as Known Issue 6).  MUST run BEFORE ``import weaviate``.
+# See ``claude_mcp_servers/weaviate_mcp/server.py`` for the matching
+# filter at the MCP-server level.
+import warnings as _kg_warnings
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
+    _kg_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
+except ImportError:
+    _kg_warnings.filterwarnings(
+        "ignore",
+        message=r".*authlib.*deprecated.*",
+        category=DeprecationWarning,
+    )
+
 import weaviate
 from weaviate.classes.query import Filter
 from weaviate_mcp.chunking import TokenCounter, Chunker

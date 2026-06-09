@@ -396,6 +396,22 @@ def _canonical_lang_id(label: Optional[str]) -> str:
     return _LANGUAGE_DISPLAY_TO_CANONICAL.get(key, key)
 
 
+# v0.2.52 (Known Issue 6, Sub-issue A): silence
+# ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` from
+# ``weaviate-client``'s transitive ``authlib`` dep during module import.
+# See ``claude_mcp_servers/weaviate_mcp/server.py`` for the matching
+# filter at the MCP-server level.  MUST run BEFORE ``import weaviate``.
+import warnings as _cg_warnings
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
+    _cg_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
+except ImportError:
+    _cg_warnings.filterwarnings(
+        "ignore",
+        message=r".*authlib.*deprecated.*",
+        category=DeprecationWarning,
+    )
+
 try:
     import weaviate
     from weaviate.classes.config import Configure, Property, DataType, ReferenceProperty

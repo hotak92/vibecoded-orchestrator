@@ -27,6 +27,21 @@ import re
 # so no sys.path manipulation is needed for claude_mcp_servers/.
 sys.path.insert(0, str(Path.home() / ".claude" / "workflow" / "scripts"))
 
+# v0.2.52 (Known Issue 6, Sub-issue A): silence
+# ``AuthlibDeprecationWarning`` from ``weaviate-client``'s transitive
+# ``authlib`` dep.  See ``claude_mcp_servers/weaviate_mcp/server.py``
+# for the canonical filter rationale.
+import warnings as _dd_warnings
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
+    _dd_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
+except ImportError:
+    _dd_warnings.filterwarnings(
+        "ignore",
+        message=r".*authlib.*deprecated.*",
+        category=DeprecationWarning,
+    )
+
 import weaviate
 from weaviate.classes.query import Filter, MetadataQuery
 

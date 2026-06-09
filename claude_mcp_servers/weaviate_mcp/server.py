@@ -52,9 +52,36 @@ import re
 import asyncio
 import functools
 import uuid
+import warnings
 from typing import Any, Optional, List, Dict
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+
+# v0.2.52 (Known Issue 6, Sub-issue A): silence the
+# ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` noise
+# that ``weaviate-client``'s transitive ``authlib`` dependency emits during
+# module import.  VCO never uses authlib's OIDC / JOSE code paths
+# (we only talk to local Weaviate via HTTP+gRPC without OAuth2 tokens),
+# so this warning is pure boilerplate during install / KG-seed and scares
+# users on their first run.  We import the warning class directly when
+# possible so the filter is precisely scoped — if authlib happens to not
+# be installed (someone stubbed weaviate-client out), the fallback uses
+# the broader ``DeprecationWarning`` category but still filters by message
+# regex so we don't accidentally silence unrelated DeprecationWarnings.
+# IMPORTANT: this MUST run BEFORE ``import weaviate`` below, because the
+# warning fires at module load time on weaviate's authlib imports.
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning  # type: ignore
+    warnings.filterwarnings("ignore", category=AuthlibDeprecationWarning)
+except ImportError:
+    # authlib not installed — fall back to message-scoped filter.  Matches
+    # both the current "authlib.jose module is deprecated" text and any
+    # future authlib deprecations that surface via the same channel.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*authlib.*deprecated.*",
+        category=DeprecationWarning,
+    )
 
 from mcp.server.fastmcp import FastMCP
 import weaviate
