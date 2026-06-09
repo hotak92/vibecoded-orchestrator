@@ -577,11 +577,17 @@ async fn project_config(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // v0.2.49 Stream B — per-project enable toggle for the RL Reranker
-    // (a global-scope module: one install on the host, visible across
-    // every project). Default `true` when no row exists; matches the
-    // DB-layer reader's fail-open contract
-    // (`Db::module_is_enabled_for_project` in vct-launcher-core).
+    // v0.2.49 Stream B + v0.2.52 V52-AD — effective enable flag for the
+    // RL Reranker (a global-scope module: one install on the host,
+    // visible across every project). Cascade order:
+    //
+    //   1. Per-project row in `module_settings` for `(project_id,
+    //      vct-rl-reranker, enabled_for_project)` — explicit override.
+    //   2. Global row (`project_id IS NULL`) for `(vct-rl-reranker,
+    //      enabled_for_project)` — host-wide default landed by V52-AD.
+    //      install.py seeds this row to `false` on fresh installs so
+    //      RL reranking is off until enough training data accumulates.
+    //   3. System default `true` (fail-open).
     //
     // The MCP's `_rl_cache_and_rerank` gate consumes this field via
     // `ProjectConfig.rl_reranker_enabled_for_project` to decide whether
@@ -592,7 +598,7 @@ async fn project_config(
     // outbound requests).
     let rl_reranker_enabled_for_project = h
         .0
-        .module_is_enabled_for_project(&project.id, "vct-rl-reranker")
+        .module_effective_enabled(&project.id, "vct-rl-reranker")
         .unwrap_or(true);
 
     // 8. Resolve binding roles.
@@ -2558,6 +2564,64 @@ kg_tier_full = 0.8
             body.get("rl_reranker_enabled_for_project")
                 .and_then(|v| v.as_bool()),
             Some(true),
+        );
+    }
+
+    /// v0.2.52 V52-AD — global-default cascade. When NO per-project row
+    /// exists for `(project, vct-rl-reranker, enabled_for_project)`, the
+    /// resolver must fall back to the global row (`project_id IS NULL`).
+    /// install.py seeds this to `false` on fresh installs so RL
+    /// reranking is off by default until training data accumulates.
+    #[tokio::test]
+    async fn config_falls_back_to_global_rl_reranker_default() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-global", "myproject");
+
+        // Step 1: no per-project row, no global row → fail-open true.
+        let resp = reqwest::get(format!("{}/projects/p-rl-global/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "no rows → default true; body={}",
+            body,
+        );
+
+        // Step 2: set global=false, no per-project row → false propagates.
+        h.0.module_set_global_enabled("vct-rl-reranker", false)
+            .unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-rl-global/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "global=false must propagate when no per-project override; body={}",
+            body,
+        );
+
+        // Step 3: per-project=true overrides global=false.
+        h.0.module_set_enabled_for_project(
+            "p-rl-global",
+            "vct-rl-reranker",
+            true,
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-rl-global/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "per-project=true must override global=false; body={}",
+            body,
         );
     }
 

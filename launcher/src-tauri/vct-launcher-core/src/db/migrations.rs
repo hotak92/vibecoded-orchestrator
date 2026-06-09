@@ -183,6 +183,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "artifact_schema_versions table (v0.2.52 V52-AG). Single registry for every derived-state artifact's schema version (Weaviate collections, code-graph indices, JSON-content shapes, controlled-vocabulary columns, project bootstrap version). Keyed by (project_id NULL = orchestrator-wide, artifact_type, artifact_name). Install/update flows compare stored version against canonical constants in vco_lib/schema_versions.py and trigger drop+recreate (derived state) OR upgrade-in-place (user-curated state) on mismatch. Foundation for the user-locked 2026-06-09 'from now on consistent' rule: no back-compat layers, no migration ladders — bump constant, drop+recreate. See v0.2.52 backlog § V52-AG + § V52-AF for the consumer wiring.",
         sql: include_str!("migrations/033_artifact_schema_versions.sql"),
     },
+    Migration {
+        version: 34,
+        description: "module_settings.project_id nullable + partial unique indexes for global-scope settings (v0.2.52 V52-AD). NULL project_id == host-wide default for a (module_id, setting_key) pair, consumed by hub resolver as fallback when no per-project row exists. Mirrors migration 027's pattern for module_installs. Reader fall-back order: per-project → global default → fail-open true. The recreate-and-copy mirrors migration 027's discipline. Plan: V52-AD in .claude/context/plans/v0.2.52-backlog-2026-06-09.md.",
+        sql: include_str!("migrations/034_module_settings_nullable_project.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
