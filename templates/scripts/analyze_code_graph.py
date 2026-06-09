@@ -687,6 +687,122 @@ def _scrub_for_brace_balance(line: str) -> str:
     return line
 
 
+def _rust_methods_for_struct(
+    content_clean: str,
+    struct_name: str,
+    source_lines: List[str],
+) -> List[str]:
+    """V52-O.11.F (v0.2.52, 2026-06-09): extract methods declared inside
+    every ``impl <struct_name>`` (or ``impl <Trait> for <struct_name>``)
+    block in the source.
+
+    Replaces the pre-V52-O.11.F line that ran
+    ``func_pattern.finditer(content_clean)`` unconditionally — that
+    attributed EVERY function in the file to EVERY struct. Audit a79152
+    confirmed: a 50-fn file with 3 structs produced 150 incorrect
+    method attributions, drowning the real ``methods`` signal in noise.
+
+    Algorithm:
+
+      1. Find every ``impl`` block whose target type matches ``struct_name``.
+         Two shapes accepted:
+           - ``impl <generics?> <struct_name> <generics?> {``      (inherent)
+           - ``impl <generics?> <Trait> for <struct_name> <generics?> {`` (trait)
+      2. For each matched impl block, find its closing brace via the
+         existing ``_extract_balanced_block`` helper (already brace-balanced
+         per V52-O.11.E).
+      3. Scan the block body for ``fn name(...)`` patterns; collect names.
+      4. Return deduplicated list, preserving first-seen order.
+
+    Returns empty list if no impl blocks match — common for plain data
+    structs that only carry fields. The caller renders ``methods: []`` in
+    the CodeClass row, which is correct (no methods exist).
+
+    Limitations:
+      - Doesn't handle ``impl<T: Trait> ...`` where the type parameter
+        appears literally in the type position (rare in practice).
+      - Doesn't extract methods declared via macros (``impl_trait!``).
+      - Doesn't follow ``impl`` in nested ``mod`` blocks transparently —
+        the brace-balance helper correctly skips over them, so methods
+        in nested mods that DO impl on ``struct_name`` from the outer
+        scope get picked up. Methods inside nested impl blocks on a
+        DIFFERENT struct are correctly excluded.
+    """
+    # Find every impl header line whose target type matches struct_name.
+    # The regex covers both shapes:
+    #   - impl <generics>? <Name> <generics>? {
+    #   - impl <generics>? <Trait> for <Name> <generics>? {
+    # Generics + trailing-where are non-capturing; we only need the impl
+    # start position. Generics are matched with a simple ``<[^>]*>`` since
+    # Rust generics rarely nest in impl headers (where-clauses move
+    # complex bounds to after the type).
+    escaped = re.escape(struct_name)
+    # Shape A: `impl Foo` / `impl<T> Foo<T>` / `impl<T> Foo`
+    # Shape B: `impl Trait for Foo` / `impl<T> Trait<T> for Foo<T>`
+    impl_pattern = re.compile(
+        # `impl` keyword
+        r"impl"
+        # Optional generic parameters on impl
+        r"(?:\s*<[^>]*>)?"
+        # The target type. Either Shape A (just struct_name) or
+        # Shape B (Trait + `for` + struct_name).
+        r"\s+(?:"
+        # Shape B alternative: any token sequence + `for` + struct_name
+        rf"(?:[\w:]+(?:\s*<[^>]*>)?\s+for\s+){escaped}"
+        rf"|{escaped}"
+        # Shape A — struct_name alone
+        r")"
+        # Optional generics on the target (rare but valid)
+        r"(?:\s*<[^>]*>)?"
+        # Optional where clause + opening brace
+        r"\s*(?:where\s+[^{]*)?\{",
+        re.MULTILINE,
+    )
+
+    method_pattern_inner = re.compile(
+        r"(?:pub\s+(?:\([^)]*\)\s+)?)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?"
+        r"fn\s+([\w]+)\s*",
+    )
+
+    methods: List[str] = []
+    seen: set = set()
+    for m in impl_pattern.finditer(content_clean):
+        # Locate the opening brace position (the regex anchors on it).
+        # m.end() is just past the `{`, so the impl body starts there.
+        impl_open_pos = m.end() - 1  # position of `{`
+        # Find the matching close via brace-balance on source_lines.
+        # We need a source-line index: convert char-offset to line.
+        impl_open_line = content_clean[:impl_open_pos].count("\n") + 1
+        impl_close_line = _extract_balanced_block(
+            source_lines, impl_open_line, max_lookahead=800
+        )
+        # Slice content_clean (NOT source_lines — content_clean has
+        # comments stripped, mirroring how the original method extraction
+        # worked).
+        block_start_pos = impl_open_pos + 1  # skip `{`
+        # Find char-offset for impl_close_line. Sum line lengths +1 for \n.
+        # Cheaper: count lines from block_start_pos and stop when we've
+        # passed (impl_close_line - impl_open_line) newlines.
+        target_newlines = impl_close_line - impl_open_line
+        if target_newlines <= 0:
+            continue
+        # Find the position by counting newlines from block_start_pos.
+        seen_newlines = 0
+        block_end_pos = block_start_pos
+        while seen_newlines < target_newlines and block_end_pos < len(content_clean):
+            if content_clean[block_end_pos] == "\n":
+                seen_newlines += 1
+            block_end_pos += 1
+        impl_body = content_clean[block_start_pos:block_end_pos]
+        for fm in method_pattern_inner.finditer(impl_body):
+            name = fm.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            methods.append(name)
+    return methods
+
+
 def _shape_for_insert(embedding: Optional[Any]) -> Optional[Any]:
     """Shape ``embedding`` for ``collection.data.insert(vector=)``.
 
@@ -3433,7 +3549,15 @@ class CodeGraphAnalyzer:
             class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
             signature = f"struct/enum/trait {sname}"
-            methods = [m.group(1) for m in func_pattern.finditer(content_clean)]
+            # V52-O.11.F (v0.2.52, 2026-06-09): scope `methods` to functions
+            # declared INSIDE `impl <sname>` blocks (or `impl <Trait> for
+            # <sname>` blocks). Pre-V52-O.11.F this line iterated
+            # func_pattern over the WHOLE file's content_clean, attributing
+            # EVERY fn in the file to EVERY struct — audit a79152 reproduced:
+            # a 50-fn file with 3 structs produced 150 incorrect method
+            # attributions, drowning real signal in noise for the
+            # `query_code_structure(methods, StructName)` MCP path.
+            methods = _rust_methods_for_struct(content_clean, sname, source_lines)
             embedding = embed_class(signature, class_body, language="rust")
             insert_params: Dict[str, Any] = {
                 "properties": {
