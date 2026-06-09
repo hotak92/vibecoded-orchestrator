@@ -2,8 +2,8 @@
 #
 # Windows equivalent of migrate-development-temporal-props.sh. Adds the
 # four canonical temporal properties (created, updated, valid_from,
-# valid_until) to every existing *_Development collection in the running
-# Weaviate.
+# valid_until) to every existing *_Development, *_KnowledgeGraph, and
+# *_Diagrams collection in the running Weaviate.
 #
 # Idempotent: per-property presence is checked before POST.
 # Soft-fail per collection: errors are logged; exit code is always 0.
@@ -16,6 +16,13 @@
 #
 # Coordinated with: scripts/migrate-shared-kg-schema.ps1 (PR-24,
 # 2026-05-16).
+#
+# V52-I Fix B (2026-06-09): -match regex extended from `_Development$`
+# to `(_KnowledgeGraph|_Development|_Diagrams)$` so existing shared KG
+# and diagrams collections gain the temporal date props on the next
+# `install.py --update`. Mirrors the bash sibling. Closes the gap that
+# produced 30 false-positive `partial_fan_out_schema_missing` MCP
+# telemetry events.
 
 [CmdletBinding()]
 param()
@@ -42,14 +49,18 @@ try {
 $devCollections = @()
 if ($schema.classes) {
     foreach ($cls in $schema.classes) {
-        if ($cls.class -match '_Development$') {
+        # V52-I Fix B (2026-06-09): match _KnowledgeGraph and _Diagrams
+        # suffixes in addition to _Development. Keeps the variable name
+        # `$devCollections` for backward source compatibility — it now
+        # holds three collection-kind families, not just dev.
+        if ($cls.class -match '(_KnowledgeGraph|_Development|_Diagrams)$') {
             $devCollections += $cls.class
         }
     }
 }
 
 if ($devCollections.Count -eq 0) {
-    Write-Host "[migrate-dev-props] No *_Development collections found; nothing to migrate."
+    Write-Host "[migrate-dev-props] No *_Development / *_KnowledgeGraph / *_Diagrams collections found; nothing to migrate."
     exit 0
 }
 

@@ -379,6 +379,39 @@ struct ProjectConfigResponse {
     /// client-side.
     #[serde(default)]
     code_graph_extra_paths: Vec<CodeGraphExtraPath>,
+    /// V52-AA (v0.2.52) — per-project RL Reranker container port.
+    ///
+    /// Sourced from `module_ports(project_id, "vct-rl-reranker", port)`
+    /// (canonical SoT since migration 017 / v0.2.26). Returned as
+    /// `Some(port)` when the supervisor has allocated a port for this
+    /// project, `None` when no row exists (RL not installed for this
+    /// project, OR allocator hasn't run yet).
+    ///
+    /// Closes the V52-AA env-propagation gap: pre-V52-AA the
+    /// `RL_SERVER_PORT` env var was the ONLY channel for the MCP
+    /// subprocess to learn the container port. The launcher writes the
+    /// allocated port to `module_ports` but never propagates it to
+    /// `.claude/settings.json env` or `.claude/env` (intentional — the
+    /// value varies per-project and the global allowlist would force
+    /// the wrong precedence per the H.1 design contract above). The
+    /// canonical channel for per-project values is the hub-resolved
+    /// `ProjectConfig`, so the MCP's `_get_rl_client` now falls back
+    /// here when env is unset.
+    ///
+    /// Consumer:
+    /// `claude_mcp_servers/weaviate_mcp/server.py::_get_rl_client` reads
+    /// this field via `ProjectConfig.rl_server_port` and, when set,
+    /// constructs the `RLClient` with `base_url=http://127.0.0.1:<port>`
+    /// — overriding the env-only `_resolve_base_url()` default. Env vars
+    /// (`RL_SERVER_URL` / `RL_SERVER_PORT`) still take precedence when
+    /// set, preserving the existing override path for tests + dev users.
+    ///
+    /// Additive field — pre-V52-AA Python clients see an unknown field
+    /// and ignore it; the parser back-fills with `None` for pre-V52-AA
+    /// hubs paired with V52-AA+ clients. `schema_version` stays at 1
+    /// because the field is defaultable client-side.
+    #[serde(default)]
+    rl_server_port: Option<u16>,
 }
 
 /// One enabled extra codegraph path for the resolver response.
@@ -577,11 +610,17 @@ async fn project_config(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // v0.2.49 Stream B — per-project enable toggle for the RL Reranker
-    // (a global-scope module: one install on the host, visible across
-    // every project). Default `true` when no row exists; matches the
-    // DB-layer reader's fail-open contract
-    // (`Db::module_is_enabled_for_project` in vct-launcher-core).
+    // v0.2.49 Stream B + v0.2.52 V52-AD — effective enable flag for the
+    // RL Reranker (a global-scope module: one install on the host,
+    // visible across every project). Cascade order:
+    //
+    //   1. Per-project row in `module_settings` for `(project_id,
+    //      vct-rl-reranker, enabled_for_project)` — explicit override.
+    //   2. Global row (`project_id IS NULL`) for `(vct-rl-reranker,
+    //      enabled_for_project)` — host-wide default landed by V52-AD.
+    //      install.py seeds this row to `false` on fresh installs so
+    //      RL reranking is off until enough training data accumulates.
+    //   3. System default `true` (fail-open).
     //
     // The MCP's `_rl_cache_and_rerank` gate consumes this field via
     // `ProjectConfig.rl_reranker_enabled_for_project` to decide whether
@@ -592,8 +631,26 @@ async fn project_config(
     // outbound requests).
     let rl_reranker_enabled_for_project = h
         .0
-        .module_is_enabled_for_project(&project.id, "vct-rl-reranker")
+        .module_effective_enabled(&project.id, "vct-rl-reranker")
         .unwrap_or(true);
+
+    // V52-AA (v0.2.52) — RL Reranker per-project container port.
+    // Reads `module_ports(project_id, "vct-rl-reranker", port)`, the
+    // canonical SoT since migration 017 / v0.2.26. Returns `None` when
+    // no row exists; the consumer (`_get_rl_client` in the MCP) handles
+    // None by falling through to env-var resolution / disabled mode.
+    // Soft-fail: on a DB error we log + return None rather than 500ing
+    // the whole resolve — RL is a value-add, not a critical path.
+    let rl_server_port = match h.0.get_project_rl_port(&project.id) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "[vct-hub] config_api: get_project_rl_port({}) failed: {}; returning None",
+                project.id, e
+            );
+            None
+        }
+    };
 
     // 8. Resolve binding roles.
     let primary_kg = kg_bindings
@@ -824,6 +881,7 @@ async fn project_config(
         claude_session_dir,
         retrieval_tuning,
         code_graph_extra_paths,
+        rl_server_port,
     };
 
     // 9. ?key= filter — pull a single top-level field by name.
@@ -2561,6 +2619,64 @@ kg_tier_full = 0.8
         );
     }
 
+    /// v0.2.52 V52-AD — global-default cascade. When NO per-project row
+    /// exists for `(project, vct-rl-reranker, enabled_for_project)`, the
+    /// resolver must fall back to the global row (`project_id IS NULL`).
+    /// install.py seeds this to `false` on fresh installs so RL
+    /// reranking is off by default until training data accumulates.
+    #[tokio::test]
+    async fn config_falls_back_to_global_rl_reranker_default() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-global", "myproject");
+
+        // Step 1: no per-project row, no global row → fail-open true.
+        let resp = reqwest::get(format!("{}/projects/p-rl-global/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "no rows → default true; body={}",
+            body,
+        );
+
+        // Step 2: set global=false, no per-project row → false propagates.
+        h.0.module_set_global_enabled("vct-rl-reranker", false)
+            .unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-rl-global/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "global=false must propagate when no per-project override; body={}",
+            body,
+        );
+
+        // Step 3: per-project=true overrides global=false.
+        h.0.module_set_enabled_for_project(
+            "p-rl-global",
+            "vct-rl-reranker",
+            true,
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{}/projects/p-rl-global/config", base))
+            .await
+            .expect("hub reachable");
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("rl_reranker_enabled_for_project")
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "per-project=true must override global=false; body={}",
+            body,
+        );
+    }
+
     /// v0.2.46 Decision B — symmetric READ gate, default branch.
     ///
     /// A project with no row in ``module_settings`` for
@@ -2815,6 +2931,100 @@ kg_tier_full = 0.8
         assert_eq!(
             arr[0].get("path").and_then(|v| v.as_str()),
             Some("/opt/x")
+        );
+    }
+
+    // ─── V52-AA (v0.2.52): rl_server_port field ──────────────────────
+
+    /// On a freshly-seeded project with no row in ``module_ports`` for
+    /// ``vct-rl-reranker``, the resolver returns ``rl_server_port`` as
+    /// JSON null. The MCP client treats null/missing as "fall through
+    /// to env-resolution / disabled mode" — exactly the pre-V52-AA
+    /// behaviour, preserved for non-RL projects.
+    #[tokio::test]
+    async fn config_emits_rl_server_port_null_when_unallocated() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-no-rl-port", "myproject");
+
+        let resp = reqwest::get(format!("{}/projects/p-no-rl-port/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        // Field MUST be present (serialised as JSON null) so the Python
+        // parser's defaultable-on-missing path is exercised consistently.
+        // Both shapes (missing key / explicit null) deserialize to None
+        // on the Python side, but pinning the wire shape here documents
+        // the contract for any future hub-shape audit.
+        let v = body
+            .get("rl_server_port")
+            .expect("rl_server_port field present");
+        assert!(
+            v.is_null(),
+            "rl_server_port must be JSON null when no allocation; got {:?}",
+            v
+        );
+    }
+
+    /// When the supervisor has allocated a port (write via the canonical
+    /// ``set_project_rl_port`` helper, mirroring
+    /// ``module_supervisor::ensure_rl_port_persisted``), the resolver
+    /// surfaces the value as a JSON number. Pinning this contract closes
+    /// the V52-AA env-propagation gap: the MCP's ``_get_rl_client``
+    /// reads ``ProjectConfig.rl_server_port`` here and builds the client
+    /// with ``base_url=http://127.0.0.1:<port>``.
+    #[tokio::test]
+    async fn config_emits_rl_server_port_when_allocated() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-port-set", "myproject");
+
+        // 11442 mirrors the canonical orchestrator-root allocation
+        // documented in migrations/014_project_rl_port.sql. Any non-zero
+        // u16 would satisfy the test; using a "real" value keeps the
+        // failure mode obvious if someone breaks the field plumbing.
+        h.0.set_project_rl_port("p-rl-port-set", 11442).unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/p-rl-port-set/config", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        assert_eq!(
+            body.get("rl_server_port").and_then(|v| v.as_u64()),
+            Some(11442),
+            "rl_server_port must surface the allocated value; body={}",
+            body,
+        );
+    }
+
+    /// Single-field filter (``?key=rl_server_port``) returns just the
+    /// new field, mirroring the existing ``rl_use_global`` /
+    /// ``rl_reranker_enabled_for_project`` filter pattern. Bash/PS1
+    /// resolver clients query single fields to avoid parsing the whole
+    /// envelope; without this assertion a serde rename of the field
+    /// would break the resolver clients without breaking the
+    /// full-envelope tests.
+    #[tokio::test]
+    async fn config_key_filter_returns_rl_server_port() {
+        let (base, h) = spawn_config_api_hub().await;
+        seed_full_project(&h, "p-rl-port-key", "myproject");
+        h.0.set_project_rl_port("p-rl-port-key", 11443).unwrap();
+
+        let resp = reqwest::get(format!(
+            "{}/projects/p-rl-port-key/config?key=rl_server_port",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        let obj = body.as_object().expect("object");
+        assert_eq!(obj.len(), 1);
+        assert_eq!(
+            obj.get("rl_server_port").and_then(|v| v.as_u64()),
+            Some(11443)
         );
     }
 }

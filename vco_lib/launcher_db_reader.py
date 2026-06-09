@@ -156,3 +156,84 @@ def get_orchestrator_root_bindings() -> Tuple[Optional[str], Optional[str]]:
     if pid is None:
         return (None, None)
     return (get_kg_binding(pid, "primary"), get_kg_binding(pid, "shared"))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# v0.2.52 V52-AJ: app_state key readers
+#
+# Used by EmbeddingService.for_project() + install.py's subprocess env-thread
+# layer to resolve the active embedding profile when no env var is set.
+#
+# The launcher writes ``embedding.active_profile`` from the Identity tab's
+# embedding selector + on install.py's preset choice. Mirror constant:
+#   launcher/src-tauri/src/commands/project_env_settings.rs
+#     ::APP_STATE_KEY_ACTIVE_EMBEDDING (canonical string: "embedding.active_profile")
+#
+# This file is read-only — writes happen exclusively from the Rust launcher.
+# ────────────────────────────────────────────────────────────────────────────
+
+#: Canonical app_state key for the active embedding profile.
+#: MUST stay in sync with the Rust constant cited above.
+APP_STATE_KEY_ACTIVE_EMBEDDING = "embedding.active_profile"
+
+
+def read_app_state_value(key: str) -> Optional[str]:
+    """Read a single ``app_state`` key from launcher.db (read-only).
+
+    Returns the stored string value, or ``None`` when the DB is unavailable,
+    the ``app_state`` table is absent (fresh install, never booted), the
+    key is missing, or any SQLite error occurs.
+
+    Soft-fail discipline: never raises. Callers treat ``None`` as
+    "unknown / use fallback".
+
+    :param key: the ``app_state.key`` to look up.
+    """
+    if not key:
+        return None
+    conn = _open_db_readonly()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = ? LIMIT 1", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+    except Exception:
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def read_app_state_active_embedding() -> Optional[str]:
+    """Return the active embedding profile from launcher.db, or ``None``.
+
+    Reads ``app_state[embedding.active_profile]``. The value, when set,
+    is one of:
+
+      * ``"qwen3"`` — local Ollama qwen3-embedding:0.6b (default)
+      * ``"arctic"`` — local Ollama snowflake-arctic-embed2:latest
+      * ``"openai"`` — OpenAI text-embedding-3-small
+      * ``"codesage"`` — CodeSage-Large-v2 (code embeddings; rarely the
+        text profile, but accepted for completeness)
+
+    Returned verbatim (no normalisation here; callers normalise via
+    ``.strip().lower()`` if needed). Returns ``None`` when launcher.db
+    is absent (free-tier install with no launcher), the key is unset
+    (fresh install before any embedding choice was made), or the value
+    is an empty string after stripping.
+
+    This is the bridge between the launcher's stored embedding choice
+    (written by the Identity-tab embedding selector + install.py's preset
+    seeding) and any subprocess (``install.py``'s ``sync_knowledge_graph.py``
+    spawn, the MCP server's ``EmbeddingService.for_project()``) that
+    needs to know which embedding to use when no env override is set.
+    """
+    raw = read_app_state_value(APP_STATE_KEY_ACTIVE_EMBEDDING)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None

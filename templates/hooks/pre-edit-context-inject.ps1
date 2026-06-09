@@ -83,6 +83,21 @@ if (Test-Path $FindPy) { . $FindPy }
 # back to "default" only if the payload is malformed (which would mean the
 # hook contract itself is broken — see ConvertFrom-Json above).
 if (-not $SessionId) { $SessionId = "default" }
+
+# V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes
+# (notably the rl_kg_search.py subprocess spawned below) inherit it.
+# Claude Code does NOT propagate CLAUDE_SESSION_ID to hook/MCP
+# subprocesses, but session_id IS available in the hook's stdin JSON.
+# The canonical telemetry emit path
+# (claude_mcp_servers/rl_client/telemetry_emit.py::resolve_session_id)
+# reads VCT_SESSION_ID as layer-2 of its 3-layer chain. Skip the
+# "default" sentinel — empty is preferable to a fake-key cohort.
+# Sibling: see templates/hooks/pre-edit-context-inject.sh for the bash
+# version of this block.
+if ($SessionId -and $SessionId -ne "default") {
+    $env:VCT_SESSION_ID = $SessionId
+}
+
 $CacheBase = Join-Path $ProjectRoot ".claude/state/edit_cache_$SessionId"
 New-Item -ItemType Directory -Force -Path $CacheBase -ErrorAction SilentlyContinue | Out-Null
 # v0.2.29 GC: prune per-session edit_cache_* directories older than 14 days.

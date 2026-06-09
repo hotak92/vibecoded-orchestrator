@@ -96,11 +96,18 @@ class ManagedPathsLockstepTests(unittest.TestCase):
         this set. The root CLAUDE.md is orchestrator-self development
         documentation; user projects render their CLAUDE.md from
         ``templates/CLAUDE.md.template`` via the project-bootstrapper,
-        not via the install whitelist."""
+        not via the install whitelist.
+
+        Note (V52-C, v0.2.52): ``knowledge`` is intentionally NOT in
+        this set anymore. KG nodes are USER-CURATED state. The
+        orchestrator's curated KG set lives under
+        ``templates/knowledge/`` and is bundle-materialized into
+        ``<project>/knowledge/`` by ``_enumerate_bundle_files`` —
+        manifest-tracked with the V47-A hash-compare pattern so user
+        edits are preserved on update."""
         py = self._python_set()
         required = {
             ".claude",
-            "knowledge",
             "docs",
             "tools",
             "infrastructure",
@@ -129,6 +136,29 @@ class ManagedPathsLockstepTests(unittest.TestCase):
             "User projects get their CLAUDE.md from "
             "templates/CLAUDE.md.template, never from a whitelist copy of "
             "the orchestrator-self's own CLAUDE.md. See PR-31 / v0.2.12.",
+        )
+
+    def test_managed_paths_excludes_knowledge(self):
+        """V52-C invariant (v0.2.52): ``knowledge`` must NOT be in the
+        whitelist. KG nodes are USER-CURATED state — the directory
+        mixes shipped + user-authored nodes, and copying through the
+        whitelist caused modify-vs-delete merge conflicts when the
+        user committed local changes and the orchestrator deleted the
+        same upstream node (the v0.2.51 KG-conflict that triggered
+        the V52-C architectural fix). User projects always
+        bundle-materialize the orchestrator's curated KG set from
+        ``templates/knowledge/`` via ``_enumerate_bundle_files``,
+        never from a whitelist copy. A future revert that re-adds
+        ``knowledge`` would re-introduce the conflict + risk
+        wholesale overwrite of user-authored nodes."""
+        py = self._python_set()
+        self.assertNotIn(
+            "knowledge",
+            py,
+            "`knowledge` must not appear in ORCHESTRATOR_MANAGED_PATHS. "
+            "User projects receive shipped KG nodes via bundle "
+            "materialization from `templates/knowledge/`, NOT a "
+            "whitelist copy. See V52-C / v0.2.52.",
         )
 
 

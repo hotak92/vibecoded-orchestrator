@@ -105,6 +105,7 @@ if _sys.platform == "win32":
         pass
 
 import argparse
+import datetime
 import json
 import os
 import platform
@@ -4632,6 +4633,31 @@ def main() -> int:
     print("=" * 62)
     print()
 
+    # V52-AI (v0.2.52, 2026-06-09): MCP fork-bomb mitigation. Mirrors
+    # the launcher's update_orchestrator gate so CLI-only updaters
+    # (users running `python install.py --update` directly without
+    # going through the launcher GUI) get the same protection.
+    #
+    # The launcher path also writes a lockfile via Rust's
+    # UpdateInProgressGuard; if both are active, the second write
+    # extends the deadline — same atomic semantics either way.
+    #
+    # atexit covers every exit path (clean return, sys.exit, raised
+    # exception, signal). The lockfile's expected_completion_by
+    # (15 min) is the second line of defense if even atexit fails to
+    # fire (e.g. SIGKILL) — the launcher's boot-time stale cleanup
+    # then removes it on next start.
+    if mode == "update":
+        try:
+            import atexit as _atexit
+            from vco_lib import update_gate as _vco_update_gate
+            _vco_update_gate.write_lockfile(
+                phase="install_py", expected_duration_min=15
+            )
+            _atexit.register(_vco_update_gate.delete_lockfile)
+        except Exception as e:  # noqa: BLE001 — soft-fail
+            print(f"[update_gate] failed to write lockfile (soft-fail): {e}")
+
     # Mark the start of this install session in the durable log. Subsequent
     # events from install.py + post-install-launcher.sh share the same log.
     # On a first-ever install the log dir doesn't exist yet (Step 8 creates
@@ -4899,6 +4925,19 @@ def main() -> int:
             _log_install_event(
                 "preset_defaults", "warn",
                 f"unexpected error writing preset defaults: {_preset_err}",
+            )
+
+        # v0.2.52 V52-AD — seed the host-wide RL reranker disable row
+        # when no training data has accumulated yet. Soft-fails on every
+        # known sqlite error (missing DB, missing table, pre-034 schema,
+        # existing user choice). Idempotent across re-runs.
+        try:
+            _seed_rl_reranker_default_disabled()
+        except Exception as _rl_default_err:  # noqa: BLE001
+            _log_install_event(
+                "rl_reranker_default", "warn",
+                f"unexpected error seeding RL reranker default: "
+                f"{_rl_default_err}",
             )
 
         # PR 6 + MEDIUM-9 + HIGH-4 fix (2026-05-01): wrap _ensure_collections
@@ -8093,6 +8132,14 @@ _APP_STATE_KEY_LAST_ACTIVE_EMBEDDING = "last_installed_active_embedding"
 _APP_STATE_KEY_LAST_KG_COLLECTION = "last_installed_kg_collection"
 _APP_STATE_KEY_LAST_SHARED_KG_COLLECTION = "last_installed_shared_kg_collection"
 _APP_STATE_KEY_LAST_KG_SYNC_AT = "last_kg_sync_at"
+
+# v0.2.52 V52-AJ: app_state key that the launcher's Identity-tab embedding
+# selector writes (mirrors Rust APP_STATE_KEY_ACTIVE_EMBEDDING in
+# launcher/src-tauri/src/commands/project_env_settings.rs). Different from
+# _APP_STATE_KEY_LAST_ACTIVE_EMBEDDING above: this one is the LIVE choice;
+# the LAST_* one is the snapshot of what install.py used at the last
+# successful KG seed. Both keys are present on the same launcher.db.
+_APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE = "embedding.active_profile"
 _APP_STATE_KEY_LAST_KG_SYNC_STATS = "last_kg_sync_stats"
 
 # Canonical OpenAI ID used by Wave A (with `openai-` prefix). MUST match:
@@ -8323,6 +8370,185 @@ def _write_preset_defaults_to_app_state(
             pass
 
 
+# ---------------------------------------------------------------------------
+# v0.2.52 V52-AD — seed host-wide RL reranker disable on fresh installs
+# ---------------------------------------------------------------------------
+#
+# User-stated 2026-06-09: "we don't have enough RL data, want to disable
+# RL rerank by default until 500+ retrieval events accumulate". This is
+# the install-time hook that lands that default: when launcher.db exists
+# (= --update flow OR fresh install after the launcher has booted at
+# least once) AND `rl_events` has fewer than 500 rows AND no global
+# enable row already exists for vct-rl-reranker, write `enabled=false`
+# at `(project_id IS NULL, vct-rl-reranker, enabled_for_project)`.
+#
+# Soft-fails identically to `_write_preset_defaults_to_app_state`:
+#   - launcher.db absent → skip (launcher will create the table on first
+#     boot; the user can then flip the toggle in Preferences → Modules).
+#   - module_settings table absent → skip.
+#   - Existing global row present → preserve user's prior choice (do
+#     not overwrite).
+#   - Existing rl_events count >= 500 → skip (training data already
+#     accumulated; let the user decide via the GUI prompt).
+#
+# Idempotency: the helper exits early if a global row already exists,
+# regardless of its value. Re-running install.py never resurrects a
+# default the user has since flipped.
+
+_RL_RERANKER_MODULE_ID = "vct-rl-reranker"
+_MODULE_ENABLED_FOR_PROJECT_KEY = "enabled_for_project"
+_RL_EVENTS_AUTO_ENABLE_THRESHOLD = 500
+
+
+def _seed_rl_reranker_default_disabled() -> None:
+    """Seed the launcher's `module_settings` table with a host-wide
+    disable row for vct-rl-reranker when the install is fresh enough
+    that the user hasn't accumulated training data yet.
+
+    Mirror of `_write_preset_defaults_to_app_state` for an adjacent
+    table. Soft-fail on every known error condition (see module-level
+    comment).
+    """
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
+        _log_install_event(
+            "rl_reranker_default", "skip",
+            f"launcher.db not found at {db_path}; the launcher will "
+            f"create the table on first boot. The user can flip the "
+            f"default via Preferences → Modules in the GUI.",
+            data={"db_path": str(db_path)},
+        )
+        return
+
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as e:
+        _log_install_event(
+            "rl_reranker_default", "warn",
+            f"sqlite3.connect failed for {db_path}: {e}",
+            data={"db_path": str(db_path), "error": str(e)},
+        )
+        return
+
+    try:
+        cur = conn.cursor()
+
+        # Step 1: probe the rl_events count. Soft-fail when the table
+        # doesn't exist yet (pre-migration-025 launcher.db).
+        try:
+            row = cur.execute("SELECT COUNT(*) FROM rl_events").fetchone()
+            rl_count = int(row[0]) if row else 0
+        except sqlite3.OperationalError as e:
+            _log_install_event(
+                "rl_reranker_default", "skip",
+                f"rl_events table not present yet ({e}); will write the "
+                f"default disable row on next install run after the "
+                f"launcher has booted at least once.",
+                data={"db_path": str(db_path), "error": str(e)},
+            )
+            return
+
+        # Step 2: if the user has already accumulated 500+ events, the
+        # auto-enable path applies. Do NOT seed a disable here — let the
+        # GUI prompt them to enable via Preferences → Modules.
+        if rl_count >= _RL_EVENTS_AUTO_ENABLE_THRESHOLD:
+            _log_install_event(
+                "rl_reranker_default", "skip",
+                f"rl_events already has {rl_count} rows "
+                f"(>= {_RL_EVENTS_AUTO_ENABLE_THRESHOLD}); not seeding a "
+                f"default disable row. The user can opt in / out via the "
+                f"GUI.",
+                data={
+                    "rl_events_count": rl_count,
+                    "threshold": _RL_EVENTS_AUTO_ENABLE_THRESHOLD,
+                },
+            )
+            return
+
+        # Step 3: probe for an existing global row. If present, the
+        # user has already configured the default (either via the GUI
+        # or a prior install.py run) — preserve their choice.
+        try:
+            existing = cur.execute(
+                "SELECT setting_value FROM module_settings "
+                " WHERE project_id IS NULL "
+                "   AND module_id = ? "
+                "   AND setting_key = ?",
+                (_RL_RERANKER_MODULE_ID, _MODULE_ENABLED_FOR_PROJECT_KEY),
+            ).fetchone()
+        except sqlite3.OperationalError as e:
+            # module_settings table missing OR project_id NOT NULL
+            # (pre-034 schema). Either way we cannot land the global
+            # default — soft-fail with a hint.
+            _log_install_event(
+                "rl_reranker_default", "skip",
+                f"module_settings probe failed ({e}); the launcher's "
+                f"migration 034 (v0.2.52) lands the nullable project_id "
+                f"column. Re-run install.py after the launcher boots.",
+                data={"db_path": str(db_path), "error": str(e)},
+            )
+            return
+
+        if existing is not None:
+            _log_install_event(
+                "rl_reranker_default", "skip",
+                f"global rl-reranker enable row already present "
+                f"(value={existing[0]!r}); preserving user choice.",
+                data={"existing_value": existing[0]},
+            )
+            return
+
+        # Step 4: write the default disable row.
+        try:
+            cur.execute(
+                "INSERT INTO module_settings "
+                "  (project_id, module_id, setting_key, setting_value) "
+                "VALUES (NULL, ?, ?, ?)",
+                (
+                    _RL_RERANKER_MODULE_ID,
+                    _MODULE_ENABLED_FOR_PROJECT_KEY,
+                    "false",  # JSON-encoded bool — matches the Rust
+                              # setter's encoding so the cascade reader
+                              # decodes it correctly.
+                ),
+            )
+            conn.commit()
+        except sqlite3.Error as e:
+            _log_install_event(
+                "rl_reranker_default", "warn",
+                f"failed to seed default disable row: {e}",
+                data={"error": str(e)},
+            )
+            return
+
+        _log_install_event(
+            "rl_reranker_default", "ok",
+            f"seeded host-wide default: vct-rl-reranker disabled until "
+            f"{_RL_EVENTS_AUTO_ENABLE_THRESHOLD}+ retrieval events "
+            f"accumulate (currently {rl_count}). Override in "
+            f"Preferences → Modules.",
+            data={
+                "module_id": _RL_RERANKER_MODULE_ID,
+                "setting_key": _MODULE_ENABLED_FOR_PROJECT_KEY,
+                "value": False,
+                "rl_events_count": rl_count,
+                "threshold": _RL_EVENTS_AUTO_ENABLE_THRESHOLD,
+            },
+        )
+    except sqlite3.Error as e:
+        _log_install_event(
+            "rl_reranker_default", "warn",
+            f"unexpected sqlite error: {e}",
+            data={"error": str(e)},
+        )
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
 def _read_app_state_key(key: str) -> "str | None":
     """Read a single key from launcher.db's app_state table.
 
@@ -8344,6 +8570,127 @@ def _read_app_state_key(key: str) -> "str | None":
             conn.close()
     except Exception:
         return None
+
+
+def _model_id_for_active(active: str) -> str:
+    """v0.2.52 V52-AJ: map an active-embedding profile to its model id.
+
+    Used when threading ``EMBEDDING_MODEL`` into ``sync_knowledge_graph.py``
+    subprocesses so the subprocess picks the same model the launcher chose,
+    even when the user shell has no ``EMBEDDING_MODEL`` set.
+
+    Profiles (case-insensitive):
+      * ``arctic`` → ``snowflake-arctic-embed2:latest``
+      * ``openai`` → ``text-embedding-3-small``
+      * ``qwen3`` (or anything else) → ``qwen3-embedding:0.6b``
+
+    Mirror of ``vco_lib.embedding_service._model_id_for_active``. Both
+    functions intentionally duplicate the mapping (install.py runs from
+    the bundled-script venv that may not have ``vco_lib`` on PYTHONPATH
+    early in the bootstrap; the helper here keeps install.py self-contained).
+    """
+    normalised = (active or "").strip().lower()
+    if normalised == "arctic":
+        return "snowflake-arctic-embed2:latest"
+    if normalised == "openai":
+        return "text-embedding-3-small"
+    return "qwen3-embedding:0.6b"
+
+
+def _read_active_embedding_from_app_state() -> "str | None":
+    """v0.2.52 V52-AJ: return the launcher's active embedding profile, or None.
+
+    Reads ``app_state[embedding.active_profile]`` (canonical key written by
+    the launcher's Identity-tab embedding selector + install.py's preset
+    seeding). Returns ``None`` when:
+      * launcher.db file is absent (free-tier install, no launcher), OR
+      * the ``app_state`` table has not been created yet (fresh first
+        boot pre-migration), OR
+      * the key is unset, OR
+      * the stored value is an empty/whitespace string, OR
+      * any sqlite error fires.
+
+    Soft-fail throughout — callers treat ``None`` as "use env or default".
+    """
+    raw = _read_app_state_key(_APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None
+
+
+def _resolve_active_embedding_for_install() -> "str | None":
+    """v0.2.52 V52-AJ: resolve the install-time active embedding profile.
+
+    Resolution chain (matches ``EmbeddingService._resolve_active_embedding``):
+
+      1. ``os.environ[ACTIVE_EMBEDDING]`` — explicit user override.
+      2. ``launcher.db app_state[embedding.active_profile]`` — what the
+         launcher's GUI / install.py preset chooser wrote.
+      3. ``None`` — caller falls back to ``"qwen3"`` default (no
+         destructive resolution here; the None sentinel lets callers
+         distinguish "use default" from "explicit qwen3").
+
+    Returned value (when not None) is lowercased + stripped.
+
+    The chain intentionally mirrors the EmbeddingService side so both
+    code paths arrive at the same answer for any given (env, db) pair.
+    """
+    env_value = os.environ.get("ACTIVE_EMBEDDING", "").strip().lower()
+    if env_value:
+        return env_value
+    db_value = _read_active_embedding_from_app_state()
+    if db_value:
+        return db_value.lower()
+    return None
+
+
+def _subprocess_env_with_embedding(base_env: "dict[str, str] | None" = None) -> "dict[str, str]":
+    """v0.2.52 V52-AJ: build a subprocess env dict with ACTIVE_EMBEDDING + EMBEDDING_MODEL threaded.
+
+    Starts from ``base_env`` (defaults to ``os.environ.copy()``) and
+    OVERLAYS the resolved values from
+    :func:`_resolve_active_embedding_for_install`. The overlay rules:
+
+      * If ``ACTIVE_EMBEDDING`` is already present in ``base_env`` with a
+        non-empty value, leave it alone (env always wins).
+      * Otherwise, if the launcher.db resolver returned a value, set it
+        in the subprocess env.
+      * If neither env nor launcher.db has a value, leave the env unset —
+        the subprocess will fall back to its own ``"qwen3"`` default.
+
+    Same rule applied to ``EMBEDDING_MODEL`` (derived via
+    :func:`_model_id_for_active`).
+
+    This is the WHOLE fix for Fabio's Windows + CPU stuck-at-40% bug
+    (msg 267, 2026-06-09): the install.py subprocess inherited a
+    bare ``os.environ.copy()`` that did not carry the launcher's
+    ``arctic`` preference, so ``EmbeddingService.for_project()`` in
+    the subprocess defaulted to qwen3 and ground for hours. With this
+    helper, install.py threads the resolved values explicitly.
+
+    Args:
+        base_env: starting env dict. Defaults to ``os.environ.copy()``.
+
+    Returns:
+        A new dict (never the caller's, never ``os.environ`` itself)
+        with the embedding env vars threaded in.
+    """
+    sub_env = dict(base_env) if base_env is not None else os.environ.copy()
+    existing_active = sub_env.get("ACTIVE_EMBEDDING", "").strip()
+    if existing_active:
+        # Env-explicit case — make sure EMBEDDING_MODEL is consistent if
+        # absent (callers may have set ACTIVE_EMBEDDING without the model id).
+        if not sub_env.get("EMBEDDING_MODEL", "").strip():
+            sub_env["EMBEDDING_MODEL"] = _model_id_for_active(existing_active)
+        return sub_env
+    # Env empty — consult launcher.db.
+    resolved = _resolve_active_embedding_for_install()
+    if resolved:
+        sub_env["ACTIVE_EMBEDDING"] = resolved
+        if not sub_env.get("EMBEDDING_MODEL", "").strip():
+            sub_env["EMBEDDING_MODEL"] = _model_id_for_active(resolved)
+    return sub_env
 
 
 def _write_app_state_key(key: str, value: str) -> None:
@@ -12329,7 +12676,11 @@ def _seed_weaviate_shared_kg_only(
     if not sync_kg.exists():
         return seed_errors
     print(f"  → knowledge/ → {current_shared_kg} (shared) ...", flush=True)
-    seed_env = os.environ.copy()
+    # v0.2.52 V52-AJ: same env-threading rationale as the per-project KG
+    # seed above. Build the base env via _subprocess_env_with_embedding()
+    # (threads ACTIVE_EMBEDDING + EMBEDDING_MODEL from env-or-launcher.db),
+    # then overlay the shared-KG-specific KG_COLLECTION + KG_BASE_DIR.
+    seed_env = _subprocess_env_with_embedding()
     seed_env["KG_COLLECTION"] = current_shared_kg
     seed_env["KG_BASE_DIR"] = str(PROJECT_ROOT)
     try:
@@ -12573,7 +12924,14 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     _nodes_skipped = 0
     _nodes_synced = 0
 
-    current_active_embedding = os.environ.get("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
+    # v0.2.52 V52-AJ: resolve active embedding via the same chain the
+    # subprocess will use (env → launcher.db → "qwen3"). This guarantees
+    # the CI-10 diff gate's "stored vs current" comparison uses the SAME
+    # value that the subprocess EmbeddingService will resolve to —
+    # otherwise install.py could write last_installed_active_embedding=arctic
+    # while the subprocess silently embedded with qwen3, and the next
+    # --update's diff gate would short-circuit on the wrong premise.
+    current_active_embedding = _resolve_active_embedding_for_install() or "qwen3"
     current_kg_collection = os.environ.get("KG_COLLECTION", "") or ""
     current_shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
     weaviate_url = (
@@ -12807,12 +13165,21 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
             cmd_args = _diff_files  # explicit list of changed files
             desc = f"{len(_diff_files)} changed file(s)"
         print(f"  → {desc} → KG + Development collections ...", flush=True)
+        # v0.2.52 V52-AJ: thread ACTIVE_EMBEDDING + EMBEDDING_MODEL into the
+        # subprocess env. Without this, install.py's bare os.environ.copy()
+        # would mask the launcher's app_state[embedding.active_profile]
+        # choice, and EmbeddingService.for_project() inside the subprocess
+        # would silently fall back to qwen3 (the hard-coded default). On
+        # Windows + CPU + 24 GB RAM with the launcher having stored
+        # active=arctic, that fallback meant ~30 s per chunk and the user
+        # stuck at 40-50% for hours (Fabio's msg 267, 2026-06-09).
         try:
             subprocess.run(
                 [str(venv_py), str(sync_kg)] + cmd_args,
                 check=True,
                 cwd=str(PROJECT_ROOT),
                 timeout=900,  # 15 min cap; large repos may hit this
+                env=_subprocess_env_with_embedding(),
             )
         except subprocess.CalledProcessError as e:
             print(f"    ! kg/docs sync exited {e.returncode} — re-run later with `kg-sync --all`")
@@ -16889,6 +17256,178 @@ def _is_windows_sharing_violation(exc: OSError) -> bool:
     return getattr(exc, "winerror", None) == 32
 
 
+def _try_invoke_windows_stage1_updater(
+    install_root: Path,
+    *,
+    launcher_pid: Optional[int],
+) -> Optional[Path]:
+    """v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): CLI parity for the
+    Windows stage1 updater handoff.
+
+    When the user runs ``python install.py --update`` from a terminal
+    (NOT via the launcher GUI), the launcher GUI's Tauri command
+    ``prepare_windows_update_handoff`` is unreachable. This Python-side
+    helper provides equivalent behaviour:
+
+    1. Check we're on Windows. POSIX → no-op (the rename pattern in
+       ``_refresh_dist_binary_after_rebuild`` already handles binary
+       swap correctly via inode ref-counting).
+    2. Check the launcher is running. ``launcher_pid`` comes from
+       ``$VCT_LAUNCHER_PID`` (set by the Tauri caller) or — when CLI-
+       invoked — from a process scan. If no launcher is running, no
+       handoff is needed; install.py overwrites the dist binary directly.
+    3. Resolve ``launcher/dist/windows-x64/vct-updater.exe``. If missing
+       (orchestrator clone predates v0.2.52), return None — caller falls
+       back to the existing ``launcher_binary_swap_failed_locked``
+       deferral path.
+    4. Build the lock JSON describing the binaries that need swapping.
+       Mirror of the Rust ``UpdateLock`` struct in
+       ``commands/update_handoff.rs``.
+    5. Write the lock atomically (``<vct_root>/update.lock.json.tmp``
+       + rename onto canonical name).
+    6. Spawn ``vct-updater.exe`` DETACHED via ``CREATE_NEW_PROCESS_GROUP``
+       + ``DETACHED_PROCESS`` flags. The updater polls the launcher PID
+       until it exits, then performs ``MoveFileExW`` for each entry.
+
+    Returns the lock file path on success, None on any failure
+    (including non-Windows, no launcher running, updater missing,
+    spawn error). Soft-fail throughout: caller treats None as
+    "fall back to legacy deferral path".
+
+    Args:
+        install_root: Repository root containing ``launcher/dist/``.
+        launcher_pid: Running launcher PID, or None if unknown. When
+            None, we attempt a best-effort scan but skip handoff if
+            we can't find a running launcher (it may have already exited).
+    """
+    if not platform.system().lower().startswith("win"):
+        return None
+
+    # Resolve dist directory + updater binary.
+    dist_dir = install_root / "launcher" / "dist" / "windows-x64"
+    updater_path = dist_dir / "vct-updater.exe"
+    if not updater_path.is_file():
+        _log_install_event(
+            "stage1_updater", "skip",
+            f"vct-updater.exe not found at {updater_path} — falling back "
+            "to launcher_restart_required deferral path",
+        )
+        return None
+
+    # Determine launcher PID. If the caller didn't pass one, no handoff
+    # is needed (install.py is in its standard "running launcher will
+    # restart later" mode; the deferral path covers this).
+    if launcher_pid is None or launcher_pid <= 0:
+        _log_install_event(
+            "stage1_updater", "skip",
+            "no launcher PID provided — handoff not needed "
+            "(install.py overwrites dist binary directly or emits deferral)",
+        )
+        return None
+
+    # Build the swap list. Only include candidates that have a
+    # `<target>.new` staged sibling on disk. If neither is staged, the
+    # handoff has nothing to do and we fall back.
+    swap_targets: list[Path] = []
+    for fname in ["vct-launcher.exe", "vct-hub.exe"]:
+        target = dist_dir / fname
+        staged = target.with_suffix(target.suffix + ".new")
+        if staged.is_file():
+            swap_targets.append(target)
+
+    if not swap_targets:
+        _log_install_event(
+            "stage1_updater", "skip",
+            "no <target>.new staged binaries — handoff not needed",
+        )
+        return None
+
+    # Resolve vct_root_dir for the lock file location. Mirror of
+    # vco_lib.paths.vct_root_dir().
+    try:
+        from vco_lib.paths import vct_root_dir as _vct_root
+        vct_root = _vct_root()
+    except Exception:  # noqa: BLE001 — soft-fail
+        # Fallback: ~/.vct (the canonical default).
+        home = Path.home()
+        vct_root = home / ".vct"
+
+    try:
+        vct_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log_install_event(
+            "stage1_updater", "warn",
+            f"could not create vct_root_dir {vct_root}: {exc}",
+        )
+        return None
+
+    lock_path = vct_root / "update.lock.json"
+
+    # Build lock contents. Keep struct shape identical to the Rust
+    # commands/update_handoff::UpdateLock — same field names, same JSON
+    # so the Rust vct-updater binary can parse it.
+    lock_payload: dict[str, Any] = {
+        "parent_pid": int(launcher_pid),
+        "swaps": [{"target": str(t)} for t in swap_targets],
+        "relaunch": str(dist_dir / "vct-launcher.exe"),
+        # Timezone-aware UTC timestamp. The launcher's boot recovery
+        # (Rust commands::update_handoff::poll_update_lock_on_boot)
+        # parses this via chrono::DateTime::parse_from_rfc3339 to
+        # detect stale locks (>10 min old).
+        "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+    # Atomic write.
+    tmp_path = lock_path.with_suffix(".json.tmp")
+    try:
+        tmp_path.write_text(json.dumps(lock_payload, indent=2), encoding="utf-8")
+        os.replace(tmp_path, lock_path)
+    except OSError as exc:
+        _log_install_event(
+            "stage1_updater", "warn",
+            f"could not write lock file {lock_path}: {exc}",
+        )
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    # Spawn the updater DETACHED so it survives this Python process
+    # exiting. The flags mirror the Rust side:
+    #   - CREATE_NEW_PROCESS_GROUP (0x00000200)
+    #   - DETACHED_PROCESS (0x00000008)
+    # On Windows, subprocess.Popen supports these via creationflags.
+    try:
+        creation_flags = 0x00000200 | 0x00000008  # NEW_PROCESS_GROUP | DETACHED
+        subprocess.Popen(
+            [str(updater_path), str(lock_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creation_flags,
+            close_fds=True,
+        )
+    except OSError as exc:
+        # Clean up the lock — no updater is running to honor it.
+        _log_install_event(
+            "stage1_updater", "warn",
+            f"could not spawn vct-updater.exe: {exc} — cleaning lock",
+        )
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    _log_install_event(
+        "stage1_updater", "ok",
+        f"stage1 handoff initiated: lock={lock_path}, swaps={len(swap_targets)}, "
+        f"parent_pid={launcher_pid}",
+    )
+    return lock_path
+
+
 def _emit_launcher_restart_deferral(
     deferral_report: Any,
     *,
@@ -17431,23 +17970,84 @@ def _refresh_dist_binary_after_rebuild(
                     f"to {backup_path}, new binary written to {dist_path}",
                 )
             except OSError as rename_exc:
-                # Both direct overwrite AND rename failed. Emit the
-                # binary-swap-locked deferral so the GUI tells the user
-                # to fully quit + retry from terminal.
-                _log_install_event(
-                    "refresh_dist_binary", "error",
-                    f"Windows binary-swap failed; both overwrite ({exc}) "
-                    f"and rename ({rename_exc}) hit ERROR_SHARING_VIOLATION. "
-                    f"Emitting launcher_binary_swap_failed_locked deferral.",
-                )
-                _emit_binary_swap_locked_deferral(
-                    deferral_report,
-                    new_binary_path=dist_path,
-                    error_detail=(
-                        f"overwrite={exc!r}; rename={rename_exc!r}"
-                    ),
-                )
-                return None
+                # v0.2.52 V52-AH (Fabio bug 1): both direct overwrite
+                # AND rename failed. Before giving up with the
+                # `launcher_binary_swap_failed_locked` deferral, try
+                # staging the new binary at `<dist_path>.new` so the
+                # stage1 updater (vct-updater.exe) can swap it after
+                # the running launcher exits.
+                staged_new = dist_path.with_suffix(dist_path.suffix + ".new")
+                try:
+                    shutil.copy2(src, staged_new)
+                    _log_install_event(
+                        "refresh_dist_binary", "ok",
+                        f"Windows binary lock detected; staged new binary at "
+                        f"{staged_new} for stage1 updater handoff "
+                        f"(overwrite={exc!r}; rename={rename_exc!r})",
+                    )
+                    # Try the stage1 handoff. If we have a launcher PID,
+                    # spawn vct-updater.exe; otherwise fall back to the
+                    # legacy `launcher_binary_swap_failed_locked` flow.
+                    old_pid_str = os.environ.get("VCT_LAUNCHER_PID", "").strip()
+                    launcher_pid: Optional[int] = None
+                    if old_pid_str:
+                        try:
+                            launcher_pid = int(old_pid_str)
+                        except ValueError:
+                            launcher_pid = None
+                    lock_path = _try_invoke_windows_stage1_updater(
+                        install_root, launcher_pid=launcher_pid,
+                    )
+                    if lock_path is not None:
+                        # Handoff initiated. Treat the swap as "logically
+                        # succeeded" — the new bytes are on disk at
+                        # <dist_path>.new and the updater will rename
+                        # them onto the canonical path after the launcher
+                        # exits. We deliberately do NOT emit
+                        # launcher_restart_required here because the
+                        # updater itself will relaunch.
+                        swap_succeeded = True
+                        _log_install_event(
+                            "refresh_dist_binary", "ok",
+                            f"stage1 updater handoff initiated "
+                            f"(lock={lock_path}); deferral suppressed",
+                        )
+                    else:
+                        # No handoff possible (no PID, no updater binary,
+                        # spawn failure). Fall back to the legacy deferral.
+                        _log_install_event(
+                            "refresh_dist_binary", "warn",
+                            "stage1 updater handoff not available; "
+                            "emitting launcher_binary_swap_failed_locked",
+                        )
+                        _emit_binary_swap_locked_deferral(
+                            deferral_report,
+                            new_binary_path=dist_path,
+                            error_detail=(
+                                f"overwrite={exc!r}; rename={rename_exc!r}; "
+                                f"staged_at={staged_new}"
+                            ),
+                        )
+                        return None
+                except OSError as stage_exc:
+                    # Couldn't even write the .new sibling — disk full,
+                    # permissions, etc. Fall back to the legacy deferral.
+                    _log_install_event(
+                        "refresh_dist_binary", "error",
+                        f"Windows binary-swap failed; both overwrite ({exc}) "
+                        f"and rename ({rename_exc}) hit ERROR_SHARING_VIOLATION, "
+                        f"and staging .new copy failed ({stage_exc}). "
+                        f"Emitting launcher_binary_swap_failed_locked deferral.",
+                    )
+                    _emit_binary_swap_locked_deferral(
+                        deferral_report,
+                        new_binary_path=dist_path,
+                        error_detail=(
+                            f"overwrite={exc!r}; rename={rename_exc!r}; "
+                            f"stage_new={stage_exc!r}"
+                        ),
+                    )
+                    return None
         else:
             _log_install_event(
                 "refresh_dist_binary", "warn",

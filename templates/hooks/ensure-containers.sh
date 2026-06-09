@@ -2,6 +2,41 @@
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
+
+# V52-AI (v0.2.52): MCP fork-bomb mitigation. If an orchestrator update
+# is in progress, skip container startup entirely — the launcher's own
+# pre-update hub-stop has already torn the supervisor down, and
+# bringing containers back up mid-update races install.py's volume +
+# binary writes. The lockfile is at <VCT_STATE_DIR or ~/.vct>/
+# .update-in-progress.json; we treat missing-file / parse-error /
+# stale (expected_completion_by in the past) as "no active update"
+# (proceed normally — same as today's pre-fix behaviour).
+__vct_root_dir="${VCT_STATE_DIR:-$HOME/.vct}"
+__vct_update_lockfile="$__vct_root_dir/.update-in-progress.json"
+if [ -f "$__vct_update_lockfile" ]; then
+    # Compare expected_completion_by to now via a one-shot Python invocation
+    # (avoids depending on jq + `date -d` which differ across distros).
+    __still_fresh=$(python3 -c "
+import json, datetime, sys
+try:
+    with open('$__vct_update_lockfile') as f:
+        d = json.load(f)
+    deadline = d.get('expected_completion_by', '')
+    if deadline.endswith('Z'):
+        deadline = deadline[:-1] + '+00:00'
+    dt = datetime.datetime.fromisoformat(deadline)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    print('1' if now < dt else '0')
+except Exception:
+    print('0')
+" 2>/dev/null)
+    if [ "$__still_fresh" = "1" ]; then
+        echo "[ensure-containers] orchestrator update in progress; skipping container startup until update completes" >&2
+        exit 0
+    fi
+fi
+unset __vct_root_dir __vct_update_lockfile __still_fresh
+
 # Ensure all required containers are running (background, non-blocking)
 # Called by SessionStart hook — checks and starts any stopped containers.
 #

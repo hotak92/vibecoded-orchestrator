@@ -361,6 +361,14 @@ PowerShell variants (`*.ps1`) ship for Windows users.
   - `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` — code entities
 - **Access**: Weaviate MCP tools (`hybrid_search`, `semantic_graph_search`, `store_knowledge_node`, `search_code_graph`, `query_code_structure`).
 
+**Configuration channel for `install.py` and its sync subprocess** (v0.2.52 V52-AJ): `install.py` runs `python sync_knowledge_graph.py` in a subprocess that does NOT read `.claude/env` (shell-sourced only by `BASH_ENV` for hook subprocesses) and does NOT read `.claude/settings.json` (Claude Code surface, MCP subprocesses only). The active-embedding choice for the install-time KG seed resolves via this chain:
+
+1. **`ACTIVE_EMBEDDING` env var** in the shell that ran `install.py`. Set this BEFORE running install.py if you want to override (e.g. `ACTIVE_EMBEDDING=arctic python install.py --update`).
+2. **`launcher.db app_state[embedding.active_profile]`** — written by the launcher GUI's Identity tab → Embedding selector AND by install.py's preset chooser. Install.py reads this as fallback when the env is absent, then threads `ACTIVE_EMBEDDING` + `EMBEDDING_MODEL` into the `sync_knowledge_graph.py` subprocess env. This is the canonical channel for "I picked arctic in the launcher; install should honor that" without needing to set env vars.
+3. **`"qwen3"` default** — free-tier installs that don't have the launcher (and therefore no `launcher.db`) keep the qwen3 default. Nothing changes for them.
+
+If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on a slow Ollama backend when you expected arctic), check the resolution chain in this order: `echo $ACTIVE_EMBEDDING` → `sqlite3 ~/.vct/launcher.db "SELECT value FROM app_state WHERE key='embedding.active_profile'"` → set the right value at whichever level is empty.
+
 ### Ollama Local LLM
 - **URL**: `http://localhost:11435`
 - **Purpose**: Local embeddings for Weaviate; code-embedding service CPU fallback. Not exposed as an MCP tool to Claude (the Ollama MCP was removed because Claude's native reasoning, `Read` tool, and built-in vision handle the same use cases at higher quality).
@@ -513,6 +521,26 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - Code entities → code graph.
 - Verbose docs → development collection.
 - Quick local analysis → use Claude directly.
+
+### KG vs Code Graph — the cross-project access asymmetry
+
+KG and code graph look similar on the surface (both are per-project Weaviate collections, both support cross-project sharing), but they have **deliberately different defaults** for cross-project access. Future-you will assume they're symmetric and be wrong — name it explicitly:
+
+| Concern                                   | Knowledge Graph                                                       | Code Graph                                                                                                                       |
+|-------------------------------------------|-----------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| Self collection on every read             | YES                                                                   | YES                                                                                                                              |
+| **Shared collection auto-merged on read** | **YES** — unconditional, via `SHARED_KG_COLLECTION`                   | **NO** — there is no `SHARED_CODE_GRAPH_COLLECTION`; the concept doesn't exist                                                   |
+| Cross-project read via access matrix      | `VCT_KG_ACCESS_LIST` env, resolved from `kg_collection_access` table  | `VCT_CODE_GRAPH_ACCESS_LIST` env, resolved from `codegraph_access` table (**separate table**, separate launcher GUI surface)     |
+| Cross-project write                       | `store_knowledge_node(scope="shared", ...)`                           | N/A — code graph is analyzer-generated, not user-authored                                                                        |
+| Custom paths into your own collection     | N/A (KG is markdown nodes, not source-walked)                         | YES — `project_codegraph_extra_paths` lets you add e.g. a public-repo clone to your private project's code graph                 |
+| Backing tables (launcher.db)              | per-project KG class + `VibeCodedOrchestrator_KnowledgeGraph` (shared) | `project_codegraph_bindings` (per-project) + `codegraph_access` (matrix) + `project_codegraph_extra_paths` (path injection)      |
+| GUI surface                               | Identity tab → KG access matrix                                       | Codegraph page → `CrossProjectAccessTab.svelte` + `ExtraCodegraphPathsPanel.svelte`                                              |
+
+**Why the asymmetry?** Knowledge graph nodes are intentionally cross-project value: a pattern you learned debugging one app is almost certainly useful in another app on the same machine. So the shared KG (`VibeCodedOrchestrator_KnowledgeGraph` by default) is auto-merged into every `hybrid_search` / `semantic_graph_search` call across all projects on this install — read access is unconditional, no opt-in required. The cost (a few extra results in your search output) is much smaller than the cost of missing a relevant pattern you wrote yesterday in a different project.
+
+Code graph rows are not cross-project value by default. Source code from one project is rarely relevant to another project's reasoning — and worse, auto-merging would leak proprietary or sensitive source across tenants (a freelancer working on Client A's codebase + Client B's codebase in the same install does NOT want Client A's code surfacing in Client B's `search_code_graph` results). So code graph **opts in** to cross-project visibility via explicit `codegraph_access` grants (the launcher's Codegraph → CrossProjectAccessTab GUI), and the orchestrator-clone / public-repo-clone case is handled via `project_codegraph_extra_paths` (you tell your project's code graph "also walk THIS path under my own collection") rather than via a shared collection.
+
+**Practical implication for agents**: when you write code that traverses peer collections, use the right helper — KG fan-out reads `SHARED_KG_COLLECTION` + `VCT_KG_ACCESS_LIST`; code-graph fan-out reads only `VCT_CODE_GRAPH_ACCESS_LIST` (no shared default). If you find yourself thinking "let me add a `SHARED_CODE_GRAPH_COLLECTION` env for symmetry," STOP — that would invert this design and silently leak code across tenants. Grep confirms: `grep -rn "SHARED_CODE_GRAPH" launcher/ claude_mcp_servers/ vco_lib/` returns zero hits today; keep it that way.
 
 ---
 

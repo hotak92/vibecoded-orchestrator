@@ -20,17 +20,35 @@ if (Test-Path $EmitContextLib) { . $EmitContextLib }
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $EditedFile = ""
+# V52-L.2 Fix 2a: parse subagent identity + session_id so credential_
+# alerts.jsonl rows carry enough context to be attributed to the agent
+# that triggered the write. Empty string when absent (parent context).
+$AgentId = ""
+$AgentType = ""
+$SessionId = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload -and $payload.tool_input -and $payload.tool_input.file_path) {
         $EditedFile = [string]$payload.tool_input.file_path
     }
+    if ($payload) {
+        if ($payload.agent_id)   { $AgentId   = [string]$payload.agent_id }
+        if ($payload.agent_type) { $AgentType = [string]$payload.agent_type }
+        if ($payload.session_id) { $SessionId = [string]$payload.session_id }
+    }
 } catch {
-    # Empty/malformed stdin — keep $EditedFile at default
+    # Empty/malformed stdin — keep variables at defaults
 }
 
 $ScriptDir = $PSScriptRoot
-$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+# v0.2.52 V52-L.2: prefer canonical $CLAUDE_PROJECT_DIR (active workspace
+# handed in by the launcher) over the SCRIPT_DIR/../.. fallback. Aligns
+# with pre-tool-use.ps1 and post-file-edit.ps1.
+$ProjectRoot = if ($env:CLAUDE_PROJECT_DIR) {
+    $env:CLAUDE_PROJECT_DIR
+} else {
+    (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+}
 
 $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
@@ -93,9 +111,15 @@ if ($alerts.Count -gt 0) {
     # -Compress keeps it on one line; -Depth 5 is plenty for this flat shape.
     # Audit fix 2026-05-07.
     $entry = [ordered]@{
-        timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        file      = $EditedFile
-        patterns  = ($alerts -join ' ')
+        timestamp  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        file       = $EditedFile
+        patterns   = ($alerts -join ' ')
+        # V52-L.2 Fix 2a: include session_id + agent_id + agent_type so
+        # post-hoc forensics can attribute the credential alert back to
+        # the agent that triggered the write.
+        session_id = $SessionId
+        agent_id   = $AgentId
+        agent_type = $AgentType
     }
     $line = $entry | ConvertTo-Json -Compress -Depth 5
     try { Add-Content -Path $AlertLog -Value $line -ErrorAction Stop } catch { }

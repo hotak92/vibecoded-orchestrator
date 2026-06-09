@@ -1,33 +1,47 @@
 <script lang="ts">
   // v0.2.23 (B4 / D19): orchestrator-update merge/rebase conflict modal.
+  // v0.2.52 (V52-A / V52-B): one-click "Keep local" + "Accept upstream"
+  //   buttons added. The legacy silent-dismiss path that wrapped a
+  //   plain `onClose()` is REMOVED — it left the install in an
+  //   inconsistent state. The modal now exposes exactly three
+  //   options: Abort & restore, Keep local versions, Accept upstream
+  //   versions. Window-X / Escape / backdrop click are mapped to
+  //   Abort (with a confirmation) instead of silent dismissal so the
+  //   user can never finish a session with a half-applied update.
   //
   // Surfaced when `merge_orchestrator_with_upstream` or
   // `rebase_orchestrator_onto_upstream` return a structured error with
   // `event: "orchestrator_update_conflict"` — the merge/rebase started
   // but produced unresolved conflicts in one or more files.
   //
-  // The working tree is left in the conflicted state on purpose so the
-  // user can:
-  //   1. Resolve in their editor (CLAUDE.md, knowledge/*.md typically
-  //      "keep local + manually merge upstream additions").
-  //   2. Or click "Abort & restore" to bail cleanly via
-  //      `abort_orchestrator_merge_or_rebase` (runs `git merge --abort`
-  //      or `git rebase --abort` as appropriate).
-  //   3. v0.2.51 (Bug A): click "Continue Update" once the working tree
-  //      is clean to re-enter the post-merge tail (install.py --update
-  //      + binary refresh + auto-restart) via the new
-  //      `resume_orchestrator_update` Tauri command.
+  // Three resolution paths (V52-B 2026-06-09):
+  //   1. **Keep local versions** — `git checkout --ours <files>` + commit +
+  //      continue update. Tauri command: `keep_local_and_continue_update`.
+  //      Tooltip: "Discards upstream changes for the conflicting files;
+  //      keeps everything you've added locally. Good for: nodes you've
+  //      heavily customized."
+  //   2. **Accept upstream versions** — `git checkout --theirs <files>` +
+  //      commit + continue update. Tauri command:
+  //      `accept_upstream_and_continue_update`. Tooltip: "Discards your
+  //      local changes for the conflicting files; takes the public
+  //      release version. Good for: KG nodes you didn't really need."
+  //   3. **Abort & restore** — `git {merge,rebase} --abort` via
+  //      `abort_orchestrator_merge_or_rebase`. Working tree returns to
+  //      its pre-merge state; the update is cancelled.
   //
-  // We do NOT auto-resolve. The user has legitimate local changes
-  // (KG nodes, CLAUDE.md tweaks) that an "ours" / "theirs" auto-pick
-  // would silently destroy.
+  // Smart default (V52-B): when EVERY conflicted file lives under
+  // `knowledge/` (KG nodes are user-curated state per V52-C's
+  // architectural framing), the modal auto-highlights "Keep local" and
+  // shows a notice explaining the recommendation. User can still
+  // override by clicking either of the other buttons.
   //
   // v0.2.51 polling: while the modal is open we poll `check_for_updates`
   // every ~2 s. Once the result reports `merge_resolved_incomplete: true`
-  // (sentinel present + .git/MERGE_HEAD gone) the "Continue Update"
-  // button becomes active. The user can keep the modal open while they
-  // resolve in their editor — no need to re-trigger the flow from the
-  // badge afterwards.
+  // (sentinel present + .git/MERGE_HEAD gone) a "Continue Update" link
+  // appears for users who chose to resolve manually via the CLI before
+  // the v0.2.52 one-click buttons existed. The button is informational —
+  // users CAN still resolve via CLI and click it, but the new defaults
+  // make this path uncommon.
 
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '$lib/tauri';
@@ -66,6 +80,34 @@
   let resumed = $state(false);
   let pollHandle: ReturnType<typeof setInterval> | null = null;
 
+  // v0.2.52 V52-B: one-click resolution state. Both buttons share a
+  // single `resolving` boolean so a click on one disables the other
+  // while the resolution is in flight (avoids racing two `git checkout`
+  // sequences against the same working tree).
+  let resolving = $state(false);
+  let resolved = $state(false);
+  let resolutionMode = $state<'keep-local' | 'accept-upstream' | null>(null);
+
+  // V52-A: tracks whether the user has triggered a "close without
+  // explicit choice" (Escape / X / backdrop click). Two-step
+  // confirmation: first close attempt sets this true and shows an
+  // inline prompt; second confirmation triggers `abort()`.
+  let confirmingDismiss = $state(false);
+
+  // V52-B smart default: when EVERY conflicted path lives under
+  // `knowledge/` (or contains `/knowledge/` for nested layouts), the
+  // modal auto-recommends "Keep local". The recommendation is purely a
+  // UI hint — the Tauri commands themselves don't filter by path. We
+  // compute it once at mount via the payload (which doesn't change for
+  // the modal's lifetime), so a simple `$derived` is enough.
+  const allConflictsAreKgNodes = $derived(
+    payload.conflicted_files.length > 0 &&
+      payload.conflicted_files.every((f) => {
+        const lower = f.toLowerCase();
+        return lower.startsWith('knowledge/') || lower.includes('/knowledge/');
+      })
+  );
+
   type CheckForUpdatesResult = {
     merge_resolved_incomplete?: boolean;
     resume_operation?: string;
@@ -93,12 +135,21 @@
     // button without a 2-second wait.
     void probeResumeReady();
     pollHandle = setInterval(probeResumeReady, 2000);
+    // V52-A: route Escape through `dismiss()` so the user can't
+    // silently escape the modal. Document-level listener because the
+    // modal-local onkeydown only fires when the modal has focus.
+    if (typeof window !== 'undefined') {
+      window.addEventListener('keydown', handleEscape);
+    }
   });
 
   onDestroy(() => {
     if (pollHandle !== null) {
       clearInterval(pollHandle);
       pollHandle = null;
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('keydown', handleEscape);
     }
   });
 
@@ -112,14 +163,19 @@
   const abortBtnTitle = $derived(
     `Run \`git ${payload.operation} --abort\` to restore the working tree to its pre-${payload.operation} state.`
   );
-  const dismissBtnTitle = $derived(
-    'Close this dialog without aborting. Your working tree stays conflicted — resolve manually in your editor.'
-  );
+  // V52-B tooltips, locked verbatim from the user 2026-06-09 (backlog
+  // §V52-B). DO NOT paraphrase — the wording is the user's chosen
+  // affordance for the choice between local-vs-upstream.
+  const keepLocalBtnTitle =
+    "Discards upstream changes for the conflicting files; keeps everything you've added locally. Good for: nodes you've heavily customized.";
+  const acceptUpstreamBtnTitle =
+    "Discards your local changes for the conflicting files; takes the public release version. Good for: KG nodes you didn't really need.";
 
   /**
    * Best-effort: classify each conflicted file so the inline hint
-   * tells the user "keep local" vs "general merge" rather than a
-   * generic message.
+   * nudges the user toward the right per-file choice. V52-B-aware: the
+   * hints reference the new Keep local / Accept upstream buttons rather
+   * than the v0.2.51 manual-edit flow.
    */
   function guidanceFor(path: string): string {
     const lower = path.toLowerCase();
@@ -131,14 +187,15 @@
       lower.startsWith('knowledge/') ||
       lower.includes('/knowledge/')
     ) {
-      return 'Keep your local version; manually merge upstream additions.';
+      return 'User-curated — Keep local is usually right.';
     }
-    return 'Resolve manually in your editor.';
+    return 'Either choice is reasonable.';
   }
 
   async function abort() {
     if (aborting || aborted) return;
     aborting = true;
+    confirmingDismiss = false;
     error = null;
     try {
       await invoke<void>('abort_orchestrator_merge_or_rebase', { path: installPath });
@@ -153,14 +210,102 @@
     }
   }
 
+  // V52-A: dismiss is NO LONGER a silent close. The legacy "Resolve
+  // manually" button that called onClose() is removed. Window-X /
+  // Escape / backdrop click ALL route here — per spec, they're
+  // treated as Abort intent (NOT silent dismissal). To avoid
+  // accidentally destroying the user's in-flight resolution, we
+  // require a two-step confirmation: first click/keypress sets
+  // `confirmingDismiss = true` and shows an inline notice; a second
+  // confirmation within the modal triggers `abort()`.
+  //
+  // Pre-condition: don't trap them mid-action. If a resolution is
+  // already in flight, ignore the close request entirely.
   function dismiss() {
-    if (aborting || resuming) return;
-    // v0.2.51 Bug A: closing without aborting OR resuming used to
-    // silently abandon the update. The launcher MenuBar now shows a
-    // persistent "Continue Update" badge in this state (driven by the
-    // resume sentinel + check_for_updates poll), so dismissing here is
-    // safe — the user can always come back via the badge.
-    onClose();
+    if (aborting || resolving || resuming) return;
+    if (aborted || resumed || resolved) {
+      // Action completed successfully — closing is safe.
+      onClose();
+      return;
+    }
+    // Don't silently close. Per V52-A: treat as Abort intent, but
+    // gate behind a confirmation so a stray click on the backdrop
+    // doesn't nuke the merge.
+    if (!confirmingDismiss) {
+      confirmingDismiss = true;
+      return;
+    }
+    // User confirmed dismiss intent — abort the merge/rebase.
+    confirmingDismiss = false;
+    void abort();
+  }
+
+  // V52-A: cancel the confirm-dismiss state when the user picks any
+  // of the explicit actions (Keep local, Accept upstream, Abort).
+  function cancelConfirmDismiss() {
+    confirmingDismiss = false;
+  }
+
+  // Listen for Escape at the document level (the modal-local
+  // onkeydown only fires when the modal has focus, which Svelte
+  // doesn't guarantee in every browser).
+  function handleEscape(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      dismiss();
+    }
+  }
+
+  // V52-B: one-click resolution handlers. Both invoke the Tauri command,
+  // which performs the git checkout + commit/continue + delegates to
+  // resume_orchestrator_update for install.py --update + binary refresh
+  // + auto-restart. The auto-restart kills the launcher mid-call so we
+  // rarely reach the `resolved = true` line — it's there for the
+  // crash-recovery path where the restart hop fails.
+  async function keepLocal() {
+    if (resolving || resolved || aborting || aborted) return;
+    resolving = true;
+    confirmingDismiss = false;
+    resolutionMode = 'keep-local';
+    error = null;
+    try {
+      await invoke<unknown>('keep_local_and_continue_update', {
+        path: installPath,
+      });
+      resolved = true;
+      toast.success(
+        `Resolved ${payload.conflicted_files.length} conflict(s) (kept local) — install.py is running.`
+      );
+      setTimeout(onClose, 600);
+    } catch (e) {
+      error = `Keep local failed: ${e}`;
+      resolutionMode = null;
+    } finally {
+      resolving = false;
+    }
+  }
+
+  async function acceptUpstream() {
+    if (resolving || resolved || aborting || aborted) return;
+    resolving = true;
+    confirmingDismiss = false;
+    resolutionMode = 'accept-upstream';
+    error = null;
+    try {
+      await invoke<unknown>('accept_upstream_and_continue_update', {
+        path: installPath,
+      });
+      resolved = true;
+      toast.success(
+        `Resolved ${payload.conflicted_files.length} conflict(s) (accepted upstream) — install.py is running.`
+      );
+      setTimeout(onClose, 600);
+    } catch (e) {
+      error = `Accept upstream failed: ${e}`;
+      resolutionMode = null;
+    } finally {
+      resolving = false;
+    }
   }
 
   async function continueUpdate() {
@@ -202,26 +347,41 @@
     </p>
 
     <p class="cfl-hint">
-      You have two options:
+      Pick how to resolve. Each option finishes the update automatically
+      (runs <code>install.py --update</code>, refreshes the launcher
+      binary, and restarts):
     </p>
-    <ol class="cfl-hint">
+    <ul class="cfl-options-list">
       <li>
-        Open the files below in your editor, resolve the conflicts manually,
-        then run <code>git add &lt;file&gt;</code> +
-        <code>git {payload.operation} --continue</code> in the orchestrator
-        directory (<code>{installPath}</code>). Once the working tree is
-        clean, the <strong>Continue Update</strong> button below activates —
-        click it to finish the install (runs
-        <code>install.py --update</code>, refreshes the launcher binary,
-        and restarts).
+        <strong>Keep local versions</strong> — replaces the conflicting
+        files with your local content, discarding the upstream changes
+        for those paths.
       </li>
       <li>
-        Click <strong>Abort &amp; restore</strong> to bail out. This runs
-        <code>git {payload.operation} --abort</code> and brings your working
-        tree back to the state it was in before the {payload.operation}
-        started.
+        <strong>Accept upstream versions</strong> — replaces the
+        conflicting files with the public release content, discarding
+        your local edits for those paths.
       </li>
-    </ol>
+      <li>
+        <strong>Abort &amp; restore</strong> — runs
+        <code>git {payload.operation} --abort</code>; the update is
+        cancelled and your working tree returns to its pre-{payload.operation}
+        state.
+      </li>
+    </ul>
+
+    <!-- V52-B smart default: KG-only conflict steers the user toward
+         "Keep local". KG nodes are user-curated state and a fresh
+         install is unlikely to want the upstream version. -->
+    {#if allConflictsAreKgNodes}
+      <div class="cfl-smart-default">
+        <strong>Recommended:</strong> all conflicting files are under
+        <code>knowledge/</code> (your KG nodes). The default suggestion
+        is <strong>Keep local versions</strong> — your KG content is
+        user-curated and the upstream release rarely needs to overwrite
+        it. You can still pick a different option below.
+      </div>
+    {/if}
 
     {#if resumeReady}
       <div class="cfl-ready">
@@ -259,44 +419,108 @@
       </div>
     {/if}
 
+    <!-- V52-A: two-step confirmation for Escape / X / backdrop click.
+         First close attempt sets `confirmingDismiss`; we explain that
+         closing without a choice will abort, and the user has to either
+         confirm (click "Yes, abort") or pick one of the proper actions
+         below. This prevents a stray click on the backdrop from
+         destroying the merge but ALSO prevents silent dismiss. -->
+    {#if confirmingDismiss && !aborting && !aborted && !resolving && !resolved}
+      <div class="cfl-confirm-dismiss">
+        <p>
+          Closing this dialog without finishing the update will
+          <strong>abort the {payload.operation}</strong> and restore
+          your working tree. Continue?
+        </p>
+        <div class="cfl-confirm-actions">
+          <button
+            class="cfl-btn cfl-btn-warn cfl-btn-small"
+            disabled={aborting}
+            onclick={() => {
+              confirmingDismiss = false;
+              void abort();
+            }}
+          >
+            Yes, abort &amp; close
+          </button>
+          <button
+            class="cfl-btn cfl-btn-small"
+            onclick={cancelConfirmDismiss}
+          >
+            No, keep the dialog open
+          </button>
+        </div>
+      </div>
+    {/if}
+
     <details class="cfl-stderr">
       <summary>Show raw git output</summary>
       <pre>{payload.git_stderr}</pre>
     </details>
 
+    <!-- V52-A / V52-B (2026-06-09): exactly three primary actions — Abort,
+         Keep local, Accept upstream. The legacy silent-dismiss button
+         is REMOVED; it left half-applied updates on disk. Continue
+         Update appears below the primary row, but only as a secondary
+         affordance for users who resolved via CLI before clicking. -->
     <div class="cfl-actions">
       <button
-        class="cfl-btn"
-        disabled={aborting || resuming}
-        onclick={dismiss}
-        title={dismissBtnTitle}
-      >
-        {resumeReady
-          ? 'Resolve manually then click Continue Update'
-          : 'Resolve manually (close this dialog)'}
-      </button>
-      <button
         class="cfl-btn cfl-btn-warn"
-        disabled={aborting || aborted || resuming}
+        disabled={aborting || aborted || resolving || resolved || resuming}
         onclick={abort}
         title={abortBtnTitle}
       >
         {aborting ? 'Aborting…' : 'Abort & restore'}
       </button>
-      <!-- v0.2.51 Bug A: Continue Update is the primary positive action.
-           Activates once polling detects the working tree is clean
-           (resume sentinel present + no .git/MERGE_HEAD). -->
       <button
         class="cfl-btn cfl-btn-primary"
-        disabled={!resumeReady || aborting || aborted || resuming || resumed}
-        onclick={continueUpdate}
-        title={resumeReady
-          ? 'Run install.py --update + binary refresh + auto-restart.'
-          : 'Activates once the working tree is clean. Resolve the conflicts (or `git merge --continue`) first.'}
+        class:cfl-btn-recommended={allConflictsAreKgNodes}
+        disabled={aborting || aborted || resolving || resolved || resuming}
+        onclick={keepLocal}
+        title={keepLocalBtnTitle}
       >
-        {resuming ? 'Continuing…' : resumed ? 'Resumed' : 'Continue Update'}
+        {resolving && resolutionMode === 'keep-local'
+          ? 'Keeping local…'
+          : resolved && resolutionMode === 'keep-local'
+            ? 'Done'
+            : 'Keep local versions'}
+      </button>
+      <button
+        class="cfl-btn cfl-btn-primary"
+        disabled={aborting || aborted || resolving || resolved || resuming}
+        onclick={acceptUpstream}
+        title={acceptUpstreamBtnTitle}
+      >
+        {resolving && resolutionMode === 'accept-upstream'
+          ? 'Accepting upstream…'
+          : resolved && resolutionMode === 'accept-upstream'
+            ? 'Done'
+            : 'Accept upstream versions'}
       </button>
     </div>
+
+    <!-- v0.2.51 Bug A: Continue Update is the CLI-finished resolution
+         path. Hidden by default; only shown when polling detects the
+         working tree is clean (sentinel present + no .git/MERGE_HEAD)
+         which happens when a user resolved via CLI then came back to
+         the modal. Most users will use the primary buttons above and
+         never see this. -->
+    {#if resumeReady && !resolved && !aborted}
+      <div class="cfl-resume-row">
+        <button
+          class="cfl-btn cfl-btn-link"
+          disabled={aborting || resolving || resuming || resumed}
+          onclick={continueUpdate}
+          title="Run install.py --update + binary refresh + auto-restart."
+        >
+          {resuming
+            ? 'Continuing…'
+            : resumed
+              ? 'Resumed'
+              : 'Already resolved via CLI? Continue Update →'}
+        </button>
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -334,14 +558,16 @@
     font-size: 14px;
     color: var(--color-pink);
   }
-  .cfl-modal p, .cfl-modal ol, .cfl-modal li {
+  .cfl-modal p, .cfl-modal li {
     font-size: 12px;
     line-height: 1.6;
     color: var(--color-mid);
   }
   .cfl-modal p { margin: 0 0 10px; }
-  .cfl-modal ol { margin: 0 0 14px; padding-left: 20px; }
-  .cfl-modal ol li { margin-bottom: 6px; }
+  /* v0.2.52: the legacy ordered-list selectors were removed alongside the
+     ordered-list of two manual-resolution options in the template. The
+     new V52-B template uses .cfl-options-list (defined below) for its
+     bullet list of three options. */
   .cfl-modal code {
     background: var(--color-card);
     padding: 1px 4px;
@@ -482,5 +708,101 @@
     color: var(--color-teal, #00bfa6);
     font-size: 11px;
     margin: 10px 0;
+  }
+
+  /* v0.2.52 V52-B: bullet list explaining the three primary options.
+     Tighter spacing than the previous ordered list since each item is
+     also documented in its button's tooltip. */
+  .cfl-options-list {
+    margin: 0 0 14px;
+    padding-left: 20px;
+    color: var(--color-mid);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .cfl-options-list li {
+    margin-bottom: 4px;
+  }
+
+  /* v0.2.52 V52-B: smart-default notice — purple-tinted (VCO accent) to
+     differentiate from the conflict-pink and teal-success colour cues.
+     Shown when EVERY conflicting file is under knowledge/, hinting the
+     user toward "Keep local". */
+  .cfl-smart-default {
+    padding: 8px 10px;
+    background: rgba(123, 95, 255, 0.1);      /* --color-purple at 10% */
+    border: 1px solid rgba(123, 95, 255, 0.3);
+    border-radius: 4px;
+    color: var(--color-text);
+    font-size: 11px;
+    line-height: 1.5;
+    margin: 10px 0 14px;
+  }
+  .cfl-smart-default strong {
+    color: var(--color-purple, #7b5fff);
+  }
+  .cfl-smart-default code {
+    background: rgba(123, 95, 255, 0.18);
+    border-color: rgba(123, 95, 255, 0.3);
+  }
+
+  /* v0.2.52 V52-B: pulse-style border on the recommended button when
+     the smart-default kicks in. Subtle — doesn't override the user's
+     ability to pick a different button. */
+  .cfl-btn-recommended {
+    box-shadow: 0 0 0 1px rgba(123, 95, 255, 0.55);
+    border-color: rgba(123, 95, 255, 0.7);
+  }
+  .cfl-btn-recommended:hover:not(:disabled) {
+    box-shadow: 0 0 0 1px rgba(123, 95, 255, 0.85);
+  }
+
+  /* v0.2.52 V52-A: inline two-step confirmation block surfaced when the
+     user tries to close the modal via Escape / X / backdrop click. The
+     pink accent matches conflict severity — closing destroys the
+     merge. */
+  .cfl-confirm-dismiss {
+    padding: 10px 12px;
+    background: rgba(255, 79, 160, 0.12);
+    border: 1px solid rgba(255, 79, 160, 0.4);
+    border-radius: 4px;
+    margin: 10px 0;
+    color: var(--color-text);
+    font-size: 12px;
+  }
+  .cfl-confirm-dismiss p {
+    margin: 0 0 8px;
+    color: var(--color-text);
+    font-size: 12px;
+  }
+  .cfl-confirm-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+  .cfl-btn-small {
+    padding: 4px 10px;
+    font-size: 11px;
+  }
+
+  /* v0.2.52: secondary row holding the "Already resolved via CLI"
+     fallback Continue Update button. Right-aligned + lighter weight so
+     it reads as advanced/optional. */
+  .cfl-resume-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 8px;
+  }
+  .cfl-btn-link {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--color-teal, #00bfa6);
+    text-decoration: underline;
+    font-size: 11px;
+    padding: 4px 8px;
+  }
+  .cfl-btn-link:hover:not(:disabled) {
+    background: rgba(0, 191, 166, 0.08);
+    border-color: rgba(0, 191, 166, 0.2);
   }
 </style>

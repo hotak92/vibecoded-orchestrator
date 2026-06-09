@@ -447,6 +447,29 @@ jobs:
             echo "binary=vct-hub" >> "$GITHUB_OUTPUT"
           fi
 
+      # v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): vct-updater is a third
+      # sibling binary built from the same workspace and staged into the
+      # same launcher/dist/<arch>/ directory. Like vct-hub above, expose
+      # its platform-specific filename (vct-updater vs vct-updater.exe)
+      # as a step output for the artifact / archive steps below.
+      #
+      # The updater is functionally meaningful ONLY on Windows (does the
+      # post-launcher-exit binary swap to dodge mandatory file locks),
+      # but the binary compiles + ships cross-platform — on POSIX it's a
+      # no-op + costs ~1 MB in the dist tree. Shipping it everywhere
+      # simplifies the install.py + Tauri resolution paths (they can
+      # always assume the file exists under launcher/dist/<arch>/).
+      - name: Compute vct-updater binary name
+        id: updater_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            echo "binary=vct-updater.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "binary=vct-updater" >> "$GITHUB_OUTPUT"
+          fi
+
       # Sanity-check that the staged artifacts exist before upload, so a
       # silent build-script change can't produce a release with empty
       # assets. Listing also surfaces sizes in the run log.
@@ -480,6 +503,21 @@ jobs:
             ls -la "$dist" || true
             exit 1
           fi
+          # v0.2.52 V52-AH: vct-updater is a sibling binary. Same
+          # hard-fail contract — if the build script didn't stage it,
+          # fail rather than ship a Windows release without the binary
+          # that the in-launcher V52-AH handoff resolver looks for.
+          updater_bin="${{ steps.updater_meta.outputs.binary }}"
+          if [ ! -f "$dist/$updater_bin" ]; then
+            echo "::error::Expected $dist/$updater_bin not found"
+            ls -la "$dist" || true
+            exit 1
+          fi
+          if [ ! -f "$dist/$updater_bin.metadata.json" ]; then
+            echo "::error::Expected $dist/$updater_bin.metadata.json not found"
+            ls -la "$dist" || true
+            exit 1
+          fi
           ls -lh "$dist"
 
       # macOS artifacts are flagged with the `-experimental` suffix in their
@@ -498,6 +536,7 @@ jobs:
           stage="$dist/_release"
           mkdir -p "$stage"
           hub_bin="${{ steps.hub_meta.outputs.binary }}"
+          updater_bin="${{ steps.updater_meta.outputs.binary }}"
           # v0.2.40 X1: macos-x64 axis dropped — GitHub-runner constraint
           # (no actions/runner-images label produces Intel macs anymore
           # after macos-13 deprecation 2025-12-04, confirmed by user
@@ -512,6 +551,10 @@ jobs:
               # UNSIGNED on macOS in v0.2.21 — same posture as vct-launcher.
               cp "$dist/$hub_bin" "$stage/vct-hub-${{ matrix.target }}-experimental"
               cp "$dist/$hub_bin.metadata.json" "$stage/vct-hub-${{ matrix.target }}-experimental.metadata.json"
+              # v0.2.52 V52-AH: vct-updater follows the same -experimental
+              # naming on macOS (Apple Developer ID signing deferred).
+              cp "$dist/$updater_bin" "$stage/vct-updater-${{ matrix.target }}-experimental"
+              cp "$dist/$updater_bin.metadata.json" "$stage/vct-updater-${{ matrix.target }}-experimental.metadata.json"
               ;;
             *)
               cp "$dist/${{ matrix.binary }}" "$stage/${{ matrix.binary }}"
@@ -520,6 +563,10 @@ jobs:
               # canonical filename (vct-hub or vct-hub.exe).
               cp "$dist/$hub_bin" "$stage/$hub_bin"
               cp "$dist/$hub_bin.metadata.json" "$stage/$hub_bin.metadata.json"
+              # v0.2.52 V52-AH: vct-updater staged under its canonical
+              # filename (vct-updater or vct-updater.exe).
+              cp "$dist/$updater_bin" "$stage/$updater_bin"
+              cp "$dist/$updater_bin.metadata.json" "$stage/$updater_bin.metadata.json"
               ;;
           esac
           ls -lh "$stage"
@@ -941,6 +988,8 @@ jobs:
             launcher/dist/${{ matrix.target }}/${{ matrix.binary }}.metadata.json
             launcher/dist/${{ matrix.target }}/${{ steps.hub_meta.outputs.binary }}
             launcher/dist/${{ matrix.target }}/${{ steps.hub_meta.outputs.binary }}.metadata.json
+            launcher/dist/${{ matrix.target }}/${{ steps.updater_meta.outputs.binary }}
+            launcher/dist/${{ matrix.target }}/${{ steps.updater_meta.outputs.binary }}.metadata.json
           if-no-files-found: error
 
       - name: Upload release archive as workflow artifact
@@ -1152,6 +1201,13 @@ jobs:
           stage_binary "_dist-artifacts/windows-x64" "windows-x64" "vct-hub.exe"
           stage_binary "_dist-artifacts/macos-arm64" "macos-arm64" "vct-hub"
 
+          # v0.2.52 V52-AH: vct-updater follows the same per-arch artifact
+          # pattern as vct-hub. Three additional stage_binary calls; same
+          # whitelist accepts launcher/dist/<arch>/vct-updater[.exe].
+          stage_binary "_dist-artifacts/linux-x64"   "linux-x64"   "vct-updater"
+          stage_binary "_dist-artifacts/windows-x64" "windows-x64" "vct-updater.exe"
+          stage_binary "_dist-artifacts/macos-arm64" "macos-arm64" "vct-updater"
+
           echo "changed=${changed}" >> "$GITHUB_OUTPUT"
           echo "Summary: ${changed} binary/binaries updated."
 
@@ -1182,7 +1238,13 @@ jobs:
             launcher/dist/windows-x64/vct-hub.exe \
             launcher/dist/windows-x64/vct-hub.exe.metadata.json \
             launcher/dist/macos-arm64/vct-hub \
-            launcher/dist/macos-arm64/vct-hub.metadata.json
+            launcher/dist/macos-arm64/vct-hub.metadata.json \
+            launcher/dist/linux-x64/vct-updater \
+            launcher/dist/linux-x64/vct-updater.metadata.json \
+            launcher/dist/windows-x64/vct-updater.exe \
+            launcher/dist/windows-x64/vct-updater.exe.metadata.json \
+            launcher/dist/macos-arm64/vct-updater \
+            launcher/dist/macos-arm64/vct-updater.metadata.json
 
           # Verify only the expected files are staged — no collateral.
           staged="$(git diff --cached --name-only)"
@@ -1199,10 +1261,10 @@ jobs:
           # release build matrix above; re-running CI on the dist commit wastes
           # ~10 min of runner time with zero new signal). See ci.yml for the
           # matching paths-ignore that also guards this case.
-          git commit -m "chore(binary): refresh vct-launcher + vct-hub dist binaries for v${VERSION} [skip ci]
+          git commit -m "chore(binary): refresh vct-launcher + vct-hub + vct-updater dist binaries for v${VERSION} [skip ci]
 
           Auto-committed by release workflow after successful tag build.
-          Binaries: vct-launcher, vct-hub on linux-x64, windows-x64, macos-arm64.
+          Binaries: vct-launcher, vct-hub, vct-updater on linux-x64, windows-x64, macos-arm64.
           Source tag: v${VERSION}  Run: ${{ github.run_id }}"
 
           # v0.2.17 fix: race-tolerant push. The build matrix took

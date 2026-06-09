@@ -145,6 +145,62 @@ except Exception as e:
     HAS_LOGGER = False
 
 
+# V52-J (v0.2.52): close the Path D-1 silent hole — search_knowledge()
+# historically did its own Weaviate fan-out + dedup + print and never
+# wrote a retrieval-event row, so every pre-tool-use hook + every direct
+# `kg-search` CLI call produced zero rl_events. Route the candidates
+# through the canonical pipeline so we get (a) the same v3 telemetry
+# emit every other entry point produces, (b) RL rerank for Pro/MAO tier
+# users (free tier passes through unchanged — see search_pipeline._
+# resolve_rl_enabled). Import is soft: the pipeline lives in the
+# orchestrator's claude_mcp_servers package which may not be on
+# PYTHONPATH for projects installed without the orchestrator venv
+# active. Free-tier installs hit the except branch and degrade to the
+# pre-v0.2.52 silent path — no telemetry, no rerank, but the CLI still
+# works.
+try:
+    from claude_mcp_servers.rl_client.search_pipeline import (  # type: ignore[import-not-found]
+        RerankRequest,
+        rerank_and_emit,
+    )
+    HAS_RL_PIPELINE = True
+except Exception:
+    HAS_RL_PIPELINE = False
+    RerankRequest = None  # type: ignore[assignment,misc]
+    rerank_and_emit = None  # type: ignore[assignment]
+
+# Embedding metadata for the v3 retrieval-event payload. Mirrors the
+# resolution `weaviate_mcp.server` does internally. Soft-import so a
+# free-tier install without the orchestrator venv still runs the CLI
+# (the values fall back to env vars / sane defaults).
+try:
+    from weaviate_mcp.server import (  # type: ignore[import-not-found]
+        _embedding_dim_for as _embedding_dim_for_imported,
+        EMBEDDING_SOURCE as _IMPORTED_EMBEDDING_SOURCE,
+        EMBEDDING_MODEL as _IMPORTED_EMBEDDING_MODEL,
+    )
+    _ACTIVE_EMBEDDING_SOURCE = _IMPORTED_EMBEDDING_SOURCE
+    _ACTIVE_EMBEDDING_MODEL = _IMPORTED_EMBEDDING_MODEL
+    _embedding_dim_for = _embedding_dim_for_imported
+except Exception:
+    # Free-tier / partial-install fallback. _embedding_dim_for becomes
+    # a tiny inline that mirrors the canonical mapping in server.py —
+    # enough to surface a non-zero dim in the (rare) case the pipeline
+    # ever gets reached without the orchestrator import.
+    _ACTIVE_EMBEDDING_SOURCE = os.getenv("EMBEDDING_SOURCE", "ollama")
+    _ACTIVE_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "qwen3-embedding:0.6b")
+
+    def _embedding_dim_for(model: str) -> int:  # type: ignore[no-redef]
+        m = (model or "").lower()
+        if "qwen3" in m or "arctic" in m:
+            return 1024
+        if "codesage" in m:
+            return 2048
+        if "openai" in m or "text-embedding" in m:
+            return 1536
+        return 1024
+
+
 def get_weaviate_client():
     """Get Weaviate client"""
     http_host = WEAVIATE_URL.replace("http://", "").replace("https://", "").split(":")[0]
@@ -419,6 +475,79 @@ def search_knowledge(
                     break
 
         result_count = len(unique_results)
+
+        # V52-J (v0.2.52): close the Path D-1 silent hole.
+        #
+        # Build a candidate-dict list in the shape the canonical pipeline
+        # expects (title + score, plus any enrichment fields the v3
+        # retrieval-event payload uses) and route through
+        # rerank_and_emit. The result's `ranked` list re-orders the
+        # candidates for Pro/MAO tier users (free tier passes through);
+        # we reorder `unique_results` to match so the print loop below
+        # honors the RL rerank. Soft-fail throughout — any failure
+        # (import missing, network down, hub unreachable) leaves
+        # `unique_results` in its original Weaviate order and the user
+        # still sees results.
+        if HAS_RL_PIPELINE and unique_results:
+            try:
+                _candidates: list[dict] = []
+                for obj in unique_results:
+                    props = obj.properties
+                    distance = (
+                        obj.metadata.distance
+                        if obj.metadata and obj.metadata.distance is not None
+                        else 1.0
+                    )
+                    _candidates.append({
+                        "title": props.get("title", ""),
+                        "node_type": props.get("node_type", "unknown"),
+                        "file_path": props.get("file_path", ""),
+                        "tags": list(props.get("tags", []) or []),
+                        "links": list(props.get("links", []) or []),
+                        "content": props.get("content", "") or "",
+                        "distance": distance,
+                        "score": max(0.0, min(1.0, 1.0 - distance)),
+                    })
+                import asyncio as _asyncio
+                import uuid as _uuid
+                _req = RerankRequest(
+                    query=query,
+                    candidates=_candidates,
+                    limit=limit,
+                    query_emb=list(query_vector) if query_vector else None,
+                    embedding_source=_ACTIVE_EMBEDDING_SOURCE,
+                    embedding_dim=_embedding_dim_for(_ACTIVE_EMBEDDING_MODEL),
+                    embedding_model=_ACTIVE_EMBEDDING_MODEL,
+                    task_id=f"kg_cli_{_uuid.uuid4().hex[:8]}",
+                    task_type="kg_search_cli",
+                )
+                _rerank_result = _asyncio.run(rerank_and_emit(_req))
+                # Re-order unique_results by ranked titles so the print
+                # loop honors the RL output. Titles are unique because
+                # we already deduplicated above.
+                _title_to_obj = {
+                    obj.properties.get("title", ""): obj for obj in unique_results
+                }
+                _ranked_objs = []
+                for _r in _rerank_result.ranked:
+                    _title = _r.get("title", "")
+                    _obj = _title_to_obj.pop(_title, None)
+                    if _obj is not None:
+                        _ranked_objs.append(_obj)
+                # Append any leftovers (objects the pipeline trimmed
+                # below `limit`) so the print loop sees the full set the
+                # user expected — the rerank only changes ORDER, not
+                # the set the CLI returns.
+                if _ranked_objs:
+                    _ranked_objs.extend(_title_to_obj.values())
+                    unique_results = _ranked_objs
+            except Exception:
+                # Telemetry/rerank must never break the user-facing CLI.
+                # Silent on purpose: any logging here would surface in
+                # the user's terminal and be confusing during normal
+                # operation. The pipeline's own debug logs capture the
+                # cause if the user enables them via logging config.
+                pass
 
         # Print results
         if detail == "titles":

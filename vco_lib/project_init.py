@@ -327,6 +327,23 @@ def kg_class_definition(name: str) -> dict:
     definition did not set it (silent drift on every fresh install).
     Adding it here closes that loop — see "Surprises" in the PR 2
     commit message.
+
+    V52-I Fix B (2026-06-09): the 4 canonical temporal date props
+    (`created_at`, `updated_at`, `valid_from`, `valid_until`) are now
+    included at create-time so fresh KG collections — including the
+    SHARED `VibeCodedOrchestrator_KnowledgeGraph` — pass the MCP's
+    universal stale filter (``valid_until is_none(True) | valid_until > now``)
+    without emitting `partial_fan_out_schema_missing` false-positives.
+
+    Pre-V52-I gap matrix (audit 2026-06-09):
+      - per-project KG: shipped without these props; sync_knowledge_graph
+        additive-migrate added them lazily on first sync.
+      - shared KG: shipped without these props AND nothing migrated it
+        → universal stale filter emitted schema errors → 30 false-positive
+        partial_fan_out events in our corpus.
+    Including them here closes the gap on every fresh install; existing
+    installs are reconciled by `migrate-development-temporal-props.sh`
+    (regex extended to cover `_KnowledgeGraph` suffix — V52-I Fix B).
     """
     return {
         "class": name,
@@ -361,6 +378,16 @@ def kg_class_definition(name: str) -> dict:
             # via the `temporal_props` migration loop for upgrades; this
             # entry covers create-from-scratch on per-project init.
             {"name": "content_hash", "dataType": ["text"]},
+            # V52-I Fix B (2026-06-09): the 4 canonical temporal date
+            # props the MCP's universal `_stale_filter` and `days=`
+            # recency filter expect on every KG-shaped collection.
+            # `valid_until` is the load-bearing one (driver of the bug);
+            # the other three are added for completeness so future code
+            # can rely on the full temporal-metadata quartet.
+            {"name": "created_at", "dataType": ["date"]},
+            {"name": "updated_at", "dataType": ["date"]},
+            {"name": "valid_from", "dataType": ["date"]},
+            {"name": "valid_until", "dataType": ["date"]},
         ],
     }
 
@@ -472,6 +499,18 @@ def diagrams_class_definition(name: str) -> dict:
       for now; adding hash later is an additive migration.
     * ``tags`` / ``links`` / ``typed_links`` — diagrams use `path_tags`
       as their sole tag axis (the path IS the tag). No WikiLink graph.
+
+    V52-I Fix B (2026-06-09): adds `valid_from` and `valid_until` as
+    date-typed props so the MCP's universal `_stale_filter` doesn't
+    schema-error on diagram collections. The indexer doesn't yet write
+    these fields (no per-diagram archival workflow); they stay None on
+    new rows, and the stale filter's `is_none(True) | > now` matcher
+    treats None as "active by default" — exactly what we want for
+    diagrams. The pre-existing INT `created_at` / `updated_at` columns
+    are NOT renamed or retyped — the indexer
+    (`vco_lib/diagram_indexer.py::_weaviate_upsert`) still writes them
+    as `int(time.time())` and downstream search code reads them as ints.
+    `valid_from` / `valid_until` are additive only.
     """
     return {
         "class": name,
@@ -491,6 +530,14 @@ def diagrams_class_definition(name: str) -> dict:
             {"name": "file_path", "dataType": ["text"]},
             {"name": "created_at", "dataType": ["int"]},
             {"name": "updated_at", "dataType": ["int"]},
+            # V52-I Fix B (2026-06-09): date-typed validity window so the
+            # MCP's universal stale filter
+            # (`valid_until is_none(True) | valid_until > now`) doesn't
+            # schema-error against diagram collections. Defaults to None
+            # on every row the indexer writes — equivalent to "active by
+            # default" under the stale filter's matcher.
+            {"name": "valid_from", "dataType": ["date"]},
+            {"name": "valid_until", "dataType": ["date"]},
         ],
     }
 
@@ -2743,6 +2790,39 @@ def _enumerate_bundle_files(
                 dest_rel=str(Path("infrastructure") / n),
                 source_abs=compose_file,
                 source_rel=str(compose_file.relative_to(orchestrator_root)),
+                transform=None,
+                always_overwrite=False,
+            ))
+
+    # v0.2.52 V52-C: shipped KG nodes (orchestrator's curated set) live
+    # under `templates/knowledge/` and are materialized into
+    # `<project>/knowledge/` here. Pre-V52-C the curated set lived at
+    # `knowledge/` in the source tree and was copied through
+    # `ORCHESTRATOR_MANAGED_PATHS`; that mixed shipped + user-authored
+    # nodes in the same directory and caused merge conflicts on update
+    # (modify-vs-delete races against user-modified nodes).
+    #
+    # `always_overwrite=False` is critical: user customizations to
+    # shipped nodes are PRESERVED across bundle updates via the
+    # manifest-driven hash compare in `_plan_bundle_action` (same V47-A
+    # pattern as agents / skills / hooks). User-authored nodes not
+    # shipped by the orchestrator survive automatically — they aren't
+    # in the bundle ops list so they're never touched.
+    #
+    # Recursive walk: enumerates every file (.md, .json metadata like
+    # `.node_formats.json`, etc.) under `templates/knowledge/`. The
+    # destination preserves the relative path beneath `knowledge/`.
+    knowledge_src = templates / "knowledge"
+    if knowledge_src.exists():
+        for f in sorted(knowledge_src.rglob("*")):
+            if f.is_dir():
+                continue
+            rel_in_knowledge = f.relative_to(knowledge_src)
+            dest_rel = str(Path("knowledge") / rel_in_knowledge)
+            ops.append(_BundleFileOp(
+                dest_rel=dest_rel,
+                source_abs=f,
+                source_rel=str(f.relative_to(orchestrator_root)),
                 transform=None,
                 always_overwrite=False,
             ))

@@ -369,12 +369,11 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// projects; per-project folders never receive the orchestrator's own
 /// machinery. Entries in the .txt must be either (a) project-meaningful
 /// configuration / docs that legitimately live alongside a user project
-/// (`.claude/`, `knowledge/`, `docs/`, `tools/`, `infrastructure/`),
-/// (b) the version-pinning manifest the launcher reads to detect an
-/// existing install (`vct-module.json`), or (c) the source-of-truth
-/// file itself (`orchestrator-managed-paths.txt`) so
-/// `update_orchestrator_at` propagates new editions of the list into
-/// every existing install.
+/// (`.claude/`, `docs/`, `tools/`, `infrastructure/`), (b) the
+/// version-pinning manifest the launcher reads to detect an existing
+/// install (`vct-module.json`), or (c) the source-of-truth file itself
+/// (`orchestrator-managed-paths.txt`) so `update_orchestrator_at`
+/// propagates new editions of the list into every existing install.
 ///
 /// 2026-05-16 (PR-31 / v0.2.12): `CLAUDE.md` was REMOVED from the
 /// whitelist. The root CLAUDE.md is the orchestrator-self's own
@@ -383,6 +382,18 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// the project-bootstrapper. `DEFAULT_PRESERVE_LIST` (below) still
 /// includes `CLAUDE.md` because that's the user-edits-on-update
 /// concern, not the whitelist-copy concern this constant governs.
+///
+/// 2026-06-09 (V52-C / v0.2.52): `knowledge/` was REMOVED from the
+/// whitelist. KG nodes are USER-CURATED state, not shipped content —
+/// the previous mixed-ownership directory caused merge conflicts on
+/// orchestrator updates (modify-vs-delete races between user-curated
+/// nodes and upstream-deleted curated nodes). The orchestrator's
+/// curated KG set now lives under `templates/knowledge/` and is
+/// bundle-materialized into `<project>/knowledge/` by
+/// `_enumerate_bundle_files` in `vco_lib/project_init.py`. The
+/// manifest-driven hash compare (V47-A pattern) preserves user
+/// customizations on bundle update — same shape as agents / skills /
+/// hooks. Result: zero conflicts on KG content across updates.
 ///
 /// **Explicitly excluded:** `install.py` / `install.sh` / `install.ps1`
 /// (orchestrator entry points), `state/` (per-install metadata; the
@@ -3583,6 +3594,153 @@ fn pre_pull_rename_running_binary(_install_path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): post-pull staging for the
+/// Windows stage1 updater handoff.
+///
+/// Background
+/// ----------
+/// Even with `pre_pull_rename_running_binary`, the dist binary at
+/// `launcher/dist/windows-x64/vct-launcher.exe` (or `vct-hub.exe`) can
+/// end up STALE after a successful git pull when:
+///   - The rename failed silently (antivirus held a handle briefly).
+///   - Some other process held the file open (Windows defender scan,
+///     indexer, dev console with the .exe drag-dropped, etc).
+/// In those cases `git pull` saw ERROR_SHARING_VIOLATION on the binary
+/// but completed the rest of the merge — leaving metadata.json at the
+/// new version but the .exe bytes at the OLD version (Fabio's bug).
+///
+/// This helper detects that state by checking `git status --porcelain
+/// <relative_path>` for each candidate binary. Any dirty status means
+/// git considers the file diverged from HEAD (= the new bytes git
+/// SHOULD have written are not actually on disk). For each such file,
+/// we extract HEAD's blob into `<target>.new` via `git show
+/// HEAD:<relative_path>`. The updater (`vct-updater.exe`) then renames
+/// `<target>.new` → `<target>` after the running launcher exits.
+///
+/// On POSIX, this is a no-op (the rename pattern in
+/// `pre_pull_rename_running_binary` plus inode ref-counting already
+/// handles binary overwrite correctly).
+///
+/// Returns the list of relative paths that were staged as `.new`
+/// (empty on POSIX or when no binaries needed staging).
+#[cfg(windows)]
+async fn stage_locked_binaries_for_handoff(install_path: &Path) -> Vec<String> {
+    let mut staged: Vec<String> = Vec::new();
+    let candidates = [
+        "launcher/dist/windows-x64/vct-launcher.exe",
+        "launcher/dist/windows-x64/vct-hub.exe",
+    ];
+    for rel_path in candidates {
+        // Check git status. An empty stdout = clean = nothing to do.
+        let status_out = match tokio::process::Command::new("git")
+            .silent()
+            .args(["status", "--porcelain", "--", rel_path])
+            .current_dir(install_path)
+            .output()
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "[vct] stage_locked_binaries: git status failed for {}: {} \
+                     (skipping; handoff will gracefully no-op for this file)",
+                    rel_path, e
+                );
+                continue;
+            }
+        };
+        if status_out.stdout.is_empty() {
+            // Clean — binary already matches HEAD. Nothing to stage.
+            continue;
+        }
+
+        // Dirty: extract HEAD blob into `<target>.new`. We use
+        // `git show HEAD:<rel_path>` to read the bytes, then write to
+        // `<target>.new`. Path safety: the candidates list is
+        // hard-coded above so no injection risk.
+        let target_abs = install_path.join(rel_path);
+        let staged_abs = path_with_new_suffix(&target_abs);
+
+        let show_out = match tokio::process::Command::new("git")
+            .silent()
+            .args(["show", &format!("HEAD:{}", rel_path)])
+            .current_dir(install_path)
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                eprintln!(
+                    "[vct] stage_locked_binaries: git show HEAD:{} exited non-zero ({:?}); \
+                     skipping. stderr: {}",
+                    rel_path,
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stderr).trim(),
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] stage_locked_binaries: git show HEAD:{} spawn failed: {} (skipping)",
+                    rel_path, e
+                );
+                continue;
+            }
+        };
+
+        // Write the bytes atomically (write to `.tmp`, rename onto `.new`).
+        let tmp_path = staged_abs.with_extension("new.tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &show_out.stdout) {
+            eprintln!(
+                "[vct] stage_locked_binaries: write {} failed: {} (skipping)",
+                tmp_path.display(),
+                e,
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &staged_abs) {
+            eprintln!(
+                "[vct] stage_locked_binaries: rename {} → {} failed: {} (skipping)",
+                tmp_path.display(),
+                staged_abs.display(),
+                e,
+            );
+            let _ = std::fs::remove_file(&tmp_path);
+            continue;
+        }
+        eprintln!(
+            "[vct] stage_locked_binaries: staged {} → {} ({} bytes)",
+            rel_path,
+            staged_abs.display(),
+            show_out.stdout.len(),
+        );
+        staged.push(rel_path.to_string());
+    }
+    staged
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)] // POSIX caller is gated by cfg; tests don't exercise this branch
+async fn stage_locked_binaries_for_handoff(_install_path: &Path) -> Vec<String> {
+    // POSIX: no-op. Inode ref-counting + rename pattern handle binary
+    // overwrite correctly without any handoff dance.
+    Vec::new()
+}
+
+/// Helper used by `stage_locked_binaries_for_handoff` (Windows) AND by
+/// tests on every host. Keep in sync with the same-named helper in
+/// `commands::update_handoff` — both must produce the same staging
+/// filename so the launcher writes where the updater reads.
+#[allow(dead_code)] // exercised by Windows path + tests
+fn path_with_new_suffix(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    parent.join(format!("{}.new", name))
+}
+
 /// v0.2.17 (plan 0.0.B): revert the pre-pull rename on git-pull failure.
 ///
 /// Best-effort: log + continue on any error. The user can manually
@@ -3919,6 +4077,42 @@ pub async fn update_orchestrator<R: Runtime>(
     clear_update_resume_sentinel(&install_path);
     clear_update_resume_deferral_if_solo(&install_path);
 
+    // V52-AI (v0.2.52, 2026-06-09): MCP fork-bomb mitigation. The user
+    // reported ~97 python (claude_mcp_servers + vct-coordination) and
+    // ~77 node (@upstash/context7 + @modelcontextprotocol/*) processes
+    // accumulating during update, requiring manual taskkill. Root cause
+    // is Windows mandatory file locks + Claude Code's MCP-respawn loop
+    // racing the binary refresh.
+    //
+    // Strategy:
+    //   1. Pre-sweep: terminate currently-running MCP processes whose
+    //      commandlines match strict MCP patterns. Soft-fail.
+    //   2. Acquire a RAII lockfile guard. The lockfile lives at
+    //      <vct_root>/.update-in-progress.json and is what the MCP
+    //      servers themselves read at startup (see
+    //      claude_mcp_servers/_lib/update_gate.py); any respawn during
+    //      the update window exits cleanly with code 75 before doing
+    //      any work, breaking the fork-bomb loop.
+    //   3. The guard's Drop impl deletes the lockfile on ALL exit paths
+    //      (success, ?-bail, panic), so even a crashed update doesn't
+    //      leave a stuck lockfile blocking future MCP spawns. The
+    //      boot-time stale-cleanup is the second line of defense.
+    let pre_sweep_count = crate::commands::update_gate::pre_update_mcp_kill_sweep();
+    if pre_sweep_count > 0 {
+        eprintln!(
+            "[vct] update_orchestrator: pre-sweep terminated {} MCP-shaped \
+             process(es) before update",
+            pre_sweep_count
+        );
+    }
+    let (mut update_gate_guard, _gate_write_result) =
+        crate::commands::update_gate::UpdateInProgressGuard::new();
+    // _gate_write_result is intentionally discarded — soft-fail.
+    // If lockfile write fails (permission denied, FS full), we proceed
+    // with the update anyway (worst case: user sees the same pre-fix
+    // fork-bomb behaviour, same as today's status quo). The guard's
+    // Drop impl is a no-op when armed=false.
+
     // v0.2.21 (Stream A Design B extension): pin the canonical public
     // AGPL upstream BEFORE any network ops. Same posture as the launcher
     // self-update (see commands/self_update.rs): we never trust `origin`
@@ -4215,6 +4409,10 @@ pub async fn update_orchestrator<R: Runtime>(
     // Stage 2: Re-run install.py with --update flag
     emit_progress(&window, "install", "Applying updates...", 40.0);
 
+    // V52-AI: advance lockfile phase so future hub-side observers can
+    // see we've moved past git_pull.
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
+
     let python_cmd = &system.python_cmd;
     let mut cmd = tokio::process::Command::new(python_cmd).silent();
     cmd.args(["install.py", "--update"])
@@ -4360,6 +4558,11 @@ pub async fn update_orchestrator<R: Runtime>(
         return Err(format!("Update failed: {}", stderr));
     }
 
+    // V52-AI: advance lockfile phase. install.py has finished; we're
+    // now in the binary-refresh + hub-restart window. MCPs that try to
+    // spawn during this window still see the lockfile and exit cleanly.
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::BinaryRefresh);
+
     // v0.2.21 Step 12 (B1 fix): Stage 3 — bring the detached vct-hub
     // back up BEFORE we restart the launcher. Soft-fail: the launcher
     // restart path itself also calls `hub_launcher::ensure_hub_running`
@@ -4407,6 +4610,92 @@ pub async fn update_orchestrator<R: Runtime>(
     {
         eprintln!("[v0.2.45 V45-B] update_orchestrator: {}", e);
         return Err(e);
+    }
+
+    // V52-AI: explicit lockfile cleanup BEFORE the restart hop. We don't
+    // want the lockfile to survive across the launcher restart — if it
+    // did, the freshly-booted launcher's MCPs would still see it as
+    // active and refuse to start until the stale-cleanup window passed
+    // (up to 15min). Drop on the guard would happen on process exit,
+    // but on Windows the process can terminate before async cleanup
+    // runs cleanly; calling disarm_and_cleanup() now makes the order
+    // deterministic.
+    update_gate_guard.disarm_and_cleanup();
+
+    // v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): Windows stage1 updater
+    // handoff. Before falling through to the regular restart_launcher
+    // flow, detect any binaries that git pull silently skipped (file
+    // locked by an antivirus / indexer / racing handle) and stage them
+    // as `<target>.new`. Then write `~/.vct/update.lock.json` and spawn
+    // `vct-updater.exe` DETACHED so it can perform the swap once the
+    // running launcher exits.
+    //
+    // Soft-fail throughout: if staging or handoff fails for ANY reason,
+    // fall through to the existing restart_launcher path — that's the
+    // pre-v0.2.52 behaviour and represents the worst case (= same as
+    // not having V52-AH at all). The new code path strictly improves
+    // on that.
+    //
+    // POSIX: stage_locked_binaries_for_handoff returns empty (no-op),
+    // prepare_windows_update_handoff returns handoff_active=false with
+    // skip_reason="non-windows", so we fall through unconditionally
+    // to restart_launcher. No behaviour change for Linux/macOS users.
+    #[cfg(target_os = "windows")]
+    {
+        let staged = stage_locked_binaries_for_handoff(&install_path).await;
+        if !staged.is_empty() {
+            eprintln!(
+                "[vct] update_orchestrator: V52-AH staged {} binary/binaries \
+                 for handoff: {:?}",
+                staged.len(),
+                staged,
+            );
+        }
+    }
+
+    let handoff_result = match crate::commands::update_handoff::
+        prepare_windows_update_handoff(path.clone()).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // True error (install_root missing etc.) — log + fall through.
+            eprintln!(
+                "[vct] update_orchestrator: V52-AH handoff returned error \
+                 ({}); falling through to legacy restart_launcher",
+                e,
+            );
+            crate::commands::update_handoff::HandoffResult::default()
+        }
+    };
+
+    if handoff_result.handoff_active {
+        eprintln!(
+            "[vct] update_orchestrator: V52-AH handoff active (lock={:?}); \
+             exiting current launcher — vct-updater.exe will perform the \
+             swap + relaunch.",
+            handoff_result.lock_path,
+        );
+        // Mirror the tail of restart_launcher: programmatic quit so the
+        // updater can complete the swap on a now-unlocked .exe. The
+        // updater's spawned child will become the new launcher process.
+        crate::quit_dialog::force_quit();
+        app.exit(0);
+        return Ok(InstallResult {
+            success: true,
+            install_path: path.clone(),
+            message: "Update applied — vct-updater is performing the binary swap. \
+                      The launcher will relaunch automatically."
+                .to_string(),
+            system,
+        });
+    }
+
+    if let Some(reason) = handoff_result.skip_reason.as_deref() {
+        eprintln!(
+            "[vct] update_orchestrator: V52-AH handoff skipped (reason={}); \
+             falling through to legacy restart_launcher",
+            reason,
+        );
     }
 
     // v0.2.17 (plan 0.0): auto-restart. The launcher has no in-flight
@@ -6311,6 +6600,26 @@ pub async fn resume_orchestrator_update<R: Runtime>(
         }),
     );
 
+    // V52-AI (v0.2.52): acquire the MCP fork-bomb gate before any
+    // file-touching work. Same shape as update_orchestrator —
+    // pre-sweep + RAII guard. Resume runs install.py + binary
+    // refresh, which is the exact window where the fork-bomb
+    // historically formed; protecting it is just as important.
+    let pre_sweep_count_resume = crate::commands::update_gate::pre_update_mcp_kill_sweep();
+    if pre_sweep_count_resume > 0 {
+        eprintln!(
+            "[vct] resume_orchestrator_update: pre-sweep terminated {} \
+             MCP-shaped process(es) before resume",
+            pre_sweep_count_resume
+        );
+    }
+    let (mut update_gate_guard, _gate_write_result) =
+        crate::commands::update_gate::UpdateInProgressGuard::new();
+    // Resume starts mid-flow; the lockfile claims InstallPy directly
+    // because we're skipping the git-pull stage (the user already
+    // resolved the merge before clicking Continue Update).
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
+
     // The on-disk source is already current (the user finished the merge),
     // so we mirror the `merge_orchestrator_with_upstream` post-pull tail.
     // We stop the hub + pre-pull-rename binaries first so install.py +
@@ -6363,6 +6672,430 @@ pub async fn resume_orchestrator_update<R: Runtime>(
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.52 V52-A / V52-B — one-click conflict resolution from the modal.
+//
+// PROBLEM (post-v0.2.51): the v0.2.51 modal exposed only "Resolve manually"
+// (close + come back via the MenuBar Continue Update badge) and "Abort &
+// restore". User feedback 2026-06-09 said the manual-edit step is friction
+// for the common case where the conflict is on KG nodes the user is happy
+// to keep local OR happy to accept upstream wholesale.
+//
+// FIX (V52-B): two new Tauri commands that the modal calls when the user
+// picks the corresponding button. Each one:
+//   1. Validates state (in mid-merge/rebase, sentinel present).
+//   2. Runs `git checkout --ours` or `git checkout --theirs` against every
+//      conflicted file. Orientation flips between merge and rebase — see
+//      the resolve_checkout_flag helper for details.
+//   3. `git add` + `git commit` (merge) or `git rebase --continue` (rebase).
+//   4. Delegates to `resume_orchestrator_update` for the post-merge tail
+//      (install.py --update + binary refresh + auto-restart). The resume
+//      function's own preconditions (sentinel present, HEAD advanced,
+//      no markers, no in-flight merge state) all pass by construction
+//      after the commit/continue above.
+//
+// V52-A is the modal-side guarantee: the modal removes "Resolve manually"
+// and ONLY exposes Abort / Keep local / Accept upstream. Window-X or
+// Escape are treated as Abort, not silent dismiss.
+// ---------------------------------------------------------------------------
+
+/// Strategy passed in from the modal: which side of a conflict to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictResolutionSide {
+    /// Keep the user's local content; discard upstream.
+    KeepLocal,
+    /// Accept upstream content; discard the user's local changes.
+    AcceptUpstream,
+}
+
+/// Translate a `(side, operation)` pair into the `git checkout` flag to
+/// pass. Critical: git swaps "ours" and "theirs" between merge and rebase.
+///
+/// * **Merge**: HEAD is "ours" (the local branch we merged INTO), MERGE_HEAD
+///   is "theirs" (the upstream branch being merged IN).
+/// * **Rebase**: HEAD is "ours" (the upstream branch we're rebasing ONTO,
+///   from git's POV after the rebase reparents HEAD onto upstream),
+///   the commits being replayed are "theirs" (the user's local commits).
+///
+/// So:
+///   * KeepLocal during merge  → `--ours`   (HEAD = local)
+///   * KeepLocal during rebase → `--theirs` (replayed commits = local)
+///   * AcceptUpstream during merge  → `--theirs`
+///   * AcceptUpstream during rebase → `--ours`
+///
+/// Reference: `git checkout --help`, "MERGES" section, plus the
+/// `core.attributesFile` discussion under `git-rebase`.
+fn resolve_checkout_flag(side: ConflictResolutionSide, operation: &str) -> &'static str {
+    let is_rebase = operation.eq_ignore_ascii_case("rebase");
+    match (side, is_rebase) {
+        (ConflictResolutionSide::KeepLocal, false) => "--ours",
+        (ConflictResolutionSide::KeepLocal, true) => "--theirs",
+        (ConflictResolutionSide::AcceptUpstream, false) => "--theirs",
+        (ConflictResolutionSide::AcceptUpstream, true) => "--ours",
+    }
+}
+
+/// Shared implementation for both `keep_local_and_continue_update` and
+/// `accept_upstream_and_continue_update`. Performs the conflict resolution
+/// (checkout + add + commit/continue) then delegates to
+/// `resume_orchestrator_update` for the post-merge tail.
+///
+/// The two public commands are thin wrappers that pick the side enum
+/// variant; centralising the body here keeps git invocation, audit logging,
+/// and error handling in lockstep between them.
+async fn resolve_conflict_and_resume<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+    side: ConflictResolutionSide,
+) -> Result<InstallResult, String> {
+    let install_path = PathBuf::from(&path);
+
+    if !install_path.join(".git").exists() {
+        return Err("Not a git repository — cannot resolve conflict".to_string());
+    }
+
+    let audit_app = app.clone();
+    let write_audit = move |operation: &str, detail: serde_json::Value| {
+        if let Some(db) = audit_app.try_state::<crate::db::Db>() {
+            let _ = db.audit(operation, None, None, &detail);
+        }
+    };
+
+    // Refuse if there's no sentinel. The conflict modal only opens when a
+    // merge/rebase produced one; absence here means the user clicked the
+    // button on a stale view (e.g. they aborted via CLI between modal
+    // open and click).
+    let sentinel = match read_update_resume_sentinel(&install_path) {
+        Some(s) => s,
+        None => {
+            write_audit(
+                "update_orchestrator_one_click_rejected",
+                serde_json::json!({
+                    "reason": "no_sentinel",
+                    "side": format!("{:?}", side),
+                    "install_path": path,
+                }),
+            );
+            return Err(
+                "No active conflict found. The merge or rebase may have \
+                 already been aborted from the command line. Refresh the \
+                 launcher and try the update again."
+                    .to_string(),
+            );
+        }
+    };
+
+    // Require the merge/rebase to still be in flight. If the user has
+    // already finished it (via CLI), the right path is the standard
+    // Continue Update flow, not these one-click resolvers.
+    let merge_head = install_path.join(".git").join("MERGE_HEAD");
+    let rebase_merge = install_path.join(".git").join("rebase-merge");
+    let rebase_apply = install_path.join(".git").join("rebase-apply");
+    let in_merge = merge_head.exists();
+    let in_rebase = rebase_merge.exists() || rebase_apply.exists();
+    if !in_merge && !in_rebase {
+        write_audit(
+            "update_orchestrator_one_click_rejected",
+            serde_json::json!({
+                "reason": "no_merge_in_progress",
+                "side": format!("{:?}", side),
+                "sentinel_operation": sentinel.operation,
+                "install_path": path,
+            }),
+        );
+        return Err(
+            "No merge or rebase is currently in progress. If you resolved \
+             the conflict from the command line, click Continue Update \
+             instead. Otherwise refresh the launcher and try again."
+                .to_string(),
+        );
+    }
+
+    // Cross-check the sentinel's stored operation against the on-disk
+    // state. They should agree; mismatch means someone tampered with
+    // either git or the sentinel. Refuse rather than guess.
+    let live_operation = if in_merge { "merge" } else { "rebase" };
+    if !sentinel.operation.eq_ignore_ascii_case(live_operation) {
+        write_audit(
+            "update_orchestrator_one_click_rejected",
+            serde_json::json!({
+                "reason": "operation_mismatch",
+                "sentinel_operation": sentinel.operation,
+                "live_operation": live_operation,
+                "side": format!("{:?}", side),
+                "install_path": path,
+            }),
+        );
+        return Err(format!(
+            "Conflict modal expected a `{}` in progress but the working \
+             tree shows a `{}` instead. Refresh the launcher.",
+            sentinel.operation, live_operation,
+        ));
+    }
+
+    // Collect conflicted files BEFORE any checkout — once we run
+    // `git checkout --ours/--theirs`, git clears the conflict state
+    // for that path and it no longer appears in `--diff-filter=U`.
+    let conflicted = collect_conflicted_files(&install_path).await;
+    if conflicted.is_empty() {
+        // No files to resolve — but we ARE in mid-merge per the earlier
+        // probe. This shouldn't happen in normal flow; treat as a
+        // probable git-state corruption and refuse with a useful message
+        // rather than silently committing an empty resolution.
+        write_audit(
+            "update_orchestrator_one_click_rejected",
+            serde_json::json!({
+                "reason": "no_conflicted_files",
+                "live_operation": live_operation,
+                "side": format!("{:?}", side),
+                "install_path": path,
+            }),
+        );
+        return Err(
+            "Merge or rebase is in progress but git reports no conflicted \
+             files. Run `git status` in the install directory and either \
+             finish or abort the merge manually."
+                .to_string(),
+        );
+    }
+
+    let flag = resolve_checkout_flag(side, live_operation);
+    emit_progress(
+        &window,
+        "update",
+        &format!(
+            "Resolving {} conflict(s) ({})...",
+            conflicted.len(),
+            match side {
+                ConflictResolutionSide::KeepLocal => "keeping local versions",
+                ConflictResolutionSide::AcceptUpstream => "accepting upstream versions",
+            },
+        ),
+        10.0,
+    );
+
+    write_audit(
+        "update_orchestrator_one_click_started",
+        serde_json::json!({
+            "side": format!("{:?}", side),
+            "operation": live_operation,
+            "flag": flag,
+            "conflicted_files": conflicted,
+            "install_path": path,
+        }),
+    );
+
+    // 1. `git checkout <flag> -- <files>`. Splitting into per-file
+    //    invocations keeps the error story per-path (and avoids
+    //    blowing past argv length limits on Windows when there are
+    //    many conflicted files).
+    for file in &conflicted {
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .args(["checkout", flag, "--", file])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| {
+                format!(
+                    "git checkout {} -- {} failed to spawn: {}",
+                    flag, file, e,
+                )
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            write_audit(
+                "update_orchestrator_one_click_failed",
+                serde_json::json!({
+                    "stage": "checkout",
+                    "file": file,
+                    "flag": flag,
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git checkout {} -- {} failed: {}. The working tree is \
+                 still in the conflicted state — you can retry, pick the \
+                 other side, or click Abort & restore.",
+                flag,
+                file,
+                stderr.trim(),
+            ));
+        }
+    }
+
+    // 2. `git add <files>`. Same per-file split for the same reason.
+    for file in &conflicted {
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .args(["add", "--", file])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git add -- {} failed to spawn: {}", file, e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            write_audit(
+                "update_orchestrator_one_click_failed",
+                serde_json::json!({
+                    "stage": "add",
+                    "file": file,
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git add -- {} failed after checkout {}: {}. Inspect the \
+                 working tree manually.",
+                file,
+                flag,
+                stderr.trim(),
+            ));
+        }
+    }
+
+    // 3. Finish the merge/rebase. Different verb depending on operation:
+    //    - merge: `git commit --no-edit` (the merge commit message is
+    //      already staged by the prior `git merge` / `git pull`).
+    //    - rebase: `git rebase --continue` (advances to the next replayed
+    //      commit; needs an empty editor on the message file).
+    //
+    //    `GIT_EDITOR=true` is the cross-OS way to short-circuit the
+    //    interactive editor: `true` exits 0 immediately, which git
+    //    treats as "user accepted the existing message". Same trick
+    //    is used in the orchestrator's own scripts.
+    emit_progress(
+        &window,
+        "update",
+        if in_merge {
+            "Finalising merge commit..."
+        } else {
+            "Continuing rebase..."
+        },
+        20.0,
+    );
+
+    if in_merge {
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .env("GIT_EDITOR", "true")
+            .args(["commit", "--no-edit"])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git commit failed to spawn: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            write_audit(
+                "update_orchestrator_one_click_failed",
+                serde_json::json!({
+                    "stage": "commit",
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git commit failed after staging the resolution: {}. \
+                 Inspect the working tree manually.",
+                stderr.trim(),
+            ));
+        }
+    } else {
+        // Rebase. `--continue` will pause if there are MORE conflicted
+        // commits to replay — in that case the caller (the modal) will
+        // see a fresh conflict modal pop and can resolve again.
+        let out = tokio::process::Command::new("git")
+            .silent()
+            .env("GIT_EDITOR", "true")
+            .args(["rebase", "--continue"])
+            .current_dir(&install_path)
+            .output()
+            .await
+            .map_err(|e| format!("git rebase --continue failed to spawn: {}", e))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            write_audit(
+                "update_orchestrator_one_click_failed",
+                serde_json::json!({
+                    "stage": "rebase_continue",
+                    "stderr": stderr.to_string(),
+                    "install_path": path,
+                }),
+            );
+            return Err(format!(
+                "git rebase --continue failed after staging the \
+                 resolution: {}. The rebase may have more conflicts on a \
+                 later commit; inspect with `git status`.",
+                stderr.trim(),
+            ));
+        }
+    }
+
+    write_audit(
+        "update_orchestrator_one_click_resolved",
+        serde_json::json!({
+            "side": format!("{:?}", side),
+            "operation": live_operation,
+            "flag": flag,
+            "resolved_count": conflicted.len(),
+            "install_path": path,
+        }),
+    );
+
+    // 4. Delegate to the existing resume command. Its preconditions are
+    //    all satisfied by construction:
+    //      * sentinel still present (we never cleared it).
+    //      * HEAD has advanced past `sha_at_conflict` (the commit/continue
+    //        above produced a new HEAD).
+    //      * No `.git/MERGE_HEAD` / `rebase-merge` / `rebase-apply` (those
+    //        clear after a successful commit/continue).
+    //      * No conflict markers in any tracked file (checkout --ours/--theirs
+    //        replaced the markered content wholesale; we never asked the user
+    //        to edit anything).
+    //
+    //    resume_orchestrator_update will stop the hub, pre-pull rename
+    //    binaries, clear the sentinel + deferral, then run install.py
+    //    --update + binary refresh + auto-restart.
+    resume_orchestrator_update(app, path, window).await
+}
+
+/// V52-B: keep local versions of every conflicted file, then continue the
+/// update (install.py --update + binary refresh + auto-restart).
+///
+/// Modal tooltip: "Discards upstream changes for the conflicting files;
+/// keeps everything you've added locally. Good for: nodes you've heavily
+/// customized."
+///
+/// User-locked default behavior (2026-06-09): when ALL conflicted files
+/// live under `knowledge/`, the modal auto-highlights this button. The
+/// auto-highlight is a UI hint only — the command itself doesn't filter
+/// by path; it operates on every conflicted file unconditionally.
+#[command]
+pub async fn keep_local_and_continue_update<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+) -> Result<InstallResult, String> {
+    resolve_conflict_and_resume(app, path, window, ConflictResolutionSide::KeepLocal).await
+}
+
+/// V52-B: accept upstream versions of every conflicted file, then continue
+/// the update (install.py --update + binary refresh + auto-restart).
+///
+/// Modal tooltip: "Discards your local changes for the conflicting files;
+/// takes the public release version. Good for: KG nodes you didn't really
+/// need."
+#[command]
+pub async fn accept_upstream_and_continue_update<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+    window: Window,
+) -> Result<InstallResult, String> {
+    resolve_conflict_and_resume(app, path, window, ConflictResolutionSide::AcceptUpstream).await
 }
 
 /// v0.2.16 (W4 / 0.5): "Pulled-but-not-installed" resolver. Runs
@@ -9970,19 +10703,25 @@ mod tests {
         let p = tmp();
         // Two managed paths already there
         fs::create_dir_all(p.join(".claude")).unwrap();
-        fs::create_dir_all(p.join("knowledge")).unwrap();
+        fs::create_dir_all(p.join("docs")).unwrap();
 
         let diff = diff_install(&p);
         assert_eq!(diff.mode, InstallMode::Adopt);
         assert!(diff.will_overwrite.contains(&".claude".to_string()));
-        assert!(diff.will_overwrite.contains(&"knowledge".to_string()));
-        // docs/tools/infrastructure/vct-module.json/orchestrator-
+        assert!(diff.will_overwrite.contains(&"docs".to_string()));
+        // tools/infrastructure/vct-module.json/orchestrator-
         // managed-paths.txt don't exist yet → in will_add. (CLAUDE.md
         // was removed from the whitelist in PR-31; it never appears in
-        // will_add or will_overwrite anymore.)
-        assert!(diff.will_add.contains(&"docs".to_string()));
+        // will_add or will_overwrite anymore. `knowledge/` was removed
+        // in v0.2.52 V52-C — shipped KG nodes now live under
+        // `templates/knowledge/` and are bundle-materialized into
+        // `<project>/knowledge/` by `_enumerate_bundle_files`, NOT
+        // copied through this whitelist.)
+        assert!(diff.will_add.contains(&"tools".to_string()));
         assert!(!diff.will_add.contains(&"CLAUDE.md".to_string()));
         assert!(!diff.will_overwrite.contains(&"CLAUDE.md".to_string()));
+        assert!(!diff.will_add.contains(&"knowledge".to_string()));
+        assert!(!diff.will_overwrite.contains(&"knowledge".to_string()));
         assert!(diff.user_paths_preserved);
         fs::remove_dir_all(&p).ok();
     }
@@ -10014,8 +10753,13 @@ mod tests {
         // PR-31 / v0.2.12 removed CLAUDE.md from the managed allowlist —
         // user projects render their own from templates/CLAUDE.md.template.)
         fs::write(p.join(".claude/CONTEXT_STATE.md"), "# upstream context state\n").unwrap();
-        fs::create_dir_all(p.join("knowledge")).unwrap();
-        fs::write(p.join("knowledge/note.md"), "hello").unwrap();
+        // `docs/` stays in the whitelist; use it as the "in-allowlist
+        // directory with file" fixture. (`knowledge/` was removed from
+        // the whitelist in v0.2.52 V52-C — shipped KG nodes are now
+        // bundle-materialized from `templates/knowledge/` rather than
+        // copied through this allowlist.)
+        fs::create_dir_all(p.join("docs")).unwrap();
+        fs::write(p.join("docs/note.md"), "hello").unwrap();
         // Files NOT in the allowlist — must NOT be copied.
         // CLAUDE.md remains in the source dir to exercise the "is OUT of
         // allowlist → not copied" contract.
@@ -10023,6 +10767,10 @@ mod tests {
         fs::write(p.join("README.md"), "readme").unwrap();
         fs::create_dir_all(p.join("scripts")).unwrap();
         fs::write(p.join("scripts/foo.sh"), "echo hi").unwrap();
+        // `knowledge/` in the source must NOT be copied — V52-C made it
+        // a non-managed path.
+        fs::create_dir_all(p.join("knowledge")).unwrap();
+        fs::write(p.join("knowledge/source-side.md"), "should-not-copy").unwrap();
         p
     }
 
@@ -10043,16 +10791,21 @@ mod tests {
         // Allowlisted entries copied
         assert!(target.join("vct-module.json").exists());
         assert!(target.join(".claude/settings.json").exists());
-        assert!(target.join("knowledge/note.md").exists());
+        assert!(target.join("docs/note.md").exists());
 
         // NOT in allowlist: must NOT have been copied. CLAUDE.md was
         // removed from the whitelist in PR-31 (v0.2.12) — see the
         // doc-comment above ORCHESTRATOR_MANAGED_PATHS. User projects
         // render their CLAUDE.md from templates/CLAUDE.md.template
         // instead of receiving the orchestrator-self's root CLAUDE.md.
+        // `knowledge/` was removed in v0.2.52 V52-C — shipped KG nodes
+        // are now materialized from `templates/knowledge/` via the
+        // bundle install path (manifest-tracked, user-modifications
+        // preserved on update).
         assert!(!target.join("CLAUDE.md").exists());
         assert!(!target.join("README.md").exists());
         assert!(!target.join("scripts/foo.sh").exists());
+        assert!(!target.join("knowledge/source-side.md").exists());
 
         fs::remove_dir_all(&source).ok();
         fs::remove_dir_all(&target).ok();
@@ -10124,7 +10877,6 @@ mod tests {
         // concern, not the whitelist-copy concern.
         let expected: &[&str] = &[
             ".claude",
-            "knowledge",
             "docs",
             "tools",
             "infrastructure",
@@ -11501,10 +12253,16 @@ MemAvailable:   23456789 kB
         assert!(ctx.contains(MERGE_BLOCK_START));
         assert!(ctx.contains(MERGE_BLOCK_END));
 
-        // Knowledge dir is NOT preserved — the user note gets overwritten.
+        // `knowledge/` was removed from the managed allowlist in v0.2.52
+        // V52-C: KG nodes are USER-CURATED state, never copied through
+        // this strategy. The user's `knowledge/note.md` survives every
+        // strategy because nothing tries to copy onto it. The shipped
+        // curated KG set is bundle-materialized from `templates/knowledge/`
+        // via `_enumerate_bundle_files` (manifest-tracked, user edits
+        // preserved on bundle update — same V47-A pattern as agents/skills).
         assert_eq!(
             fs::read_to_string(target.join("knowledge/note.md")).unwrap(),
-            "hello"
+            "OLD\n"
         );
 
         assert!(report.notification_written);

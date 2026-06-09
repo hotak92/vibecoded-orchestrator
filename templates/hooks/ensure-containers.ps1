@@ -4,6 +4,33 @@ foreach ($v in 'SUPABASE_KEY','SUPABASE_URL','GITHUB_TOKEN','GH_TOKEN','OPENAI_A
     if (Test-Path "Env:$v") { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 }
 if ($env:VCT_DISABLE_HOOKS) { exit 0 }
+
+# V52-AI (v0.2.52): MCP fork-bomb mitigation. If an orchestrator update
+# is in progress, skip container startup entirely. See the .sh sibling
+# for the full rationale. Treats missing-file / parse-error / stale-
+# deadline as "no active update" (proceed normally — same as today's
+# pre-fix behaviour).
+$VctRootDir = if ($env:VCT_STATE_DIR) { $env:VCT_STATE_DIR } else { Join-Path $env:USERPROFILE ".vct" }
+$VctUpdateLockfile = Join-Path $VctRootDir ".update-in-progress.json"
+if (Test-Path $VctUpdateLockfile) {
+    try {
+        $LockData = Get-Content $VctUpdateLockfile -Raw | ConvertFrom-Json
+        $DeadlineStr = $LockData.expected_completion_by
+        if ($DeadlineStr) {
+            # PowerShell parses ISO-8601 with `Z` suffix natively.
+            $Deadline = [datetime]::Parse($DeadlineStr).ToUniversalTime()
+            $NowUtc = [datetime]::UtcNow
+            if ($NowUtc -lt $Deadline) {
+                [Console]::Error.WriteLine("[ensure-containers] orchestrator update in progress; skipping container startup until update completes")
+                exit 0
+            }
+        }
+    } catch {
+        # Soft-fail: corrupt/unreadable lockfile means no active update,
+        # proceed with container startup.
+    }
+}
+
 # ensure-containers.ps1
 # Ensure all required containers are running (background, non-blocking).
 # Mirror of ensure-containers.sh.

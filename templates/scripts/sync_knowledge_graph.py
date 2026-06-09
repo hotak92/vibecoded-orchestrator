@@ -72,6 +72,25 @@ if str(_VCO_LIB_PARENT) not in sys.path:
     sys.path.insert(0, str(_VCO_LIB_PARENT))
 # VCO-REWIRE-END: orchestrator-root-resolution
 
+# v0.2.52 (Known Issue 6, Sub-issue A): silence
+# ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` from
+# ``weaviate-client``'s transitive ``authlib`` dep during module import.
+# Without this filter the warning lands in the user's terminal on every
+# fresh ``install.py`` KG-seed run, which is alarming (and is the warning
+# user-reported as Known Issue 6).  MUST run BEFORE ``import weaviate``.
+# See ``claude_mcp_servers/weaviate_mcp/server.py`` for the matching
+# filter at the MCP-server level.
+import warnings as _kg_warnings
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
+    _kg_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
+except ImportError:
+    _kg_warnings.filterwarnings(
+        "ignore",
+        message=r".*authlib.*deprecated.*",
+        category=DeprecationWarning,
+    )
+
 import weaviate
 from weaviate.classes.query import Filter
 from weaviate_mcp.chunking import TokenCounter, Chunker
@@ -97,11 +116,20 @@ except Exception as e:
     HAS_LOGGER = False
 
 # Configuration - Read from environment variables (set by MCP servers or project settings)
-# Note (v0.2.18): EMBEDDING_MODEL / ACTIVE_EMBEDDING are NOT read here any
-# more. The EmbeddingService instance (set up in main() and passed via the
-# WeaviateWrapper) resolves both from env and exposes the active named-
-# vector slot via `svc.text_vector_slot`. Keeping the env name in the
-# `_redacted_env_snapshot()` failure log is enough for diagnostics.
+# Note (v0.2.18 + v0.2.52 V52-AJ): EMBEDDING_MODEL / ACTIVE_EMBEDDING are NOT
+# read here directly. They are resolved by `EmbeddingService.for_project()`
+# which consults (in order):
+#   1. `os.environ[ACTIVE_EMBEDDING / EMBEDDING_MODEL]` — explicit caller env.
+#   2. `launcher.db app_state[embedding.active_profile]` — what the
+#      launcher's Identity tab + install.py preset chooser stored.
+#   3. `"qwen3"` final fallback (free-tier install, no launcher).
+# Install.py threads the resolved env into this script's subprocess on
+# fresh / --update runs (via `_subprocess_env_with_embedding` in install.py),
+# so this script sees a non-empty ACTIVE_EMBEDDING even when the user
+# shell has no such env set — this is the fix for Fabio's Windows + CPU
+# stuck-at-40-with-qwen3 bug (v0.2.52 V52-AJ, msg 267, 2026-06-09).
+# Keeping the env names in `_redacted_env_snapshot()` failure log helps
+# diagnose drift.
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))

@@ -119,6 +119,13 @@ pub mod modules;
 // `vct-hub::module_supervisor` and converts the Tauri commands into HTTP
 // proxies to the hub's lifecycle endpoints.
 pub mod module_service;
+// V52-F (v0.2.52): per-module update GUI surface.
+// Adds `check_module_updates_available` + `update_module_to_latest` Tauri
+// commands + a 24h background poll that emits `vct-module-updates-available`.
+// Layers on top of `module_catalog_client::cached_module_catalog` (L0
+// catalog) and `modules::update_module_for_project` (atomic swap) — does
+// NOT re-implement either. See module docs for the layering rationale.
+pub mod module_updates;
 pub mod openai_cmd;
 // Stream 2 follow-up (v0.2.20 / 2026-05-19): Tauri-command backings for
 // the orchestrator-core `gui.config_tab` declared in `vct-module.json`.
@@ -145,6 +152,13 @@ pub mod project_folder_health;
 pub mod project_state_cmd;
 pub mod project_state_populate;
 pub mod restart;
+// v0.2.52 V52-AH: Windows binary lock fix via stage1 updater handoff.
+// Companion to `commands::restart`. On Windows, `update_orchestrator`
+// writes a lock file describing pending binary swaps + spawns
+// `vct-updater.exe` DETACHED, which performs the swap after the
+// launcher exits. POSIX no-op (the rename pattern in installer.rs
+// already handles binary swap there).
+pub mod update_handoff;
 pub mod retrieval_tuning;
 pub mod rl_settings;
 pub mod runtime_install;
@@ -153,4 +167,10 @@ pub mod secrets_import;
 pub mod self_update;
 pub mod storage_ux;
 pub mod telemetry_cmd;
+// V52-AI (v0.2.52): MCP fork-bomb mitigation. Lockfile at
+// <vct_root>/.update-in-progress.json that MCP servers + ensure-containers
+// hooks read to decide whether to skip startup during an active update.
+// Without this gate, Windows users saw ~97 python + ~77 node MCP
+// processes spawn in a respawn loop, requiring manual taskkill.
+pub mod update_gate;
 pub mod volumes;

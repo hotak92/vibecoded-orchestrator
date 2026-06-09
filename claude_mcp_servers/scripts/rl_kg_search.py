@@ -36,18 +36,33 @@ async def main():
     header_prefix = "KG: " if args.hook_format else ""
 
     # Import the MCP server's internals
+    # V52-J (v0.2.52): rerank+emit is now routed through the canonical
+    # ``rl_client.search_pipeline.rerank_and_emit`` so every KG-search
+    # entry point shares one chokepoint for telemetry + RL rerank.
+    # Pre-v0.2.52 this script reached into ``server._rl_cache_and_rerank``
+    # directly; the new pipeline owns the license-tier gate, the RL RPC
+    # cache, the citation-cache populate, the answer-monitor spawn, and
+    # the v3 retrieval-event emit (with the 3-layer session_id resolution
+    # + project_id propagation fixes). Caller still owns Weaviate fan-out
+    # because the pipeline is intentionally orthogonal to retrieval
+    # strategy.
     from weaviate_mcp.server import (
         get_weaviate_client,
         _get_search_vector,
         _format_obj,
         _enrich_with_adjacent_chunks,
-        _rl_cache_and_rerank,
         _get_result_verbosity_by_score,
         _format_result_by_tier,
         _kg_collections_to_search,
+        _embedding_dim_for,
         KG_COLLECTION,
         EMBEDDING_SOURCE,
+        EMBEDDING_MODEL,
         _RL_OVERFETCH,
+    )
+    from claude_mcp_servers.rl_client.search_pipeline import (
+        RerankRequest,
+        rerank_and_emit,
     )
     import uuid
 
@@ -140,17 +155,34 @@ async def main():
         # below self-collection results even when their score is higher.
         all_formatted.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
-        # RL rerank (calls RL server, falls back to Weaviate order).
-        # NEW-8 (2026-05-28): pass query embedding so the local telemetry
-        # writer records it for offline training. Pre-fix, every retrieval
-        # event under cohorts orchestrator-root/VibeCoded*/VCODev (758
-        # events since 2026-05-20) was written without query_emb because
-        # this kwarg was missing.
+        # RL rerank + telemetry emit via the V52-J canonical pipeline.
+        # NEW-8 (2026-05-28): query embedding is carried into the
+        # retrieval-event payload for offline training. Pre-NEW-8, every
+        # retrieval event from this script was written without query_emb;
+        # the v0.2.52 refactor keeps that contract intact (vector flows
+        # through RerankRequest.query_emb) while moving the call-site to
+        # a single canonical chokepoint shared with the MCP server +
+        # search_knowledge.py CLI.
+        #
+        # task_type = "pre_edit_kg_search" so offline analysis can
+        # distinguish hook-triggered context-injection events from
+        # interactive MCP `hybrid_search` calls. The rl_events schema
+        # accepts arbitrary task_type strings (varchar column, no
+        # enum constraint — see launcher/src-tauri/migrations/*.sql).
         task_id = f"pre_edit_{uuid.uuid4().hex[:8]}"
-        results = await _rl_cache_and_rerank(
-            task_id, args.query, all_formatted, args.limit,
+        req = RerankRequest(
+            query=args.query,
+            candidates=all_formatted,
+            limit=args.limit,
             query_emb=vector,
+            embedding_source=EMBEDDING_SOURCE,
+            embedding_dim=_embedding_dim_for(EMBEDDING_MODEL),
+            embedding_model=EMBEDDING_MODEL,
+            task_id=task_id,
+            task_type="pre_edit_kg_search",
         )
+        rerank_result = await rerank_and_emit(req)
+        results = rerank_result.ranked
         for r in results:
             if "score" not in r:
                 d = r.get("distance")

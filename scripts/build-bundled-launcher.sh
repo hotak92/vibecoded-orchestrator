@@ -401,6 +401,64 @@ echo "[build-bundled] Staged hub: $HUB_DEST"
 echo "[build-bundled] Hub metadata: ${HUB_DEST}.metadata.json"
 echo "[build-bundled] Hub binary size: $(du -h "$HUB_DEST" | cut -f1)"
 
+# v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): build + stage vct-updater.
+#
+# vct-updater is the stage1 helper that performs the Windows binary
+# swap after the running launcher exits. The binary itself is
+# cross-platform (compiles cleanly on Linux/macOS — it's just a no-op
+# on POSIX), but only Windows users actually need it at runtime. We
+# build for the host arch unconditionally so contributor / CI hosts
+# verify the binary still compiles, and stage it into dist/<arch>/ on
+# every platform so `install.py` + the launcher can find it via the
+# canonical lookup path.
+#
+# Same `-p vct-updater` selector pattern as vct-hub for the same reason
+# (workspace root has no `vct-updater` bin target).
+echo "[build-bundled] cargo build -p vct-updater --release --bin vct-updater"
+( cd "$SRC_TAURI" && cargo build -p vct-updater --release --bin vct-updater )
+
+case "$HOST_TARGET" in
+    windows-x64) UPDATER_BIN="vct-updater.exe" ;;
+    *)           UPDATER_BIN="vct-updater" ;;
+esac
+
+UPDATER_SRC=""
+for cand in vct-updater vct-updater.exe; do
+    if [ -x "$RELEASE_DIR/$cand" ]; then
+        UPDATER_SRC="$RELEASE_DIR/$cand"
+        break
+    fi
+done
+if [ -z "$UPDATER_SRC" ]; then
+    echo "[build-bundled] No vct-updater binary found in $RELEASE_DIR" >&2
+    echo "                Try: cd $SRC_TAURI && cargo build -p vct-updater --release" >&2
+    exit 1
+fi
+
+UPDATER_DEST="$DIST_DIR/$HOST_TARGET/$UPDATER_BIN"
+cp "$UPDATER_SRC" "$UPDATER_DEST"
+chmod +x "$UPDATER_DEST"
+
+# Sidecar metadata mirrors the launcher / hub shape. Same source SHA +
+# source hash (one workspace, one commit). tier=experimental matches
+# the rest of the build (no signing pipeline for this small helper).
+cat > "${UPDATER_DEST}.metadata.json" <<UPDATER_METADATA_EOF
+{
+  "source_sha": "$SOURCE_SHA",
+  "source_short_sha": "$SOURCE_SHORT_SHA",
+  "source_hash": "$SOURCE_HASH",
+  "built_at": "$BUILT_AT",
+  "launcher_version": "$TAURI_VERSION",
+  "host_target": "$HOST_TARGET",
+  "binary_name": "$UPDATER_BIN",
+  "binary_size_bytes": $(stat -c%s "$UPDATER_DEST" 2>/dev/null || stat -f%z "$UPDATER_DEST" 2>/dev/null || echo 0),
+  "tier": "$TIER"
+}
+UPDATER_METADATA_EOF
+echo "[build-bundled] Staged updater: $UPDATER_DEST"
+echo "[build-bundled] Updater metadata: ${UPDATER_DEST}.metadata.json"
+echo "[build-bundled] Updater binary size: $(du -h "$UPDATER_DEST" | cut -f1)"
+
 echo
 echo "[build-bundled] Reminder: if THIRD_PARTY_LICENSES.txt is stale, regenerate it:"
 echo "    cd $SRC_TAURI"

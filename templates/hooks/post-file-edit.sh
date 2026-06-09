@@ -67,6 +67,50 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
+# V52-L.2 Fix 2b: parse subagent identity from the stdin payload. We
+# don't write a JSONL log directly from this hook, but the kg-sync /
+# code-graph-incremental subprocesses we spawn DO emit retrieval / sync
+# telemetry — exporting these as env vars (VCT_AGENT_ID / VCT_AGENT_TYPE)
+# lets the canonical emit path (rl_client/telemetry_emit.py) attribute
+# those rows to the agent that triggered the write. Pre-V52-L.2 every
+# subprocess saw an empty agent context regardless of which subagent ran
+# the edit. Empty string when absent (parent context).
+AGENT_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('agent_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+AGENT_TYPE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('agent_type', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+SESSION_ID_FROM_STDIN=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+# Export for child processes (kg-sync, code-graph-incremental.sh, etc.)
+# so their emit paths can attribute telemetry to the originating agent.
+# Skip empty-string exports — downstream readers treat unset and empty
+# identically, but unset keeps `env` listings clean for debugging.
+[ -n "$AGENT_ID" ]   && export VCT_AGENT_ID="$AGENT_ID"
+[ -n "$AGENT_TYPE" ] && export VCT_AGENT_TYPE="$AGENT_TYPE"
+# session_id alignment with VCT_SESSION_ID (see V52-J Edit 4 in
+# pre-edit-context-inject.sh): the canonical telemetry emit path reads
+# VCT_SESSION_ID as layer-2 of its 3-layer chain. Without this export,
+# every CLI-emitted event from a hook-triggered sync would have
+# session_id="" — same v0.2.51 bug class as the pre-edit hook fixed.
+[ -n "$SESSION_ID_FROM_STDIN" ] && export VCT_SESSION_ID="$SESSION_ID_FROM_STDIN"
 
 [ -z "$EDITED_FILE" ] && exit 0
 

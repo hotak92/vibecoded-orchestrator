@@ -103,4 +103,23 @@ if (-not (Test-Path $SnapshotDir2)) {
 }
 $flag = Join-Path $SnapshotDir2 "ctx_compact_flag_$SessionId"
 New-Item -ItemType File -Path $flag -Force | Out-Null
+
+# V52-N (2026-06-09): signal running RL citation monitors to flush their
+# accumulated answer window before the context goes away. The MCP's
+# _rl_answer_monitor polls every 2 s for this sentinel and, when present,
+# fires with whatever's accumulated regardless of the natural 25k-token
+# threshold. Without this, every PreCompact event silently drops in-flight
+# citation events (the transcript-window-based extractor can't recover
+# from a compacted-away mid-answer state).
+$Sentinel = Join-Path $ProjectDir ".claude/state/rl_monitors_force_flush.flag"
+$SentinelDir = Split-Path $Sentinel -Parent
+if (-not (Test-Path $SentinelDir)) {
+    New-Item -ItemType Directory -Path $SentinelDir -Force | Out-Null
+}
+try {
+    [int][double]::Parse((Get-Date -UFormat %s)) | Set-Content -Path $Sentinel -Encoding ascii
+} catch {
+    # Fallback: at minimum ensure the file exists so the MCP picks it up.
+    New-Item -ItemType File -Path $Sentinel -Force | Out-Null
+}
 exit 0

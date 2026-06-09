@@ -166,13 +166,18 @@ if [[ ! "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|j
     exit 0
 fi
 
-# v0.2.18 (Plan C): map the edited file's extension to the analyzer's
-# canonical language ID. Same set as analyze_code_graph.py's argparse
-# `--language` choices. When the extension matches, we pass --language
-# AND --prune-stale to the analyzer so the language-scoped prune runs
-# (only deletes rows tagged with this language that were not visited).
-# Pre-Plan-C the hook ran with neither flag, leaving deleted source-
-# files' code-graph entries behind forever.
+# v0.2.18 (Plan C) mapped the edited file's extension to the analyzer's
+# canonical language ID and passed `--language $LANG --prune-stale` to
+# scope the prune to "rows of this language not visited this run".
+#
+# v0.2.52 V52-O.7 (2026-06-09): the LANG mapping is now UNUSED in the
+# analyzer invocation below because `--prune-stale` was dropped (see audit
+# a97f0d9 — `_prune_collection` iterated the WHOLE collection per run, so
+# every Python edit deleted ALL other Python rows; collection went to 0
+# Python rows over time). The mapping stays in place because the proper
+# architectural fix queued for v0.2.53 (scope prune to the EDITED FILE
+# only, not language-wide) will need this LANG hint. Don't delete the
+# block — it's load-bearing for the v0.2.53 follow-up.
 LANG=""
 case "$EDITED_FILE" in
     *.py)                                LANG="python"     ;;
@@ -218,28 +223,30 @@ fi
 # --cfg/--pdg default to ON inside analyze_code_graph.py when joern is present;
 # silent fallback when absent. To disable, set VCT_JOERN_AVAILABLE=0.
 #
-# v0.2.18 (Plan C): --language=$LANG + --prune-stale together make the
-# language-scoped prune correct + cheap — only entries tagged with this
-# language that the analyzer didn't visit this run are deleted; other
-# languages are preserved. Empty LANG (unrecognised extension) falls back
-# to incremental-without-prune (legacy behaviour).
+# v0.2.52 V52-O.7 (2026-06-09): DROPPED `--prune-stale --language=$LANG`.
+# v0.2.18 added them as "Plan C" intending a language-scoped prune. But
+# `_prune_collection` (analyze_code_graph.py:1889) iterates the ENTIRE
+# collection and deletes every row tagged with that language that wasn't
+# visited THIS run. Incremental runs visit ~1 file at a time (HEAD~1..HEAD
+# diff) so every Python edit deleted all OTHER Python rows. Audit a97f0d9
+# (2026-06-09) confirmed: `VibeCodedOrchestrator_CodeFunction` had 5365
+# rows of which **0 were Python**, while the legacy snapshot
+# `Vco_v0243_A_install_CodeFunction` still had 219 Python rows (untouched
+# by incremental runs). This was the PRIMARY root cause of zero-Python-
+# indexed.
+#
+# Fix scope: drop --prune-stale + --language; let stale rows leak until a
+# full reanalyze (V52-O.2 `scripts/v0252_codegraph_reset.sh`) cleans them
+# up. The proper architectural fix (scope prune to the EDITED FILE only,
+# not language-wide) is queued for v0.2.53 — see V52-O.7 sub-item in
+# v0.2.52 backlog.
 (
     cd "$REPO_PATH"
-    if [ -n "$LANG" ]; then
-        "$PYTHON" "$ANALYZER" \
-            "$REPO_PATH" \
-            --project "$PROJECT_NAME" \
-            --incremental \
-            --language "$LANG" \
-            --prune-stale \
-            2>&1 | tail -5
-    else
-        "$PYTHON" "$ANALYZER" \
-            "$REPO_PATH" \
-            --project "$PROJECT_NAME" \
-            --incremental \
-            2>&1 | tail -5
-    fi
+    "$PYTHON" "$ANALYZER" \
+        "$REPO_PATH" \
+        --project "$PROJECT_NAME" \
+        --incremental \
+        2>&1 | tail -5
 ) &
 
 echo "📊 Code graph incremental update queued for $PROJECT_NAME"

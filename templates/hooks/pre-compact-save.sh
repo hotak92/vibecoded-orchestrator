@@ -79,3 +79,14 @@ fi
 SNAPSHOT_DIR="$PROJECT_DIR/.claude/state"
 mkdir -p "$SNAPSHOT_DIR"
 touch "$SNAPSHOT_DIR/ctx_compact_flag_${SESSION_ID}"
+
+# V52-N (2026-06-09): signal running RL citation monitors to flush their
+# accumulated answer window before the context goes away. The MCP's
+# _rl_answer_monitor polls every 2 s for this sentinel and, when present,
+# fires with whatever's accumulated regardless of the natural 25k-token
+# threshold. Without this, every PreCompact event silently drops in-flight
+# citation events (the transcript-window-based extractor can't recover
+# from a compacted-away mid-answer state).
+SENTINEL="$PROJECT_DIR/.claude/state/rl_monitors_force_flush.flag"
+mkdir -p "$(dirname "$SENTINEL")"
+date +%s > "$SENTINEL"

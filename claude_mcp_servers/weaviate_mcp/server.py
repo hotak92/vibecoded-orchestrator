@@ -50,10 +50,38 @@ import json
 import logging
 import re
 import asyncio
+import functools
 import uuid
+import warnings
 from typing import Any, Optional, List, Dict
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+
+# v0.2.52 (Known Issue 6, Sub-issue A): silence the
+# ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` noise
+# that ``weaviate-client``'s transitive ``authlib`` dependency emits during
+# module import.  VCO never uses authlib's OIDC / JOSE code paths
+# (we only talk to local Weaviate via HTTP+gRPC without OAuth2 tokens),
+# so this warning is pure boilerplate during install / KG-seed and scares
+# users on their first run.  We import the warning class directly when
+# possible so the filter is precisely scoped — if authlib happens to not
+# be installed (someone stubbed weaviate-client out), the fallback uses
+# the broader ``DeprecationWarning`` category but still filters by message
+# regex so we don't accidentally silence unrelated DeprecationWarnings.
+# IMPORTANT: this MUST run BEFORE ``import weaviate`` below, because the
+# warning fires at module load time on weaviate's authlib imports.
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning  # type: ignore
+    warnings.filterwarnings("ignore", category=AuthlibDeprecationWarning)
+except ImportError:
+    # authlib not installed — fall back to message-scoped filter.  Matches
+    # both the current "authlib.jose module is deprecated" text and any
+    # future authlib deprecations that surface via the same channel.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*authlib.*deprecated.*",
+        category=DeprecationWarning,
+    )
 
 from mcp.server.fastmcp import FastMCP
 import weaviate
@@ -688,9 +716,31 @@ _KG_SEARCH_TOOLS: frozenset[str] = frozenset({
 # Monitor config: poll every N seconds, stop when answer window reaches this size OR a new
 # human turn appears after the search.  Timeout is a hard ceiling.
 _RL_MONITOR_POLL_INTERVAL: float = 2.0
-_RL_MONITOR_ANSWER_THRESHOLD: int = 64_000   # chars
-_RL_TOOL_CONTENT_LIMIT: int = 20_000         # per Write/Edit, chars
-_RL_MONITOR_TIMEOUT: float = 600.0           # 10 min hard ceiling
+# V52-N (2026-06-09): the accumulator threshold is now expressed in TOKENS
+# (not chars) and aligned with the citation gate
+# ``_RL_MIN_ANSWER_TOKENS_FOR_CITATION`` immediately below. Pre-V52-N the
+# accumulator stopped at 64 000 chars (~16k tokens) while the gate required
+# 25 000 tokens -> the monitor would fire on length, the gate would reject
+# as too short, and the citation event was silently dropped. Aligning them
+# to the same 25 000-token value means the monitor fires only once the
+# answer has enough signal to pass the gate.
+_RL_MONITOR_ANSWER_THRESHOLD_TOKENS: int = 25_000  # V52-N: align with citation gate
+# Back-compat char alias for any test/external caller still importing the
+# old name. 1 token ~= 4 chars (qwen3 BPE empirical average).
+_RL_MONITOR_ANSWER_THRESHOLD: int = _RL_MONITOR_ANSWER_THRESHOLD_TOKENS * 4
+_RL_TOOL_CONTENT_LIMIT: int = 20_000         # per tool_use input, chars
+# V52-N: hard timeout raised from 10 min -> 60 min. The new accumulator
+# stops either at the 25 000-token threshold or when the PreCompact hook
+# writes ``.claude/state/rl_monitors_force_flush.flag``; the timeout is
+# now a pure safety valve for sessions that get neither (very short
+# answers, never compacted, never closed). 60 min absorbs slow agents
+# without leaking monitor tasks indefinitely.
+_RL_MONITOR_TIMEOUT: float = 3600.0           # 60 min hard ceiling (V52-N safety valve)
+# V52-N: PreCompact hook drops this sentinel; the monitor picks it up on
+# the next poll and fires with whatever's accumulated so far. After
+# firing the monitor deletes the sentinel so subsequent compactions can
+# re-arm it. Path is relative to ``CLAUDE_PROJECT_DIR``.
+_RL_MONITOR_FORCE_FLUSH_SENTINEL: str = ".claude/state/rl_monitors_force_flush.flag"
 # v0.2.47 RL-7.5: minimum answer length (TOKENS) to compute citation events.
 # Below this, the monitor still POSTs to the RL container's /rl_update
 # (the container may treat short answers as negative-signal training data)
@@ -2611,6 +2661,12 @@ def _reset_weaviate_client_cache() -> None:
     Called from search-tool exception handlers when WeaviateUnreachable
     is detected so transient port-binding glitches recover automatically
     on the next user-driven retry.
+
+    V52-I Fix A (2026-06-09): also clears the per-collection
+    `valid_until` schema cache (`_collection_has_valid_until.cache_clear`)
+    because schema-altering events (drop+recreate, additive migrate)
+    typically coincide with client-cache resets. The reset is a no-op
+    when the cache function isn't yet defined (during module init).
     """
     global weaviate_client
     if weaviate_client is not None:
@@ -2619,6 +2675,14 @@ def _reset_weaviate_client_cache() -> None:
         except Exception:
             pass
         weaviate_client = None
+    # Forward-reference safe: `_reset_valid_until_cache` is defined later
+    # in this module but resolution happens at CALL time, not def time.
+    try:
+        _reset_valid_until_cache()
+    except NameError:
+        # Module still being initialized — cache function not yet bound.
+        # Fine: there's nothing cached yet anyway.
+        pass
 
 
 # v0.2.18: Lazy + cached EmbeddingService accessor.
@@ -3332,40 +3396,58 @@ def _rl_extract_answer_window(
     """
     Extract text produced by Claude after the KG search at (start_msg_idx, start_blk_idx).
 
-    Scans forward through the transcript collecting text/thinking blocks AND
-    Write/Edit tool content until either:
-      - A new human turn appears (= Claude stopped responding)   → complete=True
-      - Accumulated text exceeds _RL_MONITOR_ANSWER_THRESHOLD   → complete=True (truncated)
-      - End of transcript                                        → complete=False (still writing)
+    V52-N rewrite (2026-06-09): the extractor is now TOOL-AGNOSTIC and does
+    NOT stop on a human turn. User direction verbatim:
 
-    Write/Edit inclusion: agents frequently write findings to files rather than
-    explaining them in chat. Write includes the full ``content``; Edit includes
-    only ``new_string`` (the added lines, not the removed context).
+      * "make it agnostic from used tool, just log the 'input' of the tool
+        use, and discard its 'output'"
+      * "if tool name ends up in the output it's ok"
+      * "human input should not interrupt 'accumulation'"
 
-    VS Code transcripts use type="user" for both real human messages and tool results.
-    A real human turn has message.role == "human"; tool results have toolUseResult set.
-    Only real human turns signal that Claude has finished responding.
+    Concretely, this function scans every assistant message from
+    ``start_msg_idx`` to the end of the transcript and accumulates:
+
+      * All ``text`` blocks.
+      * All ``thinking`` blocks (Claude's internal scratch -- useful RL
+        signal).
+      * For EVERY ``tool_use`` block (regardless of tool name): the tool
+        name + a JSON dump of the ``input`` field. ``toolUseResult`` /
+        tool-output blocks are explicitly EXCLUDED -- they would dominate
+        the answer window with shell output, file dumps, and API JSON,
+        drowning out the citation signal.
+
+    Stop conditions (whichever comes first):
+      * Token-equivalent accumulation reaches
+        ``_RL_MONITOR_ANSWER_THRESHOLD_TOKENS`` (~4x chars). Returns
+        ``complete=True`` and a truncated window.
+      * End of transcript. Returns ``complete=False`` -- the monitor keeps
+        polling.
+
+    Crucially, human turns are NO LONGER a stop condition. Subsequent
+    assistant blocks count as part of the SAME answer accumulation; this
+    captures the realistic case where the user types a quick follow-up
+    ("yes, continue") and Claude resumes producing citation-bearing text.
+    The legacy human-turn stop caused the accumulator to fire on a tiny
+    sub-25k-token slice and then the citation gate rejected it as too
+    short -- silent drop.
+
+    Per-tool-use input is truncated to ``_RL_TOOL_CONTENT_LIMIT`` chars
+    to bound any single tool call's contribution; the max-over-chunks
+    cosine downstream means the relevant chunk still dominates.
 
     Returns (text, complete).
     """
+    import json as _json
     parts: list[str] = []
     total_chars = 0
+    threshold_chars = _RL_MONITOR_ANSWER_THRESHOLD_TOKENS * 4
     for msg_idx in range(start_msg_idx, len(messages)):
         msg = messages[msg_idx]
         msg_type = msg.get("type", "")
 
-        # A real human turn after the search = Claude finished responding.
-        # VS Code transcripts use type="user" + role="user" for actual human messages;
-        # some versions use role="human". Tool results also use type="user" but have
-        # toolUseResult set — those are NOT stop signals.
-        if (
-            msg_type == "user"
-            and msg_idx > start_msg_idx
-            and msg.get("message", {}).get("role") in ("human", "user")
-            and not msg.get("toolUseResult")
-        ):
-            return "".join(parts), True
-
+        # V52-N: human turns no longer interrupt accumulation. Only
+        # assistant blocks contribute; everything else is skipped without
+        # stopping the scan.
         if msg_type != "assistant":
             continue
 
@@ -3379,35 +3461,35 @@ def _rl_extract_answer_window(
             btype = block.get("type", "")
             if btype == "text":
                 text = block.get("text", "")
-                parts.append(text)
-                total_chars += len(text)
+                if text:
+                    parts.append(text)
+                    total_chars += len(text)
             elif btype == "thinking":
                 # Include thinking blocks (useful signal for RL)
                 text = block.get("thinking", "")
-                parts.append(text)
-                total_chars += len(text)
+                if text:
+                    parts.append(text)
+                    total_chars += len(text)
             elif btype == "tool_use":
-                # Include Write/Edit content — agents often write findings
-                # to files instead of (or in addition to) the chat response.
-                # Without this, nodes that were genuinely useful but whose
-                # content was written to a file get zero reward signal.
-                # Truncate to 20K chars per tool call to avoid budget blow-out;
-                # max-over-chunks cosine means the relevant chunk still dominates.
+                # V52-N tool-agnostic: include the tool name + JSON-serialized
+                # input for EVERY tool_use block. tool name leaking into the
+                # accumulated text is fine per user direction ("if tool name
+                # ends up in the output it's ok"). Tool OUTPUTS
+                # (``toolUseResult`` or block type ``tool_result``) are not
+                # collected here -- they appear on subsequent user-type
+                # messages which we skip above.
                 tool_name = block.get("name", "")
                 tool_input = block.get("input", {})
-                if tool_name == "Write":
-                    text = tool_input.get("content", "")[:_RL_TOOL_CONTENT_LIMIT]
-                    if text:
-                        parts.append(text)
-                        total_chars += len(text)
-                elif tool_name == "Edit":
-                    # Only new_string — the added content, not old_string
-                    text = tool_input.get("new_string", "")[:_RL_TOOL_CONTENT_LIMIT]
-                    if text:
-                        parts.append(text)
-                        total_chars += len(text)
-            if total_chars >= _RL_MONITOR_ANSWER_THRESHOLD:
-                return "".join(parts)[:_RL_MONITOR_ANSWER_THRESHOLD], True
+                try:
+                    input_serialized = _json.dumps(tool_input, default=str)
+                except Exception:
+                    input_serialized = str(tool_input)
+                snippet = f"{tool_name}: {input_serialized}"[:_RL_TOOL_CONTENT_LIMIT]
+                if snippet:
+                    parts.append(snippet)
+                    total_chars += len(snippet)
+            if total_chars >= threshold_chars:
+                return "".join(parts)[:threshold_chars], True
 
     return "".join(parts), False
 
@@ -3725,15 +3807,69 @@ async def _rl_compute_and_write_citations(
     }
 
 
+def _rl_force_flush_sentinel_path() -> "Path":
+    """Resolve the V52-N compaction sentinel path relative to the project root.
+
+    Path is ``<CLAUDE_PROJECT_DIR>/.claude/state/rl_monitors_force_flush.flag``
+    with a fallback to ``_SERVER_INFERRED_BASE`` when the env var isn't
+    populated (CLI invocations + tests). The sentinel is created by
+    ``templates/hooks/pre-compact-save.{sh,ps1}`` immediately before
+    Claude Code compacts the context; this monitor polls for it on every
+    iteration and, when present, fires with whatever it has accumulated
+    so far.
+    """
+    from pathlib import Path as _Path
+    base = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if base:
+        return _Path(base) / _RL_MONITOR_FORCE_FLUSH_SENTINEL
+    return _SERVER_INFERRED_BASE / _RL_MONITOR_FORCE_FLUSH_SENTINEL
+
+
+def _rl_check_force_flush() -> bool:
+    """Return True iff the V52-N compaction-sentinel file exists.
+
+    Soft-fail: any filesystem error returns False so the monitor keeps
+    polling normally rather than crashing on a transient ENOENT race.
+    """
+    try:
+        return _rl_force_flush_sentinel_path().exists()
+    except Exception:
+        return False
+
+
+def _rl_clear_force_flush() -> None:
+    """Delete the V52-N sentinel after a fire so subsequent compactions can re-arm.
+
+    Soft-fail: missing file / permission error / race with the hook all
+    return silently. Worst case a future poll sees a stale sentinel and
+    fires once on an already-emitted task -- the per-task cache is popped
+    so the second fire is a no-op.
+    """
+    try:
+        path = _rl_force_flush_sentinel_path()
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     """
     Background asyncio task: poll the session transcript until Claude's answer
     after the KG search is available, then POST to rl_server /rl_update.
 
-    Firing condition (whichever comes first):
-      - A new human turn appears after the search (= response complete)
-      - Answer window exceeds _RL_MONITOR_ANSWER_THRESHOLD chars
-      - Hard timeout _RL_MONITOR_TIMEOUT seconds
+    V52-N stop conditions (whichever comes first):
+      - Answer window accumulates >= ``_RL_MONITOR_ANSWER_THRESHOLD_TOKENS``
+        (25 000 tokens, matching the citation gate).
+      - The PreCompact hook drops ``.claude/state/rl_monitors_force_flush.flag``
+        -- the monitor fires with whatever's accumulated so far (could be
+        less than the threshold) and deletes the sentinel so subsequent
+        compactions re-arm.
+      - Hard timeout ``_RL_MONITOR_TIMEOUT`` seconds (60 min safety valve,
+        raised from 10 min pre-V52-N).
+
+    Note: human turns are no longer a stop condition (the V52-N rewrite of
+    ``_rl_extract_answer_window`` accumulates ACROSS human follow-ups).
 
     The `seq` value is the 1-based call counter for this MCP process; it maps to
     the (seq-1)'th KG search position in the transcript (0-based rank).
@@ -3751,6 +3887,12 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     # Phase 1 + 2 combined: find the right transcript and poll for completion
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(_RL_MONITOR_POLL_INTERVAL)
+
+        # V52-N: check the compaction sentinel BEFORE scanning transcripts.
+        # When set, we force-fire on whatever's accumulated regardless of
+        # the natural threshold. Clearing happens after the fire below so
+        # subsequent compactions re-arm cleanly.
+        force_flush = _rl_check_force_flush()
 
         # Scan all transcripts for the one that contains our query at pos_idx
         candidates = await _rl_find_all_transcripts()
@@ -3795,6 +3937,15 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             start_msg_idx, start_blk_idx = matched_pos
             # Right transcript — check if answer is complete
             answer, complete = _rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
+            # V52-N: the sentinel forces fire even when the extractor returned
+            # complete=False (i.e. we haven't accumulated enough yet but compaction
+            # is about to happen and we'd lose access to the transcript).
+            if force_flush and answer.strip():
+                complete = True
+                logger.debug(
+                    "RL monitor %s: force-flush sentinel detected; firing with %d chars accumulated",
+                    task_id[:8], len(answer),
+                )
             if complete and answer.strip():
                 # v0.2.47 RL-7: MCP-side citation write (replaces the
                 # pre-v0.2.47 container-coupled write path that silently
@@ -3890,6 +4041,13 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                                 "RL monitor %s: rl_update_v3 raised (%s); continuing",
                                 task_id[:8], exc,
                             )
+                # V52-N: if we fired because the sentinel was set, clear it
+                # so the next PreCompact event can re-arm a fresh flush.
+                # When we fired on natural threshold completion, the sentinel
+                # may still be absent -- _rl_clear_force_flush handles that
+                # case as a soft-fail.
+                if force_flush:
+                    _rl_clear_force_flush()
                 return
             # Found the right transcript but answer not complete yet — stop scanning candidates
             break
@@ -3966,11 +4124,26 @@ def _get_rl_client():
     # then falls back to the base model — the safe, paying-user-not-
     # cut-off behaviour. RLClient.__init__ sanitises project_id on its
     # own; passing it through unchecked is also safe.
+    #
+    # V52-AA (v0.2.52): the same resolver also surfaces ``rl_server_port``
+    # — the per-project RL Reranker container port allocated by the
+    # supervisor and persisted to ``module_ports``. We use it as a
+    # fallback when the canonical ``RL_SERVER_URL`` / ``RL_SERVER_PORT``
+    # env vars are unset (which they always are for MCP subprocesses on
+    # the default install — the launcher deliberately does NOT propagate
+    # them to ``.claude/settings.json env`` per the H.1 contract). With
+    # this fallback the client transitions from "disabled mode" to
+    # "wired to the supervisor-allocated container" without any env
+    # ceremony. Env vars still WIN when set, preserving the existing
+    # override path for tests + dev users.
     current_project_id: Optional[str] = None
+    hub_rl_server_port: Optional[int] = None
     try:
         _cfg = _try_resolve_project_config()
-        if _cfg is not None and getattr(_cfg, "project_id", None):
-            current_project_id = _cfg.project_id
+        if _cfg is not None:
+            if getattr(_cfg, "project_id", None):
+                current_project_id = _cfg.project_id
+            hub_rl_server_port = getattr(_cfg, "rl_server_port", None)
     except Exception as exc:
         logger.debug("project_id resolve failed (%s); will send no X-VCT-Project-ID", exc)
 
@@ -3996,10 +4169,32 @@ def _get_rl_client():
             svc.close()
     except Exception as exc:
         logger.debug("EmbeddingService probe failed (%s); using default text_dim=%d", exc, text_dim)
+
+    # V52-AA: derive base_url from hub-resolved rl_server_port as a
+    # fallback when env vars are unset. Env precedence:
+    #   1. RL_SERVER_URL env (canonical override; full URL incl. host)
+    #   2. RL_SERVER_PORT env (composed against 127.0.0.1)
+    #   3. hub-resolved ``rl_server_port`` from ProjectConfig (V52-AA)
+    #   4. None → "disabled mode"
+    # RLClient.__init__ already uses _resolve_base_url() to cover (1)+(2)
+    # internally when ``base_url`` arg is None. We pre-resolve (3) here
+    # and pass it explicitly as ``base_url`` ONLY when (1)+(2) are unset,
+    # so the existing env-override path stays intact for tests + dev.
+    base_url_override: Optional[str] = None
+    _env_url = os.environ.get("RL_SERVER_URL", "").strip()
+    _env_port = os.environ.get("RL_SERVER_PORT", "").strip()
+    if not _env_url and not _env_port and hub_rl_server_port:
+        base_url_override = f"http://127.0.0.1:{hub_rl_server_port}"
+        logger.debug(
+            "RL client: env unset; using hub-resolved rl_server_port=%d",
+            hub_rl_server_port,
+        )
+
     client = RLClient(
         text_dim=text_dim,
         active_embedding=current_embedding,
         project_id=current_project_id,
+        base_url=base_url_override,
     )
     _rl_client_instances[cache_key] = client
     return client
@@ -4200,8 +4395,17 @@ def _get_rl_telemetry_writer():
     writer = _rl_telemetry_writers.get(key)
     if writer is not None:
         return writer
+    # V52-J Edit 1 (2026-06-09): also pass project_id resolved at line 4178
+    # above. Pre-fix, project_id was never threaded through → 100% NULL in
+    # launcher.db rl_events.project_id (see telemetry_emit.py module
+    # docstring for the pre-v0.2.52 baseline).
     writer = RLTelemetryWriter(
         project=project,
+        project_id=(
+            _cfg_for_telemetry.project_id
+            if _cfg_for_telemetry is not None
+            else None
+        ),
         embedding_source=emb_source,
         embedding_dim=emb_dim,
         embedding_model=emb_model,
@@ -4560,226 +4764,48 @@ async def _rl_cache_and_rerank(
     query_emb: list[float] | None = None,
 ) -> list[dict]:
     """
-    Rerank nodes via rl_server and spawn a background monitor for online training.
+    V52-J Edit 2 (2026-06-09): thin adapter that delegates to the canonical
+    rerank-and-emit pipeline in ``claude_mcp_servers.rl_client.search_pipeline``.
 
-    Returns reranked top-k from rl_server, or the first `limit` nodes (Weaviate order)
-    if the server is unreachable or returns an error.
+    The pre-v0.2.52 body (tier gate + per-project toggle + rerank + telemetry +
+    citation cache populate, all inline) has been moved verbatim into
+    ``search_pipeline.rerank_and_emit()`` so every KG-search entry point
+    (MCP ``hybrid_search`` / ``semantic_graph_search``, the CLI scripts
+    ``rl_kg_search.py`` and ``search_knowledge.py``, PreToolUse hooks that
+    invoke those CLIs) shares one canonical chokepoint instead of each
+    re-implementing the orchestration. See ``search_pipeline.py`` module
+    docstring for full rationale.
 
-    Spawns _rl_answer_monitor as an asyncio background task: it will poll the session
-    transcript until Claude's answer is available, then POST to /rl_update for training.
-
-    Tier gating: free tier skips the RL server entirely and returns Weaviate's cosine
-    ordering. Pro/MAO tiers use RL reranking (requires rl_server running on port 11439
-    from the separate orchestrator-rl repo, started by the launcher after activation).
-
-    v0.2.24 (RL-defect-2026-05-22): added optional ``failure_mode`` /
-    ``failed_collections`` kwargs. Callers may invoke with ``all_nodes=[]``
-    AND a non-None ``failure_mode`` to log a degraded-mode retrieval event
-    so offline training has visibility into queries that schema-failed.
-    Free-tier early-return ALSO logs (so failure-rate telemetry survives
-    the tier gate). Reranking is skipped when nodes is empty (nothing to
-    rerank).
+    Call sites (4 of them in this file, search ``_rl_cache_and_rerank``)
+    only care about the returned ``list[dict]`` — they don't see the
+    ``RerankResult`` diagnostic fields (``rl_used``, ``emit_success``)
+    at all. The pre-v0.2.52 inline body was preserved as
+    ``_rl_cache_and_rerank_LEGACY_v0251`` for one commit during the
+    refactor and removed in the follow-up; full history in git log.
     """
-    # Feature gate: free tier → skip RL reranking, return Weaviate order.
-    # v0.2.24 (RL-defect-2026-05-22): the telemetry log_retrieval call
-    # below now runs UNCONDITIONALLY, regardless of tier. The free tier
-    # still benefits from local JSONL accumulation so when the user
-    # upgrades to Pro the historical training corpus is already there
-    # — and so retrieval-defect investigations have audit data for
-    # free-tier installs too.
-    _rl_enabled = True
-    try:
-        from VCThelpers.license import feature_enabled
-        # v0.2.40 L1 — multi-key licensing: passing `module_id` lets
-        # `feature_enabled` consult the per-module overlay in
-        # `~/.vibecoded/license_cache.json`. So a user on orchestrator
-        # tier=free who explicitly activated a `vct-rl-reranker` license
-        # key still gets RL retrieval. Pre-L1 behaviour (no per-module
-        # key) is preserved: the function short-circuits on the legacy
-        # tier check first, so a Pro/MAO user never reaches the overlay
-        # check.
-        if not feature_enabled("rl_retrieval", module_id="vct-rl-reranker"):
-            logger.debug("RL retrieval gated off for current tier — using Weaviate order")
-            _rl_enabled = False
-    except ImportError:
-        # VCThelpers not available (pure free install) → free tier behavior.
-        _rl_enabled = False
+    # Lazy import keeps the rl_client → server.py edge from becoming a
+    # circular dep at module-load time (search_pipeline lazy-imports back
+    # into this module to reach _rl_node_content_cache et al).
+    from claude_mcp_servers.rl_client.search_pipeline import (
+        RerankRequest,
+        rerank_and_emit,
+    )
 
-    # v0.2.49 Stream B — per-project enable toggle. After the tier
-    # check, consult the hub-resolved
-    # `rl_reranker_enabled_for_project` flag: when the user has
-    # explicitly disabled the RL reranker for THIS project (via the
-    # launcher GUI's per-project Modules panel), skip the rerank
-    # request even when the license tier would permit it. The
-    # server-side telemetry path is unaffected — the RL container's
-    # local JSONL writer still records every retrieval event the
-    # container observes (which, with this gate ON, is none from this
-    # project). Reads through `_try_resolve_project_config` so the
-    # hub-down branch falls open (enabled): never silently disable a
-    # paying user's reranker because the hub crashed mid-session.
-    if _rl_enabled:
-        try:
-            _pc = _try_resolve_project_config()
-            if _pc is not None and not getattr(
-                _pc, "rl_reranker_enabled_for_project", True
-            ):
-                logger.debug(
-                    "RL retrieval gated off for this project (per-project "
-                    "enable toggle is OFF) — using Weaviate order"
-                )
-                _rl_enabled = False
-        except Exception as exc:
-            # Conservative: log + leave _rl_enabled untouched. The
-            # hub-down branch ALREADY falls open via the None return
-            # path above; only an exception in the getattr/path could
-            # land here. Mirrors the rest of the resolver call sites
-            # in this file (silent fall-through to env-fallback / safe
-            # default).
-            logger.debug(
-                "RL per-project enable resolver raised (%s); leaving "
-                "gate at tier-decision value",
-                exc,
-            )
-
-    # Rerank gate: Pro/MAO tier with at least one node → spawn monitor
-    # + call RL server. Free tier OR empty all_nodes → skip rerank but
-    # STILL fall through to the telemetry block below so the offline
-    # corpus and failure-mode telemetry continue accumulating.
-    if _rl_enabled and all_nodes:
-        global _rl_call_seq
-        _rl_call_seq += 1
-        seq = _rl_call_seq
-
-        # Spawn answer monitor (fire-and-forget, doesn't block Claude's response).
-        # v0.2.28: keep a strong reference in `_rl_monitor_tasks` so the GC
-        # cannot drop the task before it polls + writes the citation event.
-        # Discard on completion to avoid the set growing unboundedly.
-        _monitor = asyncio.create_task(_rl_answer_monitor(task_id, seq, query))
-        _rl_monitor_tasks.add(_monitor)
-        _monitor.add_done_callback(_rl_monitor_tasks.discard)
-
-        # Rerank via RLClient. The client handles "disabled mode" (no env
-        # configured) and per-call fallback (connection refused / 5xx)
-        # internally — it ALWAYS returns a list and never raises here, so
-        # we don't need a defensive try/except around the await.
-        client = _get_rl_client()
-        if client is None:
-            # rl_client package unavailable — return Weaviate order.
-            ranked = list(all_nodes[:limit])
-        else:
-            # v0.2.31 telemetry audit fix: forward CLAUDE_SESSION_ID so
-            # the container can persist session_id on /cache_nodes rows.
-            # Pre-v0.2.31 this field was empty in 99.9% of telemetry rows
-            # because no caller passed it through — the container shipped
-            # the kwarg in vct-rl-reranker v0.2.4 to receive it. Empty
-            # string is the documented backward-compat sentinel.
-            ranked = await client.cache_nodes(
-                query=query,
-                nodes=all_nodes,
-                top_k=limit,
-                task_id=task_id,
-                session_id=os.getenv("CLAUDE_SESSION_ID", ""),
-            )
-    else:
-        # Free tier OR empty nodes → return Weaviate order (which is also
-        # empty if all_nodes is empty). Free tier doesn't get reranked but
-        # the local-JSONL accumulation below is still useful for upgrade
-        # path + failure diagnostics.
-        ranked = list(all_nodes[:limit])
-
-    # Telemetry: log the retrieval event regardless of whether reranking
-    # happened OR tier. Free-tier installs collect locally (subject to
-    # the RL_LOCAL_LOGGING_DISABLED opt-out); only consented data is
-    # forwarded to the queue for upload. Soft-fail throughout.
-    #
-    # v0.2.24 (RL-defect-2026-05-22): also logs degraded-mode events
-    # (failure_mode set, all_nodes typically empty) so offline training
-    # has visibility into queries that schema-failed. The offline
-    # trainer filters non-None failure_mode out of training-pair
-    # construction at load time, but uses them as a query-distribution
-    # and failure-rate signal.
-    try:
-        writer = _get_rl_telemetry_writer()
-        if writer is not None:
-            # Build the log payload from the ranked list. Score-aware
-            # tier tagging: first ``limit`` go to top_k, rest extra_ref.
-            #
-            # v0.2.31 telemetry audit fix (Item 2.4 — was 7.4% missing):
-            # propagate emb + cos_qn / cos_ql / cos_nl when the upstream
-            # search path enriched the candidate dict.
-            #
-            # v0.2.47 RL-6c (2026-06-04): also propagate the v3 enrichment
-            # fields (n_emb / linked_embs / linked_type_names / node_type /
-            # links) that ``_rl_enrich_nodes_with_linked_embs`` attached to
-            # each node dict upstream. The writer's
-            # ``_build_v3_retrieval_event`` consumes them when present;
-            # absent values omit cleanly. The writer itself was switched
-            # from JSONL to a hub POST in the same release cycle — see
-            # ``claude_mcp_servers/rl_client/telemetry_writer.py``.
-            log_nodes: list[dict] = []
-            for idx, n in enumerate(all_nodes):
-                if not isinstance(n, dict):
-                    continue
-                rec = {
-                    "title": n.get("title", ""),
-                    "score": n.get("score", 0.0),
-                    "tier": "top_k" if idx < limit else "extra_reference",
-                }
-                if n.get("emb"):
-                    rec["emb"] = n["emb"]
-                # v3 per-node fields (from C6b-1/2 enrichment).
-                if n.get("n_emb"):
-                    rec["n_emb"] = n["n_emb"]
-                if n.get("linked_embs"):
-                    rec["linked_embs"] = n["linked_embs"]
-                if n.get("linked_type_names"):
-                    rec["linked_type_names"] = n["linked_type_names"]
-                if n.get("node_type"):
-                    rec["node_type"] = n["node_type"]
-                if n.get("links"):
-                    rec["links"] = n["links"]
-                for cos_field in ("cos_qn", "cos_ql", "cos_nl"):
-                    val = n.get(cos_field)
-                    if val is not None:
-                        rec[cos_field] = val
-                log_nodes.append(rec)
-            writer.log_retrieval(
-                task_id=task_id,
-                task_type="mcp_interactive",
-                query=query,
-                nodes=log_nodes,
-                session_id=os.getenv("CLAUDE_SESSION_ID", ""),
-                failure_mode=failure_mode,
-                failed_collections=failed_collections,
-                query_emb=query_emb,
-            )
-
-            # v0.2.47 RL-6c: populate _rl_node_content_cache so the
-            # citation-write monitor (C7) can compute citations later
-            # without re-fetching anything from Weaviate. LRU-ish eviction
-            # at _RL_NODE_CACHE_MAX. Per-task entry shape is documented
-            # at the cache's module-level definition (line ~340).
-            try:
-                _rl_node_content_cache[task_id] = {
-                    "nodes": list(log_nodes),
-                    "query_emb": list(query_emb) if query_emb is not None else None,
-                    "active_model": EMBEDDING_MODEL,
-                    "embedding_source": EMBEDDING_SOURCE,
-                    "embedding_dim": len(query_emb) if query_emb else 0,
-                    "project_id": None,  # free-tier fallback; resolver lookup deferred to C7
-                    "project_name": PROJECT_NAME if "PROJECT_NAME" in globals() else "",
-                    "task_type": "mcp_interactive",
-                }
-                # Evict oldest entry when over cap (dict iteration order
-                # preserves insertion order on Python 3.7+).
-                while len(_rl_node_content_cache) > _RL_NODE_CACHE_MAX:
-                    _rl_node_content_cache.pop(next(iter(_rl_node_content_cache)))
-            except Exception as exc:
-                logger.debug("RL node-content cache populate failed (%s)", exc)
-    except Exception as exc:
-        logger.debug("RL telemetry log_retrieval failed (%s); continuing", exc)
-
-    return ranked
+    req = RerankRequest(
+        query=query,
+        candidates=all_nodes,
+        limit=limit,
+        query_emb=query_emb,
+        embedding_source=EMBEDDING_SOURCE,
+        embedding_dim=_embedding_dim_for(EMBEDDING_MODEL),
+        embedding_model=EMBEDDING_MODEL,
+        task_id=task_id,
+        task_type="mcp_interactive",
+        failure_mode=failure_mode,
+        failed_collections=failed_collections or [],
+    )
+    result = await rerank_and_emit(req)
+    return result.ranked
 
 
 async def search_single_collection(collection_name: str, query: str, limit: int, filters=None) -> list:
@@ -4842,6 +4868,69 @@ async def search_single_collection(collection_name: str, query: str, limit: int,
         return []
 
 
+# V52-I Fix A (2026-06-09): per-collection cache of whether `valid_until`
+# property exists. The MCP fans hybrid_search / semantic_graph_search across
+# {project KG, shared KG, peer KGs, _Development, _Diagrams} but only the
+# *_Development collections AND the per-project KG (via sync_knowledge_graph
+# additive migrate path) are guaranteed to have `valid_until`. Shared KG and
+# both Diagrams classes are MISSING the property on existing installs (see
+# gap matrix in V52-I plan). Attaching the stale filter to those collections
+# triggers a Weaviate schema error → MCP records a false-positive
+# `partial_fan_out_schema_missing` telemetry event (30 events in corpus).
+#
+# This cache lets `_stale_filter_for(collection_name)` ask "does this
+# collection actually have the property?" once and reuse the answer for
+# the lifetime of the MCP subprocess. lru_cache(maxsize=64) is plenty —
+# even a power user with 10 peer projects sits at <20 distinct collections.
+#
+# Fix B (companion in vco_lib/project_init.py + the migrate script) closes
+# the gap on FRESH installs by adding the props at create-time. Fix A is
+# the defensive runtime layer that protects existing installs without
+# requiring a schema migration.
+@functools.lru_cache(maxsize=64)
+def _collection_has_valid_until(collection_name: str) -> bool:
+    """Return True iff the collection's Weaviate schema has a `valid_until`
+    property. Cached for the MCP subprocess lifetime.
+
+    Conservative on probe failure: returns False so callers SKIP the stale
+    filter (preferring "some stale nodes leak through" over "every query
+    against this collection schema-fails"). Probe failures are logged at
+    DEBUG so they don't spam under normal operation.
+
+    Why probe instead of attempting+rescuing the filter: Weaviate raises
+    the schema error from inside `near_vector` / `bm25`, which would
+    require wrapping every fan-out call site in retry logic. The probe is
+    a single cheap `collection.config.get()` per collection, called once.
+    """
+    if not collection_name:
+        return False
+    try:
+        client = get_weaviate_client()
+        coll = client.collections.get(collection_name)
+        config = coll.config.get()
+        return any(p.name == "valid_until" for p in (config.properties or []))
+    except Exception as exc:  # noqa: BLE001 — soft-fail intentional
+        logger.debug(
+            "_collection_has_valid_until: probe failed for '%s' (%s); "
+            "treating as missing-property",
+            collection_name, exc,
+        )
+        return False
+
+
+def _reset_valid_until_cache() -> None:
+    """Clear the `valid_until` schema cache.
+
+    Called from `_reset_weaviate_client_cache` after schema-altering
+    operations (drop+recreate, migrate scripts) so the next search re-probes
+    against the current schema state. Safe to call unconditionally.
+    """
+    try:
+        _collection_has_valid_until.cache_clear()
+    except Exception:  # noqa: BLE001 — defensive; cache_clear shouldn't fail
+        pass
+
+
 def _stale_filter(include_stale: bool = False):
     """Filter that excludes nodes whose `valid_until` is in the past.
 
@@ -4867,6 +4956,14 @@ def _stale_filter(include_stale: bool = False):
     rebuilt. See `sync_knowledge_graph.py::ensure_collection_exists` and
     `analyze_code_graph.py::_inverted_index_config`.
 
+    NOTE (V52-I, 2026-06-09): prefer `_stale_filter_for(collection_name)`
+    at all NEW call sites. This bare `_stale_filter` assumes every
+    collection in the fan-out has `valid_until` — that's true for
+    *_Development and per-project KG (via sync-script migrate) but NOT
+    for shared KG or *_Diagrams on existing installs. Sites that fan out
+    across heterogeneous collections must use `_stale_filter_for` to
+    avoid `partial_fan_out_schema_missing` false-positives.
+
     Pass a datetime object (not ISO string) — the Python client serializes
     to valueDate, which the date-typed property requires.
     """
@@ -4877,6 +4974,29 @@ def _stale_filter(include_stale: bool = False):
         Filter.by_property("valid_until").is_none(True)
         | Filter.by_property("valid_until").greater_than(now)
     )
+
+
+def _stale_filter_for(collection_name: str, include_stale: bool = False):
+    """Schema-aware variant of `_stale_filter`.
+
+    Returns None (caller treats as "no filter") when either:
+      - `include_stale=True` (explicit caller override), OR
+      - the collection's schema doesn't have `valid_until` (per the cache
+        in `_collection_has_valid_until`).
+
+    Otherwise returns the same `Filter` shape as `_stale_filter`. Use
+    this at every fan-out call site that searches across heterogeneous
+    collections (project KG + shared KG + Diagrams + Development) — the
+    bare `_stale_filter` is unsafe there because shared KG and Diagrams
+    collections lack `valid_until` on existing installs.
+
+    V52-I Fix A (2026-06-09).
+    """
+    if include_stale:
+        return None
+    if not _collection_has_valid_until(collection_name):
+        return None
+    return _stale_filter(include_stale=False)
 
 
 @mcp.tool()
@@ -4961,8 +5081,14 @@ async def _semantic_graph_search_body(
 
     fetch_limit = limit * _RL_OVERFETCH
 
-    # Stale-filter applied at query time, before RL rerank + result counting.
-    stale = _stale_filter(include_stale=include_stale)
+    # V52-I Fix A (2026-06-09): stale-filter is now computed PER-COLLECTION
+    # via `_stale_filter_for(coll_name, include_stale=...)` — see the
+    # for-loop body below. The single-shot `stale = _stale_filter(...)`
+    # pattern broke when shared KG / peer KGs / Diagrams collections lacked
+    # `valid_until` (Weaviate emits a schema error, which the fan-out's
+    # except classifier records as `partial_fan_out_schema_missing` —
+    # 30 false-positives in our corpus). Per-collection gating eliminates
+    # that. `include_stale` flows through unchanged.
 
     # Determine all collections to search. Mirrors hybrid_search: project KG +
     # shared KG (when configured) + peer-project KGs from the launcher's
@@ -5028,6 +5154,10 @@ async def _semantic_graph_search_body(
         # only apply when the loop never runs.)
         query_vector = None
         query_target = ""
+        # V52-I Fix A: per-collection schema-aware stale filter — skip when
+        # the collection's schema lacks `valid_until` (shared KG / Diagrams
+        # on existing installs). See `_collection_has_valid_until` cache.
+        stale = _stale_filter_for(coll_name, include_stale=include_stale)
         try:
             if EMBEDDING_SOURCE == "weaviate":
                 nt_kwargs = dict(query=query, limit=fetch_limit, return_metadata=["distance"])
@@ -5071,6 +5201,17 @@ async def _semantic_graph_search_body(
             _format_obj(obj, coll_name, obj.metadata.distance)
             for obj in primary.objects
         ]
+        # V52-J Edit 3 / V52-Q (2026-06-09): attach raw cosine score
+        # (= 1.0 - Weaviate distance) on each formatted dict so the v3
+        # telemetry envelope carries BOTH the fused score (later set as
+        # ``score`` by the RL rerank / fallback) AND the raw per-Weaviate
+        # cosine. The offline trainer uses both: fused score for ranking
+        # supervision, raw cosine for embedding-quality drift detection.
+        # Soft-fail per-result; non-float distance falls back to 0.0.
+        for r in coll_formatted:
+            d = r.get("distance")
+            if isinstance(d, (int, float)):
+                r["score_cosine"] = 1.0 - d
         # v0.2.31 telemetry audit fix: enrich formatted dicts with node
         # embedding + cos_qn so log_retrieval gets non-empty fields.
         # Soft-fail per-result: a malformed obj.vector must never
@@ -5307,12 +5448,26 @@ async def _hybrid_search_single_collection(
     fetch_limit: int,
     weaviate_filter,
     date_filter,
+    include_stale: bool = False,
 ) -> dict:
-    """Run hybrid (semantic + keyword) search on one collection, return combined dict keyed by (title, chunk)."""
+    """Run hybrid (semantic + keyword) search on one collection, return combined dict keyed by (title, chunk).
+
+    V52-I Fix A (2026-06-09): the stale-filter (valid_until > now | is_none)
+    is applied here, gated by `_stale_filter_for(coll_name)` — the gate
+    returns None when this collection's schema lacks `valid_until`
+    (shared KG + *_Diagrams on existing installs), avoiding the
+    schema error that produced 30 false-positive partial-fan-out events.
+    """
     client = get_weaviate_client()
     coll = client.collections.get(coll_name)
 
     effective_filter = weaviate_filter
+    # V52-I Fix A: schema-aware stale filter — only attach when the
+    # collection actually has `valid_until`. See `_stale_filter_for`
+    # docstring + the module-level _collection_has_valid_until cache.
+    stale = _stale_filter_for(coll_name, include_stale=include_stale)
+    if stale is not None:
+        effective_filter = (effective_filter & stale) if effective_filter else stale
     if date_filter is not None:
         effective_filter = (effective_filter & date_filter) if effective_filter else date_filter
 
@@ -5358,6 +5513,15 @@ async def _hybrid_search_single_collection(
         _format_obj(obj, coll_name, obj.metadata.distance)
         for obj in semantic_results.objects
     ]
+    # V52-J Edit 3 / V52-Q (2026-06-09): attach raw cosine score
+    # (= 1.0 - Weaviate distance) on each formatted dict. See the
+    # mirror site in semantic_graph_search for rationale: the
+    # offline trainer wants BOTH the fused ``score`` AND the raw
+    # per-Weaviate cosine carried through telemetry.
+    for r in semantic_formatted:
+        d = r.get("distance")
+        if isinstance(d, (int, float)):
+            r["score_cosine"] = 1.0 - d
     # v0.2.31 telemetry audit fix: enrich semantic_formatted with node
     # embeddings + cos_qn from the matched obj.vector. Skipped when on
     # the near_text path (no raw vectors available). Per-result
@@ -5400,6 +5564,9 @@ async def _hybrid_search_single_collection(
             entry["emb"] = r["emb"]
         if r.get("cos_qn") is not None:
             entry["cos_qn"] = r["cos_qn"]
+        # V52-J Edit 3 / V52-Q: propagate raw cosine score the same way.
+        if r.get("score_cosine") is not None:
+            entry["score_cosine"] = r["score_cosine"]
         combined[key] = entry
 
     for obj in keyword_results.objects:
@@ -5584,7 +5751,8 @@ async def _hybrid_search_body(
 ) -> str:
     """Implementation body for hybrid_search. Extracted so the public tool
     can wrap the entire query path with v2 loud-fail handling."""
-    # Build type/tag filter
+    # Build type/tag filter (NON-stale terms only; stale is mixed in
+    # per-collection below — see V52-I Fix A).
     filters = []
     if node_type:
         filters.append(Filter.by_property("node_type").equal(node_type))
@@ -5592,17 +5760,20 @@ async def _hybrid_search_body(
         for tag in tags:
             filters.append(Filter.by_property("tags").contains_any([tag]))
 
-    # Stale-filter — exclude archived/expired nodes BEFORE rerank+counting.
-    # Caller passes `include_stale=True` to disable (audits, history queries).
-    stale = _stale_filter(include_stale=include_stale)
-    if stale is not None:
-        filters.append(stale)
-
     weaviate_filter = None
     if filters:
         weaviate_filter = filters[0]
         for f in filters[1:]:
             weaviate_filter = weaviate_filter & f
+
+    # V52-I Fix A (2026-06-09): the stale-filter is applied PER-COLLECTION
+    # inside `_hybrid_search_single_collection` via `_stale_filter_for`,
+    # NOT pre-combined here. Reason: not every collection in the fan-out
+    # has `valid_until` (shared KG + *_Diagrams on existing installs lack
+    # it). Pre-combining the stale clause produced 30 false-positive
+    # `partial_fan_out_schema_missing` telemetry events. The per-collection
+    # path lets each collection get the filter only if its schema supports
+    # it. `include_stale` flows through unchanged.
 
     # Optional date filter
     date_filter = None
@@ -5668,7 +5839,8 @@ async def _hybrid_search_body(
     for coll_name in collections_to_search:
         try:
             coll_combined = await _hybrid_search_single_collection(
-                coll_name, query, fetch_limit, weaviate_filter, date_filter
+                coll_name, query, fetch_limit, weaviate_filter, date_filter,
+                include_stale=include_stale,
             )
             for key, item in coll_combined.items():
                 if key not in merged or item["combined_score"] > merged[key]["combined_score"]:
@@ -7674,6 +7846,23 @@ async def backfill_embeddings(
 
 
 if __name__ == "__main__":
+    # V52-AI (v0.2.52): exit cleanly if an orchestrator update is in
+    # progress. Breaks the Windows MCP fork-bomb (~97 python +
+    # ~77 node processes the user reported on 2026-06-09) by making
+    # every respawn during the update window exit immediately.
+    try:
+        from _lib.update_gate import exit_if_update_in_progress  # type: ignore
+    except ImportError:
+        _parent_dir = str(Path(__file__).resolve().parent.parent)
+        if _parent_dir not in sys.path:
+            sys.path.insert(0, _parent_dir)
+        try:
+            from _lib.update_gate import exit_if_update_in_progress  # type: ignore
+        except ImportError:
+            exit_if_update_in_progress = None  # type: ignore
+    if exit_if_update_in_progress is not None:
+        exit_if_update_in_progress("weaviate-kg MCP")
+
     logger.info(f"Starting Claude Orchestrator Weaviate MCP Server")
     logger.info(f"Primary Collection: {KG_COLLECTION}")
     read_state = "DISABLED" if SHARED_KG_READ_DISABLED else "enabled"

@@ -104,13 +104,18 @@ if ($EditedFile -notmatch '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|
     exit 0
 }
 
-# v0.2.18 (Plan C): map the edited file's extension to the analyzer's
-# canonical language ID. Mirror of the .sh sibling's case statement.
-# When the extension is recognised, the hook invokes the analyzer with
-# --language=$LANG + --prune-stale so the language-scoped prune runs
-# (deletes only the matching-language rows the analyzer didn't visit
-# this run). Empty $Lang (unrecognised extension) falls back to plain
-# --incremental for backward compat.
+# v0.2.18 (Plan C) mapped the edited file's extension to the analyzer's
+# canonical language ID and passed `--language $Lang --prune-stale` to
+# scope the prune to "rows of this language not visited this run".
+#
+# v0.2.52 V52-O.7 (2026-06-09): the $Lang mapping is now UNUSED in the
+# analyzer invocation below because `--prune-stale` was dropped (see audit
+# a97f0d9 — `_prune_collection` iterated the WHOLE collection per run, so
+# every Python edit deleted ALL other Python rows; collection went to 0
+# Python rows over time). The mapping stays in place because the proper
+# architectural fix queued for v0.2.53 (scope prune to the EDITED FILE
+# only, not language-wide) will need this $Lang hint. Don't delete the
+# block — it's load-bearing for the v0.2.53 follow-up.
 $Lang = ""
 switch -Regex ($EditedFile) {
     '\.py$'                          { $Lang = "python";     break }
@@ -149,15 +154,17 @@ if (-not $Python) {
 if (-not $Python -or -not (Test-Path $Analyzer)) { exit 0 }
 
 # Run incremental analysis in background.
-# v0.2.18 (Plan C): when extension is recognised, pass --language + --prune-stale
-# so the language-scoped prune runs and stale rows for deleted files are cleaned
-# up. Empty $Lang (unknown extension) falls back to plain --incremental for
-# backward compat with legacy file types.
-if ($Lang) {
-    $args = @($Analyzer, $RepoPath, '--project', $ProjectName, '--incremental', '--language', $Lang, '--prune-stale')
-} else {
-    $args = @($Analyzer, $RepoPath, '--project', $ProjectName, '--incremental')
-}
+# v0.2.52 V52-O.7 (2026-06-09): DROPPED `--prune-stale --language=$Lang`.
+# v0.2.18 added them as "Plan C" intending a language-scoped prune. But
+# `_prune_collection` (analyze_code_graph.py:1889) iterates the ENTIRE
+# collection and deletes every row tagged with that language that wasn't
+# visited THIS run. Incremental runs visit ~1 file at a time (HEAD~1..HEAD
+# diff) so every Python edit deleted all OTHER Python rows. Audit a97f0d9
+# (2026-06-09) confirmed: `VibeCodedOrchestrator_CodeFunction` had 5365
+# rows of which **0 were Python**. This was the PRIMARY root cause of
+# zero-Python-indexed. Fix: drop the flags; stale rows leak until a full
+# reanalyze (V52-O.2 `scripts/v0252_codegraph_reset.sh`).
+$args = @($Analyzer, $RepoPath, '--project', $ProjectName, '--incremental')
 Start-Process -FilePath $Python -ArgumentList $args `
     -WorkingDirectory $RepoPath -WindowStyle Hidden | Out-Null
 

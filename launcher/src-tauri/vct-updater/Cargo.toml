@@ -1,0 +1,82 @@
+[package]
+name = "vct-updater"
+version = "0.2.52"
+edition = "2021"
+description = "Stage1 updater for VCT launcher — performs Windows binary swap after parent launcher exits. Velopack/Squirrel-style pattern."
+authors = ["VibeCoded Tools"]
+license = "AGPL-3.0"
+
+# v0.2.52 V52-AH (Fabio bug 1, 2026-06-09):
+#
+# Background
+# ----------
+# Windows mandatory file locking prevents the running `vct-launcher.exe`
+# (and `vct-hub.exe`) from being overwritten during `git pull`. The
+# pre-pull rename pattern in `installer.rs::pre_pull_rename_running_binary`
+# helps for the LAUNCHER itself, but the dist binary at
+# `launcher/dist/windows-x64/vct-launcher.exe` is still the .metadata.json's
+# advertised version. When the running launcher (v0.2.50) sees v0.2.51 in
+# .metadata.json but the dist .exe is still v0.2.50 bytes, the "Restart"
+# banner relaunches the SAME stale binary → infinite loop.
+#
+# Linux/macOS don't hit this because their file locks are advisory: the
+# kernel allows the unlink + rewrite, and the running process continues
+# executing the old inode until it exits naturally. POSIX systems use
+# the existing rename pattern; this updater is a no-op on those platforms.
+#
+# Fix design (Velopack/Squirrel pattern)
+# --------------------------------------
+# 1. Launcher GUI's "Update orchestrator" flow detects Windows + new
+#    binaries on disk post-`git pull`.
+# 2. Launcher writes <vct_root>/update.lock.json with parent PID + target
+#    paths + expected SHAs.
+# 3. Launcher spawns `vct-updater.exe` DETACHED + calls `app.exit(0)`.
+# 4. Updater polls OpenProcess(parent_pid) until WAIT_OBJECT_0 (parent
+#    exited) or NULL (handle invalid → already gone).
+# 5. Updater performs MoveFileEx(MOVEFILE_REPLACE_EXISTING) to swap the
+#    binaries (now unlocked, parent is gone).
+# 6. Updater spawns the new `vct-launcher.exe` detached + exits.
+# 7. New launcher detects update.lock.json on boot → emits "Updated to
+#    v0.2.X" toast + deletes the file.
+#
+# Constraints
+# -----------
+# - MUST be statically linked (no DLL deps; user doesn't install anything).
+# - MUST be small (target <2 MB) so binary doesn't bloat the dist tree.
+# - MUST gracefully no-op on Linux/macOS (POSIX uses rename pattern; this
+#   binary exists cross-platform just for build simplicity but only does
+#   meaningful work on Windows).
+# - Soft-fail throughout: any error → log + exit non-zero so the parent
+#   (or the next launcher start) can surface a fallback message.
+
+[[bin]]
+name = "vct-updater"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+# Same Windows feature set as launcher's `windows-sys` direct dep
+# (OpenProcess + WaitForSingleObject + CloseHandle + MoveFileExW +
+# CreateProcessW + GetLastError). Pinned to 0.59 to match the rest of
+# the workspace; bumping would force a workspace-wide rev (the launcher
+# crate also imports `windows-sys = "0.59"`).
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+] }
+
+# NOTE: release profile lives at the workspace root (launcher/src-tauri/
+# Cargo.toml) per Cargo's workspace rules — `[profile.*]` in a member
+# manifest is ignored with a warning. The workspace root sets
+# `strip = "symbols"` + `lto = true` for ALL members, which gives us
+# most of what we want here. The size-optimization knobs that ONLY
+# apply to this updater binary (opt-level = "z", panic = "abort",
+# codegen-units = 1) are handled via a per-target rustflag in
+# `.cargo/config.toml` — see the `[target.'cfg(all())'.vct-updater]`
+# section there. For most installs the workspace defaults yield a
+# Windows .exe well under 2 MB after strip + LTO, which is acceptable
+# without further per-crate tuning.

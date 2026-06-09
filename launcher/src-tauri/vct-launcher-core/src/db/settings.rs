@@ -88,6 +88,133 @@ impl Db {
             .map_err(|e| format!("module_clear_enabled_for_project_all: {}", e))?;
         Ok(removed)
     }
+
+    // ─── v0.2.52 V52-AD — host-wide GLOBAL toggle ───────────────────────
+    //
+    // Stored as a row in `module_settings` with `project_id IS NULL` —
+    // see migration 034's docstring. The reader cascade is:
+    //
+    //     effective_enabled =
+    //         per_project_setting (project_id = $project)
+    //             .unwrap_or(global_default (project_id IS NULL))
+    //             .unwrap_or(true)   -- fail-open
+    //
+    // The `enabled_for_project` setting_key is reused (NOT a new key) so
+    // a single uninstall-time DELETE WHERE setting_key = ... still cleans
+    // both per-project AND global rows.
+
+    /// Read the GLOBAL (host-wide) enable flag for a module. Returns
+    /// `None` when no global row exists (caller should fall back to the
+    /// system default — typically `true`). Returns `Some(false)` only
+    /// when the row exists AND its value is the JSON literal `false`.
+    /// Malformed values fail open to `Some(true)` per the same contract
+    /// as the per-project reader.
+    pub fn module_global_enabled(
+        &self,
+        module_id: &str,
+    ) -> Result<Option<bool>, String> {
+        let guard = self.lock();
+        let row: Option<String> = guard
+            .query_row(
+                "SELECT setting_value FROM module_settings
+                  WHERE project_id IS NULL
+                    AND module_id = ?1
+                    AND setting_key = ?2",
+                params![module_id, MODULE_ENABLED_FOR_PROJECT_KEY],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("module_global_enabled read: {}", e))?;
+
+        match row {
+            None => Ok(None),
+            Some(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(Value::Bool(b)) => Ok(Some(b)),
+                // Malformed → fail open to enabled (matches per-project
+                // contract: a corrupted setting never silently disables).
+                Ok(_) | Err(_) => Ok(Some(true)),
+            },
+        }
+    }
+
+    /// Write the GLOBAL (host-wide) enable flag for a module. Idempotent
+    /// upsert. Always writes a JSON boolean. The conflict target is the
+    /// partial unique index `idx_ms_unique_global` (migration 034) so
+    /// the standard `ON CONFLICT(project_id, module_id, setting_key)`
+    /// shape used by `set_setting` would NOT trigger here — we use an
+    /// explicit DELETE + INSERT to keep the upsert semantics clear and
+    /// independent of the partial-index conflict target.
+    pub fn module_set_global_enabled(
+        &self,
+        module_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let encoded = serde_json::to_string(&Value::Bool(enabled))
+            .map_err(|e| format!("module_set_global_enabled encode: {}", e))?;
+        let guard = self.lock();
+        // Single transaction: delete any pre-existing global row, then
+        // insert the new one. Cheaper than reasoning about partial-
+        // index ON CONFLICT semantics, and the partial unique index
+        // still enforces correctness if a concurrent writer races.
+        let tx = guard
+            .unchecked_transaction()
+            .map_err(|e| format!("module_set_global_enabled txn: {}", e))?;
+        tx.execute(
+            "DELETE FROM module_settings
+              WHERE project_id IS NULL
+                AND module_id = ?1
+                AND setting_key = ?2",
+            params![module_id, MODULE_ENABLED_FOR_PROJECT_KEY],
+        )
+        .map_err(|e| format!("module_set_global_enabled delete: {}", e))?;
+        tx.execute(
+            "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
+             VALUES (NULL, ?1, ?2, ?3)",
+            params![module_id, MODULE_ENABLED_FOR_PROJECT_KEY, encoded],
+        )
+        .map_err(|e| format!("module_set_global_enabled insert: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("module_set_global_enabled commit: {}", e))?;
+        Ok(())
+    }
+
+    /// Effective enable flag for a (project, module) pair using the
+    /// v0.2.52 V52-AD cascade. Reader contract:
+    ///
+    /// 1. If a per-project row exists for `(project_id, module_id,
+    ///    enabled_for_project)`, return its boolean value (fail-open
+    ///    on malformed values).
+    /// 2. Else if a GLOBAL row exists (`project_id IS NULL`), return
+    ///    its boolean value (same fail-open contract).
+    /// 3. Else return `true` (system default — fail-open).
+    ///
+    /// This is the function the hub resolver should call when deciding
+    /// `rl_reranker_enabled_for_project`. The legacy
+    /// `module_is_enabled_for_project` still works (collapses the
+    /// cascade after step 1 → step 3) and is preserved for any caller
+    /// that doesn't want the global default factored in.
+    pub fn module_effective_enabled(
+        &self,
+        project_id: &str,
+        module_id: &str,
+    ) -> Result<bool, String> {
+        // Step 1: per-project row (explicit override).
+        if let Some(value) =
+            self.get_setting(project_id, module_id, MODULE_ENABLED_FOR_PROJECT_KEY)?
+        {
+            return match value {
+                Value::Bool(b) => Ok(b),
+                // Malformed → fail open (matches per-project contract).
+                _ => Ok(true),
+            };
+        }
+        // Step 2: global fallback (host-wide default).
+        if let Some(b) = self.module_global_enabled(module_id)? {
+            return Ok(b);
+        }
+        // Step 3: system default.
+        Ok(true)
+    }
 }
 
 impl Db {
@@ -126,11 +253,20 @@ impl Db {
         let encoded = serde_json::to_string(value)
             .map_err(|e| format!("encode setting: {}", e))?;
         let guard = self.lock();
+        // v0.2.52 V52-AD — the table-level UNIQUE(project_id, module_id,
+        // setting_key) was dropped by migration 034 (partial-index
+        // replacement; see migration docstring). For SQLite's upsert
+        // semantics to target the surviving partial index
+        // `idx_ms_unique_per_project`, the ON CONFLICT clause must
+        // include the partial index's WHERE predicate. Pre-034 callers
+        // (passing a non-NULL project_id) behave identically — the
+        // partial-index WHERE matches every such row.
         guard
             .execute(
                 "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(project_id, module_id, setting_key)
+                   WHERE project_id IS NOT NULL
                  DO UPDATE SET setting_value = excluded.setting_value",
                 params![project_id, module_id, key, encoded],
             )
@@ -399,6 +535,179 @@ mod enable_toggle_tests {
         assert!(db
             .module_is_enabled_for_project(&pid, "vct-rl-reranker")
             .unwrap());
+    }
+
+    // ─── v0.2.52 V52-AD — global toggle tests ────────────────────────────
+
+    /// Global default reads as `None` when no row exists. The hub
+    /// resolver translates that to the system default (`true`).
+    #[test]
+    fn module_global_enabled_returns_none_when_row_absent() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        let result = db.module_global_enabled("vct-rl-reranker").expect("read");
+        assert!(
+            result.is_none(),
+            "absent global row must read as None (caller picks default)"
+        );
+    }
+
+    /// Set false at global level → reads as Some(false). Set true →
+    /// Some(true). Roundtrip pins the setter/reader contract for the
+    /// `project_id IS NULL` rows added by migration 034.
+    #[test]
+    fn module_set_global_enabled_roundtrip() {
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        db.module_set_global_enabled("vct-rl-reranker", false)
+            .expect("write false");
+        assert_eq!(
+            db.module_global_enabled("vct-rl-reranker").unwrap(),
+            Some(false),
+            "explicit global disable must surface"
+        );
+
+        db.module_set_global_enabled("vct-rl-reranker", true)
+            .expect("write true");
+        assert_eq!(
+            db.module_global_enabled("vct-rl-reranker").unwrap(),
+            Some(true),
+        );
+
+        // Idempotent re-write of the same value (delete+insert path).
+        db.module_set_global_enabled("vct-rl-reranker", true)
+            .expect("write true again");
+        assert_eq!(
+            db.module_global_enabled("vct-rl-reranker").unwrap(),
+            Some(true),
+        );
+    }
+
+    /// `module_effective_enabled` cascade:
+    ///   no per-project row, no global row → true (fail-open default)
+    ///   no per-project row, global=false → false (global wins)
+    ///   no per-project row, global=true  → true
+    ///   per-project=true, global=false   → true (per-project overrides)
+    ///   per-project=false, global=true   → false (per-project overrides)
+    #[test]
+    fn module_effective_enabled_cascade() {
+        let (db, pid) = db_with_project("eff");
+
+        // (a) Both absent → default true.
+        assert!(
+            db.module_effective_enabled(&pid, "vct-rl-reranker").unwrap(),
+            "no rows → fail-open default true"
+        );
+
+        // (b) Global=false, no per-project → false (global default applies).
+        db.module_set_global_enabled("vct-rl-reranker", false)
+            .unwrap();
+        assert!(
+            !db.module_effective_enabled(&pid, "vct-rl-reranker").unwrap(),
+            "global default false must propagate when no per-project row"
+        );
+
+        // (c) Per-project=true, global=false → true (per-project overrides).
+        db.module_set_enabled_for_project(&pid, "vct-rl-reranker", true)
+            .unwrap();
+        assert!(
+            db.module_effective_enabled(&pid, "vct-rl-reranker").unwrap(),
+            "per-project enable must override global disable"
+        );
+
+        // (d) Per-project=false, global=false → false (both agree).
+        db.module_set_enabled_for_project(&pid, "vct-rl-reranker", false)
+            .unwrap();
+        assert!(
+            !db.module_effective_enabled(&pid, "vct-rl-reranker").unwrap(),
+            "both false → false"
+        );
+
+        // (e) Per-project=false, global=true → false (per-project overrides).
+        db.module_set_global_enabled("vct-rl-reranker", true)
+            .unwrap();
+        assert!(
+            !db.module_effective_enabled(&pid, "vct-rl-reranker").unwrap(),
+            "per-project disable must override global enable"
+        );
+    }
+
+    /// Global rows are independent across distinct module_ids.
+    #[test]
+    fn module_global_enabled_isolation_between_modules() {
+        let db = Db::open_in_memory().expect("in-memory db");
+
+        db.module_set_global_enabled("vct-rl-reranker", false)
+            .unwrap();
+        db.module_set_global_enabled("vct-coordination", true)
+            .unwrap();
+
+        assert_eq!(
+            db.module_global_enabled("vct-rl-reranker").unwrap(),
+            Some(false),
+        );
+        assert_eq!(
+            db.module_global_enabled("vct-coordination").unwrap(),
+            Some(true),
+        );
+        // Third unrelated module reads None.
+        assert!(db.module_global_enabled("vct-other").unwrap().is_none());
+    }
+
+    /// Global row survives a project deletion (FK cascade only fires
+    /// for non-NULL project_id rows). Critical correctness property:
+    /// dropping a project must NOT silently re-enable a globally-
+    /// disabled module across the rest of the host.
+    #[test]
+    fn module_global_enabled_survives_project_delete() {
+        let (db, pid) = db_with_project("survive");
+        db.module_set_global_enabled("vct-rl-reranker", false)
+            .unwrap();
+        db.module_set_enabled_for_project(&pid, "vct-rl-reranker", true)
+            .unwrap();
+
+        // Sanity: per-project row exists pre-delete.
+        assert!(db
+            .module_is_enabled_for_project(&pid, "vct-rl-reranker")
+            .unwrap());
+
+        // Delete the project (FK ON DELETE CASCADE wipes per-project
+        // rows for that project_id, leaves NULL rows intact).
+        db.lock()
+            .execute(
+                "DELETE FROM projects WHERE id = ?1",
+                rusqlite::params![&pid],
+            )
+            .expect("delete project");
+
+        // Global row still alive.
+        assert_eq!(
+            db.module_global_enabled("vct-rl-reranker").unwrap(),
+            Some(false),
+            "global row (project_id IS NULL) must NOT cascade-delete with a project"
+        );
+    }
+
+    /// `module_clear_enabled_for_project_all` (the uninstall-time
+    /// cleanup helper) ALSO clears the global row, because it uses
+    /// `WHERE module_id = ? AND setting_key = ?` with no project_id
+    /// filter. This is correct behaviour: when a module is uninstalled
+    /// host-wide, all its enable rows (per-project + global) should go.
+    #[test]
+    fn module_clear_enabled_for_project_all_also_clears_global_row() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.module_set_global_enabled("vct-rl-reranker", false)
+            .unwrap();
+
+        let removed = db
+            .module_clear_enabled_for_project_all("vct-rl-reranker")
+            .expect("clear");
+        assert_eq!(removed, 1, "global row counted in the cleanup");
+        assert!(
+            db.module_global_enabled("vct-rl-reranker")
+                .unwrap()
+                .is_none(),
+            "global row was cleared"
+        );
     }
 
     /// Setter always writes a JSON boolean, regardless of caller

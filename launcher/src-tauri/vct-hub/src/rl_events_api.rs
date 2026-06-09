@@ -80,13 +80,24 @@ async fn post_event(
 ) -> impl IntoResponse {
     // Cheap input validation. Bad event_type / missing task_id should 400,
     // not 500 — these are writer bugs we want surfaced loudly.
-    if body.event_type != "retrieval" && body.event_type != "citation" {
+    //
+    // V52-M (v0.2.52): accept the new pre/post outcome event types alongside
+    // the original retrieval/citation pair. Outcome events carry no embedding
+    // context and have payload-shape that's distinct from retrieval/citation;
+    // they're consumed by the offline RL trainer as the "label" half of
+    // (retrieval, outcome) training pairs. See:
+    //   - claude_mcp_servers/rl_client/outcome_emit.py (writer side)
+    //   - templates/hooks/post-bash-context-record.{sh,ps1}
+    //   - templates/hooks/post-edit-outcome.{sh,ps1}
+    //   - templates/hooks/pre-bash-context-inject.{sh,ps1}
+    let allowed_event_types = ["retrieval", "citation", "bash_outcome", "edit_outcome", "pre_bash"];
+    if !allowed_event_types.contains(&body.event_type.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": {
                     "code": "bad_event_type",
-                    "message": "event_type must be 'retrieval' or 'citation'",
+                    "message": "event_type must be one of 'retrieval', 'citation', 'bash_outcome', 'edit_outcome', 'pre_bash'",
                 }
             })),
         )

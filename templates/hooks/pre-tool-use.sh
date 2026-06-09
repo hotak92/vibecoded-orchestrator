@@ -84,6 +84,31 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
+# V52-L.2 Fix 1: parse subagent identity from stdin payload. Per A5 audit
+# (knowledge/research/claude-code-leak-agent-architecture.md + 2026-06-09
+# official docs review), PreToolUse hooks DO fire for subagent tool calls;
+# the JSON payload carries agent_id + agent_type so handlers can tell
+# parent activity apart from subagent activity. Pre-V52-L.2 we ignored
+# both fields, so every TOUCAN row looked like it came from the same
+# session_id regardless of which agent ran the tool — A3's measurement
+# artifact (26-vs-83 gap) was just this confusion. Empty string when the
+# field is absent (parent context) which is what TOUCAN consumers expect.
+AGENT_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('agent_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+AGENT_TYPE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('agent_type', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
 
 SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
 # Per-session dedup state lives under the project's .claude/state/ rather
@@ -128,6 +153,9 @@ TOUCAN_LOG="$PROJECT_ROOT/.claude/logs/toucan_dataset.jsonl"
 TOUCAN_JSONL=$(USER_MESSAGE_FOR_PY="$USER_MESSAGE" \
     TOOL_NAME_FOR_PY="$TOOL_NAME" \
     TOOL_ARGS_FOR_PY="$TOOL_ARGS" \
+    AGENT_ID_FOR_PY="$AGENT_ID" \
+    AGENT_TYPE_FOR_PY="$AGENT_TYPE" \
+    SESSION_ID_FOR_PY="$SESSION_ID" \
     "$PY" -c '
 import json, os, sys
 from datetime import datetime, timezone
@@ -136,11 +164,19 @@ try:
     tool_args_val = json.loads(tool_args_raw) if tool_args_raw else None
 except (json.JSONDecodeError, TypeError):
     tool_args_val = tool_args_raw
+# V52-L.2 Fix 1: include agent_id / agent_type so TOUCAN consumers can
+# differentiate parent vs subagent rows. Empty string when the field is
+# absent (parent context). session_id is repeated here for the same
+# reason — TOUCAN rows currently lack it, making per-session analysis
+# require a separate join against the hook contract.
 sys.stdout.write(json.dumps({
     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "query": os.environ.get("USER_MESSAGE_FOR_PY", ""),
     "chosen_tool": os.environ.get("TOOL_NAME_FOR_PY", ""),
     "tool_args": tool_args_val,
+    "session_id": os.environ.get("SESSION_ID_FOR_PY", ""),
+    "agent_id": os.environ.get("AGENT_ID_FOR_PY", ""),
+    "agent_type": os.environ.get("AGENT_TYPE_FOR_PY", ""),
 }))
 ' 2>/dev/null)
 if [ -n "$TOUCAN_JSONL" ]; then
@@ -284,8 +320,42 @@ fi
 CONCEPTS=$(echo "$USER_MESSAGE" | grep -oE "(caching|authentication|database|API|search|optimization|validation|testing|deployment|VRAM|quantization|inference|embedding|MCP|agent|workflow|pattern)" | head -3 | tr '\n' ' ')
 
 if [ -n "$CONCEPTS" ]; then
-    MATCHES=$("$PROJECT_ROOT/.claude/scripts/kg-search" search "$CONCEPTS" --limit 3 --files-only 2>/dev/null | grep "^knowledge/" || echo "")
-    MATCH_COUNT=$(echo "$MATCHES" | grep -c "^knowledge/" 2>/dev/null || echo "0")
+    # V52-J (v0.2.52): switched from kg-search → rl_kg_search.py so this
+    # hook shares the canonical chokepoint with the pre-edit-context-
+    # inject hook + the MCP hybrid_search tool. Same Weaviate fan-out,
+    # same RL rerank, same v3 retrieval-event emit. Pre-V52-J this branch
+    # called kg-search (search_knowledge.py CLI), which until Edit B
+    # produced zero telemetry — switching here closes the redundancy at
+    # the same time as Edit B closes the silent hole.
+    #
+    # rl_kg_search.py --hook-format emits headers of the shape
+    #   "KG: <title> | <node_type> | score=<n.nn> | <body...>"
+    # Title (not file_path) is what we surface to the user since it's
+    # the human-readable identifier; the pre-edit hook's dedup logic
+    # also keys on title.
+    #
+    # Venv resolution mirrors pre-edit-context-inject.sh — uses the
+    # shared _lib/resolve-vco-venv.sh helper so we never accidentally
+    # activate the USER's project venv (which lacks weaviate-client).
+    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+    resolve_vco_venv_python "$SCRIPT_DIR"
+    VENV="${VCO_VENV_PYTHON:-}"
+    RL_SCRIPT="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py"
+
+    MATCHES=""
+    MATCH_COUNT=0
+    if [ -n "$VENV" ] && [ -f "$RL_SCRIPT" ]; then
+        # Extract only the per-result HEADER lines (start with "KG: " and
+        # carry the " | " separator) — strips body chunks that would
+        # otherwise inflate the suggestion. Filter out the "no-results"
+        # sentinel rl_kg_search emits when nothing matched.
+        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" "$VENV" "$RL_SCRIPT" "$CONCEPTS" --limit 3 --hook-format 2>/dev/null \
+            | grep "^KG: " \
+            | grep -v "^KG: no-results" \
+            | head -3 || echo "")
+        MATCH_COUNT=$(printf '%s\n' "$MATCHES" | grep -c "^KG: " 2>/dev/null || echo "0")
+    fi
 
     if [ "$MATCH_COUNT" -ge 2 ]; then
         # PreToolUse hooks must wrap LLM-bound stdout in

@@ -423,7 +423,17 @@ pub fn build_podman_run_args(
     // skip the CMD override entirely so podman uses the image's default.
     // Placeholders still apply when `command` is non-empty (legacy
     // override authors can use `{project_slug}` etc.).
-    if !runtime.command.is_empty() {
+    //
+    // v0.2.52 V52-D.1: even when `command` is non-empty, detect the
+    // pre-v0.2.49 footgun pattern at runtime so a stale catalog row /
+    // legacy image that ships the broken manifest still produces a
+    // working container. See `is_runtime_pathological` for the full
+    // list of indicators. When the runtime is pathological, log a
+    // warning and DROP the CMD override (fall back to the image's
+    // ENTRYPOINT) — same effect as the v0.2.49 empty-command branch.
+    let runtime_skip_cmd = runtime.command.is_empty()
+        || is_runtime_pathological(&runtime.command, &runtime.args, Some(&manifest.id));
+    if !runtime_skip_cmd {
         args.push(resolve_value(&runtime.command, ctx, &placeholders));
         for a in &runtime.args {
             args.push(resolve_value(a, ctx, &placeholders));
@@ -499,7 +509,14 @@ pub fn build_podman_run_args_global(
     // CMD override when the manifest declares a non-empty `command`.
     // Declarative manifests with empty command let the image's
     // ENTRYPOINT run unmolested.
-    if !runtime.command.is_empty() {
+    //
+    // v0.2.52 V52-D.1: also drop the CMD override when the manifest
+    // declares a pathological runtime (`command: "podman"` /
+    // unsubstituted `{module_image}` in args / etc.). See
+    // `is_runtime_pathological` for the full indicator set.
+    let runtime_skip_cmd = runtime.command.is_empty()
+        || is_runtime_pathological(&runtime.command, &runtime.args, Some(&manifest.id));
+    if !runtime_skip_cmd {
         args.push(resolve_value(&runtime.command, ctx, &placeholders));
         for a in &runtime.args {
             args.push(resolve_value(a, ctx, &placeholders));
@@ -507,6 +524,104 @@ pub fn build_podman_run_args_global(
     }
 
     Ok(args)
+}
+
+/// v0.2.52 V52-D.1: detect the pre-v0.2.49 Bug E manifest pattern that
+/// turned `runtime.command` + `runtime.args` into a literal podman
+/// invocation embedded as the container CMD. Returns `true` when the
+/// runtime block is unsafe to honour and the caller should drop the
+/// CMD override (falling back to the image's ENTRYPOINT).
+///
+/// ## Indicators (any → pathological)
+///
+/// 1. `command` is the bare name of a container runtime —
+///    `podman` / `docker` — which strongly implies the manifest author
+///    pasted the launcher-side invocation into the container-side
+///    command. A legit module's `runtime.command` would be
+///    `python` / `node` / `<custom binary>`, never the orchestrator.
+///
+/// 2. `command` is a generic shell (`sh` / `bash`) **without** a `-c`
+///    flag in `args`. A legit shell invocation always uses
+///    `sh -c "..."` so the first arg should be `-c`. Without `-c` the
+///    container would just open an interactive shell that dies
+///    immediately under podman's `-d` (non-tty) mode — almost
+///    certainly not the publisher's intent.
+///
+/// 3. Any element of `args` contains an unsubstituted `{module_image}`
+///    placeholder. The launcher never substitutes `{module_image}`
+///    (it's the launcher-side variable for the image tag passed to
+///    `podman run` — i.e. the positional image arg, not a CMD arg).
+///    Its presence anywhere in the CMD override means the manifest
+///    author copy-pasted the wrong substitution context.
+///
+/// ## Logging
+///
+/// When pathological, emit a single `eprintln!` warning naming the
+/// module so operators can spot stale catalog rows in launcher logs.
+/// We don't return an error: the v0.2.49 contract is that broken
+/// manifests degrade to "ignore CMD override, hope ENTRYPOINT works"
+/// rather than fail the start — most images have a valid ENTRYPOINT
+/// even when the manifest's CMD is garbage.
+///
+/// The function is `pub(crate)` so the reaper (V52-D.2) can reuse the
+/// same indicator set when scanning existing containers' Config.Cmd
+/// for the same pathology.
+pub fn is_runtime_pathological(
+    command: &str,
+    args: &[String],
+    module_id: Option<&str>,
+) -> bool {
+    let cmd_trim = command.trim();
+
+    // Indicator 1: command is a container runtime binary name.
+    if matches!(cmd_trim, "podman" | "docker") {
+        eprintln!(
+            "[container_runtime] WARN: module {} declares runtime.command='{}' \
+             which is a container-runtime binary name. This is the pre-v0.2.49 \
+             Bug E manifest pattern. Dropping CMD override; using image ENTRYPOINT. \
+             Publisher should rebuild the image with runtime.command='' \
+             (and rely on the image's ENTRYPOINT) OR set command to the actual \
+             in-container binary (e.g. 'python', 'node').",
+            module_id.unwrap_or("<unknown>"),
+            cmd_trim,
+        );
+        return true;
+    }
+
+    // Indicator 2: shell without -c flag.
+    if matches!(cmd_trim, "sh" | "bash") {
+        // Look for `-c` anywhere in args. A legit shell invocation
+        // always includes -c; without it the shell would exit
+        // immediately under -d mode.
+        let has_dash_c = args.iter().any(|a| a == "-c");
+        if !has_dash_c {
+            eprintln!(
+                "[container_runtime] WARN: module {} declares runtime.command='{}' \
+                 without a '-c' arg. A detached shell with no command exits \
+                 immediately. Dropping CMD override; using image ENTRYPOINT.",
+                module_id.unwrap_or("<unknown>"),
+                cmd_trim,
+            );
+            return true;
+        }
+    }
+
+    // Indicator 3: unsubstituted {module_image} placeholder in args.
+    // The launcher never substitutes {module_image} (it's a launcher-
+    // side variable for the positional image arg, not a CMD-side one).
+    if args.iter().any(|a| a.contains("{module_image}")) {
+        eprintln!(
+            "[container_runtime] WARN: module {} declares runtime.args containing \
+             unsubstituted '{{module_image}}' placeholder. This is the pre-v0.2.49 \
+             Bug E pattern. Dropping CMD override; using image ENTRYPOINT. \
+             Publisher should rebuild the image with the actual in-container CMD \
+             (or empty `command` to rely on the image's ENTRYPOINT).",
+            module_id.unwrap_or("<unknown>"),
+        );
+        return true;
+    }
+
+    false
 }
 
 /// v0.2.49 Stream A: best-effort `mkdir -p` for each volume's host path
@@ -554,6 +669,324 @@ pub fn container_weights_path(embedding_source: &str, version: &str) -> String {
         sanitize_path_component(embedding_source),
         sanitize_path_component(version),
     )
+}
+
+// ─── V52-D.2: legacy container reaper ────────────────────────────────
+
+/// v0.2.52 V52-D.2: classification of a `podman ps -a` row against
+/// the launcher's DB state. The reaper enumerates containers whose
+/// names match the prefix patterns the launcher uses for module
+/// containers (`<module_id>` or `<module_id>-<project_slug>`) and
+/// classifies each into one of these buckets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReaperVerdict {
+    /// Container's Config.Cmd carries the unsubstituted
+    /// `{module_image}` placeholder — pre-v0.2.49 Bug E pattern. The
+    /// process inside will argparse-fail and restart-loop forever.
+    BrokenCmd,
+    /// No `module_installs` row claims this container_name. Most
+    /// likely a leftover from a manual `podman run` debug session OR
+    /// a pre-v0.2.10 launcher leftover that didn't carry the
+    /// project-slug suffix convention.
+    Orphan,
+    /// Container is running an image tag that doesn't match the DB
+    /// row's expected `install.container.image:tag`. Most often
+    /// caused by an upgrade where the launcher recreated the row but
+    /// the old container kept running with the stale image.
+    StaleImage,
+    /// Container is healthy and tracked by a DB row. Do NOT reap.
+    Healthy,
+}
+
+/// v0.2.52 V52-D.2: parsed `podman ps -a` row used by the reaper.
+/// Only the fields the reaper consults — no podman-internal noise.
+#[derive(Debug, Clone)]
+pub struct ContainerSnapshot {
+    pub name: String,
+    /// Full image reference (e.g. `ghcr.io/hotak92/vct-rl-reranker:0.1.0`).
+    pub image: String,
+    /// The container's CMD as podman reports it (string-joined argv).
+    pub cmd: String,
+}
+
+/// v0.2.52 V52-D.2: classify a single container snapshot against the
+/// DB's claimed container_name set + the expected image:tag for the
+/// container's apparent module.
+///
+/// Args:
+/// * `snap`: the container row pulled from `podman ps -a`.
+/// * `claimed_names`: container_names that at least one
+///   `module_installs` row references. A container whose name is NOT
+///   in this set is Orphan (no DB row claims it).
+/// * `expected_image_for`: lookup `(container_name) -> Option<image_ref>`
+///   that returns the expected `image:tag` for a tracked container.
+///   Returning `None` means "no expected image known" → can't
+///   stale-image-check. Used in tests with mock closures.
+///
+/// Returns the verdict; the caller decides whether to issue
+/// `podman rm -f`.
+pub fn classify_container_for_reaper<F>(
+    snap: &ContainerSnapshot,
+    claimed_names: &std::collections::HashSet<String>,
+    expected_image_for: F,
+) -> ReaperVerdict
+where
+    F: Fn(&str) -> Option<String>,
+{
+    // Indicator 1 (highest priority): broken Cmd. A literal
+    // `{module_image}` in the container's Cmd is unambiguous evidence
+    // of the pre-v0.2.49 Bug E manifest — those containers WILL
+    // restart-loop. Reap regardless of DB ownership.
+    if snap.cmd.contains("{module_image}") {
+        return ReaperVerdict::BrokenCmd;
+    }
+
+    // Indicator 2: orphan — no DB row claims this name. Includes the
+    // V52-E `vct-rl-reranker` (bare, no suffix) case.
+    if !claimed_names.contains(&snap.name) {
+        return ReaperVerdict::Orphan;
+    }
+
+    // Indicator 3: image-version drift. The container is claimed by
+    // a DB row but its actual image tag differs from what the
+    // manifest declares the row should be using. Compare on the
+    // full image ref (with tag, including variant suffix). When the
+    // expected image is unknown we can't conclude; treat as healthy.
+    if let Some(expected) = expected_image_for(&snap.name) {
+        // Tolerate minor formatting (podman occasionally normalises
+        // `docker.io/library/foo:tag` to `foo:tag` in its inspect
+        // output). Compare the trailing `<image>:<tag>` substring.
+        if !image_refs_equivalent(&snap.image, &expected) {
+            return ReaperVerdict::StaleImage;
+        }
+    }
+
+    ReaperVerdict::Healthy
+}
+
+/// v0.2.52 V52-D.2: lenient image-ref equivalence check used by the
+/// reaper. Podman occasionally rewrites registry prefixes in
+/// `inspect` output vs what the manifest declares (e.g.
+/// `docker.io/library/foo:tag` ↔ `foo:tag`). The reaper should not
+/// reap a healthy container over a cosmetic prefix difference, so we
+/// compare the trailing `<image>:<tag>` segment.
+///
+/// Rule: equal if the strings are byte-equal, OR if one ends with
+/// the other after the last `/`.
+pub fn image_refs_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_tail = a.rsplit('/').next().unwrap_or(a);
+    let b_tail = b.rsplit('/').next().unwrap_or(b);
+    a_tail == b_tail
+}
+
+/// v0.2.52 V52-D.2: parse `podman ps -a --format json` output into a
+/// vec of `ContainerSnapshot`. Podman emits an array of objects;
+/// each object's relevant fields are `Names` (array of strings,
+/// usually 1 element), `Image` (string), and `Command` (array of
+/// strings — argv).
+///
+/// Soft-fail: missing fields produce empty strings; malformed JSON
+/// returns `Err`. The reaper treats `Err` as "skip this pass" rather
+/// than "panic" — a failed parse should not block the launcher boot.
+pub fn parse_podman_ps_json(json_str: &str) -> Result<Vec<ContainerSnapshot>, String> {
+    let raw: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| format!("parse podman ps json: {}", e))?;
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| "podman ps json: top-level not an array".to_string())?;
+
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let name = entry
+            .get("Names")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_default();
+        let image = entry
+            .get("Image")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_default();
+        let cmd_parts = entry
+            .get("Command")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        if name.is_empty() {
+            // No usable name → cannot reap by name; skip.
+            continue;
+        }
+        out.push(ContainerSnapshot {
+            name,
+            image,
+            cmd: cmd_parts,
+        });
+    }
+    Ok(out)
+}
+
+/// v0.2.52 V52-D.2: top-level reaper entry point. Enumerates all
+/// containers via `<runtime> ps -a --format json`, classifies each
+/// against the supplied DB-state lookups, and issues `<runtime> rm -f`
+/// on every BrokenCmd / Orphan / StaleImage verdict.
+///
+/// Soft-fail throughout:
+/// * `<runtime> ps` failure: log + return (no reaping this pass).
+/// * `<runtime> rm` failure: log per-container + continue.
+///
+/// Returns `(reaped_count, error_count)` for forensic visibility.
+///
+/// Args:
+/// * `runtime`: `"podman"` or `"docker"`.
+/// * `claimed_names`: set of container_names referenced by at least
+///   one `module_installs` row.
+/// * `expected_image_for`: lookup mapping container_name to expected
+///   image:tag for the DB-claimed containers.
+/// * `name_filter`: optional predicate that says whether a container
+///   name should be examined at all. The reaper is scoped — it
+///   should NEVER touch containers from unrelated software (Weaviate,
+///   Ollama, user's own podman work). Default callers pass a filter
+///   that matches launcher-managed module name patterns.
+pub async fn reap_pathological_containers<F, G>(
+    runtime: &str,
+    claimed_names: &std::collections::HashSet<String>,
+    expected_image_for: F,
+    name_filter: G,
+) -> (usize, usize)
+where
+    F: Fn(&str) -> Option<String>,
+    G: Fn(&str) -> bool,
+{
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let ps_output = match Command::new(runtime)
+        .args(["ps", "-a", "--format", "json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "[container_runtime] V52-D.2 reaper: spawn {} ps failed: {}",
+                runtime, e
+            );
+            return (0, 1);
+        }
+    };
+
+    if !ps_output.status.success() {
+        eprintln!(
+            "[container_runtime] V52-D.2 reaper: {} ps exit {}, stderr={}",
+            runtime,
+            ps_output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&ps_output.stderr).chars().take(300).collect::<String>(),
+        );
+        return (0, 1);
+    }
+
+    let stdout = String::from_utf8_lossy(&ps_output.stdout);
+    // Podman's `--format json` returns `null` (not `[]`) when no
+    // containers exist on a fresh machine. Treat that as "no rows
+    // to scan".
+    if stdout.trim() == "null" || stdout.trim().is_empty() {
+        return (0, 0);
+    }
+    let snapshots = match parse_podman_ps_json(&stdout) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "[container_runtime] V52-D.2 reaper: parse {} ps json failed: {}",
+                runtime, e
+            );
+            return (0, 1);
+        }
+    };
+
+    let mut reaped = 0usize;
+    let mut errors = 0usize;
+
+    for snap in &snapshots {
+        if !name_filter(&snap.name) {
+            continue;
+        }
+        let verdict =
+            classify_container_for_reaper(snap, claimed_names, &expected_image_for);
+        match verdict {
+            ReaperVerdict::Healthy => continue,
+            ReaperVerdict::BrokenCmd => {
+                eprintln!(
+                    "[container_runtime] V52-D.2 reaper: reaping BrokenCmd container '{}' \
+                     (image='{}', cmd contains '{{module_image}}')",
+                    snap.name, snap.image,
+                );
+            }
+            ReaperVerdict::Orphan => {
+                eprintln!(
+                    "[container_runtime] V52-D.2 reaper: reaping Orphan container '{}' \
+                     (image='{}', no DB row claims this name)",
+                    snap.name, snap.image,
+                );
+            }
+            ReaperVerdict::StaleImage => {
+                let expected = expected_image_for(&snap.name).unwrap_or_default();
+                eprintln!(
+                    "[container_runtime] V52-D.2 reaper: reaping StaleImage container '{}' \
+                     (running='{}', expected='{}')",
+                    snap.name, snap.image, expected,
+                );
+            }
+        }
+
+        let rm_status = Command::new(runtime)
+            .args(["rm", "-f", &snap.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        match rm_status {
+            Ok(o) if o.status.success() => {
+                reaped += 1;
+            }
+            Ok(o) => {
+                errors += 1;
+                eprintln!(
+                    "[container_runtime] V52-D.2 reaper: {} rm -f {} exit {}, stderr={}",
+                    runtime,
+                    snap.name,
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).chars().take(200).collect::<String>(),
+                );
+            }
+            Err(e) => {
+                errors += 1;
+                eprintln!(
+                    "[container_runtime] V52-D.2 reaper: spawn {} rm failed for {}: {}",
+                    runtime, snap.name, e
+                );
+            }
+        }
+    }
+
+    if reaped > 0 || errors > 0 {
+        eprintln!(
+            "[container_runtime] V52-D.2 reaper: pass complete, reaped={} errors={}",
+            reaped, errors,
+        );
+    }
+    (reaped, errors)
 }
 
 // ─── Per-pull auth (v0.2.47 cross-runtime) ─────────────────────────────
@@ -1921,5 +2354,370 @@ mod tests {
             db: None,
             kg_collections: None,
         }
+    }
+
+    // ─── V52-D.1 manifest-runtime-pathological detection ─────────────
+
+    #[test]
+    fn v0252_d1_pathological_runtime_command_podman_detected() {
+        // The empirical v0.2.9 manifest: `runtime.command = "podman"`
+        // with `runtime.args = ["run", "--rm", "-p", "11450:11450", "{module_image}"]`.
+        // Both indicators present.
+        assert!(is_runtime_pathological(
+            "podman",
+            &[
+                "run".into(),
+                "--rm".into(),
+                "-p".into(),
+                "11450:11450".into(),
+                "{module_image}".into(),
+            ],
+            Some("vct-rl-reranker"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_command_docker_detected() {
+        assert!(is_runtime_pathological(
+            "docker",
+            &["run".into(), "{module_image}".into()],
+            Some("evil-module"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_command_podman_with_whitespace_detected() {
+        // Authoring slip: trailing whitespace in command field.
+        assert!(is_runtime_pathological(
+            "  podman  ",
+            &["run".into()],
+            Some("vct-rl-reranker"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_unsub_module_image_in_args_detected() {
+        // Even if command is "python" (not a runtime binary), the
+        // presence of {module_image} in args means the manifest author
+        // copy-pasted the wrong substitution context.
+        assert!(is_runtime_pathological(
+            "python",
+            &["-m".into(), "rl_server".into(), "{module_image}".into()],
+            Some("vct-rl-reranker"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_shell_without_dash_c_detected() {
+        // `sh` with no `-c` arg → would exit immediately under
+        // detached mode. Likely an authoring mistake.
+        assert!(is_runtime_pathological(
+            "sh",
+            &["echo".into(), "hello".into()],
+            Some("dodgy-module"),
+        ));
+        assert!(is_runtime_pathological(
+            "bash",
+            &[],
+            Some("dodgy-module"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_shell_with_dash_c_allowed() {
+        // Legit `sh -c "..."` invocation passes (the -c arg signals
+        // intent).
+        assert!(!is_runtime_pathological(
+            "sh",
+            &["-c".into(), "python -m rl_server".into()],
+            Some("ok-module"),
+        ));
+        assert!(!is_runtime_pathological(
+            "bash",
+            &["-c".into(), "exec /app/start.sh".into()],
+            Some("ok-module"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_legit_command_passes() {
+        // The canonical legit shape: `python -m <module>` with no
+        // {module_image} placeholder. Must NOT be flagged.
+        assert!(!is_runtime_pathological(
+            "python",
+            &["-m".into(), "rl_server.rl_server".into()],
+            Some("vct-rl-reranker"),
+        ));
+        assert!(!is_runtime_pathological(
+            "node",
+            &["server.js".into()],
+            Some("some-node-module"),
+        ));
+        assert!(!is_runtime_pathological(
+            "/app/start",
+            &[],
+            Some("absolute-binary-module"),
+        ));
+    }
+
+    #[test]
+    fn v0252_d1_pathological_runtime_empty_command_passes() {
+        // Empty command means "use the image ENTRYPOINT" — this is
+        // the v0.2.49 declarative-manifest shape. Not pathological;
+        // the empty-command branch in build_podman_run_args handles
+        // it separately (skip CMD override). This test pins that
+        // `is_runtime_pathological` returns false so we don't double-
+        // log the warning.
+        assert!(!is_runtime_pathological("", &[], Some("declarative-module")));
+        assert!(!is_runtime_pathological("", &[], None));
+    }
+
+    /// End-to-end: a manifest with the pre-v0.2.49 Bug E shape produces
+    /// a `podman run` argv with NO CMD override. The image ENTRYPOINT
+    /// runs unmolested — same effect as if the broken manifest had
+    /// `command: ""`. This is the user-facing fix: stale catalog rows
+    /// no longer produce restart-looping containers.
+    #[test]
+    fn v0252_d1_build_podman_run_args_strips_pathological_cmd_override() {
+        let mut manifest = make_manifest(true, true);
+        // Inject the empirical v0.2.9 broken shape.
+        manifest.runtime.command = "podman".into();
+        manifest.runtime.args = vec![
+            "run".into(),
+            "--rm".into(),
+            "-p".into(),
+            "11450:11450".into(),
+            "{module_image}".into(),
+        ];
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9",
+        )
+        .expect("build args");
+        // The positional image arg is the LAST element — no CMD
+        // override appended after it.
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("ghcr.io/hotak92/vct-rl-reranker:0.2.9"),
+            "build_podman_run_args must NOT append the pathological CMD; \
+             expected image as last arg, got args={:?}",
+            args,
+        );
+        // Defensive: no element contains "{module_image}" — the
+        // launcher must not pass the unsubstituted placeholder to
+        // podman.
+        assert!(
+            args.iter().all(|a| !a.contains("{module_image}")),
+            "no arg may carry an unsubstituted {{module_image}} placeholder; got {:?}",
+            args,
+        );
+    }
+
+    // ─── V52-D.2 reaper unit tests ───────────────────────────────────
+
+    fn snap(name: &str, image: &str, cmd: &str) -> ContainerSnapshot {
+        ContainerSnapshot {
+            name: name.into(),
+            image: image.into(),
+            cmd: cmd.into(),
+        }
+    }
+
+    fn claimed_set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn v0252_d2_classify_broken_cmd_takes_priority() {
+        // BrokenCmd verdict should fire even when the container is
+        // ALSO orphan / stale-image — operator visibility ranks the
+        // worst class first.
+        let s = snap(
+            "vct-rl-reranker-orchestrator-root",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda",
+            "podman run --rm -p 11450:11450 {module_image}",
+        );
+        let claimed = claimed_set(&["vct-rl-reranker-orchestrator-root"]);
+        let verdict = classify_container_for_reaper(&s, &claimed, |_| {
+            Some("ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda".to_string())
+        });
+        assert_eq!(verdict, ReaperVerdict::BrokenCmd);
+    }
+
+    #[test]
+    fn v0252_d2_classify_orphan_when_not_in_claimed() {
+        let s = snap("vct-rl-reranker", "ghcr.io/hotak92/vct-rl-reranker:0.1.0", "python -m rl_server");
+        let claimed = claimed_set(&["vct-rl-reranker-orchestrator-root"]);
+        let verdict = classify_container_for_reaper(&s, &claimed, |_| None);
+        assert_eq!(verdict, ReaperVerdict::Orphan);
+    }
+
+    #[test]
+    fn v0252_d2_classify_stale_image_when_tag_differs() {
+        let s = snap(
+            "vct-rl-reranker-rs-slug",
+            "ghcr.io/hotak92/vct-rl-reranker:0.1.0",
+            "python -m rl_server",
+        );
+        let claimed = claimed_set(&["vct-rl-reranker-rs-slug"]);
+        let verdict = classify_container_for_reaper(&s, &claimed, |_| {
+            Some("ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda".to_string())
+        });
+        assert_eq!(verdict, ReaperVerdict::StaleImage);
+    }
+
+    #[test]
+    fn v0252_d2_classify_healthy_when_matched() {
+        let s = snap(
+            "vct-rl-reranker-rs-slug",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda",
+            "python -m rl_server",
+        );
+        let claimed = claimed_set(&["vct-rl-reranker-rs-slug"]);
+        let verdict = classify_container_for_reaper(&s, &claimed, |_| {
+            Some("ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda".to_string())
+        });
+        assert_eq!(verdict, ReaperVerdict::Healthy);
+    }
+
+    #[test]
+    fn v0252_d2_classify_healthy_when_expected_unknown() {
+        // Claimed + cmd clean + expected_image_for returns None →
+        // cannot stale-check. Default to Healthy (we don't reap on
+        // unprovable suspicion).
+        let s = snap("vct-rl-reranker-rs-slug", "anything:latest", "python");
+        let claimed = claimed_set(&["vct-rl-reranker-rs-slug"]);
+        let verdict = classify_container_for_reaper(&s, &claimed, |_| None);
+        assert_eq!(verdict, ReaperVerdict::Healthy);
+    }
+
+    #[test]
+    fn v0252_d2_image_refs_equivalent_byte_equal() {
+        assert!(image_refs_equivalent(
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda",
+        ));
+    }
+
+    #[test]
+    fn v0252_d2_image_refs_equivalent_tail_match_after_normalisation() {
+        // Podman's inspect may strip `docker.io/library/` from short
+        // names; the tail-match rule preserves equivalence.
+        assert!(image_refs_equivalent(
+            "docker.io/library/alpine:3.20",
+            "alpine:3.20",
+        ));
+        assert!(image_refs_equivalent("alpine:3.20", "docker.io/library/alpine:3.20"));
+    }
+
+    #[test]
+    fn v0252_d2_image_refs_equivalent_different_tags_not_equivalent() {
+        assert!(!image_refs_equivalent(
+            "ghcr.io/hotak92/vct-rl-reranker:0.1.0",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda",
+        ));
+    }
+
+    #[test]
+    fn v0252_d2_parse_podman_ps_json_happy_path() {
+        // Real-shape sample: 2 containers, 1 broken + 1 healthy.
+        let json = r#"[
+            {
+                "Names": ["vct-rl-reranker-orchestrator-root"],
+                "Image": "ghcr.io/hotak92/vct-rl-reranker:0.2.9-cuda",
+                "Command": ["podman", "run", "--rm", "-p", "11450:11450", "{module_image}"]
+            },
+            {
+                "Names": ["weaviate_claude"],
+                "Image": "semitechnologies/weaviate:1.32",
+                "Command": ["/bin/weaviate", "--scheme", "http"]
+            }
+        ]"#;
+        let parsed = parse_podman_ps_json(json).expect("parse");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "vct-rl-reranker-orchestrator-root");
+        assert!(parsed[0].cmd.contains("{module_image}"));
+        assert_eq!(parsed[1].name, "weaviate_claude");
+        assert!(!parsed[1].cmd.contains("{module_image}"));
+    }
+
+    #[test]
+    fn v0252_d2_parse_podman_ps_json_handles_missing_fields() {
+        // Containers without Names get skipped (cannot reap by name).
+        // Missing Image / Command fields default to empty string.
+        let json = r#"[
+            {"Names": ["only-name"]},
+            {"Image": "no-name:tag"},
+            {"Names": [], "Image": "empty-names"}
+        ]"#;
+        let parsed = parse_podman_ps_json(json).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "only-name");
+        assert_eq!(parsed[0].image, "");
+        assert_eq!(parsed[0].cmd, "");
+    }
+
+    #[test]
+    fn v0252_d2_parse_podman_ps_json_rejects_malformed() {
+        let err = parse_podman_ps_json("not json").expect_err("must fail on malformed");
+        assert!(err.contains("parse podman ps json"));
+
+        let err = parse_podman_ps_json(r#"{"top": "object not array"}"#)
+            .expect_err("must fail on non-array top-level");
+        assert!(err.contains("not an array"));
+    }
+
+    /// V52-E + V52-D.2 integration: the bare `vct-rl-reranker`
+    /// container (image 0.1.0, no DB row) IS an orphan and the
+    /// reaper correctly classifies it. Pins the spec's V52-E claim
+    /// that V52-D.2's reaper subsumes the standalone V52-E fix.
+    #[test]
+    fn v0252_d2_v52e_bare_orphan_container_classified_as_orphan() {
+        let s = snap(
+            "vct-rl-reranker",
+            "ghcr.io/hotak92/vct-rl-reranker:0.1.0",
+            "python -m rl_server.rl_server",
+        );
+        // The claimed set contains the per-project variants but NOT
+        // the bare `vct-rl-reranker` (it was a manual / pre-v0.2.10
+        // leftover).
+        let claimed = claimed_set(&[
+            "vct-rl-reranker-orchestrator-root",
+            "vct-rl-reranker-instambul1860",
+            "vct-rl-reranker-sd15",
+        ]);
+        let verdict = classify_container_for_reaper(&s, &claimed, |_| None);
+        assert_eq!(verdict, ReaperVerdict::Orphan);
+    }
+
+    /// Sibling test for the GLOBAL builder — same pathology-stripping
+    /// behaviour.
+    #[test]
+    fn v0252_d1_build_podman_run_args_global_strips_pathological_cmd_override() {
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.command = "podman".into();
+        manifest.runtime.args = vec!["run".into(), "{module_image}".into()];
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.9",
+        )
+        .expect("build args global");
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("ghcr.io/hotak92/vct-rl-reranker:0.2.9"),
+            "global builder must also strip pathological CMD; got args={:?}",
+            args,
+        );
+        assert!(args.iter().all(|a| !a.contains("{module_image}")));
     }
 }

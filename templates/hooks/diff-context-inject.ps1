@@ -42,6 +42,17 @@ $ContextFile = ".claude/CONTEXT_STATE.md"
 if (-not $env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR = (Get-Location).Path }
 $SnapshotDir = Join-Path $env:CLAUDE_PROJECT_DIR ".claude/state"
 $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } else { "default" }
+
+# V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes
+# inherit the session_id. The canonical telemetry emit path
+# (claude_mcp_servers/rl_client/telemetry_emit.py::resolve_session_id)
+# reads VCT_SESSION_ID as layer-2 of its 3-layer chain. Skip the
+# "default" sentinel — we'd rather have empty than fake-key. Sibling:
+# see templates/hooks/diff-context-inject.sh.
+if ($SessionId -and $SessionId -ne "default") {
+    $env:VCT_SESSION_ID = $SessionId
+}
+
 $SnapshotFile = Join-Path $SnapshotDir "ctx_snapshot_$SessionId"
 $CompactFlag = Join-Path $SnapshotDir "ctx_compact_flag_$SessionId"
 

@@ -73,8 +73,9 @@ class _DedupInsertError(RuntimeError):
         self.uuid = uuid
 
 
-def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = "") -> str:
-    """Generate a deterministic UUID from project + file_path_rel + full_name.
+def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = "",
+                        project_source: str = "") -> str:
+    """Generate a deterministic UUID from project + project_source + file_path_rel + full_name.
 
     Args:
         project: Project name (used as the outermost UUID namespace).
@@ -88,6 +89,13 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
             Also used as the only-non-empty arg when callers pass through
             the legacy two-arg form ``_deterministic_uuid(project, name)``;
             handled below.
+        project_source: v0.2.52 (V52-O.3) — absolute POSIX path of the
+            source root that contributed this row (primary repo OR a
+            ``--extra-path`` value). Mixed into the seed so the SAME
+            relative path under TWO different source roots produces
+            TWO different UUIDs. Default ``""`` preserves byte-identical
+            UUIDs for the v0.2.16-through-v0.2.51 single-root call shape
+            (no on-disk migration needed for primary-repo-only installs).
 
     Why file_path_rel is part of the key (v0.2.16):
         Pre-v0.2.16 the key was just ``project::full_name``. Two files
@@ -98,16 +106,31 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
         same UUID and the second one's insert was rejected. Including
         the file path eliminates this entire collision surface.
 
-    Re-indexing the same entity (same project, same file, same symbol)
-    still produces the same UUID, so re-runs continue to upsert cleanly.
+    Why project_source is part of the key (v0.2.52 / V52-O.3):
+        ``--extra-path`` lets the analyzer walk a second source root and
+        emit its rows into the primary project's collections (with
+        ``project_source`` stamped). Pre-V52-O.3 the seed was
+        ``project::file_path_rel::full_name`` — two roots sharing a
+        relative path (e.g. ``src/index.ts`` exists in both) collided
+        on the same UUID and the second walk's ``replace()`` overwrote
+        the first. Mixing the absolute source-root path into the seed
+        means each root gets its own UUID-space; the two rows coexist.
+        Defaults to the empty string so single-root call sites
+        (``analyze_repository`` without ``--extra-path``) keep producing
+        the v0.2.16-era UUIDs and don't trigger a spurious re-write of
+        the whole collection.
+
+    Re-indexing the same entity (same project, same source root, same
+    file, same symbol) still produces the same UUID, so re-runs
+    continue to upsert cleanly.
 
     NOTE on back-compat: this helper is also called from contexts where
     only ``project`` + ``full_name`` are meaningful (cross-reference
-    creation paths). When ``file_path_rel`` is the empty string the
-    UUID degrades to the v0.2.15-and-earlier shape so those paths
-    continue to resolve to the same UUIDs they did before.
+    creation paths). When ``file_path_rel`` and ``project_source`` are
+    the empty string the UUID degrades to the v0.2.15-and-earlier shape
+    so those paths continue to resolve to the same UUIDs they did before.
     """
-    key = f"{project}::{file_path_rel}::{full_name}"
+    key = f"{project}::{project_source}::{file_path_rel}::{full_name}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 logger = logging.getLogger(__name__)
@@ -249,10 +272,24 @@ _COMMON_IGNORE_DIRS: frozenset = frozenset({
     '__pycache__', '.pytest_cache',
     # Generic build outputs
     'build', 'dist',
+    'out',                  # generic build output (alongside 'build', 'dist')
     # JS/TS dependency cache
     'node_modules',
     # v0.2.16 — git-worktree clones under .claude/worktrees/agent-*/
     'worktrees',
+    # v0.2.52 (V52-O.1) — JS/TS framework codegen + cache dirs. SvelteKit
+    # in particular produces a `.svelte-kit/output/` tree full of Rollup
+    # chunks that look like JS source to the analyzer; in real-world
+    # measurements 93% of CodeFunction rows on a SvelteKit project came
+    # from chunk-*.js files. Adding the framework codegen + cache dirs
+    # here prevents this entire pollution class.
+    '.svelte-kit',          # SvelteKit codegen (output/, generated/)
+    '.next',                # Next.js
+    '.nuxt',                # Nuxt
+    '.cache',               # generic framework cache
+    '.parcel-cache',        # Parcel
+    '.turbo',               # Turborepo
+    '.angular',             # Angular cache
 })
 
 
@@ -358,6 +395,22 @@ def _canonical_lang_id(label: Optional[str]) -> str:
         return ""
     return _LANGUAGE_DISPLAY_TO_CANONICAL.get(key, key)
 
+
+# v0.2.52 (Known Issue 6, Sub-issue A): silence
+# ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` from
+# ``weaviate-client``'s transitive ``authlib`` dep during module import.
+# See ``claude_mcp_servers/weaviate_mcp/server.py`` for the matching
+# filter at the MCP-server level.  MUST run BEFORE ``import weaviate``.
+import warnings as _cg_warnings
+try:
+    from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDeprecationWarning  # type: ignore
+    _cg_warnings.filterwarnings("ignore", category=_AuthlibDeprecationWarning)
+except ImportError:
+    _cg_warnings.filterwarnings(
+        "ignore",
+        message=r".*authlib.*deprecated.*",
+        category=DeprecationWarning,
+    )
 
 try:
     import weaviate
@@ -524,6 +577,1305 @@ def generate_embedding(text: str) -> Optional[Any]:
     except Exception as e:
         print(f"⚠️  Embedding generation error: {e}", file=sys.stderr)
         return None
+
+
+def _extract_balanced_block(
+    source_lines: List[str],
+    start_line: int,
+    *,
+    opener: str = "{",
+    closer: str = "}",
+    max_lookahead: int = 400,
+) -> int:
+    """V52-O.11.E (v0.2.52, 2026-06-09): find the real end-line of a
+    code block by counting balanced ``opener``/``closer`` pairs.
+
+    Replaces the broken ``end_line = min(start_line + N, len(source_lines))``
+    heuristic used at 17 sites in this file pre-V52-O.11.E. Audit a79152
+    confirmed the heuristic systematically over-clusters sequential
+    functions by writing each function's ``function_body`` extending up
+    to N lines past its real close brace (e.g. ``is_blocklisted_agent_file``
+    in project_state_populate.rs: real end line 281, stored end line 315,
+    body contains 34 lines of the NEXT function).
+
+    Algorithm:
+      1. Scan ``source_lines[start_line-1:]`` looking for the first
+         ``opener``. Once found, increment a brace-counter.
+      2. Continue scanning; for every additional ``opener`` increment,
+         for every ``closer`` decrement. When counter reaches 0, the
+         current line is the close-brace line — return its 1-indexed
+         line number.
+      3. Skip openers/closers inside:
+         - String literals (``"..."`` and ``'...'``) — single-line only;
+           multi-line raw/template strings are out of scope (caller
+           accepts mild bleed when the function contains a multi-line
+           string with unbalanced braces — that's a corner case).
+         - Line comments (``//`` and ``#``).
+         - Block comments (``/* ... */``) — single-line variant only.
+      4. If no balanced close is found within ``max_lookahead`` lines,
+         return ``min(start_line + max_lookahead, len(source_lines))``
+         (graceful degradation — gives the caller the existing-pattern
+         behavior for runaway functions).
+
+    Returns the **1-indexed line number of the closing brace**. Callers
+    consume it via the existing pattern:
+
+        end_line = _extract_balanced_block(source_lines, start_line)
+        body = '\\n'.join(source_lines[max(0, start_line - 1):end_line])
+
+    The 1-indexed return matches the existing ``end_line`` convention
+    at every caller site — drop-in replacement, no off-by-one.
+
+    Language coverage: works for any brace-balanced language (C, C++,
+    Java, JavaScript, TypeScript, Go, Rust, C#, Lua-with-end-keyword
+    is handled by ``_extract_balanced_block_keyword`` instead). Doesn't
+    work for indent-significant languages (Python uses AST so it
+    bypasses this helper entirely; Ruby uses ``end`` keywords —
+    callers there should still use this helper since Ruby's bodies are
+    short enough that brace-balance over a 400-line window won't
+    over-extend, but it's a less precise fit).
+
+    Performance: ~O(end_line - start_line) lines scanned per call. With
+    ``max_lookahead=400`` and typical function bodies of 10-50 lines,
+    this adds ~1ms per function vs the old fixed-window approach. The
+    correctness gain (no body-bleed contamination in embeddings) is
+    worth the cost.
+    """
+    if start_line < 1 or start_line > len(source_lines):
+        return min(start_line + 40, len(source_lines))  # legacy fallback
+
+    counter = 0
+    found_opener = False
+    end_index = start_line - 1  # 0-indexed start
+    lookahead_end = min(start_line - 1 + max_lookahead, len(source_lines))
+
+    for line_idx in range(start_line - 1, lookahead_end):
+        line = source_lines[line_idx]
+        # Strip line comment + single-line block comment + string literals.
+        # This is a best-effort scrub — multi-line strings + multi-line
+        # block comments are out of scope (callers degrade gracefully).
+        scrubbed = _scrub_for_brace_balance(line)
+        for ch in scrubbed:
+            if ch == opener:
+                counter += 1
+                found_opener = True
+            elif ch == closer:
+                counter -= 1
+                if found_opener and counter == 0:
+                    # +1 because line_idx is 0-indexed; end_line is 1-indexed
+                    return line_idx + 1
+
+    # No balanced close within lookahead — fall back to the legacy
+    # behavior so callers don't crash. This is the runaway-function
+    # branch; in practice almost never hit.
+    return min(start_line + 40, len(source_lines))
+
+
+def _scrub_for_brace_balance(line: str) -> str:
+    """Best-effort: remove comments + single-line string literals from
+    ``line`` so the brace-counter in ``_extract_balanced_block`` doesn't
+    mis-count braces inside strings/comments.
+
+    Order matters: comments first (so a quote inside a comment doesn't
+    open a string), then strings. Multi-line constructs (raw strings,
+    block comments spanning lines, template literals) are intentionally
+    not handled — they're rare enough that the caller's graceful
+    degradation suffices.
+    """
+    # Strip line comments. Handle Python ``#``, shell ``#``, C++ ``//``,
+    # Lua ``--``. We strip whichever appears first.
+    earliest = len(line)
+    for marker in ("#", "//", "--"):
+        idx = line.find(marker)
+        if idx >= 0 and idx < earliest:
+            earliest = idx
+    line = line[:earliest]
+
+    # Strip single-line block comments: /* ... */ on one line.
+    line = re.sub(r"/\*.*?\*/", "", line)
+
+    # Strip string literals. Single-line only — multi-line out of scope.
+    line = re.sub(r"\"(?:\\.|[^\"\\])*\"", '""', line)
+    line = re.sub(r"'(?:\\.|[^'\\])*'", "''", line)
+    # Template literals (backticks). Single-line only.
+    line = re.sub(r"`(?:\\.|[^`\\])*`", "``", line)
+
+    return line
+
+
+def _go_methods_for_struct(
+    content_clean: str,
+    struct_name: str,
+    source_lines: List[str],
+) -> List[str]:
+    """V52-O.11.F.2-GO (v0.2.52, 2026-06-09): extract methods declared on
+    ``struct_name`` via Go's receiver syntax.
+
+    Replaces the pre-V52-O.11.F.2-GO line that ran
+    ``func_pattern.finditer(content_clean)`` unconditionally — the same
+    bug as Rust's V52-O.11.F, applied to the Go parser. Audit a79152
+    flagged the four parallel sites (Go, JS/TS, Java, C#); this fix
+    closes the Go one. A 50-fn Go file with 3 structs produced 150
+    incorrect method attributions, drowning real signal in the
+    ``query_code_structure(methods, StructName)`` MCP path.
+
+    Go's method-scoping model (CRITICAL difference from Rust):
+
+      Go does NOT use ``impl <Type> { ... }``. Methods are functions
+      with a **receiver** declared BEFORE the function name:
+
+          func (recv *Foo) MethodName(args...) ReturnType { ... }
+          func (recv  Foo) MethodName(args...) ReturnType { ... }
+
+      The token between the receiver-paren and the close-paren is the
+      type. A leading ``*`` denotes a pointer receiver; both pointer
+      and value receivers are methods on the same type.
+
+    Algorithm:
+
+      1. Match every ``func (<recv_var> [*&]?<struct_name>) <Name>(``
+         pattern in ``content_clean``. The receiver variable name is
+         arbitrary (often a single letter), so we accept ``\\w+`` for it.
+         Whitespace around the type is lenient because Go style varies.
+      2. Collect ``<Name>`` values. Deduplicate, preserving first-seen
+         order — a struct can have a method declared on both the
+         pointer and value receiver in pathological code, but only one
+         name lands in the methods list.
+      3. We DO NOT pick up receiver-less ``func Name(...)`` declarations
+         — those are package-level free functions, not methods. They
+         get processed by the separate function-entry loop downstream.
+
+    Returns empty list if no receiver-bound functions match — common
+    for plain data structs (`type Config struct { ... }`) that only
+    carry fields, and for interfaces whose method set is defined via
+    the interface body itself (the interface body's method declarations
+    don't use `func` keyword, so the regex correctly ignores them).
+
+    Limitations:
+      - Generic Go methods (Go 1.18+, ``func (s *Foo[T]) Method()...``)
+        are matched: the ``[*&]?<struct_name>`` segment captures the
+        bare name and the optional ``[T]`` generic parameter follows
+        before the close-paren, which we tolerate via a permissive
+        post-name pattern (``[^)]*``).
+      - Methods declared in another file of the same package on the
+        same type are correctly NOT picked up here — they only land
+        in the methods list when the OTHER file is being analyzed
+        (each file is parsed independently). This is consistent with
+        the Rust path's per-file scoping and with how Go's tooling
+        itself reports methods.
+      - Doesn't follow embedded-struct method promotion (interfaces
+        that embed another interface's method set, struct types that
+        embed another struct). Those are intentionally out of scope
+        for this regex-based parser; tree-sitter is the right tool
+        for that level of fidelity (queued as V52-O.11.G in backlog).
+    """
+    escaped = re.escape(struct_name)
+    # Receiver shape:
+    #   func ( <recv_var> [*&]? <struct_name> [generics?] ) <Name> (
+    # Notes on each piece:
+    #   - `func\s*\(` — opening receiver paren, possibly with
+    #     whitespace between `func` and `(` (rare but legal style).
+    #   - `\s*\w+\s+` — the receiver variable name (e.g. `f`, `recv`,
+    #     `self`). Mandatory in Go syntax: anonymous receivers don't
+    #     exist (you can use `_` but it's still a word char).
+    #   - `[*&]?` — optional pointer marker. `&` isn't legal Go syntax
+    #     for receivers, but we include it for robustness against
+    #     hand-written test fixtures and the cost of one extra char in
+    #     the regex is negligible. Real Go code only uses `*`.
+    #   - `{escaped}` — the literal struct name, regex-escaped.
+    #   - `[^)]*` — anything else up to the closing receiver paren
+    #     (covers generic parameters like `[T]`, type assertions, and
+    #     trailing whitespace).
+    #   - `\)` — closing receiver paren.
+    #   - `\s+(\w+)\s*\(` — the method name (captured) followed by its
+    #     own argument paren. The trailing `\(` anchors us to a real
+    #     function declaration vs. a stray `func (...)` cast expression.
+    method_pattern = re.compile(
+        rf"func\s*\(\s*\w+\s+[*&]?{escaped}[^)]*\)\s+(\w+)\s*\(",
+        re.MULTILINE,
+    )
+
+    methods: List[str] = []
+    seen: set = set()
+    for m in method_pattern.finditer(content_clean):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        methods.append(name)
+    return methods
+
+
+def _rust_methods_for_struct(
+    content_clean: str,
+    struct_name: str,
+    source_lines: List[str],
+) -> List[str]:
+    """V52-O.11.F (v0.2.52, 2026-06-09): extract methods declared inside
+    every ``impl <struct_name>`` (or ``impl <Trait> for <struct_name>``)
+    block in the source.
+
+    Replaces the pre-V52-O.11.F line that ran
+    ``func_pattern.finditer(content_clean)`` unconditionally — that
+    attributed EVERY function in the file to EVERY struct. Audit a79152
+    confirmed: a 50-fn file with 3 structs produced 150 incorrect
+    method attributions, drowning the real ``methods`` signal in noise.
+
+    Algorithm:
+
+      1. Find every ``impl`` block whose target type matches ``struct_name``.
+         Two shapes accepted:
+           - ``impl <generics?> <struct_name> <generics?> {``      (inherent)
+           - ``impl <generics?> <Trait> for <struct_name> <generics?> {`` (trait)
+      2. For each matched impl block, find its closing brace via the
+         existing ``_extract_balanced_block`` helper (already brace-balanced
+         per V52-O.11.E).
+      3. Scan the block body for ``fn name(...)`` patterns; collect names.
+      4. Return deduplicated list, preserving first-seen order.
+
+    Returns empty list if no impl blocks match — common for plain data
+    structs that only carry fields. The caller renders ``methods: []`` in
+    the CodeClass row, which is correct (no methods exist).
+
+    Limitations:
+      - Doesn't handle ``impl<T: Trait> ...`` where the type parameter
+        appears literally in the type position (rare in practice).
+      - Doesn't extract methods declared via macros (``impl_trait!``).
+      - Doesn't follow ``impl`` in nested ``mod`` blocks transparently —
+        the brace-balance helper correctly skips over them, so methods
+        in nested mods that DO impl on ``struct_name`` from the outer
+        scope get picked up. Methods inside nested impl blocks on a
+        DIFFERENT struct are correctly excluded.
+    """
+    # Find every impl header line whose target type matches struct_name.
+    # The regex covers both shapes:
+    #   - impl <generics>? <Name> <generics>? {
+    #   - impl <generics>? <Trait> for <Name> <generics>? {
+    # Generics + trailing-where are non-capturing; we only need the impl
+    # start position. Generics are matched with a simple ``<[^>]*>`` since
+    # Rust generics rarely nest in impl headers (where-clauses move
+    # complex bounds to after the type).
+    escaped = re.escape(struct_name)
+    # Shape A: `impl Foo` / `impl<T> Foo<T>` / `impl<T> Foo`
+    # Shape B: `impl Trait for Foo` / `impl<T> Trait<T> for Foo<T>`
+    impl_pattern = re.compile(
+        # `impl` keyword
+        r"impl"
+        # Optional generic parameters on impl
+        r"(?:\s*<[^>]*>)?"
+        # The target type. Either Shape A (just struct_name) or
+        # Shape B (Trait + `for` + struct_name).
+        r"\s+(?:"
+        # Shape B alternative: any token sequence + `for` + struct_name
+        rf"(?:[\w:]+(?:\s*<[^>]*>)?\s+for\s+){escaped}"
+        rf"|{escaped}"
+        # Shape A — struct_name alone
+        r")"
+        # Optional generics on the target (rare but valid)
+        r"(?:\s*<[^>]*>)?"
+        # Optional where clause + opening brace
+        r"\s*(?:where\s+[^{]*)?\{",
+        re.MULTILINE,
+    )
+
+    method_pattern_inner = re.compile(
+        r"(?:pub\s+(?:\([^)]*\)\s+)?)?(?:async\s+)?(?:unsafe\s+)?(?:const\s+)?"
+        r"fn\s+([\w]+)\s*",
+    )
+
+    methods: List[str] = []
+    seen: set = set()
+    for m in impl_pattern.finditer(content_clean):
+        # Locate the opening brace position (the regex anchors on it).
+        # m.end() is just past the `{`, so the impl body starts there.
+        impl_open_pos = m.end() - 1  # position of `{`
+        # Find the matching close via brace-balance on source_lines.
+        # We need a source-line index: convert char-offset to line.
+        impl_open_line = content_clean[:impl_open_pos].count("\n") + 1
+        impl_close_line = _extract_balanced_block(
+            source_lines, impl_open_line, max_lookahead=800
+        )
+        # Slice content_clean (NOT source_lines — content_clean has
+        # comments stripped, mirroring how the original method extraction
+        # worked).
+        block_start_pos = impl_open_pos + 1  # skip `{`
+        # Find char-offset for impl_close_line. Sum line lengths +1 for \n.
+        # Cheaper: count lines from block_start_pos and stop when we've
+        # passed (impl_close_line - impl_open_line) newlines.
+        target_newlines = impl_close_line - impl_open_line
+        if target_newlines <= 0:
+            continue
+        # Find the position by counting newlines from block_start_pos.
+        seen_newlines = 0
+        block_end_pos = block_start_pos
+        while seen_newlines < target_newlines and block_end_pos < len(content_clean):
+            if content_clean[block_end_pos] == "\n":
+                seen_newlines += 1
+            block_end_pos += 1
+        impl_body = content_clean[block_start_pos:block_end_pos]
+        for fm in method_pattern_inner.finditer(impl_body):
+            name = fm.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            methods.append(name)
+    return methods
+
+
+def _js_methods_for_class(
+    content_clean: str,
+    class_name: str,
+    source_lines: List[str],
+) -> List[str]:
+    """V52-O.11.F.2-JS (v0.2.52, 2026-06-09): extract methods declared
+    inside ``class <class_name> { ... }`` (with optional ``extends``) in
+    JS/TS source.
+
+    Replaces the pre-V52-O.11.F.2-JS regex (``method_inside`` over
+    ``class_body``) which had three correctness defects:
+
+      1. Missed method shapes: ``static name()``, ``get name()``,
+         ``set name()``, ``*name()`` (generator), ``#name()`` (private),
+         ``static async name()``, ``static *name()``.
+      2. Matched ANY ``name(args) {`` pattern, including nested function
+         calls inside method bodies (``otherFn(arg) { ... }`` invoked
+         inside a method body would be miscounted as a method of the
+         outer class).
+      3. Incorrectly skipped ``constructor`` (constructor IS a method
+         that should be tracked, not filtered).
+
+    Algorithm:
+
+      1. Find every ``class <class_name>`` header (with optional
+         ``extends <Base>``). The class name must match EXACTLY — a
+         class named ``Foo`` does not match ``FooBar``. Optional
+         ``export`` / ``export default`` prefix supported.
+      2. For each matched class block, find its closing brace via the
+         existing ``_extract_balanced_block`` helper (V52-O.11.E).
+      3. Walk the class body brace-by-brace tracking depth. At depth 1
+         (immediate body, NOT inside any nested block), scan for
+         method declarations matching the JS method-shorthand patterns:
+           - ``name(args)``
+           - ``async name(args)``
+           - ``static name(args)``
+           - ``static async name(args)``
+           - ``get name()`` / ``set name(v)``
+           - ``*name(args)`` (generator)
+           - ``async *name(args)`` (async generator)
+           - ``#name(args)`` (private field)
+           - ``static #name(args)`` / ``#async name`` etc. combinations
+      4. Return deduplicated list, preserving first-seen order.
+
+    Returns empty list if no class blocks match — common for classes
+    whose body is purely fields/properties without method shorthand.
+
+    Handles ``extends``: ``class Foo extends Bar { ... }`` — the class
+    block IS Foo's body, methods of Bar are NOT picked up (Bar is in a
+    DIFFERENT class declaration entirely, scoped separately).
+
+    Limitations:
+      - Object-literal method shorthand inside method bodies isn't
+        confused with class-level methods because of the depth-tracking
+        (object literals are at depth>=2 inside any method).
+      - Multi-line strings / template literals with unbalanced braces
+        may confuse depth tracking — inherits the same constraint as
+        ``_extract_balanced_block``. Rare in practice; callers degrade
+        gracefully (under-count by 1-2 methods at worst).
+      - Decorators (``@decorator``) on a method line are skipped (the
+        pattern starts at the method name itself).
+
+    Language coverage: works for both JavaScript (``.js``, ``.mjs``,
+    ``.jsx``) and TypeScript (``.ts``, ``.tsx``) — TS class syntax is
+    a strict superset (adds type annotations on params + return types)
+    and our pattern ignores those by matching only up to the opening
+    paren.
+    """
+    # Find every class header whose name matches class_name exactly.
+    # Optional `export` / `export default` prefix; optional `extends Base`.
+    # The class name capture group is constrained to NOT be followed by
+    # any identifier character so e.g. searching for "Foo" doesn't match
+    # `class FooBar`.
+    escaped = re.escape(class_name)
+    class_pattern = re.compile(
+        r"(?:export\s+(?:default\s+)?)?"
+        rf"class\s+{escaped}\b"
+        r"(?:\s+extends\s+[\w.]+)?"
+        r"\s*\{",
+        re.MULTILINE,
+    )
+
+    # Inner method-shorthand patterns. Matched anchored at the start of
+    # the candidate position; collectively cover the JS class method
+    # shapes documented above. Each variant captures the method name in
+    # group 1.
+    #
+    # Order matters for the alternation: we test specific (longer)
+    # prefixes first so "static async foo" matches as static-async, not
+    # static + "async" (would attribute the wrong name).
+    method_patterns = [
+        # static async generator: `static async *name(...)`
+        re.compile(r"static\s+async\s+\*\s*([#\w]+)\s*\("),
+        # static generator: `static *name(...)`
+        re.compile(r"static\s+\*\s*([#\w]+)\s*\("),
+        # static async: `static async name(...)`
+        re.compile(r"static\s+async\s+([#\w]+)\s*\("),
+        # static get/set: `static get name()` / `static set name(v)`
+        re.compile(r"static\s+(?:get|set)\s+([#\w]+)\s*\("),
+        # plain static: `static name(...)`
+        re.compile(r"static\s+([#\w]+)\s*\("),
+        # async generator: `async *name(...)`
+        re.compile(r"async\s+\*\s*([#\w]+)\s*\("),
+        # async: `async name(...)`
+        re.compile(r"async\s+([#\w]+)\s*\("),
+        # generator: `*name(...)`
+        re.compile(r"\*\s*([#\w]+)\s*\("),
+        # get/set: `get name()` / `set name(v)`
+        re.compile(r"(?:get|set)\s+([#\w]+)\s*\("),
+        # plain shorthand: `name(...)` — must be tested LAST since it
+        # would otherwise eat any of the prefixed forms.
+        re.compile(r"([#\w]+)\s*\("),
+    ]
+
+    # Keywords that match the plain shorthand pattern but are NOT methods.
+    # `constructor` is INTENTIONALLY NOT in this list — it IS a method.
+    keyword_skip = {
+        "if", "else", "while", "for", "switch", "return",
+        "class", "new", "catch", "throw", "do", "try",
+        "function", "yield", "await", "void", "typeof",
+        "instanceof", "in", "of", "case", "break",
+        "continue", "delete", "var", "let", "const",
+    }
+
+    methods: List[str] = []
+    seen: set = set()
+
+    for m in class_pattern.finditer(content_clean):
+        # Locate the opening brace position (the regex anchors on it).
+        class_open_pos = m.end() - 1  # position of `{`
+        class_open_line = content_clean[:class_open_pos].count("\n") + 1
+        class_close_line = _extract_balanced_block(
+            source_lines, class_open_line, max_lookahead=800
+        )
+        block_start_pos = class_open_pos + 1  # skip `{`
+
+        # Find char-offset for class_close_line in content_clean. Same
+        # newline-counting walker as _rust_methods_for_struct uses.
+        target_newlines = class_close_line - class_open_line
+        if target_newlines <= 0:
+            continue
+        seen_newlines = 0
+        block_end_pos = block_start_pos
+        while seen_newlines < target_newlines and block_end_pos < len(content_clean):
+            if content_clean[block_end_pos] == "\n":
+                seen_newlines += 1
+            block_end_pos += 1
+        class_body_text = content_clean[block_start_pos:block_end_pos]
+
+        # Walk the class body char-by-char tracking brace depth so we
+        # only look for method declarations at depth 0 of the class
+        # body (which is depth 1 of the file's brace nesting).
+        # Method bodies/blocks at depth >=1 are skipped — this prevents
+        # nested function-call statements like `cb(arg) { ... }`
+        # inside a method body from being miscounted as class methods.
+        depth = 0
+        i = 0
+        n = len(class_body_text)
+        while i < n:
+            ch = class_body_text[i]
+            if ch == "{":
+                depth += 1
+                i += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                i += 1
+                continue
+            # Skip strings (single-line only, mirroring the existing
+            # content_clean comment-strip pre-pass which removed line +
+            # block comments — backtick-delimited template literals
+            # remain in content_clean and can throw off depth tracking
+            # if they contain unescaped braces, but that's an inherited
+            # constraint from V52-O.11.E).
+            if ch in ('"', "'"):
+                quote = ch
+                i += 1
+                while i < n and class_body_text[i] != quote:
+                    if class_body_text[i] == "\\" and i + 1 < n:
+                        i += 2
+                        continue
+                    i += 1
+                i += 1  # skip the closing quote
+                continue
+            if ch == "`":
+                # Template literal — skip naively to matching backtick.
+                i += 1
+                while i < n and class_body_text[i] != "`":
+                    if class_body_text[i] == "\\" and i + 1 < n:
+                        i += 2
+                        continue
+                    i += 1
+                i += 1
+                continue
+            if depth != 0:
+                i += 1
+                continue
+            # At depth 0 of class body — try every method pattern at
+            # this position. Use match() (anchored) on the substring
+            # from i so we don't have to write start anchors in each
+            # regex.
+            matched = False
+            substr = class_body_text[i:]
+            for mp in method_patterns:
+                pm = mp.match(substr)
+                if not pm:
+                    continue
+                name = pm.group(1)
+                # Filter out reserved keywords that look like methods.
+                # (`constructor` deliberately preserved.)
+                if name in keyword_skip:
+                    break  # don't try lower-priority patterns; this is a keyword
+                if name in seen:
+                    matched = True
+                    i += pm.end()
+                    break
+                seen.add(name)
+                methods.append(name)
+                matched = True
+                # Advance past the matched prefix so we don't re-match
+                # the same method header from a substring position.
+                i += pm.end()
+                break
+            if matched:
+                continue
+            i += 1
+
+    return methods
+
+
+def _java_methods_for_class(
+    content_clean: str,
+    class_name: str,
+    source_lines: List[str],
+) -> List[str]:
+    """V52-O.11.F.2-JAVA (v0.2.52, 2026-06-09): extract methods declared
+    inside the body of ``class <class_name> { ... }`` (or interface/enum
+    with the same name).
+
+    Replaces the pre-V52-O.11.F.2 line that ran
+    ``method_pattern.finditer(content_clean)`` unconditionally inside the
+    per-class loop — that attributed EVERY method in the file to EVERY
+    class. Same antipattern as the Rust bug fixed in V52-O.11.F; audit
+    a79152 flagged it across Rust, Go, JS/TS, Java, and C# parsers.
+
+    Java's method-scoping model is lexical (like JS): methods are declared
+    inside the class braces themselves. So we:
+
+      1. Find the ``class <class_name>`` declaration line (handling
+         optional generics on the class, ``extends Parent``, ``implements
+         Iface1, Iface2`` clauses).
+      2. Use the existing ``_extract_balanced_block`` helper to find the
+         matching close brace (V52-O.11.E, brace-balanced).
+      3. Slice the class body. Strip nested class/interface/enum blocks
+         from the body so methods declared in inner classes don't leak
+         into the outer class's method list.
+      4. Scan the stripped body for method declarations and collect names.
+
+    Bug #2 — package-private capture (audit a79152):
+      The pre-V52-O.11.F.2 method regex used ``(?:modifiers|\\s)+`` with
+      a ``+`` quantifier, requiring AT LEAST ONE modifier keyword (or
+      whitespace). Package-private methods (no visibility modifier,
+      common in Java for package-scoped helpers) were silently missed.
+      This helper's inner method pattern uses ``*`` instead, making the
+      modifier section optional.
+
+    Java method signature shape::
+
+        [modifiers] [<generics>] return_type method_name(args) [throws ...] {
+
+    Modifiers handled: public, private, protected, static, final,
+    abstract, synchronized, native, default, strictfp. ``@Annotation``
+    lines preceding a method are stripped from the per-line scrub by
+    ``_scrub_for_brace_balance`` indirectly (the regex is anchored on the
+    method-shape tail, so annotation lines simply don't match).
+
+    Returns deduplicated list of method names, preserving first-seen
+    order. Returns empty list if no class with that name is found, or if
+    the class has no methods.
+
+    Excludes:
+      - Control-flow keywords that look like method calls (``if``,
+        ``while``, ``for``, ``switch``, ``catch``, ``try``, ``else``,
+        ``return``, ``synchronized`` as a statement).
+      - Constructors (no return type — the regex requires at least one
+        return-type token before the method name, matching the pre-fix
+        behavior at line 3675).
+      - Methods declared in nested classes (stripped before scanning).
+
+    Limitations:
+      - Doesn't handle multiple classes with the same name in different
+        scopes (extremely rare in Java — only legal in nested-class
+        scope, and the nested-class stripping handles the common case).
+      - Multi-line generic type parameters (``Map<String,\\nList<...>>``
+        on a method return type) may confuse the line-anchored regex;
+        these are uncommon.
+    """
+    escaped = re.escape(class_name)
+    # `class|interface|enum` declaration with optional generics on the
+    # class, optional `extends`, optional `implements`. Anchor on `{` so
+    # m.end() points to the position of the opening brace + 1.
+    #
+    # Generics handling: Java supports nested generics on the class
+    # decl (`class Service<T extends Comparable<T>>`). A simple
+    # `<[^>]*>` would fail because it stops at the first `>`. We accept
+    # one level of nesting via `<[^<>]*(?:<[^<>]*>[^<>]*)*>` which
+    # matches outermost-balanced generic blocks. Two+ levels of nesting
+    # (e.g. `Map<String, List<Map<K,V>>>` as a TYPE PARAMETER bound) is
+    # rare in class-decl position and falls back to the legacy
+    # behavior — methods would simply be missed for those exotic
+    # declarations.
+    _GENERIC_BLOCK = r"<[^<>]*(?:<[^<>]*>[^<>]*)*>"
+    class_decl_pattern = re.compile(
+        # `class` | `interface` | `enum` keyword
+        r"\b(?:class|interface|enum)"
+        # Whitespace + the target class name (escaped)
+        rf"\s+{escaped}"
+        # Optional generic parameters on the class declaration (allows
+        # one level of nested generics).
+        rf"(?:\s*{_GENERIC_BLOCK})?"
+        # Optional `extends Parent` clause (Parent may be generic)
+        r"(?:\s+extends\s+[\w.<>,\s]+?)?"
+        # Optional `implements Iface1, Iface2<T>` clause
+        r"(?:\s+implements\s+[\w.<>,\s]+?)?"
+        # Whitespace + opening brace
+        r"\s*\{",
+        re.MULTILINE,
+    )
+
+    # Inner method pattern. Modifiers section is OPTIONAL (`*` not `+`)
+    # so package-private methods are captured. After the optional
+    # modifiers/annotations section we require:
+    #   - optional method-level generics: <T>, <T extends Foo>
+    #   - return type token(s) (1+ — excludes constructors)
+    #   - method name (captured)
+    #   - argument list (captured for parity with line-3694 functions)
+    #   - optional `throws Foo, Bar`
+    #   - opening brace
+    method_pattern_inner = re.compile(
+        # Optional modifiers / annotations / whitespace prefix. Note this
+        # is OPTIONAL — package-private methods have no modifier.
+        r"(?:(?:public|private|protected|static|final|synchronized|"
+        r"native|abstract|default|strictfp)\s+)*"
+        # Optional method-level generic parameters: `<T>`, `<T extends Foo>`,
+        # `<K, V>`. Greedy on the inside.
+        r"(?:<[^>]*>\s+)?"
+        # Return-type token(s). Requires at least one — this is what
+        # excludes constructors (which have no return type). Generics +
+        # array brackets allowed.
+        r"(?:[\w<>\[\],\s]+\s+)"
+        # Method name
+        r"([\w]+)\s*"
+        # Argument list
+        r"\(([^)]*)\)\s*"
+        # Optional throws clause
+        r"(?:throws\s+[\w.,\s]+)?\s*"
+        # Opening brace (method body — `;` for abstract/interface is
+        # excluded here; abstract methods are intentionally captured only
+        # when they have a body).
+        r"\{",
+        re.MULTILINE,
+    )
+
+    methods: List[str] = []
+    seen: set = set()
+    for m in class_decl_pattern.finditer(content_clean):
+        # m.end() is just past the `{`. Find the matching close.
+        class_open_pos = m.end() - 1  # position of `{`
+        class_open_line = content_clean[:class_open_pos].count("\n") + 1
+        class_close_line = _extract_balanced_block(
+            source_lines, class_open_line, max_lookahead=2000
+        )
+        target_newlines = class_close_line - class_open_line
+        if target_newlines <= 0:
+            continue
+        # Find the byte offset for the close line by counting newlines.
+        block_start_pos = class_open_pos + 1
+        seen_newlines = 0
+        block_end_pos = block_start_pos
+        while seen_newlines < target_newlines and block_end_pos < len(content_clean):
+            if content_clean[block_end_pos] == "\n":
+                seen_newlines += 1
+            block_end_pos += 1
+        class_body = content_clean[block_start_pos:block_end_pos]
+
+        # Strip nested class/interface/enum blocks so their methods don't
+        # leak into the outer class. We iteratively find every nested
+        # declaration and excise its balanced body.
+        stripped_body = _strip_nested_java_classes(class_body)
+
+        for fm in method_pattern_inner.finditer(stripped_body):
+            name = fm.group(1)
+            # Skip control-flow keywords that pattern-match like methods.
+            if name in (
+                "if", "while", "for", "switch", "catch", "try", "else",
+                "return", "synchronized", "do", "throw",
+            ):
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            methods.append(name)
+    return methods
+
+
+def _strip_nested_java_classes(body: str) -> str:
+    """Remove nested ``class|interface|enum <Name> { ... }`` blocks from
+    ``body`` so methods declared in inner classes don't leak into the
+    outer class's method list.
+
+    Iteratively scans ``body`` for nested class/interface/enum
+    declarations. For each match, walks the body character-by-character
+    counting braces (with a small string-literal state machine to skip
+    braces inside Java string/char literals) to find the matching close
+    brace, then excises the entire nested span (from the ``class``
+    keyword through the closing ``}``) replacing it with a single space.
+
+    The caller (``_java_methods_for_class``) passes ``content_clean``
+    where line + block comments are already stripped, so only string
+    literals can confuse the brace counter — handled by the state machine.
+
+    Returns the body with each nested block excised. The outer-class
+    method scan operates on the result.
+    """
+    _GENERIC_BLOCK = r"<[^<>]*(?:<[^<>]*>[^<>]*)*>"
+    nested_decl_pattern = re.compile(
+        r"\b(?:class|interface|enum)\s+\w+"
+        rf"(?:\s*{_GENERIC_BLOCK})?"
+        r"(?:\s+extends\s+[\w.<>,\s]+?)?"
+        r"(?:\s+implements\s+[\w.<>,\s]+?)?"
+        r"\s*\{",
+    )
+    out_parts: List[str] = []
+    cursor = 0
+    body_len = len(body)
+    while cursor < body_len:
+        m = nested_decl_pattern.search(body, cursor)
+        if not m:
+            out_parts.append(body[cursor:])
+            break
+        decl_start = m.start()
+        decl_open_brace_pos = m.end() - 1  # position of `{`
+        out_parts.append(body[cursor:decl_start])
+        close_pos = _find_matching_brace(body, decl_open_brace_pos)
+        if close_pos < 0:
+            # Unbalanced — append the rest verbatim and stop.
+            out_parts.append(body[decl_start:])
+            cursor = body_len
+            break
+        # Replace the nested span with a single space.
+        out_parts.append(" ")
+        cursor = close_pos + 1
+    return "".join(out_parts)
+
+
+def _find_matching_brace(s: str, open_pos: int) -> int:
+    """Return the position of the brace that matches the ``{`` at
+    ``open_pos``, or -1 if unbalanced.
+
+    Uses a per-character state machine that skips braces inside Java
+    string literals (``"..."``) and char literals (``'...'``). Assumes
+    comments have already been stripped by the caller (the Java parser
+    does this before calling ``_java_methods_for_class``).
+    """
+    if open_pos >= len(s) or s[open_pos] != "{":
+        return -1
+    counter = 0
+    in_string: Optional[str] = None  # which quote char opened
+    i = open_pos
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_string:
+            if ch == "\\" and i + 1 < n:
+                # Escaped char — skip both.
+                i += 2
+                continue
+            if ch == in_string:
+                in_string = None
+            i += 1
+            continue
+        if ch == '"' or ch == "'":
+            in_string = ch
+            i += 1
+            continue
+        if ch == "{":
+            counter += 1
+        elif ch == "}":
+            counter -= 1
+            if counter == 0:
+                return i
+        i += 1
+    return -1
+
+
+
+
+def _csharp_methods_for_class(
+    content_clean: str,
+    class_name: str,
+    source_lines: List[str],
+) -> List[str]:
+    """V52-O.11.F.2-CSHARP (v0.2.52, 2026-06-09): extract methods declared
+    inside the lexical body of a C# ``class``, ``struct``, ``record``, or
+    ``interface`` named ``class_name``.
+
+    Replaces the pre-V52-O.11.F.2-CSHARP line at ``analyze_code_graph.py:2540``
+    that ran ``method_pattern.finditer(content_clean)`` unconditionally —
+    the same bug Rust V52-O.11.F closed, applied to the C# parser. Audit
+    a79152 confirmed: a 50-method file with 3 classes produced 150
+    incorrect method attributions per the
+    ``query_code_structure(methods, ClassName)`` MCP path.
+
+    C# method-scoping model (lexical, like Java):
+
+      Methods live between a type's opening ``{`` and its matching close.
+      Unlike Rust there is no separate ``impl`` block — declarations are
+      lexically inside the class body. Same shape as Java, but with C#
+      specifics:
+        * Modifiers: ``public``, ``private``, ``protected``, ``internal``,
+          ``protected internal``, ``private protected``, ``static``,
+          ``virtual``, ``override``, ``sealed``, ``abstract``, ``async``,
+          ``extern``, ``partial``, ``unsafe``, ``readonly`` (on structs).
+        * Properties (``public int Foo { get; set; }``) — we INCLUDE the
+          property name in the methods list. Rationale: mirrors how the
+          Python parser counts ``@property`` decorated members, and the
+          underlying ``get_Foo`` / ``set_Foo`` are real methods at the
+          CLR level. The task brief calls this out explicitly.
+        * Indexers (``public T this[int i] { get; set; }``) — surfaced
+          as ``Item`` per the CLR property convention (``get_Item`` /
+          ``set_Item``).
+        * Records: ``record Foo(int X, int Y)`` — the positional
+          parameters generate auto-property accessors. We do NOT try to
+          extract those from the primary-constructor signature; only
+          explicit declarations inside the record body land in methods.
+        * Async methods (``async Task<T> Foo()``) — picked up.
+        * Generic methods (``T Method<U>(U arg)``) — picked up.
+        * Partial classes (``partial class Foo { ... } partial class Foo
+          { ... }``) — every matching declaration's body contributes; the
+          union is returned (mirrors Rust's multi-``impl`` behavior).
+
+    Algorithm:
+
+      1. Locate every class/struct/record/interface declaration whose
+         name matches ``class_name``. Multiple declarations are allowed
+         (partial classes). The class header regex tolerates the same
+         modifier mix as the parser's outer ``class_pattern`` plus an
+         optional inheritance clause (``: BaseClass, IInterface``).
+      2. For each match, use ``_extract_balanced_block`` to find the
+         body's closing brace (already brace-balanced via V52-O.11.E).
+      3. Scan the body text (sliced from ``content_clean``, NOT
+         ``source_lines`` — keeps the same comment-stripped surface the
+         old per-file regex used) for:
+            a. Method declarations: ``[modifiers] [returntype] Name(args) {`` or
+               ``[modifiers] [returntype] Name(args) =>`` (expression-bodied)
+               or ``[modifiers] [returntype] Name(args);`` (abstract /
+               interface).
+            b. Property declarations: ``[modifiers] [type] Name { get; set; }``
+               (no parens after the name) — the body starts directly with
+               ``{`` containing ``get``/``set``.
+            c. Indexer declarations: ``[modifiers] [type] this[...] {`` —
+               normalized to the literal ``Item``.
+      4. Filter out C# keywords that the method-regex could otherwise
+         hit (``if``, ``while``, ``for``, ``foreach``, ``switch``, ``try``,
+         ``catch``, ``return``, ``new``, ``throw``, ``using``, ``lock``,
+         ``yield``).
+      5. Return deduplicated list, preserving first-seen order.
+
+    Returns empty list if no class/struct/record/interface body matches
+    ``class_name`` — common when ``class_name`` was extracted from a
+    forward-declaration or a partial class whose other halves live in
+    different files.
+
+    Limitations:
+      * Constructors are extracted as methods (their "name" matches the
+        class name). The existing Java/JS parsers behave the same way;
+        the embedding pipeline doesn't distinguish.
+      * Static constructors (``static Foo() { ... }``) are also captured.
+      * Operator overloads (``public static Foo operator+(Foo a, Foo b)``)
+        are NOT captured — the name after ``operator`` isn't a valid
+        identifier. This matches the upstream parser's behavior.
+      * Nested types inside the class body are correctly scoped via
+        brace-balance: members of nested types fall inside the outer
+        class's braces but ALSO inside the nested type's own braces, so
+        we'd double-count them if not careful. We handle this by
+        recognizing that the nested type's header itself doesn't match
+        the method pattern, but its INNER members do — so a nested class
+        ``Inner`` inside ``Outer`` would leak ``Inner``'s members into
+        ``Outer``'s methods. We accept this minor over-count for now
+        (matches Java's behavior); a tree-sitter rewrite is the right
+        fix (queued as V52-O.11.G).
+      * Doesn't follow ``partial`` declarations across files (each file
+        is parsed independently — same as Java's package-private split).
+    """
+    escaped = re.escape(class_name)
+    # Class/struct/record/interface header. Modifiers + keyword + name +
+    # optional generics + optional inheritance + opening brace. The name
+    # capture is anchored by the `escaped` literal so we only match THE
+    # target class (not other classes that happen to start with the same
+    # prefix).
+    #
+    # Why not reuse the parser's outer `class_pattern`? That one captures
+    # the name into group(1) for class-info population. Here we need to
+    # gate on a SPECIFIC name and find the body opener — a different shape.
+    class_header_pattern = re.compile(
+        # Optional modifiers (zero or more, repeated). C# allows any order.
+        r"(?:(?:public|private|protected|internal|abstract|sealed|partial|"
+        r"static|unsafe|readonly|ref)\s+)*"
+        # Keyword introducing the type
+        r"(?:class|struct|record|interface)\s+"
+        # The target name (exact match — escaped). Trailing word boundary
+        # prevents `Stress` from matching `Stress2` (a strict-prefix
+        # superset name). Critical: without `\b` the regex matches BOTH
+        # the literal name AND any longer name starting with it, causing
+        # body extraction to fall through to the next class's brace.
+        rf"{escaped}\b"
+        # Optional generic parameters: <T>, <T, U>, <T : IFoo>
+        r"(?:\s*<[^>]*>)?"
+        # Optional primary-constructor parameter list (record Foo(int X, int Y))
+        r"(?:\s*\([^)]*\))?"
+        # Optional pre-body trailer: covers BOTH the inheritance clause
+        # (`: Base, IFoo<T>`) AND the generic constraints (`where T : new()`).
+        # We accept any sequence of non-`{` chars; the `where` clause's
+        # own `()` and `<>` are safely consumed because the only stopping
+        # condition is the opening brace. This single permissive trailer
+        # handles all of:
+        #     class Foo : Base { ... }
+        #     class Foo<T> where T : new() { ... }
+        #     class Foo<T> : Base where T : new() { ... }
+        #     class Foo<T, U> where T : class where U : struct, new() { ... }
+        r"[^{]*"
+        # Opening brace
+        r"\{",
+        re.MULTILINE,
+    )
+
+    # Inner method/property/indexer pattern. Three shapes packed into one
+    # alternation so a single pass over the class body collects all three.
+    #
+    # Strategy:
+    #   * Anchor on start-of-line (re.MULTILINE + `^[ \t]*`) — declarations
+    #     in C# are always on their own line, statements inside methods
+    #     are indented further or follow other statements.
+    #   * Modifiers are OPTIONAL because (a) interface members have no
+    #     explicit modifier prior to C# 8 default-interface-methods, and
+    #     (b) struct members can also be implicit-private.
+    #   * To compensate for optional modifiers, we filter out matches whose
+    #     captured name is a C# control-flow keyword (`if`, `return`,
+    #     `new`, etc.) — that catches the common false-positive shapes
+    #     like `return new U();` and `where U : T, new()`.
+    #   * We also filter out matches where the supposed return type IS
+    #     itself a control-flow keyword (`return`, `throw`, etc.) — that
+    #     filters `return new U();` more aggressively.
+    #
+    # Shape M (method):
+    #   ^[ws] [modifier]* [returntype] Name(args) ( { | => | ; )
+    # Shape P (property):
+    #   ^[ws] [modifier]* [type] Name { get ...|set ...|init ... }
+    # Shape I (indexer):
+    #   ^[ws] [modifier]* [type] this[args] {
+    method_modifier_alt = (
+        r"(?:public|private|protected|internal|static|virtual|override|"
+        r"async|abstract|sealed|extern|partial|new|unsafe|readonly)"
+    )
+    # Zero or more modifier tokens (with whitespace between). Optional
+    # so interface methods (no modifier) and implicit-private members
+    # still match. We compensate via the keyword filter below.
+    method_modifiers_opt = rf"(?:{method_modifier_alt}\s+)*"
+    # Compact type pattern — matches type-shaped tokens like:
+    #   T, int, string, Task, Task<int>, IList<T>, T[], int?, Dictionary<K,V>,
+    #   IList<KeyValuePair<string, object>>  (nested generics)
+    # The `\w` alternative handles single-letter generic params; the
+    # longer alternative handles compound generics.
+    #
+    # CRITICAL: type_shape MUST NOT allow whitespace at the top level,
+    # only inside angle brackets. Otherwise `return new U(` matches with
+    # type_shape spanning `return new` (taking the whitespace) and name
+    # being `U` — false positive. We allow whitespace only via nested
+    # generic groups that swallow arbitrary text including commas/spaces.
+    #
+    # Nested generics: Python regex doesn't support true recursion, but we
+    # can hand-roll a 3-level nested-generic pattern that covers all
+    # practical cases. Format builds bottom-up:
+    #   level0: <...> with no nested angles
+    #   level1: <... level0 ...> — one level of nesting
+    #   level2: <... level1 ...> — two levels of nesting (e.g.
+    #     IList<KeyValuePair<string, object>>)
+    #   level3: <... level2 ...> — three levels (e.g.
+    #     Task<Dictionary<int, List<string>>>)
+    # A 4th level (Task<Dictionary<int, List<Dictionary<...>>>>) is
+    # exceedingly rare and falls back to graceful failure (method not
+    # captured; doesn't break the parser).
+    _ang_lvl0 = r"<[^<>]*>"
+    _ang_lvl1 = rf"<(?:[^<>]|{_ang_lvl0})*>"
+    _ang_lvl2 = rf"<(?:[^<>]|{_ang_lvl1})*>"
+    _generic_block = _ang_lvl2
+    type_shape = (
+        # First char: word or dot
+        r"[\w.]"
+        # Then any mix of:
+        #   * word/dot/?/[]
+        #   * nested generic block (covers up to 2 levels of nesting)
+        rf"(?:[\w.\[\]\?]|{_generic_block})*"
+    )
+    method_decl = re.compile(
+        r"^[ \t]*"
+        + method_modifiers_opt
+        # Return type
+        + type_shape + r"\s+"
+        # Method name (captured)
+        + r"([\w]+)"
+        # Optional generic type parameters on the method
+        + r"(?:\s*<[^>]*>)?"
+        # Argument paren (anchor)
+        + r"\s*\(",
+        re.MULTILINE,
+    )
+    property_decl = re.compile(
+        r"^[ \t]*"
+        + method_modifiers_opt
+        # Return type
+        + type_shape + r"\s+"
+        # Property name (captured) followed by `{` (NOT `(`)
+        + r"([\w]+)\s*\{"
+        # Lookahead for accessor keyword to confirm this is a property
+        + r"(?=\s*(?:[\[\w]|//|/\*)*\s*(?:get|set|init)\b)",
+        re.MULTILINE,
+    )
+    indexer_decl = re.compile(
+        r"^[ \t]*"
+        + method_modifiers_opt
+        + type_shape + r"\s+"
+        + r"(this)\s*\[[^\]]*\]\s*\{",
+        re.MULTILINE,
+    )
+
+    # Tokens that look like an identifier in capture position but are
+    # actually C# control-flow keywords. Filter these out.
+    _CSHARP_KW_FILTER = {
+        "if", "else", "while", "for", "foreach", "switch", "try", "catch",
+        "finally", "return", "new", "throw", "using", "lock", "yield",
+        "do", "break", "continue", "goto", "case", "default", "checked",
+        "unchecked", "fixed", "stackalloc", "await", "is", "as", "in",
+        "out", "ref", "params", "where", "when", "var", "true", "false",
+        "null", "this", "base", "typeof", "sizeof", "nameof",
+    }
+
+    methods: List[str] = []
+    seen: set = set()
+    for hdr in class_header_pattern.finditer(content_clean):
+        # Locate the opening brace position (regex anchors on it).
+        # hdr.end() is one past `{`; the brace itself is at end()-1.
+        body_open_pos = hdr.end() - 1
+        body_open_line = content_clean[:body_open_pos].count("\n") + 1
+        body_close_line = _extract_balanced_block(
+            source_lines, body_open_line, max_lookahead=800
+        )
+        # Convert close-line back to a char offset in content_clean by
+        # counting newlines from body_open_pos onward.
+        target_newlines = body_close_line - body_open_line
+        if target_newlines <= 0:
+            continue
+        block_start_pos = body_open_pos + 1  # skip the `{`
+        seen_newlines = 0
+        block_end_pos = block_start_pos
+        while seen_newlines < target_newlines and block_end_pos < len(content_clean):
+            if content_clean[block_end_pos] == "\n":
+                seen_newlines += 1
+            block_end_pos += 1
+        body = content_clean[block_start_pos:block_end_pos]
+
+        # Indexers FIRST — the indexer regex captures the literal `this`
+        # which we map to `Item`. Doing this before the method regex
+        # avoids the method regex over-matching on `this(` constructor
+        # chains (rare, but defensive).
+        for im in indexer_decl.finditer(body):
+            if "Item" in seen:
+                continue
+            seen.add("Item")
+            methods.append("Item")
+
+        # Methods second.
+        for mm in method_decl.finditer(body):
+            name = mm.group(1)
+            if name in _CSHARP_KW_FILTER:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            methods.append(name)
+
+        # Properties third — the property regex is anchored on `{` with
+        # no preceding `(`, so it doesn't double-match methods.
+        for pm in property_decl.finditer(body):
+            name = pm.group(1)
+            if name in _CSHARP_KW_FILTER:
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            methods.append(name)
+
+    return methods
+
+
+
+
+def _strip_string_literals(content_clean: str) -> str:
+    """V52-O.11.I (v0.2.52, 2026-06-09): replace the *contents* of every
+    single-line single-quoted, double-quoted, and backtick-quoted string
+    with same-length whitespace so downstream regex scans don't match
+    against text that LOOKS like code but is actually string content.
+
+    Audit example: ``let s = "fn foo() {}";`` produces a false-positive
+    function row for a function named ``foo`` in the Rust/JS/Java/C#
+    parsers. The string-stripped version reads as
+    ``let s = "          ";`` and the regex correctly finds no ``fn`` to
+    match.
+
+    Line-number preservation: each stripped string is replaced with the
+    same number of bytes (padded with spaces, with newlines preserved as
+    newlines on the rare multi-line case where an escape sequence
+    happens to include one). This keeps downstream ``content[:m.start()]
+    .count('\\n') + 1`` line calculations correct.
+
+    Quote semantics:
+      - ``'..'`` and ``".."`` handle escape sequences (``\\"``, ``\\'``).
+      - Backtick-quoted (JS template literals) — single-line only,
+        no ``${}`` interpolation handling. A template literal containing
+        ``${expr}`` collapses to blanks too, which is correct (we want
+        to mask the literal text, not the embedded code).
+
+    Caller is expected to have already stripped comments. Multi-line
+    raw strings (Rust ``r#"..."#``, Python triple-quotes — those are
+    handled by ``_strip_triple_quoted``) are out of scope.
+
+    The implementation uses a single regex sweep instead of three passes
+    so overlapping quote characters inside another quote type don't
+    confuse the order-of-stripping (e.g. ``" 'embedded' "`` must NOT
+    re-trigger the single-quote pass after the double-quote pass).
+    """
+    # Combined alternation: try each quote type in turn. The regex engine
+    # picks the leftmost match each iteration, which is what we want.
+    pattern = re.compile(
+        r'"(?:\\.|[^"\\])*"'      # double-quoted (escape-aware)
+        r"|'(?:\\.|[^'\\])*'"     # single-quoted (escape-aware)
+        r"|`(?:\\.|[^`\\])*`",    # backtick (template literal)
+    )
+
+    def _blank(match: "re.Match[str]") -> str:
+        # Replace the matched string (inclusive of quotes) with spaces of
+        # the same length, but preserve any newlines inside (escape
+        # sequences like ``"\n"`` are written as a literal ``\``+``n`` in
+        # source, so they don't actually contain a newline — we still
+        # play it safe and preserve embedded newlines).
+        text = match.group(0)
+        return ''.join(ch if ch == '\n' else ' ' for ch in text)
+
+    return pattern.sub(_blank, content_clean)
+
+
+
+
+def _is_rust_test_fn(content: str, fn_offset: int) -> bool:
+    """V52-O.11.J (v0.2.52, 2026-06-09): return True if the Rust ``fn``
+    starting at ``content[fn_offset:]`` is gated by a ``#[cfg(test)]``,
+    ``#[test]``, or ``#[cfg(any(test, ...))]`` attribute on an
+    immediately-preceding line (test-only code, not production).
+
+    Pre-V52-O.11.J the Rust parser indexed every function the regex
+    matched into ``CodeFunction``, including unit-test helpers and
+    ``#[test]``-annotated test functions. That pollutes search results
+    (``query_code_structure(callers, ...)`` returns test fixtures), wastes
+    embedding budget, and conflates production behaviour with test
+    scaffolding. After V52-O.11.J the analyzer skips them.
+
+    Detection algorithm:
+      1. Walk backwards from ``fn_offset`` over whitespace and
+         line-continuation characters until we find the start of the line
+         that contains the ``fn`` keyword (the "fn line").
+      2. Walk backwards from the start of the fn line through one OR more
+         immediately-preceding lines that are EITHER blank OR start with
+         ``#[`` (Rust attributes). Stop at the first line that is neither.
+      3. Across all the attribute lines collected, look for ``cfg(test)``,
+         ``cfg(any(test``, ``cfg(all(test``, or bare ``[test]``.
+
+    Args:
+        content: The source (or content_no_strings — string-literal
+            content can't contain ``#[cfg(test)]`` because attributes
+            don't appear inside strings, so either input works).
+        fn_offset: Byte offset where the matched ``fn`` (or its prefix
+            modifier) starts.
+
+    Returns:
+        True if a test-gating attribute is found on a preceding attribute
+        line, False otherwise.
+    """
+    # Find start-of-line for the fn-offset.
+    line_start = content.rfind('\n', 0, fn_offset) + 1
+    # ``rfind`` returns -1 if no newline; +1 makes it 0 — correct for
+    # offset at very start of file.
+
+    # Walk backwards collecting preceding attribute lines.
+    # Each iteration: find the line PRECEDING ``line_start`` and check
+    # whether it's blank or an attribute. Stop at the first non-attribute
+    # non-blank line.
+    cursor = line_start
+    attr_lines: list[str] = []
+    # Cap the scan at 16 lines back to bound worst case (test fns rarely
+    # have more than 2-3 attribute lines).
+    for _ in range(16):
+        if cursor <= 0:
+            break
+        # ``cursor`` points at start of "current" line (which we've
+        # already classified or want to skip past). Find the line BEFORE
+        # this one.
+        # Previous newline ends the previous line.
+        prev_nl = content.rfind('\n', 0, cursor - 1)
+        prev_line_start = prev_nl + 1  # 0 if rfind returned -1
+        prev_line = content[prev_line_start: cursor - 1]
+        stripped = prev_line.strip()
+        if not stripped:
+            # Blank line — keep walking (Rust allows blank lines between
+            # attributes and the fn declaration, though it's unusual).
+            cursor = prev_line_start
+            continue
+        if stripped.startswith('#['):
+            attr_lines.append(stripped)
+            cursor = prev_line_start
+            continue
+        # Non-blank, non-attribute line: stop scanning.
+        break
+
+    # Inspect collected attribute lines for any test gate.
+    for attr in attr_lines:
+        # Normalise: collapse whitespace so ``#[ cfg ( test ) ]`` etc.
+        # all reduce to the same pattern.
+        compact = re.sub(r'\s+', '', attr)
+        # ``#[test]`` (bare test attribute)
+        if '#[test]' in compact:
+            return True
+        # ``#[cfg(test)]`` — direct test cfg
+        if '#[cfg(test)]' in compact:
+            return True
+        # ``#[cfg(any(test, ...))]`` and ``#[cfg(all(test, ...))]``
+        if '#[cfg(any(test,' in compact or '#[cfg(all(test,' in compact:
+            return True
+        # cfg(...) where test appears later in the predicate
+        if '#[cfg(' in compact and ('(test,' in compact or ',test)' in compact or ',test,' in compact):
+            return True
+
+    return False
+
+
 
 
 def _shape_for_insert(embedding: Optional[Any]) -> Optional[Any]:
@@ -1149,6 +2501,12 @@ class CodeGraphAnalyzer:
                         Property(name="secondary_layers", data_type=DataType.TEXT_ARRAY, description="Secondary architectural layers if class spans multiple", skip_vectorization=True),
                         # v0.2.47 (extras): source-root provenance (see CodeModule).
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
+                        # v0.2.52 (V52-O.4): repo-relative POSIX path of the
+                        # source file the class was extracted from. Mirrors the
+                        # `path` property on CodeModule so consumers can filter
+                        # / scope by file without joining through the `module`
+                        # reference. Empty for pre-V52-O.4 rows (graceful null).
+                        Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -1194,6 +2552,12 @@ class CodeGraphAnalyzer:
                         Property(name="call_names", data_type=DataType.TEXT_ARRAY, description="Names of called functions (for callers queries)", skip_vectorization=True),
                         # v0.2.47 (extras): source-root provenance (see CodeModule).
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
+                        # v0.2.52 (V52-O.4): repo-relative POSIX path of the
+                        # source file the function was extracted from. Mirrors
+                        # the `path` property on CodeModule so consumers can
+                        # filter / scope by file without joining through the
+                        # `module` reference. Empty for pre-V52-O.4 rows.
+                        Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -1316,7 +2680,12 @@ class CodeGraphAnalyzer:
         # exists on all 5 code collections so pre-v0.2.47 installs that picked
         # up the new analyzer pick up the property on the next analyze run.
         # Idempotent + soft-fail per collection.
-        self._ensure_project_source_property()
+
+        # v0.2.52 (V52-O.4) schema migration: ensure `file_path` property
+        # exists on CodeFunction + CodeClass so pre-V52-O.4 installs pick up
+        # the property on the next analyze run and `_dedup_insert` can stamp
+        # it. Idempotent + soft-fail per collection.
+        self._ensure_file_path_property()
 
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
@@ -1361,7 +2730,17 @@ class CodeGraphAnalyzer:
             — every call site that captures the return value (``func_uuid``,
             ``class_uuid``, ``module_uuid`` etc.) continues to work.
         """
-        det_uuid = _deterministic_uuid(self.project_name, file_path_rel, identity_key)
+        # v0.2.52 (V52-O.3): mix `_current_source` into the UUID seed so the
+        # SAME relative path under TWO different source roots (primary repo
+        # vs. an --extra-path value) produces TWO distinct UUIDs and both rows
+        # coexist instead of clobbering each other on `replace()`. Empty
+        # `_current_source` falls back to the v0.2.16 seed shape (no upgrade
+        # migration needed for primary-repo-only installs).
+        current_source_for_uuid = getattr(self, "_current_source", "")
+        det_uuid = _deterministic_uuid(
+            self.project_name, file_path_rel, identity_key,
+            project_source=current_source_for_uuid,
+        )
 
         # v0.2.18 (Plan C): stamp the canonical language ID on every insert
         # so the language-scoped prune filter can match each row. The
@@ -1391,6 +2770,22 @@ class CodeGraphAnalyzer:
             props = insert_params.get("properties")
             if isinstance(props, dict) and not props.get("project_source"):
                 props["project_source"] = current_source
+
+        # v0.2.52 (V52-O.4): stamp `file_path` on CodeFunction + CodeClass
+        # rows from the per-call `file_path_rel` argument so consumers can
+        # filter / scope by source file without joining through the `module`
+        # reference. Scope check via the collection name: only Function /
+        # Class get the property (CodeModule already has `path`; CodeAPI /
+        # CodeInteraction aren't file-anchored in the same way). Defensive:
+        # don't clobber if the caller pre-set the property; skip on empty
+        # `file_path_rel` so the property stays NULL rather than empty
+        # string for forward-compat / cross-reference paths.
+        if file_path_rel:
+            coll_name = getattr(collection, "name", "") or ""
+            if coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass"):
+                props = insert_params.get("properties")
+                if isinstance(props, dict) and not props.get("file_path"):
+                    props["file_path"] = file_path_rel
 
         # v0.2.16 docstring (above) claimed ``replace()`` is upsert.
         # weaviate-client v4.21 actually requires the object to PRE-EXIST
@@ -1503,23 +2898,25 @@ class CodeGraphAnalyzer:
                     f"Plan C language-property migration on {label} skipped: {e}"
                 )
 
-    def _ensure_project_source_property(self):
-        """v0.2.47 (extras) schema migration: add `project_source` to all 5
-        code collections so pre-v0.2.47 installs with existing data start
-        recording provenance on the next analyze run. The property is
-        nullable — pre-migration rows show NULL until they're touched by a
-        re-analyze. Idempotent + soft-fail per collection.
+
+    def _ensure_file_path_property(self):
+        """v0.2.52 (V52-O.4) schema migration: add `file_path` to CodeFunction
+        + CodeClass so consumers can filter / scope by source file without
+        joining through the `module` reference. The property mirrors
+        ``CodeModule.path``. Pre-V52-O.4 rows show NULL until they're touched
+        by a re-analyze. Idempotent + soft-fail per collection.
+
+        Only Function + Class get the new property; Module already has `path`,
+        and API / Interaction rows are not file-anchored in the same way
+        (an interaction row can cross multiple files).
         """
         collections = [
-            ("CodeModule",      self.modules_collection),
-            ("CodeClass",       self.classes_collection),
-            ("CodeFunction",    self.functions_collection),
-            ("CodeAPI",         self.apis_collection),
-            ("CodeInteraction", self.interactions_collection),
+            ("CodeFunction", self.functions_collection),
+            ("CodeClass",    self.classes_collection),
         ]
         desc = (
-            "Absolute path of the source root that produced this row "
-            "(primary repo OR extra-path)"
+            "Repo-relative POSIX path of the source file "
+            "(mirrors CodeModule.path)"
         )
         for label, coll in collections:
             if coll is None:
@@ -1527,20 +2924,20 @@ class CodeGraphAnalyzer:
             try:
                 config = coll.config.get()
                 existing_props = {p.name for p in config.properties}
-                if "project_source" in existing_props:
+                if "file_path" in existing_props:
                     continue
                 coll.config.add_property(
                     Property(
-                        name="project_source",
+                        name="file_path",
                         data_type=DataType.TEXT,
                         description=desc,
                         skip_vectorization=True,
                     )
                 )
-                print(f"   Added project_source property to {label} schema (v0.2.47)")
+                print(f"   Added file_path property to {label} schema (v0.2.52)")
             except Exception as e:
                 logger.debug(
-                    f"v0.2.47 project_source migration on {label} skipped: {e}"
+                    f"v0.2.52 file_path migration on {label} skipped: {e}"
                 )
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
@@ -2172,9 +3569,16 @@ class CodeGraphAnalyzer:
 
         # Classes
         for cname, start_line in class_info.items():
-            class_lines = source_lines[max(0, start_line - 1):min(start_line + 60, len(source_lines))]
+            _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 60)
+            class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
-            methods = [m.group(1) for m in method_pattern.finditer(content_clean)]
+            # V52-O.11.F.2-CSHARP (v0.2.52, 2026-06-09): scope `methods` to
+            # method declarations INSIDE `class <cname> { ... }` (also struct,
+            # record, interface). Pre-V52-O.11.F.2 this line ran
+            # `method_pattern.finditer(content_clean)` over the WHOLE file —
+            # attributing EVERY method to EVERY class. Same antipattern as
+            # V52-O.11.F (Rust). Audit a79152.
+            methods = _csharp_methods_for_class(content_clean, cname, source_lines)
             signature = f"class {cname}"
             embedding = embed_class(signature, class_body, methods=methods[:10], language="csharp")
             insert_params: Dict[str, Any] = {
@@ -2198,7 +3602,7 @@ class CodeGraphAnalyzer:
             if mname in ('if', 'while', 'for', 'foreach', 'switch', 'catch', 'try', 'return', 'new', 'throw'):
                 continue
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 50, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 50)
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             enclosing = next(
                 (c for c, cl in sorted(class_info.items(), key=lambda x: x[1], reverse=True)
@@ -2297,7 +3701,7 @@ class CodeGraphAnalyzer:
         for m in msg_pattern.finditer(content_clean):
             mname = m.group(1)
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 30, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
             class_body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             signature = f"message {mname}"
             embedding = generate_embedding(f"Proto message: {mname}\n{class_body[:400]}")
@@ -2363,7 +3767,7 @@ class CodeGraphAnalyzer:
         for m in msg_pattern.finditer(content_clean):
             mname = m.group(1)
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 30, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
             class_body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             signature = f"message {mname}"
             embedding = generate_embedding(f"Proto message: {mname}\n{class_body[:400]}")
@@ -2566,21 +3970,20 @@ class CodeGraphAnalyzer:
 
         # --- Store classes ---
         for cname, (start_line, base_class) in class_info.items():
-            # Extract methods defined inside the class body (rough heuristic: indented methods)
-            methods: List[str] = []
-            method_inside = re.compile(
-                rf'(?:async\s+)?([\w]+)\s*\([^)]*\)\s*\{{',
-                re.MULTILINE
-            )
-            # Grab lines from class start (rough: next 80 lines)
-            class_lines = source_lines[max(0, start_line - 1):min(start_line + 80, len(source_lines))]
+            _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 80)
+            class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
-            for mm in method_inside.finditer(class_body):
-                mname = mm.group(1)
-                # Skip keywords that match function-like syntax
-                if mname not in ('if', 'else', 'while', 'for', 'switch', 'return',
-                                 'class', 'new', 'catch', 'constructor'):
-                    methods.append(mname)
+            # V52-O.11.F.2-JS (v0.2.52, 2026-06-09): scope `methods` to
+            # method declarations inside this class's brace-balanced body
+            # (with full method-shape coverage: static, get/set, generators,
+            # private, async + combinations — plus depth-tracking that
+            # prevents nested call statements like `cb(x) { ... }` inside
+            # method bodies from being miscounted as class methods).
+            # Pre-V52-O.11.F.2-JS this inlined a `method_inside.finditer`
+            # over `class_body` with an under-covering pattern; the new
+            # helper mirrors the V52-O.11.F Rust pattern (parallel fix
+            # for JS/TS class method attribution).
+            methods = _js_methods_for_class(content_clean, cname, source_lines)
 
             signature = f"class {cname}"
             if base_class:
@@ -2609,7 +4012,7 @@ class CodeGraphAnalyzer:
 
         # --- Store functions ---
         for fname, start_line, is_async in func_matches:
-            end_line = min(start_line + 40, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{fname}"
             signature = f"{'async ' if is_async else ''}function {fname}()"
@@ -2820,7 +4223,13 @@ class CodeGraphAnalyzer:
                 f"function {class_name}.{mth}(...) end" for mth in methods
             )
             signature = f"{class_name} = {{}} -- Lua table class"
-            embedding = embed_class(signature, "", methods=methods, language="javascript")
+            # V52-O.11.H (v0.2.52, 2026-06-09): pass language="lua" — pre-
+            # V52-O.11.H this passed language="javascript", routing Lua
+            # embeddings through the JS code-path and mislabeling retrieval
+            # scores by language. Embeddings stay 2048-dim either way
+            # (model-agnostic), but downstream language-filtered retrieval
+            # (--language=lua scopes) was silently never matching.
+            embedding = embed_class(signature, "", methods=methods, language="lua")
 
             insert_params: Dict[str, Any] = {
                 "properties": {
@@ -2849,11 +4258,13 @@ class CodeGraphAnalyzer:
                 continue
 
             start_line = content[:m.start()].count('\n') + 1
-            end_line = min(start_line + 40, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
             body = '\n'.join(source_lines[start_line - 1:end_line])
 
             func_full_name = f"{file_path.stem}.{func_name}"
-            embedding = embed_function(f"function {func_name}({args_str})", body, language="javascript")
+            # V52-O.11.H (v0.2.52, 2026-06-09): see comment on the Lua class
+            # embed_class call above — same fix for the function path.
+            embedding = embed_function(f"function {func_name}({args_str})", body, language="lua")
 
             insert_params = {
                 "properties": {
@@ -2950,7 +4361,8 @@ class CodeGraphAnalyzer:
         for cname, start_line in class_info.items():
             methods = [m.group(2) for m in method_pattern.finditer(content_clean)
                        if m.group(1) == cname]
-            class_lines = source_lines[max(0, start_line - 1):min(start_line + 60, len(source_lines))]
+            _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 60)
+            class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
             signature = f"class {cname}"
             embedding = generate_embedding(
@@ -2975,7 +4387,7 @@ class CodeGraphAnalyzer:
         for m in method_pattern.finditer(content_clean):
             class_name, method_name, args_str = m.group(1), m.group(2), m.group(3)
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 50, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 50)
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{class_name}.{method_name}"
             signature = f"{class_name}::{method_name}({args_str})"
@@ -3066,10 +4478,21 @@ class CodeGraphAnalyzer:
 
         # Struct/interface entries
         for sname, start_line in struct_info.items():
-            class_lines = source_lines[max(0, start_line - 1):min(start_line + 40, len(source_lines))]
+            _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
+            class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
             signature = f"type {sname} struct/interface"
-            methods = [m.group(1) for m in func_pattern.finditer(content_clean)]
+            # V52-O.11.F.2-GO (v0.2.52, 2026-06-09): scope `methods` to
+            # functions whose receiver is `sname`. Pre-fix this line
+            # iterated func_pattern over the WHOLE file's content_clean,
+            # attributing EVERY fn (including receiver-less package-level
+            # functions and methods on OTHER structs) to EVERY struct —
+            # audit a79152 reproduced: a 50-fn file with 3 structs
+            # produced 150 incorrect method attributions, drowning real
+            # signal in the `query_code_structure(methods, StructName)`
+            # MCP path. Mirrors V52-O.11.F (Rust); Go uses receiver
+            # syntax instead of `impl` blocks (see helper docstring).
+            methods = _go_methods_for_struct(content_clean, sname, source_lines)
             embedding = embed_class(signature, class_body, language="go")
             insert_params: Dict[str, Any] = {
                 "properties": {
@@ -3092,7 +4515,7 @@ class CodeGraphAnalyzer:
             if fname[0].islower() and fname in ('if', 'for', 'switch', 'select'):
                 continue
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 40, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{pkg_name}.{fname}"
             signature = f"func {fname}({args_str})"
@@ -3149,8 +4572,21 @@ class CodeGraphAnalyzer:
             struct_info[name] = start_line
 
         # Functions: fn name(...)
+        # V52-O.11.G (v0.2.52, 2026-06-09): expand prefix regex to capture the
+        # full Rust modifier set — `pub`, `pub(crate)`, `pub(super)`,
+        # `pub(in path)`, `async`, `unsafe`, `const`, `extern "ABI"`,
+        # `default` — in any order, any combination. Pre-V52-O.11.G this
+        # regex only matched `pub` + `async`, silently dropping every
+        # `unsafe fn`, `const fn`, `extern "C" fn`, `pub(crate) fn`, and
+        # `default fn` in the codebase. Mirrors the modifier-set used in
+        # `_rust_methods_for_struct`'s inner method pattern (V52-O.11.F).
         func_pattern = re.compile(
-            r'(?:pub\s+)?(?:async\s+)?fn\s+([\w]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)',
+            # Zero or more modifier tokens, any order. Each token is one of:
+            #   pub | pub(crate) | pub(super) | pub(in path::to::mod)
+            #   async | unsafe | const | extern | extern "ABI" | default
+            r'(?:(?:pub(?:\s*\([^)]*\))?|async|unsafe|const|default'
+            r'|extern(?:\s+"[^"]*")?)\s+)*'
+            r'fn\s+([\w]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)',
             re.MULTILINE
         )
 
@@ -3179,10 +4615,19 @@ class CodeGraphAnalyzer:
         stats['modules'] = 1
 
         for sname, start_line in struct_info.items():
-            class_lines = source_lines[max(0, start_line - 1):min(start_line + 40, len(source_lines))]
+            _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
+            class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
             signature = f"struct/enum/trait {sname}"
-            methods = [m.group(1) for m in func_pattern.finditer(content_clean)]
+            # V52-O.11.F (v0.2.52, 2026-06-09): scope `methods` to functions
+            # declared INSIDE `impl <sname>` blocks (or `impl <Trait> for
+            # <sname>` blocks). Pre-V52-O.11.F this line iterated
+            # func_pattern over the WHOLE file's content_clean, attributing
+            # EVERY fn in the file to EVERY struct — audit a79152 reproduced:
+            # a 50-fn file with 3 structs produced 150 incorrect method
+            # attributions, drowning real signal in noise for the
+            # `query_code_structure(methods, StructName)` MCP path.
+            methods = _rust_methods_for_struct(content_clean, sname, source_lines)
             embedding = embed_class(signature, class_body, language="rust")
             insert_params: Dict[str, Any] = {
                 "properties": {
@@ -3201,9 +4646,16 @@ class CodeGraphAnalyzer:
 
         for m in func_pattern.finditer(content_clean):
             fname, args_str = m.group(1), m.group(2)
+            # V52-O.11.J (v0.2.52, 2026-06-09): skip functions gated by
+            # `#[cfg(test)]` / `#[test]` / `#[cfg(any(test, ...))]` /
+            # `#[cfg(all(test, ...))]` — test functions are not production
+            # code and indexing them confuses the offline trainer + bloats
+            # the CodeFunction collection. Audit a79152.
+            if _is_rust_test_fn(content_clean, m.start()):
+                continue
             is_async = bool(re.search(rf'async\s+fn\s+{re.escape(fname)}', content_clean))
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 40, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 40)
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{fname}"
             signature = f"fn {fname}({args_str})"
@@ -3294,9 +4746,17 @@ class CodeGraphAnalyzer:
         stats['modules'] = 1
 
         for cname, start_line in class_info.items():
-            class_lines = source_lines[max(0, start_line - 1):min(start_line + 60, len(source_lines))]
+            _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 60)
+            class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
-            methods = [m.group(1) for m in method_pattern.finditer(content_clean)]
+            # V52-O.11.F.2-JAVA (v0.2.52, 2026-06-09): scope `methods` to
+            # method declarations INSIDE `class <cname> { ... }` (or the
+            # matching interface/enum). Pre-V52-O.11.F.2 this line ran
+            # `method_pattern.finditer(content_clean)` unconditionally —
+            # that attributed EVERY method in the file to EVERY class.
+            # Same antipattern audit a79152 flagged in Rust, fixed there
+            # in V52-O.11.F. Java fix mirrors via `_java_methods_for_class`.
+            methods = _java_methods_for_class(content_clean, cname, source_lines)
             signature = f"class {cname}"
             embedding = embed_class(signature, class_body, methods=methods[:10], language="java")
             insert_params: Dict[str, Any] = {
@@ -3320,7 +4780,7 @@ class CodeGraphAnalyzer:
             if mname in ('if', 'while', 'for', 'switch', 'catch', 'try', 'else', 'return'):
                 continue
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 50, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 50)
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             # Find enclosing class
             enclosing = next(
@@ -3415,7 +4875,8 @@ class CodeGraphAnalyzer:
         stats['modules'] = 1
 
         for cname, start_line in class_info.items():
-            class_lines = source_lines[max(0, start_line - 1):min(start_line + 50, len(source_lines))]
+            _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 50)
+            class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
             methods = [m.group(1) for m in func_pattern.finditer(content_clean)]
             signature = f"class {cname}"
@@ -3439,7 +4900,7 @@ class CodeGraphAnalyzer:
             fname = m.group(1)
             args_str = m.group(2) or ''
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 30, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             enclosing = next(
                 (c for c, cl in sorted(class_info.items(), key=lambda x: x[1], reverse=True)
@@ -3521,7 +4982,7 @@ class CodeGraphAnalyzer:
             if not fname:
                 continue
             start_line = content_clean[:m.start()].count('\n') + 1
-            end_line = min(start_line + 30, len(source_lines))
+            end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 30)
             body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
             full_name = f"{file_path.stem}.{fname}"
             signature = f"{fname}()"

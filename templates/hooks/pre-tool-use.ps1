@@ -40,6 +40,13 @@ $ToolName = ""
 $ToolArgs = ""
 $UserMessage = ""
 $SessionIdFromStdin = ""
+# V52-L.2 Fix 1: parse subagent identity from stdin payload. Per A5
+# audit, PreToolUse hooks DO fire for subagent tool calls and the
+# payload carries agent_id + agent_type so handlers can differentiate.
+# Empty string when absent (parent context) — TOUCAN consumers expect
+# the field to always be present.
+$AgentId = ""
+$AgentType = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
@@ -47,6 +54,8 @@ try {
         if ($payload.tool_input)   { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
         if ($payload.user_message) { $UserMessage = [string]$payload.user_message }
         if ($payload.session_id)   { $SessionIdFromStdin = [string]$payload.session_id }
+        if ($payload.agent_id)     { $AgentId = [string]$payload.agent_id }
+        if ($payload.agent_type)   { $AgentType = [string]$payload.agent_type }
     }
 } catch {
     # Empty/malformed stdin — keep variables at defaults
@@ -126,6 +135,12 @@ $entry = [ordered]@{
     query       = $UserMessage
     chosen_tool = $ToolName
     tool_args   = $toolArgsVal
+    # V52-L.2 Fix 1: include agent_id / agent_type / session_id so TOUCAN
+    # consumers can differentiate parent vs subagent rows. Empty string
+    # when absent (parent context).
+    session_id  = $SessionId
+    agent_id    = $AgentId
+    agent_type  = $AgentType
 }
 $line = $entry | ConvertTo-Json -Compress -Depth 8
 try { Add-Content -Path $ToucanLog -Value $line -ErrorAction Stop } catch { }
@@ -249,18 +264,50 @@ if ($matchesList.Count -lt 1) { exit 0 }
 $concepts = ($matchesList | Select-Object -First 3 | ForEach-Object { $_.Value }) -join ' '
 if (-not $concepts) { exit 0 }
 
-# Try kg-search via the project's wrapper scripts directory. The wrapper
-# itself is bash on Linux; on Windows we just skip the suggestion.
-$kgSearchPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-search.ps1"
-$kgSearchSh = Join-Path $ProjectRoot ".claude/scripts/kg-search"
+# V52-J (v0.2.52): switched from kg-search → rl_kg_search.py so this
+# hook shares the canonical chokepoint with the pre-edit-context-inject
+# hook + the MCP hybrid_search tool. Same Weaviate fan-out, same RL
+# rerank, same v3 retrieval-event emit. Pre-V52-J this branch called
+# kg-search (search_knowledge.py CLI), which until Edit B produced zero
+# telemetry — switching here closes the redundancy at the same time as
+# Edit B closes the silent hole.
+#
+# rl_kg_search.py --hook-format emits headers of the shape
+#   "KG: <title> | <node_type> | score=<n.nn> | <body...>"
+# Title (not file_path) is what we surface; the pre-edit hook's dedup
+# logic also keys on title.
+#
+# Venv resolution mirrors pre-edit-context-inject.ps1 — uses the shared
+# _lib/resolve-vco-venv.ps1 helper so we never accidentally activate the
+# USER's project venv (which lacks weaviate-client).
+. (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
+$VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+$RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
 $matchOutput = ""
-if (Test-Path $kgSearchPs1) {
+if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
-        $matchOutput = & pwsh -NoProfile -File $kgSearchPs1 search $concepts --limit 3 --files-only 2>$null | Where-Object { $_ -like 'knowledge/*' }
-    } catch { }
-} elseif ((Test-Path $kgSearchSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-    try {
-        $matchOutput = & bash $kgSearchSh search $concepts --limit 3 --files-only 2>$null | Where-Object { $_ -like 'knowledge/*' }
+        # VCT_SESSION_ID is set into the subprocess env so the canonical
+        # 3-layer session_id resolution in telemetry_emit sees the same
+        # session as the rest of the hook chain, instead of falling
+        # through to the empty CLAUDE_SESSION_ID.
+        $prevSessionEnv = $env:VCT_SESSION_ID
+        try {
+            $env:VCT_SESSION_ID = $SessionId
+            $rawOutput = & $VenvPy $RlScript $concepts --limit 3 --hook-format 2>$null
+        } finally {
+            if ($null -eq $prevSessionEnv) {
+                Remove-Item Env:VCT_SESSION_ID -ErrorAction SilentlyContinue
+            } else {
+                $env:VCT_SESSION_ID = $prevSessionEnv
+            }
+        }
+        # Extract only the per-result HEADER lines (start with "KG: " and
+        # carry the " | " separator) — strips body chunks. Filter out the
+        # "no-results" sentinel rl_kg_search emits when nothing matched.
+        $matchOutput = $rawOutput |
+            Where-Object { $_ -like 'KG: *' } |
+            Where-Object { $_ -notlike 'KG: no-results*' } |
+            Select-Object -First 3
     } catch { }
 }
 

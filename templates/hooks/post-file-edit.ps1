@@ -44,14 +44,35 @@ function Add-Nudge([string]$msg) {
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $EditedFile = ""
+# V52-L.2 Fix 2b: parse subagent identity + session_id. We don't write
+# a JSONL log directly, but the kg-sync / code-graph-incremental child
+# processes DO emit retrieval/sync telemetry — exporting these as env
+# vars (VCT_AGENT_ID / VCT_AGENT_TYPE / VCT_SESSION_ID) lets the
+# canonical emit path attribute those rows to the agent that triggered
+# the write.
+$AgentId = ""
+$AgentType = ""
+$SessionIdFromStdin = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload -and $payload.tool_input -and $payload.tool_input.file_path) {
         $EditedFile = [string]$payload.tool_input.file_path
     }
+    if ($payload) {
+        if ($payload.agent_id)   { $AgentId   = [string]$payload.agent_id }
+        if ($payload.agent_type) { $AgentType = [string]$payload.agent_type }
+        if ($payload.session_id) { $SessionIdFromStdin = [string]$payload.session_id }
+    }
 } catch {
-    # Empty/malformed stdin — keep $EditedFile at default
+    # Empty/malformed stdin — keep variables at defaults
 }
+# Export for child processes (kg-sync, code-graph-incremental.ps1, etc.)
+# so their emit paths can attribute telemetry to the originating agent.
+# Skip empty exports — downstream readers treat unset and empty
+# identically, but unset keeps the env listing clean.
+if ($AgentId)            { $Env:VCT_AGENT_ID   = $AgentId }
+if ($AgentType)          { $Env:VCT_AGENT_TYPE = $AgentType }
+if ($SessionIdFromStdin) { $Env:VCT_SESSION_ID = $SessionIdFromStdin }
 
 $ScriptDir = $PSScriptRoot
 $ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path

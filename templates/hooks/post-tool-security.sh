@@ -14,7 +14,11 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# v0.2.52 V52-L.2: prefer canonical $CLAUDE_PROJECT_DIR (active workspace
+# handed in by the launcher / Claude Code) over the SCRIPT_DIR/../..
+# fallback. Aligns with pre-tool-use.sh and post-file-edit.sh, and is
+# required for tests that invoke the hook from an out-of-tree directory.
+PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
 # Resolve a Python interpreter portably (python3 → python → py). Must run
 # BEFORE the stdin-parsing step below because Windows ships python.exe / py
@@ -35,6 +39,35 @@ try:
     d = json.loads(sys.stdin.read())
     ti = d.get('tool_input', {})
     print(ti.get('file_path', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+# V52-L.2 Fix 2a: parse subagent identity (agent_id + agent_type) and
+# session_id from the same stdin payload — so credential_alerts.jsonl
+# rows carry enough context to be attributed back to the agent that
+# triggered the write. Pre-V52-L.2 every alert row looked like it came
+# from the parent context regardless of which subagent did the edit.
+AGENT_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('agent_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+AGENT_TYPE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('agent_type', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', ''))
 except Exception:
     print('')
 " 2>/dev/null || echo "")
@@ -76,13 +109,24 @@ if [ ${#ALERTS[@]} -gt 0 ]; then
     MSG="Possible credential in $(basename "$EDITED_FILE"): ${ALERTS[*]}"
     # Build the JSONL line via Python so EDITED_FILE / ALERTS[] / patterns
     # are properly JSON-escaped. Audit fix 2026-05-07.
-    JSONL=$(EDITED_FILE_FOR_PY="$EDITED_FILE" PATTERNS_FOR_PY="${ALERTS[*]}" "$PY" -c '
+    JSONL=$(EDITED_FILE_FOR_PY="$EDITED_FILE" \
+        PATTERNS_FOR_PY="${ALERTS[*]}" \
+        AGENT_ID_FOR_PY="$AGENT_ID" \
+        AGENT_TYPE_FOR_PY="$AGENT_TYPE" \
+        SESSION_ID_FOR_PY="$SESSION_ID" \
+        "$PY" -c '
 import json, os, sys
 from datetime import datetime, timezone
+# V52-L.2 Fix 2a: include session_id + agent_id + agent_type so post-hoc
+# forensics can attribute the credential alert back to the agent that
+# triggered the write.
 sys.stdout.write(json.dumps({
     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "file": os.environ.get("EDITED_FILE_FOR_PY", ""),
     "patterns": os.environ.get("PATTERNS_FOR_PY", ""),
+    "session_id": os.environ.get("SESSION_ID_FOR_PY", ""),
+    "agent_id": os.environ.get("AGENT_ID_FOR_PY", ""),
+    "agent_type": os.environ.get("AGENT_TYPE_FOR_PY", ""),
 }))
 ' 2>/dev/null)
     if [ -n "$JSONL" ]; then

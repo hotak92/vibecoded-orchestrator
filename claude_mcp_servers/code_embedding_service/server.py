@@ -320,6 +320,24 @@ async def startup():
 # Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    # V52-AI (v0.2.52): exit cleanly if an orchestrator update is in
+    # progress. Same shape as the MCP server gates — prevents the
+    # ensure-containers hook from spawning a GPU model load mid-update,
+    # which would race the launcher's binary refresh.
+    try:
+        from _lib.update_gate import exit_if_update_in_progress  # type: ignore
+    except ImportError:
+        from pathlib import Path as _Path
+        _parent_dir = str(_Path(__file__).resolve().parent.parent)
+        if _parent_dir not in sys.path:
+            sys.path.insert(0, _parent_dir)
+        try:
+            from _lib.update_gate import exit_if_update_in_progress  # type: ignore
+        except ImportError:
+            exit_if_update_in_progress = None  # type: ignore
+    if exit_if_update_in_progress is not None:
+        exit_if_update_in_progress("code-embedding service")
+
     # Detect import path: standalone (container) vs package (python -m ...)
     try:
         import claude_mcp_servers.code_embedding_service.server  # noqa: F401

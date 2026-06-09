@@ -643,6 +643,66 @@ pub fn run() {
                 }
             }
 
+            // V52-AI (v0.2.52): boot-time stale-lockfile self-heal. If
+            // the previous update crashed mid-way (or even just hung
+            // long enough to exceed expected_completion_by), the
+            // lockfile at <vct_root>/.update-in-progress.json could
+            // still be on disk and would block all MCP spawns
+            // indefinitely. cleanup_if_stale() removes it iff the
+            // deadline has passed; a still-fresh lockfile (e.g. user
+            // launched the launcher manually mid-update from another
+            // window) is preserved.
+            if crate::commands::update_gate::cleanup_if_stale() {
+                eprintln!(
+                    "[vct] launcher boot: removed stale \
+                     .update-in-progress.json lockfile (previous \
+                     update did not exit cleanly)"
+                );
+            }
+
+            // v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): boot-time
+            // recovery probe for the Windows stage1 updater handoff.
+            //
+            // On Windows, `prepare_windows_update_handoff` (invoked by
+            // the prior launcher process during update_orchestrator)
+            // writes `~/.vct/update.lock.json` and spawns vct-updater.exe
+            // to perform the binary swap. The updater deletes the lock
+            // file when it completes successfully.
+            //
+            // If we find the lock file here on a fresh launcher start:
+            //   - Fresh (<10 min): the updater completed the swap and
+            //     we are the new binary it relaunched. Emit a
+            //     `vct-update-recovered` event so the FE can render a
+            //     one-shot "Updated to v0.2.X" toast.
+            //   - Stale (>10 min, missing/unparseable timestamp): the
+            //     updater crashed mid-swap. Emit `vct-update-failed`
+            //     so the FE can render a "may have failed" diagnostic
+            //     pointing the user at `update.log`.
+            //
+            // The probe deletes the lock file unconditionally so the
+            // diagnostic only fires once per actual update. POSIX hosts
+            // never write the lock file, so this is effectively a no-op
+            // there (the function returns `UpdateRecoveryReport::default()`).
+            {
+                use tauri::Emitter as _;
+                let recovery = commands::update_handoff::poll_update_lock_on_boot();
+                if recovery.recovered || recovery.stale_or_invalid {
+                    let event_name = if recovery.recovered {
+                        "vct-update-recovered"
+                    } else {
+                        "vct-update-failed"
+                    };
+                    // Best-effort: if the emit fails (no windows yet,
+                    // FE not subscribed) the next FE refresh can pull
+                    // the same state via `get_update_recovery_report`.
+                    let _ = app.emit(event_name, &recovery);
+                    eprintln!(
+                        "[vct] boot recovery: {} (lock_path={:?}, reason={:?})",
+                        event_name, recovery.lock_path, recovery.reason,
+                    );
+                }
+            }
+
             // v0.2.37 (Agent V37-E, 2026-05-27): consume the
             // install_path seed file that install.py may have written
             // alongside the orchestrator clone (see
@@ -1624,6 +1684,22 @@ pub fn run() {
                 commands::licensing::backfill_license_key_from_legacy_file(&db_ref);
             }
 
+            // v0.2.52 V52-AD: RL reranker auto-enable boot probe. When
+            // `rl_events` count has crossed 500 AND the global toggle
+            // is still `false` (the install-time default), emit
+            // `vct-rl-auto-enable-available` so the renderer can prompt
+            // the user to navigate to /preferences/modules. Soft-fail:
+            // a missing rl_events table (pre-migration-025 DB) just
+            // skips the emit. The user can always navigate manually.
+            {
+                use tauri::Manager;
+                let db_ref = app.state::<crate::db::Db>();
+                commands::module_enabled::probe_rl_auto_enable_at_boot(
+                    &db_ref,
+                    &app.handle(),
+                );
+            }
+
             // System tray (v1.1)
             if let Err(e) = tray::setup(&app.handle()) {
                 eprintln!("[vct] tray setup failed: {}", e);
@@ -1745,6 +1821,20 @@ pub fn run() {
             // installed (project × module) pair via `module_update_poll`.
             // Writes last-poll timestamps to app_state. Soft-fail throughout.
             crate::commands::module_deprecation::spawn_deprecation_poll(
+                app.handle().clone(),
+            );
+
+            // V52-F (v0.2.52): daily auto-poll for module updates.
+            // Fetches the L0 catalog (15-min TTL cache → effectively one
+            // HTTPS GET per 24h) and emits `vct-module-updates-available`
+            // with the per-(project, module) summary whenever an
+            // installed module's `module_version` is behind the catalog's
+            // current version. User can opt out via app_state key
+            // `module_update_auto_check_enabled` (default true). First
+            // tick is a catch-up — emits immediately at boot if the last
+            // check was >24h ago (or never). Soft-fail throughout: every
+            // network/DB error is logged and the next tick retries.
+            crate::commands::module_updates::spawn_module_update_check_loop(
                 app.handle().clone(),
             );
 
@@ -2033,6 +2123,19 @@ pub fn run() {
             commands::modules::set_module_enabled_v2,
             commands::modules::module_start_v2,
             commands::modules::module_stop_v2,
+            // V52-F (v0.2.52): per-module update GUI surface.
+            //   * `check_module_updates_available(project_id)` — summary list.
+            //   * `update_module_to_latest(project_id, module_id)` —
+            //     idempotent wrapper over `update_module_for_project`
+            //     (no-op when already at catalog version; UPDATE_DEFERRED
+            //     entry on partial failure).
+            //   * `get_module_update_auto_check_enabled` /
+            //     `set_module_update_auto_check_enabled` — opt-out toggle
+            //     (default true; reads/writes app_state KV).
+            commands::module_updates::check_module_updates_available,
+            commands::module_updates::update_module_to_latest,
+            commands::module_updates::get_module_update_auto_check_enabled,
+            commands::module_updates::set_module_update_auto_check_enabled,
             // v0.2.21 Stream B (2026-05-19): per-project RL container
             // lifecycle (Phase 1E) + weights-update polling (Phase 3C)
             // + fine-tune-after-download (Phase 4A) + dashboard widget
@@ -2214,6 +2317,15 @@ pub fn run() {
             // the toggle UI on mount. See `module_enabled.rs`.
             commands::module_enabled::module_set_enabled_for_project,
             commands::module_enabled::module_is_enabled_for_project,
+            // v0.2.52 V52-AD: host-wide (global) enable toggle that
+            // shares the `module_settings` table with the per-project
+            // toggle above. NULL `project_id` row == host default.
+            // Reader cascade: per-project → global → fail-open true.
+            // Settings → Modules tab in the renderer binds to these.
+            commands::module_enabled::module_set_global_enabled,
+            commands::module_enabled::module_is_global_enabled,
+            commands::module_enabled::module_effective_enabled,
+            commands::module_enabled::rl_events_count,
             // Phase 1.5.7 wire-up: DiagramsTab calls
             // `is_project_module_active` on mount to decide whether to
             // render the diagrams UI or the "module disabled" overlay.
@@ -2424,6 +2536,15 @@ pub fn run() {
             // refresh + auto-restart). Without this, the modal's
             // "Resolve manually" path silently abandoned the update.
             commands::installer::resume_orchestrator_update,
+            // v0.2.52 V52-B: one-click conflict resolution from the
+            // OrchestratorUpdateConflictModal. "Keep local" runs
+            // `git checkout --ours` on every conflicted file then
+            // commits + delegates to resume_orchestrator_update.
+            // "Accept upstream" is the symmetric `--theirs` variant.
+            // Orientation flips between merge and rebase — the helper
+            // `resolve_checkout_flag` in installer.rs handles that.
+            commands::installer::keep_local_and_continue_update,
+            commands::installer::accept_upstream_and_continue_update,
             // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
             // "Pulled-but-not-installed" banner state (source updated
             // via `git pull` outside the launcher; install-manifest
@@ -2623,6 +2744,15 @@ pub fn run() {
             // install.py's _refresh_dist_binary_after_rebuild.
             commands::restart::restart_launcher,
             commands::restart::get_launcher_restart_status,
+            // v0.2.52 V52-AH (Fabio bug 1): Windows binary lock fix via
+            // stage1 updater handoff. `prepare_windows_update_handoff` writes
+            // ~/.vct/update.lock.json + spawns vct-updater.exe DETACHED so
+            // the binary swap happens AFTER the running launcher exits (the
+            // mandatory-locked .exe gets unlocked once the parent PID is gone).
+            // `get_update_recovery_report` is the FE-side pull for the
+            // boot-time recovery probe (also fired as a Tauri event on setup).
+            commands::update_handoff::prepare_windows_update_handoff,
+            commands::update_handoff::get_update_recovery_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

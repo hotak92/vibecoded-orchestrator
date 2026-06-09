@@ -1,0 +1,41 @@
+{
+  "_comment": "Generated from vco_lib/schema_versions.py \u2014 DO NOT edit by hand. Regenerate via scripts/regen_schema_versions_json.py whenever the Python module changes. Parity asserted by tests/test_schema_versions_parity.py.",
+  "canonical_versions": {
+    "bundle_materialization": 2,
+    "code_graph_builds_status_vocabulary": 1,
+    "codegraph_access_vocabulary": 1,
+    "codegraph_collection": 4,
+    "development_collection": 2,
+    "diagrams_collection": 2,
+    "kg_collection": 3,
+    "kg_collection_access_vocabulary": 1,
+    "kg_node_frontmatter": 1,
+    "launcher_db_table_set": 34,
+    "module_installs_shape": 1,
+    "module_settings_shape": 1,
+    "project_bootstrap_version": 1,
+    "project_codegraph_bindings_shape": 1,
+    "project_kg_bindings_shape": 1,
+    "rl_events_payload_shape": 3,
+    "shared_kg_collection": 3
+  },
+  "state_classification": {
+    "bundle_materialization": "derived",
+    "code_graph_builds_status_vocabulary": "derived",
+    "codegraph_access_vocabulary": "user_curated",
+    "codegraph_collection": "derived",
+    "development_collection": "derived",
+    "diagrams_collection": "derived",
+    "kg_collection": "derived",
+    "kg_collection_access_vocabulary": "user_curated",
+    "kg_node_frontmatter": "user_curated",
+    "launcher_db_table_set": "derived",
+    "module_installs_shape": "derived",
+    "module_settings_shape": "user_curated",
+    "project_bootstrap_version": "derived",
+    "project_codegraph_bindings_shape": "derived",
+    "project_kg_bindings_shape": "derived",
+    "rl_events_payload_shape": "user_curated",
+    "shared_kg_collection": "derived"
+  }
+}
