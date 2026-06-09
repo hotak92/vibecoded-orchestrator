@@ -688,9 +688,31 @@ _KG_SEARCH_TOOLS: frozenset[str] = frozenset({
 # Monitor config: poll every N seconds, stop when answer window reaches this size OR a new
 # human turn appears after the search.  Timeout is a hard ceiling.
 _RL_MONITOR_POLL_INTERVAL: float = 2.0
-_RL_MONITOR_ANSWER_THRESHOLD: int = 64_000   # chars
-_RL_TOOL_CONTENT_LIMIT: int = 20_000         # per Write/Edit, chars
-_RL_MONITOR_TIMEOUT: float = 600.0           # 10 min hard ceiling
+# V52-N (2026-06-09): the accumulator threshold is now expressed in TOKENS
+# (not chars) and aligned with the citation gate
+# ``_RL_MIN_ANSWER_TOKENS_FOR_CITATION`` immediately below. Pre-V52-N the
+# accumulator stopped at 64 000 chars (~16k tokens) while the gate required
+# 25 000 tokens -> the monitor would fire on length, the gate would reject
+# as too short, and the citation event was silently dropped. Aligning them
+# to the same 25 000-token value means the monitor fires only once the
+# answer has enough signal to pass the gate.
+_RL_MONITOR_ANSWER_THRESHOLD_TOKENS: int = 25_000  # V52-N: align with citation gate
+# Back-compat char alias for any test/external caller still importing the
+# old name. 1 token ~= 4 chars (qwen3 BPE empirical average).
+_RL_MONITOR_ANSWER_THRESHOLD: int = _RL_MONITOR_ANSWER_THRESHOLD_TOKENS * 4
+_RL_TOOL_CONTENT_LIMIT: int = 20_000         # per tool_use input, chars
+# V52-N: hard timeout raised from 10 min -> 60 min. The new accumulator
+# stops either at the 25 000-token threshold or when the PreCompact hook
+# writes ``.claude/state/rl_monitors_force_flush.flag``; the timeout is
+# now a pure safety valve for sessions that get neither (very short
+# answers, never compacted, never closed). 60 min absorbs slow agents
+# without leaking monitor tasks indefinitely.
+_RL_MONITOR_TIMEOUT: float = 3600.0           # 60 min hard ceiling (V52-N safety valve)
+# V52-N: PreCompact hook drops this sentinel; the monitor picks it up on
+# the next poll and fires with whatever's accumulated so far. After
+# firing the monitor deletes the sentinel so subsequent compactions can
+# re-arm it. Path is relative to ``CLAUDE_PROJECT_DIR``.
+_RL_MONITOR_FORCE_FLUSH_SENTINEL: str = ".claude/state/rl_monitors_force_flush.flag"
 # v0.2.47 RL-7.5: minimum answer length (TOKENS) to compute citation events.
 # Below this, the monitor still POSTs to the RL container's /rl_update
 # (the container may treat short answers as negative-signal training data)
@@ -3332,40 +3354,58 @@ def _rl_extract_answer_window(
     """
     Extract text produced by Claude after the KG search at (start_msg_idx, start_blk_idx).
 
-    Scans forward through the transcript collecting text/thinking blocks AND
-    Write/Edit tool content until either:
-      - A new human turn appears (= Claude stopped responding)   → complete=True
-      - Accumulated text exceeds _RL_MONITOR_ANSWER_THRESHOLD   → complete=True (truncated)
-      - End of transcript                                        → complete=False (still writing)
+    V52-N rewrite (2026-06-09): the extractor is now TOOL-AGNOSTIC and does
+    NOT stop on a human turn. User direction verbatim:
 
-    Write/Edit inclusion: agents frequently write findings to files rather than
-    explaining them in chat. Write includes the full ``content``; Edit includes
-    only ``new_string`` (the added lines, not the removed context).
+      * "make it agnostic from used tool, just log the 'input' of the tool
+        use, and discard its 'output'"
+      * "if tool name ends up in the output it's ok"
+      * "human input should not interrupt 'accumulation'"
 
-    VS Code transcripts use type="user" for both real human messages and tool results.
-    A real human turn has message.role == "human"; tool results have toolUseResult set.
-    Only real human turns signal that Claude has finished responding.
+    Concretely, this function scans every assistant message from
+    ``start_msg_idx`` to the end of the transcript and accumulates:
+
+      * All ``text`` blocks.
+      * All ``thinking`` blocks (Claude's internal scratch -- useful RL
+        signal).
+      * For EVERY ``tool_use`` block (regardless of tool name): the tool
+        name + a JSON dump of the ``input`` field. ``toolUseResult`` /
+        tool-output blocks are explicitly EXCLUDED -- they would dominate
+        the answer window with shell output, file dumps, and API JSON,
+        drowning out the citation signal.
+
+    Stop conditions (whichever comes first):
+      * Token-equivalent accumulation reaches
+        ``_RL_MONITOR_ANSWER_THRESHOLD_TOKENS`` (~4x chars). Returns
+        ``complete=True`` and a truncated window.
+      * End of transcript. Returns ``complete=False`` -- the monitor keeps
+        polling.
+
+    Crucially, human turns are NO LONGER a stop condition. Subsequent
+    assistant blocks count as part of the SAME answer accumulation; this
+    captures the realistic case where the user types a quick follow-up
+    ("yes, continue") and Claude resumes producing citation-bearing text.
+    The legacy human-turn stop caused the accumulator to fire on a tiny
+    sub-25k-token slice and then the citation gate rejected it as too
+    short -- silent drop.
+
+    Per-tool-use input is truncated to ``_RL_TOOL_CONTENT_LIMIT`` chars
+    to bound any single tool call's contribution; the max-over-chunks
+    cosine downstream means the relevant chunk still dominates.
 
     Returns (text, complete).
     """
+    import json as _json
     parts: list[str] = []
     total_chars = 0
+    threshold_chars = _RL_MONITOR_ANSWER_THRESHOLD_TOKENS * 4
     for msg_idx in range(start_msg_idx, len(messages)):
         msg = messages[msg_idx]
         msg_type = msg.get("type", "")
 
-        # A real human turn after the search = Claude finished responding.
-        # VS Code transcripts use type="user" + role="user" for actual human messages;
-        # some versions use role="human". Tool results also use type="user" but have
-        # toolUseResult set — those are NOT stop signals.
-        if (
-            msg_type == "user"
-            and msg_idx > start_msg_idx
-            and msg.get("message", {}).get("role") in ("human", "user")
-            and not msg.get("toolUseResult")
-        ):
-            return "".join(parts), True
-
+        # V52-N: human turns no longer interrupt accumulation. Only
+        # assistant blocks contribute; everything else is skipped without
+        # stopping the scan.
         if msg_type != "assistant":
             continue
 
@@ -3379,35 +3419,35 @@ def _rl_extract_answer_window(
             btype = block.get("type", "")
             if btype == "text":
                 text = block.get("text", "")
-                parts.append(text)
-                total_chars += len(text)
+                if text:
+                    parts.append(text)
+                    total_chars += len(text)
             elif btype == "thinking":
                 # Include thinking blocks (useful signal for RL)
                 text = block.get("thinking", "")
-                parts.append(text)
-                total_chars += len(text)
+                if text:
+                    parts.append(text)
+                    total_chars += len(text)
             elif btype == "tool_use":
-                # Include Write/Edit content — agents often write findings
-                # to files instead of (or in addition to) the chat response.
-                # Without this, nodes that were genuinely useful but whose
-                # content was written to a file get zero reward signal.
-                # Truncate to 20K chars per tool call to avoid budget blow-out;
-                # max-over-chunks cosine means the relevant chunk still dominates.
+                # V52-N tool-agnostic: include the tool name + JSON-serialized
+                # input for EVERY tool_use block. tool name leaking into the
+                # accumulated text is fine per user direction ("if tool name
+                # ends up in the output it's ok"). Tool OUTPUTS
+                # (``toolUseResult`` or block type ``tool_result``) are not
+                # collected here -- they appear on subsequent user-type
+                # messages which we skip above.
                 tool_name = block.get("name", "")
                 tool_input = block.get("input", {})
-                if tool_name == "Write":
-                    text = tool_input.get("content", "")[:_RL_TOOL_CONTENT_LIMIT]
-                    if text:
-                        parts.append(text)
-                        total_chars += len(text)
-                elif tool_name == "Edit":
-                    # Only new_string — the added content, not old_string
-                    text = tool_input.get("new_string", "")[:_RL_TOOL_CONTENT_LIMIT]
-                    if text:
-                        parts.append(text)
-                        total_chars += len(text)
-            if total_chars >= _RL_MONITOR_ANSWER_THRESHOLD:
-                return "".join(parts)[:_RL_MONITOR_ANSWER_THRESHOLD], True
+                try:
+                    input_serialized = _json.dumps(tool_input, default=str)
+                except Exception:
+                    input_serialized = str(tool_input)
+                snippet = f"{tool_name}: {input_serialized}"[:_RL_TOOL_CONTENT_LIMIT]
+                if snippet:
+                    parts.append(snippet)
+                    total_chars += len(snippet)
+            if total_chars >= threshold_chars:
+                return "".join(parts)[:threshold_chars], True
 
     return "".join(parts), False
 
@@ -3725,15 +3765,69 @@ async def _rl_compute_and_write_citations(
     }
 
 
+def _rl_force_flush_sentinel_path() -> "Path":
+    """Resolve the V52-N compaction sentinel path relative to the project root.
+
+    Path is ``<CLAUDE_PROJECT_DIR>/.claude/state/rl_monitors_force_flush.flag``
+    with a fallback to ``_SERVER_INFERRED_BASE`` when the env var isn't
+    populated (CLI invocations + tests). The sentinel is created by
+    ``templates/hooks/pre-compact-save.{sh,ps1}`` immediately before
+    Claude Code compacts the context; this monitor polls for it on every
+    iteration and, when present, fires with whatever it has accumulated
+    so far.
+    """
+    from pathlib import Path as _Path
+    base = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if base:
+        return _Path(base) / _RL_MONITOR_FORCE_FLUSH_SENTINEL
+    return _SERVER_INFERRED_BASE / _RL_MONITOR_FORCE_FLUSH_SENTINEL
+
+
+def _rl_check_force_flush() -> bool:
+    """Return True iff the V52-N compaction-sentinel file exists.
+
+    Soft-fail: any filesystem error returns False so the monitor keeps
+    polling normally rather than crashing on a transient ENOENT race.
+    """
+    try:
+        return _rl_force_flush_sentinel_path().exists()
+    except Exception:
+        return False
+
+
+def _rl_clear_force_flush() -> None:
+    """Delete the V52-N sentinel after a fire so subsequent compactions can re-arm.
+
+    Soft-fail: missing file / permission error / race with the hook all
+    return silently. Worst case a future poll sees a stale sentinel and
+    fires once on an already-emitted task -- the per-task cache is popped
+    so the second fire is a no-op.
+    """
+    try:
+        path = _rl_force_flush_sentinel_path()
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     """
     Background asyncio task: poll the session transcript until Claude's answer
     after the KG search is available, then POST to rl_server /rl_update.
 
-    Firing condition (whichever comes first):
-      - A new human turn appears after the search (= response complete)
-      - Answer window exceeds _RL_MONITOR_ANSWER_THRESHOLD chars
-      - Hard timeout _RL_MONITOR_TIMEOUT seconds
+    V52-N stop conditions (whichever comes first):
+      - Answer window accumulates >= ``_RL_MONITOR_ANSWER_THRESHOLD_TOKENS``
+        (25 000 tokens, matching the citation gate).
+      - The PreCompact hook drops ``.claude/state/rl_monitors_force_flush.flag``
+        -- the monitor fires with whatever's accumulated so far (could be
+        less than the threshold) and deletes the sentinel so subsequent
+        compactions re-arm.
+      - Hard timeout ``_RL_MONITOR_TIMEOUT`` seconds (60 min safety valve,
+        raised from 10 min pre-V52-N).
+
+    Note: human turns are no longer a stop condition (the V52-N rewrite of
+    ``_rl_extract_answer_window`` accumulates ACROSS human follow-ups).
 
     The `seq` value is the 1-based call counter for this MCP process; it maps to
     the (seq-1)'th KG search position in the transcript (0-based rank).
@@ -3751,6 +3845,12 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
     # Phase 1 + 2 combined: find the right transcript and poll for completion
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(_RL_MONITOR_POLL_INTERVAL)
+
+        # V52-N: check the compaction sentinel BEFORE scanning transcripts.
+        # When set, we force-fire on whatever's accumulated regardless of
+        # the natural threshold. Clearing happens after the fire below so
+        # subsequent compactions re-arm cleanly.
+        force_flush = _rl_check_force_flush()
 
         # Scan all transcripts for the one that contains our query at pos_idx
         candidates = await _rl_find_all_transcripts()
@@ -3795,6 +3895,15 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
             start_msg_idx, start_blk_idx = matched_pos
             # Right transcript — check if answer is complete
             answer, complete = _rl_extract_answer_window(messages, start_msg_idx, start_blk_idx)
+            # V52-N: the sentinel forces fire even when the extractor returned
+            # complete=False (i.e. we haven't accumulated enough yet but compaction
+            # is about to happen and we'd lose access to the transcript).
+            if force_flush and answer.strip():
+                complete = True
+                logger.debug(
+                    "RL monitor %s: force-flush sentinel detected; firing with %d chars accumulated",
+                    task_id[:8], len(answer),
+                )
             if complete and answer.strip():
                 # v0.2.47 RL-7: MCP-side citation write (replaces the
                 # pre-v0.2.47 container-coupled write path that silently
@@ -3890,6 +3999,13 @@ async def _rl_answer_monitor(task_id: str, seq: int, query: str) -> None:
                                 "RL monitor %s: rl_update_v3 raised (%s); continuing",
                                 task_id[:8], exc,
                             )
+                # V52-N: if we fired because the sentinel was set, clear it
+                # so the next PreCompact event can re-arm a fresh flush.
+                # When we fired on natural threshold completion, the sentinel
+                # may still be absent -- _rl_clear_force_flush handles that
+                # case as a soft-fail.
+                if force_flush:
+                    _rl_clear_force_flush()
                 return
             # Found the right transcript but answer not complete yet — stop scanning candidates
             break
