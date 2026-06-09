@@ -5139,6 +5139,17 @@ async def _semantic_graph_search_body(
             _format_obj(obj, coll_name, obj.metadata.distance)
             for obj in primary.objects
         ]
+        # V52-J Edit 3 / V52-Q (2026-06-09): attach raw cosine score
+        # (= 1.0 - Weaviate distance) on each formatted dict so the v3
+        # telemetry envelope carries BOTH the fused score (later set as
+        # ``score`` by the RL rerank / fallback) AND the raw per-Weaviate
+        # cosine. The offline trainer uses both: fused score for ranking
+        # supervision, raw cosine for embedding-quality drift detection.
+        # Soft-fail per-result; non-float distance falls back to 0.0.
+        for r in coll_formatted:
+            d = r.get("distance")
+            if isinstance(d, (int, float)):
+                r["score_cosine"] = 1.0 - d
         # v0.2.31 telemetry audit fix: enrich formatted dicts with node
         # embedding + cos_qn so log_retrieval gets non-empty fields.
         # Soft-fail per-result: a malformed obj.vector must never
@@ -5426,6 +5437,15 @@ async def _hybrid_search_single_collection(
         _format_obj(obj, coll_name, obj.metadata.distance)
         for obj in semantic_results.objects
     ]
+    # V52-J Edit 3 / V52-Q (2026-06-09): attach raw cosine score
+    # (= 1.0 - Weaviate distance) on each formatted dict. See the
+    # mirror site in semantic_graph_search for rationale: the
+    # offline trainer wants BOTH the fused ``score`` AND the raw
+    # per-Weaviate cosine carried through telemetry.
+    for r in semantic_formatted:
+        d = r.get("distance")
+        if isinstance(d, (int, float)):
+            r["score_cosine"] = 1.0 - d
     # v0.2.31 telemetry audit fix: enrich semantic_formatted with node
     # embeddings + cos_qn from the matched obj.vector. Skipped when on
     # the near_text path (no raw vectors available). Per-result
@@ -5468,6 +5488,9 @@ async def _hybrid_search_single_collection(
             entry["emb"] = r["emb"]
         if r.get("cos_qn") is not None:
             entry["cos_qn"] = r["cos_qn"]
+        # V52-J Edit 3 / V52-Q: propagate raw cosine score the same way.
+        if r.get("score_cosine") is not None:
+            entry["score_cosine"] = r["score_cosine"]
         combined[key] = entry
 
     for obj in keyword_results.objects:

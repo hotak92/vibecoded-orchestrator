@@ -402,5 +402,13 @@ def _build_log_nodes(
             val = n.get(cos_field)
             if val is not None:
                 rec[cos_field] = val
+        # V52-J Edit 3 / V52-Q (2026-06-09): raw cosine score from
+        # the source Weaviate distance (= 1.0 - distance), distinct
+        # from the fused ``score`` field (which the RL rerank or the
+        # hybrid combiner may have rewritten). The offline trainer
+        # consumes both: fused score for ranking supervision, raw
+        # cosine for embedding-quality drift detection.
+        if n.get("score_cosine") is not None:
+            rec["score_cosine"] = n["score_cosine"]
         out.append(rec)
     return out
