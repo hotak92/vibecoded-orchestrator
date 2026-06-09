@@ -601,7 +601,7 @@ pub async fn resume_containers_on_startup_with_starter(
                 };
 
                 match container_name_opt {
-                    Some(_container_name) => {
+                    Some(prior_container_name) => {
                         let rl_port = match ensure_project_rl_port(db, &project) {
                             Ok(p) => p,
                             Err(e) => {
@@ -613,13 +613,45 @@ pub async fn resume_containers_on_startup_with_starter(
                             }
                         };
                         let ctx = PlaceholderCtx::new(&module_id);
-                        if let Err(e) =
-                            start_container_for_module(&manifest, &ctx, &project, rl_port).await
+                        match start_container_for_module(&manifest, &ctx, &project, rl_port).await
                         {
-                            eprintln!(
-                                "[module_supervisor] resume: start_container_for_module({}, {}): {}",
-                                project_id, module_id, e
-                            );
+                            Ok(resolved_name) => {
+                                // V52-D: mirror of the launcher-side
+                                // container_name drift fix in
+                                // module_service.rs. Persist the
+                                // resolved name back to DB so
+                                // subsequent probes short-circuit
+                                // instead of triggering an endless
+                                // respawn loop.
+                                if resolved_name != prior_container_name {
+                                    eprintln!(
+                                        "[module_supervisor] resume: V52-D container_name drift \
+                                         for {}/{}: DB='{}' → resolved='{}'; updating DB.",
+                                        project_id, module_id,
+                                        prior_container_name, resolved_name,
+                                    );
+                                    if let Err(e) = db.set_module_container_name(
+                                        &project_id, &module_id, &resolved_name,
+                                    ) {
+                                        eprintln!(
+                                            "[module_supervisor] resume: V52-D \
+                                             set_module_container_name({}, {}): {}",
+                                            project_id, module_id, e
+                                        );
+                                    }
+                                }
+                                // V52-W: clear stale last_error on
+                                // successful restart.
+                                let _ = db.set_module_last_error(
+                                    &project_id, &module_id, None,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[module_supervisor] resume: start_container_for_module({}, {}): {}",
+                                    project_id, module_id, e
+                                );
+                            }
                         }
                     }
                     None => {
@@ -1351,18 +1383,22 @@ mod tests {
     /// T2/T3 (NEW-3.E existing path): a `status='installed'` row with a
     /// PRE-PERSISTED `container_name` + a service-type ContainerPull
     /// manifest passes the gate and reaches the "named container" branch.
-    /// The probe (`is_container_running`) returns false because no real
-    /// podman runtime is present in tests, which routes to
-    /// `start_container_for_module` (also no-op-fails without podman).
-    /// Critically: `last_error` is NOT written in this branch — the
-    /// existing path's failure handling is `eprintln!` only, NOT
-    /// `set_module_last_error`. This pins the divergence between the two
-    /// branches so the test catches an accidental cross-wire.
     ///
-    /// Conflates T2 (already-running, no-op) and T3 (not-running, restart)
-    /// because both paths converge on "no last_error write" without real
-    /// podman; the discriminator between them requires a real container
-    /// runtime which is out of scope for unit tests.
+    /// **Branch contract** (post-V52-D):
+    ///   * On `start_container_for_module` Err: `last_error` is NOT
+    ///     written (eprintln!-only, unlike the NULL-container branch's
+    ///     NEW-3.C surfacing).
+    ///   * On `start_container_for_module` Ok: V52-D persists the
+    ///     resolved container name back to DB IF it differs from the
+    ///     pre-populated name, AND V52-W clears stale last_error.
+    ///
+    /// This fixture pre-populates `container_name='vct-rl-reranker-rs-slug'`
+    /// which already matches the manifest's resolved template → V52-D
+    /// finds no drift and the DB row stays untouched. (The drift-fix
+    /// path is exercised in the launcher-side test
+    /// `v0252_d_resume_named_container_drift_persists_resolved_name`.)
+    /// The invariant pinned here is therefore "last_error stays None"
+    /// across both Err and Ok regimes.
     #[test]
     fn resume_named_container_row_uses_existing_path_no_lasterror() {
         let rt = tokio::runtime::Runtime::new().expect("rt");

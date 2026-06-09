@@ -1984,7 +1984,7 @@ where
                 };
 
                 match container_name_opt {
-                    Some(_container_name) => {
+                    Some(prior_container_name) => {
                         let rl_port = match ensure_project_rl_port(db, &project) {
                             Ok(p) => p,
                             Err(e) => {
@@ -1996,13 +1996,58 @@ where
                             }
                         };
                         let ctx = PlaceholderCtx::new(&module_id);
-                        if let Err(e) =
-                            start_container_for_module(&manifest, &ctx, &project, rl_port).await
+                        match start_container_for_module(&manifest, &ctx, &project, rl_port).await
                         {
-                            eprintln!(
-                                "[module_service] resume: start_container_for_module({}, {}): {}",
-                                project_id, module_id, e
-                            );
+                            Ok(resolved_name) => {
+                                // V52-D: when the manifest's template
+                                // resolves to a DIFFERENT name than the
+                                // DB row's stored container_name, the
+                                // probe→miss→respawn loop kicks in:
+                                // `is_container_running(prior_container_
+                                // name)` returns false every boot
+                                // (because the running container has the
+                                // freshly-resolved name), and
+                                // start_container_for_module silently
+                                // creates a new container under the new
+                                // name on every resume.
+                                //
+                                // Fix: persist the resolved name back
+                                // to the DB row so subsequent probes
+                                // hit the canonical name and short-
+                                // circuit. Soft-fail: a DB error here
+                                // is a forensic warning, not a start
+                                // failure (the container IS running).
+                                if resolved_name != prior_container_name {
+                                    eprintln!(
+                                        "[module_service] resume: V52-D container_name drift \
+                                         for {}/{}: DB='{}' → resolved='{}'; updating DB.",
+                                        project_id, module_id,
+                                        prior_container_name, resolved_name,
+                                    );
+                                    if let Err(e) = db.set_module_container_name(
+                                        &project_id, &module_id, &resolved_name,
+                                    ) {
+                                        eprintln!(
+                                            "[module_service] resume: V52-D \
+                                             set_module_container_name({}, {}): {}",
+                                            project_id, module_id, e
+                                        );
+                                    }
+                                }
+                                // V52-W: clear stale last_error after
+                                // successful restart so the GUI no
+                                // longer renders an error state for a
+                                // healthy container.
+                                let _ = db.set_module_last_error(
+                                    &project_id, &module_id, None,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[module_service] resume: start_container_for_module({}, {}): {}",
+                                    project_id, module_id, e
+                                );
+                            }
                         }
                     }
                     None => {
@@ -3476,18 +3521,30 @@ mod tests {
     /// T2/T3 (existing path): a `status='installed'` row with a
     /// pre-persisted `container_name` + a service-type ContainerPull
     /// manifest passes the gate and reaches the "named container"
-    /// branch. The probe (`is_container_running`) returns false because
-    /// no real podman runtime is present in tests, which routes to
-    /// `start_container_for_module` (also no-op-fails without podman).
-    /// Critically: `last_error` is NOT written in this branch — the
-    /// existing path's failure handling is `eprintln!` only, NOT
-    /// `set_module_last_error`. This pins the divergence between the
-    /// two branches so the test catches an accidental cross-wire.
+    /// branch.
     ///
-    /// Conflates T2 (already-running, no-op) and T3 (not-running,
-    /// restart) because both converge on "no last_error write" without
-    /// real podman; the discriminator between them requires a real
-    /// container runtime which is out of scope for unit tests.
+    /// **Branch contract** (post-V52-D):
+    ///   * On `start_container_for_module` Err: `last_error` is NOT
+    ///     written (existing-path failure handling is `eprintln!`-only,
+    ///     unlike the NULL-container branch which surfaces to
+    ///     last_error via NEW-3.C).
+    ///   * On `start_container_for_module` Ok: V52-D persists the
+    ///     resolved container name back to the DB when it differs from
+    ///     the pre-existing `container_name`, AND clears any stale
+    ///     `last_error` (V52-W self-heal).
+    ///
+    /// Two environment regimes converge under this test:
+    ///   * No podman runtime → `start_container_for_module` Err →
+    ///     `container_name` stays at the pre-populated value.
+    ///   * Podman present + cached image → Ok → V52-D updates
+    ///     `container_name` to the manifest-template-resolved value.
+    ///
+    /// **Stable invariant across both regimes**: `last_error` is never
+    /// SET by this branch (Err keeps it `None`; Ok clears any prior
+    /// value, never sets one). That's the property this test pins;
+    /// the container_name value is regime-dependent and therefore
+    /// asserted as "either the pre-populated name OR the resolved
+    /// name, never something unrelated".
     #[tokio::test]
     async fn resume_named_container_row_uses_existing_path_no_lasterror() {
         let (db, pid) = open_db_with_resume_project();
@@ -3525,22 +3582,141 @@ mod tests {
         // Existing-path's failure handler is eprintln-only — must NOT
         // call set_module_last_error. This pins that the R1 refactor
         // didn't cross-wire the named-container branch into the
-        // NULL-container branch's NEW-3.C surfacing.
+        // NULL-container branch's NEW-3.C surfacing. V52-D's success
+        // path also doesn't set last_error (it clears it).
         let row_after = db
             .get_module_install(&pid, "some-future-service")
             .unwrap()
             .unwrap();
         assert!(
             row_after.last_error.is_none(),
-            "named-container existing-path failure must NOT write last_error (only the NULL-container R1 branch does), row={:?}",
+            "named-container existing-path must NEVER set last_error (Err: \
+             eprintln!-only; Ok: V52-W clears stale errors). row={:?}",
             row_after
         );
-        // container_name must remain set (we didn't overwrite it).
+        // V52-D: container_name is either the pre-populated value
+        // (Err regime — no real podman) OR the manifest-template-
+        // resolved value (Ok regime — V52-D persisted it). Anything
+        // else means a regression.
+        let resolved_template = make_manifest_for_gate("service", InstallMethod::ContainerPull)
+            .runtime
+            .resolve_container_name_template(
+                "vct-rl-reranker", // matches make_manifest's id
+            );
+        let resolved_name = resolved_template.replace("{project_slug}", "rs-slug");
+        let observed = row_after.container_name.as_deref().unwrap_or("");
+        assert!(
+            observed == "some-future-service-rs-slug" || observed == resolved_name.as_str(),
+            "container_name must be either the pre-populated value (no-podman regime) \
+             or the V52-D-resolved value ({}); got '{}', row={:?}",
+            resolved_name, observed, row_after,
+        );
+    }
+
+    /// V52-D regression: when `start_container_for_module` returns Ok
+    /// with a container name that DIFFERS from the DB's pre-populated
+    /// `container_name`, the DB row is updated to the resolved name.
+    /// This breaks the v0.2.51 respawn loop where a stale DB name
+    /// (`vct-rl-reranker-manual`) caused every resume probe to miss
+    /// the actually-running container (`vct-rl-reranker-rs-slug`),
+    /// triggering an endless recreate cycle.
+    ///
+    /// This test requires a real podman runtime + a cached image — it
+    /// is gated on `podman --version` exit-0 + the test fixture's
+    /// image (`ghcr.io/hotak92/vct-rl-reranker:0.1.0`) being present.
+    /// In CI without podman / without the image, the test is skipped
+    /// (not a failure) to keep the suite hermetic.
+    #[tokio::test]
+    async fn v0252_d_resume_named_container_drift_persists_resolved_name() {
+        // Gate on a real podman + cached image. Skip cleanly on
+        // headless CI.
+        let podman_ok = std::process::Command::new("podman")
+            .args(["--version"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !podman_ok {
+            eprintln!(
+                "[v0252_d_resume_named_container_drift_persists_resolved_name] \
+                 skipping: no podman in PATH"
+            );
+            return;
+        }
+        // Check the test fixture's image is cached. If not, skip
+        // (we don't want this test to fail just because the host
+        // doesn't have a paid-module image pulled).
+        let img_check = std::process::Command::new("podman")
+            .args(["image", "exists", "ghcr.io/hotak92/vct-rl-reranker:0.1.0"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !img_check {
+            eprintln!(
+                "[v0252_d_resume_named_container_drift_persists_resolved_name] \
+                 skipping: fixture image ghcr.io/hotak92/vct-rl-reranker:0.1.0 \
+                 not cached on this host"
+            );
+            return;
+        }
+
+        let (db, pid) = open_db_with_resume_project();
+
+        db.insert_module_install(
+            "install-id-v52d",
+            &pid,
+            "vct-rl-reranker",
+            "0.1.0",
+            "/tmp/vct-rl-reranker",
+        )
+        .expect("insert");
+        db.set_module_status(&pid, "vct-rl-reranker", ModuleStatus::Installed, None)
+            .expect("set installed");
+        // Seed a STALE container_name that doesn't match the
+        // manifest's resolved template. Pre-V52-D this would trigger
+        // the respawn loop.
+        db.set_module_container_name(&pid, "vct-rl-reranker", "vct-rl-reranker-manual")
+            .expect("set stale container_name");
+        // Also seed a stale last_error to verify V52-W clearing.
+        db.set_module_last_error(&pid, "vct-rl-reranker", Some("stale: prior boot error"))
+            .expect("set stale last_error");
+
+        let mut manifests = HashMap::new();
+        manifests.insert(
+            "vct-rl-reranker".to_string(),
+            make_manifest_for_gate("service", InstallMethod::ContainerPull),
+        );
+        let (resolver, _visited) = tracking_resolver(manifests);
+
+        resume_containers_on_startup_with_resolver(&db, resolver).await;
+
+        let row_after = db
+            .get_module_install(&pid, "vct-rl-reranker")
+            .unwrap()
+            .unwrap();
+
+        // V52-D contract: the stale name was overwritten with the
+        // template-resolved name (`vct-rl-reranker-rs-slug` here).
         assert_eq!(
             row_after.container_name.as_deref(),
-            Some("some-future-service-rs-slug"),
-            "container_name must remain set"
+            Some("vct-rl-reranker-rs-slug"),
+            "V52-D: container_name must be updated from stale ('vct-rl-reranker-manual') \
+             to resolved ('vct-rl-reranker-rs-slug'); got {:?}",
+            row_after.container_name,
         );
+        // V52-W contract: stale last_error is cleared on successful
+        // restart.
+        assert!(
+            row_after.last_error.is_none(),
+            "V52-W: stale last_error must be cleared on successful resume restart; \
+             got {:?}",
+            row_after.last_error,
+        );
+
+        // Cleanup: stop + remove the container the test started so we
+        // don't leak state across test runs.
+        let _ = std::process::Command::new("podman")
+            .args(["rm", "-f", "vct-rl-reranker-rs-slug"])
+            .output();
     }
 
     /// T4 (gate): a `status='installed'` row whose manifest declares a
