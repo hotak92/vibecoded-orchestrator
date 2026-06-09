@@ -369,12 +369,11 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// projects; per-project folders never receive the orchestrator's own
 /// machinery. Entries in the .txt must be either (a) project-meaningful
 /// configuration / docs that legitimately live alongside a user project
-/// (`.claude/`, `knowledge/`, `docs/`, `tools/`, `infrastructure/`),
-/// (b) the version-pinning manifest the launcher reads to detect an
-/// existing install (`vct-module.json`), or (c) the source-of-truth
-/// file itself (`orchestrator-managed-paths.txt`) so
-/// `update_orchestrator_at` propagates new editions of the list into
-/// every existing install.
+/// (`.claude/`, `docs/`, `tools/`, `infrastructure/`), (b) the
+/// version-pinning manifest the launcher reads to detect an existing
+/// install (`vct-module.json`), or (c) the source-of-truth file itself
+/// (`orchestrator-managed-paths.txt`) so `update_orchestrator_at`
+/// propagates new editions of the list into every existing install.
 ///
 /// 2026-05-16 (PR-31 / v0.2.12): `CLAUDE.md` was REMOVED from the
 /// whitelist. The root CLAUDE.md is the orchestrator-self's own
@@ -383,6 +382,18 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// the project-bootstrapper. `DEFAULT_PRESERVE_LIST` (below) still
 /// includes `CLAUDE.md` because that's the user-edits-on-update
 /// concern, not the whitelist-copy concern this constant governs.
+///
+/// 2026-06-09 (V52-C / v0.2.52): `knowledge/` was REMOVED from the
+/// whitelist. KG nodes are USER-CURATED state, not shipped content —
+/// the previous mixed-ownership directory caused merge conflicts on
+/// orchestrator updates (modify-vs-delete races between user-curated
+/// nodes and upstream-deleted curated nodes). The orchestrator's
+/// curated KG set now lives under `templates/knowledge/` and is
+/// bundle-materialized into `<project>/knowledge/` by
+/// `_enumerate_bundle_files` in `vco_lib/project_init.py`. The
+/// manifest-driven hash compare (V47-A pattern) preserves user
+/// customizations on bundle update — same shape as agents / skills /
+/// hooks. Result: zero conflicts on KG content across updates.
 ///
 /// **Explicitly excluded:** `install.py` / `install.sh` / `install.ps1`
 /// (orchestrator entry points), `state/` (per-install metadata; the
@@ -10394,19 +10405,25 @@ mod tests {
         let p = tmp();
         // Two managed paths already there
         fs::create_dir_all(p.join(".claude")).unwrap();
-        fs::create_dir_all(p.join("knowledge")).unwrap();
+        fs::create_dir_all(p.join("docs")).unwrap();
 
         let diff = diff_install(&p);
         assert_eq!(diff.mode, InstallMode::Adopt);
         assert!(diff.will_overwrite.contains(&".claude".to_string()));
-        assert!(diff.will_overwrite.contains(&"knowledge".to_string()));
-        // docs/tools/infrastructure/vct-module.json/orchestrator-
+        assert!(diff.will_overwrite.contains(&"docs".to_string()));
+        // tools/infrastructure/vct-module.json/orchestrator-
         // managed-paths.txt don't exist yet → in will_add. (CLAUDE.md
         // was removed from the whitelist in PR-31; it never appears in
-        // will_add or will_overwrite anymore.)
-        assert!(diff.will_add.contains(&"docs".to_string()));
+        // will_add or will_overwrite anymore. `knowledge/` was removed
+        // in v0.2.52 V52-C — shipped KG nodes now live under
+        // `templates/knowledge/` and are bundle-materialized into
+        // `<project>/knowledge/` by `_enumerate_bundle_files`, NOT
+        // copied through this whitelist.)
+        assert!(diff.will_add.contains(&"tools".to_string()));
         assert!(!diff.will_add.contains(&"CLAUDE.md".to_string()));
         assert!(!diff.will_overwrite.contains(&"CLAUDE.md".to_string()));
+        assert!(!diff.will_add.contains(&"knowledge".to_string()));
+        assert!(!diff.will_overwrite.contains(&"knowledge".to_string()));
         assert!(diff.user_paths_preserved);
         fs::remove_dir_all(&p).ok();
     }
@@ -10438,8 +10455,13 @@ mod tests {
         // PR-31 / v0.2.12 removed CLAUDE.md from the managed allowlist —
         // user projects render their own from templates/CLAUDE.md.template.)
         fs::write(p.join(".claude/CONTEXT_STATE.md"), "# upstream context state\n").unwrap();
-        fs::create_dir_all(p.join("knowledge")).unwrap();
-        fs::write(p.join("knowledge/note.md"), "hello").unwrap();
+        // `docs/` stays in the whitelist; use it as the "in-allowlist
+        // directory with file" fixture. (`knowledge/` was removed from
+        // the whitelist in v0.2.52 V52-C — shipped KG nodes are now
+        // bundle-materialized from `templates/knowledge/` rather than
+        // copied through this allowlist.)
+        fs::create_dir_all(p.join("docs")).unwrap();
+        fs::write(p.join("docs/note.md"), "hello").unwrap();
         // Files NOT in the allowlist — must NOT be copied.
         // CLAUDE.md remains in the source dir to exercise the "is OUT of
         // allowlist → not copied" contract.
@@ -10447,6 +10469,10 @@ mod tests {
         fs::write(p.join("README.md"), "readme").unwrap();
         fs::create_dir_all(p.join("scripts")).unwrap();
         fs::write(p.join("scripts/foo.sh"), "echo hi").unwrap();
+        // `knowledge/` in the source must NOT be copied — V52-C made it
+        // a non-managed path.
+        fs::create_dir_all(p.join("knowledge")).unwrap();
+        fs::write(p.join("knowledge/source-side.md"), "should-not-copy").unwrap();
         p
     }
 
@@ -10467,16 +10493,21 @@ mod tests {
         // Allowlisted entries copied
         assert!(target.join("vct-module.json").exists());
         assert!(target.join(".claude/settings.json").exists());
-        assert!(target.join("knowledge/note.md").exists());
+        assert!(target.join("docs/note.md").exists());
 
         // NOT in allowlist: must NOT have been copied. CLAUDE.md was
         // removed from the whitelist in PR-31 (v0.2.12) — see the
         // doc-comment above ORCHESTRATOR_MANAGED_PATHS. User projects
         // render their CLAUDE.md from templates/CLAUDE.md.template
         // instead of receiving the orchestrator-self's root CLAUDE.md.
+        // `knowledge/` was removed in v0.2.52 V52-C — shipped KG nodes
+        // are now materialized from `templates/knowledge/` via the
+        // bundle install path (manifest-tracked, user-modifications
+        // preserved on update).
         assert!(!target.join("CLAUDE.md").exists());
         assert!(!target.join("README.md").exists());
         assert!(!target.join("scripts/foo.sh").exists());
+        assert!(!target.join("knowledge/source-side.md").exists());
 
         fs::remove_dir_all(&source).ok();
         fs::remove_dir_all(&target).ok();
@@ -10548,7 +10579,6 @@ mod tests {
         // concern, not the whitelist-copy concern.
         let expected: &[&str] = &[
             ".claude",
-            "knowledge",
             "docs",
             "tools",
             "infrastructure",
@@ -11925,10 +11955,16 @@ MemAvailable:   23456789 kB
         assert!(ctx.contains(MERGE_BLOCK_START));
         assert!(ctx.contains(MERGE_BLOCK_END));
 
-        // Knowledge dir is NOT preserved — the user note gets overwritten.
+        // `knowledge/` was removed from the managed allowlist in v0.2.52
+        // V52-C: KG nodes are USER-CURATED state, never copied through
+        // this strategy. The user's `knowledge/note.md` survives every
+        // strategy because nothing tries to copy onto it. The shipped
+        // curated KG set is bundle-materialized from `templates/knowledge/`
+        // via `_enumerate_bundle_files` (manifest-tracked, user edits
+        // preserved on bundle update — same V47-A pattern as agents/skills).
         assert_eq!(
             fs::read_to_string(target.join("knowledge/note.md")).unwrap(),
-            "hello"
+            "OLD\n"
         );
 
         assert!(report.notification_written);

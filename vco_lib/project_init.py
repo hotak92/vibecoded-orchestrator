@@ -2794,6 +2794,39 @@ def _enumerate_bundle_files(
                 always_overwrite=False,
             ))
 
+    # v0.2.52 V52-C: shipped KG nodes (orchestrator's curated set) live
+    # under `templates/knowledge/` and are materialized into
+    # `<project>/knowledge/` here. Pre-V52-C the curated set lived at
+    # `knowledge/` in the source tree and was copied through
+    # `ORCHESTRATOR_MANAGED_PATHS`; that mixed shipped + user-authored
+    # nodes in the same directory and caused merge conflicts on update
+    # (modify-vs-delete races against user-modified nodes).
+    #
+    # `always_overwrite=False` is critical: user customizations to
+    # shipped nodes are PRESERVED across bundle updates via the
+    # manifest-driven hash compare in `_plan_bundle_action` (same V47-A
+    # pattern as agents / skills / hooks). User-authored nodes not
+    # shipped by the orchestrator survive automatically — they aren't
+    # in the bundle ops list so they're never touched.
+    #
+    # Recursive walk: enumerates every file (.md, .json metadata like
+    # `.node_formats.json`, etc.) under `templates/knowledge/`. The
+    # destination preserves the relative path beneath `knowledge/`.
+    knowledge_src = templates / "knowledge"
+    if knowledge_src.exists():
+        for f in sorted(knowledge_src.rglob("*")):
+            if f.is_dir():
+                continue
+            rel_in_knowledge = f.relative_to(knowledge_src)
+            dest_rel = str(Path("knowledge") / rel_in_knowledge)
+            ops.append(_BundleFileOp(
+                dest_rel=dest_rel,
+                source_abs=f,
+                source_rel=str(f.relative_to(orchestrator_root)),
+                transform=None,
+                always_overwrite=False,
+            ))
+
     return ops
 
 

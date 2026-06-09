@@ -32,8 +32,20 @@
 # CLAUDE.md — that is the EXISTING-user-CLAUDE.md preservation
 # concern at update time, NOT the whitelist concern this file
 # governs. The two are deliberately decoupled.
+#
+# `knowledge/` was REMOVED from this whitelist in v0.2.52 (V52-C).
+# KG nodes are USER-CURATED state, not source-controlled content.
+# The orchestrator now ships its curated KG node set as templates
+# under `templates/knowledge/`; `vco_lib/project_init.py`'s
+# `_enumerate_bundle_files` materializes them into `<project>/knowledge/`
+# at install time. The manifest-driven hash compare preserves user
+# customizations on bundle update (V47-A pattern). Result: zero
+# merge conflicts on KG content across orchestrator updates.
+# (Same shape as the v0.2.12 CLAUDE.md removal: shipped vs user
+# state cleanly separated.) `templates/` itself remains in the
+# banned list — it's the SOURCE for `_enumerate_bundle_files`, not
+# a destination.
 .claude
-knowledge
 docs
 tools
 infrastructure

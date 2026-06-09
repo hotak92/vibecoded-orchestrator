@@ -36,20 +36,34 @@ def _fake_repo_source(root: Path) -> Path:
     file is included here precisely so the tests can assert it stays
     behind — the same way ``README.md`` and ``scripts/foo.sh`` test
     the broader "not in allowlist → not copied" contract.
+
+    V52-C note (v0.2.52): ``knowledge/`` was REMOVED from the install
+    whitelist. The source still has a ``knowledge/`` directory (it's a
+    legitimate user-state location), but ``apply_conflict_strategy``
+    must NOT copy it into the target. Shipped KG nodes are now
+    bundle-materialized from ``templates/knowledge/`` via
+    ``_enumerate_bundle_files``; the manifest-tracked path preserves
+    user customizations on update (V47-A pattern). This fixture
+    keeps the ``knowledge/`` dir so the tests can assert it stays
+    behind (mirrors the CLAUDE.md negative-assertion pattern).
     """
     p = root / "src"
     p.mkdir(parents=True, exist_ok=True)
     (p / "vct-module.json").write_text("{}")
     (p / ".claude").mkdir()
     (p / ".claude" / "settings.json").write_text("{}")
-    (p / "knowledge").mkdir()
-    (p / "knowledge" / "note.md").write_text("hello")
+    # `docs/` IS in the whitelist — fixture for the positive copy test.
+    (p / "docs").mkdir()
+    (p / "docs" / "note.md").write_text("hello")
     # Files NOT in the allowlist — must NOT be copied. CLAUDE.md is in
-    # this group as of PR-31 / v0.2.12 (see the module docstring).
+    # this group as of PR-31 / v0.2.12. `knowledge/` joined the group
+    # in V52-C / v0.2.52 (see the module docstring).
     (p / "CLAUDE.md").write_text("# orchestrator-self CLAUDE.md\n")
     (p / "README.md").write_text("readme")
     (p / "scripts").mkdir()
     (p / "scripts" / "foo.sh").write_text("echo hi")
+    (p / "knowledge").mkdir()
+    (p / "knowledge" / "note.md").write_text("source-side-should-not-copy")
     return p
 
 
@@ -256,8 +270,15 @@ class ApplyConflictStrategyTests(unittest.TestCase):
         # files. settings.json is the one driving the .new.json sibling
         # in this test.
         self.assertIn("settings.json", ctx_text)
-        # knowledge/note.md is NOT preserved → user note overwritten.
-        self.assertEqual((self.target / "knowledge" / "note.md").read_text(), "hello")
+        # V52-C (v0.2.52): `knowledge/` is OUT of the install whitelist,
+        # so apply_conflict_strategy never visits it. The user's
+        # `knowledge/note.md` survives every strategy because nothing
+        # tries to copy onto it. (Same shape as the CLAUDE.md assertion
+        # above — out-of-allowlist files survive unconditionally.)
+        # Shipped KG nodes reach the user project via
+        # `_enumerate_bundle_files`'s `templates/knowledge/` walk
+        # instead, which is the V47-A manifest-tracked path.
+        self.assertEqual((self.target / "knowledge" / "note.md").read_text(), "OLD\n")
         self.assertTrue(report["notification_written"])
         self.assertGreaterEqual(report["new_md_count"], 1)
         self.assertEqual(report["preserved_count"], report["new_md_count"])

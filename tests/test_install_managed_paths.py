@@ -43,7 +43,6 @@ import install  # type: ignore  # noqa: E402
 # in the same commit.
 EXPECTED_MANAGED_PATHS: tuple[str, ...] = (
     ".claude",
-    "knowledge",
     "docs",
     "tools",
     "infrastructure",
