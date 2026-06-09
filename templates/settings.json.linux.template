@@ -208,6 +208,16 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/pre-bash-context-inject.sh",
+            "timeout": 8
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {
@@ -300,6 +310,28 @@
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-file-edit.sh",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-edit-outcome.sh",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/post-bash-context-record.sh",
+            "timeout": 5,
+            "async": true
           }
         ]
       },

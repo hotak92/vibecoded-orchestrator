@@ -208,6 +208,16 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-bash-context-inject.ps1",
+            "timeout": 8
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {
@@ -300,6 +310,28 @@
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-file-edit.ps1",
             "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-edit-outcome.ps1",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-bash-context-record.ps1",
+            "timeout": 5,
+            "async": true
           }
         ]
       },
