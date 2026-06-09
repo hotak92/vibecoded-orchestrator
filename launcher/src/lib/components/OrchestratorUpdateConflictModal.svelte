@@ -1,12 +1,12 @@
 <script lang="ts">
   // v0.2.23 (B4 / D19): orchestrator-update merge/rebase conflict modal.
   // v0.2.52 (V52-A / V52-B): one-click "Keep local" + "Accept upstream"
-  //   buttons added. The legacy "Resolve manually (close this dialog)"
-  //   button is REMOVED — it was the silent-dismiss path that left the
-  //   install in an inconsistent state. The modal now exposes exactly
-  //   three options: Abort & restore, Keep local versions, Accept
-  //   upstream versions. Window-X / Escape / backdrop click are mapped
-  //   to Abort (with a confirmation) instead of silent dismissal so the
+  //   buttons added. The legacy silent-dismiss path that wrapped a
+  //   plain `onClose()` is REMOVED — it left the install in an
+  //   inconsistent state. The modal now exposes exactly three
+  //   options: Abort & restore, Keep local versions, Accept upstream
+  //   versions. Window-X / Escape / backdrop click are mapped to
+  //   Abort (with a confirmation) instead of silent dismissal so the
   //   user can never finish a session with a half-applied update.
   //
   // Surfaced when `merge_orchestrator_with_upstream` or
@@ -173,8 +173,9 @@
 
   /**
    * Best-effort: classify each conflicted file so the inline hint
-   * tells the user "keep local" vs "general merge" rather than a
-   * generic message.
+   * nudges the user toward the right per-file choice. V52-B-aware: the
+   * hints reference the new Keep local / Accept upstream buttons rather
+   * than the v0.2.51 manual-edit flow.
    */
   function guidanceFor(path: string): string {
     const lower = path.toLowerCase();
@@ -186,9 +187,9 @@
       lower.startsWith('knowledge/') ||
       lower.includes('/knowledge/')
     ) {
-      return 'Keep your local version; manually merge upstream additions.';
+      return 'User-curated — Keep local is usually right.';
     }
-    return 'Resolve manually in your editor.';
+    return 'Either choice is reasonable.';
   }
 
   async function abort() {
@@ -458,11 +459,10 @@
     </details>
 
     <!-- V52-A / V52-B (2026-06-09): exactly three primary actions — Abort,
-         Keep local, Accept upstream. The legacy "Resolve manually (close
-         this dialog)" button is REMOVED; it was the silent-dismiss path
-         that left half-applied updates. Continue Update appears below the
-         primary row, but only as a secondary affordance for users who
-         resolved via CLI before clicking. -->
+         Keep local, Accept upstream. The legacy silent-dismiss button
+         is REMOVED; it left half-applied updates on disk. Continue
+         Update appears below the primary row, but only as a secondary
+         affordance for users who resolved via CLI before clicking. -->
     <div class="cfl-actions">
       <button
         class="cfl-btn cfl-btn-warn"
