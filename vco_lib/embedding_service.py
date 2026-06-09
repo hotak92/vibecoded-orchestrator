@@ -783,6 +783,93 @@ DEFAULT_TEXT_MODEL = "qwen3-embedding:0.6b"
 DEFAULT_CODE_MODEL = "codesage-large-v2"
 
 
+# v0.2.52 V52-AJ: active-embedding resolution helpers.
+#
+# Single canonical resolution path for the ACTIVE_EMBEDDING value:
+#   env (ACTIVE_EMBEDDING)  →  launcher.db (app_state[embedding.active_profile])
+#                            →  "qwen3" default.
+#
+# Used by ``EmbeddingService.for_project()``. install.py uses the SAME
+# launcher.db reader (``read_app_state_active_embedding``) to thread the
+# resolved value into subprocess env BEFORE spawning sync_knowledge_graph.py
+# — so both code paths arrive at the same answer.
+#
+# No back-compat fallback ladder (per the v0.2.52 "consistent" rule,
+# user-locked 2026-06-09): exactly one resolution chain, env always wins.
+
+
+def _resolve_active_embedding() -> str:
+    """Return the active embedding profile (lowercased, stripped).
+
+    Resolution chain (each step short-circuits if non-empty):
+
+      1. ``os.environ["ACTIVE_EMBEDDING"]`` — explicit env / install.py
+         subprocess thread.
+      2. ``launcher.db app_state[embedding.active_profile]`` — what the
+         launcher's Identity tab + install.py's preset selection wrote.
+      3. ``"qwen3"`` — final fallback (free-tier install without launcher,
+         or the launcher never booted post-install).
+
+    All inputs are normalised with ``.strip().lower()``. Empty strings
+    are treated as "absent" and skipped in favour of the next step.
+
+    Returns:
+        A non-empty lowercase string identifying the active embedding
+        profile (typically ``"qwen3"``, ``"arctic"``, ``"openai"``).
+    """
+    env_value = os.environ.get("ACTIVE_EMBEDDING", "").strip().lower()
+    if env_value:
+        return env_value
+    try:
+        # Imported lazily to avoid a hard dependency on launcher_db_reader
+        # for callers that don't touch this resolution path.
+        from vco_lib.launcher_db_reader import read_app_state_active_embedding
+
+        db_value = read_app_state_active_embedding()
+        if db_value:
+            return db_value.strip().lower()
+    except Exception:
+        # Soft-fail: every read path in launcher_db_reader already
+        # swallows exceptions, but defense-in-depth against an
+        # ImportError on a partial install or sqlite-disabled build.
+        pass
+    return "qwen3"
+
+
+def _model_id_for_active(active: str) -> str:
+    """Map an active-embedding profile to its canonical Ollama / OpenAI model id.
+
+    The mapping mirrors install.py's ``EMBEDDING_CONFIGS`` table — keeping
+    one resolution rule per profile prevents drift between the install-time
+    choice and the runtime ``EmbeddingService`` selection.
+
+    Args:
+        active: profile id (case-insensitive). One of ``"qwen3"``,
+            ``"arctic"``, ``"openai"``, ``"codesage"``. Anything else
+            falls back to qwen3 (the safe default — install.py's preset
+            chooser refuses to write any other value, so this branch
+            should never fire in production).
+
+    Returns:
+        The model id string the relevant adapter expects (e.g.
+        ``"snowflake-arctic-embed2:latest"`` for Ollama,
+        ``"text-embedding-3-small"`` for OpenAI).
+
+    See also:
+        install.py ``EMBEDDING_CONFIGS`` — install-time presets that
+        produce these same active→model mappings.
+    """
+    normalised = (active or "").strip().lower()
+    if normalised == "arctic":
+        return "snowflake-arctic-embed2:latest"
+    if normalised == "openai":
+        return "text-embedding-3-small"
+    # ``qwen3``, ``codesage`` (text-side rarely used), or anything else:
+    # fall back to qwen3, which is the only-always-present-on-fresh-install
+    # text embedder.
+    return DEFAULT_TEXT_MODEL
+
+
 class EmbeddingService:
     """Per-project embedding dispatcher.
 
@@ -871,14 +958,30 @@ class EmbeddingService:
 
           * ``OLLAMA_URL`` → defaults to ``http://localhost:11435``
           * ``CODE_EMBED_SERVICE_URL`` → defaults to ``http://localhost:11440``
-          * ``EMBEDDING_MODEL`` → defaults to ``qwen3-embedding:0.6b``
+          * ``EMBEDDING_MODEL`` → if unset, falls back to launcher.db
+            ``app_state[embedding.active_profile]`` mapping, then
+            ``qwen3-embedding:0.6b`` (v0.2.52 V52-AJ).
           * ``CODE_EMBED_MODEL`` → defaults to ``codesage-large-v2``
-          * ``ACTIVE_EMBEDDING`` → drives slot selection when value
-            indicates a non-default provider (``"openai"`` selects
-            the OpenAI text model). Default ``"qwen3"``.
+          * ``ACTIVE_EMBEDDING`` → if unset, falls back to launcher.db
+            ``app_state[embedding.active_profile]``, then ``"qwen3"``
+            (v0.2.52 V52-AJ). Drives slot selection when value indicates
+            a non-default provider (``"openai"`` selects the OpenAI
+            text model, ``"arctic"`` selects snowflake-arctic-embed2).
           * ``OPENAI_API_KEY`` → empty string is "no key configured".
           * ``CODE_EMBED_BACKEND`` → ``"service"`` (default) /
             ``"ollama"``. Affects code-model defaults.
+
+        v0.2.52 V52-AJ — launcher.db fallback:
+            When ``ACTIVE_EMBEDDING`` / ``EMBEDDING_MODEL`` env vars are
+            absent or empty, ``for_project()`` consults launcher.db's
+            ``app_state[embedding.active_profile]`` (written by the
+            Identity-tab embedding selector or install.py's preset
+            seeding). This unblocks install.py's ``sync_knowledge_graph.py``
+            subprocess on Windows + CPU-only machines where the launcher
+            stored ``arctic`` but the install.py subprocess inherited an
+            empty env. Env always wins; launcher.db is fallback; default
+            ``qwen3`` is the final fallback when launcher.db is also
+            unreachable (free-tier install without the launcher).
 
         Raises:
             NoEmbeddingBackendError: If neither a text backend NOR a
@@ -893,7 +996,14 @@ class EmbeddingService:
             or DEFAULT_CODE_EMBED_URL
         )
 
-        active = os.environ.get("ACTIVE_EMBEDDING", "qwen3").strip().lower() or "qwen3"
+        # v0.2.52 V52-AJ: env → launcher.db app_state → "qwen3" default.
+        # Env always wins (explicit user / install.py thread); launcher.db
+        # is the fallback for subprocesses that inherit an empty env
+        # (notably install.py's sync_knowledge_graph.py spawn on fresh
+        # CPU-only installs where the embedding choice lives only in
+        # the launcher's app_state). No back-compat fallback ladder —
+        # one canonical resolution path per the v0.2.52 "consistent" rule.
+        active = _resolve_active_embedding()
         # Choose text model id with provider awareness.
         env_text_model = os.environ.get("EMBEDDING_MODEL", "").strip()
         if env_text_model:
@@ -903,7 +1013,13 @@ class EmbeddingService:
                 "OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"
             ).strip() or "text-embedding-3-small"
         else:
-            text_model_id = DEFAULT_TEXT_MODEL
+            # No EMBEDDING_MODEL env override → derive from the resolved
+            # ``active`` value. This is the install.py-Windows-CPU fix:
+            # when the launcher seeded ``active=arctic`` but install.py's
+            # subprocess inherited an empty EMBEDDING_MODEL, the previous
+            # code unconditionally picked DEFAULT_TEXT_MODEL (qwen3) and
+            # spent hours embedding on the wrong backend.
+            text_model_id = _model_id_for_active(active)
 
         # Code model id. CODE_EMBED_BACKEND="ollama" means CPU fallback
         # via the qwen3 model; "service" means the FastAPI service.
