@@ -213,18 +213,26 @@ def test_telemetry_emit_fires_on_pro_tier():
     _run(_inner())
 
 
-def test_emit_validation_error_does_not_raise():
-    """A caller-side missing field (failure-mode path with empty query_emb)
-    is swallowed as DEBUG. The user-facing search must not break because
-    telemetry validation rejected the payload."""
+def test_emit_validation_soft_path_does_not_raise():
+    """Per ab706bd V52-J refactor's validation tiers: empty/None
+    query_emb is SOFT (debug-log + still write), NOT STRICT (raise).
+
+    The user-facing search must never break because telemetry had a
+    soft-warn. emit_rl_event returns True in the SOFT path because the
+    event WAS written — just with the warning logged. The hard-validation
+    cases (empty query, empty task_id) remain STRICT and DO produce
+    emit_success=False via the surrounding try/except in rerank_and_emit
+    — tested separately.
+    """
     async def _inner():
-        req = _make_request(query_emb=None)  # validation will fail
+        req = _make_request(query_emb=None)  # SOFT path: warn but write
         with patch.object(search_pipeline, "_resolve_rl_enabled", return_value=False):
             # Must not raise.
             result = await search_pipeline.rerank_and_emit(req)
         # ranked still populated.
         assert len(result.ranked) > 0
-        assert result.emit_success is False
+        # Per SOFT-tier: emit succeeds + warning logged.
+        assert result.emit_success is True
     _run(_inner())
 
 

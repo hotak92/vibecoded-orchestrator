@@ -74,24 +74,34 @@ def test_emit_raises_on_empty_query():
     assert "query" in str(exc_info.value).lower()
 
 
-def test_emit_raises_on_empty_query_emb():
-    """An empty query_emb means the embedding step failed silently;
-    surfacing the error here lets the caller decide to retry or skip."""
+def test_emit_soft_warns_on_empty_query_emb():
+    """An empty query_emb is SOFT-tier (per ab706bd V52-J refactor): the
+    function logs a debug warning and STILL writes the event. Real
+    production cases include failure_mode-flagged events where the
+    embedding step legitimately failed but we want the cohort/query
+    distribution signal anyway.
+
+    Pre-refactor (legacy STRICT tier) raised EmitValidationError here;
+    post-refactor the validation tiers are STRICT (raise — empty query
+    or task_id), SOFT (log + write — empty query_emb or dim mismatch in
+    happy path), SKIPPED (failure_mode events bypass validation
+    entirely). See telemetry_emit.py lines 122-135 for the contract."""
     ev = _make_event(query_emb=[])
-    with pytest.raises(telemetry_emit.EmitValidationError) as exc_info:
-        telemetry_emit.emit_rl_event(ev, writer_factory=lambda: MagicMock())
-    assert "query_emb" in str(exc_info.value).lower()
+    # Should NOT raise; should return True (writer was called).
+    result = telemetry_emit.emit_rl_event(ev, writer_factory=lambda: MagicMock())
+    assert result is True
 
 
-def test_emit_raises_on_dim_mismatch():
-    """If the caller-declared embedding_dim doesn't match the actual
-    query_emb length, the downstream training pipeline will silently
-    misalign; raise here instead."""
+def test_emit_soft_warns_on_dim_mismatch():
+    """Dim mismatch is SOFT-tier per ab706bd V52-J refactor — same
+    rationale as test_emit_soft_warns_on_empty_query_emb. The writer's
+    _build_v3_retrieval_event still handles a non-None query_emb of any
+    length; the offline trainer filters by (embedding_dim, embedding_source)
+    cohort labels and the dim-mismatch row simply lands in a separate cohort.
+    """
     ev = _make_event(query_emb=[0.1] * 768, embedding_dim=1024)
-    with pytest.raises(telemetry_emit.EmitValidationError) as exc_info:
-        telemetry_emit.emit_rl_event(ev, writer_factory=lambda: MagicMock())
-    assert "768" in str(exc_info.value)
-    assert "1024" in str(exc_info.value)
+    result = telemetry_emit.emit_rl_event(ev, writer_factory=lambda: MagicMock())
+    assert result is True
 
 
 def test_emit_raises_on_empty_task_id():
