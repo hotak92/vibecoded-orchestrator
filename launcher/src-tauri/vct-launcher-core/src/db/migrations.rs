@@ -178,6 +178,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module_installs.kg_collections column (v0.2.49 access-matrix Step F MF3 follow-up). ALTER TABLE adds TEXT column for JSON-encoded array of Weaviate collection names a module declares it writes to (read from vct-module.json manifest at install time). Persisted in launcher DB at install time so populate_kg_collection_access_for_project can back-fill new projects' access rows without re-parsing manifest from disk. Pre-v0.2.49 module installs backfill to NULL; reinstall populates the column. User directive 2026-06-08: refactor disk-read MF3 to DB-storage now rather than queueing v0.2.50 follow-up.",
         sql: include_str!("migrations/032_module_installs_kg_collections.sql"),
     },
+    Migration {
+        version: 33,
+        description: "artifact_schema_versions table (v0.2.52 V52-AG). Single registry for every derived-state artifact's schema version (Weaviate collections, code-graph indices, JSON-content shapes, controlled-vocabulary columns, project bootstrap version). Keyed by (project_id NULL = orchestrator-wide, artifact_type, artifact_name). Install/update flows compare stored version against canonical constants in vco_lib/schema_versions.py and trigger drop+recreate (derived state) OR upgrade-in-place (user-curated state) on mismatch. Foundation for the user-locked 2026-06-09 'from now on consistent' rule: no back-compat layers, no migration ladders — bump constant, drop+recreate. See v0.2.52 backlog § V52-AG + § V52-AF for the consumer wiring.",
+        sql: include_str!("migrations/033_artifact_schema_versions.sql"),
+    },
 ];
 
 /// Apply every migration whose version is greater than the current max applied.
