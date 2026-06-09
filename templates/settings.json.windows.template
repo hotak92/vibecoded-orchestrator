@@ -164,7 +164,7 @@
           {
             "type": "command",
             "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\subagent-start-suggest.ps1",
-            "timeout": 2
+            "timeout": 5
           },
           {
             "type": "command",

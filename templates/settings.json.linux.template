@@ -164,7 +164,7 @@
           {
             "type": "command",
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/subagent-start-suggest.sh",
-            "timeout": 2
+            "timeout": 5
           },
           {
             "type": "command",
