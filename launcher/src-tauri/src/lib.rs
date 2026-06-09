@@ -660,6 +660,49 @@ pub fn run() {
                 );
             }
 
+            // v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): boot-time
+            // recovery probe for the Windows stage1 updater handoff.
+            //
+            // On Windows, `prepare_windows_update_handoff` (invoked by
+            // the prior launcher process during update_orchestrator)
+            // writes `~/.vct/update.lock.json` and spawns vct-updater.exe
+            // to perform the binary swap. The updater deletes the lock
+            // file when it completes successfully.
+            //
+            // If we find the lock file here on a fresh launcher start:
+            //   - Fresh (<10 min): the updater completed the swap and
+            //     we are the new binary it relaunched. Emit a
+            //     `vct-update-recovered` event so the FE can render a
+            //     one-shot "Updated to v0.2.X" toast.
+            //   - Stale (>10 min, missing/unparseable timestamp): the
+            //     updater crashed mid-swap. Emit `vct-update-failed`
+            //     so the FE can render a "may have failed" diagnostic
+            //     pointing the user at `update.log`.
+            //
+            // The probe deletes the lock file unconditionally so the
+            // diagnostic only fires once per actual update. POSIX hosts
+            // never write the lock file, so this is effectively a no-op
+            // there (the function returns `UpdateRecoveryReport::default()`).
+            {
+                use tauri::Emitter as _;
+                let recovery = commands::update_handoff::poll_update_lock_on_boot();
+                if recovery.recovered || recovery.stale_or_invalid {
+                    let event_name = if recovery.recovered {
+                        "vct-update-recovered"
+                    } else {
+                        "vct-update-failed"
+                    };
+                    // Best-effort: if the emit fails (no windows yet,
+                    // FE not subscribed) the next FE refresh can pull
+                    // the same state via `get_update_recovery_report`.
+                    let _ = app.emit(event_name, &recovery);
+                    eprintln!(
+                        "[vct] boot recovery: {} (lock_path={:?}, reason={:?})",
+                        event_name, recovery.lock_path, recovery.reason,
+                    );
+                }
+            }
+
             // v0.2.37 (Agent V37-E, 2026-05-27): consume the
             // install_path seed file that install.py may have written
             // alongside the orchestrator clone (see

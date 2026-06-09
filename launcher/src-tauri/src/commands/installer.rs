@@ -3594,6 +3594,153 @@ fn pre_pull_rename_running_binary(_install_path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): post-pull staging for the
+/// Windows stage1 updater handoff.
+///
+/// Background
+/// ----------
+/// Even with `pre_pull_rename_running_binary`, the dist binary at
+/// `launcher/dist/windows-x64/vct-launcher.exe` (or `vct-hub.exe`) can
+/// end up STALE after a successful git pull when:
+///   - The rename failed silently (antivirus held a handle briefly).
+///   - Some other process held the file open (Windows defender scan,
+///     indexer, dev console with the .exe drag-dropped, etc).
+/// In those cases `git pull` saw ERROR_SHARING_VIOLATION on the binary
+/// but completed the rest of the merge — leaving metadata.json at the
+/// new version but the .exe bytes at the OLD version (Fabio's bug).
+///
+/// This helper detects that state by checking `git status --porcelain
+/// <relative_path>` for each candidate binary. Any dirty status means
+/// git considers the file diverged from HEAD (= the new bytes git
+/// SHOULD have written are not actually on disk). For each such file,
+/// we extract HEAD's blob into `<target>.new` via `git show
+/// HEAD:<relative_path>`. The updater (`vct-updater.exe`) then renames
+/// `<target>.new` → `<target>` after the running launcher exits.
+///
+/// On POSIX, this is a no-op (the rename pattern in
+/// `pre_pull_rename_running_binary` plus inode ref-counting already
+/// handles binary overwrite correctly).
+///
+/// Returns the list of relative paths that were staged as `.new`
+/// (empty on POSIX or when no binaries needed staging).
+#[cfg(windows)]
+async fn stage_locked_binaries_for_handoff(install_path: &Path) -> Vec<String> {
+    let mut staged: Vec<String> = Vec::new();
+    let candidates = [
+        "launcher/dist/windows-x64/vct-launcher.exe",
+        "launcher/dist/windows-x64/vct-hub.exe",
+    ];
+    for rel_path in candidates {
+        // Check git status. An empty stdout = clean = nothing to do.
+        let status_out = match tokio::process::Command::new("git")
+            .silent()
+            .args(["status", "--porcelain", "--", rel_path])
+            .current_dir(install_path)
+            .output()
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "[vct] stage_locked_binaries: git status failed for {}: {} \
+                     (skipping; handoff will gracefully no-op for this file)",
+                    rel_path, e
+                );
+                continue;
+            }
+        };
+        if status_out.stdout.is_empty() {
+            // Clean — binary already matches HEAD. Nothing to stage.
+            continue;
+        }
+
+        // Dirty: extract HEAD blob into `<target>.new`. We use
+        // `git show HEAD:<rel_path>` to read the bytes, then write to
+        // `<target>.new`. Path safety: the candidates list is
+        // hard-coded above so no injection risk.
+        let target_abs = install_path.join(rel_path);
+        let staged_abs = path_with_new_suffix(&target_abs);
+
+        let show_out = match tokio::process::Command::new("git")
+            .silent()
+            .args(["show", &format!("HEAD:{}", rel_path)])
+            .current_dir(install_path)
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                eprintln!(
+                    "[vct] stage_locked_binaries: git show HEAD:{} exited non-zero ({:?}); \
+                     skipping. stderr: {}",
+                    rel_path,
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stderr).trim(),
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] stage_locked_binaries: git show HEAD:{} spawn failed: {} (skipping)",
+                    rel_path, e
+                );
+                continue;
+            }
+        };
+
+        // Write the bytes atomically (write to `.tmp`, rename onto `.new`).
+        let tmp_path = staged_abs.with_extension("new.tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &show_out.stdout) {
+            eprintln!(
+                "[vct] stage_locked_binaries: write {} failed: {} (skipping)",
+                tmp_path.display(),
+                e,
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &staged_abs) {
+            eprintln!(
+                "[vct] stage_locked_binaries: rename {} → {} failed: {} (skipping)",
+                tmp_path.display(),
+                staged_abs.display(),
+                e,
+            );
+            let _ = std::fs::remove_file(&tmp_path);
+            continue;
+        }
+        eprintln!(
+            "[vct] stage_locked_binaries: staged {} → {} ({} bytes)",
+            rel_path,
+            staged_abs.display(),
+            show_out.stdout.len(),
+        );
+        staged.push(rel_path.to_string());
+    }
+    staged
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)] // POSIX caller is gated by cfg; tests don't exercise this branch
+async fn stage_locked_binaries_for_handoff(_install_path: &Path) -> Vec<String> {
+    // POSIX: no-op. Inode ref-counting + rename pattern handle binary
+    // overwrite correctly without any handoff dance.
+    Vec::new()
+}
+
+/// Helper used by `stage_locked_binaries_for_handoff` (Windows) AND by
+/// tests on every host. Keep in sync with the same-named helper in
+/// `commands::update_handoff` — both must produce the same staging
+/// filename so the launcher writes where the updater reads.
+#[allow(dead_code)] // exercised by Windows path + tests
+fn path_with_new_suffix(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    parent.join(format!("{}.new", name))
+}
+
 /// v0.2.17 (plan 0.0.B): revert the pre-pull rename on git-pull failure.
 ///
 /// Best-effort: log + continue on any error. The user can manually
@@ -4474,6 +4621,82 @@ pub async fn update_orchestrator<R: Runtime>(
     // runs cleanly; calling disarm_and_cleanup() now makes the order
     // deterministic.
     update_gate_guard.disarm_and_cleanup();
+
+    // v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): Windows stage1 updater
+    // handoff. Before falling through to the regular restart_launcher
+    // flow, detect any binaries that git pull silently skipped (file
+    // locked by an antivirus / indexer / racing handle) and stage them
+    // as `<target>.new`. Then write `~/.vct/update.lock.json` and spawn
+    // `vct-updater.exe` DETACHED so it can perform the swap once the
+    // running launcher exits.
+    //
+    // Soft-fail throughout: if staging or handoff fails for ANY reason,
+    // fall through to the existing restart_launcher path — that's the
+    // pre-v0.2.52 behaviour and represents the worst case (= same as
+    // not having V52-AH at all). The new code path strictly improves
+    // on that.
+    //
+    // POSIX: stage_locked_binaries_for_handoff returns empty (no-op),
+    // prepare_windows_update_handoff returns handoff_active=false with
+    // skip_reason="non-windows", so we fall through unconditionally
+    // to restart_launcher. No behaviour change for Linux/macOS users.
+    #[cfg(target_os = "windows")]
+    {
+        let staged = stage_locked_binaries_for_handoff(&install_path).await;
+        if !staged.is_empty() {
+            eprintln!(
+                "[vct] update_orchestrator: V52-AH staged {} binary/binaries \
+                 for handoff: {:?}",
+                staged.len(),
+                staged,
+            );
+        }
+    }
+
+    let handoff_result = match crate::commands::update_handoff::
+        prepare_windows_update_handoff(path.clone()).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // True error (install_root missing etc.) — log + fall through.
+            eprintln!(
+                "[vct] update_orchestrator: V52-AH handoff returned error \
+                 ({}); falling through to legacy restart_launcher",
+                e,
+            );
+            crate::commands::update_handoff::HandoffResult::default()
+        }
+    };
+
+    if handoff_result.handoff_active {
+        eprintln!(
+            "[vct] update_orchestrator: V52-AH handoff active (lock={:?}); \
+             exiting current launcher — vct-updater.exe will perform the \
+             swap + relaunch.",
+            handoff_result.lock_path,
+        );
+        // Mirror the tail of restart_launcher: programmatic quit so the
+        // updater can complete the swap on a now-unlocked .exe. The
+        // updater's spawned child will become the new launcher process.
+        crate::quit_dialog::force_quit();
+        app.exit(0);
+        return Ok(InstallResult {
+            success: true,
+            install_path: path.clone(),
+            message: "Update applied — vct-updater is performing the binary swap. \
+                      The launcher will relaunch automatically."
+                .to_string(),
+            system,
+        });
+    }
+
+    if let Some(reason) = handoff_result.skip_reason.as_deref() {
+        eprintln!(
+            "[vct] update_orchestrator: V52-AH handoff skipped (reason={}); \
+             falling through to legacy restart_launcher",
+            reason,
+        );
+    }
 
     // v0.2.17 (plan 0.0): auto-restart. The launcher has no in-flight
     // user state to lose, so spawn the new binary detached + exit.
