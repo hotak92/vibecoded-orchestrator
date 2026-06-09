@@ -119,6 +119,13 @@ pub mod modules;
 // `vct-hub::module_supervisor` and converts the Tauri commands into HTTP
 // proxies to the hub's lifecycle endpoints.
 pub mod module_service;
+// V52-F (v0.2.52): per-module update GUI surface.
+// Adds `check_module_updates_available` + `update_module_to_latest` Tauri
+// commands + a 24h background poll that emits `vct-module-updates-available`.
+// Layers on top of `module_catalog_client::cached_module_catalog` (L0
+// catalog) and `modules::update_module_for_project` (atomic swap) — does
+// NOT re-implement either. See module docs for the layering rationale.
+pub mod module_updates;
 pub mod openai_cmd;
 // Stream 2 follow-up (v0.2.20 / 2026-05-19): Tauri-command backings for
 // the orchestrator-core `gui.config_tab` declared in `vct-module.json`.

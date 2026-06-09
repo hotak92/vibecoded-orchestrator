@@ -744,6 +744,25 @@
                     Deprecated
                   </span>
                 {/if}
+                <!-- V52-F (v0.2.52): "Update available" pip rendered at the
+                     card-head level so users see pending updates BEFORE
+                     scrolling to the card-footer button. The button below
+                     remains the actionable surface (click → handleUpdate);
+                     this badge is purely informational and only renders
+                     for the `installed` branch with `can_update=true`.
+
+                     Wording is the spec's "Update available: vX.Y.Z"
+                     (full target version) so the user knows what they
+                     would be moving to without expanding the card. -->
+                {#if display.kind === 'installed' && display.can_update}
+                  <span
+                    class="tier-badge tier-update-available"
+                    title="A newer version is available. Click 'Update' below to apply."
+                    data-testid="badge-update-available"
+                  >
+                    Update available: v{m.version}
+                  </span>
+                {/if}
                 <!-- Bug D (v0.2.49): per-project status badge.
                      Resolved at the top of the {#each} (ppBadge const).
                      Always rendered so a project switch reads as
@@ -1251,6 +1270,18 @@
   .tier-badge.tier-gated {
     background: rgba(231, 76, 60, 0.16);
     color: #ff8a7e;
+    cursor: help;
+  }
+
+  /* V52-F (v0.2.52): "Update available" badge. Pink-tinted (the brand
+     accent for actionable-but-not-urgent surfaces — sits between the
+     teal "Free" and amber "Deprecated"). cursor:help cues the
+     tooltip; the actual click target is the Update button in the
+     card-footer. Width is auto so longer version strings (1.10.0,
+     0.2.10-rc1) don't truncate. */
+  .tier-badge.tier-update-available {
+    background: rgba(255, 79, 160, 0.16);
+    color: var(--color-pink);
     cursor: help;
   }
 

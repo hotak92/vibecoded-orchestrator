@@ -1748,6 +1748,20 @@ pub fn run() {
                 app.handle().clone(),
             );
 
+            // V52-F (v0.2.52): daily auto-poll for module updates.
+            // Fetches the L0 catalog (15-min TTL cache → effectively one
+            // HTTPS GET per 24h) and emits `vct-module-updates-available`
+            // with the per-(project, module) summary whenever an
+            // installed module's `module_version` is behind the catalog's
+            // current version. User can opt out via app_state key
+            // `module_update_auto_check_enabled` (default true). First
+            // tick is a catch-up — emits immediately at boot if the last
+            // check was >24h ago (or never). Soft-fail throughout: every
+            // network/DB error is logged and the next tick retries.
+            crate::commands::module_updates::spawn_module_update_check_loop(
+                app.handle().clone(),
+            );
+
             // v0.2.6 (Bug D3): background watcher that polls services
             // every 30s and auto-restarts on running→stopped transitions.
             // Logs to <install>/state/logs/services-watcher.jsonl. User
@@ -2033,6 +2047,19 @@ pub fn run() {
             commands::modules::set_module_enabled_v2,
             commands::modules::module_start_v2,
             commands::modules::module_stop_v2,
+            // V52-F (v0.2.52): per-module update GUI surface.
+            //   * `check_module_updates_available(project_id)` — summary list.
+            //   * `update_module_to_latest(project_id, module_id)` —
+            //     idempotent wrapper over `update_module_for_project`
+            //     (no-op when already at catalog version; UPDATE_DEFERRED
+            //     entry on partial failure).
+            //   * `get_module_update_auto_check_enabled` /
+            //     `set_module_update_auto_check_enabled` — opt-out toggle
+            //     (default true; reads/writes app_state KV).
+            commands::module_updates::check_module_updates_available,
+            commands::module_updates::update_module_to_latest,
+            commands::module_updates::get_module_update_auto_check_enabled,
+            commands::module_updates::set_module_update_auto_check_enabled,
             // v0.2.21 Stream B (2026-05-19): per-project RL container
             // lifecycle (Phase 1E) + weights-update polling (Phase 3C)
             // + fine-tune-after-download (Phase 4A) + dashboard widget
