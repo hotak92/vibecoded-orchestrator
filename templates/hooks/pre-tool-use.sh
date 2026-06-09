@@ -284,8 +284,42 @@ fi
 CONCEPTS=$(echo "$USER_MESSAGE" | grep -oE "(caching|authentication|database|API|search|optimization|validation|testing|deployment|VRAM|quantization|inference|embedding|MCP|agent|workflow|pattern)" | head -3 | tr '\n' ' ')
 
 if [ -n "$CONCEPTS" ]; then
-    MATCHES=$("$PROJECT_ROOT/.claude/scripts/kg-search" search "$CONCEPTS" --limit 3 --files-only 2>/dev/null | grep "^knowledge/" || echo "")
-    MATCH_COUNT=$(echo "$MATCHES" | grep -c "^knowledge/" 2>/dev/null || echo "0")
+    # V52-J (v0.2.52): switched from kg-search → rl_kg_search.py so this
+    # hook shares the canonical chokepoint with the pre-edit-context-
+    # inject hook + the MCP hybrid_search tool. Same Weaviate fan-out,
+    # same RL rerank, same v3 retrieval-event emit. Pre-V52-J this branch
+    # called kg-search (search_knowledge.py CLI), which until Edit B
+    # produced zero telemetry — switching here closes the redundancy at
+    # the same time as Edit B closes the silent hole.
+    #
+    # rl_kg_search.py --hook-format emits headers of the shape
+    #   "KG: <title> | <node_type> | score=<n.nn> | <body...>"
+    # Title (not file_path) is what we surface to the user since it's
+    # the human-readable identifier; the pre-edit hook's dedup logic
+    # also keys on title.
+    #
+    # Venv resolution mirrors pre-edit-context-inject.sh — uses the
+    # shared _lib/resolve-vco-venv.sh helper so we never accidentally
+    # activate the USER's project venv (which lacks weaviate-client).
+    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+    . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+    resolve_vco_venv_python "$SCRIPT_DIR"
+    VENV="${VCO_VENV_PYTHON:-}"
+    RL_SCRIPT="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py"
+
+    MATCHES=""
+    MATCH_COUNT=0
+    if [ -n "$VENV" ] && [ -f "$RL_SCRIPT" ]; then
+        # Extract only the per-result HEADER lines (start with "KG: " and
+        # carry the " | " separator) — strips body chunks that would
+        # otherwise inflate the suggestion. Filter out the "no-results"
+        # sentinel rl_kg_search emits when nothing matched.
+        MATCHES=$(VCT_SESSION_ID="$SESSION_ID" "$VENV" "$RL_SCRIPT" "$CONCEPTS" --limit 3 --hook-format 2>/dev/null \
+            | grep "^KG: " \
+            | grep -v "^KG: no-results" \
+            | head -3 || echo "")
+        MATCH_COUNT=$(printf '%s\n' "$MATCHES" | grep -c "^KG: " 2>/dev/null || echo "0")
+    fi
 
     if [ "$MATCH_COUNT" -ge 2 ]; then
         # PreToolUse hooks must wrap LLM-bound stdout in
