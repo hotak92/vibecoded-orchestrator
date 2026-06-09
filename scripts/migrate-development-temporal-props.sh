@@ -2,8 +2,9 @@
 # migrate-development-temporal-props.sh
 #
 # Add the four canonical temporal properties (created, updated, valid_from,
-# valid_until) to every existing *_Development collection in the running
-# Weaviate. Properties can be added retroactively via the v1 schema REST API
+# valid_until) to every existing *_Development, *_KnowledgeGraph, and
+# *_Diagrams collection in the running Weaviate. Properties can be added
+# retroactively via the v1 schema REST API
 # (POST /v1/schema/<class>/properties returns 200 on success, 422 on
 # already-present); unlike `invertedIndexConfig.indexNullState` they do NOT
 # require a destructive recreate.
@@ -22,6 +23,14 @@
 # Requires: bash, curl, jq (skipped with a clear message if jq is missing).
 #
 # Coordinated with: scripts/migrate-shared-kg-schema.sh (PR-24, 2026-05-16).
+#
+# V52-I Fix B (2026-06-09): regex extended from `_Development$` to
+# `(_KnowledgeGraph|_Development|_Diagrams)$` so existing shared KG and
+# diagrams collections gain the temporal date props on the next
+# `install.py --update`. Closes the gap that produced 30 false-positive
+# `partial_fan_out_schema_missing` MCP telemetry events. The companion
+# Fix A in `claude_mcp_servers/weaviate_mcp/server.py` is the runtime
+# defensive layer; this script is the permanent schema closure.
 
 set -uo pipefail
 
@@ -50,11 +59,15 @@ if [ -z "$SCHEMA_JSON" ]; then
     exit 0
 fi
 
-# Discover all _Development collections in one pass.
-COLLECTIONS="$(echo "$SCHEMA_JSON" | jq -r '.classes[]?.class | select(test("_Development$"))' 2>/dev/null || true)"
+# Discover all _Development, _KnowledgeGraph, and _Diagrams collections
+# in one pass. V52-I Fix B (2026-06-09): the original regex was
+# `_Development$` only — extending to the three-suffix alternation closes
+# the gap that produced 30 false-positive partial_fan_out_schema_missing
+# MCP telemetry events on shared KG + diagram collections.
+COLLECTIONS="$(echo "$SCHEMA_JSON" | jq -r '.classes[]?.class | select(test("(_KnowledgeGraph|_Development|_Diagrams)$"))' 2>/dev/null || true)"
 
 if [ -z "$COLLECTIONS" ]; then
-    echo "[migrate-dev-props] No *_Development collections found; nothing to migrate."
+    echo "[migrate-dev-props] No *_Development / *_KnowledgeGraph / *_Diagrams collections found; nothing to migrate."
     exit 0
 fi
 

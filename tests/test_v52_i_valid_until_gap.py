@@ -327,9 +327,16 @@ class MigrateScriptRegexTests(unittest.TestCase):
         self.assertIn("_KnowledgeGraph", text)
         self.assertIn("_Development", text)
         self.assertIn("_Diagrams", text)
-        # PowerShell uses -match with a regex literal.
+        # PowerShell uses -match with a regex literal. Find the CODE line
+        # (the one inside the `if (...)` discrimination), not a docstring
+        # comment that happens to mention `-match`. The code line has
+        # `-match` AND the dollar-anchor regex `$'` AND is not a comment
+        # (PowerShell single-line comments start with `#`).
         match_line = next(
-            ln for ln in text.splitlines() if "-match" in ln and "$" in ln
+            ln for ln in text.splitlines()
+            if "-match" in ln
+            and "$'" in ln  # regex literal closes with $'
+            and not ln.strip().startswith("#")
         )
         for suffix in ("_KnowledgeGraph", "_Development", "_Diagrams"):
             self.assertIn(
