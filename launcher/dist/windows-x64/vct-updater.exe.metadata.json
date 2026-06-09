@@ -1,0 +1,11 @@
+{
+  "source_sha": "0044eb6ecb2fe23acd5c2db32e1392c1df9e72a8",
+  "source_short_sha": "0044eb6",
+  "source_hash": "fd215c7a3ec5f179f1ee9d3d694c201cc7a58043",
+  "built_at": "2026-06-09T17:39:27Z",
+  "launcher_version": "0.2.52",
+  "host_target": "windows-x64",
+  "binary_name": "vct-updater.exe",
+  "binary_size_bytes": 301056,
+  "tier": "stable"
+}
