@@ -1186,6 +1186,12 @@ class CodeGraphAnalyzer:
                         Property(name="secondary_layers", data_type=DataType.TEXT_ARRAY, description="Secondary architectural layers if class spans multiple", skip_vectorization=True),
                         # v0.2.47 (extras): source-root provenance (see CodeModule).
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
+                        # v0.2.52 (V52-O.4): repo-relative POSIX path of the
+                        # source file the class was extracted from. Mirrors the
+                        # `path` property on CodeModule so consumers can filter
+                        # / scope by file without joining through the `module`
+                        # reference. Empty for pre-V52-O.4 rows (graceful null).
+                        Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -1231,6 +1237,12 @@ class CodeGraphAnalyzer:
                         Property(name="call_names", data_type=DataType.TEXT_ARRAY, description="Names of called functions (for callers queries)", skip_vectorization=True),
                         # v0.2.47 (extras): source-root provenance (see CodeModule).
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
+                        # v0.2.52 (V52-O.4): repo-relative POSIX path of the
+                        # source file the function was extracted from. Mirrors
+                        # the `path` property on CodeModule so consumers can
+                        # filter / scope by file without joining through the
+                        # `module` reference. Empty for pre-V52-O.4 rows.
+                        Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -1355,6 +1367,12 @@ class CodeGraphAnalyzer:
         # Idempotent + soft-fail per collection.
         self._ensure_project_source_property()
 
+        # v0.2.52 (V52-O.4) schema migration: ensure `file_path` property
+        # exists on CodeFunction + CodeClass so pre-V52-O.4 installs pick up
+        # the property on the next analyze run and `_dedup_insert` can stamp
+        # it. Idempotent + soft-fail per collection.
+        self._ensure_file_path_property()
+
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
         """Upsert with a deterministic UUID derived from
@@ -1438,6 +1456,22 @@ class CodeGraphAnalyzer:
             props = insert_params.get("properties")
             if isinstance(props, dict) and not props.get("project_source"):
                 props["project_source"] = current_source
+
+        # v0.2.52 (V52-O.4): stamp `file_path` on CodeFunction + CodeClass
+        # rows from the per-call `file_path_rel` argument so consumers can
+        # filter / scope by source file without joining through the `module`
+        # reference. Scope check via the collection name: only Function /
+        # Class get the property (CodeModule already has `path`; CodeAPI /
+        # CodeInteraction aren't file-anchored in the same way). Defensive:
+        # don't clobber if the caller pre-set the property; skip on empty
+        # `file_path_rel` so the property stays NULL rather than empty
+        # string for forward-compat / cross-reference paths.
+        if file_path_rel:
+            coll_name = getattr(collection, "name", "") or ""
+            if coll_name.endswith("CodeFunction") or coll_name.endswith("CodeClass"):
+                props = insert_params.get("properties")
+                if isinstance(props, dict) and not props.get("file_path"):
+                    props["file_path"] = file_path_rel
 
         # v0.2.16 docstring (above) claimed ``replace()`` is upsert.
         # weaviate-client v4.21 actually requires the object to PRE-EXIST
@@ -1588,6 +1622,47 @@ class CodeGraphAnalyzer:
             except Exception as e:
                 logger.debug(
                     f"v0.2.47 project_source migration on {label} skipped: {e}"
+                )
+
+    def _ensure_file_path_property(self):
+        """v0.2.52 (V52-O.4) schema migration: add `file_path` to CodeFunction
+        + CodeClass so consumers can filter / scope by source file without
+        joining through the `module` reference. The property mirrors
+        ``CodeModule.path``. Pre-V52-O.4 rows show NULL until they're touched
+        by a re-analyze. Idempotent + soft-fail per collection.
+
+        Only Function + Class get the new property; Module already has `path`,
+        and API / Interaction rows are not file-anchored in the same way
+        (an interaction row can cross multiple files).
+        """
+        collections = [
+            ("CodeFunction", self.functions_collection),
+            ("CodeClass",    self.classes_collection),
+        ]
+        desc = (
+            "Repo-relative POSIX path of the source file "
+            "(mirrors CodeModule.path)"
+        )
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if "file_path" in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name="file_path",
+                        data_type=DataType.TEXT,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added file_path property to {label} schema (v0.2.52)")
+            except Exception as e:
+                logger.debug(
+                    f"v0.2.52 file_path migration on {label} skipped: {e}"
                 )
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,
