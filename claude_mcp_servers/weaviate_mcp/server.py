@@ -4200,8 +4200,17 @@ def _get_rl_telemetry_writer():
     writer = _rl_telemetry_writers.get(key)
     if writer is not None:
         return writer
+    # V52-J Edit 1 (2026-06-09): also pass project_id resolved at line 4178
+    # above. Pre-fix, project_id was never threaded through → 100% NULL in
+    # launcher.db rl_events.project_id (see telemetry_emit.py module
+    # docstring for the pre-v0.2.52 baseline).
     writer = RLTelemetryWriter(
         project=project,
+        project_id=(
+            _cfg_for_telemetry.project_id
+            if _cfg_for_telemetry is not None
+            else None
+        ),
         embedding_source=emb_source,
         embedding_dim=emb_dim,
         embedding_model=emb_model,
