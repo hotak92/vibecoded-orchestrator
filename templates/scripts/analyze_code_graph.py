@@ -687,6 +687,109 @@ def _scrub_for_brace_balance(line: str) -> str:
     return line
 
 
+def _go_methods_for_struct(
+    content_clean: str,
+    struct_name: str,
+    source_lines: List[str],
+) -> List[str]:
+    """V52-O.11.F.2-GO (v0.2.52, 2026-06-09): extract methods declared on
+    ``struct_name`` via Go's receiver syntax.
+
+    Replaces the pre-V52-O.11.F.2-GO line that ran
+    ``func_pattern.finditer(content_clean)`` unconditionally — the same
+    bug as Rust's V52-O.11.F, applied to the Go parser. Audit a79152
+    flagged the four parallel sites (Go, JS/TS, Java, C#); this fix
+    closes the Go one. A 50-fn Go file with 3 structs produced 150
+    incorrect method attributions, drowning real signal in the
+    ``query_code_structure(methods, StructName)`` MCP path.
+
+    Go's method-scoping model (CRITICAL difference from Rust):
+
+      Go does NOT use ``impl <Type> { ... }``. Methods are functions
+      with a **receiver** declared BEFORE the function name:
+
+          func (recv *Foo) MethodName(args...) ReturnType { ... }
+          func (recv  Foo) MethodName(args...) ReturnType { ... }
+
+      The token between the receiver-paren and the close-paren is the
+      type. A leading ``*`` denotes a pointer receiver; both pointer
+      and value receivers are methods on the same type.
+
+    Algorithm:
+
+      1. Match every ``func (<recv_var> [*&]?<struct_name>) <Name>(``
+         pattern in ``content_clean``. The receiver variable name is
+         arbitrary (often a single letter), so we accept ``\\w+`` for it.
+         Whitespace around the type is lenient because Go style varies.
+      2. Collect ``<Name>`` values. Deduplicate, preserving first-seen
+         order — a struct can have a method declared on both the
+         pointer and value receiver in pathological code, but only one
+         name lands in the methods list.
+      3. We DO NOT pick up receiver-less ``func Name(...)`` declarations
+         — those are package-level free functions, not methods. They
+         get processed by the separate function-entry loop downstream.
+
+    Returns empty list if no receiver-bound functions match — common
+    for plain data structs (`type Config struct { ... }`) that only
+    carry fields, and for interfaces whose method set is defined via
+    the interface body itself (the interface body's method declarations
+    don't use `func` keyword, so the regex correctly ignores them).
+
+    Limitations:
+      - Generic Go methods (Go 1.18+, ``func (s *Foo[T]) Method()...``)
+        are matched: the ``[*&]?<struct_name>`` segment captures the
+        bare name and the optional ``[T]`` generic parameter follows
+        before the close-paren, which we tolerate via a permissive
+        post-name pattern (``[^)]*``).
+      - Methods declared in another file of the same package on the
+        same type are correctly NOT picked up here — they only land
+        in the methods list when the OTHER file is being analyzed
+        (each file is parsed independently). This is consistent with
+        the Rust path's per-file scoping and with how Go's tooling
+        itself reports methods.
+      - Doesn't follow embedded-struct method promotion (interfaces
+        that embed another interface's method set, struct types that
+        embed another struct). Those are intentionally out of scope
+        for this regex-based parser; tree-sitter is the right tool
+        for that level of fidelity (queued as V52-O.11.G in backlog).
+    """
+    escaped = re.escape(struct_name)
+    # Receiver shape:
+    #   func ( <recv_var> [*&]? <struct_name> [generics?] ) <Name> (
+    # Notes on each piece:
+    #   - `func\s*\(` — opening receiver paren, possibly with
+    #     whitespace between `func` and `(` (rare but legal style).
+    #   - `\s*\w+\s+` — the receiver variable name (e.g. `f`, `recv`,
+    #     `self`). Mandatory in Go syntax: anonymous receivers don't
+    #     exist (you can use `_` but it's still a word char).
+    #   - `[*&]?` — optional pointer marker. `&` isn't legal Go syntax
+    #     for receivers, but we include it for robustness against
+    #     hand-written test fixtures and the cost of one extra char in
+    #     the regex is negligible. Real Go code only uses `*`.
+    #   - `{escaped}` — the literal struct name, regex-escaped.
+    #   - `[^)]*` — anything else up to the closing receiver paren
+    #     (covers generic parameters like `[T]`, type assertions, and
+    #     trailing whitespace).
+    #   - `\)` — closing receiver paren.
+    #   - `\s+(\w+)\s*\(` — the method name (captured) followed by its
+    #     own argument paren. The trailing `\(` anchors us to a real
+    #     function declaration vs. a stray `func (...)` cast expression.
+    method_pattern = re.compile(
+        rf"func\s*\(\s*\w+\s+[*&]?{escaped}[^)]*\)\s+(\w+)\s*\(",
+        re.MULTILINE,
+    )
+
+    methods: List[str] = []
+    seen: set = set()
+    for m in method_pattern.finditer(content_clean):
+        name = m.group(1)
+        if name in seen:
+            continue
+        seen.add(name)
+        methods.append(name)
+    return methods
+
+
 def _rust_methods_for_struct(
     content_clean: str,
     struct_name: str,
@@ -3435,7 +3538,17 @@ class CodeGraphAnalyzer:
             class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
             signature = f"type {sname} struct/interface"
-            methods = [m.group(1) for m in func_pattern.finditer(content_clean)]
+            # V52-O.11.F.2-GO (v0.2.52, 2026-06-09): scope `methods` to
+            # functions whose receiver is `sname`. Pre-fix this line
+            # iterated func_pattern over the WHOLE file's content_clean,
+            # attributing EVERY fn (including receiver-less package-level
+            # functions and methods on OTHER structs) to EVERY struct —
+            # audit a79152 reproduced: a 50-fn file with 3 structs
+            # produced 150 incorrect method attributions, drowning real
+            # signal in the `query_code_structure(methods, StructName)`
+            # MCP path. Mirrors V52-O.11.F (Rust); Go uses receiver
+            # syntax instead of `impl` blocks (see helper docstring).
+            methods = _go_methods_for_struct(content_clean, sname, source_lines)
             embedding = embed_class(signature, class_body, language="go")
             insert_params: Dict[str, Any] = {
                 "properties": {
