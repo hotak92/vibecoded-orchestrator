@@ -4098,7 +4098,13 @@ class CodeGraphAnalyzer:
                 f"function {class_name}.{mth}(...) end" for mth in methods
             )
             signature = f"{class_name} = {{}} -- Lua table class"
-            embedding = embed_class(signature, "", methods=methods, language="javascript")
+            # V52-O.11.H (v0.2.52, 2026-06-09): pass language="lua" — pre-
+            # V52-O.11.H this passed language="javascript", routing Lua
+            # embeddings through the JS code-path and mislabeling retrieval
+            # scores by language. Embeddings stay 2048-dim either way
+            # (model-agnostic), but downstream language-filtered retrieval
+            # (--language=lua scopes) was silently never matching.
+            embedding = embed_class(signature, "", methods=methods, language="lua")
 
             insert_params: Dict[str, Any] = {
                 "properties": {
@@ -4131,7 +4137,9 @@ class CodeGraphAnalyzer:
             body = '\n'.join(source_lines[start_line - 1:end_line])
 
             func_full_name = f"{file_path.stem}.{func_name}"
-            embedding = embed_function(f"function {func_name}({args_str})", body, language="javascript")
+            # V52-O.11.H (v0.2.52, 2026-06-09): see comment on the Lua class
+            # embed_class call above — same fix for the function path.
+            embedding = embed_function(f"function {func_name}({args_str})", body, language="lua")
 
             insert_params = {
                 "properties": {

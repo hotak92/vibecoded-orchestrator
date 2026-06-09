@@ -168,57 +168,71 @@ def test_g_rust_regex_still_matches_simple() -> None:
 # ===========================================================================
 
 
+def _lua_parser_text() -> str:
+    """Extract the Lua parser method body as a single string.
+
+    We bound the slice between ``def _analyze_lua_file`` (start) and the
+    next ``def _analyze_`` (which starts the next sibling method). All
+    H-relevant embedder calls live inside this slice.
+    """
+    src = (_REPO / "templates" / "scripts" / "analyze_code_graph.py").read_text()
+    start = src.find("def _analyze_lua_file")
+    assert start >= 0, "Lua analyzer method missing — analyzer layout changed"
+    # Find next sibling method (next ``    def _analyze_`` at same indent).
+    rest = src[start + 1:]
+    end_offset = rest.find("    def _analyze_")
+    assert end_offset >= 0, "Could not find Lua analyzer method end"
+    return src[start: start + 1 + end_offset]
+
+
 def test_h_lua_source_passes_language_lua_to_embed_class() -> None:
     """The Lua parser source must call ``embed_class(..., language="lua")``
     — NOT ``"javascript"`` (the pre-V52-O.11.H bug).
 
     Contract test on the source text (not runtime behaviour) because the
     Lua parser instantiates a Weaviate-bound Analyzer, and we want this
-    test to stay pure. The grep is anchored to the Lua method site by
-    looking for the surrounding ``Lua table class`` signature literal.
+    test to stay pure.
     """
-    src = (_REPO / "templates" / "scripts" / "analyze_code_graph.py").read_text()
-    # Find the Lua class embedding line:
-    # signature = f"{class_name} = {{}} -- Lua table class"
-    # embedding = embed_class(signature, "", methods=methods, language="lua")
-    lua_class_section = re.search(
-        r'-- Lua table class".*?embed_class\([^)]*\)',
-        src,
-        re.DOTALL,
+    lua_text = _lua_parser_text()
+    # Both embed_class + embed_function calls in the Lua slice must use
+    # language="lua" and none of them may use language="javascript".
+    assert 'embed_class' in lua_text, (
+        "embed_class call missing from Lua parser — layout changed"
     )
-    assert lua_class_section is not None, (
-        "Could not locate Lua class embedding site — analyzer layout changed"
-    )
-    section_text = lua_class_section.group(0)
-    assert 'language="lua"' in section_text, (
-        f"Lua class embedding still uses non-lua language tag. "
-        f"Section: {section_text!r}"
-    )
-    assert 'language="javascript"' not in section_text, (
-        "Lua class embedding still passes language=\"javascript\" — "
-        "V52-O.11.H regression."
-    )
+    # Find the embed_class call line(s).
+    embed_class_calls = re.findall(r'embed_class\([^)]*\)', lua_text)
+    assert embed_class_calls, "No embed_class call found in Lua parser"
+    for call in embed_class_calls:
+        assert 'language="lua"' in call, (
+            f"Lua embed_class call still uses non-lua language tag: {call!r}"
+        )
+        assert 'language="javascript"' not in call, (
+            f"Lua embed_class call still passes language=\"javascript\" "
+            f"— V52-O.11.H regression: {call!r}"
+        )
 
 
 def test_h_lua_source_passes_language_lua_to_embed_function() -> None:
     """The Lua parser source must call ``embed_function(..., language="lua")``."""
-    src = (_REPO / "templates" / "scripts" / "analyze_code_graph.py").read_text()
-    # Anchor on the Lua function embedding context. The closest unique
-    # neighbour is ``func_full_name = f"{file_path.stem}.{func_name}"``
-    # which is followed immediately by the embed_function call.
-    m = re.search(
-        r'func_full_name = f"\{file_path\.stem\}\.\{func_name\}"\s*\n'
-        r'\s*embedding = embed_function\([^)]*\)',
-        src,
-    )
-    assert m is not None, (
-        "Could not locate Lua function embedding site — analyzer layout changed"
-    )
-    section_text = m.group(0)
-    assert 'language="lua"' in section_text, (
-        f"Lua function embedding still uses non-lua language tag. "
-        f"Section: {section_text!r}"
-    )
+    lua_text = _lua_parser_text()
+    # Match the embed_function call up to end-of-line. The Lua parser keeps
+    # each embed_function call on a single line so this is unambiguous; the
+    # naive ``\([^)]*\)`` pattern fails because the first arg is an f-string
+    # ``f"function {func_name}({args_str})"`` whose nested ``)`` terminates
+    # the outer match prematurely.
+    embed_function_lines = [
+        line for line in lua_text.split('\n')
+        if 'embed_function(' in line
+    ]
+    assert embed_function_lines, "No embed_function call found in Lua parser"
+    for line in embed_function_lines:
+        assert 'language="lua"' in line, (
+            f"Lua embed_function call still uses non-lua language tag: {line!r}"
+        )
+        assert 'language="javascript"' not in line, (
+            f"Lua embed_function call still passes language=\"javascript\" "
+            f"— V52-O.11.H regression: {line!r}"
+        )
 
 
 # ===========================================================================
