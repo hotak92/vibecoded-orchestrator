@@ -728,8 +728,10 @@ def test_hook_extension_maps_to_canonical_lang(filename: str, expected_lang: str
 
 def test_hook_sh_contains_every_language_arm() -> None:
     """Read the .sh hook and verify every canonical language ID appears
-    in a case arm. This catches deletions/typos in the hook that would
-    otherwise silently fall through to the empty-LANG branch."""
+    in a case arm. The LANG mapping is kept in place for the v0.2.53
+    follow-up (scope prune to EDITED FILE only) even though v0.2.52
+    V52-O.7 dropped --prune-stale + --language from the invocation.
+    This catches deletions/typos that would break the v0.2.53 wiring."""
     sh = _HOOK_PATH.read_text(encoding="utf-8")
     expected_arms = [
         "*.py)",
@@ -748,14 +750,48 @@ def test_hook_sh_contains_every_language_arm() -> None:
     ]
     for arm in expected_arms:
         assert arm in sh, (
-            f"Hook is missing case arm `{arm}` — Plan C language detection "
-            f"will fall through to the unknown-extension branch and skip "
-            f"the language-scoped prune for files of that type."
+            f"Hook is missing case arm `{arm}` — LANG mapping needed "
+            f"for v0.2.53's per-file-scoped prune follow-up."
         )
 
-    # And the invocation must include both --language and --prune-stale.
-    assert "--language" in sh
-    assert "--prune-stale" in sh
+
+def test_hook_sh_does_not_pass_prune_stale_v52_o7() -> None:
+    """V52-O.7 (v0.2.52, 2026-06-09) dropped `--prune-stale --language`
+    from the incremental analyzer invocation. Audit a97f0d9 found that
+    the language-scoped prune iterated the WHOLE collection and deleted
+    every row of that language not visited THIS run — so every Python
+    edit destroyed all OTHER Python rows, driving the collection's
+    Python coverage to zero.
+
+    The LANG mapping stays in place (load-bearing for v0.2.53's proper
+    fix — scope prune to the EDITED FILE only) but the analyzer
+    invocation must NOT pass either flag. This regression test prevents
+    accidental re-addition before the v0.2.53 follow-up lands.
+    """
+    sh = _HOOK_PATH.read_text(encoding="utf-8")
+    # Extract the analyzer invocation block (between the V52-O.7 comment
+    # banner and the closing `) &`). Find any line that's a continuation
+    # of the analyzer command and assert --prune-stale / --language
+    # aren't present.
+    import re
+    # Match the actual invocation, not the comment block above it.
+    inv = re.search(
+        r'\(\s*\n\s*cd "\$REPO_PATH"\s*\n(.*?)\) &',
+        sh,
+        re.DOTALL,
+    )
+    assert inv, "could not locate analyzer-invocation subshell in the hook"
+    invocation = inv.group(1)
+    assert "--prune-stale" not in invocation, (
+        "V52-O.7 regression: --prune-stale must NOT be in the analyzer "
+        "invocation (it destroys collection-wide rows on every edit). "
+        "See v0.2.52 backlog § V52-O.7."
+    )
+    assert "--language" not in invocation, (
+        "V52-O.7 regression: --language must NOT be in the analyzer "
+        "invocation (it scopes the destructive --prune-stale to one "
+        "language). See v0.2.52 backlog § V52-O.7."
+    )
 
 
 # ---------------------------------------------------------------------------
