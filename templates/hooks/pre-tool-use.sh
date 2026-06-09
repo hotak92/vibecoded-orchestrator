@@ -84,6 +84,31 @@ try:
 except Exception:
     print('')
 " 2>/dev/null || echo "")
+# V52-L.2 Fix 1: parse subagent identity from stdin payload. Per A5 audit
+# (knowledge/research/claude-code-leak-agent-architecture.md + 2026-06-09
+# official docs review), PreToolUse hooks DO fire for subagent tool calls;
+# the JSON payload carries agent_id + agent_type so handlers can tell
+# parent activity apart from subagent activity. Pre-V52-L.2 we ignored
+# both fields, so every TOUCAN row looked like it came from the same
+# session_id regardless of which agent ran the tool — A3's measurement
+# artifact (26-vs-83 gap) was just this confusion. Empty string when the
+# field is absent (parent context) which is what TOUCAN consumers expect.
+AGENT_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('agent_id', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+AGENT_TYPE=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('agent_type', ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
 
 SESSION_ID="${SESSION_ID_FROM_STDIN:-${CLAUDE_SESSION_ID:-$(date +%Y%m%d_%H)}}"
 # Per-session dedup state lives under the project's .claude/state/ rather
@@ -128,6 +153,9 @@ TOUCAN_LOG="$PROJECT_ROOT/.claude/logs/toucan_dataset.jsonl"
 TOUCAN_JSONL=$(USER_MESSAGE_FOR_PY="$USER_MESSAGE" \
     TOOL_NAME_FOR_PY="$TOOL_NAME" \
     TOOL_ARGS_FOR_PY="$TOOL_ARGS" \
+    AGENT_ID_FOR_PY="$AGENT_ID" \
+    AGENT_TYPE_FOR_PY="$AGENT_TYPE" \
+    SESSION_ID_FOR_PY="$SESSION_ID" \
     "$PY" -c '
 import json, os, sys
 from datetime import datetime, timezone
@@ -136,11 +164,19 @@ try:
     tool_args_val = json.loads(tool_args_raw) if tool_args_raw else None
 except (json.JSONDecodeError, TypeError):
     tool_args_val = tool_args_raw
+# V52-L.2 Fix 1: include agent_id / agent_type so TOUCAN consumers can
+# differentiate parent vs subagent rows. Empty string when the field is
+# absent (parent context). session_id is repeated here for the same
+# reason — TOUCAN rows currently lack it, making per-session analysis
+# require a separate join against the hook contract.
 sys.stdout.write(json.dumps({
     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "query": os.environ.get("USER_MESSAGE_FOR_PY", ""),
     "chosen_tool": os.environ.get("TOOL_NAME_FOR_PY", ""),
     "tool_args": tool_args_val,
+    "session_id": os.environ.get("SESSION_ID_FOR_PY", ""),
+    "agent_id": os.environ.get("AGENT_ID_FOR_PY", ""),
+    "agent_type": os.environ.get("AGENT_TYPE_FOR_PY", ""),
 }))
 ' 2>/dev/null)
 if [ -n "$TOUCAN_JSONL" ]; then

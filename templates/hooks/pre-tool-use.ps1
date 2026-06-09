@@ -40,6 +40,13 @@ $ToolName = ""
 $ToolArgs = ""
 $UserMessage = ""
 $SessionIdFromStdin = ""
+# V52-L.2 Fix 1: parse subagent identity from stdin payload. Per A5
+# audit, PreToolUse hooks DO fire for subagent tool calls and the
+# payload carries agent_id + agent_type so handlers can differentiate.
+# Empty string when absent (parent context) — TOUCAN consumers expect
+# the field to always be present.
+$AgentId = ""
+$AgentType = ""
 try {
     $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
     if ($payload) {
@@ -47,6 +54,8 @@ try {
         if ($payload.tool_input)   { $ToolArgs = ($payload.tool_input | ConvertTo-Json -Compress -Depth 8) }
         if ($payload.user_message) { $UserMessage = [string]$payload.user_message }
         if ($payload.session_id)   { $SessionIdFromStdin = [string]$payload.session_id }
+        if ($payload.agent_id)     { $AgentId = [string]$payload.agent_id }
+        if ($payload.agent_type)   { $AgentType = [string]$payload.agent_type }
     }
 } catch {
     # Empty/malformed stdin — keep variables at defaults
@@ -126,6 +135,12 @@ $entry = [ordered]@{
     query       = $UserMessage
     chosen_tool = $ToolName
     tool_args   = $toolArgsVal
+    # V52-L.2 Fix 1: include agent_id / agent_type / session_id so TOUCAN
+    # consumers can differentiate parent vs subagent rows. Empty string
+    # when absent (parent context).
+    session_id  = $SessionId
+    agent_id    = $AgentId
+    agent_type  = $AgentType
 }
 $line = $entry | ConvertTo-Json -Compress -Depth 8
 try { Add-Content -Path $ToucanLog -Value $line -ErrorAction Stop } catch { }
