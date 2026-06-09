@@ -73,8 +73,9 @@ class _DedupInsertError(RuntimeError):
         self.uuid = uuid
 
 
-def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = "") -> str:
-    """Generate a deterministic UUID from project + file_path_rel + full_name.
+def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = "",
+                        project_source: str = "") -> str:
+    """Generate a deterministic UUID from project + project_source + file_path_rel + full_name.
 
     Args:
         project: Project name (used as the outermost UUID namespace).
@@ -88,6 +89,13 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
             Also used as the only-non-empty arg when callers pass through
             the legacy two-arg form ``_deterministic_uuid(project, name)``;
             handled below.
+        project_source: v0.2.52 (V52-O.3) — absolute POSIX path of the
+            source root that contributed this row (primary repo OR a
+            ``--extra-path`` value). Mixed into the seed so the SAME
+            relative path under TWO different source roots produces
+            TWO different UUIDs. Default ``""`` preserves byte-identical
+            UUIDs for the v0.2.16-through-v0.2.51 single-root call shape
+            (no on-disk migration needed for primary-repo-only installs).
 
     Why file_path_rel is part of the key (v0.2.16):
         Pre-v0.2.16 the key was just ``project::full_name``. Two files
@@ -98,16 +106,31 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
         same UUID and the second one's insert was rejected. Including
         the file path eliminates this entire collision surface.
 
-    Re-indexing the same entity (same project, same file, same symbol)
-    still produces the same UUID, so re-runs continue to upsert cleanly.
+    Why project_source is part of the key (v0.2.52 / V52-O.3):
+        ``--extra-path`` lets the analyzer walk a second source root and
+        emit its rows into the primary project's collections (with
+        ``project_source`` stamped). Pre-V52-O.3 the seed was
+        ``project::file_path_rel::full_name`` — two roots sharing a
+        relative path (e.g. ``src/index.ts`` exists in both) collided
+        on the same UUID and the second walk's ``replace()`` overwrote
+        the first. Mixing the absolute source-root path into the seed
+        means each root gets its own UUID-space; the two rows coexist.
+        Defaults to the empty string so single-root call sites
+        (``analyze_repository`` without ``--extra-path``) keep producing
+        the v0.2.16-era UUIDs and don't trigger a spurious re-write of
+        the whole collection.
+
+    Re-indexing the same entity (same project, same source root, same
+    file, same symbol) still produces the same UUID, so re-runs
+    continue to upsert cleanly.
 
     NOTE on back-compat: this helper is also called from contexts where
     only ``project`` + ``full_name`` are meaningful (cross-reference
-    creation paths). When ``file_path_rel`` is the empty string the
-    UUID degrades to the v0.2.15-and-earlier shape so those paths
-    continue to resolve to the same UUIDs they did before.
+    creation paths). When ``file_path_rel`` and ``project_source`` are
+    the empty string the UUID degrades to the v0.2.15-and-earlier shape
+    so those paths continue to resolve to the same UUIDs they did before.
     """
-    key = f"{project}::{file_path_rel}::{full_name}"
+    key = f"{project}::{project_source}::{file_path_rel}::{full_name}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
 logger = logging.getLogger(__name__)
@@ -1375,7 +1398,17 @@ class CodeGraphAnalyzer:
             — every call site that captures the return value (``func_uuid``,
             ``class_uuid``, ``module_uuid`` etc.) continues to work.
         """
-        det_uuid = _deterministic_uuid(self.project_name, file_path_rel, identity_key)
+        # v0.2.52 (V52-O.3): mix `_current_source` into the UUID seed so the
+        # SAME relative path under TWO different source roots (primary repo
+        # vs. an --extra-path value) produces TWO distinct UUIDs and both rows
+        # coexist instead of clobbering each other on `replace()`. Empty
+        # `_current_source` falls back to the v0.2.16 seed shape (no upgrade
+        # migration needed for primary-repo-only installs).
+        current_source_for_uuid = getattr(self, "_current_source", "")
+        det_uuid = _deterministic_uuid(
+            self.project_name, file_path_rel, identity_key,
+            project_source=current_source_for_uuid,
+        )
 
         # v0.2.18 (Plan C): stamp the canonical language ID on every insert
         # so the language-scoped prune filter can match each row. The
