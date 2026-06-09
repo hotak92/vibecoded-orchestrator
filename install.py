@@ -8106,6 +8106,14 @@ _APP_STATE_KEY_LAST_ACTIVE_EMBEDDING = "last_installed_active_embedding"
 _APP_STATE_KEY_LAST_KG_COLLECTION = "last_installed_kg_collection"
 _APP_STATE_KEY_LAST_SHARED_KG_COLLECTION = "last_installed_shared_kg_collection"
 _APP_STATE_KEY_LAST_KG_SYNC_AT = "last_kg_sync_at"
+
+# v0.2.52 V52-AJ: app_state key that the launcher's Identity-tab embedding
+# selector writes (mirrors Rust APP_STATE_KEY_ACTIVE_EMBEDDING in
+# launcher/src-tauri/src/commands/project_env_settings.rs). Different from
+# _APP_STATE_KEY_LAST_ACTIVE_EMBEDDING above: this one is the LIVE choice;
+# the LAST_* one is the snapshot of what install.py used at the last
+# successful KG seed. Both keys are present on the same launcher.db.
+_APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE = "embedding.active_profile"
 _APP_STATE_KEY_LAST_KG_SYNC_STATS = "last_kg_sync_stats"
 
 # Canonical OpenAI ID used by Wave A (with `openai-` prefix). MUST match:
@@ -8536,6 +8544,127 @@ def _read_app_state_key(key: str) -> "str | None":
             conn.close()
     except Exception:
         return None
+
+
+def _model_id_for_active(active: str) -> str:
+    """v0.2.52 V52-AJ: map an active-embedding profile to its model id.
+
+    Used when threading ``EMBEDDING_MODEL`` into ``sync_knowledge_graph.py``
+    subprocesses so the subprocess picks the same model the launcher chose,
+    even when the user shell has no ``EMBEDDING_MODEL`` set.
+
+    Profiles (case-insensitive):
+      * ``arctic`` → ``snowflake-arctic-embed2:latest``
+      * ``openai`` → ``text-embedding-3-small``
+      * ``qwen3`` (or anything else) → ``qwen3-embedding:0.6b``
+
+    Mirror of ``vco_lib.embedding_service._model_id_for_active``. Both
+    functions intentionally duplicate the mapping (install.py runs from
+    the bundled-script venv that may not have ``vco_lib`` on PYTHONPATH
+    early in the bootstrap; the helper here keeps install.py self-contained).
+    """
+    normalised = (active or "").strip().lower()
+    if normalised == "arctic":
+        return "snowflake-arctic-embed2:latest"
+    if normalised == "openai":
+        return "text-embedding-3-small"
+    return "qwen3-embedding:0.6b"
+
+
+def _read_active_embedding_from_app_state() -> "str | None":
+    """v0.2.52 V52-AJ: return the launcher's active embedding profile, or None.
+
+    Reads ``app_state[embedding.active_profile]`` (canonical key written by
+    the launcher's Identity-tab embedding selector + install.py's preset
+    seeding). Returns ``None`` when:
+      * launcher.db file is absent (free-tier install, no launcher), OR
+      * the ``app_state`` table has not been created yet (fresh first
+        boot pre-migration), OR
+      * the key is unset, OR
+      * the stored value is an empty/whitespace string, OR
+      * any sqlite error fires.
+
+    Soft-fail throughout — callers treat ``None`` as "use env or default".
+    """
+    raw = _read_app_state_key(_APP_STATE_KEY_ACTIVE_EMBEDDING_LIVE)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None
+
+
+def _resolve_active_embedding_for_install() -> "str | None":
+    """v0.2.52 V52-AJ: resolve the install-time active embedding profile.
+
+    Resolution chain (matches ``EmbeddingService._resolve_active_embedding``):
+
+      1. ``os.environ[ACTIVE_EMBEDDING]`` — explicit user override.
+      2. ``launcher.db app_state[embedding.active_profile]`` — what the
+         launcher's GUI / install.py preset chooser wrote.
+      3. ``None`` — caller falls back to ``"qwen3"`` default (no
+         destructive resolution here; the None sentinel lets callers
+         distinguish "use default" from "explicit qwen3").
+
+    Returned value (when not None) is lowercased + stripped.
+
+    The chain intentionally mirrors the EmbeddingService side so both
+    code paths arrive at the same answer for any given (env, db) pair.
+    """
+    env_value = os.environ.get("ACTIVE_EMBEDDING", "").strip().lower()
+    if env_value:
+        return env_value
+    db_value = _read_active_embedding_from_app_state()
+    if db_value:
+        return db_value.lower()
+    return None
+
+
+def _subprocess_env_with_embedding(base_env: "dict[str, str] | None" = None) -> "dict[str, str]":
+    """v0.2.52 V52-AJ: build a subprocess env dict with ACTIVE_EMBEDDING + EMBEDDING_MODEL threaded.
+
+    Starts from ``base_env`` (defaults to ``os.environ.copy()``) and
+    OVERLAYS the resolved values from
+    :func:`_resolve_active_embedding_for_install`. The overlay rules:
+
+      * If ``ACTIVE_EMBEDDING`` is already present in ``base_env`` with a
+        non-empty value, leave it alone (env always wins).
+      * Otherwise, if the launcher.db resolver returned a value, set it
+        in the subprocess env.
+      * If neither env nor launcher.db has a value, leave the env unset —
+        the subprocess will fall back to its own ``"qwen3"`` default.
+
+    Same rule applied to ``EMBEDDING_MODEL`` (derived via
+    :func:`_model_id_for_active`).
+
+    This is the WHOLE fix for Fabio's Windows + CPU stuck-at-40% bug
+    (msg 267, 2026-06-09): the install.py subprocess inherited a
+    bare ``os.environ.copy()`` that did not carry the launcher's
+    ``arctic`` preference, so ``EmbeddingService.for_project()`` in
+    the subprocess defaulted to qwen3 and ground for hours. With this
+    helper, install.py threads the resolved values explicitly.
+
+    Args:
+        base_env: starting env dict. Defaults to ``os.environ.copy()``.
+
+    Returns:
+        A new dict (never the caller's, never ``os.environ`` itself)
+        with the embedding env vars threaded in.
+    """
+    sub_env = dict(base_env) if base_env is not None else os.environ.copy()
+    existing_active = sub_env.get("ACTIVE_EMBEDDING", "").strip()
+    if existing_active:
+        # Env-explicit case — make sure EMBEDDING_MODEL is consistent if
+        # absent (callers may have set ACTIVE_EMBEDDING without the model id).
+        if not sub_env.get("EMBEDDING_MODEL", "").strip():
+            sub_env["EMBEDDING_MODEL"] = _model_id_for_active(existing_active)
+        return sub_env
+    # Env empty — consult launcher.db.
+    resolved = _resolve_active_embedding_for_install()
+    if resolved:
+        sub_env["ACTIVE_EMBEDDING"] = resolved
+        if not sub_env.get("EMBEDDING_MODEL", "").strip():
+            sub_env["EMBEDDING_MODEL"] = _model_id_for_active(resolved)
+    return sub_env
 
 
 def _write_app_state_key(key: str, value: str) -> None:
@@ -12521,7 +12650,11 @@ def _seed_weaviate_shared_kg_only(
     if not sync_kg.exists():
         return seed_errors
     print(f"  → knowledge/ → {current_shared_kg} (shared) ...", flush=True)
-    seed_env = os.environ.copy()
+    # v0.2.52 V52-AJ: same env-threading rationale as the per-project KG
+    # seed above. Build the base env via _subprocess_env_with_embedding()
+    # (threads ACTIVE_EMBEDDING + EMBEDDING_MODEL from env-or-launcher.db),
+    # then overlay the shared-KG-specific KG_COLLECTION + KG_BASE_DIR.
+    seed_env = _subprocess_env_with_embedding()
     seed_env["KG_COLLECTION"] = current_shared_kg
     seed_env["KG_BASE_DIR"] = str(PROJECT_ROOT)
     try:
@@ -12765,7 +12898,14 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
     _nodes_skipped = 0
     _nodes_synced = 0
 
-    current_active_embedding = os.environ.get("ACTIVE_EMBEDDING", "qwen3") or "qwen3"
+    # v0.2.52 V52-AJ: resolve active embedding via the same chain the
+    # subprocess will use (env → launcher.db → "qwen3"). This guarantees
+    # the CI-10 diff gate's "stored vs current" comparison uses the SAME
+    # value that the subprocess EmbeddingService will resolve to —
+    # otherwise install.py could write last_installed_active_embedding=arctic
+    # while the subprocess silently embedded with qwen3, and the next
+    # --update's diff gate would short-circuit on the wrong premise.
+    current_active_embedding = _resolve_active_embedding_for_install() or "qwen3"
     current_kg_collection = os.environ.get("KG_COLLECTION", "") or ""
     current_shared_kg = os.environ.get("SHARED_KG_COLLECTION", "") or ""
     weaviate_url = (
@@ -12999,12 +13139,21 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
             cmd_args = _diff_files  # explicit list of changed files
             desc = f"{len(_diff_files)} changed file(s)"
         print(f"  → {desc} → KG + Development collections ...", flush=True)
+        # v0.2.52 V52-AJ: thread ACTIVE_EMBEDDING + EMBEDDING_MODEL into the
+        # subprocess env. Without this, install.py's bare os.environ.copy()
+        # would mask the launcher's app_state[embedding.active_profile]
+        # choice, and EmbeddingService.for_project() inside the subprocess
+        # would silently fall back to qwen3 (the hard-coded default). On
+        # Windows + CPU + 24 GB RAM with the launcher having stored
+        # active=arctic, that fallback meant ~30 s per chunk and the user
+        # stuck at 40-50% for hours (Fabio's msg 267, 2026-06-09).
         try:
             subprocess.run(
                 [str(venv_py), str(sync_kg)] + cmd_args,
                 check=True,
                 cwd=str(PROJECT_ROOT),
                 timeout=900,  # 15 min cap; large repos may hit this
+                env=_subprocess_env_with_embedding(),
             )
         except subprocess.CalledProcessError as e:
             print(f"    ! kg/docs sync exited {e.returncode} — re-run later with `kg-sync --all`")
