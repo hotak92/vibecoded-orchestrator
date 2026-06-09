@@ -50,6 +50,16 @@ fi
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
 [ -z "${PY:-}" ] && exit 0
 
+# V52-L.1: source the snapshot helper so we can capture the
+# filesystem state at SubagentStart. The SubagentStop reconciler will
+# diff against this snapshot to identify files the subagent modified.
+# Optional — when the helper is missing (partial install), the
+# SubagentStop reconciler degrades to logging-only.
+if [ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/snapshot.sh" ]; then
+    # shellcheck source=_lib/snapshot.sh disable=SC1091
+    . "$(dirname "${BASH_SOURCE[0]}")/_lib/snapshot.sh"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 
@@ -83,6 +93,21 @@ SESSION_ID="$(printf '%s' "$PARSED" | sed -n '1p')"
 AGENT_ID="$(printf '%s' "$PARSED" | sed -n '2p')"
 AGENT_TYPE="$(printf '%s' "$PARSED" | sed -n '3p')"
 PROMPT="$(printf '%s' "$PARSED" | tail -n +4)"
+
+# V52-L.1: take a filesystem snapshot BEFORE the empty-prompt
+# short-circuit. The snapshot is needed for the SubagentStop reconciler
+# regardless of whether we end up injecting KG context (empty prompts
+# still produce subagents that can modify files). Soft-fail: if the
+# snapshot helper is missing or take_snapshot returns non-zero, the
+# SubagentStop reconciler will fall back to logging-only mode.
+if [ -n "$AGENT_ID" ] && command -v take_snapshot >/dev/null 2>&1; then
+    # Run in a subshell so any state leakage / `set -e` from sourced
+    # helpers cannot escape into the rest of the hook. Backgrounding is
+    # tempting (parallelize with the KG search below) but would create a
+    # snapshot-vs-edit race if the subagent starts modifying files
+    # before take_snapshot has finished hashing them. Synchronous wins.
+    (take_snapshot "$AGENT_ID" "$PROJECT_ROOT" >/dev/null 2>&1) || true
+fi
 
 [ -z "$PROMPT" ] && exit 0
 

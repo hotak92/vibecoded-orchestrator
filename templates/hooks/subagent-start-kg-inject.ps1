@@ -30,6 +30,11 @@ if (Test-Path $StderrCap) { . $StderrCap }
 $EmitHelper = Join-Path $ScriptDir "_lib/emit-context.ps1"
 if (Test-Path $EmitHelper) { . $EmitHelper }
 
+# V52-L.1: source the snapshot helper. SubagentStop reconciler will
+# diff against this snapshot to identify files modified by the subagent.
+$SnapshotHelper = Join-Path $ScriptDir "_lib/snapshot.ps1"
+if (Test-Path $SnapshotHelper) { . $SnapshotHelper }
+
 $FindPy = Join-Path $ScriptDir "_lib/find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 if (-not $PY) {
@@ -72,7 +77,22 @@ try {
     # Empty/malformed stdin — keep variables at defaults
 }
 
-if (-not $Prompt) { exit 0 }
+if (-not $Prompt) {
+    # Still take a snapshot before the early exit — see .sh sibling
+    # rationale. Empty prompts still produce subagents that can modify
+    # files; the reconciler needs the baseline.
+    if ($AgentId -and (Get-Command Take-Snapshot -ErrorAction SilentlyContinue)) {
+        try { Take-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot | Out-Null } catch {}
+    }
+    exit 0
+}
+
+# V52-L.1: take a filesystem snapshot BEFORE the rest of the hook
+# runs. SubagentStop reconciler diffs against this snapshot to find
+# files modified by the subagent. Soft-fail.
+if ($AgentId -and (Get-Command Take-Snapshot -ErrorAction SilentlyContinue)) {
+    try { Take-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot | Out-Null } catch {}
+}
 
 # Export session / agent context so rl_kg_search.py's emit path
 # attributes the retrieval event to this subagent. Mirrors the .sh
