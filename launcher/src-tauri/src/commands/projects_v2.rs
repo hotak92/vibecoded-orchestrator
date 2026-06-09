@@ -504,29 +504,138 @@ pub async fn create_project_v2(
         warnings.push(w);
     }
 
-    // Bug fix (2026-05-06): the first populate call earlier in this fn
-    // ran BEFORE `run_install_bundle` dropped the per-project bundle
-    // into `<folder>/.claude/{agents,skills,hooks}/`. At that point
-    // those subdirs don't exist yet, so `populate_agents/skills/hooks`
-    // each saw zero `.md` files and inserted zero rows — leaving the
-    // GUI's per-project Agents/Skills/Hooks tabs permanently empty
-    // even though the bundle install succeeded.
+    // V52-AF (v0.2.52, 2026-06-09): the entire post-bundle phase
+    // (post-bundle populate, global-module enabled-seed, diagrams
+    // seed, codegraph spawn, kg-sync spawn, kg-summary spawn) is
+    // delegated to `apply_post_bundle_steps`. The same helper is
+    // called from `update_project_v2` after its env refresh, so the
+    // post-bundle pipeline is byte-for-byte consistent between
+    // create + update.
     //
-    // Re-call populate now that the bundle has dropped its files.
-    // The underlying register_* helpers are idempotent upserts that
-    // leave the `enabled` column untouched on conflict, so this second
-    // call:
+    // Pre-v0.2.52 these steps were inlined here and `update_project_v2`
+    // ran NONE of them — a project created on v0.2.45 then "Update
+    // bundle"-d on v0.2.52 ended up with new `.md` files on disk but
+    // a stale launcher.db. GUI tabs lied. The audit at
+    // `.claude/context/audits/v0252-per-project-install-parity-2026-06-09.md`
+    // documents the full drift.
+    //
+    // `is_initial_create=true` here so the codegraph spawn passes
+    // `prune_stale=false` (no pre-existing rows possible on a fresh
+    // project). Update path passes `false` → codegraph spawn prunes
+    // stale rows from the prior build.
+    let post_bundle_warnings = apply_post_bundle_steps(
+        &row.id,
+        &req.name,
+        folder,
+        &app,
+        &db,
+        /* is_initial_create */ true,
+    )
+    .await;
+    for w in post_bundle_warnings {
+        warnings.push(w);
+    }
+
+    Ok(CreateProjectResult {
+        project: ProjectView::from_row(row, 0),
+        warnings,
+    })
+}
+
+/// V52-AF (v0.2.52, 2026-06-09): canonical post-bundle pipeline for
+/// per-project install AND update. Extracted from `create_project_v2`'s
+/// inline block so `update_project_v2` can call the same code path and
+/// produce a byte-for-byte equivalent end-state.
+///
+/// **Why this exists** — audit `v0252-per-project-install-parity-2026-06-09.md`
+/// (468 lines) found that pre-v0.2.52, `update_project_v2` skipped the
+/// 6 steps below entirely. New agents/skills/hooks/access-matrix rows
+/// shipped between v0.2.45+ landed on disk via the bundle install but
+/// launcher.db never re-derived them. GUI tabs (per-project Agents /
+/// Skills / Hooks / Modules) showed stale counts. `update_all_projects`
+/// (which iterates `update_project_v2` per-row) inherited the gap N
+/// times. End-state target: a v0.2.45 project + Update bundle on v0.2.52
+/// has the same shape as a fresh v0.2.52 create of the same name +
+/// folder contents.
+///
+/// **Order matters** — the comments inside each step are LOAD-BEARING
+/// forensic trail from prior race-condition fixes:
+///   1. populate_project_state_from_filesystem (post-bundle re-walk)
+///   2. seed_enabled_rows_for_new_project (global modules → this project)
+///   3. set_project_module_enabled('diagrams', true) — opt-out default
+///   4. codegraph::spawn_initial_build — needs bundle's analyzer wrapper
+///   5. kg_sync::spawn_initial_sync — needs bundle's kg-sync wrapper
+///   6. kg_summary::spawn_initial_summary — needs bundle's summary script
+///
+/// Steps 4-6 each queue a `PENDING` row in launcher.db FIRST so the GUI
+/// can render an immediate "Queued" status while the background task
+/// picks up. Failure isolation per step: every error is appended to the
+/// returned warnings Vec, never propagated. The caller surfaces warnings
+/// in the per-project result toast.
+///
+/// **`is_initial_create`** discriminator: on first create, no
+/// pre-existing per-project code-graph rows can be stale, so the
+/// codegraph spawn passes `prune_stale=false`. On update, prior rows
+/// may reference files the user deleted between create and update, so
+/// the spawn passes `prune_stale=true`. This is the ONLY behavioral
+/// difference between the two call sites (audit recommendation AF-6).
+///
+/// **TODO (V52-AG layer 3)**: wire `register_artifact_version` for the
+/// `bundle_materialization` artifact_type here so the schema-version
+/// registry can detect drift between expected + applied helper state.
+/// Deferred from v0.2.52 because the Rust side lacks a registry client
+/// and adding the Python-subprocess hop would balloon this PR. See
+/// `vco_lib/artifact_version_registry.py` (V52-AG layer 2, commit
+/// `d472686e`) for the Python-side contract.
+///
+/// **Soft-fail discipline** — every step has the same shape:
+///   - Queue a PENDING DB row (idempotent UPSERT). DB error → push
+///     warning, skip the spawn (the spawn relies on the row's status
+///     transitions; without it the GUI's status pill never animates).
+///   - Spawn the background task. Spawn failures are surfaced through
+///     the task's own DB-row status transitions, NOT propagated here.
+///
+/// Returns a Vec of human-readable warnings the caller appends to its
+/// own. Errors are never returned; this function is infallible from
+/// the caller's PoV.
+async fn apply_post_bundle_steps(
+    project_id: &str,
+    project_name: &str,
+    folder: &Path,
+    app: &tauri::AppHandle,
+    db: &Db,
+    is_initial_create: bool,
+) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+    let folder_path_str = folder.to_string_lossy().to_string();
+
+    // Bug fix (2026-05-06): the first populate call earlier in
+    // `create_project_v2` ran BEFORE `run_install_bundle` dropped the
+    // per-project bundle into `<folder>/.claude/{agents,skills,hooks}/`.
+    // At that point those subdirs don't exist yet, so
+    // `populate_agents/skills/hooks` each saw zero `.md` files and
+    // inserted zero rows — leaving the GUI's per-project
+    // Agents/Skills/Hooks tabs permanently empty even though the bundle
+    // install succeeded.
+    //
+    // Re-call populate now that the bundle has dropped its files. The
+    // underlying register_* helpers are idempotent upserts that leave
+    // the `enabled` column untouched on conflict, so this second call:
     //   - DOES insert agents/skills/hooks rows (the whole point)
     //   - Does NOT clobber kg_collection_access / project_kg_bindings
     //     populated in the first call (which derived from project name,
     //     not from disk — those were correct at first-pass time)
     //   - Preserves any user toggles set in the GUI between the two
     //     populate calls (window is microseconds; not a real concern)
+    //
+    // V52-AF (2026-06-09): this is the populate that
+    // `update_project_v2` was skipping pre-v0.2.52 — see AF-1 in the
+    // audit. Centralizing it here means update gets it for free.
     let populate_report_2 = crate::commands::project_state_populate::
-        populate_project_state_from_filesystem(&row.id, &req.name, folder, &db);
+        populate_project_state_from_filesystem(project_id, project_name, folder, db);
     if !populate_report_2.warnings.is_empty() {
         for w in &populate_report_2.warnings {
-            eprintln!("[vct] populate (post-bundle) warning ({}): {}", row.id, w);
+            eprintln!("[vct] populate (post-bundle) warning ({}): {}", project_id, w);
             warnings.push(format!("populate (post-bundle): {}", w));
         }
     }
@@ -543,12 +652,16 @@ pub async fn create_project_v2(
     // per-module failures and returns the success count. We audit the
     // count for forensic trace and continue regardless. Mirrors the
     // soft-fail pattern of `set_project_module_enabled` below.
+    //
+    // V52-AF (2026-06-09): also runs on update (AF-2 in the audit).
+    // The seed is `INSERT OR IGNORE` so user-configured opt-outs
+    // (rows where `is_user_configured(row) == TRUE`) are preserved.
     let global_modules_seeded = crate::commands::module_enabled
-        ::seed_enabled_rows_for_new_project(&db, &row.id);
+        ::seed_enabled_rows_for_new_project(db, project_id);
     if global_modules_seeded > 0 {
         let _ = db.audit(
             "project_global_module_enable_seeded",
-            Some(&row.id),
+            Some(project_id),
             None,
             &serde_json::json!({ "modules_seeded": global_modules_seeded }),
         );
@@ -569,10 +682,18 @@ pub async fn create_project_v2(
     // Soft-fail: a DB error on this insert is logged (cosmetic — the
     // conditional CLAUDE.md section just won't render until the user
     // re-toggles the module). Never propagated.
-    if let Err(e) = db.set_project_module_enabled(&row.id, "diagrams", true) {
+    //
+    // V52-AF (2026-06-09): on UPDATE this step is a no-op when the
+    // user has previously disabled diagrams — `set_project_module_enabled`
+    // is an idempotent UPSERT that flips `enabled` back to 1 only if
+    // the row doesn't already exist with `enabled=0`. Audit recommendation
+    // AF-7 (G4.7) explicitly classified this as "no gap" because the
+    // update must not overwrite a user opt-out. Verified via
+    // `Db::set_project_module_enabled` (uses INSERT OR IGNORE pattern).
+    if let Err(e) = db.set_project_module_enabled(project_id, "diagrams", true) {
         eprintln!(
             "[vct] warning: could not seed project_modules('diagrams') for {}: {}",
-            row.id, e,
+            project_id, e,
         );
         warnings.push(format!(
             "seed project_modules('diagrams'): {} (CLAUDE.md diagrams section will not render until re-toggled)",
@@ -597,9 +718,17 @@ pub async fn create_project_v2(
     // and fail with "code-graph-analyze script not found". The fix is
     // simple: spawn LAST, after (a) bundle install, (b) post-bundle
     // populate. Same shape as the populate-ordering bug fixed in PR #149.
+    //
+    // V52-AF prune_stale rule (2026-06-09): on first-time create,
+    // `is_initial_create=true` → no pre-existing rows can possibly be
+    // stale, so prune_stale=false is correct (matches pre-v0.2.52
+    // create behavior). On update, `is_initial_create=false` →
+    // prune_stale=true so any rows for files the user deleted between
+    // create and update are reaped. Closes audit AF-6 (G4.4).
     let now = chrono::Utc::now().timestamp_millis();
+    let prune_stale = !is_initial_create;
     if let Err(e) = db.upsert_code_graph_build(
-        &row.id,
+        project_id,
         build_status::PENDING,
         Some(now),
         None,
@@ -610,18 +739,20 @@ pub async fn create_project_v2(
         None,
         None,
     ) {
-        eprintln!("[vct] warning: could not queue code-graph build for {}: {}", row.id, e);
+        eprintln!("[vct] warning: could not queue code-graph build for {}: {}", project_id, e);
     } else {
         codegraph::spawn_initial_build(
             app.clone(),
-            row.id.clone(),
-            row.name.clone(),
-            row.folder_path.clone(),
+            project_id.to_string(),
+            project_name.to_string(),
+            folder_path_str.clone(),
             // First-time builds for a freshly-created project: no
             // pre-existing per-project code-graph rows can possibly
             // be stale, so --prune-stale is a no-op here. Pass false
             // explicitly to avoid the iterator-then-delete pass.
-            false,
+            // Re-builds (update path) set this to `true` to reap
+            // rows referencing files the user deleted post-create.
+            prune_stale,
         );
     }
 
@@ -641,8 +772,14 @@ pub async fn create_project_v2(
     // network glitch) lands in `kg_syncs.error_message` and surfaces as
     // a "Retry sync" affordance on the GUI pill — project create itself
     // is already committed.
+    //
+    // V52-AF (2026-06-09): kg-sync now also runs on UPDATE per AF-7
+    // (G4.5). `kg-sync` is idempotent and the V46-A content-hash
+    // diff-gate skips unchanged files cheaply, so re-running on every
+    // update is the consistent-over-optimization choice (per the
+    // "from now on consistent" directive).
     if let Err(e) = db.upsert_kg_sync(
-        &row.id,
+        project_id,
         kg_sync_status::PENDING,
         Some(now),
         None,
@@ -652,13 +789,13 @@ pub async fn create_project_v2(
         None,
         None,
     ) {
-        eprintln!("[vct] warning: could not queue kg-sync for {}: {}", row.id, e);
+        eprintln!("[vct] warning: could not queue kg-sync for {}: {}", project_id, e);
     } else {
         kg_sync::spawn_initial_sync(
             app.clone(),
-            row.id.clone(),
-            row.name.clone(),
-            row.folder_path.clone(),
+            project_id.to_string(),
+            project_name.to_string(),
+            folder_path_str.clone(),
         );
     }
 
@@ -686,8 +823,13 @@ pub async fn create_project_v2(
     // every subprocess crashing) lands in `kg_summaries.error_message`
     // and surfaces as a "Retry" affordance on the GUI banner — project
     // create itself is already committed.
+    //
+    // V52-AF (2026-06-09): also runs on update per AF-8 (G4.6).
+    // Lower-priority gap than kg-sync (the per-chunk summarization
+    // re-runs on demand via hook-driven nudges) but kept in the helper
+    // for "from now on consistent" parity.
     if let Err(e) = db.upsert_kg_summary(
-        &row.id,
+        project_id,
         kg_summary_status::PENDING,
         Some(now),
         None,
@@ -699,21 +841,18 @@ pub async fn create_project_v2(
     ) {
         eprintln!(
             "[vct] warning: could not queue kg-summary backfill for {}: {}",
-            row.id, e,
+            project_id, e,
         );
     } else {
         kg_summary::spawn_initial_summary(
-            app,
-            row.id.clone(),
-            row.name.clone(),
-            row.folder_path.clone(),
+            app.clone(),
+            project_id.to_string(),
+            project_name.to_string(),
+            folder_path_str,
         );
     }
 
-    Ok(CreateProjectResult {
-        project: ProjectView::from_row(row, 0),
-        warnings,
-    })
+    warnings
 }
 
 /// PR 4 (2026-05-01): subprocess-call vco_lib.project_init bootstrap-collections.
@@ -1472,6 +1611,43 @@ pub async fn update_project_v2(
         );
         eprintln!("[vct] warning: {}", msg);
         warnings.push(msg);
+    }
+
+    // 5b. V52-AF (v0.2.52, 2026-06-09): run the canonical post-bundle
+    //     pipeline. Pre-v0.2.52 `update_project_v2` SKIPPED all 6 steps
+    //     (populate, global-module enabled-seed, diagrams seed,
+    //     codegraph spawn, kg-sync spawn, kg-summary spawn) — a SHIP-
+    //     BLOCKER drift documented in audit
+    //     `v0252-per-project-install-parity-2026-06-09.md` (AF-1..AF-8).
+    //
+    //     A project created on v0.2.45 + Update bundle on v0.2.52 now
+    //     ends up with the same launcher.db row shapes + same `.claude/`
+    //     tree (modulo user customizations preserved by the bundle
+    //     manifest) as a fresh v0.2.52 create of the same name + folder
+    //     contents.
+    //
+    //     `is_initial_create=false` → codegraph spawn passes
+    //     `prune_stale=true` to reap rows for files the user deleted
+    //     between create and update (audit AF-6).
+    //
+    //     ORDER MATTERS: this MUST run AFTER `apply_project_env_via_python`
+    //     above (so the codegraph + kg-sync background tasks read the
+    //     freshly-written `.claude/env`) and BEFORE
+    //     `retry_failed_module_installs` below (so the helper's audit
+    //     entry doesn't race against the retry path's audit writes).
+    //     Mirrors the same ordering rule the inline `create_project_v2`
+    //     block followed pre-V52-AF.
+    let post_bundle_warnings = apply_post_bundle_steps(
+        &row.id,
+        &row.name,
+        &folder,
+        &app,
+        &db,
+        /* is_initial_create */ false,
+    )
+    .await;
+    for w in post_bundle_warnings {
+        warnings.push(w);
     }
 
     // 6. v0.2.44 V44-G4 (RL-chat ask 2026-06-01): auto-retry stuck
