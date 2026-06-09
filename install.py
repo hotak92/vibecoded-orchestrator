@@ -4632,6 +4632,31 @@ def main() -> int:
     print("=" * 62)
     print()
 
+    # V52-AI (v0.2.52, 2026-06-09): MCP fork-bomb mitigation. Mirrors
+    # the launcher's update_orchestrator gate so CLI-only updaters
+    # (users running `python install.py --update` directly without
+    # going through the launcher GUI) get the same protection.
+    #
+    # The launcher path also writes a lockfile via Rust's
+    # UpdateInProgressGuard; if both are active, the second write
+    # extends the deadline — same atomic semantics either way.
+    #
+    # atexit covers every exit path (clean return, sys.exit, raised
+    # exception, signal). The lockfile's expected_completion_by
+    # (15 min) is the second line of defense if even atexit fails to
+    # fire (e.g. SIGKILL) — the launcher's boot-time stale cleanup
+    # then removes it on next start.
+    if mode == "update":
+        try:
+            import atexit as _atexit
+            from vco_lib import update_gate as _vco_update_gate
+            _vco_update_gate.write_lockfile(
+                phase="install_py", expected_duration_min=15
+            )
+            _atexit.register(_vco_update_gate.delete_lockfile)
+        except Exception as e:  # noqa: BLE001 — soft-fail
+            print(f"[update_gate] failed to write lockfile (soft-fail): {e}")
+
     # Mark the start of this install session in the durable log. Subsequent
     # events from install.py + post-install-launcher.sh share the same log.
     # On a first-ever install the log dir doesn't exist yet (Step 8 creates
