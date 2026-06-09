@@ -2290,6 +2290,30 @@
       </div>
     </section>
 
+    <!--
+      v0.2.52 V52-AD — host-wide module defaults entry point.
+      Sibling to the per-project Modules panel in each project's
+      Settings tab. Affects every project without an explicit
+      per-project override.
+    -->
+    <section class="pr-section">
+      <h2 class="pr-section-title">Module defaults (host-wide)</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Toggle which modules are on by default</strong>
+          <span class="pr-onboarding-hint">
+            Controls the host-wide default enable state for global-scope modules
+            (e.g. RL Reranker). Per-project overrides — set from each project's
+            Modules panel — always take precedence. New installs ship with the
+            RL Reranker disabled until enough training data accumulates.
+          </span>
+        </div>
+        <button class="pr-btn" onclick={() => goto('/preferences/modules')}>
+          Open
+        </button>
+      </div>
+    </section>
+
     <section class="pr-section">
       <h2 class="pr-section-title">GitHub access token</h2>
       <div class="pr-pat-row">
