@@ -152,6 +152,13 @@ pub mod project_folder_health;
 pub mod project_state_cmd;
 pub mod project_state_populate;
 pub mod restart;
+// v0.2.52 V52-AH: Windows binary lock fix via stage1 updater handoff.
+// Companion to `commands::restart`. On Windows, `update_orchestrator`
+// writes a lock file describing pending binary swaps + spawns
+// `vct-updater.exe` DETACHED, which performs the swap after the
+// launcher exits. POSIX no-op (the rename pattern in installer.rs
+// already handles binary swap there).
+pub mod update_handoff;
 pub mod retrieval_tuning;
 pub mod rl_settings;
 pub mod runtime_install;

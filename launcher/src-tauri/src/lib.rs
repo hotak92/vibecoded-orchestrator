@@ -2701,6 +2701,15 @@ pub fn run() {
             // install.py's _refresh_dist_binary_after_rebuild.
             commands::restart::restart_launcher,
             commands::restart::get_launcher_restart_status,
+            // v0.2.52 V52-AH (Fabio bug 1): Windows binary lock fix via
+            // stage1 updater handoff. `prepare_windows_update_handoff` writes
+            // ~/.vct/update.lock.json + spawns vct-updater.exe DETACHED so
+            // the binary swap happens AFTER the running launcher exits (the
+            // mandatory-locked .exe gets unlocked once the parent PID is gone).
+            // `get_update_recovery_report` is the FE-side pull for the
+            // boot-time recovery probe (also fired as a Tauri event on setup).
+            commands::update_handoff::prepare_windows_update_handoff,
+            commands::update_handoff::get_update_recovery_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
