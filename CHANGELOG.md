@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **V52-AE — Defensive parallel-agent worktree-isolation helper** (`vco_lib/agent_dispatch_helper.py`): produces prompt boilerplate that every parallel subagent dispatch should prepend to the agent's task prompt. The boilerplate makes the agent (1) probe its own CWD + `git worktree list`, (2) assert it's NOT in the parent's primary checkout, (3) verify the active branch / base SHA / worktree-membership, and (4) refuse to commit + create its own fallback worktree if any assertion fails. Companion `render_pre_dispatch_assertion` / `render_post_dispatch_audit` helpers print sanity blocks for the dispatcher itself. Background: the launcher harness's `isolation: worktree` directive is implemented inside the closed-source Claude Code binary (verified by exhaustive grep of `launcher/src-tauri` + `claude_mcp_servers` + `vct-hub` + `vco_lib`); the orchestrator cannot fix it directly. The defensive helper is the upstream-independent path. See `knowledge/concepts/parallel-agent-worktree-isolation-footgun-2026-06-09.md` for the empirical V52-J Phase 1 failure that motivated this work.
+
 ## [0.2.51] - 2026-06-09
 
 A **public-repo cleanup release** triggered by a critical UX regression discovered during v0.2.50 dogfooding (merge-conflict update flow had no resume path), plus a comprehensive sweep of leftover operational state and stale documentation. Heavy on subtraction: 99 files changed (+3511 / -7150 = net **-3639 LoC**). Subagent-parallel: 5 worktree-isolated Opus agents (Bug A + W1 KG + W2 docs + W3 UI + W4 installer) merged via 4 zero-conflict merges.
