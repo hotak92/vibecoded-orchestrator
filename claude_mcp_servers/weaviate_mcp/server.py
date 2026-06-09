@@ -7819,6 +7819,23 @@ async def backfill_embeddings(
 
 
 if __name__ == "__main__":
+    # V52-AI (v0.2.52): exit cleanly if an orchestrator update is in
+    # progress. Breaks the Windows MCP fork-bomb (~97 python +
+    # ~77 node processes the user reported on 2026-06-09) by making
+    # every respawn during the update window exit immediately.
+    try:
+        from _lib.update_gate import exit_if_update_in_progress  # type: ignore
+    except ImportError:
+        _parent_dir = str(Path(__file__).resolve().parent.parent)
+        if _parent_dir not in sys.path:
+            sys.path.insert(0, _parent_dir)
+        try:
+            from _lib.update_gate import exit_if_update_in_progress  # type: ignore
+        except ImportError:
+            exit_if_update_in_progress = None  # type: ignore
+    if exit_if_update_in_progress is not None:
+        exit_if_update_in_progress("weaviate-kg MCP")
+
     logger.info(f"Starting Claude Orchestrator Weaviate MCP Server")
     logger.info(f"Primary Collection: {KG_COLLECTION}")
     read_state = "DISABLED" if SHARED_KG_READ_DISABLED else "enabled"
