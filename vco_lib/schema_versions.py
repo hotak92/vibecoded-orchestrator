@@ -140,7 +140,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
-LAUNCHER_DB_TABLE_SET_VERSION = 33
+LAUNCHER_DB_TABLE_SET_VERSION = 34
 
 
 # ===========================================================================
