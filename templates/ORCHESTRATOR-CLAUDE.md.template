@@ -361,6 +361,14 @@ PowerShell variants (`*.ps1`) ship for Windows users.
   - `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` — code entities
 - **Access**: Weaviate MCP tools (`hybrid_search`, `semantic_graph_search`, `store_knowledge_node`, `search_code_graph`, `query_code_structure`).
 
+**Configuration channel for `install.py` and its sync subprocess** (v0.2.52 V52-AJ): `install.py` runs `python sync_knowledge_graph.py` in a subprocess that does NOT read `.claude/env` (shell-sourced only by `BASH_ENV` for hook subprocesses) and does NOT read `.claude/settings.json` (Claude Code surface, MCP subprocesses only). The active-embedding choice for the install-time KG seed resolves via this chain:
+
+1. **`ACTIVE_EMBEDDING` env var** in the shell that ran `install.py`. Set this BEFORE running install.py if you want to override (e.g. `ACTIVE_EMBEDDING=arctic python install.py --update`).
+2. **`launcher.db app_state[embedding.active_profile]`** — written by the launcher GUI's Identity tab → Embedding selector AND by install.py's preset chooser. Install.py reads this as fallback when the env is absent, then threads `ACTIVE_EMBEDDING` + `EMBEDDING_MODEL` into the `sync_knowledge_graph.py` subprocess env. This is the canonical channel for "I picked arctic in the launcher; install should honor that" without needing to set env vars.
+3. **`"qwen3"` default** — free-tier installs that don't have the launcher (and therefore no `launcher.db`) keep the qwen3 default. Nothing changes for them.
+
+If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on a slow Ollama backend when you expected arctic), check the resolution chain in this order: `echo $ACTIVE_EMBEDDING` → `sqlite3 ~/.vct/launcher.db "SELECT value FROM app_state WHERE key='embedding.active_profile'"` → set the right value at whichever level is empty.
+
 ### Ollama Local LLM
 - **URL**: `http://localhost:11435`
 - **Purpose**: Local embeddings for Weaviate; code-embedding service CPU fallback. Not exposed as an MCP tool to Claude (the Ollama MCP was removed because Claude's native reasoning, `Read` tool, and built-in vision handle the same use cases at higher quality).
