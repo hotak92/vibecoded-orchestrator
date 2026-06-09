@@ -8,7 +8,7 @@ tags:
   - automation
   - mid-level-architecture
   - REST-API
-  - OAuth
+  - oauth
 created: 2026-05-19T00:00:00Z
 updated: 2026-05-19T00:00:00Z
 status: active

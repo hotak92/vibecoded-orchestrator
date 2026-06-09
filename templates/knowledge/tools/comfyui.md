@@ -4,7 +4,7 @@ type: tool
 tags:
 - AI
 - image-generation
-- ComfyUI
+- comfyui
 - design
 - workflow
 - open-source

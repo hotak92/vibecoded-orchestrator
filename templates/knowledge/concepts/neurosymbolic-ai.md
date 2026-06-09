@@ -1,7 +1,7 @@
 ---
 title: Neurosymbolic AI
 type: concept
-tags: [AI, machine-learning, symbolic-reasoning, neural-networks, NeSy, logic, LTN, DeepProbLog, knowledge-representation, high-level-plan]
+tags: [AI, machine-learning, symbolic-reasoning, neural-networks, nesy, logic, LTN, deepproblog, knowledge-representation, high-level-plan]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:33:38Z
 status: active

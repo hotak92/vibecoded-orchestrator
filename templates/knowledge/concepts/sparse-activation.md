@@ -1,7 +1,7 @@
 ---
 title: Sparse Activation
 type: concept
-tags: [AI, sparse-activation, MoE, efficiency, conditional-computation, routing, inference, mid-level-architecture]
+tags: [AI, sparse-activation, moe, efficiency, conditional-computation, routing, inference, mid-level-architecture]
 created: 2026-03-30T00:00:00Z
 updated: 2026-04-05T14:33:53Z
 status: active

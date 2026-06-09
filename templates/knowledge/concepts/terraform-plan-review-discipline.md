@@ -1,7 +1,7 @@
 ---
 title: Terraform Plan Review Discipline
 type: concept
-tags: [devops, infrastructure, terraform, opentofu, code-review, mid-level-architecture, security, IaC]
+tags: [devops, infrastructure, terraform, opentofu, code-review, mid-level-architecture, security, iac]
 created: 2026-05-19T00:00:00Z
 updated: 2026-05-19T00:00:00Z
 valid_from: 2026-05-19T00:00:00Z

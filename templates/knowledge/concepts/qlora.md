@@ -1,7 +1,7 @@
 ---
 title: QLoRA
 type: concept
-tags: [AI, fine-tuning, LLM, quantization, LoRA, PEFT, memory-efficiency, mid-level-architecture]
+tags: [AI, fine-tuning, LLM, quantization, lora, PEFT, memory-efficiency, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:33:47Z
 status: active

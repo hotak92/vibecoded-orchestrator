@@ -4,7 +4,7 @@ type: tool
 tags:
 - tool
 - infrastructure
-- IaC
+- iac
 - terraform
 - opentofu
 - devops

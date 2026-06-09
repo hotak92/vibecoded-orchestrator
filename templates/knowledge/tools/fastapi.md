@@ -1,7 +1,7 @@
 ---
 title: FastAPI
 type: tool
-tags: [python, web-framework, REST-API, async, OpenAPI, backend]
+tags: [python, web-framework, REST-API, async, openapi, backend]
 created: 2026-02-26T00:00:00Z
 updated: 2026-04-05T14:34:52Z
 status: active
