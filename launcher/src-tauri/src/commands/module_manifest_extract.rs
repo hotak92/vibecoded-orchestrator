@@ -202,6 +202,51 @@ pub async fn extract_manifest_from_image(
         ));
     }
 
+    // Step 5.5: V52-D.3 — Python manifest sanitizer. Reject the
+    // manifest if it carries the pre-v0.2.49 Bug E pattern OR any
+    // other pathological shape the sanitizer catches (unknown
+    // placeholders, dangerous runtime commands, install.scope
+    // incoherence). The sanitizer's reject reason flows into
+    // `module_installs.last_error` so the GUI can surface a
+    // clear "publisher shipped a malformed manifest" message.
+    //
+    // Soft-fail strategy: if the Python interpreter or the validator
+    // module is unavailable (e.g. install.py wasn't run yet on this
+    // host, exotic environment), log a warning and proceed. The
+    // Rust-side runtime sanitizer (V52-D.1's
+    // `is_runtime_pathological`) is the second line of defense and
+    // catches the Bug E pattern at podman-run time even if this
+    // step is bypassed.
+    match run_python_manifest_sanitizer(&tmp_path).await {
+        ManifestSanitizerOutcome::Rejected(reason) => {
+            // Leave the .tmp file in place for forensics — don't
+            // clobber the existing on-disk manifest. The caller's
+            // .bak rollback path is not relevant because we never
+            // committed.
+            return Err(format!(
+                "manifest_validation_failed: {} (V52-D.3 sanitizer rejected \
+                 the extracted vct-module.json before commit; the existing \
+                 on-disk manifest, if any, is untouched)",
+                reason,
+            ));
+        }
+        ManifestSanitizerOutcome::Accepted(warnings) => {
+            for w in &warnings {
+                eprintln!(
+                    "[module_manifest_extract] V52-D.3 sanitizer warning for {}: {}",
+                    module_id, w
+                );
+            }
+        }
+        ManifestSanitizerOutcome::Bypassed(reason) => {
+            eprintln!(
+                "[module_manifest_extract] V52-D.3 sanitizer bypassed for {}: {} \
+                 (Rust runtime sanitizer remains as second line of defense)",
+                module_id, reason
+            );
+        }
+    }
+
     // Step 6: pre-write backup of any existing manifest (the upgrade
     // path always lands here; the fresh-install path has nothing to
     // back up and the copy is a no-op).
@@ -299,6 +344,140 @@ impl Drop for ContainerCleanup {
             .stderr(std::process::Stdio::null())
             .status();
     }
+}
+
+// ─── V52-D.3 Python manifest sanitizer subprocess ─────────────────────
+
+/// Outcome of invoking the Python sanitizer subprocess. Three states:
+/// * `Accepted(warnings)` — manifest passed validation; warnings are
+///   non-fatal advisories that should be logged.
+/// * `Rejected(reason)` — manifest failed validation; the caller must
+///   not commit it. `reason` is operator-facing and lands in
+///   `module_installs.last_error`.
+/// * `Bypassed(reason)` — sanitizer could not run (Python interpreter
+///   missing / module not importable / subprocess spawn error). The
+///   caller proceeds AS IF accepted but logs a warning. Rust-side
+///   V52-D.1 runtime sanitizer catches the Bug E pattern at podman-
+///   run time as a second line of defense.
+#[derive(Debug)]
+enum ManifestSanitizerOutcome {
+    Accepted(Vec<String>),
+    Rejected(String),
+    #[allow(dead_code)]
+    Bypassed(String),
+}
+
+/// V52-D.3: invoke `python -m vco_lib.manifest_validation <tmp_path>`
+/// and parse its stdout JSON. Soft-fails to `Bypassed(...)` on any
+/// invocation error so a missing Python interpreter doesn't break
+/// the install path.
+async fn run_python_manifest_sanitizer(manifest_path: &Path) -> ManifestSanitizerOutcome {
+    use std::process::Stdio;
+
+    // Honour test/CI bypass: setting `VCT_MANIFEST_SANITIZER_BYPASS=1`
+    // skips the subprocess entirely. Used by the existing test
+    // fixtures that ship intentionally-malformed manifests through
+    // the extract path without our sanitizer rejecting them.
+    if std::env::var("VCT_MANIFEST_SANITIZER_BYPASS").ok().as_deref() == Some("1") {
+        return ManifestSanitizerOutcome::Bypassed(
+            "VCT_MANIFEST_SANITIZER_BYPASS=1".to_string(),
+        );
+    }
+
+    // Locate the Python interpreter. Prefer the env-pinned path
+    // (`MCP_PYTHON` — same variable the launcher uses for MCP server
+    // subprocesses); fall back to `python3` on PATH.
+    let python = std::env::var("MCP_PYTHON")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // Find python3 on PATH.
+            which_python()
+        });
+    let python = match python {
+        Some(p) => p,
+        None => {
+            return ManifestSanitizerOutcome::Bypassed(
+                "no python interpreter found (set MCP_PYTHON env or install \
+                 python3 on PATH)".to_string(),
+            );
+        }
+    };
+
+    let output = Command::new(&python).silent()
+        .args(["-m", "vco_lib.manifest_validation"])
+        .arg(manifest_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            return ManifestSanitizerOutcome::Bypassed(format!(
+                "spawn {} -m vco_lib.manifest_validation: {}",
+                python, e
+            ));
+        }
+    };
+
+    // Exit code 2 = invocation error (no path arg / bad module
+    // import). Treat as Bypassed.
+    if output.status.code() == Some(2) {
+        return ManifestSanitizerOutcome::Bypassed(format!(
+            "sanitizer exit 2 (invocation error); stderr={}",
+            String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>(),
+        ));
+    }
+
+    // Stdout carries the JSON result regardless of exit code (0 or 1).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            return ManifestSanitizerOutcome::Bypassed(format!(
+                "parse sanitizer stdout JSON failed: {}; stdout={}",
+                e,
+                stdout.chars().take(200).collect::<String>(),
+            ));
+        }
+    };
+
+    let is_valid = parsed.get("is_valid").and_then(|v| v.as_bool()).unwrap_or(false);
+    let warnings: Vec<String> = parsed
+        .get("warnings")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    if is_valid {
+        ManifestSanitizerOutcome::Accepted(warnings)
+    } else {
+        let reason = parsed
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("manifest_validation: sanitizer returned is_valid=false with no error")
+            .to_string();
+        ManifestSanitizerOutcome::Rejected(reason)
+    }
+}
+
+/// Find a python3 interpreter on PATH. Returns `None` if none of the
+/// candidates are executable.
+fn which_python() -> Option<String> {
+    for candidate in ["python3", "python"] {
+        if std::process::Command::new(candidate).silent()
+            .args(["--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -805,6 +984,181 @@ esac
         );
 
         std::env::remove_var("VCT_STATE_DIR");
+        reset_fake_env();
+    }
+
+    /// V52-D.3: when the extracted manifest carries the pre-v0.2.49
+    /// Bug E pattern (runtime.command = "podman" / args contain
+    /// `{module_image}`), the Python sanitizer subprocess rejects it
+    /// and `extract_manifest_from_image` returns an error containing
+    /// the `manifest_validation_failed:` prefix.
+    ///
+    /// Gated on Python availability + `vco_lib` import success
+    /// (subprocess attempts `python3 -m vco_lib.manifest_validation`).
+    /// On hermetic CI without the Python module available, the
+    /// sanitizer Bypasses and this test would erroneously pass-
+    /// through. To keep the test stable across environments, we
+    /// gate on a self-check via the CLI: if the CLI returns exit 1
+    /// for a known-bad manifest in our tempdir, the sanitizer is
+    /// reachable and the test runs; otherwise we skip cleanly.
+    #[tokio::test]
+    async fn v0252_d3_extract_rejects_bug_e_manifest() {
+        let _g = serialize_lock();
+        reset_fake_env();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Self-gate: can we reach the sanitizer? Probe by running
+        // the CLI against a known-bad manifest in the tempdir.
+        let probe_path = tmp.path().join("probe.json");
+        std::fs::write(
+            &probe_path,
+            r#"{"id":"x","version":"0.1.0","install":{},"runtime":{"command":"podman","args":["run","{module_image}"]}}"#,
+        )
+        .unwrap();
+        // Walk up from cwd (= launcher/src-tauri) two levels to reach
+        // the repo root. Cargo runs tests with cwd = the crate dir,
+        // which for vct-launcher-temp is `launcher/src-tauri/`.
+        let cwd_for_python = std::env::current_dir()
+            .unwrap()
+            .parent() // launcher
+            .and_then(|p| p.parent()) // repo root
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let probe = std::process::Command::new("python3")
+            .current_dir(&cwd_for_python)
+            .args(["-m", "vco_lib.manifest_validation"])
+            .arg(&probe_path)
+            .output();
+        let sanitizer_reachable = match probe {
+            Ok(o) => o.status.code() == Some(1),
+            Err(_) => false,
+        };
+        if !sanitizer_reachable {
+            eprintln!(
+                "[v0252_d3_extract_rejects_bug_e_manifest] skipping: \
+                 vco_lib.manifest_validation not reachable from cwd {:?}",
+                cwd_for_python
+            );
+            return;
+        }
+
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let bin = install_fake_podman(tmp.path());
+        let _p = push_path(&bin);
+
+        // Build a manifest that PARSES through ModuleManifest::from_json
+        // (so Step 4 passes) but the Python sanitizer rejects at
+        // Step 5.5. The runtime.command='podman' indicator does the
+        // rejection.
+        let body = serde_json::json!({
+            "id": "vct-test-mod",
+            "name": "vct-test-mod",
+            "version": "0.1.0",
+            "description": "bug-e fixture",
+            "category": "paid-independent",
+            "compatibility": { "hosts": ["base"] },
+            "install": {
+                "method": "container_pull",
+                "container": {
+                    "image": "ghcr.io/test/vct-test-mod",
+                    "tag_from_version": true,
+                    "pull_token_endpoint": "https://example.invalid/token",
+                },
+            },
+            "runtime": {
+                "type": "container",
+                "command": "podman",
+                "args": ["run", "--rm", "-p", "11450:11450", "{module_image}"],
+            },
+            "license": { "required": false },
+        })
+        .to_string();
+        std::env::set_var("FAKE_PODMAN_MODE", "create_ok");
+        std::env::set_var("FAKE_PODMAN_MANIFEST_BODY", &body);
+        // Ensure the bypass env isn't set from another test.
+        std::env::remove_var("VCT_MANIFEST_SANITIZER_BYPASS");
+        // Override PYTHONPATH so the subprocess can import vco_lib
+        // when its cwd is the launcher dir.
+        std::env::set_var("PYTHONPATH", &cwd_for_python);
+
+        let err = extract_manifest_from_image(
+            "ghcr.io/test/vct-test-mod:0.1.0",
+            "vct-test-mod",
+            "podman",
+        )
+        .await
+        .expect_err("Bug E manifest must be rejected by V52-D.3 sanitizer");
+
+        assert!(
+            err.contains("manifest_validation_failed"),
+            "expected V52-D.3 reject prefix in error; got: {}",
+            err
+        );
+        // The reason should mention the pathological pattern.
+        assert!(
+            err.contains("podman") || err.contains("{module_image}") || err.contains("Bug E"),
+            "expected Bug E indicator in error; got: {}",
+            err
+        );
+
+        // The existing on-disk manifest (if any) MUST NOT have been
+        // overwritten. Verify the final path either doesn't exist
+        // (fresh install case) OR is unchanged.
+        let expected_path = tmp
+            .path()
+            .join("modules")
+            .join("vct-test-mod")
+            .join("vct-module.json");
+        if expected_path.exists() {
+            // Shouldn't happen in this fresh-tempdir test, but if it
+            // does, the content must not be the rejected body.
+            let on_disk = std::fs::read_to_string(&expected_path).unwrap_or_default();
+            assert!(
+                !on_disk.contains("{module_image}"),
+                "rejected manifest must NOT be committed to disk; \
+                 on-disk content includes Bug E placeholder: {}",
+                on_disk
+            );
+        }
+
+        std::env::remove_var("VCT_STATE_DIR");
+        std::env::remove_var("PYTHONPATH");
+        reset_fake_env();
+    }
+
+    /// V52-D.3: `VCT_MANIFEST_SANITIZER_BYPASS=1` short-circuits the
+    /// sanitizer and lets a Bug-E manifest through. Used by existing
+    /// extract tests that ship intentionally-malformed fixtures
+    /// through the pipeline.
+    #[tokio::test]
+    async fn v0252_d3_extract_bypass_env_skips_sanitizer() {
+        let _g = serialize_lock();
+        reset_fake_env();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("VCT_STATE_DIR", tmp.path());
+        let bin = install_fake_podman(tmp.path());
+        let _p = push_path(&bin);
+
+        let body = minimal_manifest_json("vct-test-mod", "0.1.0");
+        std::env::set_var("FAKE_PODMAN_MODE", "create_ok");
+        std::env::set_var("FAKE_PODMAN_MANIFEST_BODY", &body);
+        // Bypass enabled — even a normally-rejected manifest would
+        // pass through. Here we use the good fixture to verify the
+        // happy path still works with bypass enabled (the test
+        // ordering doesn't leave bypass set for later tests).
+        std::env::set_var("VCT_MANIFEST_SANITIZER_BYPASS", "1");
+
+        let out = extract_manifest_from_image(
+            "ghcr.io/test/vct-test-mod:0.1.0",
+            "vct-test-mod",
+            "podman",
+        )
+        .await
+        .expect("bypass + good manifest must succeed");
+        assert_eq!(out.parsed.id, "vct-test-mod");
+
+        std::env::remove_var("VCT_STATE_DIR");
+        std::env::remove_var("VCT_MANIFEST_SANITIZER_BYPASS");
         reset_fake_env();
     }
 }
