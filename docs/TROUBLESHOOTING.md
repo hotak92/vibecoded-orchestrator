@@ -44,6 +44,74 @@ The first run of an unsigned Windows executable shows SmartScreen's blue dialog.
 
 SmartScreen remembers the choice per binary hash; subsequent runs on the same machine open without the dialog. Code signing is on the post-0.2.0 backlog.
 
+### Windows: Update orchestrator binary handoff (V52-AH — FIXED in v0.2.52)
+
+**Symptom (pre-v0.2.52 only)**: on Windows, after clicking "Update orchestrator" from the launcher GUI, the banner showed "newer binary on disk v0.2.5X, running v0.2.5X-1, Restart" and the restart relaunched the SAME old version, looping forever. On-disk `dist/windows-x64/vct-launcher.exe` was the OLD version even though `git pull` succeeded.
+
+**Root cause**: Windows mandatory file locks prevented overwriting the running `.exe`. Linux/macOS advisory locks allowed the pre-pull rename pattern to work; Windows did not.
+
+**Fix (v0.2.52)**: Velopack/Squirrel-style stage1 updater pattern. The launcher spawns `vct-updater.exe` (small statically-linked Rust binary) DETACHED before exiting; the updater polls the parent PID, waits for the launcher to exit (releasing file handles), performs `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` for each staged `<target>.new` sibling, then spawns the new launcher. Hand-off contract via `~/.vct/update.lock.json`.
+
+**If you hit this on v0.2.52+**: the stage1 updater should handle it automatically. If it fails for any reason, the legacy `restart_launcher` path still runs as a fallback (= same UX as v0.2.51, which is the existing `launcher_binary_swap_failed_locked` deferral with manual `git checkout` recovery instructions). Either way, the update completes.
+
+**Emergency manual workaround** (only if vct-updater.exe is missing or fails):
+
+```powershell
+taskkill /F /IM vct-launcher.exe
+taskkill /F /IM vct-hub.exe
+cd C:\path\to\vibecoded-orchestrator
+git checkout HEAD -- dist/windows-x64/vct-launcher.exe dist/windows-x64/vct-hub.exe
+.\dist\windows-x64\vct-launcher.exe
+```
+
+### Windows: MCP fork-bomb during update (V52-AI — FIXED in v0.2.52)
+
+**Symptom (pre-v0.2.52 only)**: during or after `Update orchestrator`, the system slowed to a crawl. Task Manager showed dozens of `python.exe` processes (typically 50–100) OR `node.exe` processes (typically `npx @upstash/context7` / `@modelcontextprotocol/*`). CPU pinned at 100% for hours.
+
+**Root cause**: during the update window, the launcher restart + MCP supervisor restart + Claude Code's reconnection attempts overlapped. On Windows mandatory locks, every MCP-spawn-against-an-updating-binary failed → supervisor retried → respawn loop.
+
+**Fix (v0.2.52)**: 3-layer lockfile gate at `<vct_root>/.update-in-progress.json`. (1) Pre-update kill sweep terminates currently-running MCP-shaped processes; (2) every shipped MCP server reads the lockfile at startup and exits cleanly with exit code 75 when active — so every Claude Code respawn dies immediately, breaking the loop; (3) Rust RAII `Drop` impl deletes the lockfile on every exit path. Boot-time stale-cleanup removes lockfiles whose 15-min deadline passed.
+
+**On v0.2.52+**: no action needed; the gate handles it. The kill sweep is strictly scoped to MCP-shaped processes (pattern: `claude_mcp_servers/` / `@modelcontextprotocol/` / `@upstash/context7`) — other Python/Node processes are unaffected.
+
+**Emergency manual workaround** (only if the gate fails):
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object {
+    ($_.Name -eq "python.exe" -or $_.Name -eq "node.exe") -and
+    ($_.CommandLine -match "mcp|claude_mcp_servers|@modelcontextprotocol|@upstash")
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+### Windows: `install.py --update` step 7c "seeding Weaviate" hangs at 40-50% (V52-AJ — FIXED in v0.2.52)
+
+**Symptom** (Windows + CPU-only, reported in v0.2.51 by users who configured `arctic` as their embedding via the launcher's Identity tab): `install.py --update` reaches step `7c/10 seeding Weaviate` and hangs for hours at 40-50% completion. The log shows `CI-10: full sync (context change: embedding=None→'qwen3', ...)` — using qwen3 (slow on CPU: ~30s/chunk) instead of the user-selected arctic.
+
+**Why it happened** (v0.2.51 root cause): `install.py` spawned `python sync_knowledge_graph.py` as a subprocess. The subprocess called `EmbeddingService.for_project()`, which read ONLY from `os.environ` (`ACTIVE_EMBEDDING` env var). It did NOT read `app_state.embedding.active_profile` from `launcher.db`, nor `.claude/settings.json`, nor `.claude/env`. Setting `ACTIVE_EMBEDDING=arctic` in `.claude/settings.json` had no effect — that file is read by Claude Code's MCP subprocesses, not by `install.py`'s sync subprocess.
+
+**v0.2.52 fix (V52-AJ)**: 3-layer resolution chain now closes the disconnect:
+
+1. `install.py` reads `launcher.db app_state[embedding.active_profile]` and threads `ACTIVE_EMBEDDING` + `EMBEDDING_MODEL` into the subprocess env before spawning `sync_knowledge_graph.py`.
+2. `EmbeddingService.for_project()` reads `launcher.db` as fallback when env unset (single canonical chain: env → launcher.db → `"qwen3"` default).
+3. This `docs/TROUBLESHOOTING.md` entry + `templates/ORCHESTRATOR-CLAUDE.md.template` documents the resolution chain so users + future Claude know which channel to use.
+
+**On v0.2.52+**: no action needed. Whatever you selected in the launcher's Identity tab → Embedding selector is what `install.py --update` will use. Setting `$env:ACTIVE_EMBEDDING` in PowerShell before running install.py still works as an override.
+
+**Pre-v0.2.52 workaround** (if you're still on v0.2.51 and stuck): set the env var in your shell BEFORE running install.py:
+
+```powershell
+$env:ACTIVE_EMBEDDING = "arctic"
+$env:EMBEDDING_MODEL = "snowflake-arctic-embed2:latest"
+# Verify arctic2 is on Ollama:
+ollama list | Select-String arctic
+ollama pull snowflake-arctic-embed2:latest   # if missing
+
+cd C:\path\to\vibecoded-orchestrator
+python install.py --update
+```
+
+Speed expectation on CPU + 24GB RAM: ~1-2 s/chunk (arctic2) vs ~30 s/chunk (qwen3). Full sync of ~200 nodes completes in 5-10 minutes instead of "hours".
+
 ### Windows: `first-install.bat` crashes with `UnicodeEncodeError` (v0.2.25 / v0.2.26)
 
 If you downloaded a v0.2.25 or v0.2.26 release zip and `first-install.bat` crashes at step `[5b/10]` with a message like:
