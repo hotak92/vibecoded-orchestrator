@@ -906,6 +906,236 @@ def _rust_methods_for_struct(
     return methods
 
 
+def _js_methods_for_class(
+    content_clean: str,
+    class_name: str,
+    source_lines: List[str],
+) -> List[str]:
+    """V52-O.11.F.2-JS (v0.2.52, 2026-06-09): extract methods declared
+    inside ``class <class_name> { ... }`` (with optional ``extends``) in
+    JS/TS source.
+
+    Replaces the pre-V52-O.11.F.2-JS regex (``method_inside`` over
+    ``class_body``) which had three correctness defects:
+
+      1. Missed method shapes: ``static name()``, ``get name()``,
+         ``set name()``, ``*name()`` (generator), ``#name()`` (private),
+         ``static async name()``, ``static *name()``.
+      2. Matched ANY ``name(args) {`` pattern, including nested function
+         calls inside method bodies (``otherFn(arg) { ... }`` invoked
+         inside a method body would be miscounted as a method of the
+         outer class).
+      3. Incorrectly skipped ``constructor`` (constructor IS a method
+         that should be tracked, not filtered).
+
+    Algorithm:
+
+      1. Find every ``class <class_name>`` header (with optional
+         ``extends <Base>``). The class name must match EXACTLY — a
+         class named ``Foo`` does not match ``FooBar``. Optional
+         ``export`` / ``export default`` prefix supported.
+      2. For each matched class block, find its closing brace via the
+         existing ``_extract_balanced_block`` helper (V52-O.11.E).
+      3. Walk the class body brace-by-brace tracking depth. At depth 1
+         (immediate body, NOT inside any nested block), scan for
+         method declarations matching the JS method-shorthand patterns:
+           - ``name(args)``
+           - ``async name(args)``
+           - ``static name(args)``
+           - ``static async name(args)``
+           - ``get name()`` / ``set name(v)``
+           - ``*name(args)`` (generator)
+           - ``async *name(args)`` (async generator)
+           - ``#name(args)`` (private field)
+           - ``static #name(args)`` / ``#async name`` etc. combinations
+      4. Return deduplicated list, preserving first-seen order.
+
+    Returns empty list if no class blocks match — common for classes
+    whose body is purely fields/properties without method shorthand.
+
+    Handles ``extends``: ``class Foo extends Bar { ... }`` — the class
+    block IS Foo's body, methods of Bar are NOT picked up (Bar is in a
+    DIFFERENT class declaration entirely, scoped separately).
+
+    Limitations:
+      - Object-literal method shorthand inside method bodies isn't
+        confused with class-level methods because of the depth-tracking
+        (object literals are at depth>=2 inside any method).
+      - Multi-line strings / template literals with unbalanced braces
+        may confuse depth tracking — inherits the same constraint as
+        ``_extract_balanced_block``. Rare in practice; callers degrade
+        gracefully (under-count by 1-2 methods at worst).
+      - Decorators (``@decorator``) on a method line are skipped (the
+        pattern starts at the method name itself).
+
+    Language coverage: works for both JavaScript (``.js``, ``.mjs``,
+    ``.jsx``) and TypeScript (``.ts``, ``.tsx``) — TS class syntax is
+    a strict superset (adds type annotations on params + return types)
+    and our pattern ignores those by matching only up to the opening
+    paren.
+    """
+    # Find every class header whose name matches class_name exactly.
+    # Optional `export` / `export default` prefix; optional `extends Base`.
+    # The class name capture group is constrained to NOT be followed by
+    # any identifier character so e.g. searching for "Foo" doesn't match
+    # `class FooBar`.
+    escaped = re.escape(class_name)
+    class_pattern = re.compile(
+        r"(?:export\s+(?:default\s+)?)?"
+        rf"class\s+{escaped}\b"
+        r"(?:\s+extends\s+[\w.]+)?"
+        r"\s*\{",
+        re.MULTILINE,
+    )
+
+    # Inner method-shorthand patterns. Matched anchored at the start of
+    # the candidate position; collectively cover the JS class method
+    # shapes documented above. Each variant captures the method name in
+    # group 1.
+    #
+    # Order matters for the alternation: we test specific (longer)
+    # prefixes first so "static async foo" matches as static-async, not
+    # static + "async" (would attribute the wrong name).
+    method_patterns = [
+        # static async generator: `static async *name(...)`
+        re.compile(r"static\s+async\s+\*\s*([#\w]+)\s*\("),
+        # static generator: `static *name(...)`
+        re.compile(r"static\s+\*\s*([#\w]+)\s*\("),
+        # static async: `static async name(...)`
+        re.compile(r"static\s+async\s+([#\w]+)\s*\("),
+        # static get/set: `static get name()` / `static set name(v)`
+        re.compile(r"static\s+(?:get|set)\s+([#\w]+)\s*\("),
+        # plain static: `static name(...)`
+        re.compile(r"static\s+([#\w]+)\s*\("),
+        # async generator: `async *name(...)`
+        re.compile(r"async\s+\*\s*([#\w]+)\s*\("),
+        # async: `async name(...)`
+        re.compile(r"async\s+([#\w]+)\s*\("),
+        # generator: `*name(...)`
+        re.compile(r"\*\s*([#\w]+)\s*\("),
+        # get/set: `get name()` / `set name(v)`
+        re.compile(r"(?:get|set)\s+([#\w]+)\s*\("),
+        # plain shorthand: `name(...)` — must be tested LAST since it
+        # would otherwise eat any of the prefixed forms.
+        re.compile(r"([#\w]+)\s*\("),
+    ]
+
+    # Keywords that match the plain shorthand pattern but are NOT methods.
+    # `constructor` is INTENTIONALLY NOT in this list — it IS a method.
+    keyword_skip = {
+        "if", "else", "while", "for", "switch", "return",
+        "class", "new", "catch", "throw", "do", "try",
+        "function", "yield", "await", "void", "typeof",
+        "instanceof", "in", "of", "case", "break",
+        "continue", "delete", "var", "let", "const",
+    }
+
+    methods: List[str] = []
+    seen: set = set()
+
+    for m in class_pattern.finditer(content_clean):
+        # Locate the opening brace position (the regex anchors on it).
+        class_open_pos = m.end() - 1  # position of `{`
+        class_open_line = content_clean[:class_open_pos].count("\n") + 1
+        class_close_line = _extract_balanced_block(
+            source_lines, class_open_line, max_lookahead=800
+        )
+        block_start_pos = class_open_pos + 1  # skip `{`
+
+        # Find char-offset for class_close_line in content_clean. Same
+        # newline-counting walker as _rust_methods_for_struct uses.
+        target_newlines = class_close_line - class_open_line
+        if target_newlines <= 0:
+            continue
+        seen_newlines = 0
+        block_end_pos = block_start_pos
+        while seen_newlines < target_newlines and block_end_pos < len(content_clean):
+            if content_clean[block_end_pos] == "\n":
+                seen_newlines += 1
+            block_end_pos += 1
+        class_body_text = content_clean[block_start_pos:block_end_pos]
+
+        # Walk the class body char-by-char tracking brace depth so we
+        # only look for method declarations at depth 0 of the class
+        # body (which is depth 1 of the file's brace nesting).
+        # Method bodies/blocks at depth >=1 are skipped — this prevents
+        # nested function-call statements like `cb(arg) { ... }`
+        # inside a method body from being miscounted as class methods.
+        depth = 0
+        i = 0
+        n = len(class_body_text)
+        while i < n:
+            ch = class_body_text[i]
+            if ch == "{":
+                depth += 1
+                i += 1
+                continue
+            if ch == "}":
+                depth -= 1
+                i += 1
+                continue
+            # Skip strings (single-line only, mirroring the existing
+            # content_clean comment-strip pre-pass which removed line +
+            # block comments — backtick-delimited template literals
+            # remain in content_clean and can throw off depth tracking
+            # if they contain unescaped braces, but that's an inherited
+            # constraint from V52-O.11.E).
+            if ch in ('"', "'"):
+                quote = ch
+                i += 1
+                while i < n and class_body_text[i] != quote:
+                    if class_body_text[i] == "\\" and i + 1 < n:
+                        i += 2
+                        continue
+                    i += 1
+                i += 1  # skip the closing quote
+                continue
+            if ch == "`":
+                # Template literal — skip naively to matching backtick.
+                i += 1
+                while i < n and class_body_text[i] != "`":
+                    if class_body_text[i] == "\\" and i + 1 < n:
+                        i += 2
+                        continue
+                    i += 1
+                i += 1
+                continue
+            if depth != 0:
+                i += 1
+                continue
+            # At depth 0 of class body — try every method pattern at
+            # this position. Use match() (anchored) on the substring
+            # from i so we don't have to write start anchors in each
+            # regex.
+            matched = False
+            substr = class_body_text[i:]
+            for mp in method_patterns:
+                pm = mp.match(substr)
+                if not pm:
+                    continue
+                name = pm.group(1)
+                # Filter out reserved keywords that look like methods.
+                # (`constructor` deliberately preserved.)
+                if name in keyword_skip:
+                    break  # don't try lower-priority patterns; this is a keyword
+                if name in seen:
+                    matched = True
+                    i += pm.end()
+                    break
+                seen.add(name)
+                methods.append(name)
+                matched = True
+                # Advance past the matched prefix so we don't re-match
+                # the same method header from a substring position.
+                i += pm.end()
+                break
+            if matched:
+                continue
+            i += 1
+
+    return methods
+
+
 def _shape_for_insert(embedding: Optional[Any]) -> Optional[Any]:
     """Shape ``embedding`` for ``collection.data.insert(vector=)``.
 
@@ -3032,22 +3262,20 @@ class CodeGraphAnalyzer:
 
         # --- Store classes ---
         for cname, (start_line, base_class) in class_info.items():
-            # Extract methods defined inside the class body (rough heuristic: indented methods)
-            methods: List[str] = []
-            method_inside = re.compile(
-                rf'(?:async\s+)?([\w]+)\s*\([^)]*\)\s*\{{',
-                re.MULTILINE
-            )
-            # Grab lines from class start (rough: next 80 lines)
             _class_end_line = _extract_balanced_block(source_lines, start_line)  # V52-O.11.E (was: start_line + 80)
             class_lines = source_lines[max(0, start_line - 1):_class_end_line]
             class_body = '\n'.join(class_lines)
-            for mm in method_inside.finditer(class_body):
-                mname = mm.group(1)
-                # Skip keywords that match function-like syntax
-                if mname not in ('if', 'else', 'while', 'for', 'switch', 'return',
-                                 'class', 'new', 'catch', 'constructor'):
-                    methods.append(mname)
+            # V52-O.11.F.2-JS (v0.2.52, 2026-06-09): scope `methods` to
+            # method declarations inside this class's brace-balanced body
+            # (with full method-shape coverage: static, get/set, generators,
+            # private, async + combinations — plus depth-tracking that
+            # prevents nested call statements like `cb(x) { ... }` inside
+            # method bodies from being miscounted as class methods).
+            # Pre-V52-O.11.F.2-JS this inlined a `method_inside.finditer`
+            # over `class_body` with an under-covering pattern; the new
+            # helper mirrors the V52-O.11.F Rust pattern (parallel fix
+            # for JS/TS class method attribution).
+            methods = _js_methods_for_class(content_clean, cname, source_lines)
 
             signature = f"class {cname}"
             if base_class:
