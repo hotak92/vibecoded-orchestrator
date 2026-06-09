@@ -5,7 +5,7 @@
 # build.rs, capabilities/, icons/, gen/) stay at this level — they belong
 # to the launcher member. See `knowledge/concepts/launcher-binary-metadata-schema.md`
 # §"Workspace structure (v0.2.21)" + the v0.2.21 plan §3.
-members = ["vct-launcher-core", "vct-hub"]
+members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 
 [package]
 name = "vct-launcher-temp"
