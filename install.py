@@ -4901,6 +4901,19 @@ def main() -> int:
                 f"unexpected error writing preset defaults: {_preset_err}",
             )
 
+        # v0.2.52 V52-AD — seed the host-wide RL reranker disable row
+        # when no training data has accumulated yet. Soft-fails on every
+        # known sqlite error (missing DB, missing table, pre-034 schema,
+        # existing user choice). Idempotent across re-runs.
+        try:
+            _seed_rl_reranker_default_disabled()
+        except Exception as _rl_default_err:  # noqa: BLE001
+            _log_install_event(
+                "rl_reranker_default", "warn",
+                f"unexpected error seeding RL reranker default: "
+                f"{_rl_default_err}",
+            )
+
         # PR 6 + MEDIUM-9 + HIGH-4 fix (2026-05-01): wrap _ensure_collections
         # AND _seed_weaviate in the same try/except so Weaviate-down conditions
         # emit a deferral entry instead of crashing the install. Includes a
@@ -8315,6 +8328,185 @@ def _write_preset_defaults_to_app_state(
             "preset_defaults", "warn",
             f"sqlite error writing preset defaults to {db_path}: {e}",
             data={"db_path": str(db_path), "error": str(e)},
+        )
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# v0.2.52 V52-AD — seed host-wide RL reranker disable on fresh installs
+# ---------------------------------------------------------------------------
+#
+# User-stated 2026-06-09: "we don't have enough RL data, want to disable
+# RL rerank by default until 500+ retrieval events accumulate". This is
+# the install-time hook that lands that default: when launcher.db exists
+# (= --update flow OR fresh install after the launcher has booted at
+# least once) AND `rl_events` has fewer than 500 rows AND no global
+# enable row already exists for vct-rl-reranker, write `enabled=false`
+# at `(project_id IS NULL, vct-rl-reranker, enabled_for_project)`.
+#
+# Soft-fails identically to `_write_preset_defaults_to_app_state`:
+#   - launcher.db absent → skip (launcher will create the table on first
+#     boot; the user can then flip the toggle in Preferences → Modules).
+#   - module_settings table absent → skip.
+#   - Existing global row present → preserve user's prior choice (do
+#     not overwrite).
+#   - Existing rl_events count >= 500 → skip (training data already
+#     accumulated; let the user decide via the GUI prompt).
+#
+# Idempotency: the helper exits early if a global row already exists,
+# regardless of its value. Re-running install.py never resurrects a
+# default the user has since flipped.
+
+_RL_RERANKER_MODULE_ID = "vct-rl-reranker"
+_MODULE_ENABLED_FOR_PROJECT_KEY = "enabled_for_project"
+_RL_EVENTS_AUTO_ENABLE_THRESHOLD = 500
+
+
+def _seed_rl_reranker_default_disabled() -> None:
+    """Seed the launcher's `module_settings` table with a host-wide
+    disable row for vct-rl-reranker when the install is fresh enough
+    that the user hasn't accumulated training data yet.
+
+    Mirror of `_write_preset_defaults_to_app_state` for an adjacent
+    table. Soft-fail on every known error condition (see module-level
+    comment).
+    """
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
+        _log_install_event(
+            "rl_reranker_default", "skip",
+            f"launcher.db not found at {db_path}; the launcher will "
+            f"create the table on first boot. The user can flip the "
+            f"default via Preferences → Modules in the GUI.",
+            data={"db_path": str(db_path)},
+        )
+        return
+
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as e:
+        _log_install_event(
+            "rl_reranker_default", "warn",
+            f"sqlite3.connect failed for {db_path}: {e}",
+            data={"db_path": str(db_path), "error": str(e)},
+        )
+        return
+
+    try:
+        cur = conn.cursor()
+
+        # Step 1: probe the rl_events count. Soft-fail when the table
+        # doesn't exist yet (pre-migration-025 launcher.db).
+        try:
+            row = cur.execute("SELECT COUNT(*) FROM rl_events").fetchone()
+            rl_count = int(row[0]) if row else 0
+        except sqlite3.OperationalError as e:
+            _log_install_event(
+                "rl_reranker_default", "skip",
+                f"rl_events table not present yet ({e}); will write the "
+                f"default disable row on next install run after the "
+                f"launcher has booted at least once.",
+                data={"db_path": str(db_path), "error": str(e)},
+            )
+            return
+
+        # Step 2: if the user has already accumulated 500+ events, the
+        # auto-enable path applies. Do NOT seed a disable here — let the
+        # GUI prompt them to enable via Preferences → Modules.
+        if rl_count >= _RL_EVENTS_AUTO_ENABLE_THRESHOLD:
+            _log_install_event(
+                "rl_reranker_default", "skip",
+                f"rl_events already has {rl_count} rows "
+                f"(>= {_RL_EVENTS_AUTO_ENABLE_THRESHOLD}); not seeding a "
+                f"default disable row. The user can opt in / out via the "
+                f"GUI.",
+                data={
+                    "rl_events_count": rl_count,
+                    "threshold": _RL_EVENTS_AUTO_ENABLE_THRESHOLD,
+                },
+            )
+            return
+
+        # Step 3: probe for an existing global row. If present, the
+        # user has already configured the default (either via the GUI
+        # or a prior install.py run) — preserve their choice.
+        try:
+            existing = cur.execute(
+                "SELECT setting_value FROM module_settings "
+                " WHERE project_id IS NULL "
+                "   AND module_id = ? "
+                "   AND setting_key = ?",
+                (_RL_RERANKER_MODULE_ID, _MODULE_ENABLED_FOR_PROJECT_KEY),
+            ).fetchone()
+        except sqlite3.OperationalError as e:
+            # module_settings table missing OR project_id NOT NULL
+            # (pre-034 schema). Either way we cannot land the global
+            # default — soft-fail with a hint.
+            _log_install_event(
+                "rl_reranker_default", "skip",
+                f"module_settings probe failed ({e}); the launcher's "
+                f"migration 034 (v0.2.52) lands the nullable project_id "
+                f"column. Re-run install.py after the launcher boots.",
+                data={"db_path": str(db_path), "error": str(e)},
+            )
+            return
+
+        if existing is not None:
+            _log_install_event(
+                "rl_reranker_default", "skip",
+                f"global rl-reranker enable row already present "
+                f"(value={existing[0]!r}); preserving user choice.",
+                data={"existing_value": existing[0]},
+            )
+            return
+
+        # Step 4: write the default disable row.
+        try:
+            cur.execute(
+                "INSERT INTO module_settings "
+                "  (project_id, module_id, setting_key, setting_value) "
+                "VALUES (NULL, ?, ?, ?)",
+                (
+                    _RL_RERANKER_MODULE_ID,
+                    _MODULE_ENABLED_FOR_PROJECT_KEY,
+                    "false",  # JSON-encoded bool — matches the Rust
+                              # setter's encoding so the cascade reader
+                              # decodes it correctly.
+                ),
+            )
+            conn.commit()
+        except sqlite3.Error as e:
+            _log_install_event(
+                "rl_reranker_default", "warn",
+                f"failed to seed default disable row: {e}",
+                data={"error": str(e)},
+            )
+            return
+
+        _log_install_event(
+            "rl_reranker_default", "ok",
+            f"seeded host-wide default: vct-rl-reranker disabled until "
+            f"{_RL_EVENTS_AUTO_ENABLE_THRESHOLD}+ retrieval events "
+            f"accumulate (currently {rl_count}). Override in "
+            f"Preferences → Modules.",
+            data={
+                "module_id": _RL_RERANKER_MODULE_ID,
+                "setting_key": _MODULE_ENABLED_FOR_PROJECT_KEY,
+                "value": False,
+                "rl_events_count": rl_count,
+                "threshold": _RL_EVENTS_AUTO_ENABLE_THRESHOLD,
+            },
+        )
+    except sqlite3.Error as e:
+        _log_install_event(
+            "rl_reranker_default", "warn",
+            f"unexpected sqlite error: {e}",
+            data={"error": str(e)},
         )
     finally:
         try:
