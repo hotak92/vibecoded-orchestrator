@@ -102,6 +102,21 @@ fi
 # back to "default" only if the payload is malformed (which would mean the
 # hook contract itself is broken — see _PARSED above).
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
+
+# V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes
+# (notably the rl_kg_search.py subprocess spawned below) inherit it.
+# Claude Code does NOT propagate CLAUDE_SESSION_ID to hook/MCP
+# subprocesses, but the session_id IS available in the hook's stdin
+# JSON. The canonical telemetry emit path
+# (claude_mcp_servers/rl_client/telemetry_emit.py::resolve_session_id)
+# reads VCT_SESSION_ID as layer-2 of its 3-layer chain. Without this
+# export, every CLI-emitted retrieval event from a hook-triggered
+# search would have session_id="" — which is exactly the v0.2.51
+# bug rl-logging-audit-report-2026-05-23 finding #2 pinned at 99.6%.
+# Skip the "default" sentinel — we'd rather have empty than fake-key.
+if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "default" ]; then
+    export VCT_SESSION_ID="$SESSION_ID"
+fi
 CACHE_BASE="$PROJECT_ROOT/.claude/state/edit_cache_${SESSION_ID}"
 mkdir -p "$CACHE_BASE" 2>/dev/null || true
 # v0.2.29 GC: prune per-session edit_cache_* directories older than 14 days.

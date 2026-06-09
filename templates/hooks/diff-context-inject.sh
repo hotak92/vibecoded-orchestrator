@@ -34,6 +34,19 @@ else
 fi
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
+# V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes
+# inherit the session_id. The canonical telemetry emit path
+# (claude_mcp_servers/rl_client/telemetry_emit.py::resolve_session_id)
+# reads VCT_SESSION_ID as layer-2 of its 3-layer chain. Skip the
+# "default" sentinel — we'd rather have empty than fake-key. This hook
+# itself does not spawn telemetry-emitting subprocesses, but it fires
+# on UserPromptSubmit (early in every turn) so exporting here primes
+# the env for any later in-turn shell-pipeline call (search_knowledge
+# CLI from a snippet, etc.).
+if [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "default" ]; then
+    export VCT_SESSION_ID="$SESSION_ID"
+fi
+
 CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 # Snapshot state lives under the project (gitignored .claude/state/) so it
 # survives reboots and launcher restarts — Claude Code's `resume` feature
