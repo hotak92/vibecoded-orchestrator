@@ -476,8 +476,97 @@ pub fn real_start_after_install() -> StartAfterInstall {
 /// to the next row — one broken module must not block the rest of the
 /// resume sweep.
 pub async fn resume_containers_on_startup(db: &Db, resolve_manifest: ManifestResolver) {
+    // V52-D.2: reap pathological containers BEFORE the resume sweep.
+    // Mirror of the launcher-side pre-pass in
+    // `module_service::resume_containers_on_startup`. Removes
+    // BrokenCmd / Orphan / StaleImage containers so the resume sweep
+    // can recreate legitimate ones from DB rows in its own pass.
+    // Soft-fail: errors don't block the sweep.
+    reap_pathological_containers_for_resume(db, &resolve_manifest).await;
+
     resume_containers_on_startup_with_starter(db, resolve_manifest, real_start_after_install())
         .await
+}
+
+/// V52-D.2 (hub-side mirror): build the (claimed_names,
+/// expected_image_for, name_filter) inputs the core reaper needs and
+/// invoke it. Soft-fail throughout.
+async fn reap_pathological_containers_for_resume(
+    db: &Db,
+    resolve_manifest: &ManifestResolver,
+) {
+    use std::collections::HashSet;
+
+    let claimed = match db.list_module_installs_with_containers() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[module_supervisor] V52-D.2 reaper: list_module_installs_with_containers \
+                 failed: {}",
+                e
+            );
+            return;
+        }
+    };
+    let claimed_names: HashSet<String> =
+        claimed.iter().map(|(_pid, _mid, cname)| cname.clone()).collect();
+
+    let mut expected_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let gpu_mode = read_persisted_gpu_mode_for_supervisor();
+    for (_pid, module_id, cname) in &claimed {
+        let manifest = match resolve_manifest(module_id) {
+            Some(m) => m,
+            None => continue,
+        };
+        let container = match manifest.install.container.as_ref() {
+            Some(c) => c,
+            None => continue,
+        };
+        let image_template = manifest.runtime.resolve_image_ref(container, &manifest.version);
+        if let Ok(image) =
+            vct_launcher_core::services::container_runtime::resolve_image_ref(
+                &image_template, &manifest, gpu_mode,
+            )
+        {
+            expected_map.insert(cname.clone(), image);
+        }
+    }
+
+    let prefixes: HashSet<String> = claimed
+        .iter()
+        .map(|(_pid, mid, _cn)| mid.clone())
+        .collect();
+    let name_filter = move |name: &str| -> bool {
+        prefixes.iter().any(|p| name == p.as_str() || name.starts_with(&format!("{}-", p)))
+    };
+
+    let runtime = match detect_container_runtime().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[module_supervisor] V52-D.2 reaper: detect_container_runtime failed: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let expected_lookup = move |name: &str| expected_map.get(name).cloned();
+    let (reaped, errors) =
+        vct_launcher_core::services::container_runtime::reap_pathological_containers(
+            &runtime,
+            &claimed_names,
+            expected_lookup,
+            name_filter,
+        )
+        .await;
+    if reaped > 0 || errors > 0 {
+        eprintln!(
+            "[module_supervisor] V52-D.2 reaper: pass complete, reaped={} errors={}",
+            reaped, errors
+        );
+    }
 }
 
 /// Test-friendly variant of [`resume_containers_on_startup`] that takes

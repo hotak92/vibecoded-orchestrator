@@ -1869,6 +1869,14 @@ async fn parse_recent_event_stats_from_path(path: &Path) -> (u32, f32) {
 /// single-writer for that row's container_name + last_error;
 /// double-writing from both surfaces would race).
 pub async fn resume_containers_on_startup(db: &Db) {
+    // V52-D.2: reap pathological containers BEFORE the resume sweep.
+    // Removes BrokenCmd / Orphan / StaleImage containers that would
+    // otherwise occupy the slot the resume sweep wants to fill. The
+    // sweep recreates legitimate ones from the DB rows in its own
+    // pass. Soft-fail: errors don't block the sweep.
+    let resolver_for_reap = |id: &str| crate::commands::modules::find_manifest_for_resume(db, id);
+    reap_pathological_containers_for_resume(db, &resolver_for_reap).await;
+
     // Production path delegates manifest resolution to the on-disk
     // catalog via `find_manifest_for_resume`. Tests use the
     // `_with_resolver` variant directly with an in-memory map.
@@ -1876,6 +1884,113 @@ pub async fn resume_containers_on_startup(db: &Db) {
         crate::commands::modules::find_manifest_for_resume(db, id)
     })
     .await;
+}
+
+/// V52-D.2: launcher-side reaper wrapper. Builds the (claimed_names,
+/// expected_image_for, name_filter) inputs the core reaper needs from
+/// the launcher DB + on-disk manifest catalog, then invokes
+/// `vct_launcher_core::services::container_runtime::
+/// reap_pathological_containers`.
+///
+/// Soft-fail throughout: DB / runtime / parse errors log and return.
+/// Never panics; never blocks the resume sweep.
+async fn reap_pathological_containers_for_resume<F>(db: &Db, resolve_manifest: &F)
+where
+    F: Fn(&str) -> Option<ModuleManifest>,
+{
+    use std::collections::HashSet;
+
+    // Build claimed_names: every container_name referenced by any
+    // module_installs row (whether status='installed' or other).
+    // Includes both per-project + global rows.
+    let claimed = match db.list_module_installs_with_containers() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[module_service] V52-D.2 reaper: list_module_installs_with_containers \
+                 failed: {}",
+                e
+            );
+            return;
+        }
+    };
+    let claimed_names: HashSet<String> =
+        claimed.iter().map(|(_pid, _mid, cname)| cname.clone()).collect();
+
+    // Build the (container_name → expected image:tag) lookup. For
+    // each claimed row, resolve the manifest's
+    // `install.container.image:tag` (variant-aware via the same
+    // `read_persisted_gpu_mode` the start path uses). Soft-fail per
+    // row: a missing manifest / image block leaves the lookup
+    // returning None for that name → reaper skips the stale-image
+    // check for that container.
+    let mut expected_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let gpu_mode = read_persisted_gpu_mode();
+    for (_pid, module_id, cname) in &claimed {
+        let manifest = match resolve_manifest(module_id) {
+            Some(m) => m,
+            None => continue,
+        };
+        let container = match manifest.install.container.as_ref() {
+            Some(c) => c,
+            None => continue,
+        };
+        let image_template = manifest.runtime.resolve_image_ref(container, &manifest.version);
+        if let Ok(image) =
+            vct_launcher_core::services::container_runtime::resolve_image_ref(
+                &image_template, &manifest, gpu_mode,
+            )
+        {
+            expected_map.insert(cname.clone(), image);
+        }
+    }
+
+    // Build name_filter: a container name is interesting if it
+    // matches a known module-id prefix. We derive the set of
+    // module-id prefixes from the claimed rows + any module known
+    // to the resolver (the resolve_manifest closure can be queried
+    // for arbitrary ids — but the claimed set already covers every
+    // module the launcher has installed; broken/orphan containers
+    // for those modules ARE the targets). The reaper deliberately
+    // does NOT touch containers whose names don't match any known
+    // module-id prefix — never reap Weaviate / Ollama / user
+    // containers.
+    let prefixes: HashSet<String> = claimed
+        .iter()
+        .map(|(_pid, mid, _cn)| mid.clone())
+        .collect();
+    let name_filter = move |name: &str| -> bool {
+        prefixes.iter().any(|p| name == p.as_str() || name.starts_with(&format!("{}-", p)))
+    };
+
+    // Detect runtime + invoke the core reaper.
+    let runtime = match detect_container_runtime().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[module_service] V52-D.2 reaper: detect_container_runtime failed: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let expected_lookup = move |name: &str| expected_map.get(name).cloned();
+    let (reaped, errors) =
+        vct_launcher_core::services::container_runtime::reap_pathological_containers(
+            &runtime,
+            &claimed_names,
+            expected_lookup,
+            name_filter,
+        )
+        .await;
+    if reaped > 0 || errors > 0 {
+        eprintln!(
+            "[module_service] V52-D.2 reaper: pass complete, reaped={} errors={}",
+            reaped, errors
+        );
+    }
 }
 
 /// Test-friendly variant: same logic as `resume_containers_on_startup`
