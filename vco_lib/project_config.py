@@ -422,6 +422,26 @@ class ProjectConfig:
     #: clients. Declared last to keep frozen-dataclass init signature
     #: backward-compat.
     rl_reranker_enabled_for_project: bool = True
+    #: V52-AA (v0.2.52) — per-project RL Reranker container port. Source:
+    #: hub reads ``module_ports(project_id, "vct-rl-reranker", port)``
+    #: (canonical SoT since migration 017 / v0.2.26) and exposes the
+    #: allocated port here. ``None`` when no row exists (RL not installed
+    #: for this project, OR allocator hasn't run yet).
+    #:
+    #: Closes the V52-AA env-propagation gap. Pre-V52-AA the only channel
+    #: for the MCP subprocess to learn the container port was the
+    #: ``RL_SERVER_PORT`` env var — which the launcher never wrote to
+    #: ``.claude/settings.json env`` or ``.claude/env`` (deliberate: see
+    #: the H.1 design contract in
+    #: ``launcher/src-tauri/src/mcp_registration.rs``). Now the MCP's
+    #: ``_get_rl_client`` consults this field when env is unset and
+    #: builds the client with the resolved port.
+    #:
+    #: Pre-V52-AA hubs paired with V52-AA+ clients omit the field; the
+    #: parser back-fills with ``None`` so old hubs don't crash new
+    #: clients. New hubs paired with old clients have the field
+    #: silently ignored.
+    rl_server_port: Optional[int] = None
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -751,6 +771,28 @@ def _resolve_project_id(project_arg: str) -> str:
 # ─── Internal: response → dataclass ─────────────────────────────────────
 
 
+def _coerce_optional_port(raw: Any) -> Optional[int]:
+    """Coerce a JSON value into an Optional[int] port, defensively.
+
+    V52-AA (v0.2.52). The hub's ``rl_server_port`` field serialises
+    ``Option<u16>`` — ``null`` for absent, a number for allocated. We
+    accept the JSON-typed integer directly and also coerce a numeric
+    string (defense-in-depth; the hub doesn't emit strings here today
+    but a future schema change shouldn't crash old clients). Any other
+    shape (negative, zero, oversize, malformed) is treated as
+    ``None`` — caller falls through to env-resolution / disabled mode.
+    """
+    if raw is None:
+        return None
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if port <= 0 or port > 65535:
+        return None
+    return port
+
+
 def _parse_extra_codegraph_paths(
     raw: Any,
 ) -> tuple[ExtraCodegraphPath, ...]:
@@ -922,6 +964,14 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             rl_reranker_enabled_for_project=bool(
                 body.get("rl_reranker_enabled_for_project", True)
             ),
+            # V52-AA (v0.2.52) additive field — pre-V52-AA hubs omit it;
+            # default ``None`` matches the Rust handler's
+            # ``get_project_rl_port`` returning ``Option<u16>`` (None when
+            # no row exists). Coerce to int when the JSON value is a
+            # finite number; treat anything else (None, missing key,
+            # malformed string) as ``None`` so the MCP falls through to
+            # env-resolution / disabled mode.
+            rl_server_port=_coerce_optional_port(body.get("rl_server_port")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(

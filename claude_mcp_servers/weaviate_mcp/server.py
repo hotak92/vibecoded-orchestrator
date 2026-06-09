@@ -4097,11 +4097,26 @@ def _get_rl_client():
     # then falls back to the base model — the safe, paying-user-not-
     # cut-off behaviour. RLClient.__init__ sanitises project_id on its
     # own; passing it through unchecked is also safe.
+    #
+    # V52-AA (v0.2.52): the same resolver also surfaces ``rl_server_port``
+    # — the per-project RL Reranker container port allocated by the
+    # supervisor and persisted to ``module_ports``. We use it as a
+    # fallback when the canonical ``RL_SERVER_URL`` / ``RL_SERVER_PORT``
+    # env vars are unset (which they always are for MCP subprocesses on
+    # the default install — the launcher deliberately does NOT propagate
+    # them to ``.claude/settings.json env`` per the H.1 contract). With
+    # this fallback the client transitions from "disabled mode" to
+    # "wired to the supervisor-allocated container" without any env
+    # ceremony. Env vars still WIN when set, preserving the existing
+    # override path for tests + dev users.
     current_project_id: Optional[str] = None
+    hub_rl_server_port: Optional[int] = None
     try:
         _cfg = _try_resolve_project_config()
-        if _cfg is not None and getattr(_cfg, "project_id", None):
-            current_project_id = _cfg.project_id
+        if _cfg is not None:
+            if getattr(_cfg, "project_id", None):
+                current_project_id = _cfg.project_id
+            hub_rl_server_port = getattr(_cfg, "rl_server_port", None)
     except Exception as exc:
         logger.debug("project_id resolve failed (%s); will send no X-VCT-Project-ID", exc)
 
@@ -4127,10 +4142,32 @@ def _get_rl_client():
             svc.close()
     except Exception as exc:
         logger.debug("EmbeddingService probe failed (%s); using default text_dim=%d", exc, text_dim)
+
+    # V52-AA: derive base_url from hub-resolved rl_server_port as a
+    # fallback when env vars are unset. Env precedence:
+    #   1. RL_SERVER_URL env (canonical override; full URL incl. host)
+    #   2. RL_SERVER_PORT env (composed against 127.0.0.1)
+    #   3. hub-resolved ``rl_server_port`` from ProjectConfig (V52-AA)
+    #   4. None → "disabled mode"
+    # RLClient.__init__ already uses _resolve_base_url() to cover (1)+(2)
+    # internally when ``base_url`` arg is None. We pre-resolve (3) here
+    # and pass it explicitly as ``base_url`` ONLY when (1)+(2) are unset,
+    # so the existing env-override path stays intact for tests + dev.
+    base_url_override: Optional[str] = None
+    _env_url = os.environ.get("RL_SERVER_URL", "").strip()
+    _env_port = os.environ.get("RL_SERVER_PORT", "").strip()
+    if not _env_url and not _env_port and hub_rl_server_port:
+        base_url_override = f"http://127.0.0.1:{hub_rl_server_port}"
+        logger.debug(
+            "RL client: env unset; using hub-resolved rl_server_port=%d",
+            hub_rl_server_port,
+        )
+
     client = RLClient(
         text_dim=text_dim,
         active_embedding=current_embedding,
         project_id=current_project_id,
+        base_url=base_url_override,
     )
     _rl_client_instances[cache_key] = client
     return client
