@@ -643,6 +643,23 @@ pub fn run() {
                 }
             }
 
+            // V52-AI (v0.2.52): boot-time stale-lockfile self-heal. If
+            // the previous update crashed mid-way (or even just hung
+            // long enough to exceed expected_completion_by), the
+            // lockfile at <vct_root>/.update-in-progress.json could
+            // still be on disk and would block all MCP spawns
+            // indefinitely. cleanup_if_stale() removes it iff the
+            // deadline has passed; a still-fresh lockfile (e.g. user
+            // launched the launcher manually mid-update from another
+            // window) is preserved.
+            if crate::commands::update_gate::cleanup_if_stale() {
+                eprintln!(
+                    "[vct] launcher boot: removed stale \
+                     .update-in-progress.json lockfile (previous \
+                     update did not exit cleanly)"
+                );
+            }
+
             // v0.2.37 (Agent V37-E, 2026-05-27): consume the
             // install_path seed file that install.py may have written
             // alongside the orchestrator clone (see

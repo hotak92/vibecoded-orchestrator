@@ -49,6 +49,11 @@
 //! Soft-fail throughout: lockfile errors must NOT block the update
 //! itself (worst case: user sees the same fork-bomb behaviour pre-fix,
 //! which is no worse than today's status quo).
+//!
+//! Some pub items below are public API surface for future cross-crate
+//! consumers (vct-hub's MCP-supervision endpoints, additional Tauri
+//! commands) — silence the false-positive dead-code warnings.
+#![allow(dead_code)]
 
 use std::fs;
 use std::io::Write;

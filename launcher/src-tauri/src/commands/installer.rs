@@ -3930,6 +3930,42 @@ pub async fn update_orchestrator<R: Runtime>(
     clear_update_resume_sentinel(&install_path);
     clear_update_resume_deferral_if_solo(&install_path);
 
+    // V52-AI (v0.2.52, 2026-06-09): MCP fork-bomb mitigation. The user
+    // reported ~97 python (claude_mcp_servers + vct-coordination) and
+    // ~77 node (@upstash/context7 + @modelcontextprotocol/*) processes
+    // accumulating during update, requiring manual taskkill. Root cause
+    // is Windows mandatory file locks + Claude Code's MCP-respawn loop
+    // racing the binary refresh.
+    //
+    // Strategy:
+    //   1. Pre-sweep: terminate currently-running MCP processes whose
+    //      commandlines match strict MCP patterns. Soft-fail.
+    //   2. Acquire a RAII lockfile guard. The lockfile lives at
+    //      <vct_root>/.update-in-progress.json and is what the MCP
+    //      servers themselves read at startup (see
+    //      claude_mcp_servers/_lib/update_gate.py); any respawn during
+    //      the update window exits cleanly with code 75 before doing
+    //      any work, breaking the fork-bomb loop.
+    //   3. The guard's Drop impl deletes the lockfile on ALL exit paths
+    //      (success, ?-bail, panic), so even a crashed update doesn't
+    //      leave a stuck lockfile blocking future MCP spawns. The
+    //      boot-time stale-cleanup is the second line of defense.
+    let pre_sweep_count = crate::commands::update_gate::pre_update_mcp_kill_sweep();
+    if pre_sweep_count > 0 {
+        eprintln!(
+            "[vct] update_orchestrator: pre-sweep terminated {} MCP-shaped \
+             process(es) before update",
+            pre_sweep_count
+        );
+    }
+    let (mut update_gate_guard, _gate_write_result) =
+        crate::commands::update_gate::UpdateInProgressGuard::new();
+    // _gate_write_result is intentionally discarded — soft-fail.
+    // If lockfile write fails (permission denied, FS full), we proceed
+    // with the update anyway (worst case: user sees the same pre-fix
+    // fork-bomb behaviour, same as today's status quo). The guard's
+    // Drop impl is a no-op when armed=false.
+
     // v0.2.21 (Stream A Design B extension): pin the canonical public
     // AGPL upstream BEFORE any network ops. Same posture as the launcher
     // self-update (see commands/self_update.rs): we never trust `origin`
@@ -4226,6 +4262,10 @@ pub async fn update_orchestrator<R: Runtime>(
     // Stage 2: Re-run install.py with --update flag
     emit_progress(&window, "install", "Applying updates...", 40.0);
 
+    // V52-AI: advance lockfile phase so future hub-side observers can
+    // see we've moved past git_pull.
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
+
     let python_cmd = &system.python_cmd;
     let mut cmd = tokio::process::Command::new(python_cmd).silent();
     cmd.args(["install.py", "--update"])
@@ -4371,6 +4411,11 @@ pub async fn update_orchestrator<R: Runtime>(
         return Err(format!("Update failed: {}", stderr));
     }
 
+    // V52-AI: advance lockfile phase. install.py has finished; we're
+    // now in the binary-refresh + hub-restart window. MCPs that try to
+    // spawn during this window still see the lockfile and exit cleanly.
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::BinaryRefresh);
+
     // v0.2.21 Step 12 (B1 fix): Stage 3 — bring the detached vct-hub
     // back up BEFORE we restart the launcher. Soft-fail: the launcher
     // restart path itself also calls `hub_launcher::ensure_hub_running`
@@ -4419,6 +4464,16 @@ pub async fn update_orchestrator<R: Runtime>(
         eprintln!("[v0.2.45 V45-B] update_orchestrator: {}", e);
         return Err(e);
     }
+
+    // V52-AI: explicit lockfile cleanup BEFORE the restart hop. We don't
+    // want the lockfile to survive across the launcher restart — if it
+    // did, the freshly-booted launcher's MCPs would still see it as
+    // active and refuse to start until the stale-cleanup window passed
+    // (up to 15min). Drop on the guard would happen on process exit,
+    // but on Windows the process can terminate before async cleanup
+    // runs cleanly; calling disarm_and_cleanup() now makes the order
+    // deterministic.
+    update_gate_guard.disarm_and_cleanup();
 
     // v0.2.17 (plan 0.0): auto-restart. The launcher has no in-flight
     // user state to lose, so spawn the new binary detached + exit.
@@ -6321,6 +6376,26 @@ pub async fn resume_orchestrator_update<R: Runtime>(
             "install_path": path,
         }),
     );
+
+    // V52-AI (v0.2.52): acquire the MCP fork-bomb gate before any
+    // file-touching work. Same shape as update_orchestrator —
+    // pre-sweep + RAII guard. Resume runs install.py + binary
+    // refresh, which is the exact window where the fork-bomb
+    // historically formed; protecting it is just as important.
+    let pre_sweep_count_resume = crate::commands::update_gate::pre_update_mcp_kill_sweep();
+    if pre_sweep_count_resume > 0 {
+        eprintln!(
+            "[vct] resume_orchestrator_update: pre-sweep terminated {} \
+             MCP-shaped process(es) before resume",
+            pre_sweep_count_resume
+        );
+    }
+    let (mut update_gate_guard, _gate_write_result) =
+        crate::commands::update_gate::UpdateInProgressGuard::new();
+    // Resume starts mid-flow; the lockfile claims InstallPy directly
+    // because we're skipping the git-pull stage (the user already
+    // resolved the merge before clicking Continue Update).
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
 
     // The on-disk source is already current (the user finished the merge),
     // so we mirror the `merge_orchestrator_with_upstream` post-pull tail.
