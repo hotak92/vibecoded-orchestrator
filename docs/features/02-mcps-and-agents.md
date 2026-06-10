@@ -1,6 +1,16 @@
 # MCP Servers & Infrastructure Scripts
 
-As of v0.2.11, three MCP servers ship with VCO: semantic search (Weaviate-KG), academic paper search, and Playwright (browser automation). The Python MCPs run from `claude_mcp_servers/.venv`; Playwright runs from `npx -y @playwright/mcp@latest`. Source for the Python MCPs in `claude_mcp_servers/`; Playwright install logic in `install.py::_install_playwright_browsers`.
+Five MCP servers ship with VCO by default:
+
+- `weaviate-kg` — semantic + graph search over the knowledge graph, project docs, and code graph (Python, `claude_mcp_servers/weaviate_mcp/server.py`)
+- `search` — academic-paper search via OpenAlex + arXiv (Python, `claude_mcp_servers/search_mcp/`)
+- `mermaid` — diagram describe/extract for Mermaid (`.mmd`) sources (Python wrapper around `vco_lib/mermaid_mcp_fork/`)
+- `excalidraw` — diagram describe/extract for Excalidraw sources (Python wrapper around `vco_lib/excalidraw_mcp_fork/`)
+- `playwright` — browser automation via `npx -y @playwright/mcp@latest` (default-enabled; opt out with `VCT_SKIP_PLAYWRIGHT=1`)
+
+Authoritative writer for the four Python MCPs: `launcher/src-tauri/src/mcp_registration.rs::build_default_mcp_entries`. Pure-Python fallback for installs that bypass the launcher: `install.py:20654-20661`. Playwright is invoked separately via `_install_playwright_browsers` (`install.py:24784-24858`) so users without npx still get the other four MCPs.
+
+The Python MCPs run from `claude_mcp_servers/.venv`. The `vct-coordination` MCP is Pro-tier and excluded from the default install — see `mcp_registration.rs:16` for the rationale.
 
 **Removed in v0.2.11**: the Ollama MCP (`chat`, `read_document`, `read_image`) was removed as redundant. Claude's native reasoning, `Read` tool, and built-in vision serve those use cases at higher quality. The Search MCP was narrowed to `search_papers` only — `web_search`, `search_code`, and `fetch_page` were removed since Claude's built-in WebFetch covers ad-hoc web retrieval, and GitHub code search is rarely needed in the daily Claude Code workflow. SearXNG was removed from the default container stack. See `knowledge/concepts/mcp-simplification-v0211.md`.
 
