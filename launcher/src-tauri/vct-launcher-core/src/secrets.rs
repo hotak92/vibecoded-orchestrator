@@ -787,6 +787,7 @@ pub mod for_tests {
     ///
     /// # Usage
     /// ```no_run
+    /// use vct_launcher_core::secrets::{self, SecretScope};
     /// let _g = secrets::for_tests::MockGuard::new();
     /// secrets::for_tests::fail_next_set("vct.mod.username");
     /// let result = secrets::set(SecretScope::Global, "mod", "username", "val");
@@ -815,6 +816,7 @@ pub mod for_tests {
     /// RAII guard: enables the mock on construction, disables+clears on drop.
     ///
     /// ```no_run
+    /// use vct_launcher_core::secrets;
     /// let _g = secrets::for_tests::MockGuard::new();
     /// // mock is active for the duration of this scope
     /// ```
