@@ -2,6 +2,20 @@
 //!
 //! Backed by `crate::db::project_state`. Mutations call `db.audit(...)`
 //! so the audit log records who changed what (without recording values).
+//!
+//! NEW-9 (v0.2.53) — `set_project_agent_enabled` and
+//! `set_project_skill_enabled` now perform the **FS-disable contract**:
+//! enabling/disabling an agent or skill also moves the corresponding
+//! `.md` file (or skill directory) between `.claude/agents/` and
+//! `.claude/agents.disabled/` (resp. skills). Without this move, a
+//! subsequent `install-bundle --update` would re-overwrite the
+//! enabled-side file from the orchestrator's template, silently
+//! re-enabling the user-disabled agent/skill. See
+//! `.claude/context/audits/project-bundle-install-audit-2026-06-10.md`
+//! §6.5 / B2 for the audit + verdict.
+
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -13,6 +27,118 @@ use crate::db::project_state::{
     ProjectSecretRef, ProjectSkill, ProjectStateSnapshot,
 };
 use crate::db::Db;
+
+// ─── FS-disable helpers (NEW-9, v0.2.53) ────────────────────────────────
+
+/// Compute the enabled-side and disabled-side paths for an agent.
+///
+/// Agents are single `.md` files at `.claude/agents/<name>.md`. When
+/// disabled, they live at `.claude/agents.disabled/<name>.md`.
+fn agent_paths(folder: &Path, agent_name: &str) -> (PathBuf, PathBuf) {
+    let enabled = folder
+        .join(".claude")
+        .join("agents")
+        .join(format!("{}.md", agent_name));
+    let disabled = folder
+        .join(".claude")
+        .join("agents.disabled")
+        .join(format!("{}.md", agent_name));
+    (enabled, disabled)
+}
+
+/// Compute the enabled-side and disabled-side paths for a skill.
+///
+/// Skills are whole directories at `.claude/skills/<name>/`. When
+/// disabled, they live at `.claude/skills.disabled/<name>/`.
+fn skill_paths(folder: &Path, skill_name: &str) -> (PathBuf, PathBuf) {
+    let enabled = folder.join(".claude").join("skills").join(skill_name);
+    let disabled = folder
+        .join(".claude")
+        .join("skills.disabled")
+        .join(skill_name);
+    (enabled, disabled)
+}
+
+/// Move `src` to `dst`, creating the parent directory of `dst` first.
+/// Cross-OS: `fs::rename` is POSIX rename / Windows MoveFileExW with
+/// REPLACE_EXISTING semantics; atomic per the OS's contract.
+///
+/// Returns `Ok(true)` when the move succeeded, `Ok(false)` when `src`
+/// did not exist (caller decides if that's an error or a no-op), and
+/// `Err(_)` on any other I/O error.
+fn move_path_if_exists(src: &Path, dst: &Path) -> Result<bool, String> {
+    if !src.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create_dir_all({}): {}", parent.display(), e))?;
+    }
+    // If the destination ALREADY exists (corrupt state — file in both
+    // locations), refuse to clobber. The populate-time both-locations
+    // warning surfaces this state to the user, who can clean up
+    // manually. Silently overwriting could destroy user edits made to
+    // the destination side.
+    if dst.exists() {
+        return Err(format!(
+            "FS-disable refusing to move {} → {}: destination already exists. \
+             The agent/skill is registered in both enabled and disabled \
+             locations; clean up the duplicate manually before toggling.",
+            src.display(),
+            dst.display(),
+        ));
+    }
+    fs::rename(src, dst).map_err(|e| {
+        format!(
+            "FS-disable rename {} → {}: {}",
+            src.display(),
+            dst.display(),
+            e
+        )
+    })?;
+    Ok(true)
+}
+
+/// Apply the FS-disable contract for an agent: move the `.md` file
+/// between `.claude/agents/` and `.claude/agents.disabled/` based on
+/// `enabled`. Soft-fail when the source file doesn't exist (the user
+/// may have removed it manually; the DB flag still gets flipped).
+///
+/// `folder` is the project's filesystem root. The function never
+/// touches files outside `.claude/agents/`** / `.claude/agents.disabled/`.
+fn apply_fs_disable_agent(folder: &Path, agent_name: &str, enabled: bool) -> Result<(), String> {
+    let (enabled_path, disabled_path) = agent_paths(folder, agent_name);
+    let (src, dst) = if enabled {
+        // Enabling: disabled → enabled.
+        (disabled_path, enabled_path)
+    } else {
+        // Disabling: enabled → disabled.
+        (enabled_path, disabled_path)
+    };
+    let _moved = move_path_if_exists(&src, &dst)?;
+    // Soft-fail on src-missing: it's possible the user manually moved
+    // the file (or it never existed). DB-only state remains
+    // authoritative when no FS effect is possible.
+    Ok(())
+}
+
+/// Apply the FS-disable contract for a skill: same shape as
+/// `apply_fs_disable_agent` but operating on whole directories.
+///
+/// `fs::rename` works for directories on POSIX (atomic same-FS) and
+/// Windows (when both paths are on the same volume). Cross-volume
+/// directory renames will fail with EXDEV / Win-equivalent; the
+/// caller surfaces the error to the user.
+fn apply_fs_disable_skill(folder: &Path, skill_name: &str, enabled: bool) -> Result<(), String> {
+    let (enabled_path, disabled_path) = skill_paths(folder, skill_name);
+    let (src, dst) = if enabled {
+        (disabled_path, enabled_path)
+    } else {
+        (enabled_path, disabled_path)
+    };
+    let _moved = move_path_if_exists(&src, &dst)?;
+    Ok(())
+}
 
 // ─── Read ────────────────────────────────────────────────────────────────
 
@@ -249,6 +375,21 @@ pub async fn set_project_agent_enabled(
     enabled: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
+    // NEW-9 (v0.2.53) — apply the FS-disable contract BEFORE flipping the
+    // DB flag. If the FS move fails (e.g. corrupt both-locations state),
+    // refuse the toggle so the DB doesn't end up out-of-sync with disk.
+    // If the source file is simply missing (user removed it manually),
+    // the move is a no-op and we still flip the DB row — DB remains
+    // authoritative for the soft-fail case.
+    if let Some(project) = db.get_project(&project_id)? {
+        let folder = Path::new(&project.folder_path);
+        apply_fs_disable_agent(folder, &agent_name, enabled)?;
+    }
+    // If get_project returns None (project deleted between read+write —
+    // unlikely but defensive), let the db.set_project_agent_enabled
+    // call surface the foreign-key/row-missing error in its own
+    // diagnostic shape.
+
     db.set_project_agent_enabled(&project_id, &agent_name, enabled)?;
     db.audit(
         "project_agent_set_enabled",
@@ -317,6 +458,13 @@ pub async fn set_project_skill_enabled(
     enabled: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
+    // NEW-9 (v0.2.53) — see comment on set_project_agent_enabled for the
+    // FS-disable contract rationale. Same pattern, operating on the
+    // skill's whole directory rather than a single .md file.
+    if let Some(project) = db.get_project(&project_id)? {
+        let folder = Path::new(&project.folder_path);
+        apply_fs_disable_skill(folder, &skill_name, enabled)?;
+    }
     db.set_project_skill_enabled(&project_id, &skill_name, enabled)
 }
 
@@ -1260,5 +1408,126 @@ mod tests {
             "expected folder-missing error, got: {}",
             err
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // NEW-9 (v0.2.53) — FS-disable contract unit tests.
+    //
+    // Reference:
+    // `.claude/context/audits/project-bundle-install-audit-2026-06-10.md`
+    // §6.5 / B2.
+    // ──────────────────────────────────────────────────────────────────
+
+    use uuid::Uuid;
+
+    fn scratch_project_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("fs-disable-test-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Disabling an agent must move
+    /// `.claude/agents/<name>.md` → `.claude/agents.disabled/<name>.md`.
+    #[test]
+    fn fs_disable_agent_moves_md_to_disabled_dir() {
+        let folder = scratch_project_dir();
+        let agents = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let enabled_path = agents.join("coder.md");
+        std::fs::write(&enabled_path, "name: coder\nmodel: sonnet\n").unwrap();
+
+        apply_fs_disable_agent(&folder, "coder", false).unwrap();
+
+        let disabled_path = folder.join(".claude/agents.disabled/coder.md");
+        assert!(!enabled_path.exists(), "enabled-side file must be gone");
+        assert!(
+            disabled_path.exists(),
+            "disabled-side file must exist after disable"
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Enabling an agent must move
+    /// `.claude/agents.disabled/<name>.md` → `.claude/agents/<name>.md`.
+    #[test]
+    fn fs_disable_agent_enable_moves_md_back() {
+        let folder = scratch_project_dir();
+        let disabled_dir = folder.join(".claude/agents.disabled");
+        std::fs::create_dir_all(&disabled_dir).unwrap();
+        let disabled_path = disabled_dir.join("coder.md");
+        std::fs::write(&disabled_path, "name: coder\nmodel: sonnet\n").unwrap();
+
+        apply_fs_disable_agent(&folder, "coder", true).unwrap();
+
+        let enabled_path = folder.join(".claude/agents/coder.md");
+        assert!(enabled_path.exists());
+        assert!(!disabled_path.exists());
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// When the source file doesn't exist (user removed it manually),
+    /// the helper must be a no-op — NEVER raise. The DB flag flip still
+    /// proceeds and the absence is benign.
+    #[test]
+    fn fs_disable_agent_missing_source_is_noop() {
+        let folder = scratch_project_dir();
+        // Don't create any agent file.
+        apply_fs_disable_agent(&folder, "ghost", false).unwrap();
+        apply_fs_disable_agent(&folder, "ghost", true).unwrap();
+        // No-op — neither side should have been created.
+        assert!(!folder.join(".claude/agents/ghost.md").exists());
+        assert!(!folder
+            .join(".claude/agents.disabled/ghost.md")
+            .exists());
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// When the destination ALREADY exists (corrupt both-locations
+    /// state), the helper must REFUSE the move — it would clobber the
+    /// user's destination-side file silently otherwise.
+    #[test]
+    fn fs_disable_agent_refuses_to_clobber_existing_destination() {
+        let folder = scratch_project_dir();
+        let agents = folder.join(".claude/agents");
+        let disabled = folder.join(".claude/agents.disabled");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::create_dir_all(&disabled).unwrap();
+        std::fs::write(agents.join("coder.md"), "enabled\n").unwrap();
+        std::fs::write(disabled.join("coder.md"), "disabled\n").unwrap();
+
+        let err = apply_fs_disable_agent(&folder, "coder", false).unwrap_err();
+        assert!(
+            err.contains("destination already exists"),
+            "expected clobber-refusal error, got: {}",
+            err
+        );
+        // Both files survive the refusal.
+        assert!(agents.join("coder.md").exists());
+        assert!(disabled.join("coder.md").exists());
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Disabling a skill (whole directory) must move the entire
+    /// `.claude/skills/<name>/` directory to `.claude/skills.disabled/<name>/`.
+    #[test]
+    fn fs_disable_skill_moves_directory() {
+        let folder = scratch_project_dir();
+        let skill_dir = folder.join(".claude/skills/tdd");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "name: tdd\n").unwrap();
+
+        apply_fs_disable_skill(&folder, "tdd", false).unwrap();
+
+        let disabled_dir = folder.join(".claude/skills.disabled/tdd");
+        assert!(!skill_dir.exists());
+        assert!(disabled_dir.exists());
+        assert!(disabled_dir.join("SKILL.md").exists());
+
+        std::fs::remove_dir_all(&folder).ok();
     }
 }

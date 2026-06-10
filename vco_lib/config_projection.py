@@ -1126,29 +1126,52 @@ def user_secret_known_keys_from_db(
             pass
 
 
-# ─── Sanitization (mirrors Rust ``sanitize_kg_collection``) ─────────────
+# ─── Sanitization (delegates to vco_lib.project_init SSOT) ─────────────
 #
-# Same rule as ``vco_lib.project_init.sanitize_for_weaviate_class``:
-# split on any non-alphanumeric run, PascalCase each chunk, concatenate,
-# fall back to "Vct" if nothing survives or starts with a digit.
-
-_SAFE_CLASS_RE = re.compile(r"[^A-Za-z0-9]+")
+# NEW-10 / DEDUP-6 (v0.2.53) — consolidated to call the canonical
+# underscore-DROPPING sanitizer in ``vco_lib.project_init``. The only
+# behavioural delta this wrapper preserves is the "Vct" (capitalized)
+# fallback used by ``ProjectEnvSettings.populate()``, vs the lowercase
+# "vct" fallback used by the project_init-canonical version. Without
+# this wrapper, the fallback-case env-write would change shape from
+# ``Vct_KnowledgeGraph`` to ``vct_KnowledgeGraph`` — a real breakage
+# for projects whose names sanitize to empty.
+#
+# The import is lazy (inside the function) to keep the import cycle
+# loop closed: project_init.py imports config_projection.py via
+# ``_apply_canonical_env_via_config_projection``; we mustn't take the
+# import at module load.
 
 
 def _sanitize_kg_collection(project_name: str) -> str:
-    """Mirror of Rust's ``sanitize_kg_collection``.
+    """Sanitize a project name into a Weaviate class prefix.
 
-    See ``vco_lib.project_init.sanitize_for_weaviate_class`` for the
-    canonical implementation; we re-implement here to avoid an import
-    cycle (project_init is the heavier module; this one is meant to be
-    importable by tests in isolation).
+    DEDUP-6 (v0.2.53) — calls the SSOT
+    ``vco_lib.project_init.sanitize_for_weaviate_class`` so the rule
+    stays in one place. The only divergence from the SSOT is the
+    fallback string: this wrapper returns ``"Vct"`` (capital V) where
+    the SSOT returns ``"vct"`` (lowercase), preserving the
+    historical contract that ``ProjectEnvSettings``-populated env
+    rows use a capitalized fallback.
+
+    See ``vco_lib.project_naming.canonical_class_prefix`` for the
+    underscore-PRESERVING canonical sanitizer (used by the code-graph
+    analyzer); this function uses the underscore-DROPPING rule because
+    it's what install.py-emitted manifests have shipped with since
+    v0.2.15.
     """
-    base = project_name or ""
-    parts = [p for p in _SAFE_CLASS_RE.split(base) if p]
-    pascal = "".join(p[:1].upper() + p[1:] for p in parts)
-    if not pascal or pascal[:1].isdigit():
+    # Lazy import — project_init imports config_projection at runtime,
+    # so a top-level import here would create a cycle.
+    from vco_lib.project_init import sanitize_for_weaviate_class
+
+    sanitized = sanitize_for_weaviate_class(project_name)
+    # Preserve the capitalized fallback for this consumer. project_init
+    # returns "vct" (lowercase) in its fallback path; the env-write
+    # surface here wants "Vct" so the class-name PostgreSQL/Weaviate
+    # sees has its conventional initial-capital.
+    if sanitized == "vct":
         return "Vct"
-    return pascal
+    return sanitized
 
 
 # ─── Exceptions ─────────────────────────────────────────────────────────

@@ -42,3 +42,4 @@ pub mod rl_events_api;
 pub mod secrets_api;
 pub mod server;
 pub mod weaviate_probe;
+pub mod weaviate_schema_probe;

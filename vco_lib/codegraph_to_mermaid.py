@@ -127,14 +127,38 @@ class SubgraphSpec:
 # ─── Helpers: collection naming, node-id hashing ──────────────────────────
 
 
-# Sanitisation mirrors ``claude_mcp_servers/weaviate_mcp/server.py::
-# _sanitize_collection_prefix``. Kept in-module rather than imported so we
-# stay independent of the MCP server's import-time side effects.
+# NEW-10 / DEDUP-6 (v0.2.53) — consolidated to call the canonical
+# underscore-PRESERVING sanitizer in ``vco_lib.project_naming``.
+# Previously this function was an inline copy of the rule used by
+# ``claude_mcp_servers/weaviate_mcp/server.py::_sanitize_collection_prefix``,
+# but `canonical_class_prefix` IS that rule (verified by the Rust-parity
+# test against `tests/fixtures/project_naming.json`).
+#
+# Behaviour notes:
+#   * Both functions PRESERVE underscores in the input
+#     ("Camel_Case" → "Camel_Case").
+#   * `canonical_class_prefix` raises `ValueError` on invalid input
+#     (empty / whitespace-only / leading non-letter). The legacy local
+#     version silently returned an unusable string in those cases. The
+#     fallback below mirrors the legacy behaviour so callers that pass
+#     unusual inputs (e.g. test fixtures with `--project ""`) still get
+#     a string back rather than an exception bubbling up.
 def _sanitize_collection_prefix(name: str) -> str:
-    sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-    if sanitized and not sanitized[0].isupper():
-        sanitized = sanitized[0].upper() + sanitized[1:]
-    return sanitized
+    # Lazy import — the function is hot but the import is module-level
+    # cheap; we keep it at function scope to avoid a top-level cycle
+    # via vco_lib.__init__'s test surface.
+    from vco_lib.project_naming import canonical_class_prefix
+
+    try:
+        return canonical_class_prefix(name)
+    except ValueError:
+        # Legacy fallback: replace non-alnum-underscore with underscore,
+        # uppercase the first char if it's a letter. Returns whatever
+        # the legacy regex would have produced — never raises.
+        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name or "")
+        if sanitized and sanitized[0].isalpha() and not sanitized[0].isupper():
+            sanitized = sanitized[0].upper() + sanitized[1:]
+        return sanitized
 
 
 def _collection_name(base: str, project: Optional[str]) -> str:

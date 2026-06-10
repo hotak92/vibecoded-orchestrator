@@ -55,6 +55,12 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
 
+# NEW-8 / B3 (v0.2.53) — symlink-blocking defense used by
+# ``_write_file_atomic``. Mirrors install.py's V47-B contract for the
+# orchestrator-self path; the helpers live in ``vco_lib.symlink_handler``
+# so both paths share the SSOT.
+from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
+
 # Default Weaviate port (mirrors install.DEFAULT_WEAVIATE_PORT, kept here
 # so this module is import-free of install.py).
 DEFAULT_WEAVIATE_PORT = 8081
@@ -77,22 +83,43 @@ _FALLBACK_PREFIX = "vct"
 def sanitize_for_weaviate_class(project_name: str) -> str:
     """PascalCase a project name into a Weaviate class basename.
 
+    **SSOT classification (NEW-10 / DEDUP-6, v0.2.53)**:
+    This function is the CANONICAL underscore-DROPPING sanitizer
+    used to derive ``<prefix>_KnowledgeGraph``,
+    ``<prefix>_Development``, and ``<prefix>_Diagrams`` collection
+    names from a project's display name. The companion canonical for
+    the underscore-PRESERVING rule (code-graph collections) lives at
+    ``vco_lib.project_naming.canonical_class_prefix``. The two rules
+    are intentionally distinct because production Weaviate schemas
+    contain classes named by BOTH rules (different sites adopted
+    different rules historically — see the v0.2.15 wedge described in
+    ``project_naming.py``'s module docstring). Unifying would require
+    a one-shot migration of every existing collection on every user's
+    machine and is gated on a future tag (NOT v0.2.53).
+
+    DEDUP-6 (v0.2.53) callers consolidated to use THIS function:
+      * ``vco_lib.config_projection._sanitize_kg_collection``
+        (preserves a different fallback — "Vct" capitalized).
+      * The 4-way SSOT collision is now reduced to 2 canonical
+        functions: this one (underscore-dropping) and
+        ``canonical_class_prefix`` (underscore-preserving).
+
     Single source of truth across languages — replaces both the Python
-    helper `_derive_project_kg_name` (path-based) and the Rust helper
-    `sanitize_kg_collection`. Rust callers must subprocess this module
-    via `python -m vco_lib.project_init derive --name <n> --json`.
+    helper ``_derive_project_kg_name`` (path-based) and the Rust helper
+    ``sanitize_kg_collection``. Rust callers must subprocess this module
+    via ``python -m vco_lib.project_init derive --name <n> --json``.
 
     Rules (matching the existing install.py behavior):
-      1. Split on any non-alphanumeric run (`-`, `_`, space, etc.).
+      1. Split on any non-alphanumeric run (``-``, ``_``, space, etc.).
       2. PascalCase each surviving part (uppercase first letter, keep rest).
       3. Concatenate.
       4. If nothing survives OR the result starts with a digit (invalid
-         Weaviate class name), fall back to "vct".
+         Weaviate class name), fall back to ``"vct"``.
 
-    Note on non-ASCII: the regex `[^A-Za-z0-9]+` treats any non-ASCII
-    character as a separator, so `étude` → `["tude"]` → `"Tude"` (the
-    `é` is stripped, not preserved). This matches the existing
-    install.py `_derive_project_kg_name` behavior exactly. Unicode-aware
+    Note on non-ASCII: the regex ``[^A-Za-z0-9]+`` treats any non-ASCII
+    character as a separator, so ``étude`` → ``["tude"]`` → ``"Tude"``
+    (the ``é`` is stripped, not preserved). This matches the existing
+    install.py ``_derive_project_kg_name`` behavior exactly. Unicode-aware
     sanitization is out of scope for PR 2 — would require an explicit
     migration plan for any project that already exists with a stripped
     name.
@@ -2454,6 +2481,125 @@ _MANIFEST_REL = Path(".claude") / ".vco-manifest.json"
 _MANIFEST_SCHEMA_VERSION = 2
 
 
+# ---------------------------------------------------------------------------
+# NEW-7 / B1 (v0.2.53) — bundle-update resume sentinel.
+#
+# Mirrors the v0.2.51 orchestrator-self pattern
+# (`launcher/src-tauri/src/commands/installer.rs::write_update_resume_sentinel`)
+# but scoped to per-project bundle updates rather than the
+# orchestrator-self update. Same recovery shape: a JSON file lands on
+# disk BEFORE any FS mutation; we delete it after the manifest write
+# succeeds. If the run is killed mid-pass (Cmd-C, OOM, power loss), the
+# sentinel survives and the next session-start detects it + prompts the
+# user to resume (or warns them to re-run `install-bundle --update`).
+#
+# Without this, a mid-update interrupt leaves the manifest stale + files
+# partially overwritten. The next `--update` run sees a manifest
+# pointing at OLD shipped hashes for files we've already updated →
+# `_file_action` returns `("preserve", ...)` for them → user-modified
+# false-flagging → user-visible "5 files preserved" toast for files
+# the user never touched.
+#
+# Audit:
+# `.claude/context/audits/project-bundle-install-audit-2026-06-10.md`
+# §6.6 / B1.
+# ---------------------------------------------------------------------------
+
+_BUNDLE_UPDATE_SENTINEL_REL = Path(".claude") / "state" / "bundle-update-resume-needed.json"
+_BUNDLE_UPDATE_SENTINEL_SCHEMA = 1
+
+
+def _bundle_sentinel_path(folder: Path) -> Path:
+    """Absolute path to the bundle-update sentinel for ``folder``."""
+    return folder / _BUNDLE_UPDATE_SENTINEL_REL
+
+
+def read_bundle_update_resume_sentinel(folder: Path) -> Optional[dict]:
+    """Read the bundle-update resume sentinel, if any.
+
+    Returns ``None`` when:
+      * the file is absent, or
+      * the file is malformed JSON, or
+      * the schema_version is unknown.
+
+    Caller treats any None outcome as "no resume pending" so a broken
+    sentinel never wedges the next install.
+    """
+    path = _bundle_sentinel_path(folder)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema") != _BUNDLE_UPDATE_SENTINEL_SCHEMA:
+        return None
+    return payload
+
+
+def write_bundle_update_resume_sentinel(
+    folder: Path,
+    *,
+    operation: str = "install-bundle-update",
+    orchestrator_root: Optional[Path] = None,
+    vco_version: str = "unknown",
+) -> bool:
+    """Atomic-write the bundle-update resume sentinel.
+
+    Best-effort: any I/O failure logs to stderr + returns False rather
+    than raising. The bundle install MUST proceed even when sentinel
+    write fails (sentinel is a recovery aid, not a hard requirement).
+    """
+    payload = {
+        "schema": _BUNDLE_UPDATE_SENTINEL_SCHEMA,
+        "operation": operation,
+        "folder": str(folder),
+        "orchestrator_root": str(orchestrator_root) if orchestrator_root else "",
+        "vco_version": vco_version,
+        "written_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pid": os.getpid(),
+    }
+    target = _bundle_sentinel_path(folder)
+    parent = target.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(
+            f"[vct] bundle-update sentinel: mkdir {parent} failed: {e} — "
+            f"skipping sentinel write\n"
+        )
+        return False
+    # Tempfile + rename for atomicity. _write_file_atomic already does
+    # this for arbitrary bytes; reuse it.
+    try:
+        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        _write_file_atomic(target, body)
+    except OSError as e:
+        sys.stderr.write(
+            f"[vct] bundle-update sentinel: write {target} failed: {e}\n"
+        )
+        return False
+    return True
+
+
+def clear_bundle_update_resume_sentinel(folder: Path) -> bool:
+    """Best-effort: delete the bundle-update sentinel. Returns True on
+    success or when the file was already absent; False on any other
+    error. The caller never blocks on this — failing to delete a stale
+    sentinel just leaves a warning surface for the next session."""
+    target = _bundle_sentinel_path(folder)
+    try:
+        target.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        sys.stderr.write(
+            f"[vct] bundle-update sentinel: unlink {target} failed: {e}\n"
+        )
+        return False
+
+
 # Placeholder substitutions applied to agent .md files (mirrors
 # install.py:5564). Skill .md files use the same map.
 #
@@ -3195,7 +3341,95 @@ def _file_action(
 def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None) -> None:
     """Atomic file write: temp file in same dir + os.replace. Optionally
     sets a unix mode bit (0o755 for shell scripts to preserve executable).
+
+    NEW-8 / B3 (v0.2.53) — symlink-blocking defense ported from the
+    orchestrator-self V47-B handling. When ``target`` itself is a
+    symlink, or its parent (or any ancestor up to a sensible bound) is
+    a symlink, we REFUSE to write through it. The orchestrator-self
+    path handles this via ``is_symlink_blocking`` + ``compute_vco_new_path``
+    (install.py:1286); per-project ``_write_file_atomic`` previously
+    just did tempfile + os.replace, which on POSIX would replace the
+    symlink TARGET (silent destruction of unrelated content).
+
+    Behaviour
+      * If the target itself is a symlink, redirect the write to the
+        `.vco-new` sibling and emit a stderr warning so the run logs
+        the redirect. The caller's expected file is gone — the new
+        sibling is the new VCO-shipped content for the user to merge
+        manually. Mirrors V47-B's contract.
+      * If a parent directory is a symlink (e.g. user symlinked
+        ``<project>/.claude`` to a shared location), same treatment:
+        redirect to ``<canonical parent>.vco-new/<rest of path>``.
+      * In both redirect cases we surface the redirect via stderr so
+        the install log captures it. A future per-project
+        DeferralReport emission can pick this up; minimum-viable
+        v0.2.53 contract is "no silent data destruction".
+
+    Reference:
+    ``.claude/context/audits/project-bundle-install-audit-2026-06-10.md``
+    §6.7 / B3.
     """
+    # NEW-8 (v0.2.53) — symlink-blocking detection.
+    #
+    # Two cases to guard:
+    #   1. `target` itself is a symlink (file/dir).
+    #   2. An ancestor of `target` is a symlink — we'd silently write
+    #      through it into the symlink's destination.
+    # Both are redirected to the `.vco-new` sibling pattern.
+    #
+    # We bound the ancestor walk at the first "real" directory so we
+    # don't spend time on absurd hierarchies; in practice the walk is
+    # at most ~6 levels (project root → .claude → agents → ...).
+    redirect_target: Optional[Path] = None
+    if is_symlink_blocking(target):
+        # Direct hit: target itself is a symlink.
+        redirect_target = compute_vco_new_path(target)
+    else:
+        # Walk ancestors looking for a symlinked directory. We start
+        # from target.parent (since target itself isn't a symlink) and
+        # walk up. We stop walking once we leave target's chain of
+        # ancestors that exist on disk.
+        ancestor = target.parent
+        seen: set[str] = set()
+        while True:
+            ancestor_str = str(ancestor)
+            if ancestor_str in seen:
+                break
+            seen.add(ancestor_str)
+            if is_symlink_blocking(ancestor):
+                # Redirect the write to a `.vco-new` sibling of the
+                # symlinked ancestor, replicating the rest of the path
+                # inside the new directory. E.g.
+                # target = .claude/agents/coder.md, ancestor = .claude
+                # → redirect to `.claude.vco-new/agents/coder.md`.
+                vco_new_anc = compute_vco_new_path(ancestor)
+                # The path tail BELOW the symlinked ancestor.
+                try:
+                    rel = target.relative_to(ancestor)
+                except ValueError:
+                    # Defensive: if relative_to fails (shouldn't with
+                    # the ancestor walk), fall back to using target's
+                    # filename only.
+                    rel = Path(target.name)
+                redirect_target = vco_new_anc / rel
+                break
+            # Continue up. Stop at root or when parent doesn't change
+            # (path normalisation root case).
+            parent = ancestor.parent
+            if parent == ancestor:
+                break
+            ancestor = parent
+
+    if redirect_target is not None:
+        sys.stderr.write(
+            f"[vct] NEW-8 symlink-blocking: refusing to write through symlink "
+            f"at {target}; redirecting to {redirect_target}. "
+            f"The .vco-new sibling holds the orchestrator's intended content; "
+            f"the symlink and its destination are untouched. Merge manually "
+            f"when ready.\n"
+        )
+        target = redirect_target
+
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
         dir=str(target.parent),
@@ -5769,6 +6003,34 @@ def install_project_bundle(
         })
         return result
 
+    # NEW-7 / B1 (v0.2.53) — bundle-update resume sentinel.
+    #
+    # Mid-update Cmd-C currently leaves the manifest stale + files
+    # partially overwritten. Drop a sentinel here BEFORE any FS mutation
+    # so a subsequent session-start can detect the interruption and warn
+    # the user to re-run `install-bundle --update` (which is idempotent
+    # — partial overwrites are corrected on the next pass via the
+    # manifest hash-compare). Cleared after the manifest write
+    # succeeds.
+    #
+    # Only fires in update_mode (first-install can be safely re-run
+    # without a sentinel — the heal paths cover it) and only when not
+    # dry_run (dry-run never mutates the FS so there's nothing to
+    # resume). Best-effort: a failed sentinel write logs but does NOT
+    # block the install.
+    _sentinel_written = False
+    if update_mode and not dry_run:
+        _sentinel_written = write_bundle_update_resume_sentinel(
+            folder,
+            operation="install-bundle-update",
+            orchestrator_root=orchestrator_root,
+            vco_version=result.get("vco_version", "unknown"),
+        )
+        if _sentinel_written:
+            _log("4.bundle.sentinel", "start",
+                 "wrote bundle-update resume sentinel",
+                 data={"path": str(_bundle_sentinel_path(folder))})
+
     manifest = _read_manifest(folder)
     new_files: dict[str, dict] = {}
     # Schema v2: preserved_files records every file VCO chose not to
@@ -6215,6 +6477,26 @@ def install_project_bundle(
             }
             _write_manifest_atomic(folder, manifest_payload)
             result["manifest_written"] = True
+
+            # NEW-7 / B1 (v0.2.53) — manifest write succeeded → clear
+            # the resume sentinel. From the caller's perspective the
+            # bundle update is now atomically committed: the FS reflects
+            # the new shipped versions AND the manifest agrees on the
+            # hashes. Any pre-existing sentinel (incl. one we just
+            # wrote ourselves) is now safe to remove.
+            if _sentinel_written:
+                if clear_bundle_update_resume_sentinel(folder):
+                    _log("4.bundle.sentinel", "end",
+                         "cleared bundle-update resume sentinel",
+                         data={"path": str(_bundle_sentinel_path(folder))})
+                else:
+                    # Sentinel survives — best-effort. The next
+                    # session-start detection sees a stale sentinel +
+                    # a fresh manifest and can treat the install as
+                    # complete. This branch shouldn't trip in practice.
+                    result["warnings"].append(
+                        "bundle-update sentinel not cleared after successful install"
+                    )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _log("4.bundle.manifest", "error",
@@ -8413,6 +8695,24 @@ def _cmd_re_render_claude_md(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_check_bundle_resume(args: argparse.Namespace) -> int:
+    """Check for a stale bundle-update resume sentinel (NEW-7 / B1).
+
+    Always exits 0 (this is a probe, not a mutation). Caller parses
+    the JSON to decide whether to surface a resume nudge.
+    """
+    folder = Path(args.folder).resolve()
+    sentinel = read_bundle_update_resume_sentinel(folder)
+    payload = {
+        "folder": str(folder),
+        "resume_needed": sentinel is not None,
+        "sentinel": sentinel,
+        "sentinel_path": str(_bundle_sentinel_path(folder)),
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m vco_lib.project_init",
@@ -8694,6 +8994,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "summary on stderr).",
     )
     p_render.set_defaults(func=_cmd_re_render_claude_md)
+
+    # check-bundle-resume (NEW-7 / B1, v0.2.53) ---------------------------
+    # Surfaces the bundle-update resume sentinel for the launcher's
+    # session-start check. Reads
+    # ``<folder>/.claude/state/bundle-update-resume-needed.json`` and
+    # emits a single JSON line describing the state. Exit code 0 always
+    # (this is a probe, not a mutating command). The launcher uses the
+    # JSON shape to decide whether to render an "Update bundle (resume)"
+    # nudge in the per-project settings page.
+    p_check_resume = sub.add_parser(
+        "check-bundle-resume",
+        help=(
+            "Probe a project for a stale bundle-update resume sentinel. "
+            "Emits {'resume_needed': bool, 'sentinel': {...}|null} on "
+            "stdout. Exit 0 even when no sentinel is present."
+        ),
+    )
+    p_check_resume.add_argument(
+        "--folder", required=True,
+        help="Target user-project folder.",
+    )
+    p_check_resume.set_defaults(func=_cmd_check_bundle_resume)
 
     return parser
 
