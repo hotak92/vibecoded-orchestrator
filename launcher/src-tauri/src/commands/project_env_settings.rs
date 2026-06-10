@@ -117,6 +117,21 @@ pub const LAST_RESORT_SHARED_KG_COLLECTION: &str = "VibeCodedOrchestrator_Knowle
 /// recognizing a pre-rename class still living on disk). DO NOT use as a
 /// default for new writes — picker-driven migration is the consent
 /// mechanism for renaming the on-disk class.
+///
+/// v0.2.53 (Track E, DC-1): live Rust readers were all migrated to
+/// `is_shared_kg_class_name` (extracted in v0.2.24 B4); the constant
+/// itself is now consumed only by `is_shared_kg_class_name` (kept for
+/// future migration-detection paths) and by the cross-language pin in
+/// `tests/test_shared_kg_constant_consistency.py` (regex-parses this
+/// `.rs` file by const name to guarantee Python `_LEGACY_SHARED_KG_NAME`
+/// stays in lockstep). The Rust-side `#[allow(dead_code)]` silences the
+/// cargo warning without breaking that cross-language contract.
+/// Detection-only consumers in `vco_lib/`, `install.py`, `kg.rs`, and
+/// `access.rs` use inline string literals (intentionally — the cross-
+/// language pin protects against drift) rather than this constant; if
+/// you find yourself wanting to delete this entirely, also remove the
+/// Python lockstep test in the same commit.
+#[allow(dead_code)]
 pub const LEGACY_SHARED_KG_COLLECTION: &str = "VibeCodedTools_KnowledgeGraph";
 
 /// Lowercase-c variant of the canonical name (PR-34 / v0.2.12 default
@@ -130,6 +145,11 @@ pub const LEGACY_SHARED_KG_COLLECTION: &str = "VibeCodedTools_KnowledgeGraph";
 /// the resolved `SHARED_KG_COLLECTION` env value to whatever the live
 /// class actually is, so downstream writes always target the on-disk
 /// casing.
+///
+/// v0.2.53 (Track E, DC-2): same `#[allow(dead_code)]` treatment as
+/// `LEGACY_SHARED_KG_COLLECTION` — see the rationale on that constant
+/// for why the constant is retained rather than deleted.
+#[allow(dead_code)]
 pub const LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C: &str =
     "VibecodedOrchestrator_KnowledgeGraph";
 
@@ -155,6 +175,22 @@ pub const LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C: &str =
 /// helper applies case-insensitive matching to ALL three names — strictly
 /// a widening of recognition, never narrowing. See peer-review-B HIGH-2
 /// (v0.2.23) for the original maintenance.rs fix this consolidates.
+///
+/// v0.2.53 (Track E, DC-3): live Rust call sites (`commands/kg.rs::
+/// kg_list_collections` + `commands/maintenance.rs::parse_schema_response`)
+/// were swept to inline literal-match logic during the v0.2.24-v0.2.40
+/// refactor cycle, leaving this helper with only its own unit tests as
+/// consumers. Cargo reports it as dead. Retained behind
+/// `#[allow(dead_code)]` because:
+///   1. The 7 unit tests at the bottom of this file are the canonical
+///      reference for the case-folded matching semantics — deleting the
+///      helper means deleting them too, losing the executable spec.
+///   2. Future call sites (vct-hub migration paths, white-label class
+///      detection) are likely to need this same matcher; rewriting it
+///      from the inline literals would be a regression.
+/// If a future cycle confirms no caller will ever resurrect, delete the
+/// fn + its 7 unit tests + this comment block in one commit.
+#[allow(dead_code)]
 pub fn is_shared_kg_class_name(name: &str, canonical: &str) -> bool {
     name.eq_ignore_ascii_case(canonical)
         || name.eq_ignore_ascii_case(LEGACY_SHARED_KG_COLLECTION_LOWERCASE_C)
