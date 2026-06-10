@@ -43,7 +43,11 @@ cd "$LAUNCHER_DIR"
 # ------------------------------------------------------------
 case "$(uname -s)" in
     Linux*)     ARCH_DIR="linux-x64"; BIN_NAME="vct-launcher"; STRIP_RE="^/home/[^/]+/" ;;
-    Darwin*)    ARCH_DIR="experimental_macOS"; BIN_NAME="vct-launcher.app"; STRIP_RE="^/Users/[^/]+/" ;;
+    # M-P0-2 (v0.2.53): canonical macOS dist dir is `macos-arm64/`
+    # (matches install.py:16956 + release.yml asset naming since
+    # v0.2.13). `experimental_macOS/` was the pre-v0.2.13 slot and
+    # is no longer the correct write target.
+    Darwin*)    ARCH_DIR="macos-arm64"; BIN_NAME="vct-launcher.app"; STRIP_RE="^/Users/[^/]+/" ;;
     CYGWIN*|MINGW*|MSYS*) echo "Use Windows-native PowerShell, not bash, on Windows. See launcher/dist/README.md."; exit 1 ;;
     *) echo "Unknown OS: $(uname -s)"; exit 1 ;;
 esac
@@ -78,7 +82,7 @@ echo "    (RUSTFLAGS active: $RUSTFLAGS)"
 # ------------------------------------------------------------
 mkdir -p "$DIST_DIR/$ARCH_DIR"
 
-if [ "$ARCH_DIR" = "experimental_macOS" ]; then
+if [ "$ARCH_DIR" = "macos-arm64" ]; then
     SRC="$SRC_TAURI/target/release/bundle/macos/vct-launcher.app"
     DEST="$DIST_DIR/$ARCH_DIR/vct-launcher.app"
     cp -R "$SRC" "$DEST"

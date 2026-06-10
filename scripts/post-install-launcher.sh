@@ -389,15 +389,17 @@ candidates_mac=(
     # Locally built (contributors)
     "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher"
     "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher-temp"
-    # Bundled experimental prebuilt — flat file produced by
-    # scripts/build-bundled-launcher.sh on Darwin hosts ($DIST_DIR/$HOST_TARGET/$HOST_BIN
-    # = launcher/dist/experimental_macOS/vct-launcher). Empty in repo until
-    # macOS is validated end-to-end, but populated locally after a
-    # contributor runs the build script on Apple Silicon.
+    # Bundled prebuilt — canonical dist dir is `macos-arm64/` since
+    # v0.2.13 (install.py:16956). Both flat-file and .app bundle modes
+    # supported (release.yml emits the flat file; native Gatekeeper
+    # signing path emits the .app).
+    # M-P0-2 (v0.2.53): added macos-arm64 paths; experimental_macOS
+    # retained as legacy fallback for old checkouts.
+    "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher"
+    "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/vct-launcher"
+    "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/VCT Launcher"
+    # Legacy (pre-v0.2.13) — fallback only.
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher"
-    # Bundled experimental prebuilt — full .app bundle copied in manually
-    # per launcher/dist/experimental_macOS/README.md (alternative shipping
-    # mode for when we want native Gatekeeper signing on the bundle).
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/vct-launcher"
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/VCT Launcher"
     # System installs

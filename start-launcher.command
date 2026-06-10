@@ -19,12 +19,17 @@ candidates=(
     "$SCRIPT_DIR/launcher/src-tauri/target/release/vct-launcher-temp"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/launcher"
     "$SCRIPT_DIR/launcher/src-tauri/target/debug/vct-launcher-temp"
-    # Bundled prebuilt binary shipped in the repo (flat file produced by
-    # scripts/build-bundled-launcher.sh on Darwin hosts — see line 158
-    # of that script: $DIST_DIR/$HOST_TARGET/$HOST_BIN where HOST_TARGET
-    # is `experimental_macOS` and HOST_BIN is `vct-launcher`). Last-resort
-    # fallback for users who pulled the repo without running
-    # first-install.command.
+    # Bundled prebuilt binary shipped in the repo. Canonical dist dir
+    # has been `macos-arm64/` since v0.2.13 (install.py:16956 documents
+    # this). The earlier `experimental_macOS/` slot is retained as a
+    # legacy fallback for users on an old checkout — but the runtime
+    # binary lives under `macos-arm64/` in every modern release.
+    # M-P0-2 (v0.2.53): add macos-arm64 + keep experimental_macOS as
+    # legacy.
+    "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher"
+    "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/vct-launcher"
+    "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/VCT Launcher"
+    # Legacy dist dir (pre-v0.2.13). Kept as fallback only.
     "$SCRIPT_DIR/launcher/dist/experimental_macOS/vct-launcher"
     # macOS .app bundle paths (post-v1.0 packaging). The internal
     # binary name inside the bundle is `productName` minus spaces — but
