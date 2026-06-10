@@ -83,6 +83,15 @@ python3 install.py
 7. Registers MCP servers in `~/.claude.json`: `weaviate-kg`, `search` (search_papers only), and `playwright` (the latter via `npx -y @playwright/mcp@latest`; opt out with `VCT_SKIP_PLAYWRIGHT=1`). The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama. The `vct-ollama` MCP is **not** registered by default — install via launcher → Modules if you want local LLM tool surfaces
 8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
+### Code-embedding backend by host
+
+The code-graph subsystem embeds source code into Weaviate for semantic search. Two backends ship:
+
+- **CodeSage-Large-v2** (2048-dim, Apache 2.0) — the default on NVIDIA hosts with ≥4 GB VRAM. Runs inside `infrastructure/codesage/Dockerfile.cuda` and listens on `:11440`. The bundled image is **CUDA-only by default**; the `Dockerfile.cuda` variant is the one the install pulls when it detects an NVIDIA GPU + drivers + ≥4 GB VRAM.
+- **Ollama (`qwen3-embedding:0.6b`, 1024-dim)** — the fallback for hosts without CUDA. The code-embed service exposes the same `:11440` HTTP API but routes embed requests through Ollama on `:11435`. Lower quality than CodeSage but works on every CPU and on Apple Silicon (where the CUDA path is impossible).
+
+Apple Silicon + macOS Intel users get the Ollama-based code embedding via the standard install — no extra flags, no manual Dockerfile swap. The hardware detection step (step 2) classifies the host as "Apple Silicon" and the embedding-backend resolver picks Ollama automatically; the CodeSage Dockerfile is skipped entirely (it would not build on the host's image-pull architecture anyway). A native Metal-accelerated CodeSage variant is on the v0.3.0+ roadmap — tracked upstream against sentence-transformers shipping Metal wheels.
+
 ### Common install flags
 
 ```

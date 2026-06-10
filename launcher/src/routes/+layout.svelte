@@ -58,6 +58,7 @@
   import LegacyCollectionsModal from '$lib/components/LegacyCollectionsModal.svelte';
   import WeightsUpdatePrompt from '$lib/components/WeightsUpdatePrompt.svelte';
   import Toast from '$lib/components/Toast.svelte';
+  import UpdateToast from '$lib/components/UpdateToast.svelte';
   import { invoke } from '$lib/tauri';
   // M-P1-5: per-install-root scoping for localStorage flags. See
   // `install-state-store.ts` for the migration rationale (two clones
@@ -401,6 +402,11 @@
        acknowledged it. Mounted last so it stacks above every other modal. -->
   <InstallHealthGate />
   <Toast />
+  <!-- v0.2.53 V52-AH-FE — listens for `vct-update-recovered` /
+       `vct-update-failed` Tauri events emitted by the boot probe in
+       `launcher/src-tauri/src/lib.rs` and routes them through the
+       toast store. Renders nothing on its own (pure side-effect mount). -->
+  <UpdateToast />
 {/if}
 
 <style>

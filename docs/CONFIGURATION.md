@@ -228,6 +228,18 @@ License resolution priority (first match wins; see `VCThelpers/license/validator
 
 The chosen executable is returned as a string (`podman` or `docker`) and used uniformly through the rest of the codebase. Compose files live in `infrastructure/docker-compose.yml` (canonical) and `claude_mcp_servers/compose.yaml` (legacy path, same shared volumes).
 
+### Forcing Docker when both runtimes are installed
+
+Hosts with both Podman AND Docker installed default to Podman (step 3 above). To force Docker — for example because your Docker daemon is the one wired to your team's registry credentials, or because Podman's rootless mode hits a permission wall on your filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
+
+```bash
+export VCT_CONTAINER_RUNTIME=docker
+python install.py --update          # install / update flows
+.claude/hooks/ensure-containers.sh  # session-start hook
+```
+
+Persist the override by adding the export to your shell rc (`~/.bashrc` / `~/.zshrc`) or to the per-project `.claude/env` so every Claude Code session inherits it. The value wins over auto-probe and over any caller-passed `runtime` argument. Symmetric override: `VCT_CONTAINER_RUNTIME=podman` forces Podman when auto-probe would have picked Docker (unusual but possible if `podman` is installed but not first in `PATH`).
+
 ## MCP Servers
 
 MCP servers are registered in the user's `~/.claude.json`. Each launches via the project venv (`claude_mcp_servers/.venv`).
