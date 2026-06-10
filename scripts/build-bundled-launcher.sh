@@ -196,30 +196,18 @@ for cand in vct-launcher vct-launcher-temp launcher \
     fi
 done
 
+# v0.2.53 DEDUP-15: source the shared helper instead of inline-duplicating
+# the strings → PowerShell → grep -aoc backend cascade. The helper at
+# scripts/lib/asset-ref-count.sh is the single source of truth for the
+# `_app/immutable/` marker, the VCT_ASSET_REF_MIN threshold (5), and the
+# 3-backend cascade. See `.claude/context/audits/v0253-phase3-audit-E-
+# dedup-correctness-2026-06-10.md` §DEDUP-15.
+_BUILD_BUNDLED_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/asset-ref-count.sh
+. "$_BUILD_BUNDLED_SCRIPT_DIR/lib/asset-ref-count.sh"
+
 _count_asset_refs() {
-    # Returns the integer count of `_app/immutable/` substrings in the
-    # binary's bytes. Tries strings → PowerShell → grep -ao fallback.
-    local bin="$1"
-    if command -v strings >/dev/null 2>&1; then
-        strings "$bin" 2>/dev/null | grep -c '_app/immutable/' || true
-        return
-    fi
-    # Windows fallback: PowerShell byte-scan. Works in Git Bash MSYS
-    # because powershell.exe is on PATH on every modern Windows.
-    if command -v powershell.exe >/dev/null 2>&1; then
-        # Convert MSYS path to Windows path for PowerShell.
-        local winpath
-        winpath="$(cygpath -w "$bin" 2>/dev/null || echo "$bin")"
-        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-            \$bytes = [System.IO.File]::ReadAllBytes('$winpath');
-            \$s = [System.Text.Encoding]::ASCII.GetString(\$bytes);
-            (\$s.Split([string[]]@('_app/immutable/'), [System.StringSplitOptions]::None).Count - 1)
-        " 2>/dev/null | tr -d '\r' | tr -d '[:space:]'
-        return
-    fi
-    # Last-resort: `grep -ao` (binary-mode regex count) on platforms
-    # that have neither strings nor powershell.
-    grep -aoc '_app/immutable/' "$bin" 2>/dev/null || echo 0
+    asset_ref_count "$1"
 }
 
 if [ -n "$PROBE_BIN" ]; then

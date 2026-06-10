@@ -42,27 +42,50 @@
 ASSET_REF_MARKER="_app/immutable/"
 
 # Count occurrences of the marker in the binary. Returns the count on
-# stdout. If `strings` is missing (rare — present on every Mac with
-# Xcode CLT and every Linux distro with binutils), prints `0`. Callers
-# should treat the absence of `strings` separately (skip the check
-# rather than false-fail) — see asset_ref_count_passes() below.
+# stdout.
+#
+# Backend cascade (try first, fall through on absence):
+#   1. `strings | grep -c`         — POSIX (Linux + macOS + WSL)
+#   2. PowerShell byte-scan        — Git Bash on Windows (no binutils;
+#                                    powershell.exe is on PATH everywhere)
+#   3. `grep -aoc`                 — last-resort, slower binary scan
+#   4. -1 sentinel                 — none of the above available
+#
+# v0.2.53 DEDUP-15 absorbed the PowerShell + grep -aoc fallbacks from
+# build-bundled-launcher.sh + check-bundled-binaries.sh so both CI
+# scripts can source this helper instead of inline-duplicating ~24 LoC.
 asset_ref_count() {
     local bin="$1"
     if [ -z "$bin" ] || [ ! -f "$bin" ]; then
         echo 0
         return 0
     fi
-    if ! command -v strings >/dev/null 2>&1; then
-        # No way to count — return -1 sentinel so callers can detect
-        # the "skip check" case. We use -1 (not empty) so this still
-        # parses as a number for arithmetic comparison.
-        echo -1
+    # Backend 1: strings | grep -c (POSIX).
+    if command -v strings >/dev/null 2>&1; then
+        # `|| true` so a zero-match grep (exit 1) doesn't trip set -e
+        # in callers. `strings` itself can fail on unreadable files;
+        # trap that with the file-exists check above + `2>/dev/null`.
+        strings "$bin" 2>/dev/null | grep -c "$ASSET_REF_MARKER" || true
         return 0
     fi
-    # `|| true` so a zero-match grep (exit 1) doesn't trip set -e in
-    # callers. `strings` itself can fail on unreadable files; trap
-    # that with the outer file-exists check above + `2>/dev/null`.
-    strings "$bin" 2>/dev/null | grep -c "$ASSET_REF_MARKER" || true
+    # Backend 2: PowerShell byte-scan (Git Bash on Windows).
+    if command -v powershell.exe >/dev/null 2>&1; then
+        local winpath
+        winpath="$(cygpath -w "$bin" 2>/dev/null || echo "$bin")"
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+            \$bytes = [System.IO.File]::ReadAllBytes('$winpath');
+            \$s = [System.Text.Encoding]::ASCII.GetString(\$bytes);
+            (\$s.Split([string[]]@('$ASSET_REF_MARKER'), [System.StringSplitOptions]::None).Count - 1)
+        " 2>/dev/null | tr -d '\r' | tr -d '[:space:]'
+        return 0
+    fi
+    # Backend 3: grep -aoc (binary-mode regex count).
+    if command -v grep >/dev/null 2>&1; then
+        grep -aoc "$ASSET_REF_MARKER" "$bin" 2>/dev/null || echo 0
+        return 0
+    fi
+    # Backend 4: nothing available — sentinel for callers to skip check.
+    echo -1
 }
 
 # Predicate: returns 0 (success) when the binary's marker count is

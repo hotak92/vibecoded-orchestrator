@@ -52,24 +52,18 @@ GREP_BIN="$(command -v grep)"
 for p in /usr/bin/strings /bin/strings; do [ -x "$p" ] && STRINGS_BIN="$p" && break; done
 for p in /usr/bin/grep /bin/grep; do [ -x "$p" ] && GREP_BIN="$p" && break; done
 
-# Asset-ref counter that tries strings → PowerShell → grep -aoc.
+# v0.2.53 DEDUP-15: source the shared helper instead of inline-duplicating
+# the strings → PowerShell → grep -aoc backend cascade. The helper at
+# scripts/lib/asset-ref-count.sh is the single source of truth for the
+# `_app/immutable/` marker, the VCT_ASSET_REF_MIN threshold (5), and the
+# 3-backend cascade. See `.claude/context/audits/v0253-phase3-audit-E-
+# dedup-correctness-2026-06-10.md` §DEDUP-15.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/asset-ref-count.sh
+. "$_SCRIPT_DIR/lib/asset-ref-count.sh"
+
 _count_asset_refs() {
-    local bin="$1"
-    if [ "$HAVE_STRINGS" = "1" ] && [ -n "$STRINGS_BIN" ]; then
-        "$STRINGS_BIN" "$bin" 2>/dev/null | "$GREP_BIN" -c '_app/immutable/' || true
-        return
-    fi
-    if command -v powershell.exe >/dev/null 2>&1; then
-        local winpath
-        winpath="$(cygpath -w "$bin" 2>/dev/null || echo "$bin")"
-        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-            \$bytes = [System.IO.File]::ReadAllBytes('$winpath');
-            \$s = [System.Text.Encoding]::ASCII.GetString(\$bytes);
-            (\$s.Split([string[]]@('_app/immutable/'), [System.StringSplitOptions]::None).Count - 1)
-        " 2>/dev/null | tr -d '\r' | tr -d '[:space:]'
-        return
-    fi
-    "$GREP_BIN" -aoc '_app/immutable/' "$bin" 2>/dev/null || echo 0
+    asset_ref_count "$1"
 }
 
 # Find every executable under launcher/dist/. Use the full path to GNU
