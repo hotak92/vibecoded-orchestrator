@@ -63,6 +63,17 @@ set -uo pipefail
 REPO_ROOT="${1:-}"
 shift || true
 
+# NEW-1 + DEDUP-15 (v0.2.53): shared SvelteKit asset-ref counter.
+# Source from $REPO_ROOT (caller-provided) rather than $0's dir
+# because this script is invoked as
+# `post-install-launcher.sh "$REPO_ROOT" [flags...]` from
+# first-install.{sh,command}. The lib lives at the same path on
+# every checkout.
+if [ -n "${REPO_ROOT:-}" ] && [ -f "$REPO_ROOT/scripts/lib/asset-ref-count.sh" ]; then
+    # shellcheck source=lib/asset-ref-count.sh
+    . "$REPO_ROOT/scripts/lib/asset-ref-count.sh"
+fi
+
 # Durable install log written by both install.py and this script. Both
 # the launcher and Claude Code read this on failure to figure out where
 # the install got to. JSONL: one event per line, never PII. See
@@ -260,10 +271,30 @@ _check_prerequisites() {
         fi
         return 1
     }
+    # M-P0-6 (v0.2.53): Apple Silicon Homebrew installs node / npm /
+    # pnpm under `/opt/homebrew/bin/...` (not `/usr/local/bin/...` —
+    # that's Intel-Mac homebrew). The previous probe list only
+    # checked Intel-Mac + Linux paths → Apple-Silicon users with
+    # brew-installed Node showed `node: no` and fell into the
+    # silent-build path. Add `/opt/homebrew/bin/...` to each probe
+    # list (placed before `/usr/local/bin/...` so it wins on Apple
+    # Silicon when both happen to exist).
+    #
+    # Also: re-source brew shellenv if brew is on disk but not in
+    # PATH. `install.sh` does this for python detection (line ~158)
+    # but post-install-launcher.sh runs in a fresh subshell — the
+    # env doesn't propagate. Doing it here means subsequent `brew
+    # install` / `node` / `npm` calls in this script find the right
+    # binaries on Apple Silicon.
+    if [ "$OS" = "macos" ] && [ -x "/opt/homebrew/bin/brew" ]; then
+        # shellcheck disable=SC1091
+        eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null)" || true
+    fi
     _ensure_path_for_tool node \
         "$HOME/.local/bin/node" \
         "$HOME/.fnm/aliases/default/bin/node" \
         "$HOME/.nvm/versions/node/*/bin/node" \
+        "/opt/homebrew/bin/node" \
         "/usr/local/bin/node" \
         "/usr/bin/node" \
         && HAS_NODE=1
@@ -271,12 +302,14 @@ _check_prerequisites() {
         "$HOME/.local/bin/npm" \
         "$HOME/.fnm/aliases/default/bin/npm" \
         "$HOME/.nvm/versions/node/*/bin/npm" \
+        "/opt/homebrew/bin/npm" \
         "/usr/local/bin/npm" \
         "/usr/bin/npm" \
         && HAS_NPM=1
     _ensure_path_for_tool pnpm \
         "$HOME/.local/bin/pnpm" \
         "$HOME/.local/share/pnpm/pnpm" \
+        "/opt/homebrew/bin/pnpm" \
         "/usr/local/bin/pnpm" \
         "/usr/bin/pnpm" \
         && HAS_PNPM=1
@@ -389,15 +422,17 @@ candidates_mac=(
     # Locally built (contributors)
     "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher"
     "$REPO_ROOT/launcher/src-tauri/target/release/vct-launcher-temp"
-    # Bundled experimental prebuilt — flat file produced by
-    # scripts/build-bundled-launcher.sh on Darwin hosts ($DIST_DIR/$HOST_TARGET/$HOST_BIN
-    # = launcher/dist/experimental_macOS/vct-launcher). Empty in repo until
-    # macOS is validated end-to-end, but populated locally after a
-    # contributor runs the build script on Apple Silicon.
+    # Bundled prebuilt — canonical dist dir is `macos-arm64/` since
+    # v0.2.13 (install.py:16956). Both flat-file and .app bundle modes
+    # supported (release.yml emits the flat file; native Gatekeeper
+    # signing path emits the .app).
+    # M-P0-2 (v0.2.53): added macos-arm64 paths; experimental_macOS
+    # retained as legacy fallback for old checkouts.
+    "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher"
+    "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/vct-launcher"
+    "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/VCT Launcher"
+    # Legacy (pre-v0.2.13) — fallback only.
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher"
-    # Bundled experimental prebuilt — full .app bundle copied in manually
-    # per launcher/dist/experimental_macOS/README.md (alternative shipping
-    # mode for when we want native Gatekeeper signing on the bundle).
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/vct-launcher"
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/VCT Launcher"
     # System installs
@@ -407,10 +442,37 @@ candidates_mac=(
     "$HOME/Applications/VCT Launcher.app/Contents/MacOS/vct-launcher"
 )
 
+# v0.2.53 (Track A — metadata.json reader half): if Track D's CI emitted
+# launcher/dist/<os-arch>/metadata.json the candidate_paths_per_os.<os>
+# array drives the search before the hardcoded fallback. Schema lives
+# at docs/INSTALL_ARCHITECTURE_v2.md §4.4.
+_metadata_candidates_for_os() {
+    local target_os="$1"
+    if [ -f "$REPO_ROOT/scripts/lib/launcher-metadata.sh" ]; then
+        # shellcheck source=lib/launcher-metadata.sh
+        . "$REPO_ROOT/scripts/lib/launcher-metadata.sh"
+        launcher_metadata_candidates "$REPO_ROOT" "$target_os" 2>/dev/null || true
+    fi
+}
+
 find_binary() {
+    # 1. Metadata-driven candidates win when present (matches the
+    #    binary the release CI actually shipped this version).
+    local meta_lines line
+    meta_lines="$(_metadata_candidates_for_os "$OS")"
+    if [ -n "$meta_lines" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [ -x "$line" ]; then echo "$line"; return 0; fi
+        done <<META
+$meta_lines
+META
+    fi
+    # 2. Hardcoded unix candidates.
     for c in "${candidates_unix[@]}"; do
         [ -x "$c" ] && { echo "$c"; return 0; }
     done
+    # 3. macOS-only hardcoded candidates.
     if [ "$OS" = "macos" ]; then
         for c in "${candidates_mac[@]}"; do
             [ -x "$c" ] && { echo "$c"; return 0; }
@@ -466,9 +528,24 @@ _bundled_binary_is_fresh() {
         # binary. `strings` is part of binutils — present on every
         # supported host with a Rust toolchain. If absent, skip the
         # check (don't false-fail on minimal containers).
-        if command -v strings >/dev/null 2>&1; then
+        # NEW-1 + DEDUP-15 (v0.2.53): use shared asset_ref_count
+        # helper if available (sourced at the top of this file). The
+        # helper uses the broad substring `_app/immutable/` (matches
+        # Svelte 5 emission). Falls back to the legacy inline check
+        # if the helper isn't on disk (development checkouts where
+        # the lib hasn't been pulled yet).
+        if command -v asset_ref_count >/dev/null 2>&1; then
             local embedded_count
-            embedded_count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/assets' || true)"
+            embedded_count="$(asset_ref_count "$bin")"
+            # -1 sentinel means `strings` is missing → trust binary.
+            if [ "${embedded_count:-0}" -ne -1 ] && [ "${embedded_count:-0}" -lt 5 ]; then
+                echo "[launcher] ${bin##*/} hash matches but frontend is NOT embedded (found $embedded_count asset refs, expected >=5)."
+                echo "           Refusing to trust — bundled binary was built with an empty launcher/build/."
+                return 1
+            fi
+        elif command -v strings >/dev/null 2>&1; then
+            local embedded_count
+            embedded_count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/' || true)"
             if [ "${embedded_count:-0}" -lt 5 ]; then
                 echo "[launcher] ${bin##*/} hash matches but frontend is NOT embedded (found $embedded_count asset refs, expected >=5)."
                 echo "           Refusing to trust — bundled binary was built with an empty launcher/build/."
@@ -580,13 +657,32 @@ def pick(predicate):
     return None
 
 picked = None
+# M-P0-3 (v0.2.53): release.yml currently ships .zip assets for both
+# macOS and Linux (vibecoded-orchestrator-<ver>-macos-arm64.zip,
+# vibecoded-orchestrator-<ver>-linux-x64.zip). The previous filter
+# only accepted .dmg (macOS) / .appimage (Linux), so picked was
+# always None → every user fell into the build path. Prefer .zip and
+# keep the legacy formats as a fallback for if/when CI starts shipping
+# them again.
 if os_name == "linux":
-    picked = pick(lambda n: n.endswith(".appimage"))
+    if arch in ("x86_64", "amd64", "x64"):
+        picked = pick(lambda n: n.endswith(".zip") and ("linux-x64" in n or "linux_x64" in n or "linux" in n))
+    if picked is None:
+        picked = pick(lambda n: n.endswith(".zip") and "linux" in n)
+    if picked is None:
+        # Legacy fallback (CI may resume publishing AppImages later).
+        picked = pick(lambda n: n.endswith(".appimage"))
 elif os_name == "macos":
     if arch in ("arm64", "aarch64"):
-        picked = pick(lambda n: n.endswith(".dmg") and ("arm64" in n or "aarch64" in n))
+        picked = pick(lambda n: n.endswith(".zip") and ("arm64" in n or "aarch64" in n or "macos" in n))
     if picked is None:
-        picked = pick(lambda n: n.endswith(".dmg"))
+        picked = pick(lambda n: n.endswith(".zip") and "macos" in n)
+    if picked is None:
+        # Legacy fallback (CI may resume publishing DMGs later).
+        if arch in ("arm64", "aarch64"):
+            picked = pick(lambda n: n.endswith(".dmg") and ("arm64" in n or "aarch64" in n))
+        if picked is None:
+            picked = pick(lambda n: n.endswith(".dmg"))
 
 if picked:
     print(picked.get("browser_download_url", ""))
@@ -606,7 +702,112 @@ PY
             echo "[launcher] Downloading: $asset_name"
             _log_event "download" "start" "downloading $asset_name" \
                 "{\"asset\":\"$(_json_escape "$asset_name")\"}"
-            if [ "$OS" = "linux" ]; then
+            # M-P0-3 (v0.2.53): release.yml ships .zip assets for both
+            # macOS and Linux. The earlier dispatch assumed .appimage
+            # (Linux) / .dmg (macOS) which never arrived. Now: detect
+            # the actual asset extension from $asset_name and pick the
+            # right extraction path. Legacy .appimage + .dmg branches
+            # are kept for when CI resumes shipping those formats.
+            asset_ext_lower="$(printf '%s' "$asset_name" | tr '[:upper:]' '[:lower:]')"
+            case "$asset_ext_lower" in
+                *.zip) asset_kind="zip" ;;
+                *.appimage) asset_kind="appimage" ;;
+                *.dmg) asset_kind="dmg" ;;
+                *) asset_kind="" ;;
+            esac
+
+            tmp_dir="$(mktemp -d -t vct-launcher.XXXXXX 2>/dev/null \
+                        || mktemp -d "${TMPDIR:-/tmp}/vct-launcher.XXXXXX")"
+
+            if [ "$asset_kind" = "zip" ]; then
+                # Unified .zip extraction path (works on both macOS via
+                # BSD `unzip` and Linux via Info-ZIP `unzip`). Look for:
+                #   1. A flat `vct-launcher` (or `.exe` on Windows — N/A here).
+                #   2. A `.app` bundle (macOS-only signed build).
+                # Mirrors the dist/<os-arch>/ layout the CI uses.
+                tmp_zip="$tmp_dir/launcher.zip"
+                if ! _download "$asset_url" "$tmp_zip"; then
+                    echo "[launcher] Download failed. Falling back to build."
+                    _log_event "download" "error" "$OS zip download failed (curl/wget exit non-zero)"
+                    rm -rf "$tmp_dir"
+                    MODE="build"
+                elif ! command -v unzip >/dev/null 2>&1; then
+                    echo "[launcher] unzip missing — cannot extract $asset_name. Falling back to build."
+                    _log_event "download" "error" "$OS unzip missing for zip extraction"
+                    rm -rf "$tmp_dir"
+                    MODE="build"
+                else
+                    extract_dir="$tmp_dir/extracted"
+                    mkdir -p "$extract_dir"
+                    if ! unzip -q "$tmp_zip" -d "$extract_dir" 2>/dev/null; then
+                        echo "[launcher] unzip failed on $asset_name. Falling back to build."
+                        _log_event "download" "error" "$OS unzip extraction failed"
+                        rm -rf "$tmp_dir"
+                        MODE="build"
+                    else
+                        # Locate launcher binary inside extracted tree.
+                        bin_in_zip=""
+                        if [ "$OS" = "macos" ]; then
+                            # Prefer .app bundle if present.
+                            app_in_zip="$(find "$extract_dir" -maxdepth 5 -name '*.app' -type d 2>/dev/null | head -1)"
+                            if [ -n "$app_in_zip" ]; then
+                                # Install bundle to /Applications (preferred)
+                                # or ~/Applications (fallback if no admin).
+                                if cp -R "$app_in_zip" /Applications/ 2>/dev/null; then
+                                    dest_app="/Applications/$(basename "$app_in_zip")"
+                                else
+                                    mkdir -p "$HOME/Applications"
+                                    cp -R "$app_in_zip" "$HOME/Applications/" 2>/dev/null
+                                    dest_app="$HOME/Applications/$(basename "$app_in_zip")"
+                                fi
+                                for cand in "$dest_app/Contents/MacOS/VCT Launcher" \
+                                            "$dest_app/Contents/MacOS/vct-launcher" \
+                                            "$dest_app/Contents/MacOS/vct-launcher-temp"; do
+                                    if [ -x "$cand" ]; then bin_in_zip="$cand"; break; fi
+                                done
+                            fi
+                            # Fallback: flat vct-launcher inside zip.
+                            if [ -z "$bin_in_zip" ]; then
+                                bin_in_zip="$(find "$extract_dir" -maxdepth 5 \
+                                    \( -name 'vct-launcher' -o -name 'vct-launcher-temp' \) \
+                                    -type f 2>/dev/null | head -1)"
+                                if [ -n "$bin_in_zip" ]; then
+                                    target_dir="$HOME/.local/share/vct-launcher"
+                                    mkdir -p "$target_dir"
+                                    cp "$bin_in_zip" "$target_dir/vct-launcher"
+                                    chmod +x "$target_dir/vct-launcher"
+                                    bin_in_zip="$target_dir/vct-launcher"
+                                fi
+                            fi
+                        else
+                            # Linux: flat vct-launcher.
+                            bin_in_zip="$(find "$extract_dir" -maxdepth 5 \
+                                \( -name 'vct-launcher' -o -name 'vct-launcher-temp' \) \
+                                -type f 2>/dev/null | head -1)"
+                            if [ -n "$bin_in_zip" ]; then
+                                target_dir="$HOME/.local/share/vct-launcher"
+                                mkdir -p "$target_dir"
+                                cp "$bin_in_zip" "$target_dir/vct-launcher"
+                                chmod +x "$target_dir/vct-launcher"
+                                bin_in_zip="$target_dir/vct-launcher"
+                            fi
+                        fi
+                        rm -rf "$tmp_dir"
+                        if [ -n "$bin_in_zip" ] && [ -x "$bin_in_zip" ]; then
+                            LAUNCHER_BIN="$bin_in_zip"
+                            echo "[launcher] Extracted launcher to $LAUNCHER_BIN"
+                            _log_event "download" "ok" "$OS zip extracted" \
+                                "{\"path\":\"$(_json_escape "$LAUNCHER_BIN")\"}"
+                        else
+                            echo "[launcher] No launcher binary found inside $asset_name. Falling back to build."
+                            _log_event "download" "error" "$OS zip missing launcher binary"
+                            MODE="build"
+                        fi
+                    fi
+                fi
+            elif [ "$asset_kind" = "appimage" ] && [ "$OS" = "linux" ]; then
+                # Legacy Linux .appimage path (kept for if/when CI
+                # resumes publishing AppImages — currently disabled).
                 target_dir="$HOME/.local/share/vct-launcher"
                 mkdir -p "$target_dir"
                 target_path="$target_dir/vct-launcher"
@@ -627,29 +828,26 @@ PY
                     fi
                 else
                     echo "[launcher] Download failed. Falling back to build."
-                    _log_event "download" "error" "linux download failed (curl/wget exit non-zero)"
+                    _log_event "download" "error" "linux appimage download failed (curl/wget exit non-zero)"
                     MODE="build"
                 fi
-            elif [ "$OS" = "macos" ]; then
+                rm -rf "$tmp_dir"
+            elif [ "$asset_kind" = "dmg" ] && [ "$OS" = "macos" ]; then
+                # Legacy macOS .dmg path. Kept for if/when CI resumes
+                # publishing DMGs. unreachable today because pick()
+                # prefers .zip first.
                 if [ $HAS_HDIUTIL -eq 0 ]; then
                     echo "[launcher] hdiutil missing (unexpected on macOS). Falling back to build."
                     _log_event "download" "error" "macos hdiutil missing"
+                    rm -rf "$tmp_dir"
                     MODE="build"
                 else
-                    # Use mktemp for idiomatic correctness: avoids $$ races
-                    # and respects $TMPDIR (macOS sandbox places it under
-                    # per-user dirs, not always /tmp). BSD mktemp on macOS
-                    # treats `-t` as a prefix, GNU as a template — using a
-                    # directory + manual basename keeps both happy.
-                    tmp_dir="$(mktemp -d -t vct-launcher.XXXXXX 2>/dev/null \
-                                || mktemp -d "${TMPDIR:-/tmp}/vct-launcher.XXXXXX")"
                     tmp_dmg="$tmp_dir/launcher.dmg"
                     if _download "$asset_url" "$tmp_dmg"; then
                         mount_point="$(hdiutil attach -nobrowse -quiet "$tmp_dmg" 2>/dev/null \
                             | awk '/\/Volumes\// {for (i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}' \
                             | tail -1)"
                         if [ -n "$mount_point" ] && [ -d "$mount_point" ]; then
-                            # Try /Applications first; fall back to ~/Applications if no admin.
                             app_src="$(find "$mount_point" -maxdepth 2 -name '*.app' -type d | head -1)"
                             if [ -n "$app_src" ]; then
                                 if cp -R "$app_src" /Applications/ 2>/dev/null; then
@@ -679,9 +877,16 @@ PY
                     else
                         echo "[launcher] Download failed. Falling back to build."
                         _log_event "download" "error" "macos download failed"
+                        rm -rf "$tmp_dir"
                         MODE="build"
                     fi
                 fi
+            else
+                echo "[launcher] Unrecognised asset extension for $asset_name (kind='$asset_kind'). Falling back to build."
+                _log_event "download" "error" "$OS unknown asset kind" \
+                    "{\"asset\":\"$(_json_escape "$asset_name")\"}"
+                rm -rf "$tmp_dir"
+                MODE="build"
             fi
         fi
     fi
@@ -848,9 +1053,17 @@ PY
                 # npm 7+); fall back to `npm config get prefix` and
                 # well-known prefix locations. `npm bin -g` was
                 # removed in npm 9 — don't rely on it.
-                local npm_prefix=""
+                # M-P0-5 (v0.2.53): `local` outside a function aborts
+                # under `set -u` (script runs under `set -uo pipefail`
+                # at line 50). The previous use of `local` here printed
+                # "local: can only be used in a function" + tripped
+                # the next `$npm_prefix` reference with an "unbound
+                # variable" abort → script exited 127 silently from
+                # the user's perspective. The block isn't inside a
+                # function, so plain assignment is correct.
+                npm_prefix=""
                 npm_prefix="$(npm prefix -g 2>/dev/null || npm config get prefix 2>/dev/null || true)"
-                local probe_dirs=()
+                probe_dirs=()
                 if [ -n "$npm_prefix" ]; then
                     probe_dirs+=("$npm_prefix/bin")
                 fi
@@ -859,7 +1072,9 @@ PY
                     "$HOME/.npm-global/bin"
                     "/usr/local/lib/node_modules/.bin"
                 )
-                local cand
+                # `cand` is the loop variable below; just leave it
+                # plain (no `local`). This is the third site that hit
+                # the bug.
                 for cand in "${probe_dirs[@]}"; do
                     if [ -n "$cand" ] && [ -x "$cand/pnpm" ]; then
                         case ":$PATH:" in

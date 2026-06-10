@@ -18,9 +18,29 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# v0.2.53 (Track A): metadata.json reader. If the release CI emitted
+# launcher/dist/<os-arch>/metadata.json (Track D's work), its
+# candidate_paths_per_os.linux array drives the search. The hardcoded
+# fallback below covers dev builds + checkouts pre-dating Track D.
+# See docs/INSTALL_ARCHITECTURE_v2.md §4.4 for the schema.
+metadata_candidates=()
+if [ -f "$SCRIPT_DIR/scripts/lib/launcher-metadata.sh" ]; then
+    # shellcheck source=scripts/lib/launcher-metadata.sh
+    . "$SCRIPT_DIR/scripts/lib/launcher-metadata.sh"
+    if meta_lines="$(launcher_metadata_candidates "$SCRIPT_DIR" linux 2>/dev/null)"; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            metadata_candidates+=("$line")
+        done <<META
+$meta_lines
+META
+    fi
+fi
+
 # Search paths in priority order. Add to this list as packaging
 # matures (snap, flatpak, .deb, AppImage, etc.). First match wins.
 candidates=(
+    "${metadata_candidates[@]+"${metadata_candidates[@]}"}"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/vct-launcher"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/vct-launcher-temp"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/launcher"
@@ -39,17 +59,19 @@ candidates=(
 # Refuse to launch a release binary that has no embedded SvelteKit
 # frontend. A build that ran with an empty `launcher/build/` produces
 # a binary that compiles fine but renders "Could not connect to
-# localhost" at runtime (regressed in 5abb8cf, 2026-04-28). `strings`
-# is part of binutils — present on every supported host with a Rust
-# toolchain. If absent we skip the check rather than false-fail.
+# localhost" at runtime (regressed in 5abb8cf, 2026-04-28).
+#
+# NEW-1 + DEDUP-15 (v0.2.53): substring is `_app/immutable/` (broad —
+# matches all SvelteKit emission shapes including chunks/, entry/,
+# nodes/, and assets/). Previously this site used the narrow
+# `_app/immutable/assets` which false-rejects healthy Svelte 5 builds.
+# See `.claude/context/audits/shell-scripts-dedup-2026-06-10.md` §4.
+# The shared implementation lives at `scripts/lib/asset-ref-count.sh`.
+# shellcheck source=scripts/lib/asset-ref-count.sh
+. "$SCRIPT_DIR/scripts/lib/asset-ref-count.sh"
+
 _binary_has_embedded_frontend() {
-    local bin="$1"
-    if ! command -v strings >/dev/null 2>&1; then
-        return 0  # can't check; trust the binary
-    fi
-    local count
-    count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/assets' || true)"
-    [ "${count:-0}" -ge 5 ]
+    asset_ref_count_passes "$1"
 }
 
 LAUNCHER_BIN=""

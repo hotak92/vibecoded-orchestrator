@@ -572,4 +572,9 @@ for arg in "$@"; do
     esac
 done
 
-exec "$PYTHON" install.py "${INSTALL_PY_ARGS[@]}"
+# M-P0-1 (v0.2.53): bash 3.2 (default on macOS) treats `"${arr[@]}"` of an
+# empty array as an unbound variable under `set -u`. Use the
+# `${arr[@]+"${arr[@]}"}` idiom so empty INSTALL_PY_ARGS expands to nothing
+# instead of aborting. Bash 4+ is unaffected; the idiom is safe on both.
+# See `.claude/context/audits/macos-install-shell-audit-2026-06-10.md` P0-1.
+exec "$PYTHON" install.py ${INSTALL_PY_ARGS[@]+"${INSTALL_PY_ARGS[@]}"}

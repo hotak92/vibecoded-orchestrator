@@ -12,19 +12,50 @@
 
 set -euo pipefail
 
+# M-P1-4 (v0.2.53): when Finder launches a .command file, the script's
+# cwd is the user's $HOME — not the script's directory. Resolve
+# SCRIPT_DIR explicitly + cd into it so relative paths (and the
+# launcher binary's own cwd assumptions, e.g. for vct-hub spawn or
+# .env reading) behave the same as when run from a Terminal session.
+# `cd` is idempotent (no-op when already there), so re-runs are
+# harmless.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# v0.2.53 (Track A): metadata.json reader — see
+# docs/INSTALL_ARCHITECTURE_v2.md §4.4 for the schema. Falls back to
+# the hardcoded candidates list below when metadata is missing.
+metadata_candidates=()
+if [ -f "$SCRIPT_DIR/scripts/lib/launcher-metadata.sh" ]; then
+    # shellcheck source=scripts/lib/launcher-metadata.sh
+    . "$SCRIPT_DIR/scripts/lib/launcher-metadata.sh"
+    if meta_lines="$(launcher_metadata_candidates "$SCRIPT_DIR" macos 2>/dev/null)"; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            metadata_candidates+=("$line")
+        done <<META
+$meta_lines
+META
+    fi
+fi
 
 candidates=(
+    "${metadata_candidates[@]+"${metadata_candidates[@]}"}"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/vct-launcher"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/vct-launcher-temp"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/launcher"
     "$SCRIPT_DIR/launcher/src-tauri/target/debug/vct-launcher-temp"
-    # Bundled prebuilt binary shipped in the repo (flat file produced by
-    # scripts/build-bundled-launcher.sh on Darwin hosts — see line 158
-    # of that script: $DIST_DIR/$HOST_TARGET/$HOST_BIN where HOST_TARGET
-    # is `experimental_macOS` and HOST_BIN is `vct-launcher`). Last-resort
-    # fallback for users who pulled the repo without running
-    # first-install.command.
+    # Bundled prebuilt binary shipped in the repo. Canonical dist dir
+    # has been `macos-arm64/` since v0.2.13 (install.py:16956 documents
+    # this). The earlier `experimental_macOS/` slot is retained as a
+    # legacy fallback for users on an old checkout — but the runtime
+    # binary lives under `macos-arm64/` in every modern release.
+    # M-P0-2 (v0.2.53): add macos-arm64 + keep experimental_macOS as
+    # legacy.
+    "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher"
+    "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/vct-launcher"
+    "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/VCT Launcher"
+    # Legacy dist dir (pre-v0.2.13). Kept as fallback only.
     "$SCRIPT_DIR/launcher/dist/experimental_macOS/vct-launcher"
     # macOS .app bundle paths (post-v1.0 packaging). The internal
     # binary name inside the bundle is `productName` minus spaces — but
@@ -39,18 +70,16 @@ candidates=(
 # Refuse to launch a release binary that has no embedded SvelteKit
 # frontend. A build that ran with an empty `launcher/build/` produces
 # a binary that compiles fine but renders "Could not connect to
-# localhost" at runtime (regressed in 5abb8cf, 2026-04-28). `strings`
-# is part of binutils — present on every Mac with the Xcode CLT
-# (which is required for the launcher's Rust build anyway). If absent
-# we skip the check rather than false-fail.
+# localhost" at runtime (regressed in 5abb8cf, 2026-04-28).
+#
+# NEW-1 + DEDUP-15 (v0.2.53): broad substring `_app/immutable/` via
+# shared helper at `scripts/lib/asset-ref-count.sh`. Previous narrow
+# substring `_app/immutable/assets` false-rejects Svelte 5 builds.
+# shellcheck source=scripts/lib/asset-ref-count.sh
+. "$SCRIPT_DIR/scripts/lib/asset-ref-count.sh"
+
 _binary_has_embedded_frontend() {
-    local bin="$1"
-    if ! command -v strings >/dev/null 2>&1; then
-        return 0  # can't check; trust the binary
-    fi
-    local count
-    count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/assets' || true)"
-    [ "${count:-0}" -ge 5 ]
+    asset_ref_count_passes "$1"
 }
 
 LAUNCHER_BIN=""
