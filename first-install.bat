@@ -123,16 +123,37 @@ REM _log_event <step> <phase> <detail>
 REM Idempotent: silently no-ops if the log dir doesn't exist (install.py
 REM Step 8 creates it; if we got here without that step we just skip the
 REM event — never crash).
+REM
+REM W-P1-1 (v0.2.53 Track H): values pass through ENV VARS, not via
+REM `%~1` substitution into the PowerShell command string. The previous
+REM implementation interpolated `'%~1'` literally into PowerShell `'...'`
+REM single-quoted string literals — if the value contained an apostrophe
+REM (French/Italian path component like `D'Angelo`, or any detail text
+REM with `'`), the PS literal terminated early and the rest was parsed
+REM as PowerShell code (corrupt JSONL row at best; logic injection at
+REM worst). Env-var passthrough sidesteps the cmd → PS quoting boundary
+REM entirely: PowerShell reads from $env:VCT_LOG_* via a string accessor
+REM that does not re-parse the value.
 goto :after_log_helper
 :_log_event
 if not exist "%~dp0state\logs" goto :_log_event_done
+set "VCT_LOG_STEP=%~1"
+set "VCT_LOG_PHASE=%~2"
+set "VCT_LOG_DETAIL=%~3"
+set "VCT_LOG_PATH=%INSTALL_LOG%"
 "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ');" ^
-    "$step  = '%~1' -replace '\\','\\\\' -replace '\"','\\\"';" ^
-    "$phase = '%~2' -replace '\\','\\\\' -replace '\"','\\\"';" ^
-    "$det   = '%~3' -replace '\\','\\\\' -replace '\"','\\\"';" ^
-    "$line = '{\"ts\":\"' + $ts + '\",\"actor\":\"first-install.bat\",\"step\":\"' + $step + '\",\"phase\":\"' + $phase + '\",\"detail\":\"' + $det + '\"}';" ^
-    "Add-Content -Path '%INSTALL_LOG%' -Value $line" 2>nul
+    "$step  = [string]([Environment]::GetEnvironmentVariable('VCT_LOG_STEP'));" ^
+    "$phase = [string]([Environment]::GetEnvironmentVariable('VCT_LOG_PHASE'));" ^
+    "$det   = [string]([Environment]::GetEnvironmentVariable('VCT_LOG_DETAIL'));" ^
+    "$path  = [string]([Environment]::GetEnvironmentVariable('VCT_LOG_PATH'));" ^
+    "$obj = [pscustomobject]@{ ts = $ts; actor = 'first-install.bat'; step = $step; phase = $phase; detail = $det };" ^
+    "$line = $obj | ConvertTo-Json -Compress -Depth 3;" ^
+    "Add-Content -Path $path -Value $line" 2>nul
+set "VCT_LOG_STEP="
+set "VCT_LOG_PHASE="
+set "VCT_LOG_DETAIL="
+set "VCT_LOG_PATH="
 :_log_event_done
 goto :eof
 :after_log_helper
