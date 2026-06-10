@@ -636,6 +636,22 @@ cargo test -- --test-threads=4
 
 CI overrides explicitly via the `--test-threads` flag — see `.github/workflows/`. If you see a fresh flake on a test that doesn't touch global state, it's likely a real bug; file an issue.
 
+### Contributor: `db::access::adopt_populated_tests` flaky on parallel runs (known issue PRE-2)
+
+Three tests in `launcher/src-tauri/vct-launcher-core/src/db/access.rs` flake with ~20-30% probability regardless of `--test-threads`:
+
+- `t2_vco_dev_shape_single_populated_candidate_adopted`
+- `t3_multiple_populated_candidates_defer`
+- `t5_idempotent_after_adoption`
+
+Failure mode: the assertion compares `AdoptionReport { adopted, deferred, no_change }` and the observed report has counts off by one — typically `adopted: 0, no_change: 1` instead of `adopted: 1, no_change: 0`, or `adopted: 1` instead of `deferred: 1`.
+
+**Root cause** (Track E investigation, 2026-06-10): the test fixture's hand-rolled `MockWeaviate` HTTP server does a single non-async `read()` on each accepted TCP stream. On heavily loaded systems the kernel can return BEFORE the full HTTP request body has arrived, the GraphQL class-name extraction returns empty, the count probe returns 0, and the production code takes a different branch than the test asserts. Full notes in `tests/KNOWN_FAILURES.md` § PRE-2.
+
+**Recommended retry policy**: re-run the failing test up to 3× before treating it as a real regression. The tests pass reliably in isolation (`cargo test -p vct-launcher-core --lib t5_idempotent_after_adoption`) — the race only manifests under suite-level pressure.
+
+**Real fix** is queued for v0.2.54: replace the hand-rolled mock with `httpmock` or wiremock-rs, or migrate the mock listener to async / tokio-aware TcpListener so it co-schedules cooperatively with the test's tokio runtime.
+
 ## Getting more help
 
 - GitHub Issues: <https://github.com/hotak92/vibecoded-orchestrator/issues>
