@@ -216,14 +216,24 @@ if defined LAUNCHER_BIN (
 REM Frontend-embedded check (added 2026-04-28). A release binary built
 REM with an empty launcher\build\ compiles fine but renders "Could not
 REM connect to localhost" at startup because no SvelteKit assets were
-REM embedded. We require >=5 occurrences of "_app/immutable/assets" in
-REM the binary's bytes; otherwise treat as broken and fall through to
+REM embedded. We require >=5 occurrences of "_app/immutable/" in the
+REM binary's bytes; otherwise treat as broken and fall through to
 REM download/build. Threshold derived from build artifact analysis at
 REM commit d576ad6 (which fixed the original regression in 5abb8cf).
-REM Mirror of bash _bundled_binary_is_fresh frontend-check.
+REM
+REM DEDUP-15 (v0.2.53 Track H + Track A): the count is delegated to
+REM scripts\lib\asset-ref-count.ps1 (Get-AssetRefCount) — the same
+REM helper start-launcher.bat uses and the bash sibling
+REM scripts/lib/asset-ref-count.sh consumes. Previously this site had
+REM its own inline marker substring + threshold ("_app/immutable/assets",
+REM the narrow form); the helper uses the canonical broad form
+REM "_app/immutable/" which correctly catches Svelte 5 builds where the
+REM trailing "assets/" segment is dropped. The 4 prior copies of the
+REM marker (this file, start-launcher.bat, .sh sibling, build scripts)
+REM are now collapsed to one.
 if defined LAUNCHER_BIN (
     for /f "delims=" %%C in ('"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
-        "try { $bytes=[System.IO.File]::ReadAllBytes('!LAUNCHER_BIN!'); $s=[System.Text.Encoding]::ASCII.GetString($bytes); ($s.Split([string[]]@('_app/immutable/assets'), [System.StringSplitOptions]::None).Count - 1) } catch { 0 }" 2^>nul') do set "FE_COUNT=%%C"
+        ". '%~dp0scripts\lib\asset-ref-count.ps1'; Get-AssetRefCount -Path '!LAUNCHER_BIN!'" 2^>nul') do set "FE_COUNT=%%C"
     if not defined FE_COUNT set "FE_COUNT=0"
     REM CMD batch can't do GEQ on arbitrary strings; coerce + compare numerically.
     set /a "FE_COUNT_INT=!FE_COUNT! + 0" 2>nul

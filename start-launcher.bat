@@ -70,13 +70,21 @@ REM ─── helpers ───────────────────�
 :probe
 REM %~1 = candidate exe path
 if not exist "%~1" goto :eof
-REM Count occurrences of the SvelteKit asset path in the binary. If the
-REM count is >=5, treat the binary as healthy. If <5, log to SKIPPED and
-REM keep probing. The PowerShell call returns the integer match count;
-REM we capture it via for /f.
+REM Count occurrences of the SvelteKit asset path in the binary via the
+REM shared helper at scripts/lib/asset-ref-count.ps1 (DEDUP-15, v0.2.53
+REM Track H + Track A). If the count is >=5 (the canonical
+REM VCT_ASSET_REF_MIN), treat the binary as healthy. If <5, log to
+REM SKIPPED and keep probing.
+REM
+REM The helper sources its marker substring + threshold from a single
+REM PowerShell module — the bash sibling asset-ref-count.sh uses the
+REM SAME marker. Pre-DEDUP-15 the marker was duplicated inline in 4
+REM places (start-launcher.bat, first-install.bat, and the .sh
+REM siblings); a copy-paste drift in any one of them silently
+REM mis-classified embedded vs non-embedded launcher binaries.
 set "PROBE_PATH=%~1"
 set "PROBE_COUNT="
-for /f "usebackq tokens=*" %%C in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$bytes=[System.IO.File]::ReadAllBytes('%PROBE_PATH:'=''%'); $s=[System.Text.Encoding]::ASCII.GetString($bytes); ($s.Split([string[]]@('_app/immutable/assets'), [System.StringSplitOptions]::None).Count - 1)"`) do set "PROBE_COUNT=%%C"
+for /f "usebackq tokens=*" %%C in (`powershell -NoProfile -ExecutionPolicy Bypass -Command ". '%~dp0scripts\lib\asset-ref-count.ps1'; Get-AssetRefCount -Path '%PROBE_PATH:'=''%'"`) do set "PROBE_COUNT=%%C"
 if not defined PROBE_COUNT set "PROBE_COUNT=0"
 if %PROBE_COUNT% GEQ 5 (
     set "FOUND=%~1"
