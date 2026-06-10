@@ -8,6 +8,39 @@ with each event capturing what step ran, what phase it reached, and any
 relevant detail. The launcher also appends events when it spawns at end of
 install or when its first-start wizard fires.
 
+## Read the bootstrap envelope too (v0.2.53+)
+
+If `<repo_root>/state/logs/bootstrap-prepass.json` exists, read it BEFORE
+diving into `install.jsonl`. The envelope is a versioned, read-only snapshot
+of the host's capabilities taken by the `first-install.{sh,command,bat}`
+shim (before `install.py`'s 10-step flow runs). It tells you the answer to
+"is this host even capable of installing?" without re-probing:
+
+- `system.python` — interpreter version + `wheel_support_ok` flag (False
+  means pip would have fallen back to source build; the user needs a
+  3.12/3.13 interpreter, not 3.14).
+- `system.podman` / `system.docker` / `system.container_runtime_chosen` —
+  which runtime install.py would have picked.
+- `system.gpu` — vendor (`nvidia` / `amd` / `metal` / `intel` / `none`),
+  VRAM, driver, container-toolkit reachability. This is what drove the
+  GPU-vs-CPU tier decision.
+- `paths.launcher_binary_exists` / `paths.vct_hub_binary_exists` — whether
+  the bundled binaries actually landed on disk.
+- `missing_prereqs[]` — explicit `{name, human, severity, install_hint}`
+  entries with severity `blocking` / `warning` / `optional`.
+- `ready_to_install` — boolean. False means at least one `blocking`
+  prereq is missing; the install would have failed regardless of the
+  10-step retry logic.
+
+Envelope schema: `docs/schemas/install-bootstrap-envelope-v1.json`.
+`schema_version: 1` is pinned — refuse versions you don't recognise.
+
+The envelope is **read-only** — generating it has no install side effects.
+It is regenerated on every first-install shim invocation, so a stale
+envelope from a prior run is unusual but possible (a user who ran
+install.py directly without re-running the shim will see the prior
+envelope). Check `generated_at` to confirm freshness.
+
 Schema:
 ```json
 {"ts": "2026-04-27T22:00:00Z",
@@ -279,6 +312,55 @@ clean cargo caches: `cargo clean --manifest-path launcher/src-tauri/Cargo.toml`.
 If Cargo or npm registry calls fail, check `~/.npmrc`, `~/.cargo/config.toml`,
 proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`).
 
+#### f. V52-M: bundled hooks dead because they shipped without exec bit (FIX in v0.2.53)
+
+Symptom: `claude mcp list` is healthy, hook registrations in
+`.claude/settings.json` look correct, but `bash-context-inject.sh`,
+`pre-edit-context-inject.sh` etc. never run — no logs in
+`.claude/logs/YYYY-MM-DD_tool_usage.jsonl`, no observable side
+effects. Cause (pre-v0.2.53): a subset of `templates/hooks/*.sh`
+were committed with mode `0644`, `shutil.copy2` preserved that mode
+into the project, and POSIX Claude Code refuses to invoke a
+non-executable hook script.
+
+Fix path on a fresh install or upgrade:
+
+```bash
+cd <repo_root>
+python install.py --update   # install.py:11299 force-chmods every copied
+                              # *.sh hook target to 0o755 after copy2 —
+                              # any silently-dead hook is now activated
+```
+
+No data side effects; `--update` is idempotent. If hooks still don't
+fire, check `.claude/settings.json` hook registrations were not
+inadvertently removed (PreToolUse / PostToolUse matchers absent).
+The chmod-0755 pass also covered a v0.2.52 UTF-8 BOM regression on a
+couple of `.ps1` siblings; same recovery command.
+
+#### g. Hub binary not discoverable
+
+If `find_hub_binary` returns `None` (visible as `vct-hub: not found`
+in `claude mcp list` failure modes), the launcher's discovery walked
+all candidate paths and missed. The discoverer
+(`launcher/src-tauri/src/hub_launcher.rs`) walks 5 candidates in order:
+explicit env override → `~/.vct/bin/` → in-tree dist resolved via
+`current_exe()` walking (sibling layout, then 1-up fallback).
+
+**`VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1` is a test-only sentinel** —
+never set it as a workaround. Production code never sets it. It
+exists exclusively so `cargo test` runs against `target/debug/`
+(where stray `vct-hub` binaries from sibling cargo invocations
+contaminate the search) can deterministically assert "no hub
+anywhere". If you find this env var set in a user's session, find
+out who set it and unset it — it is masking a real discovery failure.
+
+The real fix when discovery fails: rebuild the bundle locally
+(`bash scripts/build-bundled-launcher.sh` from the repo root), or
+re-run `python install.py --update` which re-stamps the launcher's
+recorded binary paths to the canonical `launcher/dist/<os>-<arch>/`
+location.
+
 ### 3. Run the build manually after fixing
 
 ```bash
@@ -512,3 +594,28 @@ Both the launcher (Rust) and `install.py` (Python) emit a
 
 `read_install_log` (Tauri command) and the Diagnostics panel surface this
 event so the user can see which strategy ran and what it touched.
+
+---
+
+## localStorage flag scoping migration (v0.2.53)
+
+In v0.2.52 and earlier, the launcher's "you have an update available"
+dismissal flag was stored under the unscoped localStorage key
+`dismissed_update_version` (one master plan name in early drafts). In
+v0.2.53 the real code uses the install-path-scoped key
+`vct.update.seen_version` (see `launcher/src/lib/stores/updater.ts`),
+threaded through `getInstallScopedFlag` / `setInstallScopedFlag` in
+`launcher/src/lib/stores/install-state-store.ts`. This lets a user
+running multiple VCO installs from the same browser session dismiss
+the banner per-install rather than globally.
+
+A one-shot legacy-cleanup migration runs at launcher boot: any
+unscoped `dismissed_update_version` value is dropped on first start
+after upgrade. No user action required. The migration is silent — it
+does not surface to the GUI or `install.jsonl`. If a user reports
+"the dismissal sticky doesn't persist any more after upgrade", that
+is the expected one-time effect of the scoping move; their next
+dismissal will persist (under the new scoped key).
+
+This is a one-off behavioural blip, not a recovery scenario. Don't
+re-implement the old key as a workaround.

@@ -21,6 +21,33 @@ It prevents cross-contamination. Global settings apply to every project you open
 3. Let `install.py` wire the rest (venv, containers, KG collection creation, `vct-hub` binary placement + boot sentinel).
 4. Launch via the VCT Launcher GUI (manages secrets, tier gating, module installs). Secrets entered via the GUI (or via the OnboardingWizard at first run) are immediately resolvable by the hub for every registered project.
 
+## Install entry-point flow (v0.2.53+)
+
+`first-install.{sh,command,bat}` (Linux / macOS / Windows) and `install.ps1` (PowerShell) are thin shims around `install.py`. The shim sequence per invocation:
+
+1. **Python detect**: a candidate cascade (newest first: `python3.13` → `python3.12` → `python3.11` → `python3` / `python`, plus the linuxbrew prefix on Linux). The first candidate that reports `sys.version_info >= (3, 11)` wins. Missing Python fails with a distro-aware install hint.
+2. **Bootstrap prepass**: `python install.py --bootstrap --json` writes a versioned, read-only system-detection envelope to `state/logs/bootstrap-prepass.json`. No install side effects; no writes outside that one file; no network; every probe has a ≤10 s timeout. Failure is soft — the full install still runs even if the prepass crashes.
+3. **Full install**: `python install.py <forwarded args>` runs the canonical 10-step flow. The shim forwards user argv verbatim (with `--non-interactive` translated to `--yes` for backward compatibility).
+4. **Auto-spawn launcher**: when install.py exits 0 and the user did not pass `--no-auto-launch` (or set `VCT_NO_AUTO_LAUNCH=1`), the shim runs `scripts/post-install-launcher.sh` (or the inline Windows equivalent inside `first-install.bat`). That script is best-effort: it ALWAYS exits 0 — a broken launcher spawn must not mask a successful install.
+
+`--bootstrap` is the prepass-only mode. It is exclusive with `--update`, `--lightweight`, and `--uninstall`; combining them aborts before any work runs. `--bootstrap` is NOT the install entry point — it is exclusively a read-only probe consumed by the shim, by `vco_lib`, and by future Rust callers that need a consistent view of host capabilities before touching disk. See `install.py:618` for the policy comment and `install.py:1524` for the dispatcher.
+
+## Bootstrap envelope (`state/logs/bootstrap-prepass.json`)
+
+The schema is published at [`docs/schemas/install-bootstrap-envelope-v1.json`](schemas/install-bootstrap-envelope-v1.json) and pinned via the `schema_version: 1` constant — consumers MUST refuse versions they don't know how to read. Top-level keys include:
+
+| Key | Purpose |
+|---|---|
+| `system` | OS, arch, RAM, CPU count, and tool probes (Python with wheel-coverage flag, Node, npm/pnpm, Podman, Docker, git, brew, Joern, lean-ctx, `claude` CLI), GPU summary (vendor / model / VRAM / driver / container-toolkit), distro-specific feature blocks (`linux_distro`, `macos_features`, `windows_features`). |
+| `paths` | `install_root` + classification (`orchestrator_clone` / `completed_install` / `git_repo` / `unknown`), venv interpreter paths, launcher + hub binary paths and exists flags, state-dir locations. |
+| `package_manager_advice` | Per-tool install command vectors for the host's primary package manager (apt / dnf / pacman / zypper / apk / winget / brew), plus `selinux_volume_flag_needed` (Fedora/RHEL with bind-mount layouts) and the NVIDIA Container Toolkit URL when relevant. |
+| `weaviate_endpoints` | Canonical Weaviate endpoints — notably `health: /v1/.well-known/ready` (this is the SSOT; Rust + bash consumers MUST read it from the envelope rather than inventing their own probe path). |
+| `ollama_endpoints` / `code_embed_endpoints` / `vct_hub_endpoints` | Same canonical-URL pattern for the other local services. |
+| `missing_prereqs` | Array of `{name, human, severity, install_hint}` entries with severities `blocking` / `warning` / `optional`. |
+| `ready_to_install` | True iff no `blocking` entries are present. Envelope exit-code 0 does NOT imply readiness — consumers SHOULD check this flag. |
+
+The envelope is also useful as a diagnostic artifact: when reporting an install failure to a maintainer, attach `state/logs/bootstrap-prepass.json` so they can see the exact host shape (OS, arch, GPU, tool versions, distro package manager) the install ran on. The file is regenerated on every first-install shim invocation.
+
 ## `.env` template management
 
 Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command call `ensure_project_env_template` (Python: `_ensure_env_template`; Rust: `ensure_project_env_template`) on the project root. The behaviour is:
@@ -81,9 +108,21 @@ VCT_TELEMETRY
 
 If you see any of these in your global `~/.claude/settings.json`, move them to the per-project config. They're leaking.
 
+## Env var resolution precedence
+
+Per-project env vars (KG / codegraph / embedding selections, service URLs) flow through a fixed 5-level precedence chain. Higher levels override lower ones; consumers (MCP subprocesses, hooks, install.py, the launcher) all resolve through this chain so the active workspace's identity is consistent:
+
+1. **vct-hub resolved values** (highest precedence). When the hub is running on `http://127.0.0.1:7700` (port configurable via `VCT_HUB_PORT`), MCP startup queries `GET /api/v1/projects/{id}/config` and uses the hub's resolved per-project record from `launcher.db`.
+2. **`.claude/settings.json` `env` block**. The canonical per-project channel — written by the launcher's `write_project_env_files`, read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. Replaced the `.vscode/settings.json claude-code.env` surface in v0.2.12 (PR-27, 2026-05-16) after empirical testing on Linux Claude Code 2.1.143 confirmed that surface does not propagate to MCP subprocesses.
+3. **`.claude/env`** (POSIX shell-sourceable). Same keys as #2; used by CLI users sourcing it from a shell rc via the `tools/claude` wrapper.
+4. **`~/.claude.json` `mcpServers.<name>.env`**. The launcher intentionally restricts this surface to machine-invariant keys (e.g. `WEAVIATE_URL`); per-project keys like `KG_COLLECTION` are dropped here. See `launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS`.
+5. **Bundled defaults** baked into `claude_mcp_servers/weaviate_mcp/server.py` (lowest precedence). Reaching this layer is logged at WARNING level. Explicit empty-string env values for `KG_COLLECTION` are coerced to the default rather than used literally (v0.2.27 fix).
+
+The MCP startup log emits a `weaviate-kg: resolved collections (...)` line showing what the subprocess actually picked up plus the resolution source (env / hub / default); this is the diagnostic to grep for when a project is silently using the wrong KG.
+
 ## Knowledge graph env vars
 
-The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup. They're written to the two per-project surfaces — `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the canonical channel that actually propagates to MCP subprocesses on Linux) — by the launcher's `write_project_env_files`. The historical third surface (`.vscode/settings.json` `claude-code.env`) was removed in v0.2.12 (PR-27, 2026-05-16); see the bullet at the top of this file for the empirical-trace KG node.
+The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup, resolved through the 5-level chain above. The launcher's `write_project_env_files` writes the canonical per-project values into both `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the channel that actually propagates to MCP subprocesses on Linux). The historical third surface (`.vscode/settings.json` `claude-code.env`) was removed in v0.2.12 (PR-27, 2026-05-16); see the bullet at the top of this file for the empirical-trace KG node.
 
 | Var | Default | What it does |
 |---|---|---|
@@ -230,7 +269,7 @@ The chosen executable is returned as a string (`podman` or `docker`) and used un
 
 ### Forcing Docker when both runtimes are installed
 
-Hosts with both Podman AND Docker installed default to Podman (step 3 above). To force Docker — for example because your Docker daemon is the one wired to your team's registry credentials, or because Podman's rootless mode hits a permission wall on your filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
+Hosts with both Podman AND Docker installed default to Podman (step 3 above; see `_detect_container_runtime` at `install.py:6799`). To force Docker — for example because the Docker daemon is the one wired to team registry credentials, or because Podman's rootless mode hits a permission wall on the filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
 
 ```bash
 export VCT_CONTAINER_RUNTIME=docker
@@ -238,7 +277,7 @@ python install.py --update          # install / update flows
 .claude/hooks/ensure-containers.sh  # session-start hook
 ```
 
-Persist the override by adding the export to your shell rc (`~/.bashrc` / `~/.zshrc`) or to the per-project `.claude/env` so every Claude Code session inherits it. The value wins over auto-probe and over any caller-passed `runtime` argument. Symmetric override: `VCT_CONTAINER_RUNTIME=podman` forces Podman when auto-probe would have picked Docker (unusual but possible if `podman` is installed but not first in `PATH`).
+Persist the override by adding the export to a shell rc (`~/.bashrc` / `~/.zshrc`) or to the per-project `.claude/env` so every Claude Code session inherits it. The value wins over auto-probe and over any caller-passed `runtime` argument. Symmetric override: `VCT_CONTAINER_RUNTIME=podman` forces Podman when auto-probe would have picked Docker (unusual but possible if `podman` is installed but not first in `PATH`). Unrecognised values are logged and ignored — falling through to auto-probe.
 
 ## MCP Servers
 
@@ -296,6 +335,7 @@ Set these before running `bash first-install.sh` (or export them for the duratio
 | `VCT_CONTAINER_RUNTIME=podman|docker` | Pin the container runtime instead of auto-probing. Useful in CI where both runtimes might be present but only one is configured. |
 | `VCT_STATE_DIR=/path` | Override `~/.vct/` as the launcher state-root. Lets dev launchers run alongside production without contaminating state. Hub binaries pick this up automatically; resolver clients honour it too. |
 | `VCT_DISABLE_HOOKS=1` | See section below. |
+| `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1` | **Test-only sentinel** consumed by `launcher/src-tauri/src/hub_launcher.rs:84`. When set, the launcher's hub-binary discovery skips steps 4 and 5 (in-tree dist resolution via `current_exe()` walking) and returns `None` if no other candidate matched. Production code never sets this — it exists so `cargo test` runs against `target/debug/` (where sibling cargo invocations may leave a real `vct-hub` binary) can deterministically assert "no hub anywhere". Do NOT use this as a user workaround for hub-start failures; the correct path for that is `vct-hub --start-if-not-running` (see TROUBLESHOOTING.md). |
 | `VCT_RL_PULL_TOKEN_ENDPOINT=<url>` | (v0.2.45 V45-D) Runtime override for the RL module's paid-module pull-token gateway URL. Short-circuits the L0 catalog / L1 manifest / hardcoded-default resolution chain inside `installer_engine::request_pull_token` and POSTs the license-key request to `<url>` verbatim. Use when the on-disk endpoint is wrong (manifest still carries a `placeholder.<tld>` URL, tenant has migrated, gateway is being staged behind a custom domain). Empty / whitespace-only values are ignored. Per-module-id generalization (`VCT_<MODULE_ID>_PULL_TOKEN_ENDPOINT`) is on the v0.2.46-46-2 backlog; the V45-D shape is intentionally module-id-flavoured so that the upgrade is backwards-compatible. |
 
 ## Disabling hooks for debugging or CI

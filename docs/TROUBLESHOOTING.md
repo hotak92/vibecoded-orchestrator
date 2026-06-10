@@ -256,36 +256,65 @@ python install.py --update --gpu-vram-threshold-gb 9
 
 This raises the threshold above 8.0 GB so the host falls into the CPU tier deterministically. Alternative: `--cpu-only` skips the GPU probe entirely.
 
-### Python 3.14 is installed but `install.py` fails to import dependencies
+### Python 3.14 detected at install step 1/10 with a wheel-coverage error
 
-`install.py` and the bundled MCP servers target Python **3.12 – 3.13**. Python 3.14 ships some stdlib removals (`distutils`, `imp`) that affect the venv layout step and break a couple of transitive dependencies. If your host's default Python is 3.14, point install at a 3.12 / 3.13 interpreter:
+On v0.2.53+, `_check_python_version` (install.py:6979) detects Python ≥ 3.14 and probes wheel coverage via `pip install --dry-run --only-binary=:all:` against a representative set of binary-heavy deps (`weaviate-client`, `pydantic`, `httpx`). When the probe reports the install would fall back to source build, step 1/10 fails fast with:
 
-```bash
-# Use pyenv (recommended)
-pyenv install 3.13.0
-pyenv shell 3.13.0
-python install.py
+```
+FAIL
+  Python 3.14.X is too new — wheels are not yet published for VCO's binary deps.
+  pip would try to build from source, which typically fails without a C/C++ toolchain installed.
 
-# Or invoke directly
-/usr/bin/python3.13 install.py
+  Workaround: install Python 3.12 or 3.13 and re-run first-install with that interpreter:
+    # macOS / Homebrew:
+    brew install python@3.13
+    /opt/homebrew/bin/python3.13 install.py
+    # Linux / apt:
+    sudo apt install python3.13
+    python3.13 install.py
+    # Windows / py launcher:
+    py -3.13 install.py
 ```
 
-Verify the venv came up on the right interpreter: `cat .venv/pyvenv.cfg | grep version` should show 3.12.x or 3.13.x. If you already created a venv on 3.14, delete `.venv/` and re-run install — `install.py` won't rebuild it just to downgrade the interpreter.
+This is a fail-fast rather than a wait-for-pip-to-fail-15-minutes-deep. The same probe runs in the bootstrap envelope (`_bootstrap_python_wheel_support`, install.py:716) so the `system.python.wheel_support_ok` field in `state/logs/bootstrap-prepass.json` indicates the same condition without running the full install. The check is gated on Python ≥ 3.14 because wheel coverage for 3.12 / 3.13 is universal in practice.
+
+If you already created a venv on 3.14, delete `.venv/` and re-run install with a 3.13 / 3.12 interpreter — install.py won't rebuild the venv just to downgrade. Verify the venv came up on the right interpreter: `cat .venv/pyvenv.cfg | grep version` should show 3.12.x or 3.13.x.
+
+### `install.py` looks hung mid-step (pip / npm / playwright)
+
+Through v0.2.52, several install steps (`pip install -r`, `pip install -e`, `npm install -g`, `npx playwright install`) blocked on long-running subprocesses with no output, making the install indistinguishable from a hang. v0.2.53 routes these through `_run_logged_subprocess` (install.py:10844) with two changes:
+
+1. **Dot-cycle animation** after 3 s of subprocess silence — you see `[12s] pip-install ...` with cycling dots, refreshed once per second. The leading second-count is monotonic from subprocess start. As long as the seconds are advancing, the subprocess is alive.
+2. **Finite per-request pip timeout**: pip is now invoked with `--timeout 60 --retries 5 --prefer-binary` (`_pip_install_flags`, install.py:10777). Previously pip used its default 15-second timeout but install.py wrapped pip in an unbounded outer subprocess — so a stuck pip call could block install.py indefinitely. The new shape gives pip 60 s per HTTP request and surfaces a clean failure (with stderr tail) if the subprocess's outer timeout fires.
+
+What changed for you: if your network is so slow pip is making real progress but slowly, you may now hit the outer subprocess timeout where you previously did not. Check the elapsed-seconds counter — if it stops advancing, the subprocess genuinely hung. If it keeps advancing past the timeout, file an issue with the bootstrap envelope + step log.
 
 ### Podman: "machine not initialized" on macOS / Windows
 
 The first time you run install on macOS or Windows with Podman selected, the Podman daemon needs a one-time `machine init`. v0.2.51+ install.py auto-runs `podman machine start` if the machine exists but is stopped — but it deliberately does NOT auto-run `podman machine init` (which writes a several-GB VM image to your home directory; should be a user-explicit step). Symptom: `install.py` exits with a `UPDATE_DEFERRED.md` entry naming the `podman machine init` command.
 
-Recovery:
+Recovery (one-time setup):
 
 ```bash
-podman machine init                  # one-time; downloads a Fedora CoreOS VM image
-podman machine start                 # boot the VM
+podman machine init --memory 4096 --cpus 2 --disk-size 30
+podman machine start
 podman info                          # sanity-check; should print the connection URI
 python install.py --update           # re-run install — the deferral self-clears once Podman responds
 ```
 
+The `--memory 4096 --cpus 2 --disk-size 30` flags are a sensible default for VCO (Weaviate plus Ollama + code-embed comfortably fit). Without them, Podman's machine defaults are smaller and the Weaviate container can run out of memory under embedding load.
+
 If `podman machine init` fails with "out of disk", clear `~/.local/share/containers/podman/machine/` and retry — the partial download blocks the next init attempt.
+
+### V52-M: bundled hooks shipped without exec bit (FIXED in v0.2.53)
+
+**Symptom (pre-v0.2.53 only)**: hooks dropped into a fresh project by `install.py` (e.g. `bash-context-inject.sh`, `pre-edit-context-inject.sh`) never fired. `claude mcp list` was healthy, the hook registrations in `.claude/settings.json` looked correct, but the hook script behaviour was silently absent. Cause: a subset of `templates/hooks/*.sh` shipped with mode `0644` (no exec bit), and on POSIX Claude Code refuses to invoke a non-executable hook.
+
+**Root cause**: `shutil.copy2` (used by install.py's hook copier) preserves the source file's mode. Any contributor who committed a 664-mode hook silently disabled it for every fresh install. The pre-existing test `test_install_into_fresh_target_linux` caught three such hooks in v0.2.52.
+
+**Fix (v0.2.53)**: belt-and-braces — `install.py:11299` now force-chmods every copied `*.sh` hook target to `0o755` after `copy2`. Source mode is no longer trusted. Same pass also fixed a UTF-8 BOM regression on a couple of `.ps1` siblings that made PowerShell 5.1 refuse to parse them.
+
+**Recovery on v0.2.52 → v0.2.53**: re-run `python install.py --update` from the install root. The chmod-0755 defence runs against every copied hook target, activating any hook that was silently dead before. No data-side work required.
 
 ### Bundled binary path drift on in-place upgrade
 
@@ -651,6 +680,31 @@ Failure mode: the assertion compares `AdoptionReport { adopted, deferred, no_cha
 **Recommended retry policy**: re-run the failing test up to 3× before treating it as a real regression. The tests pass reliably in isolation (`cargo test -p vct-launcher-core --lib t5_idempotent_after_adoption`) — the race only manifests under suite-level pressure.
 
 **Real fix** is queued for v0.2.54: replace the hand-rolled mock with `httpmock` or wiremock-rs, or migrate the mock listener to async / tokio-aware TcpListener so it co-schedules cooperatively with the test's tokio runtime.
+
+## Code embedding service on Apple Silicon / Intel macOS
+
+The CodeSage-Large-v2 GPU build is shipped through `infrastructure/Dockerfile.cuda` (referenced from `install.py:22813`) and is selected automatically on hosts where the bootstrap envelope reports `gpu.vendor == "nvidia"` AND the NVIDIA Container Toolkit is reachable. The plain `Dockerfile` is the CPU-only image (sentence-transformers on CPU, slow).
+
+Apple Silicon (`gpu.vendor == "metal"`) and Intel macOS do NOT have a Metal-accelerated build of the code-embedding service in v0.2.53. The fallback path is Ollama-served `qwen3-embedding:0.6b` for code embeddings (CPU). Configure by setting `CODE_EMBED_BACKEND=ollama` in `.claude/settings.json env` (see `docs/CONFIGURATION.md` → "Embedding configuration"). Code-graph search quality is lower than CodeSage on a CUDA host, but the system stays functional. Metal-backed code embeddings are on the v0.2.5x backlog; track via the `code-embed-metal` label on GitHub.
+
+## SELinux: bind-mount layouts need a `:Z` flag
+
+The bootstrap envelope's `package_manager_advice.selinux_volume_flag_needed` is true when the host is Fedora/RHEL/CentOS Stream with SELinux in enforcing mode (probed via `getenforce` then `/sys/fs/selinux/enforce`). On installs that use **named volumes** (the orchestrator's default), this is informational only — Podman / Docker manage the SELinux relabeling automatically. On installs that **swap in bind mounts** for any container (custom infrastructure layout, dev work, mounting a host directory into the Weaviate container), the bind-mount source needs the `:Z` flag added to the volume argument, or SELinux will deny the container's read/write attempts and the container will fail to start.
+
+The install prints the hint when this condition is detected (see `install.py:7192` → `_print_selinux_bind_mount_hint`). The hint is NOT auto-applied — it is the user's call which mount to relabel and which to leave alone. Typical fix for a custom bind mount in `compose.yaml`:
+
+```yaml
+volumes:
+  - ./mydir:/data:Z       # `:Z` tells Podman/Docker to relabel for private container access
+```
+
+Or, for shared access across multiple containers: `:z` (lowercase, shared label).
+
+## When asking for help
+
+Attach `state/logs/bootstrap-prepass.json` from your install root to any issue or support request. The envelope captures OS / arch / GPU / RAM / tool versions / package-manager advice in a single file (schema at `docs/schemas/install-bootstrap-envelope-v1.json`); maintainers can read the host shape without an unstructured back-and-forth. The file contains no PII — every probe writes only the public-facing data (`pip --version`, `nvidia-smi -L`, etc.). It is regenerated on every `first-install.{sh,command,bat}` invocation.
+
+For a deeper failure, also attach `state/logs/install.jsonl` (the structured per-step install log). `INSTALL_RECOVERY.md` documents its schema for AI-assisted recovery.
 
 ## Getting more help
 
