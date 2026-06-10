@@ -9,16 +9,18 @@
 # ship two files (not a symlink) because Git on Windows doesn't
 # preserve symlinks reliably.
 #
-# v0.2.53 (Track A): thin shim. Python-detect (Apple-Silicon + Intel
-# Homebrew) + cd + exec install.py. Heavy lifting lives in install.py
-# via its `--bootstrap` mode (docs/INSTALL_ARCHITECTURE_v2.md §4).
-#
-# TODO(Phase 2 integration, v0.2.53 → v0.2.54):
-#   - Append `--bootstrap` to the install.py argv below once Track B's
-#     bootstrap-mode dispatch is on main.
-#   - Post-install-launcher.sh dispatch moves into install.py too; users
-#     hitting the v0.2.53 shim before --bootstrap lands need to run
-#     start-launcher.command by hand after install.py completes.
+# v0.2.53 (Track A + Phase 2 integration): thin shim around install.py.
+# Sequence:
+#   1. Python-detect (Apple Silicon Homebrew, Intel Homebrew, PATH)
+#   2. cd into the repo root (Finder cwd is $HOME — M-P1-4)
+#   3. Bootstrap prepass: `install.py --bootstrap --json` writes a
+#      system-detection envelope to state/logs/bootstrap-prepass.json
+#      (read-only probe; best-effort, never blocks the install)
+#   4. Full install: `install.py <forwarded args>` runs the canonical
+#      10-step flow
+#   5. Launcher post-install: scripts/post-install-launcher.sh auto-
+#      spawns the launcher unless --no-auto-launch was passed
+# All sub-steps preserve the original argv via the ARGS array.
 
 set -euo pipefail
 
@@ -82,13 +84,48 @@ if [ -z "$PYTHON" ]; then
 fi
 
 # Forward all arguments verbatim. Translate --non-interactive → --yes.
+# Detect --no-auto-launch so we can skip the post-install launcher spawn.
 ARGS=()
+AUTO_LAUNCH=1
 for a in "$@"; do
     case "$a" in
         --non-interactive) ARGS+=("--yes") ;;
+        --no-auto-launch)  AUTO_LAUNCH=0 ;;
         *) ARGS+=("$a") ;;
     esac
 done
 
-# TODO(Phase 2): add `--bootstrap` to ARGS once Track B's dispatch lands.
-exec "$PYTHON" install.py ${ARGS[@]+"${ARGS[@]}"}
+# ---- Step 1: bootstrap prepass (read-only) ----
+# Probes Python/Node/Podman/Docker/GPU/RAM/OS into a JSON envelope at
+# state/logs/bootstrap-prepass.json. Useful for diagnostics + future
+# prepass-based blocker detection. Best-effort; failure does not stop
+# the install (--bootstrap is exclusive with install flags, so it's
+# invoked alone in a separate process).
+mkdir -p state/logs 2>/dev/null || true
+"$PYTHON" install.py --bootstrap --json \
+    > state/logs/bootstrap-prepass.json 2>/dev/null \
+    || true
+
+# ---- Step 2: full install ----
+# Forward the user's argv unchanged (NOT --bootstrap; bootstrap is
+# probe-only and exclusive with install flags like --update).
+"$PYTHON" install.py ${ARGS[@]+"${ARGS[@]}"}
+status=$?
+
+# ---- Step 3: launcher post-install (auto-spawn) ----
+# Only if install.py succeeded AND user didn't pass --no-auto-launch.
+# Soft-fail: a broken launcher spawn must NOT mask a successful install.
+if [ "$status" -eq 0 ] && [ "$AUTO_LAUNCH" -eq 1 ] \
+   && [ -x scripts/post-install-launcher.sh ]; then
+    bash scripts/post-install-launcher.sh "$SCRIPT_DIR" \
+        ${ARGS[@]+"${ARGS[@]}"} \
+        || true
+fi
+
+# Keep Terminal window open after Finder launch so user can read output.
+if [ -t 0 ] && [ "$status" -ne 0 ]; then
+    read -n 1 -s -r -p "Press any key to close..." || true
+    echo ""
+fi
+
+exit $status

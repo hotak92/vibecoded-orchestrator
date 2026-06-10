@@ -555,14 +555,56 @@ if ($NoCompile)     { $installArgs += "--no-compile" }
 # (matches the .ps1's own non-interactive semantics on line ~95).
 if ($Yes -or $NonInteractive) { $installArgs += "--yes" }
 
+# ---- Step 1: bootstrap prepass (read-only) ----
+# Probes Python/Node/Podman/Docker/GPU/RAM/OS into a JSON envelope at
+# state/logs/bootstrap-prepass.json. Read-only; never blocks the install.
+# Invoked alone in a separate process because --bootstrap is exclusive
+# with install flags like --update.
+$prepassDir = Join-Path (Get-Location) "state\logs"
+if (-not (Test-Path $prepassDir)) {
+    New-Item -ItemType Directory -Path $prepassDir -Force | Out-Null
+}
+$prepassPath = Join-Path $prepassDir "bootstrap-prepass.json"
+try {
+    if ($pythonArgs.Count -gt 0) {
+        & $pythonCmd @pythonArgs install.py --bootstrap --json 2>$null `
+            | Out-File -Encoding utf8 $prepassPath
+    } else {
+        & $pythonCmd install.py --bootstrap --json 2>$null `
+            | Out-File -Encoding utf8 $prepassPath
+    }
+} catch {
+    # Soft-fail: any prepass error is non-blocking.
+}
+
+# ---- Step 2: full install ----
 if ($pythonArgs.Count -gt 0) {
     & $pythonCmd @pythonArgs install.py @installArgs
 } else {
     & $pythonCmd install.py @installArgs
 }
+$installExitCode = $LASTEXITCODE
 
-if ($LASTEXITCODE -ne 0) {
+if ($installExitCode -ne 0) {
     Write-Host ""
     Write-Host "Installation failed. See errors above." -ForegroundColor Red
-    exit $LASTEXITCODE
+    exit $installExitCode
 }
+
+# ---- Step 3: launcher post-install (auto-spawn) ----
+# Parity with Linux/macOS first-install.{sh,command}. Honors the
+# -NoAutoLaunch param (declared in the script's param block).
+# Soft-fail: a broken launcher spawn must NOT mask a successful install.
+if (-not $NoAutoLaunch) {
+    $postInstallScript = Join-Path (Get-Location) "scripts\post-install-launcher.ps1"
+    if (Test-Path $postInstallScript) {
+        try {
+            & $postInstallScript -RepoRoot (Get-Location).Path
+        } catch {
+            Write-Host "post-install-launcher.ps1 failed (non-fatal): $_" `
+                -ForegroundColor Yellow
+        }
+    }
+}
+
+exit 0

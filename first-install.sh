@@ -4,20 +4,20 @@
 #
 # first-install.sh — VibeCoded Tools first-time installer (Linux).
 #
-# v0.2.53 (Track A): thin shim. Python-detect + cd + exec install.py.
-# Everything else (container runtime, Node, Tauri build, launcher
-# post-install) is handled by install.py via its `--bootstrap` mode
-# once Track B's commit lands (see docs/INSTALL_ARCHITECTURE_v2.md §4).
-#
-# TODO(Phase 2 integration, v0.2.53 → v0.2.54):
-#   - Append `--bootstrap` to the install.py argv below once Track B's
-#     bootstrap-mode dispatch is on main. Until then, install.py runs
-#     its normal flow which doesn't yet auto-spawn post-install-launcher.sh.
-#   - Re-run the launcher post-install (scripts/post-install-launcher.sh)
-#     is currently routed via this shim → install.sh → return; the
-#     thin shape skips that wrapper. Users who hit the v0.2.53 shim
-#     before --bootstrap lands will need to run start-launcher.sh by
-#     hand after install.py completes.
+# v0.2.53 (Track A + Phase 2 integration): thin shim around install.py.
+# Sequence:
+#   1. Python-detect (Linux distro cascade, including linuxbrew)
+#   2. cd into the repo root
+#   3. Bootstrap prepass: `install.py --bootstrap --json` writes a
+#      system-detection envelope to state/logs/bootstrap-prepass.json
+#      (read-only probe; no install side effects). Best-effort: failure
+#      here does not block the full install.
+#   4. Full install: `install.py <forwarded args>` runs the canonical
+#      10-step flow.
+#   5. Launcher post-install: scripts/post-install-launcher.sh auto-
+#      spawns the launcher (download/build/launch). Honors
+#      --no-auto-launch passthrough.
+# All sub-steps preserve the original argv via the ARGS array.
 
 set -euo pipefail
 
@@ -64,14 +64,43 @@ if [ -z "$PYTHON" ]; then
 fi
 
 # Forward all arguments verbatim. Translate --non-interactive → --yes
-# (legacy alias that install.py doesn't recognise).
+# (legacy alias that install.py doesn't recognise). Also detect
+# --no-auto-launch so we can skip the post-install launcher spawn.
 ARGS=()
+AUTO_LAUNCH=1
 for a in "$@"; do
     case "$a" in
         --non-interactive) ARGS+=("--yes") ;;
+        --no-auto-launch)  AUTO_LAUNCH=0 ;;
         *) ARGS+=("$a") ;;
     esac
 done
 
-# TODO(Phase 2): add `--bootstrap` to ARGS once Track B's dispatch lands.
-exec "$PYTHON" install.py ${ARGS[@]+"${ARGS[@]}"}
+# ---- Step 1: bootstrap prepass (read-only) ----
+# Probes Python/Node/Podman/Docker/GPU/RAM/OS into a JSON envelope at
+# state/logs/bootstrap-prepass.json. Useful for diagnostic + opens the
+# door to v0.2.54 prepass-based blocker detection. Best-effort:
+# failure does not stop the install (--bootstrap is exclusive with
+# --update etc., so we invoke it ALONE in a separate process).
+mkdir -p state/logs 2>/dev/null || true
+"$PYTHON" install.py --bootstrap --json \
+    > state/logs/bootstrap-prepass.json 2>/dev/null \
+    || true
+
+# ---- Step 2: full install ----
+# Forward the user's argv unchanged (NOT --bootstrap; bootstrap is
+# probe-only and exclusive with install flags like --update).
+"$PYTHON" install.py ${ARGS[@]+"${ARGS[@]}"}
+status=$?
+
+# ---- Step 3: launcher post-install (auto-spawn) ----
+# Only if install.py succeeded AND user didn't pass --no-auto-launch.
+# Soft-fail: a broken launcher spawn must NOT mask a successful install.
+if [ "$status" -eq 0 ] && [ "$AUTO_LAUNCH" -eq 1 ] \
+   && [ -x scripts/post-install-launcher.sh ]; then
+    bash scripts/post-install-launcher.sh "$SCRIPT_DIR" \
+        ${ARGS[@]+"${ARGS[@]}"} \
+        || true
+fi
+
+exit $status
