@@ -582,13 +582,32 @@ def pick(predicate):
     return None
 
 picked = None
+# M-P0-3 (v0.2.53): release.yml currently ships .zip assets for both
+# macOS and Linux (vibecoded-orchestrator-<ver>-macos-arm64.zip,
+# vibecoded-orchestrator-<ver>-linux-x64.zip). The previous filter
+# only accepted .dmg (macOS) / .appimage (Linux), so picked was
+# always None → every user fell into the build path. Prefer .zip and
+# keep the legacy formats as a fallback for if/when CI starts shipping
+# them again.
 if os_name == "linux":
-    picked = pick(lambda n: n.endswith(".appimage"))
+    if arch in ("x86_64", "amd64", "x64"):
+        picked = pick(lambda n: n.endswith(".zip") and ("linux-x64" in n or "linux_x64" in n or "linux" in n))
+    if picked is None:
+        picked = pick(lambda n: n.endswith(".zip") and "linux" in n)
+    if picked is None:
+        # Legacy fallback (CI may resume publishing AppImages later).
+        picked = pick(lambda n: n.endswith(".appimage"))
 elif os_name == "macos":
     if arch in ("arm64", "aarch64"):
-        picked = pick(lambda n: n.endswith(".dmg") and ("arm64" in n or "aarch64" in n))
+        picked = pick(lambda n: n.endswith(".zip") and ("arm64" in n or "aarch64" in n or "macos" in n))
     if picked is None:
-        picked = pick(lambda n: n.endswith(".dmg"))
+        picked = pick(lambda n: n.endswith(".zip") and "macos" in n)
+    if picked is None:
+        # Legacy fallback (CI may resume publishing DMGs later).
+        if arch in ("arm64", "aarch64"):
+            picked = pick(lambda n: n.endswith(".dmg") and ("arm64" in n or "aarch64" in n))
+        if picked is None:
+            picked = pick(lambda n: n.endswith(".dmg"))
 
 if picked:
     print(picked.get("browser_download_url", ""))
@@ -608,7 +627,112 @@ PY
             echo "[launcher] Downloading: $asset_name"
             _log_event "download" "start" "downloading $asset_name" \
                 "{\"asset\":\"$(_json_escape "$asset_name")\"}"
-            if [ "$OS" = "linux" ]; then
+            # M-P0-3 (v0.2.53): release.yml ships .zip assets for both
+            # macOS and Linux. The earlier dispatch assumed .appimage
+            # (Linux) / .dmg (macOS) which never arrived. Now: detect
+            # the actual asset extension from $asset_name and pick the
+            # right extraction path. Legacy .appimage + .dmg branches
+            # are kept for when CI resumes shipping those formats.
+            asset_ext_lower="$(printf '%s' "$asset_name" | tr '[:upper:]' '[:lower:]')"
+            case "$asset_ext_lower" in
+                *.zip) asset_kind="zip" ;;
+                *.appimage) asset_kind="appimage" ;;
+                *.dmg) asset_kind="dmg" ;;
+                *) asset_kind="" ;;
+            esac
+
+            tmp_dir="$(mktemp -d -t vct-launcher.XXXXXX 2>/dev/null \
+                        || mktemp -d "${TMPDIR:-/tmp}/vct-launcher.XXXXXX")"
+
+            if [ "$asset_kind" = "zip" ]; then
+                # Unified .zip extraction path (works on both macOS via
+                # BSD `unzip` and Linux via Info-ZIP `unzip`). Look for:
+                #   1. A flat `vct-launcher` (or `.exe` on Windows — N/A here).
+                #   2. A `.app` bundle (macOS-only signed build).
+                # Mirrors the dist/<os-arch>/ layout the CI uses.
+                tmp_zip="$tmp_dir/launcher.zip"
+                if ! _download "$asset_url" "$tmp_zip"; then
+                    echo "[launcher] Download failed. Falling back to build."
+                    _log_event "download" "error" "$OS zip download failed (curl/wget exit non-zero)"
+                    rm -rf "$tmp_dir"
+                    MODE="build"
+                elif ! command -v unzip >/dev/null 2>&1; then
+                    echo "[launcher] unzip missing — cannot extract $asset_name. Falling back to build."
+                    _log_event "download" "error" "$OS unzip missing for zip extraction"
+                    rm -rf "$tmp_dir"
+                    MODE="build"
+                else
+                    extract_dir="$tmp_dir/extracted"
+                    mkdir -p "$extract_dir"
+                    if ! unzip -q "$tmp_zip" -d "$extract_dir" 2>/dev/null; then
+                        echo "[launcher] unzip failed on $asset_name. Falling back to build."
+                        _log_event "download" "error" "$OS unzip extraction failed"
+                        rm -rf "$tmp_dir"
+                        MODE="build"
+                    else
+                        # Locate launcher binary inside extracted tree.
+                        bin_in_zip=""
+                        if [ "$OS" = "macos" ]; then
+                            # Prefer .app bundle if present.
+                            app_in_zip="$(find "$extract_dir" -maxdepth 5 -name '*.app' -type d 2>/dev/null | head -1)"
+                            if [ -n "$app_in_zip" ]; then
+                                # Install bundle to /Applications (preferred)
+                                # or ~/Applications (fallback if no admin).
+                                if cp -R "$app_in_zip" /Applications/ 2>/dev/null; then
+                                    dest_app="/Applications/$(basename "$app_in_zip")"
+                                else
+                                    mkdir -p "$HOME/Applications"
+                                    cp -R "$app_in_zip" "$HOME/Applications/" 2>/dev/null
+                                    dest_app="$HOME/Applications/$(basename "$app_in_zip")"
+                                fi
+                                for cand in "$dest_app/Contents/MacOS/VCT Launcher" \
+                                            "$dest_app/Contents/MacOS/vct-launcher" \
+                                            "$dest_app/Contents/MacOS/vct-launcher-temp"; do
+                                    if [ -x "$cand" ]; then bin_in_zip="$cand"; break; fi
+                                done
+                            fi
+                            # Fallback: flat vct-launcher inside zip.
+                            if [ -z "$bin_in_zip" ]; then
+                                bin_in_zip="$(find "$extract_dir" -maxdepth 5 \
+                                    \( -name 'vct-launcher' -o -name 'vct-launcher-temp' \) \
+                                    -type f 2>/dev/null | head -1)"
+                                if [ -n "$bin_in_zip" ]; then
+                                    target_dir="$HOME/.local/share/vct-launcher"
+                                    mkdir -p "$target_dir"
+                                    cp "$bin_in_zip" "$target_dir/vct-launcher"
+                                    chmod +x "$target_dir/vct-launcher"
+                                    bin_in_zip="$target_dir/vct-launcher"
+                                fi
+                            fi
+                        else
+                            # Linux: flat vct-launcher.
+                            bin_in_zip="$(find "$extract_dir" -maxdepth 5 \
+                                \( -name 'vct-launcher' -o -name 'vct-launcher-temp' \) \
+                                -type f 2>/dev/null | head -1)"
+                            if [ -n "$bin_in_zip" ]; then
+                                target_dir="$HOME/.local/share/vct-launcher"
+                                mkdir -p "$target_dir"
+                                cp "$bin_in_zip" "$target_dir/vct-launcher"
+                                chmod +x "$target_dir/vct-launcher"
+                                bin_in_zip="$target_dir/vct-launcher"
+                            fi
+                        fi
+                        rm -rf "$tmp_dir"
+                        if [ -n "$bin_in_zip" ] && [ -x "$bin_in_zip" ]; then
+                            LAUNCHER_BIN="$bin_in_zip"
+                            echo "[launcher] Extracted launcher to $LAUNCHER_BIN"
+                            _log_event "download" "ok" "$OS zip extracted" \
+                                "{\"path\":\"$(_json_escape "$LAUNCHER_BIN")\"}"
+                        else
+                            echo "[launcher] No launcher binary found inside $asset_name. Falling back to build."
+                            _log_event "download" "error" "$OS zip missing launcher binary"
+                            MODE="build"
+                        fi
+                    fi
+                fi
+            elif [ "$asset_kind" = "appimage" ] && [ "$OS" = "linux" ]; then
+                # Legacy Linux .appimage path (kept for if/when CI
+                # resumes publishing AppImages — currently disabled).
                 target_dir="$HOME/.local/share/vct-launcher"
                 mkdir -p "$target_dir"
                 target_path="$target_dir/vct-launcher"
@@ -629,29 +753,26 @@ PY
                     fi
                 else
                     echo "[launcher] Download failed. Falling back to build."
-                    _log_event "download" "error" "linux download failed (curl/wget exit non-zero)"
+                    _log_event "download" "error" "linux appimage download failed (curl/wget exit non-zero)"
                     MODE="build"
                 fi
-            elif [ "$OS" = "macos" ]; then
+                rm -rf "$tmp_dir"
+            elif [ "$asset_kind" = "dmg" ] && [ "$OS" = "macos" ]; then
+                # Legacy macOS .dmg path. Kept for if/when CI resumes
+                # publishing DMGs. unreachable today because pick()
+                # prefers .zip first.
                 if [ $HAS_HDIUTIL -eq 0 ]; then
                     echo "[launcher] hdiutil missing (unexpected on macOS). Falling back to build."
                     _log_event "download" "error" "macos hdiutil missing"
+                    rm -rf "$tmp_dir"
                     MODE="build"
                 else
-                    # Use mktemp for idiomatic correctness: avoids $$ races
-                    # and respects $TMPDIR (macOS sandbox places it under
-                    # per-user dirs, not always /tmp). BSD mktemp on macOS
-                    # treats `-t` as a prefix, GNU as a template — using a
-                    # directory + manual basename keeps both happy.
-                    tmp_dir="$(mktemp -d -t vct-launcher.XXXXXX 2>/dev/null \
-                                || mktemp -d "${TMPDIR:-/tmp}/vct-launcher.XXXXXX")"
                     tmp_dmg="$tmp_dir/launcher.dmg"
                     if _download "$asset_url" "$tmp_dmg"; then
                         mount_point="$(hdiutil attach -nobrowse -quiet "$tmp_dmg" 2>/dev/null \
                             | awk '/\/Volumes\// {for (i=3;i<=NF;i++) printf "%s%s", $i, (i<NF?" ":""); print ""}' \
                             | tail -1)"
                         if [ -n "$mount_point" ] && [ -d "$mount_point" ]; then
-                            # Try /Applications first; fall back to ~/Applications if no admin.
                             app_src="$(find "$mount_point" -maxdepth 2 -name '*.app' -type d | head -1)"
                             if [ -n "$app_src" ]; then
                                 if cp -R "$app_src" /Applications/ 2>/dev/null; then
@@ -681,9 +802,16 @@ PY
                     else
                         echo "[launcher] Download failed. Falling back to build."
                         _log_event "download" "error" "macos download failed"
+                        rm -rf "$tmp_dir"
                         MODE="build"
                     fi
                 fi
+            else
+                echo "[launcher] Unrecognised asset extension for $asset_name (kind='$asset_kind'). Falling back to build."
+                _log_event "download" "error" "$OS unknown asset kind" \
+                    "{\"asset\":\"$(_json_escape "$asset_name")\"}"
+                rm -rf "$tmp_dir"
+                MODE="build"
             fi
         fi
     fi
