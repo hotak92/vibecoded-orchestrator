@@ -4330,16 +4330,10 @@ pub async fn update_orchestrator<R: Runtime>(
         // the resume sentinel lands.
         let combined = format!("{}\n{}", stderr, stdout);
         if is_merge_or_rebase_conflict(&combined) {
-            let sha = read_head_sha(&install_path).await.unwrap_or_default();
-            write_update_resume_sentinel(
-                &install_path,
-                "rebase",
-                &pull_branch,
-                &sha,
-            );
-            // v0.2.51 Bug A: ALSO emit the UPDATE_DEFERRED.md entry so
-            // Claude sessions outside the launcher GUI see the state.
-            write_update_resume_deferral(&install_path, "rebase", &pull_branch);
+            // v0.2.53 DEDUP-14: paired sentinel + deferral via the
+            // single helper so future writers can't accidentally write
+            // one without the other (v0.2.51 Bug A class).
+            write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
                 "rebase",
@@ -5784,9 +5778,8 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             // dismiss without aborting; the sentinel + UpdateBadge bring
             // them back via the launcher GUI, while UPDATE_DEFERRED.md
             // surfaces the same state to terminal Claude sessions.
-            let sha = read_head_sha(&install_path).await.unwrap_or_default();
-            write_update_resume_sentinel(&install_path, "merge", &pull_branch, &sha);
-            write_update_resume_deferral(&install_path, "merge", &pull_branch);
+            // v0.2.53 DEDUP-14: paired writer so one cannot be forgotten.
+            write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
 
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
@@ -5951,9 +5944,8 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             // actually moved before re-entering install.py. The deferral
             // mirrors the state into UPDATE_DEFERRED.md for terminal
             // Claude sessions.
-            let sha = read_head_sha(&install_path).await.unwrap_or_default();
-            write_update_resume_sentinel(&install_path, "rebase", &pull_branch, &sha);
-            write_update_resume_deferral(&install_path, "rebase", &pull_branch);
+            // v0.2.53 DEDUP-14: paired writer so one cannot be forgotten.
+            write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
 
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
@@ -6380,6 +6372,53 @@ next successful install.py run, so the resolution is one command.\n\
 
 /// v0.2.51 Bug A: best-effort clear of the `update_resume_required`
 /// deferral entry. Called from `resume_orchestrator_update` (after
+/// v0.2.53 DEDUP-14 (PROMOTED from `rust-installer-dedup-2026-06-10.md`
+/// §Finding E): paired sentinel + deferral writer.
+///
+/// The v0.2.51 Bug A class fires when ONE of the two writes is forgotten
+/// at a conflict-handling site (sentinel-without-deferral leaves Claude
+/// terminal sessions with no signal of the pending update; deferral-
+/// without-sentinel leaves the launcher's UpdateBadge dead). Pre-v0.2.53,
+/// three sites in installer.rs repeated the same 3-line pattern verbatim:
+///
+/// ```ignore
+/// let sha = read_head_sha(&install_path).await.unwrap_or_default();
+/// write_update_resume_sentinel(&install_path, OP, &pull_branch, &sha);
+/// write_update_resume_deferral(&install_path, OP, &pull_branch);
+/// ```
+///
+/// Consolidating into a single helper means future writers can't desync:
+/// you either call `write_resume_sentinel_and_deferral` (atomic-ish from
+/// the call site's perspective) or you call neither.
+///
+/// Atomicity caveat (intentional): the underlying writers each do their
+/// own atomic-rename within their own target file, but the helper is NOT
+/// transactional ACROSS files. If the process dies between the sentinel
+/// write and the deferral write, the launcher gets the sentinel + the
+/// UpdateBadge BUT the Claude-terminal-session signal is missing for
+/// that one boot. Acceptable: the next `install.py --update` re-writes
+/// both records (it inspects the sentinel and re-emits the deferral)
+/// and the user sees no regression from the pre-v0.2.51 behaviour.
+///
+/// Sites consolidated:
+///   - `update_orchestrator` rebase-with-autostash conflict path
+///     (formerly L4324-L4342).
+///   - `merge_orchestrator_with_upstream` conflict path
+///     (formerly L5778-L5780).
+///   - `rebase_orchestrator_onto_upstream` conflict path
+///     (formerly L5945-L5947).
+///
+/// Helper expects `install_path` already-validated by the caller.
+async fn write_resume_sentinel_and_deferral(
+    install_path: &Path,
+    operation: &str,
+    pull_branch: &str,
+) {
+    let sha = read_head_sha(install_path).await.unwrap_or_default();
+    write_update_resume_sentinel(install_path, operation, pull_branch, &sha);
+    write_update_resume_deferral(install_path, operation, pull_branch);
+}
+
 /// install.py runs successfully) and `abort_orchestrator_merge_or_rebase`.
 ///
 /// Conservative semantics: ONLY removes the file when it contains a
@@ -15843,6 +15882,110 @@ MemAvailable:   23456789 kB
             assert!(
                 body.contains("(rebase on `main`)"),
                 "rebase op must be reflected in Detected copy; got: {body}"
+            );
+        }
+
+        // ─── v0.2.53 DEDUP-14: paired sentinel + deferral writer ──────────
+        //
+        // `write_resume_sentinel_and_deferral` is the single helper the
+        // three conflict-handling sites now route through. The tests
+        // below pin the contract: BOTH files land, BOTH carry the right
+        // operation/branch, and a non-existent install_path that fails
+        // the sentinel write still produces a clean error footprint
+        // (no half-written files).
+
+        #[tokio::test]
+        async fn paired_writer_emits_both_sentinel_and_deferral_for_merge() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            write_resume_sentinel_and_deferral(&install, "merge", "main").await;
+
+            let sentinel_path = install.join(UPDATE_RESUME_SENTINEL_REL);
+            let deferral_path = install.join(".claude/context/UPDATE_DEFERRED.md");
+            assert!(sentinel_path.exists(), "sentinel must be written");
+            assert!(deferral_path.exists(), "deferral must be written");
+
+            let s = read_update_resume_sentinel(&install).expect("parse sentinel");
+            assert_eq!(s.operation, "merge");
+            assert_eq!(s.branch, "main");
+
+            let body = std::fs::read_to_string(&deferral_path).expect("read deferral");
+            assert!(
+                body.contains("(merge on `main`)"),
+                "deferral must reflect operation+branch; got: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn paired_writer_emits_both_sentinel_and_deferral_for_rebase() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            write_resume_sentinel_and_deferral(&install, "rebase", "release").await;
+
+            let s = read_update_resume_sentinel(&install).expect("parse sentinel");
+            assert_eq!(s.operation, "rebase");
+            assert_eq!(s.branch, "release");
+            let body = std::fs::read_to_string(
+                install.join(".claude/context/UPDATE_DEFERRED.md"),
+            )
+            .expect("read deferral");
+            assert!(
+                body.contains("(rebase on `release`)"),
+                "deferral must reflect rebase variant; got: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn paired_writer_handles_missing_head_sha_with_empty_string() {
+            // No .git/ in the install_path → `read_head_sha` returns
+            // None → `unwrap_or_default()` gives "". The helper still
+            // writes BOTH files; the empty SHA is intentional and is
+            // handled by the v0.2.53 NEW-11 empty-sha refusal branch
+            // in `resume_orchestrator_update`.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            write_resume_sentinel_and_deferral(&install, "merge", "main").await;
+
+            let s = read_update_resume_sentinel(&install).expect("parse sentinel");
+            assert!(
+                s.sha_at_conflict.is_empty(),
+                "no .git → sha_at_conflict must be empty (NEW-11 will refuse resume)"
+            );
+            assert!(
+                install.join(".claude/context/UPDATE_DEFERRED.md").exists(),
+                "deferral must still be emitted even when sha is empty"
+            );
+        }
+
+        /// v0.2.53 DEDUP-14 integration-shape test (Track C scope).
+        /// Atomic-ish contract: both files land, OR the function returns
+        /// silently (best-effort). Forgetting one of the two writes is
+        /// what produced v0.2.51 Bug A; this test catches any future
+        /// refactor that reintroduces the split.
+        #[tokio::test]
+        async fn paired_writer_helper_writes_both_files_in_single_call() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            // PRE: nothing written.
+            assert!(!install.join(UPDATE_RESUME_SENTINEL_REL).exists());
+            assert!(!install.join(".claude/context/UPDATE_DEFERRED.md").exists());
+
+            // CALL.
+            write_resume_sentinel_and_deferral(&install, "merge", "main").await;
+
+            // POST: both written.
+            let sentinel_written = install.join(UPDATE_RESUME_SENTINEL_REL).exists();
+            let deferral_written = install
+                .join(".claude/context/UPDATE_DEFERRED.md")
+                .exists();
+            assert!(
+                sentinel_written && deferral_written,
+                "paired writer MUST emit BOTH files (forgetting one is v0.2.51 Bug A class); \
+                 sentinel_written={sentinel_written}, deferral_written={deferral_written}"
             );
         }
 
