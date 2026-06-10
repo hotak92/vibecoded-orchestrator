@@ -560,6 +560,60 @@ def _utc_iso_now() -> str:
 
 
 # ---------------------------------------------------------------------------
+# v0.2.53 DEDUP-3: _make_deferral builder
+#
+# Replaces 51 inline `DeferralEntry(...)` constructions in install.py.
+#
+# WHY:
+# * The default `kg_node_refs=[]` was an empirical bug source — half the
+#   inline constructions forgot to pass it (the dataclass field default
+#   factory works, but cleaner to make the keyword explicit + verified).
+# * Multi-line `detected` / `why_deferred` strings were copy-pasted as
+#   triple-quoted bodies with inconsistent leading-whitespace
+#   handling. The helper applies textwrap.dedent + strip uniformly.
+# * Test coverage today asserts shape per-callsite; one helper means
+#   one set of assertions catches the class.
+#
+# Per audit install-py-dedup-2026-06-10.md #11 (LoC saved ~150).
+# ---------------------------------------------------------------------------
+
+
+def _make_deferral(
+    condition_id: str,
+    *,
+    title: str,
+    detected: str,
+    why_deferred: str,
+    command_to_apply: str,
+    severity: str = "warning",
+    kg_node_refs: Optional[list[str]] = None,
+) -> DeferralEntry:
+    """Build a :class:`DeferralEntry` with shared phrasing patterns.
+
+    Applies :func:`textwrap.dedent` + :func:`str.strip` to the
+    multi-line text fields (`detected`, `why_deferred`,
+    `command_to_apply`) so callers can use triple-quoted strings with
+    arbitrary indentation without leaking whitespace into the
+    rendered Markdown of UPDATE_DEFERRED.md.
+
+    Defaults ``kg_node_refs`` to ``[]`` rather than relying on the
+    dataclass field_factory — explicit-default catches the missing-kwarg
+    typo class that bit the project in past releases (51 callsites,
+    several had drifted to forget kg_node_refs entirely).
+    """
+    import textwrap
+    return DeferralEntry(
+        condition_id=condition_id,
+        title=title.strip(),
+        detected=textwrap.dedent(detected).strip(),
+        why_deferred=textwrap.dedent(why_deferred).strip(),
+        command_to_apply=textwrap.dedent(command_to_apply).strip(),
+        severity=severity,
+        kg_node_refs=list(kg_node_refs) if kg_node_refs else [],
+    )
+
+
+# ---------------------------------------------------------------------------
 # v0.2.53 bootstrap mode (`install.py --bootstrap`)
 #
 # Implements §3 of docs/INSTALL_ARCHITECTURE_v2.md.
@@ -3639,8 +3693,12 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         # later block can pick it up. The args namespace is the only
         # mutable cross-step carrier inside _run_lightweight without
         # threading another argument through.
-        args._venv_skip_no_manifest_entry = DeferralEntry(
-            condition_id="venv_skip_no_manifest",
+        # v0.2.53 DEDUP-3: routed through _make_deferral. Text fields
+        # use single-line concatenation (matching original behavior
+        # byte-for-byte); the helper's textwrap.dedent passes them
+        # through unchanged since there's no leading whitespace.
+        args._venv_skip_no_manifest_entry = _make_deferral(
+            "venv_skip_no_manifest",
             title="Venv preserved (no VCO manifest detected)",
             detected=(
                 f"Found `.venv` at {_venv_path} but no "
@@ -3657,9 +3715,7 @@ def _run_lightweight(args: argparse.Namespace) -> int:
                 "Python is intentionally different from what created "
                 "it), re-run with the explicit `--rebuild-venv` flag."
             ),
-            command_to_apply=(
-                f"python install.py --lightweight --rebuild-venv"
-            ),
+            command_to_apply="python install.py --lightweight --rebuild-venv",
             severity="warning",
             kg_node_refs=[
                 "knowledge/concepts/venv-adopt-guard-v0246.md",
