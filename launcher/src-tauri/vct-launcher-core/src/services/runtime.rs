@@ -164,6 +164,191 @@ impl RuntimeInfo {
 // ---------------------------------------------------------------------------
 // PATH resolution
 // ---------------------------------------------------------------------------
+//
+// v0.2.53 — graphical-launch PATH augment.
+//
+// Track C M-P0-7 and Track G3 L-P0-4 are the SAME ROOT CAUSE on macOS
+// and Linux respectively: graphical launchers (Finder .app /
+// .desktop activation) inherit a minimal PATH that excludes the user's
+// homebrew/cargo/pipx/Linuxbrew/snap/flatpak install dirs. This helper
+// — Track C-owned — is duplicated here verbatim so Track G3's
+// integration test (`tests/test_linux_desktop_launch_path_augmentation.rs`)
+// compiles before Phase 2 merges Track C in. After Phase 2 the
+// duplicate resolves cleanly (identical content; Git's merge picks
+// either side).
+
+/// Augment the process-wide `PATH` with the OS-appropriate locations where
+/// user-installed CLI tooling (homebrew, cargo, pipx, linuxbrew, snap, flatpak)
+/// typically lives but which graphical launchers (Finder on macOS,
+/// `.desktop` files under GNOME/KDE on Linux) do NOT inherit.
+///
+/// Why this exists (v0.2.53 M-P0-7 / L-P0-4):
+///   - macOS: when the launcher is started by double-clicking
+///     `start-launcher.command` in Finder OR by clicking the launcher
+///     `.app` in `~/Applications/`, the process inherits the LaunchServices
+///     default PATH: `/usr/bin:/bin:/usr/sbin:/sbin` — `/opt/homebrew/bin/`
+///     and `$HOME/.cargo/bin/` are NOT on it. Every subsequent `python3`,
+///     `cargo`, `joern`, `podman`, `git` spawn fails with "command not
+///     found" until the user manually re-launches the launcher from a
+///     terminal session that DID source `.zshrc` /
+///     `eval "$(brew shellenv)"`.
+///   - Linux: same shape via `.desktop` launchers. Under systemd-user,
+///     the PATH is
+///     `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` —
+///     `$HOME/.cargo/bin`, `$HOME/.local/bin`, Linuxbrew, snap, flatpak
+///     are missing. Frequency is lower than macOS (Linux dev users tend
+///     to launch from terminal) but the bug shape is identical.
+///   - Windows: Explorer-launched apps inherit the user PATH via
+///     registry (`HKCU\Environment`), so no augmentation is needed.
+///
+/// Cross-OS triage finding (`cross-os-triage-2026-06-10.md` §P0-7)
+/// confirms the macOS + Linux PATH inheritance class is the same root
+/// cause: launcher processes spawned from graphical contexts do NOT
+/// see the user's interactive-shell PATH. Single helper, OS-cfg'd
+/// candidates.
+///
+/// Properties:
+///   - Idempotent: calling twice does not duplicate entries.
+///   - Order-preserving: existing user PATH stays in its original
+///     order; augment candidates are PREPENDED so they take precedence
+///     over the system PATH (but only when missing). This matters when
+///     the user has both a system `python3` and a homebrew `python3` —
+///     homebrew should win for parity with their interactive shell.
+///   - Soft-fail: if `HOME` is unset (CI / sandboxed contexts) the
+///     candidates that reference `$HOME` are silently dropped.
+///   - Resolves `~` expansion: `$HOME/.cargo/bin` is materialised, not
+///     literal.
+pub fn augment_path_for_graphical_launch() {
+    let candidates = augment_candidates();
+    if candidates.is_empty() {
+        return;
+    }
+
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut seen: std::collections::HashSet<PathBuf> =
+        std::env::split_paths(&current).collect();
+
+    // Prepend candidates that are not already on PATH, preserving the
+    // order declared in `augment_candidates()`. Existing PATH entries
+    // follow.
+    let mut new_entries: Vec<PathBuf> = Vec::with_capacity(candidates.len());
+    for cand in candidates {
+        if seen.insert(cand.clone()) {
+            new_entries.push(cand);
+        }
+    }
+    if new_entries.is_empty() {
+        return; // All candidates already on PATH — nothing to do.
+    }
+
+    // Append existing PATH entries after the new prepended candidates.
+    new_entries.extend(std::env::split_paths(&current));
+
+    match std::env::join_paths(new_entries.iter()) {
+        Ok(joined) => {
+            // Safety: setting PATH process-wide is sound because we
+            // are single-threaded at this call site (lib.rs `setup()`
+            // runs before any subprocess spawn or Tauri-managed thread
+            // is unparked). `set_var` itself is `unsafe` on edition
+            // 2024+, but stable Rust allows the safe form via
+            // std::env::set_var on current crate edition (2021).
+            std::env::set_var("PATH", &joined);
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] augment_path_for_graphical_launch: join_paths failed: {} — \
+                 PATH left unchanged",
+                e
+            );
+        }
+    }
+}
+
+/// OS-specific list of directories to prepend to PATH, in priority
+/// order (first entry wins for collisions). Candidates that do not
+/// exist on disk are still added — the user may install the tooling
+/// later and re-launch. Only `$HOME`-relative candidates are dropped
+/// when `HOME` is unset.
+fn augment_candidates() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut out: Vec<PathBuf> = vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/opt/homebrew/sbin"),
+        ];
+        if let Some(h) = home.as_ref() {
+            out.push(h.join(".cargo/bin"));
+            out.push(h.join(".local/bin"));
+        }
+        out
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut out: Vec<PathBuf> = Vec::new();
+        if let Some(h) = home.as_ref() {
+            out.push(h.join(".local/bin"));
+            out.push(h.join(".cargo/bin"));
+        }
+        out.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
+        out.push(PathBuf::from("/snap/bin"));
+        out.push(PathBuf::from("/var/lib/flatpak/exports/bin"));
+        out
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Windows + other targets: no-op. Explorer-launched apps
+        // inherit the user PATH via the registry, so augmentation is
+        // unnecessary.
+        let _ = home;
+        Vec::new()
+    }
+}
+
+// v0.2.53 L-P0-4 (Track G3) — coverage note:
+//
+//   On Linux, when the launcher is started by activating
+//   `vct-launcher.desktop` from the GNOME / KDE Plasma 6 menu (or via
+//   file-manager double-click), the inherited PATH from systemd --user
+//   is minimal:
+//
+//       /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+//
+//   That excludes the common user-installed tooling locations:
+//
+//       $HOME/.local/bin    (pipx, pip --user, manual installs)
+//       $HOME/.cargo/bin    (rustup-managed cargo + lean-ctx + tools)
+//       /home/linuxbrew/.linuxbrew/bin  (Linuxbrew)
+//       /snap/bin           (snap-installed CLIs)
+//       /var/lib/flatpak/exports/bin    (flatpak CLI proxies)
+//
+//   `which_on_path()` below reads the current process PATH. Without
+//   augmentation, every subsequent `node` / `npm` / `cargo` /
+//   `joern` / `lean-ctx` / `podman-compose` (pip --user install) lookup
+//   would fail under .desktop launch, and the launcher would think the
+//   user has no toolchain installed even though their interactive shell
+//   sees all of them.
+//
+//   This is fixed by Track C's M-P0-7 process-wide PATH augment:
+//   `augment_path_for_graphical_launch()` in this same module is called
+//   from `lib.rs::setup()` BEFORE any subprocess spawn or thread spawn,
+//   prepending the OS-specific candidate directories to PATH. After that
+//   runs, this `which_on_path()` resolves Node, Joern, lean-ctx, cargo,
+//   npm correctly under both interactive-shell AND .desktop launch
+//   contexts.
+//
+//   Track G3's own concern (L-P0-4 from the comprehensive audit) is
+//   THE SAME ROOT CAUSE as Track C's M-P0-7; we explicitly defer to
+//   that helper rather than duplicating the augment logic here. The
+//   integration test
+//   `tests/test_linux_desktop_launch_path_augmentation.rs` asserts
+//   the contract end-to-end on Linux: minimal-PATH process + augment +
+//   which_on_path("node"|"npm"|"cargo"|"lean-ctx"|"joern") must all
+//   resolve when the corresponding binary exists in any of the augment
+//   candidate dirs.
 
 /// Augment the process-wide `PATH` with the OS-appropriate locations where
 /// user-installed CLI tooling (homebrew, cargo, pipx, linuxbrew, snap, flatpak)

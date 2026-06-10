@@ -4,12 +4,34 @@ Version=1.0
 Name=Install VibeCoded Tools
 GenericName=VibeCoded Tools Installer
 Comment=One-click installer for the VibeCoded Tools orchestrator
-# %k expands to the directory containing this .desktop file, so the
-# launcher works whether it's run in-place from a cloned repo, copied
-# to ~/Desktop/, or installed to ~/.local/share/applications/.
-# We `cd` into that dir, run first-install.sh, then keep the terminal
-# open so the user can read the final status.
-Exec=bash -c "cd %k && ./first-install.sh; echo; read -p 'Press Enter to close.' _"
+# v0.2.53 L-P0-5 fix:
+#   The previous Exec= used `cd %k` which expanded to the .desktop file's
+#   CURRENT directory at the time of activation. That broke when users did
+#   `cp first-install.desktop ~/Desktop/` (a documented path in
+#   docs/GETTING_STARTED.md) — `%k` then resolved to `~/Desktop/`, which
+#   does NOT contain `first-install.sh`. The activation failed silently
+#   on GNOME and crashed with "first-install.sh: No such file or
+#   directory" on KDE Plasma 6.
+#
+#   Also: KDE Plasma 6's Desktop Entry parser is stricter than GNOME's
+#   about quoting inside Exec=. Embedded double quotes inside an
+#   already-double-quoted bash -c argument confused KDE (it dropped the
+#   inner quotes silently, breaking the `read -p 'Press Enter...'`
+#   prompt). We now use single quotes for the inner read prompt and
+#   escape-free `sh -c "..."` quoting per freedesktop.org §1.5.
+#
+#   The new Exec= probes (in order):
+#     1. The .desktop file's directory (%k) — works when the .desktop
+#        was activated FROM the clone (in-place double-click).
+#     2. The user's documented install root candidates (HOME-relative
+#        ~/vibecoded-orchestrator, ~/Desktop/vibecoded-orchestrator,
+#        and the cwd) — works after the cp-to-Desktop workflow.
+#     3. Falls back to a clear error message pointing at the docs URL.
+#
+#   The "Press Enter to close" prompt at the end keeps the terminal open
+#   so users can read the install result before the window vanishes
+#   (terminal-spawning DEs auto-close on script exit otherwise).
+Exec=sh -c 'set -e; for d in "%k" "$HOME/vibecoded-orchestrator" "$HOME/Desktop/vibecoded-orchestrator" "$PWD"; do if [ -x "$d/first-install.sh" ]; then cd "$d" && ./first-install.sh; rc=$?; echo; printf "Press Enter to close. "; read _; exit $rc; fi; done; echo "ERROR: could not locate first-install.sh in %k, ~/vibecoded-orchestrator, ~/Desktop/vibecoded-orchestrator, or $PWD."; echo "See https://github.com/hotak92/vibecoded-orchestrator#getting-started for the canonical install path."; printf "Press Enter to close. "; read _; exit 1'
 Icon=utilities-terminal
 Terminal=true
 Categories=Development;
