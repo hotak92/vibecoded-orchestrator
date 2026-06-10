@@ -332,8 +332,35 @@ if /I "%NODE_ANS%"=="N" (
 winget install --accept-package-agreements --accept-source-agreements OpenJS.NodeJS
 
 :after_winget_install
-REM winget modifies PATH for new shells but not us — refresh.
-call refreshenv >nul 2>&1
+REM winget modifies the persistent PATH (HKLM + HKCU registry) for NEW
+REM shells but not for us — refresh by reading the registry directly.
+REM
+REM W-P1-2 (v0.2.53 Track H): the previous `call refreshenv >nul 2>&1`
+REM relied on Chocolatey's `refreshenv` shim. That shim ships with
+REM `choco install` (and with the cmder/clink helpers) — it is NOT
+REM pre-installed on stock Win10/Win11. The redirect to nul swallowed
+REM the "is not recognized" error, so the call silently no-op'd, our
+REM in-process PATH was never updated, and `:recheck_node`'s `where /q
+REM node` couldn't find the just-installed binary. The user got "Still
+REM no Node on PATH. Try a new terminal." on the SAME terminal that
+REM JUST ran a successful winget install.
+REM
+REM Fix: read HKLM Path + HKCU Path via PowerShell's
+REM [Environment]::GetEnvironmentVariable("Path", "Machine"|"User"),
+REM concat (Machine wins ties — same precedence as a fresh shell), and
+REM splice into the current %PATH%. We use PowerShell rather than `reg
+REM query` because reg-query output requires tokenization that is
+REM brittle when the PATH contains spaces (cmd-side parsing trap).
+REM PowerShell's API returns the value as a single string already.
+REM
+REM Idempotent: if PS fails (unlikely — powershell.exe ships with
+REM every Win7+ install), we fall through with the unchanged PATH and
+REM let `:recheck_node` give the user the manual-retry prompt.
+for /f "delims=" %%P in ('"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$m = [Environment]::GetEnvironmentVariable('Path', 'Machine');" ^
+    "$u = [Environment]::GetEnvironmentVariable('Path', 'User');" ^
+    "$p = @($m, $u) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd(';') };" ^
+    "[Console]::Out.Write(($p -join ';'))" 2^>nul') do set "PATH=%%P"
 goto :recheck_node
 
 :no_winget
