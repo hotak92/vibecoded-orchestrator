@@ -9,9 +9,16 @@
 # timeout + error suppression, Write-Host -ForegroundColor Yellow for
 # stderr WARNING emission).
 #
-# Requires PowerShell 7+. PowerShell 5.1 (Windows-bundled) has buggy
-# Invoke-WebRequest error handling for non-2xx responses; users on
-# Windows should install pwsh 7+ or shell out to WSL bash.
+# Compatibility (v0.2.53 Track H W-P1-4): supports BOTH Windows
+# PowerShell 5.1 (bundled with every Win7+ install) and PowerShell 7+
+# (pwsh.exe — separate install). Earlier revisions used the PS 7+ only
+# `-SkipHttpErrorCheck` flag, which parse-fails on PS 5.1 and bricked
+# the access-matrix gate on every stock Windows machine. The new
+# try/catch wrapper covers both modes: PS 5.1 throws WebException on
+# 4xx/5xx (response readable via $_.Exception.Response); PS 7 throws
+# HttpResponseException (response readable via $_.ErrorDetails.Message
+# or $_.Exception.Response). The hub-unreachable fail-open contract is
+# unchanged across both PS versions.
 #
 # Hub contract (consumed; main chat lands the server side at
 # `launcher/src-tauri/vct-hub/src/project_state_api.rs`):
@@ -209,22 +216,66 @@ if (-not $hubToken) {
 $hubPort = Get-AccessHubPort
 $url = "http://127.0.0.1:${hubPort}/api/v1/projects/${ProjectId}/access/${Collection}"
 
-# Invoke-WebRequest with 5s timeout. -SkipHttpErrorCheck (PS 7+) lets us
-# inspect non-2xx responses inline instead of having them throw. The
-# overall try/catch still wraps in case the connection itself fails
-# (refused, DNS, etc.).
+# Invoke-WebRequest with 5s timeout, PS 5.1- and PS 7-compatible
+# (W-P1-4). The previous version used `-SkipHttpErrorCheck` which is
+# PS 7+ only — under PS 5.1 the script parse-failed before running,
+# defeating the access-matrix gate on stock Windows (the parse error
+# was caught by the hook caller's own fallback as "no stdout → assume
+# write", which technically still allowed writes, but bypassed the
+# entire policy mechanism). The new try/catch chain handles 4xx/5xx
+# uniformly on both PS versions; only true connection failures (no
+# response object) fall into Invoke-AccessFailOpen.
 $response = $null
 $statusCode = 0
+$responseBody = ''
 try {
     $response = Invoke-WebRequest `
         -Uri $url `
         -Method GET `
         -Headers @{ 'Authorization' = "Bearer $hubToken" } `
         -TimeoutSec 5 `
-        -SkipHttpErrorCheck `
         -UseBasicParsing `
         -ErrorAction Stop
     $statusCode = [int]$response.StatusCode
+    $responseBody = [string]$response.Content
+} catch [System.Net.WebException] {
+    # PS 5.1: 4xx/5xx throws WebException. Extract status + body.
+    $webResp = $_.Exception.Response
+    if ($null -eq $webResp) {
+        Invoke-AccessFailOpen -Reason "url_error_$($_.Exception.GetType().Name)"
+    }
+    try { $statusCode = [int]$webResp.StatusCode } catch { $statusCode = 0 }
+    try {
+        $stream = $webResp.GetResponseStream()
+        if ($null -ne $stream) {
+            $reader = New-Object System.IO.StreamReader($stream)
+            try {
+                $responseBody = $reader.ReadToEnd()
+            } finally {
+                $reader.Dispose()
+            }
+        }
+    } catch {
+        $responseBody = ''
+    }
+    if ($statusCode -le 0) {
+        Invoke-AccessFailOpen -Reason "url_error_$($_.Exception.GetType().Name)"
+    }
+} catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+    # PS 7: HttpResponseException carries Response + ErrorDetails.Message.
+    $psResp = $_.Exception.Response
+    if ($null -eq $psResp) {
+        Invoke-AccessFailOpen -Reason "url_error_$($_.Exception.GetType().Name)"
+    }
+    try { $statusCode = [int]$psResp.StatusCode } catch { $statusCode = 0 }
+    try {
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $responseBody = [string]$_.ErrorDetails.Message
+        }
+    } catch { $responseBody = '' }
+    if ($statusCode -le 0) {
+        Invoke-AccessFailOpen -Reason "url_error_$($_.Exception.GetType().Name)"
+    }
 } catch {
     # Connection refused, DNS failure, TLS error, etc. — all fail-open.
     Invoke-AccessFailOpen -Reason "url_error_$($_.Exception.GetType().Name)"
@@ -252,7 +303,14 @@ if ($statusCode -ne 200) {
 # Parse {"level": "..."} from response body. Strict allowlist on the
 # returned value — anything outside {read, write, none} is treated as
 # malformed.
-$body = $response.Content
+#
+# $responseBody is populated by the try/catch chain above for ALL
+# branches that reach this point (statusCode == 200). The successful
+# Invoke-WebRequest branch copies $response.Content; the WebException
+# / HttpResponseException branches read the response stream / error
+# details. (The 200-OK path in PS 5.1 doesn't throw, so $response is
+# populated and we already wrote $response.Content into $responseBody.)
+$body = $responseBody
 $level = ''
 try {
     $parsed = $body | ConvertFrom-Json -ErrorAction Stop
