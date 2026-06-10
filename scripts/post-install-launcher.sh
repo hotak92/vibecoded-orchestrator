@@ -442,10 +442,37 @@ candidates_mac=(
     "$HOME/Applications/VCT Launcher.app/Contents/MacOS/vct-launcher"
 )
 
+# v0.2.53 (Track A — metadata.json reader half): if Track D's CI emitted
+# launcher/dist/<os-arch>/metadata.json the candidate_paths_per_os.<os>
+# array drives the search before the hardcoded fallback. Schema lives
+# at docs/INSTALL_ARCHITECTURE_v2.md §4.4.
+_metadata_candidates_for_os() {
+    local target_os="$1"
+    if [ -f "$REPO_ROOT/scripts/lib/launcher-metadata.sh" ]; then
+        # shellcheck source=lib/launcher-metadata.sh
+        . "$REPO_ROOT/scripts/lib/launcher-metadata.sh"
+        launcher_metadata_candidates "$REPO_ROOT" "$target_os" 2>/dev/null || true
+    fi
+}
+
 find_binary() {
+    # 1. Metadata-driven candidates win when present (matches the
+    #    binary the release CI actually shipped this version).
+    local meta_lines line
+    meta_lines="$(_metadata_candidates_for_os "$OS")"
+    if [ -n "$meta_lines" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [ -x "$line" ]; then echo "$line"; return 0; fi
+        done <<META
+$meta_lines
+META
+    fi
+    # 2. Hardcoded unix candidates.
     for c in "${candidates_unix[@]}"; do
         [ -x "$c" ] && { echo "$c"; return 0; }
     done
+    # 3. macOS-only hardcoded candidates.
     if [ "$OS" = "macos" ]; then
         for c in "${candidates_mac[@]}"; do
             [ -x "$c" ] && { echo "$c"; return 0; }

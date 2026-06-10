@@ -22,7 +22,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# v0.2.53 (Track A): metadata.json reader — see
+# docs/INSTALL_ARCHITECTURE_v2.md §4.4 for the schema. Falls back to
+# the hardcoded candidates list below when metadata is missing.
+metadata_candidates=()
+if [ -f "$SCRIPT_DIR/scripts/lib/launcher-metadata.sh" ]; then
+    # shellcheck source=scripts/lib/launcher-metadata.sh
+    . "$SCRIPT_DIR/scripts/lib/launcher-metadata.sh"
+    if meta_lines="$(launcher_metadata_candidates "$SCRIPT_DIR" macos 2>/dev/null)"; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            metadata_candidates+=("$line")
+        done <<META
+$meta_lines
+META
+    fi
+fi
+
 candidates=(
+    "${metadata_candidates[@]+"${metadata_candidates[@]}"}"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/vct-launcher"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/vct-launcher-temp"
     "$SCRIPT_DIR/launcher/src-tauri/target/release/launcher"
