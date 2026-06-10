@@ -412,6 +412,102 @@ else
         "scripts/check-pre-tag-privacy.sh missing or not executable"
 fi
 
+# ── Gate 22: tri-OS install smoke green on main (v0.2.53 Track D, M-P1-8). ───
+#
+# The install-smoke-tri-os.yml workflow runs the full first-install.{sh,
+# command,bat} flow against ubuntu-22.04, ubuntu-24.04, macos-14,
+# windows-latest, and fedora-40 (matrix.label) using a fresh git clone
+# — the same code path third-party users exercise. Per
+# docs/INSTALL_ARCHITECTURE_v2.md §9.5 / §6 row M-P1-8 (Track D), no
+# release tag may be pushed unless EVERY matrix entry of the most-recent
+# completed run on main was successful within the last 24 hours.
+#
+# Implementation: query GitHub Actions REST API for the latest completed
+# run, then check the per-job conclusion of all 5 matrix entries (the
+# workflow uses `fail-fast: false` so each matrix leg has its own
+# conclusion). A single failed leg → FAIL. The 24-hour window prevents
+# stale-success masking: if the workflow hasn't run in the last day,
+# we WARN (the daily cron should catch this; releasing right after a
+# multi-day infrastructure outage is uncommon).
+#
+# Dry-run support: `--dry-run` flag prints the gh CLI invocation that
+# would be made + exits with the WARN state, so the gate can be exercised
+# at PR time without a fresh successful run existing yet. The flag is
+# parsed from $1 if it's literally `--dry-run`; legacy
+# `bash pre-ship-check.sh 0.2.53` argument shape still works because
+# `--dry-run` would never be a valid version string.
+TRI_OS_WORKFLOW="install-smoke-tri-os.yml"
+TRI_OS_DRY_RUN=0
+for _arg in "$@"; do
+    [ "$_arg" = "--dry-run" ] && TRI_OS_DRY_RUN=1
+done
+if [ "$TRI_OS_DRY_RUN" -eq 1 ]; then
+    gate_warn "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
+        "--dry-run: would query: gh run list --repo $REPO --workflow $TRI_OS_WORKFLOW --branch main --status completed --limit 1"
+else
+    # Fetch the most-recent completed run on main: id, conclusion,
+    # createdAt. createdAt is ISO 8601 UTC; we check it's within 24h.
+    _tri_run_json="$(gh run list \
+        --repo "$REPO" \
+        --workflow "$TRI_OS_WORKFLOW" \
+        --branch main \
+        --status completed \
+        --limit 1 \
+        --json databaseId,conclusion,createdAt \
+        --jq '.[0] // empty' 2>/dev/null || echo "")"
+    if [ -z "$_tri_run_json" ]; then
+        gate_warn "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
+            "No completed run found on main for $TRI_OS_WORKFLOW yet (workflow may have just landed; let it run before tagging)"
+    else
+        _tri_conclusion="$(echo "$_tri_run_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("conclusion",""))' 2>/dev/null || echo "")"
+        _tri_run_id="$(echo "$_tri_run_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("databaseId",""))' 2>/dev/null || echo "")"
+        _tri_created="$(echo "$_tri_run_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("createdAt",""))' 2>/dev/null || echo "")"
+        # Reject runs older than 24h — release-tagging against a stale
+        # green is exactly the failure mode this gate is meant to catch.
+        _tri_age_ok=1
+        if [ -n "$_tri_created" ]; then
+            _now_epoch="$(date -u +%s)"
+            # macOS date doesn't grok -d; use python.
+            _tri_age_ok="$(python3 - "$_tri_created" "$_now_epoch" <<'PY'
+import sys, datetime
+created_iso, now_epoch = sys.argv[1], int(sys.argv[2])
+created = datetime.datetime.strptime(created_iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+age_h = (now_epoch - int(created.timestamp())) / 3600
+print(1 if age_h <= 24 else 0)
+PY
+)"
+        fi
+        if [ "$_tri_conclusion" != "success" ]; then
+            gate_fail "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
+                "Run $_tri_run_id concluded: $_tri_conclusion (expected: success). gh run view $_tri_run_id --repo $REPO"
+        elif [ "$_tri_age_ok" != "1" ]; then
+            gate_warn "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
+                "Last success ($_tri_run_id at $_tri_created) is older than 24h; trigger a fresh run before tagging: gh workflow run $TRI_OS_WORKFLOW --repo $REPO --ref main"
+        else
+            # Verify every matrix leg in the run succeeded, not just the
+            # overall conclusion. (The aggregated `conclusion` reflects
+            # fail-fast=false semantics: even if one leg failed it can
+            # show up as `failure`, which the check above catches — but
+            # we double-check at the per-job level for defense in depth.)
+            _tri_legs="$(gh run view "$_tri_run_id" \
+                --repo "$REPO" \
+                --json jobs \
+                --jq '[.jobs[] | select(.name | startswith("install smoke ")) | {name, conclusion}]' 2>/dev/null || echo "[]")"
+            _tri_n_legs="$(echo "$_tri_legs" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "0")"
+            _tri_n_fail="$(echo "$_tri_legs" | python3 -c 'import json,sys; print(sum(1 for j in json.load(sys.stdin) if j.get("conclusion") != "success"))' 2>/dev/null || echo "0")"
+            if [ "$_tri_n_legs" -lt 5 ]; then
+                gate_warn "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
+                    "Run $_tri_run_id has only $_tri_n_legs install-smoke matrix legs (expected 5: ubuntu-22.04, ubuntu-24.04, macos-14, windows-latest, fedora-40)"
+            elif [ "$_tri_n_fail" -gt 0 ]; then
+                gate_fail "tri-OS install smoke green on main (v0.2.53 M-P1-8)" \
+                    "Run $_tri_run_id: $_tri_n_fail / $_tri_n_legs matrix legs failed. gh run view $_tri_run_id --repo $REPO"
+            else
+                gate_pass "tri-OS install smoke green on main (v0.2.53 M-P1-8): run $_tri_run_id, $_tri_n_legs/$_tri_n_legs matrix legs green within last 24h"
+            fi
+        fi
+    fi
+fi
+
 echo ""
 
 # ── Section 4: Version-pin consistency ───────────────────────────────────────

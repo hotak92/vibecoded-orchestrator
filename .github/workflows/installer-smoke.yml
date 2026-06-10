@@ -124,6 +124,16 @@ jobs:
           VCO_CI_FIXTURE: "1"
           # Point at a temp state dir so we never touch ~/.vct on the runner
           VCT_STATE_DIR: "${{ runner.temp }}/.vct-smoke-${{ github.run_id }}"
+        # L-P0-6 (v0.2.53 Track D): this step is now GATING.
+        # Prior to v0.2.53, install.py failure was wrapped in
+        # `|| { echo "::warning::..."; }` so non-zero exits were
+        # downgraded to warnings — meaning Linux install regressions
+        # could merge without anyone noticing. Per
+        # docs/INSTALL_ARCHITECTURE_v2.md §6 row L-P0-6 (Track D), the
+        # Linux Job 1 install.py invocation must be promoted to a hard
+        # failure. Audit cross-os-triage-2026-06-10.md confirmed three
+        # v0.2.46-v0.2.52 Linux install regressions that this gate
+        # would have caught at PR time.
         run: |
           set -euo pipefail
           INSTALL_ROOT="${{ runner.temp }}/vco_smoke_install_${{ github.run_id }}"
@@ -132,9 +142,7 @@ jobs:
           # access to templates/, vco_lib/, etc.
           cp -r . "$INSTALL_ROOT/"
           cd "$INSTALL_ROOT"
-          python install.py --no-containers --skip-models || {
-            echo "::warning::install.py exited non-zero; continuing to check what was written"
-          }
+          python install.py --no-containers --skip-models
           echo "INSTALL_ROOT=$INSTALL_ROOT" >> "$GITHUB_ENV"
 
       # Step 2: Run install-bundle into a fresh project directory.
@@ -742,3 +750,110 @@ jobs:
             exit 1
           fi
           echo "✓ X2-3 PASS (${{ matrix.kind }}): .claude/ scaffold materialized ($((4-missing))/4 expected subdirs present)"
+
+  # ------------------------------------------------------------------ #
+  # Job 5: Windows-native install entry-point smoke (v0.2.53 Track D — W-P1-3) #
+  #                                                                    #
+  # The pre-v0.2.53 Job 4 (`install-smoke-no-container`) used          #
+  # `defaults: run: shell: bash` for ALL steps on windows-latest,       #
+  # which meant `first-install.bat` was NEVER exercised in CI — cmd.exe #
+  # parser bugs (W-P1-1 JSONL apostrophe escaping, W-P1-2 refreshenv    #
+  # fallback, label parsing) shipped silently to users. Audit           #
+  # windows-comprehensive-audit-2026-06-10.md §W-P1-3 documents the     #
+  # gap. Track D adds this job which:                                   #
+  #                                                                     #
+  #   - Runs `first-install.bat` under SHELL=cmd, exercising the actual  #
+  #     end-user entry point.                                            #
+  #   - Runs `install.ps1` under BOTH `pwsh.exe` (PowerShell 7+) and     #
+  #     `powershell.exe` (PowerShell 5.1, stock Windows). The 5.1 case  #
+  #     catches the W-P1-4 class of bugs where modern PS syntax silently #
+  #     fails on the older parser.                                       #
+  #                                                                     #
+  # Each step uses `--help` / `/help` rather than running the full       #
+  # install: this is a SYNTAX smoke, asserting the parser doesn't reject #
+  # the script. Full install end-to-end is covered by                    #
+  # install-smoke-tri-os.yml (M-P0-9) which uses a fresh git clone.      #
+  # ------------------------------------------------------------------ #
+  windows-entry-point-smoke:
+    name: Windows entry-point parser smoke (W-P1-3)
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # W-P1-3 part 1: first-install.bat under cmd.exe.
+      #
+      # We pass `/help` (the cmd.exe-idiomatic help flag form) and accept
+      # either exit 0 (script prints help and exits) or exit 1 with the
+      # help text in stdout (older shim shape). What we MUST NOT see:
+      # cmd.exe "The system cannot find" / "is not recognized" errors,
+      # which indicate the batch parser rejected the file at parse time.
+      - name: first-install.bat parses under cmd.exe
+        shell: cmd
+        run: |
+          first-install.bat /help > bat-help.txt 2>&1
+          set BAT_EC=%ERRORLEVEL%
+          type bat-help.txt
+          findstr /I /C:"is not recognized" /C:"system cannot find" /C:"syntax of the command" bat-help.txt > nul
+          if not errorlevel 1 (
+            echo ::error::cmd.exe parser rejected first-install.bat
+            exit /b 1
+          )
+          echo first-install.bat parsed under cmd.exe (exit code: %BAT_EC%)
+          exit /b 0
+
+      # W-P1-3 part 2a: install.ps1 under pwsh.exe (PowerShell 7+).
+      #
+      # pwsh.exe is the modern, cross-platform PowerShell. It's
+      # preinstalled on windows-latest runners and is what advanced
+      # users typically run.
+      - name: install.ps1 parses under pwsh.exe (PowerShell 7+)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # `Get-Command` parses the script and returns a CommandInfo if
+          # it's syntactically valid. Failures here surface as parse errors.
+          $cmd = Get-Command .\install.ps1 -ErrorAction Stop
+          Write-Host "install.ps1 parses under pwsh.exe: $($cmd.Source)"
+          # Also do a -WhatIf / --help style probe if the script supports it.
+          # Most install.ps1 implementations support -Help or -? — fall back
+          # to a no-op syntax check via the AST parser if not.
+          $tokens = $null
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\install.ps1).Path, [ref]$tokens, [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            Write-Error "install.ps1 has $($errors.Count) parser error(s) under pwsh:"
+            $errors | ForEach-Object { Write-Error "  $($_.Message) at line $($_.Extent.StartLineNumber)" }
+            exit 1
+          }
+          Write-Host "install.ps1 parses cleanly under pwsh.exe (0 errors)"
+
+      # W-P1-3 part 2b: install.ps1 under powershell.exe (Windows PowerShell 5.1).
+      #
+      # PowerShell 5.1 ships preinstalled on every supported Windows. Many
+      # users — particularly on locked-down corporate machines — do not
+      # have pwsh.exe installed and rely on the legacy parser. Modern
+      # syntax that pwsh accepts can be silently rejected here.
+      #
+      # `powershell.exe` is the legacy PS 5.1 binary.
+      - name: install.ps1 parses under powershell.exe (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cmd = Get-Command .\install.ps1 -ErrorAction Stop
+          Write-Host "install.ps1 parses under powershell.exe: $($cmd.Source)"
+          $tokens = $null
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\install.ps1).Path, [ref]$tokens, [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            Write-Error "install.ps1 has $($errors.Count) parser error(s) under Windows PowerShell 5.1:"
+            $errors | ForEach-Object { Write-Error "  $($_.Message) at line $($_.Extent.StartLineNumber)" }
+            Write-Error "This script must remain parseable under the stock PS 5.1 that ships on Windows."
+            exit 1
+          }
+          Write-Host "install.ps1 parses cleanly under powershell.exe / PS 5.1 (0 errors)"

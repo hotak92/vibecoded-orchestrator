@@ -1208,6 +1208,76 @@ jobs:
           stage_binary "_dist-artifacts/windows-x64" "windows-x64" "vct-updater.exe"
           stage_binary "_dist-artifacts/macos-arm64" "macos-arm64" "vct-updater"
 
+          # v0.2.53 Track D: per-OS-dir metadata.json writer.
+          #
+          # The per-binary `<binary>.metadata.json` sidecars above are
+          # CI-build-only and are consumed by the launcher's update-check
+          # / freshness probe.  Track A's shell-side reader at
+          # scripts/lib/launcher-metadata.sh consumes a DIFFERENT file:
+          # launcher/dist/<os-arch>/metadata.json (singular, one per dir).
+          # That file is the canonical source for binary_name resolution
+          # by start-launcher.{sh,command,bat} when no per-OS hardcoded
+          # candidate matches (M-P0-2 fix — closes the
+          # experimental_macOS/ drift bug class). Per
+          # docs/INSTALL_ARCHITECTURE_v2.md §6 row "metadata.json writer
+          # (CI)" (Track D).
+          #
+          # Schema (kept minimal — keys consumed by the reader):
+          #   binary_name : "vct-launcher" | "vct-launcher.exe"
+          #   os          : "linux-x64" | "macos-arm64" | "windows-x64"
+          #   version     : release version
+          #   source_sha  : commit sha at build time
+          #   built_at    : UTC ISO 8601
+          #   size_bytes  : launcher binary size (sanity check for the reader)
+          write_dist_metadata() {
+            local target="$1"      # linux-x64 | windows-x64 | macos-arm64
+            local launcher_name="$2"   # vct-launcher | vct-launcher.exe
+            local dir="launcher/dist/${target}"
+            local meta="${dir}/metadata.json"
+            local launcher_bin="${dir}/${launcher_name}"
+            local size_bytes=0
+            if [ -f "$launcher_bin" ]; then
+              # wc -c is portable; stat flags differ between GNU and BSD
+              # and this runner is always ubuntu-latest, but stick to
+              # wc -c for safety.
+              size_bytes=$(wc -c < "$launcher_bin" | tr -d ' ')
+            fi
+            local built_at
+            built_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            # Use python3 for JSON emission — guaranteed correct escaping
+            # vs bash heredoc which can mangle versions with shell-special
+            # characters (none exist today, but the contract has to be
+            # robust to v0.3.0-rc.1+sha.abcdef).
+            python3 - "$meta" "$launcher_name" "$target" "$version" "$GITHUB_SHA" "$built_at" "$size_bytes" <<'PY'
+          import json, sys
+          out, binary_name, os_arch, version, source_sha, built_at, size_bytes = sys.argv[1:8]
+          payload = {
+              "binary_name": binary_name,
+              "os": os_arch,
+              "version": version,
+              "source_sha": source_sha,
+              "built_at": built_at,
+              "size_bytes": int(size_bytes),
+          }
+          with open(out, "w", encoding="utf-8") as fh:
+              json.dump(payload, fh, indent=2, sort_keys=True)
+              fh.write("\n")
+          PY
+            # Compare to HEAD: if the only changes are built_at + size,
+            # and the binary itself was byte-identical, the metadata
+            # diff is irrelevant churn. But: an out-of-band edit to the
+            # file (or first-time creation) is a real change. Don't
+            # skip-on-stable-fields; let the binary skip-check above
+            # be the gate.
+            if [ -f "${meta}.head" ]; then rm -f "${meta}.head"; fi
+            echo "  [meta] ${meta} — written"
+            changed=$((changed + 1))
+          }
+
+          write_dist_metadata "linux-x64"   "vct-launcher"
+          write_dist_metadata "windows-x64" "vct-launcher.exe"
+          write_dist_metadata "macos-arm64" "vct-launcher"
+
           echo "changed=${changed}" >> "$GITHUB_OUTPUT"
           echo "Summary: ${changed} binary/binaries updated."
 
@@ -1244,7 +1314,10 @@ jobs:
             launcher/dist/windows-x64/vct-updater.exe \
             launcher/dist/windows-x64/vct-updater.exe.metadata.json \
             launcher/dist/macos-arm64/vct-updater \
-            launcher/dist/macos-arm64/vct-updater.metadata.json
+            launcher/dist/macos-arm64/vct-updater.metadata.json \
+            launcher/dist/linux-x64/metadata.json \
+            launcher/dist/windows-x64/metadata.json \
+            launcher/dist/macos-arm64/metadata.json
 
           # Verify only the expected files are staged — no collateral.
           staged="$(git diff --cached --name-only)"
@@ -1265,6 +1338,9 @@ jobs:
 
           Auto-committed by release workflow after successful tag build.
           Binaries: vct-launcher, vct-hub, vct-updater on linux-x64, windows-x64, macos-arm64.
+          Includes per-OS-dir metadata.json (v0.2.53 Track D — read by
+          start-launcher.{sh,command,bat} via scripts/lib/launcher-metadata.sh
+          to resolve binary_name / canonical OS subdir).
           Source tag: v${VERSION}  Run: ${{ github.run_id }}"
 
           # v0.2.17 fix: race-tolerant push. The build matrix took
