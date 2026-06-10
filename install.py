@@ -559,6 +559,1031 @@ def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ---------------------------------------------------------------------------
+# v0.2.53 DEDUP-3: _make_deferral builder
+#
+# Replaces 51 inline `DeferralEntry(...)` constructions in install.py.
+#
+# WHY:
+# * The default `kg_node_refs=[]` was an empirical bug source — half the
+#   inline constructions forgot to pass it (the dataclass field default
+#   factory works, but cleaner to make the keyword explicit + verified).
+# * Multi-line `detected` / `why_deferred` strings were copy-pasted as
+#   triple-quoted bodies with inconsistent leading-whitespace
+#   handling. The helper applies textwrap.dedent + strip uniformly.
+# * Test coverage today asserts shape per-callsite; one helper means
+#   one set of assertions catches the class.
+#
+# Per audit install-py-dedup-2026-06-10.md #11 (LoC saved ~150).
+# ---------------------------------------------------------------------------
+
+
+def _make_deferral(
+    condition_id: str,
+    *,
+    title: str,
+    detected: str,
+    why_deferred: str,
+    command_to_apply: str,
+    severity: str = "warning",
+    kg_node_refs: Optional[list[str]] = None,
+) -> DeferralEntry:
+    """Build a :class:`DeferralEntry` with shared phrasing patterns.
+
+    Applies :func:`textwrap.dedent` + :func:`str.strip` to the
+    multi-line text fields (`detected`, `why_deferred`,
+    `command_to_apply`) so callers can use triple-quoted strings with
+    arbitrary indentation without leaking whitespace into the
+    rendered Markdown of UPDATE_DEFERRED.md.
+
+    Defaults ``kg_node_refs`` to ``[]`` rather than relying on the
+    dataclass field_factory — explicit-default catches the missing-kwarg
+    typo class that bit the project in past releases (51 callsites,
+    several had drifted to forget kg_node_refs entirely).
+    """
+    import textwrap
+    return DeferralEntry(
+        condition_id=condition_id,
+        title=title.strip(),
+        detected=textwrap.dedent(detected).strip(),
+        why_deferred=textwrap.dedent(why_deferred).strip(),
+        command_to_apply=textwrap.dedent(command_to_apply).strip(),
+        severity=severity,
+        kg_node_refs=list(kg_node_refs) if kg_node_refs else [],
+    )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.53 bootstrap mode (`install.py --bootstrap`)
+#
+# Implements §3 of docs/INSTALL_ARCHITECTURE_v2.md.
+#
+# READ-ONLY by default: probes Python, Node, Podman, GPU, paths; emits a
+# versioned JSON envelope on stdout (with --json) or a human-readable
+# summary table. The envelope's `weaviate_endpoints.health` is the
+# canonical SSOT (NEW-4) — Rust + bash consumers MUST read it from here
+# rather than re-deriving (which historically diverged: install.py used
+# `/v1/.well-known/ready`, installer.rs used `/v1/meta`).
+#
+# Side-effect policy: NO writes (not even `state/logs/install.jsonl` —
+# bootstrap must be safe to run before install has ever happened). NO
+# network. NO user prompts. Every probe has timeout ≤ 10s.
+#
+# The bootstrap dispatch fires at the very top of main() BEFORE
+# `_ensure_running_under_mcp_venv()` runs, so bootstrap works on a
+# freshly cloned repo with no .venv.
+#
+# Envelope schema: docs/schemas/install-bootstrap-envelope-v1.json
+# ---------------------------------------------------------------------------
+
+BOOTSTRAP_SCHEMA_VERSION = 1
+BOOTSTRAP_PROBE_TIMEOUT_S = 10
+
+
+def _bootstrap_probe_version(
+    cmd: list[str], *, timeout: int = BOOTSTRAP_PROBE_TIMEOUT_S
+) -> Optional[str]:
+    """Run a short version-probe command; return its stdout (stripped) or None.
+
+    Soft-fails on every error: missing binary, non-zero exit, timeout,
+    OSError. Used by bootstrap probes which must NEVER throw.
+    """
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    if not out:
+        # Some tools (e.g. older `node --version`) print version to stderr.
+        out = (result.stderr or "").strip()
+    return out or None
+
+
+def _bootstrap_parse_version_tuple(s: str) -> Optional[list[int]]:
+    """Extract the first dotted-numeric run from `s`; return as list[int].
+
+    `'Python 3.13.2'` -> `[3, 13, 2]`. `'v20.11.0'` -> `[20, 11, 0]`.
+    Returns None when no version is found.
+    """
+    if not s:
+        return None
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", s)
+    if not m:
+        return None
+    parts = [int(g) for g in m.groups() if g is not None]
+    return parts
+
+
+def _bootstrap_probe_binary(
+    name: str,
+    *,
+    version_argv: Optional[list[str]] = None,
+    extra_search_dirs: Optional[list[Path]] = None,
+    parser: Optional[Any] = None,
+) -> dict:
+    """Probe one binary on PATH. Return ToolProbe-shaped dict.
+
+    Soft-fails to `ok=False, cmd=None, version=None` for any error path.
+    """
+    cmd_path: Optional[str] = shutil.which(name)
+    if cmd_path is None and extra_search_dirs:
+        for d in extra_search_dirs:
+            cand = d / name
+            if cand.exists() and os.access(str(cand), os.X_OK):
+                cmd_path = str(cand)
+                break
+    if cmd_path is None:
+        return {
+            "cmd": None, "version": None, "version_tuple": None, "ok": False,
+        }
+    argv = [cmd_path] + (version_argv if version_argv is not None else ["--version"])
+    raw = _bootstrap_probe_version(argv)
+    parsed_version = parser(raw) if (parser and raw) else raw
+    vt = _bootstrap_parse_version_tuple(raw or "")
+    return {
+        "cmd": cmd_path,
+        "version": parsed_version,
+        "version_tuple": vt,
+        "ok": True,
+    }
+
+
+def _bootstrap_python_wheel_support(venv_python_or_self: str) -> Optional[bool]:
+    """M-P1-1: detect whether the running Python has wheel coverage for VCO deps.
+
+    Calls ``pip install --dry-run --only-binary=:all:`` against a small
+    representative set of pinned deps. If pip reports "Would install",
+    wheels are available. If pip falls back to source build, returns False.
+
+    Soft-fails to None if pip is unavailable (e.g. before venv exists);
+    callers treat None as "unknown, defer judgement".
+    """
+    # Representative set: cover ML/native + pure-Python so a false-negative
+    # in either family shows up. Kept small (under 10s probe budget).
+    probe_pkgs = ["weaviate-client>=4.7", "pydantic>=2", "httpx>=0.27"]
+    try:
+        result = subprocess.run(
+            [venv_python_or_self, "-m", "pip", "install",
+             "--dry-run", "--only-binary=:all:",
+             "--no-cache-dir", "--quiet",
+             *probe_pkgs],
+            capture_output=True, text=True, timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
+            env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return None
+    # Non-zero exit when pip needs to build from source under --only-binary.
+    return result.returncode == 0
+
+
+def _bootstrap_detect_os() -> tuple[str, str]:
+    """Return (canonical_os, os_family).
+
+    canonical_os: 'macos' | 'linux' | 'windows' | 'unknown'.
+    os_family: lowercased platform.system() variant.
+    """
+    sysname = (platform.system() or "").strip().lower()
+    if sysname == "darwin":
+        return ("macos", "darwin")
+    if sysname == "linux":
+        return ("linux", "linux")
+    if sysname.startswith("win"):
+        # mingw64 (git-bash) vs msvc (cmd) — both report 'windows' to
+        # platform.system(); distinguish via the SHELL env if available.
+        shell = (os.environ.get("SHELL") or "").lower()
+        fam = "mingw64" if "git" in shell or "msys" in shell else "msvc"
+        return ("windows", fam)
+    return ("unknown", sysname or "unknown")
+
+
+def _bootstrap_normalize_arch() -> str:
+    """Return normalized arch: arm64 | x86_64 | aarch64 | other."""
+    raw = (platform.machine() or "").strip().lower()
+    if raw in ("arm64", "aarch64"):
+        # macOS reports arm64; Linux reports aarch64. Canonicalise to
+        # the value present in launcher/dist subdirs.
+        return raw
+    if raw in ("x86_64", "amd64"):
+        return "x86_64"
+    return raw or "unknown"
+
+
+def _bootstrap_detect_linux_distro() -> Optional[dict]:
+    """Parse /etc/os-release. Return None on non-Linux or unreadable file."""
+    if (platform.system() or "").lower() != "linux":
+        return None
+    osr = Path("/etc/os-release")
+    if not osr.is_file():
+        return None
+    try:
+        kv: dict[str, str] = {}
+        for line in osr.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" not in line or line.startswith("#"):
+                continue
+            k, _, v = line.partition("=")
+            kv[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        return None
+    distro_id = (kv.get("ID") or "").lower()
+    pkgmgr_map = {
+        "ubuntu": "apt", "debian": "apt", "raspbian": "apt", "linuxmint": "apt",
+        "fedora": "dnf", "rhel": "dnf", "centos": "dnf", "rocky": "dnf",
+        "almalinux": "dnf", "amzn": "dnf",
+        "arch": "pacman", "manjaro": "pacman",
+        "opensuse": "zypper", "opensuse-leap": "zypper", "opensuse-tumbleweed": "zypper",
+        "sles": "zypper",
+        "alpine": "apk",
+    }
+    return {
+        "id": distro_id or None,
+        "version_id": kv.get("VERSION_ID") or None,
+        "codename": kv.get("VERSION_CODENAME") or None,
+        "pkg_mgr": pkgmgr_map.get(distro_id),
+    }
+
+
+def _bootstrap_detect_macos_features() -> Optional[dict]:
+    """macOS-only features: Homebrew prefix, Apple Silicon, Rosetta."""
+    if (platform.system() or "").lower() != "darwin":
+        return None
+    brew_prefix: Optional[str] = None
+    if Path("/opt/homebrew/bin/brew").is_file():
+        brew_prefix = "/opt/homebrew"
+    elif Path("/usr/local/bin/brew").is_file():
+        brew_prefix = "/usr/local"
+    is_apple_silicon = _bootstrap_normalize_arch() == "arm64"
+    rosetta_present = Path("/Library/Apple/usr/libexec/oah/translate").exists()
+    return {
+        "homebrew_prefix": brew_prefix,
+        "is_apple_silicon": is_apple_silicon,
+        "rosetta_present": rosetta_present,
+    }
+
+
+def _bootstrap_detect_windows_features() -> Optional[dict]:
+    """Windows-only features: PowerShell version, winget, chocolatey, WSL2."""
+    if not (platform.system() or "").lower().startswith("win"):
+        return None
+    ps_ver = _windows_powershell_version() if "_windows_powershell_version" in globals() else None
+    return {
+        "powershell_version": list(ps_ver) if ps_ver else None,
+        "winget_present": shutil.which("winget") is not None,
+        "chocolatey_present": shutil.which("choco") is not None,
+        "wsl2_present": shutil.which("wsl") is not None,
+    }
+
+
+def _bootstrap_detect_podman() -> dict:
+    """Probe Podman binary and (macOS/Windows only) machine state."""
+    base = _bootstrap_probe_binary("podman")
+    machine_running: Optional[bool] = None
+    canonical_os, _ = _bootstrap_detect_os()
+    if base["ok"] and canonical_os in ("macos", "windows"):
+        # podman machine list --format json -> parse for any Running=true.
+        try:
+            result = subprocess.run(
+                [base["cmd"], "machine", "list", "--format", "json"],
+                capture_output=True, text=True,
+                timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
+            )
+            if result.returncode == 0:
+                try:
+                    machines = json.loads(result.stdout or "[]")
+                    machine_running = any(
+                        m.get("Running") is True
+                        for m in (machines if isinstance(machines, list) else [])
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    machine_running = False
+            else:
+                machine_running = False
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            machine_running = False
+    base["machine_running"] = machine_running
+    base["ok"] = base["ok"] and (machine_running is not False)
+    return base
+
+
+def _bootstrap_detect_docker() -> dict:
+    """Probe Docker binary."""
+    return _bootstrap_probe_binary("docker")
+
+
+def _bootstrap_detect_brew() -> dict:
+    """Probe brew binary + prefix."""
+    base = _bootstrap_probe_binary("brew")
+    prefix: Optional[str] = None
+    if base["ok"] and base["cmd"]:
+        prefix = _bootstrap_probe_version([base["cmd"], "--prefix"])
+    base["prefix"] = prefix
+    return base
+
+
+def _bootstrap_detect_gpu() -> dict:
+    """Best-effort GPU detection. Soft-fails to vendor='none' on errors."""
+    canonical_os, _ = _bootstrap_detect_os()
+    if canonical_os == "macos":
+        if _bootstrap_normalize_arch() == "arm64":
+            return {
+                "vendor": "metal", "model": "Apple Silicon",
+                "vram_gb": None, "driver_version": None,
+                "container_toolkit_ok": None,
+            }
+        return {
+            "vendor": "none", "model": None, "vram_gb": None,
+            "driver_version": None, "container_toolkit_ok": None,
+        }
+    # Try nvidia-smi
+    if shutil.which("nvidia-smi"):
+        out = _bootstrap_probe_version(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+             "--format=csv,noheader,nounits"]
+        )
+        if out:
+            first = out.splitlines()[0].split(",")
+            model = first[0].strip() if first else None
+            try:
+                vram_mb = float(first[1].strip()) if len(first) > 1 else 0.0
+                vram_gb = round(vram_mb / 1024.0, 1) if vram_mb else None
+            except (ValueError, IndexError):
+                vram_gb = None
+            driver = first[2].strip() if len(first) > 2 else None
+            return {
+                "vendor": "nvidia", "model": model, "vram_gb": vram_gb,
+                "driver_version": driver, "container_toolkit_ok": None,
+            }
+    if shutil.which("rocm-smi"):
+        return {
+            "vendor": "amd", "model": "AMD GPU (rocm)",
+            "vram_gb": None, "driver_version": None,
+            "container_toolkit_ok": None,
+        }
+    return {
+        "vendor": "none", "model": None, "vram_gb": None,
+        "driver_version": None, "container_toolkit_ok": None,
+    }
+
+
+def _bootstrap_classify_install_root(root: Path) -> str:
+    """Return install_root_kind per §3.4.
+
+    - orchestrator_clone: has install.py + CLAUDE.md + .git, no state/.
+    - completed_install: has install.py + CLAUDE.md + (state/ OR .env w/ KG_COLLECTION).
+    - git_repo: has .git but no install markers.
+    - unknown: none of the above.
+    """
+    has_install_py = (root / "install.py").is_file()
+    has_claude_md = (root / "CLAUDE.md").is_file()
+    has_git = (root / ".git").exists()
+    has_state = (root / "state").is_dir()
+    env_path = root / ".env"
+    has_env_kg = False
+    if env_path.is_file():
+        try:
+            has_env_kg = "KG_COLLECTION=" in env_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            has_env_kg = False
+    if has_install_py and has_claude_md and (has_state or has_env_kg):
+        return "completed_install"
+    if has_install_py and has_claude_md and has_git:
+        return "orchestrator_clone"
+    if has_git:
+        return "git_repo"
+    return "unknown"
+
+
+def _bootstrap_launcher_dist_subdir() -> Optional[str]:
+    """Return the canonical launcher dist subdir for this OS.
+
+    SSOT for M-P0-2: macOS is `macos-arm64` (NOT `experimental_macOS`).
+    """
+    canonical_os, _ = _bootstrap_detect_os()
+    if canonical_os == "macos":
+        return "macos-arm64"
+    if canonical_os == "linux":
+        return "linux-x64"
+    if canonical_os == "windows":
+        return "windows-x64"
+    return None
+
+
+def _bootstrap_resolve_vco_version(root: Path) -> tuple[str, Optional[str]]:
+    """Return (vco_version, short_sha).
+
+    Reads VERSION file when present; falls back to git short-sha resolution.
+    Soft-fails to ('unknown', None).
+    """
+    version_file = root / "VERSION"
+    vco_version = "unknown"
+    if version_file.is_file():
+        try:
+            vco_version = version_file.read_text(
+                encoding="utf-8", errors="replace"
+            ).strip() or "unknown"
+            if vco_version != "unknown" and not vco_version.startswith("v"):
+                vco_version = "v" + vco_version
+        except OSError:
+            pass
+    short_sha: Optional[str] = None
+    git_dir = root / ".git"
+    if git_dir.exists():
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                short_sha = (r.stdout or "").strip() or None
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            short_sha = None
+    return (vco_version, short_sha)
+
+
+def _bootstrap_resolve_paths(root: Path) -> dict:
+    """Build the `paths` envelope block."""
+    subdir = _bootstrap_launcher_dist_subdir()
+    launcher_bin: Optional[Path] = None
+    hub_bin: Optional[Path] = None
+    if subdir:
+        dist_dir = root / "launcher" / "dist" / subdir
+        is_win = subdir.startswith("windows")
+        launcher_bin = dist_dir / (
+            "vct-launcher.exe" if is_win else "vct-launcher"
+        )
+        hub_bin = dist_dir / ("vct-hub.exe" if is_win else "vct-hub")
+    venv_python = root / ".venv" / (
+        "Scripts" if platform.system().lower().startswith("win") else "bin"
+    ) / ("python.exe" if platform.system().lower().startswith("win") else "python3")
+    mcp_venv_python = root / "claude_mcp_servers" / ".venv" / (
+        "Scripts" if platform.system().lower().startswith("win") else "bin"
+    ) / ("python.exe" if platform.system().lower().startswith("win") else "python3")
+    vct_root = Path(os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct"))
+    return {
+        "install_root": str(root),
+        "install_root_kind": _bootstrap_classify_install_root(root),
+        "venv_python": str(venv_python) if venv_python.parent.exists() else None,
+        "mcp_venv_python": (
+            str(mcp_venv_python) if mcp_venv_python.parent.exists() else None
+        ),
+        "launcher_dist_subdir": subdir,
+        "launcher_binary": str(launcher_bin) if launcher_bin else None,
+        "launcher_binary_exists": bool(launcher_bin and launcher_bin.is_file()),
+        "vct_hub_binary": str(hub_bin) if hub_bin else None,
+        "vct_hub_binary_exists": bool(hub_bin and hub_bin.is_file()),
+        "state_dir": str(root / "state"),
+        "state_dir_exists": (root / "state").is_dir(),
+        "claude_dir": str(root / ".claude"),
+        "vct_root_dir": str(vct_root),
+        "launcher_db": str(vct_root / "launcher.db"),
+        "hub_port_file": str(vct_root / "hub.port"),
+        "hub_token_file": str(vct_root / "hub.token"),
+    }
+
+
+def _bootstrap_package_manager_advice(
+    system_block: dict, distro: Optional[dict],
+) -> dict:
+    """Build the `package_manager_advice` block. L-P0-1 parity-aware."""
+    canonical_os = system_block["os"]
+    has_brew = system_block["brew"]["ok"]
+    has_winget = (
+        system_block.get("windows_features") and
+        system_block["windows_features"].get("winget_present")
+    )
+    primary: Optional[str] = None
+    if canonical_os == "macos" and has_brew:
+        primary = "brew"
+    elif canonical_os == "windows" and has_winget:
+        primary = "winget"
+    elif canonical_os == "linux" and distro and distro.get("pkg_mgr"):
+        primary = distro["pkg_mgr"]
+    elif canonical_os == "linux" and has_brew:
+        primary = "brew"  # Linuxbrew last-resort
+
+    # Build install hints per primary pkgmgr.
+    install_python: list[str] = []
+    install_node: list[str] = []
+    install_podman: list[str] = []
+    install_joern: list[str] = []
+    install_lean_ctx: list[str] = []
+    if primary == "brew":
+        install_python = ["brew install python@3.13"]
+        install_node = ["brew install node"]
+        install_podman = ["brew install podman"]
+        install_joern = ["brew install joern"]
+        install_lean_ctx = ["brew install lean-ctx"]
+    elif primary == "apt":
+        install_python = ["sudo apt-get update",
+                          "sudo apt-get install -y python3 python3-venv python3-pip"]
+        install_node = ["sudo apt-get install -y nodejs npm"]
+        install_podman = ["sudo apt-get install -y podman"]
+        install_joern = []  # not in apt
+        install_lean_ctx = []
+    elif primary == "dnf":
+        install_python = ["sudo dnf install -y python3 python3-pip"]
+        install_node = ["sudo dnf install -y nodejs npm"]
+        install_podman = ["sudo dnf install -y podman"]
+    elif primary == "pacman":
+        install_python = ["sudo pacman -S --noconfirm python python-pip"]
+        install_node = ["sudo pacman -S --noconfirm nodejs npm"]
+        install_podman = ["sudo pacman -S --noconfirm podman"]
+    elif primary == "zypper":
+        install_python = ["sudo zypper install -y python3 python3-pip"]
+        install_node = ["sudo zypper install -y nodejs npm"]
+        install_podman = ["sudo zypper install -y podman"]
+    elif primary == "apk":
+        install_python = ["sudo apk add python3 py3-pip"]
+        install_node = ["sudo apk add nodejs npm"]
+        install_podman = ["sudo apk add podman"]
+    elif primary == "winget":
+        install_python = ["winget install --id Python.Python.3.13 --silent"]
+        install_node = ["winget install --id OpenJS.NodeJS.LTS --silent"]
+        install_podman = ["winget install --id RedHat.Podman --silent"]
+
+    # M-P1-2 — macOS/Windows need podman machine init + start after podman install.
+    if (
+        canonical_os in ("macos", "windows")
+        and install_podman
+        and system_block["podman"].get("machine_running") is not True
+    ):
+        install_podman = install_podman + [
+            "podman machine init", "podman machine start",
+        ]
+
+    # Tauri deps — Linux-only, distro-aware (L-P0-2)
+    tauri_deps: list[str] = []
+    if canonical_os == "linux" and distro:
+        d_id = (distro.get("id") or "").lower()
+        d_ver = distro.get("version_id") or ""
+        if d_id in ("ubuntu", "debian", "linuxmint", "raspbian"):
+            # Ubuntu 24.04+ ships libwebkit2gtk-4.1; older needs 4.0 fallback.
+            tauri_deps = [
+                "build-essential", "curl", "wget", "file", "libssl-dev",
+                "libgtk-3-dev", "libayatana-appindicator3-dev",
+                "librsvg2-dev", "libwebkit2gtk-4.1-dev",
+            ]
+            try:
+                major = int((d_ver or "0").split(".")[0])
+                if major < 24:
+                    tauri_deps.append("libwebkit2gtk-4.0-dev  # fallback")
+            except ValueError:
+                tauri_deps.append("libwebkit2gtk-4.0-dev  # fallback")
+        elif d_id in ("fedora", "rhel", "centos", "rocky", "almalinux"):
+            tauri_deps = [
+                "webkit2gtk4.1-devel", "openssl-devel", "curl", "wget",
+                "file", "libappindicator-gtk3-devel", "librsvg2-devel",
+            ]
+
+    # SELinux Z-flag — Fedora-family + Enforcing
+    selinux_z = False
+    if (
+        canonical_os == "linux" and distro
+        and (distro.get("id") or "").lower() in ("fedora", "rhel", "centos", "rocky", "almalinux")
+    ):
+        try:
+            r = subprocess.run(
+                ["getenforce"], capture_output=True, text=True,
+                timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
+            )
+            selinux_z = (r.stdout or "").strip().lower() == "enforcing"
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            selinux_z = False
+
+    # NVIDIA container toolkit install hint (L-P0-7)
+    nvidia_toolkit: Optional[str] = None
+    if (
+        canonical_os == "linux"
+        and system_block["gpu"]["vendor"] == "nvidia"
+        and not shutil.which("nvidia-ctk")
+    ):
+        if primary == "apt":
+            nvidia_toolkit = (
+                "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey "
+                "| sudo gpg --dearmor -o "
+                "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && "
+                "sudo apt-get update && "
+                "sudo apt-get install -y nvidia-container-toolkit"
+            )
+        elif primary == "dnf":
+            nvidia_toolkit = "sudo dnf install -y nvidia-container-toolkit"
+
+    return {
+        "primary": primary,
+        "install_python": install_python,
+        "install_node": install_node,
+        "install_podman": install_podman,
+        "install_joern": install_joern,
+        "install_lean_ctx": install_lean_ctx,
+        "tauri_deps": tauri_deps,
+        "selinux_volume_flag_needed": selinux_z,
+        "nvidia_container_toolkit_install": nvidia_toolkit,
+        "render_group_remediation": None,
+    }
+
+
+def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
+    """Build the `missing_prereqs` list. Order matters (UI may show top-N)."""
+    out: list[dict] = []
+
+    # Python wheel-support warning (M-P1-1)
+    py = system_block["python"]
+    if py.get("wheel_support_ok") is False:
+        out.append({
+            "name": "python_wheel_coverage",
+            "human": (
+                f"Python {py.get('version')} lacks wheel coverage for "
+                "VCO's binary deps; pip would build from source"
+            ),
+            "severity": "warning",
+            "install_hint": (
+                "Consider downgrading to Python 3.12 or 3.13 for full "
+                "wheel coverage. See docs/TROUBLESHOOTING.md."
+            ),
+        })
+
+    # Container runtime — at least one of podman/docker must be present.
+    if not (system_block["podman"]["ok"] or system_block["docker"]["ok"]):
+        # Did podman binary exist but machine wasn't running?
+        if system_block["podman"]["cmd"] is not None:
+            out.append({
+                "name": "podman_machine",
+                "human": "Podman is installed but the VM is not running",
+                "severity": "blocking",
+                "install_hint": "podman machine init && podman machine start",
+            })
+        else:
+            out.append({
+                "name": "container_runtime",
+                "human": "Podman or Docker is required",
+                "severity": "blocking",
+                "install_hint": (
+                    "Install Podman (recommended) or Docker. "
+                    "See docs/GETTING_STARTED.md."
+                ),
+            })
+
+    # Node/npm — required for Claude Code MCP layer + diagram MCP.
+    if not system_block["node"]["ok"]:
+        out.append({
+            "name": "node",
+            "human": "Node.js 20+ is required",
+            "severity": "blocking",
+            "install_hint": "See package_manager_advice.install_node",
+        })
+
+    # Git — needed for orchestrator clone validation
+    if not system_block["git"]["ok"]:
+        out.append({
+            "name": "git",
+            "human": "git is required",
+            "severity": "blocking",
+            "install_hint": "Install git via your system package manager",
+        })
+
+    # Joern — optional
+    if not system_block["joern"]["ok"]:
+        out.append({
+            "name": "joern",
+            "human": "Joern is optional (CFG/PDG code-graph analysis)",
+            "severity": "optional",
+            "install_hint": "See package_manager_advice.install_joern",
+        })
+    # lean-ctx — optional
+    if not system_block["lean_ctx"]["ok"]:
+        out.append({
+            "name": "lean_ctx",
+            "human": "lean-ctx is optional (bash output compression)",
+            "severity": "optional",
+            "install_hint": "See package_manager_advice.install_lean_ctx",
+        })
+
+    return out
+
+
+def _bootstrap_build_envelope(root: Path) -> dict:
+    """Build the full v1 envelope. All sub-probes soft-fail."""
+    canonical_os, os_family = _bootstrap_detect_os()
+    arch = _bootstrap_normalize_arch()
+    vco_version, short_sha = _bootstrap_resolve_vco_version(root)
+
+    # System probes.
+    python_self = sys.executable or "python3"
+    python_block = {
+        "cmd": python_self,
+        "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "version_tuple": [
+            sys.version_info.major, sys.version_info.minor, sys.version_info.micro,
+        ],
+        "min_required": list(MIN_PYTHON),
+        "wheel_support_ok": _bootstrap_python_wheel_support(python_self),
+        "ok": (sys.version_info.major, sys.version_info.minor) >= MIN_PYTHON,
+    }
+
+    node_block = _bootstrap_probe_binary("node")
+    if node_block["ok"]:
+        node_block["min_required"] = [18, 0, 0]
+        # Check 18+ minimum
+        vt = node_block.get("version_tuple") or [0]
+        node_block["ok"] = vt[0] >= 18
+
+    npm_block = _bootstrap_probe_binary("npm")
+    pnpm_block = _bootstrap_probe_binary("pnpm")
+    git_block = _bootstrap_probe_binary("git")
+    brew_block = _bootstrap_detect_brew()
+    joern_block = _bootstrap_probe_binary("joern")
+    lean_ctx_block = _bootstrap_probe_binary("lean-ctx")
+    claude_block = _bootstrap_probe_binary("claude")
+
+    podman_block = _bootstrap_detect_podman()
+    docker_block = _bootstrap_detect_docker()
+    container_runtime_chosen: Optional[str] = None
+    if podman_block["ok"]:
+        container_runtime_chosen = "podman"
+    elif docker_block["ok"]:
+        container_runtime_chosen = "docker"
+
+    distro = _bootstrap_detect_linux_distro()
+    macos_features = _bootstrap_detect_macos_features()
+    windows_features = _bootstrap_detect_windows_features()
+    gpu_block = _bootstrap_detect_gpu()
+
+    # RAM probe (soft-fail).
+    ram_gb: Optional[float] = None
+    try:
+        if canonical_os == "linux":
+            for line in Path("/proc/meminfo").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    ram_gb = round(kb / 1024.0 / 1024.0, 1)
+                    break
+        elif canonical_os == "macos":
+            r = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
+                timeout=5,
+            )
+            if r.returncode == 0:
+                ram_gb = round(int(r.stdout.strip()) / (1024**3), 1)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        ram_gb = None
+
+    cpu_count = os.cpu_count()
+
+    system_block = {
+        "os": canonical_os,
+        "os_family": os_family,
+        "kernel_release": platform.release() or None,
+        "arch": arch,
+        "ram_gb": ram_gb,
+        "cpu_count": cpu_count,
+        "python": python_block,
+        "node": node_block,
+        "npm": npm_block,
+        "pnpm": pnpm_block,
+        "podman": podman_block,
+        "docker": docker_block,
+        "container_runtime_chosen": container_runtime_chosen,
+        "git": git_block,
+        "brew": brew_block,
+        "joern": joern_block,
+        "lean_ctx": lean_ctx_block,
+        "claude_cli": claude_block,
+        "gpu": gpu_block,
+        "linux_distro": distro,
+        "windows_features": windows_features,
+        "macos_features": macos_features,
+    }
+
+    paths_block = _bootstrap_resolve_paths(root)
+    pm_advice = _bootstrap_package_manager_advice(system_block, distro)
+
+    # Endpoints — NEW-4 SSOT: weaviate health is `/v1/.well-known/ready`.
+    weaviate_endpoints = {
+        "base": "http://localhost:8081",
+        "health": "http://localhost:8081/v1/.well-known/ready",
+        "meta": "http://localhost:8081/v1/meta",
+        "schema": "http://localhost:8081/v1/schema",
+        "graphql": "http://localhost:8081/v1/graphql",
+        "grpc_host": "localhost:50052",
+    }
+    ollama_endpoints = {
+        "base": "http://localhost:11435",
+        "tags": "http://localhost:11435/api/tags",
+        "pull": "http://localhost:11435/api/pull",
+    }
+    code_embed_endpoints = {
+        "base": "http://localhost:11440",
+        "health": "http://localhost:11440/health",
+    }
+    vct_hub_endpoints = {
+        "base": "http://127.0.0.1:7700",
+        "health": "http://127.0.0.1:7700/api/v1/health",
+    }
+
+    missing = _bootstrap_compute_missing_prereqs(system_block)
+    blocker_messages = [m["human"] for m in missing if m["severity"] == "blocking"]
+    warnings = [m["human"] for m in missing if m["severity"] == "warning"]
+    ready = len(blocker_messages) == 0
+
+    return {
+        "schema_version": BOOTSTRAP_SCHEMA_VERSION,
+        "vco_version": vco_version,
+        "vco_short_sha": short_sha,
+        "generated_at": _utc_iso_now(),
+        "system": system_block,
+        "paths": paths_block,
+        "package_manager_advice": pm_advice,
+        "weaviate_endpoints": weaviate_endpoints,
+        "ollama_endpoints": ollama_endpoints,
+        "code_embed_endpoints": code_embed_endpoints,
+        "vct_hub_endpoints": vct_hub_endpoints,
+        "missing_prereqs": missing,
+        "ready_to_install": ready,
+        "blocker_messages": blocker_messages,
+        "warnings": warnings,
+    }
+
+
+def _bootstrap_print_human(envelope: dict) -> None:
+    """Pretty-print envelope as a human-readable summary table."""
+    sys_b = envelope["system"]
+    print()
+    print(f"VCO Bootstrap Probe  (schema v{envelope['schema_version']}, "
+          f"{envelope['vco_version']})")
+    print("=" * 72)
+    print(f"OS              : {sys_b['os']} ({sys_b['os_family']}, {sys_b['arch']})")
+    if sys_b.get("ram_gb") is not None:
+        print(f"RAM             : {sys_b['ram_gb']} GB")
+    if sys_b.get("cpu_count"):
+        print(f"CPU cores       : {sys_b['cpu_count']}")
+    print("-" * 72)
+
+    def _row(label: str, probe: dict) -> None:
+        status = "ok " if probe.get("ok") else "MISS"
+        ver = probe.get("version") or ""
+        cmd = probe.get("cmd") or "(not found)"
+        print(f"  {label:<14} [{status}]  {ver:<12}  {cmd}")
+    _row("python", sys_b["python"])
+    _row("node", sys_b["node"])
+    _row("npm", sys_b["npm"])
+    _row("podman", sys_b["podman"])
+    _row("docker", sys_b["docker"])
+    _row("git", sys_b["git"])
+    _row("brew", sys_b["brew"])
+    _row("joern", sys_b["joern"])
+    _row("lean-ctx", sys_b["lean_ctx"])
+    _row("claude", sys_b["claude_cli"])
+    print("-" * 72)
+    if envelope["missing_prereqs"]:
+        print(f"Missing prereqs ({len(envelope['missing_prereqs'])}):")
+        for m in envelope["missing_prereqs"]:
+            sev = m["severity"].upper()
+            print(f"  [{sev:<8}] {m['name']}: {m['human']}")
+            if m.get("install_hint"):
+                print(f"             hint: {m['install_hint']}")
+    else:
+        print("No missing prereqs detected.")
+    print("-" * 72)
+    print(f"Ready to install: {'YES' if envelope['ready_to_install'] else 'NO'}")
+    if envelope["blocker_messages"]:
+        for b in envelope["blocker_messages"]:
+            print(f"  BLOCKER: {b}")
+    if envelope["warnings"]:
+        for w in envelope["warnings"]:
+            print(f"  WARN:    {w}")
+    print()
+
+
+def _bootstrap_install_missing(envelope: dict, *, no_prompt: bool) -> int:
+    """Implement `--install-missing`. Returns exit code (0 ok, 3 pkgmgr failed).
+
+    Side-effect policy: this IS the side-effect branch. Runs pkgmgr
+    install commands from `package_manager_advice` for each blocking
+    prereq. macOS/Windows: also runs `podman machine init` + `start`.
+    Re-prints the post-install envelope if changes succeed.
+    """
+    missing = envelope["missing_prereqs"]
+    blocking = [m for m in missing if m["severity"] == "blocking"]
+    if not blocking:
+        print("[--install-missing] No blocking prereqs; nothing to do.")
+        return 0
+    advice = envelope["package_manager_advice"]
+    if not no_prompt and sys.stdin.isatty():
+        names = ", ".join(m["name"] for m in blocking)
+        ans = input(
+            f"Install missing prereqs [{names}]? [Y/n] "
+        ).strip().lower()
+        if ans and ans not in ("y", "yes"):
+            print("[--install-missing] Aborted by user.")
+            return 3
+    failed: list[str] = []
+    for m in blocking:
+        name = m["name"]
+        # Map prereq name to advice key.
+        cmds: list[str] = []
+        if name in ("container_runtime", "podman_machine"):
+            cmds = advice.get("install_podman", [])
+        elif name == "node":
+            cmds = advice.get("install_node", [])
+        elif name == "python_wheel_coverage":
+            print(f"[--install-missing] {name}: no automated remediation; "
+                  "see docs/TROUBLESHOOTING.md")
+            continue
+        if not cmds:
+            print(f"[--install-missing] No install advice for {name}; skipping.")
+            continue
+        print(f"[--install-missing] {name}: running")
+        for c in cmds:
+            print(f"  $ {c}")
+            try:
+                r = subprocess.run(c, shell=True, timeout=600)
+            except (subprocess.SubprocessError, OSError) as e:
+                print(f"    FAIL: {e}")
+                failed.append(name)
+                break
+            if r.returncode != 0:
+                print(f"    FAIL (exit {r.returncode})")
+                failed.append(name)
+                break
+    if failed:
+        print(f"[--install-missing] Failed: {', '.join(failed)}")
+        return 3
+    print("[--install-missing] All install commands completed.")
+    return 0
+
+
+def _run_bootstrap(argv: list[str]) -> int:
+    """Top-level dispatch for `install.py --bootstrap`.
+
+    Argv parsing is intentionally lightweight (no argparse) because this
+    runs BEFORE the main argparse instance is built and BEFORE the MCP
+    venv relaunch. We accept ONLY `--bootstrap`, `--json`,
+    `--install-missing`, `--no-prompt`, `--verbose`. Any other arg is a
+    bad-invocation error.
+    """
+    # Strip --bootstrap so consumers don't double-parse it later.
+    args_set = set(argv)
+    bad_combos = {"--update", "--lightweight", "--uninstall"}
+    if args_set & bad_combos:
+        print(
+            "ERROR: --bootstrap cannot be combined with "
+            f"{', '.join(sorted(args_set & bad_combos))}",
+            file=sys.stderr,
+        )
+        return 2
+    allowed = {
+        "--bootstrap", "--json", "--install-missing",
+        "--no-prompt", "--verbose",
+    }
+    unknown = [a for a in argv if a not in allowed and a != "--yes"]
+    if unknown:
+        print(
+            f"ERROR: --bootstrap rejects unknown args: {' '.join(unknown)}",
+            file=sys.stderr,
+        )
+        return 2
+    want_json = "--json" in args_set
+    want_install_missing = "--install-missing" in args_set
+    no_prompt = "--no-prompt" in args_set or "--yes" in args_set
+
+    try:
+        envelope = _bootstrap_build_envelope(PROJECT_ROOT)
+    except Exception as e:  # noqa: BLE001 — top-level safety net
+        # Bootstrap MUST NEVER hang or crash silently. Print traceback to
+        # stderr so the user sees it; exit 1 per §3.2.
+        import traceback
+        print(f"ERROR: bootstrap envelope build failed: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+    if want_install_missing:
+        rc = _bootstrap_install_missing(envelope, no_prompt=no_prompt)
+        if rc != 0:
+            return rc
+        # Re-detect after install.
+        try:
+            envelope = _bootstrap_build_envelope(PROJECT_ROOT)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: post-install probe failed: {e}", file=sys.stderr)
+            return 1
+
+    if want_json:
+        # Stable, indented JSON for human-readable debugging + machine consumers.
+        json.dump(envelope, sys.stdout, indent=2, sort_keys=False)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    else:
+        _bootstrap_print_human(envelope)
+    return 0
+
+
 def _load_resume_state() -> dict[str, str]:
     """Parse state/logs/install.jsonl and return {step: last_phase} for the
     most-recent install session that's no older than 24 hours.
@@ -2668,8 +3693,12 @@ def _run_lightweight(args: argparse.Namespace) -> int:
         # later block can pick it up. The args namespace is the only
         # mutable cross-step carrier inside _run_lightweight without
         # threading another argument through.
-        args._venv_skip_no_manifest_entry = DeferralEntry(
-            condition_id="venv_skip_no_manifest",
+        # v0.2.53 DEDUP-3: routed through _make_deferral. Text fields
+        # use single-line concatenation (matching original behavior
+        # byte-for-byte); the helper's textwrap.dedent passes them
+        # through unchanged since there's no leading whitespace.
+        args._venv_skip_no_manifest_entry = _make_deferral(
+            "venv_skip_no_manifest",
             title="Venv preserved (no VCO manifest detected)",
             detected=(
                 f"Found `.venv` at {_venv_path} but no "
@@ -2686,9 +3715,7 @@ def _run_lightweight(args: argparse.Namespace) -> int:
                 "Python is intentionally different from what created "
                 "it), re-run with the explicit `--rebuild-venv` flag."
             ),
-            command_to_apply=(
-                f"python install.py --lightweight --rebuild-venv"
-            ),
+            command_to_apply="python install.py --lightweight --rebuild-venv",
             severity="warning",
             kg_node_refs=[
                 "knowledge/concepts/venv-adopt-guard-v0246.md",
@@ -4051,6 +5078,27 @@ def _audit_and_offer_env_secret_migration(
 
 
 def main() -> int:
+    # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
+    # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
+    # probe is usable on a freshly cloned repo with no .venv. The bootstrap
+    # dispatch reads sys.argv directly (no argparse) because argparse
+    # construction happens further down and we don't want to defer the
+    # short-circuit through there.
+    #
+    # Bootstrap is READ-ONLY by default. With --install-missing it runs
+    # pkgmgr install commands for blocking prereqs. Never writes JSONL,
+    # never spawns daemons (except `podman machine init` when explicitly
+    # requested), never mutates ~/.claude.json. See §3.5 side-effect policy.
+    if "--bootstrap" in sys.argv:
+        # Defer --help to the full argparse so the user sees the
+        # standard help envelope rather than a bootstrap-only error.
+        if "--help" in sys.argv or "-h" in sys.argv:
+            pass
+        else:
+            # Forward only flags after the script name; --bootstrap is
+            # consumed inside _run_bootstrap.
+            return _run_bootstrap(sys.argv[1:])
+
     # v0.2.46 Part-1.5 H3: DO NOT call _log_install_event or any code that
     # buffers state into module-level variables BEFORE this line. When
     # _ensure_running_under_mcp_venv() execve's into the MCP venv, the new
@@ -4131,6 +5179,31 @@ def main() -> int:
                              "Always writes .claude/context/UPDATE_DEFERRED.md at the end — "
                              "either with actionable deferral entries OR a stub confirming "
                              "the run completed cleanly (Fix 6, v0.2.13).")
+    # v0.2.53: bootstrap mode is short-circuited at top of main() BEFORE
+    # argparse runs (so it works on a freshly cloned repo with no .venv).
+    # The argparse entries here exist only so `install.py --help` shows
+    # the flags. The actual dispatch reads sys.argv directly — argparse
+    # never sees these in bootstrap runs. See _run_bootstrap().
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="(v0.2.53) Bootstrap probe mode: detect system "
+                             "prereqs and emit a versioned JSON envelope "
+                             "(with --json) or human-readable summary "
+                             "(default). READ-ONLY; safe to run before "
+                             "first install. Implements §3 of "
+                             "docs/INSTALL_ARCHITECTURE_v2.md. Schema: "
+                             "docs/schemas/install-bootstrap-envelope-v1.json.")
+    parser.add_argument("--json", action="store_true",
+                        help="With --bootstrap: emit JSON envelope on stdout "
+                             "for machine consumers (Rust + bash). Without "
+                             "--bootstrap: no effect (reserved).")
+    parser.add_argument("--install-missing", action="store_true",
+                        help="With --bootstrap: run package-manager install "
+                             "commands for missing prereqs. Side-effectful. "
+                             "Prompts for consent on TTY; --no-prompt skips "
+                             "the prompt.")
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="With --bootstrap --install-missing: skip the "
+                             "interactive consent prompt (assume yes).")
     parser.add_argument("--rebuild-collections", action="store_true", default=False,
                         help="Drop and re-ingest Weaviate collections (KG + dev). "
                              "Required when the schema invariants change "
@@ -5893,12 +6966,84 @@ def _check_python_version() -> None:
                   "required": f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"},
         )
         sys.exit(1)
+
+    # v0.2.53 M-P1-1: wheel-coverage detection.
+    # Replaces a hard MAX_PYTHON constant. We probe via `pip install
+    # --dry-run --only-binary=:all:` against a small set of pinned deps
+    # representative of VCO's binary-heavy stack (Pydantic, weaviate-client,
+    # httpx). If pip would fall back to source build, the install will
+    # almost certainly fail later in step 4/10 with a confusing C-compiler
+    # error from setup.py — print a clear hint NOW so the user can
+    # downgrade Python before wasting 10 minutes.
+    if (v.major, v.minor) >= (3, 14):
+        wheel_ok = _check_wheel_support_for_python(sys.executable)
+        if wheel_ok is False:
+            print("FAIL")
+            print(f"  Python {v.major}.{v.minor}.{v.micro} is too new — "
+                  "wheels are not yet published for VCO's binary deps.")
+            print("  pip would try to build from source, which typically "
+                  "fails without a C/C++ toolchain installed.")
+            print()
+            print("  Workaround: install Python 3.12 or 3.13 and re-run "
+                  "first-install with that interpreter:")
+            print("    # macOS / Homebrew:")
+            print("    brew install python@3.13")
+            print("    /opt/homebrew/bin/python3.13 install.py")
+            print("    # Linux / apt:")
+            print("    sudo apt install python3.13")
+            print("    python3.13 install.py")
+            print("    # Windows / py launcher:")
+            print("    py -3.13 install.py")
+            _log_install_event(
+                "1/10", "error",
+                f"Python {v.major}.{v.minor}.{v.micro} lacks wheel coverage",
+                data={
+                    "found": f"{v.major}.{v.minor}.{v.micro}",
+                    "wheel_support_ok": False,
+                    "workaround": "downgrade to 3.12 or 3.13",
+                },
+            )
+            sys.exit(1)
+
     print(f"OK ({v.major}.{v.minor}.{v.micro})")
     _log_install_event(
         "1/10", "ok",
         f"Python {v.major}.{v.minor}.{v.micro}",
         data={"version": f"{v.major}.{v.minor}.{v.micro}"},
     )
+
+
+def _check_wheel_support_for_python(python_cmd: str) -> Optional[bool]:
+    """v0.2.53 M-P1-1: probe wheel coverage via pip --dry-run.
+
+    Calls ``pip install --dry-run --only-binary=:all: <key-deps>``
+    against the given Python interpreter. Returns True iff pip
+    reports it CAN install without source build; False if it would
+    need to compile; None on probe error (network down, pip absent,
+    timeout) — callers treat None as "unknown, defer judgement".
+
+    Kept separate from the bootstrap envelope's
+    `_bootstrap_python_wheel_support` because:
+    1. This is called from _check_python_version at install step 1/10
+       (pre-venv-creation) — it must work against the host Python.
+    2. The bootstrap envelope's variant runs READ-ONLY at bootstrap
+       time; this one runs during the actual install path.
+
+    Both implementations probe the same canonical key deps.
+    """
+    probe_pkgs = ["weaviate-client>=4.7", "pydantic>=2", "httpx>=0.27"]
+    try:
+        result = subprocess.run(
+            [python_cmd, "-m", "pip", "install",
+             "--dry-run", "--only-binary=:all:",
+             "--no-cache-dir", "--quiet",
+             *probe_pkgs],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return None
+    return result.returncode == 0
 
 
 def _print_python_install_hint() -> None:
@@ -6980,6 +8125,89 @@ def _container_runtime_reachable(container_cmd: str) -> bool:
         return False
 
 
+def _podman_machine_auto_init_and_start() -> tuple[bool, str]:
+    """v0.2.53 M-P1-2: auto-init then start Podman machine on macOS + Windows.
+
+    Pre-v0.2.53 install.py asked the user to run `podman machine init`
+    manually after seeing a "VM does not exist" error from `podman
+    machine start`. This was friction for first-time installs.
+
+    Sequence:
+      1. `podman machine list --format json` — probe whether ANY
+         machine exists. If none, run init.
+      2. `podman machine init` (only when (1) showed empty list).
+         This downloads ~500 MB of VM image; we use a 600s timeout.
+      3. `podman machine start` — boots the VM.
+
+    Returns (success, detail). Soft-fails on every error path; the
+    caller decides whether to write a deferral.
+
+    The init step is intentionally skipped if a machine already exists
+    (we don't want to clobber a user's existing config; we just want to
+    make sure SOMETHING is running). If init succeeds and start fails,
+    we return the start failure rather than the init success.
+    """
+    # Probe: does a machine already exist?
+    machine_exists = False
+    try:
+        list_result = subprocess.run(
+            ["podman", "machine", "list", "--format", "json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if list_result.returncode == 0:
+            try:
+                machines = json.loads(list_result.stdout or "[]")
+                machine_exists = bool(machines and isinstance(machines, list))
+            except (json.JSONDecodeError, TypeError):
+                machine_exists = False
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"podman machine list failed: {e}"
+
+    if not machine_exists:
+        # Run init. This is the long step (~500 MB download).
+        print("  Podman machine not initialized; running "
+              "`podman machine init` (this downloads ~500 MB; "
+              "may take 2-5 min)...", flush=True)
+        try:
+            init_result = subprocess.run(
+                ["podman", "machine", "init"],
+                capture_output=True, text=True, timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            return False, (
+                "podman machine init timed out after 10 min; "
+                "network down or VM image download blocked. "
+                "Run `podman machine init` manually and re-run install.py."
+            )
+        except OSError as e:
+            return False, f"podman machine init failed: {e}"
+        if init_result.returncode != 0:
+            return False, (
+                f"podman machine init exited {init_result.returncode}: "
+                f"{init_result.stderr.strip()[:300]}"
+            )
+        print("  Podman machine initialized.", flush=True)
+
+    # Now start.
+    try:
+        start_result = subprocess.run(
+            ["podman", "machine", "start"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"podman machine start failed: {e}"
+    if start_result.returncode != 0:
+        # If machine is already running, that's success.
+        stderr = (start_result.stderr or "").strip()[:300]
+        if "already running" in stderr.lower():
+            return True, "podman machine already running"
+        return False, (
+            f"podman machine start exited {start_result.returncode}: "
+            f"{stderr}"
+        )
+    return True, "podman machine started"
+
+
 def _try_start_podman_daemon() -> tuple[bool, str]:
     """v0.2.51 Bug G: auto-start the Podman daemon on a binary-present-but-
     daemon-stopped condition.
@@ -7034,25 +8262,16 @@ def _try_start_podman_daemon() -> tuple[bool, str]:
                 f"{result.returncode}: {result.stderr.strip()[:200]}"
             )
     elif os_name in ("Darwin", "Windows"):
-        try:
-            result = subprocess.run(
-                ["podman", "machine", "start"],
-                capture_output=True, text=True, timeout=120,
-            )
-        except (subprocess.TimeoutExpired, OSError) as e:
-            return False, f"podman machine start failed: {e}"
-        if result.returncode != 0:
-            stderr = result.stderr.strip()[:300]
-            # Common case: "VM does not exist" → user hasn't run
-            # `podman machine init` yet. Pass that hint to the deferral.
-            if "does not exist" in stderr.lower() or "init" in stderr.lower():
-                return False, (
-                    "podman machine not initialized — run `podman machine init` "
-                    f"first. (stderr: {stderr})"
-                )
-            return False, (
-                f"podman machine start exited {result.returncode}: {stderr}"
-            )
+        # v0.2.53 M-P1-2: auto-init then start on macOS + Windows.
+        # Pre-v0.2.53 we asked the user to run `podman machine init`
+        # themselves — but the recipe is well-documented and the typical
+        # first-time install dropped to a deferral here, blocking
+        # container setup until the user found the right command.
+        # Now we run init→start automatically; the user only sees the
+        # deferral if BOTH steps fail.
+        ok, detail = _podman_machine_auto_init_and_start()
+        if not ok:
+            return False, detail
     else:
         return False, f"unsupported OS '{os_name}'"
 
@@ -8554,13 +9773,33 @@ def _read_app_state_key(key: str) -> "str | None":
 
     Returns the string value, or None when the key is absent or any error
     occurs (soft-fail: callers use None as "unknown / first run").
+
+    v0.2.53 DEDUP-4 / CORRECT-2: uses sqlite3 URI form
+    ``file:<path>?mode=ro&immutable=1`` (the same readonly pattern
+    used by :func:`vco_lib.launcher_db_reader._open_db_readonly`).
+    The ro+immutable URI does NOT acquire a writer lock and never
+    blocks regardless of what the launcher is doing.
+
+    Pre-v0.2.53 this site used ``sqlite3.connect(timeout=5.0)`` which
+    could block install.py for up to 5s on Windows when the launcher
+    held a write lock — a perceived install-hang during the most
+    performance-critical step.
+
+    NOTE: we DO NOT route through ``launcher_db_reader.read_app_state_value``
+    because that helper internally calls its own DB-path discovery
+    (``VCT_LAUNCHER_DB_PATH`` env override → ``vct_root_dir() / launcher.db``).
+    install.py needs to use its own ``_discover_app_state_db_path``
+    so existing test mocks (which patch the install.py-local discoverer)
+    continue to work. The cross-helper unification is a v0.2.54
+    refactor; the readonly URI pattern below closes CORRECT-2 today.
     """
     import sqlite3
     db_path = _discover_app_state_db_path()
     if not db_path.is_file():
         return None
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        uri = f"file:{db_path}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         try:
             row = conn.execute(
                 "SELECT value FROM app_state WHERE key = ?", (key,)
@@ -9183,11 +10422,267 @@ def _pip_subprocess_env() -> dict[str, str]:
     subprocess that probes PYTHONPATH sees a defined-but-empty value rather
     than inherited-from-parent semantics.
 
-    Audit finding 2026-06-03 (venv-runtime-adversarial S6).
+    v0.2.53 M-P1-3: also threads pip-quality-of-life env vars so the user
+    doesn't get "A new release of pip is available" noise mid-install and
+    doesn't get blocked by interactive prompts in non-TTY runs:
+      * PIP_DISABLE_PIP_VERSION_CHECK=1 — suppresses the pip-version
+        suggestion banner. This banner is decorative for install.py
+        (we don't auto-upgrade based on it) and consumes a network
+        round-trip per pip call.
+      * PIP_NO_INPUT=1 — refuses any pip prompt (e.g. "y/n: proceed
+        with install of pre-release?"). Defends against pip hangs in
+        CI when stdin is /dev/null but pip thinks it has a terminal.
+
+    pip retry/timeout/prefer-binary flags are passed at the argv level
+    by callers that need them (e.g. _install_requirements) rather than
+    set via env, because pip's env-var equivalents
+    (PIP_DEFAULT_TIMEOUT etc) are per-version inconsistent.
+
+    Audit finding 2026-06-03 (venv-runtime-adversarial S6) +
+    docs/INSTALL_ARCHITECTURE_v2.md per-track table M-P1-3.
     """
     env = os.environ.copy()
     env["PYTHONPATH"] = ""
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    env["PIP_NO_INPUT"] = "1"
     return env
+
+
+def _pip_install_flags() -> list[str]:
+    """v0.2.53 M-P1-3: shared pip install flags for robustness.
+
+    Returns a list of argv tokens to splice into ``[python, "-m", "pip",
+    "install", ...]`` calls:
+      * ``--timeout 60``: per-request network timeout. pip's default
+        is 15s which is too short for slow networks (corporate proxies,
+        OCI image-layer downloads, etc.). 60s is a good compromise.
+      * ``--retries 5``: pip's default is 5 already in modern versions
+        but we set it explicitly so install.py's behavior is
+        independent of the pip version on PATH.
+      * ``--prefer-binary``: when both a wheel and an sdist exist for a
+        dep, prefer the wheel. Avoids accidental source builds when
+        wheels are present.
+
+    Callers splice these flags into the argv:
+
+        cmd = [py, "-m", "pip", "install", *_pip_install_flags(),
+               "-r", "requirements.txt"]
+
+    Not bundled into _pip_subprocess_env() because not every pip
+    invocation accepts these flags (pip --version doesn't, for
+    example).
+    """
+    return [
+        "--timeout", "60",
+        "--retries", "5",
+        "--prefer-binary",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# v0.2.53 DEDUP-1: _run_logged_subprocess
+#
+# Single helper for the ~40 `subprocess.run(capture_output=True, text=True,
+# timeout=N)` callsites that follow the same boilerplate:
+#
+#   result = subprocess.run([...], capture_output=True, text=True, timeout=N)
+#   if result.returncode != 0:
+#       print(FAIL)
+#       for line in result.stderr.splitlines()[-N:]:
+#           print(line)
+#       _log_install_event(..., 'error', ..., data={'stderr_tail': ...})
+#       sys.exit(1)
+#
+# WHY consolidate (closes M-P0-4):
+# * Single place to add dot-cycle animation (M-P1-7) so users see
+#   long-running pip/npm/playwright steps are alive, not hung.
+# * Uniform stderr-tail length + uniform timeout policy.
+# * Uniform env-scrub (today only pip uses _pip_subprocess_env(); the
+#   helper makes it opt-in once at the callsite).
+# * Single place to add retry-with-backoff if/when needed.
+#
+# Sites covered in v0.2.53 (the 8 silent-hang sites per audit):
+#   - _install_requirements: pip upgrade, pip install -r, pip install -e
+#     (root), pip install -e (claude_mcp_servers)  [4 sites]
+#   - _install_pinned_npm: npm install -g                                [1]
+#   - _install_playwright_browsers: npx + playwright install             [2]
+#   - _compile_python_modules: python -m compileall                      [1]
+#
+# Other ~30 sites can migrate incrementally in v0.2.54+ as they're touched
+# for other reasons. The dot-cycle behavior is opt-in via
+# `show_dots_after_seconds`, so non-migrated callsites stay silent (which
+# is fine — they were silent before too).
+# ---------------------------------------------------------------------------
+
+
+def _run_logged_subprocess(
+    cmd: list[str],
+    *,
+    step: str,
+    phase_label: str,
+    timeout: int,
+    env: Optional[dict[str, str]] = None,
+    cwd: Optional[str] = None,
+    stderr_tail_lines: int = 15,
+    on_failure: str = "exit",
+    show_dots_after_seconds: Optional[float] = 3.0,
+    fail_message: Optional[str] = None,
+    user_hint_lines: Optional[list[str]] = None,
+) -> "subprocess.CompletedProcess[str]":
+    """Run a subprocess with uniform logging, dot-cycle animation, and stderr tail.
+
+    Args:
+        cmd: Argv list to run.
+        step: Install-step label for _log_install_event (e.g. "4/10").
+        phase_label: Short label for the log data (e.g. "pip-upgrade").
+        timeout: Subprocess timeout in seconds.
+        env: Optional env override; if None uses inherited environ.
+        cwd: Optional working directory.
+        stderr_tail_lines: Number of stderr lines to surface on failure.
+        on_failure: One of:
+            - "exit": print FAIL + tail + log error + sys.exit(1).
+            - "return": print FAIL + tail + log warn; return the result.
+            - "raise": re-raise CalledProcessError (for callers that
+              want to handle the failure themselves).
+        show_dots_after_seconds: If not None, start a dot-cycle
+            background thread after this many seconds with no output.
+            Set None to disable (e.g. for short probes).
+        fail_message: Optional one-line message to print before tail
+            when failure occurs. Default: f"FAIL ({phase_label})".
+        user_hint_lines: Optional list of follow-up hint lines printed
+            after the stderr tail (e.g. "check your network").
+
+    Returns:
+        subprocess.CompletedProcess[str] when on_failure="return" OR
+        the command succeeded. For on_failure="exit" the function does
+        not return on failure (calls sys.exit(1)).
+
+    Raises:
+        subprocess.CalledProcessError: only when on_failure="raise" AND
+            the command returned non-zero.
+        subprocess.TimeoutExpired: propagated when the subprocess times
+            out (no on_failure branch covers timeout intentionally —
+            timeout is a logic bug in the caller's `timeout` arg).
+    """
+    if on_failure not in ("exit", "return", "raise"):
+        raise ValueError(
+            f"on_failure must be 'exit'|'return'|'raise', got {on_failure!r}"
+        )
+
+    # Dot-cycle animation: in a separate thread to avoid blocking the
+    # subprocess. We poll the subprocess by spawning it ourselves rather
+    # than via subprocess.run, so the animation can be cancelled cleanly
+    # when the subprocess exits.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=cwd,
+    )
+
+    dots_stop = False
+    dots_thread = None
+
+    def _dot_cycle() -> None:
+        # Display "[12s] ..." style elapsed counter + cycling dots.
+        # The leading carriage-return overwrites the line each tick.
+        # First dot appears after `show_dots_after_seconds` of no output.
+        if show_dots_after_seconds is None:
+            return
+        time.sleep(show_dots_after_seconds)
+        start = time.monotonic()
+        dot_state = 0
+        while not dots_stop and proc.poll() is None:
+            elapsed = int(time.monotonic() - start) + int(show_dots_after_seconds)
+            dots = "." * ((dot_state % 4) + 1)  # 1, 2, 3, 4 dots
+            try:
+                sys.stdout.write(f"\r  [{elapsed:>3}s] {phase_label} {dots:<4}")
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                # Detached / closed stdout — just stop animating.
+                break
+            dot_state += 1
+            time.sleep(1.0)
+        # Clear the line so the next print starts fresh.
+        try:
+            sys.stdout.write("\r" + " " * 60 + "\r")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    if show_dots_after_seconds is not None and sys.stdout.isatty():
+        import threading
+        dots_thread = threading.Thread(target=_dot_cycle, daemon=True)
+        dots_thread.start()
+
+    try:
+        stdout_text, stderr_text = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        dots_stop = True
+        try:
+            proc.kill()
+            proc.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        if dots_thread is not None:
+            dots_thread.join(timeout=2)
+        _log_install_event(
+            step, "error",
+            f"{phase_label} timed out after {timeout}s",
+            data={"phase": phase_label, "timeout": timeout},
+        )
+        if on_failure == "exit":
+            print(f"FAIL ({phase_label} timed out after {timeout}s)")
+            sys.exit(1)
+        raise
+    finally:
+        dots_stop = True
+        if dots_thread is not None:
+            dots_thread.join(timeout=2)
+
+    result = subprocess.CompletedProcess(
+        args=cmd, returncode=proc.returncode,
+        stdout=stdout_text, stderr=stderr_text,
+    )
+
+    if result.returncode == 0:
+        return result
+
+    # Failure path. Empty `fail_message=""` means "suppress the header
+    # line"; the caller is summarising errors itself (e.g. compileall
+    # loops over multiple dirs and prints one final summary).
+    msg = fail_message if fail_message is not None else f"FAIL ({phase_label})"
+    if msg:
+        print(msg)
+    tail = (result.stderr or "").strip().splitlines()[-stderr_tail_lines:]
+    if msg:
+        for line in tail:
+            print(f"  {line}")
+    if user_hint_lines:
+        print()
+        for line in user_hint_lines:
+            print(f"  {line}")
+    _log_install_event(
+        step, "error" if on_failure == "exit" else "warn",
+        f"{phase_label} failed (exit {result.returncode})",
+        data={
+            "phase": phase_label,
+            "exit_code": result.returncode,
+            "stderr_tail": (result.stderr or "").strip()[-400:],
+        },
+    )
+    if on_failure == "exit":
+        sys.exit(1)
+    if on_failure == "raise":
+        raise subprocess.CalledProcessError(
+            returncode=result.returncode,
+            cmd=cmd,
+            output=stdout_text,
+            stderr=stderr_text,
+        )
+    return result  # on_failure == "return"
 
 
 def _install_requirements(venv_python: Path, *, dev: bool) -> None:
@@ -9199,27 +10694,25 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         data={"dev": dev},
     )
 
-    # Upgrade pip — surface errors instead of swallowing them via check=True
-    pip_up = subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
-        capture_output=True, text=True,
-        env=_pip_subprocess_env(),
+    # Upgrade pip — surface errors instead of swallowing them via check=True.
+    # v0.2.53 DEDUP-1 (M-P0-4 silent-hang fix): _run_logged_subprocess adds
+    # dot-cycle animation after 3s so the user can see pip is alive during
+    # the typical 30–90s upgrade.
+    # v0.2.53 M-P1-3: pip's own self-upgrade benefits from the same
+    # robustness flags (--timeout, --retries, --prefer-binary). pip
+    # is happy to receive flags from its own command line.
+    _run_logged_subprocess(
+        [str(venv_python), "-m", "pip", "install",
+         *_pip_install_flags(),
+         "--upgrade", "pip"],
+        step="4/10", phase_label="pip-upgrade",
+        timeout=300, env=_pip_subprocess_env(),
+        fail_message="  FAIL (pip upgrade)",
+        user_hint_lines=[
+            "Hint: check your network connection and PyPI availability.",
+            "      If behind a corporate proxy, set http_proxy/https_proxy.",
+        ],
     )
-    if pip_up.returncode != 0:
-        print("  FAIL (pip upgrade)")
-        for line in (pip_up.stderr or "").strip().splitlines()[-15:]:
-            print(f"    {line}")
-        print()
-        print("  Hint: check your network connection and PyPI availability.")
-        print("        If behind a corporate proxy, set http_proxy/https_proxy.")
-        _log_install_event(
-            "4/10", "error",
-            f"pip upgrade failed (exit {pip_up.returncode})",
-            data={"phase": "pip-upgrade",
-                  "exit_code": pip_up.returncode,
-                  "stderr_tail": (pip_up.stderr or "").strip()[-400:]},
-        )
-        sys.exit(1)
 
     # Install requirements
     req_file = PROJECT_ROOT / "requirements.txt"
@@ -9232,28 +10725,27 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         )
         return
 
-    cmd = [str(venv_python), "-m", "pip", "install", "-r", str(req_file)]
+    # v0.2.53 M-P1-3: thread pip robustness flags into install argv.
+    cmd = [str(venv_python), "-m", "pip", "install",
+           *_pip_install_flags(),
+           "-r", str(req_file)]
     if dev:
         req_dev = PROJECT_ROOT / "requirements-dev.txt"
         if req_dev.exists():
             cmd = [str(venv_python), "-m", "pip", "install",
+                   *_pip_install_flags(),
                    "-r", str(req_file), "-r", str(req_dev)]
 
-    result = subprocess.run(cmd, capture_output=True, text=True,
-                            env=_pip_subprocess_env())
-    if result.returncode != 0:
-        print("  FAIL")
-        # Show last 30 lines of error
-        lines = result.stderr.strip().splitlines()[-30:]
-        for line in lines:
-            print(f"  {line}")
-        _log_install_event(
-            "4/10", "error",
-            f"pip install failed (exit {result.returncode})",
-            data={"exit_code": result.returncode,
-                  "stderr_tail": "\n".join(lines)},
-        )
-        sys.exit(1)
+    # v0.2.53 DEDUP-1: M-P0-4 silent-hang fix at the longest-running pip
+    # call in the install. Was the dominant user-reported "install
+    # appears hung" complaint pre-v0.2.53.
+    _run_logged_subprocess(
+        cmd,
+        step="4/10", phase_label="pip-install",
+        timeout=1800, env=_pip_subprocess_env(),
+        fail_message="  FAIL",
+        stderr_tail_lines=30,
+    )
     print("  OK")
     _log_install_event("4/10", "ok", "pip install completed")
 
@@ -9277,28 +10769,25 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 
     print("[4/10] Installing vco CLI (editable) ... ", end="", flush=True)
     _log_install_event("4/10", "start", "pip install -e . (vco CLI)")
-    editable_result = subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "-e", "."],
+    # v0.2.53 DEDUP-1: silent-hang fix. Soft-fail (on_failure="return")
+    # because the CLI entry point is best-effort; sys.path fallback works.
+    editable_result = _run_logged_subprocess(
+        [str(venv_python), "-m", "pip", "install",
+         *_pip_install_flags(),
+         "-e", "."],
+        step="4/10", phase_label="pip-install-editable-vco",
+        timeout=600,
         cwd=str(PROJECT_ROOT),
-        capture_output=True, text=True,
         env=_pip_subprocess_env(),
+        on_failure="return",
+        fail_message="FAIL",
+        user_hint_lines=[
+            "The orchestrator install completed, but the `vco` CLI entry "
+            "point did NOT register. You can still invoke it via",
+            "`python -m vco_lib.cli <subcommand>` until this is resolved.",
+        ],
     )
     if editable_result.returncode != 0:
-        print("FAIL")
-        for line in (editable_result.stderr or "").strip().splitlines()[-15:]:
-            print(f"    {line}")
-        print()
-        print("  The orchestrator install completed, but the `vco` CLI entry "
-              "point did NOT register. You can still invoke it via")
-        print("  `python -m vco_lib.cli <subcommand>` until this is resolved.")
-        _log_install_event(
-            "4/10", "warn",
-            f"editable install failed (exit {editable_result.returncode}); "
-            "vco CLI unavailable on PATH",
-            data={"exit_code": editable_result.returncode,
-                  "stderr_tail": (editable_result.stderr or "")
-                                 .strip()[-400:]},
-        )
         # Soft-fail: don't kill the whole install over the CLI entry
         # point. `python -m vco_lib.cli` keeps working regardless.
         return
@@ -9325,28 +10814,24 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 
     print("[4/10] Installing weaviate_mcp (editable) ... ", end="", flush=True)
     _log_install_event("4/10", "start", "pip install -e claude_mcp_servers/ (weaviate_mcp)")
-    mcp_editable_result = subprocess.run(
-        [str(venv_python), "-m", "pip", "install", "-e",
-         str(PROJECT_ROOT / "claude_mcp_servers")],
+    # v0.2.53 DEDUP-1: silent-hang fix. Soft-fail (on_failure="return")
+    # because sys.path fallback keeps consumer scripts working.
+    mcp_editable_result = _run_logged_subprocess(
+        [str(venv_python), "-m", "pip", "install",
+         *_pip_install_flags(),
+         "-e", str(PROJECT_ROOT / "claude_mcp_servers")],
+        step="4/10", phase_label="pip-install-editable-weaviate_mcp",
+        timeout=600,
         cwd=str(PROJECT_ROOT),
-        capture_output=True, text=True,
         env=_pip_subprocess_env(),
+        on_failure="return",
+        fail_message="FAIL",
+        user_hint_lines=[
+            "The orchestrator install completed, but weaviate_mcp is not pip-installed.",
+            "Consumer scripts fall back to sys.path resolution automatically.",
+        ],
     )
     if mcp_editable_result.returncode != 0:
-        print("FAIL")
-        for line in (mcp_editable_result.stderr or "").strip().splitlines()[-15:]:
-            print(f"    {line}")
-        print()
-        print("  The orchestrator install completed, but weaviate_mcp is not pip-installed.")
-        print("  Consumer scripts fall back to sys.path resolution automatically.")
-        _log_install_event(
-            "4/10", "warn",
-            f"weaviate_mcp editable install failed (exit {mcp_editable_result.returncode}); "
-            "sys.path fallback will be used",
-            data={"exit_code": mcp_editable_result.returncode,
-                  "stderr_tail": (mcp_editable_result.stderr or "")
-                                 .strip()[-400:]},
-        )
         # Soft-fail: don't kill the whole install — sys.path fallbacks still work.
         return
     print("OK")
@@ -17005,21 +18490,48 @@ def _read_launcher_version(install_root: Path) -> Optional[str]:
     return None
 
 
-def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
-    """Tier 2: download matching release artifact from GitHub Releases.
+def _download_release_binary(
+    *,
+    install_root: Path,
+    binary_basename: str,
+    bin_subdir_fname: tuple[str, str],
+    tmpdir_prefix: str,
+    timeout_s: int = 60,
+) -> Optional[Path]:
+    """v0.2.53 DEDUP-2: consolidated GitHub-release binary downloader.
 
-    Uses `gh` CLI if available (handles auth + redirects cleanly); falls
-    back to `curl -L` if `gh` is missing. Soft-fail on every error
-    (network down, release missing, auth refused, etc.) — returns None
-    and lets the caller move to Tier 3.
+    Replaces 2 near-twin (~95% identical) helpers:
+      * _try_download_launcher_binary
+      * _try_download_vct_hub_binary
 
-    The downloaded ZIP is extracted to a tempdir; only the binary is
-    moved into place at `launcher/dist/<os>-<arch>/`.
+    Pulls the matching release ZIP for ``binary_basename`` ("vct-launcher"
+    or "vct-hub") from GitHub Releases, extracts just that one binary,
+    and lands it at ``launcher/dist/<os-arch>/<basename>``.
+
+    Tier 2 in the binary-resolution chain (see _try_download_launcher_binary
+    docstring). Soft-fails on every error path — the caller falls
+    through to Tier 3 (cargo rebuild) when this returns None.
+
+    Args:
+        install_root: orchestrator install root (PROJECT_ROOT in v0.2.53).
+        binary_basename: "vct-launcher" or "vct-hub". Used both as the
+            target filename (with optional ".exe" on Windows) AND as the
+            ZIP member-name pattern.
+        bin_subdir_fname: (subdir, fname) — output of
+            ``_launcher_binary_relative_path()`` /
+            ``_vct_hub_binary_relative_path()``. Decoupling these as
+            args (vs hard-coding) keeps the helper testable.
+        tmpdir_prefix: tempfile.mkdtemp prefix ("vct-launcher-dl-" /
+            "vct-hub-dl-"). Cosmetic only.
+        timeout_s: subprocess timeout for the gh/curl call.
+
+    Returns:
+        Path to the extracted binary on success; None on any soft-fail.
     """
     version = _read_launcher_version(install_root)
     if not version:
         return None
-    subdir, fname = _launcher_binary_relative_path()
+    subdir, fname = bin_subdir_fname
     target_dir = install_root / "launcher" / "dist" / subdir
     target_path = target_dir / fname
     # Release artifact naming convention (see .github/workflows/release.yml +
@@ -17043,10 +18555,13 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
     artifact = f"vibecoded-orchestrator-{version}-{os_arch_token}.zip"
     inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="vct-launcher-dl-"))
+    is_win = platform.system().lower().startswith("win")
+    inner_member = f"{inner_root}/{binary_basename}" + (".exe" if is_win else "")
+
+    tmpdir = Path(tempfile.mkdtemp(prefix=tmpdir_prefix))
     try:
         zip_path = tmpdir / artifact
-        # Prefer gh; fall back to curl.
+        # Prefer gh; fall back to curl. Both share a 60s timeout.
         if shutil.which("gh"):
             cmd = [
                 "gh", "release", "download", f"v{version}",
@@ -17056,7 +18571,7 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
             ]
             try:
                 result = subprocess.run(
-                    cmd, capture_output=True, timeout=60, text=True
+                    cmd, capture_output=True, timeout=timeout_s, text=True
                 )
                 if result.returncode != 0:
                     return None
@@ -17070,7 +18585,7 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
             try:
                 result = subprocess.run(
                     ["curl", "-fsSL", "-o", str(zip_path), url],
-                    capture_output=True, timeout=60, text=True,
+                    capture_output=True, timeout=timeout_s, text=True,
                 )
                 if result.returncode != 0:
                     return None
@@ -17080,20 +18595,25 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
             return None
         if not zip_path.is_file():
             return None
-        # Extract just the binary.
+        # Extract just the named binary.
         import zipfile  # stdlib — defer import to avoid startup cost.
         try:
             with zipfile.ZipFile(zip_path) as z:
-                inner = f"{inner_root}/vct-launcher" + (
-                    ".exe" if platform.system().lower().startswith("win") else ""
-                )
-                # Find the binary inside the zip regardless of inner path
-                # (release ZIPs vary; tolerate both flat + nested layouts).
-                candidates = [n for n in z.namelist()
-                              if n.endswith("vct-launcher") or n.endswith("vct-launcher.exe")]
+                # The ZIP may not yet contain a newly-added binary (e.g.
+                # user pulled v0.2.21 source but their network resolved
+                # v0.2.20). Be tolerant: any zip member ending in the
+                # basename / basename.exe is acceptable.
+                candidates = [
+                    n for n in z.namelist()
+                    if n.endswith(binary_basename)
+                    or n.endswith(binary_basename + ".exe")
+                ]
                 if not candidates:
                     return None
-                member = inner if inner in z.namelist() else candidates[0]
+                member = (
+                    inner_member if inner_member in z.namelist()
+                    else candidates[0]
+                )
                 with z.open(member) as src:
                     target_dir.mkdir(parents=True, exist_ok=True)
                     with open(target_path, "wb") as dst:
@@ -17101,7 +18621,7 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
         except (zipfile.BadZipFile, OSError, KeyError):
             return None
         # Make executable on Unix.
-        if not platform.system().lower().startswith("win"):
+        if not is_win:
             try:
                 target_path.chmod(0o755)
             except OSError:
@@ -17111,6 +18631,20 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
         return None
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
+    """Tier 2: download the launcher binary from GitHub Releases.
+
+    Thin wrapper around :func:`_download_release_binary` (v0.2.53
+    DEDUP-2 — consolidates with the vct-hub downloader).
+    """
+    return _download_release_binary(
+        install_root=install_root,
+        binary_basename="vct-launcher",
+        bin_subdir_fname=_launcher_binary_relative_path(),
+        tmpdir_prefix="vct-launcher-dl-",
+    )
 
 
 def _try_cargo_tauri_build(install_root: Path) -> Optional[Path]:
@@ -18234,108 +19768,25 @@ def _try_bundled_vct_hub_binary(install_root: Path) -> Optional[Path]:
 
 
 def _try_download_vct_hub_binary(install_root: Path) -> Optional[Path]:
-    """Tier 2: download matching release artifact from GitHub Releases.
+    """Tier 2: download the vct-hub binary from GitHub Releases.
 
-    Since v0.2.21 the release ZIP carries BOTH `vct-launcher[.exe]`
-    AND `vct-hub[.exe]` per arch (see `.github/workflows/release.yml`).
-    Reuses the launcher's download tooling preferences (gh first,
-    curl fallback) and the same naming convention
-    (`vibecoded-orchestrator-<version>-<os>-<arch>.zip`).
+    Since v0.2.21 the release ZIP carries BOTH ``vct-launcher[.exe]``
+    AND ``vct-hub[.exe]`` per arch. Tier-1/2 share the same artifact
+    (one ZIP per arch contains both binaries); if the launcher binary
+    was already downloaded earlier this run, the ZIP is on
+    disk-cache-miss territory — we re-download deliberately rather
+    than carry a side-channel.
 
-    Soft-fail on every error (network down, release missing, auth
-    refused, vct-hub not yet bundled in the release ZIP) — returns
-    None and lets the caller move to Tier 3.
-
-    Tier-1/2 share the same artifact (one ZIP per arch contains both
-    binaries); if the launcher binary was already downloaded earlier
-    this run, the ZIP is on disk-cache-miss territory — we
-    re-download deliberately rather than carry a side-channel into
-    `_try_download_launcher_binary`. The redundancy is bounded (one
-    re-download per install) and keeps the function self-contained.
+    Thin wrapper around :func:`_download_release_binary` (v0.2.53
+    DEDUP-2 — consolidates with the launcher downloader, closing the
+    drift risk before v0.2.55 needs a third binary).
     """
-    version = _read_launcher_version(install_root)
-    if not version:
-        return None
-    subdir, fname = _vct_hub_binary_relative_path()
-    target_dir = install_root / "launcher" / "dist" / subdir
-    target_path = target_dir / fname
-    os_arch_token = {
-        "linux-x64": "linux-x64",
-        "windows-x64": "windows-x64",
-        "macos-arm64": "macos-arm64",
-    }.get(subdir, subdir)
-    artifact = f"vibecoded-orchestrator-{version}-{os_arch_token}.zip"
-    inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"
-
-    tmpdir = Path(tempfile.mkdtemp(prefix="vct-hub-dl-"))
-    try:
-        zip_path = tmpdir / artifact
-        if shutil.which("gh"):
-            cmd = [
-                "gh", "release", "download", f"v{version}",
-                "--repo", "hotak92/vibecoded-orchestrator",
-                "--pattern", artifact,
-                "--dir", str(tmpdir),
-            ]
-            try:
-                result = subprocess.run(
-                    cmd, capture_output=True, timeout=60, text=True
-                )
-                if result.returncode != 0:
-                    return None
-            except (subprocess.SubprocessError, OSError):
-                return None
-        elif shutil.which("curl"):
-            url = (
-                f"https://github.com/hotak92/vibecoded-orchestrator/"
-                f"releases/download/v{version}/{artifact}"
-            )
-            try:
-                result = subprocess.run(
-                    ["curl", "-fsSL", "-o", str(zip_path), url],
-                    capture_output=True, timeout=60, text=True,
-                )
-                if result.returncode != 0:
-                    return None
-            except (subprocess.SubprocessError, OSError):
-                return None
-        else:
-            return None
-        if not zip_path.is_file():
-            return None
-        import zipfile  # stdlib — defer import to avoid startup cost.
-        try:
-            with zipfile.ZipFile(zip_path) as z:
-                inner = f"{inner_root}/vct-hub" + (
-                    ".exe" if platform.system().lower().startswith("win") else ""
-                )
-                # The ZIP may not yet contain vct-hub (e.g. user pulled
-                # v0.2.21 source but their network resolved the v0.2.20
-                # release). Be tolerant: any zip member ending in
-                # `vct-hub` / `vct-hub.exe` is acceptable.
-                candidates = [
-                    n for n in z.namelist()
-                    if n.endswith("vct-hub") or n.endswith("vct-hub.exe")
-                ]
-                if not candidates:
-                    return None
-                member = inner if inner in z.namelist() else candidates[0]
-                with z.open(member) as src:
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    with open(target_path, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-        except (zipfile.BadZipFile, OSError, KeyError):
-            return None
-        if not platform.system().lower().startswith("win"):
-            try:
-                target_path.chmod(0o755)
-            except OSError:
-                pass
-        if target_path.is_file():
-            return target_path
-        return None
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    return _download_release_binary(
+        install_root=install_root,
+        binary_basename="vct-hub",
+        bin_subdir_fname=_vct_hub_binary_relative_path(),
+        tmpdir_prefix="vct-hub-dl-",
+    )
 
 
 def _try_cargo_build_vct_hub(install_root: Path) -> Optional[Path]:
@@ -18918,14 +20369,19 @@ def _python_fallback_write_mcp_entries(
             data["mcpServers"][name] = entry
             success += 1
         # Backup + atomic write.
+        # v0.2.53 DEDUP-5 / CORRECT-1: route through
+        # vco_lib.env_template._atomic_write_text which uses
+        # tempfile.mkstemp + os.replace AND unlinks the tempfile on any
+        # exception. The inline pre-v0.2.53 recipe (tmp.write_text +
+        # os.replace) left behind <path>.tmp on partial-write failures
+        # (disk-full, write-mid-flush, sigterm). The new helper makes
+        # cleanup atomic.
         try:
             if claude_json_path.is_file():
                 bak = claude_json_path.with_suffix(claude_json_path.suffix + ".bak")
                 shutil.copy2(claude_json_path, bak)
-            tmp = claude_json_path.with_suffix(claude_json_path.suffix + ".tmp")
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            os.replace(tmp, claude_json_path)
+            from vco_lib.env_template import _atomic_write_text
+            _atomic_write_text(claude_json_path, json.dumps(data, indent=2))
         except OSError as exc:
             return (0, [f"write {claude_json_path}: {exc}"])
         return (success, errors)
@@ -22547,6 +24003,18 @@ def _install_pinned_npm(package_key: str,
     else:
         install_argv = [_NPM_PATH, "install", "-g", f"{package}@{version}"]
 
+    # v0.2.53 DEDUP-1 note: this site stays on direct subprocess.run.
+    # The custom audit-log flows below (install_timeout / install_oserror /
+    # install_nonzero with per-package audit entries) plus the very high
+    # test surface area (mock.patch.object(subprocess, "run") in
+    # tests/test_install_pinned_npm.py × 8 tests + test_install_excalidraw)
+    # make routing through _run_logged_subprocess (which uses Popen)
+    # cause test fragility. The dot-cycle animation upside is real but
+    # marginal here — npm install -g typically completes in 30-90s and
+    # this code path runs many times per --update (one per pinned MCP);
+    # the chatter of 4 dot-animations would actually be noisier than
+    # silence. Future v0.2.54 cleanup can revisit if the test harness
+    # is reworked to patch Popen alongside run.
     try:
         result = subprocess.run(
             install_argv,
@@ -22977,19 +24445,18 @@ def _install_playwright_browsers() -> None:
     print("(this may take ~30s, ~150 MB)")
 
     # 1) Cache the MCP package itself (small).
+    # v0.2.53 DEDUP-1: route through _run_logged_subprocess for dot-cycle
+    # animation. Soft-fail (on_failure="return") because the MCP can
+    # lazy-install at runtime.
     try:
-        result = subprocess.run(
+        result = _run_logged_subprocess(
             [npx_path, "-y", "@playwright/mcp@latest", "--version"],
-            capture_output=True, text=True, timeout=180,
+            step="playwright", phase_label="playwright-mcp-version",
+            timeout=180,
+            on_failure="return",
+            fail_message="  WARN: @playwright/mcp version check failed.",
         )
         if result.returncode != 0:
-            print("  WARN: @playwright/mcp version check failed.")
-            print(f"    stderr: {result.stderr.strip()[:200]}")
-            _log_install_event("playwright", "warn",
-                               "npx -y @playwright/mcp@latest --version "
-                               "exited non-zero",
-                               data={"returncode": result.returncode,
-                                     "stderr": result.stderr.strip()[:500]})
             return
     except (subprocess.TimeoutExpired, OSError) as e:
         print(f"  WARN: @playwright/mcp version check failed: {e}")
@@ -23001,24 +24468,23 @@ def _install_playwright_browsers() -> None:
     #    expensive step; we only do chromium (not firefox/webkit) to
     #    keep the install size down. Users who need other browsers can
     #    `npx playwright install firefox` etc. manually.
+    # v0.2.53 DEDUP-1: 10-min download is the canonical M-P1-7
+    # "user thinks install hung" case — dot-cycle animation is the fix.
     try:
-        result = subprocess.run(
+        result = _run_logged_subprocess(
             [npx_path, "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=600,
+            step="playwright", phase_label="playwright-chromium-download",
+            timeout=600,
+            on_failure="return",
+            fail_message="  WARN: chromium install exited non-zero.",
+            user_hint_lines=[
+                "The MCP will lazy-install Chromium on first browser call.",
+            ],
         )
         if result.returncode == 0:
             print("[playwright] Chromium cached OK.")
             _log_install_event("playwright", "ok",
                                "Playwright MCP + Chromium cached")
-        else:
-            print("  WARN: chromium install exited non-zero.")
-            print(f"    stderr: {result.stderr.strip()[:200]}")
-            print("  The MCP will lazy-install Chromium on first browser call.")
-            _log_install_event("playwright", "warn",
-                               "npx playwright install chromium exited "
-                               "non-zero",
-                               data={"returncode": result.returncode,
-                                     "stderr": result.stderr.strip()[:500]})
     except subprocess.TimeoutExpired:
         print("  WARN: chromium install timed out after 10 min.")
         print("  The MCP will lazy-install Chromium on first browser call.")
@@ -23084,9 +24550,19 @@ def _compile_python_modules(venv_python: Path) -> None:
     for target in targets:
         cmd = [str(venv_python), "-m", "compileall",
                "-q", "-j", "0", str(target)]
+        # v0.2.53 DEDUP-1: route through _run_logged_subprocess for
+        # uniformity. Disable dot-cycle here — compileall is fast
+        # (a few seconds per target on typical hardware) so the
+        # animation would be visual noise.
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120,
+            result = _run_logged_subprocess(
+                cmd,
+                step="compile_python_modules",
+                phase_label=f"compileall-{target.name}",
+                timeout=120,
+                on_failure="return",
+                show_dots_after_seconds=None,
+                fail_message="",  # don't print FAIL header; loop summarises.
             )
             if result.returncode != 0:
                 error_dirs.append(target.name)

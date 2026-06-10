@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/hotak92/vibecoded-orchestrator/blob/main/docs/schemas/install-bootstrap-envelope-v1.json",
+  "title": "VCO install.py --bootstrap envelope (v1)",
+  "description": "Machine-readable envelope emitted by `python install.py --bootstrap --json`. Implements §3.3 of docs/INSTALL_ARCHITECTURE_v2.md. Versioned via `schema_version` so Rust + bash consumers can refuse versions they don't know how to read.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "vco_version",
+    "generated_at",
+    "system",
+    "paths",
+    "package_manager_advice",
+    "weaviate_endpoints",
+    "ollama_endpoints",
+    "code_embed_endpoints",
+    "vct_hub_endpoints",
+    "missing_prereqs",
+    "ready_to_install",
+    "blocker_messages",
+    "warnings"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version. Consumers MUST refuse versions they don't know how to read."
+    },
+    "vco_version": {
+      "type": "string",
+      "description": "VCO version reading like 'v0.2.53' or 'unknown'."
+    },
+    "vco_short_sha": {
+      "type": ["string", "null"],
+      "description": "git short SHA of HEAD when the install root is a git repo; null otherwise."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO-8601 timestamp of envelope generation."
+    },
+
+    "system": {
+      "type": "object",
+      "required": ["os", "os_family", "arch", "python"],
+      "additionalProperties": true,
+      "properties": {
+        "os": {
+          "type": "string",
+          "enum": ["macos", "linux", "windows", "unknown"]
+        },
+        "os_family": {
+          "type": "string",
+          "description": "Lower-cased platform.system() variant (darwin/linux/mingw64/msvc/etc)."
+        },
+        "kernel_release": {"type": ["string", "null"]},
+        "arch": {
+          "type": "string",
+          "description": "Normalized CPU architecture (arm64/x86_64/aarch64)."
+        },
+        "ram_gb": {"type": ["number", "null"]},
+        "cpu_count": {"type": ["integer", "null"]},
+
+        "python": {"$ref": "#/$defs/ToolProbe"},
+        "node": {"$ref": "#/$defs/ToolProbe"},
+        "npm": {"$ref": "#/$defs/ToolProbe"},
+        "pnpm": {"$ref": "#/$defs/ToolProbe"},
+        "podman": {"$ref": "#/$defs/ContainerProbe"},
+        "docker": {"$ref": "#/$defs/ContainerProbe"},
+        "container_runtime_chosen": {
+          "type": ["string", "null"],
+          "enum": ["podman", "docker", null]
+        },
+        "git": {"$ref": "#/$defs/ToolProbe"},
+        "brew": {"$ref": "#/$defs/BrewProbe"},
+        "joern": {"$ref": "#/$defs/ToolProbe"},
+        "lean_ctx": {"$ref": "#/$defs/ToolProbe"},
+        "claude_cli": {"$ref": "#/$defs/ToolProbe"},
+
+        "gpu": {
+          "type": "object",
+          "properties": {
+            "vendor": {
+              "type": "string",
+              "enum": ["nvidia", "amd", "metal", "intel", "none"]
+            },
+            "model": {"type": ["string", "null"]},
+            "vram_gb": {"type": ["number", "null"]},
+            "driver_version": {"type": ["string", "null"]},
+            "container_toolkit_ok": {"type": ["boolean", "null"]}
+          }
+        },
+
+        "linux_distro": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "properties": {
+                "id": {"type": "string"},
+                "version_id": {"type": "string"},
+                "codename": {"type": ["string", "null"]},
+                "pkg_mgr": {
+                  "type": ["string", "null"],
+                  "enum": ["apt", "dnf", "pacman", "zypper", "apk", null]
+                }
+              }
+            }
+          ]
+        },
+
+        "windows_features": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "properties": {
+                "powershell_version": {
+                  "type": ["array", "null"],
+                  "items": {"type": "integer"}
+                },
+                "winget_present": {"type": "boolean"},
+                "chocolatey_present": {"type": "boolean"},
+                "wsl2_present": {"type": "boolean"}
+              }
+            }
+          ]
+        },
+
+        "macos_features": {
+          "anyOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "properties": {
+                "homebrew_prefix": {"type": ["string", "null"]},
+                "is_apple_silicon": {"type": "boolean"},
+                "rosetta_present": {"type": "boolean"}
+              }
+            }
+          ]
+        }
+      }
+    },
+
+    "paths": {
+      "type": "object",
+      "required": ["install_root", "install_root_kind"],
+      "properties": {
+        "install_root": {"type": "string"},
+        "install_root_kind": {
+          "type": "string",
+          "enum": ["orchestrator_clone", "completed_install", "git_repo", "unknown"]
+        },
+        "venv_python": {"type": ["string", "null"]},
+        "mcp_venv_python": {"type": ["string", "null"]},
+        "launcher_dist_subdir": {
+          "type": ["string", "null"],
+          "description": "macos-arm64 | linux-x64 | windows-x64. Canonical SSOT for the per-OS dist subdir name (M-P0-2)."
+        },
+        "launcher_binary": {"type": ["string", "null"]},
+        "launcher_binary_exists": {"type": "boolean"},
+        "vct_hub_binary": {"type": ["string", "null"]},
+        "vct_hub_binary_exists": {"type": "boolean"},
+        "state_dir": {"type": ["string", "null"]},
+        "state_dir_exists": {"type": "boolean"},
+        "claude_dir": {"type": ["string", "null"]},
+        "vct_root_dir": {"type": ["string", "null"]},
+        "launcher_db": {"type": ["string", "null"]},
+        "hub_port_file": {"type": ["string", "null"]},
+        "hub_token_file": {"type": ["string", "null"]}
+      }
+    },
+
+    "package_manager_advice": {
+      "type": "object",
+      "properties": {
+        "primary": {
+          "type": ["string", "null"],
+          "enum": ["brew", "apt", "dnf", "pacman", "zypper", "apk", "winget", null]
+        },
+        "install_python": {"type": "array", "items": {"type": "string"}},
+        "install_node": {"type": "array", "items": {"type": "string"}},
+        "install_podman": {"type": "array", "items": {"type": "string"}},
+        "install_joern": {"type": "array", "items": {"type": "string"}},
+        "install_lean_ctx": {"type": "array", "items": {"type": "string"}},
+        "tauri_deps": {"type": "array", "items": {"type": "string"}},
+        "selinux_volume_flag_needed": {"type": "boolean"},
+        "nvidia_container_toolkit_install": {"type": ["string", "null"]},
+        "render_group_remediation": {"type": ["string", "null"]}
+      }
+    },
+
+    "weaviate_endpoints": {
+      "type": "object",
+      "required": ["base", "health"],
+      "properties": {
+        "base": {"type": "string"},
+        "health": {
+          "type": "string",
+          "description": "CANONICAL Weaviate health endpoint (NEW-4). Always `/v1/.well-known/ready` per Weaviate's documented readiness probe. Rust + bash consumers MUST use this value and not invent their own (e.g. /v1/meta)."
+        },
+        "meta": {"type": "string"},
+        "schema": {"type": "string"},
+        "graphql": {"type": "string"},
+        "grpc_host": {"type": "string"}
+      }
+    },
+
+    "ollama_endpoints": {
+      "type": "object",
+      "required": ["base"],
+      "properties": {
+        "base": {"type": "string"},
+        "tags": {"type": "string"},
+        "pull": {"type": "string"}
+      }
+    },
+
+    "code_embed_endpoints": {
+      "type": "object",
+      "required": ["base"],
+      "properties": {
+        "base": {"type": "string"},
+        "health": {"type": "string"}
+      }
+    },
+
+    "vct_hub_endpoints": {
+      "type": "object",
+      "required": ["base"],
+      "properties": {
+        "base": {"type": "string"},
+        "health": {"type": "string"}
+      }
+    },
+
+    "missing_prereqs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "human", "severity"],
+        "properties": {
+          "name": {"type": "string"},
+          "human": {"type": "string"},
+          "severity": {
+            "type": "string",
+            "enum": ["blocking", "warning", "optional"]
+          },
+          "install_hint": {"type": ["string", "null"]}
+        }
+      }
+    },
+
+    "ready_to_install": {
+      "type": "boolean",
+      "description": "True iff `missing_prereqs` contains no entries with severity='blocking'. Callers SHOULD check this; envelope exit-code 0 does NOT imply readiness."
+    },
+    "blocker_messages": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+
+  "$defs": {
+    "ToolProbe": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "cmd": {"type": ["string", "null"]},
+        "version": {"type": ["string", "null"]},
+        "version_tuple": {
+          "type": ["array", "null"],
+          "items": {"type": "integer"}
+        },
+        "min_required": {
+          "type": ["array", "null"],
+          "items": {"type": "integer"}
+        },
+        "wheel_support_ok": {"type": ["boolean", "null"]},
+        "ok": {"type": "boolean"}
+      }
+    },
+    "ContainerProbe": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "cmd": {"type": ["string", "null"]},
+        "version": {"type": ["string", "null"]},
+        "machine_running": {"type": ["boolean", "null"]},
+        "ok": {"type": "boolean"}
+      }
+    },
+    "BrewProbe": {
+      "type": "object",
+      "required": ["ok"],
+      "properties": {
+        "cmd": {"type": ["string", "null"]},
+        "version": {"type": ["string", "null"]},
+        "prefix": {"type": ["string", "null"]},
+        "ok": {"type": "boolean"}
+      }
+    }
+  }
+}
