@@ -9627,22 +9627,20 @@ def _read_app_state_key(key: str) -> "str | None":
 
     Returns the string value, or None when the key is absent or any error
     occurs (soft-fail: callers use None as "unknown / first run").
+
+    v0.2.53 DEDUP-4 / CORRECT-2: routes through
+    :func:`vco_lib.launcher_db_reader.read_app_state_value` which uses
+    ``mode=ro&immutable=1`` URI form (non-blocking against a writer
+    lock). Previously this site used ``sqlite3.connect(timeout=5.0)``
+    which could block install.py for up to 5s on Windows when the
+    launcher held a write lock — a perceived install-hang during the
+    most performance-critical step.
     """
-    import sqlite3
-    db_path = _discover_app_state_db_path()
-    if not db_path.is_file():
-        return None
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
-        try:
-            row = conn.execute(
-                "SELECT value FROM app_state WHERE key = ?", (key,)
-            ).fetchone()
-            return row[0] if row else None
-        finally:
-            conn.close()
-    except Exception:
+        from vco_lib.launcher_db_reader import read_app_state_value
+    except ImportError:
         return None
+    return read_app_state_value(key)
 
 
 def _model_id_for_active(active: str) -> str:
@@ -20141,14 +20139,19 @@ def _python_fallback_write_mcp_entries(
             data["mcpServers"][name] = entry
             success += 1
         # Backup + atomic write.
+        # v0.2.53 DEDUP-5 / CORRECT-1: route through
+        # vco_lib.env_template._atomic_write_text which uses
+        # tempfile.mkstemp + os.replace AND unlinks the tempfile on any
+        # exception. The inline pre-v0.2.53 recipe (tmp.write_text +
+        # os.replace) left behind <path>.tmp on partial-write failures
+        # (disk-full, write-mid-flush, sigterm). The new helper makes
+        # cleanup atomic.
         try:
             if claude_json_path.is_file():
                 bak = claude_json_path.with_suffix(claude_json_path.suffix + ".bak")
                 shutil.copy2(claude_json_path, bak)
-            tmp = claude_json_path.with_suffix(claude_json_path.suffix + ".tmp")
-            tmp.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            os.replace(tmp, claude_json_path)
+            from vco_lib.env_template import _atomic_write_text
+            _atomic_write_text(claude_json_path, json.dumps(data, indent=2))
         except OSError as exc:
             return (0, [f"write {claude_json_path}: {exc}"])
         return (success, errors)
