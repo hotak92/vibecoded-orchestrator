@@ -63,6 +63,17 @@ set -uo pipefail
 REPO_ROOT="${1:-}"
 shift || true
 
+# NEW-1 + DEDUP-15 (v0.2.53): shared SvelteKit asset-ref counter.
+# Source from $REPO_ROOT (caller-provided) rather than $0's dir
+# because this script is invoked as
+# `post-install-launcher.sh "$REPO_ROOT" [flags...]` from
+# first-install.{sh,command}. The lib lives at the same path on
+# every checkout.
+if [ -n "${REPO_ROOT:-}" ] && [ -f "$REPO_ROOT/scripts/lib/asset-ref-count.sh" ]; then
+    # shellcheck source=lib/asset-ref-count.sh
+    . "$REPO_ROOT/scripts/lib/asset-ref-count.sh"
+fi
+
 # Durable install log written by both install.py and this script. Both
 # the launcher and Claude Code read this on failure to figure out where
 # the install got to. JSONL: one event per line, never PII. See
@@ -490,9 +501,24 @@ _bundled_binary_is_fresh() {
         # binary. `strings` is part of binutils — present on every
         # supported host with a Rust toolchain. If absent, skip the
         # check (don't false-fail on minimal containers).
-        if command -v strings >/dev/null 2>&1; then
+        # NEW-1 + DEDUP-15 (v0.2.53): use shared asset_ref_count
+        # helper if available (sourced at the top of this file). The
+        # helper uses the broad substring `_app/immutable/` (matches
+        # Svelte 5 emission). Falls back to the legacy inline check
+        # if the helper isn't on disk (development checkouts where
+        # the lib hasn't been pulled yet).
+        if command -v asset_ref_count >/dev/null 2>&1; then
             local embedded_count
-            embedded_count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/assets' || true)"
+            embedded_count="$(asset_ref_count "$bin")"
+            # -1 sentinel means `strings` is missing → trust binary.
+            if [ "${embedded_count:-0}" -ne -1 ] && [ "${embedded_count:-0}" -lt 5 ]; then
+                echo "[launcher] ${bin##*/} hash matches but frontend is NOT embedded (found $embedded_count asset refs, expected >=5)."
+                echo "           Refusing to trust — bundled binary was built with an empty launcher/build/."
+                return 1
+            fi
+        elif command -v strings >/dev/null 2>&1; then
+            local embedded_count
+            embedded_count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/' || true)"
             if [ "${embedded_count:-0}" -lt 5 ]; then
                 echo "[launcher] ${bin##*/} hash matches but frontend is NOT embedded (found $embedded_count asset refs, expected >=5)."
                 echo "           Refusing to trust — bundled binary was built with an empty launcher/build/."

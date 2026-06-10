@@ -39,17 +39,19 @@ candidates=(
 # Refuse to launch a release binary that has no embedded SvelteKit
 # frontend. A build that ran with an empty `launcher/build/` produces
 # a binary that compiles fine but renders "Could not connect to
-# localhost" at runtime (regressed in 5abb8cf, 2026-04-28). `strings`
-# is part of binutils — present on every supported host with a Rust
-# toolchain. If absent we skip the check rather than false-fail.
+# localhost" at runtime (regressed in 5abb8cf, 2026-04-28).
+#
+# NEW-1 + DEDUP-15 (v0.2.53): substring is `_app/immutable/` (broad —
+# matches all SvelteKit emission shapes including chunks/, entry/,
+# nodes/, and assets/). Previously this site used the narrow
+# `_app/immutable/assets` which false-rejects healthy Svelte 5 builds.
+# See `.claude/context/audits/shell-scripts-dedup-2026-06-10.md` §4.
+# The shared implementation lives at `scripts/lib/asset-ref-count.sh`.
+# shellcheck source=scripts/lib/asset-ref-count.sh
+. "$SCRIPT_DIR/scripts/lib/asset-ref-count.sh"
+
 _binary_has_embedded_frontend() {
-    local bin="$1"
-    if ! command -v strings >/dev/null 2>&1; then
-        return 0  # can't check; trust the binary
-    fi
-    local count
-    count="$(strings "$bin" 2>/dev/null | grep -c '_app/immutable/assets' || true)"
-    [ "${count:-0}" -ge 5 ]
+    asset_ref_count_passes "$1"
 }
 
 LAUNCHER_BIN=""
