@@ -2517,18 +2517,36 @@ def _parse_powershell_functions(content: str) -> List[Dict[str, Any]]:
                 body_end += 1
             body = cleaned[body_start:body_end]
 
-            # Look for `param( ... )` at top of body (allowing
-            # whitespace + comments stripped above).
-            param_match = re.search(
-                r"\bparam\s*\(([^)]*)\)",
+            # Look for `param( ... )` at top of body. We can't use a
+            # bare `\(...\)` regex because the param block contains
+            # nested parens (`[Parameter()]` attributes), and `[^)]*`
+            # stops at the first close paren which truncates the
+            # block before the first $-variable. Hand-roll the
+            # balanced-paren scan instead.
+            param_keyword = re.search(
+                r"\bparam\s*\(",
                 body,
-                re.IGNORECASE | re.DOTALL,
+                re.IGNORECASE,
             )
-            if param_match:
-                param_block = param_match.group(1)
-                # Capture `$name` occurrences, but only ones preceded
-                # by a `[Parameter(...)]` attribute or sitting at the
-                # block top level.
+            if param_keyword:
+                paren_start = param_keyword.end() - 1  # index of the `(`
+                depth = 1
+                pos = paren_start + 1
+                while pos < len(body) and depth > 0:
+                    ch = body[pos]
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                    pos += 1
+                # `param_block` is the content BETWEEN the outer
+                # parens (depth was decremented to 0 on the close,
+                # so pos is one past it).
+                param_block = body[paren_start + 1:pos - 1]
+                # Capture `$name` occurrences. We don't constrain on
+                # the leading `[Parameter()]` attribute because not
+                # all params carry the attribute (positional / simple
+                # params are valid too).
                 for pm in re.finditer(
                     r"\$([A-Za-z_][\w]*)",
                     param_block,

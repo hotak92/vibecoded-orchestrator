@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+"""V52-O.11.N (v0.2.53 Track E) — PowerShell parser unit tests.
+
+Tests the pure-function helpers at
+``templates/scripts/analyze_code_graph.py``
+(``_strip_powershell_comments`` + ``_parse_powershell_functions``).
+The wired-in analyzer method ``_analyze_powershell_file`` lives on
+``CodeGraphAnalyzer`` and depends on Weaviate / EmbeddingService;
+covered separately by integration tests.
+"""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ANALYZE_PATH = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
+
+
+def _load_module():
+    """Identical loader pattern to ``tests/test_svelte_parser.py`` —
+    parses only the prelude before ``class CodeGraphAnalyzer:`` so the
+    helpers under test are reachable without paying the
+    weaviate-client / EmbeddingService import cost."""
+    module_name = "analyze_code_graph_partial"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    source = ANALYZE_PATH.read_text(encoding="utf-8")
+    cutoff = source.find("class CodeGraphAnalyzer:")
+    if cutoff == -1:
+        raise AssertionError("Could not locate class CodeGraphAnalyzer:")
+    prelude = source[:cutoff]
+    module = type(sys)(module_name)
+    module.__dict__["__file__"] = str(ANALYZE_PATH)
+    module.__dict__["__name__"] = module_name
+    try:
+        exec(compile(prelude, str(ANALYZE_PATH), "exec"), module.__dict__)
+    except SystemExit:
+        pass
+    sys.modules[module_name] = module
+    return module
+
+
+class PowerShellCommentStrippingTests(unittest.TestCase):
+    """Exercises ``_strip_powershell_comments``."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = _load_module()
+
+    def test_single_line_comments_stripped(self) -> None:
+        src = (
+            "function Foo {\n"
+            "  # this is a comment\n"
+            "  return 1\n"
+            "}\n"
+        )
+        out = self.mod._strip_powershell_comments(src)
+        self.assertNotIn("this is a comment", out)
+        # Code line should survive.
+        self.assertIn("return 1", out)
+
+    def test_block_comments_stripped(self) -> None:
+        src = (
+            "<#\n"
+            ".SYNOPSIS\n"
+            "Does the thing.\n"
+            "#>\n"
+            "function Foo {}\n"
+        )
+        out = self.mod._strip_powershell_comments(src)
+        self.assertNotIn("SYNOPSIS", out)
+        self.assertNotIn("Does the thing", out)
+        self.assertIn("function Foo", out)
+
+    def test_region_markers_stripped(self) -> None:
+        src = (
+            "#region Helpers\n"
+            "function Foo {}\n"
+            "#endregion\n"
+        )
+        out = self.mod._strip_powershell_comments(src)
+        self.assertNotIn("#region", out)
+        self.assertNotIn("#endregion", out)
+        self.assertIn("function Foo", out)
+
+    def test_block_comment_with_inner_hash_does_not_break(self) -> None:
+        # Defense: a block comment containing `#` shouldn't bleed
+        # into the single-line stripper (block-strip runs first).
+        src = "<# inner # symbol #>\nfunction Foo {}\n"
+        out = self.mod._strip_powershell_comments(src)
+        self.assertNotIn("inner", out)
+        self.assertIn("function Foo", out)
+
+
+class PowerShellFunctionParsingTests(unittest.TestCase):
+    """Exercises ``_parse_powershell_functions``."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = _load_module()
+
+    def test_bare_function_decl(self) -> None:
+        src = (
+            "function Get-Foo {\n"
+            "  return 'foo'\n"
+            "}\n"
+        )
+        decls = self.mod._parse_powershell_functions(src)
+        self.assertEqual(len(decls), 1)
+        self.assertEqual(decls[0]["name"], "Get-Foo")
+        self.assertIsNone(decls[0]["scope"])
+        self.assertEqual(decls[0]["kind"], "function")
+        self.assertEqual(decls[0]["params"], [])
+
+    def test_function_with_parens(self) -> None:
+        # PowerShell tolerates `function Name(...)` shape too.
+        src = (
+            "function Get-Bar() {\n"
+            "  return 'bar'\n"
+            "}\n"
+        )
+        decls = self.mod._parse_powershell_functions(src)
+        self.assertEqual(len(decls), 1)
+        self.assertEqual(decls[0]["name"], "Get-Bar")
+
+    def test_function_with_param_block(self) -> None:
+        src = (
+            "function Invoke-Thing {\n"
+            "  param(\n"
+            "    [Parameter()] [string]$Name,\n"
+            "    [Parameter()] [int]$Count\n"
+            "  )\n"
+            "  Write-Output \"$Name x $Count\"\n"
+            "}\n"
+        )
+        decls = self.mod._parse_powershell_functions(src)
+        self.assertEqual(len(decls), 1)
+        self.assertEqual(decls[0]["name"], "Invoke-Thing")
+        self.assertEqual(decls[0]["params"], ["Name", "Count"])
+
+    def test_scope_prefix_captured(self) -> None:
+        src = (
+            "function global:Set-Setting {\n"
+            "  $Global:Foo = 1\n"
+            "}\n"
+            "function script:Helper { return 2 }\n"
+        )
+        decls = self.mod._parse_powershell_functions(src)
+        by_name = {d["name"]: d for d in decls}
+        self.assertEqual(by_name["Set-Setting"]["scope"], "global")
+        self.assertEqual(by_name["Helper"]["scope"], "script")
+
+    def test_filter_keyword_treated_as_function(self) -> None:
+        src = (
+            "filter Get-Big {\n"
+            "  if ($_.Length -gt 100) { $_ }\n"
+            "}\n"
+        )
+        decls = self.mod._parse_powershell_functions(src)
+        self.assertEqual(len(decls), 1)
+        self.assertEqual(decls[0]["name"], "Get-Big")
+        self.assertEqual(decls[0]["kind"], "filter")
+
+    def test_function_decl_inside_block_comment_ignored(self) -> None:
+        # Defense: docstring-style example shouldn't masquerade as a
+        # real declaration.
+        src = (
+            "<#\n"
+            ".EXAMPLE\n"
+            "function Bogus { return 1 }\n"
+            "#>\n"
+            "function Real { return 2 }\n"
+        )
+        decls = self.mod._parse_powershell_functions(src)
+        names = [d["name"] for d in decls]
+        self.assertEqual(names, ["Real"], f"Expected only 'Real', got {names}")
+
+
+if __name__ == "__main__":
+    unittest.main()
