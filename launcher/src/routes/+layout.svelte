@@ -59,6 +59,18 @@
   import WeightsUpdatePrompt from '$lib/components/WeightsUpdatePrompt.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import { invoke } from '$lib/tauri';
+  // M-P1-5: per-install-root scoping for localStorage flags. See
+  // `install-state-store.ts` for the migration rationale (two clones
+  // on the same machine share localStorage; unscoped keys leaked
+  // dismissal state cross-clone). The helper migrates legacy unscoped
+  // values on first scoped read, so existing users do not lose their
+  // suppressions.
+  import {
+    getInstallScopedFlag,
+    setInstallScopedFlag,
+    clearInstallScopedFlag,
+  } from '$lib/stores/install-state-store';
+  import type { InstallHealth } from '$lib/types/launcher';
   import { selectedProject, projects } from '$lib/stores/projects';
   import { startChangePoller, onChange } from '$lib/stores/changes';
   import type { LegacyCodegraphReport } from '$lib/types/identity';
@@ -162,9 +174,21 @@
     // ships.
     (async () => {
       try {
-        const forced = localStorage.getItem('vct.onboarding_force') === '1';
+        // M-P1-5: resolve install_root so the one-shot flags are
+        // scoped to THIS clone. A check_install_health failure is
+        // soft-fail — we proceed with `null` install_root, which the
+        // store maps to the "unknown" bucket (preserves the
+        // pre-v0.2.53 unscoped behaviour for that single launcher).
+        let installRoot: string | null = null;
+        try {
+          const h = await invoke<InstallHealth>('check_install_health');
+          installRoot = h.install_root ?? null;
+        } catch {
+          /* dev / browser mode — fall through with null */
+        }
+        const forced = getInstallScopedFlag('vct.onboarding_force', installRoot) === '1';
         if (forced) {
-          localStorage.removeItem('vct.onboarding_force');
+          clearInstallScopedFlag('vct.onboarding_force', installRoot);
           await clearOnboardingComplete();
           ui.openOnboarding(); // sets onboardingForced=true in the store
         } else {
@@ -173,8 +197,8 @@
             ui.autoOpenOnboarding(); // first-launch auto-open; preflight may auto-close
           }
         }
-        if (localStorage.getItem('vct.show_changelog_after_update') === '1') {
-          localStorage.removeItem('vct.show_changelog_after_update');
+        if (getInstallScopedFlag('vct.show_changelog_after_update', installRoot) === '1') {
+          clearInstallScopedFlag('vct.show_changelog_after_update', installRoot);
           showChangelog = true;
         }
       } catch (e) {

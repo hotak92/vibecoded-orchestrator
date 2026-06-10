@@ -23,7 +23,14 @@
   import { onMount, onDestroy } from 'svelte';
   import { invoke, tauriAvailable } from '$lib/tauri';
   import type { InstallHealth } from '$lib/types/launcher';
+  import {
+    getInstallScopedFlag,
+    setInstallScopedFlag,
+  } from '$lib/stores/install-state-store';
 
+  // M-P1-5: dismiss flag is scoped by install_root so two clones on
+  // the same machine don't share dismissals. Pre-v0.2.53 unscoped
+  // copies are migrated by `getInstallScopedFlag()` on first read.
   const DISMISSED_KEY = 'vct.install_check_dismissed';
   const README_URL =
     'https://github.com/hotak92/vibecoded-orchestrator/blob/main/README.md#tldr--install--launch';
@@ -35,13 +42,14 @@
   // listener can guard against rapid re-entry while still letting the
   // user click "Re-check" from the same render.
   let rechecking = $state(false);
+  // M-P1-5: current install_root for scoped localStorage operations.
+  // Updated on every check_install_health response (defensive — the
+  // walk-up resolver could in principle return a different root after
+  // a launcher relocates, though in practice it does not).
+  let installRoot = $state<string | null>(null);
 
   function userDismissedPreviously(): boolean {
-    try {
-      return localStorage.getItem(DISMISSED_KEY) === 'true';
-    } catch {
-      return false;
-    }
+    return getInstallScopedFlag(DISMISSED_KEY, installRoot) === 'true';
   }
 
   async function openReadme() {
@@ -62,9 +70,9 @@
   }
 
   function letMeThrough() {
-    try {
-      localStorage.setItem(DISMISSED_KEY, 'true');
-    } catch {}
+    // M-P1-5: persist the dismissal against the active install_root so
+    // a sibling clone retains its own decision.
+    setInstallScopedFlag(DISMISSED_KEY, installRoot, 'true');
     visible = false;
   }
 
@@ -85,6 +93,7 @@
     try {
       const result = await invoke<InstallHealth>('check_install_health');
       health = result;
+      installRoot = result.install_root ?? null;
       if (result.all_ok) {
         // Self-heal: the install completed in a side terminal while
         // the launcher was open. Drop the gate without requiring a

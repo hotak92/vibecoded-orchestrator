@@ -17,8 +17,42 @@
 import { writable, get } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
 import { orchestrator } from './orchestrator';
+// M-P1-5: scope the seen-version flag by install_root so two clones
+// on the same machine maintain independent dismissal state. The
+// helper transparently migrates the legacy unscoped key on first
+// scoped read.
+import {
+  getInstallScopedFlag,
+  setInstallScopedFlag,
+  clearInstallScopedFlag,
+} from './install-state-store';
+import type { InstallHealth } from '$lib/types/launcher';
 
 const SEEN_KEY = 'vct.update.seen_version';
+
+// Lazy-resolved install_root cache. The updater store is created at
+// module-load time (before the first `check_install_health` round-
+// trip), so we cannot synchronously know the install_root. Instead we
+// resolve it lazily on first read/write and reuse the cached value.
+// `null` is a sentinel for "resolved, but unknown" (dev mode); the
+// store helpers map that to the "unknown" bucket which still beats
+// the cross-clone leak of the pre-v0.2.53 unscoped key.
+let cachedInstallRoot: string | null | undefined = undefined;
+
+async function resolveInstallRoot(): Promise<string | null> {
+  if (cachedInstallRoot !== undefined) return cachedInstallRoot;
+  if (!tauriAvailable()) {
+    cachedInstallRoot = null;
+    return null;
+  }
+  try {
+    const h = await invoke<InstallHealth>('check_install_health');
+    cachedInstallRoot = h.install_root ?? null;
+  } catch {
+    cachedInstallRoot = null;
+  }
+  return cachedInstallRoot;
+}
 
 /** v0.2.16 (W4 / 0.5): which of the four update signals to render.
  *  Priority order (v0.2.51):
@@ -81,15 +115,23 @@ interface UpdaterState {
   nonFf: OrchestratorNonFfPayload | null;
 }
 
+// Synchronous loadSeen for the initial store value. When the lazy
+// install_root resolution has not yet completed, we read whatever the
+// store helper sees for the "unknown" bucket — which transparently
+// migrates the legacy key. The first async store action that observes
+// install_root (refresh / dismiss) then rewrites under the scoped key
+// AND clears the unknown bucket.
 function loadSeen(): string | null {
-  if (typeof localStorage === 'undefined') return null;
-  return localStorage.getItem(SEEN_KEY);
+  return getInstallScopedFlag(SEEN_KEY, cachedInstallRoot ?? null);
 }
 
-function saveSeen(v: string | null) {
-  if (typeof localStorage === 'undefined') return;
-  if (v) localStorage.setItem(SEEN_KEY, v);
-  else localStorage.removeItem(SEEN_KEY);
+async function saveSeen(v: string | null) {
+  const root = await resolveInstallRoot();
+  if (v) {
+    setInstallScopedFlag(SEEN_KEY, root, v);
+  } else {
+    clearInstallScopedFlag(SEEN_KEY, root);
+  }
 }
 
 function pickKind(status: {
@@ -190,7 +232,10 @@ function createUpdaterStore() {
         ? `${us.source_version}|${us.installed_version}|${us.on_disk_binary_version}|${us.running_version}`
         : (o.version || '');
       const marker = `${kind ?? 'none'}:${versionSnapshot}`;
-      saveSeen(marker);
+      // Fire-and-forget: the store mutation MUST stay synchronous
+      // (UpdateBadge depends on it for derived state), and the
+      // localStorage write is best-effort anyway.
+      void saveSeen(marker);
       update((s) => ({
         ...s,
         dismissed: true,
