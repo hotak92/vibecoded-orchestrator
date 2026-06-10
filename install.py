@@ -10207,6 +10207,212 @@ def _pip_subprocess_env() -> dict[str, str]:
     return env
 
 
+# ---------------------------------------------------------------------------
+# v0.2.53 DEDUP-1: _run_logged_subprocess
+#
+# Single helper for the ~40 `subprocess.run(capture_output=True, text=True,
+# timeout=N)` callsites that follow the same boilerplate:
+#
+#   result = subprocess.run([...], capture_output=True, text=True, timeout=N)
+#   if result.returncode != 0:
+#       print(FAIL)
+#       for line in result.stderr.splitlines()[-N:]:
+#           print(line)
+#       _log_install_event(..., 'error', ..., data={'stderr_tail': ...})
+#       sys.exit(1)
+#
+# WHY consolidate (closes M-P0-4):
+# * Single place to add dot-cycle animation (M-P1-7) so users see
+#   long-running pip/npm/playwright steps are alive, not hung.
+# * Uniform stderr-tail length + uniform timeout policy.
+# * Uniform env-scrub (today only pip uses _pip_subprocess_env(); the
+#   helper makes it opt-in once at the callsite).
+# * Single place to add retry-with-backoff if/when needed.
+#
+# Sites covered in v0.2.53 (the 8 silent-hang sites per audit):
+#   - _install_requirements: pip upgrade, pip install -r, pip install -e
+#     (root), pip install -e (claude_mcp_servers)  [4 sites]
+#   - _install_pinned_npm: npm install -g                                [1]
+#   - _install_playwright_browsers: npx + playwright install             [2]
+#   - _compile_python_modules: python -m compileall                      [1]
+#
+# Other ~30 sites can migrate incrementally in v0.2.54+ as they're touched
+# for other reasons. The dot-cycle behavior is opt-in via
+# `show_dots_after_seconds`, so non-migrated callsites stay silent (which
+# is fine — they were silent before too).
+# ---------------------------------------------------------------------------
+
+
+def _run_logged_subprocess(
+    cmd: list[str],
+    *,
+    step: str,
+    phase_label: str,
+    timeout: int,
+    env: Optional[dict[str, str]] = None,
+    cwd: Optional[str] = None,
+    stderr_tail_lines: int = 15,
+    on_failure: str = "exit",
+    show_dots_after_seconds: Optional[float] = 3.0,
+    fail_message: Optional[str] = None,
+    user_hint_lines: Optional[list[str]] = None,
+) -> "subprocess.CompletedProcess[str]":
+    """Run a subprocess with uniform logging, dot-cycle animation, and stderr tail.
+
+    Args:
+        cmd: Argv list to run.
+        step: Install-step label for _log_install_event (e.g. "4/10").
+        phase_label: Short label for the log data (e.g. "pip-upgrade").
+        timeout: Subprocess timeout in seconds.
+        env: Optional env override; if None uses inherited environ.
+        cwd: Optional working directory.
+        stderr_tail_lines: Number of stderr lines to surface on failure.
+        on_failure: One of:
+            - "exit": print FAIL + tail + log error + sys.exit(1).
+            - "return": print FAIL + tail + log warn; return the result.
+            - "raise": re-raise CalledProcessError (for callers that
+              want to handle the failure themselves).
+        show_dots_after_seconds: If not None, start a dot-cycle
+            background thread after this many seconds with no output.
+            Set None to disable (e.g. for short probes).
+        fail_message: Optional one-line message to print before tail
+            when failure occurs. Default: f"FAIL ({phase_label})".
+        user_hint_lines: Optional list of follow-up hint lines printed
+            after the stderr tail (e.g. "check your network").
+
+    Returns:
+        subprocess.CompletedProcess[str] when on_failure="return" OR
+        the command succeeded. For on_failure="exit" the function does
+        not return on failure (calls sys.exit(1)).
+
+    Raises:
+        subprocess.CalledProcessError: only when on_failure="raise" AND
+            the command returned non-zero.
+        subprocess.TimeoutExpired: propagated when the subprocess times
+            out (no on_failure branch covers timeout intentionally —
+            timeout is a logic bug in the caller's `timeout` arg).
+    """
+    if on_failure not in ("exit", "return", "raise"):
+        raise ValueError(
+            f"on_failure must be 'exit'|'return'|'raise', got {on_failure!r}"
+        )
+
+    # Dot-cycle animation: in a separate thread to avoid blocking the
+    # subprocess. We poll the subprocess by spawning it ourselves rather
+    # than via subprocess.run, so the animation can be cancelled cleanly
+    # when the subprocess exits.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=cwd,
+    )
+
+    dots_stop = False
+    dots_thread = None
+
+    def _dot_cycle() -> None:
+        # Display "[12s] ..." style elapsed counter + cycling dots.
+        # The leading carriage-return overwrites the line each tick.
+        # First dot appears after `show_dots_after_seconds` of no output.
+        if show_dots_after_seconds is None:
+            return
+        time.sleep(show_dots_after_seconds)
+        start = time.monotonic()
+        dot_state = 0
+        while not dots_stop and proc.poll() is None:
+            elapsed = int(time.monotonic() - start) + int(show_dots_after_seconds)
+            dots = "." * ((dot_state % 4) + 1)  # 1, 2, 3, 4 dots
+            try:
+                sys.stdout.write(f"\r  [{elapsed:>3}s] {phase_label} {dots:<4}")
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                # Detached / closed stdout — just stop animating.
+                break
+            dot_state += 1
+            time.sleep(1.0)
+        # Clear the line so the next print starts fresh.
+        try:
+            sys.stdout.write("\r" + " " * 60 + "\r")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    if show_dots_after_seconds is not None and sys.stdout.isatty():
+        import threading
+        dots_thread = threading.Thread(target=_dot_cycle, daemon=True)
+        dots_thread.start()
+
+    try:
+        stdout_text, stderr_text = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        dots_stop = True
+        try:
+            proc.kill()
+            proc.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        if dots_thread is not None:
+            dots_thread.join(timeout=2)
+        _log_install_event(
+            step, "error",
+            f"{phase_label} timed out after {timeout}s",
+            data={"phase": phase_label, "timeout": timeout},
+        )
+        if on_failure == "exit":
+            print(f"FAIL ({phase_label} timed out after {timeout}s)")
+            sys.exit(1)
+        raise
+    finally:
+        dots_stop = True
+        if dots_thread is not None:
+            dots_thread.join(timeout=2)
+
+    result = subprocess.CompletedProcess(
+        args=cmd, returncode=proc.returncode,
+        stdout=stdout_text, stderr=stderr_text,
+    )
+
+    if result.returncode == 0:
+        return result
+
+    # Failure path. Empty `fail_message=""` means "suppress the header
+    # line"; the caller is summarising errors itself (e.g. compileall
+    # loops over multiple dirs and prints one final summary).
+    msg = fail_message if fail_message is not None else f"FAIL ({phase_label})"
+    if msg:
+        print(msg)
+    tail = (result.stderr or "").strip().splitlines()[-stderr_tail_lines:]
+    if msg:
+        for line in tail:
+            print(f"  {line}")
+    if user_hint_lines:
+        print()
+        for line in user_hint_lines:
+            print(f"  {line}")
+    _log_install_event(
+        step, "error" if on_failure == "exit" else "warn",
+        f"{phase_label} failed (exit {result.returncode})",
+        data={
+            "phase": phase_label,
+            "exit_code": result.returncode,
+            "stderr_tail": (result.stderr or "").strip()[-400:],
+        },
+    )
+    if on_failure == "exit":
+        sys.exit(1)
+    if on_failure == "raise":
+        raise subprocess.CalledProcessError(
+            returncode=result.returncode,
+            cmd=cmd,
+            output=stdout_text,
+            stderr=stderr_text,
+        )
+    return result  # on_failure == "return"
+
+
 def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     label = "with dev extras" if dev else "production"
     print(f"[4/10] Installing dependencies ({label}) ... ", flush=True)
@@ -10216,27 +10422,20 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         data={"dev": dev},
     )
 
-    # Upgrade pip — surface errors instead of swallowing them via check=True
-    pip_up = subprocess.run(
+    # Upgrade pip — surface errors instead of swallowing them via check=True.
+    # v0.2.53 DEDUP-1 (M-P0-4 silent-hang fix): _run_logged_subprocess adds
+    # dot-cycle animation after 3s so the user can see pip is alive during
+    # the typical 30–90s upgrade.
+    _run_logged_subprocess(
         [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
-        capture_output=True, text=True,
-        env=_pip_subprocess_env(),
+        step="4/10", phase_label="pip-upgrade",
+        timeout=300, env=_pip_subprocess_env(),
+        fail_message="  FAIL (pip upgrade)",
+        user_hint_lines=[
+            "Hint: check your network connection and PyPI availability.",
+            "      If behind a corporate proxy, set http_proxy/https_proxy.",
+        ],
     )
-    if pip_up.returncode != 0:
-        print("  FAIL (pip upgrade)")
-        for line in (pip_up.stderr or "").strip().splitlines()[-15:]:
-            print(f"    {line}")
-        print()
-        print("  Hint: check your network connection and PyPI availability.")
-        print("        If behind a corporate proxy, set http_proxy/https_proxy.")
-        _log_install_event(
-            "4/10", "error",
-            f"pip upgrade failed (exit {pip_up.returncode})",
-            data={"phase": "pip-upgrade",
-                  "exit_code": pip_up.returncode,
-                  "stderr_tail": (pip_up.stderr or "").strip()[-400:]},
-        )
-        sys.exit(1)
 
     # Install requirements
     req_file = PROJECT_ROOT / "requirements.txt"
@@ -10256,21 +10455,16 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
             cmd = [str(venv_python), "-m", "pip", "install",
                    "-r", str(req_file), "-r", str(req_dev)]
 
-    result = subprocess.run(cmd, capture_output=True, text=True,
-                            env=_pip_subprocess_env())
-    if result.returncode != 0:
-        print("  FAIL")
-        # Show last 30 lines of error
-        lines = result.stderr.strip().splitlines()[-30:]
-        for line in lines:
-            print(f"  {line}")
-        _log_install_event(
-            "4/10", "error",
-            f"pip install failed (exit {result.returncode})",
-            data={"exit_code": result.returncode,
-                  "stderr_tail": "\n".join(lines)},
-        )
-        sys.exit(1)
+    # v0.2.53 DEDUP-1: M-P0-4 silent-hang fix at the longest-running pip
+    # call in the install. Was the dominant user-reported "install
+    # appears hung" complaint pre-v0.2.53.
+    _run_logged_subprocess(
+        cmd,
+        step="4/10", phase_label="pip-install",
+        timeout=1800, env=_pip_subprocess_env(),
+        fail_message="  FAIL",
+        stderr_tail_lines=30,
+    )
     print("  OK")
     _log_install_event("4/10", "ok", "pip install completed")
 
@@ -10294,28 +10488,23 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 
     print("[4/10] Installing vco CLI (editable) ... ", end="", flush=True)
     _log_install_event("4/10", "start", "pip install -e . (vco CLI)")
-    editable_result = subprocess.run(
+    # v0.2.53 DEDUP-1: silent-hang fix. Soft-fail (on_failure="return")
+    # because the CLI entry point is best-effort; sys.path fallback works.
+    editable_result = _run_logged_subprocess(
         [str(venv_python), "-m", "pip", "install", "-e", "."],
+        step="4/10", phase_label="pip-install-editable-vco",
+        timeout=600,
         cwd=str(PROJECT_ROOT),
-        capture_output=True, text=True,
         env=_pip_subprocess_env(),
+        on_failure="return",
+        fail_message="FAIL",
+        user_hint_lines=[
+            "The orchestrator install completed, but the `vco` CLI entry "
+            "point did NOT register. You can still invoke it via",
+            "`python -m vco_lib.cli <subcommand>` until this is resolved.",
+        ],
     )
     if editable_result.returncode != 0:
-        print("FAIL")
-        for line in (editable_result.stderr or "").strip().splitlines()[-15:]:
-            print(f"    {line}")
-        print()
-        print("  The orchestrator install completed, but the `vco` CLI entry "
-              "point did NOT register. You can still invoke it via")
-        print("  `python -m vco_lib.cli <subcommand>` until this is resolved.")
-        _log_install_event(
-            "4/10", "warn",
-            f"editable install failed (exit {editable_result.returncode}); "
-            "vco CLI unavailable on PATH",
-            data={"exit_code": editable_result.returncode,
-                  "stderr_tail": (editable_result.stderr or "")
-                                 .strip()[-400:]},
-        )
         # Soft-fail: don't kill the whole install over the CLI entry
         # point. `python -m vco_lib.cli` keeps working regardless.
         return
@@ -10342,28 +10531,23 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 
     print("[4/10] Installing weaviate_mcp (editable) ... ", end="", flush=True)
     _log_install_event("4/10", "start", "pip install -e claude_mcp_servers/ (weaviate_mcp)")
-    mcp_editable_result = subprocess.run(
+    # v0.2.53 DEDUP-1: silent-hang fix. Soft-fail (on_failure="return")
+    # because sys.path fallback keeps consumer scripts working.
+    mcp_editable_result = _run_logged_subprocess(
         [str(venv_python), "-m", "pip", "install", "-e",
          str(PROJECT_ROOT / "claude_mcp_servers")],
+        step="4/10", phase_label="pip-install-editable-weaviate_mcp",
+        timeout=600,
         cwd=str(PROJECT_ROOT),
-        capture_output=True, text=True,
         env=_pip_subprocess_env(),
+        on_failure="return",
+        fail_message="FAIL",
+        user_hint_lines=[
+            "The orchestrator install completed, but weaviate_mcp is not pip-installed.",
+            "Consumer scripts fall back to sys.path resolution automatically.",
+        ],
     )
     if mcp_editable_result.returncode != 0:
-        print("FAIL")
-        for line in (mcp_editable_result.stderr or "").strip().splitlines()[-15:]:
-            print(f"    {line}")
-        print()
-        print("  The orchestrator install completed, but weaviate_mcp is not pip-installed.")
-        print("  Consumer scripts fall back to sys.path resolution automatically.")
-        _log_install_event(
-            "4/10", "warn",
-            f"weaviate_mcp editable install failed (exit {mcp_editable_result.returncode}); "
-            "sys.path fallback will be used",
-            data={"exit_code": mcp_editable_result.returncode,
-                  "stderr_tail": (mcp_editable_result.stderr or "")
-                                 .strip()[-400:]},
-        )
         # Soft-fail: don't kill the whole install — sys.path fallbacks still work.
         return
     print("OK")
@@ -23564,10 +23748,18 @@ def _install_pinned_npm(package_key: str,
     else:
         install_argv = [_NPM_PATH, "install", "-g", f"{package}@{version}"]
 
+    # v0.2.53 DEDUP-1: route through _run_logged_subprocess with
+    # on_failure="raise" so we preserve the audit-log flows below while
+    # still getting dot-cycle animation (M-P1-7). The npm install
+    # commonly runs 30-90s; without dots, users think it hung.
     try:
-        result = subprocess.run(
+        result = _run_logged_subprocess(
             install_argv,
-            capture_output=True, text=True, timeout=timeout,
+            step="bundled_versions",
+            phase_label=f"npm-install-{package_key}",
+            timeout=timeout,
+            on_failure="raise",
+            show_dots_after_seconds=3.0,
         )
     except subprocess.TimeoutExpired:
         print(f"  WARN: npm install timed out after {timeout}s.")
@@ -23584,6 +23776,14 @@ def _install_pinned_npm(package_key: str,
             "timeout_seconds": timeout,
         })
         return False
+    except subprocess.CalledProcessError as e:
+        # Reconstruct result-like for the existing returncode block below.
+        result = subprocess.CompletedProcess(
+            args=install_argv,
+            returncode=e.returncode,
+            stdout=e.output or "",
+            stderr=e.stderr or "",
+        )
     except OSError as e:
         print(f"  WARN: npm install failed: {e}")
         _log_install_event("bundled_versions", "warn",
@@ -23994,19 +24194,18 @@ def _install_playwright_browsers() -> None:
     print("(this may take ~30s, ~150 MB)")
 
     # 1) Cache the MCP package itself (small).
+    # v0.2.53 DEDUP-1: route through _run_logged_subprocess for dot-cycle
+    # animation. Soft-fail (on_failure="return") because the MCP can
+    # lazy-install at runtime.
     try:
-        result = subprocess.run(
+        result = _run_logged_subprocess(
             [npx_path, "-y", "@playwright/mcp@latest", "--version"],
-            capture_output=True, text=True, timeout=180,
+            step="playwright", phase_label="playwright-mcp-version",
+            timeout=180,
+            on_failure="return",
+            fail_message="  WARN: @playwright/mcp version check failed.",
         )
         if result.returncode != 0:
-            print("  WARN: @playwright/mcp version check failed.")
-            print(f"    stderr: {result.stderr.strip()[:200]}")
-            _log_install_event("playwright", "warn",
-                               "npx -y @playwright/mcp@latest --version "
-                               "exited non-zero",
-                               data={"returncode": result.returncode,
-                                     "stderr": result.stderr.strip()[:500]})
             return
     except (subprocess.TimeoutExpired, OSError) as e:
         print(f"  WARN: @playwright/mcp version check failed: {e}")
@@ -24018,24 +24217,23 @@ def _install_playwright_browsers() -> None:
     #    expensive step; we only do chromium (not firefox/webkit) to
     #    keep the install size down. Users who need other browsers can
     #    `npx playwright install firefox` etc. manually.
+    # v0.2.53 DEDUP-1: 10-min download is the canonical M-P1-7
+    # "user thinks install hung" case — dot-cycle animation is the fix.
     try:
-        result = subprocess.run(
+        result = _run_logged_subprocess(
             [npx_path, "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=600,
+            step="playwright", phase_label="playwright-chromium-download",
+            timeout=600,
+            on_failure="return",
+            fail_message="  WARN: chromium install exited non-zero.",
+            user_hint_lines=[
+                "The MCP will lazy-install Chromium on first browser call.",
+            ],
         )
         if result.returncode == 0:
             print("[playwright] Chromium cached OK.")
             _log_install_event("playwright", "ok",
                                "Playwright MCP + Chromium cached")
-        else:
-            print("  WARN: chromium install exited non-zero.")
-            print(f"    stderr: {result.stderr.strip()[:200]}")
-            print("  The MCP will lazy-install Chromium on first browser call.")
-            _log_install_event("playwright", "warn",
-                               "npx playwright install chromium exited "
-                               "non-zero",
-                               data={"returncode": result.returncode,
-                                     "stderr": result.stderr.strip()[:500]})
     except subprocess.TimeoutExpired:
         print("  WARN: chromium install timed out after 10 min.")
         print("  The MCP will lazy-install Chromium on first browser call.")
@@ -24101,9 +24299,19 @@ def _compile_python_modules(venv_python: Path) -> None:
     for target in targets:
         cmd = [str(venv_python), "-m", "compileall",
                "-q", "-j", "0", str(target)]
+        # v0.2.53 DEDUP-1: route through _run_logged_subprocess for
+        # uniformity. Disable dot-cycle here — compileall is fast
+        # (a few seconds per target on typical hardware) so the
+        # animation would be visual noise.
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120,
+            result = _run_logged_subprocess(
+                cmd,
+                step="compile_python_modules",
+                phase_label=f"compileall-{target.name}",
+                timeout=120,
+                on_failure="return",
+                show_dots_after_seconds=None,
+                fail_message="",  # don't print FAIL header; loop summarises.
             )
             if result.returncode != 0:
                 error_dirs.append(target.name)
