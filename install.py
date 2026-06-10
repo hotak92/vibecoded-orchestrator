@@ -8125,6 +8125,89 @@ def _container_runtime_reachable(container_cmd: str) -> bool:
         return False
 
 
+def _podman_machine_auto_init_and_start() -> tuple[bool, str]:
+    """v0.2.53 M-P1-2: auto-init then start Podman machine on macOS + Windows.
+
+    Pre-v0.2.53 install.py asked the user to run `podman machine init`
+    manually after seeing a "VM does not exist" error from `podman
+    machine start`. This was friction for first-time installs.
+
+    Sequence:
+      1. `podman machine list --format json` — probe whether ANY
+         machine exists. If none, run init.
+      2. `podman machine init` (only when (1) showed empty list).
+         This downloads ~500 MB of VM image; we use a 600s timeout.
+      3. `podman machine start` — boots the VM.
+
+    Returns (success, detail). Soft-fails on every error path; the
+    caller decides whether to write a deferral.
+
+    The init step is intentionally skipped if a machine already exists
+    (we don't want to clobber a user's existing config; we just want to
+    make sure SOMETHING is running). If init succeeds and start fails,
+    we return the start failure rather than the init success.
+    """
+    # Probe: does a machine already exist?
+    machine_exists = False
+    try:
+        list_result = subprocess.run(
+            ["podman", "machine", "list", "--format", "json"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if list_result.returncode == 0:
+            try:
+                machines = json.loads(list_result.stdout or "[]")
+                machine_exists = bool(machines and isinstance(machines, list))
+            except (json.JSONDecodeError, TypeError):
+                machine_exists = False
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"podman machine list failed: {e}"
+
+    if not machine_exists:
+        # Run init. This is the long step (~500 MB download).
+        print("  Podman machine not initialized; running "
+              "`podman machine init` (this downloads ~500 MB; "
+              "may take 2-5 min)...", flush=True)
+        try:
+            init_result = subprocess.run(
+                ["podman", "machine", "init"],
+                capture_output=True, text=True, timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            return False, (
+                "podman machine init timed out after 10 min; "
+                "network down or VM image download blocked. "
+                "Run `podman machine init` manually and re-run install.py."
+            )
+        except OSError as e:
+            return False, f"podman machine init failed: {e}"
+        if init_result.returncode != 0:
+            return False, (
+                f"podman machine init exited {init_result.returncode}: "
+                f"{init_result.stderr.strip()[:300]}"
+            )
+        print("  Podman machine initialized.", flush=True)
+
+    # Now start.
+    try:
+        start_result = subprocess.run(
+            ["podman", "machine", "start"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"podman machine start failed: {e}"
+    if start_result.returncode != 0:
+        # If machine is already running, that's success.
+        stderr = (start_result.stderr or "").strip()[:300]
+        if "already running" in stderr.lower():
+            return True, "podman machine already running"
+        return False, (
+            f"podman machine start exited {start_result.returncode}: "
+            f"{stderr}"
+        )
+    return True, "podman machine started"
+
+
 def _try_start_podman_daemon() -> tuple[bool, str]:
     """v0.2.51 Bug G: auto-start the Podman daemon on a binary-present-but-
     daemon-stopped condition.
@@ -8179,25 +8262,16 @@ def _try_start_podman_daemon() -> tuple[bool, str]:
                 f"{result.returncode}: {result.stderr.strip()[:200]}"
             )
     elif os_name in ("Darwin", "Windows"):
-        try:
-            result = subprocess.run(
-                ["podman", "machine", "start"],
-                capture_output=True, text=True, timeout=120,
-            )
-        except (subprocess.TimeoutExpired, OSError) as e:
-            return False, f"podman machine start failed: {e}"
-        if result.returncode != 0:
-            stderr = result.stderr.strip()[:300]
-            # Common case: "VM does not exist" → user hasn't run
-            # `podman machine init` yet. Pass that hint to the deferral.
-            if "does not exist" in stderr.lower() or "init" in stderr.lower():
-                return False, (
-                    "podman machine not initialized — run `podman machine init` "
-                    f"first. (stderr: {stderr})"
-                )
-            return False, (
-                f"podman machine start exited {result.returncode}: {stderr}"
-            )
+        # v0.2.53 M-P1-2: auto-init then start on macOS + Windows.
+        # Pre-v0.2.53 we asked the user to run `podman machine init`
+        # themselves — but the recipe is well-documented and the typical
+        # first-time install dropped to a deferral here, blocking
+        # container setup until the user found the right command.
+        # Now we run init→start automatically; the user only sees the
+        # deferral if BOTH steps fail.
+        ok, detail = _podman_machine_auto_init_and_start()
+        if not ok:
+            return False, detail
     else:
         return False, f"unsupported OS '{os_name}'"
 
