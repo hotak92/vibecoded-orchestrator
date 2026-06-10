@@ -100,7 +100,7 @@ python3 install.py --bootstrap                            # human-readable summa
 4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain is CodeSage → qwen3 → Jina, picked at construction time)
 5. Writes `.env`, `.claude/settings.json` (canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is touched only for VS Code editor preferences (Pylance/watcher excludes); `.vscode/tasks.json` is written so VS Code auto-starts `vct-hub` on `folderOpen`
 6. Copies 45 agent templates into `.claude/agents/` and 53 skill templates into `.claude/skills/`; renders 31 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
-7. Registers four default MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search), `search` (academic-paper search via OpenAlex + arXiv), `mermaid` (Mermaid diagram describe/extract), and `excalidraw` (Excalidraw diagram describe/extract). A fifth MCP — `playwright` (browser automation) — is **default-enabled but invoked separately** via `npx -y @playwright/mcp@latest`; install.py pre-caches it at `_install_playwright_browsers`. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama. The `vct-ollama` MCP is **not** registered by default — install via launcher → Modules if you want local LLM tool surfaces. The `vct-coordination` MCP is **Pro-tier** and excluded from the default install
+7. Registers four MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search) and `search` (academic-paper search via OpenAlex + arXiv) are **enabled by default per project**; `mermaid` (Mermaid diagram describe/extract) and `excalidraw` (Excalidraw diagram describe/extract) are **registered but default-disabled per project** via `BUNDLED_MCP_DEFAULT_DISABLED` at `launcher/src-tauri/vct-launcher-core/src/db/project_mcp_servers.rs:73-76` (`claude mcp list` shows them connected, but their tools are not callable until you opt in via the launcher's Diagrams tab). A fifth MCP — `playwright` (browser automation) — is **enabled by default** and invoked separately via `npx -y @playwright/mcp@latest`; install.py pre-caches it at `_install_playwright_browsers`. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama. The `vct-ollama` MCP is **not** registered by default — install via launcher → Modules if you want local LLM tool surfaces. The `vct-coordination` MCP is **Pro-tier** and excluded from the default install
 8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
 ### Code-embedding backend by host
@@ -224,9 +224,13 @@ Verify MCP servers connected:
 ```bash
 claude mcp list
 # Expected: weaviate-kg ✓, search ✓, mermaid ✓, excalidraw ✓, playwright ✓
-# (`ollama` MCP is opt-in via launcher → Modules → vct-ollama since v0.2.11; Ollama itself still runs as
-#  embedding infrastructure — visible in `podman ps` / `docker ps`, just no MCP wrapper by default.
-#  `vct-coordination` is Pro-tier and excluded from the default install.)
+# All 5 register as Connected. mermaid + excalidraw are project-default-disabled
+# (BUNDLED_MCP_DEFAULT_DISABLED at project_mcp_servers.rs:73-76) — connect but
+# their tools won't be callable until you opt in via the launcher's Diagrams tab.
+# `ollama` MCP is opt-in via launcher → Modules → vct-ollama since v0.2.11; Ollama
+# itself still runs as embedding infrastructure — visible in `podman ps` / `docker ps`,
+# just no MCP wrapper by default. `vct-coordination` is Pro-tier and excluded from
+# the default install.
 ```
 
 Verify the hub is up (v0.2.21+):
