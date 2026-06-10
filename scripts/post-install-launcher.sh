@@ -1141,9 +1141,56 @@ PY
         if [ "$OS" = "linux" ]; then
             case "$PKGMGR" in
                 apt|apt-get)
-                    deps_pkgs=(libwebkit2gtk-4.1-dev libgtk-3-dev \
+                    # v0.2.53 (Track G2 / L-P0-2): probe BOTH the modern
+                    # webkit2gtk-4.1 family (Ubuntu 24.04+, Debian 13+) AND
+                    # the legacy 4.0 family (Ubuntu 22.04 LTS, Debian 12
+                    # "Bookworm"). The Tauri 2 build chain accepts either.
+                    # The hard-pin on 4.1 made `apt install` fail with
+                    # `E: Unable to locate package libwebkit2gtk-4.1-dev`
+                    # on every Ubuntu LTS < 24.04 install, dropping the
+                    # MODE=build path before it could complete.
+                    #
+                    # Strategy: pick the variant available in the local
+                    # apt index. If neither 4.1 nor 4.0 is available (very
+                    # old distro / restricted repo), fall back to 4.1 and
+                    # let apt surface the error — gives a deterministic
+                    # message rather than silently swapping to a "wrong"
+                    # variant.
+                    if apt-cache show libwebkit2gtk-4.1-dev >/dev/null 2>&1; then
+                        _webkit_pkg=libwebkit2gtk-4.1-dev
+                        _jscore_pkg=libjavascriptcoregtk-4.1-dev
+                    elif apt-cache show libwebkit2gtk-4.0-dev >/dev/null 2>&1; then
+                        _webkit_pkg=libwebkit2gtk-4.0-dev
+                        _jscore_pkg=libjavascriptcoregtk-4.0-dev
+                        echo "[launcher] apt: libwebkit2gtk-4.1-dev not in repo;" \
+                             "using legacy libwebkit2gtk-4.0-dev (Ubuntu 22.04 / Debian 12 shape)."
+                    else
+                        # Neither variant available — keep 4.1 for the
+                        # deterministic error path, but warn so the user
+                        # knows what's wrong.
+                        _webkit_pkg=libwebkit2gtk-4.1-dev
+                        _jscore_pkg=libjavascriptcoregtk-4.1-dev
+                        echo "[launcher] apt: neither libwebkit2gtk-4.1-dev nor -4.0-dev" \
+                             "in repo. Build will fail; manual prerequisite install needed." >&2
+                    fi
+                    # libsoup mirrors webkit: 3.0 ships with the 4.1 family
+                    # on Ubuntu 24.04+/Debian 13+, while Ubuntu 22.04 has
+                    # both 2.4 (default) and 3.0 (in universe). Probe 3.0
+                    # first; fall back to 2.4 only if 3.0 is genuinely
+                    # absent (rare — but covers Debian 11 backports
+                    # scenarios and some derivatives).
+                    if apt-cache show libsoup-3.0-dev >/dev/null 2>&1; then
+                        _libsoup_pkg=libsoup-3.0-dev
+                    elif apt-cache show libsoup2.4-dev >/dev/null 2>&1; then
+                        _libsoup_pkg=libsoup2.4-dev
+                        echo "[launcher] apt: libsoup-3.0-dev not in repo;" \
+                             "falling back to libsoup2.4-dev."
+                    else
+                        _libsoup_pkg=libsoup-3.0-dev
+                    fi
+                    deps_pkgs=("$_webkit_pkg" libgtk-3-dev \
                                libayatana-appindicator3-dev librsvg2-dev \
-                               libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+                               "$_libsoup_pkg" "$_jscore_pkg" \
                                build-essential curl wget file)
                     # Check EACH dep, not just webkit2gtk. Earlier code
                     # used webkit2gtk as a sentinel — but a system that

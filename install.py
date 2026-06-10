@@ -8417,6 +8417,78 @@ def _detect_installed_runtime() -> str:
     return ""
 
 
+def _nvidia_container_toolkit_install_hint() -> str:
+    """Return a pkgmgr-aware install hint for nvidia-container-toolkit.
+
+    nvidia-container-toolkit is NOT in default repos for apt (Debian/Ubuntu),
+    zypper (openSUSE), or apk (Alpine) — the user must add NVIDIA's
+    libnvidia-container repo first. dnf (Fedora) and AUR (Arch) DO ship it
+    directly. We surface the right command per-distro so the user can copy
+    one line instead of paging through NVIDIA's install guide.
+
+    Returns the formatted hint as a multi-line string (indented for
+    embedding in the parent prompt), or an empty string when no
+    recognised pkgmgr is on PATH (caller falls back to URL only).
+
+    Refs: linux-comprehensive-audit-2026-06-10.md §P0-L7 / §P1-L4
+    """
+    if shutil.which("apt-get"):
+        # apt: add NVIDIA's libnvidia-container repo first, then install.
+        # We give the full curl|tee + apt-get sequence as one runnable
+        # block — the user can paste it into a terminal.
+        return (
+            "      # apt (Debian/Ubuntu) — add NVIDIA's libnvidia-container repo first:\n"
+            "      curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \\\n"
+            "        sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg\n"
+            "      curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \\\n"
+            "        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \\\n"
+            "        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list\n"
+            "      sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit"
+        )
+    if shutil.which("dnf"):
+        # dnf: nvidia-container-toolkit ships in Fedora's RPM Fusion
+        # nonfree repo (already enabled if user installed nvidia-driver).
+        # The NVIDIA libnvidia-container repo is also available for
+        # RHEL/CentOS Stream.
+        return (
+            "      # dnf (Fedora / RHEL) — add NVIDIA's libnvidia-container repo if needed:\n"
+            "      curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \\\n"
+            "        sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo\n"
+            "      sudo dnf install -y nvidia-container-toolkit"
+        )
+    if shutil.which("pacman"):
+        # Arch: nvidia-container-toolkit lives in the AUR. We point the
+        # user at an AUR helper rather than pacman directly — the choice
+        # of yay/paru/etc. is user preference, so we give the canonical
+        # AUR URL too.
+        return (
+            "      # Arch — nvidia-container-toolkit is in the AUR:\n"
+            "      yay -S nvidia-container-toolkit      # or paru -S, or manual makepkg\n"
+            "      # AUR page: https://aur.archlinux.org/packages/nvidia-container-toolkit"
+        )
+    if shutil.which("zypper"):
+        # openSUSE: add NVIDIA's libnvidia-container repo, then zypper
+        # install. Same curl + tee shape as apt/dnf but using zypper's
+        # repo file syntax.
+        return (
+            "      # zypper (openSUSE/SLES) — add NVIDIA's libnvidia-container repo:\n"
+            "      sudo zypper ar -f https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo\n"
+            "      sudo zypper install -y nvidia-container-toolkit"
+        )
+    if shutil.which("apk"):
+        # Alpine: nvidia-container-toolkit is in the testing repo. Most
+        # NVIDIA-on-Alpine setups also need musl-compatible NVIDIA
+        # libraries — point the user at the upstream docs for the
+        # current procedure rather than risk giving stale advice.
+        return (
+            "      # apk (Alpine) — nvidia-container-toolkit is in the testing repo,\n"
+            "      # and Alpine + NVIDIA needs musl-compatible drivers. See:\n"
+            "      #   https://wiki.alpinelinux.org/wiki/Nvidia\n"
+            "      sudo apk add --no-cache nvidia-container-toolkit"
+        )
+    return ""
+
+
 def _ensure_nvidia_cdi_spec_for_podman() -> None:
     """Verify NVIDIA Container Toolkit's auto-refresh CDI service is active.
 
@@ -8463,10 +8535,25 @@ def _ensure_nvidia_cdi_spec_for_podman() -> None:
         return
 
     if not shutil.which("nvidia-ctk"):
+        # v0.2.53 (Track G2 / L-P0-7): surface a pkgmgr-aware install
+        # hint when nvidia-container-toolkit is missing. Previously the
+        # message pointed at NVIDIA's 4-page install-guide and left the
+        # user to figure out the right apt/dnf line themselves.
+        #
+        # Note: nvidia-container-toolkit is NOT in distro default repos
+        # for apt/zypper/apk — the user must add NVIDIA's libnvidia-
+        # container repo first. dnf (Fedora) and pacman (AUR) DO ship it
+        # directly in default repos. We mirror this in the hint so users
+        # aren't told to run a command that will fail.
         print(
             "  [!] Podman + NVIDIA: `nvidia-ctk` not on PATH. Install the "
-            "NVIDIA Container Toolkit (≥ 1.18.0 strongly recommended):\n"
-            "      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html\n"
+            "NVIDIA Container Toolkit (≥ 1.18.0 strongly recommended):"
+        )
+        hint = _nvidia_container_toolkit_install_hint()
+        if hint:
+            print(hint)
+        print(
+            "      Reference: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html\n"
             "      (then re-run install — compose-up will fail until CDI is set up)"
         )
         return
@@ -8774,6 +8861,12 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
     if os_name == "Linux":
         # Detect package manager first; we only prompt for managers we
         # can actually drive.
+        #
+        # v0.2.53 (Track G2 / L-P0-1): added zypper (openSUSE/SLES) +
+        # apk (Alpine) branches. Previously, users on those distros got
+        # "No supported package manager found" and had to install Podman
+        # manually even though post-install-launcher.sh:288 already
+        # advertised zypper+apk as detected — surface-level parity gap.
         if shutil.which("apt-get"):
             cmd = ["sudo", "apt-get", "install", "-y", "podman"]
             update_cmd = ["sudo", "apt-get", "update"]
@@ -8786,8 +8879,23 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
             cmd = ["sudo", "pacman", "-S", "--noconfirm", "podman"]
             update_cmd = None
             label = "pacman (Arch)"
+        elif shutil.which("zypper"):
+            # `zypper install -y` is the non-interactive flag. SLES/Leap
+            # ship podman in the standard repos.
+            cmd = ["sudo", "zypper", "install", "-y", "podman"]
+            update_cmd = None
+            label = "zypper (openSUSE/SLES)"
+        elif shutil.which("apk"):
+            # Alpine: `apk add` is non-interactive by default. Podman
+            # lives in the community repo; if it's not enabled, this
+            # surfaces as `ERROR: unable to select packages: podman` —
+            # acceptable failure mode.
+            cmd = ["sudo", "apk", "add", "--no-cache", "podman"]
+            update_cmd = ["sudo", "apk", "update"]
+            label = "apk (Alpine)"
         else:
-            print("    No supported package manager found (apt/dnf/pacman).")
+            print("    No supported package manager found "
+                  "(apt/dnf/pacman/zypper/apk).")
             print("    Install Podman manually: https://podman.io/getting-started/installation")
             print("    Or Docker:               https://docs.docker.com/get-docker/")
             return False

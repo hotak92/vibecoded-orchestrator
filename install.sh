@@ -104,6 +104,11 @@ prompt_yes() {
 attempt_install_linux() {
     # Detect package manager. We deliberately DON'T pass -y; user must
     # confirm at the package manager prompt. We do print a heads-up.
+    #
+    # v0.2.53 (Track G2 / L-P0-1): added zypper (openSUSE/SLES) + apk
+    # (Alpine) branches to mirror post-install-launcher.sh:288. Without
+    # these, SLES/Alpine users hit "No supported package manager found"
+    # and bailed before ever reaching post-install-launcher.sh.
     if command -v apt-get &>/dev/null; then
         echo "Detected apt (Debian/Ubuntu). Will run:"
         echo "  sudo apt-get update && sudo apt-get install python3.12 python3.12-venv python3-pip"
@@ -132,8 +137,39 @@ attempt_install_linux() {
             sudo pacman -S python python-pip
             return 0
         fi
+    elif command -v zypper &>/dev/null; then
+        # openSUSE/SLES: python3 is the default meta-package; pip is a
+        # separate package. Tumbleweed ships python311 / python312 as
+        # explicit version packages — try the versioned name first.
+        echo "Detected zypper (openSUSE/SLES). Will run:"
+        echo "  sudo zypper install python312 python3-pip"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            # Try the versioned package first; fall back to plain python3
+            # if zypper can't find it (Leap LTS / SLES 15 SP4 etc.).
+            if zypper -n se -x python312 2>/dev/null | grep -q "^i\\|^v"; then
+                sudo zypper install python312 python3-pip
+            elif zypper -n se -x python311 2>/dev/null | grep -q "^i\\|^v"; then
+                echo "  python312 not in repo; installing python311 (must be 3.11+)."
+                sudo zypper install python311 python3-pip
+            else
+                echo "  versioned python not in repo; installing default python3 (must be 3.11+)."
+                sudo zypper install python3 python3-pip
+            fi
+            return 0
+        fi
+    elif command -v apk &>/dev/null; then
+        # Alpine: `python3` is the canonical name; py3-pip ships pip.
+        # Alpine 3.19+ ships Python 3.11; Alpine 3.20+ ships 3.12.
+        # Earlier releases are below the 3.11 floor and will fail the
+        # post-install version gate — acceptable failure mode.
+        echo "Detected apk (Alpine). Will run:"
+        echo "  sudo apk add python3 py3-pip"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            sudo apk add python3 py3-pip
+            return 0
+        fi
     else
-        echo "ERROR: No supported package manager found (apt/dnf/pacman)." >&2
+        echo "ERROR: No supported package manager found (apt/dnf/pacman/zypper/apk)." >&2
         return 1
     fi
     # User declined.
@@ -244,10 +280,12 @@ print_node_manual_hint() {
     echo "Install Node.js 18+ manually, then re-run ./install.sh:" >&2
     case "${OSTYPE:-}" in
         linux*)
-            echo "  Ubuntu/Debian: sudo apt install nodejs npm" >&2
-            echo "  Fedora:        sudo dnf install nodejs npm" >&2
-            echo "  Arch:          sudo pacman -S nodejs npm" >&2
-            echo "  Or via fnm:    curl -fsSL https://fnm.vercel.app/install | bash" >&2
+            echo "  Ubuntu/Debian:    sudo apt install nodejs npm" >&2
+            echo "  Fedora:           sudo dnf install nodejs npm" >&2
+            echo "  Arch:             sudo pacman -S nodejs npm" >&2
+            echo "  openSUSE/SLES:    sudo zypper install nodejs npm" >&2
+            echo "  Alpine:           sudo apk add nodejs npm" >&2
+            echo "  Or via fnm:       curl -fsSL https://fnm.vercel.app/install | bash" >&2
             ;;
         darwin*)
             echo "  macOS (brew):  brew install node" >&2
@@ -260,6 +298,8 @@ print_node_manual_hint() {
 }
 
 attempt_install_node_linux() {
+    # v0.2.53 (Track G2 / L-P0-1): added zypper + apk branches to mirror
+    # post-install-launcher.sh:709-714 / 722-727.
     if command -v apt-get &>/dev/null; then
         echo "Detected apt (Debian/Ubuntu). Will run:"
         echo "  sudo apt-get install nodejs npm"
@@ -284,8 +324,26 @@ attempt_install_node_linux() {
             sudo pacman -S --noconfirm nodejs npm
             return 0
         fi
+    elif command -v zypper &>/dev/null; then
+        echo "Detected zypper (openSUSE/SLES). Will run:"
+        echo "  sudo zypper install nodejs npm"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            # zypper -y: non-interactive. SLES/Leap ship nodejs (current
+            # LTS) under the standard repo; Tumbleweed ships nodejs22.
+            sudo zypper install -y nodejs npm
+            return 0
+        fi
+    elif command -v apk &>/dev/null; then
+        echo "Detected apk (Alpine). Will run:"
+        echo "  sudo apk add nodejs npm"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            # Alpine 3.19+ ships Node 20; older releases ship Node 18.
+            # `apk add` is non-interactive by default.
+            sudo apk add --no-cache nodejs npm
+            return 0
+        fi
     else
-        echo "ERROR: No supported package manager found (apt/dnf/pacman)." >&2
+        echo "ERROR: No supported package manager found (apt/dnf/pacman/zypper/apk)." >&2
         return 1
     fi
     return 1
@@ -361,9 +419,11 @@ print_podman_manual_hint() {
     echo "Install Podman manually, then re-run ./install.sh:" >&2
     case "${OSTYPE:-}" in
         linux*)
-            echo "  Ubuntu/Debian: sudo apt install podman" >&2
-            echo "  Fedora:        sudo dnf install podman" >&2
-            echo "  Arch:          sudo pacman -S podman" >&2
+            echo "  Ubuntu/Debian:    sudo apt install podman" >&2
+            echo "  Fedora:           sudo dnf install podman" >&2
+            echo "  Arch:             sudo pacman -S podman" >&2
+            echo "  openSUSE/SLES:    sudo zypper install podman" >&2
+            echo "  Alpine:           sudo apk add podman" >&2
             ;;
         darwin*)
             echo "  macOS (brew):  brew install podman" >&2
@@ -376,6 +436,8 @@ print_podman_manual_hint() {
 }
 
 attempt_install_podman_linux() {
+    # v0.2.53 (Track G2 / L-P0-1): added zypper + apk branches. Mirrors
+    # install.py:_prompt_install_container_runtime's Linux ladder.
     if command -v apt-get &>/dev/null; then
         echo "Detected apt (Debian/Ubuntu). Will run:"
         echo "  sudo apt-get install podman"
@@ -397,8 +459,25 @@ attempt_install_podman_linux() {
             sudo pacman -S --noconfirm podman
             return 0
         fi
+    elif command -v zypper &>/dev/null; then
+        echo "Detected zypper (openSUSE/SLES). Will run:"
+        echo "  sudo zypper install podman"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            sudo zypper install -y podman
+            return 0
+        fi
+    elif command -v apk &>/dev/null; then
+        echo "Detected apk (Alpine). Will run:"
+        echo "  sudo apk add podman"
+        if prompt_yes "Proceed? You'll be asked for your sudo password."; then
+            # Alpine ships podman in the community repo. If community
+            # isn't enabled, apk surfaces "unable to select packages:
+            # podman" — acceptable failure mode.
+            sudo apk add --no-cache podman
+            return 0
+        fi
     else
-        echo "ERROR: No supported package manager found (apt/dnf/pacman)." >&2
+        echo "ERROR: No supported package manager found (apt/dnf/pacman/zypper/apk)." >&2
         return 1
     fi
     return 1
