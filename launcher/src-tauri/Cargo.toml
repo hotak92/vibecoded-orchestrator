@@ -9,7 +9,7 @@ members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 
 [package]
 name = "vct-launcher-temp"
-version = "0.2.52"
+version = "0.2.53"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
