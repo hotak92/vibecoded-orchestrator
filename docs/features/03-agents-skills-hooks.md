@@ -357,6 +357,35 @@ Defense-in-depth guard for diagrams integration. Rejects `.mmd` / `.excalidraw` 
 ### `post-file-delete.sh` — PostToolUse Bash
 Detects deletes of `.mmd` / `.excalidraw` files under `.claude/diagrams/` and cascades the delete across SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer drop <file>`. Matches `rm` / `unlink` / `mv` / PowerShell `Remove-Item` / `Move-Item`.
 
+### `pre-bash-context-inject.sh` — PreToolUse Bash (V52-M)
+KG context injection before `Bash` tool calls. Reads the proposed command, runs a `hybrid_search` for related concepts, and injects matches as `additionalContext`. PowerShell sibling at `templates/hooks/pre-bash-context-inject.ps1`. Propagates `session_id` to child processes so downstream invocations of `rl_kg_search.py` are attributable to the same session.
+
+### `post-bash-context-record.sh` — PostToolUse Bash (V52-M)
+Outcome recorder paired with `pre-bash-context-inject.sh`. Writes a `bash` event into the per-session learning log (exit code, elapsed time, stderr-tail). Used by the RL retrieval reranker training pipeline. PowerShell sibling ships alongside.
+
+### `post-edit-outcome.sh` — PostToolUse Edit|Write (V52-M)
+Outcome event recorder for file edits. Companion to the V52-M bash pair; mirrors the contract for edit-shaped tools. PowerShell sibling at `templates/hooks/post-edit-outcome.ps1`.
+
+### V52-M cross-OS bug fixes (v0.2.53)
+The pre-existing test investigator caught two P1 production bugs in the V52-M hooks shipped at v0.2.52:
+
+1. **POSIX exec bit missing** — three `.sh` hooks shipped with mode `0o664` (no exec bit). Without exec bit, Claude Code refuses to fire the hook on POSIX. install.py:11299–11305 now force-sets `0o755` on every `.sh` hook target after `shutil.copy2` (`copy2` preserves source mode, so any future contributor who commits a 664-mode hook silently disables it on user machines without this defensive `os.chmod`).
+2. **UTF-8 BOM missing on Windows PS 5.1** — the `.ps1` siblings need a UTF-8 BOM to parse correctly under stock Windows PowerShell 5.1 (pwsh 7 tolerates BOM-less UTF-8; PS 5.1 mis-decodes as Windows-1252). Hooks now ship with BOMs encoded in the template files.
+
+Both bugs were silently dead-on-arrival prior to v0.2.53; users with V52-M-aware retrieval reranker setups silently lost RL training signal. Tracked via the pre-existing-failure investigation in `.claude/context/audits/pre-existing-failure-investigation-2026-06-10.md`.
+
+---
+
+## Per-project Agent / Skill Enable/Disable Contract (B2)
+
+When the user toggles a per-project agent or skill off via the launcher GUI, the underlying `.md` file is **moved** from `.claude/{agents,skills}/<name>` to `.claude/{agents,skills}.disabled/<name>` (sibling directory, not deleted). The Tauri command path is `set_project_agent_enabled` / `set_project_skill_enabled` in `launcher/src-tauri/src/commands/project_state_cmd.rs` (lines 10–103).
+
+**Why move, not delete**: bundled hooks like `agent-skill-keyword-suggest.sh` glob `.claude/agents/*.md` and `.claude/skills/*/SKILL.md`. Disabled items live in sibling `.disabled/` directories and naturally fall outside the glob; the agent/skill is invisible to keyword-suggest but the file is preserved so re-enabling is a simple toggle.
+
+**Why move, not flag**: the FS layout doubles as the source-of-truth. `install-bundle --update` is idempotent UPSERT against the same directories; the `.disabled/` sibling location means a disabled row survives bundle updates without being silently re-enabled. The user instruction in `CLAUDE.md` ("don't delete `.claude/{agents,skills,hooks}/*.md` to uninstall — disable via the launcher") relies on this contract.
+
+v0.2.53 Track F (B2) verified the end-to-end contract: GUI toggle off → `mv` to `.disabled/` → `install-bundle --update` respects it → toggle on → `mv` back. Test at `tests/test_fs_disable_contract_end_to_end.py`. Per-project bundle code at `vco_lib/project_init.py:3063–3245` honours the `.disabled/` companion location at update time so preservation entries are NOT written for items the user has deliberately disabled.
+
 ---
 
 ## Composition Patterns

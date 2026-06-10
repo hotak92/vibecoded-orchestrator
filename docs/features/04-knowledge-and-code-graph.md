@@ -128,6 +128,14 @@ One object per detected outbound cross-service call. Properties: `interaction_ty
 ### Per-project collection prefixing
 All five code collections are prefixed with a sanitized project name (e.g. `VibecodeOrchestrator_CodeFunction`). `_sanitize_collection_prefix` ensures names are alphanumeric+underscore starting with uppercase. Bare base names (no prefix) are used as fallback when `project_name` is empty.
 
+### v0.2.53: class-prefix sanitiser SSOT consolidation (NEW-10 / DEDUP-6)
+Pre-v0.2.53 the project had FOUR Python implementations of "sanitize a project name into a Weaviate class prefix" with three different fallback strings (`"vct"` lowercase, `"Vct"` capitalised, and one that raised on empty). v0.2.15 already burned the project on the same drift class. v0.2.53 Track F collapses to two SSOTs distinguished by their semantic contract:
+
+- **Underscore-DROPPING** (canonical for project KG / Development collection names): `vco_lib/project_naming.py::canonical_class_prefix` stays the source of truth. `vco_lib/project_init.py::sanitize_for_weaviate_class` and `vco_lib/config_projection.py::_sanitize_kg_collection` are thin wrappers around it.
+- **Underscore-PRESERVING** (canonical for the code-graph MCP server contract): `vco_lib/codegraph_to_mermaid.py::_codegraph_mcp_sanitize_prefix` (renamed from `_sanitize_collection_prefix`). The docstring explicitly notes the divergent rule and links to the project_naming canonical so future readers don't mistake them for redundant copies.
+
+An AST-level guard test (`tests/test_canonical_class_prefix_parity.py`) asserts the four call sites converge on the right SSOT for a fixed input matrix. The two SSOTs are intentionally NOT collapsed further — they represent two real Weaviate naming behaviours (the MCP server's `<Project>_CodeFunction` shape requires the underscore; the KG's `<Project>KnowledgeGraph` shape forbids it).
+
 ### Deterministic UUIDs for upserts
 Entity UUIDs are generated as `uuid5(NAMESPACE_DNS, f"{project}::{full_name}")`. Re-analyzing the same file produces the same UUID, turning all inserts into Weaviate upserts and preventing duplicates.
 
@@ -139,7 +147,17 @@ Entity UUIDs are generated as `uuid5(NAMESPACE_DNS, f"{project}::{full_name}")`.
 Full AST/regex code extraction engine at `.claude/scripts/analyze_code_graph.py`. Accepts a repo path and populates all five code graph collections.
 
 ### Language support
-Python (full fidelity via `ast` module), plus regex-based extraction for: Lua, C++/C, JavaScript, TypeScript, JSX, Go, Rust, Java, Ruby, Shell.
+Python (full fidelity via `ast` module), plus regex-based extraction for: Lua, C++/C, JavaScript, TypeScript, JSX, Go, Rust, Java, Ruby, Shell, Svelte (v0.2.53), PowerShell (v0.2.53).
+
+### Svelte parser (V52-O.11.B, v0.2.53 Track E)
+Adds `.svelte` to the language map (`templates/scripts/analyze_code_graph.py:375`). The parser splits a Svelte component into its three logical blocks (`<script>`, `<style>`, `<template>`), feeds the `<script>` block through the existing JS/TS extraction path, and surfaces top-level functions, reactive declarations (`$: name = ...` treated as function-shaped), and `export let`/`export const` props. Component name is extracted from the file stem. Multi-block tolerance: a Svelte file may have at most one default `<script>` and one `<script context="module">`; both are concatenated for analysis.
+
+Why it matters: the orchestrator's launcher SvelteKit frontend (244 `.svelte` files in `launcher/src/`) was invisible to the code graph pre-v0.2.53 — `search_code_graph` queries for Svelte component names returned no results. Helpers live alongside `_extract_svelte_script_blocks` / `_parse_svelte_functions` at lines 2264 / 2302 so they can be unit-tested in isolation. Test: `tests/test_svelte_parser.py`.
+
+### PowerShell parser (V52-O.11.N, v0.2.53 Track E)
+Adds `.ps1` / `.psm1` / `.psd1` to the language map (same dispatch site). `_parse_powershell_functions` (line 2467) handles top-level `function Name { ... }` and `function Name([Type]$Arg) { ... }` shapes; `_analyze_powershell_file` (line 6515) routes them through the standard module/function emission pipeline.
+
+Why: the orchestrator's 168 PowerShell scripts under `templates/scripts/`, `templates/hooks/`, and `scripts/` (Windows-native siblings of the bash tooling) were invisible to the code graph. Test: `tests/test_powershell_parser.py`.
 
 ### Cross-service interaction extraction
 `_extract_external_calls` detects outbound HTTP (requests, httpx, aiohttp, axios, curl/wget), gRPC, message queue (Kafka, RabbitMQ, Redis pub/sub), and WebSocket calls. Three-gate false-positive filter: (1) import gate — only triggers if relevant library is imported; (2) literal gate — only extracts calls with a string literal target; (3) scope gate — strips triple-quoted strings to ignore URLs in docstrings.

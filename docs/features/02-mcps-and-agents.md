@@ -90,6 +90,16 @@ Use `search_code_graph` first to discover entity names, then `query_code_structu
 ### RL Reranking (ambient, opt-in)
 When `RL_SERVER_URL` is reachable, KG search results pass through a reinforcement-learning reranker before being returned. When it's not, free-tier installs see plain cosine-ordered results — no error, no warning. The RL server is a **Pro-tier component** shipped as a signed binary via CDN; it is not in the OSS bundle.
 
+### v0.2.53: case-rebind for the dev-collection suffix swap (NEW-2)
+
+When the hub derives `DEVELOPMENT_COLLECTION` (resp. `SHARED_KG_COLLECTION`, `DIAGRAMS_COLLECTION`) from the primary KG via suffix-swap (`_KnowledgeGraph` → `_Development` / `_Shared` / `_Diagrams`), the result historically followed the casing of the launcher.db binding row. On installs whose Weaviate on-disk class has a different casing (e.g. lowercase-c `Vibecodedorchestrator_Development` from a pre-canonical install), the hub's reply caused `sync_knowledge_graph.py` to call `.exists()` (case-sensitive) → False → `.create()` → Weaviate refused with "found similar class". Fabio Symptom B on v0.2.52.
+
+v0.2.53 Track F adds a case-insensitive resolver: `launcher/src-tauri/vct-hub/src/weaviate_schema_probe.rs::resolve_existing_casing_for_class()` probes `GET /v1/schema`, builds a `lowercased → actual` map, and returns the on-disk casing if a sibling exists. Cached for 5 s per `weaviate_url` to keep `/api/v1/projects/{id}/config` resolves flat under burst load. Fail-open: if Weaviate is unreachable the candidate name is returned unchanged. Wired at four config-resolver sites in `vct-hub/src/config_api.rs` (lines 726, 735, 757, 775). Two-layer port: install.py also gained `_resolve_existing_casing` for the install-time path; see [07-architecture.md](07-architecture.md#track-f-two-layer-case-rebind-pattern).
+
+### v0.2.53: `claude_mcp_servers/_lib/update_gate.py` — MCP-side update gate
+
+`claude_mcp_servers/_lib/update_gate.py` (v0.2.52, refreshed v0.2.53) is a deliberate mirror of `vco_lib.update_gate` for use from MCP-server processes. The MCPs cannot import `vco_lib` directly (separate venv, different `sys.path`); the mirror exposes the same `exit_if_update_in_progress()` and `LOCKFILE_BASENAME` constants. Constants are kept in lock-step manually with the comment block at the top calling out the invariant. The canonical implementation stays in `vco_lib.update_gate` (also mirrored in Rust at `launcher/src-tauri/src/commands/update_gate.rs`).
+
 ### Env Vars (Weaviate MCP)
 
 | Variable | Default | Purpose |

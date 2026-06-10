@@ -1,6 +1,34 @@
 # Install & Secrets
 
-From first clone to a running orchestrator: bootstrappers (Linux / macOS / Windows), the Python installer, container lifecycle, sanity checks, uninstall, and the `vct-secrets` primitive that keeps API keys out of `.env`. Code lives in `install.py`, `install.sh`, `install.ps1`, `uninstall.sh`, `infrastructure/`, `scripts/`, and `tools/vct-secrets/`.
+From first clone to a running orchestrator: first-install shims (Linux / macOS / Windows), the Python installer with its new `--bootstrap` probe mode, container lifecycle, sanity checks, uninstall, and the `vct-secrets` primitive that keeps API keys out of `.env`. Code lives in `first-install.{sh,command,bat}`, `install.py`, `install.sh`, `install.ps1`, `uninstall.sh`, `scripts/post-install-launcher.{sh,ps1}`, `infrastructure/`, `scripts/`, `vco_lib/`, and `tools/vct-secrets/`.
+
+For the design behind the v0.2.53 install changes (why `--bootstrap` is additive and read-only, why the shims stay multi-language, why DEDUPs land in tiers across two releases) see [INSTALL_ARCHITECTURE_v2.md](../INSTALL_ARCHITECTURE_v2.md).
+
+---
+
+## First-Install Shims (v0.2.53 — 3-step sequence)
+
+`first-install.{sh,command,bat}` are the user-facing entry points. As of v0.2.53 each is a thin Python-detect + dispatch wrapper that runs the same three-step sequence (`first-install.sh:1-106`, `first-install.command:1-131`, `first-install.bat:1-626`):
+
+1. **Python detect** — OS-aware candidate cascade. macOS adds `/opt/homebrew/opt/python@3.13/bin/python3.13` + `/opt/homebrew/bin/python3.{13,12,11}` to PATH probes. Linux adds Linuxbrew (`/home/linuxbrew/.linuxbrew/bin/python3.{13,12,11}`). Windows uses the Python Launcher (`py -3.13` → `py -3.12` → `py -3.11` → `python.exe` → `python3.exe`). All shims verify `>= 3.11` via `python -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)'`.
+2. **Bootstrap prepass** — `"$PYTHON" install.py --bootstrap --json > state/logs/bootstrap-prepass.json 2>/dev/null || true`. Read-only system-detection probe. Best-effort: failure does NOT block the full install (`|| true` on POSIX; `goto :continue` on Windows). The envelope's schema is at `docs/schemas/install-bootstrap-envelope-v1.json` (schema_version=1, see §3.3 of INSTALL_ARCHITECTURE_v2.md).
+3. **Full install** — `"$PYTHON" install.py <forwarded args>`. The canonical 10-step flow. ARGS array preserves quoting; `--non-interactive` is translated to `--yes` (legacy alias). `--no-auto-launch` is intercepted by the shim and used to gate step 4.
+4. **Launcher post-install (auto-spawn)** — `scripts/post-install-launcher.{sh,ps1}` is invoked when install succeeded AND `--no-auto-launch` was NOT passed AND the post-install script is executable. Soft-fail: a broken launcher spawn does not mask a successful install. This auto-spawn was missing in the v0.2.52 line and was restored in the v0.2.53 integration splice (commit `372571a5`).
+
+**Shim sizes**: `first-install.sh` 106 LoC, `first-install.command` 131 LoC, `first-install.bat` 626 LoC (still inline-implements `post-install-launcher.sh` until the full PowerShell port in v0.2.54 — see §13.1 of INSTALL_ARCHITECTURE_v2.md). The Track G design target of "thin ~30-60 LoC shims" was relaxed in implementation to accommodate the 3-step sequence (prepass + install + launcher post-install) and the per-OS install-hint blocks. Argv passthrough is verbatim via `"$@"` (POSIX) / `%*` (cmd.exe).
+
+### Bootstrap envelope at `state/logs/bootstrap-prepass.json`
+
+The envelope is a system-detection JSON document conforming to `docs/schemas/install-bootstrap-envelope-v1.json` (schema_version=1). Fields cover OS / arch / RAM, Python / Node / npm / pnpm / Podman / Docker / Git / Brew / Joern / lean-ctx / claude CLI presence + versions, GPU detection (vendor / VRAM), Linux distro + pkg_mgr / Windows features / macOS features, resolved paths (install_root, venv_python, launcher_binary, vct_root_dir), per-OS package-manager advice, Weaviate / Ollama / code-embed / vct-hub endpoint URLs, missing_prereqs list, `ready_to_install` flag with `blocker_messages`.
+
+Side-effect policy (`install.py:1523-1582`, `_run_bootstrap`):
+- READ-ONLY by default. Spawns short read-only probes (`python3 --version`, `podman --version`, `nvidia-smi`, `getenforce`, `brew --prefix`, `podman machine list`). All probes timeout-bounded.
+- Writes ONLY `state/logs/bootstrap-prepass.json` if `state/logs/` already exists. Does NOT create `state/` if absent — safe to call before install has ever run.
+- No network calls; local TCP probes are best-effort and report failures in the envelope rather than blocking.
+- `--bootstrap` is mutually exclusive with `--update`, `--lightweight`, `--uninstall`. Combining them returns exit 2 with a clear error. Unknown args are rejected with exit 2 (`install.py:1547-1552`).
+- `--bootstrap --install-missing`: side-effectful. Runs `apt-get install -y <pkg>` / `brew install <pkg>` / `winget install --id <id>` flows for missing prereqs, plus `podman machine init` on macOS/Windows if Podman is installed but the daemon is unreachable. Re-detects after install. Returns exit 3 if any install command failed.
+
+Exit codes: `0` detection succeeded; `1` exception (traceback on stderr); `2` bad invocation; `3` `--install-missing` failed.
 
 ---
 

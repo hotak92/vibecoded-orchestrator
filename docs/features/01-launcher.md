@@ -2,6 +2,8 @@
 
 Desktop control plane for `vibecoded-orchestrator`. Tauri 2 (Rust) backend, SvelteKit frontend, single native window on Windows / macOS / Linux. Manages project lifecycle, module catalog, secrets, licensing, and Claude Code surface configuration. Rust source in `launcher/src-tauri/src/`; SvelteKit UI in `launcher/src/`.
 
+Pre-built binaries ship under `launcher/dist/<os-arch>/` per release: `linux-x64/`, `macos-arm64/` (Apple Silicon — the legacy `experimental_macOS/` path was removed from all consumers in v0.2.53 M-P0-2; `start-launcher.command`, `post-install-launcher.sh`, and `rebuild-dist-binary.sh` now consume `macos-arm64/`), `windows-x64/`. Each dist subdir ships three artefacts (`vct-launcher`, `vct-hub`, `vct-updater`) plus a per-binary `<name>.metadata.json` sidecar (CI-written; consumed at runtime by `start-launcher.*`).
+
 ---
 
 ## Project Lifecycle
@@ -613,6 +615,44 @@ UI surface: `/preferences/updates` route with a manual check button + last-check
 
 ### Re-Run Onboarding from Preferences
 `/preferences` includes a "Re-run onboarding" button that clears the `vct.onboarding_complete` localStorage flag and reloads. The 4-step wizard fires again; existing projects, settings, and secrets are unaffected. Useful after a hardware change (GPU added, RAM upgraded) when the user wants to re-run the infrastructure-detection step.
+
+### `UpdateToast.svelte` — V52-AH-FE update-recovery toasts
+`launcher/src/lib/components/UpdateToast.svelte` (v0.2.53 Track E) subscribes to two Tauri events fired once per boot by the `poll_update_lock_on_boot` probe in `launcher/src-tauri/src/lib.rs`:
+
+- `vct-update-recovered` — the Windows stage-1 updater finished a binary swap and the current process is the freshly-relaunched binary; render a one-shot "Updated to v0.2.X" success toast.
+- `vct-update-failed` — a lock file was found but is stale or malformed (the updater crashed mid-swap); render a diagnostic toast pointing at `update.log` with the rejection reason.
+
+POSIX hosts no-op: the V52-AH backend probe is Windows-specific; the lock file is never written elsewhere. Browser mode (no Tauri runtime) also no-ops because `listen()` short-circuits. Payload shape mirrors `UpdateRecoveryReport { recovered, stale_or_invalid, lock_path, reason }`. The component renders nothing of its own — it calls `toast.success(...)` / `toast.error(...)` against the existing toast root mounted in `+layout.svelte`. Handler logic lives in `launcher/src/lib/update-toast-handlers.ts` for unit-testability.
+
+---
+
+## InstallHealthGate (v0.2.53 hardening)
+
+`launcher/src/lib/components/InstallHealthGate.svelte` blocks the UI when the launcher is running from inside an orchestrator install root but the install never completed (no `.venv/`, no `state/`, no `.env` with `KG_COLLECTION`, or no `claude_mcp_servers/.venv/`). Backend probe is `check_install_health` in `installer.rs`; developer mode (no install root walked-up from `current_exe()`) returns `all_ok: true` so `cargo run` / `pnpm tauri dev` never trigger the modal.
+
+### M-P0-8: refresh on focus + Re-check button
+The gate now re-runs the backend probe whenever the launcher window regains focus AND exposes an explicit "Re-check" button. When the probe is triggered from focus or the manual button, a prior dismissal is IGNORED for an unhealthy install — the user explicitly came back to the launcher, so they want to know if the install is still broken. At mount-time (no `fromFocus`) a prior dismissal still suppresses the modal so the user is not re-prompted on every relaunch. Re-entry is guarded with a `rechecking` flag.
+
+### M-P1-5: localStorage scoping by install root
+`vct.install_check_dismissed` (and three sibling flags) are now scoped by `install_root` via `getInstallScopedFlag` / `setInstallScopedFlag` from `lib/stores/install-state-store`. Two clones of the orchestrator on the same machine no longer share dismissals. Pre-v0.2.53 unscoped values are migrated transparently on first read.
+
+### M-P1-6: "Run installer now" button
+Inline button on the gate spawns `first-install.{sh,command,bat}` in a terminal emulator. `launchError` is surfaced inline if no terminal is available (e.g. headless Linux). State: `launchingInstaller` flag disables the button during spawn; resets in `finally`.
+
+---
+
+## Graphical-launch PATH augmentation (M-P0-7 / L-P0-4)
+
+`vct_launcher_core::services::runtime::augment_path_for_graphical_launch()` (`launcher/src-tauri/vct-launcher-core/src/services/runtime.rs:221`) prepends user-installed CLI tooling directories to `PATH` at launcher startup. Called from `launcher/src-tauri/src/lib.rs:639` BEFORE any subprocess spawn.
+
+**Why**: `.app` double-click on macOS Finder, and `.desktop` activation on GNOME/KDE, both inherit a minimal LaunchServices / systemd-user PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Tooling installed via Homebrew, cargo, pipx, linuxbrew, snap, flatpak is missing, so every subsequent `python3`, `cargo`, `joern`, `podman`, `git` spawn failed with "command not found" until the user re-launched from a terminal. Cross-OS triage finding `cross-os-triage-2026-06-10.md` §P0-7 confirms macOS + Linux are the same root cause.
+
+**Candidates** (prepended; first wins):
+- macOS: `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `$HOME/.cargo/bin`, `$HOME/.local/bin`.
+- Linux: `$HOME/.local/bin`, `$HOME/.cargo/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/snap/bin`, `/var/lib/flatpak/exports/bin`.
+- Windows: no-op — Explorer-launched apps inherit user PATH from registry (`HKCU\Environment`).
+
+Properties: idempotent (`HashSet` dedup), order-preserving (existing PATH stays in original order after the prepend), soft-fail (`HOME` unset → `$HOME`-relative candidates silently dropped), `~` expanded to a real path. Tests at `launcher/src-tauri/vct-launcher-core/src/services/runtime.rs:829–910`.
 
 ---
 

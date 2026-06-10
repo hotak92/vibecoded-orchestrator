@@ -14,21 +14,32 @@ The three are designed to compose — Launcher writes, Orchestrator reads, vct-s
 
 **Public release**: 2026-05-12 — repo `hotak92/vibecoded-orchestrator`.
 
+**Latest tag covered by these docs**: v0.2.53 (2026-06-11). Install architecture
+landed via the Track G design doc, see
+[INSTALL_ARCHITECTURE_v2.md](../INSTALL_ARCHITECTURE_v2.md) for the full
+design + the actual-shipped vs deferred-to-v0.2.54 reconciliation
+(Section 11).
+
 ---
 
 ## Navigation
 
-| Page | Description | ~Entries |
+| Page | Description | v0.2.53 highlights |
 |---|---|---|
-| [01-launcher.md](01-launcher.md) | Tauri 2 + SvelteKit desktop app: projects, modules, secrets, licensing, full Tauri command enumeration (~110), hub API routes, audit, CLI | ~190 |
-| [02-mcps-and-agents.md](02-mcps-and-agents.md) | Three default MCP servers (Weaviate-KG, Search, coordination), code-embed service, KG/code-graph scripts | ~65 |
-| [03-agents-skills-hooks.md](03-agents-skills-hooks.md) | 45 free agents, 53 skills, 31 hooks, composition patterns | ~75 |
-| [04-knowledge-and-code-graph.md](04-knowledge-and-code-graph.md) | KG node format, Weaviate collections, code graph analysis, embeddings, maintenance scripts | ~65 |
-| [05-install-and-secrets.md](05-install-and-secrets.md) | Installers, container lifecycle, vct-secrets CLI, secrets architecture, infrastructure compose | ~80 |
-| [06-license-and-commercial.md](06-license-and-commercial.md) | Tier model, license validator, Vault-token + LS-variant admin paths, Lemon Squeezy integration, telemetry, AGPL compliance, CLA | ~90 |
-| [07-architecture.md](07-architecture.md) | Cross-cutting architecture, surface compatibility, security model, CI/CD, release process | ~55 |
+| [01-launcher.md](01-launcher.md) | Tauri 2 + SvelteKit desktop app: projects, modules, secrets, licensing, full Tauri command enumeration (~110), hub API routes, audit, CLI | PATH augmentation for Finder/.desktop launches (M-P0-7), InstallHealthGate refresh-on-focus + Re-check (M-P0-8), per-install-root localStorage scoping (M-P1-5), "Run installer now" button (M-P1-6), V52-AH-FE update-event toast |
+| [02-mcps-and-agents.md](02-mcps-and-agents.md) | Three default MCP servers (Weaviate-KG, Search, coordination), code-embed service, KG/code-graph scripts | `_lib/update_gate.py` MCP-side mirror of `vco_lib.update_gate`; Track F two-layer case-rebind closes Fabio Symptom B |
+| [03-agents-skills-hooks.md](03-agents-skills-hooks.md) | 45 free agents, 53 skills, 31 hooks, composition patterns | V52-M hook P1 bugs fixed (exec bit on POSIX, UTF-8 BOM on Windows PS 5.1); defensive `chmod 0o755` at install.py:11299–11305; FS-disable contract (B2) verified end-to-end |
+| [04-knowledge-and-code-graph.md](04-knowledge-and-code-graph.md) | KG node format, Weaviate collections, code graph analysis, embeddings, maintenance scripts | Svelte parser (V52-O.11.B) + PowerShell parser (V52-O.11.N) added to code-graph indexer; NEW-2 case-insensitive class-name resolver in vct-hub; NEW-10 4-way → 2-SSOT class-prefix sanitiser consolidation |
+| [05-install-and-secrets.md](05-install-and-secrets.md) | Installers, container lifecycle, vct-secrets CLI, secrets architecture, infrastructure compose | 3-step first-install shim sequence (bootstrap prepass → install → launcher post-install); `install.py --bootstrap --json` envelope at `state/logs/bootstrap-prepass.json`; 6 new vco_lib modules (2 implemented, 4 skeletons); tri-OS install smoke CI gate; Python wheel-coverage detection refuses 3.14+; Linux distro broadening (zypper + apk); macOS Podman machine auto-init; Windows PS 5.1 + Scheduled Task XML hardening |
+| [06-license-and-commercial.md](06-license-and-commercial.md) | Tier model, license validator, Vault-token + LS-variant admin paths, Lemon Squeezy integration, telemetry, AGPL compliance, CLA | No v0.2.53 surface changes |
+| [07-architecture.md](07-architecture.md) | Cross-cutting architecture, surface compatibility, security model, CI/CD, release process | Track F two-layer case-rebind (vct-hub `weaviate_schema_probe.rs` + install.py `_resolve_existing_casing`); DEDUP-14 paired sentinel+deferral writer at `installer.rs::write_resume_sentinel_and_deferral`; 6 new vco_lib modules document the v0.2.54 unification staging plan |
 
 **Total documented features**: ~580 entries across the seven pages.
+
+For the design rationale behind the v0.2.53 install changes (why
+`--bootstrap` is additive and read-only, why the shims stay multi-language,
+why DEDUPs land in tiers across two releases) see
+[INSTALL_ARCHITECTURE_v2.md](../INSTALL_ARCHITECTURE_v2.md).
 
 ---
 
