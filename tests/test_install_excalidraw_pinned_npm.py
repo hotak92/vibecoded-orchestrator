@@ -180,9 +180,15 @@ class FilePinHappyPathTests(unittest.TestCase):
         # branch.
         install_call = run_factory.calls[1]
         argv = install_call[0]
+        # v0.2.53 CVE-1 (GHSA-5xrq-8626-4rwp): the file-pin branch was
+        # changed to insert `--omit=dev` before the vendor dir. The
+        # vendor dir is now the LAST argv element rather than argv[3].
         self.assertEqual(argv[:3], ("/usr/bin/npm", "install", "-g"))
-        self.assertIn("excalidraw_mcp_fork", argv[3])
-        self.assertTrue(Path(argv[3]).is_absolute())
+        self.assertIn("--omit=dev", argv,
+                      "v0.2.53 CVE-1: file-pin install must include --omit=dev")
+        vendor_arg = argv[-1]
+        self.assertIn("excalidraw_mcp_fork", vendor_arg)
+        self.assertTrue(Path(vendor_arg).is_absolute())
         # Audit log records the vendored result distinct from
         # registry-pin "ok" so a future audit can grep one shape.
         audit = (self.tmpdir / "bundled_versions.jsonl").read_text()
