@@ -6522,6 +6522,43 @@ pub async fn resume_orchestrator_update<R: Runtime>(
         }
     };
 
+    // v0.2.53 NEW-11: defensive empty-sha refusal. If the sentinel was
+    // written with an empty `sha_at_conflict` (because `read_head_sha`
+    // failed at conflict-write time — e.g. .git/HEAD missing or
+    // unreadable), we have NO baseline to verify HEAD has advanced past.
+    // The "head_unchanged" guard at line 6553 silently skips its check
+    // in that case, which would let us resume against a possibly-
+    // unrelated tree state. Refuse explicitly with a clear remediation
+    // path instead: the user should re-trigger the update from the
+    // launcher (which re-writes the sentinel with a fresh sha) OR clear
+    // the sentinel manually.
+    //
+    // Without this guard, the v0.2.51 Bug A class can re-appear in a
+    // subtler form: the user runs Continue Update, install.py re-merges
+    // against an unknown baseline, and the working tree may end up in
+    // a state neither the launcher nor install.py expected.
+    if sentinel.sha_at_conflict.is_empty() {
+        write_audit(
+            "update_orchestrator_resume_rejected",
+            serde_json::json!({
+                "reason": "empty_sha_at_conflict",
+                "install_path": path,
+                "operation": sentinel.operation,
+                "branch": sentinel.branch,
+            }),
+        );
+        return Err(
+            "Resume sentinel is missing the conflict-time SHA — the original \
+             conflict-handling write could not read .git/HEAD. We cannot \
+             verify the working tree's baseline, so the resume is refused. \
+             Either re-trigger the update from the launcher (which will \
+             write a fresh sentinel with a valid SHA), OR run \
+             `git status` + manually finish/abort any merge, then click \
+             Restart Launcher to clear this banner."
+                .to_string(),
+        );
+    }
+
     // Probe in-flight merge/rebase state. If still mid-merge we refuse —
     // the user should finish the merge (or abort it) first.
     let merge_head = install_path.join(".git").join("MERGE_HEAD");
@@ -12922,6 +12959,101 @@ MemAvailable:   23456789 kB
             "VCO clone with install.py + first-install.sh must pass the gate: {:?}",
             res
         );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // ─── v0.2.53 NEW-11: resume sentinel empty-sha refusal ───────────────
+    //
+    // The sentinel is JSON-serialised at `.claude/state/orchestrator-
+    // update-resume.json` by the merge/rebase conflict handlers. If
+    // `read_head_sha` failed at conflict-time, `sha_at_conflict` is the
+    // empty string. The pre-v0.2.53 `head_unchanged` guard silently
+    // skipped its comparison in that case (and let the resume proceed
+    // against an unknown baseline); the v0.2.53 fix refuses resume
+    // explicitly with a clear remediation path.
+    //
+    // We can test the contract WITHOUT spawning the full
+    // `resume_orchestrator_update` Tauri command by:
+    //   1. Writing a known-shape sentinel on disk.
+    //   2. Round-tripping through `read_update_resume_sentinel`.
+    //   3. Asserting the parsed value matches the on-disk shape.
+    //   4. Asserting `is_empty()` correctly detects the empty SHA, since
+    //      that is the predicate the refusal branch keys on.
+
+    /// Helper: write a sentinel with the given `sha_at_conflict` to
+    /// `<root>/.claude/state/orchestrator-update-resume.json`.
+    fn write_test_sentinel(root: &std::path::Path, sha_at_conflict: &str) -> PathBuf {
+        let target = root.join(UPDATE_RESUME_SENTINEL_REL);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let s = UpdateResumeSentinel {
+            schema: 1,
+            operation: "merge".to_string(),
+            branch: "main".to_string(),
+            sha_at_conflict: sha_at_conflict.to_string(),
+            written_at: "2026-06-10T12:00:00Z".to_string(),
+        };
+        fs::write(&target, serde_json::to_string(&s).unwrap()).unwrap();
+        target
+    }
+
+    #[test]
+    fn test_resume_sentinel_round_trips_empty_sha_at_conflict() {
+        let p = tmp();
+        write_test_sentinel(&p, "");
+        let parsed =
+            read_update_resume_sentinel(&p).expect("sentinel with empty sha must still parse");
+        assert_eq!(parsed.schema, 1);
+        assert_eq!(parsed.operation, "merge");
+        assert_eq!(parsed.branch, "main");
+        assert!(
+            parsed.sha_at_conflict.is_empty(),
+            "round-tripped sha_at_conflict must remain empty: {:?}",
+            parsed.sha_at_conflict
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_resume_sentinel_empty_sha_predicate_matches_refusal_branch() {
+        // The refusal branch in `resume_orchestrator_update` keys on
+        // `sentinel.sha_at_conflict.is_empty()`. This test pins the
+        // predicate so a future refactor of `UpdateResumeSentinel`
+        // (e.g. switching to `Option<String>`) can't silently regress
+        // the refusal logic.
+        let empty = UpdateResumeSentinel {
+            schema: 1,
+            operation: "merge".to_string(),
+            branch: "main".to_string(),
+            sha_at_conflict: String::new(),
+            written_at: "2026-06-10T12:00:00Z".to_string(),
+        };
+        assert!(
+            empty.sha_at_conflict.is_empty(),
+            "empty sha_at_conflict must satisfy the refusal predicate"
+        );
+
+        let filled = UpdateResumeSentinel {
+            schema: 1,
+            operation: "merge".to_string(),
+            branch: "main".to_string(),
+            sha_at_conflict: "deadbeef".to_string(),
+            written_at: "2026-06-10T12:00:00Z".to_string(),
+        };
+        assert!(
+            !filled.sha_at_conflict.is_empty(),
+            "non-empty sha_at_conflict must NOT satisfy the refusal predicate"
+        );
+    }
+
+    #[test]
+    fn test_resume_sentinel_filled_sha_round_trips() {
+        // Companion test to the empty-sha case: a valid sha must
+        // round-trip without alteration so the head-unchanged guard
+        // downstream can compare it byte-for-byte.
+        let p = tmp();
+        write_test_sentinel(&p, "abcdef0123456789abcdef0123456789abcdef01");
+        let parsed = read_update_resume_sentinel(&p).expect("valid sentinel must parse");
+        assert_eq!(parsed.sha_at_conflict, "abcdef0123456789abcdef0123456789abcdef01");
         fs::remove_dir_all(&p).ok();
     }
 
