@@ -244,6 +244,62 @@ If a build still fails because of a wrapper that bypasses our detection, the rec
 
 Without a driver, `first-install.*` continues with CPU-only mode automatically.
 
+### GPU mode flaps between CUDA and CPU across reboots (exactly-8GB-VRAM hosts)
+
+If you have exactly 8 GB of VRAM on the NVIDIA card and `install.py --update` decides "CPU mode" some boots and "CUDA mode" other boots, the auto-tier-up to `qwen3-embedding` is hitting the boundary case. The threshold check uses `>= 8GB` (inclusive) which is correct in theory, but **NVIDIA drivers reserve some VRAM at boot for the framebuffer + compositor**, so `nvidia-smi` reports anywhere from 7.6 GB to 8.0 GB depending on whether a display is connected, whether the compositor is running, and whether you booted with a different kernel module.
+
+Symptoms: services come up in CUDA mode after one reboot but CPU mode after the next; you see `code-embed` switching between `:11440-codesage` and `:11440-ollama` backends in logs. To pin to CPU and stop the flap:
+
+```bash
+python install.py --update --gpu-vram-threshold-gb 9
+```
+
+This raises the threshold above 8.0 GB so the host falls into the CPU tier deterministically. Alternative: `--cpu-only` skips the GPU probe entirely.
+
+### Python 3.14 is installed but `install.py` fails to import dependencies
+
+`install.py` and the bundled MCP servers target Python **3.12 – 3.13**. Python 3.14 ships some stdlib removals (`distutils`, `imp`) that affect the venv layout step and break a couple of transitive dependencies. If your host's default Python is 3.14, point install at a 3.12 / 3.13 interpreter:
+
+```bash
+# Use pyenv (recommended)
+pyenv install 3.13.0
+pyenv shell 3.13.0
+python install.py
+
+# Or invoke directly
+/usr/bin/python3.13 install.py
+```
+
+Verify the venv came up on the right interpreter: `cat .venv/pyvenv.cfg | grep version` should show 3.12.x or 3.13.x. If you already created a venv on 3.14, delete `.venv/` and re-run install — `install.py` won't rebuild it just to downgrade the interpreter.
+
+### Podman: "machine not initialized" on macOS / Windows
+
+The first time you run install on macOS or Windows with Podman selected, the Podman daemon needs a one-time `machine init`. v0.2.51+ install.py auto-runs `podman machine start` if the machine exists but is stopped — but it deliberately does NOT auto-run `podman machine init` (which writes a several-GB VM image to your home directory; should be a user-explicit step). Symptom: `install.py` exits with a `UPDATE_DEFERRED.md` entry naming the `podman machine init` command.
+
+Recovery:
+
+```bash
+podman machine init                  # one-time; downloads a Fedora CoreOS VM image
+podman machine start                 # boot the VM
+podman info                          # sanity-check; should print the connection URI
+python install.py --update           # re-run install — the deferral self-clears once Podman responds
+```
+
+If `podman machine init` fails with "out of disk", clear `~/.local/share/containers/podman/machine/` and retry — the partial download blocks the next init attempt.
+
+### Bundled binary path drift on in-place upgrade
+
+If you upgrade VCO in place (e.g. `python install.py --update` on top of an existing install where the launcher binary was previously copied to a non-default location), the launcher may keep launching from the OLD path while the new bundled binary lives at the new path. Symptom: launcher UI reports the OLD version after an update; the new `vct-launcher` and `vct-hub` binaries are present in the install root but nothing picks them up.
+
+Workaround:
+
+1. From the install root, locate both binaries: `find . -name 'vct-launcher*' -o -name 'vct-hub*'` (expect 2-4 hits).
+2. The canonical paths are `launcher/dist/<os>-<arch>/vct-launcher{,.exe}` and `vct-hub/dist/<os>-<arch>/vct-hub{,.exe}`. Any binaries at non-canonical paths are stale.
+3. Delete the stale copies (NOT the canonical ones).
+4. Quit + relaunch the launcher. The next boot picks up the canonical binary; if it doesn't, run `python install.py --update --force` to re-stamp the launcher's recorded binary path back to the canonical one.
+
+This is rare — most installs stay on the canonical paths. It happens when an earlier version's installer placed binaries in `~/bin/`, `~/.local/bin/`, or `/usr/local/bin/` and a manual upgrade left the symlinks behind.
+
 ---
 
 ## Bypass permissions mode
