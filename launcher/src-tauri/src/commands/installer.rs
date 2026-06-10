@@ -9590,10 +9590,16 @@ async fn detect_python() -> (bool, String, String) {
     // via python.org or PythonManager. Reported 2026-04-28: the wizard
     // got stuck in "Creating…" with a flashing python.exe console
     // window because the picked python_cmd was a Store-managed stub.
+    // v0.2.53 NEW-3 (drift fix): keep this list in sync with
+    // install.sh:48 and install.ps1:233 (cross-language python-candidate
+    // parity). Add `python3.13` so a Linux box where the user has ONLY
+    // python3.13 installed (no python3 alias) reports has_python=true
+    // for the launcher-driven detect_system() path. The install.sh
+    // path already accepts 3.13; this Rust list lagged.
     let candidates = if cfg!(windows) {
         vec!["py", "python3", "python"]
     } else {
-        vec!["python3.12", "python3.11", "python3", "python"]
+        vec!["python3.13", "python3.12", "python3.11", "python3", "python"]
     };
 
     for cmd in candidates {
