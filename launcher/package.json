@@ -45,6 +45,7 @@
   },
   "overrides": {
     "cookie": "^0.7.0",
-    "devalue": ">=5.8.1"
+    "devalue": ">=5.8.1",
+    "lodash-es": "^4.18.1"
   }
 }
