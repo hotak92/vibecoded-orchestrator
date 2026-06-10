@@ -47,6 +47,11 @@
   // walk-up resolver could in principle return a different root after
   // a launcher relocates, though in practice it does not).
   let installRoot = $state<string | null>(null);
+  // M-P1-6: state for the "Run installer now" button. `launchError` is
+  // surfaced inline so the user gets immediate feedback if no terminal
+  // emulator is available (e.g. headless Linux box).
+  let launchingInstaller = $state(false);
+  let launchError = $state<string | null>(null);
 
   function userDismissedPreviously(): boolean {
     return getInstallScopedFlag(DISMISSED_KEY, installRoot) === 'true';
@@ -116,6 +121,32 @@
 
   async function manualRecheck() {
     await runHealthCheck({ fromFocus: true });
+  }
+
+  /// M-P1-6: open a terminal at the install_root with the right
+  /// `python install.py` command pre-loaded so the user does NOT have
+  /// to copy/paste the path. The Rust side handles OS detection +
+  /// terminal selection (Terminal.app on macOS, gnome-terminal /
+  /// konsole / xfce4-terminal / xterm fallback chain on Linux,
+  /// cmd.exe on Windows).
+  async function runInstallerNow() {
+    if (!installRoot) {
+      launchError = 'Install root not detected — please open a terminal manually.';
+      return;
+    }
+    launchError = null;
+    launchingInstaller = true;
+    try {
+      await invoke('launch_installer_terminal', { installRoot });
+    } catch (err) {
+      console.error('[install-health-gate] launch_installer_terminal failed:', err);
+      launchError =
+        typeof err === 'string'
+          ? err
+          : 'Could not launch a terminal automatically. Open one and run `python3 install.py` from the install root.';
+    } finally {
+      launchingInstaller = false;
+    }
   }
 
   function handleFocus() {
@@ -192,8 +223,22 @@
         </ul>
       </details>
 
+      {#if launchError}
+        <p class="error" role="alert" data-testid="install-gate-launch-error">
+          {launchError}
+        </p>
+      {/if}
+
       <div class="actions">
-        <button class="primary" onclick={openReadme} disabled={opening}>
+        <button
+          class="primary"
+          onclick={runInstallerNow}
+          disabled={launchingInstaller || !installRoot}
+          data-testid="install-gate-run-installer"
+        >
+          {launchingInstaller ? 'Opening terminal…' : 'Run installer now'}
+        </button>
+        <button class="secondary" onclick={openReadme} disabled={opening}>
           {opening ? 'Opening…' : 'Open install instructions'}
         </button>
         <button
@@ -296,6 +341,16 @@
     gap: 8px;
     justify-content: flex-end;
     flex-wrap: wrap;
+  }
+
+  .error {
+    margin: 4px 0 12px;
+    padding: 8px 12px;
+    background: rgba(255, 79, 160, 0.08);
+    border: 1px solid rgba(255, 79, 160, 0.32);
+    border-radius: 6px;
+    color: var(--color-pink, #ff4fa0);
+    font-size: 13px;
   }
 
   button {

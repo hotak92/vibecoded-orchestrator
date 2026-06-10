@@ -10062,6 +10062,163 @@ pub fn check_install_health() -> InstallHealth {
     }
 }
 
+/// v0.2.53 M-P1-6: spawn an OS-appropriate terminal pre-loaded with the
+/// `python install.py` command at the given install root, so the user
+/// can complete a half-finished install WITHOUT having to copy/paste
+/// the install_root path into a side terminal.
+///
+/// Behaviour per OS:
+///   - macOS: `osascript` drives Terminal.app to open a new tab and
+///     execute `cd "<path>" && python3 install.py`.
+///   - Linux: tries `gnome-terminal` → `konsole` → `xfce4-terminal` →
+///     `xterm` in order, falling back to whichever is available with a
+///     `bash -c "cd '<path>' && python3 install.py; exec bash"` body so
+///     the terminal stays open after the script exits (useful for
+///     viewing trailing log lines).
+///   - Windows: `cmd.exe /K "cd /d <path> && python install.py"` via
+///     `start` so the console window detaches from the launcher.
+///
+/// Defence-in-depth: `install_root` is validated to be an existing
+/// directory containing `install.py` before any spawn so an empty,
+/// typo'd, or poisoned argument cannot be assembled into a shell line.
+/// Path strings are escaped per-OS (AppleScript backslash+quote,
+/// POSIX single-quote `'\''` trick, Windows double-quote wrap).
+#[command]
+pub async fn launch_installer_terminal(install_root: String) -> Result<(), String> {
+    let install_path = PathBuf::from(&install_root);
+    if !install_path.exists() {
+        return Err(format!(
+            "install_root does not exist: {}",
+            install_path.display()
+        ));
+    }
+    if !install_path.is_dir() {
+        return Err(format!(
+            "install_root is not a directory: {}",
+            install_path.display()
+        ));
+    }
+    let install_py = install_path.join("install.py");
+    if !install_py.exists() {
+        return Err(format!(
+            "install.py not found in install_root: {}",
+            install_path.display()
+        ));
+    }
+
+    let path_str = install_path.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        // AppleScript-quote the path: escape backslash + double-quote.
+        let escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "tell application \"Terminal\" to do script \"cd \\\"{escaped}\\\" && python3 install.py\""
+        );
+        let status = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .status()
+            .await
+            .map_err(|e| format!("failed to spawn osascript: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "osascript exited with status {:?}",
+                status.code()
+            ));
+        }
+        // Bring Terminal.app to the foreground so the user actually
+        // sees the new window.
+        let _ = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg("tell application \"Terminal\" to activate")
+            .status()
+            .await;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // POSIX single-quote escape: `'` becomes `'\''` (close quote,
+        // escaped quote, re-open quote).
+        let escaped = path_str.replace('\'', r"'\''");
+        // `exec bash` after install.py keeps the window open so the
+        // user can see install output AND inspect the install_root
+        // afterwards.
+        let body = format!("cd '{escaped}' && python3 install.py; exec bash");
+
+        let candidates: &[(&str, &[&str])] = &[
+            ("gnome-terminal", &["--", "bash", "-c"]),
+            ("konsole", &["-e", "bash", "-c"]),
+            ("xfce4-terminal", &["--command"]),
+            ("xterm", &["-e", "bash", "-c"]),
+        ];
+
+        for (emu, args) in candidates {
+            if which_on_path(emu).is_none() {
+                continue;
+            }
+            let mut cmd = tokio::process::Command::new(emu);
+            if *emu == "xfce4-terminal" {
+                let inner = body.replace('"', "\\\"");
+                let full = format!("bash -c \"{inner}\"");
+                cmd.arg(args[0]).arg(full);
+            } else {
+                for a in *args {
+                    cmd.arg(a);
+                }
+                cmd.arg(&body);
+            }
+            // Detach: do not await; the terminal window outlives this
+            // command invocation.
+            match cmd.spawn() {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    eprintln!(
+                        "[vct] launch_installer_terminal: {} spawn failed: {e}; trying next",
+                        emu
+                    );
+                    continue;
+                }
+            }
+        }
+        return Err(
+            "no terminal emulator found (tried gnome-terminal, konsole, \
+             xfce4-terminal, xterm) — open a terminal manually and run \
+             `python3 install.py` from the install root."
+                .to_string(),
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        // cmd.exe /K keeps the console open after install.py exits so
+        // the user can see any trailing error message. We launch via
+        // `start "" cmd.exe /K "<body>"` so the new console detaches
+        // from the launcher's process group.
+        let body = format!("cd /d \"{}\" && python install.py", path_str);
+        use std::os::windows::process::CommandExt;
+        let mut cmd = tokio::process::Command::new("cmd.exe");
+        cmd.arg("/C")
+            .arg("start")
+            .arg("") // start's first quoted arg is the window title; empty is fine
+            .arg("cmd.exe")
+            .arg("/K")
+            .arg(&body)
+            // CREATE_NEW_CONSOLE = 0x00000010.
+            .creation_flags(0x00000010);
+        cmd.spawn()
+            .map_err(|e| format!("failed to spawn cmd.exe: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = path_str;
+        Err("launch_installer_terminal: unsupported OS".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

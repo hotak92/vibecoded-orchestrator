@@ -2512,6 +2512,11 @@ pub fn run() {
             // first-install.{bat,sh,command}). Returns `all_ok: true` for
             // dev builds running outside any install root.
             commands::installer::check_install_health,
+            // v0.2.53 M-P1-6: spawn an OS-appropriate terminal at the
+            // install_root with `python install.py` pre-loaded so the
+            // InstallHealthGate can offer a one-click "Run installer
+            // now" button instead of a copy/paste instruction.
+            commands::installer::launch_installer_terminal,
             // Durable install log reader. Backs the OnboardingWizard's
             // skip-if-installed path + a future Settings → Install
             // Diagnostics panel. Pull-only: the FE invokes on demand.
