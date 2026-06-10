@@ -1,4 +1,4 @@
-# V52-M (v0.2.52) — post-edit outcome event recorder
+﻿# V52-M (v0.2.52) — post-edit outcome event recorder
 # OS-PARITY: ports the .sh sibling. Fires AFTER Edit OR Write tool
 # executes. Emits an edit_outcome event with diff size + whether the
 # file existed before. Pairing strategy: trainer joins on (session_id,

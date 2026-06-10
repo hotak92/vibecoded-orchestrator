@@ -1,4 +1,4 @@
-# V52-M (v0.2.52) — pre-bash KG context injection
+﻿# V52-M (v0.2.52) — pre-bash KG context injection
 # OS-PARITY: ports the .sh sibling. Fires BEFORE Bash tool executes
 # when the command length > VCT_BASH_KG_THRESHOLD_CHARS (default 500).
 # Mirrors pre-edit-context-inject.ps1's shape (stdin parse → emit

@@ -1,4 +1,4 @@
-# V52-M (v0.2.52) — post-bash outcome event recorder
+﻿# V52-M (v0.2.52) — post-bash outcome event recorder
 # OS-PARITY: ports the .sh sibling. Fires AFTER Bash tool executes.
 # Re-derives cmd_hash from stdin, reads the state file written by
 # pre-bash-context-inject.ps1, emits a bash_outcome event with the

@@ -11289,6 +11289,20 @@ def _materialize_orchestrator_self_claude_dir(
                 continue
             try:
                 shutil.copy2(src, target)
+                # v0.2.53 belt-and-braces: install.py's pre-existing test
+                # `test_install_into_fresh_target_linux` caught 3 v0.2.52
+                # hooks shipped with mode 664 (no exec bit). Without exec
+                # bit, Claude Code refuses to fire the hook on POSIX. Defend
+                # by force-setting 0o755 on every .sh hook target — copy2
+                # preserves source mode, so any contributor who commits a
+                # 664-mode hook silently disables it without this fix.
+                if src.suffix == ".sh":
+                    try:
+                        os.chmod(target, 0o755)
+                    except OSError as chmod_e:
+                        warnings.append(
+                            f"failed to chmod 755 {src.name}: {chmod_e}"
+                        )
                 copied_hooks += 1
             except OSError as e:
                 warnings.append(f"failed to copy {src.name}: {e}")
