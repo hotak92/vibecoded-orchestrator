@@ -81,6 +81,9 @@ PRETOOLUSE_LLM_BOUND_HOOKS = [
     "pre-edit-context-inject",
     # Section 5 KG search suggestion (Edit/Write user-prompt concept match).
     "pre-tool-use",
+    # V52-M (v0.2.52): >500-char bash KG injection. Sources _lib/emit-context.sh
+    # → emit_additional_context which produces the hookSpecificOutput.
+    "pre-bash-context-inject",
 ]
 
 

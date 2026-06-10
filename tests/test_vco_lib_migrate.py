@@ -57,6 +57,13 @@ _FULL_PROPS = [
     {"name": "tags", "dataType": ["text[]"]},
     {"name": "links", "dataType": ["text[]"]},
     {"name": "typed_links", "dataType": ["object[]"]},
+    # V52-I Fix B (2026-06-09 commit 600a5c6c): canonical temporal quartet
+    # added to kg_class_definition to close the partial_fan_out_schema_missing
+    # MCP telemetry gap (shared KG collections were shipping without these).
+    {"name": "created_at",  "dataType": ["date"]},
+    {"name": "updated_at",  "dataType": ["date"]},
+    {"name": "valid_from",  "dataType": ["date"]},
+    {"name": "valid_until", "dataType": ["date"]},
     {"name": "status", "dataType": ["text"]},
     # v0.2.17 (Reviewer B nit, folded into v0.2.17 + this test
     # fixture mirrors `kg_class_definition`'s post-v0.2.17 shape):
@@ -164,6 +171,12 @@ def _at_target_diagrams() -> dict:
             {"name": "file_path",               "dataType": ["text"]},
             {"name": "created_at",              "dataType": ["int"]},
             {"name": "updated_at",              "dataType": ["int"]},
+            # V52-I Fix B (2026-06-09 commit 600a5c6c): canonical validity
+            # window props added to diagrams_class_definition so the universal
+            # MCP stale filter (`valid_until is_none(True) | > now`) works
+            # against Diagrams collections too.
+            {"name": "valid_from",              "dataType": ["date"]},
+            {"name": "valid_until",             "dataType": ["date"]},
         ],
     }
 

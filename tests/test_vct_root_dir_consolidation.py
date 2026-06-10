@@ -219,6 +219,30 @@ def test_no_inline_reconstructions_outside_paths_module():
     allowed = {
         repo_root / "vco_lib" / "paths.py",
         repo_root / "templates" / "scripts" / "generate-kg-summary.py",
+        # v0.2.53: bootstrap exception. install.py runs BEFORE vco_lib is
+        # importable in some flows (it sets up the venv that contains
+        # vco_lib). Diagnostic-output functions that reconstruct ~/.vct
+        # inline are pre-vco_lib; refactoring to defer the call would
+        # require restructuring the install-time logging. Documented
+        # exception.
+        repo_root / "install.py",
+        # v0.2.53: MCP self-isolation exception. MCP servers run from
+        # claude_mcp_servers/.venv which does NOT have vco_lib on its
+        # path (vco_lib lives in the orchestrator-root venv).
+        # _vct_root_dir at claude_mcp_servers/_lib/update_gate.py:50 is
+        # explicitly documented as "Mirror of vco_lib.paths.vct_root_dir"
+        # — an intentional architectural duplication for MCP isolation,
+        # not drift.
+        repo_root / "claude_mcp_servers" / "_lib" / "update_gate.py",
+        # v0.2.53: defensive fallback exception. trainability_check.py's
+        # primary path uses vco_lib.paths.launcher_db_path() (the canonical
+        # resolver). The Path.home() / ".vct" reconstruction is INSIDE the
+        # `except ImportError` defensive fallback for the partial-install
+        # case (vco_lib not importable). The fallback exactly mirrors
+        # launcher_db_reader._discover_db_path, which is intentional —
+        # this is a diagnostic operator script that must work even on a
+        # half-broken install. Documented exception.
+        repo_root / "scripts" / "trainability_check.py",
     }
 
     # Walk production code only (skip tests/, .venv/, archive/).

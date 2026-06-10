@@ -227,15 +227,19 @@ class BashScriptTests(unittest.TestCase):
         finally:
             server.shutdown()
 
-    def test_only_targets_development_collections(self):
-        # Mix of _KnowledgeGraph + _Development + arbitrary classes →
-        # script only touches the _Development one.
+    def test_only_targets_orchestrator_managed_collections(self):
+        # V52-I Fix B (2026-06-09) broadened the script to target the
+        # full orchestrator-managed quartet of class suffixes:
+        # _KnowledgeGraph, _Development, _Diagrams. Other (third-party)
+        # classes must not be touched.
         if not shutil.which("jq"):
             self.skipTest("jq not available")
         initial = [
             {"class": "Acme_KnowledgeGraph",
              "properties": [{"name": "title", "dataType": ["text"]}]},
             {"class": "Acme_Development",
+             "properties": [{"name": "title", "dataType": ["text"]}]},
+            {"class": "Acme_Diagrams",
              "properties": [{"name": "title", "dataType": ["text"]}]},
             {"class": "RandomOther",
              "properties": [{"name": "title", "dataType": ["text"]}]},
@@ -250,7 +254,11 @@ class BashScriptTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0)
             targeted_classes = {e["class"] for e in _MockWeaviateHandler.post_log}
-            self.assertEqual(targeted_classes, {"Acme_Development"})
+            # Must touch all 3 orchestrator-managed; must NOT touch RandomOther.
+            self.assertEqual(
+                targeted_classes,
+                {"Acme_KnowledgeGraph", "Acme_Development", "Acme_Diagrams"},
+            )
         finally:
             server.shutdown()
 

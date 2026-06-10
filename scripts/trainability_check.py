@@ -62,12 +62,20 @@ def _resolve_db_path(override: str | None) -> Path | None:
         p = Path(env_path).expanduser()
         return p if p.is_file() else None
 
-    # Default: ~/.vct/launcher.db (matches launcher_db_reader._discover_db_path).
-    state_dir = os.environ.get("VCT_STATE_DIR", "").strip()
-    if state_dir:
-        p = Path(state_dir).expanduser() / "launcher.db"
-    else:
-        p = Path.home() / ".vct" / "launcher.db"
+    # v0.2.53 (test_vct_root_dir_consolidation): consolidate to the canonical
+    # resolver instead of hand-rolling Path.home() / ".vct". This script runs
+    # against an already-installed orchestrator so vco_lib is importable.
+    try:
+        from vco_lib.paths import launcher_db_path
+        p = launcher_db_path()
+    except ImportError:
+        # Bootstrap fallback if vco_lib is somehow unavailable (e.g. partial
+        # install). Matches launcher_db_reader._discover_db_path exactly.
+        state_dir = os.environ.get("VCT_STATE_DIR", "").strip()
+        if state_dir:
+            p = Path(state_dir).expanduser() / "launcher.db"
+        else:
+            p = Path.home() / ".vct" / "launcher.db"
     return p if p.is_file() else None
 
 
