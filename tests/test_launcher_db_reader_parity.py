@@ -81,27 +81,30 @@ def test_read_app_state_key_returns_none_for_missing_db(install_module, tmp_path
     assert install_module._read_app_state_key("any.key") is None
 
 
-def test_read_app_state_key_no_inline_sqlite_import(install_module):
-    """The migrated _read_app_state_key body must NOT have `import sqlite3`.
+def test_read_app_state_key_uses_readonly_uri(install_module):
+    """The migrated _read_app_state_key body uses mode=ro URI form.
 
     Regression guard: a future edit that re-introduces the blocking
-    sqlite3.connect pattern would re-introduce CORRECT-2.
+    sqlite3.connect (without uri=True + mode=ro) would re-introduce
+    CORRECT-2.
     """
     src = INSTALL_PY.read_text(encoding="utf-8")
     func_start = src.find("def _read_app_state_key(")
     assert func_start > 0
     func_end = src.find("\ndef ", func_start + 1)
     body = src[func_start:func_end]
-    # Body should NOT directly import sqlite3.
-    assert "import sqlite3" not in body, (
-        "_read_app_state_key must NOT re-introduce direct sqlite3 import; "
-        "use vco_lib.launcher_db_reader.read_app_state_value instead "
-        "(CORRECT-2: mode=ro&immutable=1 avoids blocking on launcher writer lock)."
+    # Body MUST use mode=ro URI form (the readonly + immutable pattern).
+    assert "mode=ro" in body, (
+        "_read_app_state_key must use the `file:?mode=ro&immutable=1` "
+        "URI form for non-blocking access (CORRECT-2)."
     )
-    # Body SHOULD reference launcher_db_reader.
-    assert "launcher_db_reader" in body, (
-        "_read_app_state_key must route through vco_lib.launcher_db_reader "
-        "for non-blocking readonly access."
+    assert "uri=True" in body, (
+        "sqlite3.connect must be called with uri=True to honor the "
+        "mode=ro URI form."
+    )
+    # The OLD blocking pattern (just timeout=5.0 without URI) must NOT appear.
+    assert "sqlite3.connect(str(db_path), timeout=5.0)" not in body, (
+        "_read_app_state_key must NOT use the legacy blocking pattern."
     )
 
 

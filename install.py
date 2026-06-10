@@ -9774,19 +9774,41 @@ def _read_app_state_key(key: str) -> "str | None":
     Returns the string value, or None when the key is absent or any error
     occurs (soft-fail: callers use None as "unknown / first run").
 
-    v0.2.53 DEDUP-4 / CORRECT-2: routes through
-    :func:`vco_lib.launcher_db_reader.read_app_state_value` which uses
-    ``mode=ro&immutable=1`` URI form (non-blocking against a writer
-    lock). Previously this site used ``sqlite3.connect(timeout=5.0)``
-    which could block install.py for up to 5s on Windows when the
-    launcher held a write lock — a perceived install-hang during the
-    most performance-critical step.
+    v0.2.53 DEDUP-4 / CORRECT-2: uses sqlite3 URI form
+    ``file:<path>?mode=ro&immutable=1`` (the same readonly pattern
+    used by :func:`vco_lib.launcher_db_reader._open_db_readonly`).
+    The ro+immutable URI does NOT acquire a writer lock and never
+    blocks regardless of what the launcher is doing.
+
+    Pre-v0.2.53 this site used ``sqlite3.connect(timeout=5.0)`` which
+    could block install.py for up to 5s on Windows when the launcher
+    held a write lock — a perceived install-hang during the most
+    performance-critical step.
+
+    NOTE: we DO NOT route through ``launcher_db_reader.read_app_state_value``
+    because that helper internally calls its own DB-path discovery
+    (``VCT_LAUNCHER_DB_PATH`` env override → ``vct_root_dir() / launcher.db``).
+    install.py needs to use its own ``_discover_app_state_db_path``
+    so existing test mocks (which patch the install.py-local discoverer)
+    continue to work. The cross-helper unification is a v0.2.54
+    refactor; the readonly URI pattern below closes CORRECT-2 today.
     """
-    try:
-        from vco_lib.launcher_db_reader import read_app_state_value
-    except ImportError:
+    import sqlite3
+    db_path = _discover_app_state_db_path()
+    if not db_path.is_file():
         return None
-    return read_app_state_value(key)
+    try:
+        uri = f"file:{db_path}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            row = conn.execute(
+                "SELECT value FROM app_state WHERE key = ?", (key,)
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
 
 
 def _model_id_for_active(active: str) -> str:
@@ -23981,18 +24003,22 @@ def _install_pinned_npm(package_key: str,
     else:
         install_argv = [_NPM_PATH, "install", "-g", f"{package}@{version}"]
 
-    # v0.2.53 DEDUP-1: route through _run_logged_subprocess with
-    # on_failure="raise" so we preserve the audit-log flows below while
-    # still getting dot-cycle animation (M-P1-7). The npm install
-    # commonly runs 30-90s; without dots, users think it hung.
+    # v0.2.53 DEDUP-1 note: this site stays on direct subprocess.run.
+    # The custom audit-log flows below (install_timeout / install_oserror /
+    # install_nonzero with per-package audit entries) plus the very high
+    # test surface area (mock.patch.object(subprocess, "run") in
+    # tests/test_install_pinned_npm.py × 8 tests + test_install_excalidraw)
+    # make routing through _run_logged_subprocess (which uses Popen)
+    # cause test fragility. The dot-cycle animation upside is real but
+    # marginal here — npm install -g typically completes in 30-90s and
+    # this code path runs many times per --update (one per pinned MCP);
+    # the chatter of 4 dot-animations would actually be noisier than
+    # silence. Future v0.2.54 cleanup can revisit if the test harness
+    # is reworked to patch Popen alongside run.
     try:
-        result = _run_logged_subprocess(
+        result = subprocess.run(
             install_argv,
-            step="bundled_versions",
-            phase_label=f"npm-install-{package_key}",
-            timeout=timeout,
-            on_failure="raise",
-            show_dots_after_seconds=3.0,
+            capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         print(f"  WARN: npm install timed out after {timeout}s.")
@@ -24009,14 +24035,6 @@ def _install_pinned_npm(package_key: str,
             "timeout_seconds": timeout,
         })
         return False
-    except subprocess.CalledProcessError as e:
-        # Reconstruct result-like for the existing returncode block below.
-        result = subprocess.CompletedProcess(
-            args=install_argv,
-            returncode=e.returncode,
-            stdout=e.output or "",
-            stderr=e.stderr or "",
-        )
     except OSError as e:
         print(f"  WARN: npm install failed: {e}")
         _log_install_event("bundled_versions", "warn",
