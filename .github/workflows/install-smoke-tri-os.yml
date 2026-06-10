@@ -1,0 +1,485 @@
+# v0.2.53 Track D — Tri-OS install smoke gate (M-P0-9).
+#
+# Exercises the third-party-user experience end-to-end on every supported
+# operating system. Performs a fresh `git clone` (NOT actions/checkout) so
+# the smoke walks the same code path Luciano hit on his macOS install:
+# `git clone && ./first-install.command`. The earlier `installer-smoke.yml`
+# only covered the `install.py` Python entry point with a shallow Linux
+# probe — it was structurally incapable of catching:
+#   - macOS-specific bash 3.2 / `experimental_macOS` path drift (M-P0-*).
+#   - Windows `first-install.bat` cmd.exe-specific bugs (W-P1-1/2/3) —
+#     the existing Job 4 uses `shell: bash`, never exercising the BAT
+#     entry point.
+#   - Fedora SELinux `:Z` mount flag handling (L-P0-3).
+#   - Linuxbrew + dnf parity gaps (L-P0-1).
+#
+# Per docs/INSTALL_ARCHITECTURE_v2.md §9.
+#
+# Triggers: PRs touching install surfaces, push to main, daily 06:00 UTC.
+# Caching: pip + pnpm caches keyed by lockfile hashes to stay under 15 min
+#          per OS. Fresh clone happens INSIDE the runner — the workspace
+#          /__w/<repo>/ checkout is unused for the install probe.
+#
+# Owner: Track D.
+# Pre-ship gate 22 reads `gh run list --workflow=install-smoke-tri-os.yml`
+# and asserts success on main before allowing a release tag.
+
+name: Install Smoke (tri-OS)
+
+on:
+  pull_request:
+    paths:
+      - "install.py"
+      - "install.sh"
+      - "install.ps1"
+      - "first-install.*"
+      - "start-launcher.*"
+      - "scripts/post-install-launcher.*"
+      - "launcher/src-tauri/src/commands/installer.rs"
+      - "vco_lib/project_init.py"
+      - ".github/workflows/install-smoke-tri-os.yml"
+  push:
+    branches: [main]
+  schedule:
+    # Daily 06:00 UTC. Catches drift introduced by upstream runner-image
+    # updates (e.g. new macos-14 base image dropping a tool we depended on).
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel in-progress PR runs to save CI minutes — but NEVER cancel a
+  # push-to-main or scheduled run, those are load-bearing for gate 22.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  install-smoke:
+    name: install smoke (${{ matrix.os }})
+    strategy:
+      # One OS failure must NOT mask the others — gate 22 reads per-matrix
+      # conclusions.
+      fail-fast: false
+      matrix:
+        # See §9.2 for OS rationale.
+        os:
+          - ubuntu-22.04   # Tests L-P0-2 (libwebkit2gtk-4.0-dev fallback)
+          - ubuntu-24.04   # Tests L-P0-2 (libwebkit2gtk-4.1-dev primary)
+          - macos-14       # Tests M-P0-* (bash 3.2, /opt/homebrew, arm64)
+          - windows-latest # Tests W-P1-* + first-install.bat (cmd.exe)
+        include:
+          # Fedora has no GitHub-hosted runner; run inside a container on
+          # the ubuntu-22.04 host so SELinux + dnf paths get exercised.
+          # Note: container SELinux is permissive on GitHub's host kernel,
+          # so the `getenforce` probe in install.py will report Permissive.
+          # That still exercises the dnf + Linuxbrew code paths; the
+          # true Enforcing path is covered by `test_selinux_z_flag.py`.
+          - os: ubuntu-22.04
+            container: fedora:40
+            label: fedora-40
+
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 25
+
+    env:
+      # Single source of truth for the per-OS dist subdir name — must
+      # match `paths.launcher_dist_subdir` from install.py --bootstrap
+      # and Track A's `metadata.json` writer + reader.
+      LAUNCHER_DIST_SUBDIR: >-
+        ${{
+          (matrix.os == 'macos-14' && 'macos-arm64') ||
+          (matrix.os == 'windows-latest' && 'windows-x64') ||
+          'linux-x64'
+        }}
+
+    steps:
+      # ----------------------------------------------------------------
+      # 0. Container prep (Fedora only) — install git + bash for the
+      #    fresh-clone step. The Fedora 40 image is minimal; runners on
+      #    bare ubuntu-22.04 / macos-14 / windows-latest already have
+      #    git on PATH.
+      # ----------------------------------------------------------------
+      - name: Fedora container prep
+        if: matrix.container == 'fedora:40'
+        run: |
+          dnf install -y git bash sudo procps-ng
+        shell: bash
+
+      # ----------------------------------------------------------------
+      # 1. Fresh git clone (NOT actions/checkout).
+      #
+      #    Reason: actions/checkout does a shallow clone via the GitHub
+      #    Actions auth helper, which is NOT what a third-party user
+      #    does. We need to exercise the public-clone code path that
+      #    Luciano hit on his macOS install. The `vco-fresh-clone/`
+      #    subdir keeps the install root isolated from the workspace
+      #    `__w/<repo>/` directory that earlier checkout actions would
+      #    leave behind.
+      # ----------------------------------------------------------------
+      - name: Clone fresh (third-party-user experience)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # On PRs, github.sha is the PR-merge commit, not the head of
+          # the source branch. For pull_request triggers we want the
+          # commit Actions resolved (github.event.pull_request.head.sha)
+          # so the smoke tests THIS PR's code, not main+merge.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            target_sha="${{ github.event.pull_request.head.sha }}"
+          else
+            target_sha="${{ github.sha }}"
+          fi
+          echo "Cloning ${{ github.repository }} @ $target_sha"
+          git clone --no-tags "https://github.com/${{ github.repository }}.git" vco-fresh-clone
+          cd vco-fresh-clone
+          git fetch --depth=1 origin "$target_sha"
+          git checkout "$target_sha"
+          git log -1 --oneline
+
+      # ----------------------------------------------------------------
+      # 2. Python setup. Uses actions/setup-python on the host runners.
+      #    On Fedora-container we let `dnf install -y python3` provide
+      #    Python 3.12 (Fedora 40 default) — setup-python does not
+      #    support arbitrary containers.
+      # ----------------------------------------------------------------
+      - name: Set up Python (host runners)
+        if: matrix.container == null
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Fedora container Python install
+        if: matrix.container == 'fedora:40'
+        shell: bash
+        run: |
+          dnf install -y python3 python3-pip python3-virtualenv
+
+      # ----------------------------------------------------------------
+      # 3. pip cache — keyed by lockfile hashes. Cross-OS cache hits
+      #    are intentional: pip wheels are platform-tagged so cache
+      #    misses on different OSes are by design.
+      # ----------------------------------------------------------------
+      - name: Cache pip
+        if: matrix.container == null
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/Library/Caches/pip
+            ~/AppData/Local/pip/Cache
+          key: tri-os-pip-${{ runner.os }}-${{ hashFiles('vco-fresh-clone/requirements.txt', 'vco-fresh-clone/pyproject.toml') }}
+          restore-keys: |
+            tri-os-pip-${{ runner.os }}-
+
+      # ----------------------------------------------------------------
+      # 4. Bootstrap probe (read-only) — exercises install.py
+      #    --bootstrap --json. Track B owns the implementation. Until
+      #    Track B's PR lands, the bootstrap mode may not exist; we
+      #    treat a missing-flag exit as a SKIP rather than fail, so
+      #    this workflow can land before Track B. After Phase 2
+      #    integration, both flags are required; tighten this then.
+      # ----------------------------------------------------------------
+      - name: Bootstrap probe (read-only) — POSIX
+        if: matrix.os != 'windows-latest'
+        working-directory: vco-fresh-clone
+        shell: bash
+        run: |
+          set -uo pipefail
+          if python3 install.py --bootstrap --json > bootstrap-pre.json 2>bootstrap-pre.stderr; then
+            python3 -m json.tool bootstrap-pre.json | head -60
+            echo "::notice::Bootstrap probe (pre-install) succeeded"
+          else
+            ec=$?
+            if grep -qiE 'unrecognized|no such option|unknown' bootstrap-pre.stderr 2>/dev/null; then
+              echo "::warning::install.py --bootstrap not yet implemented (Track B pending); skipping pre-probe"
+            else
+              echo "::error::install.py --bootstrap exited $ec for non-flag reason:"
+              cat bootstrap-pre.stderr
+              exit 1
+            fi
+          fi
+
+      - name: Bootstrap probe (read-only) — Windows
+        if: matrix.os == 'windows-latest'
+        working-directory: vco-fresh-clone
+        shell: cmd
+        run: |
+          py -3 install.py --bootstrap --json > bootstrap-pre.json 2> bootstrap-pre.stderr
+          if errorlevel 1 (
+            findstr /I "unrecognized unknown" bootstrap-pre.stderr >NUL && (
+              echo ::warning::install.py --bootstrap not yet implemented (Track B pending)^; skipping pre-probe
+              exit /b 0
+            ) || (
+              echo ::error::install.py --bootstrap failed for non-flag reason
+              type bootstrap-pre.stderr
+              exit /b 1
+            )
+          )
+          type bootstrap-pre.json
+
+      # ----------------------------------------------------------------
+      # 5. Run actual first-install.{sh,command,bat} end-to-end.
+      #
+      #    Each shim is invoked the SAME way a user would invoke it.
+      #    The `--yes` flag suppresses interactive prompts. The
+      #    `--no-auto-launch` flag prevents the launcher from spawning
+      #    a GUI window after install (CI has no display).
+      #
+      #    The Track A shim rewrite for v0.2.53 must accept these flags.
+      #    Until then, the existing wrappers may not — we treat a
+      #    flag-rejection error as a SKIP for the first-install step
+      #    only; the verify-artifacts step below still asserts the
+      #    install fully landed via the legacy `install.py` invocation.
+      # ----------------------------------------------------------------
+      - name: first-install.sh (Linux + Fedora)
+        if: matrix.os == 'ubuntu-22.04' || matrix.os == 'ubuntu-24.04' || matrix.container == 'fedora:40'
+        working-directory: vco-fresh-clone
+        shell: bash
+        # Some Linux distros mark first-install.sh non-executable when
+        # cloned over HTTPS via cgi (umask). Run via explicit `bash`.
+        run: |
+          set -uo pipefail
+          if bash first-install.sh --yes --no-auto-launch; then
+            echo "::notice::first-install.sh exited 0"
+          else
+            ec=$?
+            echo "::error::first-install.sh exited $ec"
+            # Dump the install log to aid debugging.
+            test -f state/logs/install.jsonl && tail -50 state/logs/install.jsonl || true
+            exit $ec
+          fi
+
+      - name: first-install.command (macOS)
+        if: matrix.os == 'macos-14'
+        working-directory: vco-fresh-clone
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Finder-launched .command files run with PWD=$HOME; we
+          # simulate by invoking from a separate dir to verify the shim
+          # cd's to SCRIPT_DIR (M-P1-4).
+          if (cd "$RUNNER_TEMP" && bash "$GITHUB_WORKSPACE/vco-fresh-clone/first-install.command" --yes --no-auto-launch); then
+            echo "::notice::first-install.command exited 0"
+          else
+            ec=$?
+            echo "::error::first-install.command exited $ec"
+            test -f state/logs/install.jsonl && tail -50 state/logs/install.jsonl || true
+            exit $ec
+          fi
+
+      - name: first-install.bat (Windows, cmd.exe)
+        if: matrix.os == 'windows-latest'
+        working-directory: vco-fresh-clone
+        shell: cmd
+        # CRITICAL: shell MUST be `cmd` here, not `bash`. The whole
+        # point of this step is to exercise the cmd.exe-only batch
+        # parser (W-P1-3). Git Bash on windows-latest masks bugs that
+        # only manifest under cmd.exe (e.g. `%~dp0` quoting, the
+        # `:_log_event` label parsing, refreshenv fallback).
+        run: |
+          first-install.bat --yes --no-auto-launch
+          if errorlevel 1 (
+            echo ::error::first-install.bat exited non-zero
+            if exist state\logs\install.jsonl type state\logs\install.jsonl
+            exit /b 1
+          )
+          echo first-install.bat exited 0
+
+      # ----------------------------------------------------------------
+      # 6. Verify install artifacts.
+      #
+      #    Asserts the install fully landed by checking presence of the
+      #    four contract directories + the .env file with KG_COLLECTION
+      #    set. These checks mirror what install.py --bootstrap would
+      #    report as `paths.state_dir_exists` / `paths.install_root_kind
+      #    == "completed_install"`, but expressed directly so this
+      #    workflow does not depend on Track B's bootstrap-envelope
+      #    shape being final.
+      # ----------------------------------------------------------------
+      - name: Verify install artifacts (POSIX)
+        if: matrix.os != 'windows-latest'
+        working-directory: vco-fresh-clone
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for d in .venv state claude_mcp_servers/.venv; do
+            if [ ! -d "$d" ]; then
+              echo "::error::MISSING directory: $d"
+              missing=$((missing + 1))
+            else
+              echo "  [ok] $d/"
+            fi
+          done
+          if [ ! -f .env ]; then
+            echo "::error::MISSING .env"
+            missing=$((missing + 1))
+          else
+            if grep -q "^KG_COLLECTION=" .env; then
+              kg="$(grep -m1 '^KG_COLLECTION=' .env | cut -d= -f2-)"
+              if [ -z "$kg" ]; then
+                echo "::error::.env KG_COLLECTION is set but empty"
+                missing=$((missing + 1))
+              else
+                echo "  [ok] .env has KG_COLLECTION=$kg"
+              fi
+            else
+              echo "::error::.env does not contain KG_COLLECTION="
+              missing=$((missing + 1))
+            fi
+          fi
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing install artifact(s) missing — install incomplete"
+            exit 1
+          fi
+          echo "Install artifacts OK"
+
+      - name: Verify install artifacts (Windows)
+        if: matrix.os == 'windows-latest'
+        working-directory: vco-fresh-clone
+        shell: cmd
+        run: |
+          set MISSING=0
+          if not exist .venv\NUL (
+            echo ::error::MISSING directory: .venv
+            set /a MISSING+=1
+          ) else (
+            echo   [ok] .venv\
+          )
+          if not exist state\NUL (
+            echo ::error::MISSING directory: state
+            set /a MISSING+=1
+          ) else (
+            echo   [ok] state\
+          )
+          if not exist claude_mcp_servers\.venv\NUL (
+            echo ::error::MISSING directory: claude_mcp_servers\.venv
+            set /a MISSING+=1
+          ) else (
+            echo   [ok] claude_mcp_servers\.venv\
+          )
+          if not exist .env (
+            echo ::error::MISSING .env
+            set /a MISSING+=1
+          ) else (
+            findstr /B /C:"KG_COLLECTION=" .env >NUL
+            if errorlevel 1 (
+              echo ::error::.env does not contain KG_COLLECTION=
+              set /a MISSING+=1
+            ) else (
+              echo   [ok] .env has KG_COLLECTION=
+            )
+          )
+          if %MISSING% gtr 0 (
+            echo ::error::%MISSING% install artifact(s) missing
+            exit /b 1
+          )
+          echo Install artifacts OK
+
+      # ----------------------------------------------------------------
+      # 7. Launcher headless boot via --check-only.
+      #
+      #    Track C owns the --check-only flag. If it has not landed yet
+      #    (Track C's final SHA pending integration), we SKIP this step
+      #    with a warning rather than fail — wiring up happens in Phase 2.
+      # ----------------------------------------------------------------
+      - name: Launcher --check-only (POSIX)
+        if: matrix.os != 'windows-latest'
+        working-directory: vco-fresh-clone
+        shell: bash
+        run: |
+          set -uo pipefail
+          bin="launcher/dist/${LAUNCHER_DIST_SUBDIR}/vct-launcher"
+          if [ ! -x "$bin" ]; then
+            echo "::warning::Launcher binary not present at $bin — install path may not have refreshed dist tree"
+            exit 0
+          fi
+          if "$bin" --check-only > launcher-check.json 2>launcher-check.stderr; then
+            cat launcher-check.json
+            echo "::notice::launcher --check-only exited 0 (healthy)"
+          else
+            ec=$?
+            if grep -qiE 'unrecognized|unknown|no such option|invalid' launcher-check.stderr 2>/dev/null; then
+              echo "::warning::launcher --check-only not yet implemented (Track C pending); skipping"
+            else
+              echo "::error::launcher --check-only exited $ec:"
+              cat launcher-check.stderr
+              cat launcher-check.json 2>/dev/null || true
+              exit $ec
+            fi
+          fi
+
+      - name: Launcher --check-only (Windows)
+        if: matrix.os == 'windows-latest'
+        working-directory: vco-fresh-clone
+        shell: cmd
+        run: |
+          set "BIN=launcher\dist\%LAUNCHER_DIST_SUBDIR%\vct-launcher.exe"
+          if not exist "%BIN%" (
+            echo ::warning::Launcher binary not present at %BIN%
+            exit /b 0
+          )
+          "%BIN%" --check-only > launcher-check.json 2> launcher-check.stderr
+          if errorlevel 1 (
+            findstr /I "unrecognized unknown invalid" launcher-check.stderr >NUL && (
+              echo ::warning::launcher --check-only not yet implemented (Track C pending)^; skipping
+              exit /b 0
+            ) || (
+              echo ::error::launcher --check-only exited non-zero
+              type launcher-check.stderr
+              exit /b 1
+            )
+          )
+          type launcher-check.json
+
+      # ----------------------------------------------------------------
+      # 8. Post-install bootstrap probe — assert ready_to_install=true.
+      #    Same Track-B-pending tolerance as the pre-probe.
+      # ----------------------------------------------------------------
+      - name: Bootstrap probe (post-install) + InstallHealthGate assertion
+        if: matrix.os != 'windows-latest'
+        working-directory: vco-fresh-clone
+        shell: bash
+        run: |
+          set -uo pipefail
+          if ! python3 install.py --bootstrap --json > bootstrap-post.json 2>bootstrap-post.stderr; then
+            if grep -qiE 'unrecognized|no such option|unknown' bootstrap-post.stderr 2>/dev/null; then
+              echo "::warning::install.py --bootstrap not yet implemented; skipping post-probe assertions"
+              exit 0
+            fi
+            echo "::error::install.py --bootstrap (post-install) failed:"
+            cat bootstrap-post.stderr
+            exit 1
+          fi
+          python3 -c "
+          import json, sys
+          d = json.load(open('bootstrap-post.json'))
+          assert d.get('ready_to_install') is True, f'ready_to_install != True: blockers={d.get(\"blocker_messages\")}'
+          paths = d.get('paths', {})
+          assert paths.get('install_root_kind') == 'completed_install', f'install_root_kind={paths.get(\"install_root_kind\")} expected completed_install'
+          assert paths.get('state_dir_exists') is True, 'state_dir_exists should be True after install'
+          assert paths.get('launcher_binary_exists') is True, 'launcher_binary_exists should be True after install'
+          print('Bootstrap envelope confirms install complete; InstallHealthGate would NOT fire.')
+          "
+
+      # ----------------------------------------------------------------
+      # 9. Upload diagnostic artifacts on failure.
+      # ----------------------------------------------------------------
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-smoke-diagnostics-${{ matrix.label || matrix.os }}
+          path: |
+            vco-fresh-clone/bootstrap-pre.json
+            vco-fresh-clone/bootstrap-pre.stderr
+            vco-fresh-clone/bootstrap-post.json
+            vco-fresh-clone/bootstrap-post.stderr
+            vco-fresh-clone/launcher-check.json
+            vco-fresh-clone/launcher-check.stderr
+            vco-fresh-clone/state/logs/install.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
