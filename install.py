@@ -10400,11 +10400,61 @@ def _pip_subprocess_env() -> dict[str, str]:
     subprocess that probes PYTHONPATH sees a defined-but-empty value rather
     than inherited-from-parent semantics.
 
-    Audit finding 2026-06-03 (venv-runtime-adversarial S6).
+    v0.2.53 M-P1-3: also threads pip-quality-of-life env vars so the user
+    doesn't get "A new release of pip is available" noise mid-install and
+    doesn't get blocked by interactive prompts in non-TTY runs:
+      * PIP_DISABLE_PIP_VERSION_CHECK=1 — suppresses the pip-version
+        suggestion banner. This banner is decorative for install.py
+        (we don't auto-upgrade based on it) and consumes a network
+        round-trip per pip call.
+      * PIP_NO_INPUT=1 — refuses any pip prompt (e.g. "y/n: proceed
+        with install of pre-release?"). Defends against pip hangs in
+        CI when stdin is /dev/null but pip thinks it has a terminal.
+
+    pip retry/timeout/prefer-binary flags are passed at the argv level
+    by callers that need them (e.g. _install_requirements) rather than
+    set via env, because pip's env-var equivalents
+    (PIP_DEFAULT_TIMEOUT etc) are per-version inconsistent.
+
+    Audit finding 2026-06-03 (venv-runtime-adversarial S6) +
+    docs/INSTALL_ARCHITECTURE_v2.md per-track table M-P1-3.
     """
     env = os.environ.copy()
     env["PYTHONPATH"] = ""
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    env["PIP_NO_INPUT"] = "1"
     return env
+
+
+def _pip_install_flags() -> list[str]:
+    """v0.2.53 M-P1-3: shared pip install flags for robustness.
+
+    Returns a list of argv tokens to splice into ``[python, "-m", "pip",
+    "install", ...]`` calls:
+      * ``--timeout 60``: per-request network timeout. pip's default
+        is 15s which is too short for slow networks (corporate proxies,
+        OCI image-layer downloads, etc.). 60s is a good compromise.
+      * ``--retries 5``: pip's default is 5 already in modern versions
+        but we set it explicitly so install.py's behavior is
+        independent of the pip version on PATH.
+      * ``--prefer-binary``: when both a wheel and an sdist exist for a
+        dep, prefer the wheel. Avoids accidental source builds when
+        wheels are present.
+
+    Callers splice these flags into the argv:
+
+        cmd = [py, "-m", "pip", "install", *_pip_install_flags(),
+               "-r", "requirements.txt"]
+
+    Not bundled into _pip_subprocess_env() because not every pip
+    invocation accepts these flags (pip --version doesn't, for
+    example).
+    """
+    return [
+        "--timeout", "60",
+        "--retries", "5",
+        "--prefer-binary",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -10626,8 +10676,13 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     # v0.2.53 DEDUP-1 (M-P0-4 silent-hang fix): _run_logged_subprocess adds
     # dot-cycle animation after 3s so the user can see pip is alive during
     # the typical 30–90s upgrade.
+    # v0.2.53 M-P1-3: pip's own self-upgrade benefits from the same
+    # robustness flags (--timeout, --retries, --prefer-binary). pip
+    # is happy to receive flags from its own command line.
     _run_logged_subprocess(
-        [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"],
+        [str(venv_python), "-m", "pip", "install",
+         *_pip_install_flags(),
+         "--upgrade", "pip"],
         step="4/10", phase_label="pip-upgrade",
         timeout=300, env=_pip_subprocess_env(),
         fail_message="  FAIL (pip upgrade)",
@@ -10648,11 +10703,15 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         )
         return
 
-    cmd = [str(venv_python), "-m", "pip", "install", "-r", str(req_file)]
+    # v0.2.53 M-P1-3: thread pip robustness flags into install argv.
+    cmd = [str(venv_python), "-m", "pip", "install",
+           *_pip_install_flags(),
+           "-r", str(req_file)]
     if dev:
         req_dev = PROJECT_ROOT / "requirements-dev.txt"
         if req_dev.exists():
             cmd = [str(venv_python), "-m", "pip", "install",
+                   *_pip_install_flags(),
                    "-r", str(req_file), "-r", str(req_dev)]
 
     # v0.2.53 DEDUP-1: M-P0-4 silent-hang fix at the longest-running pip
@@ -10691,7 +10750,9 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     # v0.2.53 DEDUP-1: silent-hang fix. Soft-fail (on_failure="return")
     # because the CLI entry point is best-effort; sys.path fallback works.
     editable_result = _run_logged_subprocess(
-        [str(venv_python), "-m", "pip", "install", "-e", "."],
+        [str(venv_python), "-m", "pip", "install",
+         *_pip_install_flags(),
+         "-e", "."],
         step="4/10", phase_label="pip-install-editable-vco",
         timeout=600,
         cwd=str(PROJECT_ROOT),
@@ -10734,8 +10795,9 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     # v0.2.53 DEDUP-1: silent-hang fix. Soft-fail (on_failure="return")
     # because sys.path fallback keeps consumer scripts working.
     mcp_editable_result = _run_logged_subprocess(
-        [str(venv_python), "-m", "pip", "install", "-e",
-         str(PROJECT_ROOT / "claude_mcp_servers")],
+        [str(venv_python), "-m", "pip", "install",
+         *_pip_install_flags(),
+         "-e", str(PROJECT_ROOT / "claude_mcp_servers")],
         step="4/10", phase_label="pip-install-editable-weaviate_mcp",
         timeout=600,
         cwd=str(PROJECT_ROOT),
