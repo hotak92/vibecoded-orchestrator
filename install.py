@@ -7338,6 +7338,12 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
     if os_name == "Linux":
         # Detect package manager first; we only prompt for managers we
         # can actually drive.
+        #
+        # v0.2.53 (Track G2 / L-P0-1): added zypper (openSUSE/SLES) +
+        # apk (Alpine) branches. Previously, users on those distros got
+        # "No supported package manager found" and had to install Podman
+        # manually even though post-install-launcher.sh:288 already
+        # advertised zypper+apk as detected — surface-level parity gap.
         if shutil.which("apt-get"):
             cmd = ["sudo", "apt-get", "install", "-y", "podman"]
             update_cmd = ["sudo", "apt-get", "update"]
@@ -7350,8 +7356,23 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
             cmd = ["sudo", "pacman", "-S", "--noconfirm", "podman"]
             update_cmd = None
             label = "pacman (Arch)"
+        elif shutil.which("zypper"):
+            # `zypper install -y` is the non-interactive flag. SLES/Leap
+            # ship podman in the standard repos.
+            cmd = ["sudo", "zypper", "install", "-y", "podman"]
+            update_cmd = None
+            label = "zypper (openSUSE/SLES)"
+        elif shutil.which("apk"):
+            # Alpine: `apk add` is non-interactive by default. Podman
+            # lives in the community repo; if it's not enabled, this
+            # surfaces as `ERROR: unable to select packages: podman` —
+            # acceptable failure mode.
+            cmd = ["sudo", "apk", "add", "--no-cache", "podman"]
+            update_cmd = ["sudo", "apk", "update"]
+            label = "apk (Alpine)"
         else:
-            print("    No supported package manager found (apt/dnf/pacman).")
+            print("    No supported package manager found "
+                  "(apt/dnf/pacman/zypper/apk).")
             print("    Install Podman manually: https://podman.io/getting-started/installation")
             print("    Or Docker:               https://docs.docker.com/get-docker/")
             return False
