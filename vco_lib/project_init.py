@@ -77,22 +77,43 @@ _FALLBACK_PREFIX = "vct"
 def sanitize_for_weaviate_class(project_name: str) -> str:
     """PascalCase a project name into a Weaviate class basename.
 
+    **SSOT classification (NEW-10 / DEDUP-6, v0.2.53)**:
+    This function is the CANONICAL underscore-DROPPING sanitizer
+    used to derive ``<prefix>_KnowledgeGraph``,
+    ``<prefix>_Development``, and ``<prefix>_Diagrams`` collection
+    names from a project's display name. The companion canonical for
+    the underscore-PRESERVING rule (code-graph collections) lives at
+    ``vco_lib.project_naming.canonical_class_prefix``. The two rules
+    are intentionally distinct because production Weaviate schemas
+    contain classes named by BOTH rules (different sites adopted
+    different rules historically — see the v0.2.15 wedge described in
+    ``project_naming.py``'s module docstring). Unifying would require
+    a one-shot migration of every existing collection on every user's
+    machine and is gated on a future tag (NOT v0.2.53).
+
+    DEDUP-6 (v0.2.53) callers consolidated to use THIS function:
+      * ``vco_lib.config_projection._sanitize_kg_collection``
+        (preserves a different fallback — "Vct" capitalized).
+      * The 4-way SSOT collision is now reduced to 2 canonical
+        functions: this one (underscore-dropping) and
+        ``canonical_class_prefix`` (underscore-preserving).
+
     Single source of truth across languages — replaces both the Python
-    helper `_derive_project_kg_name` (path-based) and the Rust helper
-    `sanitize_kg_collection`. Rust callers must subprocess this module
-    via `python -m vco_lib.project_init derive --name <n> --json`.
+    helper ``_derive_project_kg_name`` (path-based) and the Rust helper
+    ``sanitize_kg_collection``. Rust callers must subprocess this module
+    via ``python -m vco_lib.project_init derive --name <n> --json``.
 
     Rules (matching the existing install.py behavior):
-      1. Split on any non-alphanumeric run (`-`, `_`, space, etc.).
+      1. Split on any non-alphanumeric run (``-``, ``_``, space, etc.).
       2. PascalCase each surviving part (uppercase first letter, keep rest).
       3. Concatenate.
       4. If nothing survives OR the result starts with a digit (invalid
-         Weaviate class name), fall back to "vct".
+         Weaviate class name), fall back to ``"vct"``.
 
-    Note on non-ASCII: the regex `[^A-Za-z0-9]+` treats any non-ASCII
-    character as a separator, so `étude` → `["tude"]` → `"Tude"` (the
-    `é` is stripped, not preserved). This matches the existing
-    install.py `_derive_project_kg_name` behavior exactly. Unicode-aware
+    Note on non-ASCII: the regex ``[^A-Za-z0-9]+`` treats any non-ASCII
+    character as a separator, so ``étude`` → ``["tude"]`` → ``"Tude"``
+    (the ``é`` is stripped, not preserved). This matches the existing
+    install.py ``_derive_project_kg_name`` behavior exactly. Unicode-aware
     sanitization is out of scope for PR 2 — would require an explicit
     migration plan for any project that already exists with a stripped
     name.

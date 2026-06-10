@@ -1,6 +1,24 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Canonical project-name → Weaviate-class-prefix sanitizer.
+"""Canonical project-name → Weaviate-class-prefix sanitizer
+(underscore-PRESERVING rule).
+
+**SSOT classification (NEW-10 / DEDUP-6, v0.2.53)**: This is the canonical
+SSOT for the underscore-PRESERVING rule used by code-graph collection
+names (``CodeFunction``, ``CodeClass``, etc. — prefixed with the
+project's name). The companion SSOT for the underscore-DROPPING rule
+(KG / Development / Diagrams collections) lives at
+``vco_lib.project_init.sanitize_for_weaviate_class``. The two rules are
+intentionally distinct because production Weaviate schemas contain
+classes named by BOTH rules — see the module docstring of
+``project_init.py``'s sanitizer for the migration rationale.
+
+DEDUP-6 (v0.2.53) downstream callers that now route through this
+function:
+  * ``vco_lib.codegraph_to_mermaid._sanitize_collection_prefix``
+    (thin wrapper that catches ``ValueError`` for malformed inputs and
+    falls back to the legacy regex behaviour).
+  * ``templates/scripts/analyze_code_graph.py`` (already used this).
 
 Single source of truth, callable from both Python and Rust (Rust calls the
 matching `project_naming.rs` port and the parity test pins them together
