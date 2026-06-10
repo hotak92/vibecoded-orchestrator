@@ -6966,12 +6966,84 @@ def _check_python_version() -> None:
                   "required": f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"},
         )
         sys.exit(1)
+
+    # v0.2.53 M-P1-1: wheel-coverage detection.
+    # Replaces a hard MAX_PYTHON constant. We probe via `pip install
+    # --dry-run --only-binary=:all:` against a small set of pinned deps
+    # representative of VCO's binary-heavy stack (Pydantic, weaviate-client,
+    # httpx). If pip would fall back to source build, the install will
+    # almost certainly fail later in step 4/10 with a confusing C-compiler
+    # error from setup.py — print a clear hint NOW so the user can
+    # downgrade Python before wasting 10 minutes.
+    if (v.major, v.minor) >= (3, 14):
+        wheel_ok = _check_wheel_support_for_python(sys.executable)
+        if wheel_ok is False:
+            print("FAIL")
+            print(f"  Python {v.major}.{v.minor}.{v.micro} is too new — "
+                  "wheels are not yet published for VCO's binary deps.")
+            print("  pip would try to build from source, which typically "
+                  "fails without a C/C++ toolchain installed.")
+            print()
+            print("  Workaround: install Python 3.12 or 3.13 and re-run "
+                  "first-install with that interpreter:")
+            print("    # macOS / Homebrew:")
+            print("    brew install python@3.13")
+            print("    /opt/homebrew/bin/python3.13 install.py")
+            print("    # Linux / apt:")
+            print("    sudo apt install python3.13")
+            print("    python3.13 install.py")
+            print("    # Windows / py launcher:")
+            print("    py -3.13 install.py")
+            _log_install_event(
+                "1/10", "error",
+                f"Python {v.major}.{v.minor}.{v.micro} lacks wheel coverage",
+                data={
+                    "found": f"{v.major}.{v.minor}.{v.micro}",
+                    "wheel_support_ok": False,
+                    "workaround": "downgrade to 3.12 or 3.13",
+                },
+            )
+            sys.exit(1)
+
     print(f"OK ({v.major}.{v.minor}.{v.micro})")
     _log_install_event(
         "1/10", "ok",
         f"Python {v.major}.{v.minor}.{v.micro}",
         data={"version": f"{v.major}.{v.minor}.{v.micro}"},
     )
+
+
+def _check_wheel_support_for_python(python_cmd: str) -> Optional[bool]:
+    """v0.2.53 M-P1-1: probe wheel coverage via pip --dry-run.
+
+    Calls ``pip install --dry-run --only-binary=:all: <key-deps>``
+    against the given Python interpreter. Returns True iff pip
+    reports it CAN install without source build; False if it would
+    need to compile; None on probe error (network down, pip absent,
+    timeout) — callers treat None as "unknown, defer judgement".
+
+    Kept separate from the bootstrap envelope's
+    `_bootstrap_python_wheel_support` because:
+    1. This is called from _check_python_version at install step 1/10
+       (pre-venv-creation) — it must work against the host Python.
+    2. The bootstrap envelope's variant runs READ-ONLY at bootstrap
+       time; this one runs during the actual install path.
+
+    Both implementations probe the same canonical key deps.
+    """
+    probe_pkgs = ["weaviate-client>=4.7", "pydantic>=2", "httpx>=0.27"]
+    try:
+        result = subprocess.run(
+            [python_cmd, "-m", "pip", "install",
+             "--dry-run", "--only-binary=:all:",
+             "--no-cache-dir", "--quiet",
+             *probe_pkgs],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return None
+    return result.returncode == 0
 
 
 def _print_python_install_hint() -> None:
