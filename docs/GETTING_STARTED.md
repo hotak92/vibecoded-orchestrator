@@ -4,14 +4,14 @@ This guide walks you through installing the orchestrator, configuring your first
 
 ## Prerequisites
 
-The `install.sh` / `install.ps1` / `first-install.*` wrappers auto-install missing prerequisites (Python 3.11+, Node.js 18+, Podman) interactively via the platform package manager. They will prompt before invoking sudo / brew / winget — pass `--yes` or `--non-interactive` to skip prompts (auto-install is disabled in that mode; missing tools just get logged and `install.py` skips the dependent feature). GPU drivers are NEVER auto-installed (out of scope for an unattended installer).
+The `first-install.{sh,command,bat}` shims and `install.sh` / `install.ps1` auto-install missing prerequisites (Python 3.11+, Node.js 18+, Podman) via the platform package manager. They prompt before invoking sudo / brew / winget — pass `--yes` or `--non-interactive` to skip prompts (auto-install is disabled in that mode; missing tools just get logged and `install.py` skips the dependent feature). GPU drivers are NEVER auto-installed (out of scope for an unattended installer).
 
 What gets auto-installed when missing:
 
-- **Python 3.11 or newer** (3.12 recommended; 3.13 supported). Older versions fail at the install.py sentinel — we use stdlib `tomllib`, which is 3.11+.
-  - Linux: `sudo apt install python3.12 python3.12-venv` (or `sudo dnf install python3.12`, `sudo pacman -S python`)
-  - macOS: `brew install python@3.12`
-  - Windows: `winget install Python.Python.3.12`
+- **Python 3.11, 3.12, or 3.13.** Older versions are rejected at the shim's version probe — `install.py` uses stdlib `tomllib` (3.11+). Python 3.14 is rejected when wheel coverage is incomplete: the bootstrap prepass dry-runs `pip install --only-binary=:all:` against the dependency set and downgrades the recommendation if any dep would need to build from source. If `first-install.{sh,command,bat}` shows "Python 3.11+ required but not found" or refuses your interpreter, install 3.13 explicitly:
+  - Linux: `sudo apt install python3.13 python3.13-venv` (or `sudo dnf install python3.13`, `sudo pacman -S python`, `sudo zypper install python313`, `sudo apk add python3`)
+  - macOS: `brew install python@3.13`
+  - Windows: `winget install Python.Python.3.13`
   - Or: <https://python.org/downloads/>
 - **Node.js 18+** (needed by Playwright MCP and the Tauri launcher build path)
   - Linux: `sudo apt install nodejs npm` (Ubuntu/Debian), `sudo dnf install nodejs npm` (Fedora), `sudo pacman -S nodejs npm` (Arch)
@@ -20,11 +20,13 @@ What gets auto-installed when missing:
   - Or: <https://nodejs.org/>
   - Note: on fnm/nvm setups where you've hand-symlinked just `npm` to `~/.local/bin/`, the installer now finds `npx` via `dirname(realpath(npm))/npx` automatically — no manual PATH fiddling needed.
 - **Podman** (preferred — no commercial license, native on Linux/macOS/Windows). Docker is accepted as an alternative if already installed.
-  - Linux: `sudo apt install podman` (Ubuntu/Debian), `sudo dnf install podman` (Fedora), `sudo pacman -S podman` (Arch)
-  - macOS: `brew install podman`, then `podman machine init && podman machine start`
+  - Linux: `sudo apt install podman` (Ubuntu/Debian), `sudo dnf install podman` (Fedora), `sudo pacman -S podman` (Arch), `sudo zypper install podman` (openSUSE), `sudo apk add podman` (Alpine)
+  - macOS: `brew install podman`, then `podman machine init && podman machine start` (one-time prereq — both commands must complete before re-running the installer)
   - Windows: `winget install RedHat.Podman` (requires WSL2: `wsl --install`)
 
 Auto-start behaviour for the Podman daemon (v0.2.51+): if Podman is installed but the daemon/socket is not responding, `install.py` attempts `systemctl --user start podman.socket` (Linux) or `podman machine start` (macOS/Windows) before giving up. If the start fails (e.g. machine not yet initialized), a deferral entry is written to `.claude/context/UPDATE_DEFERRED.md` with the exact manual command to run — no destructive auto-init.
+
+On Linux (Fedora/RHEL/CentOS) with SELinux in `Enforcing` mode, the bootstrap prepass detects this and the install adds `:Z` to bind-mount volume args automatically. On hosts with an NVIDIA GPU, the install prints the distro-specific install hint for `nvidia-container-toolkit` when missing — the GPU itself is detected, the toolkit is not auto-installed.
 
 Other prerequisites (not auto-installed; you need them yourself):
 
@@ -48,31 +50,49 @@ Or, after cloning, double-click the file for your OS:
 | macOS | `first-install.command` |
 | Windows | `first-install.bat` |
 
-`first-install.*` handles everything without pre-installed Python:
-- Detects and installs Python (apt/dnf/pacman/brew/winget; tier: silent `--yes` → interactive → URL fallback)
-- Detects and installs a container runtime (Podman or Docker) via pkexec on Linux; URL-only on macOS/Windows
-- Detects GPU drivers (CUDA/ROCm) — detect-only; prints URL if hardware is present without a driver
-- Runs `install.py` (creates `<project>/.venv`, not `claude_mcp_servers/.venv`)
-- Probes for the launcher binary; if absent, offers to download from GitHub Releases or build from source
-- macOS: strips `com.apple.quarantine` xattr from downloaded binaries to preempt Gatekeeper
-- Auto-launches the launcher GUI as a detached process
+`first-install.{sh,command,bat}` is a thin OS shim (~100 LoC each) — see [`first-install.sh:1-106`](../first-install.sh) and [`first-install.command:1-131`](../first-install.command). The three steps it runs in sequence:
 
-Flags: `--yes` (non-interactive), `--no-auto-launch` (skip GUI spawn).
+1. **Python detect** — OS-aware candidate cascade. macOS tries Apple Silicon Homebrew under `/opt/homebrew/opt/python@3.13/` first, then PATH; Linux tries PATH then `/home/linuxbrew/.linuxbrew/bin/`; Windows uses the Python Launcher (`py -3.13` first) then PATH. Each candidate is version-probed (`>= 3.11` required). If none qualifies, the shim prints the distro-specific install hint (apt/dnf/pacman/zypper/apk on Linux, `brew install python@3.13` on macOS, `winget install Python.Python.3.13` on Windows) and on interactive runs offers to install via the package manager.
+
+2. **Bootstrap prepass** — `install.py --bootstrap --json` runs as a read-only system-detection probe, writing a versioned JSON envelope to `state/logs/bootstrap-prepass.json`. The envelope contains detected Python/Node/Podman/Docker versions, GPU vendor + VRAM, RAM, OS / distro / package manager, resolved paths (install root, launcher binary, dist subdir), Weaviate / Ollama / code-embed / vct-hub endpoints, and a `missing_prereqs` list with per-tool install hints. Side-effect policy: no file writes, no network, no prompts; every probe has a timeout. Failure here is logged and ignored — the full install runs regardless. Schema: [`docs/INSTALL_ARCHITECTURE_v2.md` §3](INSTALL_ARCHITECTURE_v2.md#3-target-architecture-installpy---bootstrap-mode). The `--bootstrap` flag is mutually exclusive with `--update` / `--lightweight` / `--uninstall` and is invoked alone in its own process by the shim.
+
+3. **Full install** — `install.py <forwarded args>` runs the canonical 10-step flow: Python check, system detection, optional companions (Joern, lean-ctx), venv, dependencies, containers, Ollama models, Weaviate collections + KG seeding, MCP server registration in `~/.claude.json`, and Claude CLI check. The shim forwards every user-supplied flag verbatim (so `bash first-install.sh --update`, `--gpu`, `--cpu-only`, etc. all work).
+
+On `install.py` exit 0 and unless `--no-auto-launch` was passed, the shim then runs [`scripts/post-install-launcher.sh`](../scripts/post-install-launcher.sh) (Linux/macOS) or its inline equivalent in `first-install.bat` (Windows). That step probes for an existing launcher binary, downloads the prebuilt one from GitHub Releases if absent, or offers to build from source. macOS additionally strips `com.apple.quarantine` from any downloaded binary to preempt Gatekeeper. The launcher is then spawned as a detached process.
+
+Flags the shim itself consumes: `--no-auto-launch` (skip the post-install launcher spawn), `--non-interactive` (translated to `install.py --yes`). Every other flag is forwarded to `install.py` verbatim.
 
 After install, double-click `start-launcher.<ext>` for your OS to start the launcher GUI.
 
 **Time budget**: ~5 min of interactive prompts, then 10–30 min for container images and model downloads (~5 GB; GPU mode pulls an additional ~2.5 GB). Re-runs reuse cached images.
 
+#### Diagnosing a failed install
+
+`state/logs/bootstrap-prepass.json` is the first thing to read when an install fails — it captures what the system looked like at the moment the shim ran, before anything mutated. The companion file `state/logs/install.jsonl` records every step `install.py` and `post-install-launcher.sh` attempted (one JSON event per line, schema in [`docs/INSTALL_RECOVERY.md`](INSTALL_RECOVERY.md)). Pasting both into a Claude Code session gets you a working diagnosis without re-running the install.
+
+#### CI smoke
+
+`install-smoke-tri-os.yml` runs the actual shims end-to-end on ubuntu-22.04, ubuntu-24.04, macos-14, windows-latest, and fedora-40 every PR + push to main + daily at 06:00 UTC. The Fedora job exercises SELinux `:Z` mount handling; the Ubuntu jobs exercise libwebkit2gtk-4.0/4.1 fallback; macOS exercises the Apple Silicon Homebrew cascade and bash 3.2; Windows exercises `first-install.bat` in real `cmd.exe` (the older `installer-smoke.yml` Windows job runs under `shell: bash`, which never reaches the BAT code path). Pre-ship gate 22 blocks release tags when this workflow is red on main.
+
 ### For advanced users: run install.py directly
 
-If you already have Python 3.11+ and a container runtime, you can call `install.py` directly:
+If you already have Python 3.11+ and a container runtime, you can call `install.py` directly (skipping the shim — you lose only the Python-detect cascade and the auto-spawn of the launcher GUI):
 
 ```bash
 cd vibecoded-orchestrator
 python3 install.py
 ```
 
-`install.py` does the following:
+To preview what the bootstrap prepass would detect without running the install, invoke it standalone:
+
+```bash
+python3 install.py --bootstrap --json > /tmp/probe.json   # machine-readable envelope
+python3 install.py --bootstrap                            # human-readable summary table
+```
+
+`--bootstrap` is read-only — it emits to stdout, performs no file writes, no network calls, and no prompts. It is mutually exclusive with `--update`, `--lightweight`, and `--uninstall`. The shim captures the `--json` output to `state/logs/bootstrap-prepass.json` itself; `install.py --bootstrap` invoked by hand prints to stdout instead.
+
+`install.py` (without `--bootstrap`) does the following:
 
 1. Creates a Python venv at `.venv/` (project root)
 2. Detects your hardware (NVIDIA / AMD / CPU / Apple Silicon) and chooses the embedding backend. AMD/ROCm layers `infrastructure/docker-compose.rocm.yml` on top; the precedence order is user override → Apple Silicon → NVIDIA+VRAM → AMD+VRAM → CPU

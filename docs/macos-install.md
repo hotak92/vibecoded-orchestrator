@@ -1,12 +1,50 @@
-# macOS install — best-effort (v0.2.40+)
+# macOS install — best-effort (v0.2.53+)
 
-This doc covers the first-launch user experience on macOS plus auto-start setup, troubleshooting, and uninstall. It is the canonical reference linked from the README, release notes, and the `release.yml` workflow header comment.
+This doc covers the macOS install walkthrough, first-launch user experience, auto-start setup, troubleshooting, and uninstall. It is the canonical reference linked from the README, release notes, and the `release.yml` workflow header comment.
 
 ## TL;DR
 
 - **Apple Silicon (M1/M2/M3/M4) only.** Intel x86_64 builds are NOT shipped — see "Why no Intel build?" below.
 - Binaries are **ad-hoc codesigned** (`codesign --force --deep --sign -`) but NOT signed with an Apple Developer ID. Gatekeeper warns on first launch; you bypass it once and the binary runs normally afterwards.
 - Full Developer ID + notarization is **deferred** to a follow-up patch once Apple credentials are provisioned. Until then, you'll see the "can't be verified by Apple" dialog the first time.
+- The dist binary lives at [`launcher/dist/macos-arm64/vct-launcher`](../launcher/dist/macos-arm64/). The historical `launcher/dist/experimental_macOS/` path was retired in v0.2.53 — install scripts and `start-launcher.command` now consume `macos-arm64/` only. Existing checkouts that still have the legacy directory can leave it; nothing reads from it.
+
+## Install walkthrough
+
+The supported path is:
+
+```bash
+git clone https://github.com/hotak92/vibecoded-orchestrator.git
+cd vibecoded-orchestrator
+# Double-click first-install.command in Finder, OR run from Terminal:
+bash first-install.command
+```
+
+`first-install.command` is the macOS shim (~130 LoC; see [`first-install.command:1-131`](../first-install.command)). It runs three steps in order, all forwarding your argv verbatim to `install.py`:
+
+1. **Python detect** — Apple Silicon Homebrew cascade first (`/opt/homebrew/opt/python@3.13/bin/python3.13`, `/opt/homebrew/opt/python@3.12/bin/python3.12`, `/opt/homebrew/opt/python@3.11/bin/python3.11`, then `/opt/homebrew/bin/python3.{13,12,11}`), then PATH (`python3.13`, `python3.12`, `python3.11`, `python3`, `python`). Each candidate is version-probed (`sys.version_info >= (3, 11)`); the first match wins. Intel Homebrew under `/usr/local/bin/` is reached via PATH probes. If no usable Python is found and Homebrew is installed, the shim prompts to run `brew install python@3.13` and re-probes.
+
+2. **Bootstrap prepass** — `install.py --bootstrap --json` writes a system-detection envelope to `state/logs/bootstrap-prepass.json`. Read-only; no network, no prompts. The envelope's `system.podman.machine_running` field is the cue for the next step.
+
+3. **Full install** — `install.py <forwarded args>` runs the canonical 10-step flow (Python check → system detection → optional companions → venv → dependencies → containers → Ollama models → Weaviate collections + KG seed → MCP server registration in `~/.claude.json` → Claude CLI check).
+
+On `install.py` exit 0 and unless `--no-auto-launch` was passed, the shim then runs `scripts/post-install-launcher.sh`, which probes for a launcher binary, offers download / build / skip, strips `com.apple.quarantine` from any downloaded binary, and detaches the GUI process. The shim keeps the Terminal window open if `install.py` exits non-zero so you can read the error.
+
+### Podman prereq
+
+`podman` itself is auto-installed via `brew install podman` only if Homebrew is present; the daemon (Podman Machine) is NOT auto-initialized — initializing carries platform-specific assumptions about disk space and CPU/memory allocation that should be an explicit user choice. Initialize before re-running the installer:
+
+```bash
+brew install podman      # if podman is not already on PATH
+podman machine init      # one-time
+podman machine start
+```
+
+The bootstrap prepass detects `podman.machine_running == false` and surfaces this in the envelope's `missing_prereqs` array; `install.py` writes an `UPDATE_DEFERRED.md` entry with the exact commands if it reaches the container step before the machine is up.
+
+### V52-M hook fix (relevant if you upgraded from v0.2.52)
+
+Three hooks added in v0.2.52 — `pre-bash-context-inject`, `post-bash-context-record`, `post-edit-outcome` — shipped without the POSIX exec bit, so they were silently dead on macOS (and Linux). v0.2.53 fixes the source files and `install.py` now explicitly `os.chmod(0o755)`s every hook script it materializes into `.claude/hooks/`. If you upgrade in place and find these hooks still inert, re-run `install.py --update` from the install root.
 
 ## Supported targets
 

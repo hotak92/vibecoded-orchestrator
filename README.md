@@ -47,7 +47,13 @@ One-liner (Linux / macOS):
 git clone https://github.com/hotak92/vibecoded-orchestrator.git && cd vibecoded-orchestrator && bash first-install.sh
 ```
 
-The installer auto-handles Python, the container runtime (Podman or Docker), GPU detection, and the launcher binary. Allow ~5–10 min plus first-run image downloads (~5 GB: Weaviate + Ollama qwen3 weights, +2.5 GB if GPU mode pulls CodeSage-Large-v2).
+`first-install.{sh,command,bat}` is a thin OS shim (~100 LoC) that runs three steps: (1) detect a usable Python 3.11+ via an OS-aware candidate cascade and prompt to install via the platform package manager if missing (Homebrew on macOS, apt/dnf/pacman/zypper/apk on Linux, winget on Windows); (2) run `install.py --bootstrap --json` — a read-only system-detection prepass that writes a diagnostic envelope to [`state/logs/bootstrap-prepass.json`](docs/INSTALL_ARCHITECTURE_v2.md#3-target-architecture-installpy---bootstrap-mode) (Python/Node/Podman versions, GPU, RAM, OS, package-manager advice); (3) run `install.py` for the canonical 10-step install. On success, `scripts/post-install-launcher.sh` auto-spawns the launcher GUI — pass `--no-auto-launch` to skip.
+
+The bootstrap prepass has no install side effects; failure there does not block the full install. It exists to make failed installs diagnosable without re-running probes by hand.
+
+Tri-OS install smoke CI (`install-smoke-tri-os.yml`) runs the actual `first-install.{sh,command,bat}` end-to-end on ubuntu-22.04, ubuntu-24.04, macos-14, windows-latest, and fedora-40 on every PR + push to main + daily at 06:00 UTC; pre-ship gate 22 blocks release tags when this workflow is red on main.
+
+Allow ~5–10 min plus first-run image downloads (~5 GB: Weaviate + Ollama qwen3 weights, +2.5 GB if GPU mode pulls CodeSage-Large-v2).
 
 If anything fails partway through, paste [`docs/INSTALL_RECOVERY.md`](docs/INSTALL_RECOVERY.md) into Claude Code — it walks Claude through diagnosing and finishing the build.
 
@@ -164,7 +170,7 @@ The launcher GUI ships as a per-OS standalone artifact on [GitHub Releases](http
 |-------------------------------------|-------------------------------------------------------|-------|
 | **Windows 10/11 (x64)**             | `vct-launcher-windows-x64.exe`                        | Portable, no installer. Unsigned — SmartScreen → "More info" → "Run anyway" on first run. Code signing on backlog. |
 | **Linux (x64)**                     | `*.AppImage` (portable) or `*.deb`                    | AppImage: `chmod +x VCT_Launcher_*.AppImage && ./VCT_Launcher_*.AppImage`. .deb: `sudo dpkg -i vct-launcher_*.deb`. |
-| **macOS (Apple Silicon, experimental)** | `vct-launcher-macos-arm64.dmg`                    | Built unattended in CI; we have no Mac to test on. See macOS notes in [KNOWN_ISSUES.md](KNOWN_ISSUES.md). |
+| **macOS (Apple Silicon)**           | `vct-launcher-macos-arm64.zip` (dist binary at `launcher/dist/macos-arm64/vct-launcher`) | Tier-2. Ad-hoc codesigned, not notarized — Gatekeeper warns once. See [docs/macos-install.md](docs/macos-install.md). |
 
 No GUI yet? The CLI install path (above) covers all three OSes.
 
