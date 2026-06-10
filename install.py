@@ -23999,7 +23999,12 @@ def _install_pinned_npm(package_key: str,
     #      reads package.json + symlinks the local tree into the global
     #      prefix; idempotent for re-runs).
     if is_file_pin:
-        install_argv = [_NPM_PATH, "install", "-g", str(local_dir)]
+        # CVE-1 (GHSA-5xrq-8626-4rwp): file-pinned MCP installs walk the full
+        # devDependencies tree by default; add --omit=dev so vendored forks
+        # don't ship ~50MB of test/build tooling to every user. Per Track E
+        # spec at docs/cve-1-patch-spec.md — registry pins (else branch) get
+        # devDeps stripped at `npm publish` time and don't need the flag.
+        install_argv = [_NPM_PATH, "install", "-g", "--omit=dev", str(local_dir)]
     else:
         install_argv = [_NPM_PATH, "install", "-g", f"{package}@{version}"]
 
