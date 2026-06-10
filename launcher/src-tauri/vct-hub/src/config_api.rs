@@ -657,7 +657,7 @@ async fn project_config(
         .iter()
         .find(|b| b.role == "primary")
         .map(|b| b.collection_name.clone());
-    let shared_kg_collection = kg_bindings
+    let shared_kg_collection_raw = kg_bindings
         .iter()
         .find(|b| b.role == "shared")
         .map(|b| b.collection_name.clone())
@@ -688,7 +688,7 @@ async fn project_config(
     // If we land here without one, the backfill hasn't run OR
     // failed silently — surface it loudly so resolver clients can
     // route to the warning path.
-    let kg_collection = match primary_kg {
+    let kg_collection_raw = match primary_kg {
         Some(name) => name,
         None => {
             return error_response(
@@ -702,28 +702,81 @@ async fn project_config(
         }
     };
 
+    // NEW-2 (v0.2.53) — case-rebind ported from install.py's
+    // `_resolve_existing_casing` (install.py:11848). When a
+    // case-different sibling of a derived class name exists on disk in
+    // Weaviate, adopt the on-disk casing rather than the canonical
+    // casing from the launcher.db binding row. Without this, the hub
+    // returns e.g. `VibeCodedOrchestrator_Development` (capital-C
+    // canonical) while Weaviate has `Vibecodedorchestrator_Development`
+    // (lowercase legacy), and `sync_knowledge_graph.py`'s
+    // case-sensitive `.exists()` check fails → `.create()` is called →
+    // Weaviate refuses with "class already exists, found similar class".
+    //
+    // We resolve `weaviate_url` here (earlier than the rest of the
+    // service-URL block below) so the probe has a URL to call. The
+    // probe is fail-open: if Weaviate is unreachable / responds with
+    // garbage, the candidate name is echoed back unchanged.
+    //
+    // Reference: `.claude/context/audits/fabio-v0252-rootcause-2026-06-10.md`
+    // Symptom B for the full root-cause walk.
+    let local_cfg_for_probe = LocalConfig::load();
+    let probe_weaviate_url = local_cfg_for_probe.weaviate_url.clone();
+
+    let kg_collection = crate::weaviate_schema_probe::resolve_existing_casing_for_class(
+        &probe_weaviate_url,
+        &kg_collection_raw,
+    )
+    .await;
+
+    let shared_kg_collection = if shared_kg_collection_raw.is_empty() {
+        String::new()
+    } else {
+        crate::weaviate_schema_probe::resolve_existing_casing_for_class(
+            &probe_weaviate_url,
+            &shared_kg_collection_raw,
+        )
+        .await
+    };
+
     // v0.2.46 Decision C — development collection name derives from the
     // primary KG via the canonical suffix swap (mirrors the diagrams
     // rule immediately below). When the primary's name doesn't end with
     // `_KnowledgeGraph` (e.g. a custom-rename install), fall back to a
     // slug-sanitized derivation.
-    let development_collection = if kg_collection.ends_with("_KnowledgeGraph") {
+    //
+    // NEW-2 (v0.2.53) — the suffix-swap candidate is then rebound to
+    // on-disk casing via `resolve_existing_casing_for_class`. The
+    // rebind is the load-bearing fix for Fabio's Symptom B.
+    let development_candidate = if kg_collection.ends_with("_KnowledgeGraph") {
         let basename = &kg_collection[..kg_collection.len() - "_KnowledgeGraph".len()];
         format!("{}_Development", basename)
     } else {
         format!("{}_Development", sanitize_collection_prefix(&project.slug))
     };
+    let development_collection = crate::weaviate_schema_probe::resolve_existing_casing_for_class(
+        &probe_weaviate_url,
+        &development_candidate,
+    )
+    .await;
 
     // Diagrams collection name — derived from `kg_collection` once it's
     // unwrapped from the Option above. Suffix swap mirrors the Python
     // contract; the slug-sanitized fallback handles the non-canonical
     // rename case (primary binding doesn't end with `_KnowledgeGraph`).
-    let diagrams_collection = if kg_collection.ends_with("_KnowledgeGraph") {
+    //
+    // NEW-2 (v0.2.53) — same case-rebind treatment as development above.
+    let diagrams_candidate = if kg_collection.ends_with("_KnowledgeGraph") {
         let basename = &kg_collection[..kg_collection.len() - "_KnowledgeGraph".len()];
         format!("{}_Diagrams", basename)
     } else {
         format!("{}_Diagrams", sanitize_collection_prefix(&project.slug))
     };
+    let diagrams_collection = crate::weaviate_schema_probe::resolve_existing_casing_for_class(
+        &probe_weaviate_url,
+        &diagrams_candidate,
+    )
+    .await;
 
     // Codegraph collection prefix: bind row first, slug-derived
     // fallback otherwise. Matches the Python analyzer's
@@ -779,8 +832,10 @@ async fn project_config(
     // are not (yet) in LocalConfig — they ride env var → compiled
     // default. When LocalConfig grows fields for these in a future
     // release, swap them in without breaking the wire contract.
-    let local_cfg = LocalConfig::load();
-    let weaviate_url = local_cfg.weaviate_url;
+    //
+    // NEW-2 (v0.2.53) — `local_cfg_for_probe` was already loaded above
+    // for the case-rebind probe; reuse it to avoid a second TOML read.
+    let weaviate_url = local_cfg_for_probe.weaviate_url;
     let ollama_url = std::env::var("VCT_OLLAMA_URL")
         .ok()
         .filter(|v| !v.is_empty())
@@ -3026,5 +3081,232 @@ kg_tier_full = 0.8
             obj.get("rl_server_port").and_then(|v| v.as_u64()),
             Some(11443)
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // NEW-2 (v0.2.53) — case-rebind integration tests.
+    //
+    // Reference: `.claude/context/audits/fabio-v0252-rootcause-2026-06-10.md`
+    // Symptom B.
+    //
+    // These tests spin up a fake Weaviate alongside the hub and assert
+    // the hub's resolver adopts the on-disk casing of case-different
+    // sibling classes, mirroring install.py's `_resolve_existing_casing`
+    // (install.py:11848).
+    //
+    // Env-var isolation note: the hub reads its Weaviate URL via
+    // `LocalConfig::load()` which honours `VCT_WEAVIATE_URL`. We set
+    // this once at the top of each test and the cache-reset path in
+    // `weaviate_schema_probe::_reset_cache_for_test` keeps tests
+    // independent.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Spin up a fake Weaviate that responds to GET /v1/schema with a
+    /// `{"classes":[{"class":<name>}, ...]}` body for the given list.
+    /// Returns the bound URL.
+    async fn spawn_fake_weaviate(
+        classes: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::get, Json, Router as InnerRouter};
+        let classes_payload: Vec<serde_json::Value> = classes
+            .iter()
+            .map(|c| serde_json::json!({ "class": c }))
+            .collect();
+        let body = serde_json::json!({ "classes": classes_payload });
+        let app = InnerRouter::new().route(
+            "/v1/schema",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let url = format!("http://{}", addr);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, handle)
+    }
+
+    /// NEW-2 — when Weaviate has a case-different sibling of the
+    /// suffix-swap-derived development_collection name, the hub returns
+    /// the on-disk casing rather than the canonical-capitalisation
+    /// candidate. Reproduces Fabio's Symptom B fix.
+    #[tokio::test]
+    async fn dev_collection_case_rebind_adopts_on_disk_casing() {
+        crate::weaviate_schema_probe::_reset_cache_for_test();
+
+        // Fake Weaviate: lowercase-c on-disk class (Fabio's case).
+        let (weaviate_url, _w) = spawn_fake_weaviate(vec![
+            "Vibecodedorchestrator_KnowledgeGraph".to_string(),
+            "Vibecodedorchestrator_Development".to_string(),
+            "Vibecodedorchestrator_Diagrams".to_string(),
+        ])
+        .await;
+        // SAFETY: setting env var for the duration of this test is OK
+        // because LocalConfig::load() reads it on each call and our
+        // probe cache is reset per test. Other tests that depend on
+        // LocalConfig defaults are unaffected because (a) this test is
+        // additive and (b) the probe is fail-open: even if a stale env
+        // value leaked in, the probe would just echo back the candidate.
+        std::env::set_var("VCT_WEAVIATE_URL", &weaviate_url);
+
+        let (base, h) = spawn_config_api_hub().await;
+        // Seed primary KG with capital-C canonical name (what
+        // launcher.db stores after v0.2.23 B1 canonicalisation).
+        let project_id = "p-case-rebind";
+        let slug = "vibecodedorchestrator";
+        let folder = format!("/tmp/test-config-project-{}", project_id);
+        seed_project(&h.0, project_id, "VibeCoded Orchestrator", &folder, slug);
+        h.0.set_project_kg_binding(
+            project_id,
+            "primary",
+            "VibeCodedOrchestrator_KnowledgeGraph", // capital-C canonical
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+        h.0.set_project_kg_binding(
+            project_id,
+            "shared",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, project_id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        // Assertions: every returned class name follows the on-disk
+        // casing (lowercase-c, lowercase-o), NOT the canonical
+        // capital-C that the launcher.db binding row holds.
+        assert_eq!(
+            body.get("kg_collection").and_then(|v| v.as_str()),
+            Some("Vibecodedorchestrator_KnowledgeGraph"),
+            "kg_collection must adopt on-disk casing (Fabio's Symptom B)"
+        );
+        assert_eq!(
+            body.get("development_collection").and_then(|v| v.as_str()),
+            Some("Vibecodedorchestrator_Development"),
+            "development_collection must adopt on-disk casing — the load-bearing assertion for Fabio's bug"
+        );
+        assert_eq!(
+            body.get("diagrams_collection").and_then(|v| v.as_str()),
+            Some("Vibecodedorchestrator_Diagrams"),
+            "diagrams_collection must adopt on-disk casing (parity with development)"
+        );
+        assert_eq!(
+            body.get("shared_kg_collection").and_then(|v| v.as_str()),
+            Some("Vibecodedorchestrator_KnowledgeGraph"),
+            "shared_kg_collection must adopt on-disk casing"
+        );
+        // Clean up — best-effort.
+        std::env::remove_var("VCT_WEAVIATE_URL");
+    }
+
+    /// NEW-2 — when Weaviate has no matching class (fresh install),
+    /// the hub returns the canonical-capitalisation candidate as-is.
+    /// This is the no-rebind path and must keep working.
+    #[tokio::test]
+    async fn dev_collection_no_rebind_when_no_sibling() {
+        crate::weaviate_schema_probe::_reset_cache_for_test();
+
+        // Fake Weaviate: empty schema (fresh install).
+        let (weaviate_url, _w) = spawn_fake_weaviate(vec![]).await;
+        std::env::set_var("VCT_WEAVIATE_URL", &weaviate_url);
+
+        let (base, h) = spawn_config_api_hub().await;
+        let project_id = "p-no-rebind";
+        let slug = "freshproject";
+        let folder = format!("/tmp/test-config-project-{}", project_id);
+        seed_project(&h.0, project_id, "Fresh Project", &folder, slug);
+        h.0.set_project_kg_binding(
+            project_id,
+            "primary",
+            "FreshProject_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, project_id))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+
+        assert_eq!(
+            body.get("kg_collection").and_then(|v| v.as_str()),
+            Some("FreshProject_KnowledgeGraph"),
+            "candidate name echoed unchanged when no sibling exists"
+        );
+        assert_eq!(
+            body.get("development_collection").and_then(|v| v.as_str()),
+            Some("FreshProject_Development"),
+            "suffix-swap candidate echoed unchanged when no sibling exists"
+        );
+        std::env::remove_var("VCT_WEAVIATE_URL");
+    }
+
+    /// NEW-2 — when Weaviate is unreachable (network failure), the hub
+    /// returns the canonical-capitalisation candidates as-is (fail-open).
+    /// This must keep working so a transient Weaviate hiccup never
+    /// breaks resolver responses.
+    #[tokio::test]
+    async fn dev_collection_unreachable_weaviate_fails_open() {
+        crate::weaviate_schema_probe::_reset_cache_for_test();
+
+        // Bind+drop a TCP listener to claim a port that's now closed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let unreachable_url = format!("http://{}", addr);
+        std::env::set_var("VCT_WEAVIATE_URL", &unreachable_url);
+
+        let (base, h) = spawn_config_api_hub().await;
+        let project_id = "p-unreach";
+        let slug = "unreachable";
+        let folder = format!("/tmp/test-config-project-{}", project_id);
+        seed_project(&h.0, project_id, "Unreach", &folder, slug);
+        h.0.set_project_kg_binding(
+            project_id,
+            "primary",
+            "Unreach_KnowledgeGraph",
+            Some("qwen3-embedding:0.6b"),
+            Some(1024),
+            None,
+            None,
+            &empty_json_obj(),
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/{}/config", base, project_id))
+            .await
+            .expect("hub reachable");
+        // Hub itself must still 200 even with Weaviate down.
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        // Candidates echoed back unchanged — fail-open contract.
+        assert_eq!(
+            body.get("development_collection").and_then(|v| v.as_str()),
+            Some("Unreach_Development")
+        );
+        std::env::remove_var("VCT_WEAVIATE_URL");
     }
 }
