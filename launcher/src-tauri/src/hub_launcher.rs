@@ -71,6 +71,19 @@ pub fn find_hub_binary() -> Option<PathBuf> {
     // handled by the discovery in `commands::modules::
     // find_orchestrator_manifest`, but we don't have access to its
     // current_exe walking here; instead we re-derive both candidates.
+    //
+    // v0.2.53 test-isolation gate: when running under `cargo test`,
+    // `current_exe()` points into `target/debug/deps/` whose grandparent
+    // is `target/debug/` — and sibling cargo invocations leave a real
+    // `vct-hub` binary there. That makes deterministic "no hub anywhere"
+    // tests impossible (find_hub_binary_returns_none_when_nothing_resolves
+    // + ensure_hub_running_reports_binary_not_found_in_clean_env +
+    // find_hub_binary_falls_through_when_override_is_not_executable).
+    // Setting `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1` skips steps 4+5;
+    // production code never sets this so it's a no-op there.
+    if std::env::var_os("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY").is_some() {
+        return None;
+    }
     if let Ok(exe) = std::env::current_exe() {
         // Sibling layout: same dir as the launcher binary contains
         // vct-hub too (this is what `build-bundled-launcher.sh`
@@ -296,6 +309,10 @@ mod tests {
                 ("VCT_HUB_BIN", Some(nonexec.to_str().unwrap())),
                 ("PATH", Some("/nonexistent-dir")),
                 ("HOME", Some("/nonexistent-home")),
+                // v0.2.53: disable current_exe()-based discovery so the
+                // `target/debug/vct-hub` binary other cargo runs leave behind
+                // doesn't poison this test. Production never sets this var.
+                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
             ],
             || {
                 // No legitimate hub anywhere → None.
@@ -311,6 +328,7 @@ mod tests {
                 ("VCT_HUB_BIN", None),
                 ("PATH", Some("/nonexistent-dir")),
                 ("HOME", Some("/nonexistent-home")),
+                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
             ],
             || {
                 assert_eq!(find_hub_binary(), None);
@@ -325,6 +343,7 @@ mod tests {
                 ("VCT_HUB_BIN", None),
                 ("PATH", Some("/nonexistent-dir")),
                 ("HOME", Some("/nonexistent-home")),
+                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
             ],
             || {
                 assert_eq!(ensure_hub_running(), SpawnOutcome::BinaryNotFound);
