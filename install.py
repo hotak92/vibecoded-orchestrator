@@ -6027,6 +6027,26 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
             else:
                 _print_gpu_hint(os_name)
 
+    # v0.2.53 L-P0-8: when a GPU IS detected on Linux, surface the
+    # render/video group remediation if missing. The webkit_preflight
+    # silently skips when the user lacks `render` (and sometimes `video`)
+    # group membership; without this hint the user has no idea why GPU
+    # acceleration didn't engage.
+    if os_name == "Linux" and (has_gpu or has_metal):
+        _print_render_video_group_hint()
+
+    # v0.2.53 L-P0-3: surface the SELinux `:Z` bind-mount hint when
+    # SELinux is enforcing AND we're going to set up containers. We
+    # check enforcement here (cheap) so the user sees the hint during
+    # the system-detection summary, before any container start that
+    # would silently fail to access bind-mount data.
+    if (
+        os_name == "Linux"
+        and not getattr(args, "no_containers", False)
+        and _detect_selinux_enforcing()
+    ):
+        _print_selinux_bind_mount_hint()
+
     # Container runtime
     if args.container:
         container_cmd = args.container
@@ -7276,6 +7296,203 @@ def _ensure_nvidia_cdi_spec_for_podman() -> None:
         "      CDI spec after every NVIDIA driver upgrade or GPU containers\n"
         "      will fail to start."
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.53 L-P0-3: SELinux enforcement detection + :Z bind-mount label hint
+# ---------------------------------------------------------------------------
+def _detect_selinux_enforcing() -> bool:
+    """Return True iff SELinux is currently in `Enforcing` mode.
+
+    Detection chain (priority order):
+      1. `getenforce` returns "Enforcing" — canonical signal on Fedora /
+         RHEL / CentOS Stream / Rocky / Alma. Trusted when present.
+      2. `/sys/fs/selinux/enforce` reads "1" — fallback for minimal
+         containers / chrooted environments where `getenforce` may not
+         be on PATH.
+      3. Any failure (binary missing, sysfs unreadable, file is "0",
+         non-Linux OS) → False (assume non-SELinux distro: Ubuntu, Arch,
+         openSUSE without enforcement, etc.).
+
+    The semantics are intentionally conservative: a False return is
+    treated by callers as "no SELinux label fix needed". Only return
+    True when we are certain SELinux is enforcing AND will reject bare
+    bind mounts inside Podman/Docker.
+
+    No subprocess on non-Linux. Best-effort soft-fail throughout.
+    """
+    if platform.system() != "Linux":
+        return False
+
+    # Step 1: getenforce (the canonical signal on Fedora/RHEL family).
+    getenforce = shutil.which("getenforce")
+    if getenforce:
+        try:
+            result = subprocess.run(
+                [getenforce], capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                # `getenforce` prints exactly one of: Enforcing, Permissive,
+                # Disabled. Case sensitive on stock RHEL.
+                return result.stdout.strip().lower() == "enforcing"
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass  # Fall through to sysfs probe.
+
+    # Step 2: sysfs fallback for minimal containers without selinux-utils.
+    # /sys/fs/selinux/enforce is "1" when enforcing, "0" when permissive,
+    # absent entirely when SELinux is not compiled into the kernel.
+    try:
+        enforce_path = Path("/sys/fs/selinux/enforce")
+        if enforce_path.is_file():
+            return enforce_path.read_text(encoding="utf-8").strip() == "1"
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    return False
+
+
+def _print_selinux_bind_mount_hint() -> None:
+    """Print the SELinux `:Z` / `:z` bind-mount remediation hint.
+
+    Called from the GPU/container detection block when SELinux is
+    detected as enforcing. Covers the most common Fedora/RHEL footgun:
+    Podman starts containers cleanly, but any volume bind-mount fails
+    with "Permission denied" inside the container because SELinux blocks
+    cross-context access.
+
+    The fix is one of:
+      - `:Z` suffix on the host path (private label — recommended for
+        single-container access).
+      - `:z` suffix (shared label — only if multiple containers need
+        access).
+
+    We don't auto-rewrite compose files here because the launcher's
+    volume migration (commands/volumes.rs) owns the bind-mount override
+    surface; rewriting from install.py would race with launcher edits.
+    Instead we print a clear pointer so the user can re-run the volume
+    migration with SELinux awareness.
+
+    Idempotent: no-op when called more than once in a single run
+    (deduped by a module-level flag).
+    """
+    global _SELINUX_HINT_PRINTED  # noqa: PLW0603
+    if globals().get("_SELINUX_HINT_PRINTED", False):
+        return
+    _SELINUX_HINT_PRINTED = True
+
+    print(
+        "  [!] SELinux detected as Enforcing (typical on Fedora / RHEL /\n"
+        "      CentOS Stream / Rocky / Alma).\n"
+        "      Podman + SELinux requires the `:Z` (or `:z`) label suffix\n"
+        "      on every bind-mount volume, or the container sees\n"
+        "      \"Permission denied\" on every file inside the mount.\n"
+        "      Action — pick ONE:\n"
+        "        (a) Use the orchestrator's NAMED-volume layout (the\n"
+        "            install.py default): no bind mounts, no label\n"
+        "            problem. Don't run the launcher's \"Migrate\n"
+        "            volumes to bind-mount\" workflow.\n"
+        "        (b) If you already migrated to bind-mounts: append\n"
+        "            `:Z` to each `device:` host path in\n"
+        "            `infrastructure/docker-compose.override.yml`, OR\n"
+        "            relabel the host dirs with:\n"
+        "                sudo chcon -Rt container_file_t \\\n"
+        "                    ~/podman_volumes/weaviate \\\n"
+        "                    ~/podman_volumes/ollama \\\n"
+        "                    ~/podman_volumes/code_embed\n"
+        "        (c) Temporarily set SELinux to permissive while testing:\n"
+        "                sudo setenforce 0          # session-only\n"
+        "                # /etc/selinux/config for permanent change.\n"
+        "      Without one of these, podman compose-up will succeed but\n"
+        "      the services will fail readiness checks with file-IO\n"
+        "      errors on first access.")
+
+
+# Module-level dedup flag for the SELinux hint printer.
+_SELINUX_HINT_PRINTED: bool = False
+
+
+# ---------------------------------------------------------------------------
+# v0.2.53 L-P0-8: render / video group remediation hint
+# ---------------------------------------------------------------------------
+def _user_in_group(group_name: str) -> bool:
+    """Return True iff the current user is a member of the given Unix
+    group. Linux-only check; returns False on Windows and macOS (where
+    the GPU permission model differs).
+
+    Uses the `grp` stdlib module on POSIX (no subprocess needed). Soft-
+    fails to False on any unexpected error — caller treats this as
+    "needs hint", which is the safer default.
+    """
+    if platform.system() != "Linux":
+        return False
+    try:
+        import grp  # POSIX-only stdlib module.
+        gr = grp.getgrnam(group_name)
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        if not user:
+            try:
+                import pwd  # noqa: PLC0415
+                user = pwd.getpwuid(os.getuid()).pw_name
+            except (KeyError, AttributeError, ImportError):
+                return False
+        return user in gr.gr_mem
+    except (KeyError, ImportError, AttributeError, OSError):
+        return False
+
+
+def _print_render_video_group_hint() -> None:
+    """Print the GPU-render-node group remediation hint.
+
+    When the launcher's `webkit_preflight` runs and the user is missing
+    `render` / `video` group membership, access to `/dev/dri/renderD128`
+    (and friends) raises EACCES; the preflight silently skips GPU-
+    accelerated WebKit and the user wonders why the launcher chrome is
+    slow. The fix is one `usermod` + a re-login, but the user must KNOW
+    that's the right knob.
+
+    This helper is called from install.py's GPU detection step only on
+    Linux when:
+      - We detected an NVIDIA OR AMD OR Intel GPU on the box (lspci
+        positive), AND
+      - The current user is NOT in BOTH `render` and `video` groups.
+
+    Idempotent (deduped by module flag) so repeated GPU probes don't
+    spam the user.
+    """
+    global _RENDER_GROUP_HINT_PRINTED  # noqa: PLW0603
+    if globals().get("_RENDER_GROUP_HINT_PRINTED", False):
+        return
+    _RENDER_GROUP_HINT_PRINTED = True
+
+    in_render = _user_in_group("render")
+    in_video = _user_in_group("video")
+
+    if in_render and in_video:
+        return  # Already in both — nothing to suggest.
+
+    missing = []
+    if not in_render:
+        missing.append("render")
+    if not in_video:
+        missing.append("video")
+    missing_csv = ",".join(missing)
+
+    print(
+        f"  [!] GPU detected, but your user is NOT in the `{missing_csv}`\n"
+        f"      group{'s' if len(missing) > 1 else ''}. This blocks the launcher's WebKit GPU\n"
+        f"      acceleration probe (EACCES on /dev/dri/renderD128) and any\n"
+        f"      containerized GPU workload that re-bind-mounts the same\n"
+        f"      device node. Fix:\n"
+        f"          sudo usermod -aG {missing_csv} $USER\n"
+        f"          newgrp {missing[0]}     # or log out + back in for it\n"
+        f"                                # to take effect in your shell\n"
+        f"      Without this, `webkit_preflight` will soft-skip and your\n"
+        f"      launcher window may flicker / fall back to software\n"
+        f"      rendering at boot.")
+
+
+# Module-level dedup flag for the render/video group hint printer.
+_RENDER_GROUP_HINT_PRINTED: bool = False
 
 
 def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
