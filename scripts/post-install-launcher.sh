@@ -260,10 +260,30 @@ _check_prerequisites() {
         fi
         return 1
     }
+    # M-P0-6 (v0.2.53): Apple Silicon Homebrew installs node / npm /
+    # pnpm under `/opt/homebrew/bin/...` (not `/usr/local/bin/...` —
+    # that's Intel-Mac homebrew). The previous probe list only
+    # checked Intel-Mac + Linux paths → Apple-Silicon users with
+    # brew-installed Node showed `node: no` and fell into the
+    # silent-build path. Add `/opt/homebrew/bin/...` to each probe
+    # list (placed before `/usr/local/bin/...` so it wins on Apple
+    # Silicon when both happen to exist).
+    #
+    # Also: re-source brew shellenv if brew is on disk but not in
+    # PATH. `install.sh` does this for python detection (line ~158)
+    # but post-install-launcher.sh runs in a fresh subshell — the
+    # env doesn't propagate. Doing it here means subsequent `brew
+    # install` / `node` / `npm` calls in this script find the right
+    # binaries on Apple Silicon.
+    if [ "$OS" = "macos" ] && [ -x "/opt/homebrew/bin/brew" ]; then
+        # shellcheck disable=SC1091
+        eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null)" || true
+    fi
     _ensure_path_for_tool node \
         "$HOME/.local/bin/node" \
         "$HOME/.fnm/aliases/default/bin/node" \
         "$HOME/.nvm/versions/node/*/bin/node" \
+        "/opt/homebrew/bin/node" \
         "/usr/local/bin/node" \
         "/usr/bin/node" \
         && HAS_NODE=1
@@ -271,12 +291,14 @@ _check_prerequisites() {
         "$HOME/.local/bin/npm" \
         "$HOME/.fnm/aliases/default/bin/npm" \
         "$HOME/.nvm/versions/node/*/bin/npm" \
+        "/opt/homebrew/bin/npm" \
         "/usr/local/bin/npm" \
         "/usr/bin/npm" \
         && HAS_NPM=1
     _ensure_path_for_tool pnpm \
         "$HOME/.local/bin/pnpm" \
         "$HOME/.local/share/pnpm/pnpm" \
+        "/opt/homebrew/bin/pnpm" \
         "/usr/local/bin/pnpm" \
         "/usr/bin/pnpm" \
         && HAS_PNPM=1
