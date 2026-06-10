@@ -12,7 +12,15 @@
 
 set -euo pipefail
 
+# M-P1-4 (v0.2.53): when Finder launches a .command file, the script's
+# cwd is the user's $HOME — not the script's directory. Resolve
+# SCRIPT_DIR explicitly + cd into it so relative paths (and the
+# launcher binary's own cwd assumptions, e.g. for vct-hub spawn or
+# .env reading) behave the same as when run from a Terminal session.
+# `cd` is idempotent (no-op when already there), so re-runs are
+# harmless.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 candidates=(
     "$SCRIPT_DIR/launcher/src-tauri/target/release/vct-launcher"
