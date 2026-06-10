@@ -616,6 +616,28 @@ pub fn run() {
         // commands::project_codegraph_extras::ExtrasLockRegistry.
         .manage(commands::project_codegraph_extras::ExtrasLockRegistry::default())
         .setup(|app| {
+            // v0.2.53 M-P0-7: augment PATH for graphical-launch contexts
+            // BEFORE any subprocess is spawned by the setup hook (sweep
+            // for stale binary siblings, container-runtime probe via
+            // services::watcher, update_handoff::poll_update_lock_on_boot,
+            // project-bundle sweeps, etc). On macOS, double-clicking
+            // `start-launcher.command` in Finder yields the LaunchServices
+            // default PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) which is
+            // missing `/opt/homebrew/bin`, `$HOME/.cargo/bin`,
+            // `$HOME/.local/bin` — every subsequent `python3`, `git`,
+            // `cargo`, `joern`, `podman` spawn would then fail. On Linux,
+            // `.desktop`-launched apps under systemd-user inherit a
+            // similarly minimal PATH (missing `$HOME/.local/bin`,
+            // `$HOME/.cargo/bin`, linuxbrew, snap, flatpak). Windows
+            // Explorer-launched apps inherit the user PATH via registry,
+            // so the call is a no-op there.
+            //
+            // Idempotent: candidates already on PATH are skipped, so
+            // running again from a terminal that already sourced .zshrc
+            // does not duplicate entries. Soft: never panics, never
+            // returns an error — at worst PATH is left unchanged.
+            vct_launcher_core::services::runtime::augment_path_for_graphical_launch();
+
             // Windows-only: clean up the previous launcher's .old.exe
             // left behind by `apply_launcher_update`'s rename-then-build
             // workaround for the running-binary lock. Best effort —
@@ -2490,6 +2512,11 @@ pub fn run() {
             // first-install.{bat,sh,command}). Returns `all_ok: true` for
             // dev builds running outside any install root.
             commands::installer::check_install_health,
+            // v0.2.53 M-P1-6: spawn an OS-appropriate terminal at the
+            // install_root with `python install.py` pre-loaded so the
+            // InstallHealthGate can offer a one-click "Run installer
+            // now" button instead of a copy/paste instruction.
+            commands::installer::launch_installer_terminal,
             // Durable install log reader. Backs the OnboardingWizard's
             // skip-if-installed path + a future Settings → Install
             // Diagnostics panel. Pull-only: the FE invokes on demand.

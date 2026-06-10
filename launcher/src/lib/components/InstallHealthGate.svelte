@@ -20,10 +20,17 @@
   // `vct.install_check_dismissed=true` to localStorage so the user is not
   // re-prompted on every subsequent launch.
 
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke, tauriAvailable } from '$lib/tauri';
   import type { InstallHealth } from '$lib/types/launcher';
+  import {
+    getInstallScopedFlag,
+    setInstallScopedFlag,
+  } from '$lib/stores/install-state-store';
 
+  // M-P1-5: dismiss flag is scoped by install_root so two clones on
+  // the same machine don't share dismissals. Pre-v0.2.53 unscoped
+  // copies are migrated by `getInstallScopedFlag()` on first read.
   const DISMISSED_KEY = 'vct.install_check_dismissed';
   const README_URL =
     'https://github.com/hotak92/vibecoded-orchestrator/blob/main/README.md#tldr--install--launch';
@@ -31,13 +38,23 @@
   let health = $state<InstallHealth | null>(null);
   let visible = $state(false);
   let opening = $state(false);
+  // M-P0-8: track an in-flight probe so the Re-check button + focus
+  // listener can guard against rapid re-entry while still letting the
+  // user click "Re-check" from the same render.
+  let rechecking = $state(false);
+  // M-P1-5: current install_root for scoped localStorage operations.
+  // Updated on every check_install_health response (defensive — the
+  // walk-up resolver could in principle return a different root after
+  // a launcher relocates, though in practice it does not).
+  let installRoot = $state<string | null>(null);
+  // M-P1-6: state for the "Run installer now" button. `launchError` is
+  // surfaced inline so the user gets immediate feedback if no terminal
+  // emulator is available (e.g. headless Linux box).
+  let launchingInstaller = $state(false);
+  let launchError = $state<string | null>(null);
 
   function userDismissedPreviously(): boolean {
-    try {
-      return localStorage.getItem(DISMISSED_KEY) === 'true';
-    } catch {
-      return false;
-    }
+    return getInstallScopedFlag(DISMISSED_KEY, installRoot) === 'true';
   }
 
   async function openReadme() {
@@ -58,26 +75,103 @@
   }
 
   function letMeThrough() {
-    try {
-      localStorage.setItem(DISMISSED_KEY, 'true');
-    } catch {}
+    // M-P1-5: persist the dismissal against the active install_root so
+    // a sibling clone retains its own decision.
+    setInstallScopedFlag(DISMISSED_KEY, installRoot, 'true');
     visible = false;
+  }
+
+  /// M-P0-8: run the backend health probe. Used at mount, by the
+  /// explicit "Re-check" button, and by the window-focus listener.
+  /// Updates `health` and `visible` as a side effect.
+  ///
+  /// When `opts.fromFocus` is true (focus listener OR manual Re-check),
+  /// the dismissal flag is IGNORED for an unhealthy install — the user
+  /// explicitly came back to the launcher, so they want to know if
+  /// their install is still broken. At mount-time (no `fromFocus`) a
+  /// prior dismissal still suppresses the gate so the user is not
+  /// re-prompted on every relaunch.
+  async function runHealthCheck(opts?: { fromFocus?: boolean }) {
+    if (!tauriAvailable()) return;
+    if (rechecking) return;
+    rechecking = true;
+    try {
+      const result = await invoke<InstallHealth>('check_install_health');
+      health = result;
+      installRoot = result.install_root ?? null;
+      if (result.all_ok) {
+        // Self-heal: the install completed in a side terminal while
+        // the launcher was open. Drop the gate without requiring a
+        // launcher restart.
+        visible = false;
+        return;
+      }
+      if (!opts?.fromFocus && userDismissedPreviously()) {
+        visible = false;
+        return;
+      }
+      visible = true;
+    } catch (err) {
+      // Probe failure is non-fatal: don't gate the app on a backend bug.
+      console.error('[install-health-gate] check_install_health failed:', err);
+    } finally {
+      rechecking = false;
+    }
+  }
+
+  async function manualRecheck() {
+    await runHealthCheck({ fromFocus: true });
+  }
+
+  /// M-P1-6: open a terminal at the install_root with the right
+  /// `python install.py` command pre-loaded so the user does NOT have
+  /// to copy/paste the path. The Rust side handles OS detection +
+  /// terminal selection (Terminal.app on macOS, gnome-terminal /
+  /// konsole / xfce4-terminal / xterm fallback chain on Linux,
+  /// cmd.exe on Windows).
+  async function runInstallerNow() {
+    if (!installRoot) {
+      launchError = 'Install root not detected — please open a terminal manually.';
+      return;
+    }
+    launchError = null;
+    launchingInstaller = true;
+    try {
+      await invoke('launch_installer_terminal', { installRoot });
+    } catch (err) {
+      console.error('[install-health-gate] launch_installer_terminal failed:', err);
+      launchError =
+        typeof err === 'string'
+          ? err
+          : 'Could not launch a terminal automatically. Open one and run `python3 install.py` from the install root.';
+    } finally {
+      launchingInstaller = false;
+    }
+  }
+
+  function handleFocus() {
+    // Window-regains-focus signal: the user just came back from a
+    // side terminal (often after running install.py). Re-probe so the
+    // gate either auto-clears or refreshes its details.
+    void runHealthCheck({ fromFocus: true });
   }
 
   onMount(async () => {
     // Browser-mode dev preview: nothing to gate.
     if (!tauriAvailable()) return;
-    // Once-dismissed: respect the user's choice across launches.
-    if (userDismissedPreviously()) return;
-    try {
-      const result = await invoke<InstallHealth>('check_install_health');
-      health = result;
-      if (!result.all_ok) {
-        visible = true;
-      }
-    } catch (err) {
-      // Probe failure is non-fatal: don't gate the app on a backend bug.
-      console.error('[install-health-gate] check_install_health failed:', err);
+    await runHealthCheck();
+    // M-P0-8: install-state changes during a launcher session (user
+    // runs install.py in a side terminal). Re-probe whenever the
+    // launcher window regains focus so the gate clears without a
+    // launcher restart. Idempotent — runHealthCheck guards re-entry.
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', handleFocus);
+    }
+  });
+
+  onDestroy(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('focus', handleFocus);
     }
   });
 </script>
@@ -129,9 +223,31 @@
         </ul>
       </details>
 
+      {#if launchError}
+        <p class="error" role="alert" data-testid="install-gate-launch-error">
+          {launchError}
+        </p>
+      {/if}
+
       <div class="actions">
-        <button class="primary" onclick={openReadme} disabled={opening}>
+        <button
+          class="primary"
+          onclick={runInstallerNow}
+          disabled={launchingInstaller || !installRoot}
+          data-testid="install-gate-run-installer"
+        >
+          {launchingInstaller ? 'Opening terminal…' : 'Run installer now'}
+        </button>
+        <button class="secondary" onclick={openReadme} disabled={opening}>
           {opening ? 'Opening…' : 'Open install instructions'}
+        </button>
+        <button
+          class="secondary"
+          onclick={manualRecheck}
+          disabled={rechecking}
+          data-testid="install-gate-recheck"
+        >
+          {rechecking ? 'Re-checking…' : 'Re-check'}
         </button>
         <button class="secondary" onclick={letMeThrough}>
           I know what I'm doing — let me through anyway
@@ -225,6 +341,16 @@
     gap: 8px;
     justify-content: flex-end;
     flex-wrap: wrap;
+  }
+
+  .error {
+    margin: 4px 0 12px;
+    padding: 8px 12px;
+    background: rgba(255, 79, 160, 0.08);
+    border: 1px solid rgba(255, 79, 160, 0.32);
+    border-radius: 6px;
+    color: var(--color-pink, #ff4fa0);
+    font-size: 13px;
   }
 
   button {

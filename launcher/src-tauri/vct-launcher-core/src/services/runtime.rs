@@ -165,6 +165,129 @@ impl RuntimeInfo {
 // PATH resolution
 // ---------------------------------------------------------------------------
 
+/// Augment the process-wide `PATH` with the OS-appropriate locations where
+/// user-installed CLI tooling (homebrew, cargo, pipx, linuxbrew, snap, flatpak)
+/// typically lives but which graphical launchers (Finder on macOS,
+/// `.desktop` files under GNOME/KDE on Linux) do NOT inherit.
+///
+/// Why this exists (v0.2.53 M-P0-7):
+///   - macOS: when the launcher is started by double-clicking `start-launcher.command`
+///     in Finder OR by clicking the launcher `.app` in `~/Applications/`, the process
+///     inherits the LaunchServices default PATH:
+///     `/usr/bin:/bin:/usr/sbin:/sbin` — `/opt/homebrew/bin/` and `$HOME/.cargo/bin/`
+///     are NOT on it. Every subsequent `python3`, `cargo`, `joern`, `podman`, `git`
+///     spawn fails with "command not found" until the user manually re-launches
+///     the launcher from a terminal session that DID source `.zshrc` /
+///     `eval "$(brew shellenv)"`.
+///   - Linux: same shape via `.desktop` launchers. Under systemd-user, the
+///     PATH is `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` —
+///     `$HOME/.cargo/bin`, `$HOME/.local/bin`, Linuxbrew, snap, flatpak are
+///     missing. Frequency is lower than macOS (Linux dev users tend to launch
+///     from terminal) but the bug shape is identical.
+///   - Windows: Explorer-launched apps inherit the user PATH via registry
+///     (`HKCU\Environment`), so no augmentation is needed.
+///
+/// Cross-OS triage finding (`cross-os-triage-2026-06-10.md` §P0-7) confirms
+/// the macOS + Linux PATH inheritance class is the same root cause: launcher
+/// processes spawned from graphical contexts do NOT see the user's
+/// interactive-shell PATH. Single helper, OS-cfg'd candidates.
+///
+/// Properties:
+///   - Idempotent: calling twice does not duplicate entries.
+///   - Order-preserving: existing user PATH stays in its original order;
+///     augment candidates are PREPENDED so they take precedence over the
+///     system PATH (but only when missing). This matters when the user has
+///     both a system `python3` and a homebrew `python3` — homebrew should win
+///     for parity with their interactive shell.
+///   - Soft-fail: if `HOME` is unset (CI / sandboxed contexts) the candidates
+///     that reference `$HOME` are silently dropped.
+///   - Resolves `~` expansion: `$HOME/.cargo/bin` is materialised, not literal.
+pub fn augment_path_for_graphical_launch() {
+    let candidates = augment_candidates();
+    if candidates.is_empty() {
+        return;
+    }
+
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut seen: std::collections::HashSet<PathBuf> = std::env::split_paths(&current).collect();
+
+    // Prepend candidates that are not already on PATH, preserving the order
+    // declared in `augment_candidates()`. Existing PATH entries follow.
+    let mut new_entries: Vec<PathBuf> = Vec::with_capacity(candidates.len());
+    for cand in candidates {
+        if seen.insert(cand.clone()) {
+            new_entries.push(cand);
+        }
+    }
+    if new_entries.is_empty() {
+        return; // All candidates already on PATH — nothing to do.
+    }
+
+    // Append existing PATH entries after the new prepended candidates.
+    new_entries.extend(std::env::split_paths(&current));
+
+    match std::env::join_paths(new_entries.iter()) {
+        Ok(joined) => {
+            // Safety: setting PATH process-wide is sound because we are
+            // single-threaded at this call site (lib.rs `setup()` runs before
+            // any subprocess spawn or Tauri-managed thread is unparked).
+            // `set_var` itself is `unsafe` on edition 2024+, but stable Rust
+            // allows the safe form via std::env::set_var on current
+            // crate edition (2021). Document the invariant for future maint.
+            std::env::set_var("PATH", &joined);
+        }
+        Err(e) => {
+            eprintln!(
+                "[vct] augment_path_for_graphical_launch: join_paths failed: {} — \
+                 PATH left unchanged",
+                e
+            );
+        }
+    }
+}
+
+/// OS-specific list of directories to prepend to PATH, in priority order
+/// (first entry wins for collisions). Candidates that do not exist on disk
+/// are still added — the user may install the tooling later and re-launch.
+/// Only `$HOME`-relative candidates are dropped when `HOME` is unset.
+fn augment_candidates() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut out: Vec<PathBuf> = vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/opt/homebrew/sbin"),
+        ];
+        if let Some(h) = home.as_ref() {
+            out.push(h.join(".cargo/bin"));
+            out.push(h.join(".local/bin"));
+        }
+        out
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut out: Vec<PathBuf> = Vec::new();
+        if let Some(h) = home.as_ref() {
+            out.push(h.join(".local/bin"));
+            out.push(h.join(".cargo/bin"));
+        }
+        out.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
+        out.push(PathBuf::from("/snap/bin"));
+        out.push(PathBuf::from("/var/lib/flatpak/exports/bin"));
+        out
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Windows + other targets: no-op. Explorer-launched apps inherit
+        // the user PATH via the registry, so augmentation is unnecessary.
+        let _ = home;
+        Vec::new()
+    }
+}
+
 fn which_on_path(name: &str) -> Option<PathBuf> {
     // On Windows, also try with .exe / .cmd / .bat appended. PATHEXT may
     // contain other extensions but those three cover Podman/Docker.
@@ -632,6 +755,156 @@ mod tests {
         invalidate_cache();
         let g = CACHE.lock().unwrap();
         assert!(g.is_none(), "cache should be empty after invalidate");
+    }
+
+    // ----- v0.2.53 M-P0-7: launcher PATH augmentation tests -----
+
+    /// Augmentation is idempotent — calling twice does not duplicate
+    /// entries. On Windows this is a no-op and the PATH is unchanged.
+    #[test]
+    #[serial]
+    fn augment_path_is_idempotent() {
+        // Snapshot the existing PATH so we can restore it at the end.
+        let original = std::env::var_os("PATH");
+
+        // Use a minimal known PATH so the test does not depend on the
+        // host environment.
+        std::env::set_var("PATH", "/usr/bin:/bin");
+
+        augment_path_for_graphical_launch();
+        let first = std::env::var_os("PATH").unwrap_or_default();
+
+        augment_path_for_graphical_launch();
+        let second = std::env::var_os("PATH").unwrap_or_default();
+
+        assert_eq!(
+            first, second,
+            "second augment_path call must NOT modify PATH again"
+        );
+
+        // Restore.
+        match original {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    /// Augmentation prepends candidates but preserves the existing PATH
+    /// after them — order is not destroyed. We assert this by checking
+    /// that the original entries appear AFTER any newly-prepended ones.
+    #[test]
+    #[serial]
+    fn augment_path_preserves_user_path_order() {
+        let original = std::env::var_os("PATH");
+
+        // Use a marker directory the augment_candidates() list will NOT
+        // emit — so we can verify it survives the prepend.
+        std::env::set_var("PATH", "/zzz_marker_a:/zzz_marker_b");
+
+        augment_path_for_graphical_launch();
+        let after = std::env::var_os("PATH").unwrap_or_default();
+        let parts: Vec<PathBuf> = std::env::split_paths(&after).collect();
+
+        let pos_a = parts
+            .iter()
+            .position(|p| p == &PathBuf::from("/zzz_marker_a"));
+        let pos_b = parts
+            .iter()
+            .position(|p| p == &PathBuf::from("/zzz_marker_b"));
+
+        // Both markers must still be present (augment does not delete).
+        assert!(pos_a.is_some(), "marker_a must still be on PATH");
+        assert!(pos_b.is_some(), "marker_b must still be on PATH");
+        // Original relative order must be preserved.
+        assert!(
+            pos_a.unwrap() < pos_b.unwrap(),
+            "marker_a must precede marker_b after augment (original order \
+             preserved); pos_a={:?}, pos_b={:?}",
+            pos_a,
+            pos_b
+        );
+
+        match original {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    /// On macOS, the homebrew prefix must appear on PATH after augment.
+    /// On Linux, `$HOME/.local/bin` must appear (when HOME is set).
+    /// On Windows, augment is a no-op so PATH is unchanged.
+    #[test]
+    #[serial]
+    fn augment_path_adds_expected_os_specific_dirs() {
+        let original_path = std::env::var_os("PATH");
+        let original_home = std::env::var_os("HOME");
+
+        // Set a deterministic HOME so candidate construction is stable.
+        std::env::set_var("HOME", "/tmp/vct-augment-test-home");
+        std::env::set_var("PATH", "/usr/bin:/bin");
+
+        augment_path_for_graphical_launch();
+        let after = std::env::var_os("PATH").unwrap_or_default();
+        let parts: Vec<PathBuf> = std::env::split_paths(&after).collect();
+
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                parts.iter().any(|p| p == &PathBuf::from("/opt/homebrew/bin")),
+                "macOS augment must include /opt/homebrew/bin; PATH={:?}",
+                parts
+            );
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| p == &PathBuf::from("/tmp/vct-augment-test-home/.cargo/bin")),
+                "macOS augment must include $HOME/.cargo/bin; PATH={:?}",
+                parts
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| p == &PathBuf::from("/tmp/vct-augment-test-home/.local/bin")),
+                "Linux augment must include $HOME/.local/bin; PATH={:?}",
+                parts
+            );
+            assert!(
+                parts
+                    .iter()
+                    .any(|p| p == &PathBuf::from("/home/linuxbrew/.linuxbrew/bin")),
+                "Linux augment must include linuxbrew; PATH={:?}",
+                parts
+            );
+            assert!(
+                parts.iter().any(|p| p == &PathBuf::from("/snap/bin")),
+                "Linux augment must include /snap/bin; PATH={:?}",
+                parts
+            );
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            // Windows + other: no-op.
+            assert_eq!(
+                parts,
+                vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+                "Windows augment must be a no-op; PATH={:?}",
+                parts
+            );
+        }
+
+        match original_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        match original_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     // ----- PR-15 G1: daemon_usable_probe tests -----

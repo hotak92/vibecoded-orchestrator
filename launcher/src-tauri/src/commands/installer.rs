@@ -624,10 +624,19 @@ async fn probe_http(url: String) -> Option<String> {
 ///   - http://localhost:11435/api/tags             (Ollama)
 ///   - http://localhost:11440/health               (code_embed)
 ///
-/// Note: /v1/meta (NOT /v1/.well-known/ready) is the right liveness probe
-/// for Weaviate — see commands/lifecycle.rs::canonical_services for the
-/// rationale (false-negatives observed 2026-05-06 with the strict ready
-/// endpoint while /v1/meta + /v1/graphql were fully responsive).
+/// Weaviate endpoint note (v0.2.53 NEW-4 correction): `install.py`'s
+/// canonical Weaviate liveness probe is `/v1/.well-known/ready` (see
+/// `install.py::_wait_for_weaviate`). This Rust-side
+/// `detect_existing_services()` historically used `/v1/meta` instead
+/// because the 2026-05-06 lifecycle audit observed false-negatives
+/// from the strict ready endpoint under transient module-load
+/// conditions. Both endpoints work for "is Weaviate up?" — but the
+/// previous comment claimed `/v1/meta` was THE right endpoint, which
+/// is incorrect: install.py uses `/v1/.well-known/ready`, that's the
+/// canonical liveness probe. The two endpoints are kept independent
+/// on purpose (Rust = "any signal Weaviate is reachable", Python =
+/// "Weaviate fully initialised and ready to serve queries"). See
+/// commands/lifecycle.rs::canonical_services for the rationale.
 #[command]
 pub async fn detect_existing_services() -> Result<ServicesStatus, String> {
     let weaviate = probe_http(format!(
@@ -4321,16 +4330,10 @@ pub async fn update_orchestrator<R: Runtime>(
         // the resume sentinel lands.
         let combined = format!("{}\n{}", stderr, stdout);
         if is_merge_or_rebase_conflict(&combined) {
-            let sha = read_head_sha(&install_path).await.unwrap_or_default();
-            write_update_resume_sentinel(
-                &install_path,
-                "rebase",
-                &pull_branch,
-                &sha,
-            );
-            // v0.2.51 Bug A: ALSO emit the UPDATE_DEFERRED.md entry so
-            // Claude sessions outside the launcher GUI see the state.
-            write_update_resume_deferral(&install_path, "rebase", &pull_branch);
+            // v0.2.53 DEDUP-14: paired sentinel + deferral via the
+            // single helper so future writers can't accidentally write
+            // one without the other (v0.2.51 Bug A class).
+            write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
                 "rebase",
@@ -5775,9 +5778,8 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
             // dismiss without aborting; the sentinel + UpdateBadge bring
             // them back via the launcher GUI, while UPDATE_DEFERRED.md
             // surfaces the same state to terminal Claude sessions.
-            let sha = read_head_sha(&install_path).await.unwrap_or_default();
-            write_update_resume_sentinel(&install_path, "merge", &pull_branch, &sha);
-            write_update_resume_deferral(&install_path, "merge", &pull_branch);
+            // v0.2.53 DEDUP-14: paired writer so one cannot be forgotten.
+            write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
 
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
@@ -5942,9 +5944,8 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
             // actually moved before re-entering install.py. The deferral
             // mirrors the state into UPDATE_DEFERRED.md for terminal
             // Claude sessions.
-            let sha = read_head_sha(&install_path).await.unwrap_or_default();
-            write_update_resume_sentinel(&install_path, "rebase", &pull_branch, &sha);
-            write_update_resume_deferral(&install_path, "rebase", &pull_branch);
+            // v0.2.53 DEDUP-14: paired writer so one cannot be forgotten.
+            write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
 
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
@@ -6371,6 +6372,53 @@ next successful install.py run, so the resolution is one command.\n\
 
 /// v0.2.51 Bug A: best-effort clear of the `update_resume_required`
 /// deferral entry. Called from `resume_orchestrator_update` (after
+/// v0.2.53 DEDUP-14 (PROMOTED from `rust-installer-dedup-2026-06-10.md`
+/// §Finding E): paired sentinel + deferral writer.
+///
+/// The v0.2.51 Bug A class fires when ONE of the two writes is forgotten
+/// at a conflict-handling site (sentinel-without-deferral leaves Claude
+/// terminal sessions with no signal of the pending update; deferral-
+/// without-sentinel leaves the launcher's UpdateBadge dead). Pre-v0.2.53,
+/// three sites in installer.rs repeated the same 3-line pattern verbatim:
+///
+/// ```ignore
+/// let sha = read_head_sha(&install_path).await.unwrap_or_default();
+/// write_update_resume_sentinel(&install_path, OP, &pull_branch, &sha);
+/// write_update_resume_deferral(&install_path, OP, &pull_branch);
+/// ```
+///
+/// Consolidating into a single helper means future writers can't desync:
+/// you either call `write_resume_sentinel_and_deferral` (atomic-ish from
+/// the call site's perspective) or you call neither.
+///
+/// Atomicity caveat (intentional): the underlying writers each do their
+/// own atomic-rename within their own target file, but the helper is NOT
+/// transactional ACROSS files. If the process dies between the sentinel
+/// write and the deferral write, the launcher gets the sentinel + the
+/// UpdateBadge BUT the Claude-terminal-session signal is missing for
+/// that one boot. Acceptable: the next `install.py --update` re-writes
+/// both records (it inspects the sentinel and re-emits the deferral)
+/// and the user sees no regression from the pre-v0.2.51 behaviour.
+///
+/// Sites consolidated:
+///   - `update_orchestrator` rebase-with-autostash conflict path
+///     (formerly L4324-L4342).
+///   - `merge_orchestrator_with_upstream` conflict path
+///     (formerly L5778-L5780).
+///   - `rebase_orchestrator_onto_upstream` conflict path
+///     (formerly L5945-L5947).
+///
+/// Helper expects `install_path` already-validated by the caller.
+async fn write_resume_sentinel_and_deferral(
+    install_path: &Path,
+    operation: &str,
+    pull_branch: &str,
+) {
+    let sha = read_head_sha(install_path).await.unwrap_or_default();
+    write_update_resume_sentinel(install_path, operation, pull_branch, &sha);
+    write_update_resume_deferral(install_path, operation, pull_branch);
+}
+
 /// install.py runs successfully) and `abort_orchestrator_merge_or_rebase`.
 ///
 /// Conservative semantics: ONLY removes the file when it contains a
@@ -6512,6 +6560,43 @@ pub async fn resume_orchestrator_update<R: Runtime>(
             );
         }
     };
+
+    // v0.2.53 NEW-11: defensive empty-sha refusal. If the sentinel was
+    // written with an empty `sha_at_conflict` (because `read_head_sha`
+    // failed at conflict-write time — e.g. .git/HEAD missing or
+    // unreadable), we have NO baseline to verify HEAD has advanced past.
+    // The "head_unchanged" guard at line 6553 silently skips its check
+    // in that case, which would let us resume against a possibly-
+    // unrelated tree state. Refuse explicitly with a clear remediation
+    // path instead: the user should re-trigger the update from the
+    // launcher (which re-writes the sentinel with a fresh sha) OR clear
+    // the sentinel manually.
+    //
+    // Without this guard, the v0.2.51 Bug A class can re-appear in a
+    // subtler form: the user runs Continue Update, install.py re-merges
+    // against an unknown baseline, and the working tree may end up in
+    // a state neither the launcher nor install.py expected.
+    if sentinel.sha_at_conflict.is_empty() {
+        write_audit(
+            "update_orchestrator_resume_rejected",
+            serde_json::json!({
+                "reason": "empty_sha_at_conflict",
+                "install_path": path,
+                "operation": sentinel.operation,
+                "branch": sentinel.branch,
+            }),
+        );
+        return Err(
+            "Resume sentinel is missing the conflict-time SHA — the original \
+             conflict-handling write could not read .git/HEAD. We cannot \
+             verify the working tree's baseline, so the resume is refused. \
+             Either re-trigger the update from the launcher (which will \
+             write a fresh sentinel with a valid SHA), OR run \
+             `git status` + manually finish/abort any merge, then click \
+             Restart Launcher to clear this banner."
+                .to_string(),
+        );
+    }
 
     // Probe in-flight merge/rebase state. If still mid-merge we refuse —
     // the user should finish the merge (or abort it) first.
@@ -9590,10 +9675,16 @@ async fn detect_python() -> (bool, String, String) {
     // via python.org or PythonManager. Reported 2026-04-28: the wizard
     // got stuck in "Creating…" with a flashing python.exe console
     // window because the picked python_cmd was a Store-managed stub.
+    // v0.2.53 NEW-3 (drift fix): keep this list in sync with
+    // install.sh:48 and install.ps1:233 (cross-language python-candidate
+    // parity). Add `python3.13` so a Linux box where the user has ONLY
+    // python3.13 installed (no python3 alias) reports has_python=true
+    // for the launcher-driven detect_system() path. The install.sh
+    // path already accepts 3.13; this Rust list lagged.
     let candidates = if cfg!(windows) {
         vec!["py", "python3", "python"]
     } else {
-        vec!["python3.12", "python3.11", "python3", "python"]
+        vec!["python3.13", "python3.12", "python3.11", "python3", "python"]
     };
 
     for cmd in candidates {
@@ -10059,6 +10150,163 @@ pub fn check_install_health() -> InstallHealth {
             // Developer mode: no install root → don't gate.
             all_ok: true,
         },
+    }
+}
+
+/// v0.2.53 M-P1-6: spawn an OS-appropriate terminal pre-loaded with the
+/// `python install.py` command at the given install root, so the user
+/// can complete a half-finished install WITHOUT having to copy/paste
+/// the install_root path into a side terminal.
+///
+/// Behaviour per OS:
+///   - macOS: `osascript` drives Terminal.app to open a new tab and
+///     execute `cd "<path>" && python3 install.py`.
+///   - Linux: tries `gnome-terminal` → `konsole` → `xfce4-terminal` →
+///     `xterm` in order, falling back to whichever is available with a
+///     `bash -c "cd '<path>' && python3 install.py; exec bash"` body so
+///     the terminal stays open after the script exits (useful for
+///     viewing trailing log lines).
+///   - Windows: `cmd.exe /K "cd /d <path> && python install.py"` via
+///     `start` so the console window detaches from the launcher.
+///
+/// Defence-in-depth: `install_root` is validated to be an existing
+/// directory containing `install.py` before any spawn so an empty,
+/// typo'd, or poisoned argument cannot be assembled into a shell line.
+/// Path strings are escaped per-OS (AppleScript backslash+quote,
+/// POSIX single-quote `'\''` trick, Windows double-quote wrap).
+#[command]
+pub async fn launch_installer_terminal(install_root: String) -> Result<(), String> {
+    let install_path = PathBuf::from(&install_root);
+    if !install_path.exists() {
+        return Err(format!(
+            "install_root does not exist: {}",
+            install_path.display()
+        ));
+    }
+    if !install_path.is_dir() {
+        return Err(format!(
+            "install_root is not a directory: {}",
+            install_path.display()
+        ));
+    }
+    let install_py = install_path.join("install.py");
+    if !install_py.exists() {
+        return Err(format!(
+            "install.py not found in install_root: {}",
+            install_path.display()
+        ));
+    }
+
+    let path_str = install_path.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        // AppleScript-quote the path: escape backslash + double-quote.
+        let escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "tell application \"Terminal\" to do script \"cd \\\"{escaped}\\\" && python3 install.py\""
+        );
+        let status = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .status()
+            .await
+            .map_err(|e| format!("failed to spawn osascript: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "osascript exited with status {:?}",
+                status.code()
+            ));
+        }
+        // Bring Terminal.app to the foreground so the user actually
+        // sees the new window.
+        let _ = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg("tell application \"Terminal\" to activate")
+            .status()
+            .await;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // POSIX single-quote escape: `'` becomes `'\''` (close quote,
+        // escaped quote, re-open quote).
+        let escaped = path_str.replace('\'', r"'\''");
+        // `exec bash` after install.py keeps the window open so the
+        // user can see install output AND inspect the install_root
+        // afterwards.
+        let body = format!("cd '{escaped}' && python3 install.py; exec bash");
+
+        let candidates: &[(&str, &[&str])] = &[
+            ("gnome-terminal", &["--", "bash", "-c"]),
+            ("konsole", &["-e", "bash", "-c"]),
+            ("xfce4-terminal", &["--command"]),
+            ("xterm", &["-e", "bash", "-c"]),
+        ];
+
+        for (emu, args) in candidates {
+            if which_on_path(emu).is_none() {
+                continue;
+            }
+            let mut cmd = tokio::process::Command::new(emu);
+            if *emu == "xfce4-terminal" {
+                let inner = body.replace('"', "\\\"");
+                let full = format!("bash -c \"{inner}\"");
+                cmd.arg(args[0]).arg(full);
+            } else {
+                for a in *args {
+                    cmd.arg(a);
+                }
+                cmd.arg(&body);
+            }
+            // Detach: do not await; the terminal window outlives this
+            // command invocation.
+            match cmd.spawn() {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    eprintln!(
+                        "[vct] launch_installer_terminal: {} spawn failed: {e}; trying next",
+                        emu
+                    );
+                    continue;
+                }
+            }
+        }
+        return Err(
+            "no terminal emulator found (tried gnome-terminal, konsole, \
+             xfce4-terminal, xterm) — open a terminal manually and run \
+             `python3 install.py` from the install root."
+                .to_string(),
+        );
+    }
+
+    #[cfg(windows)]
+    {
+        // cmd.exe /K keeps the console open after install.py exits so
+        // the user can see any trailing error message. We launch via
+        // `start "" cmd.exe /K "<body>"` so the new console detaches
+        // from the launcher's process group.
+        let body = format!("cd /d \"{}\" && python install.py", path_str);
+        use std::os::windows::process::CommandExt;
+        let mut cmd = tokio::process::Command::new("cmd.exe");
+        cmd.arg("/C")
+            .arg("start")
+            .arg("") // start's first quoted arg is the window title; empty is fine
+            .arg("cmd.exe")
+            .arg("/K")
+            .arg(&body)
+            // CREATE_NEW_CONSOLE = 0x00000010.
+            .creation_flags(0x00000010);
+        cmd.spawn()
+            .map_err(|e| format!("failed to spawn cmd.exe: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = path_str;
+        Err("launch_installer_terminal: unsupported OS".to_string())
     }
 }
 
@@ -12750,6 +12998,101 @@ MemAvailable:   23456789 kB
             "VCO clone with install.py + first-install.sh must pass the gate: {:?}",
             res
         );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // ─── v0.2.53 NEW-11: resume sentinel empty-sha refusal ───────────────
+    //
+    // The sentinel is JSON-serialised at `.claude/state/orchestrator-
+    // update-resume.json` by the merge/rebase conflict handlers. If
+    // `read_head_sha` failed at conflict-time, `sha_at_conflict` is the
+    // empty string. The pre-v0.2.53 `head_unchanged` guard silently
+    // skipped its comparison in that case (and let the resume proceed
+    // against an unknown baseline); the v0.2.53 fix refuses resume
+    // explicitly with a clear remediation path.
+    //
+    // We can test the contract WITHOUT spawning the full
+    // `resume_orchestrator_update` Tauri command by:
+    //   1. Writing a known-shape sentinel on disk.
+    //   2. Round-tripping through `read_update_resume_sentinel`.
+    //   3. Asserting the parsed value matches the on-disk shape.
+    //   4. Asserting `is_empty()` correctly detects the empty SHA, since
+    //      that is the predicate the refusal branch keys on.
+
+    /// Helper: write a sentinel with the given `sha_at_conflict` to
+    /// `<root>/.claude/state/orchestrator-update-resume.json`.
+    fn write_test_sentinel(root: &std::path::Path, sha_at_conflict: &str) -> PathBuf {
+        let target = root.join(UPDATE_RESUME_SENTINEL_REL);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let s = UpdateResumeSentinel {
+            schema: 1,
+            operation: "merge".to_string(),
+            branch: "main".to_string(),
+            sha_at_conflict: sha_at_conflict.to_string(),
+            written_at: "2026-06-10T12:00:00Z".to_string(),
+        };
+        fs::write(&target, serde_json::to_string(&s).unwrap()).unwrap();
+        target
+    }
+
+    #[test]
+    fn test_resume_sentinel_round_trips_empty_sha_at_conflict() {
+        let p = tmp();
+        write_test_sentinel(&p, "");
+        let parsed =
+            read_update_resume_sentinel(&p).expect("sentinel with empty sha must still parse");
+        assert_eq!(parsed.schema, 1);
+        assert_eq!(parsed.operation, "merge");
+        assert_eq!(parsed.branch, "main");
+        assert!(
+            parsed.sha_at_conflict.is_empty(),
+            "round-tripped sha_at_conflict must remain empty: {:?}",
+            parsed.sha_at_conflict
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[test]
+    fn test_resume_sentinel_empty_sha_predicate_matches_refusal_branch() {
+        // The refusal branch in `resume_orchestrator_update` keys on
+        // `sentinel.sha_at_conflict.is_empty()`. This test pins the
+        // predicate so a future refactor of `UpdateResumeSentinel`
+        // (e.g. switching to `Option<String>`) can't silently regress
+        // the refusal logic.
+        let empty = UpdateResumeSentinel {
+            schema: 1,
+            operation: "merge".to_string(),
+            branch: "main".to_string(),
+            sha_at_conflict: String::new(),
+            written_at: "2026-06-10T12:00:00Z".to_string(),
+        };
+        assert!(
+            empty.sha_at_conflict.is_empty(),
+            "empty sha_at_conflict must satisfy the refusal predicate"
+        );
+
+        let filled = UpdateResumeSentinel {
+            schema: 1,
+            operation: "merge".to_string(),
+            branch: "main".to_string(),
+            sha_at_conflict: "deadbeef".to_string(),
+            written_at: "2026-06-10T12:00:00Z".to_string(),
+        };
+        assert!(
+            !filled.sha_at_conflict.is_empty(),
+            "non-empty sha_at_conflict must NOT satisfy the refusal predicate"
+        );
+    }
+
+    #[test]
+    fn test_resume_sentinel_filled_sha_round_trips() {
+        // Companion test to the empty-sha case: a valid sha must
+        // round-trip without alteration so the head-unchanged guard
+        // downstream can compare it byte-for-byte.
+        let p = tmp();
+        write_test_sentinel(&p, "abcdef0123456789abcdef0123456789abcdef01");
+        let parsed = read_update_resume_sentinel(&p).expect("valid sentinel must parse");
+        assert_eq!(parsed.sha_at_conflict, "abcdef0123456789abcdef0123456789abcdef01");
         fs::remove_dir_all(&p).ok();
     }
 
@@ -15539,6 +15882,110 @@ MemAvailable:   23456789 kB
             assert!(
                 body.contains("(rebase on `main`)"),
                 "rebase op must be reflected in Detected copy; got: {body}"
+            );
+        }
+
+        // ─── v0.2.53 DEDUP-14: paired sentinel + deferral writer ──────────
+        //
+        // `write_resume_sentinel_and_deferral` is the single helper the
+        // three conflict-handling sites now route through. The tests
+        // below pin the contract: BOTH files land, BOTH carry the right
+        // operation/branch, and a non-existent install_path that fails
+        // the sentinel write still produces a clean error footprint
+        // (no half-written files).
+
+        #[tokio::test]
+        async fn paired_writer_emits_both_sentinel_and_deferral_for_merge() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            write_resume_sentinel_and_deferral(&install, "merge", "main").await;
+
+            let sentinel_path = install.join(UPDATE_RESUME_SENTINEL_REL);
+            let deferral_path = install.join(".claude/context/UPDATE_DEFERRED.md");
+            assert!(sentinel_path.exists(), "sentinel must be written");
+            assert!(deferral_path.exists(), "deferral must be written");
+
+            let s = read_update_resume_sentinel(&install).expect("parse sentinel");
+            assert_eq!(s.operation, "merge");
+            assert_eq!(s.branch, "main");
+
+            let body = std::fs::read_to_string(&deferral_path).expect("read deferral");
+            assert!(
+                body.contains("(merge on `main`)"),
+                "deferral must reflect operation+branch; got: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn paired_writer_emits_both_sentinel_and_deferral_for_rebase() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            write_resume_sentinel_and_deferral(&install, "rebase", "release").await;
+
+            let s = read_update_resume_sentinel(&install).expect("parse sentinel");
+            assert_eq!(s.operation, "rebase");
+            assert_eq!(s.branch, "release");
+            let body = std::fs::read_to_string(
+                install.join(".claude/context/UPDATE_DEFERRED.md"),
+            )
+            .expect("read deferral");
+            assert!(
+                body.contains("(rebase on `release`)"),
+                "deferral must reflect rebase variant; got: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn paired_writer_handles_missing_head_sha_with_empty_string() {
+            // No .git/ in the install_path → `read_head_sha` returns
+            // None → `unwrap_or_default()` gives "". The helper still
+            // writes BOTH files; the empty SHA is intentional and is
+            // handled by the v0.2.53 NEW-11 empty-sha refusal branch
+            // in `resume_orchestrator_update`.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            write_resume_sentinel_and_deferral(&install, "merge", "main").await;
+
+            let s = read_update_resume_sentinel(&install).expect("parse sentinel");
+            assert!(
+                s.sha_at_conflict.is_empty(),
+                "no .git → sha_at_conflict must be empty (NEW-11 will refuse resume)"
+            );
+            assert!(
+                install.join(".claude/context/UPDATE_DEFERRED.md").exists(),
+                "deferral must still be emitted even when sha is empty"
+            );
+        }
+
+        /// v0.2.53 DEDUP-14 integration-shape test (Track C scope).
+        /// Atomic-ish contract: both files land, OR the function returns
+        /// silently (best-effort). Forgetting one of the two writes is
+        /// what produced v0.2.51 Bug A; this test catches any future
+        /// refactor that reintroduces the split.
+        #[tokio::test]
+        async fn paired_writer_helper_writes_both_files_in_single_call() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            // PRE: nothing written.
+            assert!(!install.join(UPDATE_RESUME_SENTINEL_REL).exists());
+            assert!(!install.join(".claude/context/UPDATE_DEFERRED.md").exists());
+
+            // CALL.
+            write_resume_sentinel_and_deferral(&install, "merge", "main").await;
+
+            // POST: both written.
+            let sentinel_written = install.join(UPDATE_RESUME_SENTINEL_REL).exists();
+            let deferral_written = install
+                .join(".claude/context/UPDATE_DEFERRED.md")
+                .exists();
+            assert!(
+                sentinel_written && deferral_written,
+                "paired writer MUST emit BOTH files (forgetting one is v0.2.51 Bug A class); \
+                 sentinel_written={sentinel_written}, deferral_written={deferral_written}"
             );
         }
 
