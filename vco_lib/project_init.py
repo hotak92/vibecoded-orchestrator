@@ -55,6 +55,12 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional
 
+# NEW-8 / B3 (v0.2.53) — symlink-blocking defense used by
+# ``_write_file_atomic``. Mirrors install.py's V47-B contract for the
+# orchestrator-self path; the helpers live in ``vco_lib.symlink_handler``
+# so both paths share the SSOT.
+from vco_lib.symlink_handler import compute_vco_new_path, is_symlink_blocking
+
 # Default Weaviate port (mirrors install.DEFAULT_WEAVIATE_PORT, kept here
 # so this module is import-free of install.py).
 DEFAULT_WEAVIATE_PORT = 8081
@@ -3335,7 +3341,95 @@ def _file_action(
 def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None) -> None:
     """Atomic file write: temp file in same dir + os.replace. Optionally
     sets a unix mode bit (0o755 for shell scripts to preserve executable).
+
+    NEW-8 / B3 (v0.2.53) — symlink-blocking defense ported from the
+    orchestrator-self V47-B handling. When ``target`` itself is a
+    symlink, or its parent (or any ancestor up to a sensible bound) is
+    a symlink, we REFUSE to write through it. The orchestrator-self
+    path handles this via ``is_symlink_blocking`` + ``compute_vco_new_path``
+    (install.py:1286); per-project ``_write_file_atomic`` previously
+    just did tempfile + os.replace, which on POSIX would replace the
+    symlink TARGET (silent destruction of unrelated content).
+
+    Behaviour
+      * If the target itself is a symlink, redirect the write to the
+        `.vco-new` sibling and emit a stderr warning so the run logs
+        the redirect. The caller's expected file is gone — the new
+        sibling is the new VCO-shipped content for the user to merge
+        manually. Mirrors V47-B's contract.
+      * If a parent directory is a symlink (e.g. user symlinked
+        ``<project>/.claude`` to a shared location), same treatment:
+        redirect to ``<canonical parent>.vco-new/<rest of path>``.
+      * In both redirect cases we surface the redirect via stderr so
+        the install log captures it. A future per-project
+        DeferralReport emission can pick this up; minimum-viable
+        v0.2.53 contract is "no silent data destruction".
+
+    Reference:
+    ``.claude/context/audits/project-bundle-install-audit-2026-06-10.md``
+    §6.7 / B3.
     """
+    # NEW-8 (v0.2.53) — symlink-blocking detection.
+    #
+    # Two cases to guard:
+    #   1. `target` itself is a symlink (file/dir).
+    #   2. An ancestor of `target` is a symlink — we'd silently write
+    #      through it into the symlink's destination.
+    # Both are redirected to the `.vco-new` sibling pattern.
+    #
+    # We bound the ancestor walk at the first "real" directory so we
+    # don't spend time on absurd hierarchies; in practice the walk is
+    # at most ~6 levels (project root → .claude → agents → ...).
+    redirect_target: Optional[Path] = None
+    if is_symlink_blocking(target):
+        # Direct hit: target itself is a symlink.
+        redirect_target = compute_vco_new_path(target)
+    else:
+        # Walk ancestors looking for a symlinked directory. We start
+        # from target.parent (since target itself isn't a symlink) and
+        # walk up. We stop walking once we leave target's chain of
+        # ancestors that exist on disk.
+        ancestor = target.parent
+        seen: set[str] = set()
+        while True:
+            ancestor_str = str(ancestor)
+            if ancestor_str in seen:
+                break
+            seen.add(ancestor_str)
+            if is_symlink_blocking(ancestor):
+                # Redirect the write to a `.vco-new` sibling of the
+                # symlinked ancestor, replicating the rest of the path
+                # inside the new directory. E.g.
+                # target = .claude/agents/coder.md, ancestor = .claude
+                # → redirect to `.claude.vco-new/agents/coder.md`.
+                vco_new_anc = compute_vco_new_path(ancestor)
+                # The path tail BELOW the symlinked ancestor.
+                try:
+                    rel = target.relative_to(ancestor)
+                except ValueError:
+                    # Defensive: if relative_to fails (shouldn't with
+                    # the ancestor walk), fall back to using target's
+                    # filename only.
+                    rel = Path(target.name)
+                redirect_target = vco_new_anc / rel
+                break
+            # Continue up. Stop at root or when parent doesn't change
+            # (path normalisation root case).
+            parent = ancestor.parent
+            if parent == ancestor:
+                break
+            ancestor = parent
+
+    if redirect_target is not None:
+        sys.stderr.write(
+            f"[vct] NEW-8 symlink-blocking: refusing to write through symlink "
+            f"at {target}; redirecting to {redirect_target}. "
+            f"The .vco-new sibling holds the orchestrator's intended content; "
+            f"the symlink and its destination are untouched. Merge manually "
+            f"when ready.\n"
+        )
+        target = redirect_target
+
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
         dir=str(target.parent),
