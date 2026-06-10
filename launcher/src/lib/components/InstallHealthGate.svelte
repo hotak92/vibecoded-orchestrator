@@ -20,7 +20,7 @@
   // `vct.install_check_dismissed=true` to localStorage so the user is not
   // re-prompted on every subsequent launch.
 
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke, tauriAvailable } from '$lib/tauri';
   import type { InstallHealth } from '$lib/types/launcher';
 
@@ -31,6 +31,10 @@
   let health = $state<InstallHealth | null>(null);
   let visible = $state(false);
   let opening = $state(false);
+  // M-P0-8: track an in-flight probe so the Re-check button + focus
+  // listener can guard against rapid re-entry while still letting the
+  // user click "Re-check" from the same render.
+  let rechecking = $state(false);
 
   function userDismissedPreviously(): boolean {
     try {
@@ -64,20 +68,70 @@
     visible = false;
   }
 
-  onMount(async () => {
-    // Browser-mode dev preview: nothing to gate.
+  /// M-P0-8: run the backend health probe. Used at mount, by the
+  /// explicit "Re-check" button, and by the window-focus listener.
+  /// Updates `health` and `visible` as a side effect.
+  ///
+  /// When `opts.fromFocus` is true (focus listener OR manual Re-check),
+  /// the dismissal flag is IGNORED for an unhealthy install — the user
+  /// explicitly came back to the launcher, so they want to know if
+  /// their install is still broken. At mount-time (no `fromFocus`) a
+  /// prior dismissal still suppresses the gate so the user is not
+  /// re-prompted on every relaunch.
+  async function runHealthCheck(opts?: { fromFocus?: boolean }) {
     if (!tauriAvailable()) return;
-    // Once-dismissed: respect the user's choice across launches.
-    if (userDismissedPreviously()) return;
+    if (rechecking) return;
+    rechecking = true;
     try {
       const result = await invoke<InstallHealth>('check_install_health');
       health = result;
-      if (!result.all_ok) {
-        visible = true;
+      if (result.all_ok) {
+        // Self-heal: the install completed in a side terminal while
+        // the launcher was open. Drop the gate without requiring a
+        // launcher restart.
+        visible = false;
+        return;
       }
+      if (!opts?.fromFocus && userDismissedPreviously()) {
+        visible = false;
+        return;
+      }
+      visible = true;
     } catch (err) {
       // Probe failure is non-fatal: don't gate the app on a backend bug.
       console.error('[install-health-gate] check_install_health failed:', err);
+    } finally {
+      rechecking = false;
+    }
+  }
+
+  async function manualRecheck() {
+    await runHealthCheck({ fromFocus: true });
+  }
+
+  function handleFocus() {
+    // Window-regains-focus signal: the user just came back from a
+    // side terminal (often after running install.py). Re-probe so the
+    // gate either auto-clears or refreshes its details.
+    void runHealthCheck({ fromFocus: true });
+  }
+
+  onMount(async () => {
+    // Browser-mode dev preview: nothing to gate.
+    if (!tauriAvailable()) return;
+    await runHealthCheck();
+    // M-P0-8: install-state changes during a launcher session (user
+    // runs install.py in a side terminal). Re-probe whenever the
+    // launcher window regains focus so the gate clears without a
+    // launcher restart. Idempotent — runHealthCheck guards re-entry.
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', handleFocus);
+    }
+  });
+
+  onDestroy(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('focus', handleFocus);
     }
   });
 </script>
@@ -132,6 +186,14 @@
       <div class="actions">
         <button class="primary" onclick={openReadme} disabled={opening}>
           {opening ? 'Opening…' : 'Open install instructions'}
+        </button>
+        <button
+          class="secondary"
+          onclick={manualRecheck}
+          disabled={rechecking}
+          data-testid="install-gate-recheck"
+        >
+          {rechecking ? 'Re-checking…' : 'Re-check'}
         </button>
         <button class="secondary" onclick={letMeThrough}>
           I know what I'm doing — let me through anyway
