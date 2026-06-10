@@ -18206,21 +18206,48 @@ def _read_launcher_version(install_root: Path) -> Optional[str]:
     return None
 
 
-def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
-    """Tier 2: download matching release artifact from GitHub Releases.
+def _download_release_binary(
+    *,
+    install_root: Path,
+    binary_basename: str,
+    bin_subdir_fname: tuple[str, str],
+    tmpdir_prefix: str,
+    timeout_s: int = 60,
+) -> Optional[Path]:
+    """v0.2.53 DEDUP-2: consolidated GitHub-release binary downloader.
 
-    Uses `gh` CLI if available (handles auth + redirects cleanly); falls
-    back to `curl -L` if `gh` is missing. Soft-fail on every error
-    (network down, release missing, auth refused, etc.) — returns None
-    and lets the caller move to Tier 3.
+    Replaces 2 near-twin (~95% identical) helpers:
+      * _try_download_launcher_binary
+      * _try_download_vct_hub_binary
 
-    The downloaded ZIP is extracted to a tempdir; only the binary is
-    moved into place at `launcher/dist/<os>-<arch>/`.
+    Pulls the matching release ZIP for ``binary_basename`` ("vct-launcher"
+    or "vct-hub") from GitHub Releases, extracts just that one binary,
+    and lands it at ``launcher/dist/<os-arch>/<basename>``.
+
+    Tier 2 in the binary-resolution chain (see _try_download_launcher_binary
+    docstring). Soft-fails on every error path — the caller falls
+    through to Tier 3 (cargo rebuild) when this returns None.
+
+    Args:
+        install_root: orchestrator install root (PROJECT_ROOT in v0.2.53).
+        binary_basename: "vct-launcher" or "vct-hub". Used both as the
+            target filename (with optional ".exe" on Windows) AND as the
+            ZIP member-name pattern.
+        bin_subdir_fname: (subdir, fname) — output of
+            ``_launcher_binary_relative_path()`` /
+            ``_vct_hub_binary_relative_path()``. Decoupling these as
+            args (vs hard-coding) keeps the helper testable.
+        tmpdir_prefix: tempfile.mkdtemp prefix ("vct-launcher-dl-" /
+            "vct-hub-dl-"). Cosmetic only.
+        timeout_s: subprocess timeout for the gh/curl call.
+
+    Returns:
+        Path to the extracted binary on success; None on any soft-fail.
     """
     version = _read_launcher_version(install_root)
     if not version:
         return None
-    subdir, fname = _launcher_binary_relative_path()
+    subdir, fname = bin_subdir_fname
     target_dir = install_root / "launcher" / "dist" / subdir
     target_path = target_dir / fname
     # Release artifact naming convention (see .github/workflows/release.yml +
@@ -18244,10 +18271,13 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
     artifact = f"vibecoded-orchestrator-{version}-{os_arch_token}.zip"
     inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="vct-launcher-dl-"))
+    is_win = platform.system().lower().startswith("win")
+    inner_member = f"{inner_root}/{binary_basename}" + (".exe" if is_win else "")
+
+    tmpdir = Path(tempfile.mkdtemp(prefix=tmpdir_prefix))
     try:
         zip_path = tmpdir / artifact
-        # Prefer gh; fall back to curl.
+        # Prefer gh; fall back to curl. Both share a 60s timeout.
         if shutil.which("gh"):
             cmd = [
                 "gh", "release", "download", f"v{version}",
@@ -18257,7 +18287,7 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
             ]
             try:
                 result = subprocess.run(
-                    cmd, capture_output=True, timeout=60, text=True
+                    cmd, capture_output=True, timeout=timeout_s, text=True
                 )
                 if result.returncode != 0:
                     return None
@@ -18271,7 +18301,7 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
             try:
                 result = subprocess.run(
                     ["curl", "-fsSL", "-o", str(zip_path), url],
-                    capture_output=True, timeout=60, text=True,
+                    capture_output=True, timeout=timeout_s, text=True,
                 )
                 if result.returncode != 0:
                     return None
@@ -18281,20 +18311,25 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
             return None
         if not zip_path.is_file():
             return None
-        # Extract just the binary.
+        # Extract just the named binary.
         import zipfile  # stdlib — defer import to avoid startup cost.
         try:
             with zipfile.ZipFile(zip_path) as z:
-                inner = f"{inner_root}/vct-launcher" + (
-                    ".exe" if platform.system().lower().startswith("win") else ""
-                )
-                # Find the binary inside the zip regardless of inner path
-                # (release ZIPs vary; tolerate both flat + nested layouts).
-                candidates = [n for n in z.namelist()
-                              if n.endswith("vct-launcher") or n.endswith("vct-launcher.exe")]
+                # The ZIP may not yet contain a newly-added binary (e.g.
+                # user pulled v0.2.21 source but their network resolved
+                # v0.2.20). Be tolerant: any zip member ending in the
+                # basename / basename.exe is acceptable.
+                candidates = [
+                    n for n in z.namelist()
+                    if n.endswith(binary_basename)
+                    or n.endswith(binary_basename + ".exe")
+                ]
                 if not candidates:
                     return None
-                member = inner if inner in z.namelist() else candidates[0]
+                member = (
+                    inner_member if inner_member in z.namelist()
+                    else candidates[0]
+                )
                 with z.open(member) as src:
                     target_dir.mkdir(parents=True, exist_ok=True)
                     with open(target_path, "wb") as dst:
@@ -18302,7 +18337,7 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
         except (zipfile.BadZipFile, OSError, KeyError):
             return None
         # Make executable on Unix.
-        if not platform.system().lower().startswith("win"):
+        if not is_win:
             try:
                 target_path.chmod(0o755)
             except OSError:
@@ -18312,6 +18347,20 @@ def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
         return None
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _try_download_launcher_binary(install_root: Path) -> Optional[Path]:
+    """Tier 2: download the launcher binary from GitHub Releases.
+
+    Thin wrapper around :func:`_download_release_binary` (v0.2.53
+    DEDUP-2 — consolidates with the vct-hub downloader).
+    """
+    return _download_release_binary(
+        install_root=install_root,
+        binary_basename="vct-launcher",
+        bin_subdir_fname=_launcher_binary_relative_path(),
+        tmpdir_prefix="vct-launcher-dl-",
+    )
 
 
 def _try_cargo_tauri_build(install_root: Path) -> Optional[Path]:
@@ -19435,108 +19484,25 @@ def _try_bundled_vct_hub_binary(install_root: Path) -> Optional[Path]:
 
 
 def _try_download_vct_hub_binary(install_root: Path) -> Optional[Path]:
-    """Tier 2: download matching release artifact from GitHub Releases.
+    """Tier 2: download the vct-hub binary from GitHub Releases.
 
-    Since v0.2.21 the release ZIP carries BOTH `vct-launcher[.exe]`
-    AND `vct-hub[.exe]` per arch (see `.github/workflows/release.yml`).
-    Reuses the launcher's download tooling preferences (gh first,
-    curl fallback) and the same naming convention
-    (`vibecoded-orchestrator-<version>-<os>-<arch>.zip`).
+    Since v0.2.21 the release ZIP carries BOTH ``vct-launcher[.exe]``
+    AND ``vct-hub[.exe]`` per arch. Tier-1/2 share the same artifact
+    (one ZIP per arch contains both binaries); if the launcher binary
+    was already downloaded earlier this run, the ZIP is on
+    disk-cache-miss territory — we re-download deliberately rather
+    than carry a side-channel.
 
-    Soft-fail on every error (network down, release missing, auth
-    refused, vct-hub not yet bundled in the release ZIP) — returns
-    None and lets the caller move to Tier 3.
-
-    Tier-1/2 share the same artifact (one ZIP per arch contains both
-    binaries); if the launcher binary was already downloaded earlier
-    this run, the ZIP is on disk-cache-miss territory — we
-    re-download deliberately rather than carry a side-channel into
-    `_try_download_launcher_binary`. The redundancy is bounded (one
-    re-download per install) and keeps the function self-contained.
+    Thin wrapper around :func:`_download_release_binary` (v0.2.53
+    DEDUP-2 — consolidates with the launcher downloader, closing the
+    drift risk before v0.2.55 needs a third binary).
     """
-    version = _read_launcher_version(install_root)
-    if not version:
-        return None
-    subdir, fname = _vct_hub_binary_relative_path()
-    target_dir = install_root / "launcher" / "dist" / subdir
-    target_path = target_dir / fname
-    os_arch_token = {
-        "linux-x64": "linux-x64",
-        "windows-x64": "windows-x64",
-        "macos-arm64": "macos-arm64",
-    }.get(subdir, subdir)
-    artifact = f"vibecoded-orchestrator-{version}-{os_arch_token}.zip"
-    inner_root = f"vibecoded-orchestrator-{version}-{os_arch_token}"
-
-    tmpdir = Path(tempfile.mkdtemp(prefix="vct-hub-dl-"))
-    try:
-        zip_path = tmpdir / artifact
-        if shutil.which("gh"):
-            cmd = [
-                "gh", "release", "download", f"v{version}",
-                "--repo", "hotak92/vibecoded-orchestrator",
-                "--pattern", artifact,
-                "--dir", str(tmpdir),
-            ]
-            try:
-                result = subprocess.run(
-                    cmd, capture_output=True, timeout=60, text=True
-                )
-                if result.returncode != 0:
-                    return None
-            except (subprocess.SubprocessError, OSError):
-                return None
-        elif shutil.which("curl"):
-            url = (
-                f"https://github.com/hotak92/vibecoded-orchestrator/"
-                f"releases/download/v{version}/{artifact}"
-            )
-            try:
-                result = subprocess.run(
-                    ["curl", "-fsSL", "-o", str(zip_path), url],
-                    capture_output=True, timeout=60, text=True,
-                )
-                if result.returncode != 0:
-                    return None
-            except (subprocess.SubprocessError, OSError):
-                return None
-        else:
-            return None
-        if not zip_path.is_file():
-            return None
-        import zipfile  # stdlib — defer import to avoid startup cost.
-        try:
-            with zipfile.ZipFile(zip_path) as z:
-                inner = f"{inner_root}/vct-hub" + (
-                    ".exe" if platform.system().lower().startswith("win") else ""
-                )
-                # The ZIP may not yet contain vct-hub (e.g. user pulled
-                # v0.2.21 source but their network resolved the v0.2.20
-                # release). Be tolerant: any zip member ending in
-                # `vct-hub` / `vct-hub.exe` is acceptable.
-                candidates = [
-                    n for n in z.namelist()
-                    if n.endswith("vct-hub") or n.endswith("vct-hub.exe")
-                ]
-                if not candidates:
-                    return None
-                member = inner if inner in z.namelist() else candidates[0]
-                with z.open(member) as src:
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    with open(target_path, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-        except (zipfile.BadZipFile, OSError, KeyError):
-            return None
-        if not platform.system().lower().startswith("win"):
-            try:
-                target_path.chmod(0o755)
-            except OSError:
-                pass
-        if target_path.is_file():
-            return target_path
-        return None
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    return _download_release_binary(
+        install_root=install_root,
+        binary_basename="vct-hub",
+        bin_subdir_fname=_vct_hub_binary_relative_path(),
+        tmpdir_prefix="vct-hub-dl-",
+    )
 
 
 def _try_cargo_build_vct_hub(install_root: Path) -> Optional[Path]:
