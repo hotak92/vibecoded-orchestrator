@@ -123,16 +123,37 @@ REM _log_event <step> <phase> <detail>
 REM Idempotent: silently no-ops if the log dir doesn't exist (install.py
 REM Step 8 creates it; if we got here without that step we just skip the
 REM event — never crash).
+REM
+REM W-P1-1 (v0.2.53 Track H): values pass through ENV VARS, not via
+REM `%~1` substitution into the PowerShell command string. The previous
+REM implementation interpolated `'%~1'` literally into PowerShell `'...'`
+REM single-quoted string literals — if the value contained an apostrophe
+REM (French/Italian path component like `D'Angelo`, or any detail text
+REM with `'`), the PS literal terminated early and the rest was parsed
+REM as PowerShell code (corrupt JSONL row at best; logic injection at
+REM worst). Env-var passthrough sidesteps the cmd → PS quoting boundary
+REM entirely: PowerShell reads from $env:VCT_LOG_* via a string accessor
+REM that does not re-parse the value.
 goto :after_log_helper
 :_log_event
 if not exist "%~dp0state\logs" goto :_log_event_done
+set "VCT_LOG_STEP=%~1"
+set "VCT_LOG_PHASE=%~2"
+set "VCT_LOG_DETAIL=%~3"
+set "VCT_LOG_PATH=%INSTALL_LOG%"
 "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ts = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ');" ^
-    "$step  = '%~1' -replace '\\','\\\\' -replace '\"','\\\"';" ^
-    "$phase = '%~2' -replace '\\','\\\\' -replace '\"','\\\"';" ^
-    "$det   = '%~3' -replace '\\','\\\\' -replace '\"','\\\"';" ^
-    "$line = '{\"ts\":\"' + $ts + '\",\"actor\":\"first-install.bat\",\"step\":\"' + $step + '\",\"phase\":\"' + $phase + '\",\"detail\":\"' + $det + '\"}';" ^
-    "Add-Content -Path '%INSTALL_LOG%' -Value $line" 2>nul
+    "$step  = [string]([Environment]::GetEnvironmentVariable('VCT_LOG_STEP'));" ^
+    "$phase = [string]([Environment]::GetEnvironmentVariable('VCT_LOG_PHASE'));" ^
+    "$det   = [string]([Environment]::GetEnvironmentVariable('VCT_LOG_DETAIL'));" ^
+    "$path  = [string]([Environment]::GetEnvironmentVariable('VCT_LOG_PATH'));" ^
+    "$obj = [pscustomobject]@{ ts = $ts; actor = 'first-install.bat'; step = $step; phase = $phase; detail = $det };" ^
+    "$line = $obj | ConvertTo-Json -Compress -Depth 3;" ^
+    "Add-Content -Path $path -Value $line" 2>nul
+set "VCT_LOG_STEP="
+set "VCT_LOG_PHASE="
+set "VCT_LOG_DETAIL="
+set "VCT_LOG_PATH="
 :_log_event_done
 goto :eof
 :after_log_helper
@@ -195,14 +216,24 @@ if defined LAUNCHER_BIN (
 REM Frontend-embedded check (added 2026-04-28). A release binary built
 REM with an empty launcher\build\ compiles fine but renders "Could not
 REM connect to localhost" at startup because no SvelteKit assets were
-REM embedded. We require >=5 occurrences of "_app/immutable/assets" in
-REM the binary's bytes; otherwise treat as broken and fall through to
+REM embedded. We require >=5 occurrences of "_app/immutable/" in the
+REM binary's bytes; otherwise treat as broken and fall through to
 REM download/build. Threshold derived from build artifact analysis at
 REM commit d576ad6 (which fixed the original regression in 5abb8cf).
-REM Mirror of bash _bundled_binary_is_fresh frontend-check.
+REM
+REM DEDUP-15 (v0.2.53 Track H + Track A): the count is delegated to
+REM scripts\lib\asset-ref-count.ps1 (Get-AssetRefCount) — the same
+REM helper start-launcher.bat uses and the bash sibling
+REM scripts/lib/asset-ref-count.sh consumes. Previously this site had
+REM its own inline marker substring + threshold ("_app/immutable/assets",
+REM the narrow form); the helper uses the canonical broad form
+REM "_app/immutable/" which correctly catches Svelte 5 builds where the
+REM trailing "assets/" segment is dropped. The 4 prior copies of the
+REM marker (this file, start-launcher.bat, .sh sibling, build scripts)
+REM are now collapsed to one.
 if defined LAUNCHER_BIN (
     for /f "delims=" %%C in ('"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
-        "try { $bytes=[System.IO.File]::ReadAllBytes('!LAUNCHER_BIN!'); $s=[System.Text.Encoding]::ASCII.GetString($bytes); ($s.Split([string[]]@('_app/immutable/assets'), [System.StringSplitOptions]::None).Count - 1) } catch { 0 }" 2^>nul') do set "FE_COUNT=%%C"
+        ". '%~dp0scripts\lib\asset-ref-count.ps1'; Get-AssetRefCount -Path '!LAUNCHER_BIN!'" 2^>nul') do set "FE_COUNT=%%C"
     if not defined FE_COUNT set "FE_COUNT=0"
     REM CMD batch can't do GEQ on arbitrary strings; coerce + compare numerically.
     set /a "FE_COUNT_INT=!FE_COUNT! + 0" 2>nul
@@ -311,8 +342,35 @@ if /I "%NODE_ANS%"=="N" (
 winget install --accept-package-agreements --accept-source-agreements OpenJS.NodeJS
 
 :after_winget_install
-REM winget modifies PATH for new shells but not us — refresh.
-call refreshenv >nul 2>&1
+REM winget modifies the persistent PATH (HKLM + HKCU registry) for NEW
+REM shells but not for us — refresh by reading the registry directly.
+REM
+REM W-P1-2 (v0.2.53 Track H): the previous `call refreshenv >nul 2>&1`
+REM relied on Chocolatey's `refreshenv` shim. That shim ships with
+REM `choco install` (and with the cmder/clink helpers) — it is NOT
+REM pre-installed on stock Win10/Win11. The redirect to nul swallowed
+REM the "is not recognized" error, so the call silently no-op'd, our
+REM in-process PATH was never updated, and `:recheck_node`'s `where /q
+REM node` couldn't find the just-installed binary. The user got "Still
+REM no Node on PATH. Try a new terminal." on the SAME terminal that
+REM JUST ran a successful winget install.
+REM
+REM Fix: read HKLM Path + HKCU Path via PowerShell's
+REM [Environment]::GetEnvironmentVariable("Path", "Machine"|"User"),
+REM concat (Machine wins ties — same precedence as a fresh shell), and
+REM splice into the current %PATH%. We use PowerShell rather than `reg
+REM query` because reg-query output requires tokenization that is
+REM brittle when the PATH contains spaces (cmd-side parsing trap).
+REM PowerShell's API returns the value as a single string already.
+REM
+REM Idempotent: if PS fails (unlikely — powershell.exe ships with
+REM every Win7+ install), we fall through with the unchanged PATH and
+REM let `:recheck_node` give the user the manual-retry prompt.
+for /f "delims=" %%P in ('"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$m = [Environment]::GetEnvironmentVariable('Path', 'Machine');" ^
+    "$u = [Environment]::GetEnvironmentVariable('Path', 'User');" ^
+    "$p = @($m, $u) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd(';') };" ^
+    "[Console]::Out.Write(($p -join ';'))" 2^>nul') do set "PATH=%%P"
 goto :recheck_node
 
 :no_winget

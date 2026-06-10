@@ -106,6 +106,7 @@ if _sys.platform == "win32":
 
 import argparse
 import datetime
+import html as _html
 import json
 import os
 import platform
@@ -18347,13 +18348,31 @@ def _materialize_boot_service_windows(
     # both forward and backslash path separators uniformly.
     wrapper_forward = str(wrapper).replace("\\", "/")
     working_dir_forward = str(working_dir).replace("\\", "/")
+    # W-P1-5 (v0.2.53 Track H): XML-escape USERDOMAIN + USERNAME before
+    # substituting into the Task Scheduler XML template. Pre-fix code
+    # pasted raw env values into <UserId>DOMAIN\user</UserId>; if
+    # USERDOMAIN contains characters XML 1.0 forbids — `&`, `<`, `>`
+    # (rare but possible in WORKGROUP names containing `&`, e.g.
+    # "ACME&CO") — the resulting XML is malformed and `schtasks
+    # /Create /XML` exits non-zero. `html.escape(..., quote=False)`
+    # converts only the three XML-special chars (we don't need to
+    # escape `"` or `'` because USER_ID is substituted into element
+    # content, not attribute values). USERDOMAIN + USERNAME are read
+    # AS-IS from the env BEFORE escaping — see test_scheduled_task_xml_escape.
+    raw_domain = os.environ.get("USERDOMAIN", "")
+    raw_username = os.environ.get("USERNAME", "")
+    domain = _html.escape(raw_domain, quote=False)
+    username = _html.escape(raw_username, quote=False)
     user_id = (
-        os.environ.get("USERDOMAIN", "")
-        + ("\\" if os.environ.get("USERDOMAIN") else "")
-        + os.environ.get("USERNAME", "")
+        domain
+        + ("\\" if raw_domain else "")
+        + username
     ).strip("\\")
     if not user_id:
-        user_id = os.environ.get("USER", "user")
+        # Fallback: POSIX-style USER env (CI / WSL) → also XML-escape.
+        user_id = _html.escape(
+            os.environ.get("USER", "user"), quote=False,
+        )
 
     rendered = _render_template(template, {
         "LABEL": _BOOT_SERVICE_TASK_NAME,

@@ -4,12 +4,18 @@
 # vct_project_config.ps1 — PowerShell counterpart of
 # `vct_project_config.sh`. See the .sh header for the full contract;
 # this file mirrors the bash version's behaviour using PowerShell-
-# native primitives (Invoke-WebRequest with -SkipHttpErrorCheck so we
-# can read non-200 responses inline, named [CmdletBinding()] params).
+# native primitives (Invoke-WebRequest in a portable try/catch wrapper
+# that handles non-2xx responses on BOTH PS 5.1 and PS 7+).
 #
-# Requires PowerShell 7+ for -SkipHttpErrorCheck. PowerShell 5.1
-# (Windows-bundled) is NOT supported; users on Windows should either
-# install pwsh 7+ or shell out to WSL bash.
+# Compatibility (v0.2.53 Track H W-P1-4): supports BOTH Windows
+# PowerShell 5.1 (bundled with every Win7+ install) and PowerShell 7+
+# (pwsh.exe — separate install). Earlier revisions used the PS 7+ only
+# `-SkipHttpErrorCheck` flag, which parse-fails on PS 5.1 and causes
+# the access-matrix gate to fail closed — bricking KG writes on every
+# stock Windows machine until the user manually installed pwsh 7. The
+# new Invoke-HubRequest helper achieves the same "read non-2xx body
+# inline" semantics by catching the WebException PS 5.1 throws and
+# extracting StatusCode + body from the exception's Response property.
 #
 # Usage:
 #   .\vct_project_config.ps1 -Project <folder> [-Field <name>]
@@ -298,9 +304,16 @@ function Get-HubToken {
 
 # ── HTTP helper ─────────────────────────────────────────────────────────
 # Returns a hashtable: @{ Status = <int>; Body = <string> } on success,
-# @{ Status = 0; Body = '' } if token is missing, or $null on
-# connection failure. -SkipHttpErrorCheck makes 4xx/5xx fall through as
-# normal responses (so we can read the error envelope body).
+# @{ Status = 0; Body = '' } if token is missing, or $null on connection
+# failure.
+#
+# Compatibility (W-P1-4): works on BOTH PS 7+ (where Invoke-WebRequest
+# treats non-2xx as a normal response when -SkipHttpErrorCheck is set)
+# AND PS 5.1 (where Invoke-WebRequest throws WebException on 4xx/5xx and
+# we extract StatusCode + body from the exception's Response property).
+# We deliberately do NOT use -SkipHttpErrorCheck — that flag parse-fails
+# on PS 5.1 before the cmdlet runs, taking the whole script down with
+# it. The try/catch below covers both modes uniformly.
 function Invoke-Hub {
     param([string]$PathAndQuery)
     $port = Get-HubPort
@@ -312,11 +325,67 @@ function Invoke-Hub {
     $headers = @{ Authorization = "Bearer $token" }
     try {
         $resp = Invoke-WebRequest -Uri $url -Method Get -UseBasicParsing `
-            -Headers $headers -TimeoutSec 5 -SkipHttpErrorCheck `
+            -Headers $headers -TimeoutSec 5 `
             -ErrorAction Stop
         return @{ Status = [int]$resp.StatusCode; Body = $resp.Content }
+    } catch [System.Net.WebException] {
+        # PS 5.1 throws WebException for 4xx/5xx. Extract status + body
+        # from the response stream. If the exception carries no Response
+        # (connection-level failure: refused, DNS, TLS handshake),
+        # fall through to the catch-all below.
+        $webResp = $_.Exception.Response
+        if ($null -eq $webResp) {
+            return $null
+        }
+        try {
+            $status = [int]$webResp.StatusCode
+        } catch {
+            $status = 0
+        }
+        $body = ''
+        try {
+            $stream = $webResp.GetResponseStream()
+            if ($null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                try {
+                    $body = $reader.ReadToEnd()
+                } finally {
+                    $reader.Dispose()
+                }
+            }
+        } catch {
+            # Body read failed (stream already disposed, encoding error);
+            # return what we have (status was the load-bearing field).
+            $body = ''
+        }
+        if ($status -gt 0) {
+            return @{ Status = $status; Body = $body }
+        }
+        return $null
+    } catch [Microsoft.PowerShell.Commands.HttpResponseException] {
+        # PS 7 path: HttpResponseException is the PS 7-native error type
+        # thrown when -SkipHttpErrorCheck is NOT set. Same shape as the
+        # WebException branch above — extract status + body.
+        $psResp = $_.Exception.Response
+        if ($null -eq $psResp) {
+            return $null
+        }
+        $status = 0
+        try { $status = [int]$psResp.StatusCode } catch { }
+        # PS 7's $_.ErrorDetails.Message often carries the body verbatim.
+        $body = ''
+        try {
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                $body = [string]$_.ErrorDetails.Message
+            }
+        } catch { }
+        if ($status -gt 0) {
+            return @{ Status = $status; Body = $body }
+        }
+        return $null
     } catch {
-        # Connection refused / DNS / TLS error — no response.
+        # Connection refused / DNS / TLS error / any other unmatched
+        # exception — no response.
         return $null
     }
 }
