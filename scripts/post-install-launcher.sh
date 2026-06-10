@@ -978,9 +978,17 @@ PY
                 # npm 7+); fall back to `npm config get prefix` and
                 # well-known prefix locations. `npm bin -g` was
                 # removed in npm 9 — don't rely on it.
-                local npm_prefix=""
+                # M-P0-5 (v0.2.53): `local` outside a function aborts
+                # under `set -u` (script runs under `set -uo pipefail`
+                # at line 50). The previous use of `local` here printed
+                # "local: can only be used in a function" + tripped
+                # the next `$npm_prefix` reference with an "unbound
+                # variable" abort → script exited 127 silently from
+                # the user's perspective. The block isn't inside a
+                # function, so plain assignment is correct.
+                npm_prefix=""
                 npm_prefix="$(npm prefix -g 2>/dev/null || npm config get prefix 2>/dev/null || true)"
-                local probe_dirs=()
+                probe_dirs=()
                 if [ -n "$npm_prefix" ]; then
                     probe_dirs+=("$npm_prefix/bin")
                 fi
@@ -989,7 +997,9 @@ PY
                     "$HOME/.npm-global/bin"
                     "/usr/local/lib/node_modules/.bin"
                 )
-                local cand
+                # `cand` is the loop variable below; just leave it
+                # plain (no `local`). This is the third site that hit
+                # the bug.
                 for cand in "${probe_dirs[@]}"; do
                     if [ -n "$cand" ] && [ -x "$cand/pnpm" ]; then
                         case ":$PATH:" in
