@@ -624,10 +624,19 @@ async fn probe_http(url: String) -> Option<String> {
 ///   - http://localhost:11435/api/tags             (Ollama)
 ///   - http://localhost:11440/health               (code_embed)
 ///
-/// Note: /v1/meta (NOT /v1/.well-known/ready) is the right liveness probe
-/// for Weaviate — see commands/lifecycle.rs::canonical_services for the
-/// rationale (false-negatives observed 2026-05-06 with the strict ready
-/// endpoint while /v1/meta + /v1/graphql were fully responsive).
+/// Weaviate endpoint note (v0.2.53 NEW-4 correction): `install.py`'s
+/// canonical Weaviate liveness probe is `/v1/.well-known/ready` (see
+/// `install.py::_wait_for_weaviate`). This Rust-side
+/// `detect_existing_services()` historically used `/v1/meta` instead
+/// because the 2026-05-06 lifecycle audit observed false-negatives
+/// from the strict ready endpoint under transient module-load
+/// conditions. Both endpoints work for "is Weaviate up?" — but the
+/// previous comment claimed `/v1/meta` was THE right endpoint, which
+/// is incorrect: install.py uses `/v1/.well-known/ready`, that's the
+/// canonical liveness probe. The two endpoints are kept independent
+/// on purpose (Rust = "any signal Weaviate is reachable", Python =
+/// "Weaviate fully initialised and ready to serve queries"). See
+/// commands/lifecycle.rs::canonical_services for the rationale.
 #[command]
 pub async fn detect_existing_services() -> Result<ServicesStatus, String> {
     let weaviate = probe_http(format!(
