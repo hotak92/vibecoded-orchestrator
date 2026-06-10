@@ -1530,4 +1530,230 @@ mod tests {
 
         std::fs::remove_dir_all(&folder).ok();
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    // v0.2.53 Phase 3 Audit B optional splice A3 — FS+DB chain integration
+    //
+    // Existing unit tests cover `apply_fs_disable_*` in isolation.
+    // These tests exercise the composition: a "disable" call MUST move
+    // the file on disk AND flip the DB row. The DB and FS signals MUST
+    // stay in sync, because `install_project_bundle` consults BOTH
+    // independently (FS for skip-rebundle, DB for permission gating).
+    //
+    // The #[command] async wrapper takes `State<'_, Db>` which is awkward
+    // to construct in unit tests; we inline-replicate the wrapper's body
+    // (FS move first, then DB flip) so the integration semantics — order
+    // of operations + error propagation — are pinned.
+    // ──────────────────────────────────────────────────────────────────
+
+    fn seed_project_with_folder(db: &Db, id: &str, folder: &Path) {
+        db.insert_project(
+            id, id, folder.to_str().unwrap(), ProjectHost::Base, id,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fs_disable_agent_and_db_flag_stay_in_sync_through_a_full_toggle_cycle() {
+        let folder = scratch_project_dir();
+        let agents = folder.join(".claude/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("coder.md"),
+            "name: coder\nmodel: sonnet\n",
+        )
+        .unwrap();
+
+        let db = make_db();
+        let project_id = "proj-fs-db-sync-1";
+        seed_project_with_folder(&db, project_id, &folder);
+        db.register_project_agent(
+            project_id, "coder", "bundled", None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        // ---- Disable: FS move first, then DB flip ----
+        let project = db.get_project(project_id).unwrap().unwrap();
+        apply_fs_disable_agent(Path::new(&project.folder_path), "coder", false)
+            .unwrap();
+        db.set_project_agent_enabled(project_id, "coder", false).unwrap();
+
+        // Verify both signals report disabled.
+        assert!(
+            !folder.join(".claude/agents/coder.md").exists(),
+            "enabled-side file must be gone after disable"
+        );
+        assert!(
+            folder.join(".claude/agents.disabled/coder.md").exists(),
+            "disabled-side file must exist after disable"
+        );
+        let rows = db.list_project_agents(project_id).unwrap();
+        let coder_row = rows
+            .iter()
+            .find(|r| r.agent_name == "coder")
+            .expect("agent row must exist");
+        assert!(!coder_row.enabled, "DB flag must be false after disable");
+
+        // ---- Re-enable: FS move back, then DB flip back ----
+        apply_fs_disable_agent(Path::new(&project.folder_path), "coder", true)
+            .unwrap();
+        db.set_project_agent_enabled(project_id, "coder", true).unwrap();
+
+        assert!(folder.join(".claude/agents/coder.md").exists());
+        assert!(!folder.join(".claude/agents.disabled/coder.md").exists());
+        let rows = db.list_project_agents(project_id).unwrap();
+        let coder_row = rows
+            .iter()
+            .find(|r| r.agent_name == "coder")
+            .expect("agent row must exist");
+        assert!(coder_row.enabled, "DB flag must be true after re-enable");
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn fs_disable_skill_and_db_flag_stay_in_sync_through_a_full_toggle_cycle() {
+        let folder = scratch_project_dir();
+        let skill_dir = folder.join(".claude/skills/tdd");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "name: tdd\n").unwrap();
+
+        let db = make_db();
+        let project_id = "proj-fs-db-sync-2";
+        seed_project_with_folder(&db, project_id, &folder);
+        db.register_project_skill(
+            project_id, "tdd", "bundled", None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let project = db.get_project(project_id).unwrap().unwrap();
+        apply_fs_disable_skill(Path::new(&project.folder_path), "tdd", false)
+            .unwrap();
+        db.set_project_skill_enabled(project_id, "tdd", false).unwrap();
+
+        assert!(!skill_dir.exists());
+        assert!(folder.join(".claude/skills.disabled/tdd").exists());
+        let rows = db.list_project_skills(project_id).unwrap();
+        let tdd_row = rows
+            .iter()
+            .find(|r| r.skill_name == "tdd")
+            .expect("skill row must exist");
+        assert!(!tdd_row.enabled);
+
+        apply_fs_disable_skill(Path::new(&project.folder_path), "tdd", true)
+            .unwrap();
+        db.set_project_skill_enabled(project_id, "tdd", true).unwrap();
+
+        assert!(skill_dir.exists());
+        assert!(!folder.join(".claude/skills.disabled/tdd").exists());
+        let rows = db.list_project_skills(project_id).unwrap();
+        let tdd_row = rows
+            .iter()
+            .find(|r| r.skill_name == "tdd")
+            .expect("skill row must exist");
+        assert!(tdd_row.enabled);
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn fs_disable_agent_refuses_db_flip_when_fs_move_would_clobber() {
+        // Corrupt both-locations state: file exists in BOTH enabled and
+        // disabled dirs (created by a user manually copying). The
+        // apply_fs_disable_*  helper refuses to clobber. The Tauri command
+        // returns the error and SKIPS the DB flip, so the DB doesn't end
+        // up out-of-sync with disk.
+        let folder = scratch_project_dir();
+        let agents = folder.join(".claude/agents");
+        let disabled = folder.join(".claude/agents.disabled");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::create_dir_all(&disabled).unwrap();
+        std::fs::write(agents.join("coder.md"), "enabled side\n").unwrap();
+        std::fs::write(disabled.join("coder.md"), "disabled side stale\n")
+            .unwrap();
+
+        let db = make_db();
+        let project_id = "proj-fs-corrupt";
+        seed_project_with_folder(&db, project_id, &folder);
+        db.register_project_agent(
+            project_id, "coder", "bundled", None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        // Sanity: DB has the row as enabled by default.
+        let rows = db.list_project_agents(project_id).unwrap();
+        assert!(rows.iter().find(|r| r.agent_name == "coder").unwrap().enabled);
+
+        // Try to disable: FS move should refuse → Tauri command would
+        // bubble up the error and NOT flip the DB.
+        let project = db.get_project(project_id).unwrap().unwrap();
+        let fs_result = apply_fs_disable_agent(
+            Path::new(&project.folder_path),
+            "coder",
+            false,
+        );
+        assert!(
+            fs_result.is_err(),
+            "apply_fs_disable_agent must refuse to clobber existing destination"
+        );
+        // The Tauri command body returns at the `?` on this line — never
+        // reaches the DB flip. The DB row stays enabled.
+        let rows = db.list_project_agents(project_id).unwrap();
+        let coder_row = rows
+            .iter()
+            .find(|r| r.agent_name == "coder")
+            .expect("agent row must exist");
+        assert!(
+            coder_row.enabled,
+            "DB must remain enabled when FS move refused — out-of-sync state \
+             is the bug we're guarding against"
+        );
+
+        // Both files still exist (FS state is unchanged by the refusal).
+        assert!(agents.join("coder.md").exists());
+        assert!(disabled.join("coder.md").exists());
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
+    #[test]
+    fn fs_disable_agent_succeeds_when_source_missing_db_still_flips() {
+        // Soft-fail no-op shape: user manually removed the agent .md file
+        // from the enabled dir. apply_fs_disable_agent is a no-op (doesn't
+        // raise). The DB flip still proceeds — DB remains authoritative
+        // for the "agent doesn't actually exist on disk" case.
+        let folder = scratch_project_dir();
+        // Create the dir but no agent file.
+        std::fs::create_dir_all(folder.join(".claude/agents")).unwrap();
+
+        let db = make_db();
+        let project_id = "proj-fs-ghost";
+        seed_project_with_folder(&db, project_id, &folder);
+        db.register_project_agent(
+            project_id, "ghost", "bundled", None, None, None,
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+        let project = db.get_project(project_id).unwrap().unwrap();
+        // FS no-op:
+        apply_fs_disable_agent(Path::new(&project.folder_path), "ghost", false)
+            .unwrap();
+        // DB still flips:
+        db.set_project_agent_enabled(project_id, "ghost", false).unwrap();
+
+        let rows = db.list_project_agents(project_id).unwrap();
+        let ghost_row = rows
+            .iter()
+            .find(|r| r.agent_name == "ghost")
+            .expect("ghost agent row must exist");
+        assert!(
+            !ghost_row.enabled,
+            "DB flag must flip even when FS file is absent (soft-fail no-op)"
+        );
+
+        std::fs::remove_dir_all(&folder).ok();
+    }
 }

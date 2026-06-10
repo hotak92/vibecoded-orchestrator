@@ -291,3 +291,146 @@ def test_no_silent_hang_class_remaining_in_critical_sites(install_module):
         f"Did a regression re-introduce raw subprocess.run with "
         f"capture_output=True?"
     )
+
+
+# ---------------------------------------------------------------------------
+# Dot-cycle animation tests (v0.2.53 Audit B A2)
+#
+# Audit B noted all earlier tests pass `show_dots_after_seconds=None`,
+# so the animation thread never actually fired. These tests exercise
+# the thread + verify TTY-gating + clean shutdown.
+# ---------------------------------------------------------------------------
+
+
+def test_dot_cycle_not_started_when_show_dots_is_none(install_module, capsys):
+    """show_dots_after_seconds=None → no animation thread at all."""
+    import threading
+    threads_before = set(threading.enumerate())
+    install_module._run_logged_subprocess(
+        ["/bin/true"],
+        step="test/N", phase_label="quick noop",
+        timeout=10,
+        on_failure="raise",
+        show_dots_after_seconds=None,
+    )
+    threads_after = set(threading.enumerate())
+    new_threads = threads_after - threads_before
+    # The _dot_cycle thread is named via threading.Thread(target=_dot_cycle)
+    # so it has the default 'Thread-N' name. Filter by target attribute.
+    dot_threads = [t for t in new_threads
+                   if getattr(t, '_target', None) is not None
+                   and 'dot_cycle' in getattr(getattr(t, '_target', None),
+                                              '__name__', '')]
+    assert not dot_threads, (
+        "show_dots_after_seconds=None must not start a _dot_cycle thread"
+    )
+
+
+def test_dot_cycle_skipped_when_stdout_not_tty(install_module):
+    """sys.stdout.isatty()=False → animation thread skipped even when
+    show_dots_after_seconds is set. This is the CI-friendly path:
+    pytest's captured stdout is never a TTY so all install.py runs
+    under pytest still get the dot-cycle skip path.
+    """
+    import threading
+    threads_before = set(threading.enumerate())
+    # capsys / pytest already makes sys.stdout not a TTY.
+    # Use a very short show_dots_after_seconds so we'd see a thread
+    # if the TTY gate failed.
+    install_module._run_logged_subprocess(
+        ["/bin/true"],
+        step="test/CI", phase_label="non-tty noop",
+        timeout=10,
+        on_failure="raise",
+        show_dots_after_seconds=0.05,
+    )
+    threads_after = set(threading.enumerate())
+    new_dot_threads = [
+        t for t in (threads_after - threads_before)
+        if 'dot_cycle' in getattr(getattr(t, '_target', None),
+                                   '__name__', '')
+    ]
+    assert not new_dot_threads, (
+        "Non-TTY stdout must skip the dot-cycle thread (CI runs "
+        "must stay quiet — would clobber CI logs otherwise)"
+    )
+
+
+def test_dot_cycle_starts_when_show_dots_and_tty(install_module, monkeypatch):
+    """show_dots_after_seconds=0.05 AND sys.stdout.isatty()=True →
+    dot-cycle thread is started. Use a fake TTY-shaped stdout so the
+    isatty gate passes but the writes go to a buffer we can inspect.
+    """
+    import io
+    import threading
+
+    class FakeTTYStdout(io.StringIO):
+        def isatty(self): return True
+
+    fake_stdout = FakeTTYStdout()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+
+    threads_before = set(threading.enumerate())
+    # Subprocess sleeps long enough for the dot-cycle to fire ≥1 tick.
+    install_module._run_logged_subprocess(
+        ["/bin/sh", "-c", "sleep 1.5; exit 0"],
+        step="test/anim", phase_label="animated noop",
+        timeout=10,
+        on_failure="raise",
+        show_dots_after_seconds=0.05,
+    )
+    threads_after = set(threading.enumerate())
+    # Find dot threads that ran (joined) during the call.
+    dot_threads_ran = [
+        t for t in (threads_after | threads_before)
+        if 'dot_cycle' in getattr(getattr(t, '_target', None),
+                                   '__name__', '')
+    ]
+    # The thread may already have exited (daemon=True + proc has finished).
+    # The acceptance criterion: animation wrote at least one elapsed-
+    # counter line to our fake stdout. Use that as the empirical signal.
+    output = fake_stdout.getvalue()
+    assert "[" in output and "s]" in output and "animated noop" in output, (
+        f"Dot-cycle should have written at least one '[Ns] animated noop "
+        f"...' line to (TTY) stdout. Got: {output!r}. Thread search "
+        f"result (for diagnostic): {dot_threads_ran}"
+    )
+
+
+def test_dot_cycle_thread_stops_after_subprocess_exits(install_module,
+                                                       monkeypatch):
+    """The animation thread must clean up promptly after the subprocess
+    exits. Verifies dots_stop signal + join behavior.
+    """
+    import io
+    import threading
+    import time
+
+    class FakeTTYStdout(io.StringIO):
+        def isatty(self): return True
+
+    fake_stdout = FakeTTYStdout()
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+
+    install_module._run_logged_subprocess(
+        ["/bin/sh", "-c", "sleep 0.5; exit 0"],
+        step="test/cleanup", phase_label="cleanup noop",
+        timeout=10,
+        on_failure="raise",
+        show_dots_after_seconds=0.05,
+    )
+
+    # After the function returns, the dot-cycle thread must have stopped.
+    # Wait a moment for daemon thread to wind down (it has a 1s sleep
+    # between ticks).
+    time.sleep(2.0)
+    living_dot_threads = [
+        t for t in threading.enumerate()
+        if 'dot_cycle' in getattr(getattr(t, '_target', None),
+                                   '__name__', '')
+        and t.is_alive()
+    ]
+    assert not living_dot_threads, (
+        "Dot-cycle thread should have stopped after subprocess exit; "
+        f"still alive: {living_dot_threads}"
+    )
