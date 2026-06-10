@@ -371,6 +371,11 @@ _LANGUAGE_DISPLAY_TO_CANONICAL: Dict[str, str] = {
     "cpp":        "cpp",
     "c++":        "cpp",
     "c":          "c",
+    # V52-O.11.B / V52-O.11.N (v0.2.53 Track E):
+    "svelte":     "svelte",
+    "powershell": "powershell",
+    "ps1":        "powershell",
+    "ps":         "powershell",
 }
 
 
@@ -2186,6 +2191,366 @@ def _extract_external_calls(
     return deduped
 
 
+# =============================================================================
+# V52-O.11.B (v0.2.53 Track E) — Svelte parser helpers.
+#
+# Before v0.2.53, the orchestrator's 244 .svelte files in launcher/src/
+# were indexed as ZERO functions in the code graph (they fell through
+# every language detector because no extension match existed). This
+# module-level helper extracts the parsing logic from
+# `_analyze_svelte_file` so it can be unit-tested in isolation.
+#
+# Svelte component structure:
+#   * Optional top-level <script lang="ts"|"js"> block — host for
+#     reactive state, lifecycle hooks, and named functions.
+#   * Optional <script context="module"> block — module-level state
+#     and helpers shared across component instances (own scope).
+#   * Optional <style> block — CSS / preprocessor. Ignored for
+#     code-graph purposes.
+#   * Template body — HTML-like markup, mustaches, control flow.
+#     Ignored for code-graph purposes (no semantic functions there).
+#
+# The parser:
+#   1. Extracts the <script> block bodies (both default + module).
+#   2. Parses top-level `function name(...)` declarations.
+#   3. Parses top-level `export function name(...)` exports.
+#   4. Parses arrow-function exports
+#      (`export const name = () => ...` / `let` / `var`).
+#   5. Parses `$: name = ...` reactive declarations as pseudo-functions
+#      (they're function-shaped — a reactive expression — and useful
+#      to surface in code-graph search even though they're not
+#      callable directly).
+#   6. Extracts the component name from the file stem (Svelte
+#      convention; no class-name analogue inside the file).
+# =============================================================================
+
+
+# Match an opening <script ...> tag, capturing the full opening tag for
+# attribute inspection (we look for context="module" to label module-
+# scoped blocks).
+_SVELTE_SCRIPT_OPEN = re.compile(r"<script\b([^>]*)>", re.IGNORECASE)
+_SVELTE_SCRIPT_CLOSE = re.compile(r"</script\s*>", re.IGNORECASE)
+_SVELTE_MODULE_CONTEXT = re.compile(
+    r"""context\s*=\s*['"]module['"]""", re.IGNORECASE
+)
+
+# `function name(...)` and `export function name(...)`. We capture the
+# `export` prefix so the caller can tag exported functions.
+_SVELTE_FUNCTION_DECL = re.compile(
+    r"""^[ \t]*(export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(""",
+    re.MULTILINE,
+)
+
+# Arrow-function exports: `export const name = (...) => ...`,
+# `export let name = ...`, `export var name = ...`. Bound to const/let/var
+# so we don't pick up arbitrary `name = (...) => ...` re-assignments
+# inside function bodies.
+_SVELTE_ARROW_EXPORT = re.compile(
+    r"""^[ \t]*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*"""
+    r"""(async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>""",
+    re.MULTILINE,
+)
+
+# Svelte reactive declarations: `$: name = ...`. We treat each as a
+# pseudo-function because they're function-shaped reactive expressions
+# (an effect that re-runs on dependency change). Surfaces in code-graph
+# searches for "what reactive declarations exist".
+_SVELTE_REACTIVE_DECL = re.compile(
+    r"""^[ \t]*\$:\s*([A-Za-z_$][\w$]*)\s*=""",
+    re.MULTILINE,
+)
+
+
+def _extract_svelte_script_blocks(
+    content: str,
+) -> List[Tuple[str, bool, int]]:
+    """Extract <script>...</script> bodies from a Svelte source.
+
+    Returns a list of (block_body, is_module_context, body_start_offset)
+    tuples. `body_start_offset` is the absolute character offset in the
+    original content of the first character of the block body — used by
+    callers to translate per-block match offsets back to file-level
+    line numbers.
+
+    Multi-block tolerance: a Svelte file may have at most one default
+    <script> + at most one <script context="module">; we return all
+    matches we find rather than enforcing this constraint at parse
+    time (let the orchestrator's downstream linters surface invalid
+    Svelte structure).
+    """
+    blocks: List[Tuple[str, bool, int]] = []
+    pos = 0
+    while pos < len(content):
+        open_match = _SVELTE_SCRIPT_OPEN.search(content, pos)
+        if not open_match:
+            break
+        attrs = open_match.group(1) or ""
+        is_module = bool(_SVELTE_MODULE_CONTEXT.search(attrs))
+        body_start = open_match.end()
+        close_match = _SVELTE_SCRIPT_CLOSE.search(content, body_start)
+        if not close_match:
+            # Unclosed script — treat the rest of the file as the body.
+            blocks.append((content[body_start:], is_module, body_start))
+            break
+        blocks.append(
+            (content[body_start:close_match.start()], is_module, body_start)
+        )
+        pos = close_match.end()
+    return blocks
+
+
+def _parse_svelte_functions(content: str) -> List[Dict[str, Any]]:
+    """Parse top-level function-shaped declarations from a Svelte file.
+
+    Returns a list of dicts with keys:
+
+      * `name` (str)         — function / variable / reactive name
+      * `kind` (str)         — one of `"function"`, `"export"`,
+                              `"arrow_export"`, `"reactive"`
+      * `is_async` (bool)    — True for `async function`, `async () =>`,
+                              False for sync forms and reactive decls
+      * `start_offset` (int) — character offset in the ORIGINAL file
+                              content where the declaration starts
+                              (callers translate this to a line
+                              number via `content[:off].count('\n') + 1`)
+      * `module_scope` (bool) — True when the declaration appeared
+                              inside a `<script context="module">`
+                              block; False for default-script and
+                              fallback cases.
+
+    Deduplication: if the same name appears as both a `function` decl
+    and an `arrow_export` (unusual but possible if a file defines a
+    helper and then re-exports a const-arrow with the same name), we
+    keep BOTH entries — the dedup contract is the caller's job at
+    insert time (the orchestrator's `_dedup_insert` keys on
+    `full_name` + `file_path_rel`, which preserves the distinction).
+    """
+    results: List[Dict[str, Any]] = []
+    blocks = _extract_svelte_script_blocks(content)
+
+    # Empty-block fallback: no <script> at all → no functions to extract.
+    if not blocks:
+        return results
+
+    for block_body, is_module, body_start in blocks:
+        # `function` / `export function` / `async function`
+        for m in _SVELTE_FUNCTION_DECL.finditer(block_body):
+            name = m.group(2)
+            kind = "export" if m.group(1) else "function"
+            is_async = "async" in block_body[m.start():m.end()]
+            results.append(
+                {
+                    "name": name,
+                    "kind": kind,
+                    "is_async": is_async,
+                    "start_offset": body_start + m.start(),
+                    "module_scope": is_module,
+                }
+            )
+
+        # `export const name = (...) => ...` (+ let / var)
+        for m in _SVELTE_ARROW_EXPORT.finditer(block_body):
+            name = m.group(1)
+            is_async = m.group(2) is not None
+            results.append(
+                {
+                    "name": name,
+                    "kind": "arrow_export",
+                    "is_async": is_async,
+                    "start_offset": body_start + m.start(),
+                    "module_scope": is_module,
+                }
+            )
+
+        # `$: name = ...` reactive declarations (Svelte-specific).
+        # Only meaningful in the DEFAULT script (module context blocks
+        # don't get the reactive runtime), so we skip them in
+        # module-scoped blocks.
+        if not is_module:
+            for m in _SVELTE_REACTIVE_DECL.finditer(block_body):
+                name = m.group(1)
+                results.append(
+                    {
+                        "name": name,
+                        "kind": "reactive",
+                        "is_async": False,
+                        "start_offset": body_start + m.start(),
+                        "module_scope": False,
+                    }
+                )
+
+    # Stable sort by start_offset so test assertions are deterministic
+    # even when the regex iterators visit declarations in a non-source
+    # order (which they don't today, but stable-sort future-proofs).
+    results.sort(key=lambda r: r["start_offset"])
+    return results
+
+
+# =============================================================================
+# V52-O.11.N (v0.2.53 Track E) — PowerShell parser helpers.
+#
+# Before v0.2.53, the orchestrator's 168 .ps1 files (template hooks
+# and Windows-side scripts) were indexed as ZERO functions in the code
+# graph — same fall-through bug as Svelte (no extension match).
+#
+# PowerShell function-declaration syntax:
+#
+#   function Name { ... }
+#   function Name() { ... }
+#   function Name($a, $b) { ... }
+#   function Name {
+#     param([Parameter()] $a, [Parameter()] $b)
+#     ...
+#   }
+#   function global:Name { ... }                  # scope prefix
+#   function script:Name { ... }                  # scope prefix
+#   function Verb-Noun { ... }                    # idiomatic PS naming
+#   filter Name { ... }                           # filter is also fn-like
+#
+# We capture `function` and `filter` declarations and tolerate the
+# optional scope prefix + the parenthesised parameter list. We also
+# extract any leading `param(...)` block as the function's signature
+# extra — useful for code-graph search by parameter type.
+#
+# Comment regions:
+#   `# comment`           — single-line
+#   `<# ... #>`           — multi-line block comment
+#   `#region` / `#endregion` — folding markers; we strip them as
+#                              comments (no semantic meaning beyond
+#                              IDE folding).
+# =============================================================================
+
+
+# `function name { ... }` / `function name(...) { ... }` / `filter name { ... }`.
+# Matches both `function` and `filter`; captures the optional scope
+# prefix (`global:`, `script:`, `local:`, `private:`) and the name.
+# Trailing `(...)` or `{` is required so we don't pick up bare
+# `function` keyword mentions.
+_POWERSHELL_FUNCTION_DECL = re.compile(
+    r"""^[ \t]*(?:function|filter)\s+"""
+    r"""(?:(?P<scope>global|script|local|private):)?"""
+    r"""(?P<name>[A-Za-z_][\w-]*)\s*"""
+    r"""(?:\([^)]*\))?\s*"""
+    r"""(?=\{)""",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# `[Parameter(...)] $name` / `[Parameter()] [string]$name` etc. We
+# capture the parameter name (`$name`) and the bracketed attributes
+# above it so callers can render a richer signature in the code-graph
+# entity.
+_POWERSHELL_PARAM_ATTR = re.compile(
+    r"""\[\s*Parameter\s*\([^)]*\)\s*\]"""
+    r"""(?:\s*\[[^\]]+\])*"""
+    r"""\s*\$(?P<name>[A-Za-z_][\w]*)""",
+    re.IGNORECASE,
+)
+
+
+def _strip_powershell_comments(content: str) -> str:
+    """Strip PowerShell single-line and block comments from source.
+
+    Order matters: block comments (`<# ... #>`) come first so that
+    `#` inside a block comment isn't picked up by the single-line
+    pattern. `#region` / `#endregion` markers are stripped via the
+    single-line pass.
+    """
+    # Block comments `<# ... #>` (greedy across lines).
+    stripped = re.sub(r"<#.*?#>", " ", content, flags=re.DOTALL)
+    # Single-line `#` to end-of-line. Includes `#region`, `#endregion`,
+    # `#!` shebangs (not idiomatic in .ps1 but possible in cross-platform
+    # scripts).
+    stripped = re.sub(r"#.*$", "", stripped, flags=re.MULTILINE)
+    return stripped
+
+
+def _parse_powershell_functions(content: str) -> List[Dict[str, Any]]:
+    """Parse function/filter declarations from a PowerShell source file.
+
+    Returns a list of dicts with keys:
+
+      * `name` (str)        — function name (without scope prefix)
+      * `scope` (str|None)  — `"global"` / `"script"` / `"local"` /
+                              `"private"` / None when unscoped
+      * `kind` (str)        — `"function"` or `"filter"`
+      * `start_offset` (int) — character offset in the ORIGINAL
+                               content; callers translate to a line
+                               number via `content[:off].count('\n') + 1`
+      * `params` (List[str]) — parameter names from a `param(...)`
+                               block if present, else []. Parameter
+                               names are returned WITHOUT the leading
+                               `$` sigil.
+
+    The parser strips comments first so block-comment text doesn't
+    masquerade as a function decl (a common .ps1 footgun: docstring-
+    style `<#  function Foo  #>` blocks above the real declaration).
+    """
+    cleaned = _strip_powershell_comments(content)
+    results: List[Dict[str, Any]] = []
+
+    for m in _POWERSHELL_FUNCTION_DECL.finditer(cleaned):
+        # Inspect the original source line to recover the kind
+        # (function/filter) since the regex doesn't capture it.
+        name = m.group("name")
+        scope = m.group("scope")
+        # Determine kind by looking at the keyword that opened the
+        # match — we re-anchor on the start position because the
+        # regex consumed it.
+        line_start = cleaned.rfind("\n", 0, m.start()) + 1
+        keyword = cleaned[line_start:m.start() + 8].strip().split()[0].lower()
+        kind = "filter" if keyword.startswith("filter") else "function"
+
+        # Find the function body span to look for a `param(...)` block.
+        # We scan from the brace (`{`) following the decl forward to
+        # the matching close brace, balancing nesting.
+        body_start = cleaned.find("{", m.end())
+        params: List[str] = []
+        if body_start != -1:
+            depth = 1
+            body_end = body_start + 1
+            while body_end < len(cleaned) and depth > 0:
+                ch = cleaned[body_end]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                body_end += 1
+            body = cleaned[body_start:body_end]
+
+            # Look for `param( ... )` at top of body (allowing
+            # whitespace + comments stripped above).
+            param_match = re.search(
+                r"\bparam\s*\(([^)]*)\)",
+                body,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if param_match:
+                param_block = param_match.group(1)
+                # Capture `$name` occurrences, but only ones preceded
+                # by a `[Parameter(...)]` attribute or sitting at the
+                # block top level.
+                for pm in re.finditer(
+                    r"\$([A-Za-z_][\w]*)",
+                    param_block,
+                ):
+                    pname = pm.group(1)
+                    if pname not in params:
+                        params.append(pname)
+
+        results.append(
+            {
+                "name": name,
+                "scope": scope,
+                "kind": kind,
+                "start_offset": m.start(),
+                "params": params,
+            }
+        )
+
+    results.sort(key=lambda r: r["start_offset"])
+    return results
+
+
 class CodeGraphAnalyzer:
     """Analyzes codebase and extracts entities into Weaviate code graph."""
 
@@ -3064,6 +3429,11 @@ class CodeGraphAnalyzer:
             ('shell',      self._find_shell_files,  self._analyze_shell_file),
             ('csharp',     self._find_csharp_files, self._analyze_csharp_file),
             ('proto',      self._find_proto_files,  self._analyze_proto_file),
+            # V52-O.11.B / V52-O.11.N (v0.2.53 Track E): added so the
+            # orchestrator's 244 .svelte and 168 .ps1 files stop showing
+            # zero functions in code-graph queries.
+            ('svelte',     self._find_svelte_files,     self._analyze_svelte_file),
+            ('powershell', self._find_powershell_files, self._analyze_powershell_file),
         ]
 
         # v0.2.18 (Plan C): two-phase loop so we know the grand-total file
@@ -3470,6 +3840,38 @@ class CodeGraphAnalyzer:
             f for f in repo_path.rglob('*.cs')
             if not any(d in f.parts for d in ignore_dirs)
         ])
+
+    def _find_svelte_files(self, repo_path: Path) -> List[Path]:
+        """Find all Svelte component files in repository.
+
+        V52-O.11.B (v0.2.53 Track E): added so the launcher's 244 .svelte
+        files stop indexing as zero functions in the code graph. Shares
+        the JS/TS ignore-dir set because Svelte sits in the same npm
+        tooling ecosystem (node_modules, dist, .svelte-kit codegen).
+        """
+        ignore_dirs = _ignore_dirs_for('js')
+        return sorted([
+            f for f in repo_path.rglob('*.svelte')
+            if not any(d in f.parts for d in ignore_dirs)
+        ])
+
+    def _find_powershell_files(self, repo_path: Path) -> List[Path]:
+        """Find all PowerShell script files in repository.
+
+        V52-O.11.N (v0.2.53 Track E): added so the orchestrator's 168
+        .ps1 files (template hooks + Windows-side install scripts)
+        stop indexing as zero functions in the code graph. Reuses the
+        shell ignore-dir set since .ps1 lives in the same parts of the
+        tree as .sh (templates/hooks/, scripts/).
+        """
+        ignore_dirs = _ignore_dirs_for('shell')
+        files = []
+        for ext in ('*.ps1', '*.psm1'):
+            files.extend([
+                f for f in repo_path.rglob(ext)
+                if not any(d in f.parts for d in ignore_dirs)
+            ])
+        return sorted(files)
 
     def _find_proto_files(self, repo_path: Path) -> List[Path]:
         """Find all Protocol Buffer definition files."""
@@ -5970,6 +6372,283 @@ exit
                 pass
 
         return result
+
+    def _analyze_svelte_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
+        """Analyze a Svelte component file (V52-O.11.B, v0.2.53 Track E).
+
+        Extracts top-level functions, exports, arrow-export consts, and
+        reactive declarations from <script> and <script context="module">
+        blocks. The component name is taken from the file stem (Svelte
+        convention; the file IS the component) and recorded as the
+        module summary alongside the imports list.
+
+        Imports come from ES module syntax in any <script> block. Class
+        declarations are extracted too if present (Svelte allows
+        utility classes inside a component's script block).
+        """
+        stats = {'modules': 0, 'classes': 0, 'functions': 0}
+
+        content = file_path.read_text(encoding='utf-8', errors='ignore')
+        source_lines = content.split('\n')
+        loc = len([l for l in source_lines if l.strip()])
+        file_hash = hashlib.sha256(content.encode()).hexdigest()
+        relative_path = file_path.relative_to(repo_root).as_posix()
+
+        if self._get_existing_module(relative_path, file_hash):
+            print(f"⏭️  Skipping {relative_path} (unchanged)")
+            return stats
+
+        component_name = file_path.stem
+
+        # --- Imports across all <script> blocks ---
+        imports: List[str] = []
+        for block_body, _is_module, _start in _extract_svelte_script_blocks(content):
+            for m in re.finditer(
+                r"""import\s+(?:(?:\{[^}]*\}|[\w*]+(?:\s+as\s+\w+)?)\s+from\s+)?['"]([^'"]+)['"]""",
+                block_body,
+            ):
+                imports.append(m.group(1))
+
+        # --- Module summary ---
+        # Component name + first non-empty HTML comment from the template,
+        # if present (the Svelte convention is `<!-- ... -->` at file top).
+        leading_doc = ''
+        m_html_comment = re.search(r"<!--\s*(.*?)\s*-->", content, re.DOTALL)
+        if m_html_comment:
+            leading_doc = m_html_comment.group(1).strip().split('\n')[0][:200]
+        summary_parts = [f"Svelte component: {component_name}"]
+        if leading_doc:
+            summary_parts.append(leading_doc)
+        module_summary = '\n'.join(summary_parts)
+
+        # Cyclomatic-ish complexity: count common branches/loops across
+        # script + template (matches the JS analyser's heuristic). Cheap
+        # over-approximation — exact CFG analysis would need a Svelte
+        # AST parser which we don't bundle.
+        complexity = float(
+            1 + sum(content.count(kw) for kw in [
+                'if (', 'if(', '{#if ', '{:else if ', '{#each ', '{#await ',
+                '? ', 'while (', 'while(', 'for (', 'for('
+            ])
+        )
+
+        module_uuid = self._create_or_update_module(
+            path=relative_path,
+            language="Svelte",
+            loc=loc,
+            complexity=complexity,
+            last_modified=datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc),
+            file_hash=file_hash,
+            imports=imports,
+            module_summary=module_summary,
+        )
+        stats['modules'] = 1
+
+        # --- Functions / arrow exports / reactive decls ---
+        for decl in _parse_svelte_functions(content):
+            name: str = decl["name"]
+            start_line = content[:decl["start_offset"]].count('\n') + 1
+            end_line = _extract_balanced_block(source_lines, start_line)
+            body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
+
+            kind = decl["kind"]
+            is_async = bool(decl["is_async"])
+            if kind == "reactive":
+                signature = f"$: {name} = ..."
+            elif kind == "arrow_export":
+                signature = (
+                    f"{'async ' if is_async else ''}const {name} = (...) => ..."
+                )
+            else:
+                # function / export function
+                prefix = "export " if kind == "export" else ""
+                signature = (
+                    f"{prefix}{'async ' if is_async else ''}function {name}()"
+                )
+
+            full_name = f"{component_name}.{name}"
+            embedding = embed_function(signature, body, language="javascript")
+            insert_params: Dict[str, Any] = {
+                "properties": {
+                    "name": name,
+                    "full_name": full_name,
+                    "function_body": body,
+                    "signature": signature,
+                    "doc": "",
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "is_async": is_async,
+                    "project": self.project_name,
+                },
+                "references": {"module": module_uuid},
+            }
+            if embedding:
+                insert_params["vector"] = _shape_for_insert(embedding)
+            self._dedup_insert(
+                self.functions_collection,
+                insert_params,
+                insert_params["properties"].get("full_name", insert_params["properties"]["name"]),
+                file_path_rel=relative_path,
+            )
+            stats['functions'] += 1
+
+        return stats
+
+    def _analyze_powershell_file(self, file_path: Path, repo_root: Path) -> Dict[str, int]:
+        """Analyze a PowerShell script file (V52-O.11.N, v0.2.53 Track E).
+
+        Extracts function / filter declarations + their `param(...)`
+        blocks. Imports are best-effort: `Import-Module Foo`,
+        `. .\\Path\\Common.ps1` (dot-sourcing). External calls are
+        gated on `Invoke-WebRequest` / `Invoke-RestMethod` presence
+        in content (same gating pattern as the shell analyser).
+        """
+        stats = {'modules': 0, 'classes': 0, 'functions': 0}
+
+        content = file_path.read_text(encoding='utf-8', errors='ignore')
+        source_lines = content.split('\n')
+        loc = len([l for l in source_lines
+                   if l.strip() and not l.strip().startswith('#')])
+        file_hash = hashlib.sha256(content.encode()).hexdigest()
+        relative_path = file_path.relative_to(repo_root).as_posix()
+
+        if self._get_existing_module(relative_path, file_hash):
+            print(f"⏭️  Skipping {relative_path} (unchanged)")
+            return stats
+
+        cleaned = _strip_powershell_comments(content)
+
+        # --- Imports ---
+        imports: List[str] = []
+        # `Import-Module Foo` / `Import-Module -Name Foo`
+        for m in re.finditer(
+            r"\bImport-Module\b\s+(?:-Name\s+)?['\"]?([\w./-]+)['\"]?",
+            cleaned,
+            re.IGNORECASE,
+        ):
+            imports.append(m.group(1))
+        # Dot-source: `. .\Common.ps1` / `. $PSScriptRoot\Common.ps1`
+        for m in re.finditer(
+            r"^\s*\.\s+([\w$.\\/-]+\.ps1)",
+            cleaned,
+            re.MULTILINE,
+        ):
+            imports.append(m.group(1))
+
+        # --- Module summary ---
+        # Look for a leading `<# .SYNOPSIS ... #>` block; fall back to
+        # the first single-line comment.
+        synopsis = ''
+        m_syn = re.search(
+            r"<#\s*\.SYNOPSIS\s+(.*?)\s*(?:\.[A-Z]+|\#>)",
+            content,
+            re.DOTALL,
+        )
+        if m_syn:
+            synopsis = m_syn.group(1).strip().split('\n')[0][:200]
+        else:
+            for line in source_lines[:20]:
+                s = line.strip()
+                if (
+                    s.startswith('#')
+                    and not s.startswith('#!')
+                    and not s.startswith('#region')
+                    and s.lstrip('#').strip()
+                ):
+                    synopsis = s.lstrip('#').strip()
+                    break
+        summary_parts = [f"PowerShell script: {relative_path}"]
+        if synopsis:
+            summary_parts.append(synopsis)
+        module_summary = '\n'.join(summary_parts)
+
+        complexity = float(1 + sum(
+            cleaned.count(kw) for kw in [
+                'if (', 'if(', 'elseif ', 'while (', 'while(',
+                'for (', 'for(', 'foreach (', 'foreach(',
+                'switch (', 'switch(',
+            ]
+        ))
+
+        module_uuid = self._create_or_update_module(
+            path=relative_path,
+            language="PowerShell",
+            loc=loc,
+            complexity=complexity,
+            last_modified=datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc),
+            file_hash=file_hash,
+            imports=imports,
+            module_summary=module_summary,
+        )
+        stats['modules'] = 1
+
+        # --- Functions / filters ---
+        for decl in _parse_powershell_functions(content):
+            name: str = decl["name"]
+            scope: Optional[str] = decl["scope"]
+            kind: str = decl["kind"]
+            params: List[str] = decl["params"]
+
+            # Re-derive line numbers from the ORIGINAL content (the
+            # parser used a comment-stripped copy, so its offsets are
+            # not directly comparable to the original; re-search by
+            # name to find the start line for the orchestrator's
+            # entity insertion).
+            #
+            # We anchor on the `function NAME` / `filter NAME` pattern
+            # at start-of-line in the original content. If multiple
+            # functions share a name (e.g. accidental redefinition),
+            # the first match wins — the orchestrator's `_dedup_insert`
+            # dedup on `full_name` + `file_path_rel` then either
+            # collapses them or surfaces the dedup conflict downstream.
+            scope_prefix = f"{scope}:" if scope else ""
+            anchor = re.compile(
+                r"^\s*(?:function|filter)\s+"
+                + re.escape(scope_prefix)
+                + re.escape(name)
+                + r"\b",
+                re.MULTILINE | re.IGNORECASE,
+            )
+            anchor_match = anchor.search(content)
+            if not anchor_match:
+                continue
+            start_line = content[:anchor_match.start()].count('\n') + 1
+            end_line = _extract_balanced_block(source_lines, start_line)
+            body = '\n'.join(source_lines[max(0, start_line - 1):end_line])
+
+            param_sig = ", ".join(f"${p}" for p in params)
+            signature = (
+                f"{kind} {scope_prefix}{name}({param_sig})"
+                if params
+                else f"{kind} {scope_prefix}{name}"
+            )
+            full_name = f"{file_path.stem}.{name}"
+            embedding = embed_function(signature, body, language="python")
+            insert_params: Dict[str, Any] = {
+                "properties": {
+                    "name": name,
+                    "full_name": full_name,
+                    "function_body": body,
+                    "signature": signature,
+                    "doc": "",
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "is_async": False,
+                    "project": self.project_name,
+                },
+                "references": {"module": module_uuid},
+            }
+            if embedding:
+                insert_params["vector"] = _shape_for_insert(embedding)
+            self._dedup_insert(
+                self.functions_collection,
+                insert_params,
+                insert_params["properties"].get("full_name", insert_params["properties"]["name"]),
+                file_path_rel=relative_path,
+            )
+            stats['functions'] += 1
+
+        return stats
 
     def close(self):
         """Close Weaviate connection."""
