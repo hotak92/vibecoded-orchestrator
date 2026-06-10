@@ -559,6 +559,977 @@ def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# ---------------------------------------------------------------------------
+# v0.2.53 bootstrap mode (`install.py --bootstrap`)
+#
+# Implements §3 of docs/INSTALL_ARCHITECTURE_v2.md.
+#
+# READ-ONLY by default: probes Python, Node, Podman, GPU, paths; emits a
+# versioned JSON envelope on stdout (with --json) or a human-readable
+# summary table. The envelope's `weaviate_endpoints.health` is the
+# canonical SSOT (NEW-4) — Rust + bash consumers MUST read it from here
+# rather than re-deriving (which historically diverged: install.py used
+# `/v1/.well-known/ready`, installer.rs used `/v1/meta`).
+#
+# Side-effect policy: NO writes (not even `state/logs/install.jsonl` —
+# bootstrap must be safe to run before install has ever happened). NO
+# network. NO user prompts. Every probe has timeout ≤ 10s.
+#
+# The bootstrap dispatch fires at the very top of main() BEFORE
+# `_ensure_running_under_mcp_venv()` runs, so bootstrap works on a
+# freshly cloned repo with no .venv.
+#
+# Envelope schema: docs/schemas/install-bootstrap-envelope-v1.json
+# ---------------------------------------------------------------------------
+
+BOOTSTRAP_SCHEMA_VERSION = 1
+BOOTSTRAP_PROBE_TIMEOUT_S = 10
+
+
+def _bootstrap_probe_version(
+    cmd: list[str], *, timeout: int = BOOTSTRAP_PROBE_TIMEOUT_S
+) -> Optional[str]:
+    """Run a short version-probe command; return its stdout (stripped) or None.
+
+    Soft-fails on every error: missing binary, non-zero exit, timeout,
+    OSError. Used by bootstrap probes which must NEVER throw.
+    """
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    if not out:
+        # Some tools (e.g. older `node --version`) print version to stderr.
+        out = (result.stderr or "").strip()
+    return out or None
+
+
+def _bootstrap_parse_version_tuple(s: str) -> Optional[list[int]]:
+    """Extract the first dotted-numeric run from `s`; return as list[int].
+
+    `'Python 3.13.2'` -> `[3, 13, 2]`. `'v20.11.0'` -> `[20, 11, 0]`.
+    Returns None when no version is found.
+    """
+    if not s:
+        return None
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", s)
+    if not m:
+        return None
+    parts = [int(g) for g in m.groups() if g is not None]
+    return parts
+
+
+def _bootstrap_probe_binary(
+    name: str,
+    *,
+    version_argv: Optional[list[str]] = None,
+    extra_search_dirs: Optional[list[Path]] = None,
+    parser: Optional[Any] = None,
+) -> dict:
+    """Probe one binary on PATH. Return ToolProbe-shaped dict.
+
+    Soft-fails to `ok=False, cmd=None, version=None` for any error path.
+    """
+    cmd_path: Optional[str] = shutil.which(name)
+    if cmd_path is None and extra_search_dirs:
+        for d in extra_search_dirs:
+            cand = d / name
+            if cand.exists() and os.access(str(cand), os.X_OK):
+                cmd_path = str(cand)
+                break
+    if cmd_path is None:
+        return {
+            "cmd": None, "version": None, "version_tuple": None, "ok": False,
+        }
+    argv = [cmd_path] + (version_argv if version_argv is not None else ["--version"])
+    raw = _bootstrap_probe_version(argv)
+    parsed_version = parser(raw) if (parser and raw) else raw
+    vt = _bootstrap_parse_version_tuple(raw or "")
+    return {
+        "cmd": cmd_path,
+        "version": parsed_version,
+        "version_tuple": vt,
+        "ok": True,
+    }
+
+
+def _bootstrap_python_wheel_support(venv_python_or_self: str) -> Optional[bool]:
+    """M-P1-1: detect whether the running Python has wheel coverage for VCO deps.
+
+    Calls ``pip install --dry-run --only-binary=:all:`` against a small
+    representative set of pinned deps. If pip reports "Would install",
+    wheels are available. If pip falls back to source build, returns False.
+
+    Soft-fails to None if pip is unavailable (e.g. before venv exists);
+    callers treat None as "unknown, defer judgement".
+    """
+    # Representative set: cover ML/native + pure-Python so a false-negative
+    # in either family shows up. Kept small (under 10s probe budget).
+    probe_pkgs = ["weaviate-client>=4.7", "pydantic>=2", "httpx>=0.27"]
+    try:
+        result = subprocess.run(
+            [venv_python_or_self, "-m", "pip", "install",
+             "--dry-run", "--only-binary=:all:",
+             "--no-cache-dir", "--quiet",
+             *probe_pkgs],
+            capture_output=True, text=True, timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
+            env={**os.environ, "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return None
+    # Non-zero exit when pip needs to build from source under --only-binary.
+    return result.returncode == 0
+
+
+def _bootstrap_detect_os() -> tuple[str, str]:
+    """Return (canonical_os, os_family).
+
+    canonical_os: 'macos' | 'linux' | 'windows' | 'unknown'.
+    os_family: lowercased platform.system() variant.
+    """
+    sysname = (platform.system() or "").strip().lower()
+    if sysname == "darwin":
+        return ("macos", "darwin")
+    if sysname == "linux":
+        return ("linux", "linux")
+    if sysname.startswith("win"):
+        # mingw64 (git-bash) vs msvc (cmd) — both report 'windows' to
+        # platform.system(); distinguish via the SHELL env if available.
+        shell = (os.environ.get("SHELL") or "").lower()
+        fam = "mingw64" if "git" in shell or "msys" in shell else "msvc"
+        return ("windows", fam)
+    return ("unknown", sysname or "unknown")
+
+
+def _bootstrap_normalize_arch() -> str:
+    """Return normalized arch: arm64 | x86_64 | aarch64 | other."""
+    raw = (platform.machine() or "").strip().lower()
+    if raw in ("arm64", "aarch64"):
+        # macOS reports arm64; Linux reports aarch64. Canonicalise to
+        # the value present in launcher/dist subdirs.
+        return raw
+    if raw in ("x86_64", "amd64"):
+        return "x86_64"
+    return raw or "unknown"
+
+
+def _bootstrap_detect_linux_distro() -> Optional[dict]:
+    """Parse /etc/os-release. Return None on non-Linux or unreadable file."""
+    if (platform.system() or "").lower() != "linux":
+        return None
+    osr = Path("/etc/os-release")
+    if not osr.is_file():
+        return None
+    try:
+        kv: dict[str, str] = {}
+        for line in osr.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" not in line or line.startswith("#"):
+                continue
+            k, _, v = line.partition("=")
+            kv[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        return None
+    distro_id = (kv.get("ID") or "").lower()
+    pkgmgr_map = {
+        "ubuntu": "apt", "debian": "apt", "raspbian": "apt", "linuxmint": "apt",
+        "fedora": "dnf", "rhel": "dnf", "centos": "dnf", "rocky": "dnf",
+        "almalinux": "dnf", "amzn": "dnf",
+        "arch": "pacman", "manjaro": "pacman",
+        "opensuse": "zypper", "opensuse-leap": "zypper", "opensuse-tumbleweed": "zypper",
+        "sles": "zypper",
+        "alpine": "apk",
+    }
+    return {
+        "id": distro_id or None,
+        "version_id": kv.get("VERSION_ID") or None,
+        "codename": kv.get("VERSION_CODENAME") or None,
+        "pkg_mgr": pkgmgr_map.get(distro_id),
+    }
+
+
+def _bootstrap_detect_macos_features() -> Optional[dict]:
+    """macOS-only features: Homebrew prefix, Apple Silicon, Rosetta."""
+    if (platform.system() or "").lower() != "darwin":
+        return None
+    brew_prefix: Optional[str] = None
+    if Path("/opt/homebrew/bin/brew").is_file():
+        brew_prefix = "/opt/homebrew"
+    elif Path("/usr/local/bin/brew").is_file():
+        brew_prefix = "/usr/local"
+    is_apple_silicon = _bootstrap_normalize_arch() == "arm64"
+    rosetta_present = Path("/Library/Apple/usr/libexec/oah/translate").exists()
+    return {
+        "homebrew_prefix": brew_prefix,
+        "is_apple_silicon": is_apple_silicon,
+        "rosetta_present": rosetta_present,
+    }
+
+
+def _bootstrap_detect_windows_features() -> Optional[dict]:
+    """Windows-only features: PowerShell version, winget, chocolatey, WSL2."""
+    if not (platform.system() or "").lower().startswith("win"):
+        return None
+    ps_ver = _windows_powershell_version() if "_windows_powershell_version" in globals() else None
+    return {
+        "powershell_version": list(ps_ver) if ps_ver else None,
+        "winget_present": shutil.which("winget") is not None,
+        "chocolatey_present": shutil.which("choco") is not None,
+        "wsl2_present": shutil.which("wsl") is not None,
+    }
+
+
+def _bootstrap_detect_podman() -> dict:
+    """Probe Podman binary and (macOS/Windows only) machine state."""
+    base = _bootstrap_probe_binary("podman")
+    machine_running: Optional[bool] = None
+    canonical_os, _ = _bootstrap_detect_os()
+    if base["ok"] and canonical_os in ("macos", "windows"):
+        # podman machine list --format json -> parse for any Running=true.
+        try:
+            result = subprocess.run(
+                [base["cmd"], "machine", "list", "--format", "json"],
+                capture_output=True, text=True,
+                timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
+            )
+            if result.returncode == 0:
+                try:
+                    machines = json.loads(result.stdout or "[]")
+                    machine_running = any(
+                        m.get("Running") is True
+                        for m in (machines if isinstance(machines, list) else [])
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    machine_running = False
+            else:
+                machine_running = False
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            machine_running = False
+    base["machine_running"] = machine_running
+    base["ok"] = base["ok"] and (machine_running is not False)
+    return base
+
+
+def _bootstrap_detect_docker() -> dict:
+    """Probe Docker binary."""
+    return _bootstrap_probe_binary("docker")
+
+
+def _bootstrap_detect_brew() -> dict:
+    """Probe brew binary + prefix."""
+    base = _bootstrap_probe_binary("brew")
+    prefix: Optional[str] = None
+    if base["ok"] and base["cmd"]:
+        prefix = _bootstrap_probe_version([base["cmd"], "--prefix"])
+    base["prefix"] = prefix
+    return base
+
+
+def _bootstrap_detect_gpu() -> dict:
+    """Best-effort GPU detection. Soft-fails to vendor='none' on errors."""
+    canonical_os, _ = _bootstrap_detect_os()
+    if canonical_os == "macos":
+        if _bootstrap_normalize_arch() == "arm64":
+            return {
+                "vendor": "metal", "model": "Apple Silicon",
+                "vram_gb": None, "driver_version": None,
+                "container_toolkit_ok": None,
+            }
+        return {
+            "vendor": "none", "model": None, "vram_gb": None,
+            "driver_version": None, "container_toolkit_ok": None,
+        }
+    # Try nvidia-smi
+    if shutil.which("nvidia-smi"):
+        out = _bootstrap_probe_version(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+             "--format=csv,noheader,nounits"]
+        )
+        if out:
+            first = out.splitlines()[0].split(",")
+            model = first[0].strip() if first else None
+            try:
+                vram_mb = float(first[1].strip()) if len(first) > 1 else 0.0
+                vram_gb = round(vram_mb / 1024.0, 1) if vram_mb else None
+            except (ValueError, IndexError):
+                vram_gb = None
+            driver = first[2].strip() if len(first) > 2 else None
+            return {
+                "vendor": "nvidia", "model": model, "vram_gb": vram_gb,
+                "driver_version": driver, "container_toolkit_ok": None,
+            }
+    if shutil.which("rocm-smi"):
+        return {
+            "vendor": "amd", "model": "AMD GPU (rocm)",
+            "vram_gb": None, "driver_version": None,
+            "container_toolkit_ok": None,
+        }
+    return {
+        "vendor": "none", "model": None, "vram_gb": None,
+        "driver_version": None, "container_toolkit_ok": None,
+    }
+
+
+def _bootstrap_classify_install_root(root: Path) -> str:
+    """Return install_root_kind per §3.4.
+
+    - orchestrator_clone: has install.py + CLAUDE.md + .git, no state/.
+    - completed_install: has install.py + CLAUDE.md + (state/ OR .env w/ KG_COLLECTION).
+    - git_repo: has .git but no install markers.
+    - unknown: none of the above.
+    """
+    has_install_py = (root / "install.py").is_file()
+    has_claude_md = (root / "CLAUDE.md").is_file()
+    has_git = (root / ".git").exists()
+    has_state = (root / "state").is_dir()
+    env_path = root / ".env"
+    has_env_kg = False
+    if env_path.is_file():
+        try:
+            has_env_kg = "KG_COLLECTION=" in env_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except OSError:
+            has_env_kg = False
+    if has_install_py and has_claude_md and (has_state or has_env_kg):
+        return "completed_install"
+    if has_install_py and has_claude_md and has_git:
+        return "orchestrator_clone"
+    if has_git:
+        return "git_repo"
+    return "unknown"
+
+
+def _bootstrap_launcher_dist_subdir() -> Optional[str]:
+    """Return the canonical launcher dist subdir for this OS.
+
+    SSOT for M-P0-2: macOS is `macos-arm64` (NOT `experimental_macOS`).
+    """
+    canonical_os, _ = _bootstrap_detect_os()
+    if canonical_os == "macos":
+        return "macos-arm64"
+    if canonical_os == "linux":
+        return "linux-x64"
+    if canonical_os == "windows":
+        return "windows-x64"
+    return None
+
+
+def _bootstrap_resolve_vco_version(root: Path) -> tuple[str, Optional[str]]:
+    """Return (vco_version, short_sha).
+
+    Reads VERSION file when present; falls back to git short-sha resolution.
+    Soft-fails to ('unknown', None).
+    """
+    version_file = root / "VERSION"
+    vco_version = "unknown"
+    if version_file.is_file():
+        try:
+            vco_version = version_file.read_text(
+                encoding="utf-8", errors="replace"
+            ).strip() or "unknown"
+            if vco_version != "unknown" and not vco_version.startswith("v"):
+                vco_version = "v" + vco_version
+        except OSError:
+            pass
+    short_sha: Optional[str] = None
+    git_dir = root / ".git"
+    if git_dir.exists():
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                short_sha = (r.stdout or "").strip() or None
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            short_sha = None
+    return (vco_version, short_sha)
+
+
+def _bootstrap_resolve_paths(root: Path) -> dict:
+    """Build the `paths` envelope block."""
+    subdir = _bootstrap_launcher_dist_subdir()
+    launcher_bin: Optional[Path] = None
+    hub_bin: Optional[Path] = None
+    if subdir:
+        dist_dir = root / "launcher" / "dist" / subdir
+        is_win = subdir.startswith("windows")
+        launcher_bin = dist_dir / (
+            "vct-launcher.exe" if is_win else "vct-launcher"
+        )
+        hub_bin = dist_dir / ("vct-hub.exe" if is_win else "vct-hub")
+    venv_python = root / ".venv" / (
+        "Scripts" if platform.system().lower().startswith("win") else "bin"
+    ) / ("python.exe" if platform.system().lower().startswith("win") else "python3")
+    mcp_venv_python = root / "claude_mcp_servers" / ".venv" / (
+        "Scripts" if platform.system().lower().startswith("win") else "bin"
+    ) / ("python.exe" if platform.system().lower().startswith("win") else "python3")
+    vct_root = Path(os.environ.get("VCT_STATE_DIR") or (Path.home() / ".vct"))
+    return {
+        "install_root": str(root),
+        "install_root_kind": _bootstrap_classify_install_root(root),
+        "venv_python": str(venv_python) if venv_python.parent.exists() else None,
+        "mcp_venv_python": (
+            str(mcp_venv_python) if mcp_venv_python.parent.exists() else None
+        ),
+        "launcher_dist_subdir": subdir,
+        "launcher_binary": str(launcher_bin) if launcher_bin else None,
+        "launcher_binary_exists": bool(launcher_bin and launcher_bin.is_file()),
+        "vct_hub_binary": str(hub_bin) if hub_bin else None,
+        "vct_hub_binary_exists": bool(hub_bin and hub_bin.is_file()),
+        "state_dir": str(root / "state"),
+        "state_dir_exists": (root / "state").is_dir(),
+        "claude_dir": str(root / ".claude"),
+        "vct_root_dir": str(vct_root),
+        "launcher_db": str(vct_root / "launcher.db"),
+        "hub_port_file": str(vct_root / "hub.port"),
+        "hub_token_file": str(vct_root / "hub.token"),
+    }
+
+
+def _bootstrap_package_manager_advice(
+    system_block: dict, distro: Optional[dict],
+) -> dict:
+    """Build the `package_manager_advice` block. L-P0-1 parity-aware."""
+    canonical_os = system_block["os"]
+    has_brew = system_block["brew"]["ok"]
+    has_winget = (
+        system_block.get("windows_features") and
+        system_block["windows_features"].get("winget_present")
+    )
+    primary: Optional[str] = None
+    if canonical_os == "macos" and has_brew:
+        primary = "brew"
+    elif canonical_os == "windows" and has_winget:
+        primary = "winget"
+    elif canonical_os == "linux" and distro and distro.get("pkg_mgr"):
+        primary = distro["pkg_mgr"]
+    elif canonical_os == "linux" and has_brew:
+        primary = "brew"  # Linuxbrew last-resort
+
+    # Build install hints per primary pkgmgr.
+    install_python: list[str] = []
+    install_node: list[str] = []
+    install_podman: list[str] = []
+    install_joern: list[str] = []
+    install_lean_ctx: list[str] = []
+    if primary == "brew":
+        install_python = ["brew install python@3.13"]
+        install_node = ["brew install node"]
+        install_podman = ["brew install podman"]
+        install_joern = ["brew install joern"]
+        install_lean_ctx = ["brew install lean-ctx"]
+    elif primary == "apt":
+        install_python = ["sudo apt-get update",
+                          "sudo apt-get install -y python3 python3-venv python3-pip"]
+        install_node = ["sudo apt-get install -y nodejs npm"]
+        install_podman = ["sudo apt-get install -y podman"]
+        install_joern = []  # not in apt
+        install_lean_ctx = []
+    elif primary == "dnf":
+        install_python = ["sudo dnf install -y python3 python3-pip"]
+        install_node = ["sudo dnf install -y nodejs npm"]
+        install_podman = ["sudo dnf install -y podman"]
+    elif primary == "pacman":
+        install_python = ["sudo pacman -S --noconfirm python python-pip"]
+        install_node = ["sudo pacman -S --noconfirm nodejs npm"]
+        install_podman = ["sudo pacman -S --noconfirm podman"]
+    elif primary == "zypper":
+        install_python = ["sudo zypper install -y python3 python3-pip"]
+        install_node = ["sudo zypper install -y nodejs npm"]
+        install_podman = ["sudo zypper install -y podman"]
+    elif primary == "apk":
+        install_python = ["sudo apk add python3 py3-pip"]
+        install_node = ["sudo apk add nodejs npm"]
+        install_podman = ["sudo apk add podman"]
+    elif primary == "winget":
+        install_python = ["winget install --id Python.Python.3.13 --silent"]
+        install_node = ["winget install --id OpenJS.NodeJS.LTS --silent"]
+        install_podman = ["winget install --id RedHat.Podman --silent"]
+
+    # M-P1-2 — macOS/Windows need podman machine init + start after podman install.
+    if (
+        canonical_os in ("macos", "windows")
+        and install_podman
+        and system_block["podman"].get("machine_running") is not True
+    ):
+        install_podman = install_podman + [
+            "podman machine init", "podman machine start",
+        ]
+
+    # Tauri deps — Linux-only, distro-aware (L-P0-2)
+    tauri_deps: list[str] = []
+    if canonical_os == "linux" and distro:
+        d_id = (distro.get("id") or "").lower()
+        d_ver = distro.get("version_id") or ""
+        if d_id in ("ubuntu", "debian", "linuxmint", "raspbian"):
+            # Ubuntu 24.04+ ships libwebkit2gtk-4.1; older needs 4.0 fallback.
+            tauri_deps = [
+                "build-essential", "curl", "wget", "file", "libssl-dev",
+                "libgtk-3-dev", "libayatana-appindicator3-dev",
+                "librsvg2-dev", "libwebkit2gtk-4.1-dev",
+            ]
+            try:
+                major = int((d_ver or "0").split(".")[0])
+                if major < 24:
+                    tauri_deps.append("libwebkit2gtk-4.0-dev  # fallback")
+            except ValueError:
+                tauri_deps.append("libwebkit2gtk-4.0-dev  # fallback")
+        elif d_id in ("fedora", "rhel", "centos", "rocky", "almalinux"):
+            tauri_deps = [
+                "webkit2gtk4.1-devel", "openssl-devel", "curl", "wget",
+                "file", "libappindicator-gtk3-devel", "librsvg2-devel",
+            ]
+
+    # SELinux Z-flag — Fedora-family + Enforcing
+    selinux_z = False
+    if (
+        canonical_os == "linux" and distro
+        and (distro.get("id") or "").lower() in ("fedora", "rhel", "centos", "rocky", "almalinux")
+    ):
+        try:
+            r = subprocess.run(
+                ["getenforce"], capture_output=True, text=True,
+                timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
+            )
+            selinux_z = (r.stdout or "").strip().lower() == "enforcing"
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            selinux_z = False
+
+    # NVIDIA container toolkit install hint (L-P0-7)
+    nvidia_toolkit: Optional[str] = None
+    if (
+        canonical_os == "linux"
+        and system_block["gpu"]["vendor"] == "nvidia"
+        and not shutil.which("nvidia-ctk")
+    ):
+        if primary == "apt":
+            nvidia_toolkit = (
+                "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey "
+                "| sudo gpg --dearmor -o "
+                "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && "
+                "sudo apt-get update && "
+                "sudo apt-get install -y nvidia-container-toolkit"
+            )
+        elif primary == "dnf":
+            nvidia_toolkit = "sudo dnf install -y nvidia-container-toolkit"
+
+    return {
+        "primary": primary,
+        "install_python": install_python,
+        "install_node": install_node,
+        "install_podman": install_podman,
+        "install_joern": install_joern,
+        "install_lean_ctx": install_lean_ctx,
+        "tauri_deps": tauri_deps,
+        "selinux_volume_flag_needed": selinux_z,
+        "nvidia_container_toolkit_install": nvidia_toolkit,
+        "render_group_remediation": None,
+    }
+
+
+def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
+    """Build the `missing_prereqs` list. Order matters (UI may show top-N)."""
+    out: list[dict] = []
+
+    # Python wheel-support warning (M-P1-1)
+    py = system_block["python"]
+    if py.get("wheel_support_ok") is False:
+        out.append({
+            "name": "python_wheel_coverage",
+            "human": (
+                f"Python {py.get('version')} lacks wheel coverage for "
+                "VCO's binary deps; pip would build from source"
+            ),
+            "severity": "warning",
+            "install_hint": (
+                "Consider downgrading to Python 3.12 or 3.13 for full "
+                "wheel coverage. See docs/TROUBLESHOOTING.md."
+            ),
+        })
+
+    # Container runtime — at least one of podman/docker must be present.
+    if not (system_block["podman"]["ok"] or system_block["docker"]["ok"]):
+        # Did podman binary exist but machine wasn't running?
+        if system_block["podman"]["cmd"] is not None:
+            out.append({
+                "name": "podman_machine",
+                "human": "Podman is installed but the VM is not running",
+                "severity": "blocking",
+                "install_hint": "podman machine init && podman machine start",
+            })
+        else:
+            out.append({
+                "name": "container_runtime",
+                "human": "Podman or Docker is required",
+                "severity": "blocking",
+                "install_hint": (
+                    "Install Podman (recommended) or Docker. "
+                    "See docs/GETTING_STARTED.md."
+                ),
+            })
+
+    # Node/npm — required for Claude Code MCP layer + diagram MCP.
+    if not system_block["node"]["ok"]:
+        out.append({
+            "name": "node",
+            "human": "Node.js 20+ is required",
+            "severity": "blocking",
+            "install_hint": "See package_manager_advice.install_node",
+        })
+
+    # Git — needed for orchestrator clone validation
+    if not system_block["git"]["ok"]:
+        out.append({
+            "name": "git",
+            "human": "git is required",
+            "severity": "blocking",
+            "install_hint": "Install git via your system package manager",
+        })
+
+    # Joern — optional
+    if not system_block["joern"]["ok"]:
+        out.append({
+            "name": "joern",
+            "human": "Joern is optional (CFG/PDG code-graph analysis)",
+            "severity": "optional",
+            "install_hint": "See package_manager_advice.install_joern",
+        })
+    # lean-ctx — optional
+    if not system_block["lean_ctx"]["ok"]:
+        out.append({
+            "name": "lean_ctx",
+            "human": "lean-ctx is optional (bash output compression)",
+            "severity": "optional",
+            "install_hint": "See package_manager_advice.install_lean_ctx",
+        })
+
+    return out
+
+
+def _bootstrap_build_envelope(root: Path) -> dict:
+    """Build the full v1 envelope. All sub-probes soft-fail."""
+    canonical_os, os_family = _bootstrap_detect_os()
+    arch = _bootstrap_normalize_arch()
+    vco_version, short_sha = _bootstrap_resolve_vco_version(root)
+
+    # System probes.
+    python_self = sys.executable or "python3"
+    python_block = {
+        "cmd": python_self,
+        "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "version_tuple": [
+            sys.version_info.major, sys.version_info.minor, sys.version_info.micro,
+        ],
+        "min_required": list(MIN_PYTHON),
+        "wheel_support_ok": _bootstrap_python_wheel_support(python_self),
+        "ok": (sys.version_info.major, sys.version_info.minor) >= MIN_PYTHON,
+    }
+
+    node_block = _bootstrap_probe_binary("node")
+    if node_block["ok"]:
+        node_block["min_required"] = [18, 0, 0]
+        # Check 18+ minimum
+        vt = node_block.get("version_tuple") or [0]
+        node_block["ok"] = vt[0] >= 18
+
+    npm_block = _bootstrap_probe_binary("npm")
+    pnpm_block = _bootstrap_probe_binary("pnpm")
+    git_block = _bootstrap_probe_binary("git")
+    brew_block = _bootstrap_detect_brew()
+    joern_block = _bootstrap_probe_binary("joern")
+    lean_ctx_block = _bootstrap_probe_binary("lean-ctx")
+    claude_block = _bootstrap_probe_binary("claude")
+
+    podman_block = _bootstrap_detect_podman()
+    docker_block = _bootstrap_detect_docker()
+    container_runtime_chosen: Optional[str] = None
+    if podman_block["ok"]:
+        container_runtime_chosen = "podman"
+    elif docker_block["ok"]:
+        container_runtime_chosen = "docker"
+
+    distro = _bootstrap_detect_linux_distro()
+    macos_features = _bootstrap_detect_macos_features()
+    windows_features = _bootstrap_detect_windows_features()
+    gpu_block = _bootstrap_detect_gpu()
+
+    # RAM probe (soft-fail).
+    ram_gb: Optional[float] = None
+    try:
+        if canonical_os == "linux":
+            for line in Path("/proc/meminfo").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    ram_gb = round(kb / 1024.0 / 1024.0, 1)
+                    break
+        elif canonical_os == "macos":
+            r = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
+                timeout=5,
+            )
+            if r.returncode == 0:
+                ram_gb = round(int(r.stdout.strip()) / (1024**3), 1)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        ram_gb = None
+
+    cpu_count = os.cpu_count()
+
+    system_block = {
+        "os": canonical_os,
+        "os_family": os_family,
+        "kernel_release": platform.release() or None,
+        "arch": arch,
+        "ram_gb": ram_gb,
+        "cpu_count": cpu_count,
+        "python": python_block,
+        "node": node_block,
+        "npm": npm_block,
+        "pnpm": pnpm_block,
+        "podman": podman_block,
+        "docker": docker_block,
+        "container_runtime_chosen": container_runtime_chosen,
+        "git": git_block,
+        "brew": brew_block,
+        "joern": joern_block,
+        "lean_ctx": lean_ctx_block,
+        "claude_cli": claude_block,
+        "gpu": gpu_block,
+        "linux_distro": distro,
+        "windows_features": windows_features,
+        "macos_features": macos_features,
+    }
+
+    paths_block = _bootstrap_resolve_paths(root)
+    pm_advice = _bootstrap_package_manager_advice(system_block, distro)
+
+    # Endpoints — NEW-4 SSOT: weaviate health is `/v1/.well-known/ready`.
+    weaviate_endpoints = {
+        "base": "http://localhost:8081",
+        "health": "http://localhost:8081/v1/.well-known/ready",
+        "meta": "http://localhost:8081/v1/meta",
+        "schema": "http://localhost:8081/v1/schema",
+        "graphql": "http://localhost:8081/v1/graphql",
+        "grpc_host": "localhost:50052",
+    }
+    ollama_endpoints = {
+        "base": "http://localhost:11435",
+        "tags": "http://localhost:11435/api/tags",
+        "pull": "http://localhost:11435/api/pull",
+    }
+    code_embed_endpoints = {
+        "base": "http://localhost:11440",
+        "health": "http://localhost:11440/health",
+    }
+    vct_hub_endpoints = {
+        "base": "http://127.0.0.1:7700",
+        "health": "http://127.0.0.1:7700/api/v1/health",
+    }
+
+    missing = _bootstrap_compute_missing_prereqs(system_block)
+    blocker_messages = [m["human"] for m in missing if m["severity"] == "blocking"]
+    warnings = [m["human"] for m in missing if m["severity"] == "warning"]
+    ready = len(blocker_messages) == 0
+
+    return {
+        "schema_version": BOOTSTRAP_SCHEMA_VERSION,
+        "vco_version": vco_version,
+        "vco_short_sha": short_sha,
+        "generated_at": _utc_iso_now(),
+        "system": system_block,
+        "paths": paths_block,
+        "package_manager_advice": pm_advice,
+        "weaviate_endpoints": weaviate_endpoints,
+        "ollama_endpoints": ollama_endpoints,
+        "code_embed_endpoints": code_embed_endpoints,
+        "vct_hub_endpoints": vct_hub_endpoints,
+        "missing_prereqs": missing,
+        "ready_to_install": ready,
+        "blocker_messages": blocker_messages,
+        "warnings": warnings,
+    }
+
+
+def _bootstrap_print_human(envelope: dict) -> None:
+    """Pretty-print envelope as a human-readable summary table."""
+    sys_b = envelope["system"]
+    print()
+    print(f"VCO Bootstrap Probe  (schema v{envelope['schema_version']}, "
+          f"{envelope['vco_version']})")
+    print("=" * 72)
+    print(f"OS              : {sys_b['os']} ({sys_b['os_family']}, {sys_b['arch']})")
+    if sys_b.get("ram_gb") is not None:
+        print(f"RAM             : {sys_b['ram_gb']} GB")
+    if sys_b.get("cpu_count"):
+        print(f"CPU cores       : {sys_b['cpu_count']}")
+    print("-" * 72)
+
+    def _row(label: str, probe: dict) -> None:
+        status = "ok " if probe.get("ok") else "MISS"
+        ver = probe.get("version") or ""
+        cmd = probe.get("cmd") or "(not found)"
+        print(f"  {label:<14} [{status}]  {ver:<12}  {cmd}")
+    _row("python", sys_b["python"])
+    _row("node", sys_b["node"])
+    _row("npm", sys_b["npm"])
+    _row("podman", sys_b["podman"])
+    _row("docker", sys_b["docker"])
+    _row("git", sys_b["git"])
+    _row("brew", sys_b["brew"])
+    _row("joern", sys_b["joern"])
+    _row("lean-ctx", sys_b["lean_ctx"])
+    _row("claude", sys_b["claude_cli"])
+    print("-" * 72)
+    if envelope["missing_prereqs"]:
+        print(f"Missing prereqs ({len(envelope['missing_prereqs'])}):")
+        for m in envelope["missing_prereqs"]:
+            sev = m["severity"].upper()
+            print(f"  [{sev:<8}] {m['name']}: {m['human']}")
+            if m.get("install_hint"):
+                print(f"             hint: {m['install_hint']}")
+    else:
+        print("No missing prereqs detected.")
+    print("-" * 72)
+    print(f"Ready to install: {'YES' if envelope['ready_to_install'] else 'NO'}")
+    if envelope["blocker_messages"]:
+        for b in envelope["blocker_messages"]:
+            print(f"  BLOCKER: {b}")
+    if envelope["warnings"]:
+        for w in envelope["warnings"]:
+            print(f"  WARN:    {w}")
+    print()
+
+
+def _bootstrap_install_missing(envelope: dict, *, no_prompt: bool) -> int:
+    """Implement `--install-missing`. Returns exit code (0 ok, 3 pkgmgr failed).
+
+    Side-effect policy: this IS the side-effect branch. Runs pkgmgr
+    install commands from `package_manager_advice` for each blocking
+    prereq. macOS/Windows: also runs `podman machine init` + `start`.
+    Re-prints the post-install envelope if changes succeed.
+    """
+    missing = envelope["missing_prereqs"]
+    blocking = [m for m in missing if m["severity"] == "blocking"]
+    if not blocking:
+        print("[--install-missing] No blocking prereqs; nothing to do.")
+        return 0
+    advice = envelope["package_manager_advice"]
+    if not no_prompt and sys.stdin.isatty():
+        names = ", ".join(m["name"] for m in blocking)
+        ans = input(
+            f"Install missing prereqs [{names}]? [Y/n] "
+        ).strip().lower()
+        if ans and ans not in ("y", "yes"):
+            print("[--install-missing] Aborted by user.")
+            return 3
+    failed: list[str] = []
+    for m in blocking:
+        name = m["name"]
+        # Map prereq name to advice key.
+        cmds: list[str] = []
+        if name in ("container_runtime", "podman_machine"):
+            cmds = advice.get("install_podman", [])
+        elif name == "node":
+            cmds = advice.get("install_node", [])
+        elif name == "python_wheel_coverage":
+            print(f"[--install-missing] {name}: no automated remediation; "
+                  "see docs/TROUBLESHOOTING.md")
+            continue
+        if not cmds:
+            print(f"[--install-missing] No install advice for {name}; skipping.")
+            continue
+        print(f"[--install-missing] {name}: running")
+        for c in cmds:
+            print(f"  $ {c}")
+            try:
+                r = subprocess.run(c, shell=True, timeout=600)
+            except (subprocess.SubprocessError, OSError) as e:
+                print(f"    FAIL: {e}")
+                failed.append(name)
+                break
+            if r.returncode != 0:
+                print(f"    FAIL (exit {r.returncode})")
+                failed.append(name)
+                break
+    if failed:
+        print(f"[--install-missing] Failed: {', '.join(failed)}")
+        return 3
+    print("[--install-missing] All install commands completed.")
+    return 0
+
+
+def _run_bootstrap(argv: list[str]) -> int:
+    """Top-level dispatch for `install.py --bootstrap`.
+
+    Argv parsing is intentionally lightweight (no argparse) because this
+    runs BEFORE the main argparse instance is built and BEFORE the MCP
+    venv relaunch. We accept ONLY `--bootstrap`, `--json`,
+    `--install-missing`, `--no-prompt`, `--verbose`. Any other arg is a
+    bad-invocation error.
+    """
+    # Strip --bootstrap so consumers don't double-parse it later.
+    args_set = set(argv)
+    bad_combos = {"--update", "--lightweight", "--uninstall"}
+    if args_set & bad_combos:
+        print(
+            "ERROR: --bootstrap cannot be combined with "
+            f"{', '.join(sorted(args_set & bad_combos))}",
+            file=sys.stderr,
+        )
+        return 2
+    allowed = {
+        "--bootstrap", "--json", "--install-missing",
+        "--no-prompt", "--verbose",
+    }
+    unknown = [a for a in argv if a not in allowed and a != "--yes"]
+    if unknown:
+        print(
+            f"ERROR: --bootstrap rejects unknown args: {' '.join(unknown)}",
+            file=sys.stderr,
+        )
+        return 2
+    want_json = "--json" in args_set
+    want_install_missing = "--install-missing" in args_set
+    no_prompt = "--no-prompt" in args_set or "--yes" in args_set
+
+    try:
+        envelope = _bootstrap_build_envelope(PROJECT_ROOT)
+    except Exception as e:  # noqa: BLE001 — top-level safety net
+        # Bootstrap MUST NEVER hang or crash silently. Print traceback to
+        # stderr so the user sees it; exit 1 per §3.2.
+        import traceback
+        print(f"ERROR: bootstrap envelope build failed: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return 1
+
+    if want_install_missing:
+        rc = _bootstrap_install_missing(envelope, no_prompt=no_prompt)
+        if rc != 0:
+            return rc
+        # Re-detect after install.
+        try:
+            envelope = _bootstrap_build_envelope(PROJECT_ROOT)
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: post-install probe failed: {e}", file=sys.stderr)
+            return 1
+
+    if want_json:
+        # Stable, indented JSON for human-readable debugging + machine consumers.
+        json.dump(envelope, sys.stdout, indent=2, sort_keys=False)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    else:
+        _bootstrap_print_human(envelope)
+    return 0
+
+
 def _load_resume_state() -> dict[str, str]:
     """Parse state/logs/install.jsonl and return {step: last_phase} for the
     most-recent install session that's no older than 24 hours.
@@ -4051,6 +5022,27 @@ def _audit_and_offer_env_secret_migration(
 
 
 def main() -> int:
+    # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
+    # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
+    # probe is usable on a freshly cloned repo with no .venv. The bootstrap
+    # dispatch reads sys.argv directly (no argparse) because argparse
+    # construction happens further down and we don't want to defer the
+    # short-circuit through there.
+    #
+    # Bootstrap is READ-ONLY by default. With --install-missing it runs
+    # pkgmgr install commands for blocking prereqs. Never writes JSONL,
+    # never spawns daemons (except `podman machine init` when explicitly
+    # requested), never mutates ~/.claude.json. See §3.5 side-effect policy.
+    if "--bootstrap" in sys.argv:
+        # Defer --help to the full argparse so the user sees the
+        # standard help envelope rather than a bootstrap-only error.
+        if "--help" in sys.argv or "-h" in sys.argv:
+            pass
+        else:
+            # Forward only flags after the script name; --bootstrap is
+            # consumed inside _run_bootstrap.
+            return _run_bootstrap(sys.argv[1:])
+
     # v0.2.46 Part-1.5 H3: DO NOT call _log_install_event or any code that
     # buffers state into module-level variables BEFORE this line. When
     # _ensure_running_under_mcp_venv() execve's into the MCP venv, the new
@@ -4131,6 +5123,31 @@ def main() -> int:
                              "Always writes .claude/context/UPDATE_DEFERRED.md at the end — "
                              "either with actionable deferral entries OR a stub confirming "
                              "the run completed cleanly (Fix 6, v0.2.13).")
+    # v0.2.53: bootstrap mode is short-circuited at top of main() BEFORE
+    # argparse runs (so it works on a freshly cloned repo with no .venv).
+    # The argparse entries here exist only so `install.py --help` shows
+    # the flags. The actual dispatch reads sys.argv directly — argparse
+    # never sees these in bootstrap runs. See _run_bootstrap().
+    parser.add_argument("--bootstrap", action="store_true",
+                        help="(v0.2.53) Bootstrap probe mode: detect system "
+                             "prereqs and emit a versioned JSON envelope "
+                             "(with --json) or human-readable summary "
+                             "(default). READ-ONLY; safe to run before "
+                             "first install. Implements §3 of "
+                             "docs/INSTALL_ARCHITECTURE_v2.md. Schema: "
+                             "docs/schemas/install-bootstrap-envelope-v1.json.")
+    parser.add_argument("--json", action="store_true",
+                        help="With --bootstrap: emit JSON envelope on stdout "
+                             "for machine consumers (Rust + bash). Without "
+                             "--bootstrap: no effect (reserved).")
+    parser.add_argument("--install-missing", action="store_true",
+                        help="With --bootstrap: run package-manager install "
+                             "commands for missing prereqs. Side-effectful. "
+                             "Prompts for consent on TTY; --no-prompt skips "
+                             "the prompt.")
+    parser.add_argument("--no-prompt", action="store_true",
+                        help="With --bootstrap --install-missing: skip the "
+                             "interactive consent prompt (assume yes).")
     parser.add_argument("--rebuild-collections", action="store_true", default=False,
                         help="Drop and re-ingest Weaviate collections (KG + dev). "
                              "Required when the schema invariants change "
