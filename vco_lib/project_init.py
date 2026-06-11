@@ -1494,9 +1494,19 @@ def migrate_collections(
                 objects_copied = copied_b
 
             elif action == "rebuild":
-                # Fall back to today's drop+re-embed path. We delete the
-                # collection here; the caller's _ensure_collections +
-                # _seed_weaviate handle recreate + re-ingest.
+                # Drop + recreate with the target schema. v0.2.54 Track D
+                # (P0-2): pre-fix this branch only DELETED — the comment
+                # claimed "the caller's _ensure_collections + _seed_weaviate
+                # handle recreate + re-ingest", which was true ONLY for the
+                # install.py call path. The CLI handler
+                # (_cmd_migrate_collections) never recreated, so the
+                # `schema_migration_required` deferral's own
+                # `command_to_apply` left the user's collection GONE until
+                # the next full install.py run. Recreating here (empty,
+                # target schema) closes that gap for every caller; the
+                # data re-ingest still happens via _seed_weaviate
+                # (install.py path) or the CLI handler's re-ingest step
+                # (_cmd_migrate_collections, same Track D fix).
                 if _fetch_schema(name, weaviate_url=weaviate_url) is not None:
                     # HIGH-4 (2026-05-01): snapshot BEFORE the destructive
                     # _delete_class so a mid-rebuild crash leaves a forensic
@@ -1510,6 +1520,7 @@ def migrate_collections(
                                "object_count": _snap["object_count"],
                                "sample_uuids": _snap["sample_uuids"]})
                     _delete_class(name, weaviate_url=weaviate_url)
+                    _create_class(target, weaviate_url=weaviate_url)
             else:
                 raise RuntimeError(f"unknown action: {action}")
 
@@ -4628,19 +4639,29 @@ def _emit_migrate_required_deferral(
     # `--force-rebuild` is only mentioned when the plan actually has a
     # rebuild entry — otherwise the smart copy path handles it without
     # the escape hatch.
+    # v0.2.54 Track D (P0-2): both commands now pass `--project-folder`
+    # so the CLI's post-rebuild re-ingest step can locate the project's
+    # `.claude/scripts/sync_knowledge_graph.py` and restore the dropped
+    # data immediately. Pre-fix the command promised "falls back to
+    # drop+re-embed" while the CLI path never re-embedded — the user's
+    # collection stayed empty until the next full install.py run.
+    folder_arg = f"--project-folder {str(folder)!r} "
     if has_rebuild:
         cmd = (
             f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
             f"# NOT in this project's venv). The --name flag scopes the work to\n"
-            f"# THIS project's collections. Preserves vectors via copy where possible,\n"
-            f"# falls back to drop+re-embed for legacy single-vector collections.\n"
-            f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-            f"--name {project_name!r} --weaviate-url {weaviate_url!r} --json\n"
-            f"# OR force the destructive drop+re-embed for ALL collections (slower,\n"
-            f"# requires Ollama embedding service to be healthy; ~3-5 min):\n"
+            f"# THIS project's collections. Preserves vectors via copy where possible;\n"
+            f"# for legacy single-vector collections it drops, recreates with the\n"
+            f"# target schema, and re-ingests from knowledge/ + docs/ (requires the\n"
+            f"# embedding backend to be healthy; ~3-5 min).\n"
             f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
             f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
-            f"--force-rebuild --json"
+            f"{folder_arg}--json\n"
+            f"# OR force the destructive drop+recreate+re-ingest for ALL collections\n"
+            f"# (slower; same embedding-backend requirement):\n"
+            f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
+            f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
+            f"{folder_arg}--force-rebuild --json"
         )
     else:
         cmd = (
@@ -4649,7 +4670,8 @@ def _emit_migrate_required_deferral(
             f"# THIS project's collections. Atomic copy-with-vectors swap;\n"
             f"# preserves all UUIDs + vectors + WikiLink cross-references.\n"
             f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-            f"--name {project_name!r} --weaviate-url {weaviate_url!r} --json"
+            f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
+            f"{folder_arg}--json"
         )
 
     entry = DeferralEntry(
@@ -8247,8 +8269,109 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
                          f"{type(e).__name__}: {e}",
             })
 
-    # PR 5: drift-detection deferral (pre-update path).
+    # v0.2.54 Track D (P0-2): rebuild recovery for the CLI path. The
+    # `rebuild` action drops + recreates the collection with the target
+    # schema (see migrate_collections), but the CLI handler historically
+    # had NO re-ingest step — install.py's `_seed_weaviate` only runs on
+    # the install.py call path. Since the `schema_migration_required`
+    # deferral's `command_to_apply` points users at exactly this CLI,
+    # following the documented recovery command used to leave the KG
+    # empty until the next full install.py run.
+    #
+    # Recovery contract:
+    #   * wet-run only (dry-run has nothing to recover);
+    #   * when `--project-folder` is given, run the project's bundled
+    #     `.claude/scripts/sync_knowledge_graph.py --all` with THIS
+    #     interpreter (the orchestrator venv — it has weaviate +
+    #     weaviate_mcp importable) so knowledge/ + docs/ re-ingest
+    #     immediately;
+    #   * when `--project-folder` is absent, we cannot locate the .md
+    #     sources — surface `reingest_required` in the JSON envelope and
+    #     print the exact kg-sync command so neither a human nor an LLM
+    #     agent mistakes "schema recreated" for "data restored".
     project_folder = getattr(args, "project_folder", None)
+    rebuilt_collections = [
+        e["collection"] for e in result.get("plan", [])
+        if e.get("action") == "rebuild"
+    ]
+    result.setdefault("reingest_required", False)
+    result.setdefault("reingest", None)
+    if rebuilt_collections and not bool(args.dry_run):
+        if project_folder:
+            folder = Path(project_folder).resolve()
+            sync_script = (
+                folder / ".claude" / "scripts" / "sync_knowledge_graph.py"
+            )
+            if sync_script.is_file():
+                import subprocess  # local import — module convention
+
+                sync_env = dict(os.environ)
+                if args.weaviate_url:
+                    sync_env["WEAVIATE_URL"] = args.weaviate_url
+                print(
+                    f"  re-ingesting after rebuild of "
+                    f"{', '.join(rebuilt_collections)} via {sync_script} ...",
+                    file=sys.stderr,
+                )
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(sync_script), "--all"],
+                        cwd=str(folder),
+                        env=sync_env,
+                        timeout=900,
+                    )
+                    result["reingest"] = {
+                        "script": str(sync_script),
+                        "returncode": proc.returncode,
+                    }
+                    if proc.returncode != 0:
+                        result["reingest_required"] = True
+                        result["errors"].append({
+                            "collection": None,
+                            "action": "reingest",
+                            "error": (
+                                f"post-rebuild re-ingest exited "
+                                f"{proc.returncode}; run "
+                                f"`.claude/scripts/kg-sync --all` from "
+                                f"{folder} to restore the dropped data"
+                            ),
+                        })
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    result["reingest_required"] = True
+                    result["errors"].append({
+                        "collection": None,
+                        "action": "reingest",
+                        "error": (
+                            f"post-rebuild re-ingest failed to run: "
+                            f"{type(e).__name__}: {e}; run "
+                            f"`.claude/scripts/kg-sync --all` from "
+                            f"{folder} to restore the dropped data"
+                        ),
+                    })
+            else:
+                result["reingest_required"] = True
+                result["errors"].append({
+                    "collection": None,
+                    "action": "reingest",
+                    "error": (
+                        f"rebuild dropped {', '.join(rebuilt_collections)} "
+                        f"but {sync_script} is missing — run "
+                        f"`.claude/scripts/kg-sync --all` from {folder} "
+                        f"to restore the data"
+                    ),
+                })
+        else:
+            result["reingest_required"] = True
+            print(
+                "  NOTE: rebuild recreated "
+                f"{', '.join(rebuilt_collections)} with the target schema "
+                "but the data was NOT re-ingested (no --project-folder "
+                "given). Run `.claude/scripts/kg-sync --all` from the "
+                "project folder to restore it.",
+                file=sys.stderr,
+            )
+
+    # PR 5: drift-detection deferral (pre-update path).
     if project_folder and bool(args.dry_run) and not result["errors"] and not all_projects:
         destructive = [
             e for e in result.get("plan", [])
@@ -8277,7 +8400,11 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(result))
     else:
-        print(f"dry_run: {result['dry_run']}  deferral_emitted: {result['deferral_emitted']}")
+        print(
+            f"dry_run: {result['dry_run']}  "
+            f"deferral_emitted: {result['deferral_emitted']}  "
+            f"reingest_required: {result.get('reingest_required', False)}"
+        )
         for entry in result["plan"]:
             print(
                 f"  {entry['action']:13s} {entry['collection']}  "
