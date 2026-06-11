@@ -11447,7 +11447,8 @@ def _self_materialize_file_action(
     v0.2.54 Track D backport of ``vco_lib.project_init._file_action``'s
     bundle-path semantics (hash-compare + preserve, instead of the
     pre-fix unconditional overwrite that silently destroyed runtime-copy
-    edits like VCO_dev's 118-line agent-skill-keyword-match divergence).
+    edits like the 118-line agent-skill-keyword-match divergence observed
+    in the field).
 
     Returns (action, source_bytes) where action is one of:
       "create"    — target missing.

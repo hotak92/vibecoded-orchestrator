@@ -273,7 +273,8 @@ class TestNameScopingCoversDiagrams(unittest.TestCase):
     (exported into the shell by the INVOKING project's settings.json env)
     must not leak into a `--name <other-project>`-scoped run — pre-fix,
     `migrate-collections --name TrackDLive --force-rebuild` executed from
-    a VCO_dev shell dropped + rebuilt the live `VCODev_Diagrams`."""
+    a shell with the invoker's ambient env-vars dropped + rebuilt the
+    invoker's diagrams collection."""
 
     def test_ambient_diagrams_collection_is_overridden(self):
         captured = {}

@@ -6,7 +6,7 @@ materialize hash-compare + preserve-and-defer.
 Pre-fix, ``install._materialize_orchestrator_self_claude_dir``
 unconditionally ``shutil.copy2``-ed every template over the runtime
 ``.claude/{hooks,scripts}`` copies — silently destroying local edits
-(the live instance: VCO_dev's 118-line ``agent-skill-keyword-match.py``
+(the field-observed instance: a 118-line ``agent-skill-keyword-match.py``
 divergence would have been reverted by the next ``--update``). The
 per-project bundle path (``project_init._file_action``) had hash-compare
 + preserve + deferral semantics since v0.2.x; this backports them.
@@ -100,7 +100,7 @@ class TestMaterializeHashCompare(unittest.TestCase):
             str(Path(".claude") / "scripts" / "sample-script.py"):
                 _pi._file_sha256(script),
         })
-        # User dogfoods a local edit (the VCO_dev keyword-match shape).
+        # User dogfoods a local edit (the field-observed keyword-match shape).
         script.write_text("print('v2 + local dogfooded feature')\n")
         user_content = script.read_text()
 
