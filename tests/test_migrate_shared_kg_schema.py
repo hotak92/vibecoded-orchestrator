@@ -44,6 +44,10 @@ def _free_port() -> int:
 class _MockHandler(BaseHTTPRequestHandler):
     schema: dict = {"classes": []}
     delete_log: list = []
+    # v0.2.54 Track D: object inventory served via the GraphQL endpoint
+    # for the pre-drop shared-write probe. List of file_path strings.
+    objects: list = []
+    graphql_fail: bool = False
 
     def log_message(self, *args, **kwargs):
         return
@@ -78,10 +82,51 @@ class _MockHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def do_POST(self):
+        # v0.2.54 Track D: GraphQL endpoint for the pre-drop shared-write
+        # probe (Aggregate count + Get file_path page).
+        if self.path != "/v1/graphql":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if self.graphql_fail:
+            self.send_response(500)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length).decode("utf-8", errors="replace")
+        try:
+            query = json.loads(body).get("query", "")
+        except json.JSONDecodeError:
+            query = ""
+        # Class name = first token after "Aggregate {" / "Get {".
+        cls_name = None
+        for marker in ("Aggregate {", "Get {"):
+            if marker in query:
+                cls_name = (query.split(marker, 1)[1]
+                            .split("(", 1)[0].split("{", 1)[0].strip())
+                break
+        payload: dict = {"data": {}}
+        if "Aggregate {" in query:
+            payload["data"]["Aggregate"] = {
+                cls_name: [{"meta": {"count": len(self.objects)}}],
+            }
+        elif "Get {" in query:
+            payload["data"]["Get"] = {
+                cls_name: [{"file_path": fp} for fp in self.objects],
+            }
+        encoded = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(encoded)
 
-def _start_mock(classes: list):
+
+def _start_mock(classes: list, objects: list = None, graphql_fail: bool = False):
     _MockHandler.schema = {"classes": classes}
     _MockHandler.delete_log = []
+    _MockHandler.objects = list(objects or [])
+    _MockHandler.graphql_fail = graphql_fail
     port = _free_port()
     server = HTTPServer(("127.0.0.1", port), _MockHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -163,12 +208,41 @@ class BashScriptTests(unittest.TestCase):
         finally:
             server.shutdown()
 
-    def test_indexnullstate_false_triggers_drop(self):
-        # Shared KG has indexNullState=false → script must issue a
-        # DELETE before attempting resync. We exit 0 either way (soft
-        # fail on resync helper missing or running); the assertion is
-        # specifically about the destructive drop happening when the
-        # invariant is missing.
+    # ------------------------------------------------------------------
+    # v0.2.54 Track D (P0-2): pre-drop guard tests. The pre-fix contract
+    # ("drop happens even without resync helper", exit 0) was the
+    # data-loss bug itself — the assertions below pin the INVERTED
+    # behaviour: no kg-sync → exit 4, NO drop; unrecoverable
+    # cross-project nodes → exit 3, NO drop unless consented.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _isolated_clone(tmp: Path, *, with_kg_sync: bool,
+                        knowledge_files: list = ()) -> Path:
+        """Build a minimal fake orchestrator clone with the migration
+        script at scripts/, optionally an executable kg-sync stub that
+        records its invocation, and optional knowledge/ source files."""
+        script = tmp / "scripts" / SCRIPT_SH.name
+        script.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(SCRIPT_SH), str(script))
+        if with_kg_sync:
+            kg_sync = tmp / ".claude" / "scripts" / "kg-sync"
+            kg_sync.parent.mkdir(parents=True, exist_ok=True)
+            kg_sync.write_text(
+                "#!/usr/bin/env bash\n"
+                f"echo \"$@\" > '{tmp}/kg-sync-invoked.txt'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            kg_sync.chmod(0o755)
+        for rel in knowledge_files:
+            f = tmp / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("# stub node\n", encoding="utf-8")
+        return script
+
+    def test_missing_kg_sync_aborts_before_drop(self):
+        # GUARD 1: no resync helper → exit 4 and NO DELETE issued.
         if not shutil.which("jq"):
             self.skipTest("jq not available")
         classes = [{
@@ -178,58 +252,165 @@ class BashScriptTests(unittest.TestCase):
         }]
         port, server = _start_mock(classes=classes)
         try:
-            # Copy the .sh script to an isolated dir so the relative
-            # path lookup (`$(dirname "$0")/../.claude/scripts/kg-sync`)
-            # finds nothing — exercises the "helper not found" branch.
             with tempfile.TemporaryDirectory() as tmp:
-                isolated_script = Path(tmp) / "scripts" / SCRIPT_SH.name
-                isolated_script.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(SCRIPT_SH), str(isolated_script))
+                script = self._isolated_clone(Path(tmp), with_kg_sync=False)
                 env = os.environ.copy()
                 env["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
                 env["SHARED_KG_COLLECTION"] = "FooProj_Shared"
+                env.pop("VCO_SHARED_KG_MIGRATE_CONSENT", None)
                 result = subprocess.run(
-                    ["bash", str(isolated_script)],
+                    ["bash", str(script)],
+                    env=env, capture_output=True, text=True, timeout=30,
+                    cwd=tmp,
+                )
+                self.assertEqual(result.returncode, 4,
+                                 f"stdout={result.stdout}\nstderr={result.stderr}")
+                self.assertEqual(_MockHandler.delete_log, [],
+                                 "collection must NOT be dropped when "
+                                 "kg-sync is missing")
+                self.assertIn("kg-sync helper not found", result.stderr.lower())
+        finally:
+            server.shutdown()
+
+    def test_cross_project_nodes_refused_without_consent(self):
+        # GUARD 2: a stored file_path that does NOT resolve under the
+        # clone root (= written by another project) → exit 3, NO drop.
+        if not shutil.which("jq"):
+            self.skipTest("jq not available")
+        classes = [{
+            "class": "FooProj_Shared",
+            "invertedIndexConfig": {"indexNullState": False},
+            "properties": [],
+        }]
+        port, server = _start_mock(
+            classes=classes,
+            objects=["knowledge/concepts/local-node.md",
+                     "knowledge/concepts/from-other-project.md"],
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                script = self._isolated_clone(
+                    Path(tmp), with_kg_sync=True,
+                    # Only ONE of the two stored paths exists locally.
+                    knowledge_files=["knowledge/concepts/local-node.md"],
+                )
+                env = os.environ.copy()
+                env["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
+                env["SHARED_KG_COLLECTION"] = "FooProj_Shared"
+                env.pop("VCO_SHARED_KG_MIGRATE_CONSENT", None)
+                result = subprocess.run(
+                    ["bash", str(script)],
+                    env=env, capture_output=True, text=True, timeout=30,
+                    cwd=tmp,
+                )
+                self.assertEqual(result.returncode, 3,
+                                 f"stdout={result.stdout}\nstderr={result.stderr}")
+                self.assertEqual(_MockHandler.delete_log, [])
+                normalized = " ".join(result.stderr.lower().split())
+                self.assertIn("permanently lost", normalized)
+                self.assertIn("from-other-project.md", result.stderr)
+                self.assertIn("VCO_SHARED_KG_MIGRATE_CONSENT=1", result.stderr)
+        finally:
+            server.shutdown()
+
+    def test_consent_env_allows_drop_and_resync(self):
+        # Same unrecoverable-node scenario + explicit consent → drop
+        # proceeds and the resync helper runs.
+        if not shutil.which("jq"):
+            self.skipTest("jq not available")
+        classes = [{
+            "class": "FooProj_Shared",
+            "invertedIndexConfig": {"indexNullState": False},
+            "properties": [],
+        }]
+        port, server = _start_mock(
+            classes=classes,
+            objects=["knowledge/concepts/from-other-project.md"],
+        )
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                script = self._isolated_clone(Path(tmp), with_kg_sync=True)
+                env = os.environ.copy()
+                env["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
+                env["SHARED_KG_COLLECTION"] = "FooProj_Shared"
+                env["VCO_SHARED_KG_MIGRATE_CONSENT"] = "1"
+                result = subprocess.run(
+                    ["bash", str(script)],
                     env=env, capture_output=True, text=True, timeout=30,
                     cwd=tmp,
                 )
                 self.assertEqual(result.returncode, 0,
                                  f"stdout={result.stdout}\nstderr={result.stderr}")
-                # The drop happened — that's the core invariant we test.
                 self.assertEqual(_MockHandler.delete_log, ["FooProj_Shared"])
-                self.assertIn("kg-sync helper not found",
-                              result.stdout.lower())
+                self.assertTrue((Path(tmp) / "kg-sync-invoked.txt").is_file(),
+                                "resync helper must run after consented drop")
         finally:
             server.shutdown()
 
-    def test_drop_happens_even_without_resync_helper(self):
-        # Variant of above that ALSO asserts the script reports the
-        # missing helper as a hint to the operator (vs silently leaving
-        # the collection empty without explanation).
+    def test_all_paths_restorable_proceeds_without_consent(self):
+        # Every stored file_path resolves under the clone root → the
+        # original premise holds → migration proceeds with no consent.
         if not shutil.which("jq"):
             self.skipTest("jq not available")
         classes = [{
-            "class": "AcmeShared_KnowledgeGraph",
+            "class": "FooProj_Shared",
             "invertedIndexConfig": {"indexNullState": False},
             "properties": [],
         }]
-        port, server = _start_mock(classes=classes)
+        port, server = _start_mock(
+            classes=classes,
+            objects=["knowledge/concepts/a.md", "knowledge/tools/b.md"],
+        )
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                isolated_script = Path(tmp) / "scripts" / SCRIPT_SH.name
-                isolated_script.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(SCRIPT_SH), str(isolated_script))
+                script = self._isolated_clone(
+                    Path(tmp), with_kg_sync=True,
+                    knowledge_files=["knowledge/concepts/a.md",
+                                     "knowledge/tools/b.md"],
+                )
                 env = os.environ.copy()
                 env["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
-                env["SHARED_KG_COLLECTION"] = "AcmeShared_KnowledgeGraph"
+                env["SHARED_KG_COLLECTION"] = "FooProj_Shared"
+                env.pop("VCO_SHARED_KG_MIGRATE_CONSENT", None)
                 result = subprocess.run(
-                    ["bash", str(isolated_script)],
+                    ["bash", str(script)],
                     env=env, capture_output=True, text=True, timeout=30,
                     cwd=tmp,
                 )
-                self.assertEqual(result.returncode, 0)
-                self.assertEqual(_MockHandler.delete_log,
-                                 ["AcmeShared_KnowledgeGraph"])
+                self.assertEqual(result.returncode, 0,
+                                 f"stdout={result.stdout}\nstderr={result.stderr}")
+                self.assertEqual(_MockHandler.delete_log, ["FooProj_Shared"])
+                self.assertTrue((Path(tmp) / "kg-sync-invoked.txt").is_file())
+        finally:
+            server.shutdown()
+
+    def test_probe_failure_refused_without_consent(self):
+        # GraphQL probe failing (HTTP 500) → cannot verify → exit 3,
+        # NO drop. Conservative-by-design.
+        if not shutil.which("jq"):
+            self.skipTest("jq not available")
+        classes = [{
+            "class": "FooProj_Shared",
+            "invertedIndexConfig": {"indexNullState": False},
+            "properties": [],
+        }]
+        port, server = _start_mock(classes=classes, graphql_fail=True)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                script = self._isolated_clone(Path(tmp), with_kg_sync=True)
+                env = os.environ.copy()
+                env["WEAVIATE_URL"] = f"http://127.0.0.1:{port}"
+                env["SHARED_KG_COLLECTION"] = "FooProj_Shared"
+                env.pop("VCO_SHARED_KG_MIGRATE_CONSENT", None)
+                result = subprocess.run(
+                    ["bash", str(script)],
+                    env=env, capture_output=True, text=True, timeout=30,
+                    cwd=tmp,
+                )
+                self.assertEqual(result.returncode, 3,
+                                 f"stdout={result.stdout}\nstderr={result.stderr}")
+                self.assertEqual(_MockHandler.delete_log, [])
+                self.assertIn("could not verify", result.stderr.lower())
         finally:
             server.shutdown()
 
@@ -262,6 +443,34 @@ class PowerShellScriptTests(unittest.TestCase):
                       "PS script must default SHARED_KG_COLLECTION to "
                       "VibeCodedOrchestrator_KnowledgeGraph (matches "
                       "project_init derive_project_collection_names)")
+
+    # v0.2.54 Track D: parity assertions for the pre-drop guards.
+
+    def test_ps1_has_consent_env_gate(self):
+        body = SCRIPT_PS1.read_text(encoding="utf-8")
+        self.assertIn("VCO_SHARED_KG_MIGRATE_CONSENT", body,
+                      "PS script must honor the same consent env var as the .sh")
+
+    def test_ps1_has_refusal_exit_codes(self):
+        body = SCRIPT_PS1.read_text(encoding="utf-8")
+        self.assertIn("exit 3", body, "refusal (unrecoverable nodes) exit code")
+        self.assertIn("exit 4", body, "refusal (kg-sync missing) exit code")
+
+    def test_ps1_guards_run_before_drop(self):
+        body = SCRIPT_PS1.read_text(encoding="utf-8")
+        drop_idx = body.index("-Method Delete")
+        kg_sync_guard_idx = body.index("GUARD 1")
+        probe_guard_idx = body.index("GUARD 2")
+        self.assertLess(kg_sync_guard_idx, drop_idx,
+                        "kg-sync presence check must precede the DELETE")
+        self.assertLess(probe_guard_idx, drop_idx,
+                        "shared-write probe must precede the DELETE")
+
+    def test_sh_guards_run_before_drop(self):
+        body = SCRIPT_SH.read_text(encoding="utf-8")
+        drop_idx = body.index("-X DELETE")
+        self.assertLess(body.index("GUARD 1"), drop_idx)
+        self.assertLess(body.index("GUARD 2"), drop_idx)
 
 
 if __name__ == "__main__":

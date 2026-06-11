@@ -5407,6 +5407,18 @@ def main() -> int:
                         help="Skip rendering .claude/{hooks,scripts,settings.json} "
                              "from templates/ (PR-39, v0.2.12). Useful in tests or "
                              "when targeting a pre-populated .claude/ directory.")
+    # v0.2.54 Track D (Theme 5): the orchestrator-self materialize now
+    # hash-compares against .claude/.vco-self-manifest.json and PRESERVES
+    # user-modified hook/script copies (emitting an
+    # orchestrator_self_user_modified_preserved deferral) instead of
+    # silently overwriting them. This flag accepts the template versions
+    # for every preserved file.
+    parser.add_argument("--force-materialize-claude-dir", action="store_true",
+                        default=False,
+                        help="Overwrite user-modified .claude/{hooks,scripts} "
+                             "files with the current template versions (the "
+                             "default since v0.2.54 is to preserve them and "
+                             "emit a deferral entry).")
     parser.add_argument("--no-resume", action="store_true", default=False,
                         help="Disable resume-from-log. Forces every step to run "
                              "even if state/logs/install.jsonl says a previous "
@@ -5828,7 +5840,13 @@ def main() -> int:
     # so any Python scripts can use the venv, and BEFORE _seed_weaviate so
     # the orchestrator's KG-sync hooks are in place when seeding runs.
     if not getattr(args, "skip_materialize_claude_dir", False):
-        _materialize_orchestrator_self_claude_dir(PROJECT_ROOT)
+        _materialize_orchestrator_self_claude_dir(
+            PROJECT_ROOT,
+            deferral_report=_deferral_report,
+            force_overwrite=getattr(
+                args, "force_materialize_claude_dir", False,
+            ),
+        )
     else:
         _log_install_event(
             "4b/10", "skip",
@@ -6751,6 +6769,54 @@ def _write_update_deferred_stub(folder: Path, *, mode: str) -> None:
 # Deferral-apply helper
 # ---------------------------------------------------------------------------
 
+def _pid_is_alive_for_deferral(pid: int) -> bool:
+    """Cross-OS "is this PID still running" probe for deferral re-checks.
+
+    v0.2.54 Track D: used by the ``launcher_restart_required`` handler.
+    On Windows, ``os.kill(pid, 0)`` is NOT a probe — any non-CTRL signal
+    value unconditionally TerminateProcess-es the target — so we go via
+    OpenProcess + GetExitCodeProcess (STILL_ACTIVE == 259) instead.
+    POSIX uses the conventional ``kill(pid, 0)`` errno dance.
+
+    Conservative on uncertainty: unknown → True (treat the process as
+    alive, so the deferral entry is KEPT rather than cleared on a
+    guess).
+    """
+    if pid <= 0:
+        return True  # unparseable / sentinel value — keep the entry
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            )
+            if not handle:
+                return False  # no such process (or no access → likely gone)
+            try:
+                exit_code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(exit_code),
+                )
+                return bool(ok) and exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 — conservative fallback
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return True  # uncertain → conservative
+
+
 def _apply_deferred_entries(
     current_run_report: DeferralReport,
     project_root: Path,
@@ -6766,10 +6832,18 @@ def _apply_deferred_entries(
     at end of ``main()``).
 
     Conditions handled:
-      - ``schema_drift_rebuild_required``: not auto-applied here; requires
-        ``--rebuild-collections`` flag to be present.  We skip to preserve
-        the conservative "no silent data churn" contract.  If the user passed
-        ``--rebuild-collections`` the drift is already resolved before we arrive.
+      - ``schema_drift_rebuild_required``: never auto-applies the rebuild
+        (that stays behind explicit ``--rebuild-collections`` consent), but
+        RE-PROBES the current drift state (v0.2.54 Track D): when the
+        drift is gone (e.g. the rebuild ran earlier in this same
+        invocation) the entry is cleared instead of resurrected.
+      - ``update_resume_required``: re-probes the launcher's resume
+        sentinel (``.claude/state/orchestrator-update-resume-needed.json``
+        in the install root); sentinel gone → resolved (v0.2.54 Track D).
+      - ``launcher_restart_required``: consumes
+        ``.claude/context/launcher-restart-marker`` (written by the
+        restarted launcher) or, failing that, verifies the recorded old
+        launcher PID has exited (v0.2.54 Track D).
       - ``weaviate_unreachable_at_update``: try ``podman start <name>``
         (name discovered via ``vco_lib.containers.find_existing_container``;
         falls back to the canonical ``vco_weaviate`` if no container is
@@ -6789,9 +6863,163 @@ def _apply_deferred_entries(
         cid = entry.condition_id
 
         if cid == "schema_drift_rebuild_required":
-            # Requires explicit --rebuild-collections; not auto-applied.
-            print(f"  [skip] {cid}: requires --rebuild-collections (manual action)")
-            current_run_report.add_entry(entry)
+            # v0.2.54 Track D (Theme 5): re-probe instead of blind-skip.
+            #
+            # Pre-fix this branch unconditionally [skip]-ed and re-added
+            # the persisted entry, while the docstring claimed "if the
+            # user passed --rebuild-collections the drift is already
+            # resolved before we arrive". Run order made that a lie:
+            # the rebuild executes earlier in main(), then THIS code
+            # re-read the on-disk file and resurrected the entry — so
+            # `--update --apply-deferred --rebuild-collections` (the
+            # entry's own command_to_apply combined with the documented
+            # apply flow) performed the rebuild AND kept the deferral
+            # alive forever.
+            #
+            # Same re-probe discipline as the orphan-collection handler
+            # below (v0.2.46): probe the CURRENT drift state; clear only
+            # when the premise no longer holds; keep on drift or on
+            # probe failure. The rebuild itself is still never
+            # auto-applied here — that stays behind explicit
+            # --rebuild-collections consent.
+            kg_collection = os.environ.get("KG_COLLECTION", "")
+            if not kg_collection:
+                print(
+                    f"  [skip] {cid}: KG_COLLECTION not set — cannot "
+                    "re-probe drift. Keeping entry."
+                )
+                current_run_report.add_entry(entry)
+            else:
+                weaviate_url = os.environ.get(
+                    "WEAVIATE_URL",
+                    f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
+                )
+                print(f"  [try]  {cid}: re-probing schema drift on "
+                      f"`{kg_collection}` ...")
+                try:
+                    drift, missing = _detect_kg_schema_drift(
+                        weaviate_url, kg_collection,
+                    )
+                    if not drift:
+                        print(
+                            f"  [ok]   {cid}: no schema drift detected — "
+                            "rebuild already applied (or schema healed). "
+                            "Marking resolved."
+                        )
+                        # Resolved: do NOT re-add to current_run_report.
+                    else:
+                        print(
+                            f"  [skip] {cid}: drift persists "
+                            f"(missing: {', '.join(missing) or 'unknown'}). "
+                            "Requires --rebuild-collections (manual "
+                            "consent). Keeping entry."
+                        )
+                        current_run_report.add_entry(entry)
+                except Exception as exc:  # noqa: BLE001 — soft-fail
+                    print(f"  [fail] {cid}: drift re-probe failed ({exc}). "
+                          "Keeping entry.")
+                    current_run_report.add_entry(entry)
+
+        elif cid == "update_resume_required":
+            # v0.2.54 Track D (Theme 5): both sides of this entry's
+            # lifecycle used to defer to code that didn't exist —
+            # installer.rs pointed at install.py `mark_resolved` calls
+            # (zero call sites) and install.py's emitter docstring
+            # claimed a handler here (there was none), so after a
+            # successful resume the "update halted at a conflict" entry
+            # survived every --apply-deferred run forever whenever any
+            # other deferral coexisted.
+            #
+            # Re-probe: the sentinel
+            # `.claude/state/orchestrator-update-resume-needed.json`
+            # (written by the launcher's update commands, deleted by
+            # `resume_orchestrator_update` on success) is the source of
+            # truth. Gone → the resume completed → resolved. Present →
+            # the resume is still pending → keep. NOTE: the sentinel
+            # lives in the INSTALL ROOT (= project_root for
+            # orchestrator-self runs, where this entry is emitted).
+            sentinel = (
+                project_root / ".claude" / "state"
+                / "orchestrator-update-resume-needed.json"
+            )
+            if sentinel.is_file():
+                print(
+                    f"  [skip] {cid}: resume sentinel still present at "
+                    f"{sentinel} — the interrupted update has not been "
+                    "resumed yet. Click `Continue Update` in the "
+                    "launcher's MenuBar badge (or finish `python "
+                    "install.py --update` from the install root). "
+                    "Keeping entry."
+                )
+                current_run_report.add_entry(entry)
+            else:
+                print(
+                    f"  [ok]   {cid}: resume sentinel is gone — the "
+                    "update was resumed (or this very run completed "
+                    "it). Marking resolved."
+                )
+                # Resolved: do NOT re-add to current_run_report.
+
+        elif cid == "launcher_restart_required":
+            # v0.2.54 Track D (Theme 5): the documented self-clear
+            # protocol (".claude/context/launcher-restart-marker"
+            # written by the restarted launcher, consumed here) was
+            # never implemented on either side — the marker string
+            # existed only in a docstring and a Rust comment, and this
+            # function had no handler, so the entry fell into the
+            # [unknown] branch and survived forever unless the user
+            # clicked the banner button (whose Rust path strips the
+            # entry directly).
+            #
+            # Two-step re-probe, conservative on uncertainty:
+            #   1. Marker file present → a post-swap launcher booted →
+            #      consume the marker + resolve.
+            #   2. Else, parse the old launcher PID from the entry's
+            #      Detected text ("running launcher PID: <N>"); PID no
+            #      longer alive → the old process exited, so the next/
+            #      current launcher start loads the new binary →
+            #      resolve. PID alive or unparseable → keep.
+            marker = (
+                project_root / ".claude" / "context"
+                / "launcher-restart-marker"
+            )
+            if marker.is_file():
+                try:
+                    marker.unlink()
+                except OSError as exc:
+                    print(
+                        f"  [warn] {cid}: marker consumed but unlink "
+                        f"failed ({exc}) — will retry next run."
+                    )
+                print(
+                    f"  [ok]   {cid}: launcher-restart-marker found — "
+                    "the launcher restarted on the new binary. "
+                    "Marking resolved."
+                )
+                # Resolved: do NOT re-add to current_run_report.
+            else:
+                pid_match = re.search(
+                    r"running launcher PID:\s*(\d+)", entry.detected or "",
+                )
+                old_pid = int(pid_match.group(1)) if pid_match else -1
+                if pid_match and not _pid_is_alive_for_deferral(old_pid):
+                    print(
+                        f"  [ok]   {cid}: old launcher PID {old_pid} has "
+                        "exited — the stale in-memory code is gone. "
+                        "Marking resolved."
+                    )
+                    # Resolved: do NOT re-add to current_run_report.
+                else:
+                    detail = (
+                        f"old launcher PID {old_pid} is still running"
+                        if pid_match
+                        else "no restart marker and no PID recorded"
+                    )
+                    print(
+                        f"  [skip] {cid}: {detail} — restart still "
+                        "pending. Keeping entry."
+                    )
+                    current_run_report.add_entry(entry)
 
         elif cid == "weaviate_unreachable_at_update":
             # v0.2.15: discover the actual container name + runtime on
@@ -11420,9 +11648,135 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
 # orchestrator-self now uses the same pipeline.
 # ---------------------------------------------------------------------------
 
+def _load_self_materialize_prior_hashes(install_root: Path) -> dict:
+    """Read the prior-shipped hashes from
+    ``<install_root>/.claude/.vco-manifest.json`` (the V0243-4 manifest
+    rewritten by :func:`_refresh_orchestrator_self_vco_manifest` after
+    every materialize run).
+
+    Returns ``{".claude/hooks/<name>": "<sha256>", ...}``. Missing or
+    corrupt manifest → empty dict (the git-history heal in
+    ``_self_materialize_file_action`` covers pre-manifest installs).
+    """
+    target = install_root / ".claude" / ".vco-manifest.json"
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+        files = data.get("files") if isinstance(data, dict) else None
+        if isinstance(files, dict):
+            return {
+                k: (v or {}).get("sha256", "")
+                for k, v in files.items()
+                if isinstance(v, dict)
+            }
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def _self_materialize_file_action(
+    src: Path,
+    target: Path,
+    prior_hash: str,
+    install_root: Path,
+) -> tuple[str, bytes]:
+    """Per-file decision for the orchestrator-self materialize — the
+    v0.2.54 Track D backport of ``vco_lib.project_init._file_action``'s
+    bundle-path semantics (hash-compare + preserve, instead of the
+    pre-fix unconditional overwrite that silently destroyed runtime-copy
+    edits like the 118-line agent-skill-keyword-match divergence observed
+    in the field).
+
+    Returns (action, source_bytes) where action is one of:
+      "create"    — target missing.
+      "noop"      — target identical to the current template.
+      "overwrite" — target matches the prior-shipped hash (manifest) OR
+                    any historical shipped version (git-history heal,
+                    v0.2.31 pattern) → user untouched, safe to update.
+      "preserve"  — target diverges from every shipped version → user-
+                    modified; skip + defer.
+    """
+    source_bytes = src.read_bytes()
+    if not target.exists():
+        return ("create", source_bytes)
+    installed_hash = _project_init._file_sha256(target)
+    new_hash = _project_init._bytes_sha256(source_bytes)
+    if installed_hash == new_hash:
+        return ("noop", source_bytes)
+    if prior_hash and installed_hash == prior_hash:
+        return ("overwrite", source_bytes)
+    # Pre-manifest installs (every install before v0.2.54) have no
+    # prior_hash. Walk the template's git history: installed content
+    # matching ANY shipped version = "VCO-shipped, just stale" → safe
+    # to overwrite. Genuinely user-edited content matches nothing →
+    # preserve. (Same discipline as project_init._file_action's
+    # v0.2.31 heal — without it, the first post-v0.2.54 update would
+    # freeze every stale-but-untouched runtime copy forever.)
+    if _project_init._installed_matches_template_history(
+        src, installed_hash, install_root,
+    ):
+        return ("overwrite", source_bytes)
+    return ("preserve", source_bytes)
+
+
+def _emit_self_materialize_preserved_deferral(
+    deferral_report: "DeferralReport | None",
+    preserved: list,
+    install_root: Path,
+) -> None:
+    """Emit ``orchestrator_self_user_modified_preserved``: the
+    orchestrator-self materialize found runtime copies in
+    ``.claude/{hooks,scripts}`` that diverge from every shipped template
+    version and left them in place."""
+    if deferral_report is None or not preserved:
+        return
+    try:
+        file_list = _project_init._format_file_list_md(
+            [f".claude/{p}" for p in preserved],
+        )
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id="orchestrator_self_user_modified_preserved",
+                title=(
+                    f"{len(preserved)} user-modified .claude/ file(s) "
+                    "preserved during materialize"
+                ),
+                detected=(
+                    "While rendering the orchestrator's runtime .claude/ "
+                    "from templates/, these files diverged from every "
+                    "version VCO ever shipped (manifest hash + git-history "
+                    "walk) and were PRESERVED on disk:\n" + file_list
+                ),
+                why_deferred=(
+                    "Pre-v0.2.54 this step silently overwrote runtime "
+                    "copies, destroying local edits (dogfooded features, "
+                    "hotfixes applied directly to .claude/scripts/). The "
+                    "preserved files may now LAG the shipped templates — "
+                    "diff them and either port your changes INTO "
+                    "templates/ (so they ship) or accept the template "
+                    "versions."
+                ),
+                command_to_apply=(
+                    "# Compare each preserved file against its template:\n"
+                    "#   diff .claude/scripts/<name> templates/scripts/<name>\n"
+                    "# Accept the template versions for ALL preserved files:\n"
+                    "python install.py --update --force-materialize-claude-dir"
+                ),
+                severity="warning",
+                kg_node_refs=[],
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — soft-fail by design
+        _log_install_event(
+            "4b/10", "warn",
+            f"could not emit orchestrator_self_user_modified_preserved "
+            f"deferral: {exc}",
+        )
+
+
 def _materialize_orchestrator_self_claude_dir(
     install_root: Path,
     deferral_report: "DeferralReport | None" = None,
+    force_overwrite: bool = False,
 ) -> None:
     """Render the orchestrator-self's runtime .claude/ contents from templates.
 
@@ -11432,9 +11786,24 @@ def _materialize_orchestrator_self_claude_dir(
     ``templates/settings.json.{linux,windows}.template`` to
     ``<install_root>/.claude/settings.json``.
 
-    Idempotent: re-running overwrites with the current templates. Users
-    running ``install.py --update`` after a ``git pull`` get the latest
-    hook/script/settings content automatically.
+    v0.2.54 Track D (Theme 5): per-file hash-compare with preserve-and-
+    defer semantics, backported from the per-project bundle path
+    (``project_init._file_action``). A runtime copy that diverges from
+    every shipped template version (self-manifest hash + git-history
+    heal) is PRESERVED and listed in an
+    ``orchestrator_self_user_modified_preserved`` deferral entry instead
+    of silently overwritten. ``--force-materialize-claude-dir`` accepts
+    the template versions. ``hooks/_lib`` subdirs remain always-
+    overwrite (not user-customisable — same contract as the bundle
+    path). Prior-shipped hashes come from ``.claude/.vco-manifest.json``
+    (rewritten with template hashes by
+    ``_refresh_orchestrator_self_vco_manifest`` right after this
+    function runs).
+
+    Idempotent: re-running converges on the current templates for every
+    file the user hasn't touched. Users running ``install.py --update``
+    after a ``git pull`` get the latest hook/script/settings content
+    automatically.
 
     Soft-fail: if any individual template file is missing for some reason,
     a warning is logged and the install continues — a partial hook set
@@ -11464,6 +11833,14 @@ def _materialize_orchestrator_self_claude_dir(
     copied_hooks = 0
     copied_scripts = 0
     warnings: list[str] = []
+    # v0.2.54 Track D: hash-compare bookkeeping. Prior-shipped hashes
+    # come from .claude/.vco-manifest.json (rewritten with TEMPLATE
+    # hashes by _refresh_orchestrator_self_vco_manifest after this
+    # function). `preserved` collects ".claude/"-relative paths (e.g.
+    # "scripts/foo.py") left in place because they diverge from every
+    # shipped version.
+    prior_hashes = _load_self_materialize_prior_hashes(install_root)
+    preserved: list = []
 
     # v0.2.46 V47-B (Gap B): if .claude/ itself is a symlink, redirect
     # the entire materialization to a sibling .vco-new tree. This catches
@@ -11524,7 +11901,20 @@ def _materialize_orchestrator_self_claude_dir(
                     )
                 continue
             try:
-                shutil.copy2(src, target)
+                # v0.2.54 Track D: hash-compare instead of unconditional
+                # overwrite. User-modified runtime copies are preserved
+                # + deferred (see _self_materialize_file_action).
+                prior_hash = prior_hashes.get(
+                    str(Path(".claude") / "hooks" / src.name), "",
+                )
+                action, _source_bytes = _self_materialize_file_action(
+                    src, target, prior_hash, install_root,
+                )
+                if action == "preserve" and not force_overwrite:
+                    preserved.append(f"hooks/{src.name}")
+                    continue
+                if action != "noop":
+                    shutil.copy2(src, target)
                 # v0.2.53 belt-and-braces: install.py's pre-existing test
                 # `test_install_into_fresh_target_linux` caught 3 v0.2.52
                 # hooks shipped with mode 664 (no exec bit). Without exec
@@ -11611,7 +12001,18 @@ def _materialize_orchestrator_self_claude_dir(
                     )
                 continue
             try:
-                shutil.copy2(src, target)
+                # v0.2.54 Track D: same hash-compare contract as hooks.
+                prior_hash = prior_hashes.get(
+                    str(Path(".claude") / "scripts" / src.name), "",
+                )
+                action, _source_bytes = _self_materialize_file_action(
+                    src, target, prior_hash, install_root,
+                )
+                if action == "preserve" and not force_overwrite:
+                    preserved.append(f"scripts/{src.name}")
+                    continue
+                if action != "noop":
+                    shutil.copy2(src, target)
                 copied_scripts += 1
             except OSError as e:
                 warnings.append(f"failed to copy {src.name}: {e}")
@@ -11709,6 +12110,26 @@ def _materialize_orchestrator_self_claude_dir(
                 settings_dst.write_text(rendered, encoding="utf-8")
         except OSError as e:
             warnings.append(f"failed to render settings.json: {e}")
+
+    # v0.2.54 Track D: surface preserved (user-modified) runtime copies.
+    # Informational, not a failure — but they must be visible: the
+    # preserved files now LAG the shipped templates until the user diffs
+    # + reconciles (or re-runs with --force-materialize-claude-dir).
+    if preserved:
+        _emit_self_materialize_preserved_deferral(
+            deferral_report, preserved, install_root,
+        )
+        warnings.append(
+            f"{len(preserved)} user-modified file(s) preserved (not "
+            f"overwritten): {', '.join(sorted(preserved)[:10])}"
+            + (" ..." if len(preserved) > 10 else "")
+            + " — see UPDATE_DEFERRED.md"
+        )
+        _log_install_event(
+            "4b/10", "info",
+            f"preserved {len(preserved)} user-modified .claude/ file(s)",
+            data={"preserved": sorted(preserved)},
+        )
 
     if warnings:
         print("PARTIAL")
@@ -11906,46 +12327,52 @@ def _refresh_orchestrator_self_vco_manifest(install_root: Path) -> None:
         return h.hexdigest()
 
     # Hooks (top-level files only — _lib/ sub-tree handled below).
+    #
+    # v0.2.54 Track D: hash the TEMPLATE source, not the destination.
+    # The manifest's `sha256` is the prior-SHIPPED hash consumed by both
+    # the per-project bundle `_file_action` and the orchestrator-self
+    # materialize's hash-compare. Pre-fix the two were identical (the
+    # materialize overwrote unconditionally, so dst == src); with
+    # preserve-and-defer semantics a user-modified dst can diverge —
+    # recording the dst hash would make the NEXT run see
+    # installed == prior-shipped and overwrite the very file the
+    # previous run preserved.
     hooks_src = templates_dir / "hooks"
-    hooks_dst = claude_dir / "hooks"
     if hooks_src.is_dir():
         for src in hooks_src.iterdir():
             if not src.is_file():
                 continue
-            dst = hooks_dst / src.name
             rel = str(Path(".claude") / "hooks" / src.name)
             src_rel = str(src.relative_to(install_root))
             file_entries[rel] = {
-                "sha256": _sha256_file(dst if dst.exists() else src),
+                "sha256": _sha256_file(src),
                 "source": src_rel,
             }
         # _lib/ subdirectory.
         lib_src = hooks_src / "_lib"
-        lib_dst = hooks_dst / "_lib"
         if lib_src.is_dir():
             for src in lib_src.iterdir():
                 if not src.is_file():
                     continue
-                dst = lib_dst / src.name
                 rel = str(Path(".claude") / "hooks" / "_lib" / src.name)
                 src_rel = str(src.relative_to(install_root))
                 file_entries[rel] = {
-                    "sha256": _sha256_file(dst if dst.exists() else src),
+                    "sha256": _sha256_file(src),
                     "source": src_rel,
                 }
 
     # Scripts.
     scripts_src = templates_dir / "scripts"
-    scripts_dst = claude_dir / "scripts"
     if scripts_src.is_dir():
         for src in scripts_src.iterdir():
             if not src.is_file():
                 continue
-            dst = scripts_dst / src.name
             rel = str(Path(".claude") / "scripts" / src.name)
             src_rel = str(src.relative_to(install_root))
+            # v0.2.54 Track D: template hash (= prior-shipped), not dst.
+            # See the hooks comment above for why this is load-bearing.
             file_entries[rel] = {
-                "sha256": _sha256_file(dst if dst.exists() else src),
+                "sha256": _sha256_file(src),
                 "source": src_rel,
             }
 

@@ -365,6 +365,101 @@ def collect_skills(root: Path) -> list[tuple[str, list[str], str]]:
     return out
 
 
+def _extract_meta_block(js_text: str) -> str:
+    """Return the `export const meta = {...}` object body from a workflow
+    script, or "" if absent. Balanced-brace scan (the meta block is a pure
+    literal per the Workflow spec, so naive depth counting is safe enough;
+    braces inside string literals are the only false signal and meta
+    descriptions rarely contain them — worst case we truncate early and
+    simply find no keywords, which degrades to silence)."""
+    m = re.search(r"export\s+const\s+meta\s*=\s*\{", js_text)
+    if not m:
+        return ""
+    start = m.end() - 1
+    depth = 0
+    for i in range(start, len(js_text)):
+        ch = js_text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return js_text[start : i + 1]
+    return ""
+
+
+_JS_STRING = r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\""
+_WF_KEYWORDS_COMMENT = re.compile(r"^\s*//\s*keywords\s*:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _parse_js_string_field(block: str, field: str) -> str:
+    m = re.search(rf"\b{field}\s*:\s*({_JS_STRING})", block)
+    if not m:
+        return ""
+    return m.group(1)[1:-1]
+
+
+def _parse_workflow_keywords(js_text: str, meta_block: str) -> list[str]:
+    """Keywords for a workflow file, two accepted forms:
+
+    1. `keywords: ['a', "b c", ...]` inside the meta block. NOTE: the
+       Workflow runtime's tolerance of unknown meta keys is unverified —
+       prefer form 2 until that's confirmed.
+    2. A `// keywords: a, b c, d` comment line anywhere in the file
+       (zero risk to runtime meta validation).
+    """
+    m = re.search(r"\bkeywords\s*:\s*\[([^\]]*)\]", meta_block)
+    if m:
+        items = [
+            s[1:-1]
+            for s in re.findall(_JS_STRING, m.group(1))
+        ]
+        if items:
+            return items
+    cm = _WF_KEYWORDS_COMMENT.search(js_text)
+    if cm:
+        return [t.strip() for t in cm.group(1).split(",") if t.strip()]
+    return []
+
+
+def collect_workflows(root: Path) -> list[tuple[str, list[str], str]]:
+    """Return [(display_name, keywords, short_desc), ...] for every saved
+    workflow (`.claude/workflows/*.mjs` / `*.js`) that declares keywords.
+
+    short_desc comes from meta.description. Same disabled-files contract as
+    agents/skills: a launcher toggle would move files to a sibling
+    `.claude/workflows.disabled/`, which falls outside this glob.
+    """
+    wf_dir = root / ".claude" / "workflows"
+    if not wf_dir.is_dir():
+        return []
+    out: list[tuple[str, list[str], str]] = []
+    try:
+        candidates = sorted(
+            p
+            for pattern in ("*.mjs", "*.js")
+            for p in wf_dir.glob(pattern)
+            if p.is_file() and p.stem.lower() not in _SKIP_STEMS
+        )
+    except OSError:
+        return []
+    for path in candidates:
+        text = _read_file(path)
+        if text is None:
+            continue
+        try:
+            meta_block = _extract_meta_block(text)
+            keywords = _parse_workflow_keywords(text, meta_block)
+        except Exception:
+            continue
+        if not keywords:
+            continue
+        display = _parse_js_string_field(meta_block, "name") or path.stem
+        short_desc = _parse_js_string_field(meta_block, "description")
+        out.append((display, keywords, short_desc))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
@@ -380,6 +475,7 @@ def _bullet(name: str, short_desc: str) -> str:
 def format_suggestion(
     matched_agents: list[tuple[str, str]],
     matched_skills: list[tuple[str, str]],
+    matched_workflows: list[tuple[str, str]] | None = None,
 ) -> str:
     """Format the bullet-list suggestion message.
 
@@ -401,6 +497,19 @@ def format_suggestion(
         lines = [f"You might want to use {header}:"]
         for name, sd in matched_skills:
             lines.append(_bullet(name, sd))
+        blocks.append("\n".join(lines))
+    if matched_workflows:
+        header = (
+            "A saved workflow matches" if len(matched_workflows) == 1
+            else "Saved workflows match"
+        )
+        lines = [
+            f"{header} this task — OFFER it to the user by name with a rough "
+            "cost note (multi-agent orchestration on their token budget; do "
+            "not launch it unsolicited):"
+        ]
+        for name, sd in matched_workflows:
+            lines.append(_bullet(f"/{name}", sd))
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
@@ -531,6 +640,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         agents = collect_agents(root) if not args.skills_only else []
         skills = collect_skills(root)
+        # Workflows are main-loop-only: a subagent (--skills-only caller)
+        # has no Workflow tool, so suggesting one there is pointless.
+        workflows = collect_workflows(root) if not args.skills_only else []
     except Exception:
         return 0
 
@@ -542,6 +654,10 @@ def main(argv: list[str] | None = None) -> int:
     for name, keywords, short_desc in skills:
         if any_match(keywords, prompt):
             matched_skills.append((name, short_desc))
+    matched_workflows: list[tuple[str, str]] = []
+    for name, keywords, short_desc in workflows:
+        if any_match(keywords, prompt):
+            matched_workflows.append((name, short_desc))
 
     # Filter out already-suggested entries (per-session dedup). Key is
     # the display NAME — PR #259's short_desc may change between turns
@@ -551,8 +667,9 @@ def main(argv: list[str] | None = None) -> int:
     seen = _load_seen(args.session_id)
     matched_agents = [(n, sd) for (n, sd) in matched_agents if f"a:{n}" not in seen]
     matched_skills = [(n, sd) for (n, sd) in matched_skills if f"s:{n}" not in seen]
+    matched_workflows = [(n, sd) for (n, sd) in matched_workflows if f"w:{n}" not in seen]
 
-    message = format_suggestion(matched_agents, matched_skills)
+    message = format_suggestion(matched_agents, matched_skills, matched_workflows)
     if message:
         sys.stdout.write(message + "\n")
         # Persist BEFORE returning — if the user CTRL-Cs the next prompt,
@@ -561,7 +678,8 @@ def main(argv: list[str] | None = None) -> int:
         _persist_seen(
             args.session_id,
             [f"a:{n}" for (n, _sd) in matched_agents]
-            + [f"s:{n}" for (n, _sd) in matched_skills],
+            + [f"s:{n}" for (n, _sd) in matched_skills]
+            + [f"w:{n}" for (n, _sd) in matched_workflows],
         )
     return 0
 

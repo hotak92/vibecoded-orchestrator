@@ -289,5 +289,40 @@ class CrossLanguageInvariantTests(unittest.TestCase):
         )
 
 
+class MaintainKgScriptGuardTests(unittest.TestCase):
+    """v0.2.54 Track D: templates/scripts/maintain_knowledge_graph.py
+    carries a shared-collection refusal whose hazard-name set is a
+    LITERAL mirror of the project_init constants (the shipped script
+    can't depend on a project_init import succeeding at runtime — the
+    guard must hold even when vco_lib resolution is broken). This pins
+    the mirror so a rename in project_init fails loudly here."""
+
+    SCRIPT = REPO_ROOT / "templates" / "scripts" / "maintain_knowledge_graph.py"
+
+    def test_guard_set_mirrors_all_known_shared_names(self):
+        body = self.SCRIPT.read_text(encoding="utf-8")
+        for name in (
+            CANONICAL_SHARED_KG_NAME,
+            LEGACY_SHARED_KG_NAME,
+            # The lowercase-c v0.2.12–v0.2.22 alias needs no separate
+            # literal: the guard's case-insensitive comparison of the
+            # canonical literal covers it — asserted below.
+        ):
+            self.assertIn(
+                name.lower(),
+                body.lower(),
+                f"maintain_knowledge_graph.py shared-KG guard lost the "
+                f"{name!r} literal — destructive --fix/--rebuild would "
+                "no longer refuse on that shared collection.",
+            )
+        self.assertIn(
+            ".strip().lower()",
+            body,
+            "the guard's case-insensitive comparison was removed — the "
+            "lowercase-c legacy alias (v0.2.12–v0.2.22) is only covered "
+            "via case-folding of the canonical literal.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

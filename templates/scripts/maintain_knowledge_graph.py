@@ -15,6 +15,19 @@ Usage:
     python .claude/scripts/maintain_knowledge_graph.py --check    # Check only
     python .claude/scripts/maintain_knowledge_graph.py --fix      # Check and fix
     python .claude/scripts/maintain_knowledge_graph.py --rebuild  # Full rebuild
+
+Destructive paths (--fix orphan deletion, --rebuild) prompt for
+confirmation; pass --yes for non-interactive runs (CI, agents). On a
+non-interactive shell without --yes the destructive step is SKIPPED
+(exit 3) — never silently applied.
+
+DATA-SAFETY (v0.2.54 Track D / audit P0-2): when the resolved
+KNOWLEDGE_COLLECTION is the SHARED KG collection (orchestrator-root
+rebind, the v0.2.44 scenario), --fix / --rebuild are REFUSED: shared
+nodes written by OTHER projects carry file_paths that resolve only in
+their own project trees, so orphan-pruning/rebuilding from any single
+project root would classify them all as orphans and delete them. Set
+VCO_MAINTAIN_SHARED_KG_CONSENT=1 to override (accepting that loss).
 """
 
 import sys
@@ -108,6 +121,38 @@ def _resolve_kg_collection() -> str:
 KNOWLEDGE_COLLECTION = _resolve_kg_collection()
 DOCUMENTS_COLLECTION = "DocumentChunks"
 
+# v0.2.54 Track D (P0-2): shared-KG hazard detection. Canonical name +
+# legacy aliases mirror vco_lib/project_init.py (_SHARED_KG_NAME,
+# _LEGACY_SHARED_KG_NAME, _LEGACY_SHARED_KG_NAME_LOWERCASE_C). Compared
+# case-insensitively because install.py's case-insensitive adoption can
+# rebind to whichever casing the live class actually carries.
+_SHARED_KG_NAMES = {
+    os.getenv("SHARED_KG_COLLECTION", "").strip().lower(),
+    "vibecodedorchestrator_knowledgegraph",
+    "vibecodedtools_knowledgegraph",
+} - {""}
+
+
+def _is_shared_collection(name: str) -> bool:
+    return name.strip().lower() in _SHARED_KG_NAMES
+
+
+def _confirm_destructive(prompt: str, assume_yes: bool) -> bool:
+    """Gate for destructive steps. Returns True iff the user consented.
+
+    Interactive shell → input() prompt; non-interactive shell → True
+    only with --yes. Never destructive-by-default.
+    """
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print(f"  ⚠️  {prompt}")
+        print("  Non-interactive shell without --yes — SKIPPING the "
+              "destructive step. Re-run with --yes to apply.")
+        return False
+    answer = input(f"{prompt} [y/N]: ").strip().lower()
+    return answer in ("y", "yes")
+
 
 def get_all_knowledge_files() -> Dict[str, Path]:
     """
@@ -152,31 +197,45 @@ def _fetch_all_objects_paginated(collection, page_size: int = 1000):
     return all_objects
 
 
-def get_all_weaviate_nodes(server: WeaviateMCPServer) -> Dict[str, str]:
+def get_all_weaviate_objects(
+    server: WeaviateMCPServer,
+) -> List[Tuple[str, str, str]]:
     """
-    Get all nodes from Weaviate
-
-    Returns dict: {title: file_path}
+    Get all objects from Weaviate as (uuid, title, file_path) triples.
 
     v0.2.46 V46-D: uses cursor pagination so collections > 1000 nodes
     are fully enumerated (orphan-detection previously missed nodes 1001+).
+
+    v0.2.54 Track D (P0-2): returns UUIDs so orphan DELETION is keyed by
+    the exact object identity. Pre-fix the delete step re-queried by
+    TITLE equality (limit 10) and deleted every match — a live node that
+    happened to share a title with an orphan was collateral damage.
     """
     try:
         collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
         objects = _fetch_all_objects_paginated(collection)
 
-        nodes = {}
+        triples = []
         for obj in objects:
             title = obj.properties.get("title")
             file_path = obj.properties.get("file_path")
             if title and file_path:
-                nodes[title] = file_path
+                triples.append((str(obj.uuid), title, file_path))
 
-        return nodes
+        return triples
 
     except Exception as e:
         print(f"❌ Error fetching Weaviate nodes: {e}")
-        return {}
+        return []
+
+
+def get_all_weaviate_nodes(server: WeaviateMCPServer) -> Dict[str, str]:
+    """Get all nodes from Weaviate as {title: file_path} (back-compat view
+    over :func:`get_all_weaviate_objects`)."""
+    return {
+        title: file_path
+        for _uuid, title, file_path in get_all_weaviate_objects(server)
+    }
 
 
 def extract_wikilinks(content: str) -> Set[str]:
@@ -187,22 +246,27 @@ def extract_wikilinks(content: str) -> Set[str]:
 
 
 def check_orphaned_weaviate_entries(
-    weaviate_nodes: Dict[str, str],
+    weaviate_objects: List[Tuple[str, str, str]],
     file_nodes: Dict[str, Path]
-) -> List[str]:
-    """Find Weaviate entries without corresponding files"""
+) -> List[Tuple[str, str, str]]:
+    """Find Weaviate objects without corresponding files.
+
+    Takes and returns (uuid, title, file_path) triples so the deletion
+    step can target exact object identities (v0.2.54 Track D — see
+    :func:`get_all_weaviate_objects`).
+    """
     orphaned = []
 
-    for title, weaviate_path in weaviate_nodes.items():
+    for uuid, title, weaviate_path in weaviate_objects:
         # Check if file exists
         file_path = PROJECT_ROOT / weaviate_path
         if not file_path.exists():
-            orphaned.append(title)
+            orphaned.append((uuid, title, weaviate_path))
             continue
 
         # Check if title matches
         if title not in file_nodes:
-            orphaned.append(title)
+            orphaned.append((uuid, title, weaviate_path))
 
     return orphaned
 
@@ -247,24 +311,25 @@ def check_broken_links(file_nodes: Dict[str, Path]) -> Dict[str, List[str]]:
 
 def delete_orphaned_weaviate_entries(
     server: WeaviateMCPServer,
-    orphaned_titles: List[str]
+    orphaned: List[Tuple[str, str, str]]
 ) -> int:
-    """Delete orphaned entries from Weaviate"""
+    """Delete orphaned entries from Weaviate.
+
+    v0.2.54 Track D (P0-2): deletion is keyed by UUID — exactly the
+    objects the orphan check flagged. Pre-fix this re-queried by TITLE
+    equality (limit 10) and deleted every match, so a LIVE node sharing
+    a title with an orphan (duplicate-titled nodes are common after
+    renames) was silently destroyed alongside it.
+    """
     deleted_count = 0
 
     try:
         collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
 
-        for title in orphaned_titles:
-            results = collection.query.fetch_objects(
-                filters=Filter.by_property("title").equal(title),
-                limit=10
-            )
-
-            for obj in results.objects:
-                collection.data.delete_by_id(obj.uuid)
-                deleted_count += 1
-                print(f"  🗑️  Deleted orphaned entry: {title}")
+        for uuid, title, _file_path in orphaned:
+            collection.data.delete_by_id(uuid)
+            deleted_count += 1
+            print(f"  🗑️  Deleted orphaned entry: {title} ({uuid})")
 
     except Exception as e:
         print(f"  ❌ Error deleting orphaned entries: {e}")
@@ -303,7 +368,11 @@ def sync_orphaned_files(
     return synced_count
 
 
-def check_consistency(server: WeaviateMCPServer, fix: bool = False) -> Dict[str, int]:
+def check_consistency(
+    server: WeaviateMCPServer,
+    fix: bool = False,
+    assume_yes: bool = False,
+) -> Dict[str, int]:
     """
     Check consistency between files and Weaviate
 
@@ -330,26 +399,38 @@ def check_consistency(server: WeaviateMCPServer, fix: bool = False) -> Dict[str,
     print(f"  Found {len(file_nodes)} files")
 
     print("\n🔍 Scanning Weaviate...")
-    weaviate_nodes = get_all_weaviate_nodes(server)
-    stats["total_weaviate"] = len(weaviate_nodes)
-    print(f"  Found {len(weaviate_nodes)} nodes")
+    weaviate_objects = get_all_weaviate_objects(server)
+    weaviate_nodes = {
+        title: fp for _uuid, title, fp in weaviate_objects
+    }
+    stats["total_weaviate"] = len(weaviate_objects)
+    print(f"  Found {len(weaviate_objects)} objects")
 
     # Check orphaned Weaviate entries
     print("\n🗑️  Checking for orphaned Weaviate entries...")
-    orphaned_weaviate = check_orphaned_weaviate_entries(weaviate_nodes, file_nodes)
+    orphaned_weaviate = check_orphaned_weaviate_entries(weaviate_objects, file_nodes)
     stats["orphaned_weaviate"] = len(orphaned_weaviate)
 
     if orphaned_weaviate:
         print(f"  ⚠️  Found {len(orphaned_weaviate)} orphaned Weaviate entries:")
-        for title in orphaned_weaviate[:10]:
-            print(f"    - {title}")
+        for _uuid, title, fp in orphaned_weaviate[:10]:
+            print(f"    - {title} ({fp})")
         if len(orphaned_weaviate) > 10:
             print(f"    ... and {len(orphaned_weaviate) - 10} more")
 
         if fix:
-            print(f"\n  Fixing orphaned Weaviate entries...")
-            deleted = delete_orphaned_weaviate_entries(server, orphaned_weaviate)
-            stats["fixed"] += deleted
+            # v0.2.54 Track D (P0-2): destructive step is confirmation-
+            # gated. The orphan list above shows EXACTLY what would be
+            # deleted before the user consents.
+            if _confirm_destructive(
+                f"Delete these {len(orphaned_weaviate)} Weaviate object(s)?",
+                assume_yes,
+            ):
+                print(f"\n  Fixing orphaned Weaviate entries...")
+                deleted = delete_orphaned_weaviate_entries(server, orphaned_weaviate)
+                stats["fixed"] += deleted
+            else:
+                print("  Skipped orphan deletion (no confirmation).")
     else:
         print(f"  ✓ No orphaned Weaviate entries")
 
@@ -393,7 +474,7 @@ def check_consistency(server: WeaviateMCPServer, fix: bool = False) -> Dict[str,
     return stats
 
 
-def rebuild_all(server: WeaviateMCPServer):
+def rebuild_all(server: WeaviateMCPServer, assume_yes: bool = False):
     """Full rebuild: delete all Weaviate nodes and resync from files"""
     print("=" * 60)
     print("FULL REBUILD")
@@ -408,6 +489,17 @@ def rebuild_all(server: WeaviateMCPServer):
     try:
         collection = server.client.collections.get(KNOWLEDGE_COLLECTION)
         objects = _fetch_all_objects_paginated(collection)
+
+        # v0.2.54 Track D (P0-2): full rebuild used to delete EVERYTHING
+        # with zero prompt. Now: show the blast radius, require consent.
+        local_files = len(list(KNOWLEDGE_ROOT.rglob("*.md"))) if KNOWLEDGE_ROOT.is_dir() else 0
+        if not _confirm_destructive(
+            f"Delete ALL {len(objects)} object(s) in '{KNOWLEDGE_COLLECTION}' "
+            f"and resync from {local_files} local .md file(s)?",
+            assume_yes,
+        ):
+            print("  Rebuild aborted (no confirmation). Nothing was deleted.")
+            sys.exit(3)
 
         deleted_count = 0
         for obj in objects:
@@ -437,18 +529,53 @@ def rebuild_all(server: WeaviateMCPServer):
 
 def main():
     """Main entry point"""
-    if len(sys.argv) < 2:
+    argv = sys.argv[1:]
+    assume_yes = "--yes" in argv
+    argv = [a for a in argv if a != "--yes"]
+
+    if len(argv) < 1:
         print("Usage: maintain_knowledge_graph.py --check")
-        print("       maintain_knowledge_graph.py --fix")
-        print("       maintain_knowledge_graph.py --rebuild")
+        print("       maintain_knowledge_graph.py --fix     [--yes]")
+        print("       maintain_knowledge_graph.py --rebuild [--yes]")
         sys.exit(1)
 
-    mode = sys.argv[1]
+    mode = argv[0]
 
     if mode not in ["--check", "--fix", "--rebuild"]:
         print(f"❌ Invalid mode: {mode}")
-        print("Use --check, --fix, or --rebuild")
+        print("Use --check, --fix, or --rebuild (optionally --yes)")
         sys.exit(1)
+
+    # v0.2.54 Track D (P0-2): shared-collection refusal for destructive
+    # modes. When KNOWLEDGE_COLLECTION is the SHARED KG (orchestrator-
+    # root rebind), nodes contributed by OTHER projects have file_paths
+    # that resolve only inside their own project trees — from here they
+    # ALL look orphaned, and --fix/--rebuild would delete every one of
+    # them. install.py documents this exact hazard as the reason it
+    # never auto-adopts foreign KGs; this script must not carry the
+    # same footgun. --check stays available (read-only).
+    if mode in ("--fix", "--rebuild") and _is_shared_collection(KNOWLEDGE_COLLECTION):
+        if os.getenv("VCO_MAINTAIN_SHARED_KG_CONSENT", "") != "1":
+            print(
+                f"❌ REFUSED: '{KNOWLEDGE_COLLECTION}' is the SHARED KG "
+                f"collection.\n"
+                f"   {mode} would classify every node written by OTHER "
+                f"projects as orphaned\n"
+                f"   (their .md sources live in those projects' own "
+                f"knowledge/ trees) and DELETE them.\n"
+                f"   Use --check for a read-only report. To restore the "
+                f"shared KG instead, run each\n"
+                f"   contributing project's `.claude/scripts/kg-sync --all`.\n"
+                f"   To override anyway (accepting that loss): set "
+                f"VCO_MAINTAIN_SHARED_KG_CONSENT=1.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(
+            "⚠️  VCO_MAINTAIN_SHARED_KG_CONSENT=1 — operating destructively "
+            "on the SHARED KG collection as instructed.",
+            file=sys.stderr,
+        )
 
     embedding_service = None
     server = None
@@ -484,10 +611,10 @@ def main():
         print()
 
         if mode == "--rebuild":
-            rebuild_all(server)
+            rebuild_all(server, assume_yes=assume_yes)
         else:
             fix = (mode == "--fix")
-            stats = check_consistency(server, fix=fix)
+            stats = check_consistency(server, fix=fix, assume_yes=assume_yes)
 
             # Print summary
             print("\n" + "=" * 60)

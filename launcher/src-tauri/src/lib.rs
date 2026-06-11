@@ -616,6 +616,20 @@ pub fn run() {
         // commands::project_codegraph_extras::ExtrasLockRegistry.
         .manage(commands::project_codegraph_extras::ExtrasLockRegistry::default())
         .setup(|app| {
+            // v0.2.54 Track D (Theme 5): pin the process boot instant.
+            // `get_launcher_restart_status` compares UPDATE_DEFERRED.md's
+            // mtime against this to detect a STALE
+            // `launcher_restart_required` entry (entry written before
+            // this process started => this process already runs the
+            // post-swap binary => self-clear instead of nagging).
+            // Initialized here — before the first FE poll can race it —
+            // so the recorded instant is the real boot time, not the
+            // first-poll time (a first-poll init would mis-classify an
+            // entry written in the boot->first-poll window as stale and
+            // wrongly clear it).
+            let _ = commands::restart::LAUNCHER_BOOT_TIME
+                .get_or_init(std::time::SystemTime::now);
+
             // v0.2.53 M-P0-7: augment PATH for graphical-launch contexts
             // BEFORE any subprocess is spawned by the setup hook (sweep
             // for stale binary siblings, container-runtime probe via
