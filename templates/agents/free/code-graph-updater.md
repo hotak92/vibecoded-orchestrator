@@ -212,19 +212,17 @@ None
 
 ## Quick Reference
 
-**Spawn this agent**:
-```bash
-# From hook or manual
-python .claude/scripts/spawn_background_agent.py \
-    --agent code-graph-updater \
-    --files "file1.py file2.py" \
-    --project "ProjectName" \
-    --background
-```
+**Spawn this agent** (native background subagent — no helper script needed):
 
-**Check status**:
+> From a Claude Code session, use the Agent tool with subagent_type
+> `code-graph-updater`, `run_in_background: true`, and a prompt naming the targets:
+> "Update the code graph for: file1.py file2.py"
+
+Background completion is reported back to the session by the harness.
+
+For bulk re-analysis outside a session, run the analyzer CLI directly:
 ```bash
-python .claude/scripts/spawn_background_agent.py --list
+.claude/scripts/code-graph-analyze . --project "ProjectName" --incremental
 ```
 
 **View report**:
