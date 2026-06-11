@@ -941,65 +941,15 @@ def _bootstrap_detect_gpu() -> dict:
 
 
 def _bootstrap_detect_secrets(root: Path) -> dict:
-    """Build the `secrets` envelope block (v0.2.54 S-8).
+    """Shim over :func:`vco_lib.secrets_bootstrap.detect_secrets_envelope`.
 
-    One-stop machine-readable answer to "what secrets exist, how do I
-    use them, are they wired up?" for agents that prepass-read the
-    envelope. Lists key NAMES only — never values. All probes soft-fail.
+    Kept for backwards compatibility with the existing call-site; new
+    callers should import the shared helper directly.
     """
-    secrets_root = Path(
-        os.environ.get("VCT_SECRETS_DIR") or (Path.home() / ".vct-secrets")
+    from vco_lib.secrets_bootstrap import detect_secrets_envelope
+    return detect_secrets_envelope(
+        root, probe_timeout_s=BOOTSTRAP_PROBE_TIMEOUT_S
     )
-    shared_dir = secrets_root / "shared"
-
-    shared_keys: list[str] = []
-    try:
-        if shared_dir.is_dir():
-            shared_keys = sorted(
-                p.name for p in shared_dir.iterdir()
-                if p.is_file() and p.name != "_README.md"
-                and not p.name.startswith(".")
-            )
-    except OSError:
-        shared_keys = []
-
-    # git-credential-vct registration probe (names only, no secret I/O).
-    helper_registered = False
-    try:
-        r = subprocess.run(
-            ["git", "config", "--global", "--get-all",
-             "credential.https://github.com.helper"],
-            capture_output=True, text=True,
-            timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
-        )
-        helper_registered = (
-            r.returncode == 0 and "git-credential-vct" in (r.stdout or "")
-        )
-    except (subprocess.SubprocessError, OSError, FileNotFoundError):
-        helper_registered = False
-
-    shared_readme = shared_dir / "_README.md"
-    return {
-        "primitive": "vct-secrets",
-        "cli": str(root / "tools" / "vct-secrets" / "vct"),
-        "store_dir": str(secrets_root),
-        "store_dir_exists": secrets_root.is_dir(),
-        "shared_readme": str(shared_readme),
-        "shared_readme_exists": shared_readme.is_file(),
-        "shared_keys_available": shared_keys,
-        "credential_helper": str(
-            root / "tools" / "vct-secrets" / "git-credential-vct"
-        ),
-        "credential_helper_registered": helper_registered,
-        # Launcher-managed slots resolve via vct-hub, not the file store.
-        "hub_env_endpoint": "http://127.0.0.1:7700/api/v1/projects/{id}/env",
-        "hub_resolver_clients": [
-            "templates/scripts/vct_secrets_resolve.sh",
-            "templates/scripts/vct_secrets_resolve.ps1",
-            "vco_lib/agent_secrets.py",
-        ],
-        "docs": "docs/VCT_SECRETS_PRIMITIVE.md",
-    }
 
 
 def _bootstrap_classify_install_root(root: Path) -> str:
@@ -11674,55 +11624,36 @@ def _materialize_orchestrator_self_claude_md(install_root: Path) -> None:
 
 
 def _materialize_vct_secrets_shared_readme(install_root: Path) -> None:
-    """v0.2.54 S-3: materialize the agent-facing key-schema doc at
-    ``~/.vct-secrets/shared/_README.md`` (honoring ``$VCT_SECRETS_DIR``).
+    """v0.2.54 S-3: install-side wrapper around
+    :func:`vco_lib.secrets_bootstrap.materialize_shared_readme`.
 
-    Idempotent + user-respecting: ONLY written when the file does not
-    already exist (users edit it to document their own keys; we never
-    clobber). Creates the store skeleton (700 dirs) when absent so the
-    doc has a place to land even before the first ``vct set``.
-
-    Soft-fail: secrets-store problems never abort an install.
+    Translates the shared helper's :class:`MaterializeReadmeResult`
+    into the phase-prefixed install-event stream and the user-visible
+    print line. Soft-fail: secrets-store problems never abort an
+    install.
     """
-    template_path = (
-        install_root / "templates" / "vct-secrets-shared-readme.template"
-    )
-    if not template_path.is_file():
+    from vco_lib.secrets_bootstrap import materialize_shared_readme
+    result = materialize_shared_readme(install_root)
+    if result.status == "template_missing":
         _log_install_event(
             "5c/10", "skip",
-            f"vct-secrets readme template missing at {template_path}",
+            f"vct-secrets readme template missing: {result.message}",
         )
-        return
-    try:
-        secrets_root = Path(
-            os.environ.get("VCT_SECRETS_DIR") or (Path.home() / ".vct-secrets")
+    elif result.status == "preserved":
+        _log_install_event(
+            "5c/10", "skip",
+            "~/.vct-secrets/shared/_README.md already exists (user copy preserved)",
         )
-        shared_dir = secrets_root / "shared"
-        target = shared_dir / "_README.md"
-        if target.is_file():
-            _log_install_event(
-                "5c/10", "skip",
-                "~/.vct-secrets/shared/_README.md already exists (user copy preserved)",
-            )
-            return
-        shared_dir.mkdir(parents=True, exist_ok=True)
-        if os.name == "posix":
-            os.chmod(secrets_root, 0o700)
-            os.chmod(shared_dir, 0o700)
-        target.write_text(
-            template_path.read_text(encoding="utf-8"), encoding="utf-8"
-        )
-        if os.name == "posix":
-            os.chmod(target, 0o600)
+    elif result.status == "materialized":
         print("[5c/10] Materialized ~/.vct-secrets/shared/_README.md "
               "(agent-facing key schema)")
         _log_install_event(
-            "5c/10", "ok", f"materialized {target}",
+            "5c/10", "ok", f"materialized {result.target}",
         )
-    except OSError as e:
+    elif result.status == "error":
         _log_install_event(
             "5c/10", "warn",
-            f"failed to materialize vct-secrets shared _README.md: {e}",
+            f"failed to materialize vct-secrets shared _README.md: {result.message}",
         )
 
 
