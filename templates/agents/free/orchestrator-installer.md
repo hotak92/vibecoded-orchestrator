@@ -552,11 +552,15 @@ cp [orchestrator]/.claude/scripts/get_node_info.py ~/.claude/scripts/
 cp [orchestrator]/.claude/scripts/sync_knowledge_graph.py ~/.claude/scripts/
 chmod +x ~/.claude/scripts/kg-*
 
-# Workflow maintenance
+# Workflow maintenance + background-agent spawning
 cp [orchestrator]/.claude/scripts/detect-workflow-needs ~/.claude/scripts/
+cp [orchestrator]/.claude/scripts/detect_workflow_needs.py ~/.claude/scripts/
 cp [orchestrator]/.claude/scripts/generate-workflow ~/.claude/scripts/
+cp [orchestrator]/.claude/scripts/generate_workflow.py ~/.claude/scripts/
+cp [orchestrator]/.claude/scripts/spawn_background_agent.py ~/.claude/scripts/
 chmod +x ~/.claude/scripts/detect-workflow-needs
 chmod +x ~/.claude/scripts/generate-workflow
+chmod +x ~/.claude/scripts/spawn_background_agent.py
 
 # MCP testing
 cp [orchestrator]/.claude/scripts/test-mcp ~/.claude/scripts/
@@ -570,7 +574,9 @@ $dst = "$env:USERPROFILE\.claude\scripts"
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 Copy-Item "$src\smart_file_ops.py","$src\kg-search","$src\kg-info","$src\kg-sync",`
           "$src\search_knowledge.py","$src\get_node_info.py","$src\sync_knowledge_graph.py",`
-          "$src\detect-workflow-needs","$src\generate-workflow","$src\test-mcp" $dst
+          "$src\detect-workflow-needs.ps1","$src\detect_workflow_needs.py",`
+          "$src\generate-workflow.ps1","$src\generate_workflow.py",`
+          "$src\spawn_background_agent.ps1","$src\spawn_background_agent.py","$src\test-mcp" $dst
 # Run via:  py "$dst\smart_file_ops.py" check ...
 ```
 
@@ -1392,21 +1398,18 @@ Find infrastructure setup patterns, deployment strategies, configuration best pr
 - `query_temporal.py` - Point-in-time queries
 - `migrate_to_vocabulary.py` - Validate tags/vocabulary
 - `detect_duplicates.py` - Semantic duplicate detection
-- `queue_maintenance.py` - Background task queue
-- `process_maintenance_queue.py` - Queue processor
+- `spawn_background_agent.py` - Spawn-on-demand background agents (successor to the archived queue system)
 
 ## Background Maintenance
 
-**Queue System**:
-- `queue_maintenance.py` - Queue tasks (knowledge-curator, graph-health-checker, code-graph-updater)
-- `process_maintenance_queue.py` - Process queue (runs every 15 min via cron)
-- `maintenance_status.py` - Check queue status
-- Catch-up mechanism: Runs missed tasks at next opportunity
+**Spawn-on-demand** (replaces the archived queue system — `queue_maintenance.py` / `process_maintenance_queue.py` live in `.claude/scripts/archive/` for reference only):
+- `spawn_background_agent.py --agent <name> --files "..."` - Spawn an agent immediately as a detached `claude -p` subprocess (knowledge-curator, graph-health-checker, code-graph-updater)
+- `spawn_background_agent.py --list` / `--status <id>` / `--cancel <id>` - Manage spawns; state in `.claude/state/spawned_agents.jsonl`
+- Backpressure: refuses when VCO_MAX_BACKGROUND_AGENTS (default 3) agents are already running
 
-**Scheduled Tasks**:
-- Daily 2 AM: knowledge-curator (relationship extraction, deduplication)
-- Weekly Sunday 3 AM: graph-health-checker (consistency checks)
-- Every 15 minutes: process_maintenance_queue
+**Scheduled Tasks** (cron invokes the spawner directly — no queue processor):
+- Daily 2 AM: `spawn_background_agent.py --agent knowledge-curator --mode daily`
+- Weekly Sunday 3 AM: `spawn_background_agent.py --agent graph-health-checker --mode full`
 
 **Setup**: `.claude/scripts/setup_cron.sh` (creates cron jobs)
 

@@ -224,7 +224,7 @@ python .claude/scripts/spawn_background_agent.py \
 
 **Check status**:
 ```bash
-python .claude/scripts/maintenance_status.py
+python .claude/scripts/spawn_background_agent.py --list
 ```
 
 **View report**:
