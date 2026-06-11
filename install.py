@@ -6705,6 +6705,54 @@ def _write_update_deferred_stub(folder: Path, *, mode: str) -> None:
 # Deferral-apply helper
 # ---------------------------------------------------------------------------
 
+def _pid_is_alive_for_deferral(pid: int) -> bool:
+    """Cross-OS "is this PID still running" probe for deferral re-checks.
+
+    v0.2.54 Track D: used by the ``launcher_restart_required`` handler.
+    On Windows, ``os.kill(pid, 0)`` is NOT a probe — any non-CTRL signal
+    value unconditionally TerminateProcess-es the target — so we go via
+    OpenProcess + GetExitCodeProcess (STILL_ACTIVE == 259) instead.
+    POSIX uses the conventional ``kill(pid, 0)`` errno dance.
+
+    Conservative on uncertainty: unknown → True (treat the process as
+    alive, so the deferral entry is KEPT rather than cleared on a
+    guess).
+    """
+    if pid <= 0:
+        return True  # unparseable / sentinel value — keep the entry
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            )
+            if not handle:
+                return False  # no such process (or no access → likely gone)
+            try:
+                exit_code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(exit_code),
+                )
+                return bool(ok) and exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 — conservative fallback
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    except OSError:
+        return True  # uncertain → conservative
+
+
 def _apply_deferred_entries(
     current_run_report: DeferralReport,
     project_root: Path,
@@ -6720,10 +6768,18 @@ def _apply_deferred_entries(
     at end of ``main()``).
 
     Conditions handled:
-      - ``schema_drift_rebuild_required``: not auto-applied here; requires
-        ``--rebuild-collections`` flag to be present.  We skip to preserve
-        the conservative "no silent data churn" contract.  If the user passed
-        ``--rebuild-collections`` the drift is already resolved before we arrive.
+      - ``schema_drift_rebuild_required``: never auto-applies the rebuild
+        (that stays behind explicit ``--rebuild-collections`` consent), but
+        RE-PROBES the current drift state (v0.2.54 Track D): when the
+        drift is gone (e.g. the rebuild ran earlier in this same
+        invocation) the entry is cleared instead of resurrected.
+      - ``update_resume_required``: re-probes the launcher's resume
+        sentinel (``.claude/state/orchestrator-update-resume-needed.json``
+        in the install root); sentinel gone → resolved (v0.2.54 Track D).
+      - ``launcher_restart_required``: consumes
+        ``.claude/context/launcher-restart-marker`` (written by the
+        restarted launcher) or, failing that, verifies the recorded old
+        launcher PID has exited (v0.2.54 Track D).
       - ``weaviate_unreachable_at_update``: try ``podman start <name>``
         (name discovered via ``vco_lib.containers.find_existing_container``;
         falls back to the canonical ``vco_weaviate`` if no container is
@@ -6743,9 +6799,163 @@ def _apply_deferred_entries(
         cid = entry.condition_id
 
         if cid == "schema_drift_rebuild_required":
-            # Requires explicit --rebuild-collections; not auto-applied.
-            print(f"  [skip] {cid}: requires --rebuild-collections (manual action)")
-            current_run_report.add_entry(entry)
+            # v0.2.54 Track D (Theme 5): re-probe instead of blind-skip.
+            #
+            # Pre-fix this branch unconditionally [skip]-ed and re-added
+            # the persisted entry, while the docstring claimed "if the
+            # user passed --rebuild-collections the drift is already
+            # resolved before we arrive". Run order made that a lie:
+            # the rebuild executes earlier in main(), then THIS code
+            # re-read the on-disk file and resurrected the entry — so
+            # `--update --apply-deferred --rebuild-collections` (the
+            # entry's own command_to_apply combined with the documented
+            # apply flow) performed the rebuild AND kept the deferral
+            # alive forever.
+            #
+            # Same re-probe discipline as the orphan-collection handler
+            # below (v0.2.46): probe the CURRENT drift state; clear only
+            # when the premise no longer holds; keep on drift or on
+            # probe failure. The rebuild itself is still never
+            # auto-applied here — that stays behind explicit
+            # --rebuild-collections consent.
+            kg_collection = os.environ.get("KG_COLLECTION", "")
+            if not kg_collection:
+                print(
+                    f"  [skip] {cid}: KG_COLLECTION not set — cannot "
+                    "re-probe drift. Keeping entry."
+                )
+                current_run_report.add_entry(entry)
+            else:
+                weaviate_url = os.environ.get(
+                    "WEAVIATE_URL",
+                    f"http://localhost:{DEFAULT_WEAVIATE_PORT}",
+                )
+                print(f"  [try]  {cid}: re-probing schema drift on "
+                      f"`{kg_collection}` ...")
+                try:
+                    drift, missing = _detect_kg_schema_drift(
+                        weaviate_url, kg_collection,
+                    )
+                    if not drift:
+                        print(
+                            f"  [ok]   {cid}: no schema drift detected — "
+                            "rebuild already applied (or schema healed). "
+                            "Marking resolved."
+                        )
+                        # Resolved: do NOT re-add to current_run_report.
+                    else:
+                        print(
+                            f"  [skip] {cid}: drift persists "
+                            f"(missing: {', '.join(missing) or 'unknown'}). "
+                            "Requires --rebuild-collections (manual "
+                            "consent). Keeping entry."
+                        )
+                        current_run_report.add_entry(entry)
+                except Exception as exc:  # noqa: BLE001 — soft-fail
+                    print(f"  [fail] {cid}: drift re-probe failed ({exc}). "
+                          "Keeping entry.")
+                    current_run_report.add_entry(entry)
+
+        elif cid == "update_resume_required":
+            # v0.2.54 Track D (Theme 5): both sides of this entry's
+            # lifecycle used to defer to code that didn't exist —
+            # installer.rs pointed at install.py `mark_resolved` calls
+            # (zero call sites) and install.py's emitter docstring
+            # claimed a handler here (there was none), so after a
+            # successful resume the "update halted at a conflict" entry
+            # survived every --apply-deferred run forever whenever any
+            # other deferral coexisted.
+            #
+            # Re-probe: the sentinel
+            # `.claude/state/orchestrator-update-resume-needed.json`
+            # (written by the launcher's update commands, deleted by
+            # `resume_orchestrator_update` on success) is the source of
+            # truth. Gone → the resume completed → resolved. Present →
+            # the resume is still pending → keep. NOTE: the sentinel
+            # lives in the INSTALL ROOT (= project_root for
+            # orchestrator-self runs, where this entry is emitted).
+            sentinel = (
+                project_root / ".claude" / "state"
+                / "orchestrator-update-resume-needed.json"
+            )
+            if sentinel.is_file():
+                print(
+                    f"  [skip] {cid}: resume sentinel still present at "
+                    f"{sentinel} — the interrupted update has not been "
+                    "resumed yet. Click `Continue Update` in the "
+                    "launcher's MenuBar badge (or finish `python "
+                    "install.py --update` from the install root). "
+                    "Keeping entry."
+                )
+                current_run_report.add_entry(entry)
+            else:
+                print(
+                    f"  [ok]   {cid}: resume sentinel is gone — the "
+                    "update was resumed (or this very run completed "
+                    "it). Marking resolved."
+                )
+                # Resolved: do NOT re-add to current_run_report.
+
+        elif cid == "launcher_restart_required":
+            # v0.2.54 Track D (Theme 5): the documented self-clear
+            # protocol (".claude/context/launcher-restart-marker"
+            # written by the restarted launcher, consumed here) was
+            # never implemented on either side — the marker string
+            # existed only in a docstring and a Rust comment, and this
+            # function had no handler, so the entry fell into the
+            # [unknown] branch and survived forever unless the user
+            # clicked the banner button (whose Rust path strips the
+            # entry directly).
+            #
+            # Two-step re-probe, conservative on uncertainty:
+            #   1. Marker file present → a post-swap launcher booted →
+            #      consume the marker + resolve.
+            #   2. Else, parse the old launcher PID from the entry's
+            #      Detected text ("running launcher PID: <N>"); PID no
+            #      longer alive → the old process exited, so the next/
+            #      current launcher start loads the new binary →
+            #      resolve. PID alive or unparseable → keep.
+            marker = (
+                project_root / ".claude" / "context"
+                / "launcher-restart-marker"
+            )
+            if marker.is_file():
+                try:
+                    marker.unlink()
+                except OSError as exc:
+                    print(
+                        f"  [warn] {cid}: marker consumed but unlink "
+                        f"failed ({exc}) — will retry next run."
+                    )
+                print(
+                    f"  [ok]   {cid}: launcher-restart-marker found — "
+                    "the launcher restarted on the new binary. "
+                    "Marking resolved."
+                )
+                # Resolved: do NOT re-add to current_run_report.
+            else:
+                pid_match = re.search(
+                    r"running launcher PID:\s*(\d+)", entry.detected or "",
+                )
+                old_pid = int(pid_match.group(1)) if pid_match else -1
+                if pid_match and not _pid_is_alive_for_deferral(old_pid):
+                    print(
+                        f"  [ok]   {cid}: old launcher PID {old_pid} has "
+                        "exited — the stale in-memory code is gone. "
+                        "Marking resolved."
+                    )
+                    # Resolved: do NOT re-add to current_run_report.
+                else:
+                    detail = (
+                        f"old launcher PID {old_pid} is still running"
+                        if pid_match
+                        else "no restart marker and no PID recorded"
+                    )
+                    print(
+                        f"  [skip] {cid}: {detail} — restart still "
+                        "pending. Keeping entry."
+                    )
+                    current_run_report.add_entry(entry)
 
         elif cid == "weaviate_unreachable_at_update":
             # v0.2.15: discover the actual container name + runtime on

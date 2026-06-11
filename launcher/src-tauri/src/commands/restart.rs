@@ -80,10 +80,76 @@
 //     untouched.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Runtime};
 use vct_launcher_core::process::CommandExt as _;
+
+/// v0.2.54 Track D (Theme 5): process boot instant, initialized in
+/// `lib.rs::setup` (and defensively at first use here). Used to detect
+/// STALE `launcher_restart_required` entries: an entry written BEFORE
+/// this process started means this process already loaded the post-swap
+/// binary, so the "restart now" nag is satisfied and the entry can
+/// self-clear. Pre-fix, a manual quit+relaunch (anything but the green
+/// banner button) left the entry on disk forever — the new launcher
+/// re-rendered the restart banner on every boot, and install.py's
+/// `--apply-deferred` had no handler either.
+pub static LAUNCHER_BOOT_TIME: OnceLock<SystemTime> = OnceLock::new();
+
+/// Safety margin for the staleness comparison. The deferral file's
+/// mtime must precede the boot instant by at least this much before we
+/// self-clear — protects against same-second writes and coarse
+/// filesystem timestamp granularity. False-keep is the safe direction
+/// (banner persists; the button path still clears it); false-clear is
+/// the one we must never take.
+const RESTART_ENTRY_STALE_MARGIN: Duration = Duration::from_secs(2);
+
+/// True iff the `launcher_restart_required` entry on disk predates this
+/// launcher process (entry written, then the launcher restarted by ANY
+/// means) — i.e. the running binary is already the post-swap one.
+fn restart_entry_is_stale(deferred_md: &Path) -> bool {
+    let boot = *LAUNCHER_BOOT_TIME.get_or_init(SystemTime::now);
+    restart_entry_is_stale_at(deferred_md, boot)
+}
+
+/// Boot-instant-parameterised core of `restart_entry_is_stale` (split
+/// out so tests can exercise the comparison without mutating the
+/// process-global `LAUNCHER_BOOT_TIME` OnceLock).
+fn restart_entry_is_stale_at(deferred_md: &Path, boot: SystemTime) -> bool {
+    let mtime = match std::fs::metadata(deferred_md).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false, // cannot read mtime → conservative keep
+    };
+    match boot.duration_since(mtime) {
+        Ok(age_at_boot) => age_at_boot >= RESTART_ENTRY_STALE_MARGIN,
+        Err(_) => false, // file written after boot → entry is fresh
+    }
+}
+
+/// Fallback signal for install.py's `launcher_restart_required` handler:
+/// when the boot-time self-clear could not rewrite UPDATE_DEFERRED.md
+/// (I/O failure, permissions), drop the documented marker file so the
+/// next `install.py --update --apply-deferred` run consumes it and
+/// clears the entry instead. See install.py::_apply_deferred_entries.
+fn write_restart_marker(install_root: &Path) {
+    let marker = install_root
+        .join(".claude")
+        .join("context")
+        .join("launcher-restart-marker");
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stamp = chrono::Utc::now().to_rfc3339();
+    if let Err(e) = std::fs::write(&marker, format!("restarted-at: {}\n", stamp)) {
+        eprintln!(
+            "[restart] could not write launcher-restart-marker at {}: {}",
+            marker.display(),
+            e,
+        );
+    }
+}
 
 /// Result of `get_launcher_restart_status`: presence + details of a
 /// `launcher_restart_required` or `launcher_binary_swap_failed_locked`
@@ -132,8 +198,41 @@ pub async fn get_launcher_restart_status(
     let content = std::fs::read_to_string(&target)
         .map_err(|e| format!("read {}: {}", target.display(), e))?;
 
-    let restart_section = extract_section(&content, "launcher_restart_required");
+    let mut restart_section = extract_section(&content, "launcher_restart_required");
     let locked_section = extract_section(&content, "launcher_binary_swap_failed_locked");
+
+    // v0.2.54 Track D (Theme 5): stale-entry self-clear. If the
+    // restart entry was written BEFORE this launcher process started,
+    // the running process already loaded the post-swap binary — the
+    // restart the entry asks for has happened (manual quit+relaunch,
+    // OS reboot, anything but the banner button, whose own path strips
+    // the entry directly). Clear it instead of re-rendering the banner
+    // forever. Margin + mtime-after-boot cases conservatively KEEP the
+    // entry — false-keep is recoverable (button click), false-clear is
+    // not.
+    if restart_section.is_some() && restart_entry_is_stale(&target) {
+        eprintln!(
+            "[restart] launcher_restart_required entry predates this \
+             process (running binary is post-swap) — self-clearing",
+        );
+        match clear_restart_deferral(&install_root_path) {
+            Ok(()) => {
+                restart_section = None;
+            }
+            Err(e) => {
+                // Could not rewrite the deferral file — leave the entry
+                // (the banner shows; the button path may still succeed)
+                // and drop the documented marker so install.py's
+                // `--apply-deferred` handler clears it on its side.
+                eprintln!(
+                    "[restart] self-clear failed (non-fatal): {} — \
+                     writing launcher-restart-marker fallback",
+                    e,
+                );
+                write_restart_marker(&install_root_path);
+            }
+        }
+    }
 
     let mut status = LauncherRestartStatus {
         restart_required: restart_section.is_some(),
@@ -642,6 +741,71 @@ stub: true
 
         clear_restart_deferral(tmp.path()).expect("clear");
         assert!(!target.exists(), "non-stub empty file must be deleted");
+    }
+
+    // v0.2.54 Track D (Theme 5): stale-entry self-clear probes.
+
+    #[test]
+    fn restart_entry_fresh_when_written_after_boot() {
+        // Boot happened 1h BEFORE the entry was written → fresh →
+        // must NOT self-clear (this is the normal "install.py just
+        // swapped the binary under the running launcher" case).
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let f = tmp.path().join("UPDATE_DEFERRED.md");
+        std::fs::write(&f, "## launcher_restart_required (info)\n").expect("write");
+        let boot = SystemTime::now() - Duration::from_secs(3600);
+        assert!(
+            !restart_entry_is_stale_at(&f, boot),
+            "entry written after boot must be kept",
+        );
+    }
+
+    #[test]
+    fn restart_entry_same_instant_within_margin_is_kept() {
+        // mtime == boot (same instant) is inside the 2s safety margin →
+        // conservative keep.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let f = tmp.path().join("UPDATE_DEFERRED.md");
+        std::fs::write(&f, "## launcher_restart_required (info)\n").expect("write");
+        assert!(!restart_entry_is_stale_at(&f, SystemTime::now()));
+    }
+
+    #[test]
+    fn restart_entry_stale_when_predating_boot() {
+        // Entry written, THEN the launcher restarted (boot 1h later) →
+        // the running binary is post-swap → stale → self-clear.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let f = tmp.path().join("UPDATE_DEFERRED.md");
+        std::fs::write(&f, "## launcher_restart_required (info)\n").expect("write");
+        let boot = SystemTime::now() + Duration::from_secs(3600);
+        assert!(
+            restart_entry_is_stale_at(&f, boot),
+            "entry predating boot by 1h must be classified stale",
+        );
+    }
+
+    #[test]
+    fn restart_entry_missing_file_is_not_stale() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let f = tmp.path().join("UPDATE_DEFERRED.md");
+        assert!(
+            !restart_entry_is_stale_at(&f, SystemTime::now()),
+            "unreadable mtime → keep",
+        );
+    }
+
+    #[test]
+    fn write_restart_marker_creates_documented_path() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_restart_marker(tmp.path());
+        let marker = tmp
+            .path()
+            .join(".claude")
+            .join("context")
+            .join("launcher-restart-marker");
+        assert!(marker.is_file(), "marker must land at the documented path");
+        let body = std::fs::read_to_string(&marker).expect("read marker");
+        assert!(body.starts_with("restarted-at: "));
     }
 
     #[test]
