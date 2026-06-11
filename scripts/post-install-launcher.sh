@@ -618,11 +618,15 @@ else
     fi
 
     if [ "$MODE" = "download" ]; then
-        # Resolve OS-specific URL. Names match release.yml workflow output:
-        #   Linux:   *.AppImage and *.deb under bundle/appimage/ + bundle/deb/
-        #            (Tauri-generated names; we glob the API response)
-        #   macOS:   vct-launcher-macos-${arch}.dmg
-        #   Windows: vct-launcher-windows-x64.exe (handled in .bat, not here)
+        # Resolve OS-specific URL. Names match release.yml workflow output
+        # (uniform .zip per OS since 2026-05-10):
+        #   Linux:   vibecoded-orchestrator-<ver>-linux-x64.zip
+        #   macOS:   vibecoded-orchestrator-<ver>-macos-arm64.zip
+        #   Windows: vibecoded-orchestrator-<ver>-windows-x64.zip (handled
+        #            in first-install.bat via scripts/lib/
+        #            download-launcher-asset.ps1, not here)
+        # Legacy .appimage / .dmg / .exe assets remain as fallbacks in the
+        # respective pickers for if/when CI resumes shipping them.
         echo ""
         echo "[launcher] Probing GitHub Releases..."
 

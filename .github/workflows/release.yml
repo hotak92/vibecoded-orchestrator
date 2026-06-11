@@ -293,6 +293,23 @@ jobs:
           changed_count="$(echo "$dist_diff" | grep -c '^diff --git' || true)"
           echo "::notice::Gate 3 PASS: launcher/dist/ has ${changed_count} changed file(s) since ${prev_tag}."
 
+      # Gate 3b (v0.2.54 G-1.5) — sidecar source_hash vs live launcher
+      # subtree. Gate 3 above only proves dist/ CHANGED since the previous
+      # tag; it cannot see whether the committed binaries match THIS tag's
+      # source. At v0.2.53 all three OS sidecars carried source_hash
+      # fd215c7a (built at v0.2.52) vs live 449e6cc6, so every fresh clone
+      # rejected the bundled binary as stale and fell into the download
+      # fallback (broken on Windows until the zip-filter fix shipped with
+      # this gate). WARN mode under the current release flow — in-tree
+      # binaries are refreshed POST-release by commit-dist-binaries, so a
+      # lag is expected whenever launcher source changed since the last
+      # release; the strict twin of this check runs in commit-dist-binaries
+      # below against the freshly built artifacts. Track E: flip to
+      # `--mode strict` when the binary refresh moves to PRE-tag.
+      - name: Gate 3b — dist sidecar source_hash freshness (advisory)
+        run: |
+          python3 scripts/check-dist-freshness.py --mode warn --github
+
       - name: Gate summary
         if: success()
         run: |
@@ -1280,6 +1297,23 @@ jobs:
 
           echo "changed=${changed}" >> "$GITHUB_OUTPUT"
           echo "Summary: ${changed} binary/binaries updated."
+
+      # v0.2.54 G-1.5 — STRICT freshness check on the freshly-staged
+      # sidecars (twin of the advisory Gate 3b in pre-release-gate).
+      # After staging, launcher/dist/<os>/<binary>.metadata.json must
+      # carry the source_hash of the launcher subtree we are about to
+      # commit them against. A mismatch here means the build matrix ran
+      # from a ref whose launcher source differs from main HEAD — the
+      # v0.2.49 mislabeled-binaries failure class (tag cut from an
+      # unmerged feature branch) — or the metadata writer broke. The
+      # cross-OS consistency check also fails if the three OS builds
+      # disagree with each other. Failing BEFORE the commit+push keeps
+      # main clean; the maintainer recovery is the manual binary commit
+      # recipe in docs/MAINTAINER_GUIDE.md.
+      - name: Verify staged binaries match main HEAD launcher source (strict)
+        shell: bash
+        run: |
+          python3 scripts/check-dist-freshness.py --mode strict --github
 
       - name: Commit and push updated binaries
         if: steps.stage.outputs.changed != '0'

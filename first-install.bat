@@ -320,8 +320,8 @@ echo.
 echo ===============================================
 echo   Launcher binary not found. Choose how to get it:
 echo ===============================================
-echo   [1] Download prebuilt ^(recommended^) - fast, ~30 MB
-echo        ^(downloads vct-launcher-windows-x64.exe from latest GitHub Release^)
+echo   [1] Download prebuilt ^(recommended^) - fast, ~22 MB
+echo        ^(downloads vibecoded-orchestrator-^<version^>-windows-x64.zip from latest GitHub Release^)
 echo   [2] Build from source - slower, requires Node + Tauri toolchain
 echo        ^(auto-installs Node via winget if missing, then runs pnpm tauri build^)
 echo   [3] Skip ^(build later manually^)
@@ -349,24 +349,26 @@ set "DEST_EXE=%DEST_DIR%\vct-launcher.exe"
 REM Use PowerShell to query GitHub Releases API and download. We avoid
 REM cmd-only tools (curl / Invoke-WebRequest) so this works on Win10+
 REM regardless of curl alias presence.
-"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ErrorActionPreference='Stop';" ^
-    "try {" ^
-    "  $api='https://api.github.com/repos/hotak92/vibecoded-orchestrator/releases/latest';" ^
-    "  $r=Invoke-RestMethod -Uri $api -UseBasicParsing;" ^
-    "  $a=$r.assets | Where-Object { $_.name -like '*windows*' -and $_.name.EndsWith('.exe') } | Select-Object -First 1;" ^
-    "  if (-not $a) { Write-Host 'NO_ASSET'; exit 2 }" ^
-    "  Write-Host ('Downloading ' + $a.name);" ^
-    "  Invoke-WebRequest -Uri $a.browser_download_url -OutFile '%DEST_EXE%' -UseBasicParsing;" ^
-    "  $size=(Get-Item '%DEST_EXE%').Length;" ^
-    "  if ($size -lt 10MB) { Write-Host 'TOO_SMALL'; exit 3 }" ^
-    "  Write-Host ('Downloaded {0:N1} MB' -f ($size/1MB))" ^
-    "} catch { Write-Host ('ERR: ' + $_.Exception.Message); exit 1 }"
+REM
+REM v0.2.54 G-1.5 (Wave 0 follow-up): logic moved to
+REM scripts\lib\download-launcher-asset.ps1. The previous inline command
+REM filtered assets with $_.name.EndsWith('.exe'), but release.yml has
+REM shipped ONLY vibecoded-orchestrator-<version>-windows-x64.zip since
+REM the 2026-05-10 uniform-zip packaging change (verified against the
+REM live v0.2.53 release: zero .exe assets). The filter therefore ALWAYS
+REM returned NO_ASSET and every Windows first-run silently fell through
+REM to the 15-30 min source build. The helper prefers the windows .zip
+REM (downloads + Expand-Archive + lands vct-launcher.exe, vct-hub.exe,
+REM vct-updater.exe in %DEST_DIR%) and keeps the bare-.exe asset as a
+REM legacy fallback. Windows sibling of the POSIX M-P0-3 fix in
+REM scripts/post-install-launcher.sh. Exit codes: 0 ok, 2 NO_ASSET,
+REM 3 TOO_SMALL, 4 NO_BINARY_IN_ZIP, 1 generic.
+"%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\lib\download-launcher-asset.ps1" -DestDir "%DEST_DIR%"
 set "DL_EXIT=%ERRORLEVEL%"
 
 if "%DL_EXIT%"=="0" (
     set "LAUNCHER_BIN=%DEST_EXE%"
-    call :_log_event "download" "ok" "windows exe downloaded"
+    call :_log_event "download" "ok" "windows launcher downloaded (zip or legacy exe)"
     goto :auto_launch
 )
 echo [launcher] Download failed ^(exit %DL_EXIT%^). Falling back to build.
