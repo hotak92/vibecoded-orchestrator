@@ -7114,32 +7114,12 @@ def _check_prerequisites() -> None:
 # ---------------------------------------------------------------------------
 
 def _gpu_vendor_preference_from_env() -> Optional[str]:
-    """Return the user's explicit ``VCT_GPU_VENDOR`` preference, or None.
+    """Shim over :func:`vco_lib.gpu_profile.gpu_vendor_preference_from_env`.
 
-    v0.2.54 (gpu-audit C-3): this env var was ADVERTISED by two
-    remediation messages (the ``compose_overlay_ambiguous`` deferral's
-    ``command_to_apply`` and the ``--apply-deferred`` skip handler:
-    "Pass --gpu or set VCT_GPU_VENDOR and re-run") but had NO reader
-    anywhere — the documented dual-GPU fix was a no-op, and
-    AMD-preferring dual-vendor hosts could never select the ROCm
-    overlay (probe order is nvidia-smi first, so NVIDIA always won).
-
-    Mirrors the `_runtime_preference_from_env` contract: values are
-    case-insensitive, trimmed; empty / "auto" means no preference;
-    unknown values log to stderr and are ignored.
+    v0.2.54 gpu-audit C-3 (see shared helper for full rationale).
     """
-    raw = os.environ.get("VCT_GPU_VENDOR", "").strip().lower()
-    if not raw or raw == "auto":
-        return None
-    if raw in ("nvidia", "amd", "metal"):
-        return raw
-    print(
-        f"  VCT_GPU_VENDOR={raw!r} unrecognized (expected "
-        "'nvidia' / 'amd' / 'metal' / 'auto'); falling through to "
-        "auto-detect.",
-        file=sys.stderr,
-    )
-    return None
+    from vco_lib.gpu_profile import gpu_vendor_preference_from_env
+    return gpu_vendor_preference_from_env()
 
 
 def _detect_system(args: argparse.Namespace) -> SystemInfo:
@@ -9678,50 +9658,20 @@ _OLLAMA_SERVED_EMBEDDING_MODELS = {
 
 
 def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None:
-    """Swap the profile's stock models for the hardware-tier picks,
-    keeping every dependent field consistent (v0.2.54, gpu-audit C-5).
+    """Shim over :func:`vco_lib.gpu_profile.apply_tier_overrides`.
 
-    Mutates ``config`` in place:
-      * ``code_model`` -> ``code_dims`` follows (768/1024/1536/2048 per
-        _EMBEDDING_MODEL_DIMS). Pre-v0.2.54 only the model name was
-        swapped, so ``CODE_EMBED_DIMS=768`` was written for the
-        1024-dim qwen3 pick on 6-12 GB GPU hosts.
-      * ``text_model`` -> ``text_dims`` AND ``active_embedding`` follow
-        (the named-vector slot must be labelled for the model that
-        emitted the vector).
-      * Ollama-served override models are appended to
-        ``embedding_models`` so the pull list actually contains the
-        model the host will embed with (e.g. low_resource profile +
-        qwen3 code override).
-
-    ``code_backend`` is intentionally NOT swapped: the tier selectors
-    only ever override WITHIN a backend family (CodeSage stays
-    exclusive to the gpu profile where it is the stock pick; all other
-    picks are Ollama-served and land on profiles whose backend is
-    already "ollama").
+    Passes install.py's module-level constants through to the shared
+    helper. See `vco_lib/gpu_profile.py` for the canonical logic.
     """
-    if config.get("code_model") != code_pick:
-        config["code_model"] = code_pick
-        dims = _EMBEDDING_MODEL_DIMS.get(code_pick)
-        if dims is not None:
-            config["code_dims"] = dims
-        if (code_pick in _OLLAMA_SERVED_EMBEDDING_MODELS
-                and code_pick not in config.get("embedding_models", [])):
-            # Copy-on-write: config is a SHALLOW copy of the module-level
-            # EMBEDDING_CONFIGS profile — appending in place would mutate
-            # the shared profile list across calls.
-            config["embedding_models"] = list(config.get("embedding_models", [])) + [code_pick]
-    if config.get("text_model") != kg_pick:
-        config["text_model"] = kg_pick
-        dims = _EMBEDDING_MODEL_DIMS.get(kg_pick)
-        if dims is not None:
-            config["text_dims"] = dims
-        slot = _TEXT_MODEL_ACTIVE_EMBEDDING.get(kg_pick)
-        if slot is not None:
-            config["active_embedding"] = slot
-        if (kg_pick in _OLLAMA_SERVED_EMBEDDING_MODELS
-                and kg_pick not in config.get("embedding_models", [])):
-            config["embedding_models"] = list(config.get("embedding_models", [])) + [kg_pick]
+    from vco_lib.gpu_profile import apply_tier_overrides
+    apply_tier_overrides(
+        config,
+        code_pick=code_pick,
+        kg_pick=kg_pick,
+        model_dims=_EMBEDDING_MODEL_DIMS,
+        text_model_active_embedding=_TEXT_MODEL_ACTIVE_EMBEDDING,
+        ollama_served_models=_OLLAMA_SERVED_EMBEDDING_MODELS,
+    )
 
 
 def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> dict:
@@ -12778,65 +12728,23 @@ def _detect_existing_volume_paths() -> dict:
 
 
 def _compose_substitution_env(embed_config: dict) -> dict[str, str]:
-    """Keys docker-compose.yml substitutes that install.py COMPUTES
-    (rather than inheriting from the caller's environment).
-
-    v0.2.54 (gpu-audit C-4): pre-v0.2.54 these were written ONLY to
-    ``PROJECT_ROOT/.env`` — one level above ``infrastructure/`` — which
-    compose never reads (compose resolves ``${...}`` from its project
-    dir's ``.env`` or the process environment), AND they were written at
-    step 9/10, AFTER the compose-up at step 5/10, AND never exported
-    into ``os.environ``. Net effect: ``${CODE_EMBED_DOCKERFILE:-Dockerfile}``
-    always resolved to the CPU multi-arch default, so even NVIDIA hosts
-    built the CPU ``pytorch:2.6.0-cpu`` code-embed image — CodeSage on
-    CPU on CUDA hosts. The v0.2.50 audit-F1 "fix" (emit the var into the
-    root .env) never connected to compose substitution.
-    """
-    env: dict[str, str] = {}
-    backend = str(embed_config.get("code_backend", "") or "")
-    if backend:
-        env["CODE_EMBED_BACKEND"] = backend
-    # CUDA Dockerfile only for NVIDIA hosts (AMD ROCm / Apple / CPU stay
-    # on the multi-arch CPU default — there is no ROCm code-embed image).
-    if embed_config.get("gpu_vendor") == "nvidia":
-        env["CODE_EMBED_DOCKERFILE"] = "Dockerfile.cuda"
-    return env
+    """Shim over :func:`vco_lib.compose_env.compose_substitution_env`."""
+    from vco_lib.compose_env import compose_substitution_env
+    return compose_substitution_env(embed_config)
 
 
 def _write_infrastructure_env(embed_config: dict) -> None:
-    """Persist the compose-substitution keys to ``infrastructure/.env``
-    (the compose project dir — the file compose ACTUALLY reads), so
-    every later compose invocation (the boot wrapper, hooks'
-    ensure-containers, a user's manual ``podman-compose up -d``) sees
-    the same substitutions as install.py's own compose-up.
+    """Shim over :func:`vco_lib.compose_env.write_infrastructure_env`.
 
-    Merge semantics: lines for keys we manage are replaced; all other
-    user lines are preserved. Soft-fail on I/O errors (the explicit
-    process-env pass-through in ``_start_services`` still covers the
-    in-flight install).
+    Soft-fail on I/O errors: the explicit process-env pass-through in
+    ``_start_services`` still covers the in-flight install.
     """
-    managed = _compose_substitution_env(embed_config)
-    if not managed:
-        return
-    infra_env = PROJECT_ROOT / "infrastructure" / ".env"
-    try:
-        existing_lines: list[str] = []
-        if infra_env.is_file():
-            existing_lines = infra_env.read_text(encoding="utf-8").splitlines()
-        kept = [
-            ln for ln in existing_lines
-            if not any(ln.strip().startswith(f"{k}=") for k in managed)
-            and not ln.strip().startswith("# Managed-by-install.py")
-        ]
-        out = kept + [
-            "# Managed-by-install.py: compose ${...} substitution keys for the",
-            "# Managed-by-install.py: code-embed image build. Re-running install",
-            "# Managed-by-install.py: rewrites these lines; edit via install flags.",
-        ] + [f"{k}={v}" for k, v in sorted(managed.items())]
-        infra_env.parent.mkdir(parents=True, exist_ok=True)
-        infra_env.write_text("\n".join(out) + "\n", encoding="utf-8")
-    except OSError as exc:
-        print(f"  WARNING: could not write infrastructure/.env: {exc}")
+    from vco_lib.compose_env import write_infrastructure_env
+    ok, msg = write_infrastructure_env(
+        PROJECT_ROOT / "infrastructure", embed_config
+    )
+    if not ok:
+        print(f"  WARNING: could not write infrastructure/.env: {msg}")
 
 
 def _start_services(
