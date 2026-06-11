@@ -190,7 +190,41 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
+/// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
+///
+/// These are the table-rebuild migrations that must issue
+/// `PRAGMA foreign_keys = OFF/ON` — SQLite silently ignores that pragma
+/// inside a transaction, so the pragma has to sit OUTSIDE the
+/// transaction and the .sql owns the boundary itself. Wrapping them in
+/// the runner's outer transaction would (a) error with "cannot start a
+/// transaction within a transaction" and (b) neuter the pragma.
+///
+/// Crash-safety for these three: the .sql's own BEGIN/COMMIT makes the
+/// CONTENT atomic (journal rollback on crash). The version record is a
+/// separate statement; a crash in the millisecond window between
+/// content-COMMIT and version-INSERT re-runs the migration on next
+/// open, which is safe by construction for the create-copy-drop-rename
+/// rebuild pattern (re-running copies the data again and converges).
+/// `self_transactional_list_matches_sql` in the test module pins the
+/// list against the .sql contents so a future BEGIN-containing
+/// migration can't silently land outside it.
+const SELF_TRANSACTIONAL_MIGRATIONS: &[u32] = &[13, 27, 34];
+
+fn is_self_transactional(version: u32) -> bool {
+    SELF_TRANSACTIONAL_MIGRATIONS.contains(&version)
+}
+
 /// Apply every migration whose version is greater than the current max applied.
+///
+/// v0.2.54 Track D: each migration is applied ATOMICALLY — the SQL batch
+/// and its `_schema_migrations` version record commit together (or roll
+/// back together). Pre-fix, `execute_batch` ran with NO transaction
+/// (rusqlite does not wrap batches) and the version was recorded by a
+/// separate statement: a crash or error mid-batch (e.g. between the
+/// three `ALTER TABLE ADD COLUMN`s of migration 029) left the migration
+/// half-applied AND unrecorded, so every subsequent `Db::open` retried
+/// the whole batch, hit `duplicate column name`, and the launcher could
+/// never boot again — no rollback, no repair path.
 pub fn apply(conn: &Connection) -> Result<(), String> {
     // Bootstrap the tracking table. This statement is itself "migration 0"
     // and stays outside the MIGRATIONS list so it's always safe to re-run.
@@ -216,20 +250,71 @@ pub fn apply(conn: &Connection) -> Result<(), String> {
             continue;
         }
         tracing_apply(m);
-        conn.execute_batch(m.sql)
-            .map_err(|e| format!("apply migration {} ({}): {}", m.version, m.description, e))?;
-        conn.execute(
-            "INSERT INTO _schema_migrations (version, description, applied_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![
-                m.version,
-                m.description,
-                chrono::Utc::now().timestamp_millis(),
-            ],
-        )
-        .map_err(|e| format!("record migration {}: {}", m.version, e))?;
+        apply_one(conn, m)?;
     }
 
     Ok(())
+}
+
+/// Record a migration as applied. Caller decides the transactional
+/// context (inside the outer wrap for normal migrations; standalone for
+/// self-transactional ones).
+fn record_version(conn: &Connection, m: &Migration) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO _schema_migrations (version, description, applied_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            m.version,
+            m.description,
+            chrono::Utc::now().timestamp_millis(),
+        ],
+    )
+    .map_err(|e| format!("record migration {}: {}", m.version, e))?;
+    Ok(())
+}
+
+/// Apply ONE migration atomically (content + version record).
+fn apply_one(conn: &Connection, m: &Migration) -> Result<(), String> {
+    if is_self_transactional(m.version) {
+        // The .sql owns its BEGIN/COMMIT (see SELF_TRANSACTIONAL_MIGRATIONS).
+        conn.execute_batch(m.sql).map_err(|e| {
+            format!(
+                "apply migration {} ({}): {}",
+                m.version, m.description, e
+            )
+        })?;
+        return record_version(conn, m);
+    }
+
+    // BEGIN IMMEDIATE: take the write lock up front so a concurrent
+    // reader can't promote-deadlock us halfway through the batch.
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("begin migration {}: {}", m.version, e))?;
+
+    let applied = conn
+        .execute_batch(m.sql)
+        .map_err(|e| {
+            format!(
+                "apply migration {} ({}): {}",
+                m.version, m.description, e
+            )
+        })
+        .and_then(|_| record_version(conn, m));
+
+    match applied {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| format!("commit migration {}: {}", m.version, e)),
+        Err(e) => {
+            // Roll back the half-applied batch so the NEXT open retries
+            // from a clean slate instead of dying on `duplicate column
+            // name` forever. Rollback failure is appended (it matters
+            // for diagnosis) but the original error stays primary.
+            if let Err(rb) = conn.execute_batch("ROLLBACK") {
+                return Err(format!("{} (rollback also failed: {})", e, rb));
+            }
+            Err(e)
+        }
+    }
 }
 
 fn tracing_apply(m: &Migration) {
@@ -1557,5 +1642,162 @@ mod tests {
                 coll, created_at, updated_at
             );
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // v0.2.54 Track D: transactional migration runner.
+    //
+    // Pre-fix failure mode (audit "no-rollback" finding): a crash or
+    // error mid-batch left the migration half-applied AND unrecorded
+    // → every subsequent Db::open retried the whole batch → `duplicate
+    // column name` → launcher could never boot again.
+    // ════════════════════════════════════════════════════════════════
+
+    fn bootstrap_tracking(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _schema_migrations (
+                version     INTEGER PRIMARY KEY,
+                description TEXT NOT NULL,
+                applied_at  INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn failing_migration_rolls_back_all_statements() {
+        let conn = Connection::open_in_memory().unwrap();
+        bootstrap_tracking(&conn);
+
+        let bad = Migration {
+            version: 9001,
+            description: "synthetic: valid stmt then invalid stmt",
+            sql: "CREATE TABLE trackd_t (id INTEGER PRIMARY KEY);\n\
+                  THIS IS NOT SQL;",
+        };
+        let err = apply_one(&conn, &bad).expect_err("must fail");
+        assert!(err.contains("9001"), "error names the migration: {}", err);
+
+        // The valid first statement must have been rolled back.
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='trackd_t'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 0, "partial batch must roll back");
+
+        // And the version must NOT be recorded.
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 9001",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 0, "failed migration must not be recorded");
+    }
+
+    #[test]
+    fn alter_table_migration_is_retryable_after_failure() {
+        // The exact production failure shape: ALTER ADD COLUMN succeeds,
+        // a later statement fails. Pre-fix, the retry died on
+        // `duplicate column name`; post-fix the rollback makes the
+        // corrected migration apply cleanly.
+        let conn = Connection::open_in_memory().unwrap();
+        bootstrap_tracking(&conn);
+        conn.execute_batch("CREATE TABLE trackd_base (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let bad = Migration {
+            version: 9002,
+            description: "synthetic: ALTER then failure (migration-029 shape)",
+            sql: "ALTER TABLE trackd_base ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;\n\
+                  ALTER TABLE trackd_base ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;\n\
+                  ALTER TABLE nonexistent_table ADD COLUMN boom INTEGER;",
+        };
+        apply_one(&conn, &bad).expect_err("must fail");
+
+        // Retry with the corrected SQL: must NOT hit duplicate column.
+        let fixed = Migration {
+            version: 9002,
+            description: "synthetic: corrected",
+            sql: "ALTER TABLE trackd_base ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;\n\
+                  ALTER TABLE trackd_base ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0;",
+        };
+        apply_one(&conn, &fixed)
+            .expect("corrected migration must apply cleanly after rollback");
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 9002",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1);
+    }
+
+    #[test]
+    fn version_record_is_atomic_with_content() {
+        // A migration whose CONTENT succeeds gets BOTH the schema change
+        // and the version row (committed together).
+        let conn = Connection::open_in_memory().unwrap();
+        bootstrap_tracking(&conn);
+        let ok = Migration {
+            version: 9003,
+            description: "synthetic: ok",
+            sql: "CREATE TABLE trackd_ok (id INTEGER PRIMARY KEY);",
+        };
+        apply_one(&conn, &ok).unwrap();
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 9003",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1);
+        conn.execute("INSERT INTO trackd_ok (id) VALUES (1)", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn self_transactional_list_matches_sql() {
+        // The SELF_TRANSACTIONAL_MIGRATIONS allowlist must agree with
+        // the .sql contents: a migration carries its own `BEGIN;` iff
+        // it is on the list. A future BEGIN-containing migration that
+        // isn't listed would explode inside the runner's outer
+        // transaction ("cannot start a transaction within a
+        // transaction"); a listed migration without BEGIN would lose
+        // the atomicity guarantee silently.
+        for m in MIGRATIONS {
+            let has_begin = m
+                .sql
+                .lines()
+                .map(str::trim)
+                .any(|l| l.eq_ignore_ascii_case("BEGIN;") || l.eq_ignore_ascii_case("BEGIN TRANSACTION;"));
+            assert_eq!(
+                has_begin,
+                is_self_transactional(m.version),
+                "migration {} ({}): self-transactional list out of sync with sql",
+                m.version,
+                m.description,
+            );
+        }
+    }
+
+    #[test]
+    fn full_apply_still_green_with_transactional_runner() {
+        // End-to-end: all 34 production migrations apply on a fresh DB
+        // through the new transactional path.
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn).expect("full migration ladder must apply");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count as usize, MIGRATIONS.len());
     }
 }
