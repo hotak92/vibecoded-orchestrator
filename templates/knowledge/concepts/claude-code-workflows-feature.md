@@ -1,0 +1,45 @@
+---
+title: Claude Code Workflows Feature — Premade Workflow Integration
+type: concept
+tags: [claude-code, workflows, ultracode, multi-agent, orchestration, bundle, mid-level-architecture]
+created: 2026-06-11T00:00:00Z
+updated: 2026-06-11T00:00:00Z
+valid_from: 2026-06-11T00:00:00Z
+valid_until: null
+status: active
+---
+
+# Claude Code Workflows Feature — Premade Workflow Integration
+
+Claude Code v2.1.154+ (2026-05-28) ships a built-in `Workflow` tool: deterministic JavaScript orchestration scripts that spawn subagents via `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, with a `budget` token tracker and `args` parameterization. Official docs: code.claude.com/docs/en/workflows.md.
+
+## Key facts
+
+- **Availability**: Pro (toggle in `/config`), Max/Team/Enterprise (default on). Disable via `disableWorkflows: true` or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
+- **Triggers**: `ultracode` keyword, natural-language "use a workflow", or saved workflows invoked as `/<name>`.
+- **Saved workflows**: `.claude/workflows/<name>.{mjs,js}` (project scope — shareable in a repo, wins over user scope) or `~/.claude/workflows/` (user scope). Must start with a pure-literal `export const meta = {name, description, phases?}`.
+- **Limits**: ~16 concurrent agents, 1000 per run; subagents run `acceptEdits`; no mid-run user input; resume replays the unchanged `agent()`-call prefix within the same session.
+- **Custom agent types**: `agent(prompt, {agentType: '<registered-agent>'})` resolves from the same registry as the Agent tool — bundled orchestrator agents are usable as workflow stages.
+- **Format caveat**: public docs show `export default async function(args)`; the in-runtime tool spec shows a top-level script body after `meta`. Verify which form the target Claude Code version loads before bundling.
+
+## Orchestrator integration design (v0.2.54+ candidate)
+
+1. **`templates/workflows/`** — new bundle category installed to each project's `.claude/workflows/`, manifest-tracked with the same UPSERT + user-modified-preserve discipline as agents/skills/hooks.
+2. **Launcher per-project "Workflows" tab** — enabled toggles (`project_workflows` table), mirroring the Agents/Skills pattern (disable ≠ delete, rows survive bundle updates).
+3. **Candidate premade workflows** (each encodes a fan-out the orchestrator's workflow docs already prescribe manually):
+   - `vco-release-audit` — per-change diff-vs-plan review + secret/leak-hygiene scan + cross-OS `.sh`/`.ps1` sibling check.
+   - `vco-kg-audit` — KG drift sweep: nodes pointing at deleted files, stale validity windows, duplicate candidates.
+   - `vco-bug-hunt` — loop-until-dry finder pool + adversarial verification panel.
+   - `vco-doc-sweep` — documentation duplicate/archive/root-hygiene fan-out.
+   - `vco-onboard` — parallel-reader codebase map for newly-installed projects.
+4. **KG synergy** — workflow agents reach MCP tools (ToolSearch-resolved), so synthesis stages can call `store_knowledge_node` and persist findings into the project KG automatically.
+
+## Discoverability — ship workflows with their router, not alone
+
+Claude will not spontaneously run a workflow for users who don't know the feature exists (the Workflow tool's opt-in gate excludes "task would merely benefit"; the prescribed fallback is describe-and-ask). And on a generic "use a workflow" request, Claude may author a fresh script rather than reuse a saved one. Bundle three pieces together:
+1. Workflow files with strong `meta.description` + `meta.whenToUse` (these route selection).
+2. **Skill wrappers**: a skill whose instructions say "call Workflow({name: ...})" is a legitimate opt-in path — users invoke a familiar slash command and get the orchestration without knowing the underlying feature.
+3. **CLAUDE.md router rules**: "when a task matches a `.claude/workflows/` entry, offer it by name with a rough cost estimate" and "on workflow opt-in, check `.claude/workflows/` for a match before authoring a new script". Reliability must be structural, not dependent on per-session model discipline.
+4. **Keyword-suggest hook extension** (v0.2.54 port target): extend `templates/scripts/agent-skill-keyword-match.py` to also scan `.claude/workflows/*.{mjs,js}` and inject an offer-worded suggestion (never auto-launch — workflows are user-opt-in token spend). **Canonical keyword carrier: a `keywords: [...]` array inside the workflow's `meta` block** — the runtime tolerates the extra meta key (verified 2026-06-11 with a zero-agent probe), so each shipped workflow declares its own trigger phrases in-file and matching stays fully dynamic (no hardcoded registry). Keyword discipline: multi-word, high-specificity phrases only — single generic keywords are the dominant source of false-positive suggestions in the agent/skill matcher.
+
+[[relatedTo::Agentic-Coding-Workflow]]
