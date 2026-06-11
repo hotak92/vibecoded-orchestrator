@@ -380,8 +380,8 @@ jobs:
             echo   [ok] state\
           )
           REM NOTE: claude_mcp_servers\.venv is a STALE LEGACY PATH; the canonical
-          REM venv lives at PROJECT_ROOT\.venv (see install.py step 4 + the
-          REM comment block around line 15462). Asserting on the legacy path
+          REM venv lives at PROJECT_ROOT\.venv -- see install.py step 4 and the
+          REM comment block around line 15462. Asserting on the legacy path
           REM was failing this gate on every push despite successful installs.
           if not exist .env (
             echo ::error::MISSING .env
