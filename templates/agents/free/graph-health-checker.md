@@ -74,7 +74,15 @@ You will receive:
 
 - **maintain_knowledge_graph.py**: Script at `.claude/scripts/maintain_knowledge_graph.py`
   - Use with `--check` for validation only
-  - Use with `--fix` for auto-repair (requires approval)
+  - Use with `--fix` for auto-repair (requires approval). The deletion
+    step is confirmation-gated: non-interactive runs need `--yes`.
+  - **Shared-KG hazard (v0.2.54)**: `--fix`/`--rebuild` REFUSE (exit 2)
+    when the resolved collection is the SHARED KG — cross-project nodes
+    look orphaned from any single project root and would all be
+    deleted. Do NOT override with `VCO_MAINTAIN_SHARED_KG_CONSENT=1`
+    unless the user explicitly accepts losing other projects' shared
+    nodes; the safe repair is each contributing project's
+    `.claude/scripts/kg-sync --all`.
 
 - **File system**: Check if referenced files exist
   - Use `pathlib.Path.exists()` for file validation
