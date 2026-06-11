@@ -50,6 +50,13 @@ on:
       # v0.2.40 X1: macOS best-effort smoke triggers
       - "launcher/src-tauri/vct-hub/templates/**"
       - "docs/macos-install.md"
+      # v0.2.54 G-1: Job 5 (W-P1-3) smokes these entry points, but they were
+      # missing from the trigger paths — a .bat/.ps1 change could not re-run
+      # the very job that gates it.
+      - "first-install.bat"
+      - "first-install.sh"
+      - "first-install.command"
+      - "install.ps1"
   pull_request:
     paths:
       - "install.py"
@@ -60,6 +67,13 @@ on:
       # v0.2.40 X1: macOS best-effort smoke triggers
       - "launcher/src-tauri/vct-hub/templates/**"
       - "docs/macos-install.md"
+      # v0.2.54 G-1: Job 5 (W-P1-3) smokes these entry points, but they were
+      # missing from the trigger paths — a .bat/.ps1 change could not re-run
+      # the very job that gates it.
+      - "first-install.bat"
+      - "first-install.sh"
+      - "first-install.command"
+      - "install.ps1"
   workflow_dispatch: {}
 
 permissions:
@@ -784,23 +798,43 @@ jobs:
 
       # W-P1-3 part 1: first-install.bat under cmd.exe.
       #
-      # We pass `/help` (the cmd.exe-idiomatic help flag form) and accept
-      # either exit 0 (script prints help and exits) or exit 1 with the
-      # help text in stdout (older shim shape). What we MUST NOT see:
-      # cmd.exe "The system cannot find" / "is not recognized" errors,
-      # which indicate the batch parser rejected the file at parse time.
+      # v0.2.54 G-1 rewrite — the original step had TWO bugs that made it
+      # red from the day it landed (it never passed once):
+      #   1. `first-install.bat` was invoked WITHOUT `call`. Under cmd.exe,
+      #      invoking a .bat from a batch script without `call` CHAINS to
+      #      it — control never returns, so the findstr guard below never
+      #      executed and the step exit code was whatever the .bat exited.
+      #   2. The .bat had no /help handler at all: `/help` fell through to
+      #      install.ps1 (also helpless) and started a REAL install on the
+      #      runner (~3 min of side effects, then a non-zero exit).
+      # Both are fixed in G-1: the .bat handles /help|--help|-h|/? with
+      # usage + exit 0, and this step uses `call` so the assertions run.
+      # We assert: exit 0 + usage text present + no cmd.exe parser errors.
+      # NOTE for future edits: echo lines inside ( ) blocks must not
+      # contain unescaped parens or cmd.exe aborts the whole step with
+      # "X was unexpected at this time." — gated by
+      # tests/test_workflow_cmd_paren_safety.py.
       - name: first-install.bat parses under cmd.exe
         shell: cmd
         run: |
-          first-install.bat /help > bat-help.txt 2>&1
+          call first-install.bat /help > bat-help.txt 2>&1
           set BAT_EC=%ERRORLEVEL%
           type bat-help.txt
-          findstr /I /C:"is not recognized" /C:"system cannot find" /C:"syntax of the command" bat-help.txt > nul
+          findstr /I /C:"is not recognized" /C:"system cannot find" /C:"syntax of the command" /C:"was unexpected at this time" bat-help.txt > nul
           if not errorlevel 1 (
             echo ::error::cmd.exe parser rejected first-install.bat
             exit /b 1
           )
-          echo first-install.bat parsed under cmd.exe (exit code: %BAT_EC%)
+          if not "%BAT_EC%"=="0" (
+            echo ::error::first-install.bat /help exited %BAT_EC% instead of 0
+            exit /b 1
+          )
+          findstr /C:"Usage: first-install.bat" bat-help.txt > nul
+          if errorlevel 1 (
+            echo ::error::first-install.bat /help printed no usage text
+            exit /b 1
+          )
+          echo first-install.bat /help OK: exit 0, usage text, no parser errors
           exit /b 0
 
       # W-P1-3 part 2a: install.ps1 under pwsh.exe (PowerShell 7+).

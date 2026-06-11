@@ -69,19 +69,22 @@ jobs:
           - ubuntu-24.04   # Tests L-P0-2 (libwebkit2gtk-4.1-dev primary)
           - macos-14       # Tests M-P0-* (bash 3.2, /opt/homebrew, arm64)
           - windows-latest # Tests W-P1-* + first-install.bat (cmd.exe)
-        include:
-          # Fedora has no GitHub-hosted runner; run inside a container on
-          # the ubuntu-22.04 host so SELinux + dnf paths get exercised.
-          # Note: container SELinux is permissive on GitHub's host kernel,
-          # so the `getenforce` probe in install.py will report Permissive.
-          # That still exercises the dnf + Linuxbrew code paths; the
-          # true Enforcing path is covered by `test_selinux_z_flag.py`.
-          - os: ubuntu-22.04
-            container: fedora:40
-            label: fedora-40
+        # v0.2.54 G-1: the previous `include` entry (os: ubuntu-22.04 +
+        # container: fedora:40 + label: fedora-40) did NOT add a fifth
+        # "fedora-40" job. GitHub Actions `include` entries whose keys
+        # match an existing matrix combination MERGE into it — so the
+        # bare ubuntu-22.04 job (the documented libwebkit2gtk-4.0-dev
+        # fallback coverage) silently ran INSIDE the fedora:40 container
+        # under the misleading name "install smoke (ubuntu-22.04)", and
+        # the intended Fedora job never existed (verify: run 27340118156
+        # had 4 jobs, and the "ubuntu-22.04" job log shows
+        # `docker pull fedora:40`). Removing the include restores the
+        # bare ubuntu-22.04 coverage. Proper Fedora coverage needs a
+        # synthetic matrix key (target: [.., fedora-40] mapped to
+        # runs_on + container) plus dnf node/python prep — tracked for
+        # Track G (cross-OS parity, v0.2.54 Wave 3).
 
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
     timeout-minutes: 25
 
     env:
@@ -96,17 +99,9 @@ jobs:
         }}
 
     steps:
-      # ----------------------------------------------------------------
-      # 0. Container prep (Fedora only) — install git + bash for the
-      #    fresh-clone step. The Fedora 40 image is minimal; runners on
-      #    bare ubuntu-22.04 / macos-14 / windows-latest already have
-      #    git on PATH.
-      # ----------------------------------------------------------------
-      - name: Fedora container prep
-        if: matrix.container == 'fedora:40'
-        run: |
-          dnf install -y git bash sudo procps-ng
-        shell: bash
+      # (v0.2.54 G-1: the "Fedora container prep" step moved out with the
+      # malformed matrix include — see the matrix comment above. Track G
+      # re-adds Fedora as a proper fifth matrix entry.)
 
       # ----------------------------------------------------------------
       # 1. Fresh git clone (NOT actions/checkout).
@@ -140,22 +135,13 @@ jobs:
           git log -1 --oneline
 
       # ----------------------------------------------------------------
-      # 2. Python setup. Uses actions/setup-python on the host runners.
-      #    On Fedora-container we let `dnf install -y python3` provide
-      #    Python 3.12 (Fedora 40 default) — setup-python does not
-      #    support arbitrary containers.
+      # 2. Python setup via actions/setup-python (all jobs are bare host
+      #    runners since the G-1 matrix fix).
       # ----------------------------------------------------------------
       - name: Set up Python (host runners)
-        if: matrix.container == null
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
-      - name: Fedora container Python install
-        if: matrix.container == 'fedora:40'
-        shell: bash
-        run: |
-          dnf install -y python3 python3-pip python3-virtualenv
 
       # ----------------------------------------------------------------
       # 3. pip cache — keyed by lockfile hashes. Cross-OS cache hits
@@ -163,7 +149,6 @@ jobs:
       #    misses on different OSes are by design.
       # ----------------------------------------------------------------
       - name: Cache pip
-        if: matrix.container == null
         uses: actions/cache@v4
         with:
           path: |
@@ -202,6 +187,15 @@ jobs:
             fi
           fi
 
+      # v0.2.54 G-1: the warning echo previously contained the literal
+      # text "(Track B pending)" INSIDE the `&& ( ... )` block. cmd.exe
+      # parses the whole `if` compound before executing it, the unescaped
+      # `)` after "pending" closed the block mid-echo, and the entire
+      # step aborted at parse time with `"; was unexpected at this time."`
+      # exit 255 — THE failure that kept this workflow red since it
+      # landed. Rule: no unescaped parens (and no `;` workarounds) in
+      # echo text inside ( ) blocks. Gated by
+      # tests/test_workflow_cmd_paren_safety.py.
       - name: Bootstrap probe (read-only) — Windows
         if: matrix.os == 'windows-latest'
         working-directory: vco-fresh-clone
@@ -210,7 +204,7 @@ jobs:
           py -3 install.py --bootstrap --json > bootstrap-pre.json 2> bootstrap-pre.stderr
           if errorlevel 1 (
             findstr /I "unrecognized unknown" bootstrap-pre.stderr >NUL && (
-              echo ::warning::install.py --bootstrap not yet implemented (Track B pending)^; skipping pre-probe
+              echo ::warning::install.py --bootstrap not yet implemented - Track B pending - skipping pre-probe
               exit /b 0
             ) || (
               echo ::error::install.py --bootstrap failed for non-flag reason
@@ -234,15 +228,30 @@ jobs:
       #    only; the verify-artifacts step below still asserts the
       #    install fully landed via the legacy `install.py` invocation.
       # ----------------------------------------------------------------
-      - name: first-install.sh (Linux + Fedora)
-        if: matrix.os == 'ubuntu-22.04' || matrix.os == 'ubuntu-24.04' || matrix.container == 'fedora:40'
+      # v0.2.54 G-1: all three first-install steps now pass
+      # `--no-containers --skip-models`, mirroring the flags the (green)
+      # installer-smoke.yml jobs use. Rationale, from the never-green
+      # initial runs of this workflow (e.g. run 27340118156):
+      #   - ubuntu: install.py picked podman but the rootless
+      #     podman.socket isn't active on GH runners → `compose up`
+      #     failed with "Cannot connect to the Docker daemon at
+      #     unix:///run/user/1001/podman/podman.sock".
+      #   - macos-14: runners ship NO container runtime at all →
+      #     install.py exits 1 with "re-run with --no-containers".
+      #   - models: Ollama isn't running in CI; pulls would be slow+flaky.
+      # The container/compose path keeps real coverage via
+      # installer-smoke.yml's weaviate-smoke job (service container).
+      # Full-stack container e2e on runners (podman.socket activation)
+      # is Track G scope (v0.2.54 Wave 3).
+      - name: first-install.sh (Linux)
+        if: matrix.os == 'ubuntu-22.04' || matrix.os == 'ubuntu-24.04'
         working-directory: vco-fresh-clone
         shell: bash
         # Some Linux distros mark first-install.sh non-executable when
         # cloned over HTTPS via cgi (umask). Run via explicit `bash`.
         run: |
           set -uo pipefail
-          if bash first-install.sh --yes --no-auto-launch; then
+          if bash first-install.sh --yes --no-auto-launch --no-containers --skip-models; then
             echo "::notice::first-install.sh exited 0"
           else
             ec=$?
@@ -261,7 +270,7 @@ jobs:
           # Finder-launched .command files run with PWD=$HOME; we
           # simulate by invoking from a separate dir to verify the shim
           # cd's to SCRIPT_DIR (M-P1-4).
-          if (cd "$RUNNER_TEMP" && bash "$GITHUB_WORKSPACE/vco-fresh-clone/first-install.command" --yes --no-auto-launch); then
+          if (cd "$RUNNER_TEMP" && bash "$GITHUB_WORKSPACE/vco-fresh-clone/first-install.command" --yes --no-auto-launch --no-containers --skip-models); then
             echo "::notice::first-install.command exited 0"
           else
             ec=$?
@@ -279,8 +288,15 @@ jobs:
         # parser (W-P1-3). Git Bash on windows-latest masks bugs that
         # only manifest under cmd.exe (e.g. `%~dp0` quoting, the
         # `:_log_event` label parsing, refreshenv fallback).
+        #
+        # v0.2.54 G-1: `call` is REQUIRED — without it cmd.exe chains to
+        # the .bat and never returns, so the errorlevel guard below never
+        # ran. `--no-auto-launch` now (G-1 .bat parity fix) skips the
+        # whole launcher-acquisition phase, matching first-install.sh —
+        # previously a stale bundled binary sent CI into a multi-minute
+        # `pnpm tauri build` fallback that blew the 25-minute job cap.
         run: |
-          first-install.bat --yes --no-auto-launch
+          call first-install.bat --yes --no-auto-launch --no-containers --skip-models
           if errorlevel 1 (
             echo ::error::first-install.bat exited non-zero
             if exist state\logs\install.jsonl type state\logs\install.jsonl
@@ -342,20 +358,23 @@ jobs:
         working-directory: vco-fresh-clone
         shell: cmd
         run: |
+          REM G-1: directory existence uses the trailing-backslash idiom
+          REM rather than the legacy `dir\NUL` device trick, which is not
+          REM reliable on NTFS on modern Windows.
           set MISSING=0
-          if not exist .venv\NUL (
+          if not exist .venv\ (
             echo ::error::MISSING directory: .venv
             set /a MISSING+=1
           ) else (
             echo   [ok] .venv\
           )
-          if not exist state\NUL (
+          if not exist state\ (
             echo ::error::MISSING directory: state
             set /a MISSING+=1
           ) else (
             echo   [ok] state\
           )
-          if not exist claude_mcp_servers\.venv\NUL (
+          if not exist claude_mcp_servers\.venv\ (
             echo ::error::MISSING directory: claude_mcp_servers\.venv
             set /a MISSING+=1
           ) else (
@@ -373,67 +392,44 @@ jobs:
               echo   [ok] .env has KG_COLLECTION=
             )
           )
+          REM G-1: echo text below must stay paren-free. The earlier
+          REM "artifact(s)" wording aborted this whole step at parse time
+          REM under cmd.exe -- see the bootstrap-pre step comment.
           if %MISSING% gtr 0 (
-            echo ::error::%MISSING% install artifact(s) missing
+            echo ::error::%MISSING% install artifacts missing
             exit /b 1
           )
           echo Install artifacts OK
 
       # ----------------------------------------------------------------
-      # 7. Launcher headless boot via --check-only.
+      # 7. Launcher headless boot via --check-only — EXPLICITLY SKIPPED
+      #    until Track C lands the flag (v0.2.54).
       #
-      #    Track C owns the --check-only flag. If it has not landed yet
-      #    (Track C's final SHA pending integration), we SKIP this step
-      #    with a warning rather than fail — wiring up happens in Phase 2.
+      #    v0.2.54 G-1: the previous live invocation could NEVER work
+      #    against v0.2.53 binaries and was a guaranteed red/hang once
+      #    the install steps passed:
+      #      - `handle_cli_args()` in launcher/src-tauri/src/lib.rs only
+      #        recognises --set-storage-config and --register-default-mcps;
+      #        any other argv falls through to GUI startup.
+      #      - On headless Linux runners that dies with a GTK/display
+      #        error which does NOT match the step's
+      #        'unrecognized|unknown|no such option|invalid' skip filter
+      #        → hard step failure.
+      #      - On Windows it opens a real window that never exits →
+      #        25-minute job timeout.
+      #    The Windows variant also carried the "(Track C pending)^;"
+      #    cmd.exe paren parse bomb (same class as the bootstrap-pre bug).
+      #
+      #    Track C: when --check-only lands in handle_cli_args(), replace
+      #    this skip with a live invocation asserting exit 0 + JSON on
+      #    stdout, and gate the "pending" tolerance on a deterministic
+      #    probe (e.g. `vct-launcher --check-only` exits 2 for
+      #    unknown-flag), NOT on stderr text matching.
       # ----------------------------------------------------------------
-      - name: Launcher --check-only (POSIX)
-        if: matrix.os != 'windows-latest'
-        working-directory: vco-fresh-clone
+      - name: Launcher --check-only (skipped - Track C pending)
         shell: bash
         run: |
-          set -uo pipefail
-          bin="launcher/dist/${LAUNCHER_DIST_SUBDIR}/vct-launcher"
-          if [ ! -x "$bin" ]; then
-            echo "::warning::Launcher binary not present at $bin — install path may not have refreshed dist tree"
-            exit 0
-          fi
-          if "$bin" --check-only > launcher-check.json 2>launcher-check.stderr; then
-            cat launcher-check.json
-            echo "::notice::launcher --check-only exited 0 (healthy)"
-          else
-            ec=$?
-            if grep -qiE 'unrecognized|unknown|no such option|invalid' launcher-check.stderr 2>/dev/null; then
-              echo "::warning::launcher --check-only not yet implemented (Track C pending); skipping"
-            else
-              echo "::error::launcher --check-only exited $ec:"
-              cat launcher-check.stderr
-              cat launcher-check.json 2>/dev/null || true
-              exit $ec
-            fi
-          fi
-
-      - name: Launcher --check-only (Windows)
-        if: matrix.os == 'windows-latest'
-        working-directory: vco-fresh-clone
-        shell: cmd
-        run: |
-          set "BIN=launcher\dist\%LAUNCHER_DIST_SUBDIR%\vct-launcher.exe"
-          if not exist "%BIN%" (
-            echo ::warning::Launcher binary not present at %BIN%
-            exit /b 0
-          )
-          "%BIN%" --check-only > launcher-check.json 2> launcher-check.stderr
-          if errorlevel 1 (
-            findstr /I "unrecognized unknown invalid" launcher-check.stderr >NUL && (
-              echo ::warning::launcher --check-only not yet implemented (Track C pending)^; skipping
-              exit /b 0
-            ) || (
-              echo ::error::launcher --check-only exited non-zero
-              type launcher-check.stderr
-              exit /b 1
-            )
-          )
-          type launcher-check.json
+          echo "::warning::launcher --check-only not implemented in v0.2.53 binaries (Track C, v0.2.54). Step is an explicit no-op; see workflow comment for the re-enable contract."
 
       # ----------------------------------------------------------------
       # 8. Post-install bootstrap probe — assert ready_to_install=true.
@@ -457,11 +453,22 @@ jobs:
           python3 -c "
           import json, sys
           d = json.load(open('bootstrap-post.json'))
-          assert d.get('ready_to_install') is True, f'ready_to_install != True: blockers={d.get(\"blocker_messages\")}'
           paths = d.get('paths', {})
           assert paths.get('install_root_kind') == 'completed_install', f'install_root_kind={paths.get(\"install_root_kind\")} expected completed_install'
           assert paths.get('state_dir_exists') is True, 'state_dir_exists should be True after install'
           assert paths.get('launcher_binary_exists') is True, 'launcher_binary_exists should be True after install'
+          # v0.2.54 G-1: this smoke installs with --no-containers (GH
+          # runners have no usable compose stack; macos-14 ships no
+          # container runtime at all), and the bootstrap envelope marks a
+          # missing container runtime as a BLOCKING prereq regardless of
+          # install flags. A container-runtime blocker is therefore
+          # EXPECTED here; any OTHER blocker is a real failure.
+          blockers = d.get('blocker_messages') or []
+          non_container = [b for b in blockers
+                           if not any(k in b.lower() for k in ('podman', 'docker', 'container'))]
+          assert not non_container, f'non-container blockers present: {non_container}'
+          if blockers:
+              print(f'Tolerated container-runtime blockers (--no-containers smoke): {blockers}')
           print('Bootstrap envelope confirms install complete; InstallHealthGate would NOT fire.')
           "
 

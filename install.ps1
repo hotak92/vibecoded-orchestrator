@@ -48,6 +48,9 @@
     modules will be ~50-200ms slower; useful for dev/CI runs.
 .PARAMETER NonInteractive
     Refuse to auto-install Python; fail with a hint instead.
+.PARAMETER Help
+    Print usage and exit 0 with no side effects. Also accepted in
+    .bat-forwarded form: --help / -h / /help / /? (see the $args walk).
 #>
 param(
     [switch]$NoContainers,
@@ -69,7 +72,8 @@ param(
     [switch]$NonInteractive,
     [switch]$Yes,
     [switch]$NoAutoLaunch,
-    [switch]$NoDesktopIcon
+    [switch]$NoDesktopIcon,
+    [switch]$Help
 )
 
 $ErrorActionPreference = "Stop"
@@ -103,7 +107,39 @@ foreach ($a in $args) {
         '^--with-mao-agents$'    { $WithMaoAgents = $true }
         '^--no-skills$'          { $NoSkills = $true }
         '^--no-compile$'         { $NoCompile = $true }
+        '^--help$|^-h$|^/help$|^/h$|^/\?$|^-\?$' { $Help = $true }
     }
+}
+
+# ---------------------------------------------------------------------------
+# Help / usage (v0.2.54 G-1 — W-P1-3 regression fix). Must run BEFORE any
+# side effect (WSL guard prints, WebView2 probe, Python detect, winget).
+# Previously --help fell through the $args walk unmatched and a full
+# install ran instead — that is how CI's `first-install.bat /help` smoke
+# spent ~3 minutes side-effecting the runner before exiting non-zero.
+# ---------------------------------------------------------------------------
+if ($Help) {
+    Write-Host "Usage: .\install.ps1 [options]"
+    Write-Host ""
+    Write-Host "VibeCoded Tools - Orchestrator installer for Windows."
+    Write-Host "Wraps install.py: detects/installs Python 3.11+, then runs the"
+    Write-Host "canonical 10-step install."
+    Write-Host ""
+    Write-Host "Options (PS-style switch / .bat-forwarded form):"
+    Write-Host "  -Help            --help            Show this help and exit."
+    Write-Host "  -Yes             --yes             Non-interactive, accept defaults."
+    Write-Host "  -NonInteractive  --non-interactive Refuse auto-installs; fail with hints."
+    Write-Host "  -NoContainers    --no-containers   Skip Docker/Podman service setup."
+    Write-Host "  -SkipModels      --skip-models     Skip Ollama model pulls."
+    Write-Host "  -NoAutoLaunch    --no-auto-launch  Skip post-install launcher spawn."
+    Write-Host "  -NoDesktopIcon   --no-desktop-icon Skip desktop shortcut creation."
+    Write-Host "  -Gpu / -CpuOnly / -LowResource     Hardware mode selection."
+    Write-Host "  -Dev -Update -WithJoern -NoJoern -NoAgents -WithMaoAgents"
+    Write-Host "  -NoSkills -NoCompile -Quiet        See .PARAMETER docs in this file."
+    Write-Host "  -OpenaiKey <key>  -Container <docker|podman>"
+    Write-Host ""
+    Write-Host "Docs: docs/GETTING_STARTED.md  |  Recovery: docs/INSTALL_RECOVERY.md"
+    exit 0
 }
 
 Write-Host "=== VibeCoded Tools - Orchestrator Installer ===" -ForegroundColor Cyan

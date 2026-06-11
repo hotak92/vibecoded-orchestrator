@@ -17,8 +17,12 @@ REM   3. From a .bat we can spawn PowerShell with -ExecutionPolicy
 REM      Bypass scoped to this one process — the user's machine-wide
 REM      policy stays untouched.
 REM
-REM Status: STUB. Delegates to install.ps1. Tauri launcher build/launch
-REM is post-v1.0 (tracked in plans/first-install-entry-points.md).
+REM Status: full entry point. Delegates the core install to
+REM install.ps1 (which runs install.py), then handles the post-install
+REM launcher phase inline: bundled-binary probe + staleness check,
+REM prebuilt download, source-build fallback, desktop shortcut, and GUI
+REM auto-spawn. (An earlier revision of this header said "STUB ~100 LoC"
+REM — that was stale; corrected v0.2.54 G-1.)
 
 REM EnableDelayedExpansion so we can use !VAR! inside if/else blocks
 REM (CMD's standard %VAR% expansion happens at parse-time, which breaks
@@ -29,6 +33,49 @@ REM Pin to the script directory so relative paths work even if invoked
 REM via Explorer's "Run as Administrator" or from another working dir.
 cd /d "%~dp0"
 
+REM ---------------------------------------------------------------------------
+REM Help / usage (v0.2.54 G-1 — W-P1-3 regression fix).
+REM
+REM CI's "Windows entry-point parser smoke" invokes `first-install.bat /help`
+REM and expects usage text + exit 0 with ZERO side effects. Before this
+REM handler existed, `/help` fell through %* into install.ps1 (which has no
+REM help handling either) and started a REAL install — ~3 minutes of side
+REM effects on the CI runner, then a non-zero exit. Accept the
+REM cmd.exe-idiomatic forms (/help, /h, /?) and the cross-platform forms
+REM (--help, -h, -?). Help is a first-argument contract, matching
+REM install.py's argparse behaviour.
+REM ---------------------------------------------------------------------------
+if /I "%~1"=="/help"  goto :show_help
+if /I "%~1"=="/h"     goto :show_help
+if "%~1"=="/?"        goto :show_help
+if /I "%~1"=="--help" goto :show_help
+if /I "%~1"=="-h"     goto :show_help
+if "%~1"=="-?"        goto :show_help
+goto :after_help
+
+:show_help
+echo Usage: first-install.bat [options]
+echo.
+echo First-time installer for VibeCoded Tools on Windows. Runs install.ps1
+echo with a process-scoped ExecutionPolicy bypass, then acquires + launches
+echo the VCT Launcher GUI.
+echo.
+echo Options handled by this script:
+echo   /help, --help, -h     Show this help and exit.
+echo   --yes                 Non-interactive: accept defaults, no prompts.
+echo   --non-interactive     Same as --yes.
+echo   --no-auto-launch      Skip the post-install launcher phase entirely
+echo                         - no binary download/build, no GUI spawn.
+echo                         Run start-launcher.bat later instead.
+echo   --no-desktop-icon     Skip desktop + Start Menu shortcut creation.
+echo.
+echo All other options are forwarded to install.ps1 / install.py, e.g.:
+echo   --no-containers --skip-models --cpu-only --low-resource --update
+echo Run: powershell -File install.ps1 for the full install.py flag list,
+echo or see docs\GETTING_STARTED.md.
+exit /b 0
+
+:after_help
 echo ===============================================
 echo   VibeCoded Tools - First-Time Installer (Windows)
 echo ===============================================
@@ -88,6 +135,23 @@ if %INSTALL_EXIT% NEQ 0 (
     echo Install failed ^(exit %INSTALL_EXIT%^). See messages above.
     pause
     exit /b %INSTALL_EXIT%
+)
+
+REM ---------------------------------------------------------------------------
+REM --no-auto-launch parity with first-install.sh / first-install.command
+REM (v0.2.54 G-1). On POSIX the flag skips the ENTIRE post-install launcher
+REM phase: scripts/post-install-launcher.sh is never invoked, so no binary
+REM probe, no download, no source build, no spawn. This .bat previously
+REM honored the flag only at the final :auto_launch gate — the binary
+REM acquisition still ran, which in CI meant a multi-minute pnpm + tauri
+REM source build on a 25-minute job whenever the bundled binary was stale
+REM and the release-asset download found no .exe. Match the .sh contract:
+REM skip the whole phase.
+REM ---------------------------------------------------------------------------
+if "%NO_AUTO_LAUNCH%"=="1" (
+    echo [launcher] --no-auto-launch set: skipping launcher binary acquisition + GUI spawn.
+    echo [launcher] Run start-launcher.bat later to download/build and open the launcher.
+    goto :end
 )
 
 REM ---------------------------------------------------------------------------
@@ -161,9 +225,9 @@ goto :eof
 set "LAUNCHER_BIN="
 REM First-match-wins probe. Order:
 REM   1. Locally built (developer running pnpm tauri build directly)
-REM   2. Bundled prebuilt in launcher\dist\windows-x64\ (default for end users
-REM      once a Windows binary lands there — currently a placeholder, see
-REM      launcher\dist\windows-x64\README.md)
+REM   2. Bundled prebuilt in launcher\dist\windows-x64\ (default for end
+REM      users; vct-launcher.exe + vct-hub.exe + vct-updater.exe ship there
+REM      with .metadata.json sidecars — see the staleness check below)
 REM   3. System install paths (someone installed via winget / msi)
 if exist "%~dp0launcher\src-tauri\target\release\vct-launcher.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\release\vct-launcher.exe"
