@@ -8142,6 +8142,15 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
         # lived shell.
         os.environ["KG_COLLECTION"] = derived["kg_collection"]
         os.environ["DEVELOPMENT_COLLECTION"] = derived["development_collection"]
+        # v0.2.54 Track D (live-test finding): DIAGRAMS_COLLECTION must be
+        # scoped to --name too. Pre-fix, only KG + Dev were overridden, so
+        # an AMBIENT DIAGRAMS_COLLECTION (e.g. exported by the invoking
+        # project's .claude/settings.json env into the shell) leaked into
+        # the plan — `migrate-collections --name OtherProject
+        # --force-rebuild` would then drop + rebuild the CURRENT project's
+        # live Diagrams collection, violating the documented "--name scopes
+        # the work to THIS project's collections" contract.
+        os.environ["DIAGRAMS_COLLECTION"] = derived["diagrams_collection"]
 
         # Build a minimal Namespace-like for migrate_collections dispatch.
         ns = argparse.Namespace(force_rebuild=bool(args.force_rebuild))

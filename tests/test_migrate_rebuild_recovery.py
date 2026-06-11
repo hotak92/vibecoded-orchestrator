@@ -268,5 +268,49 @@ class TestDeferralCommandIncludesProjectFolder(unittest.TestCase):
             )
 
 
+class TestNameScopingCoversDiagrams(unittest.TestCase):
+    """v0.2.54 Track D live-test finding: an AMBIENT DIAGRAMS_COLLECTION
+    (exported into the shell by the INVOKING project's settings.json env)
+    must not leak into a `--name <other-project>`-scoped run — pre-fix,
+    `migrate-collections --name TrackDLive --force-rebuild` executed from
+    a VCO_dev shell dropped + rebuilt the live `VCODev_Diagrams`."""
+
+    def test_ambient_diagrams_collection_is_overridden(self):
+        captured = {}
+
+        def _capture(ns, **kwargs):
+            captured["kg"] = os.environ.get("KG_COLLECTION")
+            captured["dev"] = os.environ.get("DEVELOPMENT_COLLECTION")
+            captured["diagrams"] = os.environ.get("DIAGRAMS_COLLECTION")
+            return {"plan": [], "dry_run": True, "errors": []}
+
+        env_backup = {
+            k: os.environ.get(k)
+            for k in ("KG_COLLECTION", "DEVELOPMENT_COLLECTION",
+                      "DIAGRAMS_COLLECTION")
+        }
+        os.environ["DIAGRAMS_COLLECTION"] = "AmbientProject_Diagrams"
+        try:
+            args = _stub_args(dry_run=True)
+            with mock.patch.object(project_init, "migrate_collections",
+                                   side_effect=_capture):
+                project_init._cmd_migrate_collections(args)
+        finally:
+            for k, v in env_backup.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.assertEqual(captured["kg"], "Foo_KnowledgeGraph")
+        self.assertEqual(captured["dev"], "Foo_Development")
+        self.assertEqual(
+            captured["diagrams"], "Foo_Diagrams",
+            "ambient DIAGRAMS_COLLECTION must be re-scoped to --name "
+            "(pre-fix it leaked and the invoking project's live Diagrams "
+            "collection got rebuilt)",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
