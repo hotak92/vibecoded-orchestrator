@@ -3,7 +3,7 @@
   "schema_version": "1",
   "id": "orchestrator",
   "name": "VibeCoded Orchestrator",
-  "version": "0.2.53",
+  "version": "0.2.54",
   "description": "The core: 36 hooks, 45 bundled agents, 53 skills, KG + Code Graph, 4 MCP servers in ~/.claude.json (weaviate-kg + search enabled per project; mermaid + excalidraw registered but project-default-disabled until opt-in) + playwright via npx. Runs locally in Podman/Docker.",
   "category": "core",
   "license": {

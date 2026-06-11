@@ -1,6 +1,6 @@
 [package]
 name = "vct-updater"
-version = "0.2.53"
+version = "0.2.54"
 edition = "2021"
 description = "Stage1 updater for VCT launcher — performs Windows binary swap after parent launcher exits. Velopack/Squirrel-style pattern."
 authors = ["VibeCoded Tools"]

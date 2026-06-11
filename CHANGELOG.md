@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.54] - 2026-06-12
+
 ### Added
 
 - **v0.2.54 Track A1 (S-1..S-8): secrets discoverability for 3rd-party Claude agents** — the secrets primitive is now self-describing instead of tribal knowledge:
