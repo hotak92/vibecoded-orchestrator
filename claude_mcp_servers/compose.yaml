@@ -94,9 +94,20 @@ services:
       - "11435:11434"
     volumes:
       - ollama_models:/root/.ollama
-    # Uncomment for NVIDIA GPU support:
+    # Uncomment for NVIDIA GPU support — the device syntax is ENGINE-
+    # SPECIFIC (v0.2.54 C-RT-8):
+    #   * Podman (CDI form — docker compose can't parse this spec):
     # devices:
     #   - nvidia.com/gpu=all
+    #   * Docker (deploy.resources form — podman-compose ignores it on
+    #     older releases; use the CDI form above instead):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
     environment:
       # NVIDIA_VISIBLE_DEVICES: all
       # NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -117,6 +128,11 @@ services:
   # Requires NVIDIA GPU + nvidia-container-toolkit. On CPU, leave this
   # commented — Ollama serves the embedding model instead.
   # First start downloads ~2.5GB of model weights into the cache volume.
+  #
+  # NOTE (v0.2.54 C-RT-8): the `devices: [nvidia.com/gpu=all]` line in
+  # the block below is the PODMAN CDI form. Docker users must replace it
+  # with the `deploy.resources.reservations.devices` form shown on the
+  # ollama service above.
   #
   # code_embed:
   #   build:

@@ -49,9 +49,11 @@
 //!   supervisor wiring (resume sweep, manifest resolver). Promoting
 //!   the entire async lifecycle here would drag the Tauri / hub
 //!   harnesses into core, which we don't want.
-//! * `detect_container_runtime` — lives in each crate today because
-//!   the existing call sites are async tokio::process. A future
-//!   tidying pass could promote it; out of scope for v0.2.47.
+//! * ~~`detect_container_runtime` — lives in each crate today~~ —
+//!   promoted HERE in v0.2.54 (C-RT-1/C-RT-2): one daemon-aware
+//!   detector honoring `VCT_CONTAINER_RUNTIME` → `runtime.txt` →
+//!   podman-first `<cmd> info` probing. The three per-crate
+//!   `--version` copies are gone.
 //!
 //! ## Test discipline
 //!
@@ -82,6 +84,300 @@ pub const DEFAULT_OLLAMA_PORT: &str = "11435";
 /// crates' compilation units — proving the de-duplication is real and
 /// not just two structurally-similar copies.
 pub const DEDUP_SENTINEL: &str = "vct-launcher-core::services::container_runtime::v0.2.47";
+
+// ─── Runtime detection (v0.2.54 C-RT-1 / C-RT-2) ──────────────────────
+//
+// Pre-v0.2.54 THREE near-identical copies of `detect_container_runtime`
+// lived in `module_service.rs`, `installer_engine.rs`, and the hub's
+// `module_supervisor.rs`. All three:
+//
+//   * hardcoded podman-first PATH probing — ignoring the user's
+//     `VCT_CONTAINER_RUNTIME` choice and the install-time
+//     `state/install/runtime.txt` record that install.py + the hooks +
+//     the launcher's infra-stack path (services/runtime.rs) all honor
+//     (C-RT-1: dual-runtime hosts ended up with infra under docker and
+//     paid-module containers under podman, silently); and
+//
+//   * probed with `--version`, which only proves the CLIENT BINARY
+//     exists — it never contacts the daemon/machine. A macOS/Windows
+//     host with podman installed-but-machine-stopped and Docker
+//     Desktop running picked the dead podman every time (C-RT-2).
+//
+// This promoted detector applies the canonical v0.2.14 contract
+// (install.py `_runtime_preference_from_env` + `_detect_container_runtime`
+// + `_container_runtime_reachable`):
+//
+//   1. `VCT_CONTAINER_RUNTIME=podman|docker` — explicit user choice.
+//      Honored when that runtime's daemon responds; otherwise falls
+//      through to auto-detect with a stderr note (lenient — a
+//      misconfigured env var must not strand the user; mirrors
+//      install.py:8087-8103).
+//   2. `<install_root>/state/install/runtime.txt` — the runtime
+//      install.py detected and recorded (`_persist_runtime_txt`).
+//      Treated as a preference re-ordering, not a hard pin — a
+//      daemon-dead recorded runtime falls through to the other
+//      candidate with a stderr note.
+//   3. Daemon-aware probe of `["podman", "docker"]` (podman-first,
+//      matching install.py + services/runtime.rs policy) via
+//      `<cmd> info` — the round-trip that exercises the same code
+//      path `run`/`pull` need. `--version` is NOT used as a
+//      selection signal anymore (only to distinguish
+//      "binary present, daemon dead" from "not installed" in the
+//      error message).
+
+/// Read the user's explicit `VCT_CONTAINER_RUNTIME` preference.
+/// Case-insensitive, trimmed; `"auto"` / empty / unset → `None`.
+/// Unknown values log to stderr and return `None` (fall through to
+/// auto-detect) — same contract as install.py
+/// `_runtime_preference_from_env` and services/runtime.rs.
+pub fn runtime_preference_from_env() -> Option<String> {
+    let raw = std::env::var("VCT_CONTAINER_RUNTIME").ok()?;
+    let norm = raw.trim().to_lowercase();
+    if norm.is_empty() || norm == "auto" {
+        return None;
+    }
+    if norm == "podman" || norm == "docker" {
+        return Some(norm);
+    }
+    eprintln!(
+        "[container_runtime] VCT_CONTAINER_RUNTIME={:?} unrecognized \
+         (expected 'podman' / 'docker' / 'auto'); falling through to \
+         auto-detect.",
+        raw
+    );
+    None
+}
+
+/// Read `<install_root>/state/install/runtime.txt` (written by
+/// install.py `_persist_runtime_txt`). Returns `Some("podman")` /
+/// `Some("docker")` when the file exists and parses; `None` otherwise
+/// (missing file, unreadable, or unrecognized token).
+pub fn read_runtime_txt(install_root: &Path) -> Option<String> {
+    let path = install_root
+        .join("state")
+        .join("install")
+        .join("runtime.txt");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let token = raw.trim().to_lowercase();
+    if token == "podman" || token == "docker" {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+/// Daemon-aware liveness probe: `<cmd> info` with a 10s timeout.
+/// Returns true iff the daemon/socket/machine actually responds —
+/// matching install.py `_container_runtime_reachable` (which documents
+/// why `info`, not `version`: `version` only checks the client binary;
+/// `info` round-trips to the daemon and exercises the same code path
+/// `run`/`pull`/compose need. Catches stopped Docker Desktop on
+/// macOS, stopped podman.socket on Linux rootless, unstarted podman
+/// machine on macOS/Windows).
+pub async fn runtime_daemon_responsive(cmd: &str) -> bool {
+    use crate::process::CommandExt as _;
+    use std::process::Stdio;
+
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(cmd)
+            .silent()
+            .args(["info"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+    matches!(probe, Ok(Ok(s)) if s.success())
+}
+
+/// Client-binary-only probe (`<cmd> --version`). NOT a selection
+/// signal — used solely to enrich the no-runtime error message with
+/// "binary present but daemon dead" candidates.
+async fn runtime_binary_present(cmd: &str) -> bool {
+    use crate::process::CommandExt as _;
+    use std::process::Stdio;
+
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(cmd)
+            .silent()
+            .args(["--version"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+    matches!(probe, Ok(Ok(s)) if s.success())
+}
+
+/// Pure candidate-ordering helper for [`detect_container_runtime`].
+/// Split out so the env→runtime.txt→default precedence is unit-testable
+/// without spawning processes.
+///
+/// * `env_pref` — the validated `VCT_CONTAINER_RUNTIME` value (probed
+///   FIRST; on daemon failure the detector falls through to the rest).
+/// * `runtime_txt` — the validated runtime.txt token (preference
+///   re-ordering: moved to the front of the auto-detect order).
+pub fn runtime_candidate_order(
+    env_pref: Option<&str>,
+    runtime_txt: Option<&str>,
+) -> Vec<String> {
+    let mut order: Vec<String> = Vec::with_capacity(3);
+    if let Some(p) = env_pref {
+        order.push(p.to_string());
+    }
+    if let Some(t) = runtime_txt {
+        if !order.iter().any(|c| c == t) {
+            order.push(t.to_string());
+        }
+    }
+    for c in ["podman", "docker"] {
+        if !order.iter().any(|x| x == c) {
+            order.push(c.to_string());
+        }
+    }
+    order
+}
+
+/// v0.2.54: the ONE daemon-aware container-runtime detector shared by
+/// the launcher's module install/start path (`module_service.rs`,
+/// `installer_engine.rs`) and the hub's supervisor
+/// (`module_supervisor.rs`). See the section comment above for the
+/// precedence contract.
+///
+/// `install_root`: the orchestrator clone root, used to locate
+/// `state/install/runtime.txt`. The launcher passes
+/// `find_local_repo_root().ok()`; the hub passes `None` (it has no
+/// clone-root resolver today — env override + daemon-aware probing
+/// still apply, which closes C-RT-2 fully and C-RT-1 for the
+/// env-var channel on the hub path).
+///
+/// Error message names every candidate whose binary exists but whose
+/// daemon didn't respond, so a user debugging "module container won't
+/// start" learns the actual state ("podman installed but machine
+/// stopped") instead of a generic "no runtime found".
+pub async fn detect_container_runtime(
+    install_root: Option<&Path>,
+) -> Result<String, String> {
+    let env_pref = runtime_preference_from_env();
+    let runtime_txt = install_root.and_then(read_runtime_txt);
+
+    let order = runtime_candidate_order(env_pref.as_deref(), runtime_txt.as_deref());
+
+    let mut binary_only: Vec<String> = Vec::new();
+    for candidate in &order {
+        if runtime_daemon_responsive(candidate).await {
+            return Ok(candidate.clone());
+        }
+        // Daemon dead. Was this an explicit preference? Tell the user
+        // we're falling through rather than silently switching engines.
+        let was_pref = env_pref.as_deref() == Some(candidate.as_str())
+            || runtime_txt.as_deref() == Some(candidate.as_str());
+        if runtime_binary_present(candidate).await {
+            if was_pref {
+                eprintln!(
+                    "[container_runtime] preferred runtime '{}' (from {}) is \
+                     installed but its daemon/machine isn't responding to \
+                     `{} info`; trying the next candidate.",
+                    candidate,
+                    if env_pref.as_deref() == Some(candidate.as_str()) {
+                        "VCT_CONTAINER_RUNTIME"
+                    } else {
+                        "state/install/runtime.txt"
+                    },
+                    candidate,
+                );
+            }
+            binary_only.push(candidate.clone());
+        }
+    }
+
+    if binary_only.is_empty() {
+        Err("no container runtime found (tried podman, docker)".into())
+    } else {
+        Err(format!(
+            "no responsive container runtime: {} installed but daemon/machine \
+             not responding to `info` (start it: Linux `systemctl --user start \
+             podman.socket` / `sudo systemctl start docker`; macOS+Windows \
+             `podman machine start` / open Docker Desktop)",
+            binary_only.join(", "),
+        ))
+    }
+}
+
+// ─── GPU passthrough flags (v0.2.54 P0-4) ──────────────────────────────
+
+/// Engine flags that actually hand the GPU to a module container.
+///
+/// Pre-v0.2.54 the whole `gpu_image_variants` pipeline (v0.2.20 tag
+/// suffixes, v0.2.47 supervisor relocation) resolved `-cuda` / `-rocm`
+/// image tags that then ran with NO device access — `build_podman_run_args`
+/// emitted only `-d/--name/--restart/-p/-v/-e`, so torch saw no GPU and
+/// the user paid the multi-GB CUDA/ROCm layer pull for CPU inference
+/// (audit P0-4 / scout C-RT-3 ≡ gpu-C-1).
+///
+/// Flag matrix (runtime × mode):
+///
+/// | GpuMode | podman | docker |
+/// |---------|--------|--------|
+/// | Cuda    | `--device nvidia.com/gpu=all` (CDI) | `--gpus all` |
+/// | Rocm    | `--device /dev/kfd --device /dev/dri --group-add keep-groups` | `--device /dev/kfd --device /dev/dri --group-add video --group-add render` |
+/// | Cpu / Metal / None | (none) | (none) |
+///
+/// Why per-runtime: docker's CLI can't parse the CDI `nvidia.com/gpu=all`
+/// device spec (it has `--gpus`); podman has no `--gpus` and uses CDI.
+/// For ROCm, `--group-add keep-groups` is podman-only (preserves the
+/// host user's supplementary `video`/`render` groups in rootless mode);
+/// docker resolves the named groups against the container's /etc/group —
+/// same convention as `infrastructure/docker-compose.rocm.yml`.
+/// Unknown runtime names get the podman shape (conservative, mirrors
+/// `PerPullAuth::apply_to`'s catch-all).
+///
+/// `manifest_declares_variants` gate: flags are appended ONLY for
+/// modules that declare `runtime.gpu_image_variants` — i.e. modules
+/// that explicitly participate in the GPU pipeline and therefore run a
+/// GPU-capable image. Legacy single-tag modules keep their exact
+/// pre-v0.2.54 argv: appending `--device nvidia.com/gpu=all` to a
+/// CPU-only image on a host with a broken/absent CDI spec would fail a
+/// container start that used to succeed.
+pub fn gpu_passthrough_args(
+    runtime: &str,
+    gpu_mode: Option<GpuMode>,
+    manifest_declares_variants: bool,
+) -> Vec<String> {
+    if !manifest_declares_variants {
+        return Vec::new();
+    }
+    match gpu_mode {
+        Some(GpuMode::Cuda) => {
+            if runtime == "docker" {
+                vec!["--gpus".into(), "all".into()]
+            } else {
+                vec!["--device".into(), "nvidia.com/gpu=all".into()]
+            }
+        }
+        Some(GpuMode::Rocm) => {
+            let mut args: Vec<String> = vec![
+                "--device".into(),
+                "/dev/kfd".into(),
+                "--device".into(),
+                "/dev/dri".into(),
+            ];
+            if runtime == "docker" {
+                args.push("--group-add".into());
+                args.push("video".into());
+                args.push("--group-add".into());
+                args.push("render".into());
+            } else {
+                args.push("--group-add".into());
+                args.push("keep-groups".into());
+            }
+            args
+        }
+        Some(GpuMode::Cpu) | Some(GpuMode::Metal) | None => Vec::new(),
+    }
+}
 
 // ─── Pure helpers ──────────────────────────────────────────────────────
 
@@ -349,12 +645,19 @@ pub fn build_volume_arg(
 /// Build the full `podman run` argv (without the leading `podman`).
 ///
 /// Layout:
-///   `run -d --name <name> [--restart=unless-stopped] -p ... -v ... -e ... <image> <command> <args...>`
+///   `run -d --name <name> [--restart=unless-stopped] [gpu flags] -p ... -v ... -e ... <image> <command> <args...>`
 ///
 /// Accepts both `runtime.type = "container"` and `runtime.type = "service"`
 /// — both declare a long-running daemon backed by a container.
 /// `"cli"` / `"mcp_stdio"` / `"mcp_http"` have no podman args and are
 /// rejected.
+///
+/// v0.2.54 (P0-4): takes the detected `engine` name (`"podman"` /
+/// `"docker"`) + the host's `gpu_mode` so variant-bearing manifests get
+/// the runtime-appropriate GPU device flags via
+/// [`gpu_passthrough_args`]. Pre-v0.2.54 the `-cuda`/`-rocm` images
+/// selected by `resolve_variant_tag` ran with zero device access —
+/// silent CPU inference inside a GPU image.
 pub fn build_podman_run_args(
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
@@ -362,6 +665,8 @@ pub fn build_podman_run_args(
     rl_port: u16,
     container_name: &str,
     image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
 ) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
@@ -381,6 +686,13 @@ pub fn build_podman_run_args(
     if runtime.auto_restart {
         args.push("--restart=unless-stopped".into());
     }
+
+    // v0.2.54 P0-4: GPU passthrough for variant-declaring modules.
+    args.extend(gpu_passthrough_args(
+        engine,
+        gpu_mode,
+        runtime.gpu_image_variants.is_some(),
+    ));
 
     // Ports: one `-p [bind:]host:container` per entry.
     for port in &runtime.ports {
@@ -456,12 +768,17 @@ pub fn build_podman_run_args(
 ///   * `rl_port` is the machine-wide allocated port (one per global
 ///     module — the container listens on this single port for every
 ///     project's requests).
+///   * v0.2.54 (P0-4): `engine` + `gpu_mode` mirror
+///     [`build_podman_run_args`] — GPU device flags for
+///     variant-declaring manifests.
 pub fn build_podman_run_args_global(
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
     rl_port: u16,
     container_name: &str,
     image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
 ) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
@@ -481,6 +798,13 @@ pub fn build_podman_run_args_global(
     if runtime.auto_restart {
         args.push("--restart=unless-stopped".into());
     }
+
+    // v0.2.54 P0-4: GPU passthrough for variant-declaring modules.
+    args.extend(gpu_passthrough_args(
+        engine,
+        gpu_mode,
+        runtime.gpu_image_variants.is_some(),
+    ));
 
     for port in &runtime.ports {
         args.push("-p".into());
@@ -1850,6 +2174,8 @@ mod tests {
             11533,
             "vct-rl-reranker-acme-corp",
             "ghcr.io/hotak92/vct-rl-reranker:0.2.8",
+            "podman",
+            None,
         )
         .expect("build args");
         assert_eq!(args[0], "run");
@@ -1863,8 +2189,10 @@ mod tests {
         manifest.runtime.r#type = "mcp_stdio".into();
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
-        let err = build_podman_run_args(&manifest, &ctx, &project, 11533, "x", "img:tag")
-            .expect_err("must reject non-container runtime");
+        let err = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "x", "img:tag", "podman", None,
+        )
+        .expect_err("must reject non-container runtime");
         assert!(err.contains("container"));
     }
 
@@ -1881,9 +2209,275 @@ mod tests {
             11533,
             "vct-rl-reranker-acme-corp",
             "ghcr.io/hotak92/vct-rl-reranker:0.2.8",
+            "podman",
+            None,
         )
         .expect("service runtime accepted");
         assert_eq!(args[0], "run");
+    }
+
+    // ─── v0.2.54 P0-4: GPU passthrough flags ─────────────────────────
+
+    /// Pure-helper matrix: podman/docker × Cuda/Rocm/Cpu/Metal/None.
+    #[test]
+    fn v0254_gpu_passthrough_args_matrix() {
+        // CUDA — podman gets the CDI device, docker gets --gpus all.
+        assert_eq!(
+            gpu_passthrough_args("podman", Some(GpuMode::Cuda), true),
+            vec!["--device".to_string(), "nvidia.com/gpu=all".to_string()],
+        );
+        assert_eq!(
+            gpu_passthrough_args("docker", Some(GpuMode::Cuda), true),
+            vec!["--gpus".to_string(), "all".to_string()],
+        );
+        // ROCm — devices on both; group strategy differs per engine.
+        assert_eq!(
+            gpu_passthrough_args("podman", Some(GpuMode::Rocm), true),
+            vec![
+                "--device".to_string(),
+                "/dev/kfd".to_string(),
+                "--device".to_string(),
+                "/dev/dri".to_string(),
+                "--group-add".to_string(),
+                "keep-groups".to_string(),
+            ],
+        );
+        assert_eq!(
+            gpu_passthrough_args("docker", Some(GpuMode::Rocm), true),
+            vec![
+                "--device".to_string(),
+                "/dev/kfd".to_string(),
+                "--device".to_string(),
+                "/dev/dri".to_string(),
+                "--group-add".to_string(),
+                "video".to_string(),
+                "--group-add".to_string(),
+                "render".to_string(),
+            ],
+        );
+        // Cpu / Metal / None → no flags on either engine.
+        for engine in ["podman", "docker"] {
+            assert!(gpu_passthrough_args(engine, Some(GpuMode::Cpu), true).is_empty());
+            assert!(gpu_passthrough_args(engine, Some(GpuMode::Metal), true).is_empty());
+            assert!(gpu_passthrough_args(engine, None, true).is_empty());
+        }
+        // Unknown runtime falls back to the podman (CDI) shape.
+        assert_eq!(
+            gpu_passthrough_args("nerdctl", Some(GpuMode::Cuda), true),
+            vec!["--device".to_string(), "nvidia.com/gpu=all".to_string()],
+        );
+    }
+
+    /// Legacy single-tag modules (no `gpu_image_variants`) keep their
+    /// exact pre-v0.2.54 argv — no GPU flags even on a CUDA host.
+    #[test]
+    fn v0254_gpu_passthrough_args_skipped_without_variants() {
+        assert!(gpu_passthrough_args("podman", Some(GpuMode::Cuda), false).is_empty());
+        assert!(gpu_passthrough_args("docker", Some(GpuMode::Rocm), false).is_empty());
+    }
+
+    /// End-to-end through the per-project builder: a variant-declaring
+    /// manifest on a CUDA host produces the CDI device flag, positioned
+    /// BEFORE the positional image argument (engine flags must precede
+    /// the image in `run` argv).
+    #[test]
+    fn v0254_build_podman_run_args_appends_cuda_device_flag() {
+        let manifest = make_manifest_with_variants(true);
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cuda",
+            "podman",
+            Some(GpuMode::Cuda),
+        )
+        .expect("build args");
+        let dev_pos = args
+            .iter()
+            .position(|a| a == "--device")
+            .expect("--device flag present for CUDA variant module");
+        assert_eq!(args[dev_pos + 1], "nvidia.com/gpu=all");
+        let image_pos = args
+            .iter()
+            .position(|a| a == "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cuda")
+            .expect("image present");
+        assert!(
+            dev_pos < image_pos,
+            "GPU flags must precede the image arg; got {:?}",
+            args
+        );
+    }
+
+    /// End-to-end: docker + ROCm through the per-project builder.
+    #[test]
+    fn v0254_build_podman_run_args_docker_rocm_devices() {
+        let manifest = make_manifest_with_variants(true);
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.8-rocm",
+            "docker",
+            Some(GpuMode::Rocm),
+        )
+        .expect("build args");
+        assert!(args.iter().any(|a| a == "/dev/kfd"));
+        assert!(args.iter().any(|a| a == "/dev/dri"));
+        assert!(args.iter().any(|a| a == "video"));
+        assert!(args.iter().any(|a| a == "render"));
+        assert!(
+            !args.iter().any(|a| a == "keep-groups"),
+            "keep-groups is podman-only; got {:?}",
+            args
+        );
+    }
+
+    /// Cpu-mode host: variant module pulls the `-cpu` image and gets no
+    /// device flags.
+    #[test]
+    fn v0254_build_podman_run_args_cpu_mode_no_gpu_flags() {
+        let manifest = make_manifest_with_variants(true);
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "x",
+            "img:0.2.8-cpu",
+            "podman",
+            Some(GpuMode::Cpu),
+        )
+        .expect("build args");
+        assert!(!args.iter().any(|a| a == "--device" || a == "--gpus"));
+    }
+
+    /// Global builder gets the same GPU flags.
+    #[test]
+    fn v0254_build_podman_run_args_global_appends_gpu_flags() {
+        let mut manifest = make_rl_manifest_global_for_test();
+        manifest.runtime.gpu_image_variants = Some(GpuImageVariants {
+            cpu: "{version}-cpu".into(),
+            cuda: "{version}-cuda".into(),
+            rocm: "{version}-rocm".into(),
+        });
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/x/y:0.2.10-cuda",
+            "docker",
+            Some(GpuMode::Cuda),
+        )
+        .expect("build");
+        assert!(args.iter().any(|a| a == "--gpus"));
+        assert!(args.iter().any(|a| a == "all"));
+    }
+
+    /// Live podman CLI-surface check (same discipline as
+    /// `per_pull_auth_podman_env_var_accepted_by_live_podman`): the
+    /// flags we emit (`--device`, `--group-add`, `--gpus` for docker)
+    /// must exist on the live `run` subcommand's parser. Catches a
+    /// hypothetical podman release dropping/renaming the flags. Skipped
+    /// (clean return) on hosts without podman.
+    #[test]
+    fn v0254_gpu_flags_exist_on_live_podman_run_parser() {
+        let Ok(probe) = std::process::Command::new("which").arg("podman").output() else {
+            return;
+        };
+        if !probe.status.success() {
+            return;
+        }
+        let output = std::process::Command::new("podman")
+            .args(["run", "--help"])
+            .output()
+            .expect("spawn podman run --help");
+        assert!(output.status.success());
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            help.contains("--device"),
+            "podman run must support --device"
+        );
+        assert!(
+            help.contains("--group-add"),
+            "podman run must support --group-add"
+        );
+    }
+
+    // ─── v0.2.54 C-RT-1 / C-RT-2: promoted runtime detection ─────────
+
+    /// Candidate ordering: env preference first, runtime.txt second,
+    /// podman-first default tail, no duplicates.
+    #[test]
+    fn v0254_runtime_candidate_order_precedence() {
+        assert_eq!(
+            runtime_candidate_order(None, None),
+            vec!["podman".to_string(), "docker".to_string()],
+        );
+        assert_eq!(
+            runtime_candidate_order(Some("docker"), None),
+            vec!["docker".to_string(), "podman".to_string()],
+        );
+        assert_eq!(
+            runtime_candidate_order(None, Some("docker")),
+            vec!["docker".to_string(), "podman".to_string()],
+        );
+        // env wins over runtime.txt; no dup when they agree.
+        assert_eq!(
+            runtime_candidate_order(Some("podman"), Some("docker")),
+            vec!["podman".to_string(), "docker".to_string()],
+        );
+        assert_eq!(
+            runtime_candidate_order(Some("docker"), Some("docker")),
+            vec!["docker".to_string(), "podman".to_string()],
+        );
+    }
+
+    /// runtime.txt reader: valid token round-trips; junk / missing → None.
+    #[test]
+    fn v0254_read_runtime_txt_parses_valid_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("state").join("install");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(sub.join("runtime.txt"), "docker\n").expect("write");
+        assert_eq!(read_runtime_txt(dir.path()), Some("docker".to_string()));
+
+        std::fs::write(sub.join("runtime.txt"), "  PODMAN  \n").expect("write");
+        assert_eq!(read_runtime_txt(dir.path()), Some("podman".to_string()));
+
+        std::fs::write(sub.join("runtime.txt"), "containerd\n").expect("write");
+        assert_eq!(read_runtime_txt(dir.path()), None);
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_runtime_txt(empty.path()), None);
+    }
+
+    /// Live daemon-aware probe sanity: a nonexistent binary is never
+    /// "responsive"; and when podman IS on PATH with a live daemon,
+    /// the detector returns it (skip silently when no runtime is
+    /// usable on the CI host — the negative assertion above still ran).
+    #[tokio::test]
+    async fn v0254_detect_container_runtime_live_probe() {
+        assert!(
+            !runtime_daemon_responsive("definitely-not-a-container-runtime-binary").await
+        );
+        // Detection must never panic; an Err on runtime-less CI hosts is
+        // a valid outcome and carries the candidate diagnosis.
+        match detect_container_runtime(None).await {
+            Ok(rt) => assert!(rt == "podman" || rt == "docker"),
+            Err(msg) => assert!(msg.contains("container runtime")),
+        }
     }
 
     #[test]
@@ -2248,7 +2842,9 @@ mod tests {
         let mut manifest = make_rl_manifest_global_for_test();
         manifest.runtime.r#type = "cli".into();
         let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
-        let result = build_podman_run_args_global(&manifest, &ctx, 11443, "vct-rl-reranker", "img");
+        let result = build_podman_run_args_global(
+            &manifest, &ctx, 11443, "vct-rl-reranker", "img", "podman", None,
+        );
         assert!(result.is_err());
     }
 
@@ -2265,6 +2861,8 @@ mod tests {
             11443,
             "vct-rl-reranker",
             "ghcr.io/x/y:0.2.10",
+            "podman",
+            None,
         )
         .expect("build");
         assert_eq!(args[0], "run");
@@ -2498,6 +3096,8 @@ mod tests {
             11533,
             "vct-rl-reranker-acme-corp",
             "ghcr.io/hotak92/vct-rl-reranker:0.2.9",
+            "podman",
+            None,
         )
         .expect("build args");
         // The positional image arg is the LAST element — no CMD
@@ -2710,6 +3310,8 @@ mod tests {
             11443,
             "vct-rl-reranker",
             "ghcr.io/hotak92/vct-rl-reranker:0.2.9",
+            "podman",
+            None,
         )
         .expect("build args global");
         assert_eq!(

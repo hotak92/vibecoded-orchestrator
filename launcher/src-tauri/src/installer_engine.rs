@@ -1589,27 +1589,27 @@ pub(crate) async fn request_pull_token(
 #[allow(unused_imports)]
 pub(crate) use vct_launcher_core::services::container_runtime::format_pull_token_error;
 
-/// Detect which container runtime to use. Prefers podman (matches the
-/// rest of VCO's container stack), falls back to docker.
+/// Detect which container runtime to use.
 ///
 /// v0.2.33 (Agent C): hoisted to `pub(crate)` so the post-install
 /// manifest extractor (`commands::module_manifest_extract`) can probe
 /// the SAME runtime that `container_pull` chose — guarantees
 /// `docker cp` runs against the runtime that did the `docker pull`,
 /// so the image reference resolves to a known-good local copy.
+///
+/// v0.2.54 (C-RT-1/C-RT-2): thin wrapper over the promoted
+/// daemon-aware detector in
+/// `vct-launcher-core::services::container_runtime` — honors
+/// `VCT_CONTAINER_RUNTIME` -> `state/install/runtime.txt` ->
+/// podman-first `<cmd> info` probing. The pre-v0.2.54 local copy
+/// probed `--version` only (client binary, never the daemon) and
+/// ignored the user's runtime choice.
 pub(crate) async fn detect_container_runtime() -> Result<String, String> {
-    for candidate in ["podman", "docker"] {
-        let probe = Command::new(candidate).silent()
-            .args(["--version"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        if probe.map(|s| s.success()).unwrap_or(false) {
-            return Ok(candidate.to_string());
-        }
-    }
-    Err("no container runtime found (tried podman, docker)".into())
+    let install_root = crate::commands::installer::find_local_repo_root().ok();
+    vct_launcher_core::services::container_runtime::detect_container_runtime(
+        install_root.as_deref(),
+    )
+    .await
 }
 
 // v0.2.46 V46-E (C2): `container_login` removed. Was the global

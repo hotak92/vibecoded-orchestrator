@@ -92,20 +92,17 @@ pub const RL_PORT_RANGE_HI: u16 = 11900;
 // SAME implementation — closing the drift gap that produced the
 // supervisor-image-resolution-variant bug.
 
-/// Detect which container runtime to use.
+/// Detect which container runtime to use. v0.2.54 (C-RT-1/C-RT-2):
+/// thin wrapper over the promoted daemon-aware detector in
+/// `vct-launcher-core::services::container_runtime`. Honors
+/// `VCT_CONTAINER_RUNTIME` and probes daemon liveness via `<cmd> info`
+/// (the pre-v0.2.54 local copy probed `--version` only and could pick
+/// a dead podman over a live docker). The hub has no orchestrator-
+/// clone-root resolver, so `install_root=None` — the
+/// `state/install/runtime.txt` channel is launcher-side only; env
+/// override + daemon-aware probing still apply here.
 async fn detect_container_runtime() -> Result<String, String> {
-    for candidate in ["podman", "docker"] {
-        let probe = Command::new(candidate).silent()
-            .args(["--version"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-        if probe.map(|s| s.success()).unwrap_or(false) {
-            return Ok(candidate.to_string());
-        }
-    }
-    Err("no container runtime found (tried podman, docker)".into())
+    vct_launcher_core::services::container_runtime::detect_container_runtime(None).await
 }
 
 // v0.2.47: `sanitize_path_component` + `container_weights_path` moved
@@ -181,12 +178,17 @@ pub async fn start_container_for_module_with_gpu_mode(
     // on cache-miss for private GHCR packages. Soft-fail: if pre-pull
     // returns an error, log and let `podman run` make the final call —
     // the cache may have the image already, in which case `run`
-    // succeeds without needing the registry. Gated on
-    // `manifest.install.method == ContainerPull` AND `gpu_mode.is_some()`
-    // — legacy single-tag modules + cases where the caller has no
-    // GpuMode source (no persisted hardware snapshot yet) skip the
-    // pre-pull and fall through to the historical bare-tag path.
-    if gpu_mode.is_some() && manifest.install.method == InstallMethod::ContainerPull {
+    // succeeds without needing the registry.
+    //
+    // v0.2.54 (C-RT-6): gated on `method == ContainerPull` ALONE. The
+    // previous `gpu_mode.is_some() &&` conjunct meant a missing /
+    // unreadable hardware snapshot (gpu_mode soft-fails to None —
+    // hub-first boots, DB resets, legacy single-tag modules) skipped
+    // the authed pre-pull, so cache-evicted private images re-pulled
+    // anonymously and 401'd — the v0.2.46 GHCR-401 bug shape v0.2.47
+    // fixed for the variant path only. `pre_pull_with_auth_for_start`
+    // no-ops safely when no token resolves.
+    if manifest.install.method == InstallMethod::ContainerPull {
         if let Err(e) =
             vct_launcher_core::services::container_runtime::pre_pull_with_auth_for_start(
                 manifest, &podman, &image,
@@ -209,7 +211,11 @@ pub async fn start_container_for_module_with_gpu_mode(
 
     ensure_volume_host_dirs(manifest, ctx, rl_port, &project.slug).await;
 
-    let args = build_podman_run_args(manifest, ctx, project, rl_port, &container_name, &image)?;
+    // v0.2.54 (P0-4): thread detected engine + gpu_mode so variant-
+    // declaring manifests get runtime-appropriate GPU device flags.
+    let args = build_podman_run_args(
+        manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode,
+    )?;
 
     let mut cmd = Command::new(&podman).silent();
     cmd.args(&args);
@@ -806,7 +812,9 @@ pub async fn start_global_container_supervisor(
 
     let podman = detect_container_runtime().await?;
 
-    if gpu_mode.is_some() && manifest.install.method == InstallMethod::ContainerPull {
+    // v0.2.54 (C-RT-6): gated on `method == ContainerPull` alone — a
+    // missing hardware snapshot must not skip the authed pre-pull.
+    if manifest.install.method == InstallMethod::ContainerPull {
         if let Err(e) =
             vct_launcher_core::services::container_runtime::pre_pull_with_auth_for_start(
                 manifest, &podman, &image,
@@ -831,8 +839,10 @@ pub async fn start_global_container_supervisor(
     let ctx = PlaceholderCtx::new(&manifest.id);
     ensure_volume_host_dirs_global(manifest, &ctx, GLOBAL_RL_PORT).await;
 
-    let args =
-        build_podman_run_args_global(manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image)?;
+    // v0.2.54 (P0-4): thread detected engine + gpu_mode for GPU flags.
+    let args = build_podman_run_args_global(
+        manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image, &podman, gpu_mode,
+    )?;
 
     let mut cmd = Command::new(&podman).silent();
     cmd.args(&args);
@@ -1054,6 +1064,8 @@ mod tests {
             11533,
             "vct-rl-reranker-acme-corp",
             "ghcr.io/hotak92/vct-rl-reranker:0.1.0",
+            "podman",
+            None,
         )
         .expect("build args");
 
@@ -1068,9 +1080,10 @@ mod tests {
         manifest.runtime.r#type = "mcp_stdio".into();
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
-        let err =
-            build_podman_run_args(&manifest, &ctx, &project, 11533, "x", "img:tag")
-                .expect_err("must reject non-container runtime");
+        let err = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "x", "img:tag", "podman", None,
+        )
+        .expect_err("must reject non-container runtime");
         assert!(err.contains("container"));
     }
 
@@ -1196,6 +1209,8 @@ mod tests {
             11533,
             "vct-rl-reranker-acme-corp",
             "ghcr.io/hotak92/vct-rl-reranker:0.1.0",
+            "podman",
+            None,
         )
         .expect("service runtime must be accepted by hub after NEW-3.B");
         assert_eq!(args[0], "run");
@@ -1232,9 +1247,10 @@ mod tests {
         assert_eq!(image, "ghcr.io/hotak92/vct-rl-reranker:0.1.0",
             "synthesized image must use install.container.image + manifest.version");
 
-        let args =
-            build_podman_run_args(&manifest, &ctx, &project, 11533, &container_name, &image)
-                .expect("build_podman_run_args must succeed with synthesized defaults");
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, &container_name, &image, "podman", None,
+        )
+        .expect("build_podman_run_args must succeed with synthesized defaults");
         assert!(args.iter().any(|a| a == "vct-rl-reranker-acme-corp"));
     }
 

@@ -150,7 +150,7 @@ The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry 
 | `OPENAI_API_KEY` | (unset) | API key | Required when `ACTIVE_EMBEDDING=openai`. Resolved per-process from env; the launcher injects it from the shared keychain slot (see Secrets below). |
 | `OLLAMA_URL` | `http://localhost:11435` | URL | Ollama base URL used by the qwen3 slot. |
 | `CODE_EMBED_SERVICE_URL` | `http://localhost:11440` | URL | Code-embedding FastAPI service URL. |
-| `CODE_EMBED_BACKEND` | `service` (default) | `ollama` | `service` → CodeSage-Large-v2 via the FastAPI service; `ollama` → CPU fallback via `qwen3-embedding:0.6b`. |
+| `CODE_EMBED_BACKEND` | `gpu` (default) | `ollama` | `gpu` → CodeSage-Large-v2 via the FastAPI service (sentence-transformers); `ollama` → routes embeds through Ollama. The Ollama-path default model is `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim); install.py overrides `CODE_EMBED_MODEL` to `qwen3-embedding:0.6b` (1024-dim) on 6-12 GB GPU hosts. |
 | `CODE_EMBED_MODEL` | `codesage-large-v2` (default) | model id | Explicit code model override. |
 | `DUAL_EMBEDDING_ENABLED` | `false` (default) | `true` | When true, both `qwen3_embed` and `openai_embed` slots are populated on every write so the active slot can be switched without re-indexing. |
 

@@ -185,6 +185,22 @@ fn compose_override_path() -> Result<PathBuf, String> {
     Ok(orchestrator_root()?.join("infrastructure").join("docker-compose.override.yml"))
 }
 
+/// v0.2.54 (C-RT-5): the podman-compose auto-load sibling. Docker
+/// Compose auto-loads `docker-compose.override.yml`; podman-compose
+/// auto-loads `compose.override.yaml`. Pre-v0.2.54 this module wrote
+/// ONLY the docker-named file while `storage_ux.rs` wrote ONLY the
+/// podman-named one — two generators, two filenames, divergent bodies.
+/// On a dual-runtime host (or after a runtime switch, which the
+/// C-RT-1/C-RT-2 detector unification makes more likely to happen
+/// implicitly), which volume aliases applied depended on which compose
+/// binary ran — re-pointing Weaviate/Ollama at fresh empty volumes:
+/// data "loss" by alias miss. Fix: every write/remove mirrors the SAME
+/// body to BOTH names, so whichever compose binary runs sees identical
+/// volume wiring.
+fn compose_override_sibling_path() -> Result<PathBuf, String> {
+    Ok(orchestrator_root()?.join("infrastructure").join("compose.override.yaml"))
+}
+
 // ---------------------------------------------------------------------------
 // LauncherConfig persistence (atomic temp+rename)
 // ---------------------------------------------------------------------------
@@ -384,26 +400,41 @@ pub fn generate_override_yaml(shape: &OverrideShape) -> String {
     }
 }
 
-/// Write `infrastructure/docker-compose.override.yml`. Atomic temp+rename.
+/// Write `infrastructure/docker-compose.override.yml` AND mirror the
+/// identical body to `infrastructure/compose.override.yaml` (v0.2.54
+/// C-RT-5 — see [`compose_override_sibling_path`]). Atomic temp+rename
+/// per file.
 pub fn write_compose_override(body: &str) -> Result<PathBuf, String> {
     let path = compose_override_path()?;
+    write_one_override(&path, body)?;
+    // Mirror: identical body under podman-compose's auto-load name so a
+    // runtime/compose-binary switch can never apply divergent aliases.
+    let sibling = compose_override_sibling_path()?;
+    write_one_override(&sibling, body)?;
+    Ok(path)
+}
+
+fn write_one_override(path: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create {}: {}", parent.display(), e))?;
     }
-    let mut tmp = path.clone();
-    tmp.set_extension("yml.tmp");
+    let mut tmp = path.to_path_buf();
+    tmp.set_extension("tmp");
     std::fs::write(&tmp, body).map_err(|e| format!("write tmp {}: {}", tmp.display(), e))?;
-    std::fs::rename(&tmp, &path)
+    std::fs::rename(&tmp, path)
         .map_err(|e| format!("rename {} -> {}: {}", tmp.display(), path.display(), e))?;
-    Ok(path)
+    Ok(())
 }
 
 pub fn remove_compose_override() -> Result<(), String> {
-    let path = compose_override_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("remove {}: {}", path.display(), e))?;
+    // v0.2.54 (C-RT-5): remove BOTH auto-load names — leaving the
+    // sibling behind would resurrect stale aliases for one engine.
+    for path in [compose_override_path()?, compose_override_sibling_path()?] {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("remove {}: {}", path.display(), e))?;
+        }
     }
     Ok(())
 }

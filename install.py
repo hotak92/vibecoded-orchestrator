@@ -7113,6 +7113,35 @@ def _check_prerequisites() -> None:
 # Step 2: System detection
 # ---------------------------------------------------------------------------
 
+def _gpu_vendor_preference_from_env() -> Optional[str]:
+    """Return the user's explicit ``VCT_GPU_VENDOR`` preference, or None.
+
+    v0.2.54 (gpu-audit C-3): this env var was ADVERTISED by two
+    remediation messages (the ``compose_overlay_ambiguous`` deferral's
+    ``command_to_apply`` and the ``--apply-deferred`` skip handler:
+    "Pass --gpu or set VCT_GPU_VENDOR and re-run") but had NO reader
+    anywhere — the documented dual-GPU fix was a no-op, and
+    AMD-preferring dual-vendor hosts could never select the ROCm
+    overlay (probe order is nvidia-smi first, so NVIDIA always won).
+
+    Mirrors the `_runtime_preference_from_env` contract: values are
+    case-insensitive, trimmed; empty / "auto" means no preference;
+    unknown values log to stderr and are ignored.
+    """
+    raw = os.environ.get("VCT_GPU_VENDOR", "").strip().lower()
+    if not raw or raw == "auto":
+        return None
+    if raw in ("nvidia", "amd", "metal"):
+        return raw
+    print(
+        f"  VCT_GPU_VENDOR={raw!r} unrecognized (expected "
+        "'nvidia' / 'amd' / 'metal' / 'auto'); falling through to "
+        "auto-detect.",
+        file=sys.stderr,
+    )
+    return None
+
+
 def _detect_system(args: argparse.Namespace) -> SystemInfo:
     print("[2/10] Detecting system ... ", flush=True)
     _log_install_event("2/10", "start", "detecting system")
@@ -7143,35 +7172,76 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
         # may need a reboot, and the canonical install path is vendor-
         # specific. Detection-only here; the launcher GUI offers
         # opt-in install for users who want it.
-        has_gpu, gpu_name = _detect_nvidia_gpu()
-        if has_gpu:
-            gpu_vendor = "nvidia"
-            vram_gb = _probe_nvidia_vram_gb()
-            extra = _probe_nvidia_versions()
-            vram_label = f", {vram_gb:.1f} GB VRAM" if vram_gb > 0 else ""
-            if extra:
-                print(f"  GPU: {gpu_name} ({extra}{vram_label})")
-            else:
-                print(f"  GPU: {gpu_name}{vram_label.lstrip(',').rstrip()}")
-        else:
+        #
+        # v0.2.54 (gpu-audit C-3): honor VCT_GPU_VENDOR before the
+        # layered probe. On dual-vendor hosts the nvidia-smi-first order
+        # otherwise always picks NVIDIA; the env var lets the user pick
+        # the AMD/Metal arm explicitly (lenient: if the preferred
+        # vendor's probe fails, fall through to normal auto-detect with
+        # a stderr note rather than stranding the install).
+        vendor_pref = _gpu_vendor_preference_from_env()
+        if vendor_pref == "amd":
             rocm_present, rocm_info = _detect_amd_rocm()
             if rocm_present:
-                # Treat ROCm as GPU-capable for the embedding-mode
-                # picker. Ollama supports ROCm natively (per Ollama
-                # docs); if their build doesn't, the user gets a clear
-                # runtime error and can fall back to --cpu-only.
                 has_gpu = True
                 gpu_vendor = "amd"
                 gpu_name = rocm_info
                 vram_gb = _probe_amd_rocm_vram_gb()
                 vram_label = f" ({vram_gb:.1f} GB VRAM)" if vram_gb > 0 else ""
-                print(f"  GPU: {rocm_info}{vram_label}")
-            elif os_name == "Darwin" and _detect_apple_silicon():
+                print(f"  GPU: {rocm_info}{vram_label} (VCT_GPU_VENDOR=amd)")
+            else:
+                print(
+                    "  VCT_GPU_VENDOR=amd set but rocm-smi probe failed; "
+                    "falling through to auto-detect.",
+                    file=sys.stderr,
+                )
+        elif vendor_pref == "metal":
+            if os_name == "Darwin" and _detect_apple_silicon():
                 has_metal = True
                 gpu_vendor = "metal"
-                print("  GPU: Apple Silicon (Metal — built-in, no driver install needed)")
+                print("  GPU: Apple Silicon (Metal — VCT_GPU_VENDOR=metal)")
             else:
-                _print_gpu_hint(os_name)
+                print(
+                    "  VCT_GPU_VENDOR=metal set but this host is not "
+                    "Apple Silicon; falling through to auto-detect.",
+                    file=sys.stderr,
+                )
+        # vendor_pref == "nvidia" needs no special arm — the default
+        # layered order below already probes nvidia-smi first.
+
+        # Default layered probe — skipped entirely when an env-pref arm
+        # above already resolved the vendor (the pre-v0.2.54 shape would
+        # otherwise re-enter the NVIDIA arm and overwrite the choice).
+        if not gpu_vendor:
+            has_gpu, gpu_name = _detect_nvidia_gpu()
+            if has_gpu:
+                gpu_vendor = "nvidia"
+                vram_gb = _probe_nvidia_vram_gb()
+                extra = _probe_nvidia_versions()
+                vram_label = f", {vram_gb:.1f} GB VRAM" if vram_gb > 0 else ""
+                if extra:
+                    print(f"  GPU: {gpu_name} ({extra}{vram_label})")
+                else:
+                    print(f"  GPU: {gpu_name}{vram_label.lstrip(',').rstrip()}")
+            else:
+                rocm_present, rocm_info = _detect_amd_rocm()
+                if rocm_present:
+                    # Treat ROCm as GPU-capable for the embedding-mode
+                    # picker. Ollama supports ROCm natively (per Ollama
+                    # docs); if their build doesn't, the user gets a clear
+                    # runtime error and can fall back to --cpu-only.
+                    has_gpu = True
+                    gpu_vendor = "amd"
+                    gpu_name = rocm_info
+                    vram_gb = _probe_amd_rocm_vram_gb()
+                    vram_label = f" ({vram_gb:.1f} GB VRAM)" if vram_gb > 0 else ""
+                    print(f"  GPU: {rocm_info}{vram_label}")
+                elif os_name == "Darwin" and _detect_apple_silicon():
+                    has_metal = True
+                    gpu_vendor = "metal"
+                    print("  GPU: Apple Silicon (Metal — built-in, no driver install needed)")
+                else:
+                    _print_gpu_hint(os_name)
 
     # v0.2.53 L-P0-8: when a GPU IS detected on Linux, surface the
     # render/video group remediation if missing. The webkit_preflight
@@ -8306,6 +8376,77 @@ def _try_start_podman_daemon() -> tuple[bool, str]:
         time.sleep(1.0)
 
     return False, "podman daemon did not become responsive within 30s"
+
+
+def _try_start_docker_daemon() -> tuple[bool, str]:
+    """v0.2.54 (container-scout C-RT-7): best-effort auto-start of the
+    Docker daemon — closes the auto-heal asymmetry where Podman got
+    socket auto-start (v0.2.51) + machine auto-init/start (v0.2.53)
+    while Docker users only got a printed hint.
+
+    OS matrix:
+      - macOS:   ``open -a Docker`` — launches Docker Desktop. No sudo,
+                 no GUI prompt beyond Docker Desktop's own startup.
+      - Windows: shell-start ``Docker Desktop.exe`` from its canonical
+                 install locations.
+      - Linux:   NOT automated. ``sudo systemctl start docker`` needs an
+                 interactive password we don't shoulder in a pre-flight
+                 (same rationale as the original hint). Returns False
+                 with the manual recipe.
+
+    After a successful launch attempt, polls ``docker info`` for up to
+    60s (Docker Desktop's VM boot is slow). Soft-fail throughout — the
+    caller falls back to the printed hint.
+    """
+    os_name = platform.system()
+    if not shutil.which("docker"):
+        return False, "docker binary not on PATH"
+
+    if os_name == "Darwin":
+        try:
+            result = subprocess.run(
+                ["open", "-a", "Docker"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return False, f"`open -a Docker` failed: {e}"
+        if result.returncode != 0:
+            return False, (
+                f"`open -a Docker` exited {result.returncode}: "
+                f"{(result.stderr or '').strip()[:200]}"
+            )
+    elif os_name == "Windows":
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Docker" / "Docker" / "Docker Desktop.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Docker" / "Docker Desktop.exe",
+        ]
+        exe = next((c for c in candidates if c.is_file()), None)
+        if exe is None:
+            return False, (
+                "Docker Desktop.exe not found at the canonical install "
+                "locations; start Docker Desktop from the Start Menu."
+            )
+        try:
+            # Detached start — Docker Desktop is a GUI app; don't block.
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", str(exe)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            return False, f"could not launch Docker Desktop: {e}"
+    else:
+        return False, (
+            "Docker daemon auto-start is not automated on Linux "
+            "(requires sudo): run `sudo systemctl start docker`."
+        )
+
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        if _container_runtime_reachable("docker"):
+            return True, "daemon responsive"
+        time.sleep(2.0)
+    return False, "docker daemon did not become responsive within 60s"
 
 
 def _emit_podman_daemon_start_failed_deferral(
@@ -9502,6 +9643,87 @@ def _install_joern() -> bool:
 # Step 3: Embedding configuration
 # ---------------------------------------------------------------------------
 
+# v0.2.54 (gpu-audit C-5): vector dimensionality per embedding model.
+# Single source for the tier-override path so swapping a model can never
+# leave the profile's stock `code_dims` / `text_dims` behind. Keep in
+# lockstep with EMBEDDING_CONFIGS above and the per-model limits in
+# claude_mcp_servers/weaviate_mcp/chunking.py.
+_EMBEDDING_MODEL_DIMS = {
+    "codesage-large-v2": 2048,
+    "qwen3-embedding:0.6b": 1024,
+    "unclemusclez/jina-embeddings-v2-base-code:latest": 768,
+    "snowflake-arctic-embed2:latest": 1024,
+    "openai-text-embedding-3-small": 1536,
+    "text-embedding-3-small": 1536,
+}
+
+# ACTIVE_EMBEDDING named-vector slot per TEXT model — must match the
+# slot mapping in weaviate_mcp/server.py::_get_search_vector. A text-
+# model override that doesn't re-point this slot would write vectors
+# from one model into a slot labelled for another (the 2026-04-30
+# vector-audit bug class).
+_TEXT_MODEL_ACTIVE_EMBEDDING = {
+    "qwen3-embedding:0.6b": "qwen3",
+    "snowflake-arctic-embed2:latest": "arctic",
+    "openai-text-embedding-3-small": "openai",
+    "text-embedding-3-small": "openai",
+}
+
+# Models served via Ollama (must be in the pull list when selected).
+_OLLAMA_SERVED_EMBEDDING_MODELS = {
+    "qwen3-embedding:0.6b",
+    "unclemusclez/jina-embeddings-v2-base-code:latest",
+    "snowflake-arctic-embed2:latest",
+}
+
+
+def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None:
+    """Swap the profile's stock models for the hardware-tier picks,
+    keeping every dependent field consistent (v0.2.54, gpu-audit C-5).
+
+    Mutates ``config`` in place:
+      * ``code_model`` -> ``code_dims`` follows (768/1024/1536/2048 per
+        _EMBEDDING_MODEL_DIMS). Pre-v0.2.54 only the model name was
+        swapped, so ``CODE_EMBED_DIMS=768`` was written for the
+        1024-dim qwen3 pick on 6-12 GB GPU hosts.
+      * ``text_model`` -> ``text_dims`` AND ``active_embedding`` follow
+        (the named-vector slot must be labelled for the model that
+        emitted the vector).
+      * Ollama-served override models are appended to
+        ``embedding_models`` so the pull list actually contains the
+        model the host will embed with (e.g. low_resource profile +
+        qwen3 code override).
+
+    ``code_backend`` is intentionally NOT swapped: the tier selectors
+    only ever override WITHIN a backend family (CodeSage stays
+    exclusive to the gpu profile where it is the stock pick; all other
+    picks are Ollama-served and land on profiles whose backend is
+    already "ollama").
+    """
+    if config.get("code_model") != code_pick:
+        config["code_model"] = code_pick
+        dims = _EMBEDDING_MODEL_DIMS.get(code_pick)
+        if dims is not None:
+            config["code_dims"] = dims
+        if (code_pick in _OLLAMA_SERVED_EMBEDDING_MODELS
+                and code_pick not in config.get("embedding_models", [])):
+            # Copy-on-write: config is a SHALLOW copy of the module-level
+            # EMBEDDING_CONFIGS profile — appending in place would mutate
+            # the shared profile list across calls.
+            config["embedding_models"] = list(config.get("embedding_models", [])) + [code_pick]
+    if config.get("text_model") != kg_pick:
+        config["text_model"] = kg_pick
+        dims = _EMBEDDING_MODEL_DIMS.get(kg_pick)
+        if dims is not None:
+            config["text_dims"] = dims
+        slot = _TEXT_MODEL_ACTIVE_EMBEDDING.get(kg_pick)
+        if slot is not None:
+            config["active_embedding"] = slot
+        if (kg_pick in _OLLAMA_SERVED_EMBEDDING_MODELS
+                and kg_pick not in config.get("embedding_models", [])):
+            config["embedding_models"] = list(config.get("embedding_models", [])) + [kg_pick]
+
+
 def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> dict:
     # Explicit opt-ins win over auto-detection.
     #
@@ -9569,6 +9791,21 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         prefer_openai=False,
     )
 
+    # v0.2.54 (gpu-audit C-2): CodeSage has no ROCm build path — the
+    # code-embed container image is CPU-multi-arch by default with a
+    # CUDA-only alternative (`Dockerfile.cuda`, emitted only for
+    # gpu_vendor == "nvidia"). Pre-v0.2.54, an AMD host with >=12 GB
+    # VRAM landed on the "gpu" profile labeled "GPU-accelerated ...
+    # best quality" while CodeSage 1.3B silently ran on CPU inside the
+    # container. Route AMD hosts to the Ollama-served qwen3 code model
+    # instead: Ollama itself IS ROCm-accelerated (via the rocm compose
+    # overlay), so code embeddings still run on the GPU — through the
+    # backend that actually has a ROCm path. This also makes the
+    # shipped claims true (CHANGELOG F7 + podman-compose.amd-rocm.yml:
+    # "AMD users get the Ollama-based code embedding fallback").
+    if has_gpu and code_pick == _CODE_BACKEND_CODESAGE and sysinfo.gpu_vendor == "amd":
+        code_pick = _CODE_BACKEND_QWEN3
+
     # Map the per-tier picks back to a profile + overrides. The profile
     # determines the shape (active_embedding slot + which Ollama models
     # land in the pull list); the overrides surgically swap in the
@@ -9594,14 +9831,13 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     config = dict(EMBEDDING_CONFIGS[profile_key])
 
     # Surgical overrides when the selector disagrees with the stock
-    # profile model. Today this only happens on the GPU profile's
-    # text-embedding tier (sub-8-GB GPU can hit gpu code path via
-    # CodeSage but should still use arctic for KG) — but expressing it
-    # as a general override keeps future tier additions cheap.
-    if config.get("code_model") != code_pick:
-        config["code_model"] = code_pick
-    if config.get("text_model") != kg_pick:
-        config["text_model"] = kg_pick
+    # profile model. v0.2.54 (gpu-audit C-5): extracted to
+    # _apply_tier_overrides, which now keeps the DEPENDENT fields in
+    # lockstep with the swapped model — pre-v0.2.54 only the model name
+    # was replaced, so e.g. a 6-12 GB GPU host got the cpu profile with
+    # code_model swapped to qwen3 (1024-dim) while code_dims stayed 768
+    # and CODE_EMBED_DIMS=768 was written to .env for a 1024-dim model.
+    _apply_tier_overrides(config, code_pick=code_pick, kg_pick=kg_pick)
 
     _record_install_choice("embedding_mode", profile_key, {"reason": reason})
     return config
@@ -9772,9 +10008,13 @@ def _discover_app_state_db_path() -> Path:
 
     Returns a `Path` whether or not the file exists on disk — caller is
     responsible for the `.is_file()` check and the soft-fail.
+
+    v0.2.54: delegates to `vco_lib.paths.launcher_db_path` so the
+    `VCT_LAUNCHER_DB_PATH` override is honoured uniformly (previously
+    only `launcher_db_reader` honoured it — split-brain).
     """
-    from vco_lib.paths import vct_root_dir
-    return vct_root_dir() / "launcher.db"
+    from vco_lib.paths import launcher_db_path
+    return launcher_db_path()
 
 
 def _write_preset_defaults_to_app_state(
@@ -12537,6 +12777,68 @@ def _detect_existing_volume_paths() -> dict:
     return volumes
 
 
+def _compose_substitution_env(embed_config: dict) -> dict[str, str]:
+    """Keys docker-compose.yml substitutes that install.py COMPUTES
+    (rather than inheriting from the caller's environment).
+
+    v0.2.54 (gpu-audit C-4): pre-v0.2.54 these were written ONLY to
+    ``PROJECT_ROOT/.env`` — one level above ``infrastructure/`` — which
+    compose never reads (compose resolves ``${...}`` from its project
+    dir's ``.env`` or the process environment), AND they were written at
+    step 9/10, AFTER the compose-up at step 5/10, AND never exported
+    into ``os.environ``. Net effect: ``${CODE_EMBED_DOCKERFILE:-Dockerfile}``
+    always resolved to the CPU multi-arch default, so even NVIDIA hosts
+    built the CPU ``pytorch:2.6.0-cpu`` code-embed image — CodeSage on
+    CPU on CUDA hosts. The v0.2.50 audit-F1 "fix" (emit the var into the
+    root .env) never connected to compose substitution.
+    """
+    env: dict[str, str] = {}
+    backend = str(embed_config.get("code_backend", "") or "")
+    if backend:
+        env["CODE_EMBED_BACKEND"] = backend
+    # CUDA Dockerfile only for NVIDIA hosts (AMD ROCm / Apple / CPU stay
+    # on the multi-arch CPU default — there is no ROCm code-embed image).
+    if embed_config.get("gpu_vendor") == "nvidia":
+        env["CODE_EMBED_DOCKERFILE"] = "Dockerfile.cuda"
+    return env
+
+
+def _write_infrastructure_env(embed_config: dict) -> None:
+    """Persist the compose-substitution keys to ``infrastructure/.env``
+    (the compose project dir — the file compose ACTUALLY reads), so
+    every later compose invocation (the boot wrapper, hooks'
+    ensure-containers, a user's manual ``podman-compose up -d``) sees
+    the same substitutions as install.py's own compose-up.
+
+    Merge semantics: lines for keys we manage are replaced; all other
+    user lines are preserved. Soft-fail on I/O errors (the explicit
+    process-env pass-through in ``_start_services`` still covers the
+    in-flight install).
+    """
+    managed = _compose_substitution_env(embed_config)
+    if not managed:
+        return
+    infra_env = PROJECT_ROOT / "infrastructure" / ".env"
+    try:
+        existing_lines: list[str] = []
+        if infra_env.is_file():
+            existing_lines = infra_env.read_text(encoding="utf-8").splitlines()
+        kept = [
+            ln for ln in existing_lines
+            if not any(ln.strip().startswith(f"{k}=") for k in managed)
+            and not ln.strip().startswith("# Managed-by-install.py")
+        ]
+        out = kept + [
+            "# Managed-by-install.py: compose ${...} substitution keys for the",
+            "# Managed-by-install.py: code-embed image build. Re-running install",
+            "# Managed-by-install.py: rewrites these lines; edit via install flags.",
+        ] + [f"{k}={v}" for k, v in sorted(managed.items())]
+        infra_env.parent.mkdir(parents=True, exist_ok=True)
+        infra_env.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"  WARNING: could not write infrastructure/.env: {exc}")
+
+
 def _start_services(
     sysinfo: SystemInfo,
     args: argparse.Namespace,
@@ -12686,6 +12988,26 @@ def _start_services(
                     "      compose-up below may fail; re-run install.py "
                     "after starting the daemon manually."
                 )
+        elif sysinfo.container_cmd == "docker" and platform.system() in ("Darwin", "Windows"):
+            # v0.2.54 (C-RT-7): docker auto-heal sibling of the podman
+            # branch above — `open -a Docker` (macOS) / shell-start of
+            # Docker Desktop (Windows) + 60s `docker info` poll. Linux
+            # stays manual (sudo systemctl needs an interactive password
+            # we don't shoulder in a pre-flight) and takes the hint
+            # branch below.
+            print(
+                "  [!] docker is installed but its daemon isn't responding "
+                "to `docker info`. Attempting to start Docker Desktop..."
+            )
+            ok, detail = _try_start_docker_daemon()
+            if ok:
+                print("      [OK] Docker daemon is now responsive.")
+            else:
+                print(f"      [!] Auto-start failed: {detail}")
+                print(
+                    "      compose-up below may fail; start Docker Desktop "
+                    "manually and re-run install.py once it settles."
+                )
         else:
             print(
                 f"  [!] {sysinfo.container_cmd} is installed but its daemon/socket\n"
@@ -12706,6 +13028,14 @@ def _start_services(
             )
 
     compose_cmd = _get_compose_command(sysinfo.container_cmd)
+
+    # v0.2.54 (gpu-audit C-4): persist + export the compose-substitution
+    # keys (CODE_EMBED_BACKEND / CODE_EMBED_DOCKERFILE) so the build
+    # actually receives them. infrastructure/.env covers every later
+    # compose invocation (boot wrapper, hooks, manual up); the explicit
+    # process-env merge below covers THIS invocation.
+    _write_infrastructure_env(embed_config)
+    compose_env = {**os.environ, **_compose_substitution_env(embed_config)}
 
     cmd = [*compose_cmd, "-f", str(compose_file)]
 
@@ -12759,9 +13089,9 @@ def _start_services(
                         ),
                         command_to_apply=(
                             "# For NVIDIA:\n"
-                            "python install.py --gpu --update\n"
+                            "VCT_GPU_VENDOR=nvidia python install.py --gpu --update\n"
                             "# For AMD ROCm:\n"
-                            "python install.py --gpu --update  # after setting VCT_GPU_VENDOR=amd"
+                            "VCT_GPU_VENDOR=amd python install.py --gpu --update"
                         ),
                         severity="warning",
                         kg_node_refs=[],
@@ -12843,6 +13173,7 @@ def _start_services(
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, cwd=str(infra_dir), timeout=docker_timeout,
+            env=compose_env,
         )
     except subprocess.TimeoutExpired:
         timeout_min = docker_timeout // 60
@@ -25043,9 +25374,10 @@ def _run_uninstall(args: argparse.Namespace) -> int:
     else:
         print(f"  [2] [skip] Container volumes preserved (--keep-data)")
 
-    # Honour VCT_STATE_DIR so a dev launcher's state isolates cleanly.
-    from vco_lib.paths import vct_root_dir
-    launcher_db = vct_root_dir() / "launcher.db"
+    # Honour VCT_STATE_DIR / VCT_LAUNCHER_DB_PATH so a dev launcher's
+    # state isolates cleanly (v0.2.54: canonical resolver).
+    from vco_lib.paths import launcher_db_path
+    launcher_db = launcher_db_path()
     will_remove_launcher_db = launcher_db.exists()
     if will_remove_launcher_db:
         print(f"  [3] Remove launcher state: {launcher_db}")
