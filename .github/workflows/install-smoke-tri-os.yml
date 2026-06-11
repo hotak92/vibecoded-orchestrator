@@ -322,7 +322,12 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for d in .venv state claude_mcp_servers/.venv; do
+          # NOTE: claude_mcp_servers/.venv is a STALE LEGACY PATH; the
+          # canonical venv lives at PROJECT_ROOT/.venv (see install.py
+          # step 4 + the comment block around line 15462). Asserting on
+          # the legacy path was failing this gate on every push despite
+          # successful installs.
+          for d in .venv state; do
             if [ ! -d "$d" ]; then
               echo "::error::MISSING directory: $d"
               missing=$((missing + 1))
@@ -374,12 +379,10 @@ jobs:
           ) else (
             echo   [ok] state\
           )
-          if not exist claude_mcp_servers\.venv\ (
-            echo ::error::MISSING directory: claude_mcp_servers\.venv
-            set /a MISSING+=1
-          ) else (
-            echo   [ok] claude_mcp_servers\.venv\
-          )
+          REM NOTE: claude_mcp_servers\.venv is a STALE LEGACY PATH; the canonical
+          REM venv lives at PROJECT_ROOT\.venv (see install.py step 4 + the
+          REM comment block around line 15462). Asserting on the legacy path
+          REM was failing this gate on every push despite successful installs.
           if not exist .env (
             echo ::error::MISSING .env
             set /a MISSING+=1
