@@ -38,6 +38,38 @@ function Write-Debug-Line {
 }
 
 # ---------------------------------------------------------------------------
+# v0.2.54 Track C (C-7): respect the orchestrator update gate (parity with
+# the .sh sibling). During `update_orchestrator` the launcher writes
+# `<vct_root>\.update-in-progress.json` and explicitly STOPS vct-hub so the
+# binary can be swapped (Windows mandatory locks). Respawning the hub here
+# mid-update would re-lock vct-hub.exe between the stop and the swap. MCP
+# servers already honour this gate (exit 75); the hook does too.
+#
+# Staleness without a JSON parse: the launcher rewrites the lockfile on
+# every phase advance and the expected update duration is 15 minutes, so
+# "modified within the last 15 minutes" is a faithful proxy for the
+# in-JSON `expected_completion_by` deadline.
+# ---------------------------------------------------------------------------
+$vctRoot = if ($env:VCT_STATE_DIR) { $env:VCT_STATE_DIR } else {
+    $p = [System.Environment]::GetFolderPath('UserProfile')
+    if (-not $p -and $env:HOME) { $p = $env:HOME }
+    Join-Path $p ".vct"
+}
+$updateGateFile = Join-Path $vctRoot ".update-in-progress.json"
+if (Test-Path -LiteralPath $updateGateFile) {
+    try {
+        $gateAge = (Get-Date) - (Get-Item -LiteralPath $updateGateFile).LastWriteTime
+        if ($gateAge.TotalMinutes -lt 15) {
+            [Console]::Error.WriteLine("[vct] orchestrator update in progress ($updateGateFile) -- skipping vct-hub auto-start")
+            exit 0
+        }
+        Write-Debug-Line "stale update gate file present (>15 min old) -- ignoring"
+    } catch {
+        Write-Debug-Line "update gate probe failed: $($_.Exception.Message) -- continuing"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Get-ArchDirName :: name matching launcher\dist\<arch>\.
 # Best-effort; empty string if not derivable.
 # ---------------------------------------------------------------------------

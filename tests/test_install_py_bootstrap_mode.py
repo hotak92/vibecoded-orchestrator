@@ -120,7 +120,10 @@ def test_bootstrap_launcher_dist_subdir_no_experimental_macos():
         "M-P0-2 SSOT violation: `experimental_macOS` is the legacy name; "
         "current code must emit `macos-arm64`."
     )
-    assert subdir in ("macos-arm64", "linux-x64", "windows-x64", None), (
+    # v0.2.54 Track C: `macos-x64` added for Intel-Mac local builds.
+    assert subdir in (
+        "macos-arm64", "macos-x64", "linux-x64", "windows-x64", None,
+    ), (
         f"Unexpected launcher_dist_subdir: {subdir!r}"
     )
 

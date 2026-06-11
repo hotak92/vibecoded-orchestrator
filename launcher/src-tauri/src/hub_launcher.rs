@@ -167,12 +167,42 @@ pub enum SpawnOutcome {
     SpawnFailed(String),
     /// Spawn succeeded but `--start-if-not-running` exited non-zero.
     HubReportedError(i32),
+    /// v0.2.54 Track C (C-7): an orchestrator update is in progress
+    /// (`<vct_root>/.update-in-progress.json` is fresh) — respawning
+    /// the hub now would re-lock `vct-hub.exe` on Windows mid-swap and
+    /// recreate the exact sharing-violation the update flow's hub-stop
+    /// was designed to prevent. Caller should treat this as a benign
+    /// skip; the post-update launcher boot starts the hub.
+    SkippedUpdateInProgress,
 }
 
 /// Attempt to bring up the detached vct-hub. Best-effort; never
 /// returns Err — the launcher's setup must continue even if the hub
 /// can't start (see module docs for the "degraded mode" contract).
 pub fn ensure_hub_running() -> SpawnOutcome {
+    // v0.2.54 Track C (C-7): honour the V52-AI update gate the same way
+    // MCP servers do. During the update window the launcher explicitly
+    // stops the hub (`ensure_hub_stopped_for_update`) so the binary can
+    // be swapped; an ungated boot-time respawn here (e.g. a second
+    // launcher start, or any future caller) would resurrect the OLD hub
+    // and relock `vct-hub.exe` between stop and swap. A stale lockfile
+    // (deadline passed) does NOT block — `is_update_in_progress` treats
+    // it as absent, and boot-time `cleanup_if_stale` removes it.
+    //
+    // Note: the update flow's own intentional mid-flow hub starts go
+    // through `installer::ensure_hub_started_after_update`, which is
+    // NOT gated — those call sites run either after the gate has been
+    // disarmed (success tail) or on error paths where the gate is about
+    // to be dropped, and they must succeed regardless.
+    if crate::commands::update_gate::is_update_in_progress() {
+        eprintln!(
+            "[vct] ensure_hub_running: orchestrator update in progress \
+             (.update-in-progress.json is fresh) — skipping hub respawn; \
+             the post-update launcher boot will start the new hub."
+        );
+        return SpawnOutcome::SkippedUpdateInProgress;
+    }
+
     let Some(bin) = find_hub_binary() else {
         eprintln!(
             "[vct] vct-hub binary not found on this machine; \
@@ -340,6 +370,73 @@ mod tests {
     fn ensure_hub_running_reports_binary_not_found_in_clean_env() {
         with_env(
             &[
+                ("VCT_HUB_BIN", None),
+                ("PATH", Some("/nonexistent-dir")),
+                ("HOME", Some("/nonexistent-home")),
+                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+            ],
+            || {
+                assert_eq!(ensure_hub_running(), SpawnOutcome::BinaryNotFound);
+            },
+        );
+    }
+
+    // v0.2.54 Track C (C-7): hub respawn is gated on the V52-AI update
+    // lockfile. A fresh `.update-in-progress.json` must short-circuit
+    // ensure_hub_running BEFORE any binary discovery happens.
+    #[test]
+    fn ensure_hub_running_skips_when_update_in_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a fresh lockfile into the isolated state dir.
+        let lock = tmp
+            .path()
+            .join(crate::commands::update_gate::LOCKFILE_BASENAME);
+        crate::commands::update_gate::write_lockfile_at(
+            &lock,
+            crate::commands::update_gate::Phase::InstallPy,
+            15,
+        )
+        .expect("lockfile write");
+
+        with_env(
+            &[
+                ("VCT_STATE_DIR", Some(tmp.path().to_str().unwrap())),
+                ("VCT_HUB_BIN", None),
+                ("PATH", Some("/nonexistent-dir")),
+                ("HOME", Some("/nonexistent-home")),
+                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+            ],
+            || {
+                assert_eq!(
+                    ensure_hub_running(),
+                    SpawnOutcome::SkippedUpdateInProgress
+                );
+            },
+        );
+    }
+
+    // Stale lockfile (deadline in the past) must NOT block the respawn —
+    // it falls through to normal discovery (BinaryNotFound in this env).
+    #[test]
+    fn ensure_hub_running_ignores_stale_update_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = tmp
+            .path()
+            .join(crate::commands::update_gate::LOCKFILE_BASENAME);
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let payload = crate::commands::update_gate::LockfilePayload {
+            started_at: past.clone(),
+            started_by_pid: 1,
+            phase: crate::commands::update_gate::Phase::BinaryRefresh,
+            expected_completion_by: past,
+        };
+        std::fs::write(&lock, serde_json::to_string(&payload).unwrap()).unwrap();
+
+        with_env(
+            &[
+                ("VCT_STATE_DIR", Some(tmp.path().to_str().unwrap())),
                 ("VCT_HUB_BIN", None),
                 ("PATH", Some("/nonexistent-dir")),
                 ("HOME", Some("/nonexistent-home")),

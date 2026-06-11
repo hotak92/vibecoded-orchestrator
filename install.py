@@ -963,9 +963,17 @@ def _bootstrap_launcher_dist_subdir() -> Optional[str]:
     """Return the canonical launcher dist subdir for this OS.
 
     SSOT for M-P0-2: macOS is `macos-arm64` (NOT `experimental_macOS`).
+
+    v0.2.54 Track C (Intel-Mac fix): arch-aware on macOS. Releases ship
+    arm64 only, but a LOCAL cargo build on an Intel Mac lands in
+    `macos-x64/` — hardcoding arm64 made every dist-path consumer look
+    in the wrong slot on x86_64 hosts.
     """
     canonical_os, _ = _bootstrap_detect_os()
     if canonical_os == "macos":
+        machine = platform.machine().lower()
+        if machine in ("x86_64", "amd64"):
+            return "macos-x64"
         return "macos-arm64"
     if canonical_os == "linux":
         return "linux-x64"
@@ -6607,6 +6615,15 @@ def main() -> int:
     # this script independently; the helper is idempotent so the second
     # invocation is a no-op (writes the same .desktop body).
     _run_desktop_icon_step(args)
+
+    # v0.2.54 Track C (C-6): a successful --update run supersedes any
+    # pending "merge resolved but install.py not run" state — clear the
+    # launcher's resume sentinel so the purple "Continue Update" badge
+    # doesn't persist (and re-run a redundant cycle) after the very
+    # install.py run its deferral told the user to execute. Guarded:
+    # no-op when absent, refused while a merge/rebase is in progress.
+    if args.update:
+        _clear_update_resume_sentinel_after_success(PROJECT_ROOT)
 
     # Fix 6 (v0.2.13): re-write the deferral report AFTER all post-line-2611
     # deferral-adding steps complete (_check_searxng_remnants,
@@ -18807,13 +18824,21 @@ def _launcher_binary_relative_path() -> tuple[str, str]:
     (bundled) lookup to return None on macOS even when the binary was
     present, falling through to GitHub download (which landed in the
     same wrong dir). Audit Bug #1 (cross-OS audit, 2026-05-17).
-    Intel Macs (x86_64) are intentionally not shipped — release.yml
-    line 31 only builds arm64.
+
+    v0.2.54 Track C (Intel-Mac fix): the macOS branch is arch-aware.
+    Intel Macs (x86_64) are intentionally not shipped (release.yml
+    builds arm64 only) so the tier-2 GitHub download will 404 on
+    `macos-x64` and fall through to the tier-3 cargo rebuild — whose
+    LOCAL build artifact lands in `macos-x64/`, which the previous
+    arm64 hardcode could then never find.
     """
     system = platform.system().lower()
     if system.startswith("win"):
         return ("windows-x64", "vct-launcher.exe")
     if system == "darwin":
+        machine = platform.machine().lower()
+        if machine in ("x86_64", "amd64"):
+            return ("macos-x64", "vct-launcher")
         return ("macos-arm64", "vct-launcher")
     # Linux + everything else
     return ("linux-x64", "vct-launcher")
@@ -19535,6 +19560,74 @@ def _emit_update_resume_required_deferral(
         )
 
 
+def _clear_update_resume_sentinel_after_success(install_root: Path) -> None:
+    """v0.2.54 Track C (C-6): clear the launcher's resume sentinel after a
+    successful ``install.py --update`` run.
+
+    Background
+    ----------
+    The Rust update flow writes
+    ``.claude/state/orchestrator-update-resume-needed.json`` when a
+    merge/rebase halts at a conflict (v0.2.51 Bug A). The deferral text it
+    emits promises that "Option B" — a terminal ``python install.py
+    --update`` — "bumps last_installed_version … and clears this deferral"
+    / "self-clears on the next successful install.py run". Pre-v0.2.54,
+    install.py never touched the sentinel, so after a successful Option B
+    run ``check_for_updates`` still saw sentinel-present + no MERGE_HEAD →
+    the purple "Continue Update" badge persisted forever, and clicking it
+    re-ran a full redundant update cycle (hub stop, install.py, launcher
+    restart).
+
+    Guards
+    ------
+    * No-op when the sentinel is absent (the overwhelmingly common case).
+    * REFUSES to clear while a merge/rebase is still in progress
+      (``.git/MERGE_HEAD`` / ``.git/rebase-merge`` / ``.git/rebase-apply``
+      present) — in that state the sentinel is still meaningful and the
+      launcher's resume guards rely on it.
+
+    Soft-fail throughout: an unlink error is logged, never raised — the
+    update must complete regardless.
+
+    The companion ``update_resume_required`` DEFERRAL-entry reconciliation
+    is owned by the deferral subsystem (v0.2.54 Track D); this helper only
+    owns the sentinel file itself.
+    """
+    sentinel = (
+        install_root
+        / ".claude"
+        / "state"
+        / "orchestrator-update-resume-needed.json"
+    )
+    try:
+        if not sentinel.is_file():
+            return
+        git_dir = install_root / ".git"
+        mid_merge = (
+            (git_dir / "MERGE_HEAD").exists()
+            or (git_dir / "rebase-merge").exists()
+            or (git_dir / "rebase-apply").exists()
+        )
+        if mid_merge:
+            _log_install_event(
+                "update_resume_sentinel", "skip",
+                "merge/rebase still in progress — leaving "
+                "orchestrator-update-resume-needed.json in place",
+            )
+            return
+        sentinel.unlink()
+        _log_install_event(
+            "update_resume_sentinel", "ok",
+            f"cleared {sentinel} (update completed; the launcher's "
+            "Continue Update badge self-clears on next poll)",
+        )
+    except OSError as exc:
+        _log_install_event(
+            "update_resume_sentinel", "warn",
+            f"could not clear {sentinel}: {exc}",
+        )
+
+
 def _maybe_emit_running_stale_deferral(
     install_root: Path,
     *,
@@ -19877,6 +19970,32 @@ def _refresh_dist_binary_after_rebuild(
                         f"{staged_new} for stage1 updater handoff "
                         f"(overwrite={exc!r}; rename={rename_exc!r})",
                     )
+                    # v0.2.54 Track C (C-5): when the LAUNCHER drove this
+                    # install.py run (VCT_AUTO_RESTART_LAUNCHER=1), do NOT
+                    # spawn vct-updater here. The launcher's own update
+                    # tail (`finalize_update_and_restart` →
+                    # `prepare_windows_update_handoff`) picks up the
+                    # `.new` sibling we just staged and spawns the
+                    # updater right before it exits. Spawning here too
+                    # produced updater #1 whose 30 s parent-wait
+                    # deterministically timed out (the launcher was
+                    # still mid-WaitForBinaryRefresh, up to 5 min) and
+                    # — pre-C-5 — left an orphaned update.lock.json
+                    # behind, plus a brief two-updaters window once the
+                    # launcher spawned updater #2.
+                    if os.environ.get(
+                        "VCT_AUTO_RESTART_LAUNCHER", ""
+                    ).strip() == "1":
+                        swap_succeeded = True
+                        _log_install_event(
+                            "refresh_dist_binary", "ok",
+                            "launcher-driven update: staged .new only; the "
+                            "launcher's own stage1 handoff will spawn "
+                            "vct-updater after it exits (avoids the "
+                            "double-updater + 30s parent-wait timeout)",
+                        )
+                        return dist_path
+
                     # Try the stage1 handoff. If we have a launcher PID,
                     # spawn vct-updater.exe; otherwise fall back to the
                     # legacy `launcher_binary_swap_failed_locked` flow.
@@ -20102,13 +20221,16 @@ def _vct_hub_binary_relative_path() -> tuple[str, str]:
     ships in the same per-arch dir as vct-launcher.
 
     Linux: ('linux-x64', 'vct-hub')
-    macOS: ('macos-arm64', 'vct-hub')
+    macOS: ('macos-arm64' | 'macos-x64', 'vct-hub')  ← arch-aware, v0.2.54
     Windows: ('windows-x64', 'vct-hub.exe')
     """
     system = platform.system().lower()
     if system.startswith("win"):
         return ("windows-x64", "vct-hub.exe")
     if system == "darwin":
+        machine = platform.machine().lower()
+        if machine in ("x86_64", "amd64"):
+            return ("macos-x64", "vct-hub")
         return ("macos-arm64", "vct-hub")
     return ("linux-x64", "vct-hub")
 

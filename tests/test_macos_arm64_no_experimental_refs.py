@@ -30,23 +30,37 @@ def _read(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
 
 
-def test_rebuild_dist_binary_targets_macos_arm64():
-    """rebuild-dist-binary.sh must set ARCH_DIR=macos-arm64 on Darwin."""
+def test_rebuild_dist_binary_targets_macos_arch_aware():
+    """rebuild-dist-binary.sh Darwin case must be arch-aware (v0.2.54).
+
+    M-P0-2 (v0.2.53) fixed the legacy `experimental_macOS` slot to
+    `macos-arm64`; v0.2.54 Track C made it arch-aware so a local build
+    on an Intel Mac stages into `macos-x64/` (matching install.py's
+    `_launcher_binary_relative_path` + restart.rs).
+    """
     src = _read(REPO_ROOT / "launcher" / "scripts" / "rebuild-dist-binary.sh")
     assert src, "rebuild-dist-binary.sh missing"
-    # The Darwin case statement should assign macos-arm64.
-    m = re.search(
-        r"Darwin\*\)\s*ARCH_DIR=\"([a-zA-Z0-9_-]+)\"", src, re.MULTILINE
+    # The Darwin case must assign BOTH canonical slots, gated on uname -m.
+    assert 'ARCH_DIR="macos-arm64"' in src, (
+        "rebuild-dist-binary.sh Darwin case lost the macos-arm64 slot"
     )
-    assert m, "Darwin case in rebuild-dist-binary.sh not found"
-    assert m.group(1) == "macos-arm64", (
-        f"rebuild-dist-binary.sh Darwin ARCH_DIR is '{m.group(1)}', "
-        "expected 'macos-arm64' per M-P0-2"
+    assert 'ARCH_DIR="macos-x64"' in src, (
+        "rebuild-dist-binary.sh Darwin case must stage Intel builds "
+        "into macos-x64 (v0.2.54 Track C)"
     )
-    # Verify the staging block also matched the new name.
-    assert 'if [ "$ARCH_DIR" = "macos-arm64" ]' in src, (
-        "rebuild-dist-binary.sh staging block still keys off legacy "
-        "ARCH_DIR name"
+    assert 'uname -m' in src, (
+        "rebuild-dist-binary.sh Darwin case must gate the slot on the "
+        "machine arch"
+    )
+    # Legacy name must not be the assignment target anywhere.
+    assert 'ARCH_DIR="experimental_macOS"' not in src
+    # Verify the staging block keys off BOTH canonical names.
+    assert (
+        'if [ "$ARCH_DIR" = "macos-arm64" ] || [ "$ARCH_DIR" = "macos-x64" ]'
+        in src
+    ), (
+        "rebuild-dist-binary.sh staging block must handle both macOS "
+        "arch slots"
     )
 
 

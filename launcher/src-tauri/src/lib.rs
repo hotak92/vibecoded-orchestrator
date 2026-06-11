@@ -707,16 +707,34 @@ pub fn run() {
             // there (the function returns `UpdateRecoveryReport::default()`).
             {
                 use tauri::Emitter as _;
+                use tauri::Manager as _;
                 let recovery = commands::update_handoff::poll_update_lock_on_boot();
-                if recovery.recovered || recovery.stale_or_invalid {
+                let meaningful = recovery.recovered || recovery.stale_or_invalid;
+                // v0.2.54 Track C (FE C-1): cache the boot report in app
+                // state. The emit below fires during `setup`, BEFORE the
+                // webview loads — Tauri does not buffer events, so no FE
+                // listener can ever receive it. UpdateToast.svelte pulls
+                // the cached report on mount via
+                // `get_update_recovery_report` (one-shot `take()`
+                // semantics so a layout remount can't double-toast).
+                // Manage the cache unconditionally so the command never
+                // hits missing-state.
+                app.manage(commands::update_handoff::UpdateRecoveryCache(
+                    std::sync::Mutex::new(if meaningful {
+                        Some(recovery.clone())
+                    } else {
+                        None
+                    }),
+                ));
+                if meaningful {
                     let event_name = if recovery.recovered {
                         "vct-update-recovered"
                     } else {
                         "vct-update-failed"
                     };
-                    // Best-effort: if the emit fails (no windows yet,
-                    // FE not subscribed) the next FE refresh can pull
-                    // the same state via `get_update_recovery_report`.
+                    // Best-effort + belt-and-braces: kept for any future
+                    // surface that subscribes early enough; the FE's
+                    // canonical path is the pull-on-mount above.
                     let _ = app.emit(event_name, &recovery);
                     eprintln!(
                         "[vct] boot recovery: {} (lock_path={:?}, reason={:?})",

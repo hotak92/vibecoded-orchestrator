@@ -1119,7 +1119,19 @@ fn launcher_dist_subdir() -> &'static str {
     {
         "windows-x64"
     }
-    #[cfg(target_os = "macos")]
+    // v0.2.54 Track C (Intel-Mac fix): Apple Silicon and Intel Macs use
+    // different dist slots. Releases only ship `macos-arm64` (release.yml
+    // builds arm64 only), but a LOCAL cargo build on an Intel Mac lands
+    // in `macos-x64/` — hardcoding arm64 made the launcher read/write
+    // the wrong slot on x86_64 hosts. Compile-time arch is correct here:
+    // the binary executes on the arch it was built for (Rosetta-translated
+    // x86_64 builds correctly resolve macos-x64, matching where their own
+    // build artifacts land).
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        "macos-x64"
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
     {
         "macos-arm64"
     }
@@ -4566,123 +4578,32 @@ pub async fn update_orchestrator<R: Runtime>(
     // spawn during this window still see the lockfile and exit cleanly.
     update_gate_guard.advance_phase(crate::commands::update_gate::Phase::BinaryRefresh);
 
-    // v0.2.21 Step 12 (B1 fix): Stage 3 — bring the detached vct-hub
-    // back up BEFORE we restart the launcher. Soft-fail: the launcher
-    // restart path itself also calls `hub_launcher::ensure_hub_running`
-    // on boot, so this is mainly an early-warning probe + a way to
-    // surface "hub started, /health passed" in the GUI progress
-    // banner before the restart blackout.
-    emit_progress(&window, "update", "Starting vct-hub...", 90.0);
-    if let Err(e) = ensure_hub_started_after_update(&install_path) {
-        eprintln!(
-            "[vct] update_orchestrator: ensure_hub_started_after_update returned Err({}); \
-             continuing with launcher restart (hub will retry on next boot)",
-            e
-        );
-    }
-
-    emit_progress(
+    // v0.2.54 Track C (P0-7 / C-1 / C-2): shared finalize tail —
+    // V45-B binary wait, V52-AI disarm, V52-AH staging + handoff,
+    // hub restart (no-handoff path only; C-1 reorder so a freshly-
+    // restarted hub can't hold a Windows lock on vct-hub.exe while
+    // the stage1 updater tries to swap it), legacy restart + deferral
+    // fallback. Shared with merge/rebase/resume via
+    // `run_post_pull_install_and_restart` so the four entry paths
+    // can't drift apart again.
+    //
+    // v0.2.44 V44-G4: clone the AppHandle here so the post-restart
+    // retry block (Trigger B sweep + final audit) can still reach
+    // `app.try_state::<Db>()` after the finalize tail consumes its
+    // owned copy. AppHandle is Clone (cheap reference-counted handle).
+    let post_restart_app = app.clone();
+    let finalize = finalize_update_and_restart(
+        app,
+        &install_path,
+        &path,
         &window,
-        "restart",
-        "Update applied — restarting launcher...",
-        95.0,
-    );
+        python_cmd,
+        &pull_branch,
+        &mut update_gate_guard,
+    )
+    .await?;
 
-    // v0.2.45 V45-B: don't restart into a stale on-disk binary.
-    //
-    // Between the source-tag commit and the auto-committed binary-
-    // refresh (`chore(binary): refresh dist binaries for v0.2.X`),
-    // `vco_upstream/main` advertises the new source version but
-    // `launcher/dist/<arch>/vct-launcher.metadata.json` still
-    // carries the previous launcher_version. Re-execing here would
-    // relaunch the OLD binary while the UI claims "Current v0.2.X".
-    //
-    // Block restart until on-disk version catches up with source
-    // version (poll + re-pull every 15 s, up to 5 min). On timeout,
-    // surface the error to the GUI — the user retries when CI
-    // finishes the binary commit.
-    emit_progress(
-        &window,
-        "update",
-        "Waiting for new launcher binary...",
-        96.0,
-    );
-    if let Err(e) = WaitForBinaryRefresh::default_production(&install_path, &pull_branch)
-        .run()
-        .await
-    {
-        eprintln!("[v0.2.45 V45-B] update_orchestrator: {}", e);
-        return Err(e);
-    }
-
-    // V52-AI: explicit lockfile cleanup BEFORE the restart hop. We don't
-    // want the lockfile to survive across the launcher restart — if it
-    // did, the freshly-booted launcher's MCPs would still see it as
-    // active and refuse to start until the stale-cleanup window passed
-    // (up to 15min). Drop on the guard would happen on process exit,
-    // but on Windows the process can terminate before async cleanup
-    // runs cleanly; calling disarm_and_cleanup() now makes the order
-    // deterministic.
-    update_gate_guard.disarm_and_cleanup();
-
-    // v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): Windows stage1 updater
-    // handoff. Before falling through to the regular restart_launcher
-    // flow, detect any binaries that git pull silently skipped (file
-    // locked by an antivirus / indexer / racing handle) and stage them
-    // as `<target>.new`. Then write `~/.vct/update.lock.json` and spawn
-    // `vct-updater.exe` DETACHED so it can perform the swap once the
-    // running launcher exits.
-    //
-    // Soft-fail throughout: if staging or handoff fails for ANY reason,
-    // fall through to the existing restart_launcher path — that's the
-    // pre-v0.2.52 behaviour and represents the worst case (= same as
-    // not having V52-AH at all). The new code path strictly improves
-    // on that.
-    //
-    // POSIX: stage_locked_binaries_for_handoff returns empty (no-op),
-    // prepare_windows_update_handoff returns handoff_active=false with
-    // skip_reason="non-windows", so we fall through unconditionally
-    // to restart_launcher. No behaviour change for Linux/macOS users.
-    #[cfg(target_os = "windows")]
-    {
-        let staged = stage_locked_binaries_for_handoff(&install_path).await;
-        if !staged.is_empty() {
-            eprintln!(
-                "[vct] update_orchestrator: V52-AH staged {} binary/binaries \
-                 for handoff: {:?}",
-                staged.len(),
-                staged,
-            );
-        }
-    }
-
-    let handoff_result = match crate::commands::update_handoff::
-        prepare_windows_update_handoff(path.clone()).await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // True error (install_root missing etc.) — log + fall through.
-            eprintln!(
-                "[vct] update_orchestrator: V52-AH handoff returned error \
-                 ({}); falling through to legacy restart_launcher",
-                e,
-            );
-            crate::commands::update_handoff::HandoffResult::default()
-        }
-    };
-
-    if handoff_result.handoff_active {
-        eprintln!(
-            "[vct] update_orchestrator: V52-AH handoff active (lock={:?}); \
-             exiting current launcher — vct-updater.exe will perform the \
-             swap + relaunch.",
-            handoff_result.lock_path,
-        );
-        // Mirror the tail of restart_launcher: programmatic quit so the
-        // updater can complete the swap on a now-unlocked .exe. The
-        // updater's spawned child will become the new launcher process.
-        crate::quit_dialog::force_quit();
-        app.exit(0);
+    if finalize.handoff_exit {
         return Ok(InstallResult {
             success: true,
             install_path: path.clone(),
@@ -4692,135 +4613,6 @@ pub async fn update_orchestrator<R: Runtime>(
             system,
         });
     }
-
-    if let Some(reason) = handoff_result.skip_reason.as_deref() {
-        eprintln!(
-            "[vct] update_orchestrator: V52-AH handoff skipped (reason={}); \
-             falling through to legacy restart_launcher",
-            reason,
-        );
-    }
-
-    // v0.2.17 (plan 0.0): auto-restart. The launcher has no in-flight
-    // user state to lose, so spawn the new binary detached + exit.
-    // Reuse the v0.2.15-shipped restart_launcher command to keep the
-    // restart codepath identical to the W4 user-click flow.
-    // v0.2.44 V44-G4: clone the AppHandle here so the post-restart
-    // retry block (Trigger B sweep + final audit) can still reach
-    // `app.try_state::<Db>()` after `restart_launcher` consumes its
-    // owned copy. AppHandle is Clone (cheap reference-counted handle).
-    let post_restart_app = app.clone();
-    if let Err(e) = crate::commands::restart::restart_launcher(app, path.clone()).await {
-        // v0.2.17 (Reviewer A finding A2): auto-restart failed. The
-        // earlier install.py invocation suppressed the
-        // `launcher_restart_required` deferral emit because
-        // VCT_AUTO_RESTART_LAUNCHER was set — so right now there is
-        // NO banner waiting in UPDATE_DEFERRED.md to prompt a manual
-        // restart. Without a fallback, the user sees "success" while
-        // running stale in-memory binary.
-        //
-        // Recovery: re-spawn install.py with VCT_AUTO_RESTART_LAUNCHER
-        // UNSET so it takes the normal path and emits the deferral
-        // entry. This is ~10s of overhead (no source pull, just the
-        // _refresh_dist_binary check + deferral write) vs. the
-        // worst-of-three earlier behaviour. Best-effort: any failure
-        // in the recovery itself is logged but doesn't change the
-        // user-visible return value (the SOURCE update DID land
-        // successfully; only the restart hop is broken).
-        eprintln!(
-            "[vct] update_orchestrator: auto-restart failed ({}); re-spawning \
-             install.py to emit the launcher_restart_required deferral as a \
-             fallback so the banner fires on next launcher start.",
-            e,
-        );
-        let mut fallback = tokio::process::Command::new(python_cmd).silent();
-        // Re-run --update without the auto-restart env. install.py's
-        // update path is idempotent (git pull is already a no-op
-        // post-success; seed step skips unchanged content per the
-        // v0.2.17 0.2 fix). Only relevant side effect is that
-        // _refresh_dist_binary_after_rebuild now sees a version
-        // mismatch (manifest reflects the update we just did) … but
-        // wait — by this point the manifest already reflects the
-        // NEW version, so the version-mismatch helper won't emit.
-        //
-        // To force the deferral emit, we pass `--apply-deferred` AND
-        // set VCT_LAUNCHER_PID — that combination signals "running
-        // launcher is stale" via the v0.2.15 (Agent D) PID-aware
-        // path. Actually simpler: explicitly call out the case via
-        // an env var the helper checks. Going with the most boring
-        // option: just re-run without auto-restart env and rely on
-        // any divergence detection install.py has between
-        // launcher/dist binary mtime and the running PID's
-        // /proc/<pid>/exe.
-        fallback
-            .args(["install.py", "--update"])
-            .stdin(std::process::Stdio::null())
-            .current_dir(&install_path);
-        // v0.2.27: force UTF-8 stdout/stderr for the Python child. See
-        // the identical block on the `update_at` spawn site for the
-        // full rationale.
-        fallback.env("PYTHONIOENCODING", "utf-8");
-        fallback.env("PYTHONUTF8", "1");
-        fallback.env("VCT_LAUNCHER_PID", std::process::id().to_string());
-        fallback.env_remove("VCT_AUTO_RESTART_LAUNCHER");
-        // v0.2.17 (Reviewer A finding A2): force-emit the deferral on
-        // this fallback pass even when the version-comparison would
-        // suggest no change is needed (because the FIRST install.py
-        // call did the version-bump already). Helper at the install.py
-        // side checks this env to short-circuit the version-equality
-        // skip.
-        fallback.env("VCT_FORCE_RESTART_DEFERRAL", "1");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            fallback.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        match fallback.output().await {
-            Ok(out) if out.status.success() => {
-                eprintln!(
-                    "[vct] update_orchestrator: fallback install.py succeeded; \
-                     launcher_restart_required deferral should now be present \
-                     in UPDATE_DEFERRED.md. The launcher's UpdateBadge will \
-                     surface the Restart banner on next poll."
-                );
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!(
-                    "[vct] update_orchestrator: fallback install.py exited \
-                     non-zero ({:?}). stderr tail: {}",
-                    out.status.code(),
-                    stderr.lines().rev().take(10).collect::<Vec<_>>().join(" | "),
-                );
-                // Surface a real error to the GUI so the user knows the
-                // update is in an indeterminate state. The source update
-                // already landed, but neither auto-restart nor the
-                // deferral fallback completed — the user MUST manually
-                // restart to pick up the new binary.
-                return Err(format!(
-                    "Update applied but auto-restart failed AND the fallback \
-                     deferral emit failed. Please fully quit the launcher \
-                     (tray → Quit) and relaunch via your usual entrypoint to \
-                     pick up the new binary at {}/launcher/dist/.",
-                    install_path.display(),
-                ));
-            }
-            Err(spawn_err) => {
-                eprintln!(
-                    "[vct] update_orchestrator: could not spawn fallback \
-                     install.py: {}. Surfacing the error to the GUI.",
-                    spawn_err,
-                );
-                return Err(format!(
-                    "Update applied but auto-restart failed and the fallback \
-                     install.py could not be spawned: {}. Please fully quit \
-                     the launcher and relaunch manually.",
-                    spawn_err,
-                ));
-            }
-        }
-    }
-
     emit_progress(&window, "done", "Orchestrator updated successfully!", 100.0);
 
     // v0.2.44 V44-G4 (RL-chat ask 2026-06-01): Trigger B — auto-retry
@@ -5440,6 +5232,250 @@ fn maybe_emit_pre_merge_deferrals(
     }
 }
 
+/// Outcome of [`finalize_update_and_restart`]. Distinguishes "the
+/// Windows stage1 handoff fired and the caller must return immediately
+/// (the process is exiting)" from "legacy restart path completed".
+struct UpdateFinalizeOutcome {
+    /// True iff the V52-AH handoff was activated: the update lock was
+    /// written, `vct-updater.exe` was spawned detached, and
+    /// `app.exit(0)` has been requested. The caller MUST return its
+    /// success `InstallResult` without doing further work.
+    handoff_exit: bool,
+}
+
+/// v0.2.54 Track C (P0-7): the SINGLE shared finalize tail for every
+/// orchestrator-update entry path (update, merge, rebase, resume).
+///
+/// Performs, in order:
+///   1. V45-B `WaitForBinaryRefresh` (block restart until the on-disk
+///      binary version catches up with the source version).
+///   2. V52-AI gate disarm (`disarm_and_cleanup`) — MUST happen before
+///      any restart/exit hop because `app.exit(0)` can terminate the
+///      process before the guard's `Drop` runs on Windows (the C-2
+///      bug class: a surviving `.update-in-progress.json` with a fresh
+///      15-min deadline makes every MCP spawn exit 75 until it lapses).
+///   3. V52-AH staging (`stage_locked_binaries_for_handoff`, Windows)
+///      + handoff decision (`prepare_windows_update_handoff`).
+///   4. Hub restart — ONLY on the no-handoff path (C-1 fix, v0.2.54):
+///      pre-v0.2.54 the hub was restarted BEFORE staging, which meant
+///      a freshly-started (stale-binary) hub held a Windows mandatory
+///      lock on `vct-hub.exe` while the updater — which waits only on
+///      the launcher PID — tried to `MoveFileExW` onto it (exit 5,
+///      silent). With the hub start moved AFTER the handoff decision,
+///      the handoff path leaves the hub STOPPED so the updater can
+///      swap `vct-hub.exe.new`; the relaunched launcher's boot
+///      `ensure_hub_running` then starts the NEW hub binary.
+///   5. Legacy `restart_launcher` + the install.py deferral-emit
+///      fallback when the restart hop fails.
+///
+/// Error contract: on `Err` the hub is restarted best-effort first
+/// (the callers stopped it at the top of their flows) so the user is
+/// never left hub-less by a failed finalize. The V52-AI guard is NOT
+/// disarmed on the pre-disarm error paths — the caller still owns it
+/// and its RAII `Drop` cleans the lockfile on the normal Err-return
+/// path (process keeps running, so Drop is reliable there).
+async fn finalize_update_and_restart<R: Runtime>(
+    app: AppHandle<R>,
+    install_path: &Path,
+    path_string: &str,
+    window: &Window,
+    python_cmd: &str,
+    pull_branch: &str,
+    update_gate_guard: &mut crate::commands::update_gate::UpdateInProgressGuard,
+) -> Result<UpdateFinalizeOutcome, String> {
+    emit_progress(
+        window,
+        "restart",
+        "Update applied — restarting launcher...",
+        95.0,
+    );
+
+    // v0.2.45 V45-B: don't restart into a stale on-disk binary.
+    // Block restart until the on-disk `vct-launcher.metadata.json`
+    // version catches up with `vct-module.json` version (poll + re-
+    // pull every 15 s, up to 5 min). On timeout, surface the error
+    // to the GUI — the user retries when CI finishes the binary
+    // commit.
+    emit_progress(window, "update", "Waiting for new launcher binary...", 96.0);
+    if let Err(e) = WaitForBinaryRefresh::default_production(install_path, pull_branch)
+        .run()
+        .await
+    {
+        eprintln!("[v0.2.45 V45-B] finalize_update_and_restart: {}", e);
+        // The hub was stopped at the top of the caller's flow and (post-
+        // C-1 reorder) has not been restarted yet. Bring it back up so
+        // a binary-refresh timeout doesn't leave the user hub-less.
+        let _ = ensure_hub_started_after_update(install_path);
+        return Err(e);
+    }
+
+    // V52-AI: explicit lockfile cleanup BEFORE the restart hop. We don't
+    // want the lockfile to survive across the launcher restart — if it
+    // did, the freshly-booted launcher's MCPs would still see it as
+    // active and refuse to start until the stale-cleanup window passed
+    // (up to 15 min). Drop on the guard would happen on process exit,
+    // but on Windows the process can terminate before async cleanup
+    // runs cleanly; calling disarm_and_cleanup() now makes the order
+    // deterministic. (v0.2.54 C-2: this used to exist only on the
+    // `update_orchestrator` path; resume/merge/rebase leaked the lock.)
+    update_gate_guard.disarm_and_cleanup();
+
+    // v0.2.52 V52-AH (stale-binary relaunch loop): Windows stage1 handoff.
+    // Detect binaries that git pull silently skipped (file locked by an
+    // antivirus / indexer / racing handle) and stage them as
+    // `<target>.new`, then write `~/.vct/update.lock.json` and spawn
+    // `vct-updater.exe` DETACHED so it can perform the swap once the
+    // running launcher exits.
+    //
+    // Soft-fail throughout: if staging or handoff fails for ANY reason,
+    // fall through to the existing restart_launcher path — that's the
+    // pre-v0.2.52 behaviour and represents the worst case (= same as
+    // not having V52-AH at all).
+    //
+    // POSIX: stage_locked_binaries_for_handoff returns empty (no-op),
+    // prepare_windows_update_handoff returns handoff_active=false with
+    // skip_reason="non-windows", so we fall through unconditionally
+    // to restart_launcher. No behaviour change for Linux/macOS users.
+    #[cfg(target_os = "windows")]
+    {
+        let staged = stage_locked_binaries_for_handoff(install_path).await;
+        if !staged.is_empty() {
+            eprintln!(
+                "[vct] finalize_update_and_restart: V52-AH staged {} binary/binaries \
+                 for handoff: {:?}",
+                staged.len(),
+                staged,
+            );
+        }
+    }
+
+    let handoff_result = match crate::commands::update_handoff::prepare_windows_update_handoff(
+        path_string.to_string(),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // True error (install_root missing etc.) — log + fall through.
+            eprintln!(
+                "[vct] finalize_update_and_restart: V52-AH handoff returned error \
+                 ({}); falling through to legacy restart_launcher",
+                e,
+            );
+            crate::commands::update_handoff::HandoffResult::default()
+        }
+    };
+
+    if handoff_result.handoff_active {
+        eprintln!(
+            "[vct] finalize_update_and_restart: V52-AH handoff active (lock={:?}); \
+             exiting current launcher — vct-updater.exe will perform the \
+             swap + relaunch. Hub stays stopped so vct-hub.exe is swappable \
+             (v0.2.54 C-1); the relaunched launcher's boot starts the new hub.",
+            handoff_result.lock_path,
+        );
+        // Mirror the tail of restart_launcher: programmatic quit so the
+        // updater can complete the swap on a now-unlocked .exe. The
+        // updater's spawned child will become the new launcher process.
+        crate::quit_dialog::force_quit();
+        app.exit(0);
+        return Ok(UpdateFinalizeOutcome { handoff_exit: true });
+    }
+
+    if let Some(reason) = handoff_result.skip_reason.as_deref() {
+        eprintln!(
+            "[vct] finalize_update_and_restart: V52-AH handoff skipped (reason={}); \
+             falling through to legacy restart_launcher",
+            reason,
+        );
+    }
+
+    // v0.2.54 C-1: bring the detached vct-hub back up ONLY on the
+    // no-handoff path, AFTER the staging/handoff decision. See the
+    // function docs for why this ordering is load-bearing on Windows.
+    // Soft-fail: the launcher restart path itself also calls
+    // `hub_launcher::ensure_hub_running` on boot.
+    emit_progress(window, "update", "Starting vct-hub...", 97.0);
+    if let Err(e) = ensure_hub_started_after_update(install_path) {
+        eprintln!(
+            "[vct] finalize_update_and_restart: ensure_hub_started_after_update \
+             returned Err({}); continuing with launcher restart (hub will \
+             retry on next boot)",
+            e
+        );
+    }
+
+    if let Err(e) =
+        crate::commands::restart::restart_launcher(app, path_string.to_string()).await
+    {
+        // Recovery path: re-spawn install.py without
+        // VCT_AUTO_RESTART_LAUNCHER so the launcher_restart_required
+        // deferral gets emitted as a fallback and the banner fires on
+        // the next launcher start.
+        eprintln!(
+            "[vct] finalize_update_and_restart: auto-restart failed ({}); re-spawning \
+             install.py to emit the launcher_restart_required deferral as a \
+             fallback so the banner fires on next launcher start.",
+            e,
+        );
+        let mut fallback = tokio::process::Command::new(python_cmd).silent();
+        fallback
+            .args(["install.py", "--update"])
+            .stdin(std::process::Stdio::null())
+            .current_dir(install_path);
+        // v0.2.27: force UTF-8 stdout/stderr for the Python child.
+        fallback.env("PYTHONIOENCODING", "utf-8");
+        fallback.env("PYTHONUTF8", "1");
+        fallback.env("VCT_LAUNCHER_PID", std::process::id().to_string());
+        fallback.env_remove("VCT_AUTO_RESTART_LAUNCHER");
+        fallback.env("VCT_FORCE_RESTART_DEFERRAL", "1");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            fallback.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        match fallback.output().await {
+            Ok(out) if out.status.success() => {
+                eprintln!(
+                    "[vct] finalize_update_and_restart: fallback install.py succeeded; \
+                     launcher_restart_required deferral should now be present."
+                );
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!(
+                    "[vct] finalize_update_and_restart: fallback install.py exited \
+                     non-zero ({:?}). stderr tail: {}",
+                    out.status.code(),
+                    stderr.lines().rev().take(10).collect::<Vec<_>>().join(" | "),
+                );
+                return Err(format!(
+                    "Update applied but auto-restart failed AND the fallback \
+                     deferral emit failed. Please fully quit the launcher \
+                     (tray → Quit) and relaunch via your usual entrypoint to \
+                     pick up the new binary at {}/launcher/dist/.",
+                    install_path.display(),
+                ));
+            }
+            Err(spawn_err) => {
+                eprintln!(
+                    "[vct] finalize_update_and_restart: could not spawn fallback \
+                     install.py: {}. Surfacing the error to the GUI.",
+                    spawn_err,
+                );
+                return Err(format!(
+                    "Update applied but auto-restart failed and the fallback \
+                     install.py could not be spawned: {}. Please fully quit \
+                     the launcher and relaunch manually.",
+                    spawn_err,
+                ));
+            }
+        }
+    }
+
+    Ok(UpdateFinalizeOutcome { handoff_exit: false })
+}
+
 /// Run the post-pull install.py + hub-start + restart sequence. This is
 /// the tail shared by `update_orchestrator` (after `git pull --ff-only`)
 /// and the new merge/rebase commands. Extracted as a free function so
@@ -5456,6 +5492,13 @@ fn maybe_emit_pre_merge_deferrals(
 ///   - stopped the hub (`ensure_hub_stopped_for_update`)
 ///   - pre-pull-renamed binaries if Windows
 ///   - confirmed the pull/merge/rebase succeeded
+///   - acquired the V52-AI gate (`pre_update_mcp_kill_sweep` +
+///     `UpdateInProgressGuard::new`) and passed the guard in
+///     (v0.2.54 P0-7: merge/rebase/resume share the gate + staging +
+///     handoff through this tail; pre-v0.2.54 they had neither, so
+///     both v0.2.52-class bugs — the stale-binary relaunch loop AND
+///     the MCP fork-bomb — were reachable verbatim through the
+///     divergence-modal Merge/Rebase buttons).
 async fn run_post_pull_install_and_restart<R: Runtime>(
     app: AppHandle<R>,
     install_path: &Path,
@@ -5464,9 +5507,14 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
     system: SystemDetection,
     pre_pull_renamed: Option<PathBuf>,
     pre_pull_renamed_hub: Option<PathBuf>,
+    update_gate_guard: &mut crate::commands::update_gate::UpdateInProgressGuard,
 ) -> Result<InstallResult, String> {
     emit_progress(window, "update", "Changes applied", 30.0);
     emit_progress(window, "install", "Applying updates...", 40.0);
+
+    // V52-AI: advance lockfile phase so future hub-side observers can
+    // see we've moved past git_pull (parity with `update_orchestrator`).
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
 
     let python_cmd = &system.python_cmd;
     let mut cmd = tokio::process::Command::new(python_cmd).silent();
@@ -5502,30 +5550,11 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
         return Err(format!("Update failed: {}", stderr));
     }
 
-    emit_progress(window, "update", "Starting vct-hub...", 90.0);
-    if let Err(e) = ensure_hub_started_after_update(install_path) {
-        eprintln!(
-            "[vct] orchestrator post-pull: ensure_hub_started_after_update returned Err({}); \
-             continuing with launcher restart (hub will retry on next boot)",
-            e
-        );
-    }
+    // V52-AI: advance lockfile phase. install.py has finished; we're
+    // now in the binary-refresh + hub-restart window. MCPs that try to
+    // spawn during this window still see the lockfile and exit cleanly.
+    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::BinaryRefresh);
 
-    emit_progress(
-        window,
-        "restart",
-        "Update applied — restarting launcher...",
-        95.0,
-    );
-
-    // v0.2.45 V45-B: don't restart into a stale on-disk binary.
-    // Same rationale as the inline call in `update_orchestrator`:
-    // block restart until the on-disk `vct-launcher.metadata.json`
-    // version catches up with `vct-module.json` version (poll + re-
-    // pull every 15 s, up to 5 min). On timeout, surface the error
-    // to the GUI — the user retries when CI finishes the binary
-    // commit.
-    //
     // Self-contained branch detection so this helper doesn't need
     // a branch parameter ripped through both call sites
     // (`merge_orchestrator_with_upstream` /
@@ -5551,85 +5580,30 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
             _ => "main".to_string(),
         }
     };
-    emit_progress(
-        window,
-        "update",
-        "Waiting for new launcher binary...",
-        96.0,
-    );
-    if let Err(e) = WaitForBinaryRefresh::default_production(install_path, &v45b_branch)
-        .run()
-        .await
-    {
-        eprintln!("[v0.2.45 V45-B] run_post_pull_install_and_restart: {}", e);
-        return Err(e);
-    }
 
-    if let Err(e) =
-        crate::commands::restart::restart_launcher(app, path_string.clone()).await
-    {
-        // Mirror the recovery path in update_orchestrator: re-spawn
-        // install.py without VCT_AUTO_RESTART_LAUNCHER so the
-        // launcher_restart_required deferral gets emitted as a fallback.
-        eprintln!(
-            "[vct] orchestrator post-pull: auto-restart failed ({}); re-spawning \
-             install.py to emit the launcher_restart_required deferral as a \
-             fallback so the banner fires on next launcher start.",
-            e,
-        );
-        let mut fallback = tokio::process::Command::new(python_cmd).silent();
-        fallback
-            .args(["install.py", "--update"])
-            .stdin(std::process::Stdio::null())
-            .current_dir(install_path);
-        // v0.2.27: force UTF-8 stdout/stderr for the Python child.
-        fallback.env("PYTHONIOENCODING", "utf-8");
-        fallback.env("PYTHONUTF8", "1");
-        fallback.env("VCT_LAUNCHER_PID", std::process::id().to_string());
-        fallback.env_remove("VCT_AUTO_RESTART_LAUNCHER");
-        fallback.env("VCT_FORCE_RESTART_DEFERRAL", "1");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            fallback.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        match fallback.output().await {
-            Ok(out) if out.status.success() => {
-                eprintln!(
-                    "[vct] orchestrator post-pull: fallback install.py succeeded; \
-                     launcher_restart_required deferral should now be present."
-                );
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!(
-                    "[vct] orchestrator post-pull: fallback install.py exited \
-                     non-zero ({:?}). stderr tail: {}",
-                    out.status.code(),
-                    stderr.lines().rev().take(10).collect::<Vec<_>>().join(" | "),
-                );
-                return Err(format!(
-                    "Update applied but auto-restart failed AND the fallback \
-                     deferral emit failed. Please fully quit the launcher \
-                     (tray → Quit) and relaunch via your usual entrypoint to \
-                     pick up the new binary at {}/launcher/dist/.",
-                    install_path.display(),
-                ));
-            }
-            Err(spawn_err) => {
-                eprintln!(
-                    "[vct] orchestrator post-pull: could not spawn fallback \
-                     install.py: {}. Surfacing the error to the GUI.",
-                    spawn_err,
-                );
-                return Err(format!(
-                    "Update applied but auto-restart failed and the fallback \
-                     install.py could not be spawned: {}. Please fully quit \
-                     the launcher and relaunch manually.",
-                    spawn_err,
-                ));
-            }
-        }
+    // v0.2.54 Track C (P0-7): shared finalize tail — V45-B binary wait,
+    // V52-AI disarm, V52-AH staging + handoff, hub restart (no-handoff
+    // path only), legacy restart + deferral fallback.
+    let finalize = finalize_update_and_restart(
+        app,
+        install_path,
+        &path_string,
+        window,
+        python_cmd,
+        &v45b_branch,
+        update_gate_guard,
+    )
+    .await?;
+
+    if finalize.handoff_exit {
+        return Ok(InstallResult {
+            success: true,
+            install_path: path_string,
+            message: "Update applied — vct-updater is performing the binary swap. \
+                      The launcher will relaunch automatically."
+                .to_string(),
+            system,
+        });
     }
 
     emit_progress(window, "done", "Orchestrator updated successfully!", 100.0);
@@ -5666,6 +5640,28 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
     if !install_path.join(".git").exists() {
         return Err("Not a git repository — cannot merge".to_string());
     }
+
+    // V52-AI (v0.2.54 P0-7): the merge path runs install.py + binary
+    // refresh via the shared post-pull tail — the exact window where
+    // the Windows MCP fork-bomb (V52-AI bug class) historically formed.
+    // Pre-v0.2.54 this path had NEITHER the kill-sweep NOR the gate,
+    // so the fork-bomb was reachable verbatim through the divergence-
+    // modal "Merge" button. Same shape as `update_orchestrator`:
+    // pre-sweep + RAII lockfile guard. The guard is handed to
+    // `run_post_pull_install_and_restart`, which disarms it before the
+    // restart hop; on every early return (conflict modal, pull
+    // failure, already-up-to-date) the guard's Drop removes the
+    // lockfile so MCPs can respawn while the user resolves conflicts.
+    let pre_sweep_count_merge = crate::commands::update_gate::pre_update_mcp_kill_sweep();
+    if pre_sweep_count_merge > 0 {
+        eprintln!(
+            "[vct] merge_orchestrator_with_upstream: pre-sweep terminated {} \
+             MCP-shaped process(es) before merge",
+            pre_sweep_count_merge
+        );
+    }
+    let (mut update_gate_guard, _gate_write_result) =
+        crate::commands::update_gate::UpdateInProgressGuard::new();
 
     // Same upstream-pin choreography as update_orchestrator.
     crate::commands::self_update::ensure_upstream_remote(&install_path).await?;
@@ -5833,6 +5829,7 @@ pub async fn merge_orchestrator_with_upstream<R: Runtime>(
         system,
         pre_pull_renamed,
         pre_pull_renamed_hub,
+        &mut update_gate_guard,
     )
     .await
 }
@@ -5860,6 +5857,20 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
     if !install_path.join(".git").exists() {
         return Err("Not a git repository — cannot rebase".to_string());
     }
+
+    // V52-AI (v0.2.54 P0-7): same fork-bomb gate as the merge path —
+    // see `merge_orchestrator_with_upstream` for the full rationale.
+    // Pre-v0.2.54 the rebase path had neither sweep nor gate.
+    let pre_sweep_count_rebase = crate::commands::update_gate::pre_update_mcp_kill_sweep();
+    if pre_sweep_count_rebase > 0 {
+        eprintln!(
+            "[vct] rebase_orchestrator_onto_upstream: pre-sweep terminated {} \
+             MCP-shaped process(es) before rebase",
+            pre_sweep_count_rebase
+        );
+    }
+    let (mut update_gate_guard, _gate_write_result) =
+        crate::commands::update_gate::UpdateInProgressGuard::new();
 
     crate::commands::self_update::ensure_upstream_remote(&install_path).await?;
 
@@ -5974,6 +5985,7 @@ pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
         system,
         pre_pull_renamed,
         pre_pull_renamed_hub,
+        &mut update_gate_guard,
     )
     .await
 }
@@ -6732,6 +6744,12 @@ pub async fn resume_orchestrator_update<R: Runtime>(
     clear_update_resume_sentinel(&install_path);
     clear_update_resume_deferral_if_solo(&install_path);
 
+    // v0.2.54 C-2: hand the V52-AI guard to the shared tail. The tail
+    // calls `disarm_and_cleanup()` BEFORE the restart hop — pre-v0.2.54
+    // the resume path relied on the guard's Drop, which never runs when
+    // `restart_launcher` ends in `app.exit(0)` on Windows. Result was a
+    // surviving `.update-in-progress.json` with a fresh 15-min deadline:
+    // every MCP spawn after the resumed update exited 75 until it lapsed.
     let result = run_post_pull_install_and_restart(
         app,
         &install_path,
@@ -6740,6 +6758,7 @@ pub async fn resume_orchestrator_update<R: Runtime>(
         system,
         pre_pull_renamed,
         pre_pull_renamed_hub,
+        &mut update_gate_guard,
     )
     .await;
 
@@ -14426,7 +14445,11 @@ MemAvailable:   23456789 kB
             // Compile-time per-target. Just sanity-check that it's one of
             // the canonical strings the install.py side knows about.
             let s = launcher_dist_subdir();
-            assert!(matches!(s, "linux-x64" | "macos-arm64" | "windows-x64"));
+            // v0.2.54 Track C: `macos-x64` added for Intel-Mac local builds.
+            assert!(matches!(
+                s,
+                "linux-x64" | "macos-arm64" | "macos-x64" | "windows-x64"
+            ));
         }
 
         // v0.2.45 V45-H — pinpoint test for FINDING C1 of the pre-tag

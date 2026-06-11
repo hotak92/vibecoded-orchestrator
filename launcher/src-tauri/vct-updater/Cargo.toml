@@ -57,6 +57,10 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+# v0.2.54 Track C: outcome-file tests (write_outcome atomic write).
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
 # Same Windows feature set as launcher's `windows-sys` direct dep
 # (OpenProcess + WaitForSingleObject + CloseHandle + MoveFileExW +

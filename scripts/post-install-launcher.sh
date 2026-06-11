@@ -431,6 +431,11 @@ candidates_mac=(
     "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher"
     "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/vct-launcher"
     "$REPO_ROOT/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/VCT Launcher"
+    # v0.2.54 Track C (Intel-Mac fix): local builds on x86_64 Macs stage
+    # into `macos-x64/` (rebuild-dist-binary.sh is arch-aware now).
+    "$REPO_ROOT/launcher/dist/macos-x64/vct-launcher"
+    "$REPO_ROOT/launcher/dist/macos-x64/vct-launcher.app/Contents/MacOS/vct-launcher"
+    "$REPO_ROOT/launcher/dist/macos-x64/vct-launcher.app/Contents/MacOS/VCT Launcher"
     # Legacy (pre-v0.2.13) — fallback only.
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher"
     "$REPO_ROOT/launcher/dist/experimental_macOS/vct-launcher.app/Contents/MacOS/vct-launcher"

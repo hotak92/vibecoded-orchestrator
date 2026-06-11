@@ -1,51 +1,54 @@
 <!--
-  V52-AH-FE (v0.2.53 Track E) — FE consumer for V52-AH backend events.
+  V52-AH-FE (v0.2.53 Track E, reworked v0.2.54 Track C FE C-1) — FE
+  consumer for the V52-AH boot recovery report.
 
-  Subscribes to two Tauri events fired ONCE per launcher boot by the
-  `poll_update_lock_on_boot` probe in `launcher/src-tauri/src/lib.rs`:
+  v0.2.54 delivery model — PULL is canonical, events are belt-and-braces:
 
-    * `vct-update-recovered` — Windows stage1 updater completed the
-      binary swap successfully and we are the newly-relaunched binary.
-      Render a one-shot "Updated to v0.2.X" success toast.
+    The Rust boot probe (`poll_update_lock_on_boot` in
+    `launcher/src-tauri/src/lib.rs::setup`) runs BEFORE the webview
+    loads. Tauri does not buffer events, so the `vct-update-recovered` /
+    `vct-update-failed` emits from `setup` were structurally
+    unreceivable (no listener exists yet — the v0.2.53 toast never
+    fired in production). The probe result is now cached in app state
+    (`UpdateRecoveryCache`); this component PULLS it on mount via
+    `get_update_recovery_report`, which has one-shot `take()` semantics
+    so a layout remount can never double-toast.
 
-    * `vct-update-failed` — A lock file was found but was stale or
-      malformed, meaning the updater crashed mid-swap. Render a "may
-      have failed" diagnostic toast with the path to `update.log` and
-      the rejection reason for the user to triage.
+    The event listeners are kept as belt-and-braces for any future
+    re-emit surface; `consumed` guards against the theoretical
+    double-delivery (event + pull).
 
   Backend payload shape (mirrors `UpdateRecoveryReport`):
 
     {
-      recovered: bool,
-      stale_or_invalid: bool,
+      recovered: bool,           // swap succeeded (authoritative
+                                 // update.result.json from vct-updater)
+      stale_or_invalid: bool,    // swap failed / updater crashed
       lock_path: string | null,
       reason: string | null,
     }
 
-  Toast store auto-dismisses after 4s; this component does NOT need to
-  manage its own visibility lifecycle. The component renders nothing on
-  its own — it is a pure event-listener wrapper that calls
-  `toast.success(...)` / `toast.error(...)` on the existing toast root
-  (mounted in `+layout.svelte`).
+  Toast store auto-dismisses after 4s; this component renders nothing —
+  it is a pure side-effect mount calling `toast.success(...)` /
+  `toast.error(...)` on the toast root mounted in `+layout.svelte`.
 
   POSIX hosts effectively no-op: the V52-AH backend probe is a Windows
-  feature; on Linux/macOS the lock file is never written, so neither
-  event ever fires. The component subscribes regardless (cheap to do
-  so + future cross-OS expansion stays trivial). Browser-mode (no
-  Tauri runtime) also no-ops because `listen()` short-circuits.
+  feature; on Linux/macOS the lock/result files are never written, so
+  the pull returns the empty default and neither event fires.
+  Browser-mode (no Tauri runtime) also no-ops (`invoke` throws → caught;
+  `listen()` short-circuits).
 -->
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { listen, isTauriRuntime } from '$lib/tauri';
+  import { listen, isTauriRuntime, invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import {
-    handleRecovered,
-    handleFailed,
+    handleReport,
     type UpdateRecoveryPayload,
   } from '$lib/update-toast-handlers';
 
-  // Lazy-load the version at subscribe time so we don't pay the cost
-  // in browser mode (no Tauri runtime). Fallback empty string for the
+  // Lazy-load the version at use time so we don't pay the cost in
+  // browser mode (no Tauri runtime). Fallback empty string for the
   // edge case where the API resolves but returns nothing — the
   // handler downstream renders a generic message in that case.
   async function getAppVersion(): Promise<string> {
@@ -58,28 +61,54 @@
     }
   }
 
+  // Once-only guard across both delivery paths (pull + events). The
+  // backend cache is itself one-shot, so this is a second line of
+  // defense, not the primary mechanism.
+  let consumed = false;
+
+  async function deliver(payload: UpdateRecoveryPayload | null | undefined) {
+    if (consumed || !payload) return;
+    const version = await getAppVersion();
+    if (handleReport(payload, version, toast)) {
+      consumed = true;
+      console.debug('[update-toast] delivered', {
+        recovered: payload.recovered,
+        lock_path: payload.lock_path,
+        reason: payload.reason,
+        version,
+      });
+    }
+  }
+
   onMount(() => {
     let unlistenRecovered: (() => void) | undefined;
     let unlistenFailed: (() => void) | undefined;
 
-    // Subscribe asynchronously so a failure in either listener doesn't
-    // block the other. Each call to `listen()` returns a no-op cleanup
-    // when not in a Tauri runtime, so the awaits are cheap in browser
-    // mode.
+    // Canonical path (FE C-1): pull the cached boot report. One-shot on
+    // the backend (`take()`), so remounts get the empty default.
+    (async () => {
+      if (!isTauriRuntime()) return;
+      try {
+        const report = await invoke<UpdateRecoveryPayload>(
+          'get_update_recovery_report',
+        );
+        await deliver(report);
+      } catch (e) {
+        console.debug(
+          '[update-toast] get_update_recovery_report pull failed:',
+          e,
+        );
+      }
+    })();
+
+    // Belt-and-braces listeners. Each `listen()` returns a no-op
+    // cleanup when not in a Tauri runtime, so the awaits are cheap in
+    // browser mode.
     (async () => {
       try {
         unlistenRecovered = await listen<UpdateRecoveryPayload>(
           'vct-update-recovered',
-          async (e) => {
-            const version = await getAppVersion();
-            handleRecovered(e.payload, version, toast);
-            // Debug breadcrumb — useful when triaging "did the update
-            // really land?" from telemetry.
-            console.debug('[update-toast] recovered', {
-              lock_path: e.payload.lock_path,
-              version,
-            });
-          },
+          (e) => void deliver(e.payload),
         );
       } catch (e) {
         console.debug(
@@ -93,13 +122,7 @@
       try {
         unlistenFailed = await listen<UpdateRecoveryPayload>(
           'vct-update-failed',
-          (e) => {
-            handleFailed(e.payload, toast);
-            console.warn('[update-toast] failed', {
-              lock_path: e.payload.lock_path,
-              reason: e.payload.reason,
-            });
-          },
+          (e) => void deliver(e.payload),
         );
       } catch (e) {
         console.debug(

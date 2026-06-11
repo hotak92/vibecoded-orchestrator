@@ -95,3 +95,33 @@ export function handleFailed(
     key: 'vct-update-failed',
   });
 }
+
+/**
+ * v0.2.54 Track C (FE C-1): single router used by BOTH delivery paths
+ * (the pull-on-mount `get_update_recovery_report` invoke AND the
+ * legacy Tauri event listeners). Returns `true` when the payload was
+ * meaningful and a toast was raised — callers use the return value to
+ * implement once-only dedup (the backend cache is one-shot too, so a
+ * double toast would require the event AND the pull to both deliver;
+ * the boolean makes the dedup explicit anyway).
+ *
+ * Empty/default payloads (`recovered=false`, `stale_or_invalid=false`)
+ * are a no-op — that is what `get_update_recovery_report` returns on
+ * every call after the first consume.
+ */
+export function handleReport(
+  payload: UpdateRecoveryPayload | null | undefined,
+  version: string,
+  toast: ToastSurface,
+): boolean {
+  if (!payload) return false;
+  if (payload.recovered) {
+    handleRecovered(payload, version, toast);
+    return true;
+  }
+  if (payload.stale_or_invalid) {
+    handleFailed(payload, toast);
+    return true;
+  }
+  return false;
+}
