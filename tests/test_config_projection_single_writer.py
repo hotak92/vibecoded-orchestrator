@@ -202,6 +202,12 @@ _LEGACY_PRODUCTION_WRITERS: set[Path] = set()
 _LEGACY_ENV_TEMPLATE_WRITERS: set[Path] = {
     REPO_ROOT / "install.py",
     REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs",
+    # v0.2.54 Track B: writes to infrastructure/.env (compose project's
+    # env file, a different surface from the canonical project .env).
+    # Pre-extraction the same write lived in install.py and was on this
+    # allowlist; carry forward until the compose-env surface gets its
+    # own contract decision (Phase 0.D follow-up).
+    REPO_ROOT / "vco_lib" / "compose_env.py",
 }
 
 
