@@ -90,6 +90,47 @@ struct UpdateLock {
     started_at: Option<String>,
 }
 
+/// v0.2.54 Track C (C-4): authoritative swap outcome, written to
+/// `<vct_root>/update.result.json` AFTER the swaps and BEFORE the
+/// relaunch spawn. Mirror of `UpdateOutcome` in
+/// `launcher/src-tauri/src/commands/update_handoff.rs` — keep the JSON
+/// wire contract in sync.
+///
+/// Why before the relaunch: the relaunched launcher's boot probe reads
+/// this file. Writing it first guarantees the probe finds it no matter
+/// how fast the new launcher boots — the pre-v0.2.54 design (probe
+/// infers outcome from the LOCK file the updater deletes microseconds
+/// after spawning the relaunch) made the success toast a
+/// microseconds-vs-seconds race the launcher always lost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UpdateOutcome {
+    /// True iff every swap succeeded (swap_failures == 0).
+    success: bool,
+    /// Number of swap entries attempted.
+    swaps_attempted: usize,
+    /// Number of swap entries that FAILED.
+    swap_failures: usize,
+    /// Completion timestamp, `unix:<epoch-seconds>` format. Informational
+    /// only — the launcher's probe never parses it (deliberately, so this
+    /// crate stays dependency-light: no chrono).
+    #[serde(default)]
+    completed_at: Option<String>,
+    /// Optional human-readable detail (first failure, relaunch error).
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+/// Atomic-ish write of the outcome file (tmp + rename). Best-effort:
+/// failure is recorded in the log buffer by the caller.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn write_outcome(path: &Path, outcome: &UpdateOutcome) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(outcome)
+        .map_err(|e| format!("serialize outcome: {}", e))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &json).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, path).map_err(|e| format!("rename {}: {}", path.display(), e))
+}
+
 fn main() -> ExitCode {
     // Cmdline: vct-updater <path-to-update.lock.json>
     let args: Vec<String> = env::args().collect();
@@ -121,7 +162,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Windows path: wait for parent, swap, relaunch.
+    // Windows path: wait for parent, swap, record outcome, relaunch.
     #[cfg(target_os = "windows")]
     {
         match wait_for_parent_exit(lock.parent_pid) {
@@ -133,7 +174,17 @@ fn main() -> ExitCode {
                     "parent {} did NOT exit within {}s — aborting swap (binary still locked)\n",
                     lock.parent_pid, PARENT_WAIT_TIMEOUT_SECS,
                 ));
+                // v0.2.54 Track C (C-5): delete the lock on the timeout
+                // abort. Nothing was swapped — the canonical binaries
+                // are unchanged and the legacy deferral path covers
+                // user comms — so an orphaned lock here only produced a
+                // SPURIOUS "update may have failed" toast on a boot
+                // >10 min later (e.g. install.py-spawned updater #1
+                // timing out while the launcher was still mid-
+                // WaitForBinaryRefresh, pre-C-5).
+                log.push_str("timeout abort: removing lock (no swaps performed)\n");
                 let _ = fs::write(&log_path, &log);
+                let _ = fs::remove_file(&lock_path);
                 return ExitCode::from(4);
             }
             Err(WaitError::AlreadyGone) => {
@@ -143,6 +194,7 @@ fn main() -> ExitCode {
 
         // Perform each swap.
         let mut swap_failures = 0_usize;
+        let mut first_failure_detail: Option<String> = None;
         for entry in &lock.swaps {
             match swap_binary(&entry.target) {
                 Ok(SwapResult::Swapped) => {
@@ -156,12 +208,65 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     log.push_str(&format!("swap FAILED {}: {}\n", entry.target.display(), e));
+                    if first_failure_detail.is_none() {
+                        first_failure_detail =
+                            Some(format!("{}: {}", entry.target.display(), e));
+                    }
                     swap_failures += 1;
                 }
             }
         }
 
-        // Relaunch the new launcher if requested.
+        // v0.2.54 Track C (C-4): write the authoritative outcome file
+        // BEFORE spawning the relaunch, so the relaunched launcher's
+        // boot probe always finds it (closes the race where the lock
+        // was deleted microseconds after the relaunch spawn and the
+        // probe found nothing). The relaunch result is appended to the
+        // log but does NOT change `success` — a failed relaunch with
+        // successful swaps is still a successful UPDATE (the user's
+        // next manual launch runs the new binary and sees the toast).
+        let outcome = UpdateOutcome {
+            success: swap_failures == 0,
+            swaps_attempted: lock.swaps.len(),
+            swap_failures,
+            completed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| format!("unix:{}", d.as_secs())),
+            detail: first_failure_detail,
+        };
+        let result_path = lock_path.with_file_name("update.result.json");
+        match write_outcome(&result_path, &outcome) {
+            Ok(()) => {
+                log.push_str(&format!(
+                    "outcome recorded: success={} swap_failures={} → {}\n",
+                    outcome.success,
+                    outcome.swap_failures,
+                    result_path.display(),
+                ));
+            }
+            Err(e) => {
+                log.push_str(&format!("outcome write FAILED: {}\n", e));
+            }
+        }
+
+        // v0.2.54 Track C (C-4): delete the lock ONLY on full success.
+        // On swap failure the lock stays alongside the result file:
+        // the boot probe consumes both (failure toast), and if the
+        // relaunch never happens, a later manual boot still finds the
+        // trail instead of silence.
+        if swap_failures == 0 {
+            let _ = fs::remove_file(&lock_path);
+            log.push_str("lock removed (full success)\n");
+        } else {
+            log.push_str("lock KEPT (swap failure — boot probe will consume it)\n");
+        }
+
+        // Relaunch the launcher if requested. Spawned even on swap
+        // failure: the canonical binary is still the runnable OLD
+        // bytes, and relaunching it is what surfaces the failure toast
+        // (the alternative — no launcher at all — hides the failure).
+        let mut relaunch_failed = false;
         if let Some(relaunch) = lock.relaunch.as_deref() {
             match spawn_detached(relaunch) {
                 Ok(()) => {
@@ -169,19 +274,15 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     log.push_str(&format!("relaunch FAILED {}: {}\n", relaunch.display(), e));
-                    swap_failures += 1;
+                    relaunch_failed = true;
                 }
             }
         }
 
-        // Always write the log before deleting the lock — forensic trail.
+        // Always write the log last — forensic trail includes every step.
         let _ = fs::write(&log_path, &log);
 
-        // Best-effort lock cleanup. If we can't delete it, the new
-        // launcher will treat it as stale on next boot.
-        let _ = fs::remove_file(&lock_path);
-
-        if swap_failures > 0 {
+        if swap_failures > 0 || relaunch_failed {
             return ExitCode::from(5);
         }
         ExitCode::SUCCESS
@@ -415,5 +516,54 @@ mod tests {
     fn lock_parse_rejects_invalid_json() {
         let result: Result<UpdateLock, _> = serde_json::from_str("{ not json");
         assert!(result.is_err());
+    }
+
+    // v0.2.54 Track C (C-4): outcome wire-contract round-trip. The
+    // launcher-side mirror (`commands/update_handoff.rs::UpdateOutcome`)
+    // must parse exactly what this side writes.
+    #[test]
+    fn outcome_roundtrip() {
+        let outcome = UpdateOutcome {
+            success: false,
+            swaps_attempted: 2,
+            swap_failures: 1,
+            completed_at: Some("unix:1760000000".to_string()),
+            detail: Some("C:\\x\\vct-hub.exe: MoveFileExW failed: GetLastError=32".to_string()),
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let back: UpdateOutcome = serde_json::from_str(&json).unwrap();
+        assert!(!back.success);
+        assert_eq!(back.swaps_attempted, 2);
+        assert_eq!(back.swap_failures, 1);
+        assert!(back.detail.unwrap().contains("GetLastError=32"));
+    }
+
+    #[test]
+    fn outcome_parse_tolerates_missing_optionals() {
+        let json = r#"{"success": true, "swaps_attempted": 1, "swap_failures": 0}"#;
+        let outcome: UpdateOutcome = serde_json::from_str(json).unwrap();
+        assert!(outcome.success);
+        assert!(outcome.completed_at.is_none());
+        assert!(outcome.detail.is_none());
+    }
+
+    #[test]
+    fn write_outcome_lands_atomically_at_path() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("update.result.json");
+        let outcome = UpdateOutcome {
+            success: true,
+            swaps_attempted: 1,
+            swap_failures: 0,
+            completed_at: None,
+            detail: None,
+        };
+        write_outcome(&path, &outcome).expect("write");
+        assert!(path.is_file());
+        // No .tmp left behind.
+        assert!(!path.with_extension("json.tmp").exists());
+        let back: UpdateOutcome =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(back.success);
     }
 }

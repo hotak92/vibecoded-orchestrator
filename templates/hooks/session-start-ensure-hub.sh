@@ -36,13 +36,51 @@ debug() {
 }
 
 # ---------------------------------------------------------------------------
+# v0.2.54 Track C (C-7): respect the orchestrator update gate.
+#
+# During `update_orchestrator` the launcher writes
+# `<vct_root>/.update-in-progress.json` and explicitly STOPS vct-hub so
+# the binary can be swapped (Windows mandatory locks). A Claude Code
+# session starting mid-update would otherwise respawn the hub right
+# here and re-lock `vct-hub.exe` between the stop and the swap —
+# recreating the exact sharing-violation the stop was designed to
+# prevent. MCP servers already honour this gate (exit 75); the hook
+# now does too.
+#
+# Staleness check without a JSON parser: the launcher rewrites the
+# lockfile on every phase advance and the expected update duration is
+# 15 minutes, so "modified within the last 15 minutes" is a faithful
+# proxy for the in-JSON `expected_completion_by` deadline. A crashed
+# update's stale lockfile therefore never blocks the hook for more
+# than 15 minutes (and the launcher's boot self-heal removes it).
+# ---------------------------------------------------------------------------
+UPDATE_GATE_FILE="${VCT_STATE_DIR:-$HOME/.vct}/.update-in-progress.json"
+if [ -f "$UPDATE_GATE_FILE" ]; then
+    if [ -n "$(find "$UPDATE_GATE_FILE" -mmin -15 2>/dev/null)" ]; then
+        echo "[vct] orchestrator update in progress ($UPDATE_GATE_FILE) — skipping vct-hub auto-start" >&2
+        exit 0
+    fi
+    debug "stale update gate file present (>15 min old) — ignoring"
+fi
+
+# ---------------------------------------------------------------------------
 # detect_arch :: emit a directory name matching launcher/dist/<arch>/.
 # Best-effort; falls back to empty string if uname is unavailable.
+#
+# v0.2.54 Track C: normalize machine names to the canonical dist-slot
+# tokens — `uname -m` says `x86_64`/`amd64` but the dist dirs are
+# `linux-x64` / `macos-x64`, and `aarch64` (Linux) maps to `arm64`.
+# Pre-v0.2.54 this emitted `linux-x86_64` / `macos-x86_64`, which never
+# matched a real dist dir (step-4 discovery silently dead on x86_64).
 # ---------------------------------------------------------------------------
 detect_arch() {
     local os arch
     os="$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')"
     arch="$(uname -m 2>/dev/null)"
+    case "$arch" in
+        x86_64|amd64) arch="x64" ;;
+        aarch64)      arch="arm64" ;;
+    esac
     case "$os" in
         linux)  printf 'linux-%s\n'  "$arch" ;;
         darwin) printf 'macos-%s\n'  "$arch" ;;

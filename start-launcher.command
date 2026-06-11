@@ -55,6 +55,11 @@ candidates=(
     "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher"
     "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/vct-launcher"
     "$SCRIPT_DIR/launcher/dist/macos-arm64/vct-launcher.app/Contents/MacOS/VCT Launcher"
+    # v0.2.54 Track C (Intel-Mac fix): local builds on x86_64 Macs stage
+    # into `macos-x64/` (rebuild-dist-binary.sh is arch-aware now).
+    "$SCRIPT_DIR/launcher/dist/macos-x64/vct-launcher"
+    "$SCRIPT_DIR/launcher/dist/macos-x64/vct-launcher.app/Contents/MacOS/vct-launcher"
+    "$SCRIPT_DIR/launcher/dist/macos-x64/vct-launcher.app/Contents/MacOS/VCT Launcher"
     # Legacy dist dir (pre-v0.2.13). Kept as fallback only.
     "$SCRIPT_DIR/launcher/dist/experimental_macOS/vct-launcher"
     # macOS .app bundle paths (post-v1.0 packaging). The internal

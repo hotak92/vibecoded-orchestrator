@@ -388,12 +388,22 @@ fn resolve_target_binary(install_root: &Path) -> Result<PathBuf, String> {
 }
 
 /// Mirror of `install.py::_launcher_binary_relative_path`. Keep in sync.
+///
+/// v0.2.54 Track C (Intel-Mac fix): the macOS branch is arch-aware —
+/// a local build on an Intel Mac lands in `macos-x64/`, not
+/// `macos-arm64/`. Hardcoding arm64 made `restart_launcher` resolve a
+/// non-existent dist path on x86_64 hosts and fall back to
+/// `current_exe()` (= the OLD binary), silently defeating the restart.
 fn launcher_binary_relative_path() -> (&'static str, &'static str) {
     #[cfg(target_os = "windows")]
     {
         ("windows-x64", "vct-launcher.exe")
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        ("macos-x64", "vct-launcher")
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
     {
         ("macos-arm64", "vct-launcher")
     }
@@ -655,7 +665,13 @@ stub: true
             assert_eq!(subdir, "windows-x64");
             assert_eq!(fname, "vct-launcher.exe");
         }
-        #[cfg(target_os = "macos")]
+        // v0.2.54 Track C: arch-aware on macOS (Intel-Mac fix).
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        {
+            assert_eq!(subdir, "macos-x64");
+            assert_eq!(fname, "vct-launcher");
+        }
+        #[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
         {
             assert_eq!(subdir, "macos-arm64");
             assert_eq!(fname, "vct-launcher");

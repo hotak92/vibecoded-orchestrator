@@ -309,6 +309,36 @@ fn spawn_updater(_updater_path: &Path, _lock_path: &Path) -> Result<(), String> 
 /// a real handoff completes in <5s.
 const STALE_LOCK_MAX_AGE_SECS: i64 = 600;
 
+/// v0.2.54 Track C (C-4): outcome file the updater writes BEFORE
+/// relaunching the launcher. File name sibling of `update.lock.json`
+/// under `~/.vct/`. Mirror of the same struct in
+/// `vct-updater/src/main.rs` — keep the JSON wire contract in sync.
+pub const UPDATE_RESULT_FILE: &str = "update.result.json";
+
+/// Authoritative swap outcome written by `vct-updater`. Pre-v0.2.54 the
+/// boot probe INFERRED the outcome from the lock file's timestamp
+/// ("fresh lock present" → recovered), which produced false-positive
+/// success toasts for failed swaps and raced the updater's lock delete.
+/// The result file removes both guesses: it is written by the updater
+/// after the swaps and before the relaunch, so the relaunched launcher
+/// always finds it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateOutcome {
+    /// True iff every swap succeeded (swap_failures == 0).
+    pub success: bool,
+    /// Number of swap entries the updater attempted.
+    pub swaps_attempted: usize,
+    /// Number of swap entries that FAILED (MoveFileExW error).
+    pub swap_failures: usize,
+    /// Completion timestamp written by the updater (`unix:<epoch-secs>`
+    /// format — informational only, never parsed here).
+    #[serde(default)]
+    pub completed_at: Option<String>,
+    /// Optional human-readable detail (e.g. relaunch spawn failure).
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
 /// Result reported to the FE by the boot recovery probe. Wired into
 /// the launcher's `setup` callback so the FE can render a one-shot
 /// "Updated to vX" toast or a "Update failed" diagnostic.
@@ -331,14 +361,78 @@ pub struct UpdateRecoveryReport {
 }
 
 /// Called from the launcher's `setup` callback once per process start.
-/// Reads `~/.vct/update.lock.json` if present + deletes it (one-shot).
+///
+/// v0.2.54 Track C (C-4 + FE C-1) — outcome-driven probe. Decision
+/// order:
+///
+/// 1. `update.result.json` present → AUTHORITATIVE. The updater writes
+///    it after the swaps and BEFORE spawning the relaunch, so the
+///    relaunched launcher always finds it (no more racing the lock
+///    delete). `success: true` → recovered; `success: false` →
+///    failure diagnostic with the swap counts. Both result + lock are
+///    consumed (deleted) here.
+/// 2. No result, `update.lock.json` present:
+///    * lock FRESH (< 10 min) → an updater may literally still be
+///      running (e.g. the user manually started a launcher while the
+///      updater waits on the old parent PID). Report nothing and
+///      PRESERVE the lock — the next boot resolves it. Pre-v0.2.54
+///      this case falsely reported `recovered: true`.
+///    * lock STALE (> 10 min / undated / unparseable) → the updater
+///      crashed mid-swap without writing an outcome. Failure
+///      diagnostic; consume the lock.
+/// 3. Neither file → default (no update happened).
 pub fn poll_update_lock_on_boot() -> UpdateRecoveryReport {
-    let lock_path = vct_root_dir().join(UPDATE_LOCK_FILE);
+    let root = vct_root_dir();
+    let lock_path = root.join(UPDATE_LOCK_FILE);
+    let result_path = root.join(UPDATE_RESULT_FILE);
+
+    // ── 1. Authoritative outcome file ───────────────────────────────
+    if result_path.is_file() {
+        let parsed: Option<UpdateOutcome> = fs::read_to_string(&result_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok());
+        // Consume both files: the outcome has been observed. The lock
+        // is also consumed here because the updater intentionally
+        // KEEPS it on swap failure (so a crashed relaunch still leaves
+        // a trail for a later manual boot).
+        let _ = fs::remove_file(&result_path);
+        let _ = fs::remove_file(&lock_path);
+        return match parsed {
+            Some(outcome) if outcome.success => UpdateRecoveryReport {
+                recovered: true,
+                lock_path: Some(lock_path),
+                ..Default::default()
+            },
+            Some(outcome) => UpdateRecoveryReport {
+                stale_or_invalid: true,
+                lock_path: Some(lock_path),
+                reason: Some(format!(
+                    "swap_failures={} of {} swap(s) — see update.log{}",
+                    outcome.swap_failures,
+                    outcome.swaps_attempted,
+                    outcome
+                        .detail
+                        .as_deref()
+                        .map(|d| format!(" ({})", d))
+                        .unwrap_or_default(),
+                )),
+                ..Default::default()
+            },
+            None => UpdateRecoveryReport {
+                stale_or_invalid: true,
+                lock_path: Some(lock_path),
+                reason: Some("result_file_unparseable".to_string()),
+                ..Default::default()
+            },
+        };
+    }
+
+    // ── 2. Lock without outcome ─────────────────────────────────────
     if !lock_path.is_file() {
         return UpdateRecoveryReport::default();
     }
 
-    // Read + parse.
+    // Read + parse the lock (for the started_at age check only).
     let content = match fs::read_to_string(&lock_path) {
         Ok(c) => c,
         Err(e) => {
@@ -366,10 +460,6 @@ pub fn poll_update_lock_on_boot() -> UpdateRecoveryReport {
         }
     };
 
-    // Age check: if started_at is older than STALE_LOCK_MAX_AGE_SECS,
-    // the updater crashed (or never ran). Don't claim "recovered" in
-    // that case; surface a diagnostic so the user knows the update may
-    // be incomplete.
     let is_stale = match lock.started_at.as_deref() {
         Some(ts) => match chrono::DateTime::parse_from_rfc3339(ts) {
             Ok(dt) => {
@@ -382,32 +472,55 @@ pub fn poll_update_lock_on_boot() -> UpdateRecoveryReport {
         None => true, // missing timestamp → can't tell age → treat as stale
     };
 
-    // Always delete the lock file after processing (one-shot).
-    let _ = fs::remove_file(&lock_path);
-
     if is_stale {
+        // Updater crashed (or never ran) without recording an outcome.
+        let _ = fs::remove_file(&lock_path);
         UpdateRecoveryReport {
             stale_or_invalid: true,
             lock_path: Some(lock_path),
-            reason: Some("lock_file_too_old_or_undated".to_string()),
+            reason: Some("updater_crashed_no_outcome_recorded".to_string()),
             ..Default::default()
         }
     } else {
-        UpdateRecoveryReport {
-            recovered: true,
-            lock_path: Some(lock_path),
-            ..Default::default()
-        }
+        // Fresh lock, no outcome yet: an updater may still be running.
+        // Do NOT delete the lock and do NOT report anything — the
+        // pre-v0.2.54 behaviour (claim `recovered`) was a false
+        // positive, and the unconditional delete destroyed the trail
+        // a still-running updater relies on.
+        UpdateRecoveryReport::default()
     }
 }
 
-/// Tauri command exposing `poll_update_lock_on_boot` to the FE so a
-/// post-boot frontend can re-query (the setup callback also calls
-/// this and emits the result as a Tauri event; this command is the
-/// pull alternative for the FE's update tab).
+/// v0.2.54 Track C (FE C-1): boot-time recovery cache.
+///
+/// The `setup` callback's event emit (`vct-update-recovered` /
+/// `vct-update-failed`) fires BEFORE the webview loads, so no FE
+/// listener can ever receive it (Tauri does not buffer events). The
+/// probe result is therefore cached here (managed Tauri state) and the
+/// FE pulls it on mount via `get_update_recovery_report`.
+///
+/// One-shot semantics live at the STATE level (`Option::take`), not the
+/// file level: the probe already consumed the on-disk files at boot, and
+/// `take()` guarantees a layout remount can't double-toast.
+#[derive(Default)]
+pub struct UpdateRecoveryCache(pub std::sync::Mutex<Option<UpdateRecoveryReport>>);
+
+/// Tauri command: FE pull for the boot-time recovery report (FE C-1).
+///
+/// Pre-v0.2.54 this re-ran `poll_update_lock_on_boot()` — a DESTRUCTIVE
+/// one-shot read of a file the boot probe had already deleted, so it
+/// could never return the boot result (and it had zero FE callers).
+/// It now serves the cached boot report exactly once; subsequent calls
+/// return the empty default.
 #[command]
-pub async fn get_update_recovery_report() -> Result<UpdateRecoveryReport, String> {
-    Ok(poll_update_lock_on_boot())
+pub async fn get_update_recovery_report(
+    cache: tauri::State<'_, UpdateRecoveryCache>,
+) -> Result<UpdateRecoveryReport, String> {
+    let mut guard = cache
+        .0
+        .lock()
+        .map_err(|e| format!("recovery cache poisoned: {}", e))?;
+    Ok(guard.take().unwrap_or_default())
 }
 
 // -----------------------------------------------------------------------------
@@ -477,14 +590,21 @@ mod tests {
         let report = poll_update_lock_on_boot();
         assert!(!report.recovered);
         assert!(report.stale_or_invalid);
-        assert_eq!(report.reason.as_deref(), Some("lock_file_too_old_or_undated"));
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("updater_crashed_no_outcome_recorded")
+        );
 
         // Lock file should be deleted after processing.
         assert!(!path.is_file());
     }
 
+    // v0.2.54 Track C (C-4): a FRESH lock with no result file means an
+    // updater may still be running — the probe must report NOTHING and
+    // must PRESERVE the lock (pre-v0.2.54 it falsely claimed recovered
+    // AND deleted the lock).
     #[test]
-    fn poll_update_lock_marks_recovered_when_fresh() {
+    fn poll_update_lock_fresh_without_result_reports_nothing_and_preserves_lock() {
         let (_td, dir) = isolated_state_dir();
         let path = dir.join(UPDATE_LOCK_FILE);
 
@@ -497,8 +617,85 @@ mod tests {
         write_lock_file(&path, &lock).expect("write");
 
         let report = poll_update_lock_on_boot();
+        assert!(!report.recovered);
+        assert!(!report.stale_or_invalid);
+        assert!(path.is_file(), "fresh lock must be preserved");
+    }
+
+    // v0.2.54 Track C (C-4): result file with success=true → recovered,
+    // both files consumed.
+    #[test]
+    fn poll_update_result_success_reports_recovered() {
+        let (_td, dir) = isolated_state_dir();
+        let lock_path = dir.join(UPDATE_LOCK_FILE);
+        let result_path = dir.join(UPDATE_RESULT_FILE);
+
+        // A leftover lock may or may not exist; exercise the "both
+        // present" shape (failure path keeps the lock, but success
+        // deletes it — a stray lock must still be consumed here).
+        let lock = UpdateLock {
+            parent_pid: 1,
+            swaps: vec![],
+            relaunch: None,
+            started_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        write_lock_file(&lock_path, &lock).expect("write lock");
+
+        let outcome = UpdateOutcome {
+            success: true,
+            swaps_attempted: 2,
+            swap_failures: 0,
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            detail: None,
+        };
+        fs::write(&result_path, serde_json::to_string(&outcome).unwrap()).unwrap();
+
+        let report = poll_update_lock_on_boot();
         assert!(report.recovered);
         assert!(!report.stale_or_invalid);
+        assert!(!result_path.is_file(), "result consumed");
+        assert!(!lock_path.is_file(), "lock consumed");
+    }
+
+    // v0.2.54 Track C (C-4): result file with success=false → failure
+    // diagnostic with swap counts; both files consumed.
+    #[test]
+    fn poll_update_result_failure_reports_failed_with_counts() {
+        let (_td, dir) = isolated_state_dir();
+        let result_path = dir.join(UPDATE_RESULT_FILE);
+
+        let outcome = UpdateOutcome {
+            success: false,
+            swaps_attempted: 2,
+            swap_failures: 1,
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            detail: Some("MoveFileExW failed: GetLastError=32".to_string()),
+        };
+        fs::write(&result_path, serde_json::to_string(&outcome).unwrap()).unwrap();
+
+        let report = poll_update_lock_on_boot();
+        assert!(!report.recovered);
+        assert!(report.stale_or_invalid);
+        let reason = report.reason.expect("reason");
+        assert!(reason.contains("swap_failures=1"), "reason: {}", reason);
+        assert!(reason.contains("update.log"), "reason: {}", reason);
+        assert!(!result_path.is_file(), "result consumed");
+    }
+
+    // v0.2.54 Track C (C-4): unparseable result file → failure
+    // diagnostic, consumed.
+    #[test]
+    fn poll_update_result_unparseable_reports_failed() {
+        let (_td, dir) = isolated_state_dir();
+        let result_path = dir.join(UPDATE_RESULT_FILE);
+        fs::create_dir_all(result_path.parent().unwrap()).unwrap();
+        fs::write(&result_path, "{ not json").unwrap();
+
+        let report = poll_update_lock_on_boot();
+        assert!(!report.recovered);
+        assert!(report.stale_or_invalid);
+        assert_eq!(report.reason.as_deref(), Some("result_file_unparseable"));
+        assert!(!result_path.is_file());
     }
 
     #[test]
