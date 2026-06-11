@@ -202,9 +202,17 @@ done
 # `_app/immutable/` marker, the VCT_ASSET_REF_MIN threshold (5), and the
 # 3-backend cascade. See `.claude/context/audits/v0253-phase3-audit-E-
 # dedup-correctness-2026-06-10.md` §DEDUP-15.
-_BUILD_BUNDLED_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#
+# v0.2.53 HOTFIX (post-tag CI): use REPO_ROOT (computed at line 27 BEFORE
+# the `cd "$LAUNCHER_DIR"` at line 59). Earlier draft resolved
+# `dirname "${BASH_SOURCE[0]}"` AFTER the cd, which interpreted the
+# relative `scripts/build-bundled-launcher.sh` argv-path against
+# `launcher/` and looked for the helper at
+# `launcher/scripts/lib/asset-ref-count.sh` (does not exist). Release CI
+# run 27314846460 failed on all 3 platforms with
+# "No such file or directory" at this exact line.
 # shellcheck source=lib/asset-ref-count.sh
-. "$_BUILD_BUNDLED_SCRIPT_DIR/lib/asset-ref-count.sh"
+. "$REPO_ROOT/scripts/lib/asset-ref-count.sh"
 
 _count_asset_refs() {
     asset_ref_count "$1"
