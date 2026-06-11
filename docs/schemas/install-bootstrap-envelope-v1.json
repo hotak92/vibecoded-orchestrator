@@ -11,6 +11,7 @@
     "system",
     "paths",
     "package_manager_advice",
+    "secrets",
     "weaviate_endpoints",
     "ollama_endpoints",
     "code_embed_endpoints",
@@ -189,6 +190,52 @@
         "selinux_volume_flag_needed": {"type": "boolean"},
         "nvidia_container_toolkit_install": {"type": ["string", "null"]},
         "render_group_remediation": {"type": ["string", "null"]}
+      }
+    },
+
+    "secrets": {
+      "type": "object",
+      "description": "v0.2.54 S-8: machine-readable secrets discoverability. Key NAMES only — values never appear in the envelope.",
+      "required": ["primitive", "cli", "store_dir", "shared_keys_available"],
+      "properties": {
+        "primitive": {"type": "string", "const": "vct-secrets"},
+        "cli": {
+          "type": "string",
+          "description": "Absolute path to the vct file-store CLI (tools/vct-secrets/vct)."
+        },
+        "store_dir": {
+          "type": "string",
+          "description": "Resolved secrets root ($VCT_SECRETS_DIR or ~/.vct-secrets)."
+        },
+        "store_dir_exists": {"type": "boolean"},
+        "shared_readme": {
+          "type": "string",
+          "description": "Agent-facing key-schema doc (shared/_README.md), materialized by install.py."
+        },
+        "shared_readme_exists": {"type": "boolean"},
+        "shared_keys_available": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Key NAMES present in the shared file store. NEVER values."
+        },
+        "credential_helper": {
+          "type": "string",
+          "description": "Absolute path to git-credential-vct."
+        },
+        "credential_helper_registered": {
+          "type": "boolean",
+          "description": "True when `git config --global credential.https://github.com.helper` mentions git-credential-vct."
+        },
+        "hub_env_endpoint": {
+          "type": "string",
+          "description": "vct-hub secrets resolver route template for launcher/keychain-managed slots."
+        },
+        "hub_resolver_clients": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Repo-relative client entry points for the hub resolver (bash/ps1/python)."
+        },
+        "docs": {"type": "string"}
       }
     },
 

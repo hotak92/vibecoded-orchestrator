@@ -88,13 +88,23 @@ vct set --project NAME --key KEY  (reads value from stdin)
     Store a secret. Never takes the value on the command line.
     Writes to ~/.vct-secrets/projects/<NAME>/<KEY> with chmod 600.
 
-vct get --project NAME --key KEY [--trusted]
+vct get --key KEY [--project NAME] [--trusted]
     Print a secret to stdout. Requires --trusted in a TTY (tripwire
     against accidental shell-history capture). Use sparingly; prefer exec.
+    Omit --project to resolve from the shared scope (v0.2.54).
 
-vct exec --project NAME [--secret KEY[=VAR]]... [--preserve-env] -- <cmd>
+vct exec [--project NAME] [--secret KEY[=VAR]]... [--preserve-env] -- <cmd>
     Inject + exec. Primary workflow. Never taints parent shell.
     Without --preserve-env, runs with a minimal scrubbed env.
+    Omit --project to resolve from the shared scope (v0.2.54).
+
+vct can-read --key KEY [--project NAME]                       (v0.2.54)
+    Exit 0 if KEY resolves (project scope first, then shared), 1 if
+    not. Prints nothing — for scripts/agents probing availability.
+
+vct resolve --key KEY [--project NAME]                        (v0.2.54)
+    Print the file path the resolver would read (project wins over
+    shared). Never prints the value. Exit 2 when unresolvable.
 
 vct revoke --project NAME --key KEY [--yes]
     Delete a secret file. Confirmation prompt unless --yes.
@@ -107,7 +117,10 @@ vct migrate-from-env FILE --project NAME [--dry-run]
     rename source to <FILE>.migrated on success.
 
 vct doctor
-    Audit dir/file permissions, fix where needed (700/600).
+    Audit dir/file permissions, fix where needed (700/600). Also
+    shape-checks github_pat/github_pat.* keys (classic ghp_ 40 chars /
+    fine-grained github_pat_ / App ghs_; warns on corrupted blobs and
+    embedded whitespace — never prints values) (v0.2.54).
 
 vct detect-project
     Walk up from PWD looking for a `.vct-project` marker file;

@@ -3,8 +3,13 @@
 This guide helps you move your API keys and tokens from scattered `.env`
 files into the centralized, permission-hardened `~/.vct-secrets/` layout.
 
-If you installed via the **VCT Launcher**, this happened for you. Read on
-only if you're migrating manually.
+> **Scope note (v0.2.54)**: this migration is a **manual** workflow. The
+> VCT Launcher does NOT perform it for you — launcher-managed secrets
+> (`github_pat`, `openai_api_key`) live in the **OS keychain** and are
+> written via the launcher GUI (OnboardingWizard / Preferences → Special
+> Secrets), then resolved through vct-hub. The `~/.vct-secrets/` file
+> store described here is the launcher-independent path. See
+> `tools/vct-secrets/README.md` §"Two stores, one mental model".
 
 ## The new layout
 
@@ -82,14 +87,17 @@ exec vct exec --project my-project \
 Then point Claude Code (or whoever launches the MCP) at the wrapper, not
 the raw binary.
 
-For `git push`/`fetch` to GitHub, register the credential helper:
+For `git push`/`fetch` to GitHub, register the credential helper (manual
+step — the launcher does not register it):
 
 ```bash
-git config --global credential.https://github.com.helper "/$HOME/.vct-secrets/git-credential-vct"
+git config --global credential.https://github.com.helper "!$HOME/.vct-secrets/git-credential-vct"
 ```
 
-It reads `shared/github_pat` (or `projects/<repo-name>/github_pat`) and
-hands it to git. No `~/.git-credentials` file required.
+It reads `projects/<name>/github_pat` (project detected via a
+`.vct-project` marker file, or `$VCT_PROJECT_ROOT_PATTERN` — default
+`$HOME/dev`) and falls back to `shared/github_pat`, handing it to git.
+No `~/.git-credentials` file required.
 
 ## Step 4 — Verify and clean up
 

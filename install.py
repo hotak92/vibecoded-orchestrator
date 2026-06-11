@@ -918,14 +918,87 @@ def _bootstrap_detect_gpu() -> dict:
                 "driver_version": driver, "container_toolkit_ok": None,
             }
     if shutil.which("rocm-smi"):
+        # v0.2.54 S-8 (Phase C gpu-runtime finding): the AMD arm used to
+        # hardcode vram_gb=None even though the main install flow already
+        # ships `_probe_amd_rocm_vram_gb`. Reuse it; 0.0 (probe failed)
+        # maps back to None to keep the envelope contract ("unknown").
+        amd_vram: Optional[float] = None
+        if "_probe_amd_rocm_vram_gb" in globals():
+            try:
+                probed = _probe_amd_rocm_vram_gb()
+                amd_vram = probed if probed and probed > 0 else None
+            except Exception:  # noqa: BLE001 — probe must soft-fail
+                amd_vram = None
         return {
             "vendor": "amd", "model": "AMD GPU (rocm)",
-            "vram_gb": None, "driver_version": None,
+            "vram_gb": amd_vram, "driver_version": None,
             "container_toolkit_ok": None,
         }
     return {
         "vendor": "none", "model": None, "vram_gb": None,
         "driver_version": None, "container_toolkit_ok": None,
+    }
+
+
+def _bootstrap_detect_secrets(root: Path) -> dict:
+    """Build the `secrets` envelope block (v0.2.54 S-8).
+
+    One-stop machine-readable answer to "what secrets exist, how do I
+    use them, are they wired up?" for agents that prepass-read the
+    envelope. Lists key NAMES only — never values. All probes soft-fail.
+    """
+    secrets_root = Path(
+        os.environ.get("VCT_SECRETS_DIR") or (Path.home() / ".vct-secrets")
+    )
+    shared_dir = secrets_root / "shared"
+
+    shared_keys: list[str] = []
+    try:
+        if shared_dir.is_dir():
+            shared_keys = sorted(
+                p.name for p in shared_dir.iterdir()
+                if p.is_file() and p.name != "_README.md"
+                and not p.name.startswith(".")
+            )
+    except OSError:
+        shared_keys = []
+
+    # git-credential-vct registration probe (names only, no secret I/O).
+    helper_registered = False
+    try:
+        r = subprocess.run(
+            ["git", "config", "--global", "--get-all",
+             "credential.https://github.com.helper"],
+            capture_output=True, text=True,
+            timeout=BOOTSTRAP_PROBE_TIMEOUT_S,
+        )
+        helper_registered = (
+            r.returncode == 0 and "git-credential-vct" in (r.stdout or "")
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        helper_registered = False
+
+    shared_readme = shared_dir / "_README.md"
+    return {
+        "primitive": "vct-secrets",
+        "cli": str(root / "tools" / "vct-secrets" / "vct"),
+        "store_dir": str(secrets_root),
+        "store_dir_exists": secrets_root.is_dir(),
+        "shared_readme": str(shared_readme),
+        "shared_readme_exists": shared_readme.is_file(),
+        "shared_keys_available": shared_keys,
+        "credential_helper": str(
+            root / "tools" / "vct-secrets" / "git-credential-vct"
+        ),
+        "credential_helper_registered": helper_registered,
+        # Launcher-managed slots resolve via vct-hub, not the file store.
+        "hub_env_endpoint": "http://127.0.0.1:7700/api/v1/projects/{id}/env",
+        "hub_resolver_clients": [
+            "templates/scripts/vct_secrets_resolve.sh",
+            "templates/scripts/vct_secrets_resolve.ps1",
+            "vco_lib/agent_secrets.py",
+        ],
+        "docs": "docs/VCT_SECRETS_PRIMITIVE.md",
     }
 
 
@@ -1364,6 +1437,7 @@ def _bootstrap_build_envelope(root: Path) -> dict:
 
     paths_block = _bootstrap_resolve_paths(root)
     pm_advice = _bootstrap_package_manager_advice(system_block, distro)
+    secrets_block = _bootstrap_detect_secrets(root)
 
     # Endpoints — NEW-4 SSOT: weaviate health is `/v1/.well-known/ready`.
     weaviate_endpoints = {
@@ -1401,6 +1475,7 @@ def _bootstrap_build_envelope(root: Path) -> dict:
         "system": system_block,
         "paths": paths_block,
         "package_manager_advice": pm_advice,
+        "secrets": secrets_block,
         "weaviate_endpoints": weaviate_endpoints,
         "ollama_endpoints": ollama_endpoints,
         "code_embed_endpoints": code_embed_endpoints,
@@ -5801,6 +5876,10 @@ def main() -> int:
             "4b/10", "skip",
             "--skip-materialize-claude-dir set; .claude/ left untouched",
         )
+
+    # Step 5c (v0.2.54 S-3): agent-facing secrets-schema doc. Only-if-
+    # missing, so user edits survive every --update.
+    _materialize_vct_secrets_shared_readme(PROJECT_ROOT)
 
     # V0243-5: emit VCT_ORCHESTRATOR_ROOT + VCT_INFRASTRUCTURE_DIR + KG_BASE_DIR
     # to .claude/env managed block. Done unconditionally on orchestrator-root
@@ -11591,6 +11670,59 @@ def _materialize_orchestrator_self_claude_md(install_root: Path) -> None:
         _log_install_event(
             "4c/10", "warn",
             f"failed to materialize CLAUDE.md: {e}",
+        )
+
+
+def _materialize_vct_secrets_shared_readme(install_root: Path) -> None:
+    """v0.2.54 S-3: materialize the agent-facing key-schema doc at
+    ``~/.vct-secrets/shared/_README.md`` (honoring ``$VCT_SECRETS_DIR``).
+
+    Idempotent + user-respecting: ONLY written when the file does not
+    already exist (users edit it to document their own keys; we never
+    clobber). Creates the store skeleton (700 dirs) when absent so the
+    doc has a place to land even before the first ``vct set``.
+
+    Soft-fail: secrets-store problems never abort an install.
+    """
+    template_path = (
+        install_root / "templates" / "vct-secrets-shared-readme.template"
+    )
+    if not template_path.is_file():
+        _log_install_event(
+            "5c/10", "skip",
+            f"vct-secrets readme template missing at {template_path}",
+        )
+        return
+    try:
+        secrets_root = Path(
+            os.environ.get("VCT_SECRETS_DIR") or (Path.home() / ".vct-secrets")
+        )
+        shared_dir = secrets_root / "shared"
+        target = shared_dir / "_README.md"
+        if target.is_file():
+            _log_install_event(
+                "5c/10", "skip",
+                "~/.vct-secrets/shared/_README.md already exists (user copy preserved)",
+            )
+            return
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(secrets_root, 0o700)
+            os.chmod(shared_dir, 0o700)
+        target.write_text(
+            template_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        if os.name == "posix":
+            os.chmod(target, 0o600)
+        print("[5c/10] Materialized ~/.vct-secrets/shared/_README.md "
+              "(agent-facing key schema)")
+        _log_install_event(
+            "5c/10", "ok", f"materialized {target}",
+        )
+    except OSError as e:
+        _log_install_event(
+            "5c/10", "warn",
+            f"failed to materialize vct-secrets shared _README.md: {e}",
         )
 
 

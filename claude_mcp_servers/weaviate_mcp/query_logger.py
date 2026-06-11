@@ -11,12 +11,46 @@ Logs queries to:
 
 import json
 import logging
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-# Log files
-LOG_DIR = Path(__file__).parent
+# Log files.
+#
+# v0.2.54 (Track A1 install hygiene): logs used to land in the installed
+# package directory (`Path(__file__).parent`), polluting the repo/venv
+# tree and breaking on read-only installs. They now go to the VCT state
+# dir (`$VCT_STATE_DIR` or `~/.vct`) under `logs/weaviate_mcp/`, with
+# `$VCT_QUERY_LOG_DIR` as an explicit override for tests.
+
+
+def _resolve_log_dir() -> Path:
+    override = os.environ.get("VCT_QUERY_LOG_DIR", "").strip()
+    if override:
+        return Path(override)
+    # State-root resolution goes through the MCP-isolation mirror
+    # `_lib.update_gate._vct_root_dir` (the documented in-package mirror
+    # of vco_lib.paths.vct_root_dir — MCP servers run from
+    # claude_mcp_servers/.venv which doesn't carry vco_lib). The
+    # consolidation gate in tests/test_vct_root_dir_consolidation.py
+    # forbids inline ~/.vct reconstruction outside that mirror.
+    try:
+        import sys
+
+        _pkg_parent = Path(__file__).resolve().parent.parent
+        if str(_pkg_parent) not in sys.path:
+            sys.path.insert(0, str(_pkg_parent))
+        from _lib.update_gate import _vct_root_dir  # type: ignore
+
+        root = _vct_root_dir()
+    except Exception:  # noqa: BLE001 — logging must never break the MCP
+        state_dir = os.environ.get("VCT_STATE_DIR", "").strip()
+        root = Path(state_dir) if state_dir else Path(os.path.expanduser("~/.vct"))
+    return root / "logs" / "weaviate_mcp"
+
+
+LOG_DIR = _resolve_log_dir()
 QUERY_LOG = LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}_queries.jsonl"
 TOOL_USAGE_LOG = LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}_tool_usage.jsonl"
 
@@ -109,6 +143,7 @@ class QueryLogger:
     def _write_log(log_file: Path, entry: dict):
         """Write entry to JSONL log file"""
         try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
             with open(log_file, 'a') as f:
                 f.write(json.dumps(entry) + '\n')
         except Exception as e:
@@ -188,6 +223,7 @@ class ToolUsageLogger:
     def _write_log(log_file: Path, entry: dict):
         """Write entry to JSONL log file"""
         try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
             with open(log_file, 'a') as f:
                 f.write(json.dumps(entry) + '\n')
         except Exception as e:

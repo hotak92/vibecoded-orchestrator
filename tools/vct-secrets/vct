@@ -133,15 +133,29 @@ SUBCOMMANDS:
   set --project NAME --key KEY [--confirm-tty]
         Store a secret. Value read from stdin ONLY (never from argv).
         Refuses interactive TTY stdin unless --confirm-tty given.
+        --project stays REQUIRED for writes (writing should be deliberate).
 
-  get --project NAME --key KEY [--trusted]
+  get --key KEY [--project NAME] [--trusted]
         Print a secret value to stdout. Requires --trusted when stdout is a TTY
         (tripwire against shell-history capture). Prefer 'exec' instead.
+        Without --project, resolves from the shared scope.
 
-  exec --project NAME [--secret KEY[=VAR_NAME]]... [--preserve-env] -- CMD [ARGS...]
+  exec [--project NAME] [--secret KEY[=VAR_NAME]]... [--preserve-env] -- CMD [ARGS...]
         Inject named secrets into child env, then exec CMD. Secrets never
         touch the parent shell. Missing secret → exit 2, CMD not run.
         Without --preserve-env, only a safe minimal env is carried through.
+        Without --project, resolves from the shared scope (symmetric with
+        'get' and 'list').
+
+  can-read --key KEY [--project NAME]
+        Exit 0 if KEY is resolvable (project scope first, then shared),
+        exit 1 if not. Prints nothing. For scripts/agents that want to
+        probe availability without reading the value.
+
+  resolve --key KEY [--project NAME]
+        Print the file path the resolver would read for KEY (project
+        scope wins over shared). Exit 2 if the key resolves nowhere.
+        Never prints the secret value.
 
   revoke --project NAME --key KEY [--yes]
         Delete a project's secret file. Prompts unless --yes.
@@ -156,7 +170,12 @@ SUBCOMMANDS:
 
   doctor
         Audit dir/file permissions. Fixes chmod to 700/600 where needed.
-        Never reads secret contents.
+        Also shape-checks GitHub token files (any key named github_pat
+        or github_pat.*): warns when the content doesn't match a known
+        GitHub token shape (classic ghp_* 40 chars, fine-grained
+        github_pat_* ~93 chars, App ghs_*/gho_* 40 chars) or contains
+        embedded whitespace. Reads ONLY github_pat-named files for the
+        shape check; never prints secret contents.
 
   detect-project
         Walks up from PWD to find a .vct-project file; echoes its content.
@@ -200,9 +219,12 @@ cmd_list() {
         return 0
     fi
     # Print basenames of regular files, sorted. No values.
+    # `_README.md` is the agent-facing schema doc (materialized by
+    # install.py), not a secret — skip it.
     local f
     for f in "$dir"/*; do
         [ -f "$f" ] || continue
+        case "$(basename "$f")" in _README.md) continue ;; esac
         basename "$f"
     done | sort
 }
@@ -256,10 +278,13 @@ cmd_get() {
             --key) key=$2; shift 2 ;;
             --trusted) trusted=1; shift ;;
             -h|--help) cmd_help; return 0 ;;
-            *) die "get: unknown arg: $1" ;;
+            *) die "get: unknown arg: $1 (expected --key KEY [--project NAME] [--trusted])" ;;
         esac
     done
-    [ -n "$project" ] || die "get: --project required"
+    # Symmetric default (v0.2.54 S-2): no --project → shared scope,
+    # matching `list` and `exec`. resolve_secret() already falls
+    # through projects/shared/ (normally absent) to shared/.
+    [ -n "$project" ] || project="shared"
     [ -n "$key" ]     || die "get: --key required"
     validate_name "project" "$project"
     validate_name "key" "$key"
@@ -393,7 +418,10 @@ cmd_exec() {
             *) die "exec: unexpected arg before --: $1" ;;
         esac
     done
-    [ -n "$project" ] || die "exec: --project required"
+    # Symmetric default (v0.2.54 S-2): no --project → shared scope,
+    # matching `list` and `get`. Removes the friction where
+    # `vct exec --secret K=V -- cmd` failed on shared-scope keys.
+    [ -n "$project" ] || project="shared"
     validate_name "project" "$project"
     [ $saw_dashdash -eq 1 ] || die "exec: missing -- before command"
     [ $# -gt 0 ] || die "exec: no command given after --"
@@ -526,6 +554,84 @@ cmd_migrate_from_env() {
     fi
 }
 
+# can-read — probe whether a key resolves, without reading the value.
+# Exit 0 = resolvable, 1 = not. Prints nothing (script-friendly).
+cmd_can_read() {
+    local project="" key=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            --key) key=$2; shift 2 ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "can-read: unknown arg: $1 (expected --key KEY [--project NAME])" ;;
+        esac
+    done
+    [ -n "$project" ] || project="shared"
+    [ -n "$key" ]     || die "can-read: --key required"
+    validate_name "project" "$project"
+    validate_name "key" "$key"
+    ensure_root
+    if resolve_secret "$project" "$key" >/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# resolve — print the file path the resolver would pick (project scope
+# wins over shared). Never prints the value. Exit 2 if not found.
+cmd_resolve() {
+    local project="" key=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --project) project=$2; shift 2 ;;
+            --key) key=$2; shift 2 ;;
+            -h|--help) cmd_help; return 0 ;;
+            *) die "resolve: unknown arg: $1 (expected --key KEY [--project NAME])" ;;
+        esac
+    done
+    [ -n "$project" ] || project="shared"
+    [ -n "$key" ]     || die "resolve: --key required"
+    validate_name "project" "$project"
+    validate_name "key" "$key"
+    ensure_root
+    local path
+    if ! path=$(resolve_secret "$project" "$key"); then
+        die_code 2 "resolve: secret not found — project=$project key=$key. Fix: vct set --project $project --key $key"
+    fi
+    printf '%s\n' "$path"
+}
+
+# GitHub-token shape check used by doctor. Reads ONLY the file content
+# of github_pat-named keys; emits warnings, never the value.
+# Known shapes (2026):
+#   classic PAT       ghp_[A-Za-z0-9]{36}        (40 chars)
+#   fine-grained PAT  github_pat_[A-Za-z0-9_]{82} (93 chars)
+#   App installation  ghs_[A-Za-z0-9]{36}        (40 chars)
+#   OAuth token       gho_[A-Za-z0-9]{36}        (40 chars)
+_doctor_check_github_pat_shape() {
+    local f=$1
+    local val len
+    # Strip trailing newlines only — embedded whitespace is itself a defect.
+    val=$(cat -- "$f"; printf x); val=${val%x}
+    while [ "${val%$'\n'}" != "$val" ]; do val=${val%$'\n'}; done
+    len=${#val}
+    if [ "$len" -eq 0 ]; then
+        warn "token-shape: $f is EMPTY"
+        return 1
+    fi
+    case "$val" in
+        *' '*|*$'\t'*|*$'\n'*|*$'\r'*)
+            warn "token-shape: $f contains embedded whitespace/newlines ($len chars) — gh/git will reject it. Re-set with: printf %s \"\$TOKEN\" | vct set --project shared --key $(basename "$f")"
+            return 1
+            ;;
+    esac
+    if printf '%s' "$val" | LC_ALL=C grep -qE '^ghp_[A-Za-z0-9]{36}$|^ghs_[A-Za-z0-9]{36}$|^gho_[A-Za-z0-9]{36}$|^github_pat_[A-Za-z0-9_]{36,255}$'; then
+        return 0
+    fi
+    warn "token-shape: $f ($len chars) does not match any known GitHub token shape (ghp_/ghs_/gho_ 40 chars, github_pat_ fine-grained). It may be corrupted or a different credential stored under a github_pat name."
+    return 1
+}
+
 cmd_doctor() {
     ensure_root
     local issues=0 fixed=0
@@ -552,9 +658,12 @@ cmd_doctor() {
     local f
     while IFS= read -r f; do
         [ -z "$f" ] && continue
-        # Skip CLI itself (needs +x) and tests dir scripts
+        # Skip CLI itself (needs +x) and tests dir scripts.
+        # NOTE: the legacy `search-mcp-wrapper.sh` skip-arm was removed in
+        # v0.2.54 (S-6) — that wrapper was retired in 0.1.7; stale copies
+        # inside the store should be locked down like any other file.
         case "$f" in
-            */vct|*/tests/*|*/migrate-shared.sh|*/search-mcp-wrapper.sh|*/git-credential-vct)
+            */vct|*/tests/*|*/migrate-shared.sh|*/git-credential-vct)
                 continue ;;
         esac
         mode=$(stat -c '%a' "$f" 2>/dev/null || echo "")
@@ -564,6 +673,18 @@ cmd_doctor() {
             fixed=$((fixed+1))
         fi
     done < <(find "$VCT_SECRETS_DIR" -type f)
+
+    # GitHub-token shape check (v0.2.54 S-3/S-4 sibling): wrong-shape
+    # github_pat entries cost real debugging time (the "401 Bad
+    # credentials with a 330-char blob" class). Check any key named
+    # github_pat or github_pat.* in shared/ and projects/*/.
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        if ! _doctor_check_github_pat_shape "$f"; then
+            issues=$((issues+1))
+        fi
+    done < <(find "$VCT_SECRETS_DIR/shared" "$VCT_SECRETS_DIR/projects" \
+                  -type f \( -name 'github_pat' -o -name 'github_pat.*' \) 2>/dev/null)
 
     printf 'vct doctor: %d issues fixed, %d remaining.\n' "$fixed" "$issues" >&2
     return 0
@@ -603,6 +724,8 @@ main() {
         set)               cmd_set "$@" ;;
         get)               cmd_get "$@" ;;
         exec)              cmd_exec "$@" ;;
+        can-read)          cmd_can_read "$@" ;;
+        resolve)           cmd_resolve "$@" ;;
         revoke)            cmd_revoke "$@" ;;
         copy)              cmd_copy "$@" ;;
         migrate-from-env)  cmd_migrate_from_env "$@" ;;

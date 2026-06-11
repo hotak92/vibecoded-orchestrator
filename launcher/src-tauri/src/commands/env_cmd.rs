@@ -39,42 +39,48 @@
 
 use tauri::command;
 
-/// Suffixes that mark a variable as a credential-shaped name. Any
-/// variable whose UPPER-CASE name ends with one of these gets its
-/// value redacted to "" before being returned to the frontend. Kept
-/// short and conservative — the goal is "block obvious secret names",
-/// not "block every plausible secret-adjacent name".
-///
-/// Why suffixes only (not prefixes / substrings)?
-///   - All canonical secret-shaped names we've seen in the wild
-///     (`GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
-///     `POSTGRES_PASSWORD`, `TELEGRAM_BOT_TOKEN`) end with one of
-///     these tokens, so a suffix check is sufficient.
-///   - Substring matches over-block legitimate names like
-///     `KEY_FILE_PATH` (not a key) or `PASSWORD_RESET_URL` (not a
-///     password). Suffix matches don't have that footgun.
-const SECRET_NAME_SUFFIXES: &[&str] = &[
-    "_TOKEN",
-    "_KEY",
-    "_SECRET",
-    "_PASSWORD",
-    "_PASSWD",
-    "_CREDENTIAL",
-    "_CREDENTIALS",
-    "_ACCESS_KEY",  // covers AWS_*_ACCESS_KEY
-    "_SECRET_KEY",  // covers DJANGO_SECRET_KEY shape
-    "_PRIVATE_KEY", // covers SSH_PRIVATE_KEY shape
-    "_API_KEY",     // explicit alongside _KEY for clarity
-    "_AUTH",        // covers BASIC_AUTH / DIGEST_AUTH / HTTP_AUTH
-];
+/// Extra credential-shaped SEGMENTS beyond the canonical classifier in
+/// `mcp_registration::is_secret_shaped_env_key`. The canonical needle
+/// list there is [TOKEN, SECRET, PAT, PASSWORD, PASS, AUTH] (+ exact
+/// `KEY` / `*_KEY` suffix); this webview-facing blocklist additionally
+/// flags PASSWD / CREDENTIAL / CREDENTIALS, which the ~/.claude.json
+/// filter never needed but the "broad blocklist" posture here wants.
+const EXTRA_SECRET_SEGMENTS: &[&str] = &["PASSWD", "CREDENTIAL", "CREDENTIALS"];
 
-/// Check whether a variable name looks like a credential. Case-folded
-/// suffix match against `SECRET_NAME_SUFFIXES`.
+/// Check whether a variable name looks like a credential.
+///
+/// v0.2.54 (S-4 sibling): UNIFIED on the segment-based classifier in
+/// `mcp_registration::is_secret_shaped_env_key`. The previous
+/// suffix-only match missed `GH_PAT`, `DB_PASS`, and `AUTH_HEADER`
+/// (ends with `_HEADER`, not `_AUTH`) — those round-tripped cleartext
+/// to the webview while `mcp_registration`'s own classifier flagged
+/// them as secrets. Segment matching (split on `_`/`-`, exact-match
+/// each segment) catches all of those while still passing legitimate
+/// names like `KEY_FILE_PATH` (segment `KEY` is only flagged as exact
+/// name or `_KEY` suffix, mirroring the canonical classifier).
+///
+/// Posture note: segment matching DOES flag names like
+/// `PASSWORD_RESET_URL` (segment `PASSWORD`). That is an accepted
+/// false-positive — the doc-comment contract above prefers
+/// false-positives over a credential reaching the webview, and the
+/// canonical classifier makes the same trade.
 fn is_secret_shaped_name(name: &str) -> bool {
+    // Canonical segment-based classifier (TOKEN/SECRET/PAT/PASSWORD/
+    // PASS/AUTH segments + KEY exact / `_KEY` suffix). Single source
+    // of truth — keep behaviour changes THERE, not here.
+    if crate::mcp_registration::is_secret_shaped_env_key(name) {
+        return true;
+    }
     let upper = name.to_ascii_uppercase();
-    // Whole-name exact match for a few extra well-known credentials
-    // that don't carry a recognisable suffix. The list is short and
-    // hand-curated.
+    let segments: Vec<&str> = upper.split(['_', '-']).collect();
+    if EXTRA_SECRET_SEGMENTS
+        .iter()
+        .any(|needle| segments.iter().any(|s| s == needle))
+    {
+        return true;
+    }
+    // Whole-name exact match for a few extra well-known credentials,
+    // kept as defence-in-depth (all are also segment-caught today).
     const EXACT: &[&str] = &[
         "GITHUB_TOKEN",
         "GH_TOKEN",
@@ -84,10 +90,7 @@ fn is_secret_shaped_name(name: &str) -> bool {
         "SUPABASE_KEY",
         "VERCEL_TOKEN",
     ];
-    if EXACT.iter().any(|e| upper == *e) {
-        return true;
-    }
-    SECRET_NAME_SUFFIXES.iter().any(|s| upper.ends_with(s))
+    EXACT.iter().any(|e| upper == *e)
 }
 
 /// Read a single environment variable from the launcher process and
@@ -190,6 +193,48 @@ mod tests {
         let r = read_env_var("XDG_SESSION_TYPE".into()).unwrap();
         assert_eq!(r, "wayland");
         std::env::remove_var("XDG_SESSION_TYPE");
+    }
+
+    #[test]
+    fn blocklist_redacts_segment_shapes_previously_missed() {
+        // v0.2.54 regression (S-4 sibling): GH_PAT / DB_PASS /
+        // AUTH_HEADER round-tripped cleartext under the old
+        // suffix-only classifier while mcp_registration flagged them.
+        for name in ["VCT_TEST_GH_PAT", "VCT_TEST_DB_PASS", "VCT_TEST_AUTH_HEADER"] {
+            std::env::set_var(name, "supersecret");
+            let r = read_env_var(name.to_string()).unwrap();
+            assert_eq!(r, "", "{name} must be redacted (segment classifier)");
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn blocklist_redacts_extra_segments_passwd_credential() {
+        for name in ["VCT_TEST_PASSWD_X", "VCT_TEST_CREDENTIAL_BLOB"] {
+            std::env::set_var(name, "shh");
+            let r = read_env_var(name.to_string()).unwrap();
+            assert_eq!(r, "", "{name} must be redacted (extra segments)");
+            std::env::remove_var(name);
+        }
+    }
+
+    #[test]
+    fn classifier_agrees_with_mcp_registration_on_its_own_needles() {
+        // The unification contract: anything mcp_registration flags,
+        // this blocklist must also flag.
+        for name in [
+            "GH_PAT", "DB_PASS", "AUTH_HEADER", "MY_TOKEN", "X_SECRET",
+            "POSTGRES_PASSWORD", "STRIPE_KEY", "KEY",
+        ] {
+            assert!(
+                crate::mcp_registration::is_secret_shaped_env_key(name),
+                "precondition: mcp_registration flags {name}"
+            );
+            assert!(
+                is_secret_shaped_name(name),
+                "env_cmd blocklist must flag {name} too"
+            );
+        }
     }
 
     #[test]
