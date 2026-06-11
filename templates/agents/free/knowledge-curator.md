@@ -265,14 +265,13 @@ None
 
 ## Quick Reference
 
-**Spawn this agent**:
-```bash
-# From hook or manual
-python .claude/scripts/spawn_background_agent.py \
-    --agent knowledge-curator \
-    --files "knowledge/concepts/node.md" \
-    --background
-```
+**Spawn this agent** (native background subagent — no helper script needed):
+
+> From a Claude Code session, use the Agent tool with subagent_type
+> `knowledge-curator`, `run_in_background: true`, and a prompt naming the targets:
+> "Extract relationships and update cross-references for knowledge/concepts/node.md"
+
+Background completion is reported back to the session by the harness.
 
 **Check duplicates only**:
 ```bash

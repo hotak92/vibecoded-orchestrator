@@ -554,7 +554,9 @@ chmod +x ~/.claude/scripts/kg-*
 
 # Workflow maintenance
 cp [orchestrator]/.claude/scripts/detect-workflow-needs ~/.claude/scripts/
+cp [orchestrator]/.claude/scripts/detect_workflow_needs.py ~/.claude/scripts/
 cp [orchestrator]/.claude/scripts/generate-workflow ~/.claude/scripts/
+cp [orchestrator]/.claude/scripts/generate_workflow.py ~/.claude/scripts/
 chmod +x ~/.claude/scripts/detect-workflow-needs
 chmod +x ~/.claude/scripts/generate-workflow
 
@@ -570,7 +572,8 @@ $dst = "$env:USERPROFILE\.claude\scripts"
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
 Copy-Item "$src\smart_file_ops.py","$src\kg-search","$src\kg-info","$src\kg-sync",`
           "$src\search_knowledge.py","$src\get_node_info.py","$src\sync_knowledge_graph.py",`
-          "$src\detect-workflow-needs","$src\generate-workflow","$src\test-mcp" $dst
+          "$src\detect-workflow-needs.ps1","$src\detect_workflow_needs.py",`
+          "$src\generate-workflow.ps1","$src\generate_workflow.py","$src\test-mcp" $dst
 # Run via:  py "$dst\smart_file_ops.py" check ...
 ```
 
@@ -1392,21 +1395,15 @@ Find infrastructure setup patterns, deployment strategies, configuration best pr
 - `query_temporal.py` - Point-in-time queries
 - `migrate_to_vocabulary.py` - Validate tags/vocabulary
 - `detect_duplicates.py` - Semantic duplicate detection
-- `queue_maintenance.py` - Background task queue
-- `process_maintenance_queue.py` - Queue processor
+
 
 ## Background Maintenance
 
-**Queue System**:
-- `queue_maintenance.py` - Queue tasks (knowledge-curator, graph-health-checker, code-graph-updater)
-- `process_maintenance_queue.py` - Process queue (runs every 15 min via cron)
-- `maintenance_status.py` - Check queue status
-- Catch-up mechanism: Runs missed tasks at next opportunity
+**Background maintenance** (the legacy queue system is archived — `queue_maintenance.py` / `process_maintenance_queue.py` in `.claude/scripts/archive/` for reference only):
+- Maintenance agents (knowledge-curator, graph-health-checker, code-graph-updater) run as native Claude Code background subagents (Agent tool, `run_in_background: true`) — no helper script, no cron.
+- Headless KG summaries are handled separately by `generate-kg-summary.py`'s 3-tier fallback (claude CLI → Ollama → Anthropic API).
 
-**Scheduled Tasks**:
-- Daily 2 AM: knowledge-curator (relationship extraction, deduplication)
-- Weekly Sunday 3 AM: graph-health-checker (consistency checks)
-- Every 15 minutes: process_maintenance_queue
+**Scheduled Tasks**: none auto-configured. For recurring maintenance, use Claude Code scheduled agents (`/schedule`) or run the maintenance agents on demand from a session.
 
 **Setup**: `.claude/scripts/setup_cron.sh` (creates cron jobs)
 

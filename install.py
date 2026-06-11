@@ -24670,7 +24670,9 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
         # Glob all script types: Python modules, shell wrappers (no ext or .sh),
         # and PowerShell wrappers (.ps1). Previously only *.py was copied which
         # left kg-search, kg-sync, code-graph-* etc. missing from user projects.
-        script_patterns = ["*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*", "cost-summary"]
+        script_patterns = ["*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*", "cost-summary",
+                   # v0.2.54: extension-less bash wrappers for the workflow tooling
+                   "detect-workflow-needs", "generate-workflow"]
         seen: set[str] = set()
         for pattern in script_patterns:
             for script_file in sorted(scripts_src.glob(pattern)):

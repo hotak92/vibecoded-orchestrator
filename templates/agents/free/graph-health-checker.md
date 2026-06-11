@@ -418,19 +418,13 @@ Write to `.claude/logs/graph_health_report.md`:
 
 ## Quick Reference
 
-**Spawn this agent**:
-```bash
-# Full check (weekly)
-python .claude/scripts/spawn_background_agent.py \
-    --agent graph-health-checker \
-    --mode full \
-    --background
+**Spawn this agent** (native background subagent — no helper script needed):
 
-# Quick check (critical only)
-python .claude/scripts/spawn_background_agent.py \
-    --agent graph-health-checker \
-    --mode quick
-```
+> From a Claude Code session, use the Agent tool with subagent_type
+> `graph-health-checker`, `run_in_background: true`, and a prompt naming the targets:
+> "Run a full graph health check (or: quick check, critical issues only)"
+
+Background completion is reported back to the session by the harness.
 
 **View report**:
 ```bash

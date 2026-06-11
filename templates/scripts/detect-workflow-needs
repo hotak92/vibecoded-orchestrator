@@ -1,0 +1,14 @@
+#!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+# Thin wrapper for detect_workflow_needs.py (pure-stdlib — no venv needed).
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null)"
+if [ -z "$PY" ]; then
+    echo "error: no Python interpreter found on PATH" >&2
+    exit 1
+fi
+
+exec "$PY" "$SCRIPT_DIR/detect_workflow_needs.py" "$@"
