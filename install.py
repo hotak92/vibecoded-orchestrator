@@ -918,15 +918,38 @@ def _bootstrap_detect_gpu() -> dict:
                 "driver_version": driver, "container_toolkit_ok": None,
             }
     if shutil.which("rocm-smi"):
+        # v0.2.54 S-8 (Phase C gpu-runtime finding): the AMD arm used to
+        # hardcode vram_gb=None even though the main install flow already
+        # ships `_probe_amd_rocm_vram_gb`. Reuse it; 0.0 (probe failed)
+        # maps back to None to keep the envelope contract ("unknown").
+        amd_vram: Optional[float] = None
+        if "_probe_amd_rocm_vram_gb" in globals():
+            try:
+                probed = _probe_amd_rocm_vram_gb()
+                amd_vram = probed if probed and probed > 0 else None
+            except Exception:  # noqa: BLE001 — probe must soft-fail
+                amd_vram = None
         return {
             "vendor": "amd", "model": "AMD GPU (rocm)",
-            "vram_gb": None, "driver_version": None,
+            "vram_gb": amd_vram, "driver_version": None,
             "container_toolkit_ok": None,
         }
     return {
         "vendor": "none", "model": None, "vram_gb": None,
         "driver_version": None, "container_toolkit_ok": None,
     }
+
+
+def _bootstrap_detect_secrets(root: Path) -> dict:
+    """Shim over :func:`vco_lib.secrets_bootstrap.detect_secrets_envelope`.
+
+    Kept for backwards compatibility with the existing call-site; new
+    callers should import the shared helper directly.
+    """
+    from vco_lib.secrets_bootstrap import detect_secrets_envelope
+    return detect_secrets_envelope(
+        root, probe_timeout_s=BOOTSTRAP_PROBE_TIMEOUT_S
+    )
 
 
 def _bootstrap_classify_install_root(root: Path) -> str:
@@ -1364,6 +1387,7 @@ def _bootstrap_build_envelope(root: Path) -> dict:
 
     paths_block = _bootstrap_resolve_paths(root)
     pm_advice = _bootstrap_package_manager_advice(system_block, distro)
+    secrets_block = _bootstrap_detect_secrets(root)
 
     # Endpoints — NEW-4 SSOT: weaviate health is `/v1/.well-known/ready`.
     weaviate_endpoints = {
@@ -1401,6 +1425,7 @@ def _bootstrap_build_envelope(root: Path) -> dict:
         "system": system_block,
         "paths": paths_block,
         "package_manager_advice": pm_advice,
+        "secrets": secrets_block,
         "weaviate_endpoints": weaviate_endpoints,
         "ollama_endpoints": ollama_endpoints,
         "code_embed_endpoints": code_embed_endpoints,
@@ -5801,6 +5826,10 @@ def main() -> int:
             "4b/10", "skip",
             "--skip-materialize-claude-dir set; .claude/ left untouched",
         )
+
+    # Step 5c (v0.2.54 S-3): agent-facing secrets-schema doc. Only-if-
+    # missing, so user edits survive every --update.
+    _materialize_vct_secrets_shared_readme(PROJECT_ROOT)
 
     # V0243-5: emit VCT_ORCHESTRATOR_ROOT + VCT_INFRASTRUCTURE_DIR + KG_BASE_DIR
     # to .claude/env managed block. Done unconditionally on orchestrator-root
@@ -11591,6 +11620,40 @@ def _materialize_orchestrator_self_claude_md(install_root: Path) -> None:
         _log_install_event(
             "4c/10", "warn",
             f"failed to materialize CLAUDE.md: {e}",
+        )
+
+
+def _materialize_vct_secrets_shared_readme(install_root: Path) -> None:
+    """v0.2.54 S-3: install-side wrapper around
+    :func:`vco_lib.secrets_bootstrap.materialize_shared_readme`.
+
+    Translates the shared helper's :class:`MaterializeReadmeResult`
+    into the phase-prefixed install-event stream and the user-visible
+    print line. Soft-fail: secrets-store problems never abort an
+    install.
+    """
+    from vco_lib.secrets_bootstrap import materialize_shared_readme
+    result = materialize_shared_readme(install_root)
+    if result.status == "template_missing":
+        _log_install_event(
+            "5c/10", "skip",
+            f"vct-secrets readme template missing: {result.message}",
+        )
+    elif result.status == "preserved":
+        _log_install_event(
+            "5c/10", "skip",
+            "~/.vct-secrets/shared/_README.md already exists (user copy preserved)",
+        )
+    elif result.status == "materialized":
+        print("[5c/10] Materialized ~/.vct-secrets/shared/_README.md "
+              "(agent-facing key schema)")
+        _log_install_event(
+            "5c/10", "ok", f"materialized {result.target}",
+        )
+    elif result.status == "error":
+        _log_install_event(
+            "5c/10", "warn",
+            f"failed to materialize vct-secrets shared _README.md: {result.message}",
         )
 
 

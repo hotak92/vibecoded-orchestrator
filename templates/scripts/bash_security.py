@@ -184,6 +184,29 @@ _rule(
 )
 
 
+# Rules whose block is "you tried to access credentials the wrong way".
+# For these, the block message appends a REMEDIATION signpost to the
+# canonical secrets primitive (v0.2.54 S-4): an agent blocked mid-task
+# needs to know where to look INSTEAD, not just that it was blocked.
+_CREDENTIAL_ACCESS_RULES: frozenset[str] = frozenset({
+    "env_grep_secrets",
+    "read_env_files",
+    "read_proc_environ",
+    "read_ssh_keys",
+    "read_bash_history",
+})
+
+_REMEDIATION_HINT = """\
+REMEDIATION: use the vct-secrets primitive instead of scraping the environment.
+  Discover keys:     tools/vct-secrets/vct list
+  Probe one key:     tools/vct-secrets/vct can-read --key KEY
+  Inject into child: tools/vct-secrets/vct exec --secret KEY=ENV_VAR -- cmd args
+  Key purposes:      ~/.vct-secrets/shared/_README.md
+  Launcher-managed secrets (github_pat, openai_api_key) resolve via vct-hub:
+  templates/scripts/vct_secrets_resolve.sh <project> <key>  (or vco_lib.agent_secrets)
+  Full docs: docs/VCT_SECRETS_PRIMITIVE.md"""
+
+
 def check_command(cmd: str) -> tuple[bool, str]:
     """Check a command string for security violations.
 
@@ -195,7 +218,10 @@ def check_command(cmd: str) -> tuple[bool, str]:
 
     for name, pattern, explanation in _RULES:
         if pattern.search(cmd_clean):
-            return False, f"[{name}] {explanation}"
+            reason = f"[{name}] {explanation}"
+            if name in _CREDENTIAL_ACCESS_RULES:
+                reason = f"{reason}\n{_REMEDIATION_HINT}"
+            return False, reason
 
     return True, ""
 

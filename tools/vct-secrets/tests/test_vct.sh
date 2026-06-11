@@ -252,6 +252,70 @@ t_copy() {
     [ "$(cat "$VCT_SECRETS_DIR/projects/dst_p/CKEY")" = "copyval" ] || return 1
 }
 
+# --- Test (v0.2.54 S-2): get/exec default to shared scope without --project ---
+t_shared_default_get_exec() {
+    mkdir -p "$VCT_SECRETS_DIR/shared"
+    printf 'shared-default-val' > "$VCT_SECRETS_DIR/shared/S2KEY"
+    chmod 600 "$VCT_SECRETS_DIR/shared/S2KEY"
+    local out
+    out=$("$VCT" get --key S2KEY 2>/dev/null) || return 1
+    [ "$out" = "shared-default-val" ] || { echo "    get got: $out"; return 1; }
+    out=$("$VCT" exec --secret S2KEY=S2VAR -- bash -c 'printf %s "$S2VAR"' 2>/dev/null) || return 1
+    [ "$out" = "shared-default-val" ] || { echo "    exec got: $out"; return 1; }
+}
+
+# --- Test (v0.2.54 S-5): can-read exit codes, silent output ---
+t_can_read() {
+    mkdir -p "$VCT_SECRETS_DIR/shared"
+    printf 'x' > "$VCT_SECRETS_DIR/shared/CR_KEY"
+    chmod 600 "$VCT_SECRETS_DIR/shared/CR_KEY"
+    "$VCT" can-read --key CR_KEY 2>/dev/null || return 1
+    local out
+    out=$("$VCT" can-read --key CR_KEY 2>/dev/null)
+    [ -z "$out" ] || { echo "    can-read printed: $out"; return 1; }
+    if "$VCT" can-read --key NOPE_MISSING 2>/dev/null; then
+        echo "    can-read exit 0 on missing key"; return 1
+    fi
+}
+
+# --- Test (v0.2.54 S-5): resolve prints source path, project wins over shared ---
+t_resolve_path() {
+    mkdir -p "$VCT_SECRETS_DIR/shared"
+    printf 'sv' > "$VCT_SECRETS_DIR/shared/RKEY"
+    chmod 600 "$VCT_SECRETS_DIR/shared/RKEY"
+    local out
+    out=$("$VCT" resolve --key RKEY 2>/dev/null) || return 1
+    [ "$out" = "$VCT_SECRETS_DIR/shared/RKEY" ] || { echo "    got: $out"; return 1; }
+    printf 'pv' | "$VCT" set --project rp --key RKEY 2>/dev/null
+    out=$("$VCT" resolve --project rp --key RKEY 2>/dev/null) || return 1
+    [ "$out" = "$VCT_SECRETS_DIR/projects/rp/RKEY" ] || { echo "    got: $out"; return 1; }
+    if "$VCT" resolve --key TOTALLY_MISSING 2>/dev/null; then
+        echo "    resolve exit 0 on missing key"; return 1
+    fi
+}
+
+# --- Test (v0.2.54 S-3/S-4 sibling): doctor warns on malformed github_pat ---
+t_doctor_token_shape() {
+    mkdir -p "$VCT_SECRETS_DIR/shared"
+    # Valid classic PAT shape → no token-shape warning for this file
+    printf 'ghp_%s' "$(printf 'a%.0s' $(seq 1 36))" > "$VCT_SECRETS_DIR/shared/github_pat"
+    chmod 600 "$VCT_SECRETS_DIR/shared/github_pat"
+    "$VCT" doctor 2> "$TMP/doctor1.err" || return 1
+    if grep -q "token-shape:.*shared/github_pat " "$TMP/doctor1.err"; then
+        echo "    valid ghp_ shape flagged"; return 1
+    fi
+    # Corrupted blob under a github_pat name → warned
+    printf 'not-a-real-token-blob-of-junk' > "$VCT_SECRETS_DIR/shared/github_pat.alt"
+    chmod 600 "$VCT_SECRETS_DIR/shared/github_pat.alt"
+    "$VCT" doctor 2> "$TMP/doctor2.err" || return 1
+    grep -q "token-shape" "$TMP/doctor2.err" || { echo "    junk shape not flagged"; return 1; }
+    # Warning must never leak the value
+    if grep -q "not-a-real-token-blob-of-junk" "$TMP/doctor2.err"; then
+        echo "    doctor leaked secret content"; return 1
+    fi
+    rm -f "$VCT_SECRETS_DIR/shared/github_pat" "$VCT_SECRETS_DIR/shared/github_pat.alt"
+}
+
 # --- Run ---
 printf 'Running vct test suite (VCT_SECRETS_DIR=%s)\n\n' "$VCT_SECRETS_DIR"
 
@@ -273,6 +337,10 @@ run_test "doctor fixes chmod"          t_doctor
 run_test "detect-project walks up"     t_detect_project
 run_test "get works in non-TTY"        t_get_non_tty
 run_test "copy between projects"       t_copy
+run_test "get/exec default to shared (S-2)" t_shared_default_get_exec
+run_test "can-read exit codes (S-5)"   t_can_read
+run_test "resolve prints source path (S-5)" t_resolve_path
+run_test "doctor github_pat shape check (S-3)" t_doctor_token_shape
 
 printf '\n=== Results: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 if [ $FAIL -gt 0 ]; then

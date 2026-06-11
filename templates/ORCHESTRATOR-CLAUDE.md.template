@@ -766,6 +766,41 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 
 ---
 
+## Secrets — read BEFORE any credential-bearing operation
+
+VCO ships a secrets primitive so agents never scrape the environment for tokens.
+
+1. **Never grep `env` for secrets.** `env | grep TOKEN` (and similar) is blocked by the `bash_security.py` PreToolUse hook. The block message includes the remediation below.
+
+2. **Two stores, one resolution habit**:
+   - **Launcher keychain** (canonical for `github_pat`, `openai_api_key`, module secrets): values live in the OS keychain, written via the launcher GUI (OnboardingWizard step 4, or Preferences → Special Secrets → SecretsPanel). Resolve through vct-hub: `{{ORCHESTRATOR_ROOT}}/templates/scripts/vct_secrets_resolve.sh <project-path> <key>` (`.ps1` sibling on Windows), or from Python: `from vco_lib.agent_secrets import get; get("github_pat")` — hub-first with automatic file-store fallback.
+   - **File store** (`~/.vct-secrets/{shared,projects/<NAME>}/<key>`, chmod-600 files): launcher-independent, managed by the `vct` CLI at `{{ORCHESTRATOR_ROOT}}/tools/vct-secrets/vct`.
+
+3. **Discover / probe / read (file store)**:
+   ```bash
+   vct list                          # key names only — never values
+   vct can-read --key KEY            # exit 0/1 probe, prints nothing
+   vct resolve  --key KEY            # which file would be read (project > shared)
+   vct get --key KEY --trusted       # print value (--trusted required on a TTY)
+   ```
+   `get`/`exec`/`can-read`/`resolve` default to the shared scope when `--project` is omitted; per-project keys override shared.
+
+4. **Prefer injection over printing**:
+   ```bash
+   vct exec --secret KEY=ENV_VAR -- cmd args     # value lands ONLY in the child's env
+   ```
+   Python equivalent: `vco_lib.agent_secrets.exec_with_secrets([...], secrets={"KEY": "ENV_VAR"})`. Secrets never touch argv or shell history.
+
+5. **GitHub tokens are not interchangeable.** Classic `ghp_*` (40 chars) serves `git push` + `gh`; fine-grained `github_pat_*` (~93 chars) serves scoped `gh` REST calls; App-installation `ghs_*` tokens do NOT work with `gh` (`HTTP 401: Bad credentials`). Per-key purposes for THIS machine: `~/.vct-secrets/shared/_README.md`. `vct doctor` shape-checks `github_pat*` keys. Strip whitespace before use if you read a token by hand: `printf %s "$T" | tr -d '\r\n '`.
+
+6. **`git push` setup**: register the helper once — `git config --global credential.https://github.com.helper "!$HOME/.vct-secrets/git-credential-vct"` (after copying it from `tools/vct-secrets/`; the launcher does not register it for you). For acquiring a PAT, point the user at the launcher GUI flow (OnboardingWizard inlines the github.com walkthrough) rather than improvising file drops.
+
+7. **Access gating**: vct-hub serves a key only when it's active for the project (`key_not_active` 404 otherwise — paused in SecretsPanel, or not declared by any installed module/shared slot). Separately, KG/code-graph collection writes are gated by the per-project access matrix (`vct_access_check.sh <project_id> <collection>` → `read|write|none`, fail-open to `write` with a WARNING when the hub is down). Secret reads and collection access are different gates — don't conflate them.
+
+8. **Machine-readable discovery**: `python install.py --bootstrap --json` → `.secrets` block (CLI path, store dir, shared key NAMES, helper-registration state, hub endpoint). Full reference: [`docs/VCT_SECRETS_PRIMITIVE.md`](docs/VCT_SECRETS_PRIMITIVE.md).
+
+---
+
 <!-- BEGIN: SETUP-ONLY (remove after first successful session) -->
 ## First-Run Setup
 
@@ -804,7 +839,7 @@ curl -s http://localhost:11435/api/tags               # Ollama models
 
 Inside a Claude Code session, run `/context` to print the active workspace path and KG collection name. If the collection is wrong (e.g. it's reusing another project's KG), you opened Claude in the wrong directory — see the per-project isolation note above and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
-**GitHub access** (only if you push from this project): the recommended pattern is a single chmod-600 file (e.g. `~/.your-secrets/github_pat`) plus a wrapper that exports `GITHUB_TOKEN` for the search MCP and a git credential helper that reads the same file. Don't store the PAT in `~/.claude.json`. Details: [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
+**GitHub access** (only if you push from this project): register the PAT via the launcher GUI (OnboardingWizard step 4, or Preferences → Special Secrets) — it lands in the OS keychain and the search MCP + hooks resolve it through vct-hub automatically. For shell use, see the **Secrets** section above (`vct exec` / `git-credential-vct`). Don't store the PAT in `~/.claude.json`. Details: [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) §Secrets.
 
 *Once you've completed first-run setup, remove this section: `python .claude/scripts/cleanup-setup-sections.py`*
 <!-- END: SETUP-ONLY -->
