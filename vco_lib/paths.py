@@ -62,14 +62,28 @@ def vct_root_dir() -> Path:
 def launcher_db_path() -> Path:
     """Return the canonical path to the launcher SQLite DB.
 
-    Equivalent to ``vct_root_dir() / "launcher.db"`` — a convenience for
-    the many callers across ``install.py`` / ``vco_lib/diagram_indexer.py``
-    / ``vco_lib/project_init.py`` that always want the launcher.db file
-    rather than the state-root directory.
+    A convenience for the many callers across ``install.py`` /
+    ``vco_lib/diagram_indexer.py`` / ``vco_lib/project_init.py`` that
+    always want the launcher.db file rather than the state-root
+    directory.
 
-    Resolution rules inherit from :func:`vct_root_dir` — honours
-    ``$VCT_STATE_DIR`` first, falls back to ``~/.vct/launcher.db``.
+    Resolution priority:
+      1. ``$VCT_LAUNCHER_DB_PATH`` env override (v0.2.54: previously
+         honoured ONLY by ``launcher_db_reader._discover_db_path`` —
+         split-brain: setting the var moved the reader's view of the DB
+         but not ``config_projection`` / ``project_init``, so e.g.
+         ``_rebind_orchestrator_root_to_canonical_locked`` operated on a
+         DIFFERENT database than the reader reported on).
+      2. :func:`vct_root_dir` — honours ``$VCT_STATE_DIR``, falls back
+         to ``~/.vct/launcher.db``.
+
+    Unlike the reader's discovery helper, this resolver does NOT
+    require the file to exist (callers that create/await the DB need
+    the would-be path).
     """
+    override = os.environ.get("VCT_LAUNCHER_DB_PATH", "").strip()
+    if override:
+        return Path(override)
     return vct_root_dir() / "launcher.db"
 
 

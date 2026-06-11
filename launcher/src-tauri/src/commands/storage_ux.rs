@@ -268,6 +268,19 @@ fn compose_override_path() -> Result<PathBuf, String> {
     Ok(root.join("infrastructure").join("compose.override.yaml"))
 }
 
+/// v0.2.54 (C-RT-5): the Docker-Compose auto-load sibling. Docker
+/// Compose auto-loads `docker-compose.override.yml` (and `volumes.rs`'s
+/// Bug-31 path historically wrote ONLY that name while this module
+/// wrote ONLY `compose.override.yaml`) — two generators, two filenames,
+/// divergent bodies. Which volume aliases applied depended on which
+/// compose binary ran; a runtime switch could re-point Weaviate/Ollama
+/// at fresh empty volumes. Fix: every write here mirrors the SAME body
+/// to BOTH names (volumes.rs does the same in the other direction).
+fn compose_override_sibling_path() -> Result<PathBuf, String> {
+    let root = super::installer::find_local_repo_root()?;
+    Ok(root.join("infrastructure").join("docker-compose.override.yml"))
+}
+
 // ---------------------------------------------------------------------------
 // Atomic config persistence
 // ---------------------------------------------------------------------------
@@ -452,27 +465,19 @@ pub fn render_override_yaml(cfg: &StorageConfig) -> String {
     format!("{header}\nservices: {{}}\nvolumes: {{}}\n")
 }
 
-/// Atomic write of the override file.
+/// Atomic write of the override file. v0.2.54 (C-RT-5): mirrors the
+/// identical body to BOTH compose auto-load names — see
+/// [`compose_override_sibling_path`].
 pub fn write_compose_override(body: &str) -> Result<PathBuf, String> {
     let path = compose_override_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
-    }
-    let mut tmp = path.clone();
-    // set_extension replaces the final extension; on `compose.override.yaml`
-    // this yields `compose.override.yaml.tmp` after the rename target.
-    tmp.set_extension("yaml.tmp");
-    std::fs::write(&tmp, body).map_err(|e| format!("write tmp {}: {}", tmp.display(), e))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| format!("rename {} -> {}: {}", tmp.display(), path.display(), e))?;
+    write_override_yaml_to(&path, body)?;
+    let sibling = compose_override_sibling_path()?;
+    write_override_yaml_to(&sibling, body)?;
     Ok(path)
 }
 
-/// Atomic write to an arbitrary target path. Used by tests and reserved
-/// for a future install-wizard adapter that needs to emit the override
-/// file directly without spinning up the full Tauri command machinery.
-#[allow(dead_code)]
+/// Atomic write to an arbitrary target path. Used by
+/// [`write_compose_override`] (v0.2.54: both auto-load names) and tests.
 pub fn write_override_yaml_to(target: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)

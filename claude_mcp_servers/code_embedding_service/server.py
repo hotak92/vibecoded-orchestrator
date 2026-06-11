@@ -12,7 +12,8 @@ Environment variables:
   CODE_EMBED_MODEL        HuggingFace model ID or Ollama model name
                           gpu default: "codesage/codesage-large-v2"
                           ollama default: "unclemusclez/jina-embeddings-v2-base-code:latest"
-  CODE_EMBED_DEVICE       "cuda" | "cpu" | "auto"  (default: "auto", gpu backend only)
+  CODE_EMBED_DEVICE       "cuda" | "mps" | "cpu" | "auto"  (default: "auto", gpu backend only)
+                          "auto" probes CUDA, then Apple Metal (MPS), then CPU.
   CODE_EMBED_DTYPE        "float32" | "bfloat16" | "float16"  (default: "bfloat16", gpu backend only)
   CODE_EMBED_PORT         Server port (default: 11440)
   CODE_EMBED_BATCH_SIZE   Max batch size (default: 32)
@@ -91,7 +92,20 @@ def _load_gpu_model():
     device = DEVICE
     if device == "auto":
         import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif (
+            getattr(torch.backends, "mps", None) is not None
+            and torch.backends.mps.is_available()
+        ):
+            # v0.2.54 (gpu-audit C-7): Apple Metal. Stock torch wheels
+            # have shipped MPS for years and sentence-transformers
+            # accepts device="mps" — the previous auto-probe only
+            # checked CUDA, so Apple Silicon hosts running this service
+            # natively (outside a container) silently landed on CPU.
+            device = "mps"
+        else:
+            device = "cpu"
 
     dtype_map = {
         "float32": "float32",

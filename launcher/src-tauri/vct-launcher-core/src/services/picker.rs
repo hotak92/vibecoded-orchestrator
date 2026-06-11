@@ -110,8 +110,17 @@ pub const CANONICAL_WEAVIATE_COLLECTIONS: &[&str] = &[
     "_CodeFunction",
     "_CodeInteraction",
     "_CodeModule",
+    // v0.2.54 P2 fix: was lowercase `_development`, which never matched
+    // the real per-project development collections (`<Project>_Development`,
+    // capital D — see weaviate_mcp/server.py + project_init.py naming) so
+    // the picker undercounted container fullness. Suffix match is
+    // case-insensitive (below) to also cover legacy lowercase classes.
+    "_Development",
+    // v0.2.54 P2 fix: `_Diagrams` (per-project Excalidraw/Mermaid index,
+    // `<Basename>_Diagrams` — weaviate_mcp/server.py:2020) was missing
+    // entirely.
+    "_Diagrams",
     "_KnowledgeGraph",
-    "_development",
 ];
 
 /// Ollama model names the orchestrator expects to find on `/api/tags`.
@@ -128,7 +137,10 @@ pub const CANONICAL_OLLAMA_MODELS: &[&str] = &[
 /// Return true iff `name` matches one of the canonical Weaviate
 /// collection patterns. Match rule:
 ///   - exact match → true
-///   - suffix match (when canonical starts with `_`) → true
+///   - suffix match (when canonical starts with `_`) → true.
+///     v0.2.54: case-insensitive — pre-v0.2.46 installs created
+///     lowercase `_development` classes while current installs create
+///     `_Development`; the picker must recognize both generations.
 ///   - otherwise → false
 pub fn is_canonical_collection(name: &str) -> bool {
     for canon in CANONICAL_WEAVIATE_COLLECTIONS {
@@ -137,8 +149,12 @@ pub fn is_canonical_collection(name: &str) -> bool {
         }
         // Underscore-prefixed canonicals are suffix matchers — match e.g.
         // "ClaudeOrchestrator_CodeFunction" against "_CodeFunction".
-        if canon.starts_with('_') && name.ends_with(*canon) {
-            return true;
+        if canon.starts_with('_') {
+            let lc_name = name.to_ascii_lowercase();
+            let lc_canon = canon.to_ascii_lowercase();
+            if lc_name.ends_with(&lc_canon) {
+                return true;
+            }
         }
     }
     false
@@ -633,7 +649,12 @@ mod tests {
         // Suffix match — orchestrator-prefixed collection.
         assert!(is_canonical_collection("ClaudeOrchestrator_CodeFunction"));
         assert!(is_canonical_collection("MyProject_KnowledgeGraph"));
+        // v0.2.54: real installs use `_Development` (capital D); legacy
+        // pre-v0.2.46 classes were lowercase — both must match.
+        assert!(is_canonical_collection("MyProject_Development"));
         assert!(is_canonical_collection("MyProject_development"));
+        // v0.2.54: `_Diagrams` (Excalidraw/Mermaid index) is canonical.
+        assert!(is_canonical_collection("MyProject_Diagrams"));
         // Non-canonical: no exact match, no underscore suffix match.
         assert!(!is_canonical_collection("RandomClass"));
         assert!(!is_canonical_collection(""));
@@ -724,7 +745,8 @@ mod tests {
             "_CodeFunction",
             "_CodeClass",
             "_CodeModule",
-            "_development",
+            "_Development",
+            "_Diagrams",
             "DocumentChunks",
         ];
         for n in &must_have {

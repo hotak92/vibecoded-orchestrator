@@ -259,7 +259,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, TypedDict
 
-from vco_lib.paths import vct_root_dir
 
 
 # ─── Canonical key registry ─────────────────────────────────────────────
@@ -495,13 +494,16 @@ class _DbProjectRow:
 def _resolve_launcher_db_path() -> Path:
     """Return the path to the launcher's SQLite DB.
 
-    Mirrors Rust's ``crate::paths::vct_root_dir().join("launcher.db")``
-    via :func:`vco_lib.paths.vct_root_dir`.
+    v0.2.54: delegates to :func:`vco_lib.paths.launcher_db_path` so the
+    ``$VCT_LAUNCHER_DB_PATH`` override is honoured uniformly across
+    every Python-side resolver (previously only ``launcher_db_reader``
+    honoured it — split-brain).
 
     The file may not exist (fresh install where the launcher has never
     been started). Callers must handle that.
     """
-    return vct_root_dir() / "launcher.db"
+    from vco_lib.paths import launcher_db_path
+    return launcher_db_path()
 
 
 def _open_db_read_only(db_path: Path) -> sqlite3.Connection:
