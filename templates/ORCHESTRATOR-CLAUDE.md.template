@@ -89,7 +89,22 @@ These rules apply to YOU (Claude) working inside any project that has VCO instal
 
 ---
 
-## Release discipline — no deferred fixes (added 2026-05-31, post-v0.2.41 retrospective)
+## Code modularity — search before you add, extract before you duplicate
+
+A short rule that applies to every code change you make, not just VCO ones.
+
+**Before writing any new function, class, helper, or script, search for existing code that does the same thing.** Use `hybrid_search` first (conceptual queries hit the KG and project docs), then `search_code_graph` (by purpose), then `grep` for exact symbols. If you find one or more existing implementations of the same capability:
+
+1. **Do not add a third implementation alongside the existing duplicates.** Each generation of duplication compounds — the next editor will face N+1 copies to keep in sync, and the bug-fix you make in your copy will silently drift from theirs.
+2. **Extract all existing implementations into one shared module** (`vco_lib/<topic>.py` for Python helpers, `<crate>/src/services/<topic>.rs` for Rust, `scripts/lib/<topic>.sh` for shell). Pick the cleanest variant as the seed and reconcile differences against the call-sites.
+3. **Migrate the existing call-sites** to import the shared helper.
+4. **Then add your new call-site** that also calls the shared helper.
+
+Steps 2–3 cost time you didn't budget for. They are still cheaper than letting the duplication grow another generation. Track J of this cycle exists specifically to clean up duplications that earlier cycles deferred; do not add to its queue.
+
+**Same principle for file size**: if your change would add more than ~50 contiguous lines to a file already past ~5,000 lines (`install.py` is past 25,000 today), extract the new logic into a new module instead. Mega-scripts make every future audit and refactor more expensive.
+
+When extraction is genuinely hard (the new logic depends on local mutable state in a long sequential flow), extract the pure portion to a helper module and leave a thin orchestration shim in the original file. Document the split in a comment so the next editor does not merge them back.
 
 **Hard rule**: never push a tagged release if there is ANY known unresolved issue at tag time. "Known" means anything that has been (a) reported by an audit/review, (b) flagged by CI on the current branch, (c) reproduced as a bug in this or a prior cycle and not yet closed, or (d) explicitly written down as a backlog/follow-up item targeting "next version."
 
