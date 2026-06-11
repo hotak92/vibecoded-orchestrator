@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: AGPL-3.0-or-later
+﻿# SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 # PowerShell wrapper for detect_workflow_needs.py (Windows sibling).
 # PS 5.1 compatible. Pure-stdlib Python — no venv required.
