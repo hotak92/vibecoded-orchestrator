@@ -2,7 +2,7 @@
 name: helper-scripter
 description: Creates agents, skills, hooks, helper scripts. Self-improves automation system.
 short_desc: creates agents, skills, hooks, and automation scripts
-keywords: ["bash script", "shell script", "automation script", "helper script", hook, "create a script", hooks, "write a hook", "create agent", "create skill", "slash command", "Claude Code hook", "bash helper", "Python helper script"]
+keywords: ["bash script", "shell script", "automation script", "helper script", "create a script", "write a hook", "create agent", "create skill", "slash command", "Claude Code hook"]
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: haiku
 effort: high

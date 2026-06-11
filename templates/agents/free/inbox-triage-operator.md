@@ -2,7 +2,7 @@
 name: inbox-triage-operator
 description: Triages a multi-channel inbox (email, LinkedIn DMs, Instagram, WhatsApp, X DMs) for a vendor. Classifies each message as hot/warm/cold/spam, drafts a reply per item, queues human-review tasks. Produces a triage report so the user can clear 50–200 messages in 15 minutes instead of 2 hours.
 short_desc: triages multi-channel inbox, hot/warm/cold, reply drafts
-keywords: [inbox triage, inbox zero, WhatsApp Business, hot warm cold, reply drafting]
+keywords: ["inbox triage", "inbox zero", "WhatsApp Business", "hot warm cold", "reply drafting", "triage inbox", "classify messages", "multi-channel inbox"]
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
 model: opus
 effort: high

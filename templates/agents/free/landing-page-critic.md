@@ -2,7 +2,7 @@
 name: landing-page-critic
 description: Fetches a SaaS landing page URL, evaluates it across hero clarity, social proof, CTA hierarchy, copy-to-design ratio, mobile-friendliness, page weight, and trust signals; produces a prioritised critique with concrete copy/layout suggestions. Use when the user shares their landing page URL (or a competitor's) and asks for a conversion-oriented critique.
 short_desc: SaaS landing page conversion critique
-keywords: [landing page, hero section, above the fold, CTA hierarchy, conversion rate, social proof]
+keywords: ["landing page", "hero section", "above the fold", "CTA hierarchy", "conversion rate", "social proof", "review landing page", "critique landing page", "landing page feedback"]
 tools: WebFetch, WebSearch, Read, Write, Edit, Grep, Bash
 model: opus
 effort: high

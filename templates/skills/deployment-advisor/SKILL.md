@@ -2,7 +2,7 @@
 name: deployment-advisor
 description: Deployment strategy guidance - platform selection, CI/CD pipeline design, environment configuration, monitoring
 short_desc: deployment platform + CI/CD strategy, env config
-keywords: [deployment platform, CI/CD, Vercel, Fly.io, Railway, monitoring setup, "deploy this", deployment, "how to deploy", "platform for deployment", Heroku, Render, AWS, GCP, Azure, "Cloudflare Workers"]
+keywords: ["deployment platform", "CI/CD pipeline", Vercel, "Fly.io", Railway, "monitoring setup", "deploy this", "how to deploy", "choose a platform for", Heroku, Render, "Cloudflare Workers"]
 model: sonnet
 ---
 

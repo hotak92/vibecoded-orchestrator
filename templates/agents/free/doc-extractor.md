@@ -2,7 +2,7 @@
 name: doc-extractor
 description: Extract knowledge from scattered documentation - read-only, no modifications
 short_desc: extract knowledge from docs (read-only)
-keywords: [scattered documentation, extraction report, status tags, knowledge extraction, consolidate documentation, "scattered docs", "catastrophic forgetting", "documentation extraction", "review the docs", "check the docs", "extract from documentation", "read all the docs", "summarize docs", "pull from documentation", "find in docs"]
+keywords: ["scattered documentation", "extraction report", "knowledge extraction", "consolidate documentation", "documentation extraction", "extract from documentation", "summarize docs", "documentation review", "knowledge consolidation"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high

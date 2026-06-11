@@ -2,7 +2,7 @@
 name: photoshop-scripting
 description: Writes Adobe Photoshop automation scripts in UXP (JavaScript) or legacy ExtendScript (JSX), and GIMP scripts in Python (Script-Fu fallback). Use when a repetitive Photoshop task needs to run on dozens of files, when a custom panel/plugin is wanted, or when an Action recorder won't capture the logic needed.
 short_desc: Photoshop UXP/ExtendScript + GIMP automation
-keywords: [Photoshop, UXP, ExtendScript, JSX panel, GIMP, Script-Fu]
+keywords: ["Photoshop automation", UXP, ExtendScript, "JSX panel", GIMP, "Script-Fu", "batch process images", "automate Photoshop", "write a Photoshop script"]
 model: opus
 effort: high
 ---

@@ -2,7 +2,7 @@
 name: ai-rag-advisor
 description: Expert guidance on RAG (Retrieval-Augmented Generation) system design including chunking strategies, embedding selection, retrieval methods, and vector database choices
 short_desc: RAG design: chunking, retrieval, vector DB choice
-keywords: [RAG, chunking, vector database, retrieval, reranker, GraphRAG, "embedding model", "vector search", "embedding search", "RAG pipeline", Weaviate, Pinecone, Qdrant, "hybrid retrieval", "semantic search"]
+keywords: ["RAG pipeline", "design a RAG system", "chunking strategy", "vector database", "choose an embedding model", "hybrid retrieval", "improve retrieval quality", "which vector database", "RAG evaluation"]
 model: sonnet
 ---
 
