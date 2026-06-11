@@ -2,7 +2,7 @@
 name: workflow-maintain
 description: Analyzes project workflow setup and suggests/creates needed automation for hooks, scripts, skills, and agents
 short_desc: audit and improve project workflow automation
-keywords: [workflow automation, hooks, scripts, project setup, automation audit, "audit workflow", "setup workflow", "improve workflow", "add automation", "workflow improvement"]
+keywords: ["workflow automation", "project setup", "automation audit", "audit workflow", "setup workflow", "improve workflow", "add automation", "workflow improvement", "automate this task"]
 tools: Read, Write, Edit, Grep, Glob, Bash, Task
 model: sonnet
 ---

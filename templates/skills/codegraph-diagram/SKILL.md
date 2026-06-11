@@ -2,7 +2,7 @@
 name: codegraph-diagram
 description: "[PRE-ALPHA] Generate a Mermaid flowchart of a code subgraph centered on a function, class, or module. Runs `vco codegraph-diagram` under the hood, writes the .mmd to .claude/diagrams/codegraph/ so it's indexed for hybrid_search, and gives a 3-5 line summary plus a link to open it in the launcher's DiagramsTab. Output may be incomplete, inaccurate, or visually broken — always tell the user to verify against the source code before sharing. Use when the user asks \"show me a call graph for X\", \"what does Y depend on\", \"draw the inheritance chain rooted at Z\", or any other request that maps to a small-to-medium subgraph extraction from the code graph."
 short_desc: "[PRE-ALPHA] auto-generate a Mermaid call/import/extends graph from a seed symbol"
-keywords: [code graph, mermaid, flowchart, call graph, dependency diagram, codegraph, class hierarchy, architecture diagram]
+keywords: ["code graph", Mermaid, "call graph", "dependency diagram", "class hierarchy", "architecture diagram", "show me a call graph", "what does X depend on"]
 argument-hint: "<symbol> [--hops N] [--scope calls|imports|extends|composes|interactions|all]"
 model: inherit
 effort: medium

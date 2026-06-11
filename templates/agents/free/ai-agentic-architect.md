@@ -2,7 +2,7 @@
 name: ai-agentic-architect
 description: Design multi-agent systems and agentic workflows with coordination strategies
 short_desc: orchestrate multi-agent systems and workflows
-keywords: [multi-agent, agent orchestration, agentic workflow, task decomposition, coordination strategy, "multi-agent coordination", subagent, "agent swarm", "agentic system", "multi-step agent", "parallel agents", "agent design"]
+keywords: [multi-agent, "agentic workflow", "task decomposition", "coordination strategy", "multi-agent coordination", "agent swarm", "agentic system", "parallel agents", "design multi-agent"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: xhigh

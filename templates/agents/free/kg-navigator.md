@@ -2,7 +2,7 @@
 name: kg-navigator
 description: Navigate knowledge graph - search, explore connections, identify gaps (read-only)
 short_desc: navigate KG: search, explore, find gaps
-keywords: [knowledge graph, KG node, WikiLinks, kg-search, hybrid_search, semantic_graph_search]
+keywords: ["knowledge graph", "KG node", "WikiLinks", "search KG", "explore KG", "KG connections", "navigate knowledge", "find KG gaps"]
 tools: Read, Grep, Bash
 model: sonnet
 effort: high

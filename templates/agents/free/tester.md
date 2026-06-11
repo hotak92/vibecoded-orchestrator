@@ -2,7 +2,7 @@
 name: tester
 description: Test creation, verification, bug investigation with quality review
 short_desc: writes pytest, integration tests, coverage review
-keywords: [pytest, "test coverage", "unit test", "integration test", "edge case", "regression test", "flaky test", "failing test first", test-driven, "write tests", "add tests", "test suite", "coverage gap", "tests for", "pytest fixture"]
+keywords: [pytest, "test coverage", "unit test", "integration test", "edge case", "regression test", "flaky test", "failing test first", "write tests", "add tests", "test suite", "coverage gap"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: high
