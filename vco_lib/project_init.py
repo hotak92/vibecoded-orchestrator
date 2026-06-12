@@ -2663,24 +2663,14 @@ def _hook_globs_for_os() -> tuple[str, ...]:
     """Return ALL hook flavours to ship — both `.sh` and `.ps1` flavours,
     on every OS.
 
-    History (v0.2.14 fix, audit Concern #2 2026-05-17): we used to ship only
-    the host-OS flavour (`.sh` on Linux/macOS; `.ps1` on Windows). That
-    broke cross-OS workflows where the same project folder is opened from
-    both POSIX and Windows shells (dual-boot, WSL crossover, network-
-    mounted projects): orphan stale hooks of the OTHER flavour lingered
-    and could be invoked by the unexpected shell. They're text files
-    (~few KB each); the runtime picks which extension matches its shell,
-    so shipping both is cheap + correct.
+    v0.2.54 Track G (G-4): thin alias over the single source of truth in
+    `vco_lib.bundle_globs.hook_globs()` — install.py's Step 9b and the
+    orchestrator-self materialize route through the same helper, ending
+    the era of three divergent hook-flavour policies. See that module's
+    docstring for the v0.2.14 Concern-#2 history of WHY both flavours.
     """
-    return ("*.sh", "*.ps1")
-
-
-def _hook_glob_for_os() -> str:
-    """Legacy single-glob accessor kept for backward-compat in other
-    callsites. Prefer `_hook_globs_for_os()`. Mirrors install.py:5641.
-    """
-    import platform
-    return "*.ps1" if platform.system() == "Windows" else "*.sh"
+    from vco_lib.bundle_globs import hook_globs
+    return hook_globs()
 
 
 def _settings_template_path(orchestrator_root: Path) -> Path:
@@ -2806,7 +2796,8 @@ def _enumerate_bundle_files(
     orchestrator_root: Path,
     project_root: Path | None = None,
 ) -> list[_BundleFileOp]:
-    """Build the list of files to install. OS-aware (hooks pick .sh vs .ps1).
+    """Build the list of files to install. Hooks ship BOTH .sh + .ps1
+    flavours on every OS (vco_lib.bundle_globs policy, v0.2.54 Track G).
 
     `project_root` (optional) is the install target folder. When given,
     `{{PROJECT_ROOT}}` placeholder substitution in agent / skill .md
@@ -2856,12 +2847,16 @@ def _enumerate_bundle_files(
                     always_overwrite=True,
                 ))
 
-    # Scripts: copy ALL recognized flavours (mirrors install.py:5729).
+    # Scripts: copy ALL recognized flavours. v0.2.54 Track G (G-4): the
+    # pattern list is shared with install.py's Step 9b via
+    # vco_lib.bundle_globs — the two inline copies had drifted (this one
+    # was missing the extension-less detect-workflow-needs /
+    # generate-workflow wrappers, so project bundles silently skipped them).
+    from vco_lib.bundle_globs import script_patterns as _script_patterns
     scripts_src = templates / "scripts"
     if scripts_src.exists():
-        script_patterns = ["*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*", "cost-summary"]
         seen: set[str] = set()
-        for pat in script_patterns:
+        for pat in _script_patterns():
             for script_file in sorted(scripts_src.glob(pat)):
                 if script_file.is_dir() or script_file.name in seen:
                     continue

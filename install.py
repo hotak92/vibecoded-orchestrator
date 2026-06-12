@@ -11880,9 +11880,19 @@ def _materialize_orchestrator_self_claude_dir(
             hooks_dst = vco_new_hooks
 
         hooks_dst.mkdir(parents=True, exist_ok=True)
+        # v0.2.54 Track G (G-4): filter by the shared hook-flavour globs.
+        # Pre-G-4 this loop copied every file via iterdir() — which DID
+        # ship both .sh + .ps1 flavours, but by accident rather than
+        # policy, and would also have shipped any stray non-hook file
+        # someone dropped into templates/hooks/. Now the both-flavours
+        # policy is explicit and shared with Step 9b + project_init.
+        from vco_lib.bundle_globs import hook_globs as _hook_globs
+        from fnmatch import fnmatch as _fnmatch
         for src in hooks_src.iterdir():
             if not src.is_file():
                 continue  # Skip _lib/ and other subdirs; handled below.
+            if not any(_fnmatch(src.name, g) for g in _hook_globs()):
+                continue  # Not a hook flavour we ship (.sh / .ps1 only).
             target = hooks_dst / src.name
             # v0.2.46 V47-B: individual hook file is a symlink → skip
             # the in-place copy; land VCO's version at the sibling.
@@ -24588,17 +24598,6 @@ def _install_agents_and_skills(
         print("  " + ", ".join(parts))
 
 
-def _hook_glob_for_os() -> str:
-    """Pick the OS-active hook file extension glob.
-
-    Linux/macOS run bash hooks; Windows runs the PowerShell siblings shipped
-    by `feat/hook-system-ps1-parity`. The two-template + two-glob approach
-    keeps per-OS installs lean — a Linux user never gets unused .ps1 files in
-    .claude/hooks/, and vice versa. See audit F1 (P0).
-    """
-    return "*.ps1" if platform.system() == "Windows" else "*.sh"
-
-
 def _settings_template_for_os(templates_dir: Path) -> Path:
     """Return the OS-specific settings.json template path.
 
@@ -24622,9 +24621,11 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     KG_COLLECTION, WEAVIATE_URL, etc. at runtime; the launcher exports
     VCT_INSTALL_ROOT per-project.
 
-    OS-active install: only the shell flavour native to the host is copied
-    (`*.sh` on Linux/macOS, `*.ps1` on Windows). The non-active flavour is
-    skipped — a Linux project never gets stray `.ps1` files. See audit F1.
+    Hook flavours: BOTH `.sh` and `.ps1` are copied on every OS (v0.2.54
+    Track G G-4, routed through `vco_lib.bundle_globs.hook_globs()` — the
+    same policy as the per-project bundle path in `project_init`). The
+    pre-G-4 native-flavour-only policy (audit F1) broke dual-boot / WSL-
+    crossover setups where the same folder is opened from both shells.
 
     settings.json merge rules (only when target file already exists):
       * recursive dict merge — template provides defaults, user keys win on conflict
@@ -24645,14 +24646,17 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     if not hooks_src.exists():
         return ""
 
-    hook_glob = _hook_glob_for_os()
+    from vco_lib.bundle_globs import hook_globs, script_patterns
     claude_dir = PROJECT_ROOT / ".claude"
     hooks_dst = claude_dir / "hooks"
     hooks_dst.mkdir(parents=True, exist_ok=True)
 
     installed_hooks = 0
     skipped_hooks = 0  # kept for the summary string; always 0 after the P2.2 fix.
-    for hook_file in sorted(hooks_src.glob(hook_glob)):
+    hook_files: list[Path] = []
+    for hook_glob in hook_globs():
+        hook_files.extend(hooks_src.glob(hook_glob))
+    for hook_file in sorted(set(hook_files)):
         target = hooks_dst / hook_file.name
         # Always overwrite top-level hooks. Same rationale as `_lib/` below:
         # hooks are NOT user-customisable; they're canonical orchestrator
@@ -24674,7 +24678,10 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     if lib_src.exists():
         lib_dst = hooks_dst / "_lib"
         lib_dst.mkdir(parents=True, exist_ok=True)
-        for lib_file in sorted(lib_src.glob(hook_glob)):
+        lib_files: list[Path] = []
+        for hook_glob in hook_globs():
+            lib_files.extend(lib_src.glob(hook_glob))
+        for lib_file in sorted(set(lib_files)):
             shutil.copy2(lib_file, lib_dst / lib_file.name)
 
     # Scripts referenced by hooks (e.g. precompact_prune.py). Live alongside
@@ -24689,11 +24696,10 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
         # Glob all script types: Python modules, shell wrappers (no ext or .sh),
         # and PowerShell wrappers (.ps1). Previously only *.py was copied which
         # left kg-search, kg-sync, code-graph-* etc. missing from user projects.
-        script_patterns = ["*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*", "cost-summary",
-                   # v0.2.54: extension-less bash wrappers for the workflow tooling
-                   "detect-workflow-needs", "generate-workflow"]
+        # v0.2.54 Track G (G-4): pattern list shared with the per-project
+        # bundle path via vco_lib.bundle_globs (the two copies had drifted).
         seen: set[str] = set()
-        for pattern in script_patterns:
+        for pattern in script_patterns():
             for script_file in sorted(scripts_src.glob(pattern)):
                 if script_file.name in seen or script_file.is_dir():
                     continue
