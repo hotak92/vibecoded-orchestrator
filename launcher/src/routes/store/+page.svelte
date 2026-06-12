@@ -53,8 +53,8 @@
     { id: 'orchestrator', name: 'Orchestrator', desc: 'Knowledge graph, code graph, and workflow automation for Claude Code. Free tier — persistent memory for your AI.', color: 'teal', icon: 'O', version: '', checkoutUrl: '' },
     { id: 'orchestrator-pro', name: 'Orchestrator Pro', desc: 'RL-scored retrieval that learns from your usage, curated agent packs, auto-updates. €19/mo · €149/yr · €199 lifetime.', color: 'purple', icon: 'O+', version: '', checkoutUrl: '' },
     { id: 'mao', name: 'Multi-Agent Orchestrator (MAO)', desc: 'Coming soon — 10 specialist agents + Maestro coordinator + Planner pipeline + Tauri UI on top of Standard.', color: 'pink', icon: 'M', version: 'preview', checkoutUrl: '' },
-    { id: 'transcrypt', name: 'Transcrypt', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'T', version: '2.1.0', checkoutUrl: '' },
-    { id: 'arzillibus', name: 'Arzillibus', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'A', version: '1.4.0', checkoutUrl: '' },
+    { id: 'ecosystem-app-1', name: 'Ecosystem App 1', desc: 'Audio transcription with AI-powered correction and vocabulary support', color: 'teal', icon: 'E', version: '2.1.0', checkoutUrl: '' },
+    { id: 'ecosystem-app-2', name: 'Ecosystem App 2', desc: 'Smart ticketing system for events and venue management', color: 'purple', icon: 'E', version: '1.4.0', checkoutUrl: '' },
     { id: 'convertifacile', name: 'ConvertiFacile', desc: 'Universal file conversion — documents, images, audio', color: 'pink', icon: 'C', version: '1.0.0', checkoutUrl: '' },
     { id: 'dataweave', name: 'DataWeave', desc: 'Visual data pipeline builder for ETL workflows', color: 'teal', icon: 'D', version: '0.9.0', checkoutUrl: '' },
     { id: 'formcraft', name: 'FormCraft', desc: 'Drag & drop form builder with smart validations', color: 'purple', icon: 'F', version: '1.2.0', checkoutUrl: '' },
@@ -64,15 +64,15 @@
   // Apps that are not yet purchasable. "Get" / "Activate" buttons are
   // replaced by a "Coming soon" badge for these IDs.
   // 2026-04-30: pre-launch hardening — only `orchestrator` is actually
-  // shippable today. Everything else (Pro, MAO, Transcrypt, Arzillibus,
+  // shippable today. Everything else (Pro, MAO, Ecosystem App 1, Ecosystem App 2,
   // ConvertiFacile, DataWeave, FormCraft, PixelSnap) is on the
   // pipeline, none are purchasable yet. Show "Coming soon" rather than
   // a misleading "Get" button that 404s in some flows.
   const COMING_SOON = new Set([
     'orchestrator-pro',
     'mao',
-    'transcrypt',
-    'arzillibus',
+    'ecosystem-app-1',
+    'ecosystem-app-2',
     'convertifacile',
     'dataweave',
     'formcraft',

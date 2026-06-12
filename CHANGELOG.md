@@ -299,7 +299,7 @@ A **public-repo cleanup release** triggered by a critical UX regression discover
 ### Security / Privacy
 
 - Scrubbed `pb992/VCT-Launcher` references (co-maintainer's private fork, not a public repo) from `BOOTSTRAP.md`, `docs/features/07-architecture.md`, `launcher/bundled_manifests/vct-hub-api.json`.
-- Scrubbed Lemon Squeezy product names (`Transcrypt`, `Arzillibus`, `ConvertiFacile` — maintainer's other personal products) from `launcher/docs/SETUP.md` dev-mode activation examples; replaced with `DemoProduct1/2/3`.
+- Scrubbed personal product codenames (maintainer's other personal products) from `launcher/docs/SETUP.md` dev-mode activation examples; replaced with `DemoProduct1/2/3`.
 - Scrubbed personal-narrative leakage in `CHANGELOG.md` (`instambul_map`, `SD15` → "an external user project" / "a long-lived legacy project"); preserved technical context.
 - Scrubbed chat-role narrative ("RL chat", "main VCO chat") from 6 Rust inline comments + 1 TypeScript comment + 1 GHA workflow + 1 pytest test description; replaced with neutral architectural language ("v0.2.49 access-matrix follow-up", "module-author workflows", etc.).
 - Scrubbed dated release-narrative paragraphs from `launcher/supabase/functions/rl-{artifact-url,latest-weights}/README.md` while keeping the architectural Vault-vs-Edge-Function-Secrets explainer.
@@ -2309,7 +2309,7 @@ shipped in [0.2.28] same-day.)
 
 Headline release: a **generic declarative HTTP-action dispatcher** that
 lets paid modules add new GUI controls without launcher rebuilds.
-Every future paid module (`vct-coordination`, `vct-transcrypt`,
+Every future paid module (`vct-coordination`, `vct-ecosystem-app-1`,
 `mao`, …) now declares its config tab entirely in its
 `vct-module.json` manifest; the launcher renders + executes
 everything generically. The four reset/retrain Tauri command stubs
@@ -2327,7 +2327,7 @@ persistent perf cost.
 
 - **`feat(launcher-ui)` Five new schema-rendered control kinds**: `text_input` (with optional apply/validate action), `number_input` (min/max/step), `status_display` (polled GET source + `render_template`), `file_picker` (Tauri native dialog, optional extension filter, directory mode), `link` (external via tauri-plugin-opener / internal via SvelteKit goto). New components under `launcher/src/lib/components/module-controls/`. Each is documented in `docs/PAID_MODULE_DEV_CHECKLIST.md`.
 
-- **`feat(launcher-core)` Generic per-(project × module) port table** — migration 017 adds `module_ports(project_id, module_id, port, updated_at)` with `INSERT OR IGNORE` backfill from the existing `projects.rl_port` column. New helpers `db.get_module_port(...)` / `set_module_port(...)` / `ensure_module_port(...)`. The legacy `get_project_rl_port` / `set_project_rl_port` pair becomes thin wrappers — every v0.2.21+ hub call site compiles unchanged. Unblocks coordination + transcrypt without per-module schema changes. See [`knowledge/concepts/generic-per-module-db-architecture.md`](knowledge/concepts/generic-per-module-db-architecture.md).
+- **`feat(launcher-core)` Generic per-(project × module) port table** — migration 017 adds `module_ports(project_id, module_id, port, updated_at)` with `INSERT OR IGNORE` backfill from the existing `projects.rl_port` column. New helpers `db.get_module_port(...)` / `set_module_port(...)` / `ensure_module_port(...)`. The legacy `get_project_rl_port` / `set_project_rl_port` pair becomes thin wrappers — every v0.2.21+ hub call site compiles unchanged. Unblocks coordination + ecosystem-app-1 without per-module schema changes. See [`knowledge/concepts/generic-per-module-db-architecture.md`](knowledge/concepts/generic-per-module-db-architecture.md).
 
 - **`feat(launcher)` WebKitGTK + EGL pre-flight probe** at `launcher/src-tauri/src/webkit_preflight.rs`. Linux-only (`#[cfg(target_os = "linux")]`); macOS/Windows no-op. Called from `main()` BEFORE Tauri init. Walks `/sys/class/drm/*` to find the primary GPU (`boot_vga=1`), maps to its `/dev/dri/renderD*` node, dlopens `libEGL.so.1` + `libgbm.so.1`, and calls `eglInitialize` against the GBM platform display. On the well-known `EGL_NOT_INITIALIZED` (0x3001) failure signature — most commonly: NVIDIA `apt`-upgraded its proprietary userspace without a kernel-module reload — sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` (and `__NV_DISABLE_EXPLICIT_SYNC=1` on Wayland) so WebKit falls back to its legacy renderer instead of aborting the process. Kill-switch: `VCT_WEBKIT_PREFLIGHT_OFF=1`. User-set `WEBKIT_DISABLE_DMABUF_RENDERER` is respected (the probe is a no-op when the user already chose). Live-verified against the broken NVIDIA driver state on the dev box on 2026-05-22. See [`knowledge/concepts/webkit-egl-preflight-probe.md`](knowledge/concepts/webkit-egl-preflight-probe.md).
 
@@ -2335,7 +2335,7 @@ persistent perf cost.
 
 ### Changed
 
-- **`refactor(launcher)` Renamed `commands::rl_service` → `commands::module_service`** (~10 files, ~40 textual refs updated). The file's internals were already generic — v0.2.21's header noted "Today this module supports exactly one consumer — `vct-rl-reranker` — but the helpers are written against `ModuleManifest` so future container modules drop in without a code change". Now that v0.2.26 has dispatcher + module_ports for coordination + transcrypt, the file name matches the scope. Pure rename — no behavioural change.
+- **`refactor(launcher)` Renamed `commands::rl_service` → `commands::module_service`** (~10 files, ~40 textual refs updated). The file's internals were already generic — v0.2.21's header noted "Today this module supports exactly one consumer — `vct-rl-reranker` — but the helpers are written against `ModuleManifest` so future container modules drop in without a code change". Now that v0.2.26 has dispatcher + module_ports for coordination + ecosystem-app-1, the file name matches the scope. Pure rename — no behavioural change.
 
 - **`docs(paid-modules)` Extended `docs/PAID_MODULE_DEV_CHECKLIST.md`** with two new sections: "GUI tab integration via the declarative dispatcher (v0.2.26+)" (declarative-vs-legacy decision matrix, minimum example, polling example, port registration contract, template grammar reference, what-still-requires-rebuild list) and updates to the "When you add a new paid module" procedure (now includes explicit steps for declaring the GUI tab in the manifest + wiring port registration via `ensure_module_port`).
 

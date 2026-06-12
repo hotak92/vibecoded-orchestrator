@@ -2951,7 +2951,7 @@ fn _unused_host_import(_h: ProjectHost) {}
 #[cfg(test)]
 mod tests {
     //! Reviewer-B fix-8 audit: the home page used to advertise 6 vapor
-    //! "sister apps" (Transcrypt / Arzillibus / ConvertiFacile / DataWeave /
+    //! "sister apps" (Ecosystem App 1 / Ecosystem App 2 / ConvertiFacile / DataWeave /
     //! FormCraft / PixelSnap). After Bug 16 the source of truth is
     //! `list_module_catalog`, so the home page renders only what this list
     //! returns. These tests pin the contract:
@@ -3093,8 +3093,8 @@ mod tests {
         let db = open_db();
         let entries = builtin_catalog_entries(&db);
         let forbidden = [
-            "transcrypt",
-            "arzillibus",
+            "ecosystem-app-1",
+            "ecosystem-app-2",
             "convertifacile",
             "dataweave",
             "formcraft",

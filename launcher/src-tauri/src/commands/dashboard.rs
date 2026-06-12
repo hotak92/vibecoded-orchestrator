@@ -348,7 +348,7 @@ pub async fn update_mcp_setting(
     Ok(updated)
 }
 
-/// Register a new custom MCP server (e.g., user adds Transcrypt live MCP).
+/// Register a new custom MCP server (e.g., user adds an ecosystem app's live MCP).
 ///
 /// Side effects:
 /// 1. Persists the server entry into `~/.vct/orchestrator.json` (so the

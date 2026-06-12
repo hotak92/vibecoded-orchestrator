@@ -3,7 +3,7 @@
 //! in v0.2.21 for the Pro-tier `vct-rl-reranker` container; renamed in
 //! v0.2.26 alongside the declarative dispatcher rollout to reflect that
 //! the helpers are written against `ModuleManifest` and apply to any
-//! paid module (`vct-coordination`, `vct-transcrypt`, future) whose
+//! paid module (`vct-coordination`, `vct-ecosystem-app-1`, future) whose
 //! manifest's `runtime` block carries the container-specific fields
 //! added in v0.2.21 (`container_name_template`, `image_ref`, `ports`,
 //! `volumes`, `env_derived`).

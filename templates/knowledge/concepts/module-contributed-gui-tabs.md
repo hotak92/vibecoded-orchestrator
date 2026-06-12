@@ -132,7 +132,7 @@ The framework itself didn't change — the orchestrator-core's manifest just shr
 
 ### v0.2.26 evolution — declarative dispatcher + 5 new controls (2026-05-22)
 
-v0.2.26 is the framework's largest schema bump since v0.2.20 ship. Two structural changes + five new control kinds. The driving motivation: **adding a new paid module (vct-coordination, vct-transcrypt, future) should no longer require a launcher rebuild**. Pre-v0.2.26 every `action` / `on_change` / `options_source` field was a string naming a Tauri command that had to be registered in the launcher's `invoke_handler!` — adding a module's command required a signed launcher release. After v0.2.26, modules express their actions as declarative JSON the launcher executes via one generic dispatcher.
+v0.2.26 is the framework's largest schema bump since v0.2.20 ship. Two structural changes + five new control kinds. The driving motivation: **adding a new paid module (vct-coordination, vct-ecosystem-app-1, future) should no longer require a launcher rebuild**. Pre-v0.2.26 every `action` / `on_change` / `options_source` field was a string naming a Tauri command that had to be registered in the launcher's `invoke_handler!` — adding a module's command required a signed launcher release. After v0.2.26, modules express their actions as declarative JSON the launcher executes via one generic dispatcher.
 
 #### Five new ControlKind variants
 
@@ -315,7 +315,7 @@ Module authors who genuinely need launcher-side state (e.g. a control that trigg
 
 ### v0.2.27 evolution — `events_paths_for` token + `log_path_template` manifest field (2026-05-22)
 
-v0.2.27 adds one new template token + one new optional manifest field, together giving paid modules a clean way to inject per-project log paths into a descriptor's request body. The RL module's two "Retrain global model" buttons were the first consumer; transcrypt and coordination will use the same pattern when they ship.
+v0.2.27 adds one new template token + one new optional manifest field, together giving paid modules a clean way to inject per-project log paths into a descriptor's request body. The RL module's two "Retrain global model" buttons were the first consumer; ecosystem-app-1 and coordination will use the same pattern when they ship.
 
 #### The problem this solves
 

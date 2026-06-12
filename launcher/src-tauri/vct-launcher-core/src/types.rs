@@ -83,7 +83,7 @@ impl OrchestratorTier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
-    /// Unique ID: "weaviate-kg", "ollama", "search", "code-embed", "transcrypt-live", etc.
+    /// Unique ID: "weaviate-kg", "ollama", "search", "code-embed", "ecosystem-app-1-live", etc.
     pub id: String,
     pub name: String,
     pub description: String,
