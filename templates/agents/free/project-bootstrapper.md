@@ -18,7 +18,7 @@ Creates new Claude Code project configuration from scratch, optionally in existi
 
 Set up complete VibeCoded Orchestrator workflow for new projects, either in empty directory or existing codebase. Analyzes code/docs if present, interviews user about project structure, creates canonical documentation and knowledge graph integration.
 
-**Assumes**: Global workflow infrastructure exists at `~/.claude/workflow/` (see `.claude/references/GLOBAL_WORKFLOW_STRUCTURE.md`). If not, run orchestrator-installer first.
+**Assumes**: The orchestrator is already installed (via `bash first-install.sh` or the launcher GUI). The per-project bundle drops into `.claude/` — agents, skills, hooks, and the MCP wiring needed for bootstrap. If the project doesn't have `.claude/` yet, run `python install.py` from the orchestrator clone before invoking this agent.
 
 ## Capabilities
 
@@ -1242,23 +1242,10 @@ Find proven project setup patterns and configuration strategies.
 - `query_temporal.py` - Point-in-time queries
 - `migrate_to_vocabulary.py` - Validate tags/vocabulary
 - `detect_duplicates.py` - Semantic duplicate detection
-- `queue_maintenance.py` - Background task queue
-- `process_maintenance_queue.py` - Queue processor
 
 ## Background Maintenance
 
-**Queue System**:
-- `queue_maintenance.py` - Queue tasks (knowledge-curator, graph-health-checker, code-graph-updater)
-- `process_maintenance_queue.py` - Process queue (runs every 15 min via cron)
-- `maintenance_status.py` - Check queue status
-- Catch-up mechanism: Runs missed tasks at next opportunity
-
-**Scheduled Tasks**:
-- Daily 2 AM: knowledge-curator (relationship extraction, deduplication)
-- Weekly Sunday 3 AM: graph-health-checker (consistency checks)
-- Every 15 minutes: process_maintenance_queue
-
-**Setup**: `.claude/scripts/setup_cron.sh` (creates cron jobs)
+The legacy queue-based maintenance system (`queue_maintenance.py` / `process_maintenance_queue.py`) was archived to `.claude/scripts/archive/` and is no longer wired into the default install. Maintenance tasks (knowledge-curator, graph-health-checker, code-graph-updater) are now triggered on-demand via the agents themselves or via the `PostToolUse` hooks listed in the Hook System section.
 
 ## Token-Efficient Hooks
 

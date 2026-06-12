@@ -16,16 +16,16 @@ Installs VibeCoded Orchestrator workflow system on new machines (Windows or Linu
 
 ## Purpose
 
-Set up complete VibeCoded Orchestrator environment on fresh machine, creating the global workflow structure documented in `.claude/references/GLOBAL_WORKFLOW_STRUCTURE.md`.
+Set up complete VibeCoded Orchestrator environment on a fresh machine. The canonical install path is `bash first-install.sh` (or `first-install.bat` on Windows) → `install.py`, which is cross-platform and handles all the steps below. This agent exists for cases where the user wants finer-grained control or needs to diagnose a partially-failed install.
 
 **Creates**:
-- Weaviate instance (local or connect to existing)
+- Weaviate instance (local containers via Podman/Docker)
 - Ollama with embedding models
-- Shared workflow infrastructure (agents, skills, scripts, hooks)
-- MCP server configuration
-- Global knowledge graph structure
+- Per-project bundle (drops `.claude/` agents, skills, scripts, hooks into each project)
+- MCP server registrations in `~/.claude.json`
+- Initial knowledge graph structure
 
-Enables user to then bootstrap individual projects using the installed infrastructure.
+Enables user to then bootstrap individual projects using the installed infrastructure (per-project bundles materialize on the next `install.py --update` or via the launcher GUI's "Add project" flow).
 
 ## Capabilities
 

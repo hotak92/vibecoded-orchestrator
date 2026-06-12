@@ -50,8 +50,6 @@ After creating reusable scripts:
 - Knowledge graph scripts (kg-search, kg-sync, kg-duplicates, kg-info)
 - Code graph scripts (code-graph-analyze, code-graph-query)
 - Quality assurance scripts (migrate_to_vocabulary.py, detect_duplicates.py, add_temporal_metadata.py)
-- Background maintenance scripts (queue_maintenance.py, maintenance_status.py, process_maintenance_queue.py)
-- Cron setup scripts (setup_cron.sh for scheduled tasks)
 
 ## Critical Thinking & Disagreement (IMPORTANT)
 
@@ -867,18 +865,6 @@ When >500 lines: Break into multiple tools, extract common functionality.
 .claude/scripts/migrate_to_vocabulary.py --check
 .claude/scripts/add_temporal_metadata.py knowledge/
 .claude/scripts/detect_duplicates.py --threshold 0.95
-```
-
-**Background Maintenance** (NEW):
-```bash
-.claude/scripts/queue_maintenance.py AGENT CONTEXT --priority N
-.claude/scripts/maintenance_status.py
-.claude/scripts/process_maintenance_queue.py --once
-```
-
-**Scheduled Tasks** (NEW):
-```bash
-.claude/scripts/setup_cron.sh  # Configure cron jobs for background maintenance
 ```
 
 ## Storage Systems
