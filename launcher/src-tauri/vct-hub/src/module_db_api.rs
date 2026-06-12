@@ -63,6 +63,7 @@ use rusqlite::{params, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 
 use vct_launcher_core::db::Db;
+use vct_launcher_core::services::boot_token;
 
 use super::modules_api::LauncherDbHandle;
 
@@ -803,13 +804,12 @@ async fn refresh_token(
     .into_response()
 }
 
+/// Generate a fresh module-access-token secret (32 OS-CSPRNG bytes,
+/// 64 lowercase hex chars). Delegates to `boot_token::generate_token`
+/// so every token surface in the workspace shares one implementation
+/// (Track I modularity follow-up — this was a byte-identical copy).
 fn generate_token_hex() -> Result<String, String> {
-    use rand::TryRngCore;
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|e| format!("rng: {}", e))?;
-    Ok(hex::encode(bytes))
+    boot_token::generate_token()
 }
 
 // ─── PK / column resolution via PRAGMA table_info ───────────────────────
