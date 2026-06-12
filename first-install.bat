@@ -89,12 +89,29 @@ echo   - Detect NVIDIA/CUDA drivers and print install hints (drivers stay manual
 echo   - Set up the orchestrator (~5-10 min)
 echo.
 
+REM Sniff for our own flags BEFORE any pause-able path (v0.2.54 Track W:
+REM the sniff used to live below the sanity check, so an unattended --yes
+REM run against a broken clone would hang forever on that pause). We accept
+REM --no-auto-launch (skip GUI auto-spawn at the end) and --yes (silent /
+REM non-interactive). Pass-through everything else to install.ps1.
+set "NO_AUTO_LAUNCH=0"
+set "NO_DESKTOP_ICON=0"
+set "YES_FLAG=0"
+for %%A in (%*) do (
+    if /I "%%~A"=="--no-auto-launch" set "NO_AUTO_LAUNCH=1"
+    if /I "%%~A"=="--no-desktop-icon" set "NO_DESKTOP_ICON=1"
+    if /I "%%~A"=="--yes"             set "YES_FLAG=1"
+    if /I "%%~A"=="--non-interactive" set "YES_FLAG=1"
+    if /I "%%~A"=="--quiet"           set "YES_FLAG=1"
+)
+
 REM Sanity check: install.ps1 must be alongside us.
+REM (pause gated on YES_FLAG so unattended runs exit instead of hanging)
 if not exist "%~dp0install.ps1" (
     echo ERROR: install.ps1 not found alongside first-install.bat.
     echo        Make sure you ran first-install.bat from the cloned repo root.
     echo        Repo: https://github.com/hotak92/vibecoded-orchestrator
-    pause
+    if "%YES_FLAG%"=="0" pause
     exit /b 1
 )
 
@@ -112,20 +129,8 @@ if %ERRORLEVEL% EQU 0 (
 REM -ExecutionPolicy Bypass: process-scoped policy override so install.ps1
 REM runs without modifying the machine policy. -NoProfile: skip the user's
 REM PowerShell profile (faster startup; deterministic env). -File: run
-REM the script. %* forwards all batch args to PowerShell.
-REM Sniff for our own flags. We accept --no-auto-launch (skip GUI auto-spawn
-REM at the end) and --yes (silent / non-interactive). Pass-through everything
-REM else to install.ps1.
-set "NO_AUTO_LAUNCH=0"
-set "NO_DESKTOP_ICON=0"
-set "YES_FLAG=0"
-for %%A in (%*) do (
-    if /I "%%~A"=="--no-auto-launch" set "NO_AUTO_LAUNCH=1"
-    if /I "%%~A"=="--no-desktop-icon" set "NO_DESKTOP_ICON=1"
-    if /I "%%~A"=="--yes"             set "YES_FLAG=1"
-    if /I "%%~A"=="--non-interactive" set "YES_FLAG=1"
-    if /I "%%~A"=="--quiet"           set "YES_FLAG=1"
-)
+REM the script. %* forwards all batch args to PowerShell. (Our own flag
+REM sniffing happens earlier, before the sanity check.)
 
 "%PSCMD%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1" %*
 set "INSTALL_EXIT=%ERRORLEVEL%"
@@ -133,7 +138,7 @@ set "INSTALL_EXIT=%ERRORLEVEL%"
 echo.
 if %INSTALL_EXIT% NEQ 0 (
     echo Install failed ^(exit %INSTALL_EXIT%^). See messages above.
-    pause
+    if "%YES_FLAG%"=="0" pause
     exit /b %INSTALL_EXIT%
 )
 
@@ -681,8 +686,10 @@ start "" "%LAUNCHER_BIN%"
 :end
 REM Keep the cmd window open when run from Explorer double-click;
 REM `pause` shows "Press any key to continue..." which is exactly
-REM what we want. Harmless if run from terminal.
-pause
+REM what we want. Gated on YES_FLAG so unattended runs (--yes /
+REM --non-interactive, e.g. CI) exit cleanly instead of hanging
+REM forever waiting for a keypress (v0.2.54 Track W).
+if "%YES_FLAG%"=="0" pause
 exit /b 0
 
 REM TODO(post-v1.0):
