@@ -490,20 +490,14 @@ pub struct LicenseGateInput<'a> {
     pub variant_ids: &'a [String],
 }
 
-/// Tier-ordering ladder. Admin maps to 4 (strict superset of enterprise)
-/// per docs/features/06-license-and-commercial.md §"Tier ordering" +
-/// db/tier.rs:40. Unknown strings fall through to rank=0 so attacker-
-/// supplied tier values can't silently escalate.
-fn tier_rank(t: &str) -> u32 {
-    match t {
-        "free" => 0,
-        "pro" => 1,
-        "mao" => 2,
-        "enterprise" => 3,
-        "admin" => 4,
-        _ => 0,
-    }
-}
+// Tier-ordering ladder: extracted to `vct_launcher_core::licensing::
+// tier_rank` (v0.2.54 Track H) so the dashboard feature-flag path and
+// this module gate rank tiers identically. Semantics unchanged: admin
+// maps to 4 (strict superset of enterprise) per
+// docs/features/06-license-and-commercial.md §"Tier ordering"; unknown
+// strings fall through to rank=0 so attacker-supplied tier values
+// can't silently escalate.
+use vct_launcher_core::licensing::tier_rank;
 
 /// v0.2.33 license-gate that consumes the narrow `LicenseGateInput`
 /// shape. The legacy `is_module_licensed(&ModuleManifest, &Db)`

@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::command;
+use tauri::{command, State};
 
+use crate::db::Db;
 use crate::types::{McpServerConfig, McpSettingType, OrchestratorConfig, OrchestratorTier};
+use vct_launcher_core::licensing::tier_rank;
 
 // ---------------------------------------------------------------------------
 // MCP secret keychain routing (P1-B, 2026-05-08)
@@ -94,7 +96,13 @@ fn tier_required_message(min_tier: &str, feature: &str) -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureFlags {
-    pub tier: OrchestratorTier,
+    /// Lowercase tier slug from `tier_cache.orchestrator_tier`
+    /// (`free` / `pro` / `mao` / `enterprise` / `admin`). Was the
+    /// 3-variant `OrchestratorTier` enum pre-v0.2.54; the wire shape is
+    /// unchanged for the 3 legacy values (serde already emitted the
+    /// lowercase slug) and the frontend `tierLabel`/`tierColor` helpers
+    /// pass unknown slugs through verbatim.
+    pub tier: String,
     pub can_auto_update: bool,
     pub can_disable_watermark: bool,
     pub has_rl_retrieval: bool,
@@ -102,19 +110,49 @@ pub struct FeatureFlags {
     pub has_mao: bool,
 }
 
-/// Get feature flags for the current user tier.
-/// `user_apps` comes from Supabase profile (the frontend passes it).
-#[command]
-pub fn get_feature_flags(user_apps: Vec<String>) -> FeatureFlags {
-    let tier = OrchestratorTier::from_apps(&user_apps);
+/// Pure flag computation from a tier slug. Pro features unlock at
+/// rank >= pro; MAO features at rank >= mao. `enterprise`/`admin` rank
+/// above `mao` (see `licensing::tier_rank`), so they inherit every
+/// flag — mirroring `VCThelpers/license/validator.py::TIER_FEATURES`
+/// semantics (`require_tier` is a >= comparison on TIER_ORDER).
+fn feature_flags_for_tier(tier: &str) -> FeatureFlags {
+    let rank = tier_rank(tier);
+    let pro = rank >= tier_rank("pro");
+    let mao = rank >= tier_rank("mao");
     FeatureFlags {
-        can_auto_update: tier.can_auto_update(),
-        can_disable_watermark: tier.can_disable_watermark(),
-        has_rl_retrieval: tier.has_rl_retrieval(),
-        has_curated_agents: tier.has_curated_agents(),
-        has_mao: tier.has_mao(),
-        tier,
+        tier: tier.to_string(),
+        can_auto_update: pro,
+        can_disable_watermark: pro,
+        has_rl_retrieval: pro,
+        has_curated_agents: pro,
+        has_mao: mao,
     }
+}
+
+/// Resolve the current tier slug from the launcher's `tier_cache` row —
+/// the SAME source `license_get_tier` serves to the ActivationModal.
+///
+/// v0.2.54 Track H (P0-5): pre-fix, the dashboard commands derived the
+/// tier from a frontend-supplied `user_apps` list (Supabase
+/// `profiles.apps`). License-key activation never writes that list, so
+/// Pro customers saw Free gates everywhere in the dashboard. The tier
+/// cache is written by `license_refresh` / `license_activate` after a
+/// server-side `/validate-tier` round-trip and is the canonical local
+/// tier state.
+///
+/// Fail-open-to-free: a DB read error yields `"free"` (same posture as
+/// `modules::is_module_licensed_v2`) — feature gating degrades to the
+/// free tier rather than erroring the whole dashboard.
+fn current_tier_slug(db: &Db) -> String {
+    db.get_tier_cache()
+        .map(|row| row.orchestrator_tier)
+        .unwrap_or_else(|_| "free".to_string())
+}
+
+/// Get feature flags for the current cached license tier.
+#[command]
+pub fn get_feature_flags(db: State<'_, Db>) -> FeatureFlags {
+    feature_flags_for_tier(&current_tier_slug(&db))
 }
 
 // ---------------------------------------------------------------------------
@@ -134,30 +172,44 @@ pub async fn save_orchestrator_config(config: OrchestratorConfig) -> Result<(), 
 }
 
 /// Update a single top-level config field.
+///
+/// Tier gating reads the cached license tier (`tier_cache`) — see
+/// `current_tier_slug` for the P0-5 rationale.
 #[command]
-pub async fn update_orchestrator_setting(key: String, value: String, user_apps: Vec<String>) -> Result<OrchestratorConfig, String> {
-    let tier = OrchestratorTier::from_apps(&user_apps);
+pub async fn update_orchestrator_setting(key: String, value: String, db: State<'_, Db>) -> Result<OrchestratorConfig, String> {
+    let tier = current_tier_slug(&db);
+    update_orchestrator_setting_inner(key, value, &tier).await
+}
+
+/// Testable core of `update_orchestrator_setting` — takes the resolved
+/// tier slug so unit tests don't need a managed `State<Db>`.
+async fn update_orchestrator_setting_inner(
+    key: String,
+    value: String,
+    tier: &str,
+) -> Result<OrchestratorConfig, String> {
+    let flags = feature_flags_for_tier(tier);
     let mut config = load_config();
 
     match key.as_str() {
         "watermark_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
             // Free tier cannot disable watermark
-            if !val && !tier.can_disable_watermark() {
+            if !val && !flags.can_disable_watermark {
                 return Err(tier_required_message("pro", "Disabling the watermark"));
             }
             config.watermark_enabled = val;
         }
         "auto_update_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
-            if val && !tier.can_auto_update() {
+            if val && !flags.can_auto_update {
                 return Err(tier_required_message("pro", "Auto-updates"));
             }
             config.auto_update_enabled = val;
         }
         "rl_retrieval_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
-            if val && !tier.has_rl_retrieval() {
+            if val && !flags.has_rl_retrieval {
                 return Err(tier_required_message("pro", "RL-scored retrieval"));
             }
             config.rl_retrieval_enabled = val;
@@ -202,8 +254,14 @@ pub fn get_mcp_servers() -> Vec<McpServerConfig> {
 /// the disabled server (the original bug). Mirrors the pattern in
 /// `add_custom_mcp_server` / `remove_mcp_server`.
 #[command]
-pub async fn toggle_mcp_server(mcp_id: String, enabled: bool, user_apps: Vec<String>) -> Result<Vec<McpServerConfig>, String> {
-    let tier = OrchestratorTier::from_apps(&user_apps);
+pub async fn toggle_mcp_server(mcp_id: String, enabled: bool, db: State<'_, Db>) -> Result<Vec<McpServerConfig>, String> {
+    let tier = current_tier_slug(&db);
+    toggle_mcp_server_inner(mcp_id, enabled, &tier).await
+}
+
+/// Testable core of `toggle_mcp_server` — takes the resolved tier slug
+/// so unit tests don't need a managed `State<Db>`.
+async fn toggle_mcp_server_inner(mcp_id: String, enabled: bool, tier: &str) -> Result<Vec<McpServerConfig>, String> {
     let mut config = load_config();
 
     let server = config.mcp_servers.iter_mut()
@@ -211,7 +269,7 @@ pub async fn toggle_mcp_server(mcp_id: String, enabled: bool, user_apps: Vec<Str
         .ok_or_else(|| format!("MCP server '{}' not found", mcp_id))?;
 
     // Check tier requirement
-    if enabled && !tier_meets_requirement(&tier, &server.min_tier) {
+    if enabled && !tier_meets_requirement(tier, &server.min_tier) {
         return Err(format!(
             "MCP '{}' requires {:?} tier or higher",
             server.name, server.min_tier
@@ -500,13 +558,12 @@ pub struct MigrationReport {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn tier_meets_requirement(user_tier: &OrchestratorTier, required: &OrchestratorTier) -> bool {
-    let tier_level = |t: &OrchestratorTier| match t {
-        OrchestratorTier::Free => 0,
-        OrchestratorTier::Pro => 1,
-        OrchestratorTier::Mao => 2,
-    };
-    tier_level(user_tier) >= tier_level(required)
+/// Compare the cached tier slug against an MCP entry's `min_tier`.
+/// Ranks via `licensing::tier_rank`, so `enterprise`/`admin` slugs
+/// (which have no `OrchestratorTier` variant) rank above `mao` instead
+/// of falling back to free.
+fn tier_meets_requirement(user_tier: &str, required: &OrchestratorTier) -> bool {
+    tier_rank(user_tier) >= tier_rank(required.as_slug())
 }
 
 /// Write enabled MCP servers to the orchestrator's .claude/settings.json
@@ -700,10 +757,6 @@ mod tests {
         path
     }
 
-    fn user_apps_free() -> Vec<String> {
-        Vec::new()
-    }
-
     fn read_claude_json(home: &std::path::Path) -> serde_json::Value {
         let p = home.join(".claude.json");
         if !p.exists() {
@@ -766,6 +819,81 @@ mod tests {
         }
     }
 
+    // ─── P0-5 (v0.2.54 Track H): tier-cache-driven feature flags ────────
+    //
+    // `get_feature_flags` (and the gates in `update_orchestrator_setting`
+    // / `toggle_mcp_server`) now resolve the tier from `tier_cache` —
+    // the row `license_refresh` writes after a server-side
+    // /validate-tier round-trip — instead of the frontend-supplied
+    // Supabase `profiles.apps` list, which license-key activation never
+    // populated (so Pro customers saw Free gates everywhere).
+
+    #[test]
+    fn feature_flags_free_tier_gates_everything() {
+        let f = feature_flags_for_tier("free");
+        assert_eq!(f.tier, "free");
+        assert!(!f.can_auto_update);
+        assert!(!f.has_rl_retrieval);
+        assert!(!f.has_curated_agents);
+        assert!(!f.has_mao);
+    }
+
+    #[test]
+    fn feature_flags_pro_tier_unlocks_pro_features_not_mao() {
+        let f = feature_flags_for_tier("pro");
+        assert_eq!(f.tier, "pro");
+        assert!(f.can_auto_update);
+        assert!(f.has_rl_retrieval);
+        assert!(f.has_curated_agents);
+        assert!(!f.has_mao, "pro must not unlock MAO features");
+    }
+
+    /// The bug this fixes: enterprise/admin slugs have no
+    /// `OrchestratorTier` variant; the legacy `from_apps` path could
+    /// never produce them, and a rank table without their arms would
+    /// gate paying top-tier customers back to Free.
+    #[test]
+    fn feature_flags_mao_enterprise_admin_are_supersets() {
+        for slug in ["mao", "enterprise", "admin"] {
+            let f = feature_flags_for_tier(slug);
+            assert_eq!(f.tier, slug);
+            assert!(f.can_auto_update, "{slug} must unlock pro features");
+            assert!(f.has_rl_retrieval, "{slug} must unlock pro features");
+            assert!(f.has_mao, "{slug} must unlock MAO features");
+        }
+    }
+
+    /// Unknown / attacker-supplied tier strings rank as free (no silent
+    /// escalation) — mirrors `licensing::tier_rank`'s fallthrough arm.
+    #[test]
+    fn feature_flags_unknown_tier_ranks_free() {
+        let f = feature_flags_for_tier("titanium");
+        assert!(!f.can_auto_update);
+        assert!(!f.has_mao);
+    }
+
+    #[test]
+    fn tier_meets_requirement_ranks_slug_against_min_tier() {
+        assert!(tier_meets_requirement("free", &OrchestratorTier::Free));
+        assert!(!tier_meets_requirement("free", &OrchestratorTier::Pro));
+        assert!(tier_meets_requirement("pro", &OrchestratorTier::Pro));
+        assert!(!tier_meets_requirement("pro", &OrchestratorTier::Mao));
+        // enterprise/admin outrank mao despite having no enum variant.
+        assert!(tier_meets_requirement("enterprise", &OrchestratorTier::Mao));
+        assert!(tier_meets_requirement("admin", &OrchestratorTier::Mao));
+    }
+
+    /// `current_tier_slug` reads the same `tier_cache` row
+    /// `license_get_tier` serves, and fails open to "free" on DB error.
+    #[test]
+    fn current_tier_slug_reads_tier_cache() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.set_tier_cache("pro", &serde_json::json!({}), None).unwrap();
+        assert_eq!(current_tier_slug(&db), "pro");
+        db.set_tier_cache("admin", &serde_json::json!({}), None).unwrap();
+        assert_eq!(current_tier_slug(&db), "admin");
+    }
+
     /// Forward-compat: unknown tier slugs flow through verbatim so a new
     /// OrchestratorTier variant (say "enterprise") works without code
     /// changes here.
@@ -812,7 +940,7 @@ mod tests {
         .unwrap();
 
         rt().block_on(async {
-            toggle_mcp_server("search".to_string(), false, user_apps_free())
+            toggle_mcp_server_inner("search".to_string(), false, "free")
                 .await
                 .expect("toggle_mcp_server off");
         });
@@ -861,7 +989,7 @@ mod tests {
         std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
 
         rt().block_on(async {
-            toggle_mcp_server("search".to_string(), true, user_apps_free())
+            toggle_mcp_server_inner("search".to_string(), true, "free")
                 .await
                 .expect("toggle_mcp_server on");
         });

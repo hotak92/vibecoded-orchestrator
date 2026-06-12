@@ -85,6 +85,28 @@ pub fn read_license_key_from_keychain() -> Result<Option<String>, String> {
     )
 }
 
+/// Tier-ordering ladder for the server-classified tier slugs persisted
+/// in `tier_cache.orchestrator_tier`. Admin maps to 4 (strict superset
+/// of enterprise) per docs/features/06-license-and-commercial.md §"Tier
+/// ordering" + `db/tier.rs`. Unknown strings fall through to rank=0 so
+/// attacker-supplied tier values can't silently escalate.
+///
+/// Single source of truth (v0.2.54 Track H): previously duplicated as a
+/// private fn in `commands/modules.rs`; extracted here so the dashboard
+/// feature-flag path, the module license gate, and any future hub-side
+/// gate all rank tiers identically. Mirrors
+/// `VCThelpers/license/validator.py::TIER_ORDER`.
+pub fn tier_rank(tier: &str) -> u32 {
+    match tier {
+        "free" => 0,
+        "pro" => 1,
+        "mao" => 2,
+        "enterprise" => 3,
+        "admin" => 4,
+        _ => 0,
+    }
+}
+
 /// Stable, one-way machine identifier sent to `/validate-tier` and
 /// `/rl-artifact-url`. Returns 64-char lowercase hex (sha256). Never
 /// returns the raw OS identifier — the hash is the only thing that

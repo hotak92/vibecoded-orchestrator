@@ -99,7 +99,6 @@
       const updated = await invoke<McpServer[]>('toggle_mcp_server', {
         mcpId: id,
         enabled,
-        userApps: [],
       });
       servers = updated;
     } catch (e) { toast.error(e); }

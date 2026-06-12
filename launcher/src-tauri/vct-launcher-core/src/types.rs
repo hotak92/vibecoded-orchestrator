@@ -58,35 +58,24 @@ pub enum OrchestratorTier {
 }
 
 impl OrchestratorTier {
-    /// Derive tier from user's activated app list (highest wins).
-    pub fn from_apps(apps: &[String]) -> Self {
-        if apps.iter().any(|a| a == "mao") {
-            OrchestratorTier::Mao
-        } else if apps.iter().any(|a| a == "orchestrator-pro") {
-            OrchestratorTier::Pro
-        } else {
-            OrchestratorTier::Free
+    // v0.2.54 Track H (P0-5): `from_apps` was REMOVED. It derived the
+    // tier from the Supabase `profiles.apps` list the frontend passed in
+    // — but license-key activation (the canonical ActivationModal →
+    // keychain → /validate-tier → `tier_cache` flow) never writes to
+    // `profiles.apps`, so every Pro customer who activated via license
+    // key was classified Free by the dashboard. Tier resolution now
+    // reads `db.get_tier_cache()` (the same row `license_get_tier`
+    // serves) and ranks slugs via `licensing::tier_rank`.
+
+    /// Lowercase wire slug for this tier — same string serde emits
+    /// (`#[serde(rename_all = "lowercase")]`), usable with
+    /// `licensing::tier_rank` without a serialization round-trip.
+    pub fn as_slug(&self) -> &'static str {
+        match self {
+            OrchestratorTier::Free => "free",
+            OrchestratorTier::Pro => "pro",
+            OrchestratorTier::Mao => "mao",
         }
-    }
-
-    pub fn can_auto_update(&self) -> bool {
-        matches!(self, OrchestratorTier::Pro | OrchestratorTier::Mao)
-    }
-
-    pub fn can_disable_watermark(&self) -> bool {
-        matches!(self, OrchestratorTier::Pro | OrchestratorTier::Mao)
-    }
-
-    pub fn has_rl_retrieval(&self) -> bool {
-        matches!(self, OrchestratorTier::Pro | OrchestratorTier::Mao)
-    }
-
-    pub fn has_curated_agents(&self) -> bool {
-        matches!(self, OrchestratorTier::Pro | OrchestratorTier::Mao)
-    }
-
-    pub fn has_mao(&self) -> bool {
-        matches!(self, OrchestratorTier::Mao)
     }
 }
 
