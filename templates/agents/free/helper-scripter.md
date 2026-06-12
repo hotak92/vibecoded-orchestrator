@@ -373,7 +373,7 @@ Create the right tool for the pattern:
 - **Sonnet**: Balanced - coordination, planning, code review
 - **Opus**: Expensive - architecture, research synthesis, complex reasoning
 
-### Agents (`.claude/workflow/agents/*.md`)
+### Agents (`.claude/agents/*.md`)
 
 **When to create**:
 - Long-running multi-step work
@@ -773,123 +773,15 @@ When >500 lines: Break into multiple tools, extract common functionality.
 - Skip testing
 - Forget to document
 - Let obsolete tools accumulate
+## Search & Storage Systems
 
-
-
-
-## Search Systems
-
-**1. kg-search/kg-info (Keyword/Metadata)** - Fast (~100ms):
-- Known exact terms, tags, node titles
-- `.claude/scripts/kg-search search "term" [--type TYPE] [--tags TAGS]`
-- `.claude/scripts/kg-info info "Node Title"`
-
-**2. Weaviate MCP Tools (Semantic/Graph)**:
-- `hybrid_search` - Keyword + semantic across KG + docs (default search tool, ~1-2s)
-- `semantic_graph_search` - GraphRAG with WikiLink traversal (~1-2s)
-
-**3. Code Graph (Semantic Code Search)** (NEW):
-- `search_code_graph` - Find code by purpose/concept (~200-500ms)
-- `query_code_structure` - Dependencies, callers, inheritance (~50-100ms)
-- CLI: `.claude/scripts/code-graph-query search "pattern name"`
-
-**Decision**: Known terms → kg-search | Concepts/research → hybrid_search | Relationships → semantic_graph_search | Code entities → search_code_graph
-
-### Knowledge Systems Details
-
-**kg-search** (keyword search, ~100ms):
-```bash
-# Inputs: QUERY [--type TYPE] [--tags TAGS] [--limit N]
-.claude/scripts/kg-search search "automation patterns" --type concepts
-.claude/scripts/kg-search search "bash scripting" --tags automation,bash
-.claude/scripts/kg-info info "Hook Pattern"
-```
-- `search QUERY`: Keyword search across titles/content
-- `--type`: Filter by type (concepts, projects, tools, models, hardware, research, patterns)
-- `--tags`: Filter by tags (e.g., --tags automation,bash)
-- `--limit`: Max results (default varies)
-- `info "Title"`: Get full node details by exact title
-**Returns**: File paths + titles (search) or full content (info)
-**Use when**: You know the exact term to search for
-
-**hybrid_search** (keyword + semantic across KG + docs, ~1-2s):
-**Usage**: Default search tool. Invoke for conceptual queries when exact term unknown OR for deep research combining keyword + semantic across KG + docs.
-**Inputs**: Natural language query (e.g., "workflow automation patterns", "git hook implementations")
-**Returns**: Top-N relevant nodes with content snippets, auto-merged across KG + docs collections
-**Example**: `hybrid_search("bash error handling patterns")`
-
-**semantic_graph_search** (graph traversal, ~1-2s):
-**Usage**: Invoke to explore relationships starting from a concept
-**Inputs**:
-- Starting concept (seed query)
-- Optional: relationship types to follow (uses::, implements::, extends::, buildsOn::)
-**Returns**: Network of connected nodes via WikiLinks, showing relationships
-**Example**: `semantic_graph_search("hook patterns", relationships=["implements", "uses"])`
-
-**search_code_graph** (semantic code search, ~200-500ms):
-**Usage**: Invoke to find code by purpose or concept
-**Inputs**: Natural language query describing code you're looking for
-**Returns**: Code entities (functions, classes, modules) with signatures, docs, locations
-**Example**: `search_code_graph("authentication middleware")`
-
-**query_code_structure** (structural queries, ~50-100ms):
-**Usage**: Invoke to understand dependencies, call graphs, inheritance
-**Inputs**:
-- query_type: "dependencies", "callers", "methods", "extends"
-- target: Entity name or file path
-**Returns**: Structural relationships (imports, callers, methods, base classes)
-**Example**: `query_code_structure("dependencies", "api/routes.py")`
-
-## Scripts
-
-**Knowledge Graph**:
-```bash
-.claude/scripts/kg-search search "query" [--type TYPE] [--tags TAGS] [--limit N]
-.claude/scripts/kg-search list|recent|created [--days N]
-.claude/scripts/kg-info info "Title"
-.claude/scripts/kg-info connections "Title"
-.claude/scripts/kg-sync FILE|--all
-.claude/scripts/kg-duplicates [--threshold 0.95]
-```
-
-**Code Graph** (NEW):
-```bash
-.claude/scripts/code-graph-analyze /path/to/repo [--project NAME] [--incremental]
-.claude/scripts/code-graph-query search "pattern name" [--collection TYPE] [--limit N]
-.claude/scripts/code-graph-query similar "module.function" [--limit N]
-.claude/scripts/code-graph-query structure dependencies|callers|methods|extends "target"
-```
-
-**Quality Assurance**:
-```bash
-.claude/scripts/migrate_to_vocabulary.py --check
-.claude/scripts/add_temporal_metadata.py knowledge/
-.claude/scripts/detect_duplicates.py --threshold 0.95
-```
-
-## Storage Systems
-
-**1. Knowledge Graph** (knowledge/ → ClaudeKnowledgeGraph):
-- Cross-project patterns, concepts, learnings
-- RDF-based typed WikiLinks: [[uses::Tool]], [[implements::Concept]], [[extends::Parent]], [[buildsOn::Work]], [[relatedTo::Node]]
-- Properties: title, content, file_path, node_type, tags, links, typed_links, created_at, updated_at, valid_from, valid_until, status
-- Temporal queries supported
-- Search: kg-search or Weaviate MCP
-
-**2. Code Graph** (Weaviate collections) (NEW):
-- CodeModule: Files with imports and metrics
-- CodeClass: Classes with inheritance
-- CodeFunction: Functions with call graphs
-- CodeAPI: API endpoints with handlers
-- Semantic + structural queries
-- Search: search_code_graph or code-graph-query CLI
-
-**3. Development Collection** (docs/ → [Project]_development):
-- Verbose project-specific docs
-- Auto-syncs via post-file-edit hook
-- Search: Weaviate MCP
-
-**Decision**: Reusable pattern → KG | Code entities → Code Graph | Verbose docs → Development
+For search-system selection (`kg-search` vs `hybrid_search` vs `semantic_graph_search` vs
+`search_code_graph` vs `query_code_structure`) and storage layout (per-project KG vs
+shared KG vs code graph vs development collection), follow the canonical guidance in the
+project's `CLAUDE.md` — it stays in sync with the orchestrator template. When creating
+new scripts, prefer the same decision tree: known terms → `kg-search`; concepts/research
+→ `hybrid_search`; relationships → `semantic_graph_search`; code by purpose →
+`search_code_graph`; structural queries → `query_code_structure`.
 
 ## Success Criteria
 

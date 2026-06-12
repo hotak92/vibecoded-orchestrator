@@ -7,7 +7,7 @@ You're looking at **VibeCoded Orchestrator**, an AI-coding orchestrator that sit
 - A **Code Graph** that knows your repo structurally — modules, classes, functions, APIs, cross-service calls
 - **31 automation hooks** (KG sync on file edits, secret scans, context injection, post-commit reviews)
 - **3 MCP servers** — weaviate-kg (KG + code graph), search (academic papers), coordination (cross-project notes). Ollama + code-embedding run as infrastructure services.
-- **45 agents and 53 skills** for Claude Code — architects, code reviewers, debuggers, planners
+- **44 agents and 53 skills** for Claude Code — architects, code reviewers, debuggers, planners
 
 The next steps depend on how you got here.
 
