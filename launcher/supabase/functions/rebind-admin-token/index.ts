@@ -48,20 +48,15 @@ import {
   lookupVaultAdminTokenUser,
   rebindVaultAdminMachine,
 } from "../_shared/variant_map.ts";
+import { buildCorsHeaders, makeJsonResponse } from "../_shared/http.ts";
 import { validateRequestBody } from "./validation.ts";
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  "Access-Control-Max-Age": "86400",
-};
-
-const JSON_HEADERS = { ...CORS_HEADERS, "Content-Type": "application/json" };
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
-}
+const CORS_HEADERS = buildCorsHeaders({
+  methods: "POST, OPTIONS",
+  allowHeaders: "Content-Type, Authorization",
+  extra: { "Access-Control-Max-Age": "86400" },
+});
+const jsonResponse = makeJsonResponse(CORS_HEADERS);
 
 /** Safe license-key fragment for logs. Never log the full token. */
 function maskToken(key: string): string {

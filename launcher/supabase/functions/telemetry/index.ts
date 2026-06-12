@@ -48,22 +48,13 @@
 //   - Rate limiting deferred to Supabase platform defaults for now;
 //     production should add Hub-token rate-limiting per machine_hash.
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+import { buildCorsHeaders, makeJsonResponse } from "../_shared/http.ts";
+
+const CORS_HEADERS = buildCorsHeaders({ methods: "POST, OPTIONS" });
+const jsonResponse = makeJsonResponse(CORS_HEADERS);
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5MB
 const MAX_EVENTS_PER_BATCH = 200; // collector caps at 100; defense in depth
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-  });
-}
 
 interface IncomingEvent {
   event_type?: string;

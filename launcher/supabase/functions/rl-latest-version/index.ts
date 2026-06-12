@@ -61,9 +61,8 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import { createClient, type SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
-import {
-  type OrchestratorTier,
-} from "../_shared/variant_map.ts";
+import { buildCorsHeaders, makeJsonResponse } from "../_shared/http.ts";
+import { revalidateTierViaSupabase } from "../_shared/tier_revalidation.ts";
 import {
   REQUIRED_TIER,
   type RequestBody,
@@ -73,12 +72,7 @@ import {
   validateRequestBody,
 } from "./validation.ts";
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+const CORS_HEADERS = buildCorsHeaders({ methods: "POST, OPTIONS" });
 
 // Storage bucket name for the paid-module weights. Private bucket;
 // rows are accessible only via signed URLs generated server-side.
@@ -90,78 +84,13 @@ const WEIGHTS_BUCKET_DEFAULT = "paid-module-weights";
 // break.
 const SIGNED_URL_TTL_SECONDS = 15 * 60;
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-  });
-}
+const jsonResponse = makeJsonResponse(CORS_HEADERS);
 
-/**
- * Re-validate the license via Supabase. We trust /validate-tier to be
- * the single source of truth for tier mapping — calling its function
- * directly (server-to-server) avoids duplicating the Lemon Squeezy
- * logic here. The launcher could in theory pass us a stale cache
- * (this WOULD bypass /validate-tier on the client side), so we MUST
- * re-call /validate-tier from inside this function before issuing a
- * signed URL.
- */
-async function revalidateTierViaSupabase(
-  body: RequestBody,
-): Promise<{ valid: boolean; tier: OrchestratorTier; reason?: string }> {
-  const supabaseUrl = Deno.env.get("SUPABASE_URL");
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-  if (!supabaseUrl || !serviceRoleKey) {
-    return { valid: false, tier: "free", reason: "service_misconfigured" };
-  }
-
-  const url = `${supabaseUrl}/functions/v1/validate-tier`;
-  let resp: Response;
-  try {
-    resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${serviceRoleKey}`,
-      },
-      body: JSON.stringify({
-        license_key: body.license_key,
-        machine_id_hash: body.machine_id_hash,
-      }),
-      signal: AbortSignal.timeout(8000),
-    });
-  } catch (e) {
-    return {
-      valid: false,
-      tier: "free",
-      reason: `validate-tier_unreachable: ${String(e).slice(0, 200)}`,
-    };
-  }
-
-  if (!resp.ok) {
-    return {
-      valid: false,
-      tier: "free",
-      reason: `validate-tier_${resp.status}`,
-    };
-  }
-
-  let parsed: { valid?: boolean; tier?: OrchestratorTier };
-  try {
-    parsed = await resp.json();
-  } catch (e) {
-    return {
-      valid: false,
-      tier: "free",
-      reason: `validate-tier_parse: ${String(e).slice(0, 200)}`,
-    };
-  }
-
-  if (!parsed.valid || !parsed.tier) {
-    return { valid: false, tier: "free", reason: "validate-tier_rejected" };
-  }
-  return { valid: true, tier: parsed.tier };
-}
+// Tier re-validation: shared `revalidateTierViaSupabase` from
+// `_shared/tier_revalidation.ts` (H-7 extraction — was a local copy,
+// identical in rl-artifact-url and rl-latest-weights). We MUST
+// re-validate server-side before issuing a signed URL: the launcher
+// could pass a stale/forged cache.
 
 interface ReleaseRow {
   version: string;

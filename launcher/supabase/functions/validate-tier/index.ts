@@ -18,6 +18,7 @@ import {
   lookupVaultAdminToken,
   type OrchestratorTier,
 } from "../_shared/variant_map.ts";
+import { buildCorsHeaders, makeJsonResponse } from "../_shared/http.ts";
 
 // Pre-flight: hard-fail at module init if VARIANT_MAP still has
 // placeholder keys in production. Same rationale as
@@ -27,24 +28,20 @@ assertNoPlaceholderKeysInProduction();
 const LS_BASE = "https://api.lemonsqueezy.com/v1";
 const LS_TIMEOUT_MS = 8000;
 
-const CORS_HEADERS = {
-  // Orchestrator runs on user machines — origins vary. Validate-tier is a
-  // public endpoint that authenticates via license_key, so wildcard is safe.
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-  "Access-Control-Max-Age": "86400",
-};
-
-const JSON_HEADERS = { ...CORS_HEADERS, "Content-Type": "application/json" };
+// Origin wildcard rationale: orchestrator runs on user machines — origins
+// vary. Validate-tier is a public endpoint that authenticates via
+// license_key, so wildcard is safe (see `buildCorsHeaders` doc).
+const CORS_HEADERS = buildCorsHeaders({
+  methods: "POST, OPTIONS",
+  allowHeaders: "Content-Type, Authorization",
+  extra: { "Access-Control-Max-Age": "86400" },
+});
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
-}
+const jsonResponse = makeJsonResponse(CORS_HEADERS);
 
 /** UUID v4 / v5 string check — LS license keys are 36 chars with dashes. */
 function isValidLicenseKey(s: unknown): s is string {
