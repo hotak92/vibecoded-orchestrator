@@ -193,7 +193,7 @@ for function in code_functions:
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
-- Conceptual → `search_knowledge_graph` or `hybrid_search` MCP
+- Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
 - Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)

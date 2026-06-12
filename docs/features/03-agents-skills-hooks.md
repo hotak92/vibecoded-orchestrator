@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 45 bundled agents, 53 skills, and 36 hooks (most wired in default `.claude/settings.json`; some available but not wired). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 44 bundled agents, 53 skills, and 36 hooks (most wired in default `.claude/settings.json`; some available but not wired). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -8,7 +8,7 @@ For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-
 
 ## Bundled Agents (`templates/agents/free/`)
 
-Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 45 agents below split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / migrate / bootstrap).
+Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 44 agents below split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / bootstrap-refinement). The `project-migrator` agent was archived in v0.2.54 to `templates/agents/_archive/` — `install.py --add-project` and the launcher GUI's "+ Existing Project" tab now handle that flow automatically.
 
 ### `coder` (Sonnet, `isolation: worktree`)
 Writes code from a spec, following patterns from the KG. Runs in git worktree isolation by default.
@@ -80,13 +80,10 @@ The web counterpart to `code-explorer`: searches, reads pages, cross-references 
 Reviews and rewrites agent prompts using current Claude 4.x patterns.
 
 ### `orchestrator-installer` (Opus)
-Installs the VibeCoded Orchestrator workflow system on a new machine (Windows or Linux). Full shared-infrastructure setup.
+Diagnose and recover from a partially-failed install. Canonical install path: `bash first-install.sh` → `install.py`.
 
 ### `project-bootstrapper` (Sonnet)
-Creates a new Claude Code project from scratch with the full Orchestrator workflow: hooks, KG, scripts, settings, CLAUDE.md.
-
-### `project-migrator` (Sonnet)
-Migrates an existing Claude Code project onto the Orchestrator workflow.
+Refine bootstrap docs (CLAUDE.md, ARCHITECTURE.md) after the launcher's "+ New/Existing Project" flow generates them.
 
 ---
 

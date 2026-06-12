@@ -39,7 +39,7 @@ When providing RAG guidance, you can reference this workflow's working implement
 
 **Search Methods**:
 - Keyword: `.claude/scripts/kg-search` (~100ms) for exact terms
-- Semantic: Weaviate MCP `search_knowledge_graph()` (~500ms) for concepts
+- Semantic: Weaviate MCP `hybrid_search()` (~500ms) for concepts
 - Graph: Weaviate MCP `semantic_graph_search()` (~1-2s) for relationships
 - Hybrid: Weaviate MCP `hybrid_search()` (~1-2s) combines all three
 

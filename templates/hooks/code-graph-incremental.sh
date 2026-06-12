@@ -98,9 +98,9 @@ fi
 # project's `code_graph_extra_paths`. If the edited file is under any of
 # them, re-point REPO_PATH to that extra and KEEP the current
 # PROJECT_NAME (extras index into the SAME per-project collections; they
-# don't get their own prefix). This makes edits under e.g.
-# `vibecoded-orchestrator/` show up in VCO_dev's codegraph without
-# vibecoded-orchestrator/ being a launcher project. See:
+# don't get their own prefix). This makes edits under e.g. a sibling
+# `vibecoded-orchestrator/` checkout show up in the current project's
+# codegraph without the sibling becoming a launcher project. See:
 # knowledge/concepts/project-extra-codegraph-paths-2026-06-05.md
 #
 # Order of checks below (matches the spec, first match wins):

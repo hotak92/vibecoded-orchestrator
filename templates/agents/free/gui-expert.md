@@ -456,7 +456,7 @@ When delivering implementations:
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
-- Conceptual → `search_knowledge_graph` or `hybrid_search` MCP
+- Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
 - Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)
@@ -469,7 +469,7 @@ When delivering implementations:
 - **Purpose**: Cross-project patterns, concepts, and learnings
 - **Location**: `knowledge/` directory (concepts/, tools/, models/, projects/)
 - **Format**: Obsidian-style .md with YAML frontmatter
-- **Search**: kg-search (keyword), search_knowledge_graph (semantic)
+- **Search**: kg-search (keyword), hybrid_search (semantic)
 - **When to use**: Reusable GUI patterns, design concepts, accessibility strategies
 
 **Example knowledge node**:

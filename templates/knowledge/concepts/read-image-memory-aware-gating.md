@@ -3,13 +3,13 @@ title: read_image — Memory-Aware Vision-Model Gating
 type: concept
 tags: [ollama, vision, vlm, memory, mcp, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
-status: active
+updated: 2026-06-12T00:00:00Z
+status: deprecated
 ---
 
 # read_image — Memory-Aware Vision-Model Gating
 
-**Availability note (v0.2.11+)**: The Ollama MCP server is no longer part of the default VCO install (PR-14a, v0.2.11). The `read_image` tool described below remains in the Ollama MCP source code and is available via opt-in install (Launcher → Modules → "Ollama Local LLM" or the `vct-ollama.json` bundled manifest). The gating logic itself (resize tiers, VRAM thresholds) is unchanged.
+**Availability note (historical reference)**: The Ollama MCP server was removed from the default VCO install in v0.2.11 (PR-14a), and its source code no longer ships in this repo — the `ollama_mcp/` directory was removed pre-v0.2.30 when the Ollama MCP became an opt-in module, installable via the launcher → Modules tab → **vct-ollama**. Claude's native vision via the `Read` tool on image paths is the recommended path. This node is kept as a design reference: the gating logic (resize tiers, VRAM thresholds) documented below applies whenever the opt-in `read_image` tool is invoked against a running Ollama instance.
 
 The `read_image` MCP tool (Ollama MCP) returns an image as a base64 data URL Claude can see directly. The optional **local description tier** runs a vision model (`qwen3.5:9b` default) on-device. Memory-aware gating probes free VRAM and system RAM at module load and either picks a fitting model, falls back to a smaller installed one, or skips the description with a clear reason. The image-as-base64 path is unchanged — it always returns.
 
@@ -92,13 +92,11 @@ The base64 data URL path is independent of vision-model state. Claude's own visi
 
 ## Files
 
-- `claude_mcp_servers/ollama_mcp/server.py` — `probe_capabilities()`, `_pick_vision_model()`, `read_image()`
-- `tests/test_ollama_vision_gating.py` — unit tests (capability probe, threshold logic, model fallback, resize-budget tiers, env override, no-crash on insufficient VRAM)
-- `CLAUDE.md` — `read_image` documented with the qwen3.5:9b default
+The implementation (`probe_capabilities()`, `_pick_vision_model()`, `read_image()`) and its unit tests ship with the opt-in **vct-ollama** module (launcher → Modules tab), not in this repo.
 
 ## See also
 
-- `docs/CONFIGURATION.md` "Vision (read_image) memory budget"
+- `docs/CONFIGURATION.md` "Vision and image analysis (v0.2.11+)"
 - [[uses::Ollama]]
 - [[Qwen3.5]]
 - [[Gemma 4 E4B]]

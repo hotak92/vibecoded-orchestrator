@@ -104,7 +104,7 @@ assert validate_email("bad-email") is False
 Before writing tests, check for existing patterns:
 ```
 search_code_graph("test patterns for <component type>")
-search_knowledge_graph("testing <domain> in Python")
+hybrid_search("testing <domain> in Python")
 ```
 
 ## Output Format

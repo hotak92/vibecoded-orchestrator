@@ -3,7 +3,14 @@ name: planner
 description: Requirements analysis, architectural design, task breakdown
 short_desc: requirements analysis, architecture, task breakdown
 keywords: [requirements analysis, task breakdown, implementation plan, constraints, prior art, "task decomposition", "plan this", "plan the work", "break this down", "figure out approach", "how should we", "what's the plan", "roadmap for"]
-tools: Read, Write, Edit, Glob, Grep, Bash
+tools:
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - Bash
+  - mcp__weaviate-kg__*
 model: sonnet
 effort: xhigh
 mcpServers:
@@ -667,7 +674,7 @@ Decision: B because we have multiple API instances and need consistent rate limi
 
 **Decision tree**:
 - Known terms → `kg-search` CLI (fast, ~100ms)
-- Conceptual → `search_knowledge_graph` or `hybrid_search` MCP
+- Conceptual → `hybrid_search` MCP
 - Relationships → `semantic_graph_search` MCP
 - Code by purpose → `search_code_graph` MCP
 - Quick analysis: use Claude directly (Ollama MCP removed in v0.2.11 as redundant)

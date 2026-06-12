@@ -20,9 +20,8 @@ model: sonnet
 ## Available Tools (KG/Semantic ONLY)
 
 **ALLOWED**:
-- `search_knowledge_graph(query, limit)` - Semantic search across KG
+- `hybrid_search(query, limit)` - Keyword + semantic across KG + docs (most comprehensive; default search tool)
 - `semantic_graph_search(query, depth)` - Graph traversal via WikiLinks
-- `hybrid_search(query, limit)` - Keyword + semantic + graph (most comprehensive)
 - `search_code_graph(query, collection, project, limit)` - Semantic code search
 - `query_code_structure(query_type, target, project)` - Dependencies, callers, inheritance
 - `get_node_connections(title)` - Explore specific node relationships

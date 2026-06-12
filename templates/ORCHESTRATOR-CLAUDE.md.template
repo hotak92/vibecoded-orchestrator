@@ -20,7 +20,7 @@ This block appears on every new project until you remove it. It's NOT for you to
 
 2. **Once you understand the project**, offer the scoping choice. Use AskUserQuestion (or plain prose if AskUserQuestion isn't available). Suggested phrasing:
 
-   > VCO ships with 45 agents, 53 skills, and 31 hooks pre-registered for this project. Most of them are off-topic for what you've described. Want me to scope this project — disable the agents/skills that don't apply to your stack, leaving just the relevant ones? Pros: cleaner Agents/Skills tabs, less noise in `@agent-*` autocomplete, faster mental model of what's available. Cons: if the project's scope expands later, you'll have to re-enable items manually (one click each from the launcher's per-project Agents/Skills tabs). If you'd rather keep everything visible and triage on demand, that's also a valid choice — just say "keep all" and I'll skip this.
+   > VCO ships with 44 agents, 53 skills, and 36 hooks pre-registered for this project. Most of them are off-topic for what you've described. Want me to scope this project — disable the agents/skills that don't apply to your stack, leaving just the relevant ones? Pros: cleaner Agents/Skills tabs, less noise in `@agent-*` autocomplete, faster mental model of what's available. Cons: if the project's scope expands later, you'll have to re-enable items manually (one click each from the launcher's per-project Agents/Skills tabs). If you'd rather keep everything visible and triage on demand, that's also a valid choice — just say "keep all" and I'll skip this.
 
 3. **If the user says yes**, do it via the launcher's enabled-toggle APIs (NOT by deleting files):
    - Tauri commands `set_project_agent_enabled` / `set_project_skill_enabled` / `set_project_hook_enabled` (callable from the launcher GUI's per-project tabs).
@@ -35,7 +35,7 @@ This block appears on every new project until you remove it. It's NOT for you to
    ```
    The script strips ALL `BEGIN: SETUP-ONLY` blocks at once — fine in practice because by the time the user has done the scoping pass, the other two SETUP-ONLY blocks ("First-Run Setup" and "Verifying Installation") have also served their purpose.
 
-**Why this block exists**: every project that gets VCO installed inherits the full agent/skill catalog, but a project's actual domain rarely needs all 45+53 of them. Disabling the off-topic ones at project-start time is a 30-second improvement to every future session's mental model — and the user almost always forgets to do it unless prompted explicitly. The nudge here makes it a deliberate first-session choice rather than a deferred housekeeping task that never happens.
+**Why this block exists**: every project that gets VCO installed inherits the full agent/skill catalog, but a project's actual domain rarely needs all 44+53 of them. Disabling the off-topic ones at project-start time is a 30-second improvement to every future session's mental model — and the user almost always forgets to do it unless prompted explicitly. The nudge here makes it a deliberate first-session choice rather than a deferred housekeeping task that never happens.
 <!-- END: SETUP-ONLY -->
 
 # VibeCoded Orchestrator — Project Instructions
@@ -63,9 +63,8 @@ Do NOT re-derive the palette from individual components, invent colors, or redra
 the logo by hand — use the tokens verbatim so the first generation is already
 brand-consistent. When AskUserQuestion offers a style choice for a VCO visual,
 include "**Brand VCO**" (navy/teal identity from the reference) as a ready option,
-not something the user has to type. Available design skills (`refactoring-ui`,
-`gui-ux-expert`, `microinteractions`, `design`) should be used proactively for
-substantial UI work.
+not something the user has to type. The `gui-ux-expert` skill should be used
+proactively for substantial UI work.
 
 ---
 
@@ -310,7 +309,9 @@ status: active  # active, archived, deprecated, idea
 4. Env vars from `~/.claude.json mcpServers.weaviate-kg.env` (the launcher intentionally restricts this to truly machine-invariant keys like `WEAVIATE_URL`; `KG_COLLECTION`-shape per-project keys are dropped from this surface, see `launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS`).
 5. Bundled defaults baked into `claude_mcp_servers/weaviate_mcp/server.py` (last-resort fallback; logged at WARNING when reached, and explicit empty-string env values for `KG_COLLECTION` are coerced to this default rather than used literally — see v0.2.27 fix).
 
-**Asymmetric shared-KG access**: every project ALWAYS reads the shared KG when `SHARED_KG_COLLECTION` is set — there is no per-project read opt-out (knowledge accumulates across all projects, by design). The per-project gate `SHARED_KG_WRITE_DISABLED=true` restricts only WRITES from this project to the shared collection (`store_knowledge_node(scope='shared')` returns an error rather than silently rerouting).
+**Shared-KG access gates**: every project reads the shared KG by default when `SHARED_KG_COLLECTION` is set (knowledge accumulates across all projects). Two symmetric per-project gates exist (canonical from v0.2.46 onward):
+- `SHARED_KG_READ_DISABLED=true` — excludes the shared collection from `hybrid_search` / `semantic_graph_search` results on this project. Reads fall back to the per-project KG only.
+- `SHARED_KG_WRITE_DISABLED=true` — refuses writes to the shared collection from this project (`store_knowledge_node(scope='shared')` returns an error rather than silently rerouting).
 
 **Weaviate Collection** (per-project KG, name from `KG_COLLECTION`):
 - Properties: `title`, `content`, `file_path`, `node_type`, `tags`, `links`, `typed_links`, `created_at`, `updated_at`, `valid_from`, `valid_until`, `status`.
@@ -412,15 +413,16 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
 - **Boot auto-start**: cross-OS (systemd-user / launchd / Windows Scheduled Task). Default OFF; user opts in via launcher GUI Preferences.
 
 ### MCP Servers
-Located in the user's `~/.claude.json`. Each launches via the project venv (`claude_mcp_servers/.venv`):
-- **weaviate-kg** — semantic search and code graph.
-  - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate).
-- **search** — academic paper search via OpenAlex and arXiv.
+Four MCPs are registered in `~/.claude.json` on install via `launcher/src-tauri/src/mcp_registration.rs::build_default_mcp_entries`. Each launches via the project venv (`claude_mcp_servers/.venv`):
+- **weaviate-kg** — semantic search and code graph. **Enabled by default per project.**
+  - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_READ_DISABLED` (read gate), `SHARED_KG_WRITE_DISABLED` (write gate).
+- **search** — academic paper search via OpenAlex and arXiv. **Enabled by default per project.**
   - Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API).
   - Tools: `search_papers` only.
-- **coordination** — local KG-backed coordination notes (decisions, tasks, patterns).
-  - Env: `KG_BASE_DIR` (optional, defaults to project root).
-  - Tools: `post_coordination_note`, `read_coordination_notes`.
+- **mermaid** — Mermaid diagram describe/extract. **Registered but default-disabled per project** (`BUNDLED_MCP_DEFAULT_DISABLED` at `launcher/src-tauri/vct-launcher-core/src/db/project_mcp_servers.rs:73-76`); `claude mcp list` shows it Connected, but tools are not callable until you opt in via the launcher's Diagrams tab.
+- **excalidraw** — Excalidraw diagram describe/extract. **Registered but default-disabled per project** (same gate as mermaid).
+
+A fifth MCP — **playwright** (browser automation) — is enabled by default and invoked separately via `npx -y @playwright/mcp@latest`; install.py pre-caches it at `_install_playwright_browsers` (opt out with `VCT_SKIP_PLAYWRIGHT=1`). The code-embedding FastAPI service on port 11440 is backend infrastructure, not an MCP.
 
 **Free-tier RL gate** — retrieval reranking skips RL when `feature_enabled("rl_retrieval") == False`. Pro/MAO licenses unlock RL; free-tier users get plain Weaviate cosine ordering. Nothing breaks when the gate is closed — retrieval just falls back to base scores.
 
@@ -468,9 +470,6 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 
 **StopFailure**:
 - `stop-failure-notify.sh` — urgent notification + failure logging to `~/.claude/metrics/failures.jsonl`.
-
-**SessionEnd**:
-- `session-end.sh` — cleanup, final sync.
 
 **All available hook events** (as of Claude Code v2.1.81):
 
@@ -821,7 +820,7 @@ VCO ships a secrets primitive so agents never scrape the environment for tokens.
 
 If you're seeing this orchestrator for the first time, here's the 60-second mental model:
 
-- **What it is**: an infrastructure layer for Claude Code that adds persistent memory (KG), semantic code search (code graph), and ~31 hooks that run automatically. You keep using Claude Code the way you already do; the orchestrator works in the background via hooks and MCP servers.
+- **What it is**: an infrastructure layer for Claude Code that adds persistent memory (KG), semantic code search (code graph), and ~36 hooks that run automatically. You keep using Claude Code the way you already do; the orchestrator works in the background via hooks and MCP servers.
 - **What runs locally**: Weaviate (vector DB) on `:8081`, Ollama (local LLM + embeddings) on `:11435`. Both started automatically by the `SessionStart` hook if not already running.
 - **Free vs Pro**: this repo is fully functional standalone. Optional paid modules (RL retrieval reranking, MAO multi-agent runtime, specialist agent packs) activate only when a license key is present. Without a key, retrieval falls back to cosine ordering — nothing breaks.
 

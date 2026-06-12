@@ -120,7 +120,6 @@ Adds timestamped entry to Session Log.
 ## Supporting Files
 
 - **Examples**: See [examples/usage-patterns.md](examples/usage-patterns.md) for common workflows
-- **Scripts**: Backend scripts at `~/.claude/workflow/scripts/context_info.sh` and `memory_manager.py`
 
 ---
 

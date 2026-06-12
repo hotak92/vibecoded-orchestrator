@@ -1,7 +1,16 @@
+<!--
+RETIRED in v0.2.54 (2026-06-12). The "migrate existing project to VCO" flow
+is now handled automatically by `python install.py --add-project /path/to/existing`
+or by the launcher GUI's "+ Existing Project" tab. install_project_bundle
+preserves user customizations via hash-compare (V47-A pattern), so the manual
+walkthrough below is no longer the recommended path. Preserved here for
+historical reference and any unusual edge case where the automated flow needs
+human-led restructuring.
+-->
 ---
 name: project-migrator
-description: Migrates existing Claude Code projects to VibeCoded Orchestrator workflow system
-short_desc: migrates existing project to VCO workflow
+description: (RETIRED) Migrates existing Claude Code projects to VCO — superseded by install.py --add-project
+short_desc: (retired) migrates existing project to VCO workflow
 keywords: [migrate project, existing project to Orchestrator, brownfield, preserve customizations, workflow migration, "port project", "bring project into VCO", "migrate to VCO", "existing project setup"]
 tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion
 model: sonnet
@@ -18,7 +27,7 @@ Migrates existing Claude Code projects to the VibeCoded Orchestrator workflow sy
 
 Analyze existing project structure, preserve customizations, and update to modern workflow (knowledge graph, agents, skills, hooks, scripts, canonical documentation).
 
-**Assumes**: Global workflow infrastructure exists at `~/.claude/workflow/` (see `.claude/references/GLOBAL_WORKFLOW_STRUCTURE.md`). If not, run orchestrator-installer first.
+**Assumes**: The orchestrator is already installed (via `bash first-install.sh` or the launcher GUI). The per-project bundle drops into `.claude/` — agents, skills, hooks, and the MCP wiring needed for migration. If the project doesn't have `.claude/` yet, run `python install.py` from the orchestrator clone before invoking this agent.
 
 ## Capabilities
 
@@ -719,16 +728,15 @@ Commercial workflow standards v0.3.0
 - `.claude/scripts/kg-info info "Node Title"`
 
 **2. Weaviate MCP Tools (Semantic/Graph)**:
-- `search_knowledge_graph` - Basic semantic (~500ms)
+- `hybrid_search` - Keyword + semantic across KG + docs (default search tool, ~1-2s)
 - `semantic_graph_search` - GraphRAG with WikiLink traversal (~1-2s)
-- `hybrid_search` - Parallel keyword+semantic+graph (~1-2s)
 
 **3. Code Graph (Semantic Code Search)**:
 - `search_code_graph` - Find code by purpose/concept (~200-500ms)
 - `query_code_structure` - Dependencies, callers, inheritance (~50-100ms)
 - CLI: `.claude/scripts/code-graph-query search "migration patterns"`
 
-**Decision**: Known terms → kg-search | Concepts → search_knowledge_graph | Relationships → semantic_graph_search | Research → hybrid_search | Code entities → search_code_graph
+**Decision**: Known terms → kg-search | Concepts/research → hybrid_search | Relationships → semantic_graph_search | Code entities → search_code_graph
 
 Find proven migration strategies and restructuring patterns.
 
@@ -787,23 +795,10 @@ Find proven migration strategies and restructuring patterns.
 - `query_temporal.py` - Point-in-time queries
 - `migrate_to_vocabulary.py` - Validate tags/vocabulary
 - `detect_duplicates.py` - Semantic duplicate detection
-- `queue_maintenance.py` - Background task queue
-- `process_maintenance_queue.py` - Queue processor
 
 ## Background Maintenance
 
-**Queue System**:
-- `queue_maintenance.py` - Queue tasks (knowledge-curator, graph-health-checker, code-graph-updater)
-- `process_maintenance_queue.py` - Process queue (runs every 15 min via cron)
-- `maintenance_status.py` - Check queue status
-- Catch-up mechanism: Runs missed tasks at next opportunity
-
-**Scheduled Tasks**:
-- Daily 2 AM: knowledge-curator (relationship extraction, deduplication)
-- Weekly Sunday 3 AM: graph-health-checker (consistency checks)
-- Every 15 minutes: process_maintenance_queue
-
-**Setup**: `.claude/scripts/setup_cron.sh` (creates cron jobs)
+The legacy queue-based maintenance system (`queue_maintenance.py` / `process_maintenance_queue.py`) was archived to `.claude/scripts/archive/` and is no longer wired into the default install. Maintenance tasks (knowledge-curator, graph-health-checker, code-graph-updater) are now triggered on-demand via the agents themselves or via the `PostToolUse` hooks listed in the Hook System section.
 
 ## Token-Efficient Hooks
 
@@ -818,9 +813,6 @@ Find proven migration strategies and restructuring patterns.
 - Auto-sync `knowledge/` to Weaviate
 - Queue code graph updates for .py files
 - Auto-sync `docs/` to development collection
-
-**session-end.sh**:
-- Cleanup, queue health checks
 
 ## Success Criteria
 
