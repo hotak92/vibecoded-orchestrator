@@ -72,10 +72,13 @@ Copy `.env.example` or create `.env` with:
 # Supabase Auth
 VITE_SUPABASE_URL=https://<YOUR_SUPABASE_PROJECT_REF>.supabase.co
 VITE_SUPABASE_ANON_KEY=<your-anon-key>
-
-# Lemon Squeezy (license validation)
-VITE_LEMONSQUEEZY_API_KEY=<your-ls-api-key>
 ```
+
+> License validation does NOT need an env var here. It runs in the Rust
+> backend against the Supabase `validate-tier` edge function; payment-provider
+> API keys live only in Supabase function secrets (server-side). Anything
+> prefixed `VITE_` is embedded into the shipped client bundle — never put a
+> secret behind that prefix.
 
 ## Database Setup
 

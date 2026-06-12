@@ -10,11 +10,10 @@
 //   - `license.ts` (singular) — orchestrator-tier root key (legacy flow).
 //                                Kept for backward compat with the
 //                                ActivationModal.
-//   - `licenses.ts` (plural)  — localStorage-backed LS consumer apps
-//                                portfolio (Transcrypt, Arzillibus, …).
-//                                Talks directly to Lemon Squeezy from
-//                                the browser; UNRELATED to the
-//                                orchestrator+modules licensing flow.
+//   (The old `licenses.ts` plural store — localStorage-backed per-app
+//   portfolio that talked to Lemon Squeezy directly from the browser —
+//   was deleted in v0.2.54 Track H: zero importers, and it embedded the
+//   LS API key in the client bundle.)
 //
 // Per the primary licensing review:
 //   .claude/context/reviews/v0240-pre-push-2026-05-30/primary-licensing.md

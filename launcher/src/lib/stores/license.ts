@@ -5,10 +5,12 @@
 // /validate-tier edge function and persists the tier cache in
 // ~/.vct/launcher.db; the actual license key is held in the OS keychain.
 //
-// The legacy `lib/stores/licenses.ts` is kept around so the per-app
-// activation flow (Transcrypt etc.) doesn't break. This store is
-// orthogonal — it gates the *orchestrator* tier (free/pro/mao/enterprise)
-// which determines whether paid orchestrator modules can be installed.
+// The legacy `lib/stores/licenses.ts` (per-app, localStorage-backed,
+// client-side LemonSqueezy calls) was DELETED in v0.2.54 Track H — it
+// had zero importers and embedded the LS API key in the client bundle.
+// This store gates the *orchestrator* tier (free/pro/mao/enterprise/
+// admin), which determines whether paid orchestrator modules can be
+// installed.
 
 import { writable } from 'svelte/store';
 import { invoke, tauriAvailable } from '$lib/tauri';
