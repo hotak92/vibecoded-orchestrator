@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS-EXEMPT-PARITY: integration test for the bash resolver client only — the PowerShell resolver client has its own dedicated test (vct_project_config.Tests.ps1).
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
