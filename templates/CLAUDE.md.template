@@ -29,10 +29,13 @@ _(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
 **Before answering any non-trivial question:**
 
 1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
-2. For architecture / system questions → search the KG **before** generating a response.
-3. For any other project question → search KG / code graph **before** answering.
+2. Check `.claude/context/UPDATE_DEFERRED.md` if present — the last orchestrator update may have queued conditions you need to know about (in particular `update_resume_required` halts here until a manual nudge).
+3. For architecture / system questions → search the KG **before** generating a response.
+4. For any other project question → search KG / code graph **before** answering.
 
 **Never explain project state from memory.** If you don't know something with certainty, look it up first.
+
+**Fresh install nudge**: on a brand-new project, run the 6-item audit in `{{ORCHESTRATOR_ROOT}}/docs/post-install/POST-INSTALL-HEALTH-AUDIT.md` once before starting real work — it confirms containers, MCPs, KG collections, and the code graph are all wired up. Paste-into-Claude diagnostic flow lives next to it at `CLAUDE-DIAGNOSTIC-PROMPT.md`.
 
 ---
 
