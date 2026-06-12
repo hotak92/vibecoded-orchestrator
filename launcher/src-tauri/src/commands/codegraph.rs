@@ -1396,16 +1396,10 @@ fn walk(
 /// boundary so non-ASCII output (rare in this analyzer's logs but
 /// possible on Windows file paths) doesn't panic the format step.
 fn tail_log(s: &str) -> String {
-    use crate::db::code_graph_builds::LOG_TAIL_MAX_BYTES;
-    if s.len() <= LOG_TAIL_MAX_BYTES {
-        return s.to_string();
-    }
-    let cut_at = s.len() - LOG_TAIL_MAX_BYTES;
-    let mut idx = cut_at;
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    format!("…\n{}", &s[idx..])
+    // v0.2.54 Track J: delegates to the shared char-boundary-safe
+    // capping helper (was one of three near-identical copies across
+    // the codegraph / kg_sync / kg_summary command modules).
+    crate::db::log_tail::cap_log_tail(s)
 }
 
 /// Parse "Files analyzed: N" from analyzer stdout. Falls back to 0 if

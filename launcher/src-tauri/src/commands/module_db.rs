@@ -39,7 +39,13 @@ pub const DEFAULT_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
 /// Token-bytes length we generate. 32 bytes = 256 bits, hex-encoded to
 /// 64 chars. Matches the hub-auth token shape so any future migration
 /// to a single token surface is purely a wiring change.
-pub const TOKEN_BYTES: usize = 32;
+/// v0.2.54 Track J: now a re-export of the canonical
+/// `vct_launcher_core::services::boot_token::TOKEN_BYTES` so the const
+/// lives at exactly one address. Only consumed by this module's own
+/// `#[cfg(test)]` block today — the `pub` keeps the import path
+/// available for future callers.
+#[allow(dead_code)]
+pub const TOKEN_BYTES: usize = vct_launcher_core::services::boot_token::TOKEN_BYTES;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AccessTokenIssued {
@@ -149,17 +155,11 @@ fn resolve_manifest_and_install_dir(
 
 /// Generate a hex-encoded 32-byte random token from the OS CSPRNG.
 ///
-/// Matches the auth-token shape used by `vct_hub::auth::generate_token`
-/// so the two surfaces stay aligned visually. A future v0.2.32 refactor
-/// can move this helper into a shared crate; for v0.2.31 the duplication
-/// is acceptable (different processes, different crates).
+/// v0.2.54 Track J amend: delegates to
+/// `vct_launcher_core::services::boot_token::generate_token` — the
+/// "future v0.2.32 refactor" predicted in the prior comment.
 fn generate_token_hex() -> Result<String, String> {
-    use rand::TryRngCore;
-    let mut bytes = [0u8; TOKEN_BYTES];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|e| format!("rng unavailable: {}", e))?;
-    Ok(hex::encode(bytes))
+    vct_launcher_core::services::boot_token::generate_token()
 }
 
 #[cfg(test)]

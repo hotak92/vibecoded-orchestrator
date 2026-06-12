@@ -250,14 +250,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sqlite3
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, TypedDict
+
+from vco_lib.atomic import atomic_write_text
 
 
 
@@ -2216,52 +2216,20 @@ def _merge_managed_block(prior: Optional[str], managed: str) -> str:
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically.
 
-    Uses a tempfile in the SAME directory as ``path`` (so the rename
-    stays on one filesystem — cross-filesystem rename fails with EXDEV
-    on Linux), then ``os.replace``-s into place. ``os.replace`` is
-    cross-OS atomic (POSIX rename / Windows MoveFileExW with
-    REPLACE_EXISTING).
+    Thin delegate to :func:`vco_lib.atomic.atomic_write_text` (v0.2.54
+    Track J consolidation — this module, ``env_template``,
+    ``deferral_report`` and ``cli/codegraph_diagram`` each carried a
+    copy of the mkstemp + fsync + ``os.replace`` recipe). The name is
+    kept: four internal call-sites use it and external code mirrors
+    the ``env_template`` sibling.
 
-    UTF-8 encoded, LF line endings (matches Rust's ``std::fs::write``
-    which writes the byte sequence verbatim — Rust never CRLF-converts
-    unless the caller asked for it).
-
-    The tempfile is fsync'd to disk before rename. The parent directory
-    is NOT fsync'd; on most filesystems this means a crash immediately
-    after the rename could leave the rename un-persisted (the file
-    would either be the old or the new content — never a partial-write).
-    That's the acceptable trade for not paying directory-fsync cost on
-    every write.
+    Byte-parity with the Rust writers is preserved: the shared helper
+    opens the tempfile with ``newline=""`` (no translation — write-
+    equivalent to the previous ``newline="\\n"``), so ``\\n`` in
+    ``content`` lands verbatim as LF, matching Rust's
+    ``std::fs::write`` which never CRLF-converts.
     """
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    # NamedTemporaryFile with delete=False so we can rename it; the
-    # caller's responsibility to clean up if rename fails.
-    fd, tmp_path_str = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=str(parent),
-    )
-    tmp_path = Path(tmp_path_str)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                # fsync can fail on some pseudo-filesystems (procfs,
-                # tmpfs in containers); don't fail the write over it.
-                pass
-        os.replace(str(tmp_path), str(path))
-    except Exception:
-        # Best-effort cleanup of the tempfile on any failure. Don't
-        # mask the original exception.
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, content)
 
 
 # ─── CLI entry point ────────────────────────────────────────────────────

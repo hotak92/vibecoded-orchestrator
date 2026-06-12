@@ -72,18 +72,9 @@ pub fn router() -> Router<LauncherDbHandle> {
 // makes the failure mode machine-parseable without breaking 200-OK
 // responses (those keep their existing flat-object shape).
 
-fn error_response(status: StatusCode, code: &str, message: impl Into<String>) -> axum::response::Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "code": code,
-                "message": message.into(),
-            }
-        })),
-    )
-        .into_response()
-}
+// v0.2.54 Track J: error_response moved to the shared
+// `crate::http_error` module (was four byte-identical copies).
+use crate::http_error::error_response;
 
 /// Internal-server-error helper that takes a `String` from the DB layer,
 /// logs it for the launcher operator, and returns a generic envelope to

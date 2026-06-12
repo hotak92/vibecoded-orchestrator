@@ -29,6 +29,9 @@ pub mod cli;
 pub mod cli_api;
 pub mod config_api;
 pub mod db;
+// v0.2.54 Track J — shared JSON error envelope, extracted from four
+// byte-identical `error_response` copies in the *_api modules.
+pub mod http_error;
 pub mod lifecycle;
 pub mod lifecycle_api;
 pub mod lockfile;

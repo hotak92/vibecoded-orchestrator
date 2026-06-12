@@ -33,10 +33,14 @@ Public surface:
 * :func:`atomic_write_bytes` — write bytes to file, atomically.
 * :func:`atomic_write_json` — write JSON object, atomically.
 
-v0.2.53 lands the module with these three exports; install.py's
-``.claude.json`` write site still uses
-``vco_lib.env_template._atomic_write_text`` directly (consolidating
-the two implementations is a v0.2.54 organisational refactor).
+v0.2.53 landed the module with these three exports. v0.2.54 Track J
+completed the consolidation this paragraph used to queue: the sibling
+copies in ``env_template`` / ``config_projection`` /
+``deferral_report`` / ``cli/codegraph_diagram`` (plus the inline block
+in ``DeferralReport.write``) are now thin delegates to
+:func:`atomic_write_text`. install.py's ``.claude.json`` write site
+keeps importing ``env_template._atomic_write_text`` (same
+implementation, one hop).
 """
 
 from __future__ import annotations
