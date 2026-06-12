@@ -100,9 +100,12 @@ populated.
 
 ## Uninstall path
 
-Re-run the install command with the `--uninstall` flag:
+Double-click `uninstall.bat` in the install root (v0.2.54 Track G — the
+Windows sibling of `uninstall.sh`), or run the Python entry point
+directly:
 
 ```cmd
+uninstall.bat --dry-run     REM print the plan first
 python install.py --uninstall
 ```
 

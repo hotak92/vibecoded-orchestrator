@@ -31,6 +31,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BAT = REPO_ROOT / "first-install.bat"
+UNINSTALL_BAT = REPO_ROOT / "uninstall.bat"  # v0.2.54 Track G (G-2)
 PS1 = REPO_ROOT / "install.ps1"
 
 WINDOWS_ONLY = pytest.mark.skipif(
@@ -127,6 +128,49 @@ def test_bat_help_gate_precedes_side_effects():
     assert invoke_pos != -1, "first-install.bat no longer invokes install.ps1?"
     assert help_pos < invoke_pos, (
         ":show_help must be dispatched before install.ps1 runs"
+    )
+
+
+def test_uninstall_bat_help_gate_precedes_side_effects():
+    """Same ordering contract for uninstall.bat (v0.2.54 Track G G-2): the
+    /help dispatch must precede the `install.py --uninstall` invocation so
+    `uninstall.bat /help` can never trigger a real uninstall."""
+    text = UNINSTALL_BAT.read_text(encoding="utf-8", errors="replace")
+    help_pos = text.find(":show_help")
+    invoke_pos = text.find("install.py --uninstall %*")
+    assert help_pos != -1, "uninstall.bat lost its :show_help handler"
+    assert invoke_pos != -1, "uninstall.bat no longer invokes install.py --uninstall?"
+    assert help_pos < invoke_pos, (
+        ":show_help must be dispatched before install.py --uninstall runs"
+    )
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("flag", ["/help", "--help", "-h", "/?"])
+def test_uninstall_bat_help_flag(flag):
+    """`uninstall.bat <help-flag>` must print usage and exit 0 with no side
+    effects and no cmd.exe parser errors (live windows-latest contract)."""
+    proc = subprocess.run(
+        ["cmd.exe", "/d", "/c", "call", str(UNINSTALL_BAT), flag],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=REPO_ROOT,
+    )
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    for err in CMD_PARSER_ERRORS:
+        assert err.lower() not in combined.lower(), (
+            f"cmd.exe parser error for {flag!r}: {combined[:2000]}"
+        )
+    assert proc.returncode == 0, (
+        f"{flag!r} exited {proc.returncode}; output: {combined[:2000]}"
+    )
+    assert "Usage: uninstall.bat" in combined, (
+        f"{flag!r} printed no usage text; output: {combined[:2000]}"
+    )
+    # The real uninstaller banner must NOT appear.
+    assert "Orchestrator Uninstaller" not in combined, (
+        "uninstall.bat help flag fell through to the real uninstall path"
     )
 
 
