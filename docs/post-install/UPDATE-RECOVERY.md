@@ -3,10 +3,13 @@
 > **Scope note (v0.2.54)**: this document covers the UPDATE-mechanics half
 > (lockfiles, sentinels, the stage1 updater, toasts, manual recovery).
 > The broader post-install verification flow (containers, MCPs, Weaviate,
-> hub health) is Track F's `POST-INSTALL-HEALTH-AUDIT.md` /
-> `CLAUDE-DIAGNOSTIC-PROMPT.md` in this same folder — if those files
-> don't exist yet in your checkout, they're planned; this file stands on
-> its own for update issues.
+> hub health) is in this same folder:
+> [`POST-INSTALL-HEALTH-AUDIT.md`](./POST-INSTALL-HEALTH-AUDIT.md) (6-item
+> audit) / [`CLAUDE-DIAGNOSTIC-PROMPT.md`](./CLAUDE-DIAGNOSTIC-PROMPT.md)
+> (paste-into-Claude diagnostic flow) /
+> [`CONTAINER-RECOVERY.md`](./CONTAINER-RECOVERY.md) (Podman / Docker /
+> port conflicts) / [`WINDOWS-FIRST-RUN-CHECK.md`](./WINDOWS-FIRST-RUN-CHECK.md)
+> (native-Windows quirks).
 
 This file is written for two audiences at once: a user pasting symptoms
 into Claude, and the Claude session itself trying to diagnose an update
