@@ -194,15 +194,23 @@ fn baseline_without_augment_does_not_see_home_local_bin_tools() {
     // gap has already been silently fixed elsewhere — in which case the
     // assertion below would give a false-positive "augment worked"
     // signal. We hold the line.
+    //
+    // CI-portability note: use a unique, host-absent stub name (NOT
+    // `node`/`npm`/`cargo`, which are pre-installed at /usr/local/bin
+    // on GitHub `ubuntu-latest` runners). The minimal PATH sets
+    // /usr/local/bin first, so a pre-installed system copy would
+    // satisfy `which` and break the baseline assertion despite a
+    // correct fixture. `vct_l_p0_4_stub_marker` is reserved-namespace.
     let _guard = ENV_MUTEX.lock().expect("lock env");
     let fx = DesktopLaunchFixture::new_with_minimal_path();
     let local_bin = fx.home_path().join(".local/bin");
-    lay_down_stub(&local_bin, "node");
+    lay_down_stub(&local_bin, "vct_l_p0_4_stub_marker");
 
     // PRE-augment: minimal PATH does NOT include $HOME/.local/bin, so
-    // `which node` returns None even though the binary exists.
+    // `which vct_l_p0_4_stub_marker` returns None even though the
+    // stub exists at $HOME/.local/bin.
     assert!(
-        which_using_process_path("node").is_none(),
+        which_using_process_path("vct_l_p0_4_stub_marker").is_none(),
         "baseline broken: PATH already includes $HOME/.local/bin somehow"
     );
 }
