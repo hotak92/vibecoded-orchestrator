@@ -49,12 +49,24 @@ Parse arguments:
 
 Run via the MAO gui_testing framework:
 ```bash
+# POSIX (bash/zsh)
 python -m orchestrator.gui_testing.runner \
   --url {URL} \
   --complexity {quick|standard|full} \
   --target-type {web_app|presentation|website|document} \
-  --output-dir /tmp/gui-report
+  --output-dir "$(python -c 'import tempfile,os;print(os.path.join(tempfile.gettempdir(),"vct-gui-report"))')"
 ```
+
+```powershell
+# Windows (PowerShell)
+python -m orchestrator.gui_testing.runner `
+  --url {URL} `
+  --complexity {quick|standard|full} `
+  --target-type {web_app|presentation|website|document} `
+  --output-dir "$env:TEMP\vct-gui-report"
+```
+
+The output dir is the `vct-gui-report` folder under the system temp dir — same name the `gui-tester` agent uses for its screenshots, so reports and screenshots land together.
 
 After the agent completes, read the report and show the user:
 1. Summary (pass/fail counts, target type, complexity used)
