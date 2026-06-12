@@ -125,11 +125,15 @@ pub enum McpSettingType {
 
 // --- Orchestrator feature config (persisted to disk) ---
 
+// v0.2.54 Track H: `watermark_enabled` was REMOVED. The flag only fed a
+// `VCT_WATERMARK` env emission in `apply_mcp_to_claude_settings` that
+// nothing ever read — the watermark feature never shipped a consumer.
+// Existing orchestrator.json files that still carry the key parse fine
+// (serde ignores unknown fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
     pub install_path: String,
     pub tier: OrchestratorTier,
-    pub watermark_enabled: bool,
     pub auto_update_enabled: bool,
     pub rl_retrieval_enabled: bool,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -142,7 +146,6 @@ impl Default for OrchestratorConfig {
         Self {
             install_path: String::new(),
             tier: OrchestratorTier::Free,
-            watermark_enabled: true,
             auto_update_enabled: false,
             rl_retrieval_enabled: false,
             mcp_servers: default_mcp_servers(),

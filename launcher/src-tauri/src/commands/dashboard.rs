@@ -76,8 +76,8 @@ async fn save_config(config: &OrchestratorConfig) -> Result<(), String> {
 ///
 /// `min_tier` is the lowercase tier slug from OrchestratorTier
 /// (free/pro/mao/enterprise/admin). `feature` is a short noun phrase
-/// describing what's gated — capitalised at start (e.g. "Disabling the
-/// watermark", "Auto-updates", "RL-scored retrieval").
+/// describing what's gated — capitalised at start (e.g. "Auto-updates",
+/// "RL-scored retrieval").
 fn tier_required_message(min_tier: &str, feature: &str) -> String {
     let tier_label = match min_tier {
         "free" => "any",  // shouldn't happen, but defensive
@@ -104,7 +104,6 @@ pub struct FeatureFlags {
     /// pass unknown slugs through verbatim.
     pub tier: String,
     pub can_auto_update: bool,
-    pub can_disable_watermark: bool,
     pub has_rl_retrieval: bool,
     pub has_curated_agents: bool,
     pub has_mao: bool,
@@ -122,7 +121,6 @@ fn feature_flags_for_tier(tier: &str) -> FeatureFlags {
     FeatureFlags {
         tier: tier.to_string(),
         can_auto_update: pro,
-        can_disable_watermark: pro,
         has_rl_retrieval: pro,
         has_curated_agents: pro,
         has_mao: mao,
@@ -192,14 +190,8 @@ async fn update_orchestrator_setting_inner(
     let mut config = load_config();
 
     match key.as_str() {
-        "watermark_enabled" => {
-            let val: bool = value.parse().map_err(|_| "Invalid bool")?;
-            // Free tier cannot disable watermark
-            if !val && !flags.can_disable_watermark {
-                return Err(tier_required_message("pro", "Disabling the watermark"));
-            }
-            config.watermark_enabled = val;
-        }
+        // v0.2.54 Track H: the "watermark_enabled" arm was removed along
+        // with the watermark gate (no consumer ever shipped).
         "auto_update_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
             if val && !flags.can_auto_update {
@@ -610,11 +602,9 @@ async fn apply_mcp_to_claude_settings(config: &OrchestratorConfig) -> Result<(),
             }
         }
 
-        // Watermark setting
-        env_map.insert(
-            "VCT_WATERMARK".to_string(),
-            serde_json::Value::String(config.watermark_enabled.to_string()),
-        );
+        // v0.2.54 Track H: the `VCT_WATERMARK` env emission was removed —
+        // no hook, MCP server, or script ever read it. Stale entries in
+        // existing settings.json files are harmless leftovers.
     }
 
     let json = serde_json::to_string_pretty(&settings)
@@ -782,10 +772,10 @@ mod tests {
 
     #[test]
     fn tier_required_message_picks_pro_label() {
-        let msg = tier_required_message("pro", "Disabling the watermark");
+        let msg = tier_required_message("pro", "RL-scored retrieval");
         assert_eq!(
             msg,
-            "Disabling the watermark requires a Pro or higher tier license."
+            "RL-scored retrieval requires a Pro or higher tier license."
         );
     }
 
@@ -808,7 +798,7 @@ mod tests {
         for feature in &[
             "Auto-updates",
             "RL-scored retrieval",
-            "Disabling the watermark",
+            "Curated agent packs",
             "MAO orchestration",
         ] {
             let msg = tier_required_message("mao", feature);

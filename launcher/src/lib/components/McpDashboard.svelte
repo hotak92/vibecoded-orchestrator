@@ -27,7 +27,6 @@
   interface FeatureFlags {
     tier: string;
     can_auto_update: boolean;
-    can_disable_watermark: boolean;
     has_rl_retrieval: boolean;
     has_curated_agents: boolean;
     has_mao: boolean;
@@ -36,7 +35,6 @@
   interface OrchestratorConfig {
     install_path: string;
     tier: string;
-    watermark_enabled: boolean;
     auto_update_enabled: boolean;
     rl_retrieval_enabled: boolean;
     telemetry_enabled: boolean;
@@ -230,23 +228,6 @@
         <!-- Tab: Features -->
         {:else if activeTab === 'features'}
           <div class="features-list">
-            <!-- Watermark -->
-            <div class="feature-row">
-              <div class="feature-info">
-                <h3>Watermark</h3>
-                <p>Adds "Made with VibeCoded Tools" comment to new files</p>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" checked={config.watermark_enabled}
-                  disabled={!features.can_disable_watermark && config.watermark_enabled}
-                  onchange={(e) => updateSetting('watermark_enabled', String((e.target as HTMLInputElement).checked))} />
-                <span class="toggle-slider"></span>
-              </label>
-              {#if !features.can_disable_watermark}
-                <span class="upgrade-hint">Pro to disable</span>
-              {/if}
-            </div>
-
             <!-- Auto-update -->
             <div class="feature-row">
               <div class="feature-info">
