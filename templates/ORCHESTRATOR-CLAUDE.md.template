@@ -465,7 +465,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `config-change-audit.sh` — log `settings.json` changes to JSONL (background).
 
 **Stop**:
-- `cost-tracker.sh` — append `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, cost_usd}` to `~/.claude/metrics/costs.jsonl`. Summary: `.claude/scripts/cost-summary`.
+- `cost-tracker.sh` — append `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, cost_usd}` to `~/.claude/metrics/costs.jsonl`. Summary: `python .claude/scripts/cost-summary.py [--days N]` (portable, all OSes; the bash `cost-summary` shim still works on POSIX).
 - `notify-stop.sh` — desktop notification (`notify-send`).
 
 **StopFailure**:

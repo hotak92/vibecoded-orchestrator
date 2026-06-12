@@ -168,7 +168,7 @@ Context nearing limit
 
 **cost-tracker.sh**
 - Appends `{timestamp, session_id, model, input_tokens, output_tokens, cache_read_tokens, cost_usd}` to `~/.claude/metrics/costs.jsonl`.
-- Summary CLI: `.claude/scripts/cost-summary`.
+- Summary CLI: `python .claude/scripts/cost-summary.py [--days N]` (portable, all OSes; bash `cost-summary` shim delegates to it on POSIX).
 
 **notify-stop.sh**
 - Desktop notification via `notify-send`: "Claude session ended".
