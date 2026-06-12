@@ -34,6 +34,9 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Always exit 0 (never block the edit).
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh` (absent on
+# PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
+. "$PSScriptRoot/_lib/resolve-powershell.ps1"
 # Source emit-context.ps1 ONLY if the file exists. If the helper is
 # missing (partial install or just-after-clone before _lib/ is fully
 # populated), the hook still runs its dedup/state work. The
@@ -179,7 +182,7 @@ $DetectScriptPs1 = Join-Path $ProjectRoot ".claude/scripts/detect-project.ps1"
 $DetectedProject = ""
 if (Test-Path $DetectScriptPs1) {
     try {
-        $DetectedProject = (& pwsh -NoProfile -File $DetectScriptPs1 $FilePath $ProjectRoot 2>$null).Trim()
+        $DetectedProject = (& $PsExe -NoProfile -File $DetectScriptPs1 $FilePath $ProjectRoot 2>$null).Trim()
     } catch { }
 }
 $CodeGraphProjectArg = if ($DetectedProject) { @('--project', $DetectedProject) } else { @() }
@@ -220,7 +223,7 @@ if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|
     try {
         # --hook-format emits "CODE: <full_name> | <collection> | distance=..." headers.
         if (Test-Path $cgQueryPs1) {
-            $out = & pwsh -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
+            $out = & $PsExe -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
                 Where-Object { $_ -notlike "*$FilePath*" } |
                 Select-Object -First 20
             $out | Set-Content -Path $CodeTmp.FullName
