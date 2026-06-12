@@ -43,8 +43,13 @@ on:
   push:
     paths:
       - "install.py"
-      - "vco_lib/project_init.py"
-      - "vco_lib/config_projection.py"
+      # v0.2.54 Track E (Theme 6): broadened from specific vco_lib files
+      # to `vco_lib/**` so every helper module under vco_lib (e.g.
+      # env_template, project_config, agent_dispatch_helper, kg_sync) is
+      # also a trigger. Pre-Track-E only project_init + config_projection
+      # were named, so changes to other vco_lib modules could land
+      # without re-running this gate.
+      - "vco_lib/**"
       - "templates/**"
       - ".github/workflows/installer-smoke.yml"
       # v0.2.40 X1: macOS best-effort smoke triggers
@@ -60,8 +65,13 @@ on:
   pull_request:
     paths:
       - "install.py"
-      - "vco_lib/project_init.py"
-      - "vco_lib/config_projection.py"
+      # v0.2.54 Track E (Theme 6): broadened from specific vco_lib files
+      # to `vco_lib/**` so every helper module under vco_lib (e.g.
+      # env_template, project_config, agent_dispatch_helper, kg_sync) is
+      # also a trigger. Pre-Track-E only project_init + config_projection
+      # were named, so changes to other vco_lib modules could land
+      # without re-running this gate.
+      - "vco_lib/**"
       - "templates/**"
       - ".github/workflows/installer-smoke.yml"
       # v0.2.40 X1: macOS best-effort smoke triggers

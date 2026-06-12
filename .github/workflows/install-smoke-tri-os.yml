@@ -57,34 +57,45 @@ concurrency:
 
 jobs:
   install-smoke:
-    name: install smoke (${{ matrix.os }})
+    name: install smoke (${{ matrix.target }})
     strategy:
       # One OS failure must NOT mask the others — gate 22 reads per-matrix
       # conclusions.
       fail-fast: false
       matrix:
+        # v0.2.54 Track E (Theme 6): use a synthetic `target` matrix key
+        # so the Fedora leg gets its own distinct job slot. Pre-Track-E
+        # the matrix had a bare `os:` list; trying to add Fedora via
+        # `include` MERGED into the existing ubuntu-22.04 leg instead of
+        # creating a fifth job (GitHub Actions `include` semantics:
+        # entries whose keys match an existing matrix combo merge into
+        # it). With `target` as the primary axis and explicit `os:` /
+        # `container:` per row, each row produces its own job and the
+        # ubuntu-22.04 libwebkit2gtk-4.0-dev fallback coverage stays
+        # intact alongside the new fedora-40 leg.
+        #
         # See §9.2 for OS rationale.
-        os:
+        target:
           - ubuntu-22.04   # Tests L-P0-2 (libwebkit2gtk-4.0-dev fallback)
           - ubuntu-24.04   # Tests L-P0-2 (libwebkit2gtk-4.1-dev primary)
           - macos-14       # Tests M-P0-* (bash 3.2, /opt/homebrew, arm64)
           - windows-latest # Tests W-P1-* + first-install.bat (cmd.exe)
-        # v0.2.54 G-1: the previous `include` entry (os: ubuntu-22.04 +
-        # container: fedora:40 + label: fedora-40) did NOT add a fifth
-        # "fedora-40" job. GitHub Actions `include` entries whose keys
-        # match an existing matrix combination MERGE into it — so the
-        # bare ubuntu-22.04 job (the documented libwebkit2gtk-4.0-dev
-        # fallback coverage) silently ran INSIDE the fedora:40 container
-        # under the misleading name "install smoke (ubuntu-22.04)", and
-        # the intended Fedora job never existed (verify: run 27340118156
-        # had 4 jobs, and the "ubuntu-22.04" job log shows
-        # `docker pull fedora:40`). Removing the include restores the
-        # bare ubuntu-22.04 coverage. Proper Fedora coverage needs a
-        # synthetic matrix key (target: [.., fedora-40] mapped to
-        # runs_on + container) plus dnf node/python prep — tracked for
-        # Track G (cross-OS parity, v0.2.54 Wave 3).
+          - fedora-40      # Tests L-P0-3 (SELinux :Z mount flag) + L-P0-1 (dnf parity)
+        include:
+          - target: ubuntu-22.04
+            os: ubuntu-22.04
+          - target: ubuntu-24.04
+            os: ubuntu-24.04
+          - target: macos-14
+            os: macos-14
+          - target: windows-latest
+            os: windows-latest
+          - target: fedora-40
+            os: ubuntu-22.04
+            container: fedora:40
 
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container || null }}
     timeout-minutes: 25
 
     env:
@@ -99,9 +110,34 @@ jobs:
         }}
 
     steps:
-      # (v0.2.54 G-1: the "Fedora container prep" step moved out with the
-      # malformed matrix include — see the matrix comment above. Track G
-      # re-adds Fedora as a proper fifth matrix entry.)
+      # v0.2.54 Track E (Theme 6): Fedora container prep. The fedora-40
+      # row in the matrix sets `container: fedora:40` (see matrix above),
+      # so this step only runs on that leg. dnf installs git + python +
+      # the system libraries needed for the libwebkit2gtk + dbus build
+      # path that actions/setup-python's manylinux wheels can't cover.
+      # SELinux :Z mount-flag coverage (L-P0-3) and dnf-vs-apt parity
+      # coverage (L-P0-1) ride on this leg.
+      - name: Fedora container prep (dnf install)
+        if: matrix.target == 'fedora-40'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y \
+            git \
+            python3 \
+            python3-pip \
+            python3-devel \
+            nodejs \
+            npm \
+            curl \
+            tar \
+            gzip \
+            findutils \
+            which \
+            shadow-utils
+          python3 --version
+          git --version
+          node --version || true
 
       # ----------------------------------------------------------------
       # 1. Fresh git clone (NOT actions/checkout).
@@ -109,10 +145,10 @@ jobs:
       #    Reason: actions/checkout does a shallow clone via the GitHub
       #    Actions auth helper, which is NOT what a third-party user
       #    does. We need to exercise the public-clone code path that
-      #    Luciano hit on his macOS install. The `vco-fresh-clone/`
-      #    subdir keeps the install root isolated from the workspace
-      #    `__w/<repo>/` directory that earlier checkout actions would
-      #    leave behind.
+      #    a third-party user would hit on their macOS install. The
+      #    `vco-fresh-clone/` subdir keeps the install root isolated
+      #    from the workspace `__w/<repo>/` directory that earlier
+      #    checkout actions would leave behind.
       # ----------------------------------------------------------------
       - name: Clone fresh (third-party-user experience)
         shell: bash
@@ -135,10 +171,14 @@ jobs:
           git log -1 --oneline
 
       # ----------------------------------------------------------------
-      # 2. Python setup via actions/setup-python (all jobs are bare host
-      #    runners since the G-1 matrix fix).
+      # 2. Python setup via actions/setup-python on bare runners; on
+      #    fedora-40 (container leg) actions/setup-python's downloaded
+      #    Python lacks libdbus + libwebkit2gtk symbols, so we use the
+      #    distro python installed by the Fedora container prep step
+      #    above. Skip the action on that leg.
       # ----------------------------------------------------------------
       - name: Set up Python (host runners)
+        if: matrix.target != 'fedora-40'
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -243,12 +283,17 @@ jobs:
       # installer-smoke.yml's weaviate-smoke job (service container).
       # Full-stack container e2e on runners (podman.socket activation)
       # is Track G scope (v0.2.54 Wave 3).
-      - name: first-install.sh (Linux)
-        if: matrix.os == 'ubuntu-22.04' || matrix.os == 'ubuntu-24.04'
+      - name: first-install.sh (Linux + Fedora)
+        if: matrix.target == 'ubuntu-22.04' || matrix.target == 'ubuntu-24.04' || matrix.target == 'fedora-40'
         working-directory: vco-fresh-clone
         shell: bash
         # Some Linux distros mark first-install.sh non-executable when
         # cloned over HTTPS via cgi (umask). Run via explicit `bash`.
+        #
+        # v0.2.54 Track E: fedora-40 now runs the same first-install.sh
+        # step (matrix.target gating, not matrix.os, since fedora-40's
+        # `os:` is ubuntu-22.04 the host runner). Exercises L-P0-1 (dnf
+        # parity) + L-P0-3 (SELinux :Z mount flag handling).
         run: |
           set -uo pipefail
           if bash first-install.sh --yes --no-auto-launch --no-containers --skip-models; then
@@ -482,7 +527,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: install-smoke-diagnostics-${{ matrix.label || matrix.os }}
+          name: install-smoke-diagnostics-${{ matrix.target }}
           path: |
             vco-fresh-clone/bootstrap-pre.json
             vco-fresh-clone/bootstrap-pre.stderr

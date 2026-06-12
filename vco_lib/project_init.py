@@ -6439,11 +6439,15 @@ def install_project_bundle(
     # as the live file; present → refresh the `.reference.md` sidecar and
     # flag for review when meaningfully diverged.
     template_review_diverged: list[str] = []
+    # Project name derived from folder basename — kept simple per
+    # coord ("no fancy templating engine"). Callers that want a
+    # different display name can edit CLAUDE.md after install.
+    # Assigned OUTSIDE the try: the legacy-KG / legacy-codegraph
+    # detection further down also reads it, and a templates-install
+    # failure swallowed by the except below must not leave it unbound
+    # (NameError in the failure path).
+    derived_project_name = folder.name or "Project"
     try:
-        # Project name derived from folder basename — kept simple per
-        # coord ("no fancy templating engine"). Callers that want a
-        # different display name can edit CLAUDE.md after install.
-        derived_project_name = folder.name or "Project"
         templates_result = _install_project_level_templates(
             folder,
             orchestrator_root=orchestrator_root,
@@ -6985,7 +6989,10 @@ def _apply_canonical_env_via_config_projection(
         result["action"] = "not_registered"
         return result
 
-    # Delegate to the contract.
+    # Delegate to the contract. The import lives in its OWN try: if it
+    # were inside the call-try below and failed, the `except
+    # DbUnreachable` clause would itself NameError on the unbound
+    # exception class, masking the real ImportError.
     try:
         from vco_lib.config_projection import (
             apply_project_env,
@@ -6993,6 +7000,10 @@ def _apply_canonical_env_via_config_projection(
             DbUnreachable,
             ProjectNotFound,
         )
+    except ImportError as e:  # pragma: no cover — module ships in-tree
+        result["action"] = f"apply_failed:{type(e).__name__}:{e}"
+        return result
+    try:
         bundle = project_env_from_db(
             project_id,
             orchestrator_root=orchestrator_root,

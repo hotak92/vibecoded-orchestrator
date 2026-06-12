@@ -154,8 +154,27 @@ jobs:
       # eliminates the entire class of "keychain-induced flake" CI
       # failures. See scripts/test-keychain-safe.sh for the threat
       # model and crate::secrets's module-level docs.
-      - name: cargo test --lib (keychain-safe wrapper)
+      #
+      # v0.2.54 Track E (P0-1): the script now runs
+      # `cargo test --workspace --tests`, covering all 4 workspace
+      # members (vct-launcher-temp, vct-launcher-core, vct-hub,
+      # vct-updater) — pre-Track-E this was `--lib` against the root
+      # crate only, so 3 of 4 crates' tests never ran in CI. See the
+      # script header for the retry-policy decision on adopt_populated.
+      - name: cargo test --workspace --tests (keychain-safe wrapper)
         run: bash scripts/test-keychain-safe.sh
+
+      # v0.2.54 Track E (P0-1): vct-cli is a SEPARATE Cargo workspace
+      # at launcher/tools/vct-cli/Cargo.toml (not a member of the main
+      # workspace, per its package = "vct-cli" line). Its tests would
+      # not be picked up by the --workspace run above. Run them
+      # explicitly here. Single-threaded for parity with the main run
+      # (the CLI doesn't touch the keychain, but consistency is cheap).
+      - name: cargo test (vct-cli sub-workspace)
+        run: |
+          cargo test --tests \
+            --manifest-path launcher/tools/vct-cli/Cargo.toml \
+            -- --test-threads=1
 
   managed-paths-cross-language:
     name: Managed-paths cross-language consistency
@@ -227,15 +246,24 @@ jobs:
           pip install -r requirements.txt
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
       - name: pyright
-        # Don't fail on pre-existing errors at first introduction —
-        # `--warnings` mode reports without exit-1 on warnings (errors
-        # still fail). Switch to strict mode once we've cleared the
-        # backlog. Until then, this job's value is preventing NEW
-        # errors from creeping in via PR.
+        # v0.2.54 Track E (Theme 6): removed the `|| true` swallow that
+        # made this job always-green. `--warnings` mode already reports
+        # WITHOUT exit-1 on warnings (only errors fail), so the swallow
+        # was redundant for warnings AND was actively hiding genuine
+        # type errors.
+        #
+        # v0.2.54 Track E amendment: scope comes from the repo-root
+        # `pyrightconfig.json` — vco_lib/ + claude_mcp_servers/
+        # {weaviate_mcp,search_mcp}/ are gated at ZERO errors (repo-wide
+        # had 813 pre-existing errors across 429 files, which is why the
+        # old swallow existed). Two backlog files are out of scope until
+        # v0.2.55: weaviate_mcp/server.py (93 errors) and install.py
+        # (34 errors) — counts + rationale in pyrightconfig.json and
+        # CHANGELOG. If your PR adds a NEW type error in scope, fix it
+        # or annotate the line with `# pyright: ignore[<rule>]` plus a
+        # rationale comment. Do NOT re-add `|| true`.
         run: |
-          pyright --warnings || true
-          # Re-run with no `|| true` once backlog is clean to make this
-          # gate actually enforce. Tracked as follow-up to pre-fork #18.
+          pyright --warnings
 
   frontend:
     name: Frontend (svelte-check)
@@ -315,9 +343,28 @@ jobs:
       # rewrites their personal home dir. See
       # `launcher/src-tauri/.cargo/config.toml` for the
       # full two-layer strategy.
+      #
+      # v0.2.54 Track E (Theme 6): the previous `${{ env.HOME }}`
+      # GitHub-expression resolved to the workflow's top-level `env:`
+      # block (none defined → empty string), NOT to the runner's
+      # shell `$HOME`. The result was a silent no-op remap like
+      # `--remap-path-prefix==<home>` that effectively did nothing.
+      # Fixed by computing the remap arguments in a shell step that
+      # reads `$HOME` from the runtime environment, then exporting
+      # RUSTFLAGS into the next step via GITHUB_ENV. Reference:
+      # https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables
+      - name: Resolve RUSTFLAGS for path remapping
+        run: |
+          set -euo pipefail
+          # $HOME is /home/runner on GitHub-hosted Linux runners.
+          # The remap rewrites both the home root AND .cargo subdir,
+          # matching the two-layer strategy in
+          # launcher/src-tauri/.cargo/config.toml.
+          remap_flags="--remap-path-prefix=${HOME}=<home> --remap-path-prefix=${HOME}/.cargo=<cargo>"
+          echo "RUSTFLAGS=${remap_flags}" >> "$GITHUB_ENV"
+          echo "Resolved RUSTFLAGS: ${remap_flags}"
+
       - name: cargo build --release (no bundle)
-        env:
-          RUSTFLAGS: --remap-path-prefix=${{ env.HOME }}=<home> --remap-path-prefix=${{ env.HOME }}/.cargo=<cargo>
         run: |
           cargo build --release \
             --bin vct-launcher-temp \
@@ -395,3 +442,43 @@ jobs:
             exit 1
           fi
           echo "Launcher leak-check passed."
+
+  # v0.2.54 Track E (Theme 6 + P0-8): tree-scanning leak gates.
+  #
+  # Pre-Track-E, the secrets-scan + pre-tag-privacy scripts existed but
+  # were registered in ZERO workflows — they only ran when invoked
+  # manually (git pre-commit hook, or scripts/pre-ship-check.sh). That
+  # meant a PR could land with a leaked token or personal-machine path
+  # reference and nothing in CI would catch it.
+  #
+  # This job runs both scripts on every push/PR so the tree is gated
+  # against the patterns documented inside each script (see the
+  # `BLOCKLIST` array + Track C/D pattern lists in the script sources).
+  # Categories covered: historical-leak tokens, personal-project name
+  # references, hostname + author-machine path leaks.
+  #
+  # No needs:[] dependency — leak detection is cheap and parallelizable
+  # with the heavier rust/python/frontend jobs above.
+  leak-gates:
+    name: Repo-tree leak gates (no-secrets + pre-tag-privacy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Privacy gate uses `git ls-tree` against HEAD; full history
+          # not needed. The leak grep scans tracked files only.
+          fetch-depth: 1
+
+      # The secrets gate (--all scans the full tracked tree, including
+      # docs + tests, against the historical-leak blocklist). Self-
+      # excludes the script itself + CHANGELOG.md (historical narrative
+      # may legitimately name past tokens for documentation).
+      - name: check-no-secrets.sh (--all)
+        run: bash scripts/check-no-secrets.sh --all
+
+      # The pre-tag privacy gate exits 1 on any pattern hit outside the
+      # documented sentinels (tests/test_launcher_leak_grep.py +
+      # scripts/check-install.sh + docs/REPO_CLEANLINESS.md + pyproject).
+      # Per Track C / D pattern docs in the script itself.
+      - name: check-pre-tag-privacy.sh
+        run: bash scripts/check-pre-tag-privacy.sh

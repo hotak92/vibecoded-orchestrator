@@ -504,7 +504,7 @@
           "type": "boolean"
         },
         "rotate_weights_endpoint": {
-          "description": "HTTPS endpoint that returns the latest available weights bundle version + a signed download URL. Polled on launcher startup + once per day (locked decision 2026-05-16).",
+          "description": "HTTPS endpoint that returns the latest available weights bundle version + a signed download URL. Polled on launcher startup + once per day per the project's locked decision (2026-05-16).",
           "default": null,
           "type": [
             "string",

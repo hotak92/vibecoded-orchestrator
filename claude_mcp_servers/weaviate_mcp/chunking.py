@@ -15,11 +15,14 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-# Try to import langchain_ollama for accurate token counting
+# Try to import langchain_ollama for accurate token counting.
+# Optional dependency — not in requirements.txt; the ignore comment
+# keeps pyright quiet in environments (incl. CI) where it is absent.
 try:
-    from langchain_ollama import ChatOllama
+    from langchain_ollama import ChatOllama  # pyright: ignore[reportMissingImports]  # noqa: E501
     OLLAMA_AVAILABLE = True
 except ImportError:
+    ChatOllama = None  # sentinel: checked via OLLAMA_AVAILABLE below
     OLLAMA_AVAILABLE = False
 
 
@@ -95,7 +98,10 @@ class TokenCounter:
     def _get_llm(cls):
         """Get or create LLM instance for token counting"""
         if cls._llm is None:
-            if not OLLAMA_AVAILABLE:
+            # The `ChatOllama is None` arm is redundant at runtime
+            # (set together with OLLAMA_AVAILABLE) but narrows the
+            # optional-import sentinel for the type checker.
+            if not OLLAMA_AVAILABLE or ChatOllama is None:
                 cls._use_approximation = True
                 return None
 

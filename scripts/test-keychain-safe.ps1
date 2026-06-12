@@ -5,10 +5,14 @@
 # Windows Credential Manager's per-process throttling under burst load.
 #
 # Usage:
-#   .\scripts\test-keychain-safe.ps1                # all lib tests
+#   .\scripts\test-keychain-safe.ps1                # all workspace tests
 #   .\scripts\test-keychain-safe.ps1 secrets_cmd::  # filter by name
 #
 # CI: invoked by .github/workflows/ci.yml on windows-latest runners.
+#
+# v0.2.54 Track E (P0-1): switched from `cargo test --lib` to
+# `cargo test --workspace --tests` so all four workspace members are
+# covered, not just `vct-launcher-temp`. See the .sh sibling for details.
 
 $ErrorActionPreference = 'Stop'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -22,6 +26,6 @@ if (-not (Test-Path $Manifest)) {
 
 # Forward args + pin --test-threads=1. The `--` separator routes the
 # threads flag to the test binary, not to cargo.
-Write-Host "[test-keychain-safe] cargo test --lib --manifest-path $Manifest -- --test-threads=1 $args"
-& cargo test --lib --manifest-path $Manifest @args -- --test-threads=1
+Write-Host "[test-keychain-safe] cargo test --workspace --tests --manifest-path $Manifest -- --test-threads=1 $args"
+& cargo test --workspace --tests --manifest-path $Manifest @args -- --test-threads=1
 exit $LASTEXITCODE

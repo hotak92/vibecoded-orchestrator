@@ -1,0 +1,36 @@
+{
+    // v0.2.54 Track E amendment: scope the CI pyright gate (ci.yml
+    // `python-typecheck` job) to the surfaces where the gate is REAL —
+    // zero errors today, so any new error is a regression and fails
+    // the build. Running pyright repo-wide reported 813 pre-existing
+    // errors across 429 files (tests/, templates/, scripts/, launcher
+    // frontend is covered by svelte-check), which is why the old job
+    // needed `|| true` and was decorative.
+    //
+    // If your PR adds a NEW type error inside this scope: fix it, or
+    // annotate the single line with `# pyright: ignore[<rule>]` plus a
+    // rationale comment. Do NOT re-add `|| true` in ci.yml and do NOT
+    // grow the exclude list without logging the error count + a
+    // CHANGELOG backlog entry, as done for the two exclusions below.
+    "include": [
+        "vco_lib",
+        "claude_mcp_servers/weaviate_mcp",
+        "claude_mcp_servers/search_mcp"
+    ],
+    "exclude": [
+        "**/.venv",
+        "**/node_modules",
+        "**/target",
+        "**/dist",
+        ".claude/worktrees",
+        // Backlog (v0.2.55, see CHANGELOG): 93 pre-existing errors,
+        // dominated by reportArgumentType friction against
+        // weaviate-client v4 stubs. Gate it after that cleanup.
+        "claude_mcp_servers/weaviate_mcp/server.py"
+        // NOTE: install.py (34 pre-existing errors, 26k lines) is a
+        // second backlog item — it is simply NOT in `include` above,
+        // so it needs no exclude entry. Add it to `include` once the
+        // v0.2.55 backlog clears it.
+    ],
+    "pythonVersion": "3.12"
+}

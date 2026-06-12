@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS-EXEMPT-PARITY: BASH_ENV-sourced file — Bash-specific. PowerShell uses $PROFILE for the equivalent concept, not a sibling script.
 # leanctx-bash-env.sh - DISABLED as of vibecoded-orchestrator 0.2.11
 #
 # WHAT THIS USED TO BE

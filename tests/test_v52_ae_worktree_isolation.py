@@ -87,7 +87,7 @@ class RenderVerifyBoilerplateTests(unittest.TestCase):
             agent_id="abc1234",
             expected_branch="chore/v0252-test-branch",
             base_commit="8c86de15",
-            parent_checkout_path="/home/martino/Desktop/PROGETTI/vibecoded-orchestrator",
+            parent_checkout_path="/home/dev/projects/vibecoded-orchestrator",
         )
 
     def test_includes_version_marker(self) -> None:
@@ -120,7 +120,7 @@ class RenderVerifyBoilerplateTests(unittest.TestCase):
         """Step 2 must explicitly name the parent's checkout path."""
         out = render_verify_boilerplate(self.full_directive)
         self.assertIn(
-            "/home/martino/Desktop/PROGETTI/vibecoded-orchestrator", out
+            "/home/dev/projects/vibecoded-orchestrator", out
         )
         self.assertIn("MUST NOT equal", out)
 
@@ -251,13 +251,13 @@ class IntegrationDualSubagentDispatchTests(unittest.TestCase):
             agent_id="dummy_a",
             expected_branch="chore/v0252-dummy-a",
             base_commit="8c86de15",
-            parent_checkout_path="/home/martino/Desktop/PROGETTI/vibecoded-orchestrator",
+            parent_checkout_path="/home/dev/projects/vibecoded-orchestrator",
         )
         agent_b = WorktreeIsolationDirective(
             agent_id="dummy_b",
             expected_branch="chore/v0252-dummy-b",
             base_commit="8c86de15",
-            parent_checkout_path="/home/martino/Desktop/PROGETTI/vibecoded-orchestrator",
+            parent_checkout_path="/home/dev/projects/vibecoded-orchestrator",
         )
 
         prompt_a = render_verify_boilerplate(agent_a)
@@ -325,11 +325,11 @@ class IntegrationDualSubagentDispatchTests(unittest.TestCase):
         parent path as forbidden."""
         agent_a = WorktreeIsolationDirective(
             agent_id="dummy_a",
-            parent_checkout_path="/home/martino/Desktop/PROGETTI/vibecoded-orchestrator",
+            parent_checkout_path="/home/dev/projects/vibecoded-orchestrator",
         )
         prompt = render_verify_boilerplate(agent_a)
         # The parent's checkout path must be present AS A FORBIDDEN value.
-        self.assertIn("/home/martino/Desktop/PROGETTI/vibecoded-orchestrator", prompt)
+        self.assertIn("/home/dev/projects/vibecoded-orchestrator", prompt)
         self.assertIn("MUST NOT equal", prompt)
 
 

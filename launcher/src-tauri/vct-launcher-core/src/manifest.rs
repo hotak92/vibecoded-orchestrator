@@ -1481,7 +1481,7 @@ pub struct ContainerInstallBlock {
     pub rotate_weights: bool,
     /// HTTPS endpoint that returns the latest available weights bundle
     /// version + a signed download URL. Polled on launcher startup +
-    /// once per day per VCO_dev's locked decision (2026-05-16).
+    /// once per day per the project's locked decision (2026-05-16).
     #[serde(default)]
     pub rotate_weights_endpoint: Option<String>,
 }
