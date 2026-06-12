@@ -420,15 +420,20 @@ async fn run_install_inner(
 /// Pull a container image from a private registry via a short-lived
 /// signed pull-token (paid-module flow).
 ///
-/// Token gateway flow (Phase 3A — gateway not deployed yet):
-///   1. POST validated-tier JWT to `pull_token_endpoint`.
+/// Token gateway flow (canonical since v0.2.35 — the gateway IS deployed;
+/// `request_pull_token` POSTs to the manifest's `pull_token_endpoint`,
+/// e.g. the `rl-artifact-url` edge function):
+///   1. POST `{license_key, machine_id_hash}` to `pull_token_endpoint`.
 ///   2. Receive `{ image, tag, pull_token, expires_at }` — token TTL ~15min.
 ///   3. `podman login` with that token, `podman pull`, `podman logout`.
 ///   4. Discard token from memory.
 ///
-/// Today (gateway returns 404): falls back to anonymous pull. Anonymous
-/// pull will succeed for public images and 401 for private — both produce
-/// clear errors that help diagnose the gateway-not-deployed-yet state.
+/// On token-request failure we fall back to anonymous pull — still valid
+/// for public images (free-tier publishers, dev/test variants not yet
+/// flipped private). For private images the anonymous 401 is diagnostic:
+/// the `request_pull_token` Err carries the actual cause
+/// (license_invalid / tier_insufficient / network / …) — see the Step 1
+/// comment in the body.
 ///
 /// Runtime detection: prefers `podman` (rootless, matches the rest of
 /// VCO's container stack). Falls back to `docker` if podman is missing.
