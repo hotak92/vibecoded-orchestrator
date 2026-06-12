@@ -124,13 +124,17 @@ npx supabase functions deploy lemon-squeezy-webhook --no-verify-jwt
 
 ## Dev Mode
 
-Without LS products configured, you can test activation with codes:
-- `test-demo1` → activates DemoProduct1
-- `test-demo2` → activates DemoProduct2
-- `test-demo3` → activates DemoProduct3
-- etc.
+For testing license activation without configuring Lemon Squeezy
+products, use the staging tier-validation endpoint and a real (or
+test) license key:
 
-Enter these in: Avatar menu → Activation Codes
+1. Set `VCT_VALIDATE_TIER_URL` to your staging Supabase function URL.
+2. Enter a license key via Avatar menu → Activation Codes
+   (ActivationModal).
+
+The legacy `test-(\w+)` regex codes shipped before v0.2.54 were
+removed alongside the per-app activation stack — see
+`docs/features/01-launcher.md` for the current single-key flow.
 
 ## Project Structure
 

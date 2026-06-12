@@ -8,8 +8,8 @@
 -- dispatcher's HTTP descriptor (`{ kind: "http", method, path, ... }`)
 -- needs to resolve `module_id → port` at dispatch time. The RL-only
 -- column scales to one module; we're about to add `vct-coordination`
--- and `vct-transcrypt` and any further paid modules without per-module
--- launcher changes. One generic table → N modules.
+-- and `vct-ecosystem-app-1` and any further paid modules without
+-- per-module launcher changes. One generic table → N modules.
 --
 -- KEY SHAPE: (project_id, module_id). One port per (project × module).
 -- Modules that don't expose HTTP (CLI-only / future shell-action
