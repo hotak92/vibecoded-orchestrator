@@ -11880,9 +11880,19 @@ def _materialize_orchestrator_self_claude_dir(
             hooks_dst = vco_new_hooks
 
         hooks_dst.mkdir(parents=True, exist_ok=True)
+        # v0.2.54 Track G (G-4): filter by the shared hook-flavour globs.
+        # Pre-G-4 this loop copied every file via iterdir() — which DID
+        # ship both .sh + .ps1 flavours, but by accident rather than
+        # policy, and would also have shipped any stray non-hook file
+        # someone dropped into templates/hooks/. Now the both-flavours
+        # policy is explicit and shared with Step 9b + project_init.
+        from vco_lib.bundle_globs import hook_globs as _hook_globs
+        from fnmatch import fnmatch as _fnmatch
         for src in hooks_src.iterdir():
             if not src.is_file():
                 continue  # Skip _lib/ and other subdirs; handled below.
+            if not any(_fnmatch(src.name, g) for g in _hook_globs()):
+                continue  # Not a hook flavour we ship (.sh / .ps1 only).
             target = hooks_dst / src.name
             # v0.2.46 V47-B: individual hook file is a symlink → skip
             # the in-place copy; land VCO's version at the sibling.
@@ -24588,17 +24598,6 @@ def _install_agents_and_skills(
         print("  " + ", ".join(parts))
 
 
-def _hook_glob_for_os() -> str:
-    """Pick the OS-active hook file extension glob.
-
-    Linux/macOS run bash hooks; Windows runs the PowerShell siblings shipped
-    by `feat/hook-system-ps1-parity`. The two-template + two-glob approach
-    keeps per-OS installs lean — a Linux user never gets unused .ps1 files in
-    .claude/hooks/, and vice versa. See audit F1 (P0).
-    """
-    return "*.ps1" if platform.system() == "Windows" else "*.sh"
-
-
 def _settings_template_for_os(templates_dir: Path) -> Path:
     """Return the OS-specific settings.json template path.
 
@@ -24622,9 +24621,11 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     KG_COLLECTION, WEAVIATE_URL, etc. at runtime; the launcher exports
     VCT_INSTALL_ROOT per-project.
 
-    OS-active install: only the shell flavour native to the host is copied
-    (`*.sh` on Linux/macOS, `*.ps1` on Windows). The non-active flavour is
-    skipped — a Linux project never gets stray `.ps1` files. See audit F1.
+    Hook flavours: BOTH `.sh` and `.ps1` are copied on every OS (v0.2.54
+    Track G G-4, routed through `vco_lib.bundle_globs.hook_globs()` — the
+    same policy as the per-project bundle path in `project_init`). The
+    pre-G-4 native-flavour-only policy (audit F1) broke dual-boot / WSL-
+    crossover setups where the same folder is opened from both shells.
 
     settings.json merge rules (only when target file already exists):
       * recursive dict merge — template provides defaults, user keys win on conflict
@@ -24645,14 +24646,17 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     if not hooks_src.exists():
         return ""
 
-    hook_glob = _hook_glob_for_os()
+    from vco_lib.bundle_globs import hook_globs, script_patterns
     claude_dir = PROJECT_ROOT / ".claude"
     hooks_dst = claude_dir / "hooks"
     hooks_dst.mkdir(parents=True, exist_ok=True)
 
     installed_hooks = 0
     skipped_hooks = 0  # kept for the summary string; always 0 after the P2.2 fix.
-    for hook_file in sorted(hooks_src.glob(hook_glob)):
+    hook_files: list[Path] = []
+    for hook_glob in hook_globs():
+        hook_files.extend(hooks_src.glob(hook_glob))
+    for hook_file in sorted(set(hook_files)):
         target = hooks_dst / hook_file.name
         # Always overwrite top-level hooks. Same rationale as `_lib/` below:
         # hooks are NOT user-customisable; they're canonical orchestrator
@@ -24674,7 +24678,10 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
     if lib_src.exists():
         lib_dst = hooks_dst / "_lib"
         lib_dst.mkdir(parents=True, exist_ok=True)
-        for lib_file in sorted(lib_src.glob(hook_glob)):
+        lib_files: list[Path] = []
+        for hook_glob in hook_globs():
+            lib_files.extend(lib_src.glob(hook_glob))
+        for lib_file in sorted(set(lib_files)):
             shutil.copy2(lib_file, lib_dst / lib_file.name)
 
     # Scripts referenced by hooks (e.g. precompact_prune.py). Live alongside
@@ -24689,11 +24696,10 @@ def _install_hooks_and_settings(args: argparse.Namespace) -> str:
         # Glob all script types: Python modules, shell wrappers (no ext or .sh),
         # and PowerShell wrappers (.ps1). Previously only *.py was copied which
         # left kg-search, kg-sync, code-graph-* etc. missing from user projects.
-        script_patterns = ["*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*", "cost-summary",
-                   # v0.2.54: extension-less bash wrappers for the workflow tooling
-                   "detect-workflow-needs", "generate-workflow"]
+        # v0.2.54 Track G (G-4): pattern list shared with the per-project
+        # bundle path via vco_lib.bundle_globs (the two copies had drifted).
         seen: set[str] = set()
-        for pattern in script_patterns:
+        for pattern in script_patterns():
             for script_file in sorted(scripts_src.glob(pattern)):
                 if script_file.name in seen or script_file.is_dir():
                     continue
@@ -25869,8 +25875,15 @@ def _run_uninstall(args: argparse.Namespace) -> int:
       3. Remove launcher state (~/.vct/launcher.db)
       4. Remove orchestrator MCP server entries from ~/.claude.json
          (preserves user's other MCP servers)
-      5. (opt-in via --remove-projects) Remove .claude/ folders in registered projects
-      6. NEVER touches: ~/.vct-secrets/ (user's secret material)
+      5. Remove boot-time autostart entries (v0.2.54 Track G):
+         - the container-stack boot service registered unconditionally at
+           install time (systemd user unit on Linux / LaunchAgent on macOS /
+           `ClaudeMcpContainers` Scheduled Task on Windows), and
+         - the opt-in vct-hub boot service via `vct-hub --unregister-boot`.
+         Without this, post-uninstall every boot retried
+         `scripts/launch-claude-mcp-stack.*` from a deleted clone forever.
+      6. (opt-in via --remove-projects) Remove .claude/ folders in registered projects
+      7. NEVER touches: ~/.vct-secrets/ (user's secret material)
 
     Writes an audit log of what was removed to stdout and to
     ~/.vibecoded/uninstall_audit.log.
@@ -25929,10 +25942,28 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         print(f"  [4] Remove orchestrator MCP server entries from {claude_json}")
         print(f"      (preserves your other MCP servers)")
 
-    if args.remove_projects:
-        print(f"  [5] Remove .claude/ folders in registered projects (--remove-projects)")
+    # Boot-service removal (v0.2.54 Track G): plan lines name the exact
+    # OS-specific artefact so --dry-run output is auditable.
+    os_name = platform.system()
+    if os_name == "Linux":
+        boot_artefact = (
+            f"systemd user unit ~/.config/systemd/user/{_BOOT_SERVICE_UNIT_NAME}"
+        )
+    elif os_name == "Darwin":
+        boot_artefact = (
+            f"LaunchAgent ~/Library/LaunchAgents/{_BOOT_SERVICE_PLIST_LABEL}.plist"
+        )
+    elif os_name == "Windows":
+        boot_artefact = f"Scheduled Task {_BOOT_SERVICE_TASK_NAME}"
     else:
-        print(f"  [5] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
+        boot_artefact = f"(no boot service on {os_name})"
+    print(f"  [5] Remove boot autostart: {boot_artefact}")
+    print(f"      + `vct-hub --unregister-boot` (no-op if never enabled)")
+
+    if args.remove_projects:
+        print(f"  [6] Remove .claude/ folders in registered projects (--remove-projects)")
+    else:
+        print(f"  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
 
     print()
     print(f"  WILL NOT TOUCH: ~/.vct-secrets/ (your GitHub PAT and other secrets stay)")
@@ -26028,7 +26059,34 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         except (OSError, ValueError) as e:
             audit.append(f"WARN: could not scrub {claude_json}: {e}")
 
-    # Step 5: per-project .claude/ folders (opt-in).
+    # Step 5: boot-time autostart entries (v0.2.54 Track G).
+    #
+    # The container-stack boot service is materialized UNCONDITIONALLY on
+    # default installs (`_materialize_boot_service`, Step 8 region), and the
+    # vct-hub boot service may have been enabled via the launcher GUI
+    # Preferences (`vct-hub --register-boot`). Neither dies with the clone:
+    # the systemd unit / LaunchAgent / Scheduled Task lives in the USER's
+    # home or the OS task store and points INTO the clone — so after clone
+    # deletion every boot retried `scripts/launch-claude-mcp-stack.*` from a
+    # deleted path forever. Removal logic lives in
+    # `vco_lib/boot_service_cleanup.py` (shared, unit-tested, soft-fail).
+    if _confirm(f"Remove boot autostart entries ({boot_artefact} + vct-hub)?"):
+        from vco_lib.boot_service_cleanup import (
+            unregister_container_boot_service,
+            unregister_hub_boot_service,
+        )
+        audit.extend(unregister_container_boot_service(
+            unit_name=_BOOT_SERVICE_UNIT_NAME,
+            plist_label=_BOOT_SERVICE_PLIST_LABEL,
+            task_name=_BOOT_SERVICE_TASK_NAME,
+        ))
+        # Resolve the bundled vct-hub binary (Tier 1 only — never download
+        # or rebuild during an uninstall); fall back to PATH inside the
+        # helper.
+        hub_bin = _try_bundled_vct_hub_binary(PROJECT_ROOT)
+        audit.extend(unregister_hub_boot_service(hub_bin))
+
+    # Step 6: per-project .claude/ folders (opt-in).
     if args.remove_projects:
         registry = PROJECT_ROOT / ".claude" / "PROJECT_REGISTRY.md"
         if registry.exists() and _confirm("Remove .claude/ in registered projects?"):

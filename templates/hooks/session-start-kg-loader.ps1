@@ -17,6 +17,9 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Purpose: Display paths to relevant KG resources (no auto-loading)
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh` (absent on
+# PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
+. "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 
@@ -33,7 +36,7 @@ if ($UserHome -and (Test-Path $RlLauncher)) {
     if (-not $env:RL_SERVER_PORT) { $env:RL_SERVER_PORT = "11439" }
     if (-not $env:RL_PROJECT_ROOT) { $env:RL_PROJECT_ROOT = $ProjectDir }
     try {
-        & pwsh -NoProfile -File $RlLauncher 2>$null | Out-Null
+        & $PsExe -NoProfile -File $RlLauncher 2>$null | Out-Null
     } catch {
         try { & powershell -NoProfile -File $RlLauncher 2>$null | Out-Null } catch { }
     }

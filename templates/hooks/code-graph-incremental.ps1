@@ -25,6 +25,9 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Triggered by post-file-edit.ps1.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh` (absent on
+# PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
+. "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
 param(
     [Parameter(Position=0,Mandatory=$true)] [string]$EditedFile,
@@ -70,7 +73,7 @@ if ($EditedFile -notlike "$RepoPath/*" -and $EditedFile -notlike "$RepoPath\*") 
     $ExtrasResolver = Join-Path $RepoPath ".claude/scripts/vct_project_config.ps1"
     if (Test-Path $ExtrasResolver) {
         try {
-            $extras = (& pwsh -NoProfile -File $ExtrasResolver -Project $RepoPath -Field "code_graph_extra_paths" 2>$null)
+            $extras = (& $PsExe -NoProfile -File $ExtrasResolver -Project $RepoPath -Field "code_graph_extra_paths" 2>$null)
             if ($extras) {
                 foreach ($_line in ($extras -split "`n")) {
                     $extraPath = $_line.Trim().TrimEnd('/').TrimEnd('\')
@@ -91,7 +94,7 @@ if ($EditedFile -notlike "$RepoPath/*" -and $EditedFile -notlike "$RepoPath\*") 
 $DetectPs1 = Join-Path $DefaultRepoRoot ".claude/scripts/detect-project.ps1"
 if (-not $ExtrasMatched -and (Test-Path $DetectPs1)) {
     try {
-        $detected = (& pwsh -NoProfile -File $DetectPs1 $EditedFile $RepoPath 2>$null).Trim()
+        $detected = (& $PsExe -NoProfile -File $DetectPs1 $EditedFile $RepoPath 2>$null).Trim()
         if ($detected) {
             $ProjectName = $detected
             $RepoPath = Join-Path (Split-Path $RepoPath -Parent) $detected

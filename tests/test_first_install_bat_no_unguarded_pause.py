@@ -35,6 +35,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BAT = REPO_ROOT / "first-install.bat"
+# v0.2.54 Track G (G-2): uninstall.bat ships the same YES_FLAG pause
+# discipline — scan it with the same lint. Add future .bat entry points here.
+ALL_BATS = (BAT, REPO_ROOT / "uninstall.bat")
 
 # `pause` as a standalone word, case-insensitive (cmd.exe keywords are
 # case-insensitive). Negative lookarounds keep tokens like "paused" or
@@ -47,13 +50,13 @@ PAUSE_TOKEN_RE = re.compile(r"(?i)(?<![\w./\\-])pause(?![\w./\\-])")
 GATE_RE = re.compile(r"(?i)if\s+\"%YES_FLAG%\"\s*==\s*\"0\"\s+(?:@\s*)?pause\b")
 
 
-def _iter_pause_lines() -> list[tuple[int, str]]:
+def _iter_pause_lines(bat: Path = BAT) -> list[tuple[int, str]]:
     """Yield (lineno, stripped_line) for every executable line containing a
     `pause` token. REM / `::` comments and echo text are not executable
     pause sites and are skipped."""
     out: list[tuple[int, str]] = []
     for lineno, raw in enumerate(
-        BAT.read_text(encoding="utf-8").splitlines(), start=1
+        bat.read_text(encoding="utf-8").splitlines(), start=1
     ):
         stripped = raw.strip()
         low = stripped.lower()
@@ -66,38 +69,44 @@ def _iter_pause_lines() -> list[tuple[int, str]]:
     return out
 
 
-def test_bat_exists() -> None:
-    assert BAT.is_file(), f"missing {BAT}"
+def test_bats_exist() -> None:
+    for bat in ALL_BATS:
+        assert bat.is_file(), f"missing {bat}"
 
 
 def test_every_pause_is_gated_on_yes_flag() -> None:
-    offenders = [
-        (lineno, line)
-        for lineno, line in _iter_pause_lines()
-        if not GATE_RE.search(line)
-    ]
-    assert not offenders, (
-        "first-install.bat contains unguarded `pause` statement(s) — these "
-        "hang unattended runs (CI's --yes invocation) forever. Gate each one "
-        'as `if "%YES_FLAG%"=="0" pause`:\n'
-        + "\n".join(f"  line {n}: {line}" for n, line in offenders)
-    )
+    for bat in ALL_BATS:
+        offenders = [
+            (lineno, line)
+            for lineno, line in _iter_pause_lines(bat)
+            if not GATE_RE.search(line)
+        ]
+        assert not offenders, (
+            f"{bat.name} contains unguarded `pause` statement(s) — these "
+            "hang unattended runs (CI's --yes invocation) forever. Gate each "
+            'one as `if "%YES_FLAG%"=="0" pause`:\n'
+            + "\n".join(f"  line {n}: {line}" for n, line in offenders)
+        )
 
 
 def test_scanner_finds_the_gated_pauses() -> None:
     """Self-check: if the scanner ever stops seeing the known gated pauses
     (e.g. a refactor renames the file or rewrites the pause sites), the
     unguarded-pause test above would pass vacuously. Pin the expectation
-    that at least the three known pause sites (broken-clone sanity check,
-    install-failed path, end-of-script keep-window-open) are still found
-    and gated."""
-    gated = [
-        (lineno, line)
-        for lineno, line in _iter_pause_lines()
-        if GATE_RE.search(line)
-    ]
-    assert len(gated) >= 3, (
-        f"expected >= 3 gated pause sites in first-install.bat, found "
-        f"{len(gated)}: {gated!r} — if pause sites were legitimately removed, "
-        "update this expectation."
-    )
+    that at least the known pause sites per .bat are still found and gated:
+    first-install.bat has three (broken-clone sanity check, install-failed
+    path, end-of-script keep-window-open); uninstall.bat has three (sanity
+    check, python-missing, end-of-script keep-window-open)."""
+    expected_min = {"first-install.bat": 3, "uninstall.bat": 3}
+    for bat in ALL_BATS:
+        gated = [
+            (lineno, line)
+            for lineno, line in _iter_pause_lines(bat)
+            if GATE_RE.search(line)
+        ]
+        floor = expected_min[bat.name]
+        assert len(gated) >= floor, (
+            f"expected >= {floor} gated pause sites in {bat.name}, found "
+            f"{len(gated)}: {gated!r} — if pause sites were legitimately "
+            "removed, update this expectation."
+        )

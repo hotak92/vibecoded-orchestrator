@@ -25,11 +25,16 @@
 #     so the launcher shows up in Start search (parity with what
 #     first-install.bat L530 does).
 #
+# Scope addition (v0.2.54 Track G, G-7): when -NoAutoLaunch is NOT passed,
+# the script now spawns the launcher GUI detached after writing the
+# shortcuts — closing the Windows-vs-POSIX parity gap (the bash sibling's
+# Step 5 has always spawned). install.ps1 invokes this helper WITHOUT the
+# flag on auto-launch runs; install.py keeps passing -NoAutoLaunch because
+# it exits right after and first-install.bat owns its own inline spawn.
+#
 # Out of scope:
 #   - Building the launcher (caller is responsible — install.py already
 #     drives the build via first-install.bat or the wizard).
-#   - Auto-launching the GUI (install.py passes -NoAutoLaunch, since it
-#     exits right after and we don't want a duplicate spawn).
 #   - System-tray registration (handled by the launcher binary itself
 #     once it starts).
 #
@@ -52,11 +57,11 @@ param(
     [Parameter(Position = 0)]
     [string]$RepoRoot,
 
-    # `-NoAutoLaunch`: install.py always passes this so it can spawn the
-    # GUI itself (or skip — install.py exits next, so we'd just race for
-    # the same .lnk if both spawned). Reserved for future symmetry with
-    # the bash helper's --no-auto-launch; this PS1 doesn't auto-spawn the
-    # GUI today (Tauri spawn from PowerShell is OS-managed via the .lnk).
+    # `-NoAutoLaunch`: skip the detached GUI spawn at the end (symmetric
+    # with the bash helper's --no-auto-launch). install.py always passes
+    # this (it exits right after; the user opens the launcher from the
+    # shortcut); install.ps1 omits it on auto-launch runs so the GUI
+    # opens after a successful install — v0.2.54 Track G (G-7).
     [switch]$NoAutoLaunch,
 
     # Pretty-print path to log under, falls back to $RepoRoot\state\logs
@@ -221,7 +226,19 @@ if ($createdCount -eq 0) {
 }
 
 if ($NoAutoLaunch) {
-    Write-Host "[launcher] -NoAutoLaunch set — install.py will exit; user opens launcher from the shortcut."
+    Write-Host "[launcher] -NoAutoLaunch set — skipping GUI spawn; open the launcher from the shortcut."
+} else {
+    # v0.2.54 Track G (G-7): detached GUI spawn, parity with the bash
+    # helper's Step 5. Soft-fail: a broken spawn must never mask the
+    # successful shortcut refresh (same never-block-exit-0 contract as
+    # post-install-launcher.sh).
+    try {
+        Start-Process -FilePath $LauncherBin -WorkingDirectory $workingDir | Out-Null
+        Write-Host "[launcher] Launcher GUI spawned: $LauncherBin"
+    } catch {
+        Write-Host "[launcher] GUI spawn failed (non-fatal): $_" -ForegroundColor Yellow
+        Write-Host "[launcher] Open it manually from the Desktop shortcut."
+    }
 }
 
 exit 0

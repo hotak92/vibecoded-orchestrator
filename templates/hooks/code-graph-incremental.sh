@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Parity note (v0.2.54 Track G G-6): the .ps1 sibling now resolves its
+# child-spawn PowerShell binary via _lib/resolve-powershell.ps1 (pwsh ->
+# powershell fallback for PS 5.1-only machines). No bash-side logic
+# change is needed - bash hooks never spawn PowerShell.
 # Scrub sensitive env vars before any subprocess spawning
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0

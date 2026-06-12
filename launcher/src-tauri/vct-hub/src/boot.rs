@@ -404,27 +404,33 @@ fn render_win_shim(state_dir: &Path) -> String {
 
 /// Pure parse: given the stdout of `schtasks /Query /V /FO LIST`,
 /// returns the BootStatus implied by the "Scheduled Task State: ..."
-/// line. Locale-fragile in the wild (the key is localised); we match
-/// on the VALUE only — `Enabled` / `Disabled` happen to be English
-/// even on localised Windows because schtasks reports the literal task
-/// state name from the underlying API.
+/// line, or `None` when neither English marker appears.
+///
+/// Locale-fragile in the wild: `schtasks /FO LIST` localises BOTH the
+/// keys AND the values on non-English Windows (e.g. German prints
+/// `Aktiviert` / `Deaktiviert`), so an English-marker miss is the
+/// EXPECTED case there, not a corner case. v0.2.54 Track G (G-8): this
+/// used to default to `Enabled` on a miss, and the caller early-returned
+/// on `Enabled` — which made the locale-invariant PowerShell fallback in
+/// `windows::status()` unreachable in exactly the localised-Windows case
+/// it was written for (a Disabled task on German Windows reported as
+/// Enabled). Returning `None` routes the unparseable case to the
+/// PowerShell fallback instead of guessing.
 ///
 /// `dead_code` allowed on non-Windows: top-level for unit-test
 /// accessibility from any host; only invoked from the windows module.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn parse_win_status_output(text: &str) -> BootStatus {
+fn parse_win_status_output(text: &str) -> Option<BootStatus> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.ends_with(": Enabled") || trimmed.ends_with(":Enabled") {
-            return BootStatus::Enabled;
+            return Some(BootStatus::Enabled);
         }
         if trimmed.ends_with(": Disabled") || trimmed.ends_with(":Disabled") {
-            return BootStatus::Disabled;
+            return Some(BootStatus::Disabled);
         }
     }
-    // Couldn't parse — default to Enabled since the task exists and we
-    // never write a Disabled task. Locale-corner-case fallback.
-    BootStatus::Enabled
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -772,15 +778,19 @@ mod windows {
             .output()
             .map_err(|_| BootError::ToolNotFound { tool: "schtasks" })?;
         let text = String::from_utf8_lossy(&detail.stdout);
-        let parsed = parse_win_status_output(&text);
-        if parsed == BootStatus::Enabled {
-            return Ok(BootStatus::Enabled);
+        // Confident parse (English `Enabled` / `Disabled` marker found) is
+        // trusted directly. v0.2.54 Track G (G-8): the pre-fix flow
+        // early-returned only on Enabled — and the parser DEFAULTED to
+        // Enabled when it couldn't parse — so the PowerShell fallback
+        // below was unreachable on non-English Windows, the exact case
+        // it exists for.
+        if let Some(parsed) = parse_win_status_output(&text) {
+            return Ok(parsed);
         }
-        // Locale fragility: fall back to PowerShell for a robust read.
-        // Get-ScheduledTask returns an enum value that's locale-
-        // invariant (the Microsoft.Management.Infrastructure CIM
-        // class). If PowerShell is unavailable, defer to the schtasks
-        // parse result.
+        // Unparseable (localised schtasks output): fall back to
+        // PowerShell for a robust read. Get-ScheduledTask returns an
+        // enum value that's locale-invariant (the
+        // Microsoft.Management.Infrastructure CIM class).
         if let Ok(ps) = Command::new("powershell").silent()
             .args([
                 "-NoProfile",
@@ -802,7 +812,10 @@ mod windows {
                 }
             }
         }
-        Ok(parsed)
+        // Last resort (PowerShell unavailable / unparseable too): the
+        // task EXISTS (the /Query probe above succeeded) and we never
+        // write a Disabled task ourselves — report Enabled.
+        Ok(BootStatus::Enabled)
     }
 
     /// Encode a UTF-8 string as UTF-16LE with a BOM, so schtasks
@@ -1041,22 +1054,35 @@ TaskName: \\VCT-Hub\r\n\
 Scheduled Task State: Enabled\r\n\
 Status: Ready\r\n\
 ";
-        assert_eq!(parse_win_status_output(stdout), BootStatus::Enabled);
+        assert_eq!(parse_win_status_output(stdout), Some(BootStatus::Enabled));
     }
 
     #[test]
     fn parse_win_status_disabled() {
         let stdout = "TaskName: \\VCT-Hub\r\nScheduled Task State: Disabled\r\n";
-        assert_eq!(parse_win_status_output(stdout), BootStatus::Disabled);
+        assert_eq!(parse_win_status_output(stdout), Some(BootStatus::Disabled));
     }
 
     #[test]
-    fn parse_win_status_unparseable_defaults_to_enabled() {
-        // Garbled / localised output where neither marker appears.
-        // Per design: default to Enabled since the task exists and we
-        // never write a Disabled task ourselves.
+    fn parse_win_status_unparseable_returns_none() {
+        // Garbled / LOCALISED output where neither English marker appears
+        // (schtasks /FO LIST localises values too: German prints
+        // `Aktiviert` / `Deaktiviert`). v0.2.54 Track G (G-8): this used
+        // to assert a default of Enabled — which, combined with the
+        // caller's early-return-on-Enabled, made the locale-invariant
+        // PowerShell fallback unreachable on non-English Windows and
+        // reported Disabled tasks as Enabled there. None routes the
+        // caller to the PowerShell fallback instead.
         let stdout = "Lorem ipsum dolor sit amet\r\n";
-        assert_eq!(parse_win_status_output(stdout), BootStatus::Enabled);
+        assert_eq!(parse_win_status_output(stdout), None);
+    }
+
+    #[test]
+    fn parse_win_status_localised_disabled_returns_none() {
+        // Real-world German schtasks /V /FO LIST shape: localised key AND
+        // value. Must be None (PowerShell fallback decides), never Enabled.
+        let stdout = "Status der geplanten Aufgabe: Deaktiviert\r\n";
+        assert_eq!(parse_win_status_output(stdout), None);
     }
 
     // ------- error_kind tag stability -------

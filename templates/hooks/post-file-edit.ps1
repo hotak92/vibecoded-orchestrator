@@ -27,6 +27,12 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # `Emit-AdditionalContext` from `_lib/emit-context.ps1`.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+
+# v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh`, which does
+# not exist on PowerShell 5.1-only machines - KG sync, write-gate,
+# dup-detection and code-graph updates were all silently lost there.
+# $PsExe resolves pwsh -> powershell fallback.
+. "$PSScriptRoot/_lib/resolve-powershell.ps1"
 $EmitContextLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
 if (Test-Path $EmitContextLib) { . $EmitContextLib }
 
@@ -242,7 +248,7 @@ function Test-KgWriteAllowed {
     }
 
     try {
-        $level = & pwsh -NoProfile -File $resolver $Project $Collection 2>$null
+        $level = & $PsExe -NoProfile -File $resolver $Project $Collection 2>$null
         if ($null -eq $level) { return $true }  # fail-open on null
         $level = ([string]$level).Trim()
     } catch {
@@ -282,7 +288,7 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
         $kgSyncPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-sync.ps1"
         $kgSyncSh = Join-Path $ProjectRoot ".claude/scripts/kg-sync"
         if (Test-Path $kgSyncPs1) {
-            Start-Process -FilePath "pwsh" -ArgumentList @('-NoProfile','-File',$kgSyncPs1,$relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
+            Start-Process -FilePath $PsExe -ArgumentList @('-NoProfile','-File',$kgSyncPs1,$relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
         } elseif ((Test-Path $kgSyncSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
             Start-Process -FilePath "bash" -ArgumentList @($kgSyncSh, $relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
         }
@@ -300,11 +306,13 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
     Set-Content -Path $editCountFile -Value $count -Encoding ascii
 
     if (($count % 10) -eq 0) {
-        $dupPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates.ps1"
+        # v0.2.54 Track G (G-6): the old first-choice probe for
+        # kg-duplicates.ps1 was dead code - that sibling has never shipped
+        # (only the bash kg-duplicates wrapper exists in templates/scripts/).
+        # Probe the bash wrapper directly; native-Windows-without-bash
+        # machines skip dup-detection until a .ps1 wrapper actually ships.
         $dupSh = Join-Path $ProjectRoot ".claude/scripts/kg-duplicates"
-        if (Test-Path $dupPs1) {
-            Start-Process -FilePath "pwsh" -ArgumentList @('-NoProfile','-File',$dupPs1,'--threshold','0.95') -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
-        } elseif ((Test-Path $dupSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
+        if ((Test-Path $dupSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
             Start-Process -FilePath "bash" -ArgumentList @($dupSh, '--threshold', '0.95') -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
         }
     }
@@ -440,7 +448,7 @@ if ($EditedFile -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|jav
         $resolverPs1 = Join-Path $ProjectRoot ".claude/scripts/vct_project_config.ps1"
         if (Test-Path $resolverPs1) {
             try {
-                $codeGraphPrefix = (& pwsh -NoProfile -File $resolverPs1 `
+                $codeGraphPrefix = (& $PsExe -NoProfile -File $resolverPs1 `
                     -Project $ProjectRoot -Field code_graph_collection_prefix 2>$null) -as [string]
                 if ($null -eq $codeGraphPrefix) { $codeGraphPrefix = "" }
                 $codeGraphPrefix = $codeGraphPrefix.Trim()
@@ -451,7 +459,7 @@ if ($EditedFile -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|jav
                 elseif ($env:PROJECT_NAME) { $env:PROJECT_NAME } `
                 else { Split-Path $ProjectRoot -Leaf }
         }
-        & pwsh -NoProfile -File $cgIncPs1 $EditedFile $ProjectRoot $codeGraphPrefix
+        & $PsExe -NoProfile -File $cgIncPs1 $EditedFile $ProjectRoot $codeGraphPrefix
     }
     Add-Nudge "[Code edit reminder] $bn was just edited.`nWhen you're done with this work item:`n- Update CONTEXT_STATE.md with what changed and what's next.`n- Capture any non-obvious learnings as a KG node under knowledge/concepts/."
 }

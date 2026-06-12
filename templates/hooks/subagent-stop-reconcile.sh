@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Parity note (v0.2.54 Track G G-6): the .ps1 sibling now resolves its
+# child-spawn PowerShell binary via _lib/resolve-powershell.ps1 (pwsh ->
+# powershell fallback for PS 5.1-only machines). No bash-side logic
+# change is needed - bash hooks never spawn PowerShell.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #

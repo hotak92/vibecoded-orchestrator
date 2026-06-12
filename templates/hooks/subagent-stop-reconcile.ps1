@@ -19,6 +19,9 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 $ScriptDir = $PSScriptRoot
 
+# v0.2.54 Track G (G-6): child spawns used a hardcoded `pwsh` (absent on
+# PowerShell 5.1-only machines). $PsExe resolves pwsh -> powershell.
+. (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
 $StderrCap = Join-Path $ScriptDir "_lib/stderr-cap.ps1"
 if (Test-Path $StderrCap) { . $StderrCap }
 
@@ -175,7 +178,7 @@ if ($kgSyncScript -and $kgFiles.Count -gt 0) {
         $kfAbs = Join-Path $ProjectRoot $kf
         try {
             $proc = if ($kgSyncScript.EndsWith(".ps1")) {
-                Start-Process -FilePath "pwsh" -ArgumentList @("-NoProfile","-File",$kgSyncScript,$kfAbs) -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
+                Start-Process -FilePath $PsExe -ArgumentList @("-NoProfile","-File",$kgSyncScript,$kfAbs) -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
             } else {
                 Start-Process -FilePath $kgSyncScript -ArgumentList $kfAbs -PassThru -WindowStyle Hidden -ErrorAction SilentlyContinue
             }

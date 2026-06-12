@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **v0.2.54 Track G (G-7): Windows GUI auto-spawn now actually exists — and a v0.2.53 CHANGELOG correction**. The v0.2.53 entry "Thin OS shims with 3-step orchestration" claimed the shims "(4) auto-spawn `scripts/post-install-launcher.{sh,ps1}` unless `--no-auto-launch` / `-NoAutoLaunch`" and that "Linux/macOS shims pass `--no-auto-launch` through to install.py". Two corrections against the shipped code: (1) `post-install-launcher.ps1` never spawned the GUI — it only wrote Desktop/Start Menu shortcuts and explicitly listed auto-launch as out of scope, so the `install.ps1` path ended without the launcher opening (POSIX users got the spawn via the bash helper's Step 5; Windows users didn't). The .ps1 now performs the detached `Start-Process` spawn when `-NoAutoLaunch` is absent, same soft-fail contract as the bash sibling. (2) The POSIX shims deliberately CONSUME `--no-auto-launch` (install.py has no such argparse flag — passing it through would error); the flag controls the shim's own Step-3 spawn decision.
+
 ## [0.2.54] - 2026-06-12
 
 ### Added

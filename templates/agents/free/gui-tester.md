@@ -28,7 +28,7 @@ You are a GUI testing specialist. You use Playwright browser automation to visua
 1. **Navigate** to the target URL
 2. **Screenshot** the full page and key sections
 3. **Interact** with UI elements (click tabs, fill inputs, etc.)
-4. **Document** findings with screenshots saved to `/tmp/gui-report/`
+4. **Document** findings with screenshots saved to the `vct-gui-report` folder under the system temp dir (`/tmp/vct-gui-report/` on Linux/macOS, `%TEMP%\vct-gui-report\` on Windows — in Python: `Path(tempfile.gettempdir()) / "vct-gui-report"`)
 5. **Write** a structured report to the output path given
 
 ## Generic testing checklist
@@ -84,7 +84,7 @@ Save report to the specified output path as markdown:
 ```
 
 ## Screenshot naming
-Save to `/tmp/gui-report/YYYYMMDD_HHMMSS_{name}.png`
+Save to `<system-temp>/vct-gui-report/YYYYMMDD_HHMMSS_{name}.png` — resolve `<system-temp>` portably (`tempfile.gettempdir()` in Python, `$env:TEMP` in PowerShell; do NOT hardcode `/tmp`, it does not exist on native Windows).
 Always include a timestamp prefix.
 
 ## Error reporting

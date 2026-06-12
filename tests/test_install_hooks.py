@@ -165,8 +165,12 @@ class InstallHooksAndSettingsIntegrationTest(unittest.TestCase):
             installed_ps1 = list(hooks_dst.glob("*.ps1"))
             self.assertGreaterEqual(len(installed_sh), 15,
                                     "linux install should land .sh hooks")
-            self.assertEqual(installed_ps1, [],
-                             "linux install must NOT land .ps1 hooks")
+            # v0.2.54 Track G (G-4): BOTH flavours ship on every OS
+            # (vco_lib.bundle_globs policy — dual-boot / WSL-crossover
+            # setups invoke hooks from both shells). The pre-G-4
+            # assertion here pinned the retired native-only policy.
+            self.assertGreaterEqual(len(installed_ps1), 15,
+                                    "linux install should ALSO land .ps1 hooks")
             for h in installed_sh:
                 self.assertTrue(h.stat().st_mode & 0o111, f"{h.name} not executable")
 
@@ -225,8 +229,9 @@ class InstallHooksAndSettingsIntegrationTest(unittest.TestCase):
 
 
 class WindowsHookInstallTest(unittest.TestCase):
-    """`_install_hooks_and_settings` on Windows hosts copies `.ps1` siblings
-    instead of `.sh`, and writes the Windows settings template."""
+    """`_install_hooks_and_settings` on Windows hosts ships BOTH hook
+    flavours (v0.2.54 Track G G-4) and writes the Windows settings
+    template."""
 
     def test_windows_install_picks_ps1_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,20 +249,22 @@ class WindowsHookInstallTest(unittest.TestCase):
                 len(installed_ps1), 15,
                 "windows install should land .ps1 hooks",
             )
-            self.assertEqual(
-                installed_sh, [],
-                "windows install must NOT land .sh hooks",
+            # v0.2.54 Track G (G-4): both flavours ship on every OS — see
+            # the linux integration test above for the rationale.
+            self.assertGreaterEqual(
+                len(installed_sh), 15,
+                "windows install should ALSO land .sh hooks",
             )
-            # _lib subdir should also pick the Windows variant.
+            # _lib subdir ships both flavours too.
             lib_dst = hooks_dst / "_lib"
             if lib_dst.exists():
                 self.assertTrue(
                     (lib_dst / "find-python.ps1").exists(),
                     "_lib/find-python.ps1 should land on Windows",
                 )
-                self.assertFalse(
+                self.assertTrue(
                     (lib_dst / "find-python.sh").exists(),
-                    "_lib/find-python.sh should NOT land on Windows",
+                    "_lib/find-python.sh should also land (both-flavours policy)",
                 )
 
     def test_windows_install_uses_windows_settings_template(self) -> None:

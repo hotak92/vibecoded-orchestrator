@@ -205,8 +205,8 @@ Detect near-duplicate KG nodes above a similarity threshold.
 
 Usage: `.claude/scripts/kg-duplicates [--threshold 0.95]`. `--auto-merge` flag merges high-confidence duplicates. Backed by `detect_duplicates.py`. Triggered automatically every 10 edits by the `post-file-edit.sh` hook.
 
-### `kg-infer` CLI (roadmap — wrapper present, backing script not shipped)
-The wrapper at `.claude/scripts/kg-infer` is in the bundle, but its backing `infer_knowledge.py` module is not in v0.1.0. The intent is to infer typed WikiLink relationships using a local LLM and apply tag-propagation rules from `TAG_HIERARCHY.md`. Treat as roadmap until `infer_knowledge.py` lands.
+### `kg-infer` CLI (roadmap — not shipped)
+Removed from the bundle in v0.2.54 (Track G parity sweep): the wrapper shipped without its backing `infer_knowledge.py` module, so it was broken-on-arrival on every OS. The intent — infer typed WikiLink relationships using a local LLM and apply tag-propagation rules from `TAG_HIERARCHY.md` — remains roadmap; the wrapper returns together with `infer_knowledge.py` when that lands.
 
 ### `kg-migrate` CLI
 Validate and fix KG nodes against `VOCABULARY.md` and `TAG_HIERARCHY.md`. Flags: `--check`, `--fix`, `--interactive`, `--file <path>`. Backed by `migrate_to_vocabulary.py`.
@@ -236,6 +236,8 @@ Usage: `.claude/scripts/code-graph-query search "<concept>"` / `similar "<full_n
 
 ### `cost-summary` CLI
 Print a summary of Claude API token costs from `~/.claude/metrics/costs.jsonl`.
+
+Portable entry point (Linux / macOS / Windows, stdlib-only Python, v0.2.54 Track G): `python .claude/scripts/cost-summary.py [--days N] [--session ID]`. The bash `cost-summary` wrapper survives as a POSIX shim delegating to the `.py`.
 
 ### `add_temporal_metadata.py`
 Backfill `valid_from` / `created` / `updated` fields in KG node YAML frontmatter from `git log` history. `--dry-run` previews changes; `--file PATH` scopes to one file.

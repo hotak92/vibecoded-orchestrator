@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Parity note (v0.2.54 Track G G-6): the .ps1 sibling now resolves its
+# child-spawn PowerShell binary via _lib/resolve-powershell.ps1 (pwsh ->
+# powershell fallback for PS 5.1-only machines). No bash-side logic
+# change is needed - bash hooks never spawn PowerShell.
 # Pre-edit context injection hook
 # Fires BEFORE Edit tool executes — injects KG + code graph context for the file being edited
 # Output goes to stdout → becomes additionalContext the LLM sees before executing the edit
