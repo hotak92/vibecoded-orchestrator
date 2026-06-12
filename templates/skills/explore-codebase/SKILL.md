@@ -47,7 +47,7 @@ Map the top-level directories:
 
 **Check KG first** (fastest if project is known):
 ```
-search_knowledge_graph("project architecture [name]")
+hybrid_search("project architecture [name]")
 search_code_graph("main entry point", collection="CodeModule")
 ```
 

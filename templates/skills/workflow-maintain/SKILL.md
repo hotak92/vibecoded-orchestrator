@@ -31,16 +31,15 @@ model: sonnet
 - `.claude/scripts/kg-info info "Title"`
 
 **2. Weaviate MCP Tools** (Semantic/Graph):
-- `search_knowledge_graph` - Basic semantic (~500ms)
+- `hybrid_search` - Keyword + semantic across KG + docs (default search tool, ~1-2s)
 - `semantic_graph_search` - GraphRAG with WikiLink traversal (~1-2s)
-- `hybrid_search` - Parallel keyword+semantic+graph (~1-2s)
 
 **3. Code Graph** (Semantic Code Search):
 - `search_code_graph` - Find code by purpose/concept (~200-500ms)
 - `query_code_structure` - Dependencies, callers, inheritance (~50-100ms)
 - CLI: `.claude/scripts/code-graph-query search "pattern"`
 
-**Decision**: Known terms → kg-search | Concepts → search_knowledge_graph | Relationships → semantic_graph_search | Code entities → search_code_graph
+**Decision**: Known terms → kg-search | Concepts → hybrid_search | Relationships → semantic_graph_search | Code entities → search_code_graph
 
 ## Commands
 

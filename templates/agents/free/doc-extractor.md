@@ -502,16 +502,15 @@ Create structured extraction report organized by target document:
 - `.claude/scripts/kg-info info "Node Title"`
 
 **2. Weaviate MCP Tools (Semantic/Graph)**:
-- `search_knowledge_graph` - Basic semantic (~500ms)
+- `hybrid_search` - Keyword + semantic across KG + docs (default search tool, ~1-2s)
 - `semantic_graph_search` - GraphRAG with WikiLink traversal (~1-2s)
-- `hybrid_search` - Parallel keyword+semantic+graph (~1-2s)
 
 **3. Code Graph (Semantic Code Search)** (NEW):
 - `search_code_graph` - Find code by purpose/concept (~200-500ms)
 - `query_code_structure` - Dependencies, callers, inheritance (~50-100ms)
 - CLI: `.claude/scripts/code-graph-query search "pattern name"`
 
-**Decision**: Known terms → kg-search | Concepts → search_knowledge_graph | Relationships → semantic_graph_search | Research → hybrid_search | Code entities → search_code_graph
+**Decision**: Known terms → kg-search | Concepts/research → hybrid_search | Relationships → semantic_graph_search | Code entities → search_code_graph
 
 ### Knowledge Systems Details
 
@@ -530,11 +529,11 @@ Create structured extraction report organized by target document:
 **Returns**: File paths + titles (search) or full content (info)
 **Use when**: You know the exact term to search for
 
-**search_knowledge_graph** (semantic search, ~500ms):
-**Usage**: Invoke directly for conceptual queries when exact term unknown
+**hybrid_search** (keyword + semantic across KG + docs, ~1-2s):
+**Usage**: Default search tool. Invoke for conceptual queries when exact term unknown OR for deep research combining keyword + semantic across KG + docs.
 **Inputs**: Natural language query (e.g., "content organization strategies", "large document processing")
-**Returns**: Top-N relevant nodes with content snippets
-**Example**: `search_knowledge_graph("documentation extraction patterns")`
+**Returns**: Top-N relevant nodes with content snippets, auto-merged across KG + docs collections
+**Example**: `hybrid_search("documentation extraction patterns")`
 
 **semantic_graph_search** (graph traversal, ~1-2s):
 **Usage**: Invoke to explore relationships starting from a concept
@@ -543,12 +542,6 @@ Create structured extraction report organized by target document:
 - Optional: relationship types to follow (uses::, implements::, extends::, buildsOn::)
 **Returns**: Network of connected nodes via WikiLinks, showing relationships
 **Example**: `semantic_graph_search("documentation", relationships=["implements", "extends"])`
-
-**hybrid_search** (comprehensive, ~1-2s):
-**Usage**: Invoke for deep research combining keyword + semantic + graph
-**Inputs**: Topic query (combines all search methods)
-**Returns**: Deduplicated results from all three search methods
-**Example**: `hybrid_search("knowledge extraction from technical documentation")`
 
 ## Scripts
 

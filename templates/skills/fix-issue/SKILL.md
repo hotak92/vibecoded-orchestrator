@@ -37,7 +37,7 @@ Extract:
 
 ### 2. Search for Root Cause
 
-**KG-first**: `search_knowledge_graph("error description or symptom")`
+**KG-first**: `hybrid_search("error description or symptom")`
 **Code graph**: `search_code_graph("function or component name")`
 **Then Grep**: for exact error messages, function names, stack traces
 

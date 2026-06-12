@@ -642,12 +642,12 @@ You succeed when your prompts:
 **Returns**: File paths + titles (search) or full content (info)
 **Use when**: You know the exact term to search for
 
-**hybrid_search** (semantic search, ~500ms) - Weaviate MCP:
-**Usage**: Invoke directly for conceptual queries when exact term unknown
+**hybrid_search** (keyword + semantic across KG + docs, ~1-2s) - Weaviate MCP:
+**Usage**: Default search tool. Use for conceptual queries when exact term unknown OR for deep research before crafting prompts.
 **Inputs**: Natural language query (e.g., "Claude 4.x optimization techniques", "agent prompt design")
-**Returns**: Top-N relevant nodes with content snippets
+**Returns**: Top-N relevant nodes with content snippets, auto-merged across KG + docs collections
 **Example**: `hybrid_search("chain-of-thought prompting patterns")`
-**Why use**: Find patterns you didn't know existed (semantic discovery)
+**Why use**: Most comprehensive search; finds patterns you didn't know existed (semantic discovery)
 
 **semantic_graph_search** (graph traversal, ~1-2s) - Weaviate MCP:
 **Usage**: Invoke to explore patterns and their relationships
@@ -657,13 +657,6 @@ You succeed when your prompts:
 **Returns**: Network of connected nodes via WikiLinks, showing relationships
 **Example**: `semantic_graph_search("prompting", relationships=["implements", "extends"])`
 **Why use**: Discover related patterns through WikiLink graph traversal
-
-**hybrid_search** (comprehensive, ~1-2s) - Weaviate MCP:
-**Usage**: Invoke for deep research before crafting prompts
-**Inputs**: Topic query (combines keyword, semantic, and graph search)
-**Returns**: Deduplicated results from all three search methods
-**Example**: `hybrid_search("agent coordination patterns for code workflows")`
-**Why use**: Most comprehensive search (keyword + semantic + graph)
 
 **search_code_graph** (semantic code search, ~200-500ms) - Weaviate MCP:
 **Usage**: Find code examples for few-shot prompting or understanding implementation patterns
@@ -771,9 +764,8 @@ Three collections via Weaviate MCP:
 - `[Project]_development` - Project docs (docs/)
 
 Search tools:
-- `hybrid_search(query, limit)` - Semantic (~500ms)
+- `hybrid_search(query, limit)` - Keyword + semantic across KG + docs (default search tool, ~1-2s)
 - `semantic_graph_search(query, depth)` - With graph traversal (~1-2s)
-- `hybrid_search(query, limit)` - Keyword+semantic+graph (~1-2s)
 ```
 
 **When Creating Agent Prompts**:
