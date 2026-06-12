@@ -16,3 +16,9 @@ pub mod runtime;
 // See knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md.
 pub mod container_runtime;
 pub mod gpu_mode;
+
+// v0.2.54 Track I: per-boot bearer-token primitives (generate /
+// persist-0o600 / constant-time-compare / Bearer parse). Extracted
+// from vct-hub's auth.rs so the launcher's diagrams local server
+// (diagrams.token) reuses the same implementation as hub.token.
+pub mod boot_token;

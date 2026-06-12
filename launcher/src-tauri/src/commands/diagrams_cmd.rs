@@ -1081,7 +1081,7 @@ pub async fn open_diagrams_editor(
             .map_err(|e| format!("open_diagrams_editor: open server-side Db: {}", e))?,
     );
     let vendor_root = crate::commands::diagrams_local_server::resolve_vendor_root()?;
-    let port = crate::commands::diagrams_local_server::ensure_started(server_db, vendor_root)
+    let server = crate::commands::diagrams_local_server::ensure_started(server_db, vendor_root)
         .await
         .map_err(|e| format!("open_diagrams_editor: ensure_started: {}", e))?;
 
@@ -1090,6 +1090,16 @@ pub async fn open_diagrams_editor(
     //    the query-string round trip. urlencoding::encode is a tiny
     //    dep — we don't pull it in. Manual encoding (only paths + ASCII)
     //    keeps the dependency footprint flat.
+    //
+    //    The per-boot save token rides in the URL FRAGMENT (`#token=`),
+    //    not the query string: fragments are never sent in HTTP
+    //    requests, so the token stays out of request lines, server
+    //    logs, and Referer headers. The editor page's JS reads it from
+    //    `location.hash` and presents it as `Authorization: Bearer` on
+    //    POST /save (see the gate in diagrams_local_server.rs). The
+    //    fragment does land in browser history — accepted: the token
+    //    is per-boot (regenerated every launcher start), gates only
+    //    diagram-file writes, and the server is 127.0.0.1-only.
     let encoded = encode_query_value(&rel_path);
     let editor_path = if diagram_type == "mermaid" {
         "mermaid"
@@ -1097,14 +1107,39 @@ pub async fn open_diagrams_editor(
         "excalidraw"
     };
     let url = format!(
-        "http://127.0.0.1:{}/{}/?file={}",
-        port, editor_path, encoded,
+        "http://127.0.0.1:{}/{}/?file={}#token={}",
+        server.port, editor_path, encoded, server.token,
     );
 
     tauri_plugin_opener::open_url(&url, None::<&str>)
         .map_err(|e| format!("open_diagrams_editor: open_url({}): {}", url, e))?;
 
     Ok(url)
+}
+
+/// Read the diagrams local server's per-boot save token from
+/// `<vct_root_dir>/diagrams.token` (written by
+/// `diagrams_local_server::spawn_server` with mode 0o600).
+///
+/// This is the sanctioned channel for the Svelte frontend to obtain
+/// the token if it ever needs to POST /save directly — the token is
+/// deliberately NOT baked into the frontend bundle (a bundle ships to
+/// every install; the token is per-boot and per-machine). Errors if
+/// the editor server hasn't been started yet this session (no token
+/// file, or a stale one from a previous boot would fail auth anyway —
+/// callers should invoke `open_diagrams_editor` first, which starts
+/// the server and mints the token).
+#[command]
+pub async fn get_diagrams_token() -> Result<String, String> {
+    let path = vct_launcher_core::paths::vct_root_dir()
+        .join(crate::commands::diagrams_local_server::TOKEN_FILE);
+    vct_launcher_core::services::boot_token::read_token_file(&path).map_err(|e| {
+        format!(
+            "get_diagrams_token: {} (the diagrams editor server may not \
+             have started yet this session — open an editor first)",
+            e,
+        )
+    })
 }
 
 /// Minimal URL-encoder for query-string values. Encodes the printable

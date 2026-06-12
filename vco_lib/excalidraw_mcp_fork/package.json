@@ -3,13 +3,14 @@
   "mcpName": "io.github.debu-sinha/excalidraw",
   "version": "2.0.0",
   "description": "Security-hardened MCP server for Excalidraw with API key auth, rate limiting, and real-time canvas sync",
-  "main": "dist/mcp/index.js",
+  "main": "dist/mcp/index.bundled.js",
   "type": "module",
   "bin": {
-    "excalidraw-mcp-server": "dist/mcp/index.js"
+    "excalidraw-mcp-server": "dist/mcp/index.bundled.js"
   },
   "scripts": {
-    "start": "node dist/mcp/index.js",
+    "start": "node dist/mcp/index.bundled.js",
+    "bundle": "esbuild dist/mcp/index.js --bundle --platform=node --format=esm --outfile=dist/mcp/index.bundled.js --define:process.env.NODE_ENV='\"production\"' --banner:js='import { createRequire as __vcoCreateRequire } from \"node:module\"; const require = __vcoCreateRequire(import.meta.url);'",
     "canvas": "node dist/canvas/index.js",
     "build": "npm run build:server && npm run build:widget && npm run build:frontend",
     "build:server": "tsc -p tsconfig.json",
@@ -56,6 +57,7 @@
     "@vitejs/plugin-react": "^4.6.0",
     "@vitest/coverage-v8": "^2.1.0",
     "concurrently": "^9.2.0",
+    "esbuild": "0.28.1",
     "eslint": "^9.16.0",
     "prettier": "^3.4.0",
     "typescript": "^5.8.3",

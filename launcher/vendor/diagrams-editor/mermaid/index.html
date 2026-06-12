@@ -182,6 +182,19 @@ The page:
       // the project root (commands::diagrams_local_server::resolve_request_path).
       const params = new URLSearchParams(window.location.search);
       const filePath = params.get('file') || '';
+
+      // Per-boot save token (v0.2.54, C-EX-3). The launcher appends it
+      // as a URL FRAGMENT (`#token=<hex>`) — fragments never travel in
+      // HTTP requests, so the token stays out of request lines and
+      // logs. We echo it back as `Authorization: Bearer` on POST /save;
+      // the launcher's local server rejects writes without it (plus an
+      // Origin allowlist — see diagrams_local_server.rs Security notes).
+      // Left in location.hash (not stripped) so a page reload keeps
+      // working; the token is per-boot and 127.0.0.1-only.
+      const hashParams = new URLSearchParams(
+        window.location.hash.replace(/^#/, ''),
+      );
+      const saveToken = hashParams.get('token') || '';
       const srcEl = document.getElementById('src');
       const previewEl = document.getElementById('preview');
       const saveBtn = document.getElementById('saveBtn');
@@ -297,7 +310,10 @@ The page:
             '/save?path=' + encodeURIComponent(filePath),
             {
               method: 'POST',
-              headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+              headers: {
+                'Content-Type': 'text/plain; charset=utf-8',
+                'Authorization': 'Bearer ' + saveToken,
+              },
               body: srcEl.value,
             },
           );

@@ -1,0 +1,4 @@
+# Installed only to (re)generate dist/mcp/index.bundled.js and
+# npm-shrinkwrap.json — see VENDORED.md "Bundling recipe". The runtime
+# artifact is the committed bundle; node_modules never ships.
+node_modules/

@@ -2402,6 +2402,7 @@ pub fn run() {
             // webkit2gtk) and ships a self-hosted visual Mermaid editor
             // alongside the existing text-only one.
             commands::diagrams_cmd::open_diagrams_editor,
+            commands::diagrams_cmd::get_diagrams_token,
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,

@@ -68,6 +68,12 @@ shasum  = "a5f1050ef7af6dc2595f5507366006489fef2879"
 # show provenance; `shasum` is empty because integrity is verified by
 # the on-disk tree (git tracks the vendored files), not by npm's
 # tarball integrity field.
+#
+# (v0.2.54 Track I, P0-3: the vendored tree now ships an esbuild
+# self-contained bundle at `dist/mcp/index.bundled.js` — the runtime
+# entry — plus a committed `npm-shrinkwrap.json` pinning the full
+# dependency tree for the legacy `npm install -g` path. Regeneration
+# recipe + rationale: VENDORED.md "Bundling recipe".)
 package = "file:vco_lib/excalidraw_mcp_fork"
 version = "git+vendored-2.0.0-2026-05-25"
 shasum  = ""
