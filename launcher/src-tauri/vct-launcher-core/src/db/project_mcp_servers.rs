@@ -355,7 +355,7 @@ mod tests {
             assert!(is_bundled_mcp(name), "{} should be bundled", name);
         }
         assert!(!is_bundled_mcp("my-custom-mcp"));
-        assert!(!is_bundled_mcp("transcrypt-live"));
+        assert!(!is_bundled_mcp("ecosystem-app-1-live"));
         // Empty string and case sensitivity sanity.
         assert!(!is_bundled_mcp(""));
         assert!(!is_bundled_mcp("Weaviate-KG")); // case-sensitive

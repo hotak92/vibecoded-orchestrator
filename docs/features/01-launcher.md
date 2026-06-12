@@ -200,10 +200,10 @@ Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-
 `licensing.rs` includes source-level audit tests: (1) default validate URL must not contain `supabase.co`, (2) production source must not contain bypass symbols (`MAINTAINER_TOKEN`, `ed25519_dalek`, etc.). Run as Rust unit tests to prevent accidental regression.
 
 ### Admin-only Routes
-`/admin/diagnostic`, `/admin/feature-flags`, `/admin/license-issuance-test`. Gated by `tier === 'admin'` in `+layout.svelte`. Client-side check is UX only; each admin tab re-validates server-side.
+`/admin/diagnostic`, `/admin/feature-flags`. Gated by `tier === 'admin'` in `+layout.svelte`. Client-side check is UX only; each admin tab re-validates server-side. (`/admin/license-issuance-test` — a backend-less placeholder — was removed in v0.2.54 Track H.)
 
 ### Dev Mode Activation Codes
-Test codes (`test-transcrypt`, `test-arzillibus`, etc.) bypass the webhook and activate modules directly for development. Entered via Settings → Activation Codes (`ActivationModal.svelte`).
+Removed in v0.2.54 Track H together with the legacy `licenses.ts` store that implemented them (`test-<app>` codes validated client-side against a localStorage portfolio). Dev-time license testing goes through the ActivationModal against a staging `VCT_VALIDATE_TIER_URL` endpoint.
 
 ---
 
@@ -275,7 +275,7 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 
 ## Hub API
 
-The Hub is the launcher's local HTTP face — used by the headless `vco` CLI, by ecosystem apps (Transcrypt, Arzillibus), and by other VCT processes that need to talk to the launcher without going through Tauri IPC. It runs on `127.0.0.1` only, gates every request on a Bearer token, and writes its bound port to `~/.vct/hub.port` so consumers don't have to guess.
+The Hub is the launcher's local HTTP face — used by the headless `vco` CLI, by ecosystem apps (Ecosystem App 1, Ecosystem App 2), and by other VCT processes that need to talk to the launcher without going through Tauri IPC. It runs on `127.0.0.1` only, gates every request on a Bearer token, and writes its bound port to `~/.vct/hub.port` so consumers don't have to guess.
 
 ### Local HTTP Server (port 7700)
 `hub/server.rs` starts an Axum HTTP server on `127.0.0.1:7700` (or `VCT_HUB_PORT`) as a background tokio task at launcher startup. Uses WAL mode for the SQLite connection so it coexists with the Tauri-side DB handle.
@@ -305,7 +305,7 @@ Hub server has `CorsLayer` with `allow_origin(Any)` — permissive at the CORS l
 `commands/hub_proxy.rs` exposes `hub_info`, `hub_list_apps`, `hub_poll_messages`, `hub_data_catalog` for the SvelteKit UI to talk to the same hub API its CLI consumers use, without re-implementing every endpoint as a Tauri command.
 
 ### Cross-app message passing (`hub_poll_messages`)
-The hub maintains a per-app message queue so other VCT-ecosystem apps (Transcrypt, Arzillibus, future plugins) can drop notifications for the orchestrator. Polled via `hub_poll_messages` from the UI; consumed-or-dropped semantics, not a durable queue.
+The hub maintains a per-app message queue so other VCT-ecosystem apps (Ecosystem App 1, Ecosystem App 2, future plugins) can drop notifications for the orchestrator. Polled via `hub_poll_messages` from the UI; consumed-or-dropped semantics, not a durable queue.
 
 ---
 
@@ -466,7 +466,7 @@ Twenty-one commands wired in `lib.rs` cover the orchestrator-installer surface u
 
 ## App Lifecycle Commands (`commands/lifecycle.rs`)
 
-Six commands manage external app processes (Transcrypt, Arzillibus, future plugins) registered with the launcher's `AppManager`.
+Six commands manage external app processes (Ecosystem App 1, Ecosystem App 2, future plugins) registered with the launcher's `AppManager`.
 
 ### `launch_app(app_id, command, args, working_dir)`
 Spawn an external app as a child process, register it with `AppManager`, and stream stdout/stderr back to the UI via Tauri events.
@@ -507,7 +507,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 ### Core operations (`hub/api.rs`)
 - `GET /api/v1/health` — liveness probe; returns `{ok: true, version}`.
 - `GET /api/v1/apps` — list registered VCT-ecosystem apps with last-heartbeat timestamps.
-- `POST /api/v1/apps/register` — register a new app (Transcrypt, Arzillibus, custom). Body: `{app_id, name, version}`.
+- `POST /api/v1/apps/register` — register a new app (Ecosystem App 1, Ecosystem App 2, custom). Body: `{app_id, name, version}`.
 - `DELETE /api/v1/apps/{app_id}` — deregister an app.
 - `POST /api/v1/apps/{app_id}/heartbeat` — keepalive ping; advances the app's `last_seen_at`.
 - `POST /api/v1/messages` — drop a message into another app's inbox. Body: `{recipient, sender, payload}`.

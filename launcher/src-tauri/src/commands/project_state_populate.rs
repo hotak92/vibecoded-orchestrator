@@ -2161,7 +2161,7 @@ mod tests {
     #[test]
     fn populate_mcp_servers_from_settings_json_flags_user_added() {
         // settings.json carries one bundled (weaviate-kg) and one
-        // user-added (transcrypt-live) entry. Populate must flag them
+        // user-added (ecosystem-app-1-live) entry. Populate must flag them
         // correctly so the Custom MCP tab filters surface only the
         // user-added one.
         let folder = scratch_dir("mcp-settings");
@@ -2174,8 +2174,8 @@ mod tests {
                     "args": ["-m", "weaviate_mcp.server"],
                     "env": {"OLLAMA_URL": "http://localhost:11435"}
                 },
-                "transcrypt-live": {
-                    "command": "/usr/local/bin/transcrypt-live",
+                "ecosystem-app-1-live": {
+                    "command": "/usr/local/bin/ecosystem-app-1-live",
                     "args": []
                 }
             }
@@ -2201,14 +2201,14 @@ mod tests {
         assert_eq!(weaviate.command.as_deref(), Some("/usr/bin/python3"));
         assert_eq!(weaviate.source_file.as_deref(), Some(".claude/settings.json"));
 
-        let transcrypt = by_name.get("transcrypt-live").expect("transcrypt-live row");
-        assert!(transcrypt.is_user_added, "transcrypt-live is user-added");
-        assert_eq!(transcrypt.source, "user");
+        let ecosystem_app = by_name.get("ecosystem-app-1-live").expect("ecosystem-app-1-live row");
+        assert!(ecosystem_app.is_user_added, "ecosystem-app-1-live is user-added");
+        assert_eq!(ecosystem_app.source, "user");
 
         // Custom MCP tab feed surfaces only the user-added entry.
         let custom = db.list_user_added_mcp_servers("p1").unwrap();
         assert_eq!(custom.len(), 1);
-        assert_eq!(custom[0].mcp_name, "transcrypt-live");
+        assert_eq!(custom[0].mcp_name, "ecosystem-app-1-live");
 
         std::fs::remove_dir_all(&folder).ok();
     }

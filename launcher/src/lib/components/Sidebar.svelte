@@ -278,12 +278,11 @@
                 sub: 'License + container + KG state inspector',
                 match: (p) => p.startsWith('/admin/diagnostic'),
               },
-              {
-                href: '/admin/license-issuance-test',
-                label: 'License test',
-                sub: 'Issue and verify test licenses',
-                match: (p) => p.startsWith('/admin/license-issuance-test'),
-              },
+              // v0.2.54 Track H: the '/admin/license-issuance-test' link was
+              // removed — the route was a "Backend hookup pending" placeholder
+              // that never gained a backend. Test-license verification goes
+              // through the ActivationModal (license_activate/license_refresh
+              // against the live validate-tier endpoint) + Diagnostics.
             ],
           } satisfies NavGroup,
         ]

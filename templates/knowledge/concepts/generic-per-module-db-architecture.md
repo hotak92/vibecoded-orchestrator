@@ -17,9 +17,9 @@ The v0.2.26 declarative-action dispatcher made the scale problem urgent: with [[
 
 ## Problem statement — why the old pattern doesn't scale
 
-Pre-v0.2.26, `projects.rl_port` was the single column tracking where vct-rl-reranker's container was reachable. It was added by migration 014 specifically for RL. With the planned addition of vct-coordination (Q3) and vct-transcrypt (Q4) — plus an open-ended pipeline of future paid modules — the per-column approach would require:
+Pre-v0.2.26, `projects.rl_port` was the single column tracking where vct-rl-reranker's container was reachable. It was added by migration 014 specifically for RL. With the planned addition of vct-coordination (Q3) and vct-ecosystem-app-1 (Q4) — plus an open-ended pipeline of future paid modules — the per-column approach would require:
 
-1. A new SQL migration per module (`018_coordination_port.sql`, `019_transcrypt_port.sql`, …).
+1. A new SQL migration per module (`018_coordination_port.sql`, `019_ecosystem_app_1_port.sql`, …).
 2. A new pair of read/write helpers per module (`get_coordination_port` / `set_coordination_port`, etc.).
 3. A new launcher rebuild every time the marketplace adds a module.
 4. Schema bloat on the `projects` table (column count grows monotonically).

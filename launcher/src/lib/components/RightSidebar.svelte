@@ -97,7 +97,7 @@
   // pass `catalogKind` straight from `ModuleCatalogEntry.kind` so the
   // right-rail badge agrees with the home tile.
   const COMING_SOON_IDS = new Set([
-    'orchestrator-pro', 'mao', 'transcrypt', 'arzillibus',
+    'orchestrator-pro', 'mao', 'ecosystem-app-1', 'ecosystem-app-2',
     'convertifacile', 'dataweave', 'formcraft', 'pixelsnap',
     'rl-reranker',
   ]);

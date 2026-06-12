@@ -90,7 +90,10 @@ Deno.test("lookupVariant: unknown variant returns undefined", () => {
 
 Deno.test("lookupVariant: static map fallback when not admin", () => {
   withAdminEnv(undefined, () => {
-    const m = lookupVariant("ORCHESTRATOR_PRO_MONTHLY_TODO");
+    // v0.2.54 Track H drift fix: this test queried the pre-rename
+    // "ORCHESTRATOR_PRO_MONTHLY_TODO" key after the map keys moved to
+    // the *_PLACEHOLDER suffix — red on every run since the rename.
+    const m = lookupVariant("ORCHESTRATOR_PRO_MONTHLY_PLACEHOLDER");
     assertEquals(m, { appId: "orchestrator", tier: "pro" });
   });
 });

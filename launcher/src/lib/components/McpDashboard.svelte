@@ -1,6 +1,5 @@
 <script lang="ts">
   import { invoke } from '$lib/tauri';
-  import { currentUser } from '$lib/stores/auth';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
 
   let { onClose }: { onClose: () => void } = $props();
@@ -28,7 +27,6 @@
   interface FeatureFlags {
     tier: string;
     can_auto_update: boolean;
-    can_disable_watermark: boolean;
     has_rl_retrieval: boolean;
     has_curated_agents: boolean;
     has_mao: boolean;
@@ -37,7 +35,6 @@
   interface OrchestratorConfig {
     install_path: string;
     tier: string;
-    watermark_enabled: boolean;
     auto_update_enabled: boolean;
     rl_retrieval_enabled: boolean;
     telemetry_enabled: boolean;
@@ -55,10 +52,11 @@
   async function loadConfig() {
     loading = true;
     try {
-      const userApps = $currentUser?.apps ?? [];
+      // P0-5 (v0.2.54): the backend resolves the tier from the cached
+      // license state (tier_cache) — no frontend-supplied apps list.
       const [cfg, flags] = await Promise.all([
         invoke<OrchestratorConfig>('get_orchestrator_config'),
-        invoke<FeatureFlags>('get_feature_flags', { userApps }),
+        invoke<FeatureFlags>('get_feature_flags'),
       ]);
       config = cfg;
       features = flags;
@@ -72,8 +70,7 @@
   async function toggleMcp(mcpId: string, enabled: boolean) {
     error = null;
     try {
-      const userApps = $currentUser?.apps ?? [];
-      const servers = await invoke<McpServer[]>('toggle_mcp_server', { mcpId, enabled, userApps });
+      const servers = await invoke<McpServer[]>('toggle_mcp_server', { mcpId, enabled });
       if (config) config.mcp_servers = servers;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -98,8 +95,7 @@
   async function updateSetting(key: string, value: string) {
     error = null;
     try {
-      const userApps = $currentUser?.apps ?? [];
-      config = await invoke<OrchestratorConfig>('update_orchestrator_setting', { key, value, userApps });
+      config = await invoke<OrchestratorConfig>('update_orchestrator_setting', { key, value });
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -109,6 +105,8 @@
     if (tier === 'free') return 'Free';
     if (tier === 'pro') return 'Pro';
     if (tier === 'mao') return 'MAO';
+    if (tier === 'enterprise') return 'Enterprise';
+    if (tier === 'admin') return 'Admin';
     return tier;
   }
 
@@ -116,6 +114,8 @@
     if (tier === 'free') return 'var(--color-teal)';
     if (tier === 'pro') return 'var(--color-purple)';
     if (tier === 'mao') return 'var(--color-pink)';
+    if (tier === 'enterprise') return 'var(--color-pink)';
+    if (tier === 'admin') return 'var(--color-pink)';
     return 'var(--color-mid)';
   }
 
@@ -228,23 +228,6 @@
         <!-- Tab: Features -->
         {:else if activeTab === 'features'}
           <div class="features-list">
-            <!-- Watermark -->
-            <div class="feature-row">
-              <div class="feature-info">
-                <h3>Watermark</h3>
-                <p>Adds "Made with VibeCoded Tools" comment to new files</p>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" checked={config.watermark_enabled}
-                  disabled={!features.can_disable_watermark && config.watermark_enabled}
-                  onchange={(e) => updateSetting('watermark_enabled', String((e.target as HTMLInputElement).checked))} />
-                <span class="toggle-slider"></span>
-              </label>
-              {#if !features.can_disable_watermark}
-                <span class="upgrade-hint">Pro to disable</span>
-              {/if}
-            </div>
-
             <!-- Auto-update -->
             <div class="feature-row">
               <div class="feature-info">

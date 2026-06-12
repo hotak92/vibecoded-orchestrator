@@ -7,9 +7,24 @@ How VibeCoded Orchestrator gates paid features.
 - **No license key on the machine → free tier**, every time, no exceptions.
 - The free tier is fully functional — knowledge graph, code graph, hooks,
   MCP servers, default agents/skills all work standalone.
-- Optional Pro features (RL retrieval, coordination layer, signed binaries
-  via the launcher) activate when a valid key is present and the tier
-  resolves to `pro` or `enterprise`.
+- Paid features activate when a valid key is present and the tier resolves
+  to `pro` or higher. Per `TIER_FEATURES` in `validator.py`: `pro` unlocks
+  `rl_retrieval`, `auto_update`, `curated_agent_packs`; `mao` adds
+  `multi_agent_orchestration`; `enterprise` adds `soc2_compliance` and
+  `priority_support`.
+
+## Tier ladder
+
+Tiers are strictly ordered (`TIER_ORDER` in `validator.py`); a higher tier
+unlocks every feature of the tiers below it:
+
+| Tier         | Rank | Notes                                                          |
+| ------------ | ---- | -------------------------------------------------------------- |
+| `free`       | 0    | Default. No key, unknown tier values, and all failure modes.   |
+| `pro`        | 1    | LS Pro variant.                                                |
+| `mao`        | 2    | LS MAO variant — multi-agent orchestration stack.              |
+| `enterprise` | 3    | LS Enterprise variant.                                         |
+| `admin`      | 4    | Server-classified only (`LS_ADMIN_VARIANT_IDS`); strict superset of `enterprise`. Never present in any public variant map. |
 
 ## Components
 
@@ -61,8 +76,8 @@ How VibeCoded Orchestrator gates paid features.
 
 ```python
 from VCThelpers.license import (
-    get_tier,           # -> "free" | "pro" | "enterprise"
-    require_tier,       # require_tier("pro") -> bool
+    get_tier,           # -> "free" | "pro" | "mao" | "enterprise" | "admin"
+    require_tier,       # require_tier("pro") -> bool (>= comparison on TIER_ORDER)
     feature_enabled,    # feature_enabled("rl_retrieval") -> bool
     validate_license,   # force a fresh remote call
     license_status,     # introspection dict (no network)

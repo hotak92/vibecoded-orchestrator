@@ -163,24 +163,11 @@ function createAuthStore() {
       update((s) => ({ ...s, error: null }));
     },
 
-    /**
-     * Optimistically mark an app as active in the LOCAL store only.
-     *
-     * SECURITY: This does NOT write to the database. The source of truth for
-     * `profiles.apps` is the lemon-squeezy-webhook (server-side, service_role).
-     * RLS policies block the client from updating the `apps` column.
-     *
-     * Use this only after a successful license activation flow (which the
-     * webhook will eventually mirror to the database). Call
-     * `auth.refreshProfile()` afterwards to reconcile with the server.
-     */
-    markAppActiveLocal(appId: string) {
-      update((s) => {
-        if (!s.user || s.user.apps.includes(appId)) return s;
-        const updatedUser = { ...s.user, apps: [...s.user.apps, appId] };
-        return { ...s, user: updatedUser };
-      });
-    },
+    // v0.2.54 Track H (P0-6): `markAppActiveLocal` was removed together
+    // with its only caller, the legacy localStorage `licenses` store
+    // that validated LemonSqueezy keys client-side. `profiles.apps`
+    // remains server-managed (lemon-squeezy-webhook, service_role);
+    // clients read it via `refreshProfile()`.
 
     async refreshProfile() {
       const { data: { session } } = await supabase.auth.getSession();

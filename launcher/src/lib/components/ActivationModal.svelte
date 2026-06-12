@@ -8,10 +8,10 @@
   //   3. refresh() → POST /validate-tier with current key
   //   4. deactivate() → secrets::delete + tier_cache→free
   //
-  // The legacy localStorage `licenses` store is still wired in the rest of
-  // the app (per-app activation for Transcrypt, Arzillibus, etc.). This
-  // modal is specifically for the *orchestrator tier* license that gates
-  // paid orchestrator modules.
+  // The legacy localStorage `licenses` store (per-app activation that
+  // called LemonSqueezy from the browser) was deleted in v0.2.54 Track H
+  // — it had zero importers. This modal is specifically for the
+  // *orchestrator tier* license that gates paid orchestrator modules.
 
   import { onMount } from 'svelte';
   import { license, formatGrace } from '$lib/stores/license';

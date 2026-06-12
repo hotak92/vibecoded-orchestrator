@@ -70,6 +70,12 @@ TIER_ORDER: dict[Tier, int] = {
 }
 
 # Features gated per tier. Order: most-restrictive tier that unlocks it.
+#
+# v0.2.54: `watermark_disabled` was REMOVED. The watermark concept never
+# shipped a consumer — the launcher wrote a `VCT_WATERMARK` env value
+# nothing read, and no code path ever called
+# `feature_enabled("watermark_disabled")`. Gating a feature that doesn't
+# exist only misled the tier table.
 TIER_FEATURES: dict[str, Tier] = {
     "knowledge_graph": "free",
     "code_graph": "free",
@@ -78,7 +84,6 @@ TIER_FEATURES: dict[str, Tier] = {
     "rl_retrieval": "pro",
     "auto_update": "pro",
     "curated_agent_packs": "pro",
-    "watermark_disabled": "pro",
     "multi_agent_orchestration": "mao",
     "soc2_compliance": "enterprise",
     "priority_support": "enterprise",

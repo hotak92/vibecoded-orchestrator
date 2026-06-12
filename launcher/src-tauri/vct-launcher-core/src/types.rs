@@ -58,35 +58,24 @@ pub enum OrchestratorTier {
 }
 
 impl OrchestratorTier {
-    /// Derive tier from user's activated app list (highest wins).
-    pub fn from_apps(apps: &[String]) -> Self {
-        if apps.iter().any(|a| a == "mao") {
-            OrchestratorTier::Mao
-        } else if apps.iter().any(|a| a == "orchestrator-pro") {
-            OrchestratorTier::Pro
-        } else {
-            OrchestratorTier::Free
+    // v0.2.54 Track H (P0-5): `from_apps` was REMOVED. It derived the
+    // tier from the Supabase `profiles.apps` list the frontend passed in
+    // — but license-key activation (the canonical ActivationModal →
+    // keychain → /validate-tier → `tier_cache` flow) never writes to
+    // `profiles.apps`, so every Pro customer who activated via license
+    // key was classified Free by the dashboard. Tier resolution now
+    // reads `db.get_tier_cache()` (the same row `license_get_tier`
+    // serves) and ranks slugs via `licensing::tier_rank`.
+
+    /// Lowercase wire slug for this tier — same string serde emits
+    /// (`#[serde(rename_all = "lowercase")]`), usable with
+    /// `licensing::tier_rank` without a serialization round-trip.
+    pub fn as_slug(&self) -> &'static str {
+        match self {
+            OrchestratorTier::Free => "free",
+            OrchestratorTier::Pro => "pro",
+            OrchestratorTier::Mao => "mao",
         }
-    }
-
-    pub fn can_auto_update(&self) -> bool {
-        matches!(self, OrchestratorTier::Pro | OrchestratorTier::Mao)
-    }
-
-    pub fn can_disable_watermark(&self) -> bool {
-        matches!(self, OrchestratorTier::Pro | OrchestratorTier::Mao)
-    }
-
-    pub fn has_rl_retrieval(&self) -> bool {
-        matches!(self, OrchestratorTier::Pro | OrchestratorTier::Mao)
-    }
-
-    pub fn has_curated_agents(&self) -> bool {
-        matches!(self, OrchestratorTier::Pro | OrchestratorTier::Mao)
-    }
-
-    pub fn has_mao(&self) -> bool {
-        matches!(self, OrchestratorTier::Mao)
     }
 }
 
@@ -94,7 +83,7 @@ impl OrchestratorTier {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
-    /// Unique ID: "weaviate-kg", "ollama", "search", "code-embed", "transcrypt-live", etc.
+    /// Unique ID: "weaviate-kg", "ollama", "search", "code-embed", "ecosystem-app-1-live", etc.
     pub id: String,
     pub name: String,
     pub description: String,
@@ -136,11 +125,15 @@ pub enum McpSettingType {
 
 // --- Orchestrator feature config (persisted to disk) ---
 
+// v0.2.54 Track H: `watermark_enabled` was REMOVED. The flag only fed a
+// `VCT_WATERMARK` env emission in `apply_mcp_to_claude_settings` that
+// nothing ever read — the watermark feature never shipped a consumer.
+// Existing orchestrator.json files that still carry the key parse fine
+// (serde ignores unknown fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
     pub install_path: String,
     pub tier: OrchestratorTier,
-    pub watermark_enabled: bool,
     pub auto_update_enabled: bool,
     pub rl_retrieval_enabled: bool,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -153,7 +146,6 @@ impl Default for OrchestratorConfig {
         Self {
             install_path: String::new(),
             tier: OrchestratorTier::Free,
-            watermark_enabled: true,
             auto_update_enabled: false,
             rl_retrieval_enabled: false,
             mcp_servers: default_mcp_servers(),

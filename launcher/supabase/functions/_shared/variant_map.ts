@@ -28,8 +28,8 @@ export interface VariantMapping {
 export const VARIANT_MAP: Record<string, VariantMapping> = {
   // ─── Existing single-app products ─────────────────────────────────────────
   // Variant IDs TBD — fill in when products are created in LS.
-  // "123456": { appId: "transcrypt" },
-  // "123457": { appId: "arzillibus" },
+  // "123456": { appId: "ecosystem-app-1" },
+  // "123457": { appId: "ecosystem-app-2" },
   // "123458": { appId: "convertifacile" },
   // "123459": { appId: "dataweave" },
   // "123460": { appId: "formcraft" },

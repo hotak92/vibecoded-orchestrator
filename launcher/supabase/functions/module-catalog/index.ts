@@ -35,27 +35,21 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { buildCorsHeaders, makeJsonResponse } from "../_shared/http.ts";
 
 const SCHEMA_VERSION = 1;
 const BUCKET = "paid-module-catalog";
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
-  // Server-side cache hint: 60s. Supabase Edge Functions are stateless across
-  // invocations so this lives only in client / CDN caches; the launcher's
-  // 15min app_state TTL is the durable cache.
-  "Cache-Control": "public, max-age=60",
-};
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
-  });
-}
+const CORS_HEADERS = buildCorsHeaders({
+  methods: "GET, OPTIONS",
+  extra: {
+    // Server-side cache hint: 60s. Supabase Edge Functions are stateless
+    // across invocations so this lives only in client / CDN caches; the
+    // launcher's 15min app_state TTL is the durable cache.
+    "Cache-Control": "public, max-age=60",
+  },
+});
+const jsonResponse = makeJsonResponse(CORS_HEADERS);
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {

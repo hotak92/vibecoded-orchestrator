@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **v0.2.54 Track G (G-7): Windows GUI auto-spawn now actually exists — and a v0.2.53 CHANGELOG correction**. The v0.2.53 entry "Thin OS shims with 3-step orchestration" claimed the shims "(4) auto-spawn `scripts/post-install-launcher.{sh,ps1}` unless `--no-auto-launch` / `-NoAutoLaunch`" and that "Linux/macOS shims pass `--no-auto-launch` through to install.py". Two corrections against the shipped code: (1) `post-install-launcher.ps1` never spawned the GUI — it only wrote Desktop/Start Menu shortcuts and explicitly listed auto-launch as out of scope, so the `install.ps1` path ended without the launcher opening (POSIX users got the spawn via the bash helper's Step 5; Windows users didn't). The .ps1 now performs the detached `Start-Process` spawn when `-NoAutoLaunch` is absent, same soft-fail contract as the bash sibling. (2) The POSIX shims deliberately CONSUME `--no-auto-launch` (install.py has no such argparse flag — passing it through would error); the flag controls the shim's own Step-3 spawn decision.
+- **Track H (P0-5): Pro customers saw Free gates across the launcher dashboard** — `get_feature_flags` / `update_orchestrator_setting` / `toggle_mcp_server` derived the tier from a frontend-supplied Supabase `profiles.apps` list that license-key activation never populates (the ActivationModal flow writes the keychain + `tier_cache`, not `profiles.apps`), so every license-key-activated Pro/MAO user was gated as Free in the Orchestrator Dashboard. Tier now resolves server-side from the cached `tier_cache` row (the same source `license_get_tier` serves), `OrchestratorTier::from_apps` is deleted, and the tier ladder is unified on a single `vct_launcher_core::licensing::tier_rank` (extracted from `commands/modules.rs`; mirrors `validator.py::TIER_ORDER`, so `enterprise`/`admin` rank above `mao` instead of falling back to free).
+
+### Removed
+
+- **Track H (P0-5 watermark decision): the never-shipped watermark gate is gone** — `TIER_FEATURES["watermark_disabled"]` (validator.py), the `watermark_enabled` config field + dashboard toggle + preferences row, and the `VCT_WATERMARK` env emission in `apply_mcp_to_claude_settings` are all removed. The watermark concept never had a consumer: nothing read `VCT_WATERMARK`, and no code path called `feature_enabled("watermark_disabled")`. Existing `orchestrator.json` / `.claude/settings.json` files that still carry the old key/env entry parse fine (unknown fields ignored; stale env entries are inert).
+- **Track H (P0-6): LemonSqueezy API key removed from the client bundle surface** — `VITE_LEMONSQUEEZY_API_KEY` is gone from `launcher/.env.example` and `launcher/docs/SETUP.md`, and the legacy zero-importer `launcher/src/lib/stores/licenses.ts` store (which embedded the key into the webview bundle via `import.meta.env` and called the LemonSqueezy API directly from the client) is deleted along with its only callee `auth.markAppActiveLocal`. License validation goes exclusively through the Rust backend → Supabase `validate-tier` edge function; the key never belonged in a Vite-bundled client.
+- **Track H: placeholder admin "License issuance test" page removed** — `/admin/license-issuance-test` shipped as a "Backend hookup pending" stub yet was wired live in the admin sidebar. The sidebar link and the route are removed; license verification lives in the ActivationModal (`license_activate`/`license_refresh`) and the admin Diagnostics page.
+
+### Changed
+
+- **Track H (H-7): `revalidateTierViaSupabase` deduplicated across edge functions** — the identical 3× copies in `rl-artifact-url` / `rl-latest-version` / `rl-latest-weights` are extracted to `launcher/supabase/functions/_shared/tier_revalidation.ts`, and the 7× copied `CORS_HEADERS` + `jsonResponse` boilerplate is consolidated behind `_shared/http.ts` (parametric, preserving each function's exact wire headers). A future security fix to the tier-revalidation path now lands in one file instead of three.
+- **Track H (H-5/H-6): licensing docs brought up to truth** — `docs/license/README.md` now documents the full `free < pro < mao < enterprise < admin` tier ladder (was: pro/enterprise only) and no longer lists a "coordination layer" feature that has no `TIER_FEATURES` entry; `installer_engine.rs`'s `container_pull` doc header no longer claims the pull-token gateway is "not deployed yet" (contradicting the v0.2.35 canonical-path comment 80 lines below).
 
 ## [0.2.54] - 2026-06-12
 
@@ -287,7 +299,7 @@ A **public-repo cleanup release** triggered by a critical UX regression discover
 ### Security / Privacy
 
 - Scrubbed `pb992/VCT-Launcher` references (co-maintainer's private fork, not a public repo) from `BOOTSTRAP.md`, `docs/features/07-architecture.md`, `launcher/bundled_manifests/vct-hub-api.json`.
-- Scrubbed Lemon Squeezy product names (`Transcrypt`, `Arzillibus`, `ConvertiFacile` — maintainer's other personal products) from `launcher/docs/SETUP.md` dev-mode activation examples; replaced with `DemoProduct1/2/3`.
+- Scrubbed personal product codenames (maintainer's other personal products) from `launcher/docs/SETUP.md` dev-mode activation examples; replaced with `DemoProduct1/2/3`.
 - Scrubbed personal-narrative leakage in `CHANGELOG.md` (`instambul_map`, `SD15` → "an external user project" / "a long-lived legacy project"); preserved technical context.
 - Scrubbed chat-role narrative ("RL chat", "main VCO chat") from 6 Rust inline comments + 1 TypeScript comment + 1 GHA workflow + 1 pytest test description; replaced with neutral architectural language ("v0.2.49 access-matrix follow-up", "module-author workflows", etc.).
 - Scrubbed dated release-narrative paragraphs from `launcher/supabase/functions/rl-{artifact-url,latest-weights}/README.md` while keeping the architectural Vault-vs-Edge-Function-Secrets explainer.
@@ -2297,7 +2309,7 @@ shipped in [0.2.28] same-day.)
 
 Headline release: a **generic declarative HTTP-action dispatcher** that
 lets paid modules add new GUI controls without launcher rebuilds.
-Every future paid module (`vct-coordination`, `vct-transcrypt`,
+Every future paid module (`vct-coordination`, `vct-ecosystem-app-1`,
 `mao`, …) now declares its config tab entirely in its
 `vct-module.json` manifest; the launcher renders + executes
 everything generically. The four reset/retrain Tauri command stubs
@@ -2315,7 +2327,7 @@ persistent perf cost.
 
 - **`feat(launcher-ui)` Five new schema-rendered control kinds**: `text_input` (with optional apply/validate action), `number_input` (min/max/step), `status_display` (polled GET source + `render_template`), `file_picker` (Tauri native dialog, optional extension filter, directory mode), `link` (external via tauri-plugin-opener / internal via SvelteKit goto). New components under `launcher/src/lib/components/module-controls/`. Each is documented in `docs/PAID_MODULE_DEV_CHECKLIST.md`.
 
-- **`feat(launcher-core)` Generic per-(project × module) port table** — migration 017 adds `module_ports(project_id, module_id, port, updated_at)` with `INSERT OR IGNORE` backfill from the existing `projects.rl_port` column. New helpers `db.get_module_port(...)` / `set_module_port(...)` / `ensure_module_port(...)`. The legacy `get_project_rl_port` / `set_project_rl_port` pair becomes thin wrappers — every v0.2.21+ hub call site compiles unchanged. Unblocks coordination + transcrypt without per-module schema changes. See [`knowledge/concepts/generic-per-module-db-architecture.md`](knowledge/concepts/generic-per-module-db-architecture.md).
+- **`feat(launcher-core)` Generic per-(project × module) port table** — migration 017 adds `module_ports(project_id, module_id, port, updated_at)` with `INSERT OR IGNORE` backfill from the existing `projects.rl_port` column. New helpers `db.get_module_port(...)` / `set_module_port(...)` / `ensure_module_port(...)`. The legacy `get_project_rl_port` / `set_project_rl_port` pair becomes thin wrappers — every v0.2.21+ hub call site compiles unchanged. Unblocks coordination + ecosystem-app-1 without per-module schema changes. See [`knowledge/concepts/generic-per-module-db-architecture.md`](knowledge/concepts/generic-per-module-db-architecture.md).
 
 - **`feat(launcher)` WebKitGTK + EGL pre-flight probe** at `launcher/src-tauri/src/webkit_preflight.rs`. Linux-only (`#[cfg(target_os = "linux")]`); macOS/Windows no-op. Called from `main()` BEFORE Tauri init. Walks `/sys/class/drm/*` to find the primary GPU (`boot_vga=1`), maps to its `/dev/dri/renderD*` node, dlopens `libEGL.so.1` + `libgbm.so.1`, and calls `eglInitialize` against the GBM platform display. On the well-known `EGL_NOT_INITIALIZED` (0x3001) failure signature — most commonly: NVIDIA `apt`-upgraded its proprietary userspace without a kernel-module reload — sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` (and `__NV_DISABLE_EXPLICIT_SYNC=1` on Wayland) so WebKit falls back to its legacy renderer instead of aborting the process. Kill-switch: `VCT_WEBKIT_PREFLIGHT_OFF=1`. User-set `WEBKIT_DISABLE_DMABUF_RENDERER` is respected (the probe is a no-op when the user already chose). Live-verified against the broken NVIDIA driver state on the dev box on 2026-05-22. See [`knowledge/concepts/webkit-egl-preflight-probe.md`](knowledge/concepts/webkit-egl-preflight-probe.md).
 
@@ -2323,7 +2335,7 @@ persistent perf cost.
 
 ### Changed
 
-- **`refactor(launcher)` Renamed `commands::rl_service` → `commands::module_service`** (~10 files, ~40 textual refs updated). The file's internals were already generic — v0.2.21's header noted "Today this module supports exactly one consumer — `vct-rl-reranker` — but the helpers are written against `ModuleManifest` so future container modules drop in without a code change". Now that v0.2.26 has dispatcher + module_ports for coordination + transcrypt, the file name matches the scope. Pure rename — no behavioural change.
+- **`refactor(launcher)` Renamed `commands::rl_service` → `commands::module_service`** (~10 files, ~40 textual refs updated). The file's internals were already generic — v0.2.21's header noted "Today this module supports exactly one consumer — `vct-rl-reranker` — but the helpers are written against `ModuleManifest` so future container modules drop in without a code change". Now that v0.2.26 has dispatcher + module_ports for coordination + ecosystem-app-1, the file name matches the scope. Pure rename — no behavioural change.
 
 - **`docs(paid-modules)` Extended `docs/PAID_MODULE_DEV_CHECKLIST.md`** with two new sections: "GUI tab integration via the declarative dispatcher (v0.2.26+)" (declarative-vs-legacy decision matrix, minimum example, polling example, port registration contract, template grammar reference, what-still-requires-rebuild list) and updates to the "When you add a new paid module" procedure (now includes explicit steps for declaring the GUI tab in the manifest + wiring port registration via `ensure_module_port`).
 
