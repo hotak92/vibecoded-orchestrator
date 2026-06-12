@@ -21354,12 +21354,31 @@ def _deploy_and_start_vct_hub(
         "[8/10] Starting vct-hub (--start-if-not-running) ... ",
         end="", flush=True,
     )
+    # Windows (v0.2.54 Track W): do NOT capture stdout/stderr here. vct-hub
+    # spawns its detached daemon grandchild via Rust std::process::Command,
+    # whose CreateProcessW uses bInheritHandles=TRUE without a
+    # PROC_THREAD_ATTRIBUTE_HANDLE_LIST — so the daemon inherits the
+    # write-ends of our capture pipes (CPython marks them inheritable) and
+    # holds them for its lifetime. The pipes never reach EOF, and the
+    # timeout cannot rescue us: after TimeoutExpired + kill(), Windows
+    # CPython re-calls communicate() with NO timeout and its reader threads
+    # stay blocked in ReadFile forever. DEVNULL all three stdio handles so
+    # there is nothing for the daemon to inherit. The /health poll below
+    # (8c') remains the real success signal; the error-log path already
+    # guards with `(proc.stdout or "")`, so None is safe there.
+    run_kwargs: dict = {"timeout": 15, "text": True}
+    if os.name == "nt":
+        run_kwargs.update(
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        run_kwargs["capture_output"] = True
     try:
         proc = subprocess.run(
             [str(binary), "--start-if-not-running"],
-            capture_output=True,
-            timeout=15,
-            text=True,
+            **run_kwargs,
         )
     except (subprocess.SubprocessError, OSError) as exc:
         print(f"FAILED ({exc})")
