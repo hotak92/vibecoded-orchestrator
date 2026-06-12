@@ -253,17 +253,18 @@ def test_no_inline_reconstructions_outside_paths_module():
         rel = py_file.relative_to(repo_root)
         if any(part in skip_dirs for part in rel.parts):
             continue
-        # Skip transient agent-worktree mirrors (scratch dirs spawned
-        # by the multi-agent harness — full copies of production code,
-        # not production code themselves). Match any path component
-        # shaped like ``agent-<hexhash>`` directly under
-        # ``.claude/worktrees/``.
+        # Skip transient worktree mirrors under ``.claude/worktrees/``.
+        # By convention this directory holds short-lived scratch copies
+        # spawned by the multi-agent harness (full repo trees, not
+        # production code). The narrow ``agent-<hexhash>`` match used
+        # pre-v0.2.54 missed human-named worktrees (e.g.
+        # ``track-W-windows-hub-hang``); the canonical rule is "ignore
+        # the entire subtree" — the directory itself is the boundary.
         rel_parts = rel.parts
         if (
             len(rel_parts) >= 3
             and rel_parts[0] == ".claude"
             and rel_parts[1] == "worktrees"
-            and rel_parts[2].startswith("agent-")
         ):
             continue
         # Skip the gitignored ``.claude/scripts/`` bundle copies. The
