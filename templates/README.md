@@ -2,7 +2,7 @@
 
 This directory holds the agents and skills that `install.py` copies into a user's `.claude/agents/` and `.claude/skills/` at install time. Contents here are *templates*, not active agents — they're populated into your project's `.claude/` so Claude Code picks them up.
 
-## Bundled agents — `agents/free/` (29 agents)
+## Bundled agents — `agents/free/` (44 agents)
 
 All bundled agents are free and installed by default. They cover the base orchestrator workflow plus specialist + coordinator roles: coding, testing, planning, docs, knowledge graph, code graph, migration, bootstrapping, multi-agent design, and language/framework expertise.
 
@@ -21,9 +21,8 @@ All bundled agents are free and installed by default. They cover the base orches
 | `code-graph-updater` | Incremental code graph sync |
 | `code-migrator` | Language/framework migration |
 | `prompt-engineer` | Review + optimize agent prompts |
-| `orchestrator-installer` | Infrastructure bring-up |
-| `project-bootstrapper` | New-project scaffolding |
-| `project-migrator` | Adopt orchestrator into existing project |
+| `orchestrator-installer` | Diagnose + recover partially-failed installs |
+| `project-bootstrapper` | Refine bootstrap docs after `--add-project` |
 | `ai-agentic-architect` | Designs multi-agent workflows |
 | `project-coordinator` | Coordinates running agents |
 | `project-architect` | End-to-end design |
@@ -37,10 +36,26 @@ All bundled agents are free and installed by default. They cover the base orches
 | `code-explorer` | Read-only code exploration |
 | `gui-tester` | GUI testing |
 | `web-explorer` | Web research |
+| `api-integration-scaffolder` | Typed API clients from specs/docs |
+| `automation-engineer` | End-to-end automation workflow design |
+| `brand-identity-architect` | Visual brand identity systems |
+| `consulting-cto-portfolio-coordinator` | Multi-client consulting portfolio status |
+| `consulting-employee-impersonator` | Employee-archetype roleplay output |
+| `consulting-sow-drafter` | Statement-of-Work / proposal drafting |
+| `discipline-expert` | Cross-disciplinary scientific consultation |
+| `enterprise-ux-architect` | IA + interaction design for complex enterprise tools |
+| `experiment-designer` | Experiment design from a hypothesis |
+| `inbox-triage-operator` | Multi-channel inbox triage + reply drafting |
+| `landing-page-critic` | SaaS landing-page evaluation |
+| `launch-orchestrator` | Multi-channel release launch content |
+| `outbound-sequence-writer` | Cold outreach sequence drafting |
+| `paper-triage` | PDF folder triage into structured claims table |
+| `postmortem-author` | Blameless post-mortem drafting |
+| `sre-incident-responder` | Live production incident triage |
 
-### Skills — `skills/` (29 skills)
+### Skills — `skills/` (53 skills)
 
-All shipped in free tier. Short-form guidance documents invoked via `/skill-name`. Organized alphabetically: `accessibility-checker`, `ai-model-selector`, `ai-prompting`, `ai-rag-advisor`, `api-designer`, `architect`, `architecture-consultant`, `code-review-expert`, `context`, `context-compress`, `database-advisor`, `debug-expert`, `deployment-advisor`, `doc-organizer`, `doc-template`, `explore-codebase`, `extract-docs`, `fix-issue`, `gui-test`, `gui-ux-expert`, `hardware-calculator`, `interview`, `kg-research`, `performance-optimizer`, `react-patterns`, `security-reviewer`, `task-breakdown`, `tdd`, `workflow-maintain`.
+All shipped in free tier. Short-form guidance documents invoked via `/skill-name`. Organized alphabetically: `accessibility-checker`, `ai-image-prompting`, `ai-model-selector`, `ai-prompting`, `ai-rag-advisor`, `api-designer`, `architect`, `architecture-consultant`, `batch-image-pipeline`, `build-vs-buy-decision`, `code-review-expert`, `codegraph-diagram`, `consulting-due-diligence`, `consulting-incident-coordinator`, `consulting-portfolio-status`, `content-calendar-planner`, `context`, `context-compress`, `database-advisor`, `debug-expert`, `deployment-advisor`, `design-system-auditor`, `doc-template`, `equation-check`, `explore-codebase`, `extract-docs`, `fix-issue`, `gui-test`, `gui-ux-expert`, `hardware-calculator`, `hpc-submit`, `idempotency-keys`, `interview`, `k8s-manifest-reviewer`, `kg-research`, `performance-optimizer`, `photoshop-scripting`, `react-patterns`, `repro-audit`, `saas-metrics-health-check`, `saas-pricing-strategist`, `sales-call-prep`, `security-reviewer`, `seo-content-brief`, `slo-designer`, `stats-consult`, `structured-output-extraction`, `task-breakdown`, `tdd`, `terraform-plan-reviewer`, `webhook-receiver`, `workflow-cost-estimator`, `workflow-maintain`.
 
 ## Other paid modules (not agents)
 
@@ -68,7 +83,7 @@ Keep placeholders in templates — do NOT hard-code paths.
 ## Install flags
 
 ```bash
-python install.py                      # 29 bundled agents + all skills (default)
+python install.py                      # 44 bundled agents + all skills (default)
 python install.py --no-agents          # skip agent installation
 python install.py --no-skills          # skip skill installation
 ```

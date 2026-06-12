@@ -293,11 +293,6 @@ MCP servers are registered in the user's `~/.claude.json`. Each launches via the
 - Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API); `GITHUB_TOKEN` (resolved at wrapper startup from the `github_pat` shared keychain slot).
 - Tools: `search_papers` only.
 
-**coordination** — local KG-backed coordination notes (decisions, tasks, patterns).
-- Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/coordination_mcp/server.py`
-- Env: `KG_BASE_DIR` (optional, defaults to project root).
-- Tools: `post_coordination_note`, `read_coordination_notes`.
-
 **Removed in v0.2.11**: the **ollama** MCP (`chat`, `read_document`, `read_image`) was removed as redundant. Claude's native reasoning, `Read` tool, and built-in vision handle the same use cases at higher quality. Ollama continues running as infrastructure for Weaviate text embeddings and the code-embedding service CPU fallback. The **SearXNG** container was also removed from the default stack — `search_papers` calls OpenAlex and arXiv directly without a local search proxy. See `knowledge/concepts/mcp-simplification-v0211.md` for the full rationale.
 
 **Stale MCP cleanup**: `install.py --rewrite-stale-mcps` (added in v0.2.12 / PR-33) detects deprecated MCP entries left over from older versions in `~/.claude.json` and offers consent-prompted auto-rewrite. Run after upgrading from pre-v0.2.11 installs.

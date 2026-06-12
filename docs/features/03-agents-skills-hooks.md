@@ -80,13 +80,10 @@ The web counterpart to `code-explorer`: searches, reads pages, cross-references 
 Reviews and rewrites agent prompts using current Claude 4.x patterns.
 
 ### `orchestrator-installer` (Opus)
-Installs the VibeCoded Orchestrator workflow system on a new machine (Windows or Linux). Full shared-infrastructure setup.
+Diagnose and recover from a partially-failed install. Canonical install path: `bash first-install.sh` → `install.py`.
 
 ### `project-bootstrapper` (Sonnet)
-Creates a new Claude Code project from scratch with the full Orchestrator workflow: hooks, KG, scripts, settings, CLAUDE.md.
-
-### `project-migrator` (Sonnet)
-Migrates an existing Claude Code project onto the Orchestrator workflow.
+Refine bootstrap docs (CLAUDE.md, ARCHITECTURE.md) after the launcher's "+ New/Existing Project" flow generates them.
 
 ---
 

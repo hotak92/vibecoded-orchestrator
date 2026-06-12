@@ -3,13 +3,13 @@ title: Orchestrator MCP Servers
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, mcp, tools]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T03:52:34Z
+updated: 2026-06-12T00:00:00Z
 status: active
 ---
 
 # Orchestrator MCP Servers
 
-The orchestrator ships MCP (Model Context Protocol) servers that extend Claude Code with semantic search, academic paper search, and team coordination. All servers run as native Python processes registered in the user's MCP config and share a virtual environment at `claude_mcp_servers/.venv`.
+The orchestrator ships MCP (Model Context Protocol) servers that extend Claude Code with semantic search and academic paper search. All servers run as native Python processes registered in the user's MCP config and share a virtual environment at `claude_mcp_servers/.venv`.
 
 [[implements::Model Context Protocol]] [[uses::Weaviate]] [[uses::Ollama]] [[relatedTo::Orchestrator Knowledge Graph]] [[relatedTo::MCP Simplification v0.2.11]]
 
@@ -20,7 +20,6 @@ The orchestrator ships MCP (Model Context Protocol) servers that extend Claude C
 | weaviate-kg | Semantic search + KG/code-graph management | hybrid_search, search_code_graph, store_knowledge_node, query_code_structure |
 | search | Academic paper search | search_papers |
 | code-embedding-service | GPU/CPU code-embedding HTTP service (port 11440) | `/embed`, `/health` (REST, not MCP) |
-| coordination | Team coordination notes (Pro tier) | post_coordination_note, read_coordination_notes |
 
 ## Removed in v0.2.11
 
@@ -134,22 +133,6 @@ A small FastAPI server (not an MCP server — used internally by `weaviate-kg`) 
 
 - `gpu` (default if CUDA available): [[CodeSage-Large-v2]] (2048-dim).
 - `ollama`: [[Jina Embeddings v2 Base Code]] (768-dim, CPU-friendly).
-
-## coordination
-
-**Script**: `claude_mcp_servers/coordination_mcp/server.py` (Pro tier — separate package).
-
-Local KG-backed coordination notes for team decisions, task assignments, and cross-session agreements. Provides a persistent scratchpad that survives context compaction.
-
-### post_coordination_note
-```python
-post_coordination_note(title, content, category="decision")
-```
-
-### read_coordination_notes
-```python
-read_coordination_notes(category=None, days=7)
-```
 
 ## Infrastructure
 
