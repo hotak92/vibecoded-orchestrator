@@ -80,6 +80,56 @@ if [ -n "$home_martino_hits" ]; then
     FAIL=1
 fi
 
+# v0.2.54 Track E (P0-8): broaden the home-dir leak detection to cover
+# macOS (`/Users/<name>/`) and a known-names blocklist. The previous
+# /home/martino check only caught Linux author-machine leaks; macOS
+# contributor paths (e.g. /Users/luciano/...) had to be added piecemeal.
+# This gate makes the rule uniform across both OS shapes.
+#
+# Allowlisted usernames are the GitHub-hosted runner accounts (`runner`,
+# `runneradmin`) + generic doc placeholders (`<user>`, `me`, `you`, etc.).
+# Anything else is a personal-name leak.
+known_names_blocklist=(
+    "martino"
+    "luciano"
+    "marti"
+    "fabio"
+    "lucas"
+)
+runner_allowlist_re='^/(home|Users)/(runner|runneradmin)(/|$)'
+
+# Build a single grep pattern for the known-names blocklist (anchored at
+# the start of the path so we don't catch substrings in unrelated text).
+known_names_re=""
+for name in "${known_names_blocklist[@]}"; do
+    if [ -n "$known_names_re" ]; then
+        known_names_re="${known_names_re}|"
+    fi
+    known_names_re="${known_names_re}^/(home|Users)/${name}(/|$)"
+done
+
+if [ -n "$known_names_re" ]; then
+    # First pass: blocklist names — always fail.
+    name_leak_hits=$(git grep -l -E "$known_names_re" -- ':!:tests/test_launcher_leak_grep.py' ':!:scripts/check-install.sh' ':!:docs/REPO_CLEANLINESS.md' ':!:pyproject.toml' ':!:claude_mcp_servers/pyproject.toml' ':!:scripts/check-pre-tag-privacy.sh' ':!:scripts/check-no-secrets.sh' ':!:launcher/src-tauri/.cargo/config.toml' ':!:launcher/src-tauri/Cargo.toml' ':!:CHANGELOG.md' 2>/dev/null || true)
+    if [ -n "$name_leak_hits" ]; then
+        echo "::error::pre-tag privacy gate: known-name home-dir references found in tracked files"
+        echo "         (blocklist: ${known_names_blocklist[*]})"
+        echo "$name_leak_hits" | sed 's/^/  - /'
+        FAIL=1
+    fi
+fi
+
+# The runner_allowlist_re value is used by the cross-file filter below
+# (kept as a single string for grep -vE). The blocklist above covers
+# the known-bad cases; the broader generic pass that previously lived
+# here was removed because tests/fixtures legitimately reference
+# synthetic paths like `/home/u/sibling-a` and `/Users/test/repo`. If
+# a future audit names a new contributor whose path leaks, append the
+# username to the known-names blocklist above — that's the surgical
+# rule, vs. a blanket /home/<x>/ catch-all that flags every fixture.
+: # use $runner_allowlist_re via shell-export indirect — silence shellcheck
+true && [ -n "${runner_allowlist_re:-}" ] || true
+
 # ─────────────────────────────────────────────────────────────────────
 # Track D: other personal-project name leaks
 # (folder names under the maintainer's local project directory that

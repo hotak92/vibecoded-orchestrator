@@ -371,22 +371,22 @@ install.py [--bootstrap] [--json] [--install-missing] [--no-prompt] [--verbose]
   },
 
   "paths": {
-    "install_root": "/Users/luciano/vibecoded-orchestrator",
+    "install_root": "/Users/<user>/vibecoded-orchestrator",
     "install_root_kind": "orchestrator_clone | completed_install | git_repo",
-    "venv_python": "/Users/luciano/vibecoded-orchestrator/.venv/bin/python3",
-    "mcp_venv_python": "/Users/luciano/vibecoded-orchestrator/claude_mcp_servers/.venv/bin/python3",
+    "venv_python": "/Users/<user>/vibecoded-orchestrator/.venv/bin/python3",
+    "mcp_venv_python": "/Users/<user>/vibecoded-orchestrator/claude_mcp_servers/.venv/bin/python3",
     "launcher_dist_subdir": "macos-arm64 | linux-x64 | windows-x64",
-    "launcher_binary": "/Users/luciano/vibecoded-orchestrator/launcher/dist/macos-arm64/vct-launcher",
+    "launcher_binary": "/Users/<user>/vibecoded-orchestrator/launcher/dist/macos-arm64/vct-launcher",
     "launcher_binary_exists": true,
-    "vct_hub_binary": "/Users/luciano/vibecoded-orchestrator/launcher/dist/macos-arm64/vct-hub",
+    "vct_hub_binary": "/Users/<user>/vibecoded-orchestrator/launcher/dist/macos-arm64/vct-hub",
     "vct_hub_binary_exists": true,
-    "state_dir": "/Users/luciano/vibecoded-orchestrator/state",
+    "state_dir": "/Users/<user>/vibecoded-orchestrator/state",
     "state_dir_exists": false,
-    "claude_dir": "/Users/luciano/vibecoded-orchestrator/.claude",
-    "vct_root_dir": "/Users/luciano/.vct",
-    "launcher_db": "/Users/luciano/.vct/launcher.db",
-    "hub_port_file": "/Users/luciano/.vct/hub.port",
-    "hub_token_file": "/Users/luciano/.vct/hub.token"
+    "claude_dir": "/Users/<user>/vibecoded-orchestrator/.claude",
+    "vct_root_dir": "/Users/<user>/.vct",
+    "launcher_db": "/Users/<user>/.vct/launcher.db",
+    "hub_port_file": "/Users/<user>/.vct/hub.port",
+    "hub_token_file": "/Users/<user>/.vct/hub.token"
   },
 
   "package_manager_advice": {
@@ -1320,7 +1320,7 @@ See §9. Each OS run is itself a parity test asserting the install completes end
 
 ### 11.2 Risk: shim forwards `$@` / `%*` incorrectly
 
-**Scenario**: macOS shim drops a quoted argument with spaces (e.g. `--install-root "/Users/luciano/My Projects/vco"`).
+**Scenario**: macOS shim drops a quoted argument with spaces (e.g. `--install-root "/Users/<user>/My Projects/vco"`).
 
 **Detection**:
 - Track A writes `tests/test_shim_argv_forwarding.sh` (and `.bat` equivalent) exercising args with spaces, special chars, quotes.

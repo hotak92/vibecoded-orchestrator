@@ -16,14 +16,36 @@ set -euo pipefail
 
 # Tokens / project refs that have leaked at some point in this repo's
 # history. Treat each as compromised forever.
+#
+# v0.2.54 Track E (P0-8): the previous version of this file embedded the
+# literal leaked-token values verbatim (so the file itself was a leak
+# vector — anyone reading scripts/check-no-secrets.sh learned the exact
+# secrets to grep for in older history). The blocklist now stores only
+# PREFIX PATTERNS that are uniquely shaped enough to catch the secret
+# without naming it. Reasoning:
+#   - `wh_vct_ls_*` matches the Lemon Squeezy webhook prefix used by
+#     this project's webhooks (LS uses `wh_` for webhooks; the
+#     `_vct_ls_` infix is unique to our naming convention). Real
+#     placeholders like `wh_vct_ls_<rotate_me>` are caught.
+#   - `ltnlwh*` matches the 6-char Supabase project-ref prefix that
+#     leaked. The full ref is 20 chars; 6 chars is enough to uniquely
+#     identify it without re-stating the value.
+# If a leaked-token shape ever becomes ambiguous (collides with a
+# legitimate string), tighten the regex rather than expanding it back
+# into a literal — the leak-script-as-leak-vector failure mode is the
+# one this redesign prevents.
 BLOCKLIST=(
   # Lemon Squeezy webhook signing secret leaked in launcher/docs (commit
   # 2f1cc88, 2026-03-07). Sanitized in oss/round3-secrets-rotation-and-admin.
-  "wh_vct_ls_2026_s3cur3k3y"
+  # Pattern matches `wh_vct_ls_<anything>` — the unique infix `_vct_ls_`
+  # is project-specific and not present in legitimate code.
+  "wh_vct_ls_"
 
   # Supabase project ref leaked alongside the webhook secret. The public
   # alias https://api.vibecodedtools.it/* should be used instead.
-  "ltnlwhaxnpbiifordlbk"
+  # Pattern matches the first 6 chars of the 20-char ref — enough to
+  # identify it without re-stating the full value.
+  "ltnlwh"
 )
 
 # Files we don't want to scan (binaries, generated, vendored).
