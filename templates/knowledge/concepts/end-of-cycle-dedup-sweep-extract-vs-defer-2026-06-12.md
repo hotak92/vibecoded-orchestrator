@@ -73,11 +73,27 @@ v0.2.54 application: the three helper families above were extracted
 
 ## Re-check delegates, not just copies
 
-Two of the would-be findings were already fixed by per-track
-adversarial verifiers (`generate_token_hex` → `boot_token` delegate;
-`vct-hub::auth::write_token_file` → delegate). A name appearing twice
-is a *lead*, not a verdict — read the body before counting it as
-duplication.
+A function name appearing N times is a *lead*, not a verdict — read
+the body before counting it as duplication. Worked examples from this
+sweep:
+
+- `vct-hub::auth::write_token_file` was already a delegate to the
+  shared `boot_token` primitive (Track I verifier caught it during
+  Wave 2; counted as 1, not 2).
+- `generate_token_hex`: the **end-of-cycle audit identified 3 copies**
+  in the launcher commands crate (`module_db_client.rs`,
+  `module_db.rs`, `module_default_weights.rs`) that the Track I
+  verifier had only resolved for `vct-hub::module_db_api.rs`. The
+  per-track delegation didn't propagate to siblings in a different
+  crate. Track J's own adversarial verifier caught the gap; all 4
+  copies now delegate to `boot_token::generate_token` (closing the
+  v0.2.32-era pre-existing "move to shared crate" TODO).
+
+The general lesson: even when one verifier resolves a duplication
+during its track's review, **the SAME shape may persist in adjacent
+crates the verifier didn't scan**. End-of-cycle dedup MUST re-run
+the histogram against the merged tree to catch cross-track residues
+that no per-track verifier owned.
 
 Related: [[relatedTo::code-modularity-search-before-add-extract-before-duplicate]],
 [[relatedTo::architecture-first-dispatch-discipline-2026-06-12]]

@@ -35,7 +35,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tauri::{command, State};
 
-use crate::commands::module_db::{DEFAULT_TOKEN_TTL_MS, TOKEN_BYTES};
+use crate::commands::module_db::DEFAULT_TOKEN_TTL_MS;
 use crate::db::Db;
 
 /// Bounded HTTP-call timeout for hub reads. 5 s matches the existing
@@ -65,13 +65,10 @@ fn hub_port() -> Result<u16, String> {
 /// duplicated here (3 lines) to keep `module_db_client` self-contained
 /// without re-exporting private helpers. v0.2.32 should move both into
 /// a shared crate.
+// v0.2.54 Track J amend: delegate to vct-launcher-core::services::boot_token
+// (same OsRng + hex shape; v0.2.32-era "move to shared crate" comment closed).
 fn generate_token_hex() -> Result<String, String> {
-    use rand::TryRngCore;
-    let mut bytes = vec![0u8; TOKEN_BYTES];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|e| format!("rng unavailable: {}", e))?;
-    Ok(hex::encode(bytes))
+    vct_launcher_core::services::boot_token::generate_token()
 }
 
 /// Get a usable per-(module, project) bearer token. Reads

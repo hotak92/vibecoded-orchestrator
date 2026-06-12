@@ -62,7 +62,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{command, AppHandle, State};
 
-use crate::commands::module_db::{DEFAULT_TOKEN_TTL_MS, TOKEN_BYTES};
+use crate::commands::module_db::DEFAULT_TOKEN_TTL_MS;
 use crate::db::Db;
 
 /// Default Supabase edge endpoint. Operators override via
@@ -697,14 +697,10 @@ fn hub_port() -> Result<u16, String> {
 }
 
 /// Generate a hex-encoded 32-byte random token from the OS CSPRNG.
-/// Mirrors `module_db_client::generate_token_hex`.
+/// v0.2.54 Track J amend: delegates to
+/// `vct_launcher_core::services::boot_token::generate_token`.
 fn generate_token_hex() -> Result<String, String> {
-    use rand::TryRngCore;
-    let mut bytes = vec![0u8; TOKEN_BYTES];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|e| format!("rng unavailable: {}", e))?;
-    Ok(hex::encode(bytes))
+    vct_launcher_core::services::boot_token::generate_token()
 }
 
 /// Get-or-issue a per-(module, project) bearer token from the
