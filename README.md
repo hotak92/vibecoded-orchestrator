@@ -301,7 +301,7 @@ Embeddings are aggregated, irreversible representations — we can't reconstruct
 Entire repository is **[AGPL-3.0-or-later](LICENSE)**. No source-level dual licensing.
 
 - **Individuals and non-commercial users**: use freely under AGPL.
-- **Companies running this in a service or product**: either open-source your modifications under AGPL, or buy a commercial license / Enterprise subscription. Email [team@vibecodedtools.com](mailto:team@vibecodedtools.com).
+- **Companies running this in a service or product**: either open-source your modifications under AGPL, or buy a commercial license / Enterprise subscription. Open the launcher → Settings → Activate License (the OnboardingWizard walks you through the in-product purchase flow).
 
 **Commercial-module model**: free source under AGPL, plus optional paid binaries delivered via signed-URL CDN. Paid modules ship as pre-compiled, Ed25519-signed artifacts gated by Lemon Squeezy — subscribers receive binaries, not source. The license validator in this repo (`VCThelpers/`) is AGPL like the rest; the trust root for paid-module access is server-side (Supabase + Lemon Squeezy + signature verification on download).
 

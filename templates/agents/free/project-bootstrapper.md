@@ -1274,9 +1274,6 @@ Find proven project setup patterns and configuration strategies.
 - Queue code graph updates for .py files
 - Auto-sync `docs/` to development collection
 
-**session-end.sh**:
-- Cleanup, queue health checks
-
 ## Success Criteria
 
 - Complete .claude/ structure created

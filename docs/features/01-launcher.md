@@ -91,7 +91,7 @@ Catalog entries carry a `kind` field controlling how the card renders: `bundled`
 `coming_soon_tier` and `coming_soon_target` fields display the planned tier (e.g. `"pro"`) and shipping window (e.g. `"Q3 2026"`). Reserved for roadmap-committed items only.
 
 ### Bundled Core Manifests
-Seven manifest JSON files under `launcher/bundled_manifests/` ship with the launcher binary and are copied to `~/.vct/bundled_manifests/` on first launch: `vct-kg`, `vct-codegraph`, `vct-ollama`, `vct-search`, `vct-code-embedding`, `vct-hub-api`, `vct-session-state`. All free/AGPL-3.0, all auto-install on first run.
+Six manifest JSON files under `launcher/bundled_manifests/` ship with the launcher binary and are copied to `~/.vct/bundled_manifests/` on first launch: `vct-kg`, `vct-codegraph`, `vct-search`, `vct-code-embedding`, `vct-hub-api`, `vct-session-state`. All free/AGPL-3.0, all auto-install on first run.
 
 <details>
 <summary>Details</summary>

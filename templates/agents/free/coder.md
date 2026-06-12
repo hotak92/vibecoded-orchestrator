@@ -3,7 +3,14 @@ name: coder
 description: Writes clean, explicit, production-ready code following specifications and leveraging proven patterns
 short_desc: default code writer for clear specifications
 keywords: [implement, "write the code", "production-ready", boilerplate, "write a function", "code this up", "build this", "code it", specification]
-tools: Read, Write, Edit, Grep, Glob, Bash
+tools:
+  - Read
+  - Write
+  - Edit
+  - Grep
+  - Glob
+  - Bash
+  - mcp__weaviate-kg__*
 model: sonnet
 effort: high
 isolation: worktree

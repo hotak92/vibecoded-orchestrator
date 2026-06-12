@@ -1420,9 +1420,6 @@ Find infrastructure setup patterns, deployment strategies, configuration best pr
 - Queue code graph updates for .py files
 - Auto-sync `docs/` to development collection
 
-**session-end.sh**:
-- Cleanup, queue health checks
-
 ## Track Installation Work
 
 Update `CONTEXT_STATE.md` during installation:

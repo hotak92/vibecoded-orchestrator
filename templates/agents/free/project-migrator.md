@@ -818,9 +818,6 @@ Find proven migration strategies and restructuring patterns.
 - Queue code graph updates for .py files
 - Auto-sync `docs/` to development collection
 
-**session-end.sh**:
-- Cleanup, queue health checks
-
 ## Success Criteria
 
 - All workflow files updated
