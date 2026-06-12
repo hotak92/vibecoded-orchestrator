@@ -65,10 +65,11 @@ pub struct KgSummaryRow {
     pub log_tail: Option<String>,
 }
 
-/// Cap stored log_tail at 4 KiB. Matches `kg_syncs::LOG_TAIL_MAX_BYTES`.
-/// One node's progress is ~3-5 lines, so a 4 KiB tail covers the last
-/// ~20-30 nodes for debugging without bloating SQLite.
-pub const LOG_TAIL_MAX_BYTES: usize = 4096;
+/// Cap stored log_tail at 4 KiB. (v0.2.54 Track J: re-exported from
+/// the shared `db::log_tail` module — was a per-file const
+/// triplicated across the three log-writing db modules.)
+pub use super::log_tail::LOG_TAIL_MAX_BYTES;
+use super::log_tail::cap_log_tail;
 
 impl Db {
     /// UPSERT the summary row for a project. Used by every transition
@@ -107,14 +108,7 @@ impl Db {
         // Defensive: cap log_tail so we never write a huge blob, even if
         // a buggy caller hands us megabytes. Same shape as
         // kg_syncs::upsert_kg_sync.
-        let log_tail_capped: Option<String> = log_tail.map(|s| {
-            if s.len() <= LOG_TAIL_MAX_BYTES {
-                s.to_string()
-            } else {
-                let cut = floor_char_boundary(s, s.len() - LOG_TAIL_MAX_BYTES);
-                format!("…\n{}", &s[cut..])
-            }
-        });
+        let log_tail_capped: Option<String> = log_tail.map(cap_log_tail);
 
         let guard = self.lock();
         guard
@@ -272,20 +266,6 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<KgSummaryRow> {
         error_message: row.get(11)?,
         log_tail: row.get(12)?,
     })
-}
-
-/// std::str::floor_char_boundary is unstable; tiny local replacement.
-/// Returns the largest valid char-boundary index `<= idx`. Mirrors the
-/// helper in `kg_syncs` / `code_graph_builds`.
-fn floor_char_boundary(s: &str, idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    let mut i = idx;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
 }
 
 #[cfg(test)]

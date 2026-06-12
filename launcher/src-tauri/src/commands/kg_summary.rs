@@ -954,11 +954,11 @@ fn emit_summary(
 fn append_log(accum: &mut String, chunk: &str) {
     accum.push_str(chunk);
     accum.push('\n');
-    const CAP: usize = crate::db::kg_summaries::LOG_TAIL_MAX_BYTES * 5;
+    const CAP: usize = crate::db::log_tail::LOG_TAIL_MAX_BYTES * 5;
     if accum.len() > CAP {
         // Slice on a char boundary to keep non-ASCII output (qwen/gemma
         // may print Unicode) from panicking.
-        let cut_at = accum.len() - crate::db::kg_summaries::LOG_TAIL_MAX_BYTES * 3;
+        let cut_at = accum.len() - crate::db::log_tail::LOG_TAIL_MAX_BYTES * 3;
         let mut idx = cut_at;
         while idx < accum.len() && !accum.is_char_boundary(idx) {
             idx += 1;
@@ -971,16 +971,10 @@ fn append_log(accum: &mut String, chunk: &str) {
 /// Tail the last N bytes of subprocess output. Slice on a char boundary
 /// so non-ASCII output doesn't panic. Mirrors `kg_sync::tail_log`.
 fn tail_log(s: &str) -> String {
-    use crate::db::kg_summaries::LOG_TAIL_MAX_BYTES;
-    if s.len() <= LOG_TAIL_MAX_BYTES {
-        return s.to_string();
-    }
-    let cut_at = s.len() - LOG_TAIL_MAX_BYTES;
-    let mut idx = cut_at;
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    format!("…\n{}", &s[idx..])
+    // v0.2.54 Track J: delegates to the shared char-boundary-safe
+    // capping helper (was one of three near-identical copies across
+    // the codegraph / kg_sync / kg_summary command modules).
+    crate::db::log_tail::cap_log_tail(s)
 }
 
 // ─── Pre-check + script / interpreter resolution ─────────────────────────

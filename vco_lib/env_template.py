@@ -211,12 +211,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-import tempfile
 from pathlib import Path
 from typing import Mapping, Optional
 
+from vco_lib.atomic import atomic_write_text
 from vco_lib.config_projection import (
     ConfigProjectionError,
     DbUnreachable,
@@ -564,51 +563,23 @@ def _merge_managed_block(prior: Optional[str], managed: str) -> str:
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically with LF line endings.
 
-    Uses :func:`tempfile.mkstemp` in the SAME directory as ``path`` (so
-    the rename stays on one filesystem — cross-filesystem rename fails
-    with EXDEV on Linux), then :func:`os.replace` to swap into place.
-    :func:`os.replace` is cross-OS atomic (POSIX rename / Windows
-    MoveFileExW with REPLACE_EXISTING).
+    Thin delegate to :func:`vco_lib.atomic.atomic_write_text` (v0.2.54
+    Track J closed the consolidation that :mod:`vco_lib.atomic`'s
+    module docstring queued when it landed in v0.2.53 — this module,
+    ``config_projection``, ``deferral_report`` and
+    ``cli/codegraph_diagram`` each carried their own copy of the
+    mkstemp + fsync + ``os.replace`` recipe).
 
-    Forces LF line endings even on Windows — the ``.env`` file is
-    consumed by POSIX shells (bash via WSL2 or git-bash), which reject
-    CRLF.
+    The name is kept because install.py's ``.claude.json`` write site
+    and ``tests/test_atomic_write_cleanup.py`` import it from here.
 
-    The tempfile is fsync'd to disk before rename. Parent directory is
-    NOT fsync'd (same trade-off as Phase 0.B); a crash immediately after
-    rename can leave the rename un-persisted, but the file is never
-    half-written.
-
-    Cleanup on error: the tempfile is unlinked on any exception before
-    re-raising. No ``.tmp`` leaks on any code path.
+    LF preservation: the shared helper opens the tempfile with
+    ``newline=""`` (no translation), which is write-equivalent to the
+    previous ``newline="\\n"`` — ``\\n`` in ``content`` lands as LF on
+    every OS, never CRLF. The ``.env`` consumers (bash via WSL2 /
+    git-bash) keep getting the LF bytes they require.
     """
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path_str = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=str(parent),
-    )
-    tmp_path = Path(tmp_path_str)
-    try:
-        # newline="\n" forces LF on Windows. encoding="utf-8" matches the
-        # de-facto .env convention.
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                # fsync can fail on pseudo-filesystems (procfs, tmpfs in
-                # containers); don't fail the write over it.
-                pass
-        os.replace(str(tmp_path), str(path))
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, content)
 
 
 # ─── CLI entry points ───────────────────────────────────────────────────

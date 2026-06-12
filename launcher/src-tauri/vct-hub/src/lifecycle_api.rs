@@ -111,22 +111,9 @@ pub fn router() -> Router<LauncherDbHandle> {
 
 // ─── Error envelope ─────────────────────────────────────────────
 
-fn error_response(
-    status: StatusCode,
-    code: &str,
-    message: impl Into<String>,
-) -> axum::response::Response {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "code": code,
-                "message": message.into(),
-            }
-        })),
-    )
-        .into_response()
-}
+// v0.2.54 Track J: error_response moved to the shared
+// `crate::http_error` module (was four byte-identical copies).
+use crate::http_error::error_response;
 
 /// The single 501 envelope used by every stubbed handler. Centralised
 /// so the message stays consistent (and a single edit when Step 24

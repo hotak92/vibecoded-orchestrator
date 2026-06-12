@@ -32,6 +32,10 @@ pub mod change_log;
 pub mod code_graph_builds;
 pub mod kg_syncs;
 pub mod kg_summaries;
+// v0.2.54 Track J — shared log-tail truncation (LOG_TAIL_MAX_BYTES +
+// char-boundary-safe capping), extracted from SIX per-module copies in
+// the three db writers above + the launcher crate's command layer.
+pub mod log_tail;
 pub mod secret_active;
 pub mod secret_grants;
 pub mod app_state;

@@ -38,9 +38,10 @@ import logging
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any, Optional
+
+from vco_lib.atomic import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -198,30 +199,16 @@ def _default_output_path(seed_symbol: str) -> Path:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    """Atomic UTF-8 text write via tempfile + os.replace.
+    """Atomic UTF-8 text write via the shared :mod:`vco_lib.atomic` helper.
 
-    Tempfile is created in the SAME directory as the target so
-    ``os.replace`` is guaranteed atomic (cross-device renames are not).
-    Mirrors ``vco_lib.config_projection._atomic_write_text``.
+    v0.2.54 Track J consolidation — this was the fourth inline copy of
+    the mkstemp + ``os.replace`` recipe. The one local behaviour this
+    wrapper keeps: ``.mmd`` files always end with a trailing newline
+    (POSIX-friendly diffs; Mermaid tooling tolerates both).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".mmd.tmp",
-        dir=str(path.parent),
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-            if not content.endswith("\n"):
-                fh.write("\n")
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    if not content.endswith("\n"):
+        content += "\n"
+    atomic_write_text(path, content)
 
 
 def _is_under_diagrams_dir(path: Path) -> bool:

@@ -1059,16 +1059,10 @@ fn emit_sync(
 /// so non-ASCII output (the script uses emoji prefixes) doesn't panic.
 /// Mirrors `codegraph::tail_log`.
 fn tail_log(s: &str) -> String {
-    use crate::db::kg_syncs::LOG_TAIL_MAX_BYTES;
-    if s.len() <= LOG_TAIL_MAX_BYTES {
-        return s.to_string();
-    }
-    let cut_at = s.len() - LOG_TAIL_MAX_BYTES;
-    let mut idx = cut_at;
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    format!("…\n{}", &s[idx..])
+    // v0.2.54 Track J: delegates to the shared char-boundary-safe
+    // capping helper (was one of three near-identical copies across
+    // the codegraph / kg_sync / kg_summary command modules).
+    crate::db::log_tail::cap_log_tail(s)
 }
 
 // ─── Pre-check + script resolution ───────────────────────────────────────

@@ -29,13 +29,13 @@ design; the YAML frontmatter is machine-parseable.
 
 from __future__ import annotations
 
-import os
 import re
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
+
+from vco_lib.atomic import atomic_write_text
 
 # Relative path inside any managed project folder.
 _DEFERRED_REL = Path(".claude") / "context" / "UPDATE_DEFERRED.md"
@@ -234,24 +234,12 @@ def _strip_claude_md_reminder(folder: Path) -> None:
 def _atomic_write_text(target: Path, content: str) -> None:
     """Atomic text write via temp file + os.replace in the same dir.
 
-    Same primitive as ``DeferralReport.write``; pulled out so the reminder
-    helpers can re-use it. Preserves UTF-8 (Unicode emoji-safe — some
-    deferral entries carry emoji)."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(target.parent), suffix=".tmp",
-        prefix=f".{target.name}.reminder.",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.replace(tmp_path, str(target))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    Thin delegate to :func:`vco_lib.atomic.atomic_write_text` (v0.2.54
+    Track J consolidation). Preserves UTF-8 (Unicode emoji-safe — some
+    deferral entries carry emoji) and additionally gains the shared
+    helper's fsync-before-rename crash-safety, which the previous
+    inline copy lacked."""
+    atomic_write_text(target, content)
 
 
 @dataclass
@@ -534,21 +522,9 @@ class DeferralReport:
             + "".join(_render_entry(e) for e in self._entries)
         )
 
-        # Atomic write: temp file in the same directory, then os.replace().
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(target.parent), suffix=".tmp", prefix="UPDATE_DEFERRED_"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            os.replace(tmp_path, str(target))
-        except Exception:
-            # Clean up the temp file on failure; re-raise.
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        # Atomic write via the shared vco_lib.atomic helper (temp file
+        # in the same directory, fsync, then os.replace()).
+        atomic_write_text(target, content)
 
         # Inject/refresh the wrapped reminder block in CLAUDE.md.
         _ensure_claude_md_reminder(folder)
