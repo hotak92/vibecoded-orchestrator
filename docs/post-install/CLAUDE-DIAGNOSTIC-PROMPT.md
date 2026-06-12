@@ -8,7 +8,7 @@
 > **How to use**: open ANY Claude session (the one in your install, or
 > a brand-new claude.ai chat, or a friend's session). Paste the prompt
 > block below verbatim, then paste your filled-in report immediately
-> after. Replace the three placeholders at the top.
+> after. Replace the four placeholders at the top.
 
 ---
 

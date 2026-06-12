@@ -39,7 +39,7 @@ codegraph / secrets for hooks and MCPs.
 **GUI**: if the launcher is running, the hub is reachable.
 
 **CLI**: `vct-hub --status` + `curl -s http://127.0.0.1:7700/api/v1/health`
-should print `running (pid=…, port=7700)` and `{"status":"ok",...}`.
+should print `running pid=<N>` and `{"status":"ok",...}`.
 Use `/api/v1/health` — bare `/health` returns 401 (auth). Token at
 `<vct_root>/hub.token` (`~/.vct/` Linux/macOS, `%USERPROFILE%\.vct\`
 Windows; mode `0600`, regenerated every startup).
@@ -129,8 +129,8 @@ or 4 are wrong.
 **Checks**: the code-graph indexer has run at least once and results
 are searchable.
 
-**GUI**: launcher → **Identity** tab → **Code-graph status** should
-read `indexed: N modules, M functions` with a recent timestamp.
+**GUI**: launcher → **Code Graph** page — your project's row should
+show non-zero entity counts (`N modules / N classes / N functions`).
 
 **CLI**: `.claude/scripts/code-graph-query search "init" --limit 3` →
 expect 1+ results with `path:` and `name:` fields.
@@ -172,7 +172,7 @@ Fill in and paste into Claude with the
 - **OS / version**: <Linux 6.x / macOS 14 / Windows 11 …>
 - **Install root**: <full path>
 - **Project root**: <full path>
-- **Orchestrator version**: <python install.py --version OR release tag>
+- **Orchestrator version**: <release tag, or `git describe --tags --always` run from the install root>
 - **Report date**: <YYYY-MM-DD>
 
 | # | Item                                    | Status   | Notes |

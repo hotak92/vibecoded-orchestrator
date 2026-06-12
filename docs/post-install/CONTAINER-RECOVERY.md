@@ -29,29 +29,32 @@ podman ps --format "{{.Names}} {{.State}} {{.Ports}}" 2>/dev/null \
   || docker ps --format "{{.Names}} {{.State}} {{.Ports}}"
 ```
 
-You should see at least `weaviate_*`, `ollama_*`, and (optionally)
-`vct-codeembed-*` rows. If everything is "Exited" or absent, jump to
-the next section.
+You should see at least `vco_weaviate`, `vco_ollama`, and (optionally)
+`vco_code_embed` rows (names from `infrastructure/docker-compose.yml`).
+If everything is "Exited" or absent, jump to the next section.
 
 ---
 
 ## Restarting the container stack
 
-The canonical command (works whether your project uses Podman or
-Docker):
+The canonical compose directory is `<project_root>/infrastructure/`
+(this is what the `ensure-containers.sh` hook prefers — its resolution
+order is `$VCT_COMPOSE_DIR` → `$VCT_INFRASTRUCTURE_DIR` →
+`$VCT_ORCHESTRATOR_ROOT/infrastructure` → `<project>/infrastructure` →
+`<project>/claude_mcp_servers` as a legacy fallback). Works whether
+your project uses Podman or Docker:
+
+```bash
+cd <project_root>/infrastructure
+podman-compose up -d 2>/dev/null || docker compose up -d
+```
+
+Only if your install predates the `infrastructure/` layout (legacy
+orchestrator-clone setups), fall back to:
 
 ```bash
 cd <project_root>/claude_mcp_servers
 podman-compose up -d 2>/dev/null || docker compose up -d
-```
-
-If your project ships an explicit `infrastructure/docker-compose.yml`
-(newer projects do), use that instead:
-
-```bash
-cd <project_root>
-podman-compose -f infrastructure/docker-compose.yml up -d 2>/dev/null \
-  || docker compose -f infrastructure/docker-compose.yml up -d
 ```
 
 The `SessionStart` hook `ensure-containers.sh` runs the same command on
@@ -126,9 +129,10 @@ Common offenders:
 - **7700**: an old `vct-hub` process that didn't exit cleanly.
 
 Resolution: stop the offender, OR change the orchestrator's port via
-the env vars documented in `docs/CONFIGURATION.md` (search for
-`WEAVIATE_HTTP_PORT`, `OLLAMA_PORT`, `CODE_EMBED_PORT`, `VCT_HUB_PORT`),
-THEN restart the relevant container.
+env vars, THEN restart the relevant container. `WEAVIATE_PORT`,
+`OLLAMA_PORT`, and `VCT_HUB_PORT` are documented in
+`docs/CONFIGURATION.md`; `CODE_EMBED_PORT` is read directly by
+`infrastructure/docker-compose.yml` (host-side default `11440`).
 
 ---
 
@@ -152,9 +156,9 @@ supervisor's image-ref + the authfile path it consulted.
 Switching Podman ↔ Docker can mount a fresh volume instead of the
 existing one. Volume locations:
 
-- Podman rootless: `~/.local/share/containers/storage/volumes/weaviate_data/_data`
-- Podman rootful: `/var/lib/containers/storage/volumes/weaviate_data/_data`
-- Docker: `/var/lib/docker/volumes/weaviate_data/_data`
+- Podman rootless: `~/.local/share/containers/storage/volumes/vco_weaviate_data/_data`
+- Podman rootful: `/var/lib/containers/storage/volumes/vco_weaviate_data/_data`
+- Docker: `/var/lib/docker/volumes/vco_weaviate_data/_data`
 
 Before re-embedding (which can take 30+ min on a 10k-node KG):
 

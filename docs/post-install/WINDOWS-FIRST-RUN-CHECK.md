@@ -90,55 +90,71 @@ populated.
 **Common failures**:
 
 - Task absent → install never ran the boot-registration step. Re-run
-  `python install.py --update` (creates the task idempotently); OR opt
-  in via the launcher GUI Preferences → "Auto-start containers on
-  login" toggle.
+  `python install.py --update` (creates the task idempotently — skipped
+  only when `VCT_DISABLE_BOOT_SERVICE=1` or `--no-containers` is set).
 - Task present but `Last Result: 0x80070002` → the script path it
   references is wrong (typically because the install root moved).
   Re-run `python install.py --update` to repair.
 
 ---
 
-## File-watcher quirks (`PostToolUse` hooks fire twice on the same edit)
-
-Windows file-system watchers occasionally fire two events for one
-write (an `OnCreated` followed by `OnChanged` within milliseconds).
-The orchestrator's hooks dedupe via a per-path debounce, but if you
-see KG syncs running twice on every Edit, increase the debounce
-window:
-
-```
-set VCO_HOOK_DEBOUNCE_MS=500    # default is 200
-```
-
-Persist via `setx VCO_HOOK_DEBOUNCE_MS 500` (no `=`) or set per-project
-via `.claude/env`.
-
----
-
 ## Uninstall path
 
-For now: re-run the install command with the `--uninstall` flag:
+Re-run the install command with the `--uninstall` flag:
 
 ```cmd
 python install.py --uninstall
 ```
 
-This will:
+> ⚠️ **Data-loss warning — read before running.** Container-volume
+> removal (your Weaviate KG vectors + Ollama models + code embeddings)
+> is the DEFAULT in the uninstall plan. You must pass **`--keep-data`**
+> to preserve the volumes. If you want to keep your KG vectors, back up
+> the Weaviate volume (`vco_weaviate_data`) BEFORE uninstalling, or run
+> with `--keep-data`.
 
-- Remove the Scheduled Task `ClaudeMcpContainers`.
-- Stop and remove the orchestrator-owned containers.
-- Remove MCP registrations from `~/.claude.json` (additive: other MCPs
-  preserved).
-- Leave the `<install_root>/` directory and Weaviate volumes intact
-  (deliberate — destructive deletion of vector data needs explicit
-  consent).
+What it does, step by step:
 
-To finish the cleanup manually after uninstall:
+- Stops the orchestrator-owned containers (`compose down` — this step
+  alone preserves volumes).
+- **Volume removal (default unless `--keep-data`)**: the uninstaller
+  prints the exact destructive commands
+  (`<runtime> compose down --volumes`, or per-volume `volume rm`) for
+  you to run — it deliberately does not invoke `volume rm` itself
+  (defense-in-depth audit rule). Treat the printed commands as the
+  intended cleanup: running them deletes your KG data.
+- Removes the launcher state DB (`~/.vct/launcher.db`).
+- Removes orchestrator MCP registrations from `~/.claude.json` (your
+  other MCP servers are preserved).
+- Never touches `~/.vct-secrets/` or your source code.
+
+Flags that change confirmation behavior — be explicit about these:
+
+- **`--yes`** (or running non-interactively / piped stdin) **skips every
+  confirmation prompt** — all steps proceed as `[auto-yes]` with no
+  chance to back out. Combine `--yes` WITHOUT `--keep-data` only if you
+  have already backed up or deliberately want the data gone.
+- **`--dry-run`** prints the full plan and exits without removing
+  anything. Run this first if unsure.
+- **`--keep-data`** skips the volume-removal step entirely.
+
+**Known gap**: the Scheduled Task registered at install time
+(`ClaudeMcpContainers`) is NOT automatically removed by `--uninstall`
+in v0.2.54. To remove it manually after uninstall:
+
+```cmd
+schtasks /Delete /TN ClaudeMcpContainers /F
+```
+
+(Track G in a later release will add automatic boot-service
+unregister.)
+
+To finish the cleanup manually after uninstall (only if you're sure —
+this deletes your KG vectors):
 
 ```cmd
 rmdir /s /q "%USERPROFILE%\.vct"
-podman volume rm weaviate_data    REM only if you're sure
+podman volume rm vco_weaviate_data    REM destroys KG vectors — back up first
 ```
 
 ---
