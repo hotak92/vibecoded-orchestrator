@@ -250,15 +250,18 @@ jobs:
         # made this job always-green. `--warnings` mode already reports
         # WITHOUT exit-1 on warnings (only errors fail), so the swallow
         # was redundant for warnings AND was actively hiding genuine
-        # type errors. If a regression introduces type errors that
-        # exceed the backlog's tolerance, the right fix is narrowing
-        # the scope to specific files/dirs in `pyrightconfig.json`,
-        # NOT silencing every error globally with `|| true`.
+        # type errors.
         #
-        # Backlog tolerance: pyright config tracks the "known noise"
-        # files in `pyrightconfig.json` `exclude:` or `ignore:` lists.
-        # If your PR adds a NEW type error, either fix it or add the
-        # offending file to the exclude list with a brief rationale.
+        # v0.2.54 Track E amendment: scope comes from the repo-root
+        # `pyrightconfig.json` — vco_lib/ + claude_mcp_servers/
+        # {weaviate_mcp,search_mcp}/ are gated at ZERO errors (repo-wide
+        # had 813 pre-existing errors across 429 files, which is why the
+        # old swallow existed). Two backlog files are out of scope until
+        # v0.2.55: weaviate_mcp/server.py (93 errors) and install.py
+        # (34 errors) — counts + rationale in pyrightconfig.json and
+        # CHANGELOG. If your PR adds a NEW type error in scope, fix it
+        # or annotate the line with `# pyright: ignore[<rule>]` plus a
+        # rationale comment. Do NOT re-add `|| true`.
         run: |
           pyright --warnings
 

@@ -856,7 +856,10 @@ def _check_weaviate_class(
         )
     try:
         try:
-            collections = client.collections.list_all()
+            # Annotated Any: weaviate-client v4 stubs type list_all() as
+            # a dict, which would narrow the defensive else-branch below
+            # to Never; older clients returned an iterable of objects.
+            collections: Any = client.collections.list_all()
         except Exception as exc:
             return _CheckResult(
                 "weaviate_diagrams_class",

@@ -96,16 +96,22 @@ known_names_blocklist=(
     "fabio"
     "lucas"
 )
-runner_allowlist_re='^/(home|Users)/(runner|runneradmin)(/|$)'
 
-# Build a single grep pattern for the known-names blocklist (anchored at
-# the start of the path so we don't catch substrings in unrelated text).
+# Build a single grep pattern for the known-names blocklist.
+#
+# v0.2.54 Track E amendment: NO `^` anchor. `git grep` anchors `^` to
+# LINE start, not PATH start, so an anchored pattern missed every
+# mid-line leak shape — `KG_BASE_DIR=/home/martino/...`,
+# `path = "/Users/luciano/bar"`, etc. The `/(home|Users)/` prefix +
+# `(/|$)` name boundary keep the pattern specific without the anchor:
+# `/home/martinos/` and `/home/martin/` do NOT match `martino`/`marti`
+# entries (the char after the name must be `/` or end-of-line).
 known_names_re=""
 for name in "${known_names_blocklist[@]}"; do
     if [ -n "$known_names_re" ]; then
         known_names_re="${known_names_re}|"
     fi
-    known_names_re="${known_names_re}^/(home|Users)/${name}(/|$)"
+    known_names_re="${known_names_re}/(home|Users)/${name}(/|$)"
 done
 
 if [ -n "$known_names_re" ]; then
@@ -119,16 +125,14 @@ if [ -n "$known_names_re" ]; then
     fi
 fi
 
-# The runner_allowlist_re value is used by the cross-file filter below
-# (kept as a single string for grep -vE). The blocklist above covers
-# the known-bad cases; the broader generic pass that previously lived
-# here was removed because tests/fixtures legitimately reference
-# synthetic paths like `/home/u/sibling-a` and `/Users/test/repo`. If
-# a future audit names a new contributor whose path leaks, append the
-# username to the known-names blocklist above — that's the surgical
-# rule, vs. a blanket /home/<x>/ catch-all that flags every fixture.
-: # use $runner_allowlist_re via shell-export indirect — silence shellcheck
-true && [ -n "${runner_allowlist_re:-}" ] || true
+# Design note: the blocklist above covers the known-bad cases; the
+# broader generic /home/<anything>/ pass that previously lived here was
+# removed because tests/fixtures legitimately reference synthetic paths
+# like `/home/u/sibling-a` and `/Users/test/repo` (and GitHub-runner
+# paths like `/home/runner/...`). If a future audit names a new
+# contributor whose path leaks, append the username to the
+# known-names blocklist above — that's the surgical rule, vs. a
+# blanket catch-all that flags every fixture.
 
 # ─────────────────────────────────────────────────────────────────────
 # Track D: other personal-project name leaks

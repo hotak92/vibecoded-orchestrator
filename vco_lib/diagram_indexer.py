@@ -1396,7 +1396,15 @@ def snapshot_diagram_file(
                     },
                 )
                 conn.commit()
-                snapshot_id = int(cursor.lastrowid)
+                lastrowid = cursor.lastrowid
+                if lastrowid is None:  # pragma: no cover — sqlite always
+                    # sets lastrowid after a successful INSERT; guard for
+                    # the Optional in the dbapi typeshed signature.
+                    raise RuntimeError(
+                        "sqlite INSERT returned no lastrowid for "
+                        f"diagram_id={diagram_id}"
+                    )
+                snapshot_id = int(lastrowid)
                 logger.debug(
                     "snapshot_diagram_file: inserted snapshot_id=%d "
                     "diagram_id=%d trigger=%s bytes=%d",

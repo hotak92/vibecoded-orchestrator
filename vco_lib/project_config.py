@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import requests
+import requests.adapters
 
 from vco_lib.paths import vct_root_dir
 

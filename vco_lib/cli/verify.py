@@ -42,9 +42,13 @@ Two upstream modules land in parallel branches:
   ``bundled_mcp_versions.toml`` at repo root, and
   ``install.py::_install_pinned_npm(package_key: str) -> InstallResult``.
 * **Phase 0.B** — ``vco_lib/config_projection.py`` exposes
-  ``project_env_from_db(project_id: str) -> dict[str, str]`` and
-  ``apply_project_env(bundle: Mapping[str, str], *, project_folder: Path)
-  -> ApplyResult``.
+  ``project_env_from_db(project_id: str) -> ProjectEnvBundle`` (a
+  TypedDict carrying ``canonical_env``, ``project_id``,
+  ``project_root``) and ``apply_project_env(bundle: ProjectEnvBundle,
+  *, surfaces=None, user_secret_bundle=None) -> dict[str, list[str]]``.
+  The wrappers below adapt that landed API to this module's internal
+  flat ``Mapping[str, str]`` contract (the plan-era API differed; see
+  the wrapper docstrings).
 
 This module imports them lazily via thin wrappers so that:
 
@@ -168,50 +172,71 @@ def _install_pinned_npm(package_key: str) -> Any:
 
 
 def _project_env_from_db(project_id: str) -> Mapping[str, str]:
-    """Phase 0.B dependency — actual import wired post-merge.
+    """Adapter over ``config_projection.project_env_from_db``.
 
-    Expected upstream API (per plan §3 Phase 0 step 4)::
-
-        from vco_lib.config_projection import project_env_from_db
-        bundle = project_env_from_db("video-frames")  # slug or rowid
-        # Returns dict[str, str] of every canonical env key the project
-        # should expose to .claude/settings.json env, .claude/env, and
-        # .vscode/settings.json claude-code.env. Raises LookupError if
-        # the project cannot be resolved.
+    The landed Phase 0.B API returns a ``ProjectEnvBundle`` TypedDict
+    (``canonical_env`` + ``project_id`` + ``project_root``), not the
+    flat ``dict[str, str]`` the plan-era spec described. This module's
+    internal contract (``expected.keys()``, ``_diff_surface``) wants
+    the flat canonical map, so we unwrap ``canonical_env`` here.
+    Raises ``LookupError`` subclasses (``ProjectNotFound``) upstream.
     """
-    # Phase 0.B dependency — actual import wired post-merge.
     try:
-        from vco_lib.config_projection import project_env_from_db  # type: ignore  # noqa: E501
+        from vco_lib.config_projection import project_env_from_db
     except ImportError as exc:  # pragma: no cover — exercised post-merge
         raise RuntimeError(
             "vco_lib.config_projection.project_env_from_db() is not "
             "available. This subcommand requires Phase 0.B to be merged."
         ) from exc
-    return project_env_from_db(project_id)
+    return project_env_from_db(project_id)["canonical_env"]
 
 
 def _apply_project_env(
     bundle: Mapping[str, str], *, project_folder: Path
 ) -> Any:
-    """Phase 0.B dependency — actual import wired post-merge.
+    """Adapter over ``config_projection.apply_project_env``.
 
-    Expected upstream API (per plan §3 Phase 0 step 4)::
-
-        from vco_lib.config_projection import apply_project_env
-        result = apply_project_env(bundle, project_folder=Path("..."))
-        # Writes the bundle to all three on-disk surfaces atomically.
-        # Returns an object exposing at least ``.ok`` (bool) and
-        # ``.message`` (str).
+    The landed Phase 0.B API takes a ``ProjectEnvBundle`` (which
+    carries ``project_root`` itself — there is no ``project_folder``
+    kwarg) and returns ``{surface: [keys_written]}``, raising
+    ``ConfigProjectionError`` on write failure. We rebuild the bundle
+    from this module's flat-map contract, opt into ALL THREE surfaces
+    (the verifier diffs ``.vscode/settings.json`` too — writing only
+    the two default surfaces would fail the round-trip idempotency
+    check), and normalise the result to the ``{ok, message}`` shape
+    ``_result_ok`` expects. Exceptions propagate to the caller's
+    ``fix_failed`` handler.
     """
-    # Phase 0.B dependency — actual import wired post-merge.
     try:
-        from vco_lib.config_projection import apply_project_env  # type: ignore  # noqa: E501
+        from vco_lib.config_projection import (
+            ProjectEnvBundle,
+            apply_project_env,
+        )
     except ImportError as exc:  # pragma: no cover — exercised post-merge
         raise RuntimeError(
             "vco_lib.config_projection.apply_project_env() is not "
             "available. This subcommand requires Phase 0.B to be merged."
         ) from exc
-    return apply_project_env(bundle, project_folder=project_folder)
+    real_bundle: ProjectEnvBundle = {
+        "canonical_env": dict(bundle),
+        # apply_project_env() reads only canonical_env + project_root;
+        # project_id is carried for audit logging by other callers.
+        "project_id": "",
+        "project_root": project_folder,
+    }
+    report = apply_project_env(
+        real_bundle,
+        surfaces=(
+            "claude_settings_json",
+            "claude_env",
+            "vscode_settings_json",
+        ),
+    )
+    total = sum(len(keys) for keys in report.values())
+    return {
+        "ok": True,
+        "message": f"wrote {total} keys across {len(report)} surfaces",
+    }
 
 
 def _list_registered_projects() -> Iterable[Mapping[str, str]]:
