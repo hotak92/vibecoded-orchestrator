@@ -126,10 +126,37 @@ class ResolveUpstreamArgvTests(unittest.TestCase):
             argv = excalidraw_proxy._resolve_upstream_argv()
         self.assertEqual(argv[0], "/usr/bin/node")
         self.assertEqual(len(argv), 2)
-        self.assertTrue(argv[1].endswith("/dist/mcp/index.js"))
+        # v0.2.54 (P0-3): the wrapper prefers the esbuild-bundled
+        # self-contained entry — the vendored tree ships without
+        # node_modules, so only the bundle runs out of the box.
+        self.assertTrue(argv[1].endswith("/dist/mcp/index.bundled.js"))
         self.assertIn("excalidraw_mcp_fork", argv[1])
         self.assertTrue(Path(argv[1]).is_file(),
                         f"vendored entry point missing at {argv[1]}")
+
+    def test_file_pin_falls_back_to_unbundled_entry(self):
+        # If the bundle is absent but an unbundled tree (with
+        # node_modules) exists, the wrapper falls back to
+        # dist/mcp/index.js rather than failing.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            mcp_dir = Path(td) / "fork" / "dist" / "mcp"
+            mcp_dir.mkdir(parents=True)
+            (mcp_dir / "index.js").write_text("// unbundled entry\n")
+            manifest = {
+                "npm": {
+                    "excalidraw_mcp": {
+                        "package": f"file:{td}/fork",
+                        "version": "vendored-test",
+                        "shasum": "",
+                    },
+                },
+            }
+            with _patch_manifest(manifest), \
+                 mock.patch("shutil.which", return_value="/usr/bin/node"):
+                from claude_mcp_servers.wrappers import excalidraw_proxy
+                argv = excalidraw_proxy._resolve_upstream_argv()
+            self.assertTrue(argv[1].endswith("/dist/mcp/index.js"))
 
     def test_registry_pin_falls_through_to_npx(self):
         # Sanity: if a future release switches back to a registry

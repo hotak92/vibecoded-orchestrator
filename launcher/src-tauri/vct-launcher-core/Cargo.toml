@@ -71,6 +71,12 @@ regex = "1"
 
 hex = "0.4"
 
+# v0.2.54 Track I: OS CSPRNG for per-boot bearer tokens
+# (services::boot_token — shared by vct-hub's hub.token and the
+# launcher's diagrams.token surfaces). Feature set matches the
+# workspace siblings' rand declarations.
+rand = { version = "0.9", default-features = false, features = ["std", "std_rng", "os_rng"] }
+
 # Platform hostname
 gethostname = "1"
 

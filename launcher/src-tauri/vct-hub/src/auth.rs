@@ -84,31 +84,29 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use rand::TryRngCore;
+// v0.2.54 Track I: the token primitives (CSPRNG generation, 0o600
+// persistence, constant-time compare, Bearer parsing) moved to
+// `vct_launcher_core::services::boot_token` so the launcher's diagrams
+// local server (diagrams.token) shares the SAME implementation instead
+// of growing a drifting copy. This module keeps its public API
+// (generate_token, write_token_file, TOKEN_BYTES, the middleware) and
+// delegates the primitives.
+use vct_launcher_core::services::boot_token;
 
 /// Length in bytes of the auth token we generate. 32 bytes = 256 bits;
 /// hex-encoded → 64 chars. Standard length for opaque session tokens
 /// (matches GitHub PAT classic, Vercel access tokens, etc.).
-pub const TOKEN_BYTES: usize = 32;
+pub const TOKEN_BYTES: usize = boot_token::TOKEN_BYTES;
 
 /// Filename inside `vct_root_dir()` where the token persists for the
 /// lifetime of the hub process. Clients (resolver helpers, vct-cli,
 /// hub_proxy) read this file fresh on every call.
 pub const TOKEN_FILE: &str = "hub.token";
 
-/// Generate a fresh, cryptographically-random hex token.
-///
-/// Uses `OsRng` directly so we get bytes from the OS CSPRNG without
-/// going through ThreadRng's reseed-from-OS-on-startup dance — for a
-/// once-per-launcher-startup operation that's wasted machinery.
-///
-/// Returns the lowercase hex encoding (64 chars for 32 bytes).
+/// Generate a fresh, cryptographically-random hex token (64 hex chars
+/// for 32 OS-CSPRNG bytes). Delegates to `boot_token::generate_token`.
 pub fn generate_token() -> Result<String, String> {
-    let mut bytes = [0u8; TOKEN_BYTES];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|e| format!("OS CSPRNG unavailable: {}", e))?;
-    Ok(hex::encode(bytes))
+    boot_token::generate_token()
 }
 
 /// Path to the token file under the launcher's state-root.
@@ -116,51 +114,12 @@ fn token_path() -> PathBuf {
     vct_launcher_core::paths::vct_root_dir().join(TOKEN_FILE)
 }
 
-/// Persist the token to disk with mode 0o600 on Unix.
-///
-/// Sequence (Unix):
-///   1. mkdir -p the parent directory.
-///   2. Open with O_CREAT|O_TRUNC|O_WRONLY and mode 0o600 in a single
-///      syscall (`OpenOptions::mode`) — the canonical way to avoid the
-///      classic write-then-chmod TOCTOU window where the file briefly
-///      exists with the umask's default mode.
-///   3. Write the token bytes.
-///
-/// On Windows we fall through to a plain `std::fs::write`. The default
-/// ACL on a file under the user's profile dir is already same-user-only
-/// (the user owns it; siblings on the same machine can't read it
-/// without admin). Setting NTFS ACLs from Rust without the `windows`
-/// crate is heavy; we accept the default-ACL posture and document it.
+/// Persist the token to `<vct_root_dir>/hub.token` with mode 0o600 on
+/// Unix (default same-user ACL on Windows). Delegates to
+/// `boot_token::write_token_file` — see that function for the
+/// TOCTOU-free open-with-mode sequence and the Windows ACL rationale.
 pub fn write_token_file(token: &str) -> Result<(), String> {
-    let path = token_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create_dir_all {}: {}", parent.display(), e))?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| format!("open {}: {}", path.display(), e))?;
-        f.write_all(token.as_bytes())
-            .map_err(|e| format!("write {}: {}", path.display(), e))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, token.as_bytes())
-            .map_err(|e| format!("write {}: {}", path.display(), e))?;
-    }
-
-    Ok(())
+    boot_token::write_token_file(&token_path(), token)
 }
 
 /// Shared authentication state injected as an axum extension.
@@ -180,51 +139,23 @@ impl AuthState {
     }
 }
 
-/// Constant-time compare of two byte slices.
-///
-/// Returns true iff slices are byte-equal. The accumulator pattern
-/// (XOR-or each pair, then check the final zero) avoids the early-exit
-/// short-circuit that `==` has, which would leak prefix-match length
-/// through timing. Both slices are walked in full length-min(a, b);
-/// length-mismatch is always false but still does the full walk to
-/// avoid leaking via the path that returns early on length difference.
+/// Constant-time compare of two byte slices. Delegates to
+/// `boot_token::constant_time_eq` (accumulator pattern — no early
+/// exit, no prefix-length timing leak).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        // Walk anyway to keep timing roughly in line with the matched
-        // path — we're returning false either way.
-        let mut acc: u8 = 0;
-        let n = a.len().min(b.len());
-        for i in 0..n {
-            acc |= a[i] ^ b[i];
-        }
-        // Fold in a length-difference signal so the optimizer can't
-        // notice the early answer.
-        let _ = acc | ((a.len() ^ b.len()) as u8);
-        return false;
-    }
-    let acc = a.iter().zip(b.iter()).fold(0u8, |a, (x, y)| a | (x ^ y));
-    acc == 0
+    boot_token::constant_time_eq(a, b)
 }
 
 /// Extract the bearer token from `Authorization: Bearer <token>`.
 ///
 /// Returns `None` if the header is missing, malformed, not a Bearer
-/// scheme, or empty after the prefix. Case-insensitive on the scheme
-/// (per RFC 7235 §2.1) but case-sensitive on the token itself.
+/// scheme, or empty after the prefix. The HeaderMap lookup stays here
+/// (boot_token is HTTP-library-free); the scheme parsing delegates to
+/// `boot_token::parse_bearer` (case-insensitive scheme per RFC 7235
+/// §2.1, case-sensitive token).
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     let raw = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
-    // Canonical form: "Bearer <token>". We accept any ASCII whitespace
-    // between scheme and token, single space being the canonical case.
-    let mut parts = raw.splitn(2, char::is_whitespace);
-    let scheme = parts.next()?;
-    let token = parts.next()?.trim();
-    if !scheme.eq_ignore_ascii_case("Bearer") {
-        return None;
-    }
-    if token.is_empty() {
-        return None;
-    }
-    Some(token)
+    boot_token::parse_bearer(raw)
 }
 
 /// Whether a request path is exempt from the hub-wide bearer-token gate.

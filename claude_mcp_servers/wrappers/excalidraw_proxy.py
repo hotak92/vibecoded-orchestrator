@@ -20,7 +20,10 @@ because Mermaid MCP is a published registry package), Excalidraw's
 ``file:vco_lib/excalidraw_mcp_fork`` pin. The vendored copy lives
 in-tree and is invoked directly via Node:
 
-    node <repo-root>/vco_lib/excalidraw_mcp_fork/dist/mcp/index.js
+    node <repo-root>/vco_lib/excalidraw_mcp_fork/dist/mcp/index.bundled.js
+
+(the esbuild-bundled self-contained entry; falls back to the unbundled
+``dist/mcp/index.js`` if the bundle is missing — see VENDORED.md)
 
 (The vendored tree moved from ``claude_mcp_servers/`` to ``vco_lib/``
 in v0.2.34 so it ships in the Python wheel — see
@@ -233,7 +236,18 @@ def _resolve_upstream_argv() -> list[str]:
         rel = package_pin[len("file:"):]
         repo_root = Path(__file__).resolve().parent.parent.parent
         candidate = (repo_root / rel).resolve()
-        entry = candidate / "dist" / "mcp" / "index.js"
+        # Prefer the esbuild-bundled, self-contained entry (P0-3 fix,
+        # v0.2.54): `dist/mcp/index.bundled.js` has every transitive
+        # dependency inlined, so it runs with a bare `node` even though
+        # the vendored tree ships WITHOUT node_modules (node_modules is
+        # gitignored — the unbundled `dist/mcp/index.js` dies on its
+        # first `import pino` unless someone ran `npm install` in the
+        # fork dir). The unbundled entry stays as a fallback for a tree
+        # where the bundle was deleted but node_modules exists.
+        # Regeneration recipe: VENDORED.md "Bundling recipe".
+        entry = candidate / "dist" / "mcp" / "index.bundled.js"
+        if not entry.is_file():
+            entry = candidate / "dist" / "mcp" / "index.js"
         if not entry.is_file():
             sys.stderr.write(
                 f"[excalidraw_proxy] ERROR: vendored entry point not "

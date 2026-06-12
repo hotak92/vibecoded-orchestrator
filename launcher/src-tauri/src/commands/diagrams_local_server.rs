@@ -34,7 +34,11 @@
 //   POST /save?path=<rel_path>          → writes the body verbatim to
 //                                          <project>/<rel_path> via the
 //                                          atomic sibling-tmp + rename
-//                                          path used elsewhere
+//                                          path used elsewhere.
+//                                          REQUIRES `Authorization:
+//                                          Bearer <per-boot token>` and
+//                                          an allowlisted (or absent)
+//                                          `Origin` header — see below.
 //
 // Security
 // --------
@@ -50,9 +54,54 @@
 //      `<project>/.claude/diagrams/` directory. Mirrors the per-call
 //      guard used by `commands::diagrams_cmd::read_project_diagram_source`
 //      and `write_text_file`.
-//   4. No CORS headers added — only the user's own browser will hit
-//      127.0.0.1, and we deliberately don't want third-party pages to
-//      reach the editor server.
+//   4. POST /save is gated by BOTH a per-boot bearer token AND an
+//      Origin-header check (v0.2.54 Track I, C-EX-3). Why both — and
+//      why "no CORS headers" was NEVER a write-path defence:
+//
+//      The threat is a drive-by malicious web page in the user's own
+//      browser. A cross-origin POST with a "simple" content type
+//      (text/plain) is sent WITHOUT a CORS preflight — the absence of
+//      CORS response headers only stops the attacker page from
+//      READING our response; the write itself would have already
+//      happened. (An earlier revision of this comment claimed the
+//      missing CORS headers kept third-party pages out — that was
+//      factually wrong for simple-request writes. CORS gates response
+//      reads, not request delivery.) GET /file stays unauthenticated
+//      for exactly that reason: a cross-origin reader gets an opaque
+//      response it cannot read, so reads ARE protected by the missing
+//      CORS headers.
+//
+//      Layer A — Origin check: browsers attach `Origin` to every
+//      cross-origin POST and to same-origin fetch() POSTs; it is not
+//      script-spoofable. We allow only our own origin
+//      (`http://127.0.0.1:<port>` / `http://localhost:<port>` — the
+//      editor pages are served by this very server) plus the Tauri
+//      webview origins (`tauri://localhost` on Linux/macOS WebKit,
+//      `http(s)://tauri.localhost` on Windows WebView2) in case the
+//      launcher UI ever POSTs directly. `Origin: null` (sandboxed
+//      iframes, file:// pages — attacker-producible) is REJECTED.
+//      Requests with NO Origin header pass this layer: they cannot
+//      come from a browser page (which always attaches Origin to
+//      POSTs), so they're non-browser local clients — which the next
+//      layer still gates.
+//
+//      Layer B — per-boot bearer token: minted from the OS CSPRNG at
+//      server start (same `boot_token` primitives as vct-hub's
+//      hub.token), persisted to `<vct_root_dir>/diagrams.token` mode
+//      0o600, handed to the editor page via the URL fragment
+//      (`#token=…` — fragments are never sent in HTTP requests, so
+//      the token stays out of request lines and server logs). A web
+//      attacker cannot read the token file, cannot read our responses
+//      (no CORS headers), and cannot see the fragment of another
+//      tab's URL — so even a request that somehow presented a clean
+//      Origin would still fail without the token. Conversely, if the
+//      token ever leaked, the Origin check still blocks browser-borne
+//      writes from foreign pages. Defence in depth: each layer covers
+//      the other's residual risk.
+//
+//      The Svelte frontend can obtain the token via the
+//      `get_diagrams_token` Tauri command (reads the token file);
+//      it is NOT baked into any bundle.
 //
 // State model
 // -----------
@@ -79,9 +128,17 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
 
+use vct_launcher_core::services::boot_token;
+
 use crate::db::Db;
 
 // ─── Module-private state ──────────────────────────────────────────
+
+/// Filename inside `vct_root_dir()` where the per-boot save token
+/// persists for the lifetime of the launcher process. Mirrors the
+/// `hub.token` pattern (vct-hub/src/auth.rs::TOKEN_FILE). Read back by
+/// the `get_diagrams_token` Tauri command for the Svelte frontend.
+pub const TOKEN_FILE: &str = "diagrams.token";
 
 /// Lazily-initialised server-state singleton. Holds the bound port so
 /// repeat `open_diagrams_editor` calls can build the URL without
@@ -92,6 +149,10 @@ pub struct DiagramsLocalServerState {
     /// Resolved once at startup so per-request handlers don't repeat the
     /// filesystem probe.
     pub vendor_root: PathBuf,
+    /// Per-boot bearer token gating POST /save (see module Security
+    /// notes, layer B). Regenerated on every launcher start; also
+    /// persisted to `<vct_root_dir>/diagrams.token` (mode 0o600).
+    pub token: String,
 }
 
 /// Process-wide singleton. The `OnceCell` provides "spawn on first use"
@@ -110,8 +171,9 @@ struct AppState {
 
 // ─── Public entry points ───────────────────────────────────────────
 
-/// Start the server if it isn't running yet. Returns the bound port.
-/// Idempotent: subsequent calls short-circuit to the cached port.
+/// Start the server if it isn't running yet. Returns the shared state
+/// (bound port + per-boot save token). Idempotent: subsequent calls
+/// short-circuit to the cached state.
 ///
 /// `db` is an `Arc<Db>` rather than a borrowed reference so the spawn
 /// closure can capture it cheaply. The Db is the same instance shared
@@ -122,11 +184,14 @@ struct AppState {
 /// which surfaces our `Err` as a toast in the UI. We don't auto-retry on
 /// port-bind failure — the user clicks Draw again if something transient
 /// stole every port in our scan range.
-pub async fn ensure_started(db: Arc<Db>, vendor_root: PathBuf) -> Result<u16, String> {
+pub async fn ensure_started(
+    db: Arc<Db>,
+    vendor_root: PathBuf,
+) -> Result<Arc<DiagramsLocalServerState>, String> {
     let state = SERVER_STATE
         .get_or_try_init(|| async { spawn_server(db, vendor_root).await })
         .await?;
-    Ok(state.port)
+    Ok(state.clone())
 }
 
 /// Resolve the absolute path to `launcher/vendor/diagrams-editor/`.
@@ -202,9 +267,20 @@ async fn spawn_server(
     // we hand to `open_url`, so it doesn't matter which we land on.
     let (listener, port) = try_bind_in_range(22000, 20).await?;
 
+    // Mint the per-boot save token and persist it for the Svelte
+    // frontend (`get_diagrams_token` command). Same generate + 0o600
+    // persistence primitives as vct-hub's hub.token. A persist failure
+    // is fatal for the server start: a token that exists in memory but
+    // not on disk would leave the frontend permanently unable to
+    // authenticate, which is worse than a clear startup error.
+    let token = boot_token::generate_token()?;
+    let token_path = vct_launcher_core::paths::vct_root_dir().join(TOKEN_FILE);
+    boot_token::write_token_file(&token_path, &token)?;
+
     let final_state = Arc::new(DiagramsLocalServerState {
         port,
         vendor_root,
+        token,
     });
 
     let app_state = AppState {
@@ -212,14 +288,7 @@ async fn spawn_server(
         state: final_state.clone(),
     };
 
-    let app = Router::new()
-        .route("/mermaid/", get(serve_mermaid_index))
-        .route("/mermaid/{*tail}", get(serve_mermaid_asset))
-        .route("/excalidraw/", get(serve_excalidraw_index))
-        .route("/excalidraw/{*tail}", get(serve_excalidraw_asset))
-        .route("/file", get(read_file_handler))
-        .route("/save", post(save_file_handler))
-        .with_state(app_state);
+    let app = build_router(app_state);
 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -233,6 +302,20 @@ async fn spawn_server(
         final_state.vendor_root.display(),
     );
     Ok(final_state)
+}
+
+/// Build the axum router. Factored out of `spawn_server` so the
+/// HTTP-level tests can mount the exact production route table +
+/// auth gate on a test listener without going through the singleton.
+fn build_router(app_state: AppState) -> Router {
+    Router::new()
+        .route("/mermaid/", get(serve_mermaid_index))
+        .route("/mermaid/{*tail}", get(serve_mermaid_asset))
+        .route("/excalidraw/", get(serve_excalidraw_index))
+        .route("/excalidraw/{*tail}", get(serve_excalidraw_asset))
+        .route("/file", get(read_file_handler))
+        .route("/save", post(save_file_handler))
+        .with_state(app_state)
 }
 
 /// Bind to the first available port in `[base, base+span)`. We probe
@@ -396,8 +479,14 @@ async fn read_file_handler(
 async fn save_file_handler(
     State(s): State<AppState>,
     Query(q): Query<FilePathQuery>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Auth gate FIRST — before any path resolution or disk work. See
+    // the module-level Security notes (item 4) for why both layers.
+    if let Err(resp) = authorize_save(&headers, &s.state.token, s.state.port) {
+        return resp;
+    }
     let abs = match resolve_diagrams_path(&s.db, &q.path) {
         Ok(p) => p,
         Err(e) => return (StatusCode::FORBIDDEN, e).into_response(),
@@ -406,6 +495,82 @@ async fn save_file_handler(
         Ok(()) => (StatusCode::OK, "saved").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+// ─── POST /save auth gate ──────────────────────────────────────────
+
+/// Validate the Origin header + per-boot bearer token for a /save
+/// request. Returns `Err(response)` with the appropriate status on
+/// rejection:
+///
+///   * 403 — Origin present but not allowlisted (browser-borne
+///     cross-origin write attempt, the exact drive-by the gate exists
+///     to stop). Includes `Origin: null` (sandboxed iframes / file://
+///     pages — attacker-producible, so never allowlisted).
+///   * 401 — missing / malformed / wrong bearer token.
+///
+/// Order: Origin first (cheapest, catches the browser drive-by class
+/// outright), token second.
+fn authorize_save(headers: &HeaderMap, expected_token: &str, port: u16) -> Result<(), Response> {
+    // Layer A — Origin allowlist.
+    match headers.get(header::ORIGIN) {
+        None => {
+            // No Origin → cannot be a browser-page POST (browsers
+            // always attach Origin to fetch/XHR/form POSTs). A local
+            // non-browser client; layer B still gates it.
+        }
+        Some(raw) => {
+            let origin = raw.to_str().unwrap_or("");
+            if !origin_allowed(origin, port) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "origin not allowed for /save".to_string(),
+                )
+                    .into_response());
+            }
+        }
+    }
+
+    // Layer B — per-boot bearer token (constant-time compare; same
+    // primitives as vct-hub's hub.token middleware).
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(boot_token::parse_bearer);
+    match provided {
+        Some(tok) if boot_token::constant_time_eq(tok.as_bytes(), expected_token.as_bytes()) => {
+            Ok(())
+        }
+        _ => Err((
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token for /save".to_string(),
+        )
+            .into_response()),
+    }
+}
+
+/// Whether a (present, non-empty) Origin header value is allowed to
+/// POST /save. Allowlist:
+///
+///   * our own origin — the editor pages are served by this server,
+///     so their fetch() POSTs carry `http://127.0.0.1:<port>` (or
+///     `http://localhost:<port>` if the user retyped the URL).
+///   * the Tauri webview origins, in case the launcher UI ever POSTs
+///     directly: `tauri://localhost` (Linux/macOS WKWebView/WebKitGTK)
+///     and `http://tauri.localhost` / `https://tauri.localhost`
+///     (Windows WebView2).
+///
+/// Everything else — including `null` — is rejected.
+fn origin_allowed(origin: &str, port: u16) -> bool {
+    if origin == format!("http://127.0.0.1:{}", port)
+        || origin == format!("http://localhost:{}", port)
+    {
+        return true;
+    }
+    matches!(
+        origin,
+        "tauri://localhost" | "http://tauri.localhost" | "https://tauri.localhost"
+    )
 }
 
 // ─── Path resolution + atomic write ────────────────────────────────
@@ -632,5 +797,192 @@ mod tests {
         // Inside project but outside .claude/diagrams/ — must fail.
         let err = resolve_diagrams_path(&db, "secrets/creds.txt").unwrap_err();
         assert!(err.contains("did not resolve inside any project"));
+    }
+
+    // ─── POST /save auth gate (v0.2.54 Track I, C-EX-3) ─────────────
+
+    #[test]
+    fn origin_allowed_accepts_own_and_tauri_origins() {
+        assert!(origin_allowed("http://127.0.0.1:22003", 22003));
+        assert!(origin_allowed("http://localhost:22003", 22003));
+        assert!(origin_allowed("tauri://localhost", 22003));
+        assert!(origin_allowed("http://tauri.localhost", 22003));
+        assert!(origin_allowed("https://tauri.localhost", 22003));
+    }
+
+    #[test]
+    fn origin_allowed_rejects_foreign_null_and_port_mismatch() {
+        assert!(!origin_allowed("https://evil.example", 22003));
+        // `Origin: null` is attacker-producible (sandboxed iframe,
+        // file:// page) — must never be allowlisted.
+        assert!(!origin_allowed("null", 22003));
+        // Same host, wrong port → a DIFFERENT 127.0.0.1 service's page
+        // (or a stale tab from a previous boot's port). Reject.
+        assert!(!origin_allowed("http://127.0.0.1:22004", 22003));
+        assert!(!origin_allowed("", 22003));
+        // https on loopback is not how we serve — reject.
+        assert!(!origin_allowed("https://127.0.0.1:22003", 22003));
+    }
+
+    // ── HTTP-level tests: production router on a real listener ──
+    //
+    // Same spawn-on-random-port + reqwest pattern as vct-hub's
+    // auth.rs tests — exercises the same axum::serve code path the
+    // production server runs, no extra dev-deps.
+
+    /// Bind a listener, build the production router around a fresh
+    /// in-memory Db with one registered project, serve it. Returns
+    /// (base_url, port, project_dir_guard). The tempdir guard must
+    /// stay alive for the duration of the test (the save handler
+    /// writes into it).
+    async fn spawn_test_server(token: &str) -> (String, u16, tempfile::TempDir) {
+        use crate::db::models::ProjectHost;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join(".claude").join("diagrams")).unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let slug = db.generate_unique_slug("Acme").unwrap();
+        db.insert_project(
+            "p1",
+            "Acme",
+            project.to_string_lossy().as_ref(),
+            ProjectHost::Base,
+            &slug,
+        )
+        .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let app_state = AppState {
+            db: Arc::new(db),
+            state: Arc::new(DiagramsLocalServerState {
+                port,
+                vendor_root: dir.path().join("vendor-unused"),
+                token: token.to_string(),
+            }),
+        };
+        let app = build_router(app_state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", port), port, dir)
+    }
+
+    const SAVE_PATH: &str = "/save?path=.claude/diagrams/x.mmd";
+
+    #[tokio::test]
+    async fn save_rejects_request_without_bearer_token() {
+        let (base, _port, _dir) = spawn_test_server("tok-secret").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{}{}", base, SAVE_PATH))
+            .body("flowchart TD")
+            .send()
+            .await
+            .expect("server reachable");
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_request_with_wrong_bearer_token() {
+        let (base, _port, _dir) = spawn_test_server("tok-secret").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{}{}", base, SAVE_PATH))
+            .header("Authorization", "Bearer tok-wrong")
+            .body("flowchart TD")
+            .send()
+            .await
+            .expect("server reachable");
+        assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_foreign_origin_even_with_correct_token() {
+        // Defence in depth: a leaked token presented from a browser
+        // page on a foreign origin must STILL be rejected.
+        let (base, _port, _dir) = spawn_test_server("tok-secret").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{}{}", base, SAVE_PATH))
+            .header("Authorization", "Bearer tok-secret")
+            .header("Origin", "https://evil.example")
+            .body("flowchart TD")
+            .send()
+            .await
+            .expect("server reachable");
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_null_origin() {
+        let (base, _port, _dir) = spawn_test_server("tok-secret").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{}{}", base, SAVE_PATH))
+            .header("Authorization", "Bearer tok-secret")
+            .header("Origin", "null")
+            .body("flowchart TD")
+            .send()
+            .await
+            .expect("server reachable");
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn save_accepts_correct_token_with_own_origin_and_writes_file() {
+        // The happy path the mermaid editor page exercises: fetch()
+        // from the page this server itself served → Origin is our own
+        // origin, Authorization carries the fragment token.
+        let (base, port, dir) = spawn_test_server("tok-secret").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{}{}", base, SAVE_PATH))
+            .header("Authorization", "Bearer tok-secret")
+            .header("Origin", format!("http://127.0.0.1:{}", port))
+            .body("flowchart TD\n  A --> B")
+            .send()
+            .await
+            .expect("server reachable");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let written = dir.path().join("proj/.claude/diagrams/x.mmd");
+        assert_eq!(
+            std::fs::read_to_string(written).unwrap(),
+            "flowchart TD\n  A --> B",
+        );
+    }
+
+    #[tokio::test]
+    async fn save_accepts_correct_token_without_origin_header() {
+        // Non-browser local client (no Origin) — layer A passes it
+        // through, layer B (token) is the gate. reqwest sends no
+        // Origin header by default.
+        let (base, _port, dir) = spawn_test_server("tok-secret").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{}{}", base, SAVE_PATH))
+            .header("Authorization", "Bearer tok-secret")
+            .body("graph LR")
+            .send()
+            .await
+            .expect("server reachable");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(dir.path().join("proj/.claude/diagrams/x.mmd").is_file());
+    }
+
+    #[tokio::test]
+    async fn file_read_stays_unauthenticated() {
+        // GET /file is deliberately outside the token gate: reads are
+        // already protected cross-origin by the ABSENCE of CORS
+        // headers (the attacker page gets an opaque response). See the
+        // module Security notes, item 4.
+        let (base, _port, dir) = spawn_test_server("tok-secret").await;
+        std::fs::write(
+            dir.path().join("proj/.claude/diagrams/x.mmd"),
+            "flowchart TD",
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("{}/file?path=.claude/diagrams/x.mmd", base))
+            .await
+            .expect("server reachable");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "flowchart TD");
     }
 }
