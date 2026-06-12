@@ -200,10 +200,10 @@ Operators can set `VCT_VALIDATE_TIER_URL` to point at a staging or dev validate-
 `licensing.rs` includes source-level audit tests: (1) default validate URL must not contain `supabase.co`, (2) production source must not contain bypass symbols (`MAINTAINER_TOKEN`, `ed25519_dalek`, etc.). Run as Rust unit tests to prevent accidental regression.
 
 ### Admin-only Routes
-`/admin/diagnostic`, `/admin/feature-flags`, `/admin/license-issuance-test`. Gated by `tier === 'admin'` in `+layout.svelte`. Client-side check is UX only; each admin tab re-validates server-side.
+`/admin/diagnostic`, `/admin/feature-flags`. Gated by `tier === 'admin'` in `+layout.svelte`. Client-side check is UX only; each admin tab re-validates server-side. (`/admin/license-issuance-test` — a backend-less placeholder — was removed in v0.2.54 Track H.)
 
 ### Dev Mode Activation Codes
-Test codes (`test-transcrypt`, `test-arzillibus`, etc.) bypass the webhook and activate modules directly for development. Entered via Settings → Activation Codes (`ActivationModal.svelte`).
+Removed in v0.2.54 Track H together with the legacy `licenses.ts` store that implemented them (`test-<app>` codes validated client-side against a localStorage portfolio). Dev-time license testing goes through the ActivationModal against a staging `VCT_VALIDATE_TIER_URL` endpoint.
 
 ---
 
