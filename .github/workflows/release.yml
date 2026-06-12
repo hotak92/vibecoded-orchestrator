@@ -140,6 +140,15 @@ jobs:
           pip install weaviate-client
           pip install -e ".[dev]" 2>/dev/null || pip install -e . 2>/dev/null || true
 
+      # v0.2.54 Track E (Theme 6): removed the `|| { echo "::warning::…" }`
+      # swallows around install.py + install-bundle. Pre-Track-E those
+      # blocks downgraded non-zero exits to GitHub Actions warnings, so a
+      # broken install.py could still pass the pre-release gate. Per the
+      # release discipline rule ("no deferred fixes — fix first, then
+      # push"), pre-release-gate failures must be HARD. If a future
+      # install.py issue is genuinely environmental (e.g. an upstream
+      # apt-get hiccup), retry the workflow run rather than re-introducing
+      # the swallow.
       - name: Run install.py (no containers, no models)
         env:
           VCO_CI_FIXTURE: "1"
@@ -150,9 +159,7 @@ jobs:
           mkdir -p "$INSTALL_ROOT"
           cp -r . "$INSTALL_ROOT/"
           cd "$INSTALL_ROOT"
-          python install.py --no-containers --skip-models || {
-            echo "::warning::install.py exited non-zero; continuing to assert what was written"
-          }
+          python install.py --no-containers --skip-models
           echo "INSTALL_ROOT=$INSTALL_ROOT" >> "$GITHUB_ENV"
 
       - name: Run install-bundle into tmp project dir
@@ -162,10 +169,7 @@ jobs:
           mkdir -p "$PROJECT_DIR"
           python -m vco_lib.project_init install-bundle \
             --folder "$PROJECT_DIR" \
-            --orchestrator-root "$INSTALL_ROOT" \
-            || {
-              echo "::warning::install-bundle exited non-zero; continuing assertions"
-            }
+            --orchestrator-root "$INSTALL_ROOT"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Gate 1 — Assert install.py root env present
