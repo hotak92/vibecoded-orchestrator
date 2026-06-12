@@ -126,6 +126,13 @@ What it does, step by step:
 - Removes the launcher state DB (`~/.vct/launcher.db`).
 - Removes orchestrator MCP registrations from `~/.claude.json` (your
   other MCP servers are preserved).
+- Removes boot autostart entries (closed in v0.2.54 Track G — this used
+  to be a known gap): the `ClaudeMcpContainers` Scheduled Task registered
+  at install time is deleted via `schtasks /Delete`, and the opt-in
+  vct-hub boot task (`VCT-Hub`) is removed via `vct-hub
+  --unregister-boot`. If you uninstalled with an older orchestrator and
+  the task lingers, remove it manually:
+  `schtasks /Delete /TN ClaudeMcpContainers /F`
 - Never touches `~/.vct-secrets/` or your source code.
 
 Flags that change confirmation behavior — be explicit about these:
@@ -137,17 +144,6 @@ Flags that change confirmation behavior — be explicit about these:
 - **`--dry-run`** prints the full plan and exits without removing
   anything. Run this first if unsure.
 - **`--keep-data`** skips the volume-removal step entirely.
-
-**Known gap**: the Scheduled Task registered at install time
-(`ClaudeMcpContainers`) is NOT automatically removed by `--uninstall`
-in v0.2.54. To remove it manually after uninstall:
-
-```cmd
-schtasks /Delete /TN ClaudeMcpContainers /F
-```
-
-(Track G in a later release will add automatic boot-service
-unregister.)
 
 To finish the cleanup manually after uninstall (only if you're sure —
 this deletes your KG vectors):

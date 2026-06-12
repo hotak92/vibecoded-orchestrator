@@ -25869,8 +25869,15 @@ def _run_uninstall(args: argparse.Namespace) -> int:
       3. Remove launcher state (~/.vct/launcher.db)
       4. Remove orchestrator MCP server entries from ~/.claude.json
          (preserves user's other MCP servers)
-      5. (opt-in via --remove-projects) Remove .claude/ folders in registered projects
-      6. NEVER touches: ~/.vct-secrets/ (user's secret material)
+      5. Remove boot-time autostart entries (v0.2.54 Track G):
+         - the container-stack boot service registered unconditionally at
+           install time (systemd user unit on Linux / LaunchAgent on macOS /
+           `ClaudeMcpContainers` Scheduled Task on Windows), and
+         - the opt-in vct-hub boot service via `vct-hub --unregister-boot`.
+         Without this, post-uninstall every boot retried
+         `scripts/launch-claude-mcp-stack.*` from a deleted clone forever.
+      6. (opt-in via --remove-projects) Remove .claude/ folders in registered projects
+      7. NEVER touches: ~/.vct-secrets/ (user's secret material)
 
     Writes an audit log of what was removed to stdout and to
     ~/.vibecoded/uninstall_audit.log.
@@ -25929,10 +25936,28 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         print(f"  [4] Remove orchestrator MCP server entries from {claude_json}")
         print(f"      (preserves your other MCP servers)")
 
-    if args.remove_projects:
-        print(f"  [5] Remove .claude/ folders in registered projects (--remove-projects)")
+    # Boot-service removal (v0.2.54 Track G): plan lines name the exact
+    # OS-specific artefact so --dry-run output is auditable.
+    os_name = platform.system()
+    if os_name == "Linux":
+        boot_artefact = (
+            f"systemd user unit ~/.config/systemd/user/{_BOOT_SERVICE_UNIT_NAME}"
+        )
+    elif os_name == "Darwin":
+        boot_artefact = (
+            f"LaunchAgent ~/Library/LaunchAgents/{_BOOT_SERVICE_PLIST_LABEL}.plist"
+        )
+    elif os_name == "Windows":
+        boot_artefact = f"Scheduled Task {_BOOT_SERVICE_TASK_NAME}"
     else:
-        print(f"  [5] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
+        boot_artefact = f"(no boot service on {os_name})"
+    print(f"  [5] Remove boot autostart: {boot_artefact}")
+    print(f"      + `vct-hub --unregister-boot` (no-op if never enabled)")
+
+    if args.remove_projects:
+        print(f"  [6] Remove .claude/ folders in registered projects (--remove-projects)")
+    else:
+        print(f"  [6] [skip] Per-project .claude/ folders preserved (use --remove-projects)")
 
     print()
     print(f"  WILL NOT TOUCH: ~/.vct-secrets/ (your GitHub PAT and other secrets stay)")
@@ -26028,7 +26053,34 @@ def _run_uninstall(args: argparse.Namespace) -> int:
         except (OSError, ValueError) as e:
             audit.append(f"WARN: could not scrub {claude_json}: {e}")
 
-    # Step 5: per-project .claude/ folders (opt-in).
+    # Step 5: boot-time autostart entries (v0.2.54 Track G).
+    #
+    # The container-stack boot service is materialized UNCONDITIONALLY on
+    # default installs (`_materialize_boot_service`, Step 8 region), and the
+    # vct-hub boot service may have been enabled via the launcher GUI
+    # Preferences (`vct-hub --register-boot`). Neither dies with the clone:
+    # the systemd unit / LaunchAgent / Scheduled Task lives in the USER's
+    # home or the OS task store and points INTO the clone — so after clone
+    # deletion every boot retried `scripts/launch-claude-mcp-stack.*` from a
+    # deleted path forever. Removal logic lives in
+    # `vco_lib/boot_service_cleanup.py` (shared, unit-tested, soft-fail).
+    if _confirm(f"Remove boot autostart entries ({boot_artefact} + vct-hub)?"):
+        from vco_lib.boot_service_cleanup import (
+            unregister_container_boot_service,
+            unregister_hub_boot_service,
+        )
+        audit.extend(unregister_container_boot_service(
+            unit_name=_BOOT_SERVICE_UNIT_NAME,
+            plist_label=_BOOT_SERVICE_PLIST_LABEL,
+            task_name=_BOOT_SERVICE_TASK_NAME,
+        ))
+        # Resolve the bundled vct-hub binary (Tier 1 only — never download
+        # or rebuild during an uninstall); fall back to PATH inside the
+        # helper.
+        hub_bin = _try_bundled_vct_hub_binary(PROJECT_ROOT)
+        audit.extend(unregister_hub_boot_service(hub_bin))
+
+    # Step 6: per-project .claude/ folders (opt-in).
     if args.remove_projects:
         registry = PROJECT_ROOT / ".claude" / "PROJECT_REGISTRY.md"
         if registry.exists() and _confirm("Remove .claude/ in registered projects?"):
