@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.56] - 2026-06-14
+
+v0.2.56 fixes a spurious "Local clone has diverged from upstream"
+modal that every active install was on track to hit on every update.
+A real user's Claude **commits** knowledge-graph nodes locally (the
+encouraged behavior), which advances the local branch tip past
+upstream. The GUI update then ran `git pull --ff-only`, which refuses
+on any such divergence — surfacing a scary Merge/Rebase/Cancel modal
+**even when a real merge would be 100% conflict-free** (committed KG
+additions never overlap upstream's source/version/binary changes). The
+update should not require human intervention for divergences that merge
+cleanly.
+
+### Fixed
+
+- **The divergence modal now appears only on a REAL conflict.** When
+  `git pull --ff-only` would refuse due to committed local divergence,
+  the launcher first probes the merge statelessly with
+  `git merge-tree --write-tree` (writes nothing to the working tree or
+  index — unlike `git merge --no-commit`, which would need an `--abort`
+  even on success). If the merge is conflict-free, the launcher routes
+  through a real `git merge` (`--no-rebase --no-edit --autostash`),
+  folding in upstream and preserving the local commits **silently** —
+  no modal. The Merge/Rebase/Cancel modal is reserved for genuine
+  content conflicts (or a merge that cannot start). The pre-merge step
+  was blind to this case because it only inspects `git status`
+  (uncommitted edits), never committed local commits.
+
+### Added
+
+- **`.gitattributes` union driver for knowledge-graph nodes
+  (belt-and-suspenders).** The repo root now declares
+  `knowledge/**/*.md merge=union`. `union` is git's BUILT-IN driver (no
+  `.git/config` registration required): on an overlapping append it
+  keeps BOTH sides' lines instead of writing conflict markers — exactly
+  right for append-only KG nodes, so a hand-run `git pull`/`git merge`
+  resolves them cleanly without the launcher. Scope is deliberately
+  narrow: `CLAUDE.md` is modify-heavy (union would keep both
+  contradictory lines — a clean conflict is safer there) and the other
+  candidate paths (`.claude/CONTEXT_STATE.md`, `.claude/MEMORY.md`,
+  `HANDOFF-*.md`, `CLAUDE.local.md`) are gitignored, so a rule for them
+  would be a dead no-op. Note the driver is **forward-only**: git reads
+  the merge driver from the merge-base side, so union activates on
+  updates *after* v0.2.56 is committed locally, not on the upgrade to
+  v0.2.56 itself. `launcher/dist/**` binaries intentionally get no
+  driver — the auto-merge path resolves the normal binary-refresh case
+  to upstream, and the divergence modal surfaces on a rare genuine
+  binary conflict.
+
 ## [0.2.55] - 2026-06-14
 
 v0.2.55 is a focused fix for the launcher GUI self-update path. A

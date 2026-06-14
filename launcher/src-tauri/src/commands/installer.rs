@@ -4340,6 +4340,93 @@ pub async fn update_orchestrator<R: Runtime>(
     let pre_merge_committed = crate::commands::git_user_editable_merge::any_outcome_produced_synthetic_commit(
         &pre_merge_outcomes,
     );
+    // v0.2.56 (Defect A fix): when pre-merge did NOT synthesize a commit
+    // (so the code below would otherwise pick `--ff-only`), the LOCAL
+    // clone may STILL have diverged from upstream via COMMITTED local
+    // commits — the universal case for a 3rd-party user whose Claude has
+    // committed KG nodes (encouraged behavior). A bare `--ff-only` then
+    // refuses with non-fast-forward and surfaces the scary B4
+    // Merge/Rebase/Cancel modal EVEN WHEN a real merge would be
+    // conflict-free (committed KG additions never overlap upstream's
+    // source/version/binary changes).
+    //
+    // The pre-merge step is blind to this: it only inspects `git status
+    // --porcelain` (UNcommitted edits). So before settling on --ff-only,
+    // probe statelessly with `git merge-tree --write-tree` (writes
+    // nothing — see committed_divergence_merges_cleanly). If the merge is
+    // conflict-free, route through a REAL merge pull (`--no-rebase
+    // --no-edit`) instead of --ff-only: the merge completes silently, the
+    // existing post-pull success flow runs unchanged, and NO modal
+    // surfaces. The modal is reserved for GENUINE content conflicts (or a
+    // merge that can't even start). Best-effort: any probe failure leaves
+    // `--ff-only` in place so the legacy non-FF path still surfaces the
+    // modal — never auto-merge on uncertainty.
+    // v0.2.56 (review BLOCKER B1): the auto-merge path uses `--autostash`,
+    // which can leave a SILENTLY-broken working tree (exit 0 + UU markers +
+    // dangling stash) if an uncommitted edit to a non-union file conflicts
+    // on the autostash pop — bypassing the post-pull conflict modal. Guard
+    // it: only auto-merge when the working tree is CLEAN (nothing to stash
+    // → the pop-conflict hazard cannot arise). A dirty tree falls back to
+    // --ff-only, which aborts cleanly and surfaces the modal exactly as
+    // before. Probe the tree ONCE, up front; on any error, treat as dirty.
+    let working_tree_clean = crate::commands::git_user_editable_merge::working_tree_is_clean(
+        &install_path,
+    )
+    .await
+    .unwrap_or(false);
+    let auto_merge_committed_divergence = if pre_merge_committed {
+        // pre-merge already advanced HEAD; the rebase path below owns it.
+        false
+    } else if !working_tree_clean {
+        // Dirty tree — never take the silent --autostash auto-merge (B1).
+        // --ff-only will refuse on non-FF and the modal surfaces safely.
+        false
+    } else {
+        match crate::commands::git_user_editable_merge::compute_theirs_sha(
+            &install_path,
+            &pull_branch,
+        )
+        .await
+        {
+            Ok(Some(theirs)) => {
+                match crate::commands::git_user_editable_merge::committed_divergence_merges_cleanly(
+                    &install_path,
+                    &theirs,
+                )
+                .await
+                {
+                    Ok(clean) => {
+                        if clean {
+                            eprintln!(
+                                "[vct] update_orchestrator: committed local divergence merges \
+                                 cleanly with upstream — routing through a real merge (no modal)."
+                            );
+                        }
+                        clean
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[vct] update_orchestrator: merge-tree probe failed ({}) — \
+                             keeping --ff-only; modal will surface on non-FF.",
+                            e
+                        );
+                        false
+                    }
+                }
+            }
+            // Upstream tip not resolvable (no fetch yet / detached) — let
+            // the bare pull surface the real error.
+            Ok(None) => false,
+            Err(e) => {
+                eprintln!(
+                    "[vct] update_orchestrator: could not resolve upstream tip for merge \
+                     probe ({}) — keeping --ff-only.",
+                    e
+                );
+                false
+            }
+        }
+    };
     // v0.2.29 (2026-05-23, post-v0.2.28 bugfix): add `--autostash` to the
     // rebase path. Without it, ANY uncommitted change in the working tree
     // outside the user-editable allowlist (typical for private-fork
@@ -4362,6 +4449,42 @@ pub async fn update_orchestrator<R: Runtime>(
             "--rebase",
             "--autostash",
             "--no-edit",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            &pull_branch,
+        ]
+    } else if auto_merge_committed_divergence {
+        // v0.2.56 (Defect A fix): committed local divergence that
+        // merge-tree proved conflict-free AND a verified-clean working
+        // tree (the B1 guard above). Do a REAL merge so the local
+        // commits are preserved and folded in — no modal.
+        // `--no-rebase` forces the merge strategy (overriding any
+        // `pull.rebase=true` in the user's git config); `--no-edit`
+        // accepts the default merge-commit message non-interactively.
+        // `--autostash` is a defensive no-op here (the tree is already
+        // clean — see the B1 guard; without it there is nothing to stash
+        // and therefore no autostash-pop-conflict hazard). On the rare
+        // event the merge conflicts despite the clean probe (a TOCTOU
+        // race with an upstream push between probe and pull, on COMMITTED
+        // content), the merge exits non-zero and the post-pull
+        // `is_merge_or_rebase_conflict` branch catches it and surfaces
+        // the conflict modal + resume sentinel.
+        //
+        // NOTE (review C1): after this auto-merge, local HEAD is a MERGE
+        // commit. If the user updated INSIDE the post-tag binary-refresh
+        // window (the `chore(binary): refresh` commit lands ~minutes after
+        // the tag), `WaitForBinaryRefresh`'s `--ff-only` re-pull won't
+        // fast-forward a merge-commit HEAD onto the later refresh tip —
+        // it soft-fails + times out, and the v0.2.55 finalize recovery
+        // either restarts into a newer on-disk binary or writes a
+        // BinaryRefreshTimeout deferral. Self-heals on the next update
+        // click (another auto-merge folds in the binary). Common case
+        // (update AFTER the window → binary already upstream → folded in
+        // on this merge) is unaffected.
+        &[
+            "pull",
+            "--no-rebase",
+            "--no-edit",
+            "--autostash",
             crate::commands::self_update::VCO_UPSTREAM_REMOTE,
             &pull_branch,
         ]
@@ -4403,15 +4526,28 @@ pub async fn update_orchestrator<R: Runtime>(
         // pop). Detect that before falling through to the non-FF /
         // generic-error paths so the conflict modal surfaces correctly +
         // the resume sentinel lands.
+        //
+        // v0.2.56: the new `auto_merge_committed_divergence` path runs a
+        // `--no-rebase` MERGE pull, which on the rare probe-vs-pull TOCTOU
+        // race can ALSO conflict. Label the operation accurately so the
+        // resume sentinel + modal say "merge" not "rebase". (The abort
+        // recovery `abort_orchestrator_merge_or_rebase` is label-agnostic
+        // — it reads .git/MERGE_HEAD vs .git/rebase-merge on disk — so
+        // this is for the user-facing message only, but accuracy matters.)
         let combined = format!("{}\n{}", stderr, stdout);
         if is_merge_or_rebase_conflict(&combined) {
+            let conflict_op = if auto_merge_committed_divergence {
+                "merge"
+            } else {
+                "rebase"
+            };
             // v0.2.53 DEDUP-14: paired sentinel + deferral via the
             // single helper so future writers can't accidentally write
             // one without the other (v0.2.51 Bug A class).
-            write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
+            write_resume_sentinel_and_deferral(&install_path, conflict_op, &pull_branch).await;
             let conflicted = collect_conflicted_files(&install_path).await;
             return Err(serialize_orchestrator_conflict_error(
-                "rebase",
+                conflict_op,
                 &pull_branch,
                 &conflicted,
                 combined.trim(),

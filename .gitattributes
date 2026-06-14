@@ -37,3 +37,44 @@
 *.pt        binary
 *.onnx      binary
 *.bin       binary
+
+# ---------------------------------------------------------------------------
+# v0.2.56: union merge driver for knowledge-graph nodes.
+#
+# WHY: A real 3rd-party user's Claude COMMITS knowledge-graph nodes locally
+# (the encouraged behavior — see CLAUDE.md + the post-file-edit hook). When a
+# later update folds in upstream, a KG file the user appended to ALSO touched
+# upstream appears on both sides of the merge. Git's default merge marks the
+# overlapping append region as a CONFLICT even though both sides are purely
+# ADDITIVE (the user appended a node; upstream appended an unrelated one).
+#
+# `merge=union` is git's BUILT-IN union driver: on conflict it keeps BOTH
+# sides' lines (concatenated) instead of writing conflict markers. For
+# append-only KG nodes this is exactly right — never loses a local node,
+# never loses an upstream addition, never needs a human. It is a no-op when
+# there is no conflict (the normal 3-way merge still runs).
+#
+# `union` is BUILT-IN: it needs NO `git config merge.<x>.driver` registration
+# in the user's `.git/config`. (Custom `ours`/`theirs` drivers WOULD require
+# that registration — `.gitattributes` alone can't enable a non-builtin
+# driver — so we deliberately avoid them.)
+#
+# SCOPE NOTES (deliberately NARROW — verified during the v0.2.56 review):
+#   * Only `knowledge/**/*.md` gets the driver. CLAUDE.md / CLAUDE.local.md /
+#     .claude/CONTEXT_STATE.md / .claude/MEMORY.md / HANDOFF-*.md were
+#     considered and REJECTED: CLAUDE.md is modify-heavy (in-place edits to
+#     ports/paths/rules), where union would keep BOTH contradictory lines —
+#     a clean conflict the user resolves is safer there. The other four are
+#     gitignored in this repo (git never merges gitignored files), so a rule
+#     for them would be a dead no-op.
+#   * FORWARD-ONLY: git reads the merge driver from the merge-base/HEAD side,
+#     so union does NOT apply to the very update that first introduces this
+#     file — it activates on updates AFTER v0.2.56 is committed locally. KG
+#     nodes are usually NEW files (which never conflict), so the practical
+#     gap is small; the launcher's auto-merge path is the primary fix and
+#     this driver is the secondary safety net for hand-run merges.
+#   * launcher/dist/** binaries intentionally get NO driver: the auto-merge
+#     path resolves the normal binary-refresh case to upstream, and the
+#     divergence modal correctly surfaces on a rare genuine binary conflict.
+
+knowledge/**/*.md          merge=union

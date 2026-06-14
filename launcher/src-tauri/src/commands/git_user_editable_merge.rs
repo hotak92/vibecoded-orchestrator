@@ -990,6 +990,108 @@ fn pick_python_for_deferral() -> Option<String> {
     None
 }
 
+/// v0.2.56 (Defect A fix): stateless probe — would merging the local
+/// HEAD with `vco_upstream/<branch>` produce a conflict-free tree?
+///
+/// THE PROBLEM this solves: a real 3rd-party user's Claude COMMITS KG
+/// nodes locally (the encouraged behavior — `post-file-edit` hook +
+/// CLAUDE.md both push it). Those local commits make `git pull
+/// --ff-only` refuse with non-fast-forward, surfacing the scary
+/// "Merge / Rebase / Cancel" modal — EVEN WHEN a real `git merge`
+/// would be 100% conflict-free (committed KG additions never overlap
+/// upstream's source/version/binary changes). The pre-merge step
+/// (`run_pre_merge_user_editable`) can't help here: it only inspects
+/// `git status --porcelain` (UNcommitted edits), so it's blind to the
+/// committed divergence. Result: every active install hits the modal on
+/// every update — not an edge case, the default trajectory.
+///
+/// THE FIX: before deciding `--ff-only` is the only option, ask git
+/// "would the merge conflict?" via `git merge-tree --write-tree HEAD
+/// <theirs>`. This is STATELESS: it computes the merge in git's object
+/// store and writes NOTHING to the working tree or index (unlike `git
+/// merge --no-commit`, which mutates the tree and needs an `--abort`
+/// even on success — a process death between merge-start and abort
+/// would leave a half-merged tree). Exit code contract (git >= 2.38,
+/// `man git-merge-tree`): 0 = clean, 1 = conflicts, >=2 = the merge
+/// could not even start (missing ref, etc.).
+///
+/// Returns:
+///   - `Ok(true)`  — merge is conflict-free; caller should do a REAL
+///                   `git merge` (not `--ff-only`) and proceed silently.
+///   - `Ok(false)` — real content conflict (exit 1) OR merge couldn't
+///                   start (exit >=2): caller must keep the modal so the
+///                   user resolves by hand. (Conservative: any non-zero,
+///                   non-clean outcome routes to the modal.)
+///   - `Err(_)`    — subprocess spawn failure ONLY; caller treats as
+///                   "can't probe" and falls back to the modal.
+///
+/// `theirs` is the already-resolved upstream tip SHA (use
+/// `compute_theirs_sha`) — we pass a concrete SHA rather than the
+/// `vco_upstream/<branch>` ref so this can't race an upstream push that
+/// lands between the fetch and the probe.
+pub(crate) async fn committed_divergence_merges_cleanly(
+    install_path: &Path,
+    theirs: &str,
+) -> Result<bool, String> {
+    let out = tokio::process::Command::new("git").silent()
+        .args(["merge-tree", "--write-tree", "HEAD", theirs])
+        .current_dir(install_path)
+        .output()
+        .await
+        .map_err(|e| format!("git merge-tree spawn failed: {}", e))?;
+    // Exit 0 = clean merge. Exit 1 = conflicts. Any other non-zero
+    // (git uses 128 for fatal errors like unrelated histories / missing
+    // object, not 2) = the merge couldn't even start. Only exit 0 is
+    // safe to auto-merge; EVERY non-zero outcome keeps the modal.
+    Ok(out.status.success())
+}
+
+/// v0.2.56 (Defect A fix — review BLOCKER B1): is the working tree clean
+/// (no uncommitted/staged/untracked-tracked changes)?
+///
+/// THE HAZARD this guards: the auto-merge path runs `git pull --no-rebase
+/// --autostash`. `--autostash` stashes uncommitted edits, merges, then
+/// pops. If the pop CONFLICTS (an uncommitted edit to a NON-union file
+/// overlaps upstream's change to the same region), git completes the pull
+/// with EXIT 0 but leaves `UU` conflict markers in the working tree + a
+/// dangling autostash. Because the pull exited 0, the launcher's
+/// post-pull conflict handler (gated on `!pull.status.success()`) never
+/// fires — so the launcher would restart on a silently-broken tree with
+/// no modal and no deferral. The OLD `--ff-only` path aborted cleanly in
+/// this exact state and routed to the modal; the auto-merge must NOT
+/// regress that.
+///
+/// The fix: only take the silent auto-merge when the working tree is
+/// CLEAN. With nothing to stash, `--autostash` is a guaranteed no-op and
+/// the pop-conflict hazard cannot arise. A dirty tree falls back to
+/// `--ff-only` — which aborts (non-FF) and surfaces the modal, exactly
+/// as before. (`pre_merge_user_editable` separately handles the
+/// allowlisted-uncommitted-edit case via the rebase arm; this guard is
+/// only consulted on the `!pre_merge_committed` branch.)
+///
+/// `git status --porcelain` lists EVERY non-clean path (modified, staged,
+/// renamed, deleted, and untracked). We treat ANY output as "dirty" —
+/// conservative on purpose: an untracked file is harmless to autostash,
+/// but gating on a fully-clean tree is the simplest provably-safe rule
+/// and a dirty tree just gets the (correct, safe) modal fallback.
+///
+/// Returns `Ok(true)` when clean, `Ok(false)` when dirty, `Err` only on
+/// subprocess spawn failure (caller treats Err as "can't confirm clean"
+/// → no auto-merge).
+pub(crate) async fn working_tree_is_clean(install_path: &Path) -> Result<bool, String> {
+    let out = tokio::process::Command::new("git").silent()
+        .args(["status", "--porcelain"])
+        .current_dir(install_path)
+        .output()
+        .await
+        .map_err(|e| format!("git status spawn failed: {}", e))?;
+    if !out.status.success() {
+        // Couldn't read status — don't claim clean.
+        return Ok(false);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1978,6 +2080,251 @@ mod tests {
             sidecar_path.exists(),
             "sidecar disappeared after failed pull: {}",
             sidecar_path.display(),
+        );
+    }
+
+    // ----- v0.2.56: committed_divergence_merges_cleanly probe -----
+
+    /// Commit a NEW local KG node (the universal 3rd-party scenario:
+    /// Claude commits a knowledge node, advancing local HEAD past
+    /// upstream) and push an UNRELATED upstream change. The probe must
+    /// report the merge is conflict-free → caller auto-merges, no modal.
+    #[tokio::test]
+    async fn v0256_probe_reports_clean_for_committed_kg_node_vs_unrelated_upstream() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // LOCAL: Claude commits a brand-new KG node (a real commit, not a
+        // working-tree edit — this is what the pre-merge step is BLIND to).
+        write_local_mod(
+            &local,
+            "knowledge/concepts/my-new-node.md",
+            "# My New Node\nlearned something\n",
+        );
+        run_git(&local, &["add", "knowledge/concepts/my-new-node.md"]);
+        run_git(&local, &["commit", "-m", "docs(kg): new node"]);
+
+        // UPSTREAM: an unrelated source change (different file entirely).
+        push_upstream_change(
+            &seed,
+            &local,
+            "vco_lib/foo.py",
+            "def base(): pass\ndef added_upstream(): pass\n",
+        );
+
+        // A bare --ff-only would now refuse (local HEAD diverged). But the
+        // merge is trivially clean: probe must say so.
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let clean = committed_divergence_merges_cleanly(&local, &theirs)
+            .await
+            .expect("probe should not error");
+        assert!(
+            clean,
+            "expected clean merge for committed KG node vs unrelated upstream change",
+        );
+
+        // Sanity: confirm --ff-only genuinely fails here (proves the probe
+        // is solving a real non-FF, not a case git would FF anyway).
+        let ff = StdCommand::new("git")
+            .args(["merge-base", "--is-ancestor", "HEAD", &theirs])
+            .current_dir(&local)
+            .status()
+            .expect("merge-base");
+        assert!(
+            !ff.success(),
+            "test precondition: HEAD must NOT be an ancestor of upstream (i.e. non-FF)",
+        );
+    }
+
+    /// Local and upstream edit the SAME line of the SAME file →
+    /// genuine content conflict. The probe must report NOT clean so the
+    /// caller keeps the modal for human resolution.
+    #[tokio::test]
+    async fn v0256_probe_reports_conflict_for_overlapping_edits() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // LOCAL: commit an edit to line 2 of CLAUDE.md.
+        write_local_mod(&local, "CLAUDE.md", "# base\nLine A (local edit)\nLine B\n");
+        run_git(&local, &["add", "CLAUDE.md"]);
+        run_git(&local, &["commit", "-m", "local edit"]);
+
+        // UPSTREAM: edit the SAME line differently.
+        push_upstream_change(
+            &seed,
+            &local,
+            "CLAUDE.md",
+            "# base\nLine A (upstream edit)\nLine B\n",
+        );
+
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let clean = committed_divergence_merges_cleanly(&local, &theirs)
+            .await
+            .expect("probe should not error");
+        assert!(
+            !clean,
+            "expected CONFLICT (not clean) for overlapping same-line edits",
+        );
+    }
+
+    /// The probe must be STATELESS: a clean probe (and even a conflicting
+    /// probe) must leave the working tree + index + HEAD untouched — no
+    /// MERGE_HEAD, no staged changes. This is the whole reason we use
+    /// `merge-tree --write-tree` instead of `git merge --no-commit`.
+    #[tokio::test]
+    async fn v0256_probe_is_stateless_no_working_tree_mutation() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        write_local_mod(&local, "knowledge/concepts/n.md", "# n\nbody\n");
+        run_git(&local, &["add", "knowledge/concepts/n.md"]);
+        run_git(&local, &["commit", "-m", "kg"]);
+        push_upstream_change(&seed, &local, "vco_lib/bar.py", "x = 1\n");
+
+        let head_before = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let _ = committed_divergence_merges_cleanly(&local, &theirs)
+            .await
+            .unwrap();
+
+        // HEAD unchanged.
+        let head_after = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        assert_eq!(
+            head_before.stdout, head_after.stdout,
+            "probe must not move HEAD",
+        );
+        // No merge in progress.
+        assert!(
+            !local.join(".git").join("MERGE_HEAD").exists(),
+            "probe must not leave a MERGE_HEAD (it must be stateless)",
+        );
+        // Working tree + index clean (no staged/unstaged changes).
+        let status = StdCommand::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&local)
+            .output()
+            .unwrap();
+        assert!(
+            status.stdout.is_empty(),
+            "probe must leave a clean working tree, got: {}",
+            String::from_utf8_lossy(&status.stdout),
+        );
+    }
+
+    /// End-to-end belt-and-suspenders: the shipped repo-root
+    /// `.gitattributes` declares `knowledge/**/*.md merge=union`, a
+    /// BUILT-IN driver that needs no `.git/config` registration. Prove a
+    /// real `git merge` of append-divergent KG nodes resolves WITHOUT
+    /// conflict markers and KEEPS BOTH additions. (This guards Defect B
+    /// independently of the launcher Rust path.)
+    #[tokio::test]
+    async fn v0256_gitattributes_union_driver_merges_kg_appends_without_registration() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // Ship the union driver in the LOCAL clone's .gitattributes
+        // (mirrors the repo-root file we add in v0.2.56). NO
+        // `git config merge.union.driver` — union is built-in.
+        write_local_mod(&local, ".gitattributes", "knowledge/**/*.md merge=union\n");
+        run_git(&local, &["add", ".gitattributes"]);
+        run_git(&local, &["commit", "-m", "attrs"]);
+
+        // Both sides APPEND a different line to the SAME existing KG file
+        // (seed shipped knowledge/concepts/foo.md = "# foo\nstart\n").
+        write_local_mod(&local, "knowledge/concepts/foo.md", "# foo\nstart\nLOCAL-NODE\n");
+        run_git(&local, &["add", "knowledge/concepts/foo.md"]);
+        run_git(&local, &["commit", "-m", "local kg append"]);
+        push_upstream_change(
+            &seed,
+            &local,
+            "knowledge/concepts/foo.md",
+            "# foo\nstart\nUPSTREAM-NODE\n",
+        );
+
+        // Real merge (the launcher's auto-merge path). Must succeed.
+        let merge = StdCommand::new("git")
+            .args(["merge", "--no-edit", "vco_upstream/main"])
+            .current_dir(&local)
+            .output()
+            .expect("git merge");
+        assert!(
+            merge.status.success(),
+            "union-driver merge must succeed: stdout={} stderr={}",
+            String::from_utf8_lossy(&merge.stdout),
+            String::from_utf8_lossy(&merge.stderr),
+        );
+        let merged = std::fs::read_to_string(local.join("knowledge/concepts/foo.md")).unwrap();
+        assert!(
+            merged.contains("LOCAL-NODE") && merged.contains("UPSTREAM-NODE"),
+            "union merge must keep BOTH additions, got:\n{}",
+            merged,
+        );
+        assert!(
+            !merged.contains("<<<<<<<") && !merged.contains(">>>>>>>"),
+            "union merge must NOT leave conflict markers, got:\n{}",
+            merged,
+        );
+    }
+
+    // ----- v0.2.56: working_tree_is_clean (review BLOCKER B1 guard) -----
+
+    /// A pristine clone (only committed content) is clean.
+    #[tokio::test]
+    async fn v0256_working_tree_is_clean_true_on_pristine_clone() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        assert!(
+            working_tree_is_clean(&local).await.unwrap(),
+            "a freshly-cloned tree with no edits must report clean",
+        );
+    }
+
+    /// An UNCOMMITTED edit makes the tree dirty — even a committed local
+    /// divergence on top must NOT be treated as clean. This is the B1
+    /// guard's reason for being: a dirty tree must fall back to --ff-only
+    /// (modal) rather than the silent --autostash auto-merge.
+    #[tokio::test]
+    async fn v0256_working_tree_is_clean_false_with_uncommitted_edit() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+
+        // Commit a KG node (committed divergence — the case auto-merge
+        // targets) ...
+        write_local_mod(&local, "knowledge/concepts/n.md", "# n\nbody\n");
+        run_git(&local, &["add", "knowledge/concepts/n.md"]);
+        run_git(&local, &["commit", "-m", "kg"]);
+        // ... then leave an UNCOMMITTED edit to a non-union source file
+        // (the exact B1 hazard: an autostash pop on this could conflict).
+        write_local_mod(&local, "vco_lib/foo.py", "def base(): pass\ndef wip(): pass\n");
+
+        assert!(
+            !working_tree_is_clean(&local).await.unwrap(),
+            "an uncommitted edit must make the tree report DIRTY so the \
+             auto-merge falls back to the safe --ff-only/modal path (B1)",
+        );
+    }
+
+    /// An untracked file also reports dirty (conservative — see helper doc).
+    #[tokio::test]
+    async fn v0256_working_tree_is_clean_false_with_untracked_file() {
+        skip_if_no_git!();
+        let (_tmp, _remote, local) = init_repo_pair();
+        write_local_mod(&local, "scratch.tmp", "junk\n");
+        assert!(
+            !working_tree_is_clean(&local).await.unwrap(),
+            "an untracked file must make the tree report dirty (conservative)",
         );
     }
 }

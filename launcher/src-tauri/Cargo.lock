@@ -5398,7 +5398,7 @@ dependencies = [
 
 [[package]]
 name = "vct-launcher-temp"
-version = "0.2.55"
+version = "0.2.56"
 dependencies = [
  "axum",
  "base64 0.22.1",
