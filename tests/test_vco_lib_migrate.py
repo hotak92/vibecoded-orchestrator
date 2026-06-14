@@ -529,11 +529,11 @@ class CliMigrateCommandTests(unittest.TestCase):
             self.assertEqual(rc, 1)
 
     def test_v0255_clean_dry_run_clears_stale_migration_deferral(self):
-        """v0.2.55 (SD15 stale-deferral fix): when a dry-run finds NO
+        """v0.2.55 (stale-migration-deferral fix): when a dry-run finds NO
         destructive action but a `schema_migration_required` deferral was
         left by an earlier update, the clean dry-run must CLEAR it (re-probe-
         clears-stale). PRE-v0.2.55 the stale entry survived every bundle
-        update forever (SD15's symptom)."""
+        update forever (the stale-deferral symptom)."""
         import tempfile
         from pathlib import Path
         from vco_lib.deferral_report import DeferralEntry, DeferralReport
