@@ -32,7 +32,7 @@
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.61.1",
-    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tailwindcss/vite": "^4.3.0",
     "@tauri-apps/cli": "^2",
     "@types/node": "^22.0.0",
@@ -40,7 +40,7 @@
     "svelte-check": "^4.4.8",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.3",
-    "vite": "^6.0.3",
+    "vite": "^8.0.16",
     "vitest": "^4.1.8"
   },
   "overrides": {
