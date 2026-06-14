@@ -1794,7 +1794,18 @@ pub async fn install_module_for_project(
             // daemon that should auto-start after install. `"cli"` /
             // `"mcp_stdio"` / `"mcp_http"` are deliberately excluded
             // (invoked on-demand, not persisted as containers).
-            let resolved_container_name = if manifest.install.method
+            // v0.2.59: capture BOTH the resolved container name (Some on a
+            // successful start) AND a container-start error (Some when the
+            // post-install start failed). Pre-v0.2.59 only the name was
+            // carried out, so the `module://install-complete` emit below
+            // always reported `success: true` even when the container start
+            // had just flipped the row to status=Error — the GUI toast then
+            // showed a generic "install did not complete (status: error)"
+            // with no reason. This was the confusing surface in the
+            // vct-rl-reranker `{module_id}` failure: install pulled fine,
+            // container start failed, but the success toast fired anyway.
+            let (resolved_container_name, container_start_error): (Option<String>, Option<String>) =
+                if manifest.install.method
                 == crate::manifest::InstallMethod::ContainerPull
                 && matches!(manifest.runtime.r#type.as_str(), "container" | "service")
             {
@@ -1909,7 +1920,7 @@ pub async fn install_module_for_project(
                                     .await;
                             });
                         }
-                        Some(name)
+                        (Some(name), None)
                     }
                     Err(e) => {
                         eprintln!(
@@ -1978,28 +1989,50 @@ pub async fn install_module_for_project(
                                 "scope": if is_global { "global" } else { "per_project" },
                             }),
                         );
-                        None
+                        (None, Some(e))
                     }
                 }
             } else {
-                None
+                (None, None)
             };
 
+            // v0.2.59: the install pull/extract succeeded, but if the
+            // post-install container start failed we must report THAT to
+            // the GUI — not a blanket `success: true`. A container/service
+            // module whose container never started is not a usable install,
+            // and the row was just flipped to status=Error with `last_error`
+            // set. Surface the real error so the toast is actionable
+            // instead of a generic "status: error".
+            let install_succeeded = container_start_error.is_none();
             let _ = app.emit(
                 "module://install-complete",
                 serde_json::json!({
                     "project_id": if is_global { None } else { Some(&project_id) },
                     "module_id": module_id,
-                    "success": true,
+                    "success": install_succeeded,
                     "scope": if is_global { "global" } else { "per_project" },
                     "container_name": resolved_container_name,
+                    "error": container_start_error,
                 }),
             );
-            Ok(ModuleInstallRow {
-                status: ModuleStatus::Installed,
-                container_name: resolved_container_name,
-                ..row
-            })
+            // v0.2.59: return a row that reflects the ACTUAL outcome. When
+            // the post-install container start failed, the DB row was just
+            // flipped to status=Error with `last_error` set; the returned
+            // row must match (pre-v0.2.59 it hardcoded status=Installed,
+            // contradicting the DB and the install-complete event).
+            match container_start_error {
+                Some(start_err) => Ok(ModuleInstallRow {
+                    status: ModuleStatus::Error,
+                    container_name: None,
+                    last_error: Some(start_err),
+                    ..row
+                }),
+                None => Ok(ModuleInstallRow {
+                    status: ModuleStatus::Installed,
+                    container_name: resolved_container_name,
+                    ..row
+                }),
+            }
         }
         Err(e) => {
             if is_global {

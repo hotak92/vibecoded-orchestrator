@@ -2821,10 +2821,51 @@ mod tests {
     }
 
     /// Unresolved non-`{project_slug}` placeholders are rejected.
+    ///
+    /// NOTE: this asserts the contract of the LOW-LEVEL resolver in
+    /// isolation — by the time a template reaches
+    /// `resolve_global_container_name`, the `{module_id}` token has
+    /// ALREADY been substituted upstream by
+    /// `RuntimeBlock::resolve_container_name_template`. A `{module_id}`
+    /// that still survives at this layer therefore genuinely is a bug
+    /// (a caller that bypassed the template resolver), so rejecting it
+    /// is correct. The end-to-end happy path is covered by
+    /// `v0259_global_container_name_resolves_module_id_token_end_to_end`
+    /// below.
     #[test]
     fn v0249_resolve_global_container_name_rejects_unresolved_placeholders() {
         let result = resolve_global_container_name("name-{module_id}", "vct-rl-reranker");
         assert!(result.is_err());
+    }
+
+    /// v0.2.59 regression: the canonical global-singleton template
+    /// `container_name_template: "{module_id}"` — the exact form shipped
+    /// by vct-rl-reranker v0.2.10's `vct-module.json` — must resolve to
+    /// the bare module id END-TO-END (template resolver → global name
+    /// resolver), not be rejected as an "unresolved placeholder".
+    ///
+    /// This is the bug the 2026-06-09 "global-singleton bidirectionally
+    /// verified" paper audit missed: every prior test used the
+    /// per-project-suffix form `"vct-rl-reranker-{project_slug}"`, so the
+    /// `"{module_id}"` form the real manifest ships was never exercised.
+    /// The install failed at container-start with
+    /// `container_name_template '{module_id}' has unresolved placeholders`.
+    #[test]
+    fn v0259_global_container_name_resolves_module_id_token_end_to_end() {
+        let manifest = make_rl_manifest_global_for_test();
+        let mut runtime = manifest.runtime.clone();
+        // Use the REAL shipped template, not the test factory's
+        // `-{project_slug}` form.
+        runtime.container_name_template = Some("{module_id}".into());
+
+        let template = runtime.resolve_container_name_template("vct-rl-reranker");
+        // Template resolver substitutes {module_id} at the choke-point.
+        assert_eq!(template, "vct-rl-reranker");
+
+        // Downstream global resolver now sees a clean bare name.
+        let resolved =
+            resolve_global_container_name(&template, "vct-rl-reranker").expect("must resolve");
+        assert_eq!(resolved, "vct-rl-reranker");
     }
 
     /// `rl_placeholders_global` substitutes `"global"` for `{project_slug}`.

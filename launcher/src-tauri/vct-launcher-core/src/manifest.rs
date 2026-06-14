@@ -1748,7 +1748,22 @@ impl RuntimeBlock {
         // NEW-3.B (2026-05-28): use declared value when non-empty.
         if let Some(t) = self.container_name_template.as_deref() {
             if !t.is_empty() {
-                return t.to_string();
+                // v0.2.59: substitute `{module_id}` here, at the single
+                // choke-point every name-resolution path funnels through
+                // (both `resolve_container_name` for per-project scope and
+                // `resolve_global_container_name` for global scope, across
+                // launcher + hub). The downstream resolvers only know how
+                // to substitute `{project_slug}`; without this, a manifest
+                // that names its container after the module — the canonical
+                // global-singleton form `container_name_template:
+                // "{module_id}"` shipped by vct-rl-reranker v0.2.10 — would
+                // reach `resolve_global_container_name("{module_id}", ...)`,
+                // which rejects the leftover `{...}` as "unresolved
+                // placeholders" and fails the install at container-start.
+                // `{module_id}` is always resolvable here (it's our own
+                // parameter), so resolve it eagerly and let the downstream
+                // resolver handle only the project-scoped token.
+                return t.replace("{module_id}", module_id);
             }
         }
         // Synthesize: replace non-alphanumeric with '-', collapse runs of
