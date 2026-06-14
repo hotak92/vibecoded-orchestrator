@@ -36,6 +36,15 @@ hit any project whose code graph is (re)built by the launcher.
   directory with no `vco_lib/` and crashed. Both bootstraps now route
   through one validated helper that honors both env-var names (the
   launcher sets `VCT_INSTALL_ROOT`, which the helper now uses).
+- **`artifact_schema_versions` upsert no longer duplicates orchestrator-wide
+  rows.** `register_artifact_version` used `INSERT OR REPLACE`, which relies
+  on the primary key to find the conflict — but SQLite treats `NULL` as
+  distinct in a uniqueness check, so a row with `project_id IS NULL`
+  (orchestrator-wide artifacts) was APPENDED rather than replaced, and a
+  stale duplicate could shadow the fresh version on read. Now a NULL-safe
+  delete-then-insert (matching the reader's `COALESCE(project_id,'')`)
+  keeps exactly one row. (Latent; surfaced by the new `kg_node_formats`
+  artifact below.)
 
 ### Added
 
@@ -51,6 +60,21 @@ hit any project whose code graph is (re)built by the launcher.
   `version.workspace = true` (no resurrected per-crate literal). The
   release-time `pre-ship-check.sh` sources the same logic, so CI and
   release can't disagree. Fast (~1s, no build/test).
+- **Regenerated-data file class for the bundle update.** Files that are
+  REGENERATED per-project (currently `knowledge/.node_formats.json`, the
+  KG-summary cache) no longer trigger the `bundle_user_modified_preserved`
+  warning when they diverge from the shipped seed — that divergence is
+  expected, not a user edit. The update silently keeps the local copy
+  (new `keep-regenerated` action) and only re-generates it when its schema
+  version bumps, tracked in the `artifact_schema_versions` DB registry
+  (artifact_type `kg_node_formats`, classified `derived`). On a future
+  schema bump the cache is re-generated from the project's KG nodes — never
+  blind-overwritten with the seed; if the generator backend can't run, an
+  info `regenerated_data_schema_migration_pending` deferral is written and
+  the cache is left intact. (User-authored living docs — `CLAUDE.md`,
+  `.claude/CONTEXT_STATE.md`, `.claude/MEMORY.md` — were already handled by
+  the separate `.reference.md` sidecar path; a test now pins that they
+  never double-warn.)
 
 v0.2.56 fixes a spurious "Local clone has diverged from upstream"
 modal that every active install was on track to hit on every update.

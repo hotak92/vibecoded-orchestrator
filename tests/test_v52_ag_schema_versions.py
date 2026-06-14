@@ -52,6 +52,7 @@ def test_canonical_versions_dict_populated() -> None:
         "codegraph_collection",
         # Layer 2 — KG content
         "kg_node_frontmatter",
+        "kg_node_formats",  # v0.2.57: .node_formats.json regen-cache (derived)
         # Layer 3 — Bundle
         "bundle_materialization",
         # Layer 4 — launcher.db row content

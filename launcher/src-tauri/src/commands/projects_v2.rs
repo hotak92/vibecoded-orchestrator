@@ -588,6 +588,12 @@ pub async fn create_project_v2(
 /// `vco_lib/artifact_version_registry.py` (V52-AG layer 2, commit
 /// `d472686e`) for the Python-side contract.
 ///
+/// v0.2.57: the Python-subprocess-hop pattern this TODO worried about is
+/// now established — `run_node_formats_schema_check` does exactly that for
+/// the `kg_node_formats` artifact (check + register via
+/// `check-node-formats-schema`). The `bundle_materialization` wiring can
+/// follow the same shape when picked up.
+///
 /// **Soft-fail discipline** — every step has the same shape:
 ///   - Queue a PENDING DB row (idempotent UPSERT). DB error → push
 ///     warning, skip the spawn (the spawn relies on the row's status
@@ -850,6 +856,22 @@ async fn apply_post_bundle_steps(
             project_name.to_string(),
             folder_path_str,
         );
+    }
+
+    // v0.2.57: regenerated-data schema gate for knowledge/.node_formats.json
+    // (artifact_type kg_node_formats). Lives HERE in the shared post-bundle
+    // pipeline (run by BOTH create + update) rather than only in the update
+    // flow, so the artifact is registered at the CURRENT canonical on
+    // create. That closes review-C1's window: if a node-formats schema bump
+    // ships between a project's create and its first update, the create-time
+    // registration means the first update correctly sees RECREATE_NEEDED
+    // (and regenerates) instead of swallowing it as NEVER_MATERIALIZED. The
+    // KG-summary generator above is async, so the cache may not exist yet at
+    // this point — registering the version anyway is correct (a fresh
+    // project is at the current schema by definition). Soft-fails to a
+    // warning; never blocks.
+    for w in run_node_formats_schema_check(folder, project_id).await {
+        warnings.push(w);
     }
 
     warnings
@@ -1512,6 +1534,124 @@ pub(crate) async fn run_migrate_dry_run(
     warnings
 }
 
+/// v0.2.57: schema-version gate for the regenerated KG-summary cache
+/// (`knowledge/.node_formats.json`, artifact_type `kg_node_formats`).
+/// Subprocess-calls `vco_lib.project_init check-node-formats-schema` during
+/// update — the sibling of `run_migrate_dry_run` for a regenerated DATA file
+/// rather than a Weaviate collection. Registers the artifact at the canonical
+/// version on first materialize, and on a schema bump regenerates the cache
+/// (or writes an info `regenerated_data_schema_migration_pending` deferral if
+/// the generator backend can't run). Closes the V52-AG layer-3
+/// `register_artifact_version` TODO for this artifact. Soft-fail: every error
+/// becomes a warning; the bundle update always proceeds.
+pub(crate) async fn run_node_formats_schema_check(
+    folder: &Path,
+    project_id: &str,
+) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    let system = match detect_system().await {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(format!(
+                "node-formats schema probe skipped: detect_system failed: {}. \
+                 Bundle install will proceed.",
+                e
+            ));
+            return warnings;
+        }
+    };
+    if !system.has_python {
+        warnings.push(
+            "node-formats schema probe skipped: no Python 3.11+ on PATH. \
+             Bundle install will proceed."
+                .to_string(),
+        );
+        return warnings;
+    }
+
+    let orch_root = match find_local_repo_root() {
+        Ok(p) => p,
+        Err(e) => {
+            warnings.push(format!(
+                "node-formats schema probe skipped: orchestrator root not found: {}. \
+                 Bundle install will proceed.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let folder_str = folder.to_string_lossy().to_string();
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    cmd.args([
+        "-m",
+        "vco_lib.project_init",
+        "check-node-formats-schema",
+        "--folder",
+        &folder_str,
+        "--project-id",
+        project_id,
+    ])
+    .current_dir(&orch_root)
+    .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let out = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            warnings.push(format!(
+                "node-formats schema probe subprocess failed to start: {}. \
+                 Bundle install will proceed.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(v) => {
+            let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("none");
+            if action == "deferred" || action == "deferred-downgrade" {
+                warnings.push(format!(
+                    "KG-summary cache schema check: `regenerated_data_schema_migration_pending` \
+                     info-deferral written to {}/.claude/context/UPDATE_DEFERRED.md. \
+                     The cache was NOT modified (regenerated data is never \
+                     blind-overwritten); re-run the KG-summary generator when \
+                     its backend is available.",
+                    folder_str
+                ));
+            }
+            // action in {none, registered, regenerated} → silent success.
+        }
+        Err(parse_err) => {
+            warnings.push(format!(
+                "node-formats schema probe produced unparseable output ({}): \
+                 stderr tail: {}. Bundle install will proceed.",
+                parse_err,
+                stderr
+                    .lines()
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+        }
+    }
+    warnings
+}
+
 /// PR 5 (2026-05-01): re-run the bundle install in update mode against an
 /// existing user project. Picks up newly-shipped orchestrator files (hooks,
 /// scripts, agents, skills, settings, infrastructure) WITHOUT overwriting
@@ -1579,6 +1719,12 @@ pub async fn update_project_v2(
     for w in run_migrate_dry_run(&folder, &row.name).await {
         warnings.push(w);
     }
+
+    // (v0.2.57: the regenerated-data schema gate for
+    // knowledge/.node_formats.json runs in the SHARED apply_post_bundle_steps
+    // pipeline below — NOT inline here — so it executes on BOTH create +
+    // update exactly once. See run_node_formats_schema_check + the C1 note in
+    // apply_post_bundle_steps.)
 
     // 4. Bundle install in update mode. Manifest-driven drift detection.
     let (bundle_warnings, summary) = run_install_bundle_update(&folder).await;

@@ -192,8 +192,23 @@ def register_artifact_version(
         )
     try:
         with _conn(db_path) as conn:
+            # NULL-safe upsert. `INSERT OR REPLACE` resolves conflicts via the
+            # PRIMARY KEY (project_id, artifact_type, artifact_name) — but in
+            # SQLite NULL is DISTINCT from NULL for uniqueness, so an
+            # orchestrator-wide row (project_id IS NULL) never "conflicts" and
+            # OR REPLACE would APPEND a duplicate instead of replacing. The
+            # read side (`check_artifact_version`) matches on
+            # COALESCE(project_id,'') — so a stale duplicate could shadow the
+            # fresh row. DELETE-then-INSERT with the same COALESCE match makes
+            # the upsert correct for both NULL and non-NULL project_id.
             conn.execute(
-                "INSERT OR REPLACE INTO artifact_schema_versions "
+                "DELETE FROM artifact_schema_versions "
+                "WHERE COALESCE(project_id, '') = COALESCE(?, '') "
+                "  AND artifact_type = ? AND artifact_name = ?",
+                (project_id, artifact_type, artifact_name),
+            )
+            conn.execute(
+                "INSERT INTO artifact_schema_versions "
                 "(project_id, artifact_type, artifact_name, schema_version, materialized_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (project_id, artifact_type, artifact_name, schema_version, materialized_at),

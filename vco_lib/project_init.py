@@ -2784,12 +2784,23 @@ class _BundleFileOp:
     `(bytes) -> bytes` for substitution (e.g. agent placeholder rewrites).
     `always_overwrite=True` for files that aren't user-customisable
     (e.g. hooks/_lib).
+
+    `regenerated_data=True` (v0.2.57) for shipped files that are actually
+    REGENERATED per-project at runtime (e.g. `knowledge/.node_formats.json`,
+    the KG-summary cache rewritten by generate-kg-summary.py). Such a file
+    diverges from the shipped seed the moment the project is used — that
+    divergence is EXPECTED, not a user customization, so it must NOT trip
+    the `bundle_user_modified_preserved` warning. On update it is silently
+    kept-local (action `keep-regenerated`) UNLESS its schema version bumped,
+    in which case it is re-generated/migrated (data ported forward, never
+    blind-overwritten with the seed). See `_file_action` + `_schema_version`.
     """
     dest_rel: str
     source_abs: Path
     source_rel: str = ""  # rel to orchestrator_root, for manifest
     transform: Optional[Callable[[bytes], bytes]] = None
     always_overwrite: bool = False
+    regenerated_data: bool = False
 
 
 def _enumerate_bundle_files(
@@ -2977,9 +2988,38 @@ def _enumerate_bundle_files(
                 source_rel=str(f.relative_to(orchestrator_root)),
                 transform=None,
                 always_overwrite=False,
+                # v0.2.57: regenerated per-project caches (e.g.
+                # `.node_formats.json`, the KG-summary cache) diverge from
+                # the shipped seed the moment the project is used — that
+                # is EXPECTED, not a user customization. Flagging them
+                # `regenerated_data` routes _file_action to `keep-regenerated`
+                # (silent keep-local, NO bundle_user_modified_preserved
+                # warning) instead of `preserve`. Schema-bump regeneration
+                # is gated by the artifact_schema_versions DB registry.
+                regenerated_data=_is_regenerated_data_file(dest_rel),
             ))
 
     return ops
+
+
+# v0.2.57: filenames under templates/knowledge/ that are REGENERATED
+# per-project at runtime rather than user-authored/curated. Kept as a
+# narrow, explicit allowlist (not a broad glob) so a newly-shipped curated
+# node can never be silently mis-classified as throwaway regenerated data.
+_REGENERATED_DATA_BASENAMES: frozenset = frozenset({
+    ".node_formats.json",   # KG-summary cache written by generate-kg-summary.py
+})
+
+#: Stable artifact_name for the kg_node_formats registry row. One cache per
+#: project (identified by project_id), so a fixed name — NOT the folder
+#: basename — keeps the row stable across project-folder renames (review N2).
+_NODE_FORMATS_ARTIFACT_NAME = "default"
+
+
+def _is_regenerated_data_file(dest_rel: str) -> bool:
+    """True if `dest_rel` is a regenerated per-project data file (not a
+    user-customizable bundle template). See `_REGENERATED_DATA_BASENAMES`."""
+    return Path(dest_rel).name in _REGENERATED_DATA_BASENAMES
 
 
 def _stale_orchestrator_root_heal_match(
@@ -3221,6 +3261,12 @@ def _file_action(
                           hash → safe to update with new shipped content.
       "preserve"        — file exists, user-modified vs manifest. Skip; emit
                           deferral.
+      "keep-regenerated"— v0.2.57: `op.regenerated_data=True` file (e.g.
+                          `.node_formats.json`) that diverged because the
+                          project REGENERATED it. Keep local, NO warning /
+                          deferral (the divergence is expected, not a user
+                          edit). Schema-bump regeneration gated separately
+                          by the artifact_schema_versions DB registry.
       "noop"            — file exists, source identical to installed (no-op).
       "always-overwrite"— `op.always_overwrite=True` (e.g. hooks/_lib).
       "skip-existing"   — first-install (update_mode=False) and target exists.
@@ -3339,6 +3385,19 @@ def _file_action(
         )
     ):
         return ("overwrite", source_bytes)
+
+    # v0.2.57: regenerated-data file (e.g. `.node_formats.json`). We reach
+    # here only when the installed bytes differ from BOTH the new shipped
+    # seed AND every prior-shipped/historical version — i.e. the file was
+    # rewritten. For a NORMAL bundle file that means "user-modified →
+    # preserve + warn". For a regenerated-data file it just means "the
+    # project generated its own cache", which is EXPECTED. Return
+    # `keep-regenerated` so we silently keep the local copy and DON'T emit
+    # the bundle_user_modified_preserved warning. (Schema-bump-driven
+    # regeneration is handled separately, gated by the
+    # artifact_schema_versions DB registry — not by this hash compare.)
+    if op.regenerated_data:
+        return ("keep-regenerated", source_bytes)
 
     # Default to safety: user-modified (or unknown provenance).
     return ("preserve", source_bytes)
@@ -5940,6 +5999,7 @@ def install_project_bundle(
             "preserve": [<rel>...],
             "skip-existing": [<rel>...],
             "skip-disabled": [<rel>...],        # Wave 2 D, 2026-05-22
+            "keep-regenerated": [<rel>...],     # v0.2.57: regen'd data, no warn
             "orphan-deleted": [<rel>...],       # v0.2.24 §A0
             "orphan-preserved": [<rel>...],     # v0.2.24 §A0
         },
@@ -5973,7 +6033,7 @@ def install_project_bundle(
             "actions": {k: [] for k in
                         ("create", "overwrite", "always-overwrite",
                          "noop", "preserve", "skip-existing",
-                         "skip-disabled",
+                         "skip-disabled", "keep-regenerated",
                          "orphan-deleted", "orphan-preserved")},
             "settings_action": "",
             "manifest_written": False,
@@ -6004,7 +6064,7 @@ def install_project_bundle(
         "actions": {k: [] for k in
                     ("create", "overwrite", "always-overwrite",
                      "noop", "preserve", "skip-existing",
-                     "skip-disabled",
+                     "skip-disabled", "keep-regenerated",
                      "orphan-deleted", "orphan-preserved")},
         "settings_action": "",
         "manifest_written": False,
@@ -6136,6 +6196,34 @@ def install_project_bundle(
             # Pure no-op other than the result["actions"]["skip-disabled"]
             # append below for caller introspection.
             pass
+
+        elif action == "keep-regenerated":
+            # v0.2.57: regenerated per-project data file (e.g.
+            # `.node_formats.json`). Its divergence from the shipped seed
+            # is EXPECTED (the project regenerated its own cache), NOT a
+            # user customization. So unlike "preserve":
+            #   * do NOT append to user_modified_paths (no
+            #     bundle_user_modified_preserved warning),
+            #   * do NOT record a `reason="preserve"` entry (it isn't a
+            #     user edit VCO must remember to offer --force for),
+            #   * keep the local file untouched on disk.
+            # We DO keep the manifest's prior `files` entry if present so
+            # later updates still recognize the shipped baseline, and we
+            # record a distinct preserved-entry reason for auditability
+            # (kept-regenerated) WITHOUT it surfacing in the user-modified
+            # deferral list. Schema-bump regeneration is gated separately
+            # by the artifact_schema_versions DB registry. (The kept path is
+            # recorded in result["actions"]["keep-regenerated"] below; no
+            # separate accumulator is needed.)
+            existing = manifest.get("files", {}).get(op.dest_rel)
+            if existing is not None:
+                new_files[op.dest_rel] = existing
+            new_preserved[op.dest_rel] = {
+                "shipped_sha256": shipped_hash,
+                "preserved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "shipped_source": op.source_rel,
+                "reason": "keep-regenerated",
+            }
 
         elif action == "noop":
             # File matches what we'd write. Manifest entry should reflect
@@ -8896,6 +8984,229 @@ def _cmd_check_bundle_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_check_node_formats_schema(args: argparse.Namespace) -> int:
+    """v0.2.57: schema-version gate for the regenerated KG-summary cache
+    (`knowledge/.node_formats.json`, artifact_type ``kg_node_formats``).
+
+    The cache is DERIVED (regeneratable from the project's KG nodes), so:
+      * NEVER_MATERIALIZED / UP_TO_DATE → register at canonical, no action.
+      * RECREATE_NEEDED (stored < canonical, i.e. the .node_formats schema
+        bumped in a release) → the cache must be re-generated in the NEW
+        schema. We attempt an inline regeneration (re-run
+        generate-kg-summary.py --force over every knowledge node); if that
+        can't run here (generator/​backend unavailable), write an INFO
+        ``regenerated_data_schema_migration_pending`` deferral with the
+        command, and DO NOT touch the existing cache (no data loss).
+      * REFUSE_DOWNGRADE (stored > canonical) → INFO deferral; never
+        downgrade-regenerate.
+
+    DB-aware: needs ``--db`` (defaults to the canonical launcher.db) and an
+    optional ``--project-id``. Folder-only callers (no launcher) pass no
+    project-id; the registry keys on COALESCE(project_id,'') so NULL works.
+    Always exits 0 unless --strict (this is an update-time probe; soft-fail
+    keeps the bundle update flowing). Prints a JSON result.
+    """
+    from . import artifact_version_registry as avr
+    from . import schema_versions as sv
+
+    folder = Path(args.folder).resolve()
+    db_path = Path(args.db).resolve() if getattr(args, "db", None) else _launcher_db_path()
+    project_id = getattr(args, "project_id", None) or None
+    # artifact_name: a STABLE constant, NOT the folder basename (review N2).
+    # The project is already identified by project_id; keying on the
+    # volatile folder name would orphan the registry row on a folder
+    # rename + re-trigger the NEVER_MATERIALIZED window. There is exactly
+    # one node-formats cache per project, so a fixed name is correct.
+    artifact_name = _NODE_FORMATS_ARTIFACT_NAME
+    formats_path = folder / "knowledge" / ".node_formats.json"
+    now_ms = int(getattr(args, "now_ms", 0)) or _now_ms_safe()
+
+    canonical = sv.canonical_version("kg_node_formats")
+    status = avr.check_artifact_version(
+        db_path,
+        project_id=project_id,
+        artifact_type="kg_node_formats",
+        artifact_name=artifact_name,
+    )
+
+    result = {
+        "folder": str(folder),
+        "artifact_type": "kg_node_formats",
+        "artifact_name": artifact_name,
+        "canonical_version": canonical,
+        "status": status.name,
+        "action": "none",
+        "regenerated": False,
+        "deferral_written": False,
+    }
+
+    if status in (avr.ArtifactVersionStatus.NEVER_MATERIALIZED,
+                  avr.ArtifactVersionStatus.UP_TO_DATE):
+        # Record the version so a FUTURE canonical bump is detectable.
+        # Idempotent upsert. Register UNCONDITIONALLY (review C1): a fresh
+        # project is, by definition, at the current node-formats schema —
+        # whether or not the cache file has been materialized YET (the
+        # KG-summary generator runs async/in the background, so the file
+        # may not exist at update-check time). Registering here closes the
+        # window where a schema bump shipped between create and first
+        # update would be swallowed as NEVER_MATERIALIZED (registering
+        # straight to the new canonical, skipping regeneration). Now the
+        # first check records the CURRENT canonical, so the NEXT bump is
+        # correctly seen as RECREATE_NEEDED. A project that never uses KG
+        # just carries a harmless registry row.
+        avr.register_artifact_version(
+            db_path, project_id=project_id, artifact_type="kg_node_formats",
+            artifact_name=artifact_name, schema_version=canonical,
+            materialized_at=now_ms,
+        )
+        result["action"] = "registered"
+    elif status == avr.ArtifactVersionStatus.RECREATE_NEEDED:
+        # The .node_formats schema bumped. Re-generate in the new schema
+        # (force-rewrite every node's entry), preserving the node SET (we
+        # re-derive from the same knowledge/**/*.md files). If regen can't
+        # run, defer — NEVER overwrite/clobber the existing cache.
+        regenerated, detail = _regenerate_node_formats(folder)
+        if regenerated:
+            avr.register_artifact_version(
+                db_path, project_id=project_id, artifact_type="kg_node_formats",
+                artifact_name=artifact_name, schema_version=canonical,
+                materialized_at=now_ms,
+            )
+            result["action"] = "regenerated"
+            result["regenerated"] = True
+        else:
+            _write_node_formats_migration_deferral(folder, canonical, detail)
+            result["action"] = "deferred"
+            result["deferral_written"] = True
+            result["detail"] = detail
+    elif status == avr.ArtifactVersionStatus.REFUSE_DOWNGRADE:
+        _write_node_formats_migration_deferral(
+            folder, canonical,
+            "on-disk kg_node_formats schema is NEWER than this orchestrator "
+            "expects (you may have downgraded). Not modifying the cache.",
+        )
+        result["action"] = "deferred-downgrade"
+        result["deferral_written"] = True
+
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _now_ms_safe() -> int:
+    """Milliseconds since epoch. Wrapped so tests can inject via --now-ms
+    (Date.now()-style time isn't available in some sandboxes)."""
+    return int(time.time() * 1000)
+
+
+def _regenerate_node_formats(folder: Path) -> tuple[bool, str]:
+    """Force-regenerate `knowledge/.node_formats.json` by re-running the
+    KG-summary generator over every node. Returns (ok, detail).
+
+    Returns ``ok=True`` ONLY when regeneration ACTUALLY happened — i.e.
+    every node's generator run exited 0 AND the cache file's content
+    changed. Otherwise ``(False, <reason>)`` so the caller DEFERS and
+    leaves the cache intact (no data loss, no false "migrated" registry
+    row).
+
+    Why the content-change check (review B1): `generate-kg-summary.py`
+    exits 0 WITHOUT writing when no summary backend is available
+    (`select_backend() == "skip"` — the normal headless-update state: no
+    `claude` CLI, no Ollama, no API key). A per-node exit-code check alone
+    would then report success while nothing was regenerated, registering
+    the artifact at the new schema version with a stale cache + no
+    deferral — silently masking the migration. Hashing the cache
+    before/after the `--force` pass detects this: a real regeneration
+    rewrites entries (new ``generated_at`` at minimum), so an UNCHANGED
+    file after force-regenerating >=1 node means the backend didn't run.
+
+    Why all-or-defer (review C2): a PARTIAL regen (some nodes succeed,
+    some genuinely error) would leave a MIXED-schema cache that the
+    registry would then mark fully-migrated, so the stale entries never
+    self-heal. Any per-node failure → defer; the registry stays at the old
+    version and the next update retries until it fully converges.
+    """
+    gen = folder / ".claude" / "scripts" / "generate-kg-summary.py"
+    if not gen.is_file():
+        return (False, f"generator not found at {gen}")
+    knowledge_dir = folder / "knowledge"
+    nodes = sorted(p for p in knowledge_dir.rglob("*.md")) if knowledge_dir.is_dir() else []
+    if not nodes:
+        return (False, "no knowledge/**/*.md nodes to regenerate from")
+    formats_path = knowledge_dir / ".node_formats.json"
+    before_hash = _file_sha256(formats_path) if formats_path.exists() else ""
+    py = sys.executable or "python3"
+    failures = 0
+    for node in nodes:
+        try:
+            proc = _subprocess_run_quiet(
+                [py, str(gen), str(node), "--force"], cwd=folder
+            )
+            if proc != 0:
+                failures += 1
+        except Exception:
+            failures += 1
+    # C2: any failure → defer (never register a half-migrated cache).
+    if failures:
+        return (False, f"{failures}/{len(nodes)} node regenerations failed — deferring")
+    # B1: all exited 0, but did anything actually get written? If the cache
+    # is byte-identical, the backend was unavailable (exit-0-no-write) →
+    # treat as NOT regenerated and defer.
+    after_hash = _file_sha256(formats_path) if formats_path.exists() else ""
+    if after_hash == before_hash:
+        return (False,
+                "generator ran but the cache did not change — summary backend "
+                "unavailable (no claude CLI / Ollama / API key). Cache left "
+                "intact; re-run when a backend is available.")
+    return (True, f"regenerated {len(nodes)} node summaries")
+
+
+def _subprocess_run_quiet(argv: list[str], cwd: Path) -> int:
+    """Run a subprocess, returning its exit code; stdout/stderr suppressed.
+    Isolated so tests can monkeypatch it without spawning real processes."""
+    import subprocess
+    return subprocess.run(
+        argv, cwd=str(cwd),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode
+
+
+def _write_node_formats_migration_deferral(folder: Path, canonical: int, detail: str) -> None:
+    """INFO deferral `regenerated_data_schema_migration_pending`: the
+    .node_formats schema bumped but regeneration couldn't run inline. The
+    existing cache is untouched; this tells the project's Claude how to
+    regenerate manually."""
+    try:
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+        report = DeferralReport.read(folder)
+        report.add_entry(DeferralEntry(
+            condition_id="regenerated_data_schema_migration_pending",
+            severity="info",
+            title="KG-summary cache schema bumped — regeneration pending",
+            detected=(
+                f"`knowledge/.node_formats.json` is at an older schema than "
+                f"this orchestrator's canonical v{canonical}. It is a "
+                f"regenerated cache (derived from your KG nodes), so it was "
+                f"NOT overwritten. Inline regeneration did not run: {detail}."
+            ),
+            why_deferred=(
+                "Regenerated-data files are re-derived, never blind-overwritten. "
+                "When the generator backend is available, re-running it rewrites "
+                "the cache in the new schema with no data loss."
+            ),
+            command_to_apply=(
+                "# Regenerate every node summary in the new schema:\n"
+                "for f in knowledge/**/*.md; do "
+                "python .claude/scripts/generate-kg-summary.py \"$f\" --force; done\n"
+                f"# Then dismiss:\n"
+                f"python -m vco_lib.project_init dismiss-deferral --folder {str(folder)!r} "
+                f"--condition-id regenerated_data_schema_migration_pending"
+            ),
+        ))
+        report.write(folder)
+    except Exception as exc:  # never block the update flow
+        print(f"[node-formats] deferral write failed (non-fatal): {exc}", file=sys.stderr)
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m vco_lib.project_init",
@@ -9199,6 +9510,39 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Target user-project folder.",
     )
     p_check_resume.set_defaults(func=_cmd_check_bundle_resume)
+
+    # v0.2.57: schema-version gate for the regenerated KG-summary cache
+    # (knowledge/.node_formats.json). The launcher subprocesses this during
+    # update — mirrors the migrate-collections schema-drift probe but for the
+    # kg_node_formats artifact. Registers on first materialize; regenerates
+    # (or defers) on a canonical schema bump. NEVER blind-overwrites.
+    p_check_nf = sub.add_parser(
+        "check-node-formats-schema",
+        help=(
+            "Schema-version gate for knowledge/.node_formats.json "
+            "(artifact_type kg_node_formats). Registers at canonical on first "
+            "materialize; on a schema bump, regenerates the cache (or writes "
+            "an info deferral). Emits a JSON result; exit 0 (probe)."
+        ),
+    )
+    p_check_nf.add_argument(
+        "--folder", required=True,
+        help="Target user-project folder.",
+    )
+    p_check_nf.add_argument(
+        "--db", default=None,
+        help="launcher.db path (defaults to the canonical ~/.vct/launcher.db).",
+    )
+    p_check_nf.add_argument(
+        "--project-id", default=None,
+        help="Project id/slug for the artifact_schema_versions row "
+             "(optional; registry keys on COALESCE(project_id,'')).",
+    )
+    p_check_nf.add_argument(
+        "--now-ms", default=0, type=int,
+        help="Override materialized_at epoch-ms (testing; 0 = wall clock).",
+    )
+    p_check_nf.set_defaults(func=_cmd_check_node_formats_schema)
 
     return parser
 

@@ -75,6 +75,17 @@ CODEGRAPH_COLLECTION_SCHEMA_VERSION = 4
 #: idempotently on first pass.
 KG_NODE_FRONTMATTER_SCHEMA_VERSION = 1
 
+#: ``knowledge/.node_formats.json`` per-entry shape (the KG-summary cache
+#: written by ``generate-kg-summary.py``). v1 entry shape:
+#: ``{title, description, summary, generated_at, content_hash, backend}``.
+#: DERIVED — fully regeneratable from the project's KG nodes, so a schema
+#: bump triggers a clean regeneration (re-run the summary generator), not a
+#: forward-migration. v0.2.57: registered so the bundle-update flow keeps
+#: the per-project cache silently (action ``keep-regenerated``) and only
+#: re-generates when THIS version bumps — handled via the
+#: ``artifact_schema_versions`` DB registry, NOT a marker inside the JSON.
+KG_NODE_FORMATS_SCHEMA_VERSION = 1
+
 # ===========================================================================
 # Layer 3 — Bundle materialization (DERIVED — manifest-driven)
 # ===========================================================================
@@ -158,8 +169,9 @@ CANONICAL_VERSIONS: dict[str, int] = {
     "diagrams_collection":        DIAGRAMS_COLLECTION_SCHEMA_VERSION,
     "development_collection":     DEVELOPMENT_COLLECTION_SCHEMA_VERSION,
     "codegraph_collection":       CODEGRAPH_COLLECTION_SCHEMA_VERSION,
-    # Layer 2 — KG content (USER-CURATED)
-    "kg_node_frontmatter":        KG_NODE_FRONTMATTER_SCHEMA_VERSION,
+    # Layer 2 — KG content
+    "kg_node_frontmatter":        KG_NODE_FRONTMATTER_SCHEMA_VERSION,   # user-curated
+    "kg_node_formats":            KG_NODE_FORMATS_SCHEMA_VERSION,        # derived (regen cache)
     # Layer 3 — Bundle (DERIVED)
     "bundle_materialization":     BUNDLE_MATERIALIZATION_SCHEMA_VERSION,
     # Layer 4 — launcher.db row content
@@ -191,8 +203,9 @@ ARTIFACT_STATE_CLASSIFICATION: dict[str, str] = {
     "diagrams_collection":        "derived",
     "development_collection":     "derived",
     "codegraph_collection":       "derived",
-    # Layer 2 — KG content (user-curated)
+    # Layer 2 — KG content
     "kg_node_frontmatter":        "user_curated",
+    "kg_node_formats":            "derived",          # regen cache (generate-kg-summary)
     # Layer 3 — Bundle (derived from templates/)
     "bundle_materialization":     "derived",
     # Layer 4 — launcher.db rows
