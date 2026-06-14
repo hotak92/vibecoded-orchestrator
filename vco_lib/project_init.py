@@ -8172,6 +8172,9 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
         result = {"plan": [], "dry_run": bool(args.dry_run), "errors": []}
 
     result.setdefault("deferral_emitted", False)
+    # v0.2.55 (SD15 stale-deferral fix): True when a clean dry-run cleared a
+    # stale `schema_migration_required` entry left by an earlier update.
+    result.setdefault("stale_migrate_deferral_cleared", False)
     result.setdefault("v0218_schema_reports", [])
 
     # v0.2.18: additive migration to the new 5-slot KG + 6-slot Code
@@ -8392,10 +8395,11 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
             e for e in result.get("plan", [])
             if e.get("action") in ("copy", "rebuild")
         ]
+        resolved_folder = Path(project_folder).resolve()
         if destructive:
             try:
                 _emit_migrate_required_deferral(
-                    Path(project_folder).resolve(),
+                    resolved_folder,
                     project_name=args.name,
                     weaviate_url=args.weaviate_url or _weaviate_url_default(),
                     plan_entries=destructive,
@@ -8409,6 +8413,42 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
                     "collection": None,
                     "action": "deferral",
                     "error": f"migrate-required deferral write failed: "
+                             f"{type(e).__name__}: {e}",
+                })
+        else:
+            # v0.2.55 (SD15 stale-deferral fix): the dry-run is CLEAN (no
+            # copy/rebuild needed). PRE-v0.2.55 this branch did nothing, so
+            # a `schema_migration_required` entry written by an EARLIER
+            # update (when a migration WAS pending) survived forever even
+            # after the migration was applied or the schema healed —
+            # exactly the SD15 carry-forward bug (the entry was re-read by
+            # `DeferralReport.read()` on every subsequent bundle update and
+            # never cleared because the emitter is gated on `destructive`).
+            # Re-probe-clears-stale, matching the Track D `--apply-deferred`
+            # discipline: a clean dry-run IS the re-probe; clear the stale
+            # entry. Soft-fail — never abort the update over a deferral
+            # housekeeping write.
+            try:
+                from vco_lib.deferral_report import DeferralReport
+
+                report = DeferralReport.read(resolved_folder)
+                if report.has_condition("schema_migration_required"):
+                    report.mark_resolved("schema_migration_required")
+                    report.write(resolved_folder)
+                    result["stale_migrate_deferral_cleared"] = True
+                    # stderr (not stdout) so `--json` output stays parseable.
+                    print(
+                        "  [ok] schema_migration_required: dry-run clean — "
+                        "cleared stale migration deferral (no copy/rebuild "
+                        "needed).",
+                        file=sys.stderr,
+                    )
+            except Exception as e:
+                # Housekeeping only — report but don't fail.
+                result["errors"].append({
+                    "collection": None,
+                    "action": "deferral-clear",
+                    "error": f"stale migrate-deferral clear failed: "
                              f"{type(e).__name__}: {e}",
                 })
 

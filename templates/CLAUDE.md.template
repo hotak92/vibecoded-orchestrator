@@ -29,7 +29,7 @@ _(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
 **Before answering any non-trivial question:**
 
 1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
-2. Check `.claude/context/UPDATE_DEFERRED.md` if present — the last orchestrator update may have queued conditions you need to know about (in particular `update_resume_required` halts here until a manual nudge).
+2. Check `.claude/context/UPDATE_DEFERRED.md` if present — the last orchestrator update may have queued conditions you need to know about. Two to surface proactively: `update_resume_required` (an update halted at a conflict and needs a manual nudge — click **Continue Update** in the launcher or run `python install.py --update`) and `launcher_update_diverged` (a GUI update could not fast-forward / pull / fully refresh the binary — inspect `git status`, resolve the divergence, then re-run the update). Each entry's **For your Claude assistant** block has the specific recovery.
 3. For architecture / system questions → search the KG **before** generating a response.
 4. For any other project question → search KG / code graph **before** answering.
 

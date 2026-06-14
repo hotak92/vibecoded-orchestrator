@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.55] - 2026-06-14
+
+v0.2.55 is a focused fix for the launcher GUI self-update path. A
+"Fetch + Install" update could leave the launcher running the OLD
+binary while still offering the update — an infinite "update available"
+loop with no error the user could act on.
+
+### Fixed
+
+- **Launcher restarts into an available newer binary "in any case"**
+  (the primary bug). `finalize_update_and_restart` previously returned
+  an error and never restarted when `WaitForBinaryRefresh` timed out —
+  even when a newer dist binary than the running launcher was already on
+  disk. It now restarts into that newer binary (strictly better than
+  staying on the old one) and records the partial-refresh state durably;
+  it only hard-fails when there is genuinely no newer binary to run.
+- **Durable, Claude-readable update-failure logging.** Launcher-side
+  update failures that previously surfaced only as a transient GUI modal
+  now also write a `launcher_update_diverged` entry to
+  `.claude/context/UPDATE_DEFERRED.md` (four kinds: non-fast-forward
+  divergence, partial binary refresh, binary-refresh timeout, and a
+  generic git-pull failure). The project `CLAUDE.md` SESSION START rule
+  now names this condition so a session reads it at start. The entry
+  self-clears on the next successful update (re-probed against the
+  on-disk launcher + hub versions).
+- **Local fallback builds are staged into `launcher/dist/`.** The
+  `post-install-launcher.sh` build/download fallbacks now copy the
+  acquired binary into the canonical `launcher/dist/<arch>/` slot the
+  restart path re-execs (atomic temp+mv; skips macOS `.app` bundles).
+  Inside a launcher-managed update the shell helper now defers binary
+  acquisition to the Rust path entirely (no wasteful local build).
+- **Hub binary freshness gating.** `WaitForBinaryRefresh` now also gates
+  the post-update restart on the on-disk `vct-hub` metadata version, so
+  an update cannot restart into a launcher that would start a stale hub.
+  Absent hub metadata degrades gracefully (no deadlock).
+- **Stale `schema_migration_required` deferrals self-clear.** A clean
+  pre-update schema dry-run (no copy/rebuild needed) now clears a stale
+  migration deferral left by an earlier update instead of carrying it
+  forward forever; unrelated deferral entries are preserved.
+
+### Added
+
+- `tests/test_launcher_dist_subdir_parity.py` — cross-language parity
+  test pinning the OS→dist-subdir mapping across the bash, Python, and
+  Rust resolvers (specified in `docs/INSTALL_ARCHITECTURE_v2.md` §10.1,
+  Track A; first implemented here).
+
 ## [0.2.54] - 2026-06-12
 
 v0.2.54 is a multi-wave hardening release. Wave 0 made the Windows

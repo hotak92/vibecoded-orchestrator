@@ -565,6 +565,103 @@ _bundled_binary_is_fresh() {
     return 1
 }
 
+# v0.2.55 (launcher self-update fix): resolve the canonical dist subdir for
+# the current OS + arch. MUST stay in sync with three siblings that all
+# resolve the same path:
+#   - install.py::_launcher_binary_relative_path
+#   - launcher/src-tauri/src/commands/restart.rs::launcher_binary_relative_path
+#   - launcher/src-tauri/src/commands/installer.rs::launcher_dist_subdir
+# The launcher GUI's "Fetch + Install" restart (restart.rs) ALWAYS relaunches
+# from `launcher/dist/<subdir>/vct-launcher` — so a local fallback build that
+# lands only in `target/release/` is invisible to the restart and the user
+# keeps running the OLD binary. Echoing the subdir here lets the build path
+# stage its output where the restart will find it.
+_canonical_dist_subdir() {
+    case "$OS" in
+        macos)
+            # Arch-aware (v0.2.54 Track C): Intel Macs build into macos-x64,
+            # Apple Silicon into macos-arm64. `uname -m` reports arm64 on
+            # Apple Silicon, x86_64 on Intel.
+            case "$(uname -m 2>/dev/null)" in
+                arm64|aarch64) printf '%s\n' "macos-arm64" ;;
+                *)             printf '%s\n' "macos-x64" ;;
+            esac
+            ;;
+        linux)   printf '%s\n' "linux-x64" ;;
+        *)       return 1 ;;
+    esac
+}
+
+# v0.2.55 (defect #1 fix): stage a locally-built launcher binary into the
+# canonical `launcher/dist/<subdir>/vct-launcher` slot. After `tauri build`
+# the executable lands at `target/release/vct-launcher-temp` (the Cargo crate
+# name; see launcher/src-tauri/Cargo.toml). Pre-v0.2.55 NOTHING copied it into
+# dist/, so the Rust restart (restart.rs::resolve_target_binary) relaunched
+# the OLD dist binary and the GUI update appeared to do nothing.
+#
+# This mirrors install.py::_refresh_dist_binary_after_rebuild (which already
+# stages cargo output to dist) and install.py::_try_cargo_tauri_build's own
+# copy step (install.py ~19813). We add the same behaviour to the shell
+# fallback build so all three launcher-build paths converge on dist/.
+#
+# Args: $1 = path to the freshly-built binary (the value find_binary returned
+#            after the build). Soft-fail: any error is logged + ignored so the
+#            install never aborts here (the build already succeeded).
+# Echoes the staged dist path on success (so the caller can re-point
+# LAUNCHER_BIN at the canonical location); empty on no-op/failure.
+_stage_built_binary_into_dist() {
+    local built="$1"
+    [ -z "$built" ] && return 1
+    [ -f "$built" ] || return 1
+
+    # Only stage when the built binary is NOT already a dist binary
+    # (find_binary may have returned the dist path directly when the
+    # bundled binary was fresh — nothing to stage in that case).
+    case "$built" in
+        "$REPO_ROOT"/launcher/dist/*) return 0 ;;  # already canonical
+    esac
+
+    # macOS .app bundle: the binary is the inner Mach-O of a directory
+    # bundle. Copying just the inner executable into a flat dist path
+    # would strip the Info.plist + resources and produce an unlaunchable
+    # file. The dist-staging path is for flat single-file binaries
+    # (Linux, and Intel/ARM Mac flat builds) only — skip .app bundles and
+    # let find_binary keep resolving the .app candidates directly.
+    case "$built" in
+        *.app/Contents/MacOS/*) return 0 ;;
+    esac
+
+    local subdir
+    subdir="$(_canonical_dist_subdir)" || return 1
+    [ -z "$subdir" ] && return 1
+
+    local dist_dir="$REPO_ROOT/launcher/dist/$subdir"
+    local dist_path="$dist_dir/vct-launcher"
+
+    if ! mkdir -p "$dist_dir" 2>/dev/null; then
+        echo "[launcher] could not create $dist_dir — skipping dist staging" >&2
+        _log_event "build/stage-dist" "error" "mkdir failed for $dist_dir"
+        return 1
+    fi
+
+    # Atomic-ish copy: write to a temp sibling then mv into place so a
+    # concurrent reader never sees a half-written binary.
+    local tmp="$dist_path.staging.$$"
+    if cp "$built" "$tmp" 2>/dev/null && chmod +x "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$dist_path" 2>/dev/null; then
+        echo "[launcher] Staged built binary into dist: $dist_path"
+        _log_event "build/stage-dist" "ok" "$dist_path" \
+            "{\"src\":\"$(_json_escape "$built")\",\"dest\":\"$(_json_escape "$dist_path")\"}"
+        printf '%s\n' "$dist_path"
+        return 0
+    fi
+
+    rm -f "$tmp" 2>/dev/null || true
+    echo "[launcher] failed to stage built binary into $dist_path (non-fatal)" >&2
+    _log_event "build/stage-dist" "error" "copy/mv failed -> $dist_path"
+    return 1
+}
+
 LAUNCHER_BIN="$(find_binary || true)"
 
 # If find_binary picked a bundled binary, verify it's fresh. Stale =
@@ -580,6 +677,32 @@ if [ -n "$LAUNCHER_BIN" ]; then
         "{\"path\":\"$(_json_escape "$LAUNCHER_BIN")\"}"
 else
     _log_event "binary-probe" "skip" "no existing launcher binary on disk"
+
+    # v0.2.55 (freshness-ordering fix): when we're running INSIDE the
+    # launcher GUI's "Fetch + Install" update (the Rust update_orchestrator
+    # command sets VCT_AUTO_RESTART_LAUNCHER=1 in the install.py env, which
+    # we inherit), binary acquisition is owned by the Rust path:
+    # finalize_update_and_restart::WaitForBinaryRefresh re-pulls main until
+    # the released dist binary lands, then restart_launcher relaunches from
+    # launcher/dist/<arch>/. A fallback build HERE is the wasteful 4-minute
+    # detour the user reported: it builds into target/release/, which the
+    # Rust restart never reads, so the work is discarded and the user keeps
+    # running the old dist binary. Defer: skip build/download, let the Rust
+    # path fetch the committed released binary. This is the desktop-icon
+    # step (--no-auto-launch is always passed by install.py here); on an
+    # update the icon already exists, and the Rust restart_launcher relaunch
+    # uses the freshly-staged dist binary regardless of the icon. The icon
+    # is refreshed on the next start-launcher run if its target ever drifts.
+    if [ "${VCT_AUTO_RESTART_LAUNCHER:-0}" = "1" ]; then
+        echo "[launcher] No bundled binary yet, but a launcher-managed update is in"
+        echo "           flight (VCT_AUTO_RESTART_LAUNCHER=1). Deferring binary"
+        echo "           acquisition to the launcher's update flow — it will pull the"
+        echo "           released dist binary and restart. Skipping local build."
+        _log_event "binary-probe" "skip" \
+            "deferred to launcher-managed update (VCT_AUTO_RESTART_LAUNCHER=1)"
+        exit 0
+    fi
+
     # ----- Step 3: prompt for path --------------------------------------------
     echo "==============================================="
     echo "  Launcher binary not found. Choose how to get it:"
@@ -807,6 +930,18 @@ PY
                             echo "[launcher] Extracted launcher to $LAUNCHER_BIN"
                             _log_event "download" "ok" "$OS zip extracted" \
                                 "{\"path\":\"$(_json_escape "$LAUNCHER_BIN")\"}"
+                            # v0.2.55 (defect #1 fix): the download path stages
+                            # into ~/.local/share/vct-launcher/ (Linux flat
+                            # case), which the launcher GUI restart never
+                            # consults. Mirror the build path: also place the
+                            # binary in launcher/dist/<arch>/ so restart.rs's
+                            # resolve_target_binary finds it. macOS .app
+                            # bundles are left in place (not a single flat
+                            # binary) and skipped by the dist-stager.
+                            staged_dist="$(_stage_built_binary_into_dist "$LAUNCHER_BIN" || true)"
+                            if [ -n "$staged_dist" ] && [ -x "$staged_dist" ]; then
+                                LAUNCHER_BIN="$staged_dist"
+                            fi
                         else
                             echo "[launcher] No launcher binary found inside $asset_name. Falling back to build."
                             _log_event "download" "error" "$OS zip missing launcher binary"
@@ -1335,6 +1470,15 @@ PY
             _log_event "build/locate" "error" "binary missing after build success"
         else
             _log_event "build/locate" "ok" "$LAUNCHER_BIN"
+            # v0.2.55 (defect #1 fix): a fallback build lands in
+            # target/release/ but the launcher GUI restart relaunches from
+            # launcher/dist/<arch>/. Stage the fresh binary into dist so the
+            # next restart (and the desktop icon, re-pointed below) actually
+            # runs the binary we just built — not the stale dist one.
+            staged_dist="$(_stage_built_binary_into_dist "$LAUNCHER_BIN" || true)"
+            if [ -n "$staged_dist" ] && [ -x "$staged_dist" ]; then
+                LAUNCHER_BIN="$staged_dist"
+            fi
         fi
     fi
 fi

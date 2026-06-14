@@ -528,6 +528,90 @@ class CliMigrateCommandTests(unittest.TestCase):
                 rc = project_init.main(argv)
             self.assertEqual(rc, 1)
 
+    def test_v0255_clean_dry_run_clears_stale_migration_deferral(self):
+        """v0.2.55 (SD15 stale-deferral fix): when a dry-run finds NO
+        destructive action but a `schema_migration_required` deferral was
+        left by an earlier update, the clean dry-run must CLEAR it (re-probe-
+        clears-stale). PRE-v0.2.55 the stale entry survived every bundle
+        update forever (SD15's symptom)."""
+        import tempfile
+        from pathlib import Path
+        from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            # Pre-seed a stale schema_migration_required deferral (as an
+            # earlier update would have written when a migration WAS pending)
+            # PLUS an unrelated info-level entry — the clear must remove ONLY
+            # the stale migration entry and PRESERVE the other (pins the
+            # mark_resolved preservation semantics, review concern #2).
+            seed = DeferralReport()
+            seed.add_entry(DeferralEntry(
+                condition_id="schema_migration_required",
+                title="Schema migration required",
+                detected="stale entry from a prior update",
+                why_deferred="destructive — needs consent",
+                command_to_apply="migrate-collections ...",
+                severity="warning",
+            ))
+            seed.add_entry(DeferralEntry(
+                condition_id="legacy_vscode_mcp_env_keys_present",
+                title="Legacy MCP keys",
+                detected="an unrelated info-level entry that must survive",
+                why_deferred="hygiene only",
+                command_to_apply="dismiss-deferral ...",
+                severity="info",
+            ))
+            seed.write(folder)
+            target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
+            self.assertTrue(target.exists(), "seed deferral must be written")
+            self.assertIn("schema_migration_required", target.read_text())
+            self.assertIn("legacy_vscode_mcp_env_keys_present", target.read_text())
+
+            # Mock a CLEAN dry-run plan (everything noop — no copy/rebuild).
+            fake_result = {
+                "plan": [
+                    {"collection": "Foo_KnowledgeGraph", "action": "noop",
+                     "objects_copied": 0, "elapsed_ms": 0},
+                ],
+                "dry_run": True,
+                "errors": [],
+            }
+            with mock.patch.object(project_init, "migrate_collections",
+                                   return_value=fake_result):
+                argv = ["migrate-collections", "--name", "Foo",
+                        "--dry-run", "--project-folder", str(folder),
+                        "--json"]
+                from io import StringIO
+                buf = StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    rc = project_init.main(argv)
+                self.assertEqual(rc, 0)
+                payload = json.loads(buf.getvalue().strip())
+                self.assertTrue(
+                    payload.get("stale_migrate_deferral_cleared"),
+                    f"clean dry-run should clear the stale deferral; got {payload}",
+                )
+
+            # The stale migration entry must be gone, but the unrelated
+            # info-level entry must be PRESERVED (mark_resolved filters by
+            # condition_id only).
+            self.assertTrue(
+                target.exists(),
+                "file must remain — it still holds the info-level entry",
+            )
+            body = target.read_text()
+            self.assertNotIn(
+                "## schema_migration_required",
+                body,
+                "stale migration deferral section must be cleared",
+            )
+            self.assertIn(
+                "legacy_vscode_mcp_env_keys_present",
+                body,
+                "unrelated info-level entry must be preserved",
+            )
+
 
 # ---------------------------------------------------------------------------
 # Live integration test — real Weaviate, throwaway collection.

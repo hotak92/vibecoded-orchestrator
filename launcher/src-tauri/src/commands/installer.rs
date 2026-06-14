@@ -1110,6 +1110,39 @@ fn read_on_disk_binary_version(install_path: &Path) -> Option<String> {
     None
 }
 
+/// v0.2.55 (hub-freshness gap): read the on-disk vct-hub binary version
+/// from its dist sidecar `launcher/dist/<subdir>/vct-hub[.exe].metadata.json`.
+/// The hub metadata uses the SAME `launcher_version` field as the launcher
+/// sidecar (verified: scripts/build-bundled-launcher.sh writes one schema
+/// for all three binaries). Returns None when the sidecar is absent (older
+/// installs that predate hub metadata) — the WaitForBinaryRefresh gate
+/// treats absent-metadata as "don't block on hub" so it never deadlocks.
+fn read_on_disk_hub_version(install_path: &Path) -> Option<String> {
+    let subdir = launcher_dist_subdir();
+    // Hub dist filename mirrors the launcher's `.exe` suffix rule on
+    // Windows (build-bundled-launcher.sh's `${DEST}.metadata.json` includes
+    // the extension). vct-hub on POSIX, vct-hub.exe on Windows.
+    #[cfg(target_os = "windows")]
+    let hub_name = "vct-hub.exe";
+    #[cfg(not(target_os = "windows"))]
+    let hub_name = "vct-hub";
+    let meta_path = install_path
+        .join("launcher")
+        .join("dist")
+        .join(subdir)
+        .join(format!("{}.metadata.json", hub_name));
+    if let Ok(txt) = std::fs::read_to_string(&meta_path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(s) = val.get("launcher_version").and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Compile-time per-OS launcher dist subdirectory. Mirror of
 /// `install.py::_launcher_binary_relative_path` and the analogous
 /// helper in `commands::restart` — kept here to avoid a cross-module
@@ -3940,13 +3973,33 @@ impl<'a> WaitForBinaryRefresh<'a> {
             })?;
             let on_disk_version =
                 read_on_disk_binary_version(self.install_path).unwrap_or_default();
+            // v0.2.55 (hub-freshness gap, decision #2 — close fully): also
+            // require the on-disk vct-hub binary to have caught up before
+            // declaring the refresh landed. Pre-v0.2.55 the gate watched
+            // ONLY the launcher binary, so a partial refresh (launcher new,
+            // hub stale) could restart into a launcher that then started a
+            // STALE hub. One Release commit refreshes all three binaries
+            // together, so in practice they advance in lock-step — but the
+            // gate now enforces it rather than assuming it. CAVEAT: if the
+            // hub sidecar is ABSENT (older installs predating hub metadata)
+            // we must NOT block forever — treat absent as "hub OK" so the
+            // gate degrades to the pre-v0.2.55 launcher-only behaviour
+            // instead of deadlocking.
+            let hub_version_opt = read_on_disk_hub_version(self.install_path);
+            let hub_caught_up = match &hub_version_opt {
+                None => true, // no hub sidecar → don't block on it
+                Some(hv) if hv.is_empty() => true,
+                Some(hv) => !version_is_outdated(hv, &source_version),
+            };
             if !on_disk_version.is_empty()
                 && !version_is_outdated(&on_disk_version, &source_version)
+                && hub_caught_up
             {
                 // on_disk >= source — either equal (the normal
                 // "binary refresh landed" case) or ahead (the
                 // version-pin-stale case fixed in v0.2.48). Both
-                // are valid exit states.
+                // are valid exit states. AND the hub binary (when its
+                // sidecar exists) is at/above source too.
                 if iteration > 1 {
                     eprintln!(
                         "[v0.2.45 V45-B] binary refresh landed after {} poll(s): on-disk now v{} (source v{})",
@@ -3966,14 +4019,24 @@ impl<'a> WaitForBinaryRefresh<'a> {
                 } else {
                     on_disk_version
                 };
+                // v0.2.55: name the hub version too — a partial refresh
+                // (launcher caught up, hub still stale) now also times out
+                // here (so we don't start a stale hub), and the message
+                // should make that diagnosable rather than blaming only the
+                // launcher binary.
+                let hub_displayed = match &hub_version_opt {
+                    Some(hv) if !hv.is_empty() => hv.clone(),
+                    _ => "<no hub sidecar>".to_string(),
+                };
                 return Err(format!(
                     "Binary refresh for v{} did not land within {} sec. \
-                     On-disk binary is v{}. The Release workflow is still \
-                     building/committing the new dist binaries. Wait a \
+                     On-disk launcher is v{}, hub is v{}. The Release workflow \
+                     is still building/committing the new dist binaries. Wait a \
                      few minutes and click Update again.",
                     source_version,
                     self.timeout.as_secs(),
                     displayed,
+                    hub_displayed,
                 ));
             }
             eprintln!(
@@ -4370,6 +4433,23 @@ pub async fn update_orchestrator<R: Runtime>(
             let remote_sha = read_remote_sha(&install_path, &pull_branch).await;
             let (upstream_changed, local_only) =
                 collect_diverged_files(&install_path, &pull_branch).await;
+            // v0.2.55 (durable-logging fix): the non-FF case previously
+            // surfaced ONLY as the GUI Merge/Rebase/Cancel modal below. If
+            // the user dismisses/cancels it, the update silently didn't
+            // apply and there was NO record a terminal Claude could find.
+            // Write a durable UPDATE_DEFERRED.md entry too (the conflict
+            // path already does this via write_resume_sentinel_and_deferral;
+            // this closes the non-FF asymmetry). Best-effort: never blocks
+            // the structured error the frontend needs.
+            write_launcher_update_diverged_deferral(
+                &install_path,
+                &pull_branch,
+                LauncherUpdateDivergedKind::NonFastForward {
+                    local_sha: local_sha.clone(),
+                    remote_sha: remote_sha.clone(),
+                    detail: stderr.trim().to_string(),
+                },
+            );
             return Err(serialize_orchestrator_non_ff_error(
                 &pull_branch,
                 local_sha.as_deref(),
@@ -4379,6 +4459,18 @@ pub async fn update_orchestrator<R: Runtime>(
                 stderr.trim(),
             ));
         }
+        // v0.2.55 (audit R1): any OTHER git-pull failure (not a conflict,
+        // not a non-FF divergence) — e.g. a broken local git, a detached
+        // HEAD, a missing upstream remote. PRE-v0.2.55 this returned a
+        // GUI-only error string with no durable trace; a 3rd-party's Claude
+        // couldn't see it at session start. Write a durable deferral too.
+        write_launcher_update_diverged_deferral(
+            &install_path,
+            &pull_branch,
+            LauncherUpdateDivergedKind::GitPullFailed {
+                detail: stderr.trim().to_string(),
+            },
+        );
         return Err(format!("git pull failed: {}", stderr));
     }
 
@@ -5302,11 +5394,85 @@ async fn finalize_update_and_restart<R: Runtime>(
         .await
     {
         eprintln!("[v0.2.45 V45-B] finalize_update_and_restart: {}", e);
-        // The hub was stopped at the top of the caller's flow and (post-
-        // C-1 reorder) has not been restarted yet. Bring it back up so
-        // a binary-refresh timeout doesn't leave the user hub-less.
-        let _ = ensure_hub_started_after_update(install_path);
-        return Err(e);
+
+        // v0.2.55 (PRIMARY-BUG fix): WaitForBinaryRefresh timed out — the
+        // on-disk dist binary never reached the exact `source_version`
+        // target. PRE-v0.2.55 this `return Err(e)` ABORTED the whole
+        // update with NO restart, so the launcher stayed on the OLD
+        // binary and kept offering the update (the infinite "update
+        // available" loop the user reported). Two ways to time out:
+        //   (a) the re-pull keeps failing (non-FF divergence — the
+        //       maintainer's 2-checkout case) → binary genuinely never
+        //       advances; OR
+        //   (b) the binary-refresh commit simply hasn't been pushed by
+        //       the Release workflow yet (the one-commit ordering window).
+        // In BOTH cases, if a dist binary is present that is NEWER than
+        // the CURRENTLY-RUNNING launcher, restarting into it is strictly
+        // better than staying on the old one — even if it's a hair below
+        // the absolute target. "Update to the new binary in any case."
+        // We still write a durable UPDATE_DEFERRED.md entry so a
+        // terminal Claude can see the update did not fully reach target,
+        // and the next update attempt will close the remaining gap.
+        let running = env!("CARGO_PKG_VERSION");
+        let on_disk = read_on_disk_binary_version(install_path).unwrap_or_default();
+        // version_is_outdated(a, b) == (a < b); here: running < on_disk.
+        let on_disk_beats_running =
+            !on_disk.is_empty() && version_is_outdated(running, &on_disk);
+
+        if on_disk_beats_running {
+            eprintln!(
+                "[v0.2.55] binary-refresh did not reach target, but on-disk dist \
+                 binary v{} is NEWER than running v{} — restarting into it anyway \
+                 (strictly better than staying on the old binary). A durable \
+                 deferral is written noting the update may be one step behind \
+                 target; the next update closes the gap.",
+                on_disk, running,
+            );
+            // Durable record: the update advanced but did not fully reach
+            // the source target (likely the binary-refresh ordering
+            // window or a transient pull failure). Non-fatal: continue to
+            // the restart below.
+            write_launcher_update_diverged_deferral(
+                install_path,
+                pull_branch,
+                LauncherUpdateDivergedKind::PartialBinaryRefresh {
+                    running: running.to_string(),
+                    on_disk: on_disk.clone(),
+                    detail: e.clone(),
+                },
+            );
+            // Fall through (do NOT return) — proceed to hub-start +
+            // restart with the newer on-disk binary.
+        } else {
+            // No newer binary on disk at all — restarting would re-exec
+            // the SAME old binary, which doesn't help. Keep the abort,
+            // but now ALSO write a durable deferral so the stuck state is
+            // diagnosable at session start instead of dying in a GUI
+            // modal (the durable-logging gap: pre-v0.2.55 this surfaced
+            // ONLY as a transient "click Update again" error string).
+            eprintln!(
+                "[v0.2.55] binary-refresh timed out and no newer dist binary is \
+                 available (running v{}, on-disk v{}); writing durable deferral \
+                 and aborting restart.",
+                running,
+                if on_disk.is_empty() { "<unknown>" } else { &on_disk },
+            );
+            write_launcher_update_diverged_deferral(
+                install_path,
+                pull_branch,
+                LauncherUpdateDivergedKind::BinaryRefreshTimeout {
+                    running: running.to_string(),
+                    on_disk: on_disk.clone(),
+                    detail: e.clone(),
+                },
+            );
+            // The hub was stopped at the top of the caller's flow and
+            // (post-C-1 reorder) has not been restarted yet. Bring it
+            // back up so a binary-refresh timeout doesn't leave the user
+            // hub-less.
+            let _ = ensure_hub_started_after_update(install_path);
+            return Err(e);
+        }
     }
 
     // V52-AI: explicit lockfile cleanup BEFORE the restart hop. We don't
@@ -6374,6 +6540,315 @@ next successful install.py run, so the resolution is one command.\n\
     if let Err(e) = std::fs::rename(&tmp, &target) {
         eprintln!(
             "[vct] update_resume_deferral: rename {} → {} failed: {}",
+            tmp.display(),
+            target.display(),
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// v0.2.55 (durable-logging fix): the distinct launcher-side update
+/// failure shapes that `write_launcher_update_diverged_deferral` renders.
+/// All three are the SAME condition_id (`launcher_update_diverged`) so the
+/// deferral self-clears on the next successful `install.py --update` — they
+/// differ only in the human/Claude-facing diagnosis text.
+enum LauncherUpdateDivergedKind {
+    /// `git pull --ff-only` failed because local `main` has diverged from
+    /// upstream by committed history (NOT user-editable allowlisted paths —
+    /// those are handled non-blocking by the A0 per-path 3-way merge). The
+    /// GUI shows a Merge/Rebase/Cancel modal, but if the user cancels or
+    /// the modal is dismissed there was — pre-v0.2.55 — NO durable record.
+    NonFastForward {
+        local_sha: Option<String>,
+        remote_sha: Option<String>,
+        detail: String,
+    },
+    /// `WaitForBinaryRefresh` timed out but the on-disk dist binary is
+    /// NEWER than the running launcher — we restarted into it anyway
+    /// (v0.2.55 "update in any case"), and record that the update may be
+    /// one step behind the absolute source target.
+    PartialBinaryRefresh {
+        running: String,
+        on_disk: String,
+        detail: String,
+    },
+    /// `WaitForBinaryRefresh` timed out and there is NO newer binary on
+    /// disk — the restart was (correctly) aborted because re-execing the
+    /// same old binary helps nothing. The durable record makes the stuck
+    /// state diagnosable at session start.
+    BinaryRefreshTimeout {
+        running: String,
+        on_disk: String,
+        detail: String,
+    },
+    /// v0.2.55 (audit R1): a git-pull failure that is neither a conflict
+    /// nor a non-FF divergence (broken local git, detached HEAD, missing
+    /// upstream remote, etc.). PRE-v0.2.55 these returned a GUI-only error
+    /// string with no durable trace.
+    GitPullFailed {
+        detail: String,
+    },
+}
+
+/// v0.2.55 (durable-logging fix): write a `launcher_update_diverged`
+/// entry into `.claude/context/UPDATE_DEFERRED.md` for launcher-side
+/// update failures that PRE-v0.2.55 surfaced ONLY as a transient GUI
+/// modal / a confusing "still offers update" loop.
+///
+/// WHY this exists: a 3rd-party user's Claude reads `UPDATE_DEFERRED.md`
+/// at session start (per the project CLAUDE.md SESSION START rule). The
+/// rebase/merge CONFLICT path already writes a deferral via
+/// `write_resume_sentinel_and_deferral`; a plain non-FF divergence and a
+/// binary-refresh timeout did NOT — so a stuck update was invisible to
+/// the terminal Claude. This closes that asymmetry.
+///
+/// Standalone Rust writer (does NOT depend on install.py firing) — the
+/// whole point is that install.py / the binary swap did NOT complete.
+/// Markdown shape mirrors `vco_lib/deferral_report.py` (frontmatter +
+/// `## <condition_id> (<severity>)` + Title/Detected/Why/To apply/For
+/// your Claude assistant/Detected at), so `DeferralReport.read()`
+/// round-trips it and treats it as resolved on the next successful
+/// install.py run (install.py running IS the resolution). Best-effort:
+/// any I/O failure is logged + swallowed — the caller MUST still surface
+/// its own error / continue its own flow.
+fn write_launcher_update_diverged_deferral(
+    install_path: &Path,
+    branch: &str,
+    kind: LauncherUpdateDivergedKind,
+) {
+    let target = install_path.join(".claude/context/UPDATE_DEFERRED.md");
+    let parent = match target.parent() {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "[vct] launcher_update_diverged: target has no parent: {}",
+                target.display()
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!(
+            "[vct] launcher_update_diverged: mkdir {} failed: {} — skipping",
+            parent.display(),
+            e
+        );
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let install_root_display = install_path.display();
+
+    // Per-kind diagnosis. `detected` + `why` + `claude` vary; the
+    // condition_id, severity, and recovery commands are shared.
+    let (title, detected, why, claude_note) = match &kind {
+        LauncherUpdateDivergedKind::NonFastForward {
+            local_sha,
+            remote_sha,
+            detail,
+        } => {
+            let l = local_sha.as_deref().unwrap_or("<unknown>");
+            let r = remote_sha.as_deref().unwrap_or("<unknown>");
+            (
+                "Orchestrator update could not fast-forward (local history diverged)".to_string(),
+                format!(
+                    "`git pull --ff-only {branch}` failed: local `{branch}` (HEAD `{l}`) has \
+                     diverged from upstream (`{r}`) by committed history. This is NOT the \
+                     normal case of editing CLAUDE.md / CONTEXT_STATE.md / KG nodes — those \
+                     are handled non-blocking by the per-path 3-way merge. It means real \
+                     commits exist on your local `{branch}` that upstream doesn't have (e.g. \
+                     a clone whose `origin` was repointed at a private fork, or local commits \
+                     on `{branch}` instead of a feature branch). git said: `{d}`",
+                    branch = branch,
+                    l = l,
+                    r = r,
+                    d = detail.trim(),
+                ),
+                "The launcher cannot safely fast-forward over diverged history. It surfaced a \
+                 Merge / Rebase / Cancel modal in the GUI; if that was dismissed, the update \
+                 did not apply and the launcher still runs the old binary. This entry is the \
+                 durable record so the state is recoverable from a terminal."
+                    .to_string(),
+                format!(
+                    "The user's orchestrator update could not fast-forward: local `{branch}` \
+                     has committed history upstream doesn't have. The update did NOT apply. \
+                     Recommended: surface this at session start. The cleanest fix depends on \
+                     WHY they diverged — if local commits belong on a feature branch, move \
+                     them there and reset `{branch}` to upstream; if `origin` was repointed at \
+                     a private fork, the public upstream is the pull source (the launcher \
+                     pulls from its configured upstream remote, not `origin`). DO NOT blindly \
+                     `git reset --hard` without confirming the local commits are backed up. \
+                     Once `{branch}` can fast-forward, click Update again in the launcher.",
+                    branch = branch,
+                ),
+            )
+        }
+        LauncherUpdateDivergedKind::PartialBinaryRefresh {
+            running,
+            on_disk,
+            detail,
+        } => (
+            "Orchestrator updated, but the launcher binary may be one step behind target"
+                .to_string(),
+            format!(
+                "`WaitForBinaryRefresh` timed out before the on-disk launcher binary reached \
+                 the exact source target, but a NEWER binary than the running one was present \
+                 (running v{running}, on-disk v{on_disk}), so the launcher restarted into it \
+                 anyway (v0.2.55 \"update in any case\"). The remaining gap is usually the \
+                 binary-refresh commit (`chore(binary): refresh … [skip ci]`) not yet pushed \
+                 by the Release workflow, or a transient pull failure. Underlying: `{d}`",
+                running = running,
+                on_disk = on_disk,
+                d = detail.trim(),
+            ),
+            "Non-fatal: the launcher is now newer than before. The update may be a single \
+             version behind the absolute target until the Release workflow's binary-refresh \
+             commit lands; the next update closes the gap."
+                .to_string(),
+            format!(
+                "The user's orchestrator update advanced the launcher (running was v{running}, \
+                 on-disk now v{on_disk}) but may be one version behind the absolute target. \
+                 This is expected briefly while the Release workflow finishes committing the \
+                 refreshed dist binaries. Recommended: mention it's benign and self-resolving; \
+                 if it persists across multiple update attempts over >15 min, the binary-refresh \
+                 commit may have failed — check the repo's latest commit for a \
+                 `chore(binary): refresh` and the Release workflow run.",
+                running = running,
+                on_disk = on_disk,
+            ),
+        ),
+        LauncherUpdateDivergedKind::BinaryRefreshTimeout {
+            running,
+            on_disk,
+            detail,
+        } => {
+            let od = if on_disk.is_empty() { "<unknown>" } else { on_disk };
+            (
+                "Orchestrator update did not deliver a new launcher binary".to_string(),
+                format!(
+                    "`WaitForBinaryRefresh` timed out and NO binary newer than the running \
+                     launcher (v{running}) is on disk (on-disk v{od}). Restarting was aborted \
+                     because re-execing the same old binary would not help. This usually means \
+                     the source pull did not land the binary-refresh commit (a non-FF \
+                     divergence that the re-pull kept failing on, or the Release workflow has \
+                     not pushed the refreshed binaries yet). Underlying: `{d}`",
+                    running = running,
+                    od = od,
+                    d = detail.trim(),
+                ),
+                "The launcher is still on the OLD binary. If a divergence blocked the pull, \
+                 resolve it (see the non-FF guidance). If the binary-refresh commit simply \
+                 hasn't shipped yet, waiting a few minutes and clicking Update again resolves \
+                 it."
+                    .to_string(),
+                format!(
+                    "The user's orchestrator update failed to deliver a new launcher binary — \
+                     it's still on v{running}. Recommended: surface at session start. Check (1) \
+                     whether `git -C {root} status` shows a diverged/non-FF `{branch}` (then \
+                     follow the non-FF recovery), and (2) whether the latest upstream commit \
+                     includes a `chore(binary): refresh` (if not, the Release workflow may \
+                     still be building — wait + retry). Re-run the update via the launcher GUI \
+                     or `python install.py --update` once the pull can advance.",
+                    running = running,
+                    root = install_root_display,
+                    branch = branch,
+                ),
+            )
+        }
+        LauncherUpdateDivergedKind::GitPullFailed { detail } => (
+            "Orchestrator update could not pull from upstream".to_string(),
+            format!(
+                "`git pull` for the orchestrator update failed for a reason that is \
+                 neither a merge conflict nor a fast-forward divergence (e.g. a broken \
+                 local git repo, a detached HEAD, or a missing/misconfigured upstream \
+                 remote). git said: `{d}`",
+                d = detail.trim(),
+            ),
+            "The update did not apply — the launcher is unchanged. The git state needs \
+             attention before the update can proceed."
+                .to_string(),
+            format!(
+                "The user's orchestrator update could not `git pull` from upstream (not a \
+                 conflict, not a non-FF). Recommended: surface at session start, then \
+                 inspect the repo state: `git -C {root} status`, `git -C {root} remote -v`, \
+                 `git -C {root} branch --show-current`. Common causes: detached HEAD (check \
+                 out `{branch}`), missing upstream remote, or an interrupted prior git op \
+                 (look for `.git/MERGE_HEAD` / `.git/rebase-*`). Fix the git state, then \
+                 click Update again or run `python install.py --update`.",
+                root = install_root_display,
+                branch = branch,
+            ),
+        ),
+    };
+
+    let content = format!(
+        "---\n\
+title: VCO Update Deferred\n\
+generated_at: {now}\n\
+condition_ids: [launcher_update_diverged]\n\
+severity_max: warning\n\
+---\n\
+\n\
+# VCO Update Deferred\n\
+\n\
+The last orchestrator update (run from the launcher GUI) hit a condition it could not \
+auto-resolve safely. The section below names the condition and how to recover.\n\
+\n\
+## launcher_update_diverged (warning)\n\
+\n\
+**Title**: {title}\n\
+\n\
+**Detected**: {detected}\n\
+\n\
+**Why deferred**: {why}\n\
+\n\
+**To apply**:\n\
+```bash\n\
+# Option A (recommended): open the launcher GUI and click Update again\n\
+# (top-right MenuBar). If the launcher shows a Merge/Rebase/Cancel modal,\n\
+# choose Rebase to replay upstream cleanly (your local edits are kept).\n\
+#\n\
+# Option B (terminal): from the orchestrator install root, inspect + pull:\n\
+cd {install_root_display}\n\
+git status            # is `{branch}` diverged / non-fast-forward?\n\
+git log --oneline -5  # do you have local commits upstream lacks?\n\
+# Then either resolve the divergence (move local commits to a branch, or\n\
+# pull --rebase from the configured upstream), or wait for the Release\n\
+# workflow's `chore(binary): refresh` commit, then:\n\
+python install.py --update\n\
+# After install.py finishes, fully quit the launcher (tray -> Quit) and\n\
+# relaunch so the freshly-staged binary loads.\n\
+```\n\
+\n\
+**For your Claude assistant** (read this before continuing the user's task):\n\
+{claude_note}\n\
+\n\
+**Detected at**: {now}\n\
+\n\
+---\n",
+        now = now,
+        title = title,
+        detected = detected,
+        why = why,
+        claude_note = claude_note,
+        install_root_display = install_root_display,
+        branch = branch,
+    );
+
+    // Atomic write: temp file in the same directory, then rename.
+    let tmp = parent.join(format!("UPDATE_DEFERRED.md.tmp.{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+        eprintln!(
+            "[vct] launcher_update_diverged: write {} failed: {}",
+            tmp.display(),
+            e
+        );
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        eprintln!(
+            "[vct] launcher_update_diverged: rename {} → {} failed: {}",
             tmp.display(),
             target.display(),
             e
@@ -10565,6 +11040,101 @@ mod tests {
             elapsed >= std::time::Duration::from_millis(50),
             "should have slept at least once, took {:?}",
             elapsed
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    // v0.2.55 (hub-freshness gap): write the on-disk vct-hub sidecar so
+    // `read_on_disk_hub_version` resolves it. Mirrors
+    // `write_v0245_on_disk_version` but for the hub binary name.
+    fn write_v0255_on_disk_hub_version(install_path: &Path, version: &str) {
+        let dist_arch = install_path
+            .join("launcher")
+            .join("dist")
+            .join(launcher_dist_subdir());
+        fs::create_dir_all(&dist_arch).unwrap();
+        let v = serde_json::json!({"launcher_version": version}).to_string();
+        #[cfg(target_os = "windows")]
+        let hub_meta = "vct-hub.exe.metadata.json";
+        #[cfg(not(target_os = "windows"))]
+        let hub_meta = "vct-hub.metadata.json";
+        fs::write(dist_arch.join(hub_meta), v).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v0255_wait_blocks_when_launcher_fresh_but_hub_stale() {
+        // The partial-refresh case the hub-freshness gap closes: launcher
+        // binary caught up to source, but the hub sidecar is still stale.
+        // Pre-v0.2.55 this returned Ok immediately (and could start a
+        // stale hub). Now it must keep waiting (→ time out here).
+        let p = tmp();
+        write_v0245_source_version(&p, "0.2.55");
+        write_v0245_on_disk_version(&p, "0.2.55"); // launcher: fresh
+        write_v0255_on_disk_hub_version(&p, "0.2.54"); // hub: STALE
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            timeout: std::time::Duration::from_millis(250),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let res = waiter.run().await;
+        assert!(
+            res.is_err(),
+            "expected timeout because hub is stale, got {:?}",
+            res
+        );
+        let err = res.unwrap_err();
+        // Timeout message should name the hub version so the partial
+        // refresh is diagnosable.
+        assert!(
+            err.contains("hub is v0.2.54"),
+            "error should name the stale hub version: {}",
+            err
+        );
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[tokio::test]
+    async fn test_v0255_wait_returns_ok_when_both_launcher_and_hub_fresh() {
+        // Both binaries caught up → the normal lock-step refresh → Ok.
+        let p = tmp();
+        write_v0245_source_version(&p, "0.2.55");
+        write_v0245_on_disk_version(&p, "0.2.55");
+        write_v0255_on_disk_hub_version(&p, "0.2.55");
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            timeout: std::time::Duration::from_secs(5),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let res = waiter.run().await;
+        assert!(res.is_ok(), "expected Ok when both fresh, got {:?}", res);
+        fs::remove_dir_all(&p).ok();
+    }
+
+    #[tokio::test]
+    async fn test_v0255_wait_ignores_absent_hub_sidecar() {
+        // Older installs predating hub metadata: NO hub sidecar. The gate
+        // must degrade to launcher-only (don't deadlock waiting for a hub
+        // version that will never appear).
+        let p = tmp();
+        write_v0245_source_version(&p, "0.2.55");
+        write_v0245_on_disk_version(&p, "0.2.55"); // launcher fresh
+        // (deliberately NO write_v0255_on_disk_hub_version)
+        let waiter = WaitForBinaryRefresh {
+            install_path: &p,
+            branch: "main",
+            timeout: std::time::Duration::from_secs(5),
+            interval: std::time::Duration::from_millis(50),
+            disable_git_pull: true,
+        };
+        let res = waiter.run().await;
+        assert!(
+            res.is_ok(),
+            "absent hub sidecar must not block (launcher-only fallback), got {:?}",
+            res
         );
         fs::remove_dir_all(&p).ok();
     }
@@ -15905,6 +16475,129 @@ MemAvailable:   23456789 kB
             assert!(
                 body.contains("(rebase on `main`)"),
                 "rebase op must be reflected in Detected copy; got: {body}"
+            );
+        }
+
+        // ─── v0.2.55: launcher_update_diverged durable-logging writer ─────
+        //
+        // The writer closes the gap where a non-FF divergence / a binary-
+        // refresh timeout surfaced ONLY as a transient GUI modal. These
+        // tests pin: (1) all three kinds write a parseable, comprehensive
+        // entry under the single `launcher_update_diverged` condition_id,
+        // and (2) the PRIMARY-BUG version comparison (restart into a
+        // newer-than-running binary) uses the right direction.
+
+        #[test]
+        fn launcher_update_diverged_non_ff_shape_is_comprehensive() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+            write_launcher_update_diverged_deferral(
+                &install,
+                "main",
+                LauncherUpdateDivergedKind::NonFastForward {
+                    local_sha: Some("aaaa111".into()),
+                    remote_sha: Some("bbbb222".into()),
+                    detail: "fatal: Not possible to fast-forward, aborting.".into(),
+                },
+            );
+            let target = install.join(".claude/context/UPDATE_DEFERRED.md");
+            let body = std::fs::read_to_string(&target).expect("read");
+
+            assert!(body.starts_with("---\n"), "YAML frontmatter required");
+            assert!(
+                body.contains("condition_ids: [launcher_update_diverged]"),
+                "frontmatter must carry the condition_id"
+            );
+            assert!(body.contains("## launcher_update_diverged (warning)"));
+            assert!(body.contains("**Title**:"));
+            assert!(body.contains("**Detected**:"));
+            assert!(body.contains("**Why deferred**:"));
+            assert!(body.contains("**To apply**:"));
+            assert!(body.contains("**For your Claude assistant**"));
+            assert!(body.contains("**Detected at**:"));
+            // The non-FF detail + SHAs should be embedded for diagnosis.
+            assert!(body.contains("aaaa111"), "local sha must appear");
+            assert!(body.contains("bbbb222"), "remote sha must appear");
+            assert!(body.contains("python install.py --update"), "CLI recovery");
+        }
+
+        #[test]
+        fn launcher_update_diverged_partial_and_timeout_kinds_render() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let install = dir.path().to_path_buf();
+
+            write_launcher_update_diverged_deferral(
+                &install,
+                "main",
+                LauncherUpdateDivergedKind::PartialBinaryRefresh {
+                    running: "0.2.54".into(),
+                    on_disk: "0.2.55".into(),
+                    detail: "timeout".into(),
+                },
+            );
+            let body =
+                std::fs::read_to_string(install.join(".claude/context/UPDATE_DEFERRED.md"))
+                    .unwrap();
+            assert!(body.contains("condition_ids: [launcher_update_diverged]"));
+            assert!(body.contains("running v0.2.54"));
+            assert!(body.contains("on-disk v0.2.55"));
+
+            // Overwrite with the timeout kind (single-entry writer).
+            write_launcher_update_diverged_deferral(
+                &install,
+                "main",
+                LauncherUpdateDivergedKind::BinaryRefreshTimeout {
+                    running: "0.2.54".into(),
+                    on_disk: String::new(), // unknown on-disk
+                    detail: "no newer binary".into(),
+                },
+            );
+            let body2 =
+                std::fs::read_to_string(install.join(".claude/context/UPDATE_DEFERRED.md"))
+                    .unwrap();
+            assert!(body2.contains("did not deliver a new launcher binary"));
+            assert!(
+                body2.contains("on-disk v<unknown>"),
+                "empty on-disk must render as <unknown>; got: {body2}"
+            );
+
+            // v0.2.55 audit R1: the GitPullFailed kind renders under the
+            // same condition_id with git-state recovery guidance.
+            write_launcher_update_diverged_deferral(
+                &install,
+                "main",
+                LauncherUpdateDivergedKind::GitPullFailed {
+                    detail: "fatal: not a git repository".into(),
+                },
+            );
+            let body3 =
+                std::fs::read_to_string(install.join(".claude/context/UPDATE_DEFERRED.md"))
+                    .unwrap();
+            assert!(body3.contains("condition_ids: [launcher_update_diverged]"));
+            assert!(body3.contains("could not pull from upstream"));
+            assert!(
+                body3.contains("not a git repository"),
+                "git detail must be embedded; got: {body3}"
+            );
+        }
+
+        #[test]
+        fn primary_bug_on_disk_beats_running_comparison_direction() {
+            // The PRIMARY-BUG fix restarts into the on-disk binary when it
+            // is NEWER than the running launcher. version_is_outdated(a, b)
+            // is true iff a < b, so `version_is_outdated(running, on_disk)`
+            // == "running is older than on_disk" == "restart is worth it".
+            assert!(
+                version_is_outdated("0.2.54", "0.2.55"),
+                "running 0.2.54 < on-disk 0.2.55 → should restart"
+            );
+            assert!(
+                !version_is_outdated("0.2.55", "0.2.55"),
+                "equal versions → no newer binary → keep abort"
+            );
+            assert!(
+                !version_is_outdated("0.2.56", "0.2.55"),
+                "running ahead of on-disk → keep abort (don't downgrade)"
             );
         }
 

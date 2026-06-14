@@ -7214,6 +7214,113 @@ def _apply_deferred_entries(
                 )
                 current_run_report.add_entry(entry)
 
+        elif cid == "launcher_update_diverged":
+            # v0.2.55 (durable-logging fix, re-probe handler): the launcher
+            # writes this entry when a GUI update could not fast-forward
+            # (non-FF divergence) OR `WaitForBinaryRefresh` timed out
+            # before the on-disk launcher binary reached the source target.
+            # All three kinds share this condition_id (see
+            # installer.rs::write_launcher_update_diverged_deferral).
+            #
+            # Re-probe (mirrors WaitForBinaryRefresh's own exit condition):
+            # the source-of-truth is whether the on-disk launcher binary
+            # version now meets/exceeds the source version. install.py
+            # reaching THIS point already means the pull + --update
+            # succeeded (otherwise we wouldn't be running), so the
+            # divergence is resolved; we additionally confirm the binary
+            # caught up. on_disk >= source → resolved; else keep (the
+            # binary-refresh commit may still be landing).
+            try:
+                source_version = _read_launcher_version(project_root)
+                # On-disk binary version lives in the dist sidecar
+                # `<binary>.metadata.json::launcher_version` (written by
+                # scripts/build-bundled-launcher.sh; read by the Rust
+                # read_on_disk_binary_version). Parse it directly here.
+                subdir, fname = _launcher_binary_relative_path()
+                dist_dir = project_root / "launcher" / "dist" / subdir
+
+                def _read_dist_meta_version(meta_name: str) -> "str | None":
+                    p = dist_dir / meta_name
+                    if not p.is_file():
+                        return None
+                    try:
+                        m = json.loads(p.read_text(encoding="utf-8"))
+                    except Exception:
+                        return None
+                    raw = m.get("launcher_version")
+                    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+                on_disk_version = _read_dist_meta_version(f"{fname}.metadata.json")
+                # Symmetric with the Rust WaitForBinaryRefresh hub-gate
+                # (v0.2.55): also re-probe the hub binary so a launcher that
+                # caught up but a still-stale hub doesn't clear the entry
+                # prematurely (the C2 asymmetry the review flagged). Absent
+                # hub sidecar → treated as "hub OK" (same as the Rust gate).
+                hub_meta_name = (
+                    "vct-hub.exe.metadata.json"
+                    if fname.endswith(".exe")
+                    else "vct-hub.metadata.json"
+                )
+                on_disk_hub_version = _read_dist_meta_version(hub_meta_name)
+
+                def _vparts(v: str) -> list[int]:
+                    out: list[int] = []
+                    for p in v.split("."):
+                        digits = ""
+                        for ch in p:
+                            if ch.isdigit():
+                                digits += ch
+                            else:
+                                break
+                        out.append(int(digits) if digits else 0)
+                    return out
+
+                def _ge(a_str: str, b_str: str) -> bool:
+                    a, b = _vparts(a_str), _vparts(b_str)
+                    n = max(len(a), len(b))
+                    a += [0] * (n - len(a))
+                    b += [0] * (n - len(b))
+                    return a >= b
+
+                launcher_ok = bool(
+                    source_version and on_disk_version
+                    and _ge(on_disk_version, source_version)
+                )
+                # Hub: absent sidecar → don't block on it (degrade to
+                # launcher-only, matching the Rust gate's caveat).
+                hub_ok = (
+                    on_disk_hub_version is None
+                    or (source_version is not None
+                        and _ge(on_disk_hub_version, source_version))
+                )
+                resolved = launcher_ok and hub_ok
+
+                if resolved:
+                    print(
+                        f"  [ok]   {cid}: on-disk launcher v{on_disk_version} "
+                        f"(hub v{on_disk_hub_version or 'n/a'}) >= source "
+                        f"v{source_version} — the update reached target. "
+                        "Marking resolved."
+                    )
+                    # Resolved: do NOT re-add.
+                else:
+                    blocker = "launcher" if not launcher_ok else "hub"
+                    print(
+                        f"  [skip] {cid}: {blocker} binary has not reached "
+                        f"source v{source_version or '<unknown>'} yet "
+                        f"(launcher v{on_disk_version or '<unknown>'}, hub "
+                        f"v{on_disk_hub_version or '<none>'}; binary-refresh "
+                        "commit may still be landing, or divergence unresolved). "
+                        "Keeping entry."
+                    )
+                    current_run_report.add_entry(entry)
+            except Exception as exc:  # noqa: BLE001 — soft-fail
+                print(
+                    f"  [fail] {cid}: version re-probe failed ({exc}). "
+                    "Keeping entry."
+                )
+                current_run_report.add_entry(entry)
+
         else:
             # Unknown condition: preserve it to avoid silently losing info.
             print(f"  [unknown] {cid}: no handler. Preserving entry.")

@@ -45,6 +45,24 @@ pub fn find_hub_binary() -> Option<PathBuf> {
         );
     }
 
+    // NOTE on hub freshness during an update (v0.2.55): the hub is kept
+    // fresh by TWO mechanisms that do NOT depend on this discovery order —
+    //   (1) install.py Step 8c starts the freshly-deployed dist hub by its
+    //       ABSOLUTE path (`[<dist>/vct-hub, --start-if-not-running]`,
+    //       install.py ~21468) before control returns to the launcher; and
+    //   (2) `WaitForBinaryRefresh` (installer.rs) now gates the post-update
+    //       restart on the on-disk hub METADATA version (read from the dist
+    //       sidecar, not from PATH), so the restart can't proceed into a
+    //       stale-hub state.
+    // An earlier v0.2.55 draft added an in-process dist-preference branch
+    // here gated on `VCT_AUTO_RESTART_LAUNCHER=1`; that env var is set only
+    // on the install.py CHILD (installer.rs cmd.env), never on the launcher
+    // process that runs find_hub_binary(), so the branch was dead in
+    // production — and forcing it via `set_var` would leak the preference
+    // into the detached-restart child (which inherits this env) on every
+    // future boot. Dropped. The discovery order below is the steady-state
+    // one; freshness is owned by (1)+(2).
+
     // 2. PATH lookup.
     if let Some(on_path) = find_on_path("vct-hub") {
         return Some(on_path);
@@ -67,42 +85,45 @@ pub fn find_hub_binary() -> Option<PathBuf> {
     }
 
     // 4 + 5. In-tree dist relative to the running launcher binary.
-    // Both shipped (4-level walk-up) and dev (`cargo run`) layouts are
-    // handled by the discovery in `commands::modules::
-    // find_orchestrator_manifest`, but we don't have access to its
-    // current_exe walking here; instead we re-derive both candidates.
-    //
-    // v0.2.53 test-isolation gate: when running under `cargo test`,
-    // `current_exe()` points into `target/debug/deps/` whose grandparent
-    // is `target/debug/` — and sibling cargo invocations leave a real
-    // `vct-hub` binary there. That makes deterministic "no hub anywhere"
-    // tests impossible (find_hub_binary_returns_none_when_nothing_resolves
-    // + ensure_hub_running_reports_binary_not_found_in_clean_env +
-    // find_hub_binary_falls_through_when_override_is_not_executable).
-    // Setting `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1` skips steps 4+5;
-    // production code never sets this so it's a no-op there.
+    // (Extracted to `find_hub_dist_sibling` in v0.2.55 — the resolution is
+    // a self-contained unit with its own test-isolation gate, so factoring
+    // it out keeps this function readable and the gate independently
+    // testable.)
+    find_hub_dist_sibling()
+}
+
+/// v0.2.55: resolve the in-tree dist `vct-hub` sibling relative to the
+/// running launcher binary (the layout `build-bundled-launcher.sh`
+/// produces). Returns the first executable of:
+///   4. `<dir of current_exe>/vct-hub` (sibling)
+///   5. `<dir of current_exe>/../vct-hub` (arch-less fallback)
+/// or `None`.
+///
+/// v0.2.53 test-isolation gate is honoured here: when running under
+/// `cargo test`, `current_exe()` points into `target/debug/deps/` whose
+/// grandparent is `target/debug/` — and sibling cargo invocations leave a
+/// real `vct-hub` binary there, making deterministic "no hub anywhere"
+/// tests impossible. Setting `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY=1`
+/// makes this return `None`; production never sets it so it's a no-op
+/// there.
+fn find_hub_dist_sibling() -> Option<PathBuf> {
     if std::env::var_os("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY").is_some() {
         return None;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        // Sibling layout: same dir as the launcher binary contains
-        // vct-hub too (this is what `build-bundled-launcher.sh`
-        // produces).
-        if let Some(parent) = exe.parent() {
-            let sibling = parent.join(hub_binary_name());
-            if is_executable(&sibling) {
-                return Some(sibling);
-            }
-            // 5. arch-less fallback one dir up (some packaging layouts).
-            if let Some(grandparent) = parent.parent() {
-                let fallback = grandparent.join(hub_binary_name());
-                if is_executable(&fallback) {
-                    return Some(fallback);
-                }
-            }
+    let exe = std::env::current_exe().ok()?;
+    let parent = exe.parent()?;
+    // Sibling layout: same dir as the launcher binary contains vct-hub too.
+    let sibling = parent.join(hub_binary_name());
+    if is_executable(&sibling) {
+        return Some(sibling);
+    }
+    // Arch-less fallback one dir up (some packaging layouts).
+    if let Some(grandparent) = parent.parent() {
+        let fallback = grandparent.join(hub_binary_name());
+        if is_executable(&fallback) {
+            return Some(fallback);
         }
     }
-
     None
 }
 
@@ -362,6 +383,19 @@ mod tests {
             ],
             || {
                 assert_eq!(find_hub_binary(), None);
+            },
+        );
+    }
+
+    #[test]
+    fn find_hub_dist_sibling_respects_test_isolation_gate() {
+        // The extracted helper must honour the test-isolation gate the
+        // same way the inlined steps 4+5 did (else cargo-test cross-talk
+        // poisons the "nothing resolves" tests).
+        with_env(
+            &[("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1"))],
+            || {
+                assert_eq!(find_hub_dist_sibling(), None);
             },
         );
     }
