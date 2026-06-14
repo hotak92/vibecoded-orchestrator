@@ -4361,25 +4361,31 @@ pub async fn update_orchestrator<R: Runtime>(
     // merge that can't even start). Best-effort: any probe failure leaves
     // `--ff-only` in place so the legacy non-FF path still surfaces the
     // modal — never auto-merge on uncertainty.
-    // v0.2.56 (review BLOCKER B1): the auto-merge path uses `--autostash`,
-    // which can leave a SILENTLY-broken working tree (exit 0 + UU markers +
-    // dangling stash) if an uncommitted edit to a non-union file conflicts
-    // on the autostash pop — bypassing the post-pull conflict modal. Guard
-    // it: only auto-merge when the working tree is CLEAN (nothing to stash
-    // → the pop-conflict hazard cannot arise). A dirty tree falls back to
-    // --ff-only, which aborts cleanly and surfaces the modal exactly as
-    // before. Probe the tree ONCE, up front; on any error, treat as dirty.
-    let working_tree_clean = crate::commands::git_user_editable_merge::working_tree_is_clean(
-        &install_path,
-    )
-    .await
-    .unwrap_or(false);
+    // v0.2.56 (review BLOCKER B1) + v0.2.58 (precise gate): the auto-merge
+    // path uses `--autostash`, which can leave a SILENTLY-broken working
+    // tree (exit 0 + UU markers + dangling stash) if an uncommitted edit
+    // conflicts on the autostash pop — bypassing the post-pull conflict
+    // modal. v0.2.56 guarded this with a BLUNT "working tree must be 100%
+    // clean" check, but an installed orchestrator is PERMANENTLY dirty in
+    // the expected way (hundreds of untracked user KG nodes + scratch
+    // files): that gate bailed every real update to the scary divergence
+    // modal even when the merge was perfectly safe.
+    //
+    // v0.2.58 narrows the gate to the PRECISE pop-conflict-risk set:
+    // `tracked-modified ∩ upstream-changed`. `git stash`/`--autostash`
+    // never touches UNTRACKED files, and a tracked-modified file upstream
+    // didn't change can't pop-conflict — so the ONLY risky files are ones
+    // both locally-modified (tracked) AND changed by upstream in this
+    // merge. If that set is empty, the auto-merge is safe regardless of how
+    // many untracked KG nodes / scratch files dirty the tree. This honors
+    // the principle that the update must NOT CARE about expected-to-diverge
+    // user files. See `tracked_modified_overlapping_upstream`.
+    //
+    // Resolve `theirs` ONCE; reuse for both the risk check and the
+    // merge-tree probe. Any resolution/probe error → keep `--ff-only`
+    // (conservative: the modal surfaces, never a wrong silent auto-merge).
     let auto_merge_committed_divergence = if pre_merge_committed {
         // pre-merge already advanced HEAD; the rebase path below owns it.
-        false
-    } else if !working_tree_clean {
-        // Dirty tree — never take the silent --autostash auto-merge (B1).
-        // --ff-only will refuse on non-FF and the modal surfaces safely.
         false
     } else {
         match crate::commands::git_user_editable_merge::compute_theirs_sha(
@@ -4389,28 +4395,75 @@ pub async fn update_orchestrator<R: Runtime>(
         .await
         {
             Ok(Some(theirs)) => {
-                match crate::commands::git_user_editable_merge::committed_divergence_merges_cleanly(
+                let base = crate::commands::git_user_editable_merge::compute_base_sha(
                     &install_path,
-                    &theirs,
+                    &pull_branch,
                 )
                 .await
-                {
-                    Ok(clean) => {
-                        if clean {
-                            eprintln!(
-                                "[vct] update_orchestrator: committed local divergence merges \
-                                 cleanly with upstream — routing through a real merge (no modal)."
-                            );
+                .ok()
+                .flatten();
+                // Precise pop-conflict-risk check (v0.2.58). Empty set =
+                // safe to --autostash auto-merge. On any error, treat as
+                // risky (non-empty) → keep --ff-only.
+                let pop_conflict_risk = match base.as_deref() {
+                    Some(base_sha) => {
+                        match crate::commands::git_user_editable_merge::tracked_modified_overlapping_upstream(
+                            &install_path, base_sha, &theirs,
+                        )
+                        .await
+                        {
+                            Ok(risk) => risk,
+                            Err(e) => {
+                                eprintln!(
+                                    "[vct] update_orchestrator: pop-conflict-risk check failed \
+                                     ({}) — keeping --ff-only.",
+                                    e
+                                );
+                                vec!["<risk-check-failed>".to_string()]
+                            }
                         }
-                        clean
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "[vct] update_orchestrator: merge-tree probe failed ({}) — \
-                             keeping --ff-only; modal will surface on non-FF.",
-                            e
-                        );
-                        false
+                    None => {
+                        // No merge-base resolvable → can't compute the
+                        // upstream-changed set; be conservative.
+                        vec!["<no-merge-base>".to_string()]
+                    }
+                };
+                if !pop_conflict_risk.is_empty() {
+                    eprintln!(
+                        "[vct] update_orchestrator: {} tracked file(s) locally-modified AND \
+                         upstream-changed (autostash-pop-conflict risk) — keeping --ff-only; \
+                         modal surfaces if non-FF.",
+                        pop_conflict_risk.len()
+                    );
+                    false
+                } else {
+                    // Tree carries no pop-conflict risk. Now confirm the
+                    // merge itself is conflict-free (stateless merge-tree).
+                    match crate::commands::git_user_editable_merge::committed_divergence_merges_cleanly(
+                        &install_path,
+                        &theirs,
+                    )
+                    .await
+                    {
+                        Ok(clean) => {
+                            if clean {
+                                eprintln!(
+                                    "[vct] update_orchestrator: committed local divergence merges \
+                                     cleanly with upstream AND no pop-conflict risk — routing \
+                                     through a real merge (no modal)."
+                                );
+                            }
+                            clean
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[vct] update_orchestrator: merge-tree probe failed ({}) — \
+                                 keeping --ff-only; modal will surface on non-FF.",
+                                e
+                            );
+                            false
+                        }
                     }
                 }
             }
@@ -4453,21 +4506,26 @@ pub async fn update_orchestrator<R: Runtime>(
             &pull_branch,
         ]
     } else if auto_merge_committed_divergence {
-        // v0.2.56 (Defect A fix): committed local divergence that
-        // merge-tree proved conflict-free AND a verified-clean working
-        // tree (the B1 guard above). Do a REAL merge so the local
+        // v0.2.56 (Defect A) + v0.2.58 (precise gate): committed local
+        // divergence that merge-tree proved conflict-free AND no
+        // pop-conflict risk (`tracked-modified ∩ upstream-changed` is
+        // empty — see the decision above). Do a REAL merge so the local
         // commits are preserved and folded in — no modal.
         // `--no-rebase` forces the merge strategy (overriding any
         // `pull.rebase=true` in the user's git config); `--no-edit`
         // accepts the default merge-commit message non-interactively.
-        // `--autostash` is a defensive no-op here (the tree is already
-        // clean — see the B1 guard; without it there is nothing to stash
-        // and therefore no autostash-pop-conflict hazard). On the rare
-        // event the merge conflicts despite the clean probe (a TOCTOU
-        // race with an upstream push between probe and pull, on COMMITTED
-        // content), the merge exits non-zero and the post-pull
-        // `is_merge_or_rebase_conflict` branch catches it and surfaces
-        // the conflict modal + resume sentinel.
+        // `--autostash` IS LIVE here (v0.2.58 allows a dirty tree): it
+        // stashes the user's tracked working-tree edits, merges, then
+        // pops. We proved none of those edits overlap upstream's changes,
+        // so the pop normally re-applies cleanly. The ONE residual hazard
+        // is a TOCTOU race — upstream pushes a commit touching a
+        // locally-modified file in the window between our pop-conflict
+        // pre-check and the pull's own fetch — which would make the pop
+        // conflict AND exit 0. That is NOT caught by the
+        // `!pull.status.success()` branch; the dedicated post-pull
+        // autostash-pop-conflict check (v0.2.58 BLOCKER-1 fix, right after
+        // this pull) detects unmerged files / the autostash-conflict
+        // marker and routes to the conflict modal + resume sentinel.
         //
         // NOTE (review C1): after this auto-merge, local HEAD is a MERGE
         // commit. If the user updated INSIDE the post-tag binary-refresh
@@ -4608,6 +4666,65 @@ pub async fn update_orchestrator<R: Runtime>(
             },
         );
         return Err(format!("git pull failed: {}", stderr));
+    }
+
+    // v0.2.58 (review BLOCKER-1): the `--autostash` pull can SUCCEED (exit 0)
+    // yet leave the tree broken. `git pull --no-rebase/--rebase --autostash`
+    // stashes local tracked changes, merges/rebases, then POPS the stash. If
+    // the pop conflicts, git prints "Applying autostash resulted in
+    // conflicts." and leaves `UU` markers + a dangling autostash — but STILL
+    // EXITS 0. The `!pull.status.success()` block above therefore does NOT
+    // catch it, and proceeding would run install.py + restart on a
+    // silently-broken tree (the original B1 hazard).
+    //
+    // This can happen on a TOCTOU race: our pop-conflict-risk pre-check saw
+    // no overlap, but upstream pushed a commit touching a locally-modified
+    // file in the window before the pull's own fetch. (It also covers the
+    // pre-existing `--rebase --autostash` arm, which had the same latent
+    // hole.) Detect it on the SUCCESS path — unmerged files present and/or
+    // the autostash-conflict marker in stdout — and route to the conflict
+    // modal + resume sentinel exactly like the non-zero conflict branch,
+    // instead of silently continuing. Best-effort; never auto-proceed on a
+    // tree we can't confirm clean.
+    {
+        let pull_combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&pull.stdout),
+            String::from_utf8_lossy(&pull.stderr)
+        );
+        let autostash_pop_failed = pull_combined.contains("autostash resulted in conflicts")
+            || pull_combined.contains("Applying autostash");
+        let unmerged = collect_conflicted_files(&install_path).await;
+        if !unmerged.is_empty() || autostash_pop_failed {
+            eprintln!(
+                "[vct] update_orchestrator: pull exited 0 but the working tree has \
+                 {} unmerged file(s){} — an --autostash pop conflict (TOCTOU race). \
+                 Routing to the conflict modal instead of proceeding on a broken tree.",
+                unmerged.len(),
+                if autostash_pop_failed { " + autostash-conflict marker" } else { "" },
+            );
+            // Restore the running binary + hub (we renamed/stopped pre-pull)
+            // so the user can keep using the launcher after they resolve.
+            if let Some(backup) = pre_pull_renamed.as_deref() {
+                revert_pre_pull_rename(backup);
+            }
+            if let Some(backup) = pre_pull_renamed_hub.as_deref() {
+                revert_pre_pull_rename(backup);
+            }
+            let _ = ensure_hub_started_after_update(&install_path);
+            let conflict_op = if auto_merge_committed_divergence {
+                "merge"
+            } else {
+                "rebase"
+            };
+            write_resume_sentinel_and_deferral(&install_path, conflict_op, &pull_branch).await;
+            return Err(serialize_orchestrator_conflict_error(
+                conflict_op,
+                &pull_branch,
+                &unmerged,
+                pull_combined.trim(),
+            ));
+        }
     }
 
     let pull_output = String::from_utf8_lossy(&pull.stdout);

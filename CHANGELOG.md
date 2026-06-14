@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.58] - 2026-06-14
+
+v0.2.58 stops the GUI "Update orchestrator" flow from showing the scary
+"Local clone has diverged from upstream" modal on a normal, actively-used
+install. The v0.2.56/57 silent auto-merge required a 100%-clean working
+tree — but an installed orchestrator is *expected* to be dirty (hundreds
+of untracked user knowledge-graph nodes, scratch files, etc.), so that
+blunt gate bailed every real update to the modal even when the merge was
+perfectly safe.
+
+### Fixed
+
+- **The update no longer blocks on expected-to-diverge user files.** The
+  auto-merge "is it safe to `--autostash` merge?" gate was a blunt "the
+  working tree must be entirely clean" check. It now computes the PRECISE
+  pop-conflict-risk set — `tracked-modified ∩ upstream-changed` — and
+  proceeds with the silent auto-merge whenever that set is empty.
+  Rationale: `git stash`/`--autostash` never touches UNTRACKED files (so
+  any number of untracked KG nodes / scratch files are irrelevant), and a
+  tracked file that upstream did NOT change can't pop-conflict either. Only
+  a file that is BOTH locally-modified (tracked) AND changed by upstream in
+  this merge can actually conflict on the autostash pop — and only that
+  case now falls back to `--ff-only` + the divergence modal. The v0.2.56
+  B1 safety guarantee (never silently break the tree on a real
+  pop-conflict) is preserved exactly; the over-conservatism is removed.
+  This realizes the design principle that the update flow must not care
+  about a user's knowledge-graph nodes or other expected-to-diverge files.
+  The now-unused blunt `working_tree_is_clean` helper was removed.
+
+Note: `.claude/env`, `.claude/settings.json`, and `.vscode/settings.json`
+are gitignored, so they never participate in the `git pull` and cannot
+cause the divergence modal; surfacing newly-shipped defaults from those
+files to the user is a separate, non-blocking enhancement tracked for a
+future release.
+
 ## [0.2.57] - 2026-06-14
 
 v0.2.57 is a version-hygiene + reliability release: it makes the

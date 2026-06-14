@@ -1046,50 +1046,126 @@ pub(crate) async fn committed_divergence_merges_cleanly(
     Ok(out.status.success())
 }
 
-/// v0.2.56 (Defect A fix — review BLOCKER B1): is the working tree clean
-/// (no uncommitted/staged/untracked-tracked changes)?
+/// v0.2.58: the precise pop-conflict-risk check that replaces the blunt
+/// `working_tree_is_clean` gate for the auto-merge decision.
 ///
-/// THE HAZARD this guards: the auto-merge path runs `git pull --no-rebase
-/// --autostash`. `--autostash` stashes uncommitted edits, merges, then
-/// pops. If the pop CONFLICTS (an uncommitted edit to a NON-union file
-/// overlaps upstream's change to the same region), git completes the pull
-/// with EXIT 0 but leaves `UU` conflict markers in the working tree + a
-/// dangling autostash. Because the pull exited 0, the launcher's
-/// post-pull conflict handler (gated on `!pull.status.success()`) never
-/// fires — so the launcher would restart on a silently-broken tree with
-/// no modal and no deferral. The OLD `--ff-only` path aborted cleanly in
-/// this exact state and routed to the modal; the auto-merge must NOT
-/// regress that.
+/// THE PROBLEM with `working_tree_is_clean` (review of the v0.2.56 B1
+/// guard): it treats ANY `git status --porcelain` output as "dirty" →
+/// bails the silent auto-merge to the modal. But an installed orchestrator
+/// is PERMANENTLY dirty in the expected way — a real instance had 540
+/// dirty entries, 538 of them UNTRACKED user KG nodes + scratch files, 2
+/// tracked-modified, with ZERO overlap with what upstream changed. None of
+/// those could cause the `--autostash` pop-conflict the guard exists to
+/// prevent, yet the blunt gate showed the scary divergence modal anyway.
 ///
-/// The fix: only take the silent auto-merge when the working tree is
-/// CLEAN. With nothing to stash, `--autostash` is a guaranteed no-op and
-/// the pop-conflict hazard cannot arise. A dirty tree falls back to
-/// `--ff-only` — which aborts (non-FF) and surfaces the modal, exactly
-/// as before. (`pre_merge_user_editable` separately handles the
-/// allowlisted-uncommitted-edit case via the rebase arm; this guard is
-/// only consulted on the `!pre_merge_committed` branch.)
+/// THE PRECISE HAZARD the guard must actually catch: `git pull --no-rebase
+/// --autostash` stashes LOCAL changes, merges, then pops. A pop conflict
+/// can ONLY happen for a file that is (a) tracked + locally-modified (git
+/// stash does NOT touch untracked files — they're never stashed) AND (b)
+/// also changed by upstream in this merge (otherwise the pop re-applies
+/// onto unchanged content, no conflict). So the ONLY risk set is
+/// `tracked-modified ∩ upstream-changed`. Everything else — all untracked
+/// files (user KG nodes, scratch), and tracked-modified files upstream
+/// didn't touch — is safe to auto-merge over.
 ///
-/// `git status --porcelain` lists EVERY non-clean path (modified, staged,
-/// renamed, deleted, and untracked). We treat ANY output as "dirty" —
-/// conservative on purpose: an untracked file is harmless to autostash,
-/// but gating on a fully-clean tree is the simplest provably-safe rule
-/// and a dirty tree just gets the (correct, safe) modal fallback.
+/// This honors the design principle that the update flow must NOT CARE
+/// about the user's KG nodes / scratch / any expected-to-diverge file: it
+/// only blocks when a genuine merge-time conflict is actually possible.
 ///
-/// Returns `Ok(true)` when clean, `Ok(false)` when dirty, `Err` only on
-/// subprocess spawn failure (caller treats Err as "can't confirm clean"
-/// → no auto-merge).
-pub(crate) async fn working_tree_is_clean(install_path: &Path) -> Result<bool, String> {
-    let out = tokio::process::Command::new("git").silent()
-        .args(["status", "--porcelain"])
+/// Returns the risk set (empty = safe to auto-merge). `base`/`theirs` are
+/// the merge-base + upstream-tip SHAs (from `compute_base_sha` /
+/// `compute_theirs_sha`). Never raises; on a git error returns the inputs
+/// such that the caller treats the tree as risky (conservative).
+pub(crate) async fn tracked_modified_overlapping_upstream(
+    install_path: &Path,
+    base: &str,
+    theirs: &str,
+) -> Result<Vec<String>, String> {
+    // (1) tracked + locally-modified paths (EXCLUDING untracked `??`).
+    //     We parse `git status --porcelain -z` directly here rather than
+    //     calling `list_locally_modified` because that helper INCLUDES
+    //     untracked entries (which we must exclude — git stash skips them,
+    //     so they can't pop-conflict) and returns only the new path for
+    //     renames. The parse below is the same `-z` record walk shape as
+    //     `list_locally_modified` (rename/copy emit two NUL records); a
+    //     future cleanup could extract a shared tracked-only walker.
+    let status = tokio::process::Command::new("git").silent()
+        .args(["status", "--porcelain", "-z"])
         .current_dir(install_path)
         .output()
         .await
-        .map_err(|e| format!("git status spawn failed: {}", e))?;
-    if !out.status.success() {
-        // Couldn't read status — don't claim clean.
-        return Ok(false);
+        .map_err(|e| format!("git status (tracked-modified) spawn failed: {}", e))?;
+    if !status.status.success() {
+        // Can't read status → be conservative: signal risk by returning a
+        // sentinel non-empty list so the caller bails to --ff-only/modal.
+        return Ok(vec!["<status-read-failed>".to_string()]);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().is_empty())
+    let mut tracked_modified: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let bytes = status.stdout;
+    let mut records = bytes.split(|b| *b == 0u8).peekable();
+    while let Some(rec) = records.next() {
+        if rec.len() < 4 {
+            continue;
+        }
+        let x = rec[0];
+        let y = rec[1];
+        // Untracked entry is `?` in both columns — skip (git stash never
+        // touches it, so it can't pop-conflict).
+        if x == b'?' {
+            continue;
+        }
+        // Rename/copy entries (`R`/`C`) emit a SECOND NUL record (the old
+        // path) — consume + ignore it; the new path (this record) is what
+        // a merge cares about.
+        if x == b'R' || x == b'C' {
+            let _ = records.next();
+        }
+        // Any tracked path with a non-clean status (M/A/D/R/C/U in X or Y).
+        if x != b' ' || y != b' ' {
+            if let Ok(path) = std::str::from_utf8(&rec[3..]) {
+                if !path.is_empty() {
+                    tracked_modified.insert(path.to_string());
+                }
+            }
+        }
+    }
+    if tracked_modified.is_empty() {
+        return Ok(Vec::new()); // nothing tracked-modified → no risk at all.
+    }
+
+    // (2) files upstream changed in this merge (merge-base..theirs).
+    // CONCERN-1 fix: use `-z` (NUL-separated, LITERAL paths). Without it,
+    // `git diff --name-only` honors `core.quotePath` (default true) and
+    // octal-escapes non-ASCII paths (e.g. `"caff\303\250.md"`), while step
+    // 1's `status --porcelain -z` emits the LITERAL path — so the
+    // HashSet intersection would MISS a non-ASCII file that is both
+    // tracked-modified AND upstream-changed, under-classifying a real
+    // pop-conflict risk as safe (the dangerous direction). `-z` makes both
+    // sides literal so the intersection is correct for any filename.
+    let spec = format!("{}...{}", base, theirs);
+    let diff = tokio::process::Command::new("git").silent()
+        .args(["diff", "--name-only", "-z", &spec])
+        .current_dir(install_path)
+        .output()
+        .await
+        .map_err(|e| format!("git diff (upstream-changed) spawn failed: {}", e))?;
+    if !diff.status.success() {
+        // Can't compute the upstream set → conservative: treat ALL
+        // tracked-modified as risky.
+        return Ok(tracked_modified.into_iter().collect());
+    }
+    let upstream_changed: std::collections::HashSet<String> =
+        String::from_utf8_lossy(&diff.stdout)
+            .split('\0')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+    // (3) the ONLY pop-conflict-risk set: tracked-modified ∩ upstream-changed.
+    Ok(tracked_modified
+        .intersection(&upstream_changed)
+        .cloned()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2278,53 +2354,119 @@ mod tests {
         );
     }
 
-    // ----- v0.2.56: working_tree_is_clean (review BLOCKER B1 guard) -----
+    // ----- v0.2.58: tracked_modified_overlapping_upstream (precise gate) -----
+    //
+    // Replaces the v0.2.56 blunt `working_tree_is_clean` gate. The
+    // auto-merge pop-conflict risk is ONLY `tracked-modified ∩
+    // upstream-changed`; untracked files + tracked-modified-not-upstream-
+    // changed are safe. These tests pin that contract.
 
-    /// A pristine clone (only committed content) is clean.
+    /// VCO_dev-shaped regression (the bug this fix exists for): MANY
+    /// untracked files (user KG nodes + scratch) on a committed-divergent
+    /// tree, upstream changed something ELSE → risk set EMPTY → safe to
+    /// auto-merge. Under the old blunt gate this returned "dirty" → modal.
     #[tokio::test]
-    async fn v0256_working_tree_is_clean_true_on_pristine_clone() {
+    async fn v0258_many_untracked_files_are_not_pop_conflict_risk() {
         skip_if_no_git!();
-        let (_tmp, _remote, local) = init_repo_pair();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // Committed local divergence (a KG node) — the auto-merge case.
+        write_local_mod(&local, "knowledge/concepts/mine.md", "# mine\n");
+        run_git(&local, &["add", "knowledge/concepts/mine.md"]);
+        run_git(&local, &["commit", "-m", "docs(kg): node"]);
+        // Pile of UNTRACKED files (like 468 user KG nodes + scratch).
+        for i in 0..20 {
+            write_local_mod(&local, &format!("knowledge/concepts/untracked_{i}.md"), "# u\n");
+        }
+        write_local_mod(&local, "scratch_output.txt", "junk\n");
+        // Upstream changes an UNRELATED tracked file.
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def base(): pass\ndef up(): pass\n");
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let risk = tracked_modified_overlapping_upstream(&local, &base, &theirs).await.unwrap();
         assert!(
-            working_tree_is_clean(&local).await.unwrap(),
-            "a freshly-cloned tree with no edits must report clean",
+            risk.is_empty(),
+            "untracked files + a committed KG node must carry NO pop-conflict \
+             risk (git stash skips untracked; the KG node is committed, not \
+             working-tree-modified). got risk set: {:?}",
+            risk,
         );
     }
 
-    /// An UNCOMMITTED edit makes the tree dirty — even a committed local
-    /// divergence on top must NOT be treated as clean. This is the B1
-    /// guard's reason for being: a dirty tree must fall back to --ff-only
-    /// (modal) rather than the silent --autostash auto-merge.
+    /// A tracked-modified file that upstream ALSO changed IS a pop-conflict
+    /// risk → must appear in the set (so the caller bails to --ff-only/modal).
     #[tokio::test]
-    async fn v0256_working_tree_is_clean_false_with_uncommitted_edit() {
+    async fn v0258_tracked_modified_overlapping_upstream_is_flagged() {
         skip_if_no_git!();
-        let (_tmp, _remote, local) = init_repo_pair();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
 
-        // Commit a KG node (committed divergence — the case auto-merge
-        // targets) ...
-        write_local_mod(&local, "knowledge/concepts/n.md", "# n\nbody\n");
-        run_git(&local, &["add", "knowledge/concepts/n.md"]);
-        run_git(&local, &["commit", "-m", "kg"]);
-        // ... then leave an UNCOMMITTED edit to a non-union source file
-        // (the exact B1 hazard: an autostash pop on this could conflict).
-        write_local_mod(&local, "vco_lib/foo.py", "def base(): pass\ndef wip(): pass\n");
+        // Upstream changes vco_lib/foo.py (it exists in the seed).
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def base(): pass\ndef upstream(): pass\n");
+        // Locally leave an UNCOMMITTED (tracked) edit to the SAME file.
+        write_local_mod(&local, "vco_lib/foo.py", "def base(): pass\ndef local_wip(): pass\n");
 
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let risk = tracked_modified_overlapping_upstream(&local, &base, &theirs).await.unwrap();
         assert!(
-            !working_tree_is_clean(&local).await.unwrap(),
-            "an uncommitted edit must make the tree report DIRTY so the \
-             auto-merge falls back to the safe --ff-only/modal path (B1)",
+            risk.iter().any(|p| p == "vco_lib/foo.py"),
+            "a tracked file edited locally AND changed upstream MUST be flagged \
+             as pop-conflict risk. got: {:?}",
+            risk,
         );
     }
 
-    /// An untracked file also reports dirty (conservative — see helper doc).
+    /// A tracked-modified file upstream did NOT touch is NOT a risk (the
+    /// autostash pop re-applies onto unchanged content → no conflict).
     #[tokio::test]
-    async fn v0256_working_tree_is_clean_false_with_untracked_file() {
+    async fn v0258_tracked_modified_not_upstream_changed_is_safe() {
         skip_if_no_git!();
-        let (_tmp, _remote, local) = init_repo_pair();
-        write_local_mod(&local, "scratch.tmp", "junk\n");
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        // Upstream changes ONE file.
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def base(): pass\ndef up(): pass\n");
+        // Locally edit a DIFFERENT tracked file (CLAUDE.md exists in seed).
+        write_local_mod(&local, "CLAUDE.md", "# base\nLine A\nLine B\nlocal edit\n");
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let risk = tracked_modified_overlapping_upstream(&local, &base, &theirs).await.unwrap();
         assert!(
-            !working_tree_is_clean(&local).await.unwrap(),
-            "an untracked file must make the tree report dirty (conservative)",
+            risk.is_empty(),
+            "a tracked file edited locally but NOT changed upstream is safe \
+             (no overlap). got risk set: {:?}",
+            risk,
+        );
+    }
+
+    /// CONCERN-2: a STAGED-only (`git add`, not committed) tracked file that
+    /// upstream ALSO changed IS a pop-conflict risk (autostash stashes
+    /// staged changes too) and must be flagged. Pins the parser's
+    /// non-`?`/non-clean (X column) detection so a future refactor can't
+    /// silently drop staged-only coverage.
+    #[tokio::test]
+    async fn v0258_staged_only_overlapping_upstream_is_flagged() {
+        skip_if_no_git!();
+        let (tmp, _remote, local) = init_repo_pair();
+        let seed = tmp.path().join("seed");
+
+        push_upstream_change(&seed, &local, "vco_lib/foo.py", "def base(): pass\ndef up(): pass\n");
+        // Edit vco_lib/foo.py locally and STAGE it (git add) without committing.
+        write_local_mod(&local, "vco_lib/foo.py", "def base(): pass\ndef staged_wip(): pass\n");
+        run_git(&local, &["add", "vco_lib/foo.py"]);
+
+        let base = compute_base_sha(&local, "main").await.unwrap().unwrap();
+        let theirs = compute_theirs_sha(&local, "main").await.unwrap().unwrap();
+        let risk = tracked_modified_overlapping_upstream(&local, &base, &theirs).await.unwrap();
+        assert!(
+            risk.iter().any(|p| p == "vco_lib/foo.py"),
+            "a STAGED-only tracked file changed upstream must be flagged (it \
+             gets autostashed + can pop-conflict). got: {:?}",
+            risk,
         );
     }
 }
