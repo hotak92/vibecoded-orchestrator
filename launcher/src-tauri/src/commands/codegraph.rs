@@ -1115,6 +1115,20 @@ async fn run_build_task(
         .stdin(std::process::Stdio::null());
     if let Some(ref root) = install_root {
         cmd.env("VCT_INSTALL_ROOT", root);
+        // v0.2.57 NOTE: we intentionally do NOT also set
+        // VCT_ORCHESTRATOR_ROOT here. The analyzer's vco_lib sys.path
+        // bootstrap was historically split (one site read
+        // VCT_INSTALL_ROOT, another read VCT_ORCHESTRATOR_ROOT); the fix
+        // unified both onto one validated helper that honors
+        // VCT_INSTALL_ROOT (which we DO set), so the codegraph build no
+        // longer needs the orchestrator-root name. A first cut also
+        // exported VCT_ORCHESTRATOR_ROOT as "belt-and-suspenders" — but
+        // analyze_code_graph.py ALSO reads VCT_ORCHESTRATOR_ROOT to pick
+        // the soft-fail deferral-write root; setting it to the install
+        // root would relocate a user project's no-embedding-backend
+        // UPDATE_DEFERRED.md entry out of the project and into the
+        // orchestrator clone. The helper fix alone closes the bug, so we
+        // leave VCT_ORCHESTRATOR_ROOT unset and preserve that behavior.
     }
     let output = cmd.output().await;
 

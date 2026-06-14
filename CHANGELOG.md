@@ -7,7 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.56] - 2026-06-14
+## [0.2.57] - 2026-06-14
+
+v0.2.57 is a version-hygiene + reliability release: it makes the
+orchestrator version a single source of truth (fixing a stale version
+the `vct-hub` reported), and fixes a code-graph build failure that could
+hit any project whose code graph is (re)built by the launcher.
+
+### Fixed
+
+- **`vct-hub` now reports the correct version.** The four Rust crates
+  (the launcher binary, `vct-hub`, `vct-updater`, `vct-launcher-core`)
+  each carried their own literal `version = "X.Y.Z"`, hand-maintained
+  per release. They drifted: `vct-hub` sat at an old version while the
+  launcher moved ahead, so the hub's `/health` endpoint
+  (`env!("CARGO_PKG_VERSION")`) reported a stale number — misleading
+  diagnostics and the freshness checks that read it. All four crates now
+  inherit one `[workspace.package]` version (`version.workspace = true`),
+  so a single bump propagates everywhere and the hub can't drift again.
+- **Code-graph build no longer fails with `ModuleNotFoundError: No
+  module named 'vco_lib'`.** The analyzer
+  (`templates/scripts/analyze_code_graph.py`) had two divergent
+  `sys.path` bootstraps for `vco_lib`; one honored `VCT_INSTALL_ROOT`
+  (which the launcher sets) and validated the candidate, the other
+  honored only `VCT_ORCHESTRATOR_ROOT` (which the launcher does not set)
+  with an unvalidated fallback to the project root. When the launcher
+  spawned a code-graph (re)build, the second bootstrap fell back to a
+  directory with no `vco_lib/` and crashed. Both bootstraps now route
+  through one validated helper that honors both env-var names (the
+  launcher sets `VCT_INSTALL_ROOT`, which the helper now uses).
+
+### Added
+
+- **One-command version bump (`scripts/bump-version.sh`).** Bumps every
+  version pin — the `[workspace.package]` Cargo version (covering all
+  four crates), `pyproject.toml`, `package.json`, `package-lock.json`,
+  `tauri.conf.json`, `vct-module.json`, and `Cargo.lock` — from a single
+  argument: `scripts/bump-version.sh 0.2.57`. Replaces the error-prone
+  per-file hand-edit that caused the drift above.
+- **CI version-pin gate (`scripts/check-version-pins.sh` + a `version-pins`
+  CI job).** Every push/PR now asserts all pins agree with
+  `pyproject.toml` AND that the workspace-inheriting crates still use
+  `version.workspace = true` (no resurrected per-crate literal). The
+  release-time `pre-ship-check.sh` sources the same logic, so CI and
+  release can't disagree. Fast (~1s, no build/test).
 
 v0.2.56 fixes a spurious "Local clone has diverged from upstream"
 modal that every active install was on track to hit on every update.

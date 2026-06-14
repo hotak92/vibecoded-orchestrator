@@ -17,9 +17,10 @@
 #   - EXPECTED_VERSION derived from pyproject.toml at runtime (single
 #     source of truth) — or overridden via $1 / $EXPECTED_VERSION for
 #     testing.
-#   - VERSION_PIN_FILES is a single declared list near the top: add a
-#     line when a new file gets a version pin, remove a line when one
-#     goes away. Every entry runs through the same `check_pin` helper.
+#   - The version-pin lists + checking logic live in ONE place,
+#     `scripts/check-version-pins.sh` (also the per-push CI `version-pins`
+#     job). Section 4 sources it and calls `vcheck_run_pins`. Add/remove a
+#     pinned file THERE, not here.
 #   - Version-specific test-file presence checks are intentionally NOT
 #     re-introduced — the `pytest tests/` and `cargo test --lib` gates
 #     already exercise them; tying gate-presence to a particular release
@@ -61,22 +62,14 @@ if [ -z "$EXPECTED_VERSION" ]; then
     exit 2
 fi
 
-# ── Canonical version-pin file list ────────────────────────────────────
-# Every file that carries a `version = "X.Y.Z"` or `"version": "X.Y.Z"`
-# pin matching the release. ADD a line when a new pin is introduced.
-# REMOVE a line when one goes away. Each entry runs through `check_pin`
-# below — the helper matches both TOML (`version = "x"`) and JSON
-# (`"version": "x"`) shapes.
-VERSION_PIN_FILES=(
-    "pyproject.toml"
-    "vct-module.json"
-    "launcher/package.json"
-    "launcher/package-lock.json"
-    "launcher/src-tauri/Cargo.toml"
-    "launcher/src-tauri/tauri.conf.json"
-    "launcher/src-tauri/vct-hub/Cargo.toml"
-    "launcher/src-tauri/vct-launcher-core/Cargo.toml"
-)
+# ── Canonical version-pin lists ─────────────────────────────────────────
+# v0.2.57: the pin lists (VERSION_PIN_FILES + WORKSPACE_INHERITED_CRATES)
+# AND the checking logic (vcheck_run_pins) now live in ONE place:
+# scripts/check-version-pins.sh. Section 4 below sources that file and
+# calls vcheck_run_pins, so the per-push CI `version-pins` job and this
+# release-time gate run identical logic and can never drift. (Don't
+# re-declare the lists here — that would shadow the sourced canonical
+# copies and reintroduce the multi-source-of-truth class this fixes.)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -511,36 +504,23 @@ fi
 echo ""
 
 # ── Section 4: Version-pin consistency ───────────────────────────────────────
+# v0.2.57: the pin-checking logic lives in ONE place — scripts/check-version-pins.sh
+# (also run standalone by the CI `version-pins` job). We SOURCE it and call
+# its `vcheck_run_pins` helper so CI and release-time use identical logic
+# and can't drift. The sourced file defines VERSION_PIN_FILES +
+# WORKSPACE_INHERITED_CRATES + vcheck_run_pins; sourcing it (not executing)
+# is a no-op for output because its report block is guarded by
+# `[ "${BASH_SOURCE[0]}" = "$0" ]`.
 echo "--- Version-pin consistency (all files at v$EXPECTED_VERSION) ---"
-echo "  [checking ${#VERSION_PIN_FILES[@]} pinned files at $EXPECTED_VERSION...]"
+# shellcheck source=scripts/check-version-pins.sh
+. "$SCRIPT_DIR/check-version-pins.sh"
+echo "  [checking ${#VERSION_PIN_FILES[@]} literal pins + ${#WORKSPACE_INHERITED_CRATES[@]} inherited crates at $EXPECTED_VERSION...]"
 
-declare -a pin_failures=()
-check_pin() {
-    local file="$1"
-    local expected="$2"
-    local got
-    if [ ! -f "$file" ]; then
-        pin_failures+=("$file (missing)")
-        return
-    fi
-    if ! grep -q "\"version\": \"$expected\"" "$file" 2>/dev/null \
-        && ! grep -q "^version = \"$expected\"" "$file" 2>/dev/null; then
-        got="$(grep -m1 -E '^(version = |"version": )' "$file" \
-            | sed -E 's/.*"([^"]+)".*/\1/' \
-            | head -c 80)"
-        pin_failures+=("$file (got: $got)")
-    fi
-}
-
-for f in "${VERSION_PIN_FILES[@]}"; do
-    check_pin "$f" "$EXPECTED_VERSION"
-done
-
-if [ "${#pin_failures[@]}" -eq 0 ]; then
-    gate_pass "all ${#VERSION_PIN_FILES[@]} forward version pins at $EXPECTED_VERSION"
+if vcheck_run_pins "$EXPECTED_VERSION"; then
+    gate_pass "all version pins agree at $EXPECTED_VERSION (literals + [workspace.package] + ${#WORKSPACE_INHERITED_CRATES[@]} inherited crates)"
 else
-    gate_fail "forward version pins at $EXPECTED_VERSION" \
-        "Mismatch: ${pin_failures[*]}"
+    gate_fail "version-pin / workspace-inheritance drift at $EXPECTED_VERSION" \
+        "Run scripts/bump-version.sh $EXPECTED_VERSION. Offending: ${VCHECK_FAILURES[*]}"
 fi
 
 # Gate (no-deferred-fixes): [Unreleased] CHANGELOG block must be empty.

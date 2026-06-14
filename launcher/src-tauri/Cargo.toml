@@ -7,9 +7,22 @@
 # §"Workspace structure (v0.2.21)" + the v0.2.21 plan §3.
 members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 
+# v0.2.57: SINGLE source of truth for the workspace version. Every member
+# crate (the launcher binary below + vct-hub / vct-updater /
+# vct-launcher-core) sets `version.workspace = true` and inherits THIS
+# value. Bump it here ONCE per release — cargo propagates it to all
+# crates, and the hub's `env!("CARGO_PKG_VERSION")` (its /health version)
+# then reports correctly. Before v0.2.57 each crate carried its own
+# literal `version =`, which silently drifted (the hub was stuck at
+# 0.2.54 while the launcher shipped 0.2.56). The non-Cargo pins are
+# propagated from this same logical version by `scripts/bump-version.sh`
+# and verified by `scripts/pre-ship-check.sh`.
+[workspace.package]
+version = "0.2.57"
+
 [package]
 name = "vct-launcher-temp"
-version = "0.2.56"
+version.workspace = true
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

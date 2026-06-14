@@ -160,14 +160,53 @@ CODE_GRAPH_BASES = ["CodeModule", "CodeClass", "CodeFunction", "CodeAPI", "CodeI
 #      `looks_like_install_root`).
 #   3. Walk up from this script: <root>/.claude/scripts/foo.py →
 #      <root> contains vco_lib/.
-_vct_install_root = os.environ.get("VCT_INSTALL_ROOT", "").strip()
-for _candidate in [
-    _vct_install_root,
-    str(Path(__file__).resolve().parent.parent.parent),  # script_dir/../..
-]:
-    if _candidate and _candidate not in sys.path and (Path(_candidate) / "vco_lib").is_dir():
-        sys.path.insert(0, _candidate)
-        break
+def _ensure_vco_lib_on_path() -> bool:
+    """Put the orchestrator root (the dir CONTAINING ``vco_lib/``) on
+    ``sys.path`` so ``import vco_lib...`` works regardless of which venv
+    the wrapper activated.
+
+    v0.2.57 (codegraph bootstrap fix): this is the SINGLE bootstrap both
+    ``vco_lib`` import sites in this module call. Previously there were
+    TWO divergent copies — the first (for ``project_naming``) honored
+    ``VCT_INSTALL_ROOT`` and validated the candidate actually contained
+    ``vco_lib/``; the second (for ``embedding_service``) honored ONLY
+    ``VCT_ORCHESTRATOR_ROOT`` with an UNVALIDATED ``parent.parent.parent``
+    fallback. The launcher's codegraph spawn sets ``VCT_INSTALL_ROOT``
+    but NOT ``VCT_ORCHESTRATOR_ROOT`` (see
+    launcher/src-tauri/src/commands/codegraph.rs), so the second copy fell
+    back to the user-project root — which has no ``vco_lib/`` — and the
+    build died with ``ModuleNotFoundError: No module named 'vco_lib'`` (a
+    user project hit this on 2026-06-14). One validated helper, both
+    env-var names, no drift.
+
+    Candidate order (first that actually contains ``vco_lib/`` wins):
+      1. ``$VCT_INSTALL_ROOT`` — the launcher always sets this to the
+         orchestrator install root (see ``looks_like_install_root``).
+      2. ``$VCT_ORCHESTRATOR_ROOT`` — set by ``.claude/env`` (shell
+         sourcing); present for CLI users, absent in launcher subprocs.
+      3. ``<script_dir>/../..`` — when the script lives in the
+         orchestrator clone's own ``.claude/scripts/``.
+
+    Returns True if ``vco_lib`` is importable afterward (either already
+    on path, or a candidate was inserted), False otherwise. Never raises.
+    """
+    # Already importable (e.g. an editable .pth in the active venv, or a
+    # prior call) — nothing to do.
+    if any((Path(p) / "vco_lib").is_dir() for p in sys.path if p):
+        return True
+    for _candidate in (
+        os.environ.get("VCT_INSTALL_ROOT", "").strip(),
+        os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip(),
+        str(Path(__file__).resolve().parent.parent.parent),  # script_dir/../..
+    ):
+        if _candidate and (Path(_candidate) / "vco_lib").is_dir():
+            if _candidate not in sys.path:
+                sys.path.insert(0, _candidate)
+            return True
+    return False
+
+
+_ensure_vco_lib_on_path()
 
 try:
     from vco_lib.project_naming import canonical_class_prefix as _canonical_class_prefix
@@ -451,16 +490,16 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # (A1, v0.2.38) — no sys.path entry needed for weaviate_mcp.code_truncation.
 # vco_lib (EmbeddingService) still needs its parent on sys.path because
 # vco_lib is not yet a standalone package.
-# Resolution order:
-#   1. $VCT_ORCHESTRATOR_ROOT (set by .claude/env)
-#   2. <in-tree> fallback — claude_mcp_servers/../ relative to this script
-_env_root = os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip()
-if _env_root and Path(_env_root).is_dir():
-    _vco_lib_parent = Path(_env_root)
-else:
-    _vco_lib_parent = Path(__file__).resolve().parent.parent.parent
-if str(_vco_lib_parent) not in sys.path:
-    sys.path.insert(0, str(_vco_lib_parent))
+#
+# v0.2.57: use the SINGLE validated bootstrap helper (defined near the top
+# of this module). Previously this site read ONLY $VCT_ORCHESTRATOR_ROOT
+# with an unvalidated parent.parent.parent fallback — which broke under
+# the launcher (it sets $VCT_INSTALL_ROOT, not $VCT_ORCHESTRATOR_ROOT) and
+# fell back to the user-project root, crashing the `from
+# vco_lib.embedding_service import` below with ModuleNotFoundError. The
+# helper honors both env-var names + validates the candidate contains
+# vco_lib/, so the two sites can no longer drift.
+_ensure_vco_lib_on_path()
 # VCO-REWIRE-END: orchestrator-root-resolution
 try:
     from weaviate_mcp.code_truncation import (

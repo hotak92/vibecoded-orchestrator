@@ -482,3 +482,26 @@ jobs:
       # Per Track C / D pattern docs in the script itself.
       - name: check-pre-tag-privacy.sh
         run: bash scripts/check-pre-tag-privacy.sh
+
+  version-pins:
+    name: Version-pin consistency (no cross-file drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Pin check reads tracked manifests only; no history needed.
+          fetch-depth: 1
+
+      # v0.2.57: enforce the single-version-source guarantee on EVERY
+      # push/PR, not just at release time. Before v0.2.57 the orchestrator
+      # version was hand-maintained in ~9 files; they silently drifted
+      # (the vct-hub crate sat at 0.2.54 while the launcher shipped 0.2.56,
+      # so the hub's /health reported the wrong version). This fast (~1s,
+      # no build/test) gate asserts every literal pin agrees with
+      # pyproject.toml AND that the workspace-inheriting Rust crates still
+      # use `version.workspace = true` (no resurrected per-crate literal).
+      # Fix on failure: `scripts/bump-version.sh <X.Y.Z>` bumps all pins
+      # from one command. (`pre-ship-check.sh` runs the same logic at
+      # release time via the shared `vcheck_run_pins` helper.)
+      - name: check-version-pins.sh
+        run: bash scripts/check-version-pins.sh

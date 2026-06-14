@@ -1,6 +1,8 @@
 [package]
 name = "vct-launcher-core"
-version = "0.2.54"
+# v0.2.57: inherit the single workspace version (root Cargo.toml
+# [workspace.package]) — see vct-hub/Cargo.toml for the rationale.
+version.workspace = true
 edition = "2021"
 description = "Shared library for vct-launcher and vct-hub binaries — db, manifest, secrets, paths, config, services::runtime/picker, state, types, registry."
 authors = ["VibeCoded Tools"]

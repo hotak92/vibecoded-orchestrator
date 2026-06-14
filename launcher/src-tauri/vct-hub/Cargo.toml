@@ -1,6 +1,10 @@
 [package]
 name = "vct-hub"
-version = "0.2.54"
+# v0.2.57: inherit the single workspace version (root Cargo.toml
+# [workspace.package]). This is what makes /health report correctly —
+# `env!("CARGO_PKG_VERSION")` now resolves to the workspace version
+# instead of a hand-maintained literal that drifted to 0.2.54.
+version.workspace = true
 edition = "2021"
 description = "Detached HTTP server for VCT — supervisor + resolver, survives launcher GUI close."
 authors = ["VibeCoded Tools"]

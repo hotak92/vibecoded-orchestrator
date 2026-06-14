@@ -1,6 +1,8 @@
 [package]
 name = "vct-updater"
-version = "0.2.54"
+# v0.2.57: inherit the single workspace version (root Cargo.toml
+# [workspace.package]) — see vct-hub/Cargo.toml for the rationale.
+version.workspace = true
 edition = "2021"
 description = "Stage1 updater for VCT launcher — performs Windows binary swap after parent launcher exits. Velopack/Squirrel-style pattern."
 authors = ["VibeCoded Tools"]
