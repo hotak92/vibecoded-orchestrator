@@ -326,21 +326,24 @@ fn launcher_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Bug 16: detect whether the orchestrator core is "installed" by checking
-/// whether any project in the launcher DB has host=base. This is the same
-/// signal used elsewhere — projects with the base host imply a working
-/// orchestrator install.
-fn orchestrator_installed(db: &Db) -> bool {
-    db.list_projects()
-        .map(|rows| rows.iter().any(|p| matches!(p.host, ProjectHost::Base)))
-        .unwrap_or(false)
-}
+// v0.2.59: `orchestrator_installed(db)` was removed. Its only consumer
+// was the orchestrator core catalog card's `kind`, which is now an
+// unconditional `"bundled"` (the orchestrator IS the running host — it's
+// installed by definition, never "available" to install). The old
+// "any project has host=Base" heuristic produced a spurious Install
+// button on machines with no Base-host project yet.
 
 /// Bug 16: built-in catalog entries that always render in /modules even
 /// when no installable modules are present. Reflects real repo state:
 /// launcher version comes from CARGO_PKG_VERSION, orchestrator + components
-/// from `vct-module.json` at repo root, install state from the launcher DB.
-fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
+/// from `vct-module.json` at repo root.
+///
+/// v0.2.59: `_db` is currently unused — the orchestrator-installed
+/// heuristic that read it was removed when the core card became
+/// unconditionally `"bundled"`. The parameter is retained (7 call sites)
+/// because a future builtin entry keyed on launcher-DB install state is
+/// plausible; drop it if that never materialises.
+fn builtin_catalog_entries(_db: &Db) -> Vec<ModuleCatalogEntry> {
     let mut out = Vec::new();
 
     // 1. The launcher itself — always "bundled" (the running process).
@@ -402,7 +405,6 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
             )
         };
 
-    let installed = orchestrator_installed(db);
     out.push(ModuleCatalogEntry {
         id: "orchestrator".into(),
         name: "VibeCoded Orchestrator".into(),
@@ -416,7 +418,17 @@ fn builtin_catalog_entries(db: &Db) -> Vec<ModuleCatalogEntry> {
         compatibility_hosts: vec!["base".into()],
         is_licensed: true,
         manifest_source: "builtin".into(),
-        kind: if installed { "installed".into() } else { "available".into() },
+        // v0.2.59: the orchestrator IS the host (the launcher you're
+        // running is the orchestrator), so it's bundled-by-definition —
+        // never offer an "Install" button for it. Pre-v0.2.59 this was
+        // `if installed { "installed" } else { "available" }` keyed on
+        // `orchestrator_installed(db)` = "does any project have
+        // host=Base?". On a machine with no Base-host project yet that
+        // predicate is false → kind="available" → a spurious Install
+        // button on the orchestrator's own core card. Match the launcher
+        // self-card above (unconditional "bundled"). `installed` is no
+        // longer read here; the helper stays for any future use.
+        kind: "bundled".into(),
         parent_id: String::new(),
         cta_route: String::new(),
         coming_soon_tier: String::new(),
@@ -3039,6 +3051,32 @@ mod tests {
              The Store page falls back to the static `version` field in `allApps` \
              when the catalog returns no version — leaving it empty prevents \
              showing a stale hardcoded string."
+        );
+    }
+
+    /// v0.2.59 regression: the orchestrator core card must render as
+    /// `"bundled"` (no Install button) even on a fresh DB with NO
+    /// Base-host project. Pre-v0.2.59 its kind was
+    /// `if orchestrator_installed(db) { "installed" } else { "available" }`,
+    /// and `orchestrator_installed` returned false when no project had
+    /// host=Base — producing a spurious Install button on the
+    /// orchestrator's OWN card (it's the running host, installed by
+    /// definition). `open_db()` returns an empty DB → no Base-host
+    /// project → exactly the bug-triggering condition.
+    #[test]
+    fn builtin_catalog_orchestrator_entry_is_bundled_with_no_base_project() {
+        let db = open_db();
+        let entries = builtin_catalog_entries(&db);
+        let orch = entries
+            .iter()
+            .find(|e| e.id == "orchestrator")
+            .expect("orchestrator entry must be present");
+        assert_eq!(
+            orch.kind, "bundled",
+            "orchestrator core card must be 'bundled' (the host is installed \
+             by definition); got '{}' — a non-'bundled' kind renders an \
+             Install/available affordance on the orchestrator's own card",
+            orch.kind
         );
     }
 
