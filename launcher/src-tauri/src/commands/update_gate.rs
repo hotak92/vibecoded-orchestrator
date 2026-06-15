@@ -438,6 +438,103 @@ pub fn mcp_pattern_match(cmdline: &str) -> bool {
         .any(|pat| cmdline.contains(pat))
 }
 
+/// v0.2.59: return true if a process's executable BASENAME identifies it
+/// as a `vct-hub` instance we should reap during an update.
+///
+/// Matched on the executable file name (`vct-hub` / `vct-hub.exe`), NOT
+/// a cmdline substring — a substring like `"vct-hub"` would also hit
+/// `vct-hub-notes.txt` in someone's args, or a `vct-hub --stop` helper
+/// invocation. The exe basename is the precise signal: it IS a hub
+/// binary. (Windows comparison is case-insensitive; POSIX is exact.)
+///
+/// Pure helper, isolated for unit testing — process enumeration is hard
+/// to mock but the basename logic is deterministic.
+pub fn hub_exe_basename_match(exe_basename: &str) -> bool {
+    let b = exe_basename;
+    #[cfg(target_os = "windows")]
+    {
+        let lower = b.to_ascii_lowercase();
+        lower == "vct-hub.exe" || lower == "vct-hub"
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        b == "vct-hub"
+    }
+}
+
+/// v0.2.59: backstop sweep for `vct-hub` processes the single-`hub.pid`
+/// stop path (`ensure_hub_stopped_for_update`) could not see.
+///
+/// WHY this exists: `ensure_hub_stopped_for_update` reads exactly ONE
+/// lockfile — `<vct_root_dir()>/hub.pid` — and stops only the pid it
+/// names. But a `vct-hub` started outside THAT lockfile's protocol is
+/// invisible to it and to `vct-hub --stop`:
+///   * a dev `cargo run`/`--foreground` hub from a different checkout,
+///   * a hub from a SECOND install root (different `VCT_STATE_DIR` →
+///     different `hub.pid`),
+///   * a hub that survived a crash which cleared/overwrote the pid.
+/// Any such hub keeps `~/.vct/launcher.db` open (blocking DB writes)
+/// and, on Windows, keeps `vct-hub.exe` locked (blocking the binary
+/// swap). This sweep is the process-identity backstop: after the
+/// lockfile-driven stop, terminate any REMAINING hub binary.
+///
+/// Posture (per the 2026-06-15 decision): SIGTERM (graceful) + soft-fail
+/// — mirrors `pre_update_mcp_kill_sweep`. We never SIGKILL here and we
+/// never block the update if one survives; the pre-pull binary rename +
+/// the update-gate lockfile already backstop the Windows path, and
+/// SQLite is crash-safe so a surviving reader is at worst a transient
+/// lock the next write retries past.
+///
+/// SAFETY: strictly filtered to processes whose EXE BASENAME is
+/// `vct-hub`/`vct-hub.exe` (never a cmdline substring), and never our
+/// own pid (the launcher). Returns the number of hubs signalled
+/// (informational).
+pub fn pre_update_hub_kill_sweep() -> usize {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let my_pid = std::process::id();
+    let mut count = 0usize;
+    for (pid, proc) in sys.processes() {
+        // Never signal ourselves (the launcher) or our parent.
+        if pid.as_u32() == my_pid {
+            continue;
+        }
+        // Identify by executable basename, not cmdline substring.
+        let exe_basename = proc
+            .exe()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !hub_exe_basename_match(&exe_basename) {
+            continue;
+        }
+        let cmdline = proc
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "[update_gate] hub-sweep: terminating stray vct-hub PID {} (exe: {}, cmd: {})",
+            pid.as_u32(),
+            exe_basename,
+            cmdline.chars().take(120).collect::<String>()
+        );
+        // SIGTERM (graceful) + soft-fail. `kill_with` returns None when
+        // the platform lacks the signal — fall back to the default
+        // terminate in that case. We do NOT escalate to SIGKILL or wait.
+        match proc.kill_with(sysinfo::Signal::Term) {
+            Some(_) => {}
+            None => {
+                proc.kill();
+            }
+        }
+        count += 1;
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +748,44 @@ mod tests {
         assert!(!mcp_pattern_match(
             "/home/x/.vct/dist/vct-hub --start-if-not-running"
         ));
+    }
+
+    // ── hub_exe_basename_match (v0.2.59 backstop sweep) ─────────────────
+
+    #[test]
+    fn hub_match_accepts_bare_basename() {
+        // The exe basename sysinfo reports for an installed hub.
+        assert!(hub_exe_basename_match("vct-hub"));
+    }
+
+    #[test]
+    fn hub_match_rejects_launcher_and_unrelated() {
+        // The launcher itself must never be swept (we exclude our own
+        // pid too, but the basename filter is the first line of defense).
+        assert!(!hub_exe_basename_match("vct-launcher"));
+        assert!(!hub_exe_basename_match("vct-updater"));
+        assert!(!hub_exe_basename_match("python3"));
+        assert!(!hub_exe_basename_match(""));
+        // NOT a substring matcher: a hub-ish-looking but distinct binary
+        // name must not match.
+        assert!(!hub_exe_basename_match("vct-hub-notes"));
+        assert!(!hub_exe_basename_match("my-vct-hub"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn hub_match_windows_is_case_insensitive_and_accepts_exe() {
+        assert!(hub_exe_basename_match("vct-hub.exe"));
+        assert!(hub_exe_basename_match("VCT-HUB.EXE"));
+        assert!(hub_exe_basename_match("Vct-Hub"));
+        assert!(!hub_exe_basename_match("vct-hub-notes.exe"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn hub_match_posix_is_exact() {
+        // POSIX exe basenames are case-sensitive and carry no `.exe`.
+        assert!(!hub_exe_basename_match("vct-hub.exe"));
+        assert!(!hub_exe_basename_match("VCT-HUB"));
     }
 }

@@ -3094,7 +3094,38 @@ async fn run_install_orchestrator_lightweight(
 /// can't be spawned (binary not on disk, exec failed), we fall
 /// through to the direct signal path — the hub IPC is just a polite
 /// hint; the OS-level signal is the real mechanism.
-fn ensure_hub_stopped_for_update(_install_path: &Path) -> Result<bool, String> {
+///
+/// v0.2.59: this is a thin wrapper. It (1) stops the hub named by
+/// `<vct_root_dir()>/hub.pid` via `stop_lockfile_hub_for_update`, then
+/// (2) ALWAYS runs `pre_update_hub_kill_sweep` as a process-identity
+/// backstop. The lockfile path can only see ONE hub; a hub from a
+/// different state-root/install (dev `--foreground` builds, a 2nd
+/// install root, or a crash that cleared the pid) is invisible to it
+/// yet still holds `launcher.db` open and locks `vct-hub.exe` on
+/// Windows — blocking the binary swap. The sweep reaps those. The
+/// lockfile result is what we return (it carries the Err that blocks
+/// the pull when the NAMED hub provably won't die); the sweep is
+/// soft-fail and never changes the return value.
+fn ensure_hub_stopped_for_update(install_path: &Path) -> Result<bool, String> {
+    let lockfile_result = stop_lockfile_hub_for_update(install_path);
+    // Backstop: reap any stray vct-hub the single-lockfile path missed.
+    // Soft-fail — runs even when the lockfile stop returned Err (a
+    // surviving named hub is a separate problem; we still want to clear
+    // strays). The count is informational.
+    let swept = crate::commands::update_gate::pre_update_hub_kill_sweep();
+    if swept > 0 {
+        eprintln!(
+            "[vct] update_orchestrator: hub-sweep backstop terminated {} stray vct-hub process(es) the lockfile path did not cover",
+            swept
+        );
+    }
+    lockfile_result
+}
+
+/// v0.2.59: the original single-`hub.pid`-driven stop. Renamed from
+/// `ensure_hub_stopped_for_update` so the wrapper above can always run
+/// the process-identity backstop sweep afterward. Behaviour unchanged.
+fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
     let pid_file = vct_launcher_core::paths::vct_root_dir().join("hub.pid");
     let pid_raw = match std::fs::read_to_string(&pid_file) {
         Ok(s) => s,
