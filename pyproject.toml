@@ -78,7 +78,7 @@ mcp = [
     # Pinned <4.50 because CodeSage-Large-v2 trust_remote_code modeling
     # file imports `Conv1D` from `transformers.modeling_utils` (moved in
     # 4.50). See requirements.txt for the full multi-paragraph rationale.
-    "transformers >= 4.40.0, < 4.50.0",
+    "transformers >= 4.40.0, < 5.13.0",
     "torch >= 2.11.0",
     "fastapi >= 0.136.1",
     "uvicorn >= 0.46.0",
