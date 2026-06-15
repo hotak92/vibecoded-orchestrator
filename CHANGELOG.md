@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.59] - 2026-06-15
+
+v0.2.59 fixes a paid-module install failure (a container-name template
+token the launcher never substituted), removes a spurious "Install"
+button from the orchestrator's own catalog card, and hardens the
+"Update orchestrator" flow against background service processes that
+could lock the launcher database or block the binary swap.
+
+### Fixed
+
+- **Global-singleton modules install correctly.** A module manifest that
+  names its container after itself — the canonical global-singleton form
+  `runtime.container_name_template: "{module_id}"` — failed at
+  post-install container-start with
+  `container_name_template '{module_id}' has unresolved placeholders`.
+  The launcher only ever substituted `{project_slug}`, never
+  `{module_id}`. The `{module_id}` token is now resolved at the single
+  choke-point every container-name path funnels through
+  (`RuntimeBlock::resolve_container_name_template`), so both per-project
+  and global scopes get it for free. No container or manifest re-release
+  is needed — an already-pulled install heals on the next launcher boot
+  (auto-retry) or via Retry.
+
+- **Install reports the real outcome instead of a misleading success.**
+  When a container/service module pulled and extracted fine but its
+  post-install container *start* failed, the launcher still emitted
+  `success: true` and returned a row hardcoded to `status=Installed` —
+  contradicting the database row it had just flipped to `Error`, and
+  showing a detail-less "install did not complete (status: error)"
+  toast. The install path now carries the container-start error out:
+  it emits `success: false` with the error string and returns a row that
+  matches the actual outcome (`status=Error`, `last_error` set), so the
+  toast is actionable.
+
+- **The orchestrator's own card no longer offers an "Install" button.**
+  The built-in "VibeCoded Orchestrator" catalog card keyed its state on
+  "does any project use the base host?", which is false on a machine
+  with no base-host project yet — rendering an Install affordance on the
+  host that is, by definition, already installed (it's the running
+  launcher). The card is now unconditionally a bundled/host state, the
+  same as the launcher's own self-card.
+
+- **Updates reap stray `vct-hub` processes that the lockfile path can't
+  see.** The pre-update hub stop was driven entirely by the single
+  `hub.pid` lockfile, so a `vct-hub` started outside that protocol — a
+  second install root (different state directory → different lockfile),
+  a development `--foreground` build, or one that survived a crash which
+  cleared the pid — stayed alive holding the launcher database open
+  (blocking writes) and, on Windows, locking `vct-hub.exe` (blocking the
+  binary swap). The update flow now runs a process-identity backstop
+  sweep after the lockfile-driven stop: it matches strictly on the
+  executable basename (`vct-hub` / `vct-hub.exe`, never our own process),
+  sends a graceful `SIGTERM`, and soft-fails (it never force-kills,
+  waits, or blocks the update — the pre-pull binary rename and the
+  update-gate lockfile already backstop the Windows path).
+
 ## [0.2.58] - 2026-06-14
 
 v0.2.58 stops the GUI "Update orchestrator" flow from showing the scary
