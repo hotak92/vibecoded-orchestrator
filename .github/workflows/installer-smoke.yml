@@ -111,7 +111,7 @@ jobs:
           python-version: "3.12"
 
       # v0.2.42 CI-3: pip cache — saves ~2-4 min on repeated runs.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-smoke-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
@@ -328,7 +328,7 @@ jobs:
           python-version: "3.12"
 
       # v0.2.42 CI-3: pip cache.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-smoke-${{ hashFiles('requirements.txt', 'pyproject.toml') }}
@@ -623,7 +623,7 @@ jobs:
 
       # v0.2.42 CI-3: pip cache — saves ~3-5 min on repeated windows-latest runs.
       # Both Linux and Windows cache paths included; macOS uses ~/.cache/pip too.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cache/pip
