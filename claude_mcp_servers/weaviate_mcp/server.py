@@ -1036,6 +1036,28 @@ def _get_result_verbosity_by_score(score: float) -> str:
 # caller asked for uniform output, so we honour it without budget logic.
 _HYBRID_CHUNK_BUDGET: int = int(os.getenv("KG_HYBRID_CHUNK_BUDGET", "20"))
 
+
+def _resolve_hybrid_alpha() -> float:
+    """Cosine (vector) weight for relativeScoreFusion in hybrid_search.
+
+    Weaviate's `alpha` convention: alpha=1.0 → pure vector, 0.0 → pure
+    keyword. Default 0.6 = cosine-dominant (semantic meaning is the primary
+    signal; BM25 keyword overlap is the booster/tiebreaker). Overridable via
+    KG_HYBRID_ALPHA; malformed / out-of-range values clamp to [0,1] and fall
+    back to 0.6 on parse failure so a bad env var can never break search.
+    """
+    raw = os.getenv("KG_HYBRID_ALPHA")
+    if raw is None:
+        return 0.6
+    try:
+        a = float(raw)
+    except (TypeError, ValueError):
+        return 0.6
+    return max(0.0, min(1.0, a))
+
+
+_HYBRID_ALPHA: float = _resolve_hybrid_alpha()
+
 # Tier downgrade chain: if budget can't cover the score-allowed tier, drop
 # one step. summary always succeeds (cost 0).
 _TIER_DOWNGRADE: dict[str, str] = {
@@ -1515,6 +1537,16 @@ def _format_result_by_tier(
         base["content"] = f"{prefix}{body}"
         base["chunks_shown"] = len(chunks)
         base["chunks_total"] = total_chunks
+        # Coverage hint (2026-06-15): tell the caller explicitly when the
+        # returned chunks already cover the ENTIRE node, so it doesn't waste a
+        # Read on the source file. Only emitted when coverage is 100% — when
+        # is_partial, the absence of the hint signals "more exists on disk".
+        if not is_partial:
+            base["coverage"] = "complete"
+            base["retrieval_hint"] = (
+                "Full node provided (all chunks). No further Read of the source "
+                "file is needed."
+            )
         return base
 
     # Single-chunk node (or coll unavailable) — return content as-is.
@@ -1525,10 +1557,30 @@ def _format_result_by_tier(
             base["content"] = f"[Node summary: {node_summary}]\n\n{content}"
         else:
             base["content"] = content
+            # Single-chunk node returned whole at single_chunk tier → complete.
+            if not (total_chunks and total_chunks > 1):
+                base["coverage"] = "complete"
+                base["retrieval_hint"] = (
+                    "Full node provided (single-chunk node). No further Read of "
+                    "the source file is needed."
+                )
         return base
 
     # three_chunks / full fallback when chunk fetch failed: return full snippet.
     base["content"] = content
+    # Coverage hint (2026-06-15): a single-chunk node (total_chunks <= 1) is
+    # returned in its entirety here — this is the common `full`-tier case for
+    # the many KG nodes that embed as one chunk (large-context embedders like
+    # qwen3 fit ~13.5k tokens / ~50KB per chunk). Tell the caller so it doesn't
+    # redundantly Read the source file. For a MULTI-chunk node that reached this
+    # fallback because chunk-fetch FAILED, coverage is NOT complete (content is
+    # the single matched chunk's snippet) → no hint, so the caller knows to Read.
+    if not (total_chunks and total_chunks > 1):
+        base["coverage"] = "complete"
+        base["retrieval_hint"] = (
+            "Full node provided (single-chunk node). No further Read of the "
+            "source file is needed."
+        )
     return base
 
 
@@ -5592,9 +5644,64 @@ async def _hybrid_search_single_collection(
                 "source_id": formatted_kw.get("source_id"),
             }
 
-    for item in combined.values():
-        sem_score = 1.0 - item["semantic_distance"]
-        item["combined_score"] = (sem_score + item["keyword_score"]) / 2
+    # ── Fusion: relativeScoreFusion (2026-06-15) ──────────────────────────
+    #
+    # PRIOR BUG: combined_score = (sem_score + keyword_score) / 2 averaged a
+    # bounded cosine half (1 - distance ∈ [0,1]) with the RAW BM25 keyword
+    # score, which is UNBOUNDED (BM25 = Σ IDF(term)·tf-saturation; empirically
+    # 2–8+ on this corpus). The fused value therefore routinely exceeded 1.0,
+    # silently defeating the auto-tier thresholds (_TIER_THRESHOLDS, documented
+    # as "0..1") — a strong keyword match always landed ≥0.75 → `full` tier
+    # regardless of semantic relevance.
+    #
+    # FIX: mirror Weaviate's relativeScoreFusion (the engine default since
+    # v1.24, which this hand-rolled dual-query path bypasses). Min-max normalize
+    # EACH modality across this query's candidate set → [0,1], then average.
+    # This keeps BM25's *relative magnitude* within the result set (unlike
+    # rankedFusion, which keeps only rank) while making the fused score bounded
+    # and threshold-comparable. The absolute cross-query meaning of raw BM25 is
+    # not lost here because it never existed — raw BM25 is only comparable
+    # within one query's results (its scale depends on query length + corpus
+    # IDF). `score_cosine` (raw cosine, untouched above) remains the absolute
+    # signal the RL trainer consumes.
+    #
+    # alpha = cosine (vector) weight, matching Weaviate's `alpha` convention
+    # (alpha=1.0 → pure vector, 0.0 → pure keyword). Default 0.6 makes the
+    # SEMANTIC signal slightly dominant over the LEXICAL one: cosine captures
+    # what the query MEANS, BM25 captures which words literally appear. For a
+    # semantic KG/code retrieval system the meaning is the primary signal and
+    # keyword is the booster/tiebreaker, so cosine gets 60% and BM25 40%.
+    # Overridable via KG_HYBRID_ALPHA without a code change (clamped to [0,1]).
+    # Single-candidate or all-equal sets: min==max → that modality contributes
+    # a flat 0.0 after normalization; if BOTH modalities are flat (one
+    # candidate), fall back to its cosine so a lone exact hit still scores.
+    _ALPHA = _HYBRID_ALPHA  # module-level, env-overridable (see definition)
+    sem_scores = {k: (1.0 - v["semantic_distance"]) for k, v in combined.items()}
+    kw_scores = {k: v.get("keyword_score", 0.0) for k, v in combined.items()}
+
+    def _minmax_norm(values: dict) -> dict:
+        if not values:
+            return {}
+        lo, hi = min(values.values()), max(values.values())
+        span = hi - lo
+        if span <= 0:
+            # All equal (incl. single candidate) → no relative information in
+            # this modality; contribute 0 so the other modality decides.
+            return {k: 0.0 for k in values}
+        return {k: (x - lo) / span for k, x in values.items()}
+
+    sem_norm = _minmax_norm(sem_scores)
+    kw_norm = _minmax_norm(kw_scores)
+
+    single_candidate = len(combined) == 1
+    for key, item in combined.items():
+        fused = _ALPHA * sem_norm.get(key, 0.0) + (1.0 - _ALPHA) * kw_norm.get(key, 0.0)
+        # Degenerate single-candidate case: both modalities normalize flat to
+        # 0.0, which would discard a lone exact match. Fall back to its raw
+        # cosine (already bounded [0,1]) so it tiers sensibly on its own merit.
+        if single_candidate:
+            fused = max(0.0, sem_scores.get(key, 0.0))
+        item["combined_score"] = fused
 
     return combined
 

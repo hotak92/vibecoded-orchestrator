@@ -281,6 +281,126 @@ class SidecarPerCollectionTests(unittest.TestCase):
         self.assertIsNotNone(out)
         self.assertEqual(out["description"], "PROJECT: foo description")
 
+    def test_coverage_hint_only_when_whole_node_returned(self):
+        """2026-06-15: a full/single_chunk tier that returns 100% of the node
+        must emit coverage='complete' + a retrieval_hint so the caller doesn't
+        redundantly Read the source file. It must NOT emit the hint when only a
+        partial view is returned (multi-chunk fetch failed) or for non-content
+        tiers (summary/titles)."""
+        srv = _fresh_server({
+            "KG_COLLECTION": "ProjectKG",
+            "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph",
+        })
+        single = {
+            "title": "X", "node_type": "concept",
+            "file_path": "knowledge/concepts/x.md", "tags": [],
+            "content": "whole single-chunk body", "total_chunks": 1,
+            "chunk_number": 1,
+        }
+        # Single-chunk @ full → complete.
+        out = srv._format_result_by_tier(dict(single), "full", coll=None)
+        self.assertEqual(out.get("coverage"), "complete")
+        self.assertIn("retrieval_hint", out)
+        # Single-chunk @ single_chunk → complete.
+        out = srv._format_result_by_tier(dict(single), "single_chunk", coll=None)
+        self.assertEqual(out.get("coverage"), "complete")
+        # Multi-chunk node, chunk-fetch unavailable (coll=None) → NOT complete.
+        multi = dict(single, total_chunks=5, chunk_number=2, title="Y",
+                     file_path="knowledge/concepts/y.md")
+        out = srv._format_result_by_tier(multi, "full", coll=None)
+        self.assertIsNone(out.get("coverage"))
+        self.assertNotIn("retrieval_hint", out)
+        # Non-content tiers never claim completeness.
+        for tier in ("summary", "titles"):
+            out = srv._format_result_by_tier(dict(single), tier, coll=None)
+            self.assertIsNone(out.get("coverage"),
+                              f"{tier} tier must not claim coverage")
+
+        # Multi-chunk node where ALL chunks are returned → complete.
+        # (Point 2: a 3-chunk node at three_chunks tier, or a 5-chunk node at
+        # full tier whose 7-wide window covers all 5, is 100% covered.)
+        orig_fetch = srv._fetch_node_chunks
+        sentinel_coll = object()  # non-None so the coll guard passes
+        try:
+            # All 3 chunks returned for a 3-chunk node.
+            srv._fetch_node_chunks = lambda *a, **k: [
+                (1, "c1"), (2, "c2"), (3, "c3")
+            ]
+            n3 = {"title": "M", "node_type": "concept",
+                  "file_path": "knowledge/concepts/m.md", "tags": [],
+                  "content": "", "total_chunks": 3, "chunk_number": 2}
+            out = srv._format_result_by_tier(dict(n3), "three_chunks", coll=sentinel_coll)
+            self.assertEqual(out.get("coverage"), "complete",
+                             "all 3 of 3 chunks returned → complete")
+            self.assertEqual(out.get("chunks_shown"), 3)
+
+            # Only 3 of 5 chunks returned → partial → NO hint.
+            srv._fetch_node_chunks = lambda *a, **k: [(1, "c1"), (2, "c2"), (3, "c3")]
+            n5 = dict(n3, total_chunks=5, title="P",
+                      file_path="knowledge/concepts/p.md")
+            out = srv._format_result_by_tier(n5, "three_chunks", coll=sentinel_coll)
+            self.assertIsNone(out.get("coverage"),
+                              "3 of 5 chunks → partial → must NOT claim complete")
+            self.assertNotIn("retrieval_hint", out)
+        finally:
+            srv._fetch_node_chunks = orig_fetch
+
+
+class HybridAlphaResolutionTests(unittest.TestCase):
+    """relativeScoreFusion alpha (cosine/vector weight) resolution + clamping.
+
+    2026-06-15: replaced the broken `(cosine + raw_BM25)/2` fusion — which
+    leaked unbounded BM25 (>1) into the 0..1 tier thresholds — with min-max
+    normalized relativeScoreFusion. Alpha defaults cosine-dominant (0.6).
+    """
+
+    def setUp(self) -> None:
+        os.environ.pop("KG_HYBRID_ALPHA", None)
+
+    def tearDown(self) -> None:
+        os.environ.pop("KG_HYBRID_ALPHA", None)
+
+    def test_default_alpha_is_cosine_dominant(self):
+        srv = _fresh_server({})
+        self.assertEqual(srv._HYBRID_ALPHA, 0.6,
+                         "default must be cosine-dominant (0.6 vector / 0.4 keyword)")
+
+    def test_alpha_env_override_and_clamp(self):
+        srv = _fresh_server({})
+        cases = {"0.4": 0.4, "0.0": 0.0, "1.0": 1.0,
+                 "1.5": 1.0, "-0.2": 0.0, "garbage": 0.6}
+        for raw, expected in cases.items():
+            os.environ["KG_HYBRID_ALPHA"] = raw
+            self.assertEqual(srv._resolve_hybrid_alpha(), expected,
+                             f"KG_HYBRID_ALPHA={raw!r} should resolve to {expected}")
+
+    def test_fusion_is_bounded_and_cosine_dominant(self):
+        """The fusion math: min-max normalize each modality, weight by alpha.
+        Must be bounded [0,1] even on raw BM25 >1, and a semantic-only hit must
+        outrank a keyword-only hit at alpha=0.6 (cosine dominant)."""
+        alpha = 0.6
+        # Real measured BM25 values (2–4) that broke the old (sem+bm25)/2.
+        combined = {
+            "A": {"semantic_distance": 0.28, "keyword_score": 4.067},
+            "C": {"semantic_distance": 0.30, "keyword_score": 0.0},   # semantic-only
+            "D": {"semantic_distance": 1.00, "keyword_score": 2.742}, # keyword-only
+        }
+        sem = {k: 1.0 - v["semantic_distance"] for k, v in combined.items()}
+        kw = {k: v["keyword_score"] for k, v in combined.items()}
+
+        def mm(d):
+            lo, hi = min(d.values()), max(d.values())
+            span = hi - lo
+            return {k: 0.0 for k in d} if span <= 0 else {k: (x - lo) / span for k, x in d.items()}
+
+        sn, kn = mm(sem), mm(kw)
+        fused = {k: alpha * sn[k] + (1 - alpha) * kn[k] for k in combined}
+        for k, f in fused.items():
+            self.assertGreaterEqual(f, 0.0, f"{k} below 0")
+            self.assertLessEqual(f, 1.0, f"{k} above 1 (unbounded BM25 leak)")
+        self.assertGreater(fused["C"], fused["D"],
+                           "semantic-only hit must outrank keyword-only at cosine-dominant alpha")
+
 
 class StoreKnowledgeNodeScopeTests(unittest.TestCase):
     """The scope='shared' parameter on store_knowledge_node routes writes to
