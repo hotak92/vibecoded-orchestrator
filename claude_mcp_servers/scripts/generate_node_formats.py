@@ -330,7 +330,19 @@ def store_formats(
         entry["content_hash"] = c_hash
     if chunk_summaries:
         entry["chunk_summaries"] = chunk_summaries
-        entry["total_chunks"] = total_chunks if total_chunks is not None else len(chunk_summaries)
+    # Always record total_chunks (2026-06-15) — previously written ONLY for
+    # multi-chunk nodes, so a single-chunk node had `total_chunks` ABSENT,
+    # indistinguishable from "never computed". Consumers (auto-tier retrieval,
+    # the "does tier:full cover the whole node?" check) need to know the chunk
+    # count for every node. Single-chunk nodes get total_chunks=1; multi-chunk
+    # nodes keep their real count. Falls back to len(chunk_summaries) when an
+    # explicit count wasn't threaded, else 1 (the node embeds as one chunk).
+    if total_chunks is not None:
+        entry["total_chunks"] = total_chunks
+    elif chunk_summaries:
+        entry["total_chunks"] = len(chunk_summaries)
+    else:
+        entry["total_chunks"] = 1
     db[rel_path] = entry
 
 
