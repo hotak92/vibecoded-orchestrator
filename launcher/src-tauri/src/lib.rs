@@ -2106,6 +2106,16 @@ pub fn run() {
             commands::projects_v2::get_project_by_slug,
             commands::projects_v2::create_project_v2,
             commands::projects_v2::update_project_v2,
+            // Piece 4 (v0.2.60): regenerate-or-defer modal command pair +
+            // the INERT §7 hard-cut driver. probe_stale_derived_collections
+            // is read-only (migrate-schema --check); apply_stale_derived_choice
+            // performs the user's explicit modal click (regenerate via the
+            // guarded recreate, or defer via the deferral write);
+            // perform_hard_cut is INERT (refuses unless below the inert
+            // version floor, which never trips in v0.2.60).
+            commands::projects_v2::probe_stale_derived_collections,
+            commands::projects_v2::apply_stale_derived_choice,
+            commands::projects_v2::perform_hard_cut,
             commands::projects_v2::rename_project_v2,
             commands::projects_v2::set_shared_kg_write_disabled,
             // v0.2.46 Decision B — symmetric READ gate. Mirrors

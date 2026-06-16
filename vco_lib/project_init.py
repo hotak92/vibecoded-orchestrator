@@ -9196,11 +9196,17 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
       * ``--regenerate <type> --artifact-name <name>`` → the launcher's
                                "Regenerate now" choice for ONE derived
                                collection: drop + recreate + re-sync via the
-                               EXISTING guarded body, then register at
-                               canonical. (Piece 4 wires the guarded recreate;
-                               for v0.2.60 the flag is accepted + validated so
-                               the surface is invokable, but the destructive
-                               recreate itself lands with the modal in Piece 4.)
+                               EXISTING guarded body
+                               (``vco_lib.schema_regenerate``), then register at
+                               canonical. The destructive recreate ONLY happens
+                               on this explicit flag (the launcher's
+                               ``apply_stale_derived_choice(choice="regenerate")``
+                               Tauri command, driven by an explicit modal click).
+                               The shared-KG branch still routes through the
+                               guarded ``migrate-shared-kg-schema`` script
+                               (GUARD 1/2); per-project / codegraph branches
+                               reuse ``migrate-collections --force-rebuild`` /
+                               ``code-graph-analyze --force``. NO new drop path.
 
     Always exits 0 (probe / soft-fail) unless ``--strict``. Prints JSON.
     """
@@ -9235,31 +9241,98 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
 
     regenerate_type = getattr(args, "regenerate", None)
     if regenerate_type:
-        # POLICY STEP 3 "Regenerate now" — validate the request. The guarded
-        # drop+recreate body is wired in Piece 4 (the launcher modal); here we
-        # validate inputs + emit a structured result so the launcher subprocess
-        # surface exists and is testable.
+        # POLICY STEP 3 "Regenerate now" (Piece 4) — the EXPLICIT, user-clicked
+        # drop+recreate+re-sync for ONE derived collection. This is the only
+        # code path in v0.2.60 that performs a destructive Weaviate recreate,
+        # and it ONLY runs when the launcher passes --regenerate (driven by an
+        # explicit modal click) — never automatically. The recreate composes
+        # EXISTING machinery (the guarded migrate-shared-kg-schema script for
+        # the shared KG with GUARD 1/2; migrate-collections --force-rebuild for
+        # per-project KG/Dev/Diagrams; code-graph-analyze --force for codegraph)
+        # via vco_lib.schema_regenerate — NO new drop path.
+        from . import schema_regenerate as sregen
+
         artifact_name = getattr(args, "artifact_name", None)
         result = {
             "folder": str(folder),
             "mode": "regenerate",
             "artifact_type": regenerate_type,
             "artifact_name": artifact_name,
-            "action": "pending_piece4",
+            "action": "regenerate",
             "ok": False,
         }
         if regenerate_type not in sv.CANONICAL_VERSIONS:
             result["error"] = f"unknown artifact_type {regenerate_type!r}"
-        elif not artifact_name:
+            print(json.dumps(result, indent=2))
+            return 0 if not getattr(args, "strict", False) else 1
+        if not artifact_name:
             result["error"] = "--regenerate requires --artifact-name"
-        else:
-            result["ok"] = True
-            result["detail"] = (
-                "regenerate (drop+recreate+re-sync via the guarded body) is "
-                "wired with the launcher modal in Piece 4; the request is valid."
-            )
+            print(json.dumps(result, indent=2))
+            return 0 if not getattr(args, "strict", False) else 1
+
+        # The per-project recreate needs the raw project name to derive the
+        # canonical class names (migrate-collections --name). Resolve from the
+        # explicit --project-name, else the PROJECT_NAME env. The shared-KG and
+        # codegraph branches don't need it.
+        project_name = (
+            getattr(args, "project_name", None)
+            or os.environ.get("PROJECT_NAME")
+            or None
+        )
+        # Orchestrator-wide artifacts (shared KG) are keyed project_id=NULL in
+        # the registry (mirrors run_schema_migrations' ORCHESTRATOR_WIDE_TYPES).
+        effective_pid = (
+            None
+            if regenerate_type in smr.ORCHESTRATOR_WIDE_TYPES
+            else project_id
+        )
+        orchestrator_root = Path(__file__).resolve().parent.parent
+        regen = sregen.regenerate_derived_collection(
+            artifact_type=regenerate_type,
+            artifact_name=artifact_name,
+            folder=folder,
+            db_path=db_path,
+            project_id=effective_pid,
+            project_name=project_name,
+            env=os.environ,
+            weaviate_url=weaviate_url,
+            when=now_ms,
+            orchestrator_root=orchestrator_root,
+        )
+        result.update(regen.to_dict())
+
+        # C1: when the drop completed but re-ingest is unconfirmed
+        # (reingest_incomplete), the registry row stays absent — so the NEXT
+        # update would see NEVER_MATERIALIZED and silently register the EMPTY
+        # collection at canonical without re-ingesting. Persist a
+        # schema_reingest_incomplete_<slug> deferral so the gap is visible +
+        # actionable (the kg-sync / code-graph-analyze remediation). Soft-fail:
+        # a deferral-write error never crashes the regenerate result.
+        result["reingest_deferral_written"] = False
+        if regen.reingest_incomplete:
+            try:
+                entry = sregen.build_reingest_incomplete_entry(regen, folder)
+                if entry is not None:
+                    from .deferral_report import DeferralReport
+
+                    report_file = DeferralReport.read(folder)
+                    report_file.add_entry(entry)
+                    report_file.write(folder)
+                    result["reingest_deferral_written"] = True
+            except Exception as exc:  # never block on a deferral write
+                print(
+                    f"[migrate-schema] reingest-incomplete deferral write "
+                    f"failed (non-fatal): {exc}",
+                    file=sys.stderr,
+                )
+
         print(json.dumps(result, indent=2))
-        return 0 if result.get("ok") or not getattr(args, "strict", False) else 1
+        # Soft-fail by default (the launcher reads `ok`/`refused`/`error` from
+        # the JSON). --strict returns non-zero on a non-ok, non-refused outcome
+        # so a manual CLI retry surfaces the failure.
+        if getattr(args, "strict", False):
+            return 0 if (regen.ok or regen.refused) else 1
+        return 0
 
     check = bool(getattr(args, "check", False))
     report = smr.run_schema_migrations(
@@ -9825,6 +9898,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_migrate.add_argument(
         "--artifact-name", default=None,
         help="Live class name for --regenerate (e.g. the shared KG class).",
+    )
+    p_migrate.add_argument(
+        "--project-name", default=None,
+        help="Raw project name for the per-project --regenerate path "
+             "(derives the canonical KG/Dev/Diagrams class names via "
+             "migrate-collections --name). Falls back to $PROJECT_NAME. "
+             "Unused by the shared-KG / codegraph regenerate branches.",
     )
     p_migrate.add_argument(
         "--strict", action="store_true",

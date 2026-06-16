@@ -5600,9 +5600,458 @@ fn launch_in_terminal_with_cli(folder: &str) -> Result<(), String> {
         .into())
 }
 
+// ===========================================================================
+// Piece 4 (v0.2.60): regenerate-or-defer modal Tauri command pair + the INERT
+// §7 hard-cut command.
+//
+// SPEC-v0260-migration-runner.md §6.1; DESIGN-v0300 §7. The pair drives the
+// `RegenerateOrDeferModal.svelte` modal: `probe_stale_derived_collections`
+// surfaces the POLICY STEP 3 list (read-only `migrate-schema --check`), and
+// `apply_stale_derived_choice` performs the user's modal click —
+// "regenerate" → the guarded drop+recreate+re-sync (via
+// `migrate-schema --regenerate`, which reuses migrate-shared-kg-schema /
+// migrate-collections --force-rebuild / code-graph-analyze --force); "defer" →
+// write the deferral (via the same runner, whose CLI already persists
+// schema_regenerate_or_defer_<slug> to UPDATE_DEFERRED.md). NO new drop path.
+//
+// `perform_hard_cut` is INERT in v0.2.60: it exists + is registered but is
+// reachable ONLY when the (Piece-5) version-floor check returns below-floor,
+// which never happens with the inert `min_upgradable_from = "0.0.0"`. The
+// normal update path (`update_orchestrator`) does NOT call it — proven by
+// `test_perform_hard_cut_not_wired_into_update_orchestrator`.
+// ===========================================================================
+
+/// One DERIVED collection that hit POLICY STEP 3 (stale + schema-changed + NO
+/// data-preserving migration script). The modal renders one card per entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleDerivedArtifact {
+    pub artifact_type: String,
+    pub artifact_name: String,
+    pub stored_version: Option<i64>,
+    pub canonical_version: Option<i64>,
+    pub changed_fields: Vec<String>,
+    pub regenerate_est_seconds: Option<i64>,
+    /// GUARD-2 surface: true/false when known, null when the launcher hasn't
+    /// probed cross-project shared writes yet (the shared-KG script does the
+    /// authoritative probe at recreate time). Lets the modal pre-warn.
+    pub has_cross_project_shared_nodes: Option<bool>,
+}
+
+/// Result of an `apply_stale_derived_choice` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationChoiceResult {
+    pub artifact_type: String,
+    pub artifact_name: String,
+    pub choice: String,
+    pub ok: bool,
+    /// True when an existing data-safety guard (GUARD 1/2) blocked the drop —
+    /// nothing was dropped; `detail` carries the refusal reason.
+    pub refused: bool,
+    pub dropped: bool,
+    pub registered: bool,
+    pub deferred: bool,
+    pub detail: String,
+    pub error: Option<String>,
+}
+
+/// Probe: which DERIVED collections are stale with NO data-preserving migration
+/// script for the edge (POLICY STEP 3)? Subprocess-calls the runner in
+/// `--check` mode and returns `pending_regenerate`. READ-ONLY: `--check` never
+/// mutates Weaviate or the registry. Soft-fail → empty list (the update flow
+/// proceeds; the modal just doesn't appear).
+///
+/// Mirrors `run_schema_migration_check`'s subprocess-driver shape. Called by
+/// the update-progress surface right after the bundle update so the modal can
+/// interrupt only when a real STEP-3 condition exists.
+#[command]
+pub async fn probe_stale_derived_collections(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<Vec<StaleDerivedArtifact>, String> {
+    let row = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+    let folder = PathBuf::from(&row.folder_path);
+
+    let system = detect_system()
+        .await
+        .map_err(|e| format!("detect_system failed: {}", e))?;
+    if !system.has_python {
+        // Soft: no Python → no probe → no modal. Don't block.
+        return Ok(Vec::new());
+    }
+    let orch_root = find_local_repo_root()
+        .map_err(|e| format!("orchestrator root not found: {}", e))?;
+
+    let folder_str = folder.to_string_lossy().to_string();
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    cmd.args([
+        "-m",
+        "vco_lib.project_init",
+        "migrate-schema",
+        "--folder",
+        &folder_str,
+        "--project-id",
+        &project_id,
+        "--check",
+    ])
+    .current_dir(&orch_root)
+    .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("migrate-schema --check failed to start: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+
+    let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+        format!(
+            "migrate-schema --check produced unparseable output ({}); stderr: {}",
+            e,
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })?;
+
+    let mut result = Vec::new();
+    if let Some(arr) = v.get("pending_regenerate").and_then(|x| x.as_array()) {
+        for p in arr {
+            result.push(StaleDerivedArtifact {
+                artifact_type: p
+                    .get("artifact_type")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                artifact_name: p
+                    .get("artifact_name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                stored_version: p.get("stored_version").and_then(|x| x.as_i64()),
+                canonical_version: p.get("canonical_version").and_then(|x| x.as_i64()),
+                changed_fields: p
+                    .get("changed_fields")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                regenerate_est_seconds: p
+                    .get("regenerate_est_seconds")
+                    .and_then(|x| x.as_i64()),
+                has_cross_project_shared_nodes: p
+                    .get("has_cross_project_shared_nodes")
+                    .and_then(|x| x.as_bool()),
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Apply the user's modal choice for ONE derived artifact.
+///
+///   `choice == "regenerate"` → subprocess `migrate-schema --regenerate
+///       <artifact_type> --artifact-name <name> --project-name <name> --strict`
+///       which performs the guarded drop+recreate+re-sync via the EXISTING
+///       bodies (migrate-shared-kg-schema with GUARD 1/2; migrate-collections
+///       --force-rebuild; code-graph-analyze --force) and re-registers at
+///       canonical. A GUARD refusal returns `refused=true` WITHOUT dropping.
+///
+///   `choice == "defer"`      → subprocess `migrate-schema` (apply mode, no
+///       --check) which re-detects the STEP-3 condition and PERSISTS the
+///       `schema_regenerate_or_defer_<slug>` deferral to UPDATE_DEFERRED.md
+///       (the runner's CLI does this via build_deferral_entries). NO drop.
+///
+/// Mirrors `run_schema_migration_check`'s subprocess-driver shape. The drop is
+/// ONLY ever performed on `choice == "regenerate"` (an explicit modal click).
+#[command]
+pub async fn apply_stale_derived_choice(
+    project_id: String,
+    artifact_type: String,
+    artifact_name: String,
+    choice: String,
+    db: State<'_, Db>,
+) -> Result<MigrationChoiceResult, String> {
+    let row = db
+        .get_project(&project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+    let folder = PathBuf::from(&row.folder_path);
+    let project_name = row.name.clone();
+
+    let mut res = MigrationChoiceResult {
+        artifact_type: artifact_type.clone(),
+        artifact_name: artifact_name.clone(),
+        choice: choice.clone(),
+        ok: false,
+        refused: false,
+        dropped: false,
+        registered: false,
+        deferred: false,
+        detail: String::new(),
+        error: None,
+    };
+
+    if choice != "regenerate" && choice != "defer" {
+        res.error = Some(format!(
+            "unknown choice {:?} (expected \"regenerate\" | \"defer\")",
+            choice
+        ));
+        return Ok(res);
+    }
+
+    let system = detect_system()
+        .await
+        .map_err(|e| format!("detect_system failed: {}", e))?;
+    if !system.has_python {
+        res.error = Some("no Python 3.11+ on PATH; cannot apply the choice".into());
+        return Ok(res);
+    }
+    let orch_root = find_local_repo_root()
+        .map_err(|e| format!("orchestrator root not found: {}", e))?;
+    let folder_str = folder.to_string_lossy().to_string();
+
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    if choice == "regenerate" {
+        cmd.args([
+            "-m",
+            "vco_lib.project_init",
+            "migrate-schema",
+            "--folder",
+            &folder_str,
+            "--project-id",
+            &project_id,
+            "--regenerate",
+            &artifact_type,
+            "--artifact-name",
+            &artifact_name,
+            "--project-name",
+            &project_name,
+            "--strict",
+        ]);
+    } else {
+        // "defer" — a plain apply re-detects STEP 3 + persists the deferral.
+        // No --regenerate → NO drop. The runner's CLI writes the
+        // schema_regenerate_or_defer_<slug> entry to UPDATE_DEFERRED.md.
+        cmd.args([
+            "-m",
+            "vco_lib.project_init",
+            "migrate-schema",
+            "--folder",
+            &folder_str,
+            "--project-id",
+            &project_id,
+        ]);
+    }
+    cmd.current_dir(&orch_root)
+        .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("migrate-schema subprocess failed to start: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    let v: serde_json::Value = serde_json::from_str(&stdout).map_err(|e| {
+        format!(
+            "migrate-schema produced unparseable output ({}); stderr: {}",
+            e, stderr
+        )
+    })?;
+
+    if choice == "regenerate" {
+        res.ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+        res.refused = v.get("refused").and_then(|x| x.as_bool()).unwrap_or(false);
+        res.dropped = v.get("dropped").and_then(|x| x.as_bool()).unwrap_or(false);
+        res.registered = v
+            .get("registered")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        res.detail = v
+            .get("detail")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        res.error = v
+            .get("error")
+            .and_then(|x| x.as_str())
+            .map(String::from);
+    } else {
+        // defer: the deferral write is the success signal.
+        res.deferred = v
+            .get("deferral_written")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        res.ok = res.deferred;
+        res.detail = if res.deferred {
+            format!(
+                "Deferred to Claude — `schema_regenerate_or_defer_*` written to \
+                 {}/.claude/context/UPDATE_DEFERRED.md. Nothing was dropped.",
+                folder_str
+            )
+        } else {
+            "Defer requested but no deferral was written (the collection may no \
+             longer be stale)."
+                .to_string()
+        };
+    }
+    Ok(res)
+}
+
+/// INERT (v0.2.60): the §7 hard-cut driver. EXISTS + is registered, but is
+/// reachable ONLY when the Piece-5 version-floor check returns below-floor —
+/// which NEVER happens while `min_upgradable_from` is the inert `"0.0.0"`. The
+/// normal update path (`update_orchestrator`) does NOT call this. v0.3.0 raises
+/// the floor to activate it.
+///
+/// Subprocess-calls the Python primitive `vco_lib.hard_cut` (built + tested in
+/// v0.2.60) which performs DESIGN §7.4: git bundle + verify → hard_cut_performed
+/// deferral → `git reset --hard <tag>` (CODE only) → install.py --update →
+/// migration runner. The `stamp` is generated launcher-side (wall-clock; the
+/// Python primitive takes it as an argument because the agent build env has no
+/// clock). MUST-PRESERVE (§7.1): never touches ~/.vct DBs, the Weaviate volume,
+/// knowledge/**, .claude/state/, ~/.vct-secrets/** — only the git clone.
+///
+/// `_allow_below_floor` is the inert gate: callers MUST pass `true`, which only
+/// happens behind the floor check the v0.3.0 cycle wires. With the v0.2.60
+/// inert floor, no caller ever passes it.
+#[command]
+pub async fn perform_hard_cut(
+    install_path: String,
+    from_version: String,
+    to_version: String,
+    project_id: Option<String>,
+    _allow_below_floor: bool,
+) -> Result<serde_json::Value, String> {
+    // INERT GUARD: refuse unless the (future) floor check explicitly allows it.
+    // In v0.2.60 nothing sets this true, so this command is a no-op surface.
+    if !_allow_below_floor {
+        return Err(
+            "perform_hard_cut is INERT in this release: it is only reachable \
+             below the version floor (min_upgradable_from), which is not set \
+             in v0.2.60. No hard cut was performed."
+                .to_string(),
+        );
+    }
+
+    let clone_root = PathBuf::from(&install_path);
+    let vct_root = vct_launcher_core::paths::vct_root_dir();
+
+    let system = detect_system()
+        .await
+        .map_err(|e| format!("detect_system failed: {}", e))?;
+    if !system.has_python {
+        return Err("no Python 3.11+ on PATH; cannot run the hard-cut primitive".into());
+    }
+
+    // Wall-clock stamp for the backup filename (Python takes it as an arg).
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+
+    // The Python entrypoint for the primitive is exposed as a small CLI shim;
+    // for v0.2.60 (inert) we invoke it via `-c` so no new install.py surface
+    // is needed. A v0.3.0 wiring may promote this to a dedicated subcommand.
+    let pid_arg = project_id.unwrap_or_default();
+    let snippet = format!(
+        "import json,sys; from pathlib import Path; from vco_lib.hard_cut import hard_cut; \
+         r=hard_cut(sys.argv[1], sys.argv[2], clone_root=Path(sys.argv[3]), \
+         vct_root=Path(sys.argv[4]), project_id=(sys.argv[5] or None), stamp=sys.argv[6]); \
+         print(json.dumps(r.to_dict()))"
+    );
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    cmd.args([
+        "-c",
+        &snippet,
+        &from_version,
+        &to_version,
+        &clone_root.to_string_lossy(),
+        &vct_root.to_string_lossy(),
+        &pid_arg,
+        &stamp,
+    ])
+    .current_dir(&clone_root)
+    .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("hard_cut primitive failed to start: {}", e))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    serde_json::from_str(&stdout).map_err(|e| {
+        format!(
+            "hard_cut primitive produced unparseable output ({}); stderr: {}",
+            e,
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── Piece 4 (v0.2.60): hard-cut INERT guarantee ───────────────────
+
+    /// `perform_hard_cut` refuses unless the (inert) below-floor flag is set.
+    /// In v0.2.60 nothing ever sets it true → the command is a no-op surface.
+    #[tokio::test]
+    async fn perform_hard_cut_refuses_when_not_below_floor() {
+        let res = perform_hard_cut(
+            "/tmp/whatever".to_string(),
+            "0.2.60".to_string(),
+            "0.3.0".to_string(),
+            Some("p1".to_string()),
+            /* _allow_below_floor */ false,
+        )
+        .await;
+        assert!(res.is_err(), "hard cut must refuse when not below floor");
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("INERT"),
+            "refusal message must name the INERT gate, got: {}",
+            msg
+        );
+    }
+
+    /// Source-level proof that the normal update path does NOT invoke the
+    /// hard cut. `update_orchestrator` (the launcher "Update orchestrator"
+    /// button) lives in installer.rs; it must contain no `perform_hard_cut` /
+    /// `hard_cut(` call. This is the INERT guarantee at the wiring layer
+    /// (mirrors the Python test_hard_cut_not_invoked_by_normal_update).
+    #[test]
+    fn test_perform_hard_cut_not_wired_into_update_orchestrator() {
+        let installer_src = include_str!("installer.rs");
+        // The hard-cut command name must not appear in installer.rs at all
+        // (it's defined + registered in projects_v2.rs / lib.rs only).
+        assert!(
+            !installer_src.contains("perform_hard_cut"),
+            "installer.rs (home of update_orchestrator) must NOT reference \
+             perform_hard_cut in v0.2.60 — the hard cut is INERT"
+        );
+        // And no direct call into the Python primitive from the update flow.
+        assert!(
+            !installer_src.contains("hard_cut("),
+            "installer.rs must NOT call hard_cut() — INERT until v0.3.0"
+        );
+    }
 
     // ─── Bug 23: per-project env file generation ───────────────────
 

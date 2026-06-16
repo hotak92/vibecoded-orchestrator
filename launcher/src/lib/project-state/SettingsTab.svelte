@@ -20,8 +20,18 @@
   import { toast } from '$lib/stores/toast';
   import { projects } from '$lib/stores/projects';
   import type { ProjectView, RenameProjectResult } from '$lib/types/launcher';
+  import RegenerateOrDeferModal, {
+    type StaleDerivedArtifact,
+  } from '$lib/components/RegenerateOrDeferModal.svelte';
 
   let { projectId }: { projectId: string } = $props();
+
+  // v0.2.60 Piece 4: after a bundle update we probe for DERIVED collections
+  // that are stale + schema-changed + have NO data-preserving migration
+  // (POLICY STEP 3). If any, render the regenerate-or-defer modal. The probe
+  // is read-only (migrate-schema --check) and soft-fails to "no modal".
+  let staleDerived = $state<StaleDerivedArtifact[]>([]);
+  let showRegenerateModal = $state(false);
 
   let project = $state<ProjectView | null>(null);
   let newName = $state('');
@@ -104,11 +114,35 @@
       // throw; they flow through `result.warnings`.
       const result = await projects.update(project.id);
       project = result.project;
+
+      // v0.2.60 Piece 4: probe for stale derived collections that hit POLICY
+      // STEP 3 (no data-preserving migration). If any, surface the modal so
+      // the user explicitly chooses Regenerate-now vs Defer per collection.
+      // Read-only probe; soft-fail (a failed probe just means no modal — the
+      // bundle update already succeeded).
+      try {
+        const pending = await invoke<StaleDerivedArtifact[]>(
+          'probe_stale_derived_collections',
+          { projectId: project.id },
+        );
+        if (pending && pending.length > 0) {
+          staleDerived = pending;
+          showRegenerateModal = true;
+        }
+      } catch (probeErr) {
+        // Non-fatal: the update succeeded; the modal is an optional follow-up.
+        console.warn('probe_stale_derived_collections failed:', probeErr);
+      }
     } catch (e) {
       toast.error(`Update bundle failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       updating = false;
     }
+  }
+
+  function closeRegenerateModal() {
+    showRegenerateModal = false;
+    staleDerived = [];
   }
 
   function addEnv() {
@@ -309,6 +343,17 @@
       </div>
     </section>
   </div>
+{/if}
+
+<!-- v0.2.60 Piece 4: regenerate-or-defer modal, shown after a bundle update
+     when ≥1 derived collection is stale with no data-preserving migration
+     (POLICY STEP 3). Closing == Defer (safe default — never drops). -->
+{#if showRegenerateModal && project}
+  <RegenerateOrDeferModal
+    projectId={project.id}
+    artifacts={staleDerived}
+    onClose={closeRegenerateModal}
+  />
 {/if}
 
 <style>
