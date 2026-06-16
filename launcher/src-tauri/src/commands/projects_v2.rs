@@ -874,6 +874,17 @@ async fn apply_post_bundle_steps(
         warnings.push(w);
     }
 
+    // v0.2.60: version-gated schema-migration runner for THIS project's
+    // per-project artifacts (KG / Development / Diagrams / Codegraph + row
+    // shapes / vocabularies). Runs on BOTH create + update, like the
+    // node-formats check above. Per-project scoped: it does NOT migrate the
+    // shared KG or launcher-global shapes (those are the ROOT orchestrator
+    // self-update's job — install.py). Verified no-op today (empty
+    // migrations/). Soft-fails to warnings; never blocks.
+    for w in run_schema_migration_check(folder, project_id).await {
+        warnings.push(w);
+    }
+
     warnings
 }
 
@@ -1635,6 +1646,152 @@ pub(crate) async fn run_node_formats_schema_check(
         Err(parse_err) => {
             warnings.push(format!(
                 "node-formats schema probe produced unparseable output ({}): \
+                 stderr tail: {}. Bundle install will proceed.",
+                parse_err,
+                stderr
+                    .lines()
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+        }
+    }
+    warnings
+}
+
+/// v0.2.60: version-gated schema-migration runner for ONE project's
+/// per-project artifacts. The sibling of `run_node_formats_schema_check`, but
+/// general over the whole `artifact_schema_versions` registry + the
+/// `migrations/` edge directory rather than just the node-formats cache.
+///
+/// Subprocess-calls `vco_lib.project_init migrate-schema --folder <folder>
+/// --project-id <id>` with cwd=<orchestrator-root> (so the runner reads the
+/// orchestrator clone's `migrations/`). Crucially it does NOT pass
+/// `--include-orchestrator-wide`: a NON-root project's bundle update migrates
+/// ONLY that project's own collections — never the shared KG / launcher-global
+/// shapes (those are the ROOT orchestrator self-update's job, run by
+/// install.py). This is the structural per-project scoping (audit C2/C3).
+///
+/// Ships as a verified no-op today (empty `migrations/`): every artifact is
+/// registered at canonical or left untouched. Soft-fail: every error becomes a
+/// warning and the bundle update always proceeds.
+pub(crate) async fn run_schema_migration_check(
+    folder: &Path,
+    project_id: &str,
+) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    let system = match detect_system().await {
+        Ok(s) => s,
+        Err(e) => {
+            warnings.push(format!(
+                "schema-migration runner skipped: detect_system failed: {}. \
+                 Bundle install will proceed.",
+                e
+            ));
+            return warnings;
+        }
+    };
+    if !system.has_python {
+        warnings.push(
+            "schema-migration runner skipped: no Python 3.11+ on PATH. \
+             Bundle install will proceed."
+                .to_string(),
+        );
+        return warnings;
+    }
+
+    let orch_root = match find_local_repo_root() {
+        Ok(p) => p,
+        Err(e) => {
+            warnings.push(format!(
+                "schema-migration runner skipped: orchestrator root not found: {}. \
+                 Bundle install will proceed.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let folder_str = folder.to_string_lossy().to_string();
+    let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
+    cmd.args([
+        "-m",
+        "vco_lib.project_init",
+        "migrate-schema",
+        "--folder",
+        &folder_str,
+        "--project-id",
+        project_id,
+    ])
+    .current_dir(&orch_root)
+    .stdin(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let out = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            warnings.push(format!(
+                "schema-migration runner subprocess failed to start: {}. \
+                 Bundle install will proceed.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(v) => {
+            let errors = v.get("errors").and_then(|x| x.as_u64()).unwrap_or(0);
+            let refused = v.get("refused").and_then(|x| x.as_u64()).unwrap_or(0);
+            let register_failed =
+                v.get("register_failed").and_then(|x| x.as_u64()).unwrap_or(0);
+            let pending = v
+                .get("pending_regenerate")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            if pending > 0 {
+                warnings.push(format!(
+                    "schema migration: {} derived collection(s) are stale with no \
+                     data-preserving migration script — a `schema_regenerate_or_defer_*` \
+                     deferral was written to {}/.claude/context/UPDATE_DEFERRED.md. \
+                     Nothing was dropped; choose Regenerate now or leave deferred.",
+                    pending, folder_str
+                ));
+            }
+            if errors > 0 || refused > 0 {
+                warnings.push(format!(
+                    "schema migration: {} edge error(s), {} downgrade refusal(s) — \
+                     see {}/.claude/context/UPDATE_DEFERRED.md. Recorded versions were \
+                     NOT advanced; the next update re-attempts.",
+                    errors, refused, folder_str
+                ));
+            }
+            if register_failed > 0 {
+                warnings.push(format!(
+                    "schema migration: {} registry write(s) failed (launcher.db \
+                     locked/unwritable); will retry on the next update.",
+                    register_failed
+                ));
+            }
+            // No errors/refused/pending/register_failed → silent success.
+        }
+        Err(parse_err) => {
+            warnings.push(format!(
+                "schema-migration runner produced unparseable output ({}): \
                  stderr tail: {}. Bundle install will proceed.",
                 parse_err,
                 stderr

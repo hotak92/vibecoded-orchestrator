@@ -15967,149 +15967,246 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
 
 
 def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
-    """Run the two schema-correctness migration scripts that ship in
-    ``scripts/``:
+    """Version-gated schema migrations (v0.2.60 — thin shim over the runner).
 
-      1. ``migrate-development-temporal-props.{sh,ps1}`` — adds the four
-         canonical temporal properties (``created``, ``updated``,
-         ``valid_from``, ``valid_until``) to every existing
-         ``*_Development`` collection. Properties CAN be added
-         retroactively via the Weaviate v1 REST schema API, so this is
-         an additive in-place patch.
-      2. ``migrate-shared-kg-schema.{sh,ps1}`` — drops + recreates the
-         shared KG collection when its schema lacks
-         ``invertedIndexConfig.indexNullState=True``. Weaviate <=1.30
-         cannot add that retroactively, so the only fix is a destructive
-         recreate. Safe because shared-KG content derives from
-         ``knowledge/**/*.md`` and the script re-syncs after recreate.
+    Historically this ran TWO hardcoded ``scripts/migrate-*.{sh,ps1}`` scripts
+    UNCONDITIONALLY on every install/update. v0.2.60 folds that into ONE
+    version-gated runner (``vco_lib.schema_migration_runner``) driven by the
+    existing ``artifact_schema_versions`` registry, so a FUTURE schema-changing
+    release can drop a single ``migrations/<type>/<from>_to_<to>.<ext>`` edge
+    that runs only when the DB-recorded version is behind canonical. The runner
+    ships as a verified NO-OP today (``migrations/`` is empty).
 
-    Both scripts are idempotent and soft-fail. A non-zero exit (or a
-    failed spawn) emits a ``schema_migration_failed`` deferral entry but
-    does NOT abort install.py. OS dispatch:
+    This shim:
+      1. Calls ``run_schema_migrations(...)`` (the per-artifact version gate +
+         the DERIVED-collection binding policy).
+      2. Translates the returned ``MigrationRunReport`` into the EXISTING
+         ``DeferralEntry`` shape (condition_ids: ``schema_migration_failed_*``,
+         ``schema_migration_refuse_downgrade``,
+         ``schema_regenerate_or_defer_<artifact>`` /
+         ``schema_migration_needs_choice``, ``schema_migration_script_missing``)
+         — the same family install.py emitted before.
+      3. KEEPS the safe ADDITIVE script (``migrate-development-temporal-props``)
+         running UNCONDITIONALLY (SPEC §3.1 / R1 Option A): it is idempotent,
+         in-place, always exit 0 — zero risk, and ``detect_kg_schema_drift``
+         does NOT yet check the temporal props, so the live-drift net would
+         miss a pre-V52-I collection missing them. Only the DESTRUCTIVE
+         shared-KG recreate moved under version+policy gating (it was already
+         guarded, so no safety regression — strictly safer now).
+      4. Still calls ``_migrate_kg_named_vector_slots`` +
+         ``_emit_lowercase_codegraph_cleanup_deferrals`` after the runner —
+         unchanged.
 
-      - Linux + macOS: bash ``scripts/<name>.sh``
-      - Windows:       PowerShell ``scripts/<name>.ps1``
-
-    The deferral entry includes the explicit command to apply the
-    migration manually so users can retry on demand.
+    Soft-fail throughout: a runner exception never aborts install.py.
     """
     print("[7d/10] Running schema-correctness migrations ... ", flush=True)
-    _log_install_event("7d/10", "start", "schema migration scripts")
+    _log_install_event("7d/10", "start", "version-gated schema migrations")
 
-    if sys.platform == "win32":
-        script_ext = ".ps1"
-    else:
-        script_ext = ".sh"
+    # --- (3) Option A: keep the safe additive props script unconditional. ---
+    # SPEC §3.1 / R1: in-place, idempotent, always exit 0. Run it directly
+    # here (NOT through the version gate) so its current "always run, no-op
+    # when present" semantics are preserved exactly and remain auditable.
+    _run_additive_temporal_props_migration(deferral_report)
 
-    scripts_dir = PROJECT_ROOT / "scripts"
-    migrations = [
-        ("development_temporal_props",
-         f"migrate-development-temporal-props{script_ext}",
-         "Add temporal properties to existing Development collections."),
-        ("shared_kg_schema",
-         f"migrate-shared-kg-schema{script_ext}",
-         "Drop + recreate the shared KG when indexNullState is missing."),
-    ]
+    # --- (1) The version-gated runner (no-op today). ---
+    # STRUCTURAL (2026-06-16): this is the ROOT (orchestrator self-)update path.
+    # It migrates the ROOT project's own per-project collections (keyed by the
+    # root's REAL project_id) AND the orchestrator-wide artifacts (shared KG +
+    # Layer-5 shapes, keyed project_id=NULL) — hence include_orchestrator_wide
+    # = True. A NON-root project's collections are migrated by ITS OWN
+    # per-project bundle update (launcher → apply_post_bundle_steps →
+    # `migrate-schema --project-id <that-project>`), NOT here.
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+    # Resolve the ROOT (base-host) project's real id so per-project collection
+    # artifacts (KG / Development / Diagrams / Codegraph) are keyed correctly.
+    # Falls back to VCT_PROJECT_ID env then None (orchestrator-wide only) when
+    # the launcher.db row isn't resolvable.
+    root_project_id = None
+    try:
+        from vco_lib.launcher_db_reader import get_orchestrator_root_project_id
+        root_project_id = get_orchestrator_root_project_id()
+    except Exception:
+        root_project_id = None
+    # NIT-A (2026-06-16): when neither the launcher.db orchestrator_root row nor
+    # VCT_PROJECT_ID resolves (free-tier / launcher-less install, or before the
+    # row exists), project_id is None → ONLY the orchestrator-wide artifacts
+    # (shared KG + Layer-5 shapes, keyed NULL) get registered this run. The
+    # ROOT's OWN per-project collections (its KG/Development/Diagrams/Codegraph)
+    # are NOT seeded into the registry until the first launcher-attached update
+    # resolves the root project_id. Harmless today (no-op: empty migrations/ →
+    # those artifacts are simply registered later at the then-current canonical,
+    # which is correct since a fresh collection is born at canonical); a future
+    # schema bump shipped during this window would be seen as NEVER_MATERIALIZED
+    # on the first launcher-attached run and registered straight to the new
+    # canonical (no spurious recreate). Documented consequence, not a bug.
+    project_id = root_project_id or (os.environ.get("VCT_PROJECT_ID") or None)
+    try:
+        from vco_lib import schema_migration_runner as smr
 
-    for migration_id, script_name, description in migrations:
-        script_path = scripts_dir / script_name
-        if not script_path.exists():
-            print(f"  [migrate:{migration_id}] {script_name} not found; skipping.")
-            _log_install_event(
-                "7d/10", "skip",
-                f"{migration_id}: script not present at {script_path}",
-            )
-            continue
+        run_report = smr.run_schema_migrations(
+            db_path=_project_init._launcher_db_path(),
+            project_id=project_id,
+            migrations_dir=PROJECT_ROOT / "migrations",
+            deferral_report=deferral_report,
+            weaviate_url=weaviate_url,
+            env=os.environ,
+            check=False,
+            project_root=PROJECT_ROOT,
+            include_orchestrator_wide=True,
+        )
+    except Exception as exc:  # never abort install on a runner fault
+        print(f"  [migrate:runner] runner failed (non-fatal): {exc}")
+        _log_install_event(
+            "7d/10", "error", f"schema_migration_runner failed: {exc}",
+        )
+        run_report = None
 
-        if sys.platform == "win32":
-            cmd = [
-                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                "-File", str(script_path),
-            ]
-        else:
-            cmd = ["bash", str(script_path)]
-
-        print(f"  [migrate:{migration_id}] {description}")
-        try:
-            rc = subprocess.call(
-                cmd, cwd=str(PROJECT_ROOT), timeout=300,
-            )
-        except (OSError, subprocess.TimeoutExpired) as e:
-            print(f"  [migrate:{migration_id}] spawn failed: {e}")
-            _log_install_event(
-                "7d/10", "error",
-                f"{migration_id}: spawn failed: {e}",
-            )
-            deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id=f"schema_migration_failed_{migration_id}",
-                    title=f"Schema migration failed: {migration_id}",
-                    detected=(
-                        f"Migration script `scripts/{script_name}` failed to "
-                        f"launch: {e}"
-                    ),
-                    why_deferred=(
-                        "The migration script could not be invoked. Search "
-                        "and stale-data filtering may misbehave until the "
-                        "migration is applied manually."
-                    ),
-                    command_to_apply=(
-                        f"{'powershell.exe -File ' if sys.platform == 'win32' else 'bash '}"
-                        f"scripts/{script_name}"
-                    ),
-                    severity="warning",
-                    kg_node_refs=[],
-                )
-            )
-            continue
-
-        if rc != 0:
-            print(f"  [migrate:{migration_id}] exit rc={rc} (non-fatal)")
-            _log_install_event(
-                "7d/10", "warn",
-                f"{migration_id}: exit rc={rc}",
-                data={"rc": rc, "script": str(script_path)},
-            )
-            deferral_report.add_entry(
-                DeferralEntry(
-                    condition_id=f"schema_migration_failed_{migration_id}",
-                    title=f"Schema migration failed: {migration_id}",
-                    detected=(
-                        f"Migration script `scripts/{script_name}` exited "
-                        f"with non-zero status (rc={rc})."
-                    ),
-                    why_deferred=(
-                        "Search and stale-data filtering may misbehave on "
-                        "the affected collections until the migration is "
-                        "applied successfully. Re-run the script manually "
-                        "after addressing the underlying cause (e.g. "
-                        "Weaviate not running, missing jq, etc.)."
-                    ),
-                    command_to_apply=(
-                        f"{'powershell.exe -File ' if sys.platform == 'win32' else 'bash '}"
-                        f"scripts/{script_name}"
-                    ),
-                    severity="warning",
-                    kg_node_refs=[],
-                )
-            )
-            continue
-
+    if run_report is not None:
+        _translate_migration_report_to_deferrals(run_report, deferral_report)
         _log_install_event(
             "7d/10", "ok",
-            f"{migration_id}: migration script completed",
+            "version-gated runner completed",
+            data={
+                "registered": len(run_report.registered),
+                "up_to_date": len(run_report.up_to_date),
+                "applied": len(run_report.applied),
+                "refused": len(run_report.refused),
+                "errors": len(run_report.errors),
+                "pending_regenerate": len(run_report.pending_regenerate),
+            },
         )
 
     _log_install_event("7d/10", "ok", "schema migrations completed")
 
     # V0243-2: additive named-vector slot migration for per-project KG +
-    # Development collections. Runs after the shell-script migrations so
-    # the collections are guaranteed to exist before we attempt slot adds.
+    # Development collections. Runs after the runner so the collections are
+    # guaranteed to exist before we attempt slot adds.
     _migrate_kg_named_vector_slots(deferral_report)
 
     # V0243-14: emit deferred cleanup suggestions for residual lowercase
     # legacy code-graph collections. Idempotent; never auto-drops.
     _emit_lowercase_codegraph_cleanup_deferrals(deferral_report)
+
+
+def _run_additive_temporal_props_migration(
+    deferral_report: "DeferralReport",
+) -> None:
+    """Run the safe, additive ``migrate-development-temporal-props`` script
+    UNCONDITIONALLY (SPEC §3.1 / R1 Option A).
+
+    Adds the 4 temporal date props to existing ``*_Development`` /
+    ``*_KnowledgeGraph`` / ``*_Diagrams`` collections via the v1 REST schema
+    API. In-place, per-property presence-checked → idempotent; always exit 0.
+    A spawn failure / non-zero exit converts to a ``schema_migration_failed_*``
+    deferral (same family as before) and never aborts install.py.
+    """
+    script_ext = ".ps1" if sys.platform == "win32" else ".sh"
+    script_name = f"migrate-development-temporal-props{script_ext}"
+    migration_id = "development_temporal_props"
+    script_path = PROJECT_ROOT / "scripts" / script_name
+
+    if not script_path.exists():
+        print(f"  [migrate:{migration_id}] {script_name} not found; skipping.")
+        _log_install_event(
+            "7d/10", "skip",
+            f"{migration_id}: script not present at {script_path}",
+        )
+        return
+
+    if sys.platform == "win32":
+        cmd = [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(script_path),
+        ]
+    else:
+        cmd = ["bash", str(script_path)]
+
+    print(f"  [migrate:{migration_id}] Add temporal properties to existing "
+          f"Development / KnowledgeGraph / Diagrams collections (additive).")
+    try:
+        rc = subprocess.call(cmd, cwd=str(PROJECT_ROOT), timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"  [migrate:{migration_id}] spawn failed: {e}")
+        _log_install_event(
+            "7d/10", "error", f"{migration_id}: spawn failed: {e}",
+        )
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id=f"schema_migration_failed_{migration_id}",
+                title=f"Schema migration failed: {migration_id}",
+                detected=(
+                    f"Migration script `scripts/{script_name}` failed to "
+                    f"launch: {e}"
+                ),
+                why_deferred=(
+                    "The additive temporal-props migration could not be "
+                    "invoked. Search and stale-data filtering may misbehave "
+                    "until it is applied manually."
+                ),
+                command_to_apply=(
+                    f"{'powershell.exe -File ' if sys.platform == 'win32' else 'bash '}"
+                    f"scripts/{script_name}"
+                ),
+                severity="warning",
+                kg_node_refs=[],
+            )
+        )
+        return
+
+    if rc != 0:
+        print(f"  [migrate:{migration_id}] exit rc={rc} (non-fatal)")
+        _log_install_event(
+            "7d/10", "warn", f"{migration_id}: exit rc={rc}",
+            data={"rc": rc, "script": str(script_path)},
+        )
+        deferral_report.add_entry(
+            DeferralEntry(
+                condition_id=f"schema_migration_failed_{migration_id}",
+                title=f"Schema migration failed: {migration_id}",
+                detected=(
+                    f"Migration script `scripts/{script_name}` exited with "
+                    f"non-zero status (rc={rc})."
+                ),
+                why_deferred=(
+                    "Search and stale-data filtering may misbehave on the "
+                    "affected collections until the migration is applied "
+                    "successfully. Re-run the script manually after "
+                    "addressing the underlying cause (e.g. Weaviate not "
+                    "running, missing jq, etc.)."
+                ),
+                command_to_apply=(
+                    f"{'powershell.exe -File ' if sys.platform == 'win32' else 'bash '}"
+                    f"scripts/{script_name}"
+                ),
+                severity="warning",
+                kg_node_refs=[],
+            )
+        )
+        return
+
+    _log_install_event(
+        "7d/10", "ok", f"{migration_id}: additive migration completed",
+    )
+
+
+def _translate_migration_report_to_deferrals(
+    run_report: "object", deferral_report: "DeferralReport",
+) -> None:
+    """Add a ``MigrationRunReport``'s findings to the run-scoped DeferralReport.
+
+    Thin wrapper over the SINGLE-SOURCE-OF-TRUTH builder
+    ``schema_migration_runner.build_deferral_entries`` (shared with the
+    per-project CLI surface in ``project_init._cmd_migrate_schema`` so both
+    paths emit identical condition_ids). The runner never writes deferrals
+    itself; this is the ROOT-update sink for its findings.
+    """
+    from vco_lib import schema_migration_runner as smr
+
+    for entry in smr.build_deferral_entries(run_report):
+        deferral_report.add_entry(entry)
 
 
 def _migrate_kg_named_vector_slots(deferral_report: "DeferralReport") -> None:

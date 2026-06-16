@@ -9092,6 +9092,149 @@ def _cmd_check_node_formats_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_migrate_schema(args: argparse.Namespace) -> int:
+    """CLI entrypoint for the version-gated schema-migration runner.
+
+    Mirrors ``check-node-formats-schema`` (a thin DB-aware subprocess surface
+    the launcher + manual retries call). Three modes:
+
+      * default              → run the runner against ``migrations/`` (no-op
+                               today), print the ``MigrationRunReport`` as JSON.
+      * ``--check``          → dry-run; plan only, no mutation, no registry
+                               write. Surfaces ``pending_regenerate`` so the
+                               launcher's ``probe_stale_derived_collections``
+                               Tauri command can render the modal.
+      * ``--regenerate <type> --artifact-name <name>`` → the launcher's
+                               "Regenerate now" choice for ONE derived
+                               collection: drop + recreate + re-sync via the
+                               EXISTING guarded body, then register at
+                               canonical. (Piece 4 wires the guarded recreate;
+                               for v0.2.60 the flag is accepted + validated so
+                               the surface is invokable, but the destructive
+                               recreate itself lands with the modal in Piece 4.)
+
+    Always exits 0 (probe / soft-fail) unless ``--strict``. Prints JSON.
+    """
+    from . import schema_migration_runner as smr
+    from . import schema_versions as sv
+
+    folder = Path(args.folder).resolve()
+    db_path = Path(args.db).resolve() if getattr(args, "db", None) else _launcher_db_path()
+    project_id = getattr(args, "project_id", None) or None
+    now_ms = int(getattr(args, "now_ms", 0)) or _now_ms_safe()
+    weaviate_url = (
+        os.environ.get("WEAVIATE_URL")
+        or f"http://localhost:{os.environ.get('WEAVIATE_PORT', '8081')}"
+    )
+    # The migration EDGES ship in the orchestrator clone's `migrations/`, NOT
+    # in the per-project folder. The launcher runs this subcommand with
+    # cwd=<orchestrator-root> (mirrors run_node_formats_schema_check), so the
+    # orchestrator root is the parent of this vco_lib package. A test / manual
+    # caller can override via --migrations-dir.
+    migrations_override = getattr(args, "migrations_dir", None)
+    if migrations_override:
+        migrations_dir = Path(migrations_override).resolve()
+    else:
+        orchestrator_root = Path(__file__).resolve().parent.parent
+        migrations_dir = orchestrator_root / "migrations"
+    # Per-project CLI surface (launcher → apply_post_bundle_steps) migrates ONLY
+    # that project's own collections — never the shared KG / launcher-global
+    # shapes (those are the ROOT update's job, via install.py). So default
+    # include_orchestrator_wide=False here; --include-orchestrator-wide opts in
+    # (the root project's own per-project run, or a deliberate manual call).
+    include_wide = bool(getattr(args, "include_orchestrator_wide", False))
+
+    regenerate_type = getattr(args, "regenerate", None)
+    if regenerate_type:
+        # POLICY STEP 3 "Regenerate now" — validate the request. The guarded
+        # drop+recreate body is wired in Piece 4 (the launcher modal); here we
+        # validate inputs + emit a structured result so the launcher subprocess
+        # surface exists and is testable.
+        artifact_name = getattr(args, "artifact_name", None)
+        result = {
+            "folder": str(folder),
+            "mode": "regenerate",
+            "artifact_type": regenerate_type,
+            "artifact_name": artifact_name,
+            "action": "pending_piece4",
+            "ok": False,
+        }
+        if regenerate_type not in sv.CANONICAL_VERSIONS:
+            result["error"] = f"unknown artifact_type {regenerate_type!r}"
+        elif not artifact_name:
+            result["error"] = "--regenerate requires --artifact-name"
+        else:
+            result["ok"] = True
+            result["detail"] = (
+                "regenerate (drop+recreate+re-sync via the guarded body) is "
+                "wired with the launcher modal in Piece 4; the request is valid."
+            )
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") or not getattr(args, "strict", False) else 1
+
+    check = bool(getattr(args, "check", False))
+    report = smr.run_schema_migrations(
+        db_path=db_path,
+        project_id=project_id,
+        migrations_dir=migrations_dir,
+        deferral_report=None,
+        weaviate_url=weaviate_url,
+        env=os.environ,
+        check=check,
+        now_ms=now_ms,
+        project_root=migrations_dir.parent,
+        include_orchestrator_wide=include_wide,
+    )
+
+    # CONCERN-1 (2026-06-16): actually PERSIST the findings to the project's
+    # UPDATE_DEFERRED.md when NOT --check, mirroring _cmd_check_node_formats_
+    # schema's _write_node_formats_migration_deferral. Without this, a real
+    # per-project run with a genuinely stale collection would emit
+    # pending_regenerate in JSON but write NO durable deferral — the Rust
+    # toast's "deferral written to UPDATE_DEFERRED.md" claim would lie and a
+    # future Claude session reading the file at session-start would see
+    # nothing. --check stays no-write (dry-run). Uses the SAME builder the
+    # install.py shim uses (schema_migration_runner.build_deferral_entries) so
+    # the condition_ids are identical across both surfaces. Soft-fail: a
+    # deferral-write error never crashes the probe.
+    deferral_written = False
+    if not check:
+        entries = smr.build_deferral_entries(report)
+        if entries:
+            try:
+                from .deferral_report import DeferralReport
+
+                report_file = DeferralReport.read(folder)
+                for entry in entries:
+                    report_file.add_entry(entry)
+                report_file.write(folder)
+                deferral_written = True
+            except Exception as exc:  # never block the probe
+                print(
+                    f"[migrate-schema] deferral write failed (non-fatal): {exc}",
+                    file=sys.stderr,
+                )
+
+    result = {
+        "folder": str(folder),
+        "mode": "check" if check else "apply",
+        "registered": len(report.registered),
+        "register_failed": len(report.register_failed),
+        "up_to_date": len(report.up_to_date),
+        "applied": len(report.applied),
+        "refused": len(report.refused),
+        "errors": len(report.errors),
+        "pending_regenerate": report.pending_regenerate,
+        "deferral_written": deferral_written,
+        "planned": [
+            {"artifact_type": a, "artifact_name": n, "edge": e}
+            for (a, n, e) in report.planned
+        ],
+    }
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _now_ms_safe() -> int:
     """Milliseconds since epoch. Wrapped so tests can inject via --now-ms
     (Date.now()-style time isn't available in some sandboxes)."""
@@ -9543,6 +9686,66 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Override materialized_at epoch-ms (testing; 0 = wall clock).",
     )
     p_check_nf.set_defaults(func=_cmd_check_node_formats_schema)
+
+    # v0.2.60: version-gated schema-migration runner (verified no-op today).
+    p_migrate = sub.add_parser(
+        "migrate-schema",
+        help=(
+            "Run the version-gated schema-migration runner over migrations/ "
+            "(no-op today). --check dry-runs; --regenerate <type> "
+            "--artifact-name <name> is the launcher's 'Regenerate now' choice. "
+            "Emits a JSON MigrationRunReport summary; exit 0 (probe)."
+        ),
+    )
+    p_migrate.add_argument(
+        "--folder", required=True,
+        help="Target user-project folder (the project whose per-project "
+             "artifacts are migrated). Migration EDGES are read from the "
+             "orchestrator clone's migrations/, not this folder.",
+    )
+    p_migrate.add_argument(
+        "--db", default=None,
+        help="launcher.db path (defaults to the canonical ~/.vct/launcher.db).",
+    )
+    p_migrate.add_argument(
+        "--project-id", default=None,
+        help="Project id/slug for the per-project artifact_schema_versions "
+             "rows (the launcher passes the project's real id; "
+             "orchestrator-wide rows are keyed NULL).",
+    )
+    p_migrate.add_argument(
+        "--migrations-dir", default=None,
+        help="Override the migrations/ directory (default: the orchestrator "
+             "clone root beside vco_lib). Testing / manual use.",
+    )
+    p_migrate.add_argument(
+        "--include-orchestrator-wide", action="store_true",
+        dest="include_orchestrator_wide",
+        help="Also migrate the orchestrator-wide artifacts (shared KG + "
+             "Layer-5 launcher/global shapes, keyed project_id=NULL). Set by "
+             "the ROOT update; OFF for a non-root project's bundle update.",
+    )
+    p_migrate.add_argument(
+        "--check", action="store_true",
+        help="Dry-run: plan only, no mutation, no registry write.",
+    )
+    p_migrate.add_argument(
+        "--regenerate", default=None, metavar="ARTIFACT_TYPE",
+        help="POLICY STEP 3 'Regenerate now' for ONE derived collection.",
+    )
+    p_migrate.add_argument(
+        "--artifact-name", default=None,
+        help="Live class name for --regenerate (e.g. the shared KG class).",
+    )
+    p_migrate.add_argument(
+        "--strict", action="store_true",
+        help="Return non-zero on a regenerate validation error (default soft).",
+    )
+    p_migrate.add_argument(
+        "--now-ms", default=0, type=int,
+        help="Override materialized_at epoch-ms (testing; 0 = wall clock).",
+    )
+    p_migrate.set_defaults(func=_cmd_migrate_schema)
 
     return parser
 
