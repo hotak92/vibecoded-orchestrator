@@ -9270,6 +9270,22 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2))
             return 0 if not getattr(args, "strict", False) else 1
 
+        # --check is a DRY-RUN: it must NEVER perform the destructive recreate.
+        # Report what WOULD be regenerated and return without touching
+        # Weaviate. (Without this guard, `--regenerate <type> --check` would
+        # fall through to the real drop+rebuild below — a dry-run that mutates
+        # is both a contract violation and a data-safety footgun.)
+        if getattr(args, "check", False):
+            result["mode"] = "regenerate-check"
+            result["ok"] = True
+            result["would_regenerate"] = True
+            result["note"] = (
+                "dry-run: would drop+recreate+re-sync this collection from "
+                "on-disk source. Re-run WITHOUT --check to perform it."
+            )
+            print(json.dumps(result, indent=2))
+            return 0
+
         # The per-project recreate needs the raw project name to derive the
         # canonical class names (migrate-collections --name). Resolve from the
         # explicit --project-name, else the PROJECT_NAME env. The shared-KG and

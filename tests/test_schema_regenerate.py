@@ -488,3 +488,45 @@ def test_c1_cli_no_deferral_on_clean_regenerate(
     assert out["reingest_deferral_written"] is False
     report = DeferralReport.read(folder)
     assert not report.has_condition("schema_reingest_incomplete_P1_KnowledgeGraph")
+
+
+def test_regenerate_check_is_a_dry_run_never_mutates(
+    db_with_v033, tmp_path, monkeypatch, capsys
+):
+    """`--regenerate <type> --check` must NOT perform the destructive recreate.
+
+    Regression for the dogfood-caught bug: the --regenerate handler ignored
+    --check and called regenerate_derived_collection() unconditionally, so a
+    dry-run actually dropped+rebuilt the live collection (and hung on the
+    re-ingest). --check must return a plan WITHOUT touching Weaviate.
+    """
+    from vco_lib import project_init as pinit
+
+    folder = tmp_path / "proj"
+    folder.mkdir()
+
+    called = {"n": 0}
+
+    def _must_not_run(**kwargs):  # pragma: no cover - asserted not-called
+        called["n"] += 1
+        raise AssertionError(
+            "regenerate_derived_collection MUST NOT be called under --check"
+        )
+
+    monkeypatch.setattr(sregen, "regenerate_derived_collection", _must_not_run)
+    monkeypatch.setenv("WEAVIATE_URL", "http://x:8081")
+
+    args = __import__("argparse").Namespace(
+        folder=str(folder), db=str(db_with_v033), project_id="p1",
+        migrations_dir=None, include_orchestrator_wide=False,
+        regenerate="kg_collection", artifact_name="P1_KnowledgeGraph",
+        project_name="P1", strict=False, now_ms=1, check=True,  # ← the dry-run
+    )
+    rc = pinit._cmd_migrate_schema(args)
+    out = json.loads(capsys.readouterr().out)
+
+    assert called["n"] == 0, "destructive recreate ran under --check"
+    assert rc == 0
+    assert out["mode"] == "regenerate-check"
+    assert out["would_regenerate"] is True
+    assert out["ok"] is True
