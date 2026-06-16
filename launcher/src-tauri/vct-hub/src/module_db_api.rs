@@ -89,7 +89,13 @@ pub fn router() -> Router<LauncherDbHandle> {
             "/modules/{module_id}/token/refresh",
             post(refresh_token),
         )
-        // Both crud and token routes get the same bearer-scope check.
+        // v0.2.60: module-scoped RL events read (training container reads
+        // its own corpus from launcher.db with its module token).
+        .route(
+            "/modules/{module_id}/projects/{project_id}/rl/events",
+            get(list_module_rl_events),
+        )
+        // All crud, token, and rl/events routes get the same bearer-scope check.
         .layer(axum::middleware::from_fn(require_module_scope))
 }
 
@@ -117,7 +123,8 @@ fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
 #[derive(Clone, Debug)]
 struct ModuleScope {
     module_id: String,
-    #[allow(dead_code)]
+    // v0.2.60: now read by `list_module_rl_events` to PIN the events query
+    // to the token's granted project (never a client-supplied pid).
     project_id: String,
 }
 
@@ -233,10 +240,22 @@ fn parse_module_path(path: &str) -> Option<(String, Option<String>)> {
     let parts: Vec<&str> = p.split('/').collect();
     // "modules", "{module_id}", "db", "projects", "{project_id}", ...
     // OR "modules", "{module_id}", "token", "refresh"
+    // OR "modules", "{module_id}", "projects", "{project_id}", "rl", "events"
+    //    (v0.2.60: module-scoped RL events read — the RL training container
+    //    reads its own corpus from launcher.db with its module token,
+    //    scoped to the granted project. Same (module_id, project_id) gate as
+    //    the /db/projects routes; no host hub.token in the container.)
     if parts.len() >= 2 && parts[0] == "modules" {
         let module_id = parts[1].to_string();
         if parts.len() >= 5 && parts[2] == "db" && parts[3] == "projects" {
             return Some((module_id, Some(parts[4].to_string())));
+        }
+        if parts.len() >= 6
+            && parts[2] == "projects"
+            && parts[4] == "rl"
+            && parts[5] == "events"
+        {
+            return Some((module_id, Some(parts[3].to_string())));
         }
         if parts.len() >= 4 && parts[2] == "token" && parts[3] == "refresh" {
             return Some((module_id, None));
@@ -740,6 +759,103 @@ async fn delete_row(
     }
 }
 
+// ─── Module-scoped RL events read (v0.2.60) ─────────────────────────────
+
+/// Query params for the module-scoped RL events read. Mirrors the
+/// hub.token-gated `rl_events_api::ListEventsQuery` MINUS `project_id`:
+/// the project is pinned to the token's scope (see handler), never taken
+/// from the client, so a module token can only ever read events for the
+/// project it was granted.
+#[derive(Debug, Deserialize)]
+struct ModuleRlEventsQuery {
+    event_type: Option<String>,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    limit: Option<u32>,
+}
+
+/// `GET /modules/{module_id}/projects/{project_id}/rl/events`
+///
+/// v0.2.60: lets the RL training container read its OWN event corpus from
+/// `launcher.db` using its module-scoped token (the container has no
+/// host `hub.token` — different trust boundary, see `require_module_scope`
+/// doc). The `require_module_scope` middleware already validated the
+/// bearer maps to a `(module_id, project_id)` row matching the URL (wrong
+/// module → 401, wrong project → 403, expired → 401).
+///
+/// SECURITY: the `project_id` filter passed to the DB is taken from the
+/// token-validated `ModuleScope` extension, NOT from the URL path or any
+/// query param. The middleware 403s a URL/path mismatch, but the handler
+/// must not trust a client-supplied project either — so we pin to the
+/// scope. Returns the SAME `RlEventOut` shape as the dashboard route
+/// (`payload_json` verbatim).
+async fn list_module_rl_events(
+    State(h): State<LauncherDbHandle>,
+    Path((module_id, project_id)): Path<(String, String)>,
+    Query(q): Query<ModuleRlEventsQuery>,
+    req: Request<Body>,
+) -> Response {
+    let scope = match req.extensions().get::<ModuleScope>().cloned() {
+        Some(s) => s,
+        None => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no_scope",
+                "scope extension missing",
+            )
+        }
+    };
+    // Defense in depth: the middleware already enforced these, but re-check
+    // so the handler never reads events for a project the token doesn't
+    // authorize even if the route were ever mounted without the layer.
+    if scope.module_id != module_id {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "scope_mismatch",
+            "token does not authorize this module",
+        );
+    }
+    if scope.project_id != project_id {
+        return err(
+            StatusCode::FORBIDDEN,
+            "scope_mismatch",
+            "token does not authorize this project",
+        );
+    }
+
+    let limit = q.limit.unwrap_or(500).min(10_000);
+    // PIN to the token's project_id — never a client-supplied value.
+    match h.0.list_rl_events(
+        Some(scope.project_id.as_str()),
+        q.event_type.as_deref(),
+        q.since_ms,
+        q.until_ms,
+        limit,
+    ) {
+        Ok(rows) => {
+            let out: Vec<super::rl_events_api::RlEventOut> = rows
+                .into_iter()
+                .map(|e| super::rl_events_api::RlEventOut {
+                    id: e.id,
+                    event_type: e.event_type,
+                    schema_version: e.schema_version,
+                    ts_ms: e.ts_ms,
+                    project_id: e.project_id,
+                    project_name: e.project_name,
+                    task_id: e.task_id,
+                    task_type: e.task_type,
+                    embedding_source: e.embedding_source,
+                    embedding_dim: e.embedding_dim,
+                    embedding_model: e.embedding_model,
+                    payload_json: e.payload_json,
+                })
+                .collect();
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "query_failed", e.to_string()),
+    }
+}
+
 // ─── Token refresh ──────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -867,6 +983,42 @@ mod tests {
         assert_eq!(
             parse_module_path(p),
             Some(("vct-rl-reranker".into(), None))
+        );
+    }
+
+    #[test]
+    fn parse_module_path_rl_events_route() {
+        // v0.2.60: the module-scoped RL events read resolves to
+        // (module_id, Some(project_id)) — same scope shape as /db/projects,
+        // so it goes through require_module_scope with the same gate.
+        let p = "/api/v1/modules/vct-rl-reranker/projects/abc-123/rl/events";
+        assert_eq!(
+            parse_module_path(p),
+            Some(("vct-rl-reranker".into(), Some("abc-123".into())))
+        );
+        // With query string (axum usually strips it before the middleware,
+        // but parse is path-only anyway).
+        let p2 = "/api/v1/modules/vct-rl-reranker/projects/abc-123/rl/events?event_type=retrieval&limit=50";
+        // path with query is not split here; the router/middleware passes the
+        // path component. Assert the bare path resolves; query handling is the
+        // handler's Query extractor, not parse_module_path's job.
+        assert_eq!(
+            parse_module_path(p2.split('?').next().unwrap()),
+            Some(("vct-rl-reranker".into(), Some("abc-123".into())))
+        );
+    }
+
+    #[test]
+    fn parse_module_path_rl_events_wrong_shape_is_none() {
+        // Missing the trailing rl/events → not our route.
+        assert_eq!(
+            parse_module_path("/api/v1/modules/m/projects/p"),
+            None
+        );
+        // rl without events → not matched.
+        assert_eq!(
+            parse_module_path("/api/v1/modules/m/projects/p/rl"),
+            None
         );
     }
 
