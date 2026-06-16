@@ -6039,17 +6039,33 @@ mod tests {
     #[test]
     fn test_perform_hard_cut_not_wired_into_update_orchestrator() {
         let installer_src = include_str!("installer.rs");
-        // The hard-cut command name must not appear in installer.rs at all
-        // (it's defined + registered in projects_v2.rs / lib.rs only).
+        // The hard cut must not be WIRED (called) from the update flow. We
+        // check for a CALL, not a bare mention: Piece 5's `update_orchestrator`
+        // floor-gate carries a prose comment naming `perform_hard_cut` (the
+        // v0.3.0 activation hook) — a harmless reference, NOT a call. So the
+        // assertion targets the call syntax `perform_hard_cut(` rather than
+        // the bare identifier (which the original substring check flagged on
+        // the comment, a false positive).
         assert!(
-            !installer_src.contains("perform_hard_cut"),
-            "installer.rs (home of update_orchestrator) must NOT reference \
-             perform_hard_cut in v0.2.60 — the hard cut is INERT"
+            !installer_src.contains("perform_hard_cut("),
+            "installer.rs (home of update_orchestrator) must NOT CALL \
+             perform_hard_cut(...) in v0.2.60 — the hard cut is INERT"
         );
-        // And no direct call into the Python primitive from the update flow.
+        // And no direct call into the §7 Python primitive `hard_cut(...)`
+        // from the update flow. NB: Piece 5 added the floor-check helper
+        // `update_requires_hard_cut(...)` to installer.rs — a legitimate,
+        // INERT gate (it only LOGS in v0.2.60), NOT the hard-cut driver. Its
+        // name ends in `hard_cut(`, so a naive substring check false-positives
+        // on it. Strip those occurrences before checking for a real primitive
+        // call. (The primitive `hard_cut(` is invoked only from the Python
+        // `vco_lib.hard_cut` module + the inert `perform_hard_cut` Tauri
+        // command in projects_v2.rs — never from installer.rs.)
+        let without_floor_helper = installer_src.replace("update_requires_hard_cut(", "");
         assert!(
-            !installer_src.contains("hard_cut("),
-            "installer.rs must NOT call hard_cut() — INERT until v0.3.0"
+            !without_floor_helper.contains("hard_cut("),
+            "installer.rs must NOT call the §7 hard_cut() primitive — INERT \
+             until v0.3.0 (the floor-check helper update_requires_hard_cut() \
+             is allowed; it only logs)"
         );
     }
 

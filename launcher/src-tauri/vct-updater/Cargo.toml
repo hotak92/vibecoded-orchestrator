@@ -58,9 +58,18 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# v0.2.60 Piece 6 (DORMANT signature layer): sha256 artifact-integrity
+# verification for the inverted-updater trust gate (signature.rs). Pinned to
+# the same versions the launcher crate already uses (workspace consistency:
+# launcher/src-tauri/Cargo.toml `sha2 = "0.11"`, `hex = "0.4"`), so the lock
+# resolves to a single rev. Only the DORMANT engine/bootstrap path uses these;
+# the LIVE swap-only `main()` does not touch them.
+sha2 = "0.11"
+hex = "0.4"
 
 [dev-dependencies]
 # v0.2.54 Track C: outcome-file tests (write_outcome atomic write).
+# v0.2.60 Piece 6: signature.rs / bootstrap.rs unit tests use tempdirs too.
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]

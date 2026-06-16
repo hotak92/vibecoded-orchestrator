@@ -43,22 +43,34 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(target_os = "windows")]
-use std::time::{Duration, Instant};
-#[cfg(not(target_os = "windows"))]
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum time (in seconds) we'll wait for the parent process to exit.
-/// 30s is generous — typical launcher shutdown is sub-second; this
-/// guards against a hung parent that would block the updater forever.
-#[cfg(target_os = "windows")]
-const PARENT_WAIT_TIMEOUT_SECS: u64 = 30;
+// v0.2.60 Piece 6 (DORMANT): the per-OS binary-swap mechanism lives in
+// `swap` so BOTH the LIVE swap-only `main()` here AND the (not-wired)
+// cross-OS `engine` call the SAME code (reuse, not duplicate). `update_plan`,
+// `signature`, `engine`, `bootstrap` are the v0.3.0 inverted-updater pieces:
+// compiled, unit-tested, but NEVER reached from `main()` (the live path).
+mod bootstrap;
+mod engine;
+mod signature;
+mod swap;
+mod update_plan;
 
-/// Polling interval while waiting for the parent.
+// v0.2.60 Piece 6: the parent-wait timeout + swap mechanism moved to
+// `swap.rs` (reused by `main()` here and the dormant `engine`). Re-export
+// the timeout under the original name so the log strings below are
+// unchanged from the pre-extraction version.
+// The swap mechanism + parent-wait, reused verbatim from `swap.rs`. On
+// Windows `main()` calls these directly (same behaviour as the pre-extraction
+// inline definitions). On POSIX `main()` returns early (the no-op rename
+// path) and never references them, so the import is Windows-only to avoid an
+// unused-import warning — the POSIX stubs in `swap.rs` exist for the engine.
 #[cfg(target_os = "windows")]
-const PARENT_WAIT_POLL_MS: u64 = 200;
+use swap::{
+    spawn_detached, swap_binary, wait_for_parent_exit, SwapResult, WaitError,
+    PARENT_WAIT_TIMEOUT_SECS,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SwapEntry {
@@ -294,168 +306,11 @@ fn read_lock(path: &Path) -> Result<UpdateLock, String> {
     serde_json::from_str(&content).map_err(|e| format!("parse: {}", e))
 }
 
-/// Outcome of a single swap attempt.
-#[allow(dead_code)] // Swapped is constructed only on Windows
-enum SwapResult {
-    /// `<target>.new` was found and successfully renamed to `<target>`.
-    Swapped,
-    /// `<target>.new` did not exist — nothing to do. This is OK; one
-    /// of the original swap attempts may have already succeeded
-    /// (e.g. the launcher itself was renamed pre-pull on Windows).
-    NoOpMissingNew,
-}
-
-// -----------------------------------------------------------------------------
-// Windows-only logic (parent wait + MoveFileEx + CreateProcess)
-// -----------------------------------------------------------------------------
-
-#[cfg(target_os = "windows")]
-enum WaitError {
-    Timeout,
-    AlreadyGone,
-}
-
-#[cfg(target_os = "windows")]
-fn wait_for_parent_exit(pid: u32) -> Result<Duration, WaitError> {
-    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
-
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(PARENT_WAIT_TIMEOUT_SECS);
-
-    // SAFETY: OpenProcess is safe to call with any DWORD pid. A NULL
-    // return indicates the process is gone or we lack permissions.
-    // Either way we can't wait on it — treat as "already gone" so the
-    // swap proceeds.
-    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
-    if handle.is_null() {
-        return Err(WaitError::AlreadyGone);
-    }
-
-    loop {
-        // Poll in small chunks so we can check our own deadline cleanly.
-        // SAFETY: handle is valid (non-null check above) until we call
-        // CloseHandle.
-        let wait_result = unsafe { WaitForSingleObject(handle, PARENT_WAIT_POLL_MS as u32) };
-        if wait_result == WAIT_OBJECT_0 {
-            // Parent terminated.
-            unsafe { CloseHandle(handle) };
-            return Ok(started.elapsed());
-        }
-        if wait_result != WAIT_TIMEOUT {
-            // Unexpected wait state (handle invalidated mid-poll, etc.).
-            // Treat as "already gone" so we proceed with the swap.
-            unsafe { CloseHandle(handle) };
-            return Err(WaitError::AlreadyGone);
-        }
-        if Instant::now() >= deadline {
-            unsafe { CloseHandle(handle) };
-            return Err(WaitError::Timeout);
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn swap_binary(target: &Path) -> Result<SwapResult, String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let staged = target.with_extension(format!(
-        "{}.new",
-        target
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-    ));
-    // Normalize: we want <target>.new, not <stem>.<ext>.new — fix when
-    // the extension was non-empty.
-    let staged = if let Some(ext) = target.extension().and_then(|s| s.to_str()) {
-        let mut s = target.to_path_buf();
-        s.set_extension(format!("{}.new", ext));
-        s
-    } else {
-        staged
-    };
-
-    if !staged.exists() {
-        return Ok(SwapResult::NoOpMissingNew);
-    }
-
-    // Convert paths to UTF-16 null-terminated strings (Windows API
-    // requirement). encode_wide() yields the code units, we append the
-    // null terminator manually.
-    let staged_w: Vec<u16> = staged.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    let target_w: Vec<u16> = target.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-
-    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
-
-    // SAFETY: both pointers point to null-terminated UTF-16 strings
-    // valid for the duration of the call (they're owned by `staged_w`
-    // and `target_w` Vec<u16>s).
-    let ok = unsafe { MoveFileExW(staged_w.as_ptr(), target_w.as_ptr(), flags) };
-
-    if ok == 0 {
-        let err = unsafe { GetLastError() };
-        return Err(format!("MoveFileExW failed: GetLastError={}", err));
-    }
-    Ok(SwapResult::Swapped)
-}
-
-#[cfg(target_os = "windows")]
-fn spawn_detached(exe: &Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    const DETACHED_PROCESS: u32 = 0x00000008;
-
-    let mut cmd = Command::new(exe);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-
-    cmd.spawn()
-        .map(|_child| ())
-        .map_err(|e| format!("spawn {}: {}", exe.display(), e))
-}
-
-// -----------------------------------------------------------------------------
-// Cross-platform stubs for non-Windows (keep the binary compiling but
-// inactive on POSIX so we don't have to gate the entire workspace by
-// target_os).
-// -----------------------------------------------------------------------------
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-enum WaitError {
-    Timeout,
-    AlreadyGone,
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-fn wait_for_parent_exit(_pid: u32) -> Result<Duration, WaitError> {
-    // POSIX: not used (main() returns early). Stub for compile parity.
-    Err(WaitError::AlreadyGone)
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-fn swap_binary(_target: &Path) -> Result<SwapResult, String> {
-    // POSIX: not used.
-    Ok(SwapResult::NoOpMissingNew)
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-fn spawn_detached(_exe: &Path) -> Result<(), String> {
-    // POSIX: not used.
-    Ok(())
-}
+// The per-OS swap mechanism (`SwapResult`, `WaitError`, `wait_for_parent_exit`,
+// `swap_binary`, `spawn_detached`) lives in `swap.rs` (v0.2.60 Piece 6
+// extraction). `main()` above calls those — identical behaviour to the
+// pre-extraction inline definitions, single source of truth shared with the
+// dormant `engine`.
 
 // -----------------------------------------------------------------------------
 // Tests
@@ -464,6 +319,45 @@ fn spawn_detached(_exe: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── v0.2.60 Piece 6: DORMANT-engine guarantee ──────────────────────
+    //
+    // The cross-OS engine (engine::run_engine / engine::run_plan) and the
+    // bootstrap stub (bootstrap::decide) must NOT be reachable from the LIVE
+    // updater entrypoint `main()`. `main()` in v0.2.60 does ONLY the
+    // swap-only path (parse update.lock.json → wait → swap → relaunch). The
+    // engine/bootstrap are wired by v0.3.0 (a `--engine` arg dispatch), never
+    // in v0.2.60. This mirrors Piece 4's
+    // `test_perform_hard_cut_not_wired_into_update_orchestrator`.
+    #[test]
+    fn engine_entrypoint_is_not_wired_into_main() {
+        // Read this file's source and isolate the LIVE code (everything
+        // before the `#[cfg(test)]` test module) so we don't match the
+        // assertion strings in this very test.
+        let src = include_str!("main.rs");
+        let live = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source has a live (pre-test) section");
+
+        // The live `main()` must not dispatch to the engine entrypoint…
+        assert!(
+            !live.contains("run_engine") && !live.contains("engine::run_plan"),
+            "main.rs LIVE code must NOT call the cross-OS engine in v0.2.60 — \
+             the engine is DORMANT until v0.3.0 wires a --engine dispatch"
+        );
+        // …nor to the bootstrap stub's decide()…
+        assert!(
+            !live.contains("bootstrap::decide"),
+            "main.rs LIVE code must NOT invoke the bootstrap stub in v0.2.60 — \
+             update_orchestrator stays the live path"
+        );
+        // …nor parse an `--engine` flag (the v0.3.0 dispatch arg).
+        assert!(
+            !live.contains("--engine"),
+            "main.rs LIVE code must NOT parse a --engine arg in v0.2.60"
+        );
+    }
 
     #[test]
     fn lock_roundtrip_minimal() {

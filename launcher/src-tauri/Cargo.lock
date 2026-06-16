@@ -5442,8 +5442,10 @@ dependencies = [
 name = "vct-updater"
 version = "0.2.59"
 dependencies = [
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "windows-sys 0.59.0",
 ]
