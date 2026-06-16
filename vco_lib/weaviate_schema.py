@@ -184,6 +184,42 @@ _CODE_COLLECTION_SUFFIXES: frozenset[str] = frozenset(
 )
 
 
+def embedding_schema_fingerprint(name: str) -> str:
+    """v0.2.60: a stable fingerprint of the EMBED-RELEVANT schema for a
+    collection, used to gate re-embedding on an ACTUAL embedding-schema
+    change rather than on a version-number bump.
+
+    The fingerprint hashes ONLY the things whose change actually invalidates
+    stored vectors: the named-vector slot catalog as ``(slot_name, dim)``
+    pairs (sorted for order-independence — Weaviate treats vectorConfig as an
+    unordered map). It deliberately EXCLUDES property additions, descriptions,
+    inverted-index flags, and the schema VERSION integer — none of those
+    require re-embedding (a new property or an additive slot is a
+    copy-with-vectors / patch_props operation, never a re-embed).
+
+    Two collections with the same fingerprint hold vectors that are still
+    valid under the current catalog → NO re-embed needed. A changed
+    fingerprint (a slot removed, or a slot's dim changed) means the stored
+    vectors no longer match the catalog → re-embed/rebuild required.
+
+    Per-shape: code-shaped classes use ``CODE_NAMED_VECTORS``, everything
+    else uses ``KG_NAMED_VECTORS`` (matches how the rest of the module
+    resolves the target catalog).
+
+    Returns a short hex digest. Stable across processes/machines (pure
+    function of the in-code catalog), so it can be stored alongside the
+    artifact_schema_versions row and compared on the next update.
+    """
+    from vco_lib.hashing import sha256_text
+
+    catalog = CODE_NAMED_VECTORS if is_code_collection(name) else KG_NAMED_VECTORS
+    # Sorted (name, dim) pairs — the ONLY embed-invalidating schema facts.
+    payload = ";".join(
+        f"{slot.name}:{slot.dim}" for slot in sorted(catalog, key=lambda s: s.name)
+    )
+    return sha256_text(payload)[:24]
+
+
 def is_code_collection(name: str) -> bool:
     """Best-effort check: does `name` look like a code-graph class?
 

@@ -747,17 +747,22 @@ def _live_probe_for(
 def _default_live_drift_probe(
     weaviate_url: str, artifact_name: str
 ) -> tuple[bool, list[str]]:
-    """Default ``live_drift_probe`` → ``detect_kg_schema_drift``.
+    """Default ``live_drift_probe`` → ``live_fingerprint_stale`` (Piece 3).
 
-    Piece 3 will supersede this with the richer ``live_fingerprint_stale``.
-    Until then the existing invariant-list detector is the POLICY STEP 1
-    "is it stale?" test. Failure-soft (Weaviate down / class absent → not
-    stale), preserving the §5 NO-OP guarantee on a containers-down install.
+    The POLICY STEP 1 "is it stale?" test. Re-embed is gated on an ACTUAL
+    embedding-invalidating change: a missing CORE named-vector slot, a
+    missing ``indexNullState``, OR a slot whose live stored-vector dim
+    differs from the catalog. A purely-additive optional-slot gap is NOT
+    stale (handled by copy-with-vectors / patch_props, no re-embed). See
+    ``vco_lib.project_init.live_fingerprint_stale`` +
+    ``vco_lib.weaviate_schema.embedding_schema_fingerprint``. Failure-soft
+    (Weaviate down / class absent → not stale), preserving the §5 NO-OP
+    guarantee on a containers-down install.
     """
     try:
-        from .project_init import detect_kg_schema_drift
+        from .project_init import live_fingerprint_stale
 
-        return detect_kg_schema_drift(weaviate_url, artifact_name)
+        return live_fingerprint_stale(weaviate_url, artifact_name)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("_default_live_drift_probe: probe failed (%s)", exc)
         return (False, [])

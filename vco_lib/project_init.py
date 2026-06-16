@@ -645,6 +645,95 @@ def detect_kg_schema_drift(weaviate_url: str, kg_collection: str) -> tuple[bool,
     return (bool(missing), missing)
 
 
+def live_fingerprint_stale(
+    weaviate_url: str, collection: str
+) -> tuple[bool, list[str]]:
+    """v0.2.60 (Piece 3): the re-embed gate. Returns (stale, changed_fields)
+    where ``stale=True`` means the live collection's EMBEDDING-RELEVANT schema
+    no longer matches the current catalog → a migration is needed.
+
+    This is the probe the schema-migration runner uses to decide whether a
+    derived (Weaviate) collection that is recorded at the canonical version
+    nonetheless needs work. It gates re-embedding on an ACTUAL
+    embedding-invalidating change — NOT on a version bump and NOT on a purely
+    additive change:
+
+      - Missing CORE named-vector slot OR missing ``indexNullState`` →
+        stale (delegates to :func:`detect_kg_schema_drift`; these can't be
+        retro-added on Weaviate ≤1.30, so they need a rebuild/copy).
+      - A slot present BOTH live and in the catalog but at a DIFFERENT
+        dimensionality → stale (stored vectors are invalid for that slot;
+        this is the case ``detect_kg_schema_drift`` does NOT catch — it only
+        checks slot *presence*, not *dim*).
+      - A merely-additive difference (catalog has an OPTIONAL slot the live
+        collection lacks) is NOT stale — the existing copy-with-vectors /
+        patch_props path adds it without re-embedding. The catalog
+        fingerprint (:func:`vco_lib.weaviate_schema.embedding_schema_fingerprint`)
+        documents the embed-relevant identity; this probe is its live
+        counterpart.
+
+    Failure-soft: Weaviate unreachable / collection absent → (False, []),
+    same contract as ``detect_kg_schema_drift``, so a down Weaviate never
+    triggers a spurious migration.
+    """
+    # Invariant subset (core slots + indexNullState) — reuse the existing
+    # detector verbatim so the two never drift apart.
+    drift, missing = detect_kg_schema_drift(weaviate_url, collection)
+    changed = list(missing)
+
+    # Dim-mismatch check (the embedder-identity dimension the invariant
+    # detector omits). Compare each slot that exists BOTH live and in the
+    # catalog; a dim change invalidates that slot's stored vectors.
+    try:
+        from vco_lib.weaviate_schema import (
+            CODE_NAMED_VECTORS,
+            KG_NAMED_VECTORS,
+            is_code_collection,
+        )
+
+        schema = _fetch_schema(collection, weaviate_url)
+        if schema is not None:
+            catalog = (
+                CODE_NAMED_VECTORS if is_code_collection(collection) else KG_NAMED_VECTORS
+            )
+            catalog_dims = {slot.name: slot.dim for slot in catalog}
+            for slot_name, cfg in (schema.get("vectorConfig") or {}).items():
+                want = catalog_dims.get(slot_name)
+                if want is None:
+                    continue  # live slot not in catalog — not our concern here
+                live_dim = _existing_vector_dim_for_slot(
+                    weaviate_url, collection, slot_name
+                )
+                if live_dim is not None and live_dim != want:
+                    changed.append(
+                        f"slot '{slot_name}' dim {live_dim} != catalog {want} "
+                        f"(stored vectors invalid → re-embed)"
+                    )
+    except Exception as exc:  # failure-soft — never block on a probe error
+        logger = __import__("logging").getLogger(__name__)
+        logger.debug("live_fingerprint_stale: dim probe failed (%s)", exc)
+
+    return (bool(changed), changed)
+
+
+def _existing_vector_dim_for_slot(
+    weaviate_url: str, collection: str, slot_name: str
+) -> Optional[int]:
+    """Best-effort: the stored vector dim for ``slot_name`` on ``collection``.
+
+    Delegates to the shared probe in ``vco_lib.weaviate_schema`` so the dim
+    discovery logic lives in one place. Returns None when the slot is empty
+    / unprobeable (treated as "no mismatch" by the caller — we never re-embed
+    on an inconclusive probe).
+    """
+    try:
+        from vco_lib.weaviate_schema import _existing_slot_dim
+
+        return _existing_slot_dim(collection, slot_name, weaviate_url=weaviate_url)
+    except Exception:
+        return None
+
+
 # Internal alias preserving install.py's underscored name.
 _detect_kg_schema_drift = detect_kg_schema_drift
 
