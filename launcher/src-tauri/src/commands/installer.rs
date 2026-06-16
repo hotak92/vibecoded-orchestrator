@@ -1078,6 +1078,78 @@ fn read_manifest_version(install_path: &Path) -> Option<String> {
     None
 }
 
+/// v0.2.60 (Piece 5): read `vct-module.json::min_upgradable_from` — the
+/// oldest installed version this release can update IN-PLACE from. Below
+/// this floor, the update routes to the guided hard-cut instead of an
+/// in-place pull. Returns `None` when the field is absent (older manifests)
+/// or empty — callers treat `None` as "no floor declared → never hard-cut".
+fn read_min_upgradable_from(install_path: &Path) -> Option<String> {
+    let vct_module = install_path.join("vct-module.json");
+    let txt = std::fs::read_to_string(&vct_module).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(&txt).ok()?;
+    let s = val.get("min_upgradable_from").and_then(|v| v.as_str())?;
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Parse a `major.minor.patch` version string into a comparable tuple.
+/// The orchestrator uses plain numeric `0.2.x` versions (no pre-release /
+/// build metadata — see `bump-version.sh`), so a 3-int tuple is sufficient.
+/// Missing components default to 0; non-numeric components make the parse
+/// fail (returns `None`) so a malformed version can never be silently
+/// treated as `0.0.0` and wrongly trip the floor.
+fn parse_version_tuple(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.trim().trim_start_matches('v');
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    // minor/patch default to 0 when absent (e.g. "1" → (1,0,0)), but a
+    // PRESENT-but-non-numeric component is a hard failure.
+    let minor = match parts.next() {
+        Some(s) => s.parse::<u64>().ok()?,
+        None => 0,
+    };
+    let patch = match parts.next() {
+        Some(s) => s.parse::<u64>().ok()?,
+        None => 0,
+    };
+    Some((major, minor, patch))
+}
+
+/// True iff `installed` is strictly below the `floor` version (= an in-place
+/// update is NOT supported and the hard-cut path applies). Fail-SAFE: if
+/// either version can't be parsed, returns `false` (never force a
+/// destructive hard-cut on a parse ambiguity — prefer the in-place attempt,
+/// which surfaces its own errors).
+fn version_is_below_floor(installed: &str, floor: &str) -> bool {
+    match (parse_version_tuple(installed), parse_version_tuple(floor)) {
+        (Some(i), Some(f)) => i < f,
+        _ => false,
+    }
+}
+
+/// v0.2.60 (Piece 5): decide whether an update from the installed version
+/// must take the guided hard-cut path (installed < the source manifest's
+/// `min_upgradable_from`) rather than an in-place pull.
+///
+/// INERT in v0.2.60: the shipped floor is `"0.0.0"` (vct-module.json), and
+/// no real install is below `0.0.0`, so this ALWAYS returns false today.
+/// v0.3.0 raises the floor to declare the first real hard-cut boundary;
+/// only then does this gate ever open. Returns false when no floor is
+/// declared or the installed version is unknown (fresh install → there's
+/// nothing to upgrade-from, the normal install path runs).
+fn update_requires_hard_cut(install_path: &Path) -> bool {
+    let Some(floor) = read_min_upgradable_from(install_path) else {
+        return false; // no floor declared → never hard-cut
+    };
+    let Some(installed) = read_manifest_version(install_path) else {
+        return false; // never completed an install here → normal install path
+    };
+    version_is_below_floor(&installed, &floor)
+}
+
 /// Read the on-disk binary version from
 /// `launcher/dist/<arch>/<launcher-binary>.metadata.json::launcher_version`.
 /// The arch subdir is selected via `launcher_dist_subdir()` and the
@@ -4225,6 +4297,30 @@ pub async fn update_orchestrator<R: Runtime>(
 
     if !install_path.join(".git").exists() {
         return Err("Not a git repository — cannot update".to_string());
+    }
+
+    // v0.2.60 (Piece 5): version-floor gate. If the installed version is
+    // below the source manifest's `min_upgradable_from`, an in-place pull
+    // is not supported and the update must route to the guided hard-cut
+    // (git-bundle backup + git reset --hard + reinstall, preserving all
+    // ~/.vct DBs + Weaviate vectors + knowledge/ + .claude/state/).
+    //
+    // INERT in v0.2.60: the shipped floor is "0.0.0" (vct-module.json), so
+    // `update_requires_hard_cut` ALWAYS returns false here today — the check
+    // is LIVE (exercised every update, dogfoodable) but never opens the
+    // gate. v0.3.0 raises the floor to declare the first real hard-cut
+    // boundary; the routing to `perform_hard_cut` is wired then (the
+    // primitive + its Tauri command already exist, gated by
+    // `_allow_below_floor`). We only LOG the decision now so the floor logic
+    // is proven in practice before v0.3.0 relies on it.
+    if update_requires_hard_cut(&install_path) {
+        // Unreachable in v0.2.60 (floor=0.0.0). When v0.3.0 raises the floor,
+        // replace this log with the routing to the hard-cut flow.
+        eprintln!(
+            "[vct] update_orchestrator: installed version is below \
+             min_upgradable_from — a guided hard-cut is required (v0.3.0 \
+             activation; not wired in v0.2.60)"
+        );
     }
 
     // v0.2.43 V0243-15: audit_log coverage for the update flow.
@@ -11194,6 +11290,113 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    // ── v0.2.60 Piece 5: min_upgradable_from version floor ──────────────
+
+    #[test]
+    fn parse_version_tuple_handles_normal_and_partial() {
+        assert_eq!(parse_version_tuple("0.2.60"), Some((0, 2, 60)));
+        assert_eq!(parse_version_tuple("v0.3.0"), Some((0, 3, 0))); // strips leading v
+        assert_eq!(parse_version_tuple("1"), Some((1, 0, 0))); // missing → 0
+        assert_eq!(parse_version_tuple("1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_version_tuple(" 0.2.60 "), Some((0, 2, 60))); // trims
+    }
+
+    #[test]
+    fn parse_version_tuple_rejects_nonnumeric() {
+        // A present-but-non-numeric component must FAIL (not silently 0),
+        // so a malformed version never wrongly trips the floor.
+        assert_eq!(parse_version_tuple("0.2.x"), None);
+        assert_eq!(parse_version_tuple("abc"), None);
+        assert_eq!(parse_version_tuple(""), None);
+    }
+
+    #[test]
+    fn version_is_below_floor_basic_ordering() {
+        assert!(version_is_below_floor("0.2.59", "0.3.0"));
+        assert!(version_is_below_floor("0.1.9", "0.2.0"));
+        assert!(!version_is_below_floor("0.3.0", "0.3.0")); // equal → not below
+        assert!(!version_is_below_floor("0.3.1", "0.3.0")); // above
+        assert!(!version_is_below_floor("0.2.60", "0.0.0")); // the v0.2.60 inert floor
+    }
+
+    #[test]
+    fn version_is_below_floor_fails_safe_on_parse_error() {
+        // Unparseable either side → false (never force a destructive
+        // hard-cut on ambiguity).
+        assert!(!version_is_below_floor("garbage", "0.3.0"));
+        assert!(!version_is_below_floor("0.2.59", "garbage"));
+    }
+
+    #[test]
+    fn update_requires_hard_cut_inert_at_0_0_0_floor() {
+        // The v0.2.60 shipped state: floor=0.0.0, a real installed version
+        // → never requires a hard-cut.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(
+            root.join("vct-module.json"),
+            r#"{"version":"0.2.60","min_upgradable_from":"0.0.0"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("state")).unwrap();
+        fs::write(
+            root.join("state").join("install-manifest.json"),
+            r#"{"version":"0.2.55"}"#,
+        )
+        .unwrap();
+        assert!(
+            !update_requires_hard_cut(root),
+            "floor=0.0.0 must never trip the hard-cut in v0.2.60"
+        );
+    }
+
+    #[test]
+    fn update_requires_hard_cut_true_when_below_a_real_floor() {
+        // Simulate v0.3.0 raising the floor: installed 0.2.55 < floor 0.3.0.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(
+            root.join("vct-module.json"),
+            r#"{"version":"0.3.0","min_upgradable_from":"0.3.0"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("state")).unwrap();
+        fs::write(
+            root.join("state").join("install-manifest.json"),
+            r#"{"version":"0.2.55"}"#,
+        )
+        .unwrap();
+        assert!(update_requires_hard_cut(root));
+    }
+
+    #[test]
+    fn update_requires_hard_cut_false_when_no_floor_or_no_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // No min_upgradable_from declared (older manifest) → never hard-cut.
+        fs::write(root.join("vct-module.json"), r#"{"version":"0.2.60"}"#).unwrap();
+        fs::create_dir_all(root.join("state")).unwrap();
+        fs::write(
+            root.join("state").join("install-manifest.json"),
+            r#"{"version":"0.1.0"}"#,
+        )
+        .unwrap();
+        assert!(!update_requires_hard_cut(root), "no floor declared → no hard-cut");
+
+        // Floor declared but no install-manifest (fresh install) → no hard-cut.
+        let tmp2 = tempfile::tempdir().expect("tempdir");
+        let root2 = tmp2.path();
+        fs::write(
+            root2.join("vct-module.json"),
+            r#"{"version":"0.3.0","min_upgradable_from":"0.3.0"}"#,
+        )
+        .unwrap();
+        assert!(
+            !update_requires_hard_cut(root2),
+            "no install-manifest (fresh) → normal install path, no hard-cut"
+        );
+    }
 
     fn tmp() -> PathBuf {
         let p = std::env::temp_dir()
