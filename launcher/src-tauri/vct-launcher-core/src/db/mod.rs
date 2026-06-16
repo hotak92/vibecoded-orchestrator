@@ -84,6 +84,26 @@ pub fn db_path() -> PathBuf {
     crate::paths::vct_root_dir().join("launcher.db")
 }
 
+/// Apply the canonical connection pragmas. SINGLE source of truth so the
+/// startup `open()` and the v0.2.60 `reopen_after_update()` can never drift
+/// (a forgotten `busy_timeout` on reopen would silently change post-update
+/// contention behaviour — see the launcher-self-db-lock fix).
+fn apply_connection_pragmas(conn: &Connection) -> Result<(), String> {
+    // WAL for concurrent readers + durable writes.
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| format!("enable WAL: {}", e))?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|e| format!("set synchronous: {}", e))?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| format!("enable FK: {}", e))?;
+    // Match install.py's sqlite3.connect(..., timeout=5.0) so both sides
+    // wait up to 5 s before raising SQLITE_BUSY rather than failing
+    // immediately when the launcher and a Python install script contend.
+    conn.pragma_update(None, "busy_timeout", 5000)
+        .map_err(|e| format!("set busy_timeout: {}", e))?;
+    Ok(())
+}
+
 /// Thread-safe connection handle stored in Tauri managed state.
 ///
 /// A single `rusqlite::Connection` is NOT `Sync`, so we wrap it in a `Mutex`.
@@ -104,18 +124,7 @@ impl Db {
         let conn = Connection::open(&path)
             .map_err(|e| format!("open {}: {}", path.display(), e))?;
 
-        // WAL for concurrent readers + durable writes.
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| format!("enable WAL: {}", e))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| format!("set synchronous: {}", e))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(|e| format!("enable FK: {}", e))?;
-        // Match install.py's sqlite3.connect(..., timeout=5.0) so both sides
-        // wait up to 5 s before raising SQLITE_BUSY rather than failing
-        // immediately when the launcher and a Python install script contend.
-        conn.pragma_update(None, "busy_timeout", 5000)
-            .map_err(|e| format!("set busy_timeout: {}", e))?;
+        apply_connection_pragmas(&conn)?;
 
         migrations::apply(&conn)?;
 
@@ -146,6 +155,81 @@ impl Db {
     /// needed data under the lock then release before awaiting.
     pub fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.0.lock().expect("db mutex poisoned")
+    }
+
+    /// v0.2.60: release the launcher's OS handle on `launcher.db` for the
+    /// `install.py --update` window, so install.py can take the SQLite
+    /// writer lock (Windows holds it exclusively — see the
+    /// launcher-self-db-lock bug). The managed connection is swapped for a
+    /// throwaway schema-less in-memory connection; any stray managed write
+    /// during the window then fails LOUDLY (`no such table`) instead of
+    /// silently persisting to a file we'd discard. Pollers that open their
+    /// OWN connections are gated separately via
+    /// `update_gate::skip_if_update_in_progress` — BOTH are required for
+    /// the "zero launcher-side handles" guarantee.
+    ///
+    /// Poison-tolerant: recovers a poisoned mutex (`into_inner`) rather than
+    /// panicking, so a prior panic can't wedge the update. The in-memory
+    /// stand-in is built BEFORE the lock so an open failure is a clean
+    /// `Err`, never a mid-swap panic. `wal_checkpoint(TRUNCATE)` is
+    /// best-effort (flushes/shrinks the `-wal`); a partial checkpoint is
+    /// fine since the pollers stand down.
+    ///
+    /// Pair with [`reopen_after_update`] (an RAII guard in the launcher
+    /// calls it on every exit path).
+    pub fn close_for_update(&self) -> Result<(), String> {
+        // Build the stand-in FIRST (fallible) — outside the lock.
+        let standin = Connection::open_in_memory()
+            .map_err(|e| format!("close_for_update: open stand-in: {}", e))?;
+
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Best-effort WAL flush + shrink so install.py sees a consistent
+        // main DB and the -wal/-shm aren't left large/open.
+        if let Err(e) = guard.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+            eprintln!("[db] close_for_update: wal_checkpoint(TRUNCATE) best-effort failed: {}", e);
+        }
+        // Infallible move: swap the live conn out, stand-in in.
+        let real = std::mem::replace(&mut *guard, standin);
+        drop(guard); // release the mutex before the (possibly slow) close.
+
+        // Explicitly close the real connection so the OS handle (+ -wal/-shm
+        // on Windows) is released deterministically BEFORE we return — do
+        // not rely on scope-end Drop timing.
+        if let Err((conn, e)) = real.close() {
+            eprintln!(
+                "[db] close_for_update: Connection::close() returned err ({}); \
+                 dropping handle explicitly",
+                e
+            );
+            drop(conn);
+        }
+        Ok(())
+    }
+
+    /// v0.2.60: reopen the real `launcher.db` file connection after the
+    /// update window, restoring the managed connection. Re-applies the
+    /// SAME pragmas as `open()` (via the shared `apply_connection_pragmas`)
+    /// and re-runs `migrations::apply` (idempotent — this re-establishes
+    /// the open() invariant; it is NOT relied upon to pick up install.py
+    /// migrations: install.py provably does not own/migrate launcher.db).
+    ///
+    /// Poison-tolerant. On failure the launcher MUST NOT continue running
+    /// on the schema-less stand-in (that would silently discard writes) —
+    /// the caller (RAII guard) treats a reopen error as fatal and forces a
+    /// restart/exit.
+    pub fn reopen_after_update(&self) -> Result<(), String> {
+        let path = db_path();
+        let conn = Connection::open(&path)
+            .map_err(|e| format!("reopen_after_update: open {}: {}", path.display(), e))?;
+        apply_connection_pragmas(&conn)?;
+        migrations::apply(&conn)?;
+
+        let mut guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let standin = std::mem::replace(&mut *guard, conn);
+        drop(guard);
+        // The stand-in was in-memory; dropping it is cheap and infallible.
+        drop(standin);
+        Ok(())
     }
 
     /// Open an in-memory DB for tests. Runs all migrations + ensures the
@@ -182,4 +266,146 @@ pub fn current_actor() -> &'static str {
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "unknown".to_string())
     })
+}
+
+#[cfg(test)]
+mod close_reopen_tests {
+    //! v0.2.60 — `close_for_update` / `reopen_after_update` (the
+    //! launcher-self-db-lock fix). These exercise the REAL file open/close
+    //! against `db_path()`, so they mutate the process-wide `VCT_STATE_DIR`
+    //! and MUST be serialised (same pattern as `lockfile::tests`).
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    static SERIALIZE: StdMutex<()> = StdMutex::new(());
+
+    fn with_state_dir<F: FnOnce(&std::path::Path)>(f: F) {
+        let _g = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialised by SERIALIZE; no other thread observes/mutates
+        // VCT_STATE_DIR concurrently.
+        unsafe {
+            std::env::set_var("VCT_STATE_DIR", tmp.path());
+        }
+        f(tmp.path());
+        unsafe {
+            std::env::remove_var("VCT_STATE_DIR");
+        }
+    }
+
+    #[test]
+    fn close_for_update_releases_file_handle_for_a_second_writer() {
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            // Seed a row so there's real content + a populated schema.
+            db.app_state_set("v0260_probe", "before").expect("seed");
+
+            // Close the managed connection for the "update window".
+            db.close_for_update().expect("close_for_update");
+
+            // A SECOND connection (mimicking install.py / a fresh-conn
+            // poller) must now be able to open the file RW and WRITE —
+            // proving the launcher released its OS handle.
+            let path = db_path();
+            let other = Connection::open(&path).expect("second open");
+            other
+                .pragma_update(None, "busy_timeout", 2000)
+                .expect("busy_timeout");
+            other
+                .execute(
+                    "INSERT OR REPLACE INTO app_state(key, value, updated_at) \
+                     VALUES('v0260_external','x', strftime('%s','now')*1000)",
+                    [],
+                )
+                .expect("external write must succeed while launcher conn is closed");
+            drop(other);
+
+            // Reopen and confirm the external write is visible + a managed
+            // write works again.
+            db.reopen_after_update().expect("reopen");
+            let seen: String = db
+                .lock()
+                .query_row(
+                    "SELECT value FROM app_state WHERE key='v0260_external'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("read external write back");
+            assert_eq!(seen, "x");
+            db.app_state_set("v0260_probe", "after").expect("managed write after reopen");
+        });
+    }
+
+    #[test]
+    fn close_then_reopen_round_trips_and_is_repeatable() {
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            db.app_state_set("rt", "1").expect("seed");
+            for _ in 0..3 {
+                db.close_for_update().expect("close");
+                db.reopen_after_update().expect("reopen");
+            }
+            // Schema + data still intact after repeated close/reopen.
+            let v: String = db
+                .lock()
+                .query_row("SELECT value FROM app_state WHERE key='rt'", [], |r| {
+                    r.get(0)
+                })
+                .expect("row survives close/reopen cycles");
+            assert_eq!(v, "1");
+        });
+    }
+
+    #[test]
+    fn reopen_preserves_schema_version() {
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            let before: i64 = db
+                .lock()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .expect("user_version before");
+            db.close_for_update().expect("close");
+            db.reopen_after_update().expect("reopen");
+            let after: i64 = db
+                .lock()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .expect("user_version after");
+            assert_eq!(
+                before, after,
+                "reopen must not change the schema version (no surprise migration)"
+            );
+        });
+    }
+
+    #[test]
+    fn close_for_update_recovers_a_poisoned_mutex() {
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            // Poison the mutex.
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = db.0.lock().unwrap();
+                panic!("intentional poison");
+            }));
+            assert!(poisoned.is_err());
+            // close/reopen must NOT panic on the poisoned mutex.
+            db.close_for_update().expect("close tolerates poison");
+            db.reopen_after_update().expect("reopen tolerates poison");
+        });
+    }
+
+    #[test]
+    fn reopen_after_update_restores_a_working_busy_timeout() {
+        // N7: reopen must re-apply ALL pragmas. busy_timeout is the
+        // load-bearing one for post-update contention; assert it's set.
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            db.close_for_update().expect("close");
+            db.reopen_after_update().expect("reopen");
+            let bt: i64 = db
+                .lock()
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .expect("busy_timeout pragma");
+            assert_eq!(bt, 5000, "busy_timeout must be re-applied on reopen");
+        });
+    }
 }

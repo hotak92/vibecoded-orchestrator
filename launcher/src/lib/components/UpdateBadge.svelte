@@ -64,15 +64,27 @@
           buttonLabel: 'Restart Launcher',
           actionKey: 'restart' as const,
         };
-      case 'install_stale':
+      case 'install_stale': {
+        // v0.2.60: distinguish a fresh apply from RESUMING a half-finished
+        // install. When a prior `install.py --update` already ran on this
+        // tree (installed_version present) but didn't reach the on-disk
+        // source version, the source is on disk yet the install is
+        // incomplete — clicking again RESUMES it, it isn't a brand-new
+        // install. Say so, so the user understands they're finishing a
+        // previously-interrupted update (e.g. one that hit the launcher.db
+        // lock and deferred), not starting over.
+        const priorInstall = !!us?.installed_version;
         return {
-          title: 'Install Update',
+          title: priorInstall ? 'Resume Update' : 'Install Update',
           desc: us
-            ? `v${us.source_version} is on disk; last install ran v${us.installed_version}. Click Install Update to apply.`
-            : 'Source is newer than the last successful install. Click Install Update to apply.',
-          buttonLabel: 'Install Update',
+            ? priorInstall
+              ? `A previous update to v${us.source_version} did not finish (last completed install: v${us.installed_version}). Click Resume Update to apply the rest.`
+              : `v${us.source_version} is on disk. Click Install Update to apply.`
+            : 'Source is newer than the last successful install. Click to apply.',
+          buttonLabel: priorInstall ? 'Resume Update' : 'Install Update',
           actionKey: 'install' as const,
         };
+      }
       case 'remote_ahead':
         return {
           title: 'Update available',

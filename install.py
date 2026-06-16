@@ -10412,7 +10412,12 @@ def _write_preset_defaults_to_app_state(
     # transaction.
     import sqlite3
     try:
-        conn = sqlite3.connect(str(db_path))
+        # v0.2.60: retry-with-backoff on a transient lock (was a single
+        # no-timeout shot → instant fail-to-skip when the launcher held the
+        # lock). The writes are `ON CONFLICT(key) DO NOTHING`, so a missed
+        # write is benign (defaults already present), but riding out a
+        # transient AV/indexer lock on Windows is strictly better.
+        conn = _connect_launcher_db_with_retry(db_path, label="preset_defaults")
     except sqlite3.Error as e:
         _log_install_event(
             "preset_defaults", "warn",
@@ -17207,6 +17212,54 @@ def _w40_write_adoption_audit(
         )
 
 
+def _connect_launcher_db_with_retry(
+    db_path,
+    *,
+    timeout: float = 5.0,
+    attempts: int = 5,
+    base_delay: float = 0.5,
+    label: str = "launcher.db",
+):
+    """v0.2.60: open a RW sqlite3 connection to launcher.db, retrying on a
+    transient "database is locked" / "busy" error with exponential backoff.
+
+    Defense-in-depth for the launcher-self-db-lock fix. v0.2.60 closes the
+    launcher's managed connection for the install.py window AND stands the
+    fresh-conn pollers down, so the lock SHOULD be free — but on Windows an
+    antivirus/indexer can briefly retain a sharing flag on the -wal/-shm
+    after the launcher releases its handle. A single ``timeout=5.0`` shot
+    used to fail straight into a deferral; bounded retry-with-backoff rides
+    out those transients.
+
+    Raises the last ``sqlite3.OperationalError`` if every attempt is locked
+    (callers keep their existing soft-fail-to-deferral contract). Non-lock
+    errors are raised immediately (no point retrying a corrupt/permission
+    error). ``base_delay`` doubles each attempt (0.5→1→2→4→8s by default).
+    """
+    import sqlite3  # stdlib; install.py imports it locally per-use site.
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return sqlite3.connect(str(db_path), timeout=timeout)
+        except sqlite3.OperationalError as oe:
+            msg = str(oe).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise  # not a contention error — don't retry
+            last_exc = oe
+            if attempt < attempts - 1:
+                delay = base_delay * (2 ** attempt)
+                _log_install_event(
+                    label, "warn",
+                    f"launcher.db locked (attempt {attempt + 1}/{attempts}); "
+                    f"retrying in {delay:.1f}s",
+                    data={"db_path": str(db_path), "error": str(oe)[:160]},
+                )
+                time.sleep(delay)
+    # Exhausted — re-raise so the caller's existing except writes its
+    # deferral exactly as before (contract unchanged).
+    raise last_exc  # type: ignore[misc]
+
+
 def _self_heal_kg_bindings_on_update(
     deferral_report: "DeferralReport",
 ) -> None:
@@ -17437,7 +17490,11 @@ def _self_heal_kg_bindings_on_update(
     prefix_adopts: list[tuple[str, str, str, str, int]] = []
     prefix_multi_candidates: list[tuple[str, str, str, list[tuple[str, int]]]] = []
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        # v0.2.60: retry-with-backoff on a transient lock (defense in depth
+        # alongside the launcher closing its managed connection + pollers
+        # standing down). Exhausted retries re-raise → the outer
+        # `except sqlite3.Error` below writes the same deferral as before.
+        conn = _connect_launcher_db_with_retry(db_path, label="7e/10")
         try:
             cur = conn.cursor()
 

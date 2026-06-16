@@ -466,6 +466,14 @@ pub fn spawn_deprecation_poll(app: AppHandle) {
 pub async fn poll_deprecations_once(app: &AppHandle) {
     use tauri::Manager;
 
+    // v0.2.60: stand down while an orchestrator update is in progress —
+    // this opens its OWN launcher.db connection (below), bypassing the
+    // managed-connection close `update_orchestrator` does for the
+    // install.py window. See `update_gate::skip_if_update_in_progress`.
+    if crate::commands::update_gate::skip_if_update_in_progress("deprecation_poll") {
+        return;
+    }
+
     // Open a fresh DB connection — we can't hold a `State<'_, Db>` across an
     // `await` point (same pattern as `poll_all_projects_once` in
     // `module_service.rs`).

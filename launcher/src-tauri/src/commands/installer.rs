@@ -4129,6 +4129,91 @@ async fn run_git_pull_ff_only(install_path: &Path, branch: &str) -> Result<(), S
     Ok(())
 }
 
+/// v0.2.60: RAII guard that closes the launcher's managed `launcher.db`
+/// connection for the `install.py --update` window and reopens it on drop.
+///
+/// WHY: on Windows the launcher holds the SQLite writer lock on
+/// `launcher.db` (it's the process running the update + stays alive), so
+/// install.py's `_self_heal_kg_bindings_on_update` RW rebind 5s-times-out
+/// → `kg_binding_self_heal_db_error` deferral → half-install loop. Closing
+/// the managed connection (+ the fresh-conn pollers standing down via
+/// `update_gate::skip_if_update_in_progress`) gives install.py a clean
+/// shot at the writer lock.
+///
+/// `new()` closes; `Drop` reopens on EVERY exit path (success, `?`-bail,
+/// panic). If reopen FAILS, the launcher cannot keep running on the
+/// schema-less in-memory stand-in (it would silently discard writes) — so
+/// the guard force-quits the process. That's safe because every caller is
+/// in the middle of an update that ends in a restart anyway; a clean
+/// relaunch reopens the real DB at startup.
+struct DbUpdateClosedGuard<R: Runtime> {
+    app: AppHandle<R>,
+    /// Set false once we've successfully reopened explicitly, so Drop is a
+    /// no-op (avoids a double reopen on the happy path).
+    armed: bool,
+}
+
+impl<R: Runtime> DbUpdateClosedGuard<R> {
+    /// Close the managed connection. Soft-fails (logs) if the Db state is
+    /// absent or close errors — the worst case is the pre-fix behaviour
+    /// (install.py contends for the lock), never a hard update abort.
+    fn new(app: AppHandle<R>) -> Self {
+        if let Some(db) = app.try_state::<crate::db::Db>() {
+            if let Err(e) = db.close_for_update() {
+                eprintln!(
+                    "[vct] update_orchestrator: close_for_update failed ({}); \
+                     proceeding (install.py may contend for the launcher.db lock)",
+                    e
+                );
+            } else {
+                eprintln!(
+                    "[vct] update_orchestrator: launcher.db connection closed for the \
+                     install.py window (writer lock released)"
+                );
+            }
+        } else {
+            eprintln!(
+                "[vct] update_orchestrator: no managed Db state — nothing to close"
+            );
+        }
+        Self { app, armed: true }
+    }
+
+    /// Reopen the managed connection. On failure, force-quit (see struct
+    /// doc). Disarms so Drop won't reopen again.
+    fn reopen(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let Some(db) = self.app.try_state::<crate::db::Db>() else {
+            eprintln!("[vct] update_orchestrator: no managed Db state to reopen");
+            return;
+        };
+        match db.reopen_after_update() {
+            Ok(()) => {
+                eprintln!("[vct] update_orchestrator: launcher.db connection reopened");
+            }
+            Err(e) => {
+                eprintln!(
+                    "[vct] update_orchestrator: FATAL — could not reopen launcher.db \
+                     after update ({}); forcing restart so the launcher does not run \
+                     on a dead in-memory DB",
+                    e
+                );
+                crate::quit_dialog::force_quit();
+                self.app.exit(1);
+            }
+        }
+    }
+}
+
+impl<R: Runtime> Drop for DbUpdateClosedGuard<R> {
+    fn drop(&mut self) {
+        self.reopen();
+    }
+}
+
 #[command]
 pub async fn update_orchestrator<R: Runtime>(
     app: AppHandle<R>,
@@ -4804,6 +4889,15 @@ pub async fn update_orchestrator<R: Runtime>(
     // see we've moved past git_pull.
     update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
 
+    // v0.2.60: close the launcher's managed launcher.db connection for the
+    // install.py window so install.py can take the SQLite writer lock
+    // (Windows holds it exclusively — the launcher-self-db-lock bug). The
+    // fresh-conn pollers stand down via the `.update-in-progress` lockfile
+    // (set above by `UpdateInProgressGuard`) + `skip_if_update_in_progress`.
+    // RAII: reopens on EVERY exit path below (incl. the install-fail
+    // early-return), and force-restarts if reopen fails.
+    let mut db_close_guard = DbUpdateClosedGuard::new(app.clone());
+
     let python_cmd = &system.python_cmd;
     let mut cmd = tokio::process::Command::new(python_cmd).silent();
     cmd.args(["install.py", "--update"])
@@ -4946,8 +5040,15 @@ pub async fn update_orchestrator<R: Runtime>(
             revert_pre_pull_rename(backup);
         }
         let _ = ensure_hub_started_after_update(&install_path);
+        // db_close_guard drops here on the early-return → reopens (or
+        // force-restarts if reopen fails). No explicit call needed.
         return Err(format!("Update failed: {}", stderr));
     }
+
+    // v0.2.60: install.py is done with launcher.db — reopen the managed
+    // connection now (explicitly, before the binary-refresh/finalize tail
+    // which may read/write the DB). On reopen failure this force-restarts.
+    db_close_guard.reopen();
 
     // V52-AI: advance lockfile phase. install.py has finished; we're
     // now in the binary-refresh + hub-restart window. MCPs that try to

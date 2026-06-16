@@ -236,6 +236,44 @@ pub fn is_update_in_progress() -> bool {
     is_update_in_progress_at(&lockfile_path())
 }
 
+/// v0.2.60: poller stand-down gate. Returns `true` (and logs once) when a
+/// background task that opens its OWN `launcher.db` connection should SKIP
+/// this tick because an orchestrator update is in progress.
+///
+/// WHY: `update_orchestrator` closes the launcher's managed `Db`
+/// connection for the `install.py --update` window so install.py can take
+/// the SQLite writer lock (Windows holds it exclusively — see the
+/// launcher-self-db-lock bug). But several background pollers open their
+/// OWN fresh `rusqlite::Connection::open(db_path())` (deliberately — see
+/// `module_updates.rs::spawn_module_update_check_loop`'s "the main `Db`
+/// State holds the only long-lived connection" note) and WRITE on timers.
+/// Those connections bypass the managed-connection close entirely, so
+/// without this gate a poller firing mid-update re-contends with
+/// install.py and re-creates the lock-timeout → deferral → half-install
+/// loop. EVERY fresh-conn poller MUST call this at the top of its tick and
+/// skip when it returns true. Reuses the existing `.update-in-progress`
+/// lockfile (armed by `UpdateInProgressGuard` at the start of the update)
+/// — no new state, and it inherits the stale-deadline self-healing.
+pub fn skip_if_update_in_progress(task_name: &str) -> bool {
+    skip_if_update_in_progress_at(task_name, &lockfile_path())
+}
+
+/// Path-injectable core of [`skip_if_update_in_progress`] for unit tests
+/// (mirrors the `_at` pattern used throughout this module so tests never
+/// mutate the process-wide `VCT_STATE_DIR`).
+pub fn skip_if_update_in_progress_at(task_name: &str, path: &Path) -> bool {
+    if is_update_in_progress_at(path) {
+        eprintln!(
+            "[update_gate] {}: orchestrator update in progress — skipping this tick \
+             (avoids contending with install.py for the launcher.db writer lock)",
+            task_name
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Boot-time self-healing: remove a stale lockfile (deadline passed).
 /// Returns `true` if a stale lockfile was found and removed.
 pub fn cleanup_if_stale_at(path: &Path) -> bool {
@@ -603,6 +641,48 @@ mod tests {
         let p = d.path().join(LOCKFILE_BASENAME);
         write_lockfile_at(&p, Phase::GitPull, 10).unwrap();
         assert!(is_update_in_progress_at(&p));
+    }
+
+    // ── v0.2.60 poller stand-down gate ──────────────────────────────────
+
+    #[test]
+    fn skip_gate_true_when_update_in_progress() {
+        let d = tmpdir();
+        let p = d.path().join(LOCKFILE_BASENAME);
+        write_lockfile_at(&p, Phase::InstallPy, 10).unwrap();
+        assert!(
+            skip_if_update_in_progress_at("test-poller", &p),
+            "a fresh in-progress lockfile must make pollers stand down"
+        );
+    }
+
+    #[test]
+    fn skip_gate_false_when_no_update() {
+        let d = tmpdir();
+        let p = d.path().join(LOCKFILE_BASENAME);
+        assert!(
+            !skip_if_update_in_progress_at("test-poller", &p),
+            "no lockfile → pollers run normally"
+        );
+    }
+
+    #[test]
+    fn skip_gate_false_when_lockfile_stale() {
+        // A stale (deadline-passed) lockfile must NOT wedge pollers off
+        // forever — it's treated as no-update, same as is_update_in_progress.
+        let d = tmpdir();
+        let p = d.path().join(LOCKFILE_BASENAME);
+        let past = (Utc::now() - ChronoDuration::minutes(10))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let payload = LockfilePayload {
+            started_at: past.clone(),
+            started_by_pid: 1,
+            phase: Phase::InstallPy,
+            expected_completion_by: past,
+        };
+        fs::write(&p, serde_json::to_string(&payload).unwrap()).unwrap();
+        assert!(!skip_if_update_in_progress_at("test-poller", &p));
     }
 
     #[test]
