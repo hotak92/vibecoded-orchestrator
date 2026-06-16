@@ -7,7 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.59] - 2026-06-15
+## [0.2.60] - 2026-06-17
+
+v0.2.60 fixes a Windows update-loop bug and lays the groundwork for a robust,
+data-preserving update system. Most of the new update machinery ships
+**dormant or inert** — present, tested, and exercised by every update, but
+not yet activated — so it can be proven in practice before a future release
+turns it on.
+
+### Fixed
+
+- **Windows: the orchestrator update no longer gets stuck in a half-install
+  loop.** On Windows the launcher held an exclusive lock on its own
+  `launcher.db` while running the update (it is the process performing the
+  update and stays alive), so `install.py`'s knowledge-graph-binding
+  self-heal step timed out trying to write the database, recorded a deferral,
+  and left the install half-finished — which then repeated on every Install
+  click until the user manually closed the launcher. The update now releases
+  the launcher's database connection for the install window (and the
+  background pollers that open their own connections stand down), so the
+  install step can take the lock cleanly. Plus retry-with-backoff on a
+  transient lock, and the update button now reads "Resume Update" when a
+  prior update did not finish.
+
+- **Search relevance: hybrid search scores are bounded again.** The
+  knowledge-graph hybrid search fused a bounded semantic score with a RAW
+  (unbounded) BM25 keyword score by averaging, so any strong keyword match
+  pushed the combined score above 1.0 and silently defeated the
+  relevance-tier thresholds — every result rendered at full verbosity
+  regardless of actual relevance. Fusion now mirrors Weaviate's
+  relativeScoreFusion (per-query min-max normalization, cosine-weighted at
+  0.6, tunable via `KG_HYBRID_ALPHA`), so scores are bounded [0,1] and the
+  tiers reflect real relevance again.
+
+### Added
+
+- **Module-scoped RL-events read API.** A new
+  `GET /api/v1/modules/{module_id}/projects/{project_id}/rl/events` hub route
+  lets a module's training container read its own event corpus from the
+  launcher database using its module-scoped token (the container has no host
+  credential), scoped to the project it was granted.
+
+- **Versioned schema-migration runner (no-op today).** A single
+  version-driven migration runner replaces the previous hardcoded migration
+  scripts, gated on the database-tracked schema version per artifact and
+  scoped per-project (each project migrates its own collections when it
+  updates; the base-host/root project also covers the shared knowledge
+  graph). Ships as a verified no-op — a future release that changes a schema
+  drops a migration script and the runner applies it.
+
+- **Re-embed only on actual embedding-schema change.** Updates no longer
+  needlessly regenerate expensive vector embeddings: a collection is
+  re-embedded only when its embedding-relevant schema (named-vector slots /
+  dimensions) actually changed, not on a version bump. A merely-additive
+  change is migrated in place without re-embedding.
+
+- **Regenerate-or-defer choice for stale collections.** When a collection's
+  schema changed and no in-place migration is available, the launcher now
+  asks the user to choose "Regenerate now" (rebuild from on-disk source) or
+  "Defer" — it never silently drops data.
+
+- **Inert update-system groundwork for a future release** (present + tested,
+  not yet active): a version floor (`min_upgradable_from`, set to an inert
+  value) that will route a too-old install to a guided, data-preserving
+  reinstall; that guided hard-cut primitive itself (which always backs up via
+  `git bundle` and never touches user databases, vectors, knowledge-graph
+  nodes, or state); and a cross-OS update engine + signed-fetch bootstrap
+  scaffold (integrity-checked) for a future inverted updater.
 
 v0.2.59 fixes a paid-module install failure (a container-name template
 token the launcher never substituted), removes a spurious "Install"

@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vibecoded-orchestrator"
-version = "0.2.59"
+version = "0.2.60"
 description = "VibeCoded Orchestrator — local-first agentic infrastructure for Claude Code"
 readme = "README.md"
 requires-python = ">=3.11"
