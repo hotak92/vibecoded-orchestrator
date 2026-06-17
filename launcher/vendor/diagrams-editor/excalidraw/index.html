@@ -2,23 +2,21 @@
 <!--
 SPDX-License-Identifier: AGPL-3.0-or-later
 
-Excalidraw bridge page (v0.2.36 Agent R).
+Excalidraw workflow page.
 
-Honest scope statement: in v0.2.36 we DO NOT ship a fully self-hosted
-Excalidraw SPA. The @excalidraw/excalidraw npm bundle ships as ES
-modules with bare imports (react, react-dom, jotai, @radix-ui/*, etc.)
-and making it run standalone without a bundler is several hours of
-build-system work that didn't fit a single-agent v0.2.36 slot.
-
-What this page does INSTEAD: it explains the v0.2.36 workflow — draw
-the diagram at excalidraw.com (the upstream-hosted editor), export it
-as a `.excalidraw` file, then drag the file into the launcher's
-DiagramsTab drop zone (Agent L's v0.2.35 work). The drop zone
+This page does NOT embed an Excalidraw editor. It explains the
+current external workflow: draw the diagram at excalidraw.com (the
+upstream-hosted editor), export it as a `.excalidraw` file, then drag
+the file into the launcher's DiagramsTab drop zone. The drop zone
 auto-registers the diagram + creates the file under
 `<project>/.claude/diagrams/<category>/<name>.excalidraw`.
 
-The full-vendored Excalidraw SPA is queued for v0.2.37. Tracked in
-the agent summary returned to the main chat.
+Why not embed it here: the @excalidraw/excalidraw npm bundle ships as
+ES modules with bare imports (react, react-dom, jotai, @radix-ui/*,
+etc.) that need a bundler to run standalone; a self-hosted in-launcher
+Excalidraw editor (wired to the local /file + /save endpoints, the way
+mermaid/index.html already is) is a separate piece of work. See the
+diagrams backlog.
 
 The URL contract (matches mermaid/index.html for symmetry):
     http://127.0.0.1:<port>/excalidraw/?file=<rel_path>
@@ -29,7 +27,7 @@ user knows which file the launcher pre-created for them.
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>VCO — Excalidraw (v0.2.36 bridge)</title>
+    <title>VCO — Excalidraw workflow</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
       :root {
@@ -142,14 +140,41 @@ user knows which file the launcher pre-created for them.
         color: #c8c8c8;
       }
       .note strong { color: var(--fg); }
+      .help {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        margin-left: 8px;
+        border-radius: 50%;
+        background: var(--border);
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 600;
+        cursor: help;
+        vertical-align: middle;
+        user-select: none;
+      }
+      .help:hover, .help:focus { background: var(--accent); color: #fff; outline: none; }
     </style>
   </head>
   <body>
     <header>
-      <h1>Excalidraw — external workflow</h1>
+      <h1>
+        Excalidraw workflow
+        <span
+          class="help"
+          tabindex="0"
+          role="note"
+          aria-label="Why a round-trip"
+          title="Why a round-trip? The hosted excalidraw.com editor runs in your browser and cannot read or write files on your disk, so editing happens there and the file is brought back via export + drag-import. (The embedded in-window editor was removed because it rendered incorrectly on some Linux setups.)"
+          >?</span
+        >
+      </h1>
       <div class="subtitle">
-        v0.2.36 ships a bridge to excalidraw.com. Fully self-hosted
-        Excalidraw is queued for v0.2.37.
+        Draw at excalidraw.com, export the file, then drag it into the
+        launcher's Diagrams tab.
       </div>
     </header>
     <main>
@@ -190,16 +215,6 @@ user knows which file the launcher pre-created for them.
         </p>
       </div>
 
-      <div class="note">
-        <strong>Why this round-trip?</strong> Excalidraw ships as a
-        React app with several runtime peer-dependencies (react, jotai,
-        radix-ui, etc.). Vendoring the full standalone build is queued
-        for a future release. Until then, the upstream-hosted editor +
-        drag-import is the pragmatic v0.2.36 workflow. The embedded
-        editor we used to ship (Excalidraw inside the Tauri WebView)
-        rendered as broken giant-icons garbage on Wayland + webkit2gtk,
-        so it was removed.
-      </div>
     </main>
 
     <script>

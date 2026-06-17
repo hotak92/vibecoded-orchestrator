@@ -30,6 +30,27 @@
   // ─── Props ────────────────────────────────────────────────────────────
   let { projectId }: { projectId: string } = $props();
 
+  // ─── Diagram-name validation (v0.2.61) ──────────────────────────────────
+  // A diagram name becomes a FILENAME at
+  // `.claude/diagrams/<category>/<name>.<ext>` and must round-trip through
+  // the auto-register path parser (`AUTO_REGISTER_PATH_RE` below). The DB +
+  // MCP impose NO name pattern (diagram_name is a free-form column), so the
+  // only real constraints are path/parser safety:
+  //   - must NOT contain `/` (path separator) or `.` (extension delimiter),
+  //   - must NOT contain whitespace or control chars,
+  //   - must start + end with an alphanumeric or `_` (no leading/trailing
+  //     `-`, no surprises for the parser).
+  // Everything else a normal filename allows is fine — including `_` and
+  // mixed case. (Previously this was lowercase-kebab-only `[a-z0-9][a-z0-9-]*`,
+  // which rejected perfectly safe names like `my_diagram`.)
+  const DIAGRAM_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_-]*$/;
+  // The human-facing rule, kept in sync with DIAGRAM_NAME_RE. Shown on reject.
+  const DIAGRAM_NAME_RULE =
+    'Letters, numbers, hyphen (-) and underscore (_) only; must start/end with a letter, number, or underscore. No spaces, slashes, or dots.';
+  function isValidDiagramName(name: string): boolean {
+    return DIAGRAM_NAME_RE.test(name);
+  }
+
   // ─── Module gate ──────────────────────────────────────────────────────
   // The diagrams module can be disabled per-project (plan §1.5.7). When
   // disabled, the rest of the tab dims and shows an explanatory message;
@@ -234,8 +255,8 @@
       toast.error('Category path required (e.g. gui/auth)');
       return;
     }
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
-      toast.error('Name must be lowercase-kebab (regex [a-z0-9][a-z0-9-]*)');
+    if (!isValidDiagramName(name)) {
+      toast.error(`Invalid name. ${DIAGRAM_NAME_RULE}`);
       return;
     }
     if (!/^[a-z0-9][a-z0-9/-]*[a-z0-9]$/.test(category)) {
@@ -361,16 +382,16 @@
     // the file is registered (or unregister + re-register elsewhere).
     const raw = window.prompt(
       `Name for the new ${type === 'mermaid' ? 'Mermaid' : 'Excalidraw'} diagram?\n` +
-        `(lowercase-kebab — e.g. "login-flow"; will be saved under .claude/diagrams/visual-draft/)`,
+        `(e.g. "login-flow" or "my_diagram"; saved under .claude/diagrams/visual-draft/)`,
     );
     if (raw === null) return;
-    const name = raw.trim().toLowerCase();
+    const name = raw.trim();
     if (!name) {
       toast.error('Name cannot be empty');
       return;
     }
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
-      toast.error('Name must be lowercase-kebab (regex [a-z0-9][a-z0-9-]*)');
+    if (!isValidDiagramName(name)) {
+      toast.error(`Invalid name. ${DIAGRAM_NAME_RULE}`);
       return;
     }
     openingVisualEditor = true;
@@ -403,7 +424,12 @@
     autoRegisterTried.add(relPath);
 
     // Path shape: .claude/diagrams/<category-path>/<name>.<ext>
-    const m = relPath.match(/^\.claude\/diagrams\/(.+)\/([a-z0-9][a-z0-9-]*)\.(mmd|excalidraw)$/);
+    // Name charset MUST stay in lockstep with DIAGRAM_NAME_RE (the
+    // creation-time validator) so any name we let the user create also
+    // round-trips through this on-disk auto-register parser.
+    const m = relPath.match(
+      /^\.claude\/diagrams\/(.+)\/([A-Za-z0-9_][A-Za-z0-9_-]*)\.(mmd|excalidraw)$/,
+    );
     if (!m) {
       console.warn('[diagrams] auto-register: skipping unsupported path shape:', relPath);
       return;
@@ -448,8 +474,8 @@
     }
     // Validate matches the enforced shape so we fail fast in the UI
     // rather than having the wrapper MCP reject after a round-trip.
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
-      toast.error('Name must be lowercase-kebab (regex [a-z0-9][a-z0-9-]*)');
+    if (!isValidDiagramName(name)) {
+      toast.error(`Invalid name. ${DIAGRAM_NAME_RULE}`);
       return;
     }
     if (!/^[a-z0-9][a-z0-9/-]*[a-z0-9]$/.test(category)) {
@@ -984,7 +1010,7 @@
             class="ps-btn-secondary"
             onclick={() => openVisualEditor('excalidraw')}
             disabled={openingVisualEditor}
-            title="Open the Excalidraw bridge page in your default browser (v0.2.36 ships a workflow page; full self-hosted editor is queued for v0.2.37)."
+            title="Open the Excalidraw workflow page in your default browser (draw at excalidraw.com, export, then drag the file into the Diagrams tab)."
           >
             Draw Excalidraw
           </button>
@@ -1024,7 +1050,9 @@
               />
             </label>
             <p id="diagram-name-hint" class="ps-hint">
-              Lowercase-kebab: <code>[a-z0-9][a-z0-9-]*</code>.
+              Letters, numbers, <code>-</code> and <code>_</code>. Start/end
+              with a letter, number, or <code>_</code>. No spaces, slashes, or
+              dots.
             </p>
             <p id="diagram-path-hint" class="ps-hint">
               Multi-level allowed. Becomes the diagram's primary tags
