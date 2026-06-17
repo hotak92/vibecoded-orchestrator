@@ -1485,8 +1485,21 @@ async fn run_finetune_then_rotate_async(
         sanitize_path_component(&project.slug),
     );
 
+    // v0.2.61 (RL DB-cutover follow-up, coordination msg 301): the
+    // vct-rl-reranker container's /finetune is now DB-only — it resolves
+    // which project's events to train on from the `X-VCT-Project-ID`
+    // HEADER (the same header the rerank path sends, keyed on the
+    // ProjectConfig.project_id — see weaviate_mcp server.py
+    // `current_project_id`), NOT from the events_path body field. Send
+    // the header so finetune targets the right per-project model head;
+    // the value MUST match what rerank sends (project_id, not slug) so
+    // both hit the same training-data key. `events_path` is left in the
+    // body — the new container ignores it, and the OLD container (pre
+    // the container's v0.2.11 cutover) still needs it, so leaving it
+    // keeps both container versions working regardless of ship order.
     let kick = client
         .post(&finetune_url)
+        .header("X-VCT-Project-ID", &project_id)
         .json(&serde_json::json!({
             "events_path": events_path_container,
             "base_weights_path": container_path,

@@ -16,6 +16,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Emitter, Manager, State};
 
+use crate::commands::installer::resolve_orchestrator_root;
 use crate::config::LocalConfig;
 use crate::db::code_graph_builds::{status as build_status, CodeGraphBuildRow};
 use crate::db::Db;
@@ -1075,33 +1076,57 @@ async fn run_build_task(
                 .is_file()
     }
 
-    let install_root = match from_script {
-        Some(p) if looks_like_install_root(&p) => Some(p),
-        _ => {
-            // Fall back to the launcher binary's own location.
-            std::env::current_exe().ok().and_then(|exe| {
-                // launcher/dist/<arch>/vct-launcher → walk up 4 hops
-                // to reach the orchestrator install root. Try a few
-                // hop counts since dev-build (`target/release/`) and
-                // bundled (`launcher/dist/<arch>/`) layouts differ.
-                let parent = exe.parent()?.to_path_buf();
-                for hops in [3, 4, 5] {
-                    let mut cur = parent.clone();
-                    let mut ok = true;
-                    for _ in 0..hops {
-                        match cur.parent() {
-                            Some(p) => cur = p.to_path_buf(),
-                            None => { ok = false; break; }
+    // v0.2.61: resolve the orchestrator install root via the SAME
+    // DB-cached, marker-based resolver KG sync uses
+    // (`resolve_orchestrator_root` → app_state `launcher.install_path`,
+    // then a walk for the `vct-module.json` / `install.py`+`CLAUDE.md`
+    // markers). This is the FIRST source, before the two legacy
+    // filesystem heuristics below.
+    //
+    // Why this is the durable fix (codegraph-vco-lib-bootstrap-env-mismatch
+    // KG node): the legacy heuristics both depend on a `.venv` sitting at
+    // an exact relative depth — `from_script` needs the project to have a
+    // venv at `script_dir/../..` (FALSE for a project-local analyzer
+    // script in a venv-less user project), and the launcher-binary walk
+    // needs a fixed hop count that breaks on dev-layout (`target/release/`) and
+    // any non-matching bundle layout. When BOTH miss, `install_root` was
+    // `None` → `VCT_INSTALL_ROOT` unset → the analyzer's vco_lib bootstrap
+    // found nothing → `ModuleNotFoundError: No module named 'vco_lib'`.
+    // The marker-based resolver doesn't care about venv placement or hop
+    // count, and its DB cache is the install path written at install time,
+    // so a correctly-installed orchestrator always resolves — matching
+    // why KG "just works" per project (it already uses this channel).
+    let install_root = resolve_orchestrator_root(&app.state::<Db>())
+        // `.or_else` so the legacy heuristics run ONLY when the
+        // marker/DB resolver misses (e.g. running entirely outside any
+        // orchestrator clone). On success, the fallbacks never evaluate.
+        .or_else(|| match from_script {
+            Some(p) if looks_like_install_root(&p) => Some(p),
+            _ => {
+                // Legacy fallback: the launcher binary's own location.
+                std::env::current_exe().ok().and_then(|exe| {
+                    // launcher/dist/<arch>/vct-launcher → walk up 4 hops
+                    // to reach the orchestrator install root. Try a few
+                    // hop counts since dev-build (`target/release/`) and
+                    // bundled (`launcher/dist/<arch>/`) layouts differ.
+                    let parent = exe.parent()?.to_path_buf();
+                    for hops in [3, 4, 5] {
+                        let mut cur = parent.clone();
+                        let mut ok = true;
+                        for _ in 0..hops {
+                            match cur.parent() {
+                                Some(p) => cur = p.to_path_buf(),
+                                None => { ok = false; break; }
+                            }
+                        }
+                        if ok && looks_like_install_root(&cur) {
+                            return Some(cur);
                         }
                     }
-                    if ok && looks_like_install_root(&cur) {
-                        return Some(cur);
-                    }
-                }
-                None
-            })
-        }
-    };
+                    None
+                })
+            }
+        });
 
     // 5. Run it. We capture stdout+stderr; they're combined into one
     //    log buffer (interleaving is fine for human debugging).

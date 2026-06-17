@@ -499,7 +499,36 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # vco_lib.embedding_service import` below with ModuleNotFoundError. The
 # helper honors both env-var names + validates the candidate contains
 # vco_lib/, so the two sites can no longer drift.
-_ensure_vco_lib_on_path()
+# v0.2.61: assert the bootstrap succeeded BEFORE the bare `from
+# vco_lib...` imports below (531 embedding_service, and later 6915
+# project_config / 7204 deferral_report). Those are top-level imports
+# with no try/except — if the helper couldn't find a dir containing
+# `vco_lib/`, they crash with a bare `ModuleNotFoundError: No module
+# named 'vco_lib'` deep in the file, which surfaces in the launcher as
+# an opaque "Code graph: build failed". Failing here instead gives an
+# actionable message naming the actual fix (the missing install root).
+# The companion launcher fix (codegraph.rs resolving VCT_INSTALL_ROOT
+# via resolve_orchestrator_root) makes this branch unreachable for a
+# correctly-installed orchestrator; this is the defense-in-depth so a
+# resolution miss never again hard-crashes mid-file.
+if not _ensure_vco_lib_on_path():
+    _tried = [
+        ("VCT_INSTALL_ROOT", os.environ.get("VCT_INSTALL_ROOT", "").strip() or "(unset)"),
+        ("VCT_ORCHESTRATOR_ROOT", os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip() or "(unset)"),
+        ("<script_dir>/../..", str(Path(__file__).resolve().parent.parent.parent)),
+    ]
+    _detail = "; ".join(f"{name}={val}" for name, val in _tried)
+    sys.stderr.write(
+        "FATAL: could not locate the orchestrator root (a directory "
+        "containing 'vco_lib/') — the code-graph analyzer cannot import "
+        "its vco_lib dependencies.\n"
+        f"  Candidates tried (none contained vco_lib/): {_detail}\n"
+        "  Fix: ensure the launcher passes VCT_INSTALL_ROOT pointing at "
+        "the orchestrator install root, OR run the analyzer from within "
+        "the orchestrator clone, OR set VCT_ORCHESTRATOR_ROOT in the "
+        "environment.\n"
+    )
+    sys.exit(1)
 # VCO-REWIRE-END: orchestrator-root-resolution
 try:
     from weaviate_mcp.code_truncation import (

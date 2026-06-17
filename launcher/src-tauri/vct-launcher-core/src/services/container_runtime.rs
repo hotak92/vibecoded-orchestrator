@@ -514,9 +514,28 @@ pub fn resolve_image_ref(
         None => base_tag,
     };
 
+    // The fully-resolved image reference (`<image>:<variant-tag>`).
+    // `{module_image}` is the manifest token for THIS value — the RL
+    // reranker manifest ships `runtime.image_ref: "{module_image}"`
+    // expecting the launcher to substitute it (confirmed with the
+    // module owner, 2026-06-17). It's the image-ref-path sibling of the
+    // v0.2.59 `{module_id}` container-name fix: a token substituted on
+    // one path but missed on a sibling path.
+    //
+    // NOTE — scope: we resolve `{module_image}` ONLY here, on the
+    // image_ref path. We deliberately do NOT add it to the CMD-override
+    // (`runtime.args`) substitution: an unsubstituted `{module_image}`
+    // inside `runtime.args` is a deliberate pre-v0.2.49 Bug-E signal
+    // (`is_runtime_pathological`, indicator 3) — there it means the
+    // author pasted the launcher-side `podman run … {module_image}`
+    // invocation into the container CMD. Same token, opposite meaning
+    // per field; keep the two paths separate.
+    let module_image = format!("{}:{}", container.image, tag);
+
     let out = template
         .replace("{install.container.image}", &container.image)
-        .replace("{install.container.tag}", &tag);
+        .replace("{install.container.tag}", &tag)
+        .replace("{module_image}", &module_image);
 
     if out.contains('{') && out.contains('}') {
         return Err(format!(
@@ -2130,6 +2149,60 @@ mod tests {
         )
         .expect("resolve");
         assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.2.8");
+    }
+
+    // ─── v0.2.61: {module_image} token resolution ────────────────────
+    //
+    // The vct-rl-reranker manifest ships `runtime.image_ref:
+    // "{module_image}"` (confirmed with the module owner 2026-06-17).
+    // Pre-fix, resolve_image_ref substituted only
+    // {install.container.image}+{install.container.tag}, so the literal
+    // "{module_image}" hit the unresolved-placeholder guard → install
+    // failed at image-ref resolution. Sibling of the v0.2.59
+    // {module_id} container-name bug. Tests use the REAL shipped token
+    // ("{module_image}") — NOT a factory stand-in (the v0.2.59 lesson:
+    // a test that asserts a value the manifest never ships gives false
+    // confidence).
+
+    /// `{module_image}` with a GPU-variant manifest → `<image>:<variant-tag>`.
+    #[test]
+    fn resolve_image_ref_resolves_module_image_token_cuda_variant() {
+        let manifest = make_manifest_with_variants(true);
+        let got = resolve_image_ref("{module_image}", &manifest, Some(GpuMode::Cuda))
+            .expect("resolve");
+        assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cuda");
+    }
+
+    /// `{module_image}` with Cpu mode (the `gpu_optional` no-GPU path) →
+    /// `-cpu` variant.
+    #[test]
+    fn resolve_image_ref_resolves_module_image_token_cpu_variant() {
+        let manifest = make_manifest_with_variants(true);
+        let got = resolve_image_ref("{module_image}", &manifest, Some(GpuMode::Cpu))
+            .expect("resolve");
+        assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cpu");
+    }
+
+    /// `{module_image}` with no gpu_mode (variant resolution skipped) →
+    /// bare `<image>:<version>`.
+    #[test]
+    fn resolve_image_ref_resolves_module_image_token_no_gpu_mode() {
+        let manifest = make_manifest(true, true);
+        let got = resolve_image_ref("{module_image}", &manifest, None).expect("resolve");
+        assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.2.8");
+    }
+
+    /// The pre-v0.2.61 failure mode: a bare "{module_image}" template
+    /// must no longer trip the unresolved-placeholder guard.
+    #[test]
+    fn resolve_image_ref_module_image_no_longer_unresolved() {
+        let manifest = make_manifest_with_variants(true);
+        let got = resolve_image_ref("{module_image}", &manifest, Some(GpuMode::Cuda))
+            .expect("must resolve, not error on unresolved placeholder");
+        assert!(
+            !got.contains('{') && !got.contains('}'),
+            "resolved image ref must have no leftover placeholders, got {got:?}",
+        );
     }
 
     /// Manifest WITH variants but caller passes `gpu_mode = None`:
