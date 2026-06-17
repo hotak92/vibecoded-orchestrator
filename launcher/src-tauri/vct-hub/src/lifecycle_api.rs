@@ -107,6 +107,15 @@ pub fn router() -> Router<LauncherDbHandle> {
             "/projects/{project_id}/modules/{module_id}/restart",
             post(module_restart),
         )
+        // v0.2.61 (Option H): GLOBAL module start. The hub is now the
+        // SOLE spawn point for global containers — the launcher delegates
+        // here (after ensuring the hub is up) instead of spawning podman
+        // itself, so the per-spawn module-identity token is minted +
+        // registered in the hub's in-memory set at the one place the
+        // container is created. (Collapses the former two byte-identical
+        // spawn paths: launcher start_global_container_for_module + the
+        // hub supervisor. See module_identity.rs.)
+        .route("/modules/{module_id}/start", post(global_module_start))
 }
 
 // ─── Error envelope ─────────────────────────────────────────────
@@ -458,6 +467,59 @@ async fn module_start(
             StatusCode::INTERNAL_SERVER_ERROR,
             "container_start_failed",
             format!("start_container_after_install({}, {}): {}", p.project_id, p.module_id, e),
+        ),
+    }
+}
+
+/// `POST /modules/{module_id}/start` — GLOBAL module start (v0.2.61,
+/// Option H). The hub is the sole spawn point for global containers; the
+/// launcher delegates here (after `ensure_hub_running`) instead of
+/// spawning podman directly. This routes through
+/// `start_global_container_supervisor`, which mints + registers the
+/// per-spawn module-identity token (`VCT_MODULE_TOKEN`) and injects it —
+/// the credential the container then presents to the hub's module-scoped
+/// data routes. Returns `{"container_name": String}`.
+///
+/// Error envelopes:
+///   * 404 `manifest_not_found`   — no on-disk manifest for `module_id`.
+///   * 400 `not_container_module` — runtime type isn't container/service.
+///   * 500 `container_start_failed` — supervisor/podman failure.
+async fn global_module_start(Path(module_id): Path<String>) -> impl IntoResponse {
+    let manifest = match super::module_supervisor::lookup_manifest_by_id(&module_id) {
+        Some(m) => m,
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "manifest_not_found",
+                format!(
+                    "no manifest found for module_id {} in catalog \
+                     (~/.vct/modules + ~/.vct/bundled_manifests)",
+                    module_id
+                ),
+            );
+        }
+    };
+
+    if !matches!(manifest.runtime.r#type.as_str(), "container" | "service") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "not_container_module",
+            format!(
+                "module {} has runtime.type='{}' — only container / service \
+                 modules can be started via this endpoint",
+                module_id, manifest.runtime.r#type
+            ),
+        );
+    }
+
+    match super::module_supervisor::start_global_container_supervisor(&manifest, &module_id).await {
+        Ok(container_name) => {
+            Json(serde_json::json!({ "container_name": container_name })).into_response()
+        }
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "container_start_failed",
+            format!("start_global_container_supervisor({}): {}", module_id, e),
         ),
     }
 }

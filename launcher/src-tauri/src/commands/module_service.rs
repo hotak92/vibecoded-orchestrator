@@ -559,8 +559,16 @@ pub async fn start_global_container_for_module(
     ensure_volume_host_dirs_global(manifest, &ctx, GLOBAL_RL_PORT).await;
 
     // v0.2.54 (P0-4): thread detected engine + gpu_mode for GPU flags.
+    // v0.2.61 (Option H) TEMP: this launcher-side direct spawn passes NO
+    // extra_env. It is being COLLAPSED (Track B) to delegate to the hub's
+    // `/modules/{id}/start` (which mints + injects VCT_MODULE_TOKEN) after
+    // `ensure_hub_running`. Until that collapse lands, a container spawned
+    // by THIS path would have no module token and 401 on hub reads — so
+    // the collapse is required for the global-container data path to work,
+    // not optional. See module_identity.rs + DESIGN-v0261-OptionH.
     let args = build_podman_run_args_global(
         manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image, &podman, gpu_mode,
+        &[],
     )?;
 
     let mut cmd = Command::new(&podman).silent();

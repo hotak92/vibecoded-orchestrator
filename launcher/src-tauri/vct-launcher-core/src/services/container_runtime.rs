@@ -798,6 +798,17 @@ pub fn build_podman_run_args_global(
     image: &str,
     engine: &str,
     gpu_mode: Option<GpuMode>,
+    // v0.2.61 (Option H): caller-injected `-e KEY=VALUE` pairs appended
+    // after the manifest's own env. The hub uses this to inject the
+    // per-spawn module-identity token (`VCT_MODULE_TOKEN`) it minted +
+    // registered in its in-memory set — the credential the global
+    // container presents to the hub's `/modules/{id}/projects/{pid}/rl/events`
+    // route. Kept as a caller param (not resolved inside this pure
+    // builder) so the secret never lives in core logic and only the
+    // spawn site — which has the hub's in-memory state — controls it.
+    // SECURITY: values here may be secrets; callers that LOG the returned
+    // argv MUST redact `-e` elements (see `redact_run_args_for_log`).
+    extra_env: &[(String, String)],
 ) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
@@ -844,6 +855,16 @@ pub fn build_podman_run_args_global(
         let resolved = resolve_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
+    }
+
+    // v0.2.61 (Option H): caller-injected env, last so it can't be
+    // shadowed by a manifest env of the same key. Values are passed
+    // verbatim (already-resolved by the caller) — NOT run through
+    // `resolve_value`, since these are runtime-minted secrets, not
+    // manifest placeholder templates.
+    for (k, v) in extra_env {
+        args.push("-e".into());
+        args.push(format!("{}={}", k, v));
     }
 
     args.push(image.to_string());
@@ -2452,10 +2473,42 @@ mod tests {
             "ghcr.io/x/y:0.2.10-cuda",
             "docker",
             Some(GpuMode::Cuda),
+            &[],
         )
         .expect("build");
         assert!(args.iter().any(|a| a == "--gpus"));
         assert!(args.iter().any(|a| a == "all"));
+    }
+
+    /// v0.2.61 (Option H): caller-injected `extra_env` lands as trailing
+    /// `-e KEY=VALUE` pairs, after the manifest env, before the image.
+    #[test]
+    fn v0261_build_podman_run_args_global_appends_extra_env() {
+        let manifest = make_rl_manifest_global_for_test();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/x/y:0.2.10",
+            "podman",
+            None,
+            &[("VCT_MODULE_TOKEN".to_string(), "tok-abc123".to_string())],
+        )
+        .expect("build");
+        // The pair is present as a `-e KEY=VALUE` arg…
+        let env_idx = args
+            .iter()
+            .position(|a| a == "VCT_MODULE_TOKEN=tok-abc123")
+            .expect("extra_env pair must be emitted");
+        assert_eq!(args[env_idx - 1], "-e", "extra_env must be a -e flag");
+        // …and BEFORE the positional image (env precedes image in argv).
+        let image_idx = args
+            .iter()
+            .position(|a| a == "ghcr.io/x/y:0.2.10")
+            .expect("image present");
+        assert!(env_idx < image_idx, "extra_env must precede the image arg");
     }
 
     /// Live podman CLI-surface check (same discipline as
@@ -2957,7 +3010,7 @@ mod tests {
         manifest.runtime.r#type = "cli".into();
         let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
         let result = build_podman_run_args_global(
-            &manifest, &ctx, 11443, "vct-rl-reranker", "img", "podman", None,
+            &manifest, &ctx, 11443, "vct-rl-reranker", "img", "podman", None, &[],
         );
         assert!(result.is_err());
     }
@@ -2977,6 +3030,7 @@ mod tests {
             "ghcr.io/x/y:0.2.10",
             "podman",
             None,
+            &[],
         )
         .expect("build");
         assert_eq!(args[0], "run");
@@ -3426,6 +3480,7 @@ mod tests {
             "ghcr.io/hotak92/vct-rl-reranker:0.2.9",
             "podman",
             None,
+            &[],
         )
         .expect("build args global");
         assert_eq!(

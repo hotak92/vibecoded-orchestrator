@@ -840,8 +840,22 @@ pub async fn start_global_container_supervisor(
     ensure_volume_host_dirs_global(manifest, &ctx, GLOBAL_RL_PORT).await;
 
     // v0.2.54 (P0-4): thread detected engine + gpu_mode for GPU flags.
+    // v0.2.61 (Option H): mint a per-spawn module-identity token, register
+    // it in the hub's in-memory set, and inject it as `VCT_MODULE_TOKEN`.
+    // This is the credential the container presents to the hub's
+    // `/modules/{id}/projects/{pid}/rl/events` route (require_module_scope
+    // accepts it). Minted HERE — the single global-container spawn point —
+    // so a (re)spawn always produces a fresh, registered token (the
+    // restart-contract self-heal; see module_identity.rs). A mint failure
+    // is fatal for the start: without the token the container can't read
+    // its training corpus, so failing loudly beats spawning a container
+    // that 401s on every hub read.
+    let module_token = crate::module_identity::mint_and_register(module_id)?;
+    let extra_env = vec![("VCT_MODULE_TOKEN".to_string(), module_token)];
+
     let args = build_podman_run_args_global(
         manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image, &podman, gpu_mode,
+        &extra_env,
     )?;
 
     let mut cmd = Command::new(&podman).silent();
