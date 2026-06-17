@@ -17,34 +17,32 @@ documented rendering issues with both libraries on Wayland + webkit2gtk.
 
 ## Scope decision
 
-An earlier proposal called for vendoring the
-upstream `excalidraw/excalidraw` SPA AND `mermaid-js/mermaid-live-editor`
-SPA, each rebuilt locally and adapted to call our `/file` and `/save`
-HTTP endpoints. Realistic time budget made that scope impossible:
+Both editors are now **self-hosted visual editors** wired to the local
+`/file` + `/save` endpoints — draw in the browser, hit Save, the on-disk
+`.claude/diagrams/<cat>/<name>.{mmd,excalidraw}` file updates, and Claude
+reads the same file. No CDN, no excalidraw.com round-trip.
 
-  - **Mermaid live editor** (mermaid-js/mermaid-live-editor) is a full
-    SvelteKit app with its own state model, Monaco editor, theme system,
-    history, and 30+ dependency surfaces. Vendoring it as-is plus
-    patching localStorage → HTTP would be ~6h of work and add ~5 MB
-    of build output (Monaco alone is 4 MB).
-  - **Excalidraw** (`@excalidraw/excalidraw` npm package) ships as ES
-    modules with bare imports (`react`, `react-dom`, `jotai`, `clsx`,
-    `@radix-ui/react-popover`, etc.). Making it run standalone in the
-    browser requires either bundling everything via Vite/Rollup (and
-    re-shipping the 18 MB+ output for every install) or using esm.sh
-    CDN (forbidden — self-hosted requirement).
+| Editor    | What we ship                                                                                                                                                            |
+|-----------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Mermaid   | **Custom minimal visual editor** — single HTML page with a textarea, live `mermaid.min.js` preview, Save button posting to `/save`. ~3.3 MB. Self-hosted, no CDN.       |
+| Excalidraw| **Self-hosted Excalidraw editor** — an esbuild bundle of `@excalidraw/excalidraw` + react + react-dom + glue (`excalidraw.bundle.js`, ~7.8 MB minified) + the upstream canvas fonts (`fonts/`, ~14 MB). Renders the real Excalidraw canvas in the user's default browser; Save serializes the scene to `.excalidraw` and POSTs `/save`. Self-hosted, no CDN. |
 
-The pragmatic ship is:
+### History
 
-| Editor    | What we ship now                                                     | Future                                            |
-|-----------|----------------------------------------------------------------------|---------------------------------------------------|
-| Mermaid   | **Custom minimal visual editor** — single HTML page with a textarea, live `mermaid.min.js` preview, save button posting to `/save`. ~3.3 MB total. Self-hosted, no CDN. | Optionally adopt mermaid-live-editor for Monaco + history + theming. |
-| Excalidraw| **Bridge page** — a static page that links out to `excalidraw.com` and explains the file-import workflow: draw there, export `.excalidraw`, then drag the file onto our DiagramsTab drop zone. | Full vendored Excalidraw SPA with React + deps bundled. |
+An earlier (v0.2.36) ship made Excalidraw a **bridge page** (link out to
+`excalidraw.com`, export `.excalidraw`, drag-import into the DiagramsTab
+drop zone) because making `@excalidraw/excalidraw` run standalone needs a
+bundler and the upstream fonts re-shipped. v0.2.61 closed that gap: the
+package's ESM entry (bare imports — `react`, `react-dom`, `jotai`,
+`@radix-ui/*`, …) is bundled once via esbuild into a self-contained IIFE
+and committed (like `mermaid.min.js`), so installs never run a bundler.
+The font self-hosting requirement is met by copying
+`dist/prod/fonts` into `fonts/` and pointing `window.EXCALIDRAW_ASSET_PATH`
+at the served editor root (`/excalidraw/`).
 
-The embedded `ExcalidrawEditor.svelte` (broken on Wayland+webkit2gtk per
-internal notes) **is preserved on disk for now** so we don't break any
-deep-linked tests, but the DiagramsTab "Draw Excalidraw" button no
-longer routes to it.
+The old embedded `ExcalidrawEditor.svelte` (broken on Wayland+webkit2gtk)
+is unrelated to this server-served editor and can be removed once its
+deep-linked tests are re-checked.
 
 ## Files
 
@@ -67,16 +65,27 @@ longer routes to it.
 - On load, fetches `/file?path=<rel_path>` to populate the textarea
   with the current file contents.
 
-### `excalidraw/index.html`
+### `excalidraw/` (self-hosted editor)
 
-- Custom HTML page written by us. AGPL-3.0-or-later.
-- Static bridge page — no Excalidraw runtime is loaded. Explains
-  the current workflow (use excalidraw.com → export → drag into
-  DiagramsTab drop zone).
-- Shipped so the same `/excalidraw/` route renders something
-  intentional rather than 404'ing.
+| File                              | What                                                                                                  | License |
+|-----------------------------------|-------------------------------------------------------------------------------------------------------|---------|
+| `index.html`                      | Our HTML shell — toolbar (file path + Save + status) + `#root` for the Excalidraw canvas; sets `window.EXCALIDRAW_ASSET_PATH = "/excalidraw/"` then loads the bundle. | AGPL-3.0-or-later (ours) |
+| `src/main.jsx`                     | Our React entry — mounts `<Excalidraw>`, loads via `GET /file`, saves via `serializeAsJSON` → `POST /save` (Bearer `#token`). Bundled, not served. | AGPL-3.0-or-later (ours) |
+| `src/build.mjs`                    | esbuild build script (run via `npm run build:excalidraw-editor`). Bundled-from, not served. | AGPL-3.0-or-later (ours) |
+| `excalidraw.bundle.js`            | esbuild output: `@excalidraw/excalidraw` + react + react-dom + scheduler + pako + our glue, IIFE, minified. ~7.8 MB. | MIT (3rd-party) |
+| `excalidraw.bundle.js.LEGAL.txt`  | Per-dependency license notices esbuild collected from the bundled sources (`legalComments: "external"`). | — |
+| `excalidraw.bundle.css`           | `@excalidraw/excalidraw` stylesheet (collected by esbuild from the CSS import). ~144 KB. | MIT (3rd-party) |
+| `css-fonts/*.woff2`               | The "Assistant" UI font referenced by the stylesheet's `@font-face` `url()`s (esbuild `file` loader output). | OFL/MIT (3rd-party) |
+| `fonts/**`                        | The hand-drawn CANVAS fonts (Excalifont, Virgil, Cascadia, Comic Shanns, Nunito, Lilita, Liberation, Xiaolai, Assistant) copied from `dist/prod/fonts`; loaded at runtime via `EXCALIDRAW_ASSET_PATH`. ~14 MB / 234 files. | OFL/MIT (3rd-party) |
+| `LICENSE-excalidraw`              | MIT attribution for the vendored Excalidraw assets + pointer to the bundle's LEGAL.txt for React/pako. | — |
 
-## Refreshing the vendored bundle
+- **Version**: pinned via `launcher/package.json` (`"@excalidraw/excalidraw": "^0.18.1"`; bundled version 0.18.1). React/react-dom `^18.3.1`.
+- **Why a bundle (not a `dist/` copy like mermaid)**: Excalidraw 0.18 ships ESM-only with split chunks + bare imports (no UMD/IIFE build), so a one-shot esbuild bundle is required to serve it as a plain static page. (Mermaid ships a UMD `mermaid.min.js`, so it needs no bundler.)
+- **The `?file=` / `#token=` contract** matches `mermaid/index.html`: `GET /file?path=<rel>` on load (404/empty = new file), `POST /save?path=<rel>` with `Authorization: Bearer <token>` on save.
+
+## Refreshing the vendored bundles
+
+### Mermaid
 
 When upgrading mermaid's `package.json` pin:
 
@@ -88,16 +97,44 @@ cp node_modules/mermaid/dist/mermaid.min.js vendor/diagrams-editor/mermaid/merma
 # Smoke-test the editor by clicking "Draw Mermaid (visual)" in the Diagrams tab.
 ```
 
+### Excalidraw
+
+When upgrading the `@excalidraw/excalidraw` (or `react`/`react-dom`)
+`package.json` pin — rebuild the bundle AND re-copy the fonts (the font
+files are content-hashed by upstream, so a version bump changes their
+names):
+
+```bash
+cd launcher
+npm ci                                   # match the lockfile-pinned versions
+npm run build:excalidraw-editor          # -> excalidraw.bundle.{js,css} + css-fonts/ + .LEGAL.txt
+rm -rf vendor/diagrams-editor/excalidraw/fonts
+cp -r node_modules/@excalidraw/excalidraw/dist/prod/fonts \
+      vendor/diagrams-editor/excalidraw/fonts
+# Update the version line in this file's table above.
+# Smoke-test: click "Draw Excalidraw (visual)" in the Diagrams tab → draw → Save
+#   → confirm the .claude/diagrams/.../<name>.excalidraw file updates on disk.
+```
+
+The build is reproducible (no content-hash in `excalidraw.bundle.js`'s
+own name; identical inputs → byte-identical output), so a no-op rebuild
+produces no git diff.
+
 ## License notes
 
 - **Mermaid** is MIT-licensed; vendoring the minified output and
   serving it from a local HTTP server falls inside that license's
   permissive terms. Attribution is preserved by keeping a copy of
   the upstream LICENSE file at `mermaid/LICENSE-mermaid` (see below).
-- **Our HTML wrappers** (`mermaid/index.html`, `excalidraw/index.html`,
-  and any future static glue) are AGPL-3.0-or-later (same as the rest
-  of the launcher), with the SPDX header in each file.
-- **No Excalidraw source is currently vendored**, so there's no
-  Excalidraw license concern. If/when the Excalidraw SPA is vendored,
-  a parallel `LICENSE-excalidraw` (MIT) file MUST be added and this
-  section updated.
+- **Excalidraw** (`@excalidraw/excalidraw`) is MIT-licensed, as are the
+  bundled React / react-dom / scheduler / pako dependencies (pako is
+  MIT AND Zlib). The vendored bundle + assets carry:
+  - `excalidraw/LICENSE-excalidraw` — the Excalidraw MIT notice + an
+    index of which files are 3rd-party.
+  - `excalidraw/excalidraw.bundle.js.LEGAL.txt` — esbuild-collected
+    per-dependency notices for everything inside the bundle.
+  The Excalidraw fonts are distributed by upstream under OFL/MIT and
+  are vendored verbatim from `dist/prod/fonts`.
+- **Our HTML/JS wrappers** (`mermaid/index.html`, `excalidraw/index.html`,
+  `excalidraw/src/*`, and any future static glue) are AGPL-3.0-or-later
+  (same as the rest of the launcher), with the SPDX header in each file.
