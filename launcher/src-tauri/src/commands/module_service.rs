@@ -489,6 +489,16 @@ pub async fn start_container_after_install(
 /// ONE container per global module. Chosen above the orchestrator-root
 /// port + above the per-project allocation range to avoid collision
 /// with both.
+///
+/// v0.2.61 (Option H): the launcher no longer spawns the global
+/// container directly — `start_global_container_for_module` delegates to
+/// the hub, which owns the actual `podman run` and reads its OWN copy of
+/// this value (`vct-hub::module_supervisor::start_global_container_supervisor`'s
+/// local `GLOBAL_RL_PORT`). This constant is therefore unreferenced in the
+/// launcher today, but it remains the DOCUMENTED source-of-truth the hub's
+/// duplicate is "kept in sync with" — keep it (and its value) authoritative
+/// here. `#[allow(dead_code)]` rather than deletion preserves that contract.
+#[allow(dead_code)]
 pub const GLOBAL_RL_PORT: u16 = 11443;
 
 /// v0.2.49 Stream A: start (or restart) the GLOBAL container for a
@@ -496,21 +506,46 @@ pub const GLOBAL_RL_PORT: u16 = 11443;
 ///
 /// Differences:
 ///   * No `ProjectRow` arg — global containers are not project-scoped.
-///   * Container name = bare module_id (via [`resolve_global_container_name`]),
-///     not `{module_id}-{project_slug}`.
+///   * Container name = bare module_id, not `{module_id}-{project_slug}`.
 ///   * Volume paths substitute `"global"` for `{project_slug}` so the
 ///     state dir is stable across launcher restarts.
 ///   * Listens on [`GLOBAL_RL_PORT`] machine-wide.
+///
+/// ## v0.2.61 (Option H): delegates to the hub instead of spawning podman
+///
+/// The launcher and the hub are SEPARATE processes. The per-spawn
+/// module-identity token (`VCT_MODULE_TOKEN`) the container presents to
+/// the hub's module-scoped data routes is minted + held in the HUB's
+/// in-memory map at the hub's spawn point. A launcher-side direct
+/// `podman run` produces a container with NO such token → it 401s on
+/// every hub read. So the launcher MUST delegate global starts to the
+/// hub's `POST /api/v1/modules/{module_id}/start`
+/// (`global_module_start` → `start_global_container_supervisor`, which
+/// mints the token and injects it at `podman run`).
+///
+/// Sequence:
+///   1. [`ensure_hub_running`](crate::hub_launcher::ensure_hub_running) —
+///      bring up the detached hub. ANY non-`Started`
+///      [`SpawnOutcome`](crate::hub_launcher::SpawnOutcome) is a hard
+///      failure here: we must NOT fall back to a local podman spawn
+///      (tokenless → 401). Fail loudly with a message naming the outcome.
+///   2. POST the global-start route via [`hub_proxy_global_module_start`],
+///      returning the hub-resolved `container_name`.
+///   3. Persist the resolved name on the global install row so subsequent
+///      resume sweeps short-circuit on the running-probe path.
+///
+/// The hub side now owns image resolution / pre-pull / idempotent
+/// `rm -f` / `podman run` (its `start_global_container_supervisor`
+/// mirrors the former launcher body plus the token injection), so none of
+/// that lives here anymore.
 pub async fn start_global_container_for_module(
     manifest: &ModuleManifest,
     module_id: &str,
     db: &Db,
 ) -> Result<String, String> {
-    use vct_launcher_core::services::container_runtime::{
-        build_podman_run_args_global, ensure_volume_host_dirs_global, resolve_global_container_name,
-        resolve_image_ref,
-    };
-
+    // Early-fail on a non-daemon runtime with the same message shape the
+    // launcher used pre-v0.2.61. The hub gates on this too, but catching
+    // it before a network round-trip keeps the error local + cheap.
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
@@ -519,92 +554,34 @@ pub async fn start_global_container_for_module(
         ));
     }
 
-    let name_template = runtime.resolve_container_name_template(&manifest.id);
-    let container_name = resolve_global_container_name(&name_template, module_id)?;
-    let image_template = runtime.resolve_image_ref(
-        manifest.install.container.as_ref().ok_or_else(|| {
-            "install.container block missing — required for container/service modules".to_string()
-        })?,
-        &manifest.version,
-    );
-
-    let gpu_mode = read_persisted_gpu_mode();
-    let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
-
-    let podman = detect_container_runtime().await?;
-
-    // Pre-pull with auth for cache-evicted hosts (v0.2.47 pattern).
-    // v0.2.54 (C-RT-6): gated on `method == ContainerPull` alone — a
-    // missing hardware snapshot (gpu_mode=None) must not skip the
-    // authed pre-pull (anonymous-401 shape, v0.2.46 GHCR-401 bug class).
-    if manifest.install.method == InstallMethod::ContainerPull {
-        if let Err(e) = pre_pull_with_auth_for_start(manifest, &podman, &image).await {
-            eprintln!(
-                "[module_service] global pre-pull for start failed (continuing — cache may suffice): {}",
-                e
-            );
+    // (1) Ensure the hub is up. The hub is the sole spawn point for
+    // global containers (it mints + injects VCT_MODULE_TOKEN); we never
+    // fall back to a launcher-side podman spawn — that would yield a
+    // tokenless container that 401s on every hub data read. So any
+    // outcome other than `Started` is a hard, loud failure.
+    match crate::hub_launcher::ensure_hub_running() {
+        crate::hub_launcher::SpawnOutcome::Started => {}
+        other => {
+            return Err(format!(
+                "cannot start global container '{}': vct-hub is not running and \
+                 could not be started ({:?}). Global containers are spawned by \
+                 the hub (it mints the module-identity token); the launcher will \
+                 NOT spawn a tokenless container directly. Run install.py to \
+                 deploy the hub binary, or set VCT_HUB_BIN.",
+                module_id, other
+            ));
         }
     }
 
-    // Idempotency: force-remove any prior container with the same name.
-    let _ = Command::new(&podman)
-        .silent()
-        .args(["rm", "-f", &container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
-    let ctx = PlaceholderCtx::new(&manifest.id);
-    ensure_volume_host_dirs_global(manifest, &ctx, GLOBAL_RL_PORT).await;
-
-    // v0.2.54 (P0-4): thread detected engine + gpu_mode for GPU flags.
-    // v0.2.61 (Option H) TEMP: this launcher-side direct spawn passes NO
-    // extra_env. It is being COLLAPSED (Track B) to delegate to the hub's
-    // `/modules/{id}/start` (which mints + injects VCT_MODULE_TOKEN) after
-    // `ensure_hub_running`. Until that collapse lands, a container spawned
-    // by THIS path would have no module token and 401 on hub reads — so
-    // the collapse is required for the global-container data path to work,
-    // not optional. See module_identity.rs + DESIGN-v0261-OptionH.
-    let args = build_podman_run_args_global(
-        manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image, &podman, gpu_mode,
-        &[],
-    )?;
-
-    let mut cmd = Command::new(&podman).silent();
-    cmd.args(&args);
-    cmd.env_clear();
-    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+    // (2) Delegate the actual spawn to the hub. The hub resolves the
+    // container name, pre-pulls (with auth), force-removes any stale
+    // same-named container, runs podman with the injected token, and
+    // returns the resolved `container_name`.
+    let container_name = hub_proxy_global_module_start(module_id)
         .await
-        .map_err(|_| format!("{} run timed out after 60s for {}", podman, container_name))?
-        .map_err(|e| format!("spawn {} run: {}", podman, e))?;
+        .map_err(|e| format!("hub-delegated global start for '{}' failed: {}", module_id, e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "{} run failed (exit {}) for {}: {}",
-            podman,
-            output.status.code().unwrap_or(-1),
-            container_name,
-            stderr.chars().take(500).collect::<String>()
-        ));
-    }
-
-    // Persist resolved container_name on the global install row so
+    // (3) Persist resolved container_name on the global install row so
     // subsequent resume sweeps short-circuit on the running-probe path.
     db.set_global_module_container_name(module_id, &container_name)?;
 
@@ -1091,6 +1068,77 @@ async fn hub_proxy_module_stop(project_id: &str, module_id: &str) -> Result<(), 
     Ok(())
 }
 
+/// Proxy for `POST /modules/{module_id}/start` — the GLOBAL-container
+/// spawn route added by the v0.2.61 Option-H foundation. The hub is the
+/// sole spawn point for global containers because it mints + injects the
+/// per-spawn module-identity token (`VCT_MODULE_TOKEN`) at the moment of
+/// `podman run`; a launcher-side direct spawn would produce a tokenless
+/// container that 401s on every hub module-scoped data read. See the
+/// `start_global_container_for_module` docstring for the full rationale.
+///
+/// Returns the resolved `container_name` from the `{"container_name": ...}`
+/// success envelope. On a hub error envelope
+/// (`{"error": {"code", "message"}}`) the `code` + `message` are folded
+/// into the returned `Err` string so the caller can surface a clear cause.
+async fn hub_proxy_global_module_start(module_id: &str) -> Result<String, String> {
+    let port = hub_port_for_proxy()?;
+    let token = hub_token_for_proxy()?;
+    let client = reqwest::Client::builder()
+        // Generous timeout: the hub-side start does an (optionally authed)
+        // image pre-pull + `podman run` before responding, matching the
+        // 60s ceiling the old launcher-side direct spawn used.
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/modules/{}/start",
+        port, module_id
+    );
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("hub POST global start: {}", e))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse hub global-start body: {}", e))?;
+
+    if !status.is_success() {
+        // Hub error envelope: { "error": { "code": "...", "message": "..." } }
+        let code = body
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let message = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no message)");
+        return Err(format!(
+            "hub global-start returned {} [{}]: {}",
+            status, code, message
+        ));
+    }
+
+    let container_name = body
+        .get("container_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "hub global-start succeeded ({}) but response had no \
+                 non-empty container_name: {}",
+                status, body
+            )
+        })?;
+    Ok(container_name.to_string())
+}
+
 // ─── Phase 3C: weights update check + download + rotate ─────────────────
 
 /// POST `/rl-latest-version` for the active embedding source of the
@@ -1310,6 +1358,7 @@ pub async fn download_weights(
 pub async fn signal_rotate_weights(
     rl_port: u16,
     container_path: &str,
+    project_id: &str,
 ) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{}/rotate_weights", rl_port);
     let client = reqwest::Client::builder()
@@ -1319,6 +1368,11 @@ pub async fn signal_rotate_weights(
 
     let resp = client
         .post(&url)
+        // v0.2.61 (Option H): X-VCT-Project-ID routes the container's
+        // per-project model head; matches /finetune + rerank. The global
+        // container is a singleton serving all projects, so rotate must
+        // name the project whose head it's swapping.
+        .header("X-VCT-Project-ID", project_id)
         .json(&serde_json::json!({ "weights_path": container_path }))
         .send()
         .await
@@ -1415,7 +1469,7 @@ pub async fn apply_weights_update(
                 &response.embedding_source,
                 &response.latest_version,
             );
-            signal_rotate_weights(rl_port, &container_path).await?;
+            signal_rotate_weights(rl_port, &container_path, &project_id).await?;
             Ok(())
         }
         FinetuneChoice::Now => {
@@ -1623,7 +1677,7 @@ async fn run_finetune_then_rotate_async(
     }
 
     // Rotate unconditionally — see contract pin in fn doc.
-    signal_rotate_weights(rl_port, &container_path).await?;
+    signal_rotate_weights(rl_port, &container_path, &project_id).await?;
 
     let _ = app.emit(
         "module://finetune-progress",
@@ -2103,7 +2157,13 @@ where
         //   substitute `{project_slug}` in templates, allocate rl_port.
         match project_id_opt {
             None => {
-                // GLOBAL path.
+                // GLOBAL path. v0.2.61 (Option H): this now delegates to
+                // the hub's `/modules/{id}/start` (via
+                // `start_global_container_for_module`), which first calls
+                // `ensure_hub_running`. If the hub is down at resume time
+                // and can't be started, that returns a clear Err — logged
+                // + stamped to last_error below; the sweep does not crash
+                // and the per-project rows still get resumed.
                 if let Err(e) =
                     start_global_container_for_module(&manifest, &module_id, db).await
                 {

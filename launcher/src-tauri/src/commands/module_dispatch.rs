@@ -1195,6 +1195,9 @@ async fn execute_one_step(
                 HttpMethod::Put => http_client.put(&url),
                 HttpMethod::Delete => http_client.delete(&url),
             };
+            // v0.2.61 (Option H): X-VCT-Project-ID routes the container's
+            // per-project model head; matches /finetune + rerank.
+            req = req.header("X-VCT-Project-ID", project_id);
             if let Some(ref body_value) = substituted_body {
                 req = req.json(body_value);
             }
@@ -1358,6 +1361,11 @@ async fn run_poller(
 
         let resp = client
             .get(&url)
+            // v0.2.61 (Option H): X-VCT-Project-ID routes the container's
+            // per-project model head; matches /finetune + rerank. The
+            // poller is a GET (status poll), but the per-project head
+            // routing applies the same way as the action POST above.
+            .header("X-VCT-Project-ID", project_id)
             .query(&[(spec.job_id_query_param.as_str(), job_id)])
             .send()
             .await;
@@ -3341,6 +3349,143 @@ mod tests {
             err.contains("invoker") || err.contains("AppHandle"),
             "error should point at the missing invoker, got: {}",
             err,
+        );
+    }
+
+    // ─── v0.2.61 (Option H): X-VCT-Project-ID header routing ─────────
+
+    /// The dispatcher's HTTP action POST MUST carry the
+    /// `X-VCT-Project-ID` header (value = the project_id, NOT the slug).
+    /// The RL container's training endpoints route per-project by this
+    /// header — same contract as the rerank path + /finetune.
+    #[tokio::test]
+    async fn http_action_post_carries_project_id_header() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        // Server captures the inbound X-VCT-Project-ID header so the
+        // test can assert the dispatcher set it.
+        let captured: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let captured_for_handler = captured.clone();
+
+        let router = Router::new().route(
+            "/kick",
+            routing::post(move |headers: axum::http::HeaderMap| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    let hv = headers
+                        .get("X-VCT-Project-ID")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    *captured.lock().unwrap() = hv;
+                    Json(json!({"ok": true}))
+                }
+            }),
+        );
+        let port = start_server(router).await;
+
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let action = ActionDescriptor::Http {
+            method: HttpMethod::Post,
+            path: "/kick".into(),
+            body: Some(json!({"x": 1})),
+            polling: None,
+            next_action: None,
+        };
+
+        dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink, None, &db, &client,
+        )
+        .await
+        .expect("dispatch ok");
+
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(
+            seen.as_deref(),
+            Some(project_id),
+            "HTTP action POST must carry X-VCT-Project-ID = project_id (not slug)",
+        );
+    }
+
+    /// The background poller's status GET MUST also carry
+    /// `X-VCT-Project-ID` so long-running per-project training polls
+    /// route to the correct model head for the duration of the job.
+    #[tokio::test]
+    async fn poller_get_carries_project_id_header() {
+        let project_id = "proj-A";
+        let module_id = "mod-X";
+
+        let captured: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let captured_for_status = captured.clone();
+
+        let router = Router::new()
+            // Kick returns a job id so the dispatcher attaches a poller.
+            .route(
+                "/kick",
+                routing::post(|| async { Json(json!({"job_id": "job-123"})) }),
+            )
+            // Status endpoint captures the header + returns a terminal
+            // success state so the poller stops after one tick.
+            .route(
+                "/status",
+                routing::get(move |headers: axum::http::HeaderMap| {
+                    let captured = captured_for_status.clone();
+                    async move {
+                        let hv = headers
+                            .get("X-VCT-Project-ID")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        *captured.lock().unwrap() = hv;
+                        Json(json!({"state": "done"}))
+                    }
+                }),
+            );
+        let port = start_server(router).await;
+
+        let db = db_with_module(project_id, module_id, port);
+        let client = build_http_client();
+        let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::new());
+
+        let action = ActionDescriptor::Http {
+            method: HttpMethod::Post,
+            path: "/kick".into(),
+            body: None,
+            polling: Some(PollingSpec {
+                endpoint: "/status".into(),
+                // job_id_path / terminal_state_field use the v1
+                // top-level mini-JSONPath form ($.<key>).
+                job_id_path: "$.job_id".into(),
+                job_id_query_param: "job_id".into(),
+                interval_seconds: 1,
+                max_attempts: 3,
+                terminal_state_field: "$.state".into(),
+                terminal_success_values: vec!["done".into()],
+                terminal_failure_values: vec!["failed".into()],
+                progress_event: "poll_progress".into(),
+                failed_event: "poll_failed".into(),
+            }),
+            next_action: None,
+        };
+
+        dispatch_action_with_sink(
+            module_id, project_id, action, None, None, None, sink, None, &db, &client,
+        )
+        .await
+        .expect("dispatch ok");
+
+        // The poller is spawned via tokio::spawn and sleeps
+        // `interval_seconds` before the first tick — wait long enough
+        // for one poll round-trip to land.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(
+            seen.as_deref(),
+            Some(project_id),
+            "poller status GET must carry X-VCT-Project-ID = project_id (not slug)",
         );
     }
 }

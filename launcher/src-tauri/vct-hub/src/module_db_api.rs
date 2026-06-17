@@ -130,22 +130,31 @@ struct ModuleScope {
 
 /// Per-(module, project) bearer-token validator. Pulls the token from
 /// `Authorization: Bearer <secret>`, the URL's (module_id, project_id),
-/// and checks against `module_access_tokens`. Mismatched module_id →
-/// 401; mismatched project_id → 403; expired → 401.
+/// and authorizes via EITHER of two coexisting credential paths:
 ///
-/// The hub-wide `require_auth` middleware in `auth.rs` already ran
-/// against the same token, but it accepts the launcher's hub.token —
-/// our module-scoped tokens are different. We re-validate here against
-/// the per-(module, project) row so two security boundaries hold:
-/// (1) only same-user processes have hub.token; (2) only the legit
-/// module container has its scoped secret.
+///   1. **DB path** (`module_access_tokens`, since v0.2.31): a
+///      per-(module, project) secret issued by the launcher. Mismatched
+///      module_id → 401; mismatched project_id → 403; expired → 401.
 ///
-/// HACK / v0.2.31 simplification: the hub-wide `require_auth` is
-/// effectively bypassed for these routes because we accept the scoped
-/// secret as the bearer instead of hub.token. That's deliberate:
-/// containers don't have hub.token (they shouldn't — different trust
-/// boundary). v0.2.32 will land a proper "module-token-aware"
-/// middleware that does both checks.
+///   2. **Ephemeral identity path** (Option H, v0.2.61): a per-MODULE
+///      token minted at container spawn by `module_identity` and held in
+///      the hub's in-memory set. `resolve_module(&bearer)` returns the
+///      owning module_id. This proves IDENTITY ("I am module X"); the
+///      SCOPE is the URL's `{project_id}` (D-B auto-grant: a module reads
+///      ANY of its own per-project data — accept the URL project_id).
+///      No DB row, no per-project secret, no expiry: validity == set
+///      membership (the supervisor re-mints at every (re)spawn).
+///
+/// The two paths are tried independently: a bearer matching EITHER
+/// authorizes; matching NEITHER → 401. On the ephemeral path a
+/// module-mismatch (token owns X, URL says Y) → 401. We try the DB path
+/// first to preserve every existing CRUD/refresh behavior unchanged,
+/// then fall back to the ephemeral path.
+///
+/// The hub-wide `require_auth` in `auth.rs` exempts these routes (it
+/// accepts hub.token, which containers deliberately don't have — a
+/// different trust boundary) and hands the bearer down to us. We are the
+/// authoritative gate for module-token-bearing requests.
 async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
     // Pull the bearer.
     let bearer = req
@@ -177,53 +186,90 @@ async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
         }
     };
 
-    let row = match lookup_token(&launcher_db.0, &bearer) {
-        Ok(Some(row)) => row,
-        Ok(None) => return err(StatusCode::UNAUTHORIZED, "invalid_token", "bearer token not recognized"),
+    // ── Credential path 1: DB-backed per-(module, project) token ──────
+    let scope: ModuleScope = match lookup_token(&launcher_db.0, &bearer) {
+        Ok(Some(row)) => {
+            // Module scope check.
+            if row.module_id != module_id_from_url {
+                return err(
+                    StatusCode::UNAUTHORIZED,
+                    "module_mismatch",
+                    "token does not authorize this module",
+                );
+            }
+            // Project scope check (when URL carries project_id).
+            if let Some(pid) = project_id_from_url.as_ref() {
+                if &row.project_id != pid {
+                    return err(
+                        StatusCode::FORBIDDEN,
+                        "project_out_of_scope",
+                        "token does not authorize this project",
+                    );
+                }
+            }
+            // Expiry check.
+            let now = Utc::now().timestamp_millis();
+            if row.expires_at_ms <= now {
+                return err(
+                    StatusCode::UNAUTHORIZED,
+                    "token_expired",
+                    "token has expired; refresh via POST /modules/{module_id}/token/refresh",
+                );
+            }
+            ModuleScope {
+                module_id: row.module_id.clone(),
+                project_id: row.project_id.clone(),
+            }
+        }
+        Ok(None) => {
+            // ── Credential path 2: ephemeral module-identity token ────
+            // The DB had no matching row; this bearer may instead be the
+            // per-MODULE identity token minted at container spawn.
+            match crate::module_identity::resolve_module(&bearer) {
+                Some(owner) => {
+                    // The token proves "I am module <owner>". It must
+                    // match the module named in the URL.
+                    if owner != module_id_from_url {
+                        return err(
+                            StatusCode::UNAUTHORIZED,
+                            "module_mismatch",
+                            "token does not authorize this module",
+                        );
+                    }
+                    // SCOPE: the project named in the URL. The
+                    // token-refresh route carries no project_id; the
+                    // identity path doesn't serve token refresh (there's
+                    // no DB row to rotate), so a None here means the
+                    // refresh handler will fail its own scope check.
+                    // D-B: auto-grant open; per-project gate is a future
+                    // tightening (a module reads any of its own
+                    // per-project data with one identity token).
+                    let project_id = project_id_from_url.clone().unwrap_or_default();
+                    ModuleScope {
+                        module_id: owner,
+                        project_id,
+                    }
+                }
+                None => {
+                    return err(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_token",
+                        "bearer token not recognized",
+                    );
+                }
+            }
+        }
         Err(e) => {
             eprintln!("[module_db_api] token lookup error: {}", e);
             return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "token lookup failed");
         }
     };
 
-    // Module scope check.
-    if row.module_id != module_id_from_url {
-        return err(
-            StatusCode::UNAUTHORIZED,
-            "module_mismatch",
-            "token does not authorize this module",
-        );
-    }
-
-    // Project scope check (when URL carries project_id).
-    if let Some(pid) = project_id_from_url.as_ref() {
-        if &row.project_id != pid {
-            return err(
-                StatusCode::FORBIDDEN,
-                "project_out_of_scope",
-                "token does not authorize this project",
-            );
-        }
-    }
-
-    // Expiry check.
-    let now = Utc::now().timestamp_millis();
-    if row.expires_at_ms <= now {
-        return err(
-            StatusCode::UNAUTHORIZED,
-            "token_expired",
-            "token has expired; refresh via POST /modules/{module_id}/token/refresh",
-        );
-    }
-
     // Stash the verified scope for the route handler.
     let mut req = req;
-    req.extensions_mut().insert(ModuleScope {
-        module_id: row.module_id.clone(),
-        project_id: row.project_id.clone(),
-    });
+    req.extensions_mut().insert(scope);
     // Stash the raw bearer so token-refresh can find the current row
-    // to replace.
+    // to replace (DB path only; the ephemeral path has no DB row).
     req.extensions_mut().insert(BearerToken(bearer));
 
     next.run(req).await
@@ -1537,5 +1583,154 @@ mod integration_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 403);
+    }
+
+    // ── Option H (v0.2.61): ephemeral module-identity credential path ──
+    //
+    // These tests mint tokens into the process-global
+    // `module_identity::MODULE_IDENTITY_TOKENS` map, so they must NOT run
+    // concurrently with each other (one test's mint could collide with
+    // another's resolve). The whole hub-test invocation runs
+    // `--test-threads=1` per the dispatch, but we also take an explicit
+    // lock so the intent survives a future parallel run and so each test
+    // cleans up its own module after itself.
+    static IDENTITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[tokio::test]
+    async fn ephemeral_token_validates_for_own_module_rl_events() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // spawn() seeds module migrations + a DB token; we ignore the DB
+        // token and authenticate with a freshly-minted IDENTITY token,
+        // proving the ephemeral path authorizes when the DB path misses.
+        let (base, _h, _db_token) = spawn("test-mod", "proj1", "rl").await;
+        let ident = crate::module_identity::mint_and_register("test-mod").expect("mint");
+
+        // Seed one rl_event for proj1 so the read returns a row.
+        // rl_events.project_id is a FK to projects.id, so seed a project
+        // row first.
+        {
+            let now = chrono::Utc::now().timestamp_millis();
+            {
+                let guard = _h.0.lock();
+                guard
+                    .execute(
+                        "INSERT INTO projects \
+                            (id, name, folder_path, host, slug, created_at, updated_at) \
+                         VALUES ('proj1', 'Proj One', '/tmp/proj1', 'base', 'proj1', ?1, ?1)",
+                        rusqlite::params![now],
+                    )
+                    .expect("seed project row");
+            }
+            _h.0
+                .insert_rl_event(
+                    "retrieval",
+                    3,
+                    now,
+                    Some("proj1"),
+                    Some("Proj One"),
+                    "task-1",
+                    Some("code"),
+                    Some("qwen3"),
+                    Some(1024),
+                    Some("qwen3-embedding:0.6b"),
+                    r#"{"k":"v"}"#,
+                )
+                .expect("seed rl_event");
+        }
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "{}/modules/test-mod/projects/proj1/rl/events",
+                base
+            ))
+            .headers(auth_header(&ident))
+            .send()
+            .await
+            .expect("hub reachable");
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 200, "ephemeral token must authorize rl/events; body: {}", body);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.as_array().map(|a| a.len()), Some(1), "one event for proj1");
+
+        crate::module_identity::revoke("test-mod");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_token_rejected_on_other_module_url() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Mint an identity token for module X, hit a module-Y URL → 401.
+        // The 401 fires inside require_module_scope (module-mismatch on the
+        // ephemeral path) BEFORE any handler/namespace logic, so module-y
+        // needs no migration seeded.
+        let (base, _h, _db_token) = spawn("module-x", "proj1", "rl").await;
+        let ident = crate::module_identity::mint_and_register("module-x").expect("mint");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "{}/modules/module-y/projects/proj1/rl/events",
+                base
+            ))
+            .headers(auth_header(&ident))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            401,
+            "identity token for module-x must not authorize a module-y URL"
+        );
+
+        crate::module_identity::revoke("module-x");
+    }
+
+    #[tokio::test]
+    async fn unknown_bearer_rejected_with_401() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // A bearer that matches NEITHER a DB token NOR the identity set.
+        let (base, _h, _db_token) = spawn("test-mod", "proj1", "rl").await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "{}/modules/test-mod/projects/proj1/rl/events",
+                base
+            ))
+            .headers(auth_header("not-a-db-token-and-not-an-identity-token"))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 401, "unknown bearer must 401 (neither path matches)");
+    }
+
+    #[tokio::test]
+    async fn db_token_path_still_authorizes_with_identity_path_present() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Regression guard: the DB credential path must keep working even
+        // with the ephemeral path wired in. We present the DB-issued token
+        // (NOT an identity token) on a CRUD route and expect success.
+        let (base, _h, db_token) = spawn("test-mod", "proj1", "rl").await;
+        // Also mint an identity token for the same module to prove the two
+        // paths coexist without the identity path shadowing the DB path.
+        let _ident = crate::module_identity::mint_and_register("test-mod").expect("mint");
+
+        let client = reqwest::Client::new();
+        // POST via the DB token (exercises the DB path end-to-end).
+        let resp = client
+            .post(format!("{}/modules/test-mod/db/projects/proj1/rows/rl_state", base))
+            .headers(auth_header(&db_token))
+            .json(&serde_json::json!({ "key": "k1", "fields": { "value": "v1" } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "DB-token CRUD must still authorize with identity path present: {}",
+            resp.text().await.unwrap()
+        );
+
+        crate::module_identity::revoke("test-mod");
     }
 }
