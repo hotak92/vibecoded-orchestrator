@@ -727,13 +727,12 @@ fn has_module_row(db: &Db, project_id: &str, module_name: &str) -> Result<bool, 
 
 // ─── Diagrams file IO (v0.2.34 Agent D) ─────────────────────────────────
 //
-// The DiagramsTab + ExcalidrawEditor invoke these three commands to
-// load + persist diagram source files. Until v0.2.34 they were
-// missing — the frontend caught the "command not found" error and
-// silently degraded (empty preview, Excalidraw boots empty every
-// mount, SVG export silently fails). See
-// `diagrams-frontend-wiring-handoff-2026-05-25.md` for the full
-// gap analysis.
+// The DiagramsTab invokes these commands to load + persist diagram
+// source files (mermaid preview render, snapshot restore, drop-import
+// write). Until v0.2.34 they were missing — the frontend caught the
+// "command not found" error and silently degraded. (v0.2.61: the
+// Excalidraw scene load/save now happens entirely in the browser editor
+// via the local server's /file + /save, not through these commands.)
 //
 // Security boundary: every read/write is scoped to the project root.
 // The `read_project_diagram_source` command additionally restricts
@@ -1041,66 +1040,123 @@ pub async fn open_diagrams_editor(
     if name.is_empty() {
         return Err("open_diagrams_editor: name must be non-empty".to_string());
     }
-    // Lowercase-kebab guard mirrors the registration check used elsewhere
-    // in this module. Keeps the path stable for both the legacy register
-    // flow and the new auto-register-on-first-save path.
-    let name_re = regex::Regex::new(r"^[a-z0-9][a-z0-9-]*$")
+    // Name guard MUST stay in lockstep with the frontend's
+    // DIAGRAM_NAME_RE (DiagramsTab.svelte) and the diagram-path
+    // auto-register parser: `^[A-Za-z0-9_][A-Za-z0-9_-]*$` — allows
+    // `_` and mixed case, excludes `/`, `.`, spaces, leading/trailing
+    // `-`. (v0.2.61: widened from the old lowercase-kebab rule so a
+    // name the user can create in the UI also opens here. Excludes the
+    // path-structural chars so the file lands cleanly under
+    // visual-draft/.)
+    let name_re = regex::Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
         .map_err(|e| format!("regex compile: {}", e))?;
     if !name_re.is_match(&name) {
         return Err(format!(
-            "open_diagrams_editor: name must be lowercase-kebab (got \"{}\")",
+            "open_diagrams_editor: name must match [A-Za-z0-9_][A-Za-z0-9_-]* \
+             (letters, digits, _ and -; got \"{}\")",
             name,
         ));
     }
 
-    // 2. Resolve the project folder and the destination file path.
-    let project_folder = lookup_project_folder(&db, &project_id)?;
+    // 2. Resolve the destination file path. Default category for
+    //    "Draw new" diagrams is visual-draft/; the user can re-organise
+    //    via the registration UI once the file is registered.
     let ext = if diagram_type == "mermaid" { "mmd" } else { "excalidraw" };
-    // Default category for "Draw new (visual)" diagrams. The user can
-    // re-organise via the existing registration UI once the file is
-    // registered; this just picks a sensible starting folder.
     let rel_path = format!(".claude/diagrams/visual-draft/{}.{}", name, ext);
-    let abs_path = project_folder.join(&rel_path);
 
-    // 3. Create an empty file on disk so the editor has a target to
-    //    GET /file against (returns 404 with empty body otherwise; the
-    //    editor's JS handles that, but creating the file lets the
-    //    watcher see the first save as `edit` rather than `create`,
-    //    which is cleaner UX for the auto-register path).
-    if !abs_path.exists() {
-        write_file_atomic(&abs_path, b"")?;
+    // 3. Create an empty file on disk so the watcher sees the first save
+    //    as `edit` rather than `create` (cleaner UX for auto-register),
+    //    then open the editor against it.
+    open_editor_for_rel_path(&db, &project_id, &diagram_type, &rel_path, true).await
+}
+
+/// Open the visual editor for an ALREADY-EXISTING diagram file
+/// (project-relative `rel_path`, e.g.
+/// `.claude/diagrams/gui/auth/login.excalidraw`). Used by the "Edit in
+/// browser" action on a selected diagram (v0.2.61 — both editors are
+/// now browser-served; the launcher no longer embeds an editor in the
+/// Tauri WebView). Returns the opened URL.
+///
+/// Unlike `open_diagrams_editor` (which creates a new file under
+/// visual-draft/ from a name), this opens whatever path the row already
+/// points at. The path is re-validated server-side by
+/// `resolve_diagrams_path` (must live under some registered project's
+/// `.claude/diagrams/`), so we don't re-derive it here.
+#[command]
+pub async fn open_diagram_editor_for_path(
+    project_id: String,
+    diagram_type: String,
+    rel_path: String,
+    db: State<'_, Db>,
+) -> Result<String, String> {
+    if !matches!(diagram_type.as_str(), "mermaid" | "excalidraw") {
+        return Err(format!(
+            "open_diagram_editor_for_path: diagram_type must be \"mermaid\" or \"excalidraw\" (got \"{}\")",
+            diagram_type,
+        ));
+    }
+    // Reject absolute paths + `..` traversal at the boundary; the
+    // server-side guard also enforces this, but failing fast here gives
+    // a clearer error.
+    if Path::new(&rel_path).is_absolute() {
+        return Err(format!(
+            "open_diagram_editor_for_path: rel_path must be project-relative (got absolute: {})",
+            rel_path,
+        ));
+    }
+    if rel_path.split('/').any(|s| s == "..") {
+        return Err(format!(
+            "open_diagram_editor_for_path: `..` not allowed in rel_path: {}",
+            rel_path,
+        ));
+    }
+    // Don't create the file — it must already exist for an existing
+    // diagram. (If it was deleted out from under the row, the editor's
+    // GET /file returns 404 and the page boots empty, which is fine.)
+    open_editor_for_rel_path(&db, &project_id, &diagram_type, &rel_path, false).await
+}
+
+/// Shared tail for both editor-open commands: optionally create the
+/// target file, lazy-start the local diagrams-editor HTTP server, build
+/// the `?file=…#token=…` URL, and hand it to the OS opener. Returns the
+/// opened URL.
+///
+/// The per-boot save token rides in the URL FRAGMENT (`#token=`), not
+/// the query string: fragments are never sent in HTTP requests, so the
+/// token stays out of request lines, server logs, and Referer headers.
+/// The editor page reads it from `location.hash` and presents it as
+/// `Authorization: Bearer` on POST /save (see the gate in
+/// diagrams_local_server.rs). The fragment lands in browser history —
+/// accepted: the token is per-boot, gates only diagram-file writes, and
+/// the server is 127.0.0.1-only.
+async fn open_editor_for_rel_path(
+    db: &Db,
+    project_id: &str,
+    diagram_type: &str,
+    rel_path: &str,
+    create_if_missing: bool,
+) -> Result<String, String> {
+    if create_if_missing {
+        let project_folder = lookup_project_folder(db, project_id)?;
+        let abs_path = project_folder.join(rel_path);
+        if !abs_path.exists() {
+            write_file_atomic(&abs_path, b"")?;
+        }
     }
 
-    // 4. Spin up the local server (idempotent — first call only) and
-    //    grab its port. We open a fresh Db handle for the server (WAL
-    //    mode keeps it consistent with the main launcher connection).
-    //    Soft-fail: a Db::open failure here means the server can't
-    //    answer /file or /save, so we surface a clear error.
+    // Lazy-start the local server (idempotent — first call only) and
+    // grab its port. Fresh Db handle for the server (WAL keeps it
+    // consistent with the main launcher connection).
     let server_db = Arc::new(
         crate::db::Db::open()
-            .map_err(|e| format!("open_diagrams_editor: open server-side Db: {}", e))?,
+            .map_err(|e| format!("open_editor_for_rel_path: open server-side Db: {}", e))?,
     );
     let vendor_root = crate::commands::diagrams_local_server::resolve_vendor_root()?;
     let server = crate::commands::diagrams_local_server::ensure_started(server_db, vendor_root)
         .await
-        .map_err(|e| format!("open_diagrams_editor: ensure_started: {}", e))?;
+        .map_err(|e| format!("open_editor_for_rel_path: ensure_started: {}", e))?;
 
-    // 5. Build the URL and hand it to the OS opener.
-    //    URL-encode the rel_path so any slashes / special chars survive
-    //    the query-string round trip. urlencoding::encode is a tiny
-    //    dep — we don't pull it in. Manual encoding (only paths + ASCII)
-    //    keeps the dependency footprint flat.
-    //
-    //    The per-boot save token rides in the URL FRAGMENT (`#token=`),
-    //    not the query string: fragments are never sent in HTTP
-    //    requests, so the token stays out of request lines, server
-    //    logs, and Referer headers. The editor page's JS reads it from
-    //    `location.hash` and presents it as `Authorization: Bearer` on
-    //    POST /save (see the gate in diagrams_local_server.rs). The
-    //    fragment does land in browser history — accepted: the token
-    //    is per-boot (regenerated every launcher start), gates only
-    //    diagram-file writes, and the server is 127.0.0.1-only.
-    let encoded = encode_query_value(&rel_path);
+    let encoded = encode_query_value(rel_path);
     let editor_path = if diagram_type == "mermaid" {
         "mermaid"
     } else {
@@ -1112,7 +1168,7 @@ pub async fn open_diagrams_editor(
     );
 
     tauri_plugin_opener::open_url(&url, None::<&str>)
-        .map_err(|e| format!("open_diagrams_editor: open_url({}): {}", url, e))?;
+        .map_err(|e| format!("open_editor_for_rel_path: open_url({}): {}", url, e))?;
 
     Ok(url)
 }
@@ -1585,6 +1641,24 @@ mod tests {
     // through the #[command] macros is covered by the launcher's
     // integration tests + the hub-side tests in
     // `mcp_tool_grants_api.rs`.
+
+    #[test]
+    fn open_diagrams_editor_name_guard_matches_frontend_rule() {
+        // The name guard in `open_diagrams_editor` MUST stay in lockstep
+        // with the frontend's DIAGRAM_NAME_RE (DiagramsTab.svelte) and the
+        // on-disk auto-register parser — otherwise a name the user can
+        // create in the UI fails to open here (the v0.2.61 drift this test
+        // pins). Pattern: ^[A-Za-z0-9_][A-Za-z0-9_-]*$.
+        let re = regex::Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$").unwrap();
+        // Accept: the cases the widened frontend rule allows.
+        for ok in ["login-flow", "my_diagram", "MyDiagram", "a", "X1", "_priv", "a-b_c"] {
+            assert!(re.is_match(ok), "should accept {ok:?}");
+        }
+        // Reject: path-structural chars + leading dash + spaces + empty.
+        for bad in ["", "-leading", "a/b", "a.b", "a b", "a..b", ".hidden"] {
+            assert!(!re.is_match(bad), "should reject {bad:?}");
+        }
+    }
 
     #[test]
     fn encode_query_value_preserves_slashes_and_encodes_unsafe_chars() {

@@ -24,8 +24,6 @@
     SnapshotTrigger,
   } from '$lib/types/project-state';
   import Dropdown from '$lib/components/Dropdown.svelte';
-  import ExcalidrawEditor from './ExcalidrawEditor.svelte';
-  import MermaidEditor from './MermaidEditor.svelte';
 
   // ─── Props ────────────────────────────────────────────────────────────
   let { projectId }: { projectId: string } = $props();
@@ -184,22 +182,21 @@
   let newCategoryPath = $state('');
   let adding = $state(false);
 
-  // ─── Draft state: "Draw new" inline editor (v0.2.35 Agent L) ─────────
-  // The DiagramsTab originally accepted only externally-created diagrams
-  // (the "+ Add diagram" modal registers a file path; the user creates
-  // the content elsewhere). v0.2.35 adds two affordances for creating
-  // diagrams directly from the launcher:
-  //   1. "Draw new Mermaid" → inline MermaidEditor (textarea + preview).
-  //   2. "Draw new Excalidraw" → embedded ExcalidrawEditor with empty
-  //      initial scene.
-  // The draft persists in component state until the user clicks "Save
-  // as new", at which point we prompt for name + category, then call
-  // register_project_diagram + write_text_file (both Tauri commands
-  // shipped by Agent D in v0.2.34).
+  // ─── Import state: drag-drop a .mmd/.excalidraw file (v0.2.35) ────────
+  // The DiagramsTab accepts externally-created diagrams two ways:
+  //   1. "+ Add diagram" registers an existing file path.
+  //   2. Drag-drop a `.mmd`/`.excalidraw` file onto the list's drop zone
+  //      (onDrop below) → we read its content client-side, stash it in
+  //      the slots below, and show the name/category dialog → `saveDraft`
+  //      registers the row + writes the file.
+  // (v0.2.61: this state used to ALSO back inline "Draw new" editors;
+  // those are gone — creation now goes through the browser editor
+  // (open*VisualEditor). The slots survive solely to carry a dropped
+  // file's content into `saveDraft`.)
   //
-  // While drafting, the right pane is fully owned by the draft editor
-  // (the registered-diagram preview is hidden). Cancel discards the
-  // draft. Selecting a registered diagram cancels the draft.
+  // `draftingType !== null` means "an import is pending its name"; the
+  // right pane shows the save dialog. Selecting a registered diagram or
+  // Cancel clears it.
   let draftingType = $state<DiagramType | null>(null);
   let draftMermaidSource = $state<string>('');
   let draftExcalidrawSource = $state<string>('');
@@ -210,37 +207,11 @@
   // Drag-drop import zone state — single boolean for visual hover/active.
   let dropZoneActive = $state(false);
 
-  function startDrawing(type: DiagramType) {
-    // Cancel any current selection so the right pane shows the draft.
-    selectedId = null;
-    draftingType = type;
-    if (type === 'mermaid') {
-      draftMermaidSource = '';
-    } else {
-      draftExcalidrawSource = '';
-    }
-  }
-
   function cancelDraft() {
-    if (draftingType === null) return;
-    if (
-      (draftingType === 'mermaid' && draftMermaidSource.trim()) ||
-      (draftingType === 'excalidraw' && draftExcalidrawSource.trim())
-    ) {
-      if (!confirm('Discard the draft? Unsaved content will be lost.')) return;
-    }
     draftingType = null;
     draftMermaidSource = '';
     draftExcalidrawSource = '';
     showSaveDraftDialog = false;
-  }
-
-  function openSaveDraftDialog() {
-    if (!draftingType) return;
-    // Pre-fill with safe defaults the user can edit.
-    draftSaveName = '';
-    draftSaveCategory = '';
-    showSaveDraftDialog = true;
   }
 
   async function saveDraft() {
@@ -357,16 +328,17 @@
     }
   }
 
-  // ─── v0.2.36 Agent R — vendored visual editor opener ────────────────
-  // Distinct from `startDrawing` (which opens the in-tab inline editor).
-  // `openVisualEditor` calls the backend's `open_diagrams_editor` Tauri
-  // command, which:
+  // ─── Visual editor opener (v0.2.36 Agent R; unified v0.2.61) ─────────
+  // `openVisualEditor(type)` creates a NEW diagram and opens it.
+  // `open_diagrams_editor` (Tauri) then:
   //   1. Creates an empty file under `.claude/diagrams/visual-draft/`
   //      so the file watcher has a target.
   //   2. Lazy-starts the local diagrams-editor HTTP server.
-  //   3. Opens the vendored Mermaid (or Excalidraw bridge) page in the
+  //   3. Opens the self-hosted Mermaid or Excalidraw editor in the
   //      user's DEFAULT BROWSER — NOT in the Tauri WebView, which has
   //      Wayland+webkit2gtk rendering bugs for both libraries.
+  // (`openVisualEditorForSelected`, below, is the EXISTING-diagram
+  // counterpart — same browser editor, against the selected row's path.)
   //
   // Auto-register on first non-blank save is handled by the existing
   // `diagram-changed` event handler below — when an `edit` payload
@@ -403,6 +375,29 @@
       });
       toast.info(`Opening ${type} editor in your default browser…`);
       console.info('[diagrams] open_diagrams_editor →', url);
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      openingVisualEditor = false;
+    }
+  }
+
+  // "Edit in browser" for the CURRENTLY-SELECTED diagram (v0.2.61).
+  // Opens the same self-hosted browser editor against the existing
+  // file's path (open_diagram_editor_for_path), rather than creating a
+  // new visual-draft/ file. Works for both mermaid and excalidraw — the
+  // launcher no longer embeds an editor in the Tauri WebView.
+  async function openVisualEditorForSelected() {
+    if (!selected) return;
+    openingVisualEditor = true;
+    try {
+      const url = await invoke<string>('open_diagram_editor_for_path', {
+        projectId,
+        diagramType: selected.diagram_type,
+        relPath: selected.file_path,
+      });
+      toast.info(`Opening ${selected.diagram_type} editor in your default browser…`);
+      console.info('[diagrams] open_diagram_editor_for_path →', url);
     } catch (e) {
       toast.error(e);
     } finally {
@@ -529,119 +524,13 @@
   let creatingSnapshot = $state(false);
   let mermaidModulePromise: Promise<typeof import('mermaid').default> | null = null;
 
-  // ─── Excalidraw embedded editor state (Phase 2, 2026-05-25) ──────────
-  // The embedded React-in-Svelte editor mounts via ExcalidrawEditor.svelte
-  // when the selected diagram is .excalidraw AND the runtime environment
-  // doesn't trip the Wayland+webkit2gtk fallback. The fallback path
-  // shows an "Open externally" prompt instead of an inline editor — see
-  // docs/EXCALIDRAW_WAYLAND_TEST.md for the threshold + rationale.
-  //
-  // `excalidrawSource` is the JSON string read from disk; passed into
-  // the editor as `initialSceneJson`. The editor calls back with the
-  // serialised scene on every (debounced 300ms) change.
-  let excalidrawSource = $state<string>('');
-  let excalidrawLoading = $state(false);
-  let excalidrawWaylandFallback = $state<boolean | null>(null); // null = unchecked
-  let excalidrawExportSvg = $state<(() => Promise<string | null>) | null>(null);
-
-  async function detectExcalidrawFallback(): Promise<boolean> {
-    // Wayland + webkit2gtk has documented canvas latency / pointer
-    // event issues for Excalidraw (plan §4 Risk 5, docs/
-    // EXCALIDRAW_WAYLAND_TEST.md). Two signals trigger the fallback:
-    //   1. Tauri exposes XDG_SESSION_TYPE via an env-read command
-    //      (best signal; only fires when the launcher backend confirms
-    //      Wayland is the active session type).
-    //   2. Navigator UA contains "WebKit" (covers webkit2gtk webview,
-    //      Safari, and Tauri's macOS WebKit — macOS is fine, but the
-    //      env-read signal disambiguates).
-    //
-    // We require BOTH signals before falling back so we don't
-    // accidentally disable the embed for Safari users testing the
-    // launcher in a browser preview (rare but possible).
-    try {
-      const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
-      const hasWebkit = /WebKit/i.test(ua);
-      let sessionType = '';
-      try {
-        sessionType = await invoke<string>('read_env_var', {
-          name: 'XDG_SESSION_TYPE',
-        });
-      } catch {
-        // Backend command not present → skip the env check; fall back
-        // only on a webview confirmation later, never silently.
-        sessionType = '';
-      }
-      const isWayland = sessionType.toLowerCase() === 'wayland';
-      return hasWebkit && isWayland;
-    } catch {
-      return false;
-    }
-  }
-
-  async function loadExcalidrawSource() {
-    if (!selected) {
-      excalidrawSource = '';
-      return;
-    }
-    excalidrawLoading = true;
-    try {
-      const txt = await readFile(selected.file_path);
-      excalidrawSource = txt;
-    } catch (e) {
-      // File doesn't exist yet (just-registered diagram with no
-      // starter content) — boot empty.
-      console.info('[diagrams] excalidraw source unreadable, booting empty:', e);
-      excalidrawSource = '';
-    } finally {
-      excalidrawLoading = false;
-    }
-  }
-
-  async function saveExcalidrawSource(sceneJsonString: string) {
-    if (!selected) return;
-    // Resolve relative file_path → absolute (the existing helper
-    // `resolve_project_path` already does this for Open in editor).
-    try {
-      const absPath = await invoke<string>('resolve_project_path', {
-        projectId,
-        relPath: selected.file_path,
-      });
-      await invoke('write_text_file', {
-        path: absPath,
-        contents: sceneJsonString,
-      });
-      // The PostToolUse hook on Write(.claude/diagrams/**) will fire
-      // the indexer; we don't need to invoke it here. The live-push
-      // subscription will refresh `diagrams` in turn.
-    } catch (e) {
-      // Surface a single toast per session-of-failures rather than
-      // one per debounced save; the editor will retry on next change.
-      console.warn('[diagrams] excalidraw save failed:', e);
-      toast.error(e);
-    }
-  }
-
-  async function exportExcalidrawSvg() {
-    if (!selected || selected.diagram_type !== 'excalidraw') return;
-    if (!excalidrawExportSvg) return;
-    try {
-      const svg = await excalidrawExportSvg();
-      if (!svg) {
-        toast.error('Excalidraw export returned nothing — try again.');
-        return;
-      }
-      const { save } = await import('@tauri-apps/plugin-dialog');
-      const path = await save({
-        defaultPath: `${selected.diagram_name}.svg`,
-        filters: [{ name: 'SVG', extensions: ['svg'] }],
-      });
-      if (!path) return;
-      await invoke('write_text_file', { path, contents: svg });
-      toast.success('SVG exported');
-    } catch (e) {
-      toast.error(e);
-    }
-  }
+  // (v0.2.61) Excalidraw is no longer embedded in the Tauri WebView —
+  // it's edited in the user's default browser via the self-hosted editor
+  // (openVisualEditorForSelected → open_diagram_editor_for_path). The
+  // old embedded-editor state (excalidrawSource/Loading/exportSvg) +
+  // Wayland+webkit2gtk fallback detection were removed; the launcher
+  // never reads/writes the Excalidraw scene JSON directly anymore (the
+  // browser editor owns load via GET /file + save via POST /save).
 
   async function ensureMermaid() {
     if (!mermaidModulePromise) {
@@ -717,14 +606,12 @@
         previewError = e instanceof Error ? e.message : String(e);
       }
     } else {
-      // Excalidraw embedded editor (Phase 2, 2026-05-25). The actual
-      // canvas lives in <ExcalidrawEditor>; this branch just loads the
-      // on-disk JSON source so the editor's `initialSceneJson` prop is
-      // current. The Mermaid-specific `previewSvg`/`previewError` are
-      // unused for excalidraw rows.
+      // Excalidraw rows have no in-pane preview (v0.2.61) — the canvas
+      // can't render in the Tauri WebView, so the pane shows an "Edit in
+      // browser" launchpad instead. The Mermaid-specific
+      // previewSvg/previewError are simply cleared for excalidraw rows.
       previewSvg = '';
       previewError = null;
-      await loadExcalidrawSource();
     }
   }
 
@@ -870,19 +757,8 @@
   // ─── Lifecycle ───────────────────────────────────────────────────────
   onMount(async () => {
     await loadModuleState();
-    // Run Wayland detection in parallel with the module-state load —
-    // it's a single env-var read so cost is negligible, but we want
-    // the result settled before the user clicks on an excalidraw row.
-    void detectExcalidrawFallback().then((flag) => {
-      excalidrawWaylandFallback = flag;
-      if (flag) {
-        console.warn(
-          '[diagrams] Wayland+webkit2gtk detected — Excalidraw ' +
-          'embedded editor disabled, will fall back to Open externally. ' +
-          'See docs/EXCALIDRAW_WAYLAND_TEST.md',
-        );
-      }
-    });
+    // (v0.2.61) No Wayland+webkit2gtk detection anymore — Excalidraw is
+    // edited in the default browser, which sidesteps the WebView entirely.
     if (moduleActive) {
       await load();
       await subscribeToChanges();
@@ -972,17 +848,15 @@
     <div class="diagrams-split" class:dimmed={moduleToggling}>
       <!-- ─── Left pane: list + add ───────────────────────────────────── -->
       <aside class="diagrams-list" aria-label="Project diagrams list">
-        <!-- v0.2.35 Agent L: three creation affordances live here.
-             "+ Add diagram" registers an externally-created file (legacy
-             v0.2.34 flow). "Draw Mermaid (text)" / "Draw Mermaid (visual)"
-             / "Draw Excalidraw (visual)" each open a different editor:
-             - text: inline textarea + preview (still works; useful for
-               code-first users).
-             - visual: opens the vendored editor in the user's default
-               browser via the local diagrams-editor HTTP server
-               (v0.2.36 Agent R rework). Replaces the previously-broken
-               embedded Excalidraw editor that rendered as enormous
-               icons in the Tauri WebView on Wayland+webkit2gtk. -->
+        <!-- Creation affordances. "+ Add diagram" registers an
+             externally-created file (legacy v0.2.34 flow). "Draw Mermaid"
+             / "Draw Excalidraw" each open the self-hosted visual editor
+             in the user's DEFAULT BROWSER via the local diagrams-editor
+             HTTP server. (v0.2.61: unified — both editors are now
+             browser-served; the old in-WebView embedded editors are
+             gone, so there's no separate "text" vs "visual" split and no
+             Wayland+webkit2gtk fallback to worry about.) Save
+             auto-registers the new diagram. -->
         <div class="diagrams-list-header">
           <button
             class="ps-btn-primary"
@@ -993,24 +867,17 @@
           </button>
           <button
             class="ps-btn-secondary"
-            onclick={() => startDrawing('mermaid')}
-            title="Draft a new Mermaid diagram inline (textarea + live preview); save auto-registers it."
-          >
-            Draw Mermaid (text)
-          </button>
-          <button
-            class="ps-btn-secondary"
             onclick={() => openVisualEditor('mermaid')}
             disabled={openingVisualEditor}
-            title="Open a vendored Mermaid visual editor in your default browser. Save auto-registers it."
+            title="Open the Mermaid editor in your default browser. Save auto-registers the new diagram."
           >
-            Draw Mermaid (visual)
+            Draw Mermaid
           </button>
           <button
             class="ps-btn-secondary"
             onclick={() => openVisualEditor('excalidraw')}
             disabled={openingVisualEditor}
-            title="Open the Excalidraw workflow page in your default browser (draw at excalidraw.com, export, then drag the file into the Diagrams tab)."
+            title="Open the Excalidraw editor in your default browser. Save auto-registers the new diagram."
           >
             Draw Excalidraw
           </button>
@@ -1178,99 +1045,60 @@
       <!-- ─── Right pane: preview + actions ───────────────────────────── -->
       <main class="diagrams-preview" aria-label="Diagram preview">
         {#if draftingType !== null}
-          <!-- v0.2.35 Agent L: draft state. Right pane is owned by the
-               inline editor (MermaidEditor or ExcalidrawEditor) until
-               the user clicks "Save as new" (opens the name/category
-               dialog) or "Cancel" (discards the draft). -->
+          <!-- Drag-drop import pending (v0.2.61). The drop handler reads
+               the dropped .mmd/.excalidraw file's content into the draft
+               slot and opens this name/category dialog — the only
+               remaining use of the "draft" state now that creation goes
+               through the browser editor (open*Visual*Editor). No inline
+               editor here: the content is already in hand from the file.
+               "Cancel" discards the pending import. -->
           <div class="diagrams-preview-toolbar">
-            <strong>Drafting new {draftingType} diagram</strong>
-            <span class="ps-tag diagrams-tag-kind">draft</span>
+            <strong>Import {draftingType} diagram</strong>
+            <span class="ps-tag diagrams-tag-kind">import</span>
             <span class="diagrams-preview-spacer"></span>
-            <button
-              class="ps-btn-primary"
-              onclick={openSaveDraftDialog}
-              disabled={savingDraft}
-              title="Register this draft as a new project diagram and write the file."
-            >
-              Save as new
-            </button>
             <button class="ps-btn-link" onclick={cancelDraft}>Cancel</button>
           </div>
-          <div class="diagrams-preview-body">
-            {#if draftingType === 'mermaid'}
-              <MermaidEditor bind:source={draftMermaidSource} diagramName="draft" />
-            {:else if excalidrawWaylandFallback}
-              <div class="diagrams-excalidraw-placeholder">
-                <p>
-                  Embedded Excalidraw editor disabled on Wayland +
-                  webkit2gtk (known canvas latency / pointer issue).
-                </p>
-                <p class="ps-hint">
-                  See <code>docs/EXCALIDRAW_WAYLAND_TEST.md</code> for the
-                  test recipe and reproduction steps. Cancel the draft and
-                  use an external editor instead.
-                </p>
-              </div>
-            {:else}
-              <ExcalidrawEditor
-                diagramName="draft"
-                initialSceneJson={draftExcalidrawSource}
-                onSave={async (json) => {
-                  draftExcalidrawSource = json;
-                }}
+          <!-- v0.2.35 (a11y, Agent O): "Modal-ish" inline form, not a
+               true modal — focus isn't trapped, backdrop doesn't block.
+               role="group" with aria-labelledby points to the visible
+               heading so SR users get the name without a false-modal
+               announcement. -->
+          <div class="diagrams-save-dialog" role="group" aria-labelledby="save-draft-heading">
+            <h4 id="save-draft-heading">Save imported diagram</h4>
+            <label class="ps-form-row">
+              <span>Name</span>
+              <input
+                bind:value={draftSaveName}
+                placeholder="login-form"
+                aria-label="Diagram name"
               />
-            {/if}
-          </div>
-
-          {#if showSaveDraftDialog}
-            <!-- v0.2.35 (a11y, Agent O): "Modal-ish" inline form, not a
-                 true modal — focus isn't trapped, backdrop doesn't
-                 block. role="dialog" was misleading; switched to
-                 role="group" with aria-labelledby pointing to the
-                 visible heading so SR users get the same name without
-                 the false-modal announcement. -->
-            <div class="diagrams-save-dialog" role="group" aria-labelledby="save-draft-heading">
-              <h4 id="save-draft-heading">Save draft as new diagram</h4>
-              <label class="ps-form-row">
-                <span>Name</span>
-                <input
-                  bind:value={draftSaveName}
-                  placeholder="login-form"
-                  aria-label="Diagram name"
-                />
-              </label>
-              <label class="ps-form-row">
-                <span>Category path</span>
-                <input
-                  bind:value={draftSaveCategory}
-                  placeholder="gui/auth"
-                  aria-label="Category path"
-                />
-              </label>
-              <p class="ps-hint">
-                Lowercase-kebab name; multi-level category path. File will
-                be written to
-                <code>
-                  .claude/diagrams/{draftSaveCategory || '<category>'}/{draftSaveName || '<name>'}.{draftingType === 'mermaid' ? 'mmd' : 'excalidraw'}
-                </code>.
-              </p>
-              <div class="diagrams-save-dialog-actions">
-                <button
-                  class="ps-btn-primary"
-                  onclick={saveDraft}
-                  disabled={savingDraft}
-                >
-                  {savingDraft ? 'Saving…' : 'Save'}
-                </button>
-                <button
-                  class="ps-btn-link"
-                  onclick={() => (showSaveDraftDialog = false)}
-                >
-                  Cancel
-                </button>
-              </div>
+            </label>
+            <label class="ps-form-row">
+              <span>Category path</span>
+              <input
+                bind:value={draftSaveCategory}
+                placeholder="gui/auth"
+                aria-label="Category path"
+              />
+            </label>
+            <p class="ps-hint">
+              {DIAGRAM_NAME_RULE} Multi-level category path. File will be
+              written to
+              <code>
+                .claude/diagrams/{draftSaveCategory || '<category>'}/{draftSaveName || '<name>'}.{draftingType === 'mermaid' ? 'mmd' : 'excalidraw'}
+              </code>.
+            </p>
+            <div class="diagrams-save-dialog-actions">
+              <button
+                class="ps-btn-primary"
+                onclick={saveDraft}
+                disabled={savingDraft}
+              >
+                {savingDraft ? 'Saving…' : 'Save'}
+              </button>
+              <button class="ps-btn-link" onclick={cancelDraft}>Cancel</button>
             </div>
-          {/if}
+          </div>
         {:else if !selected}
           <p class="ps-empty">Select a diagram on the left to preview.</p>
         {:else}
@@ -1280,6 +1108,14 @@
               {selected.diagram_kind ?? selected.diagram_type}
             </span>
             <span class="diagrams-preview-spacer"></span>
+            <button
+              class="ps-btn-primary"
+              onclick={openVisualEditorForSelected}
+              disabled={openingVisualEditor}
+              title="Open this diagram in the visual editor in your default browser. Edits save back to this file."
+            >
+              Edit in browser
+            </button>
             <button class="ps-btn-link" onclick={openInEditor} title="Open file in OS default editor">
               Open in editor
             </button>
@@ -1296,15 +1132,6 @@
                 onclick={exportSvg}
                 disabled={!previewSvg}
                 title="Save the rendered SVG to disk"
-              >
-                Export SVG
-              </button>
-            {:else if selected.diagram_type === 'excalidraw' && !excalidrawWaylandFallback}
-              <button
-                class="ps-btn-link"
-                onclick={exportExcalidrawSvg}
-                disabled={!excalidrawExportSvg}
-                title="Export the Excalidraw scene to SVG"
               >
                 Export SVG
               </button>
@@ -1330,36 +1157,26 @@
                 <p class="ps-loading">Rendering…</p>
               {/if}
             {:else}
-              <!-- Excalidraw branch (Phase 2, 2026-05-25). Three states:
-                   1. fallback triggered (Wayland+webkit2gtk) → "Open
-                      externally" prompt. Doc reference baked into the
-                      info text so the user can find the test recipe.
-                   2. source loading → spinner.
-                   3. ready → embedded editor mounted. -->
-              {#if excalidrawWaylandFallback}
-                <div class="diagrams-excalidraw-placeholder">
-                  <p>
-                    Embedded Excalidraw editor disabled on Wayland +
-                    webkit2gtk (known canvas latency / pointer issue).
-                  </p>
-                  <p class="ps-hint">
-                    See <code>docs/EXCALIDRAW_WAYLAND_TEST.md</code> for the
-                    test recipe and reproduction steps.
-                  </p>
-                  <button class="ps-btn-link" onclick={openInEditor}>
-                    Open in OS default editor
-                  </button>
-                </div>
-              {:else if excalidrawLoading}
-                <p class="ps-loading">Loading scene…</p>
-              {:else}
-                <ExcalidrawEditor
-                  diagramName={selected.diagram_name}
-                  initialSceneJson={excalidrawSource}
-                  onSave={saveExcalidrawSource}
-                  bind:exportSvgFn={excalidrawExportSvg}
-                />
-              {/if}
+              <!-- Excalidraw is edited in the browser (v0.2.61) — the
+                   Excalidraw canvas renders broken in the Tauri WebView
+                   on Wayland+webkit2gtk, so we don't embed it here.
+                   Selecting the row shows this launchpad; "Edit in
+                   browser" opens the self-hosted editor against this
+                   file. -->
+              <div class="diagrams-excalidraw-placeholder">
+                <p>This is an Excalidraw diagram.</p>
+                <p class="ps-hint">
+                  Open it in the visual editor in your default browser —
+                  your changes save straight back to this file.
+                </p>
+                <button
+                  class="ps-btn-primary"
+                  onclick={openVisualEditorForSelected}
+                  disabled={openingVisualEditor}
+                >
+                  Edit in browser
+                </button>
+              </div>
             {/if}
           </div>
 

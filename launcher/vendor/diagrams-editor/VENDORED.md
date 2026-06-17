@@ -10,8 +10,9 @@ local diagrams-editor HTTP server (commands/diagrams_local_server.rs).
 
 This directory contains static HTML/CSS/JS assets that the launcher
 serves on a local HTTP server (`127.0.0.1:<free-port>`) when the user
-clicks **Draw Mermaid (visual)** or **Draw Excalidraw (visual)** in the
-Diagrams tab. The page opens in the user's default browser via
+clicks **Draw Mermaid** or **Draw Excalidraw** in the Diagrams tab (or
+**Edit in browser** on a selected diagram). The page opens in the
+user's default browser via
 `tauri-plugin-opener::open_url` — NOT in the Tauri WebView, which has
 documented rendering issues with both libraries on Wayland + webkit2gtk.
 
@@ -40,9 +41,12 @@ The font self-hosting requirement is met by copying
 `dist/prod/fonts` into `fonts/` and pointing `window.EXCALIDRAW_ASSET_PATH`
 at the served editor root (`/excalidraw/`).
 
-The old embedded `ExcalidrawEditor.svelte` (broken on Wayland+webkit2gtk)
-is unrelated to this server-served editor and can be removed once its
-deep-linked tests are re-checked.
+v0.2.61 also unified the editing model: BOTH mermaid and excalidraw are
+now edited in the browser. The old in-WebView Svelte editors
+(`ExcalidrawEditor.svelte`, `MermaidEditor.svelte`) + the Excalidraw
+Wayland+webkit2gtk fallback were removed; "Draw …" and "Edit in browser"
+both route here. The launcher pane shows mermaid as a read-only SVG
+preview and excalidraw as an "Edit in browser" launchpad.
 
 ## Files
 
@@ -94,7 +98,7 @@ cd launcher
 npm install mermaid@<new-version>
 cp node_modules/mermaid/dist/mermaid.min.js vendor/diagrams-editor/mermaid/mermaid.min.js
 # Update the version line in this file's table above.
-# Smoke-test the editor by clicking "Draw Mermaid (visual)" in the Diagrams tab.
+# Smoke-test the editor by clicking "Draw Mermaid" in the Diagrams tab.
 ```
 
 ### Excalidraw
@@ -112,7 +116,7 @@ rm -rf vendor/diagrams-editor/excalidraw/fonts
 cp -r node_modules/@excalidraw/excalidraw/dist/prod/fonts \
       vendor/diagrams-editor/excalidraw/fonts
 # Update the version line in this file's table above.
-# Smoke-test: click "Draw Excalidraw (visual)" in the Diagrams tab → draw → Save
+# Smoke-test: click "Draw Excalidraw" in the Diagrams tab → draw → Save
 #   → confirm the .claude/diagrams/.../<name>.excalidraw file updates on disk.
 ```
 
