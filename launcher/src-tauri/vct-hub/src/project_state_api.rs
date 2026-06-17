@@ -5,8 +5,10 @@
 //! `vibecoded` CLI) can register state without going through the
 //! desktop UI.
 //!
-//! Bound to 127.0.0.1 only (see `hub::server::start_hub_server`). Auth
-//! is deferred — same security posture as `modules_api.rs`.
+//! Served on `0.0.0.0` since v0.2.61 (see `hub::server::start_hub_server`
+//! for why — global-module container reachability). The access control is
+//! the bearer token (`auth::require_auth`), NOT the bind address — same
+//! security posture as `modules_api.rs`.
 
 use axum::{
     extract::{Path, Query, State},

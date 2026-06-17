@@ -20,7 +20,9 @@
 //! Routing through the hub gives us:
 //!
 //!   * Single writer (launcher) + multiple read-only callers (wrappers).
-//!   * Same auth + 127.0.0.1 binding as the rest of the hub API.
+//!   * Same bearer-token auth as the rest of the hub API (which binds
+//!     `0.0.0.0` since v0.2.61 — the token, not the bind address, is the
+//!     gate; see `server::start_hub_server`).
 //!   * Cross-OS HTTP rather than cross-OS SQLite handle sharing.
 //!
 //! Routes

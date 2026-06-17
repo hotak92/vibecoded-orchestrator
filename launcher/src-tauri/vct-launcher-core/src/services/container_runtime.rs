@@ -829,6 +829,23 @@ pub fn build_podman_run_args_global(
         args.push("--restart=unless-stopped".into());
     }
 
+    // v0.2.61 (Option H, B2): make `host.containers.internal` resolve to
+    // the host gateway INSIDE the container, so the module can reach the
+    // hub via `VCT_HUB_BASE_URL=http://host.containers.internal:<port>`
+    // (the env pair the spawn site injects through `extra_env` — see the
+    // contract in the spawn site comment). `:host-gateway` is the
+    // podman/docker-managed magic value that the runtime substitutes for
+    // the actual host-gateway IP at container start, so we don't hard-code
+    // (or have to detect) a bridge IP here. Matches the existing Ollama
+    // wiring, which already hands containers
+    // `OLLAMA_URL=http://host.containers.internal:<port>` and relies on
+    // this same name resolving.
+    //
+    // Gated to container/service runtimes only — already guaranteed by the
+    // `runtime.r#type` check at function entry (we returned Err otherwise),
+    // so an unconditional push here applies exactly where it's needed.
+    args.push("--add-host=host.containers.internal:host-gateway".into());
+
     // v0.2.54 P0-4: GPU passthrough for variant-declaring modules.
     args.extend(gpu_passthrough_args(
         engine,
@@ -2509,6 +2526,42 @@ mod tests {
             .position(|a| a == "ghcr.io/x/y:0.2.10")
             .expect("image present");
         assert!(env_idx < image_idx, "extra_env must precede the image arg");
+    }
+
+    /// v0.2.61 (Option H, B2): the global builder must emit
+    /// `--add-host=host.containers.internal:host-gateway` so the container
+    /// can reach the hub via `VCT_HUB_BASE_URL=http://host.containers.internal:<port>`.
+    /// The flag must appear BEFORE the positional image arg (it's a
+    /// `podman run` option, not a CMD arg).
+    #[test]
+    fn v0261_build_podman_run_args_global_emits_add_host_host_gateway() {
+        let manifest = make_rl_manifest_global_for_test();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/x/y:0.2.10",
+            "podman",
+            None,
+            &[],
+        )
+        .expect("build");
+
+        let add_host_idx = args
+            .iter()
+            .position(|a| a == "--add-host=host.containers.internal:host-gateway")
+            .expect("global builder must emit --add-host=host.containers.internal:host-gateway");
+
+        let image_idx = args
+            .iter()
+            .position(|a| a == "ghcr.io/x/y:0.2.10")
+            .expect("image present");
+        assert!(
+            add_host_idx < image_idx,
+            "--add-host must be a run option (precede the image arg)"
+        );
     }
 
     /// Live podman CLI-surface check (same discipline as

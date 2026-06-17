@@ -619,11 +619,31 @@ pub async fn resume_containers_on_startup_with_starter(
             continue;
         }
 
-        // Short-circuit if container already running.
-        if let Some(ref container_name) = container_name_opt {
-            let running = is_container_running(container_name).await.unwrap_or(false);
-            if running {
-                continue;
+        // Short-circuit if container already running — but ONLY for
+        // PER-PROJECT rows. (v0.2.61, Option H BLOCKER-1 fix.)
+        //
+        // GLOBAL rows (project_id IS NULL) must NOT short-circuit on a
+        // running container: the module-identity token that the running
+        // container holds was minted into the PREVIOUS hub process's
+        // in-memory set (`module_identity`), which is empty after a hub
+        // restart. If we skip the re-spawn here, that live container keeps
+        // presenting a token the new hub no longer knows → every
+        // `/rl/events` read 401s, permanently, until something recreates
+        // the container. So for global rows we fall through to
+        // `start_global_container_supervisor` even when running: it's
+        // idempotent (`podman rm -f` + run) and re-mints + re-registers a
+        // fresh token, restoring the hub↔container contract. (Per-project
+        // module tokens live in the launcher.db `module_access_tokens`
+        // table and survive a hub restart, so their containers are safe to
+        // short-circuit.) The brief cost is one container recreate per hub
+        // boot for the global singleton — acceptable, and the only way the
+        // in-memory token set can be made to match a live container.
+        if project_id_opt.is_some() {
+            if let Some(ref container_name) = container_name_opt {
+                let running = is_container_running(container_name).await.unwrap_or(false);
+                if running {
+                    continue;
+                }
             }
         }
 
@@ -775,6 +795,56 @@ pub async fn resume_containers_on_startup_with_starter(
 /// Returns `Ok(container_name)` on success; the caller persists the
 /// container_name to the DB row. Returns `Err(...)` on any podman error
 /// or missing manifest field.
+/// Resolve the hub's ACTUAL listening port for building the
+/// container-facing `VCT_HUB_BASE_URL` (v0.2.61, Option H). Source order:
+///   1. `<vct_root_dir>/hub.port` — the real bound port the hub persisted
+///      at startup (`server::write_port_file`). Authoritative: the hub's
+///      `try_bind` walks past 7700 on collision, so the default may be
+///      wrong. We run inside the hub process, so this file is present.
+///   2. `$VCT_HUB_PORT` — the configured port (the hub's own first
+///      choice), used if the file is somehow unreadable.
+///   3. `7700` — the hard default, last resort.
+fn resolve_hub_base_port() -> u16 {
+    const DEFAULT_HUB_PORT: u16 = 7700;
+    let port_file = vct_launcher_core::paths::vct_root_dir().join("hub.port");
+    if let Ok(s) = std::fs::read_to_string(&port_file) {
+        if let Ok(p) = s.trim().parse::<u16>() {
+            return p;
+        }
+    }
+    std::env::var("VCT_HUB_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_HUB_PORT)
+}
+
+/// Per-module spawn serialization (v0.2.61, Option H CONCERN-1 fix).
+///
+/// Two callers can invoke `start_global_container_supervisor` for the SAME
+/// module near-simultaneously: the hub's own boot resume sweep, AND the
+/// launcher's resume/install path delegating in via
+/// `POST /modules/{id}/start`. Without serialization they race two
+/// `podman rm -f` + `mint_and_register` + `podman run` sequences on the
+/// same container name: the second `mint_and_register` drops the first's
+/// token (`module_identity` retains one token per module), so whichever
+/// container survives the name collision may hold a token that's no longer
+/// the registered one → 401. This per-module async lock makes the second
+/// concurrent spawn WAIT for the first to finish (then it does a clean
+/// rm -f + re-mint of its own), so the surviving container's token always
+/// matches the registry. Keyed by module_id; the map only ever holds a
+/// handful of entries (one per installed global module).
+fn module_spawn_lock(module_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("module spawn-lock registry poisoned");
+    guard
+        .entry(module_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 pub async fn start_global_container_supervisor(
     manifest: &ModuleManifest,
     module_id: &str,
@@ -797,6 +867,16 @@ pub async fn start_global_container_supervisor(
             runtime.r#type
         ));
     }
+
+    // v0.2.61 (Option H CONCERN-1): serialize concurrent spawns of THIS
+    // module so the hub-resume sweep and a launcher-delegated
+    // `/modules/{id}/start` can't race two rm -f + mint + run sequences
+    // (which would leave the surviving container holding a token the
+    // registry already dropped → 401). Held for the whole critical
+    // section below; a second caller waits here, then does its own clean
+    // recreate + re-mint.
+    let _spawn_lock = module_spawn_lock(module_id);
+    let _spawn_guard = _spawn_lock.lock().await;
 
     let name_template = runtime.resolve_container_name_template(&manifest.id);
     let container_name = resolve_global_container_name(&name_template, module_id)?;
@@ -851,7 +931,25 @@ pub async fn start_global_container_supervisor(
     // its training corpus, so failing loudly beats spawning a container
     // that 401s on every hub read.
     let module_token = crate::module_identity::mint_and_register(module_id)?;
-    let extra_env = vec![("VCT_MODULE_TOKEN".to_string(), module_token)];
+
+    // v0.2.61 (Option H, BLOCKER-INT fix): also inject VCT_HUB_BASE_URL so
+    // the container knows where the hub is. `build_podman_run_args_global`
+    // emits `--add-host=host.containers.internal:host-gateway`, making that
+    // hostname resolve to the host inside the container; combined with the
+    // hub binding 0.0.0.0 (server.rs), the container can reach the hub at
+    // `http://host.containers.internal:<actual hub port>`. The port is the
+    // hub's ACTUAL bound port (server.rs walks past 7700 on collision and
+    // persists the real one to `hub.port`), NOT the hard-coded default —
+    // so we read it from the port file the hub wrote at startup, falling
+    // back to $VCT_HUB_PORT → 7700 only if the file is unreadable.
+    let hub_port = resolve_hub_base_port();
+    let extra_env = vec![
+        ("VCT_MODULE_TOKEN".to_string(), module_token),
+        (
+            "VCT_HUB_BASE_URL".to_string(),
+            format!("http://host.containers.internal:{}", hub_port),
+        ),
+    ];
 
     let args = build_podman_run_args_global(
         manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image, &podman, gpu_mode,

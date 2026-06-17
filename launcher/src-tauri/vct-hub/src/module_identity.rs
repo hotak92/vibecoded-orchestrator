@@ -84,9 +84,22 @@ pub fn resolve_module(token: &str) -> Option<String> {
     guard.as_ref()?.get(token).cloned()
 }
 
-/// Drop a module's identity token (e.g. on explicit container stop /
-/// uninstall). Best-effort; a poisoned mutex is a no-op (the worst case
-/// is a dead token lingering until the next hub restart clears the set).
+/// Drop a module's identity token. Available for an explicit
+/// container-stop / uninstall hook to call.
+///
+/// NOTE (v0.2.61): not yet wired into a production stop/uninstall path —
+/// there is no hub-side GLOBAL-module-stop route today (the hub's
+/// `module_stop` is per-project; global uninstall runs launcher-side in a
+/// DIFFERENT process that can't reach this in-memory map). Wiring it would
+/// need a new hub revoke endpoint, which isn't warranted: the exposure is
+/// minimal and self-clearing — the token lives ONLY in memory (dies with
+/// the hub process), `mint_and_register`'s `retain` drops a module's prior
+/// token on every re-spawn, and a stopped/uninstalled container is gone so
+/// it can't present the lingering token anyway. So a dead token's only
+/// window is "until the next hub restart or re-spawn", with no live holder.
+/// Kept + tested so a future explicit-revoke hook (or a hub global-stop
+/// route) has the primitive ready. Best-effort; a poisoned mutex is a
+/// no-op (worst case: the dead token lingers until the next hub restart).
 pub fn revoke(module_id: &str) {
     if let Ok(mut guard) = MODULE_IDENTITY_TOKENS.lock() {
         if let Some(map) = guard.as_mut() {

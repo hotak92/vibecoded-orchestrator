@@ -2,14 +2,21 @@
 //!
 //! ─── Why this exists ────────────────────────────────────────────────
 //!
-//! The hub binds `127.0.0.1:7700`. Without authentication, ANY process
-//! running as the same OS user can curl `http://localhost:7700/api/v1
-//! /projects/<id>/env` and exfiltrate every secret the launcher's
-//! keychain has marked active for that project. This is a real attack
-//! class (rogue `npm install`, `pip install`, `cargo install`, browser
-//! extension calling fetch on localhost, etc.) that has hit other
-//! localhost-bound daemons (Docker, Bun's dev server, several
-//! CI-injected typosquats).
+//! The hub binds `0.0.0.0:7700` (v0.2.61, Option H — see the bind-site
+//! comment in `server::start_hub_server` for the full rationale). It must
+//! be reachable from a global module's CONTAINER network namespace, and
+//! `host.containers.internal` maps to a different host address per
+//! container runtime, so listening on all interfaces is the only
+//! runtime-agnostic way to be reachable — with the BEARER TOKEN, not the
+//! bind address, as the access control. Without authentication, ANY
+//! process that can reach the port could curl
+//! `http://<host>:7700/api/v1/projects/<id>/env` and exfiltrate every
+//! secret the launcher's keychain has marked active for that project.
+//! This is a real attack class (rogue `npm install`, `pip install`,
+//! `cargo install`, browser extension calling fetch on localhost, etc.)
+//! that has hit other localhost-bound daemons (Docker, Bun's dev server,
+//! several CI-injected typosquats) — and, post-0.0.0.0, also a same-LAN
+//! peer. The token gate is what stops all of them.
 //!
 //! The fix: every hub startup generates a fresh 32-byte token from the
 //! OS CSPRNG, persists it to `<vct_root_dir>/hub.token` (mode 0o600 on
@@ -72,7 +79,15 @@
 //!   protection level as other localhost daemons (Docker socket
 //!   permissions, etc.).
 //!
-//! * Network adversary — out of scope, hub binds 127.0.0.1 only.
+//! * Network adversary — since v0.2.61 the hub binds `0.0.0.0` (so a
+//!   global module's container can reach it; see `server::start_hub_server`),
+//!   so a same-LAN peer CAN now reach the port. The bearer-token gate is
+//!   what stops them: every `/api/v1/*` route requires the 256-bit
+//!   `hub.token` (or, for module routes, the per-module ephemeral token),
+//!   so a network peer without the token gets 401 exactly like an
+//!   unauthorized local process. The token, not the bind address, is the
+//!   boundary. (A LAN attacker who can ALSO read `<vct_root_dir>/hub.token`
+//!   off this host is already the same-user-RCE case above.)
 
 use std::path::PathBuf;
 use std::sync::Arc;

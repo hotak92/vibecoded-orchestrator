@@ -573,6 +573,25 @@ pub async fn start_global_container_for_module(
         }
     }
 
+    // (1b) Wait for the hub to actually be LISTENING before delegating.
+    // (v0.2.61, Option H BLOCKER-2 fix.) `ensure_hub_running()` returns
+    // `Started` as soon as it forks `vct-hub --start-if-not-running` and
+    // that exits 0 (~100ms) — it does NOT block until the hub binds its
+    // port. On a cold boot the delegated POST below would then race the
+    // hub's listener and get connection-refused, with no retry → the
+    // global module silently fails to start. So poll the unauthenticated
+    // `/api/v1/health` liveness endpoint with a short backoff until the
+    // hub answers (or we give up and fail loudly, same no-silent-skip
+    // contract as above).
+    if let Err(e) = wait_for_hub_ready().await {
+        return Err(format!(
+            "cannot start global container '{}': vct-hub was started but did not \
+             become ready in time ({}). It may still be binding its port; retry \
+             shortly.",
+            module_id, e
+        ));
+    }
+
     // (2) Delegate the actual spawn to the hub. The hub resolves the
     // container name, pre-pulls (with auth), force-removes any stale
     // same-named container, runs podman with the injected token, and
@@ -1076,6 +1095,45 @@ async fn hub_proxy_module_stop(project_id: &str, module_id: &str) -> Result<(), 
 /// container that 401s on every hub module-scoped data read. See the
 /// `start_global_container_for_module` docstring for the full rationale.
 ///
+/// Poll the hub's unauthenticated `/api/v1/health` liveness endpoint until
+/// it answers 2xx, or give up after a bounded backoff. (v0.2.61, Option H
+/// BLOCKER-2.) Used right after `ensure_hub_running()` returns `Started` —
+/// which only means "the start command was forked", not "the hub is
+/// listening" — so the subsequent delegated POST doesn't race the
+/// listener and connection-refuse on a cold boot.
+///
+/// Health is exempt from the hub.token gate (see hub `is_exempt_path`), so
+/// no token is needed here — this is purely a reachability probe.
+async fn wait_for_hub_ready() -> Result<(), String> {
+    // ~3s total: 10 attempts × 300ms. The hub binds within ~100ms of the
+    // forked start in practice; this leaves comfortable headroom on a
+    // loaded machine without making a genuinely-down hub hang the caller.
+    const ATTEMPTS: u32 = 10;
+    const DELAY_MS: u64 = 300;
+    let port = hub_port_for_proxy()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    let url = format!("http://127.0.0.1:{}/api/v1/health", port);
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
+        }
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "hub /api/v1/health not reachable on port {} after {} attempts (~{}ms)",
+        port,
+        ATTEMPTS,
+        ATTEMPTS as u64 * DELAY_MS
+    ))
+}
+
 /// Returns the resolved `container_name` from the `{"container_name": ...}`
 /// success envelope. On a hub error envelope
 /// (`{"error": {"code", "message"}}`) the `code` + `message` are folded

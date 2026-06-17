@@ -2,7 +2,10 @@
 //!
 //! These routes back the `vct` CLI (P6). They expose operations that
 //! were previously only callable via the GUI's Tauri commands. The
-//! routes are bound to 127.0.0.1 only, like the rest of the hub.
+//! routes are gated by the hub's bearer token (`auth::require_auth`), like
+//! the rest of the hub. (Since v0.2.61 the hub binds `0.0.0.0` rather than
+//! 127.0.0.1-only — see `server::start_hub_server` — so the token, not the
+//! bind address, is the access control.)
 //!
 //! Design choice: rather than scatter endpoints across modules, the
 //! CLI-facing routes live here as a single, self-documenting surface.
