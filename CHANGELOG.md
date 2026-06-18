@@ -9,9 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.62] - 2026-06-18
 
-v0.2.62 is a fix release: it unblocks `install.py --update` on machines without
-ROCm, points the Windows launcher shortcut at the right binary, and improves
-code-graph search quality.
+v0.2.62 unblocks `install.py --update` on machines without ROCm, adds a hub-side
+watchdog that keeps the infra containers alive, points the Windows launcher
+shortcut at the right binary, and improves code-graph search quality.
+
+### Added
+
+- **Hub-side infra-container watchdog.** `vct-hub` (the always-on background
+  service) now keeps the infra stack — `weaviate` / `ollama` / `code_embed` —
+  alive: a periodic task (default 45s; `VCT_HUB_INFRA_WATCHDOG_INTERVAL_SECS`;
+  opt-out `VCT_HUB_INFRA_WATCHDOG=0`) restarts a DOWN, VCO-managed, non-paused
+  infra container. Previously these were only started at launcher boot + by the
+  SessionStart hook, so a mid-session death went unhealed until the launcher
+  restarted. Guard rails: it restarts through the same GPU-overlay/CDI-aware
+  path the launcher uses (the `launch-claude-mcp-stack` wrapper), never touches
+  an adopted/parallel/refused service, honors a deliberate stop (the launcher's
+  stop commands drop a pause marker the watchdog respects; a start clears it),
+  honors the `launcher.services_watcher_enabled` toggle, and applies
+  crash-loop backoff (45s→…→30 min cap, give up after 5) so a flapping
+  container is never hammered. Soft-fail throughout — it never crashes the hub.
 
 ### Fixed
 
