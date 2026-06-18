@@ -1038,6 +1038,31 @@ pub async fn start_global_container_supervisor(
         return Ok(container_name);
     }
 
+    // v0.2.61 (Option H, re-audit CONCERN-5): single-choke-point finetune
+    // guard. The recreate below does `podman rm -f`, which HARD-KILLS a
+    // training job running in the live container. The resume sweep + the
+    // deferred-remint both already check the finetune sentinel BEFORE getting
+    // here, but a SECOND finetune can start in the gap between their check and
+    // this recreate (chained/back-to-back finetunes, or the deferred task's
+    // 30-min stale-backstop). Re-checking the sentinel HERE — inside the
+    // lock, immediately before rm-f, the one place EVERY recreate path flows
+    // through — closes that window for all callers. When a finetune is in
+    // flight we refuse to recreate a RUNNING container (the finetune talks
+    // DIRECTLY to the container, not through the hub, so it keeps working; the
+    // token-staleness self-heals on the next boot / deferred poll once the job
+    // ends). We only guard a RUNNING container: if it's down, there's no job
+    // to kill and the recreate must proceed.
+    if is_container_running(&container_name).await.unwrap_or(false)
+        && vct_launcher_core::paths::finetune_sentinel_path(module_id).exists()
+    {
+        return Err(format!(
+            "deferred: fine-tune in flight for {} (sentinel present) — refusing to \
+             recreate a running container that would kill the job; will re-mint \
+             after the job finishes",
+            module_id
+        ));
+    }
+
     let _ = Command::new(&podman)
         .silent()
         .args(["rm", "-f", &container_name])

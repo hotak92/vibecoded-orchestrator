@@ -5808,6 +5808,13 @@ def main() -> int:
     # NVIDIA hosts → Dockerfile.cuda. Anyone else (AMD ROCm / Apple
     # Silicon / CPU-only / unknown) → default Dockerfile (CPU multi-arch).
     embed_config["gpu_vendor"] = sysinfo.gpu_vendor or ""
+    # v0.2.61 (stale-embedding reconcile): if a stale ACTIVE_EMBEDDING=qwen3
+    # was inherited from the env / an OLD settings.json on hardware whose
+    # selector picked arctic (and no deliberate user choice exists), rewrite
+    # os.environ so every downstream reader (the seed-subprocess resolver +
+    # the .env / settings.json / env-template writers) uses the hardware
+    # model instead of re-cementing the value that times out KG sync on CPU.
+    _reconcile_install_active_embedding(embed_config, args)
     print(f"\n  Embedding mode: {embed_config['description']}")
 
     # Step 3b (PR-28, Group G, v0.2.12): storage-location prompt. Runs
@@ -10784,6 +10791,176 @@ def _resolve_active_embedding_for_install() -> "str | None":
     if db_value:
         return db_value.lower()
     return None
+
+
+# v0.2.61 (stale-embedding reconcile): the active_embedding profile slot
+# (qwen3 / arctic / openai) that the KG-text writer corresponds to. Mirrors
+# `_TEXT_MODEL_ACTIVE_EMBEDDING` but keyed by the KG-backend constant the
+# hardware selector returns, so we can map a `select_kg_embedding_backend`
+# result back to its active_embedding slot without going through the model id.
+_KG_BACKEND_ACTIVE_EMBEDDING = {
+    _KG_BACKEND_QWEN3: "qwen3",
+    _KG_BACKEND_ARCTIC: "arctic",
+    _KG_BACKEND_OPENAI: "openai",
+}
+
+
+def _decide_reconciled_active_embedding(
+    env_active: "str | None",
+    hardware_active: str,
+    deliberate_choice: bool,
+) -> "tuple[str, bool]":
+    """Pure decision: reconcile a possibly-stale ACTIVE_EMBEDDING.
+
+    v0.2.61 (stale-embedding reconcile). Background: a clone updated
+    v0.2.51→v0.2.60 on a CPU / low-RAM box carried a STALE
+    ``.claude/settings.json``/``.env`` ``ACTIVE_EMBEDDING=qwen3`` written by an
+    OLD install (before the hardware-aware selectors existed). On that
+    hardware ``select_kg_embedding_backend`` correctly picks arctic, but the
+    stale ``qwen3`` value wins at priority #1 in
+    ``_resolve_active_embedding_for_install`` and the settings/.env writers
+    re-cement it on every update → KG sync times out (qwen3-embedding on
+    CPU-only Ollama is ~30-60 s per embedding).
+
+    Reconciliation is intentionally NARROW + conservative — it fires only on
+    the exact known-failure shape so deliberate user choices and every other
+    hardware tier are left byte-for-byte untouched:
+
+    Decision table (first match wins):
+
+      | # | condition                                          | result                  |
+      |---|----------------------------------------------------|-------------------------|
+      | 1 | deliberate_choice is True                           | (env_active or hw, NO)  |
+      | 2 | env_active empty / None                              | (hardware_active, NO)   |
+      | 3 | env_active == hardware_active                        | (env_active, NO)        |
+      | 4 | env_active == "qwen3" AND hardware_active == "arctic"| (hardware_active, YES)  |
+      | 5 | env_active != hardware_active (any other mismatch)   | (env_active, NO)        |
+
+    Row 1 (deliberate): a CLI flag (``--openai-key`` / ``--low-resource`` /
+    ``--cpu-only``) or a launcher.db ``embedding.active_profile`` value means
+    the user stated a preference — honour it and NEVER reconcile. (When a
+    deliberate choice exists with no env value, we fall back to the env value
+    if present else the hardware pick, but the caller normally already
+    threaded the deliberate value into the env.)
+
+    Row 4 (the ONLY reconcile path): stale qwen3 on hardware whose selector
+    says arctic. This is almost always a leftover from a pre-selector install
+    and is the documented failure mode. We rewrite to the hardware pick.
+
+    Row 5 (other mismatch): a NON-default explicit value (e.g. env=arctic but
+    hw=qwen3, or env=openai) is honoured — the user (or a deliberate prior
+    install) chose a value the current detector wouldn't, and that is a
+    legitimate override we must not clobber.
+
+    Args:
+        env_active: ``os.environ["ACTIVE_EMBEDDING"]`` (lowercased / stripped
+            by the caller, or None / "" when unset).
+        hardware_active: the hardware-aware active_embedding slot, i.e.
+            ``embed_config["active_embedding"]`` from ``_choose_embedding_config``
+            (or a ``select_kg_embedding_backend`` result mapped via
+            ``_KG_BACKEND_ACTIVE_EMBEDDING``).
+        deliberate_choice: True when a CLI flag or launcher.db value pinned
+            the embedding mode (see rows 1).
+
+    Returns:
+        ``(resolved_active_embedding, was_reconciled)``. ``was_reconciled`` is
+        True only on row 4 — the caller uses it to emit the log notice +
+        rewrite the env. Idempotent: once the env holds the hardware pick,
+        row 3 short-circuits to (value, False) on the next run.
+    """
+    env = (env_active or "").strip().lower()
+    hw = (hardware_active or "").strip().lower() or "qwen3"
+
+    # Row 1: deliberate choice always wins, never reconciled.
+    if deliberate_choice:
+        return (env or hw, False)
+    # Row 2: nothing stale to reconcile — use the hardware pick.
+    if not env:
+        return (hw, False)
+    # Row 3: env already agrees with hardware — idempotent no-op.
+    if env == hw:
+        return (env, False)
+    # Row 4: the ONE known-failure shape — stale qwen3 where hardware says
+    # arctic (CPU / low-RAM host). Reconcile to the hardware pick.
+    if env == "qwen3" and hw == "arctic":
+        return (hw, True)
+    # Row 5: any other explicit mismatch is a legitimate override — honour it.
+    return (env, False)
+
+
+def _reconcile_install_active_embedding(
+    embed_config: dict,
+    args: "argparse.Namespace",
+) -> bool:
+    """Reconcile a stale ``ACTIVE_EMBEDDING`` env value against the hardware pick.
+
+    v0.2.61 (stale-embedding reconcile). Called once from the main install
+    flow right after ``_choose_embedding_config``. When the shell/env-inherited
+    ``ACTIVE_EMBEDDING`` is the stale ``qwen3`` default on hardware whose
+    selector picked arctic — AND the user expressed no deliberate choice — this
+    rewrites ``os.environ["ACTIVE_EMBEDDING"]`` (and ``EMBEDDING_MODEL``) to the
+    hardware pick so every downstream consumer is automatically correct:
+
+      * ``_resolve_active_embedding_for_install`` (env is priority #1) → seed
+        subprocess embeds with arctic, not qwen3.
+      * The ``.env`` / settings.json / env-template writers that read
+        ``os.environ.get("ACTIVE_EMBEDDING", ...)`` → persist the hardware pick
+        instead of re-cementing the stale value.
+
+    Deliberate choices are never touched (see
+    ``_decide_reconciled_active_embedding`` row 1): a CLI flag
+    (``--openai-key`` / ``--low-resource`` / ``--cpu-only``) or a launcher.db
+    ``embedding.active_profile`` value pins the mode and wins byte-for-byte.
+
+    Idempotent + safe on GPU / OpenAI / low-resource installs: the only path
+    that mutates anything is the exact stale-qwen3-vs-arctic shape; everything
+    else is a no-op.
+
+    Returns:
+        True iff a reconciliation happened (env was rewritten) — callers may
+        ignore the return; it exists for observability / tests.
+    """
+    hardware_active = str(embed_config.get("active_embedding") or "qwen3")
+
+    # Deliberate-choice signals:
+    #   (a) explicit CLI flags that bypass auto-detect in _choose_embedding_config
+    cli_flag = bool(
+        getattr(args, "openai_key", None)
+        or getattr(args, "low_resource", False)
+        or getattr(args, "cpu_only", False)
+    )
+    #   (b) a launcher.db embedding.active_profile value (GUI Identity tab)
+    db_choice = _read_active_embedding_from_app_state()
+    deliberate = cli_flag or bool(db_choice)
+
+    env_active = os.environ.get("ACTIVE_EMBEDDING", "").strip().lower()
+
+    resolved, was_reconciled = _decide_reconciled_active_embedding(
+        env_active=env_active,
+        hardware_active=hardware_active,
+        deliberate_choice=deliberate,
+    )
+
+    if not was_reconciled:
+        return False
+
+    # Stale value detected on this hardware — rewrite the env so every
+    # downstream reader (resolver + writers) picks the hardware model.
+    os.environ["ACTIVE_EMBEDDING"] = resolved
+    os.environ["EMBEDDING_MODEL"] = _model_id_for_active(resolved)
+
+    notice = (
+        f"[embedding] settings.json ACTIVE_EMBEDDING={env_active} is stale for "
+        f"this CPU hardware; auto-selected {resolved}. (Set it explicitly in "
+        f"the launcher Identity tab to override.)"
+    )
+    print(f"  {notice}")
+    _log_install_event(
+        "3/10", "info", "stale ACTIVE_EMBEDDING reconciled",
+        data={"stale": env_active, "reconciled_to": resolved,
+              "embedding_model": os.environ["EMBEDDING_MODEL"]},
+    )
+    return True
 
 
 def _subprocess_env_with_embedding(base_env: "dict[str, str] | None" = None) -> "dict[str, str]":
@@ -23854,6 +24031,13 @@ def _ensure_env_template(env_path: Path, project_name: str = "<project>",
         # v0.2.46 Decision B — symmetric READ gate. No legacy alias
         # because pre-v0.2.46 the read path was unconditional.
         "SHARED_KG_READ_DISABLED": "false",
+        # v0.2.61 (stale-embedding reconcile): os.environ["ACTIVE_EMBEDDING"]
+        # is reconciled upstream by `_reconcile_install_active_embedding`
+        # (called right after `_choose_embedding_config`). On the stale-qwen3-
+        # on-CPU shape it already holds the hardware pick (arctic) here, so
+        # this reader no longer re-cements the value that times out KG sync.
+        # A deliberate choice (CLI flag / launcher.db) is left untouched and
+        # flows through verbatim.
         "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
         "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
         "WEAVIATE_PORT": weaviate_port,
@@ -24108,6 +24292,12 @@ def _reconcile_env_keys(env_path: Path) -> dict:
         "SHARED_KG_OPT_OUT": "false",
         # v0.2.46 Decision B — symmetric READ gate.
         "SHARED_KG_READ_DISABLED": "false",
+        # v0.2.61 (stale-embedding reconcile): see the matching note in
+        # `_ensure_env_template`. os.environ["ACTIVE_EMBEDDING"] is already
+        # reconciled to the hardware pick (or a deliberate choice) by
+        # `_reconcile_install_active_embedding` before this additive-write
+        # runs, so a stale qwen3 is never re-appended for a CPU host whose
+        # selector chose arctic.
         "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
         "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
         "WEAVIATE_PORT": weaviate_port,

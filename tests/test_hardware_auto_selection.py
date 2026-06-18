@@ -43,6 +43,8 @@ from install import (
     _SUMMARY_BACKEND_QWEN35_9B,
     _SUMMARY_BACKEND_GEMMA,
     _SUMMARY_BACKEND_OPENAI,
+    _decide_reconciled_active_embedding,
+    _reconcile_install_active_embedding,
 )
 
 
@@ -421,3 +423,226 @@ class TestCpuCoresProbe:
         # outside contrived containerised CI.
         assert isinstance(n, int)
         assert n >= 1
+
+
+# ────────────────────────────────────────────────────────────────────
+# v0.2.61 — stale ACTIVE_EMBEDDING reconciliation
+# ────────────────────────────────────────────────────────────────────
+#
+# Background: a clone updated v0.2.51→v0.2.60 on a CPU / low-RAM box
+# carried a STALE settings.json/.env ACTIVE_EMBEDDING=qwen3 written by an
+# OLD install (pre hardware-aware selectors). On that hardware the KG
+# selector picks arctic, but the stale qwen3 won at priority #1 in the
+# resolver + the writers re-cemented it every update → KG sync timed out
+# (qwen3-embedding on CPU-only Ollama ~30-60s per embedding).
+#
+# The reconcile is intentionally NARROW: it only fires on the exact
+# stale-qwen3-vs-arctic shape and never touches a deliberate user choice
+# (CLI flag / launcher.db) nor any other hardware tier.
+
+
+class TestDecideReconciledActiveEmbedding:
+    """Pure decision function: `_decide_reconciled_active_embedding`."""
+
+    def test_stale_qwen3_cpu_arctic_reconciled(self) -> None:
+        """(a) stale qwen3 + CPU-hardware (arctic) + no deliberate → reconcile."""
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active="qwen3",
+            hardware_active="arctic",
+            deliberate_choice=False,
+        )
+        assert (resolved, was) == ("arctic", True)
+
+    def test_deliberate_choice_never_reconciled(self) -> None:
+        """(b/c) a deliberate choice (CLI flag OR launcher.db) is honoured.
+
+        Even on the stale-qwen3-vs-arctic shape, deliberate_choice=True
+        means the user pinned the mode — return the env value untouched.
+        """
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active="qwen3",
+            hardware_active="arctic",
+            deliberate_choice=True,
+        )
+        assert (resolved, was) == ("qwen3", False)
+
+    def test_gpu_hardware_qwen3_not_reconciled(self) -> None:
+        """(d) GPU host: env qwen3 == hardware qwen3 → no-op (qwen3 correct)."""
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active="qwen3",
+            hardware_active="qwen3",
+            deliberate_choice=False,
+        )
+        assert (resolved, was) == ("qwen3", False)
+
+    def test_empty_env_uses_hardware_pick(self) -> None:
+        """No env value → use the hardware pick, but that's not a 'reconcile'."""
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active="",
+            hardware_active="arctic",
+            deliberate_choice=False,
+        )
+        assert (resolved, was) == ("arctic", False)
+
+    def test_none_env_uses_hardware_pick(self) -> None:
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active=None,
+            hardware_active="qwen3",
+            deliberate_choice=False,
+        )
+        assert (resolved, was) == ("qwen3", False)
+
+    def test_explicit_non_default_mismatch_honoured(self) -> None:
+        """Row 5: env=arctic but hardware=qwen3 is a legit override → honour env.
+
+        The user (or a prior deliberate install) chose arctic on a host the
+        current detector would put on qwen3. NOT the known-failure shape, so
+        we must NOT clobber it.
+        """
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active="arctic",
+            hardware_active="qwen3",
+            deliberate_choice=False,
+        )
+        assert (resolved, was) == ("arctic", False)
+
+    def test_explicit_openai_env_honoured(self) -> None:
+        """env=openai on arctic hardware is an explicit override → honour env."""
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active="openai",
+            hardware_active="arctic",
+            deliberate_choice=False,
+        )
+        assert (resolved, was) == ("openai", False)
+
+    def test_idempotent_after_reconcile(self) -> None:
+        """Once the env holds arctic (post-reconcile), re-running is a no-op."""
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active="arctic",
+            hardware_active="arctic",
+            deliberate_choice=False,
+        )
+        assert (resolved, was) == ("arctic", False)
+
+    def test_case_and_whitespace_normalised(self) -> None:
+        """Mixed-case / padded stale value still matches the known shape."""
+        resolved, was = _decide_reconciled_active_embedding(
+            env_active="  QWEN3  ",
+            hardware_active="ARCTIC",
+            deliberate_choice=False,
+        )
+        assert (resolved, was) == ("arctic", True)
+
+
+class _StubArgs:
+    """Minimal argparse.Namespace stand-in for the reconcile wrapper."""
+
+    def __init__(self, *, openai_key=None, low_resource=False, cpu_only=False):
+        self.openai_key = openai_key
+        self.low_resource = low_resource
+        self.cpu_only = cpu_only
+
+
+class TestReconcileInstallActiveEmbedding:
+    """Impure wrapper: `_reconcile_install_active_embedding` (env + launcher.db)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        """Each test controls ACTIVE_EMBEDDING / EMBEDDING_MODEL explicitly."""
+        monkeypatch.delenv("ACTIVE_EMBEDDING", raising=False)
+        monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+        # Default: no launcher.db deliberate choice unless a test sets one.
+        monkeypatch.setattr(
+            "install._read_active_embedding_from_app_state",
+            lambda: None,
+        )
+        yield
+
+    def test_a_stale_qwen3_cpu_no_choice_reconciled_to_arctic(self, monkeypatch):
+        """(a) stale qwen3 + CPU-hardware + no deliberate choice → arctic.
+
+        Rewrites os.environ ACTIVE_EMBEDDING + EMBEDDING_MODEL to arctic.
+        """
+        monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
+        embed_config = {"active_embedding": "arctic"}  # low_resource profile pick
+        did = _reconcile_install_active_embedding(embed_config, _StubArgs())
+        assert did is True
+        import os as _os
+        assert _os.environ["ACTIVE_EMBEDDING"] == "arctic"
+        assert _os.environ["EMBEDDING_MODEL"] == "snowflake-arctic-embed2:latest"
+
+    def test_b_deliberate_launcher_db_choice_not_reconciled(self, monkeypatch):
+        """(b) launcher.db embedding.active_profile set → NOT reconciled."""
+        monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
+        monkeypatch.setattr(
+            "install._read_active_embedding_from_app_state",
+            lambda: "qwen3",
+        )
+        embed_config = {"active_embedding": "arctic"}
+        did = _reconcile_install_active_embedding(embed_config, _StubArgs())
+        assert did is False
+        import os as _os
+        # env left untouched — the GUI choice wins byte-for-byte.
+        assert _os.environ["ACTIVE_EMBEDDING"] == "qwen3"
+        assert "EMBEDDING_MODEL" not in _os.environ
+
+    def test_c_cli_flag_not_reconciled(self, monkeypatch):
+        """(c) a CLI flag (--low-resource) → NOT reconciled."""
+        monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
+        embed_config = {"active_embedding": "arctic"}
+        did = _reconcile_install_active_embedding(
+            embed_config, _StubArgs(low_resource=True),
+        )
+        assert did is False
+        import os as _os
+        assert _os.environ["ACTIVE_EMBEDDING"] == "qwen3"
+
+    def test_c_cpu_only_flag_not_reconciled(self, monkeypatch):
+        monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
+        embed_config = {"active_embedding": "arctic"}
+        did = _reconcile_install_active_embedding(
+            embed_config, _StubArgs(cpu_only=True),
+        )
+        assert did is False
+
+    def test_c_openai_key_flag_not_reconciled(self, monkeypatch):
+        monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
+        embed_config = {"active_embedding": "arctic"}
+        did = _reconcile_install_active_embedding(
+            embed_config, _StubArgs(openai_key="sk-test"),
+        )
+        assert did is False
+
+    def test_d_gpu_hardware_qwen3_not_reconciled(self, monkeypatch):
+        """(d) GPU host: env qwen3 + hardware qwen3 → no-op (qwen3 correct)."""
+        monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
+        embed_config = {"active_embedding": "qwen3"}  # gpu/cpu profile pick
+        did = _reconcile_install_active_embedding(embed_config, _StubArgs())
+        assert did is False
+        import os as _os
+        assert _os.environ["ACTIVE_EMBEDDING"] == "qwen3"
+
+    def test_no_env_value_is_noop(self, monkeypatch):
+        """No inherited env → nothing to reconcile (writers use embed_config)."""
+        embed_config = {"active_embedding": "arctic"}
+        did = _reconcile_install_active_embedding(embed_config, _StubArgs())
+        assert did is False
+        import os as _os
+        assert "ACTIVE_EMBEDDING" not in _os.environ
+
+    def test_explicit_non_default_env_honoured(self, monkeypatch):
+        """env=arctic on qwen3 hardware is a legit override → not reconciled."""
+        monkeypatch.setenv("ACTIVE_EMBEDDING", "arctic")
+        embed_config = {"active_embedding": "qwen3"}
+        did = _reconcile_install_active_embedding(embed_config, _StubArgs())
+        assert did is False
+        import os as _os
+        assert _os.environ["ACTIVE_EMBEDDING"] == "arctic"
+
+    def test_idempotent_second_run(self, monkeypatch):
+        """After a reconcile sets env=arctic, a second call is a no-op."""
+        monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
+        embed_config = {"active_embedding": "arctic"}
+        assert _reconcile_install_active_embedding(embed_config, _StubArgs()) is True
+        # env now arctic; re-run must not "re-reconcile".
+        assert _reconcile_install_active_embedding(embed_config, _StubArgs()) is False
