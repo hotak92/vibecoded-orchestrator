@@ -2,35 +2,42 @@
 <!--
 SPDX-License-Identifier: AGPL-3.0-or-later
 
-Excalidraw bridge page (v0.2.36 Agent R).
+Self-hosted Excalidraw visual editor. Served by the launcher's local
+diagrams-editor HTTP server (commands/diagrams_local_server.rs) when the
+user clicks "Draw Excalidraw (visual)" in DiagramsTab.svelte.
 
-Honest scope statement: in v0.2.36 we DO NOT ship a fully self-hosted
-Excalidraw SPA. The @excalidraw/excalidraw npm bundle ships as ES
-modules with bare imports (react, react-dom, jotai, @radix-ui/*, etc.)
-and making it run standalone without a bundler is several hours of
-build-system work that didn't fit a single-agent v0.2.36 slot.
-
-What this page does INSTEAD: it explains the v0.2.36 workflow — draw
-the diagram at excalidraw.com (the upstream-hosted editor), export it
-as a `.excalidraw` file, then drag the file into the launcher's
-DiagramsTab drop zone (Agent L's v0.2.35 work). The drop zone
-auto-registers the diagram + creates the file under
-`<project>/.claude/diagrams/<category>/<name>.excalidraw`.
-
-The full-vendored Excalidraw SPA is queued for v0.2.37. Tracked in
-the agent summary returned to the main chat.
+The page opens in the user's DEFAULT BROWSER, NOT in the Tauri WebView —
+Excalidraw renders broken on Wayland + webkit2gtk (docs/EXCALIDRAW_WAYLAND_TEST.md),
+which is the whole reason for the local-server-in-browser design.
 
 The URL contract (matches mermaid/index.html for symmetry):
-    http://127.0.0.1:<port>/excalidraw/?file=<rel_path>
+    http://127.0.0.1:<port>/excalidraw/?file=<rel_path>#token=<hex>
 
-`<rel_path>` is informational on this page — we display it so the
-user knows which file the launcher pre-created for them.
+`<rel_path>` is the project-relative path of the .excalidraw file the
+launcher created or pre-existed. The page:
+    1. On load, GET /file?path=<rel_path> to populate the canvas
+       (404 / empty body = blank new file).
+    2. On Save, serialize the scene and POST it to
+       /save?path=<rel_path> with `Authorization: Bearer <#token>`.
+    3. The launcher's filesystem watcher (commands/diagram_watcher.rs)
+       picks up the change and auto-registers the diagram on first edit.
+
+Assets are 100% self-hosted (no CDN):
+    - excalidraw.bundle.js  — react + react-dom + @excalidraw + glue
+                              (built by src/build.mjs; see VENDORED.md)
+    - excalidraw.bundle.css — Excalidraw's stylesheet
+    - css-fonts/            — the small UI font (Assistant), referenced
+                              by the CSS @font-face url()s
+    - fonts/               — the hand-drawn CANVAS fonts (Excalifont,
+                              Virgil, Cascadia, CJK, …), loaded at
+                              runtime via window.EXCALIDRAW_ASSET_PATH.
 -->
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>VCO — Excalidraw (v0.2.36 bridge)</title>
+    <title>VCO — Excalidraw editor</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="./excalidraw.bundle.css" />
     <style>
       :root {
         --bg: #1e1e1e;
@@ -39,7 +46,8 @@ user knows which file the launcher pre-created for them.
         --accent-hover: #2563eb;
         --border: #3a3a3a;
         --panel: #252525;
-        --muted: #8a8a8a;
+        --error: #ef4444;
+        --success: #10b981;
       }
       * { box-sizing: border-box; }
       html, body {
@@ -49,163 +57,82 @@ user knows which file the launcher pre-created for them.
         color: var(--fg);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         font-size: 14px;
-        line-height: 1.5;
       }
       header {
-        padding: 16px 32px;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 8px 16px;
         background: var(--panel);
         border-bottom: 1px solid var(--border);
+        height: 48px;
       }
       header h1 {
-        font-size: 18px;
+        font-size: 14px;
         margin: 0;
         font-weight: 600;
       }
-      header .subtitle {
-        font-size: 13px;
-        color: var(--muted);
-        margin-top: 4px;
-      }
-      main {
-        max-width: 720px;
-        margin: 0 auto;
-        padding: 32px;
-      }
-      .step {
-        background: var(--panel);
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        padding: 20px 24px;
-        margin-bottom: 16px;
-      }
-      .step .num {
-        display: inline-block;
-        background: var(--accent);
-        color: white;
-        width: 28px;
-        height: 28px;
-        line-height: 28px;
-        text-align: center;
-        border-radius: 50%;
-        font-weight: 600;
-        margin-right: 12px;
-      }
-      .step h2 {
-        font-size: 16px;
-        margin: 0 0 12px 0;
-        display: flex;
-        align-items: center;
-      }
-      .step p {
-        margin: 0 0 8px 0;
-        color: #c8c8c8;
-      }
-      .step a {
-        color: var(--accent);
-        text-decoration: none;
-      }
-      .step a:hover { text-decoration: underline; }
-      .step .btn {
-        display: inline-block;
-        background: var(--accent);
-        color: white;
-        padding: 10px 20px;
-        border-radius: 4px;
-        text-decoration: none;
-        margin-top: 8px;
-        font-weight: 500;
-      }
-      .step .btn:hover {
-        background: var(--accent-hover);
-        text-decoration: none;
-      }
-      code, .filepath {
-        background: #2a2a2a;
-        padding: 2px 6px;
-        border-radius: 3px;
+      header .file-path {
         font-family: ui-monospace, "SF Mono", Menlo, monospace;
         font-size: 12px;
-        color: #e8e8e8;
+        color: #999;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
-      .filepath {
-        display: block;
-        padding: 8px 12px;
-        word-break: break-all;
-        margin-top: 8px;
-      }
-      .note {
-        background: rgba(59, 130, 246, 0.08);
-        border-left: 3px solid var(--accent);
-        padding: 12px 16px;
-        margin-top: 24px;
+      header button {
+        background: var(--accent);
+        color: white;
+        border: none;
+        padding: 6px 16px;
+        border-radius: 4px;
         font-size: 13px;
-        color: #c8c8c8;
+        font-weight: 500;
+        cursor: pointer;
       }
-      .note strong { color: var(--fg); }
+      header button:hover { background: var(--accent-hover); }
+      header button:disabled { opacity: 0.5; cursor: not-allowed; }
+      header .status {
+        font-size: 12px;
+        color: #999;
+        min-width: 120px;
+        text-align: right;
+      }
+      header .status.error { color: var(--error); }
+      header .status.success { color: var(--success); }
+      header .status.modified { color: #f59e0b; }
+      /* The Excalidraw canvas fills everything below the toolbar. */
+      #root {
+        height: calc(100% - 48px);
+        width: 100%;
+      }
+      /* Excalidraw mounts a full-height flex container into #root. */
+      #root .excalidraw {
+        height: 100%;
+      }
     </style>
   </head>
   <body>
     <header>
-      <h1>Excalidraw — external workflow</h1>
-      <div class="subtitle">
-        v0.2.36 ships a bridge to excalidraw.com. Fully self-hosted
-        Excalidraw is queued for v0.2.37.
-      </div>
+      <h1>Excalidraw editor</h1>
+      <span id="filePath" class="file-path">—</span>
+      <span id="status" class="status">Loading…</span>
+      <button id="saveBtn" disabled>Save</button>
     </header>
-    <main>
-      <div class="step">
-        <h2><span class="num">1</span>Draw your diagram</h2>
-        <p>
-          Click below to open the upstream Excalidraw editor in a new
-          tab. The launcher created an empty file on disk for you at:
-        </p>
-        <code id="filePath" class="filepath">—</code>
-        <p>
-          <a class="btn" href="https://excalidraw.com" target="_blank" rel="noopener">
-            Open excalidraw.com →
-          </a>
-        </p>
-      </div>
+    <div id="root"></div>
 
-      <div class="step">
-        <h2><span class="num">2</span>Export as <code>.excalidraw</code></h2>
-        <p>
-          In excalidraw.com, use the menu (☰) → <strong>Save to…</strong>
-          → <strong>Excalidraw file (.excalidraw)</strong>. Choose a
-          temporary location like your Downloads folder.
-        </p>
-      </div>
-
-      <div class="step">
-        <h2><span class="num">3</span>Drag into the launcher</h2>
-        <p>
-          Return to the launcher window. In the Diagrams tab, drag the
-          exported <code>.excalidraw</code> file onto the drop zone
-          (the dashed-outline area in the diagrams list). The launcher
-          reads the file content, prompts you for a name + category,
-          and saves it into <code>.claude/diagrams/&lt;category&gt;/&lt;name&gt;.excalidraw</code>.
-        </p>
-        <p>
-          You can close this browser tab once the import is done.
-        </p>
-      </div>
-
-      <div class="note">
-        <strong>Why this round-trip?</strong> Excalidraw ships as a
-        React app with several runtime peer-dependencies (react, jotai,
-        radix-ui, etc.). Vendoring the full standalone build is queued
-        for a future release. Until then, the upstream-hosted editor +
-        drag-import is the pragmatic v0.2.36 workflow. The embedded
-        editor we used to ship (Excalidraw inside the Tauri WebView)
-        rendered as broken giant-icons garbage on Wayland + webkit2gtk,
-        so it was removed.
-      </div>
-    </main>
-
+    <!--
+      EXCALIDRAW_ASSET_PATH must be the directory that CONTAINS the
+      `fonts/` tree (Excalidraw builds font URLs as
+      `new URL("fonts/<Family>/<file>.woff2", EXCALIDRAW_ASSET_PATH)`).
+      This page is served at /excalidraw/, and we copied the font tree
+      to /excalidraw/fonts/, so the asset path is this page's own dir.
+      Set it BEFORE the bundle loads so the font resolver sees it.
+    -->
     <script>
-      const params = new URLSearchParams(window.location.search);
-      const filePath = params.get('file') || '(no file specified)';
-      document.getElementById('filePath').textContent = filePath;
+      window.EXCALIDRAW_ASSET_PATH = "/excalidraw/";
     </script>
+    <script src="./excalidraw.bundle.js"></script>
   </body>
 </html>

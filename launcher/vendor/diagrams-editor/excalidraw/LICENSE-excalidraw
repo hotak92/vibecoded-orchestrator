@@ -1,0 +1,60 @@
+Third-party license attribution for the self-hosted Excalidraw editor
+bundle vendored under this directory.
+
+The files in this directory that are NOT our own AGPL-3.0 source
+(index.html, src/*) are third-party assets vendored from the
+@excalidraw/excalidraw npm package and its dependencies:
+
+  - excalidraw.bundle.js      — esbuild output bundling
+                                @excalidraw/excalidraw + react + react-dom
+                                + scheduler + pako + glue (see
+                                excalidraw.bundle.js.LEGAL.txt for the
+                                per-dependency license notices esbuild
+                                collected from the bundled sources).
+  - excalidraw.bundle.css     — @excalidraw/excalidraw stylesheet.
+  - css-fonts/*.woff2         — the "Assistant" UI font referenced by
+                                the stylesheet.
+  - fonts/**                  — the hand-drawn canvas fonts (Excalifont,
+                                Virgil, Cascadia, Comic Shanns, Nunito,
+                                Lilita, Liberation, Xiaolai, Assistant),
+                                shipped by @excalidraw/excalidraw for
+                                self-hosting (window.EXCALIDRAW_ASSET_PATH).
+
+@excalidraw/excalidraw is MIT-licensed (pinned via launcher/package.json,
+"@excalidraw/excalidraw": "^0.18.1"; bundled version 0.18.1):
+
+    MIT License
+
+    Copyright (c) 2020 Excalidraw
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+React, ReactDOM, scheduler (MIT, Copyright (c) Facebook, Inc. and its
+affiliates) and pako (MIT AND Zlib) notices, as embedded in the bundle,
+are reproduced in excalidraw.bundle.js.LEGAL.txt (committed alongside
+the bundle).
+
+The Excalidraw fonts are distributed by upstream Excalidraw under their
+respective open-source licenses (OFL / MIT); they are vendored verbatim
+from node_modules/@excalidraw/excalidraw/dist/prod/fonts. Refer to the
+upstream Excalidraw repository for the per-font license details.
+
+Our own wrapper sources in this directory (index.html, src/main.jsx,
+src/build.mjs) are AGPL-3.0-or-later (same as the rest of the launcher),
+carrying the SPDX header in each file.
