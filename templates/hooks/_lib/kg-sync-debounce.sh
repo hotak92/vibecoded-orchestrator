@@ -45,7 +45,7 @@
 #      future edit of the SAME file would see a stale lock and skip
 #      forever. To prevent a permanently-unsynced file, every call first
 #      runs `_kg_debounce_reap_stale`: any lock whose mtime is older than
-#      N + GRACE seconds is treated as abandoned — we delete it and run
+#      N + GRACE seconds is treated as abandoned — we recover it and run
 #      its sync NOW (backgrounded). The NEXT edit to ANY debounced file
 #      thus recovers ALL abandoned pending syncs. (Session-start could
 #      also reap, but reap-on-next-edit needs no extra hook wiring and
@@ -55,6 +55,45 @@
 #      and completes independently of the parent hook — the sync still
 #      lands. (On the rare hard-kill-the-process-group case, mode 1's
 #      reap recovers it on the next session's first edit.)
+#
+# EXACTLY-ONCE UNDER CONCURRENCY (the atomic-claim invariant, 2026-06-18)
+# ----------------------------------------------------------------------
+# Both the normal flusher-completion path AND the reaper recover a lock
+# through the SAME atomic step: rename the lock dir aside to
+# "<lock>.claimed.<pid>" via `mv`. rename(2) within one directory is
+# atomic on POSIX — for a given source path EXACTLY ONE caller's `mv`
+# succeeds; every other caller's `mv` fails (source already gone) and
+# that caller no-ops. So for each scheduled sync there is exactly one
+# winner that runs the cmd, regardless of how many processes (a live
+# flusher + one or more concurrent reapers) race to recover the lock.
+# This closes two races that the old "read cmd, then rm -rf lock" order
+# left open:
+#   * Two concurrent reapers (two parallel agents editing different files
+#     fire two schedule calls → two reap passes) could both read the
+#     persisted cmd of the SAME orphan before either deleted it, then
+#     both eval it → 2 redundant upserts. Now both attempt the same `mv`;
+#     one wins, the other's `mv` fails → 1 upsert.
+#   * A LIVE flusher whose `sleep` stretched past window+GRACE (laptop
+#     suspend/resume, heavy load, wall-clock jump) still holds its lock,
+#     so the reaper treats it as orphaned and recovers it, while the
+#     still-alive flusher also wakes to run its cmd → 2 upserts. Now the
+#     flusher's own completion goes through the SAME `mv` claim: whichever
+#     of {the woken flusher, the reaper} wins the rename runs the cmd;
+#     the loser's `mv` fails and it no-ops → 1 upsert.
+#
+# RESIDUAL: claimed-by-dead-pid
+#   A process can die between the successful `mv` and the `eval` (the
+#   window is tiny — a couple of syscalls — but non-zero). That would
+#   leave a "<lock>.claimed.<pid>" dir whose cmd is claimed-but-not-run,
+#   violating coalesce-NEVER-DROP if left forever. The reaper therefore
+#   ALSO sweeps stale ".claimed.<pid>" dirs: if the owning <pid> is no
+#   longer alive (kill -0 fails) the claim is dead → re-claim it (rename
+#   to ".claimed.<our-pid>") and run it. (A pid that IS still alive is a
+#   claim in flight by a live process — leave it; it will run or, if that
+#   process later dies, a future pass re-orphans it. PID reuse is a
+#   theoretical false-"alive": worst case the dead claim waits until the
+#   reused pid also exits, then is recovered — still never dropped, only
+#   delayed, matching the feature's eventually-consistent contract.)
 #
 # WHY sleep+background rather than a watcher daemon: zero new processes
 # at rest, zero new deps, no IPC, and it degrades to "sync slightly
@@ -108,48 +147,197 @@ _kg_debounce_key() {
         2>/dev/null || printf '%s' "_"
 }
 
-# Reap abandoned locks (flusher died mid-sleep). Any lock older than
-# window+GRACE is treated as orphaned: delete it and run its recorded
-# sync NOW (backgrounded), so the file is never left permanently
-# un-synced. GRACE absorbs sleep scheduling jitter.
+# mtime (epoch seconds) of a path, portable across GNU/BSD coreutils.
+# Falls back to $2 (a "now" fallback supplied by the caller) when neither
+# stat flavour works, so an unreadable stat is treated as "fresh" (never
+# reaped) rather than crashing the reaper.
+#   $1 = path, $2 = now-fallback epoch
+_kg_debounce_mtime() {
+    local m
+    m=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || printf '%s' "$2")
+    case "$m" in ''|*[!0-9]*) m="$2" ;; esac
+    printf '%s' "$m"
+}
+
+# Real PID of the current process, portably. In a backgrounded subshell
+# `$$` is the PARENT shell's pid, so it is useless for a liveness check on
+# the actual eval-runner. bash exposes the subshell's true pid as BASHPID;
+# the POSIX fallback reads it via a child sh whose $PPID == us.
+_kg_debounce_realpid() {
+    if [ -n "${BASHPID:-}" ]; then
+        printf '%s' "$BASHPID"
+    else
+        sh -c 'echo "$PPID"' 2>/dev/null || printf '%s' "$$"
+    fi
+}
+
+# Recover ONE atomically-won work dir: re-stamp it with the eval-runner's
+# REAL pid (for the dead-pid sweep), run the recorded sync, then remove it.
+# The dir passed in is ALREADY owned by us (we won its rename), so no
+# further locking is needed. Everything runs in ONE backgrounded subshell
+# so reaping never blocks the live edit.
+#
+# The re-stamp is what makes the dead-pid sweep correct: the winning
+# rename in the caller used the CLAIMER's $$ (which, for a flusher, is the
+# short-lived parent hook), but the process that actually runs the eval is
+# THIS backgrounded subshell. We rename the dir to ".claimed.<realpid>" so
+# that `kill -0 <realpid>` in Sweep B truthfully reports whether the eval
+# is in flight. If a process dies after this rename but before eval, the
+# ".claimed.<realpid>" residual is left for Sweep B to recover.
+#   $1 = won work dir (e.g. "<lock>.reaping.<token>")
+#   $2 = state dir (where the ".claimed.<pid>" lands)
+#   $3 = lock base name (e.g. "kg_<md5>.lock") — used to rebuild the name
+_kg_debounce_run_claimed() {
+    local won="$1" dir="$2" base="$3"
+    (
+        _rp=$(_kg_debounce_realpid)
+        _claimed="$dir/$base.claimed.$_rp"
+        # Re-stamp to our real pid. If the rename fails (extremely unlikely
+        # — we already own $won), fall back to running from $won directly
+        # so the sync is never dropped.
+        if mv "$won" "$_claimed" 2>/dev/null; then
+            : # owned under a liveness-accurate name
+        else
+            _claimed="$won"
+        fi
+        # CRITICAL: refresh the dir's mtime to NOW. A directory rename
+        # PRESERVES mtime, so if this claim descends from a backdated
+        # orphan, the ".claimed"/".reaping" successor would still look
+        # `grace`-stale and a concurrent reaper's Sweep B/C could re-trip
+        # on it and double-run before our eval finishes. Touching restarts
+        # the grace clock at each claim transition, so an in-flight claim
+        # is never treated as stranded while it is actively running.
+        touch "$_claimed" 2>/dev/null || true
+        _line=""
+        [ -f "$_claimed/cmd" ] && _line=$(head -1 "$_claimed/cmd" 2>/dev/null || echo "")
+        _wd=$(printf '%s' "$_line" | cut -f1)
+        _cmd=$(printf '%s' "$_line" | cut -f2-)
+        [ -n "$_wd" ] && cd "$_wd" 2>/dev/null || true
+        [ -n "$_cmd" ] && eval "$_cmd" >/dev/null 2>&1 || true
+        # Drop only after the eval finishes so a crash before/during eval
+        # leaves a recoverable ".claimed.<realpid>" behind (Sweep B
+        # recovers it) rather than dropping the sync.
+        rm -rf "$_claimed" 2>/dev/null || true
+    ) &
+}
+
+# Generate a per-attempt unique claim token: "<pid>.<nonce>". Used only to
+# WIN the atomic rename without two concurrent claimers colliding on the
+# same temp name; liveness is tracked separately via the re-stamp above.
+_kg_debounce_claimtok() {
+    printf '%s.%s' "$$" "${RANDOM:-$(date +%N 2>/dev/null || echo 0)}"
+}
+
+# Reap abandoned work. Two sweeps, both using the SAME atomic rename-claim
+# so that for any one piece of pending work EXACTLY ONE process runs it:
+#   (A) live ".lock" dirs older than window+GRACE → orphaned (the flusher
+#       died mid-sleep, OR its sleep stretched past the grace budget while
+#       still alive). Atomically claim via `mv "$lock" "$lock.claimed.$$"`;
+#       only the winner runs the cmd. A concurrent reaper's `mv` fails
+#       (source gone) and a live flusher that later wakes finds its own
+#       lock renamed away — its completion-time `mv` (see the flusher in
+#       _kg_debounce_schedule) also fails, so it too no-ops. Exactly one
+#       run.
+#   (B) stale ".claimed.<pid>" dirs whose owning <pid> is dead (a process
+#       died between claim and eval). Re-claim via `mv` to our own pid and
+#       run it. A live <pid> is a claim in flight → left untouched. This
+#       is the residual-safety net for coalesce-NEVER-DROP.
+# GRACE absorbs sleep scheduling jitter.
 #   $1 = PROJECT_ROOT
 _kg_debounce_reap_stale() {
     local proot="$1"
-    local dir window grace now lock cmd_file age mtime _reap_line
+    local dir window grace now lock claimed age mtime cpid base won reclaimed
     dir="$(_kg_debounce_dir "$proot")"
     [ -d "$dir" ] || return 0
     window="$(_kg_debounce_window)"
     grace=$(( window + 30 ))   # window + 30s jitter budget
     now=$(date +%s 2>/dev/null) || return 0
 
+    # --- Sweep A: orphaned (or stretched-live) ".lock" dirs --------------
     for lock in "$dir"/*.lock; do
         # No-glob-match → literal pattern; skip.
         [ -e "$lock" ] || continue
-        # mtime of the lock dir. `stat` flag differs across coreutils
-        # (GNU -c %Y) vs BSD/macOS (-f %m); try both, then give up
-        # safely (treat as fresh → do not reap).
-        mtime=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || echo "$now")
-        case "$mtime" in ''|*[!0-9]*) mtime="$now" ;; esac
+        mtime=$(_kg_debounce_mtime "$lock" "$now")
         age=$(( now - mtime ))
         if [ "$age" -ge "$grace" ]; then
-            cmd_file="$lock/cmd"
-            # Capture the recorded command BEFORE deleting the lock — the
-            # cmd file lives INSIDE the lock dir, so `rm -rf` would erase
-            # it first and lose the sync. The recorded line is: working
-            # dir, a TAB, then the command to eval.
-            _reap_line=""
-            [ -f "$cmd_file" ] && _reap_line=$(head -1 "$cmd_file" 2>/dev/null || echo "")
-            # Remove the lock so a concurrent reaper can't double-run.
-            rm -rf "$lock" 2>/dev/null || true
-            if [ -n "$_reap_line" ]; then
-                # Run backgrounded so reaping never blocks the live edit.
-                (
-                    _wd=$(printf '%s' "$_reap_line" | cut -f1)
-                    _cmd=$(printf '%s' "$_reap_line" | cut -f2-)
-                    [ -n "$_wd" ] && cd "$_wd" 2>/dev/null || true
-                    [ -n "$_cmd" ] && eval "$_cmd" >/dev/null 2>&1 || true
-                ) &
+            # ATOMIC CLAIM: rename(2) within $dir is atomic; exactly one
+            # racer's mv succeeds. The winner owns the orphan and runs it
+            # exactly once; every loser (a second reaper, or the live
+            # flusher waking to its completion-time mv) gets a non-zero mv
+            # (source gone) and skips. This is the single point that makes
+            # double-recovery impossible — replacing the old read-cmd-then-
+            # rm order whose comment promised this but did not deliver it.
+            base=$(basename "$lock")                 # e.g. "kg_<md5>.lock"
+            won="$lock.reaping.$(_kg_debounce_claimtok)"
+            if mv "$lock" "$won" 2>/dev/null; then
+                # Refresh mtime to NOW: rename preserves the (backdated)
+                # mtime, so without this a concurrent reaper's Sweep C
+                # would immediately re-trip on this fresh ".reaping" dir
+                # and double-run. Touch restarts the grace clock at the
+                # claim transition. (run_claimed touches again after its
+                # re-stamp, covering the whole in-flight lifetime.)
+                touch "$won" 2>/dev/null || true
+                # Hand the won dir to the runner, which re-stamps it with
+                # its REAL backgrounded pid and runs the cmd once.
+                _kg_debounce_run_claimed "$won" "$dir" "$base"
             fi
+            # else: another process already claimed/removed it → skip.
+        fi
+    done
+
+    # --- Sweep B: dead-pid ".claimed.<pid>" residuals --------------------
+    # A process that died between winning a claim and finishing its eval
+    # leaves a ".claimed.<pid>" dir (the runner re-stamped it with its real
+    # pid). If <pid> is no longer alive the work was claimed-but-not-run →
+    # recover it (re-claim, run). A still-alive <pid> is an in-flight claim
+    # → leave it. We only sweep claims at least `grace` old so we never
+    # race a just-created claim; combined with the kill -0 liveness check
+    # this makes a false recovery require BOTH pid-reuse AND age —
+    # vanishingly rare, and even then the result is at-most-one extra run,
+    # never a drop.
+    for claimed in "$dir"/*.claimed.*; do
+        [ -e "$claimed" ] || continue
+        # Extract the trailing numeric pid from "...claimed.<pid>".
+        cpid="${claimed##*.claimed.}"
+        case "$cpid" in ''|*[!0-9]*) continue ;; esac   # malformed → skip
+        mtime=$(_kg_debounce_mtime "$claimed" "$now")
+        age=$(( now - mtime ))
+        [ "$age" -ge "$grace" ] || continue   # too fresh → leave in flight
+        # If the owning pid is still alive, the claim is in flight → leave.
+        if kill -0 "$cpid" 2>/dev/null; then
+            continue
+        fi
+        # Dead owner → re-claim atomically and run. Rename to a fresh
+        # ".reaping.<token>" first (so a second reaper's mv on the same
+        # source fails → exactly one re-claimer), then hand to the runner
+        # which re-stamps to its own real pid.
+        base=$(printf '%s' "$(basename "$claimed")" | sed 's/\.claimed\.[0-9]*$//')  # strip ".claimed.<pid>"
+        reclaimed="$dir/$base.reaping.$(_kg_debounce_claimtok)"
+        if mv "$claimed" "$reclaimed" 2>/dev/null; then
+            touch "$reclaimed" 2>/dev/null || true   # restart grace clock
+            _kg_debounce_run_claimed "$reclaimed" "$dir" "$base"
+        fi
+    done
+
+    # --- Sweep C: stranded ".reaping.<token>" residuals ------------------
+    # A runner that died between winning the race-rename and the re-stamp
+    # to ".claimed.<realpid>" leaves a ".reaping.<token>" dir. The reaping
+    # window is microseconds (one rename), so any ".reaping" dir older than
+    # `grace` is definitively stranded — its token carries no liveness info
+    # (it is the CLAIMER's pid+nonce, not the runner's), so recover purely
+    # on age. Re-claim with a fresh token (exactly-one re-claimer via the
+    # atomic mv) and hand to the runner. This closes the last
+    # claimed-but-not-run gap, preserving coalesce-NEVER-DROP.
+    for claimed in "$dir"/*.reaping.*; do
+        [ -e "$claimed" ] || continue
+        mtime=$(_kg_debounce_mtime "$claimed" "$now")
+        age=$(( now - mtime ))
+        [ "$age" -ge "$grace" ] || continue   # too fresh → live re-stamp in flight
+        base=$(printf '%s' "$(basename "$claimed")" | sed 's/\.reaping\..*$//')  # strip ".reaping.<token>"
+        reclaimed="$dir/$base.reaping.$(_kg_debounce_claimtok)"
+        if mv "$claimed" "$reclaimed" 2>/dev/null; then
+            touch "$reclaimed" 2>/dev/null || true   # restart grace clock
+            _kg_debounce_run_claimed "$reclaimed" "$dir" "$base"
         fi
     done
 }
@@ -200,14 +388,35 @@ _kg_debounce_schedule() {
     if mkdir "$lock" 2>/dev/null; then
         # Record the command so a reaper can recover it if we die.
         printf '%s\t%s\n' "$wd" "$cmd" > "$lock/cmd" 2>/dev/null || true
-        # Spawn the single flusher. It sleeps the quiet-window, then
-        # removes the lock (so subsequent edits re-arm) and runs the
-        # sync, which re-reads the file fresh → latest content.
+        local base
+        base="$(basename "$lock")"   # "<chan>_<md5>.lock"
+        # Spawn the single flusher. It sleeps the quiet-window, then claims
+        # its own lock through the SAME atomic rename the reaper uses (win
+        # the lock → ".reaping.<token>") and recovers it via the shared
+        # _kg_debounce_run_claimed path, so the sync re-reads the file
+        # fresh → latest content. The completion-time `mv` is the
+        # exactly-once gate: normally (sleep finished within grace) the
+        # flusher wins its own rename and runs the cmd once. But if its
+        # sleep stretched past window+GRACE (suspend/resume, load spike,
+        # clock jump) a reaper may have ALREADY claimed the lock and run
+        # it — in that case the flusher's `mv` fails (source gone) and it
+        # does NOT double-run. Whichever of {this flusher, any reaper}
+        # wins the rename is the single runner. The unified path means the
+        # flusher's normal completion and the reaper's recovery are the
+        # SAME mechanism, making "exactly once" structural rather than
+        # comment-promised.
         (
             sleep "$window"
-            rm -rf "$lock" 2>/dev/null || true
-            cd "$wd" 2>/dev/null || true
-            eval "$cmd" >/dev/null 2>&1 || true
+            _flush_won="$lock.reaping.$(_kg_debounce_claimtok)"
+            if mv "$lock" "$_flush_won" 2>/dev/null; then
+                _kg_debounce_run_claimed "$_flush_won" "$dir" "$base"
+                # _kg_debounce_run_claimed backgrounds its own subshell;
+                # wait for it so this flusher subshell does not exit (and
+                # potentially get its process group reaped) before the
+                # re-stamp + eval complete.
+                wait
+            fi
+            # else: a reaper already claimed+ran this lock → no-op.
         ) &
     fi
     # else: lock already held → a flush is pending → no-op. Correct: the

@@ -876,15 +876,52 @@ fn module_spawn_lock(module_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> 
         .clone()
 }
 
+/// Decide whether the deferred re-mint should still recreate the global
+/// container once the fine-tune poll loop ends (v0.2.61, Option H B1-E fix).
+///
+/// `status` is the global install row's status as read fresh from the DB at
+/// re-mint time (`None` ⇒ the row no longer exists). Between deferral and the
+/// poll loop ending the USER may have stopped/uninstalled the module — in which
+/// case its container has been removed and resurrecting it would be wrong.
+///
+/// Skip the re-mint (return `false`) iff the row is GONE or the user/DB says the
+/// module should NOT be running:
+///   * `None`              — row deleted (uninstalled mid-defer) → skip.
+///   * `Stopped`           — user stopped it → skip.
+///   * `Broken`            — artifact gone, recovery is Reinstall not re-mint → skip.
+///
+/// Proceed (return `true`) when the row says it SHOULD be running, regardless of
+/// the container's *current* running state — the whole point of the deferred
+/// re-mint is to recreate a container that's still running but holds a STALE
+/// (401-ing) token, so we must NOT skip purely because the container is up:
+///   * `Installed` / `Running` / `Error` — proceed (recreate restores the token).
+///   * `Installing`                       — proceed (transient; the install path
+///                                           expects a running container next).
+fn should_deferred_remint(
+    status: Option<vct_launcher_core::db::models::ModuleStatus>,
+) -> bool {
+    use vct_launcher_core::db::models::ModuleStatus;
+    match status {
+        None => false,
+        Some(ModuleStatus::Stopped) | Some(ModuleStatus::Broken) => false,
+        Some(
+            ModuleStatus::Installed
+            | ModuleStatus::Running
+            | ModuleStatus::Error
+            | ModuleStatus::Installing,
+        ) => true,
+    }
+}
+
 /// Background "re-mint once the fine-tune finishes" task (v0.2.61, Option H
 /// B1). Spawned by the resume sweep when it finds a running global container
 /// with a fine-tune in flight. Polls the finetune sentinel every 30s; once it
 /// clears (the launcher's `FinetuneSentinel` drops on job completion/failure)
-/// AND the container is still running, performs the deferred recreate +
-/// re-mint so the hub↔container token contract is restored. Bounded so a stuck
-/// sentinel (e.g. launcher process crashed without removing it) can't poll
-/// forever — after the cap we re-mint anyway (the next hub boot is the
-/// ultimate backstop regardless).
+/// AND (B1-E) the module is still supposed to be running, performs the deferred
+/// recreate + re-mint so the hub↔container token contract is restored. Bounded
+/// so a stuck sentinel (e.g. launcher process crashed without removing it)
+/// can't poll forever — after the cap we re-mint anyway (the next hub boot is
+/// the ultimate backstop regardless).
 fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
     tokio::spawn(async move {
         const POLL_INTERVAL_SECS: u64 = 30;
@@ -917,21 +954,61 @@ fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
                 let _ = std::fs::remove_file(&sentinel);
             }
         }
+
+        // Open a fresh launcher.db handle ONCE (the resume sweep's borrowed
+        // `&Db` can't cross the 'static spawn boundary). Used first for the
+        // B1-E status re-check, then reused for the post-re-mint persist —
+        // don't double-open. Mirrors how server.rs wires the DB on boot.
+        let db = match vct_launcher_core::db::Db::open() {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: Db::open() for {}: {} \
+                     (skipping re-mint; next hub boot is the backstop)",
+                    module_id, e
+                );
+                return;
+            }
+        };
+
+        // B1-E: between deferral and now the user may have STOPPED or
+        // uninstalled the module, removing its container. Resurrecting a
+        // container the user deliberately stopped is wrong, so re-check the
+        // global row's status and skip the re-mint unless the row says the
+        // module should still be running. We do NOT skip merely because the
+        // container is currently up — a running-but-stale-token container is
+        // exactly the case this deferred re-mint exists to repair.
+        let status = match db.get_global_module_install(&module_id) {
+            Ok(row) => row.map(|r| r.status),
+            Err(e) => {
+                // Read failure ⇒ unknown state. Don't risk resurrecting a
+                // user-stopped container on a guess; skip and let the next hub
+                // boot re-evaluate from a clean read.
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: get_global_module_install({}): \
+                     {} (skipping re-mint; next hub boot is the backstop)",
+                    module_id, e
+                );
+                return;
+            }
+        };
+        if !should_deferred_remint(status.clone()) {
+            eprintln!(
+                "[module_supervisor] deferred re-mint: global {} is no longer \
+                 active (status {:?}); skipping re-mint so a user-stopped / \
+                 uninstalled container is not resurrected",
+                module_id,
+                status
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("<row-missing>")
+            );
+            return;
+        }
+
         match start_global_container_supervisor(&manifest, &module_id).await {
             Ok(name) => {
-                // Open a fresh launcher.db handle for the persist (the
-                // resume sweep's borrowed `&Db` can't cross the 'static spawn
-                // boundary). Mirrors how server.rs wires the DB on boot.
-                match vct_launcher_core::db::Db::open() {
-                    Ok(db) => {
-                        let _ = db.set_global_module_container_name(&module_id, &name);
-                    }
-                    Err(e) => eprintln!(
-                        "[module_supervisor] deferred re-mint: Db::open() to persist \
-                         container_name for {}: {}",
-                        module_id, e
-                    ),
-                }
+                let _ = db.set_global_module_container_name(&module_id, &name);
             }
             Err(e) => {
                 eprintln!(
@@ -2255,5 +2332,48 @@ mod tests {
         assert!(crate::module_identity::resolve_registered("mod-reg-test"));
         crate::module_identity::revoke("mod-reg-test");
         assert!(!crate::module_identity::resolve_registered("mod-reg-test"));
+    }
+
+    /// B1-E: `should_deferred_remint` skips the deferred re-mint when the user
+    /// stopped/uninstalled the module mid-defer (status Stopped/Broken or row
+    /// gone), and proceeds when the row says the module should still be
+    /// running — INCLUDING the `Running` case, since the deferred re-mint's
+    /// whole purpose is to repair a still-running container holding a stale
+    /// (401-ing) token.
+    #[test]
+    fn v0261_should_deferred_remint_skips_user_stopped_or_missing() {
+        // Skip: user stopped it.
+        assert!(
+            !should_deferred_remint(Some(ModuleStatus::Stopped)),
+            "Stopped row must NOT be resurrected"
+        );
+        // Skip: row deleted (uninstalled mid-defer).
+        assert!(
+            !should_deferred_remint(None),
+            "missing row must NOT be resurrected"
+        );
+        // Skip: artifact gone — recovery is Reinstall, not re-mint.
+        assert!(
+            !should_deferred_remint(Some(ModuleStatus::Broken)),
+            "Broken row must NOT be re-minted"
+        );
+
+        // Proceed: the module is supposed to be running.
+        assert!(
+            should_deferred_remint(Some(ModuleStatus::Installed)),
+            "Installed row should re-mint"
+        );
+        assert!(
+            should_deferred_remint(Some(ModuleStatus::Running)),
+            "Running row should re-mint (stale-token repair is the whole point)"
+        );
+        assert!(
+            should_deferred_remint(Some(ModuleStatus::Error)),
+            "Error row should re-mint (recreate is the recovery action)"
+        );
+        assert!(
+            should_deferred_remint(Some(ModuleStatus::Installing)),
+            "Installing row should re-mint (transient; install expects it up next)"
+        );
     }
 }

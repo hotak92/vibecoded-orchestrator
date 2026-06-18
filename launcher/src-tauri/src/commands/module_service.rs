@@ -1899,18 +1899,32 @@ async fn run_finetune_then_rotate_async(
     // has the new base global model regardless; the message just tells the
     // truth about whether it was specialized to their corpus.
     //
-    // The rich inline match below carries reason strings; finetune_emit_decision
-    // is the pure, unit-tested distillation of the SAME logic. Assert they agree
-    // in debug builds so the inline code can never silently drift from the spec.
-    debug_assert_eq!(
-        finetune_emit_decision(&outcome, rotate_result.is_ok()).0,
-        match (&outcome, &rotate_result) {
-            (FtOutcome::Done, Ok(())) => "module://finetune-progress",
-            _ => "module://finetune-failed",
-        },
-        "inline emit decision drifted from finetune_emit_decision spec"
-    );
-    match (&outcome, &rotate_result) {
+    // v0.2.61 (re-audit B1-A): the two HARD-ERROR arms — (Failed, rotate-Err)
+    // and (Inconclusive, rotate-Err) — used to `return Err(...)` WITHOUT
+    // emitting `module://finetune-failed` first. Result: when BOTH the
+    // fine-tune AND the rotate failed, the frontend got no terminal event and
+    // the UI hung forever on the last "running" progress emit. The pure
+    // `finetune_emit_decision` already classifies these as
+    // ("module://finetune-failed", "failed", is_hard_error=true) — i.e. EMIT,
+    // THEN hard-error. Both arms now do exactly that: emit a failed event
+    // (reason naming BOTH failures) and still `return Err` so the task is
+    // recorded as failed and the UI is informed.
+    //
+    // `emitted_event` captures the event each inline arm actually fired so the
+    // strengthened `debug_assert_eq!` below can prove the inline code agrees
+    // with `finetune_emit_decision(.0)` for ALL FOUR (outcome, rotate_ok)
+    // combinations — including the hard-error path that previously emitted
+    // nothing and so silently diverged from the spec.
+    //
+    // The two hard-error arms `return Err` before the post-match assert can
+    // run, so each carries its OWN per-arm `debug_assert*` that verifies (a)
+    // it emits the spec event `finetune_emit_decision(...).0` and (b) the
+    // spec's is_hard_error flag `.2` is `true` — i.e. the arm IS the one that
+    // returns Err. This is the parity check that B1-A defeated: the old 2-arm
+    // probe never noticed the hard-error arms emitted nothing. (Calls to the
+    // pure fn are kept inline inside the `debug_assert*` macros so nothing is
+    // computed — and nothing is left unused — in release builds.)
+    let emitted_event: &str = match (&outcome, &rotate_result) {
         (FtOutcome::Done, Ok(())) => {
             let _ = app.emit(
                 "module://finetune-progress",
@@ -1922,6 +1936,7 @@ async fn run_finetune_then_rotate_async(
                     "message": "Fine-tune complete",
                 }),
             );
+            "module://finetune-progress"
         }
         (FtOutcome::Done, Err(e)) => {
             // Trained fine, but the rotate-in failed — surface that.
@@ -1934,31 +1949,63 @@ async fn run_finetune_then_rotate_async(
                     "reason": format!("fine-tune completed but weight rotation failed: {}", e),
                 }),
             );
+            "module://finetune-failed"
         }
-        (FtOutcome::Failed(reason), rotate) => {
-            let rotate_note = match rotate {
-                Ok(()) => "base model rotated in; not specialized to your data",
-                Err(e) => return Err(format!(
-                    "fine-tune failed ({}) and rotate failed ({})",
-                    reason, e
-                )),
-            };
+        (FtOutcome::Failed(reason), Ok(())) => {
+            // Fine-tune failed, but the base model rotated in — Ok outcome,
+            // just not specialized to the user's corpus.
             let _ = app.emit(
                 "module://finetune-failed",
                 serde_json::json!({
                     "module_id": RL_RERANKER_MODULE_ID,
                     "project_id": project_id,
                     "state": "failed",
-                    "reason": format!("{} ({})", reason, rotate_note),
+                    "reason": format!(
+                        "{} (base model rotated in; not specialized to your data)",
+                        reason
+                    ),
                 }),
             );
+            "module://finetune-failed"
         }
-        (FtOutcome::Inconclusive, rotate) => {
+        (FtOutcome::Failed(reason), Err(e)) => {
+            // v0.2.61 (re-audit B1-A): EMIT the terminal failed event BEFORE
+            // the hard-error return — the frontend must learn the job ended
+            // (was previously a silent `return Err`, hanging the UI).
+            //
+            // Per-arm parity assert (covers the hard-error path the post-match
+            // assert can't reach): this arm MUST emit the spec event, and the
+            // spec's is_hard_error flag MUST be true — it returns Err below.
+            debug_assert_eq!(
+                "module://finetune-failed",
+                finetune_emit_decision(&outcome, false).0,
+                "(Failed, Err) arm event diverged from finetune_emit_decision spec"
+            );
+            debug_assert!(
+                finetune_emit_decision(&outcome, false).2,
+                "(Failed, Err) arm returns Err but finetune_emit_decision says not a hard error"
+            );
+            let _ = app.emit(
+                "module://finetune-failed",
+                serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
+                    "project_id": project_id,
+                    "state": "failed",
+                    "reason": format!(
+                        "fine-tune failed ({}) and weight rotation failed ({})",
+                        reason, e
+                    ),
+                }),
+            );
+            return Err(format!(
+                "fine-tune failed ({}) and rotate failed ({})",
+                reason, e
+            ));
+        }
+        (FtOutcome::Inconclusive, Ok(())) => {
             // Loop hit the 5-min cap while still "running". Don't claim done;
-            // don't claim failed. The container may still finish on its own.
-            if let Err(e) = rotate {
-                return Err(format!("fine-tune inconclusive and rotate failed: {}", e));
-            }
+            // don't claim failed-hard. The container may still finish on its
+            // own — base model rotated in, re-run to specialize.
             let _ = app.emit(
                 "module://finetune-failed",
                 serde_json::json!({
@@ -1969,8 +2016,59 @@ async fn run_finetune_then_rotate_async(
                                base model rotated in — re-run to specialize",
                 }),
             );
+            "module://finetune-failed"
         }
-    }
+        (FtOutcome::Inconclusive, Err(e)) => {
+            // v0.2.61 (re-audit B1-A): EMIT the terminal failed event BEFORE
+            // the hard-error return — same UI-hang fix as the (Failed, Err) arm.
+            //
+            // Per-arm parity assert (mirrors the (Failed, Err) arm): emits the
+            // spec event, and the spec's is_hard_error flag MUST be true.
+            debug_assert_eq!(
+                "module://finetune-failed",
+                finetune_emit_decision(&outcome, false).0,
+                "(Inconclusive, Err) arm event diverged from finetune_emit_decision spec"
+            );
+            debug_assert!(
+                finetune_emit_decision(&outcome, false).2,
+                "(Inconclusive, Err) arm returns Err but finetune_emit_decision says not a hard error"
+            );
+            let _ = app.emit(
+                "module://finetune-failed",
+                serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
+                    "project_id": project_id,
+                    "state": "failed",
+                    "reason": format!(
+                        "fine-tune did not finish within 5 minutes and weight \
+                         rotation failed ({}) — re-run to specialize",
+                        e
+                    ),
+                }),
+            );
+            return Err(format!("fine-tune inconclusive and rotate failed: {}", e));
+        }
+    };
+
+    // v0.2.61 (re-audit B1-A): the rich inline match above carries reason
+    // strings; `finetune_emit_decision` is the pure, unit-tested distillation
+    // of the SAME logic. Assert they agree in debug builds so the inline code
+    // can never silently drift from the spec. STRENGTHENED over the prior
+    // 2-arm probe (which only mapped (Done, Ok)=>progress, _=>failed and could
+    // not see that the hard-error arms emitted NOTHING): we now compare against
+    // the event each inline arm ACTUALLY emitted (`emitted_event`), captured
+    // above. A future divergence — e.g. re-introducing a non-emitting
+    // `return Err` on a hard-error path, or flipping an arm's event — trips
+    // this assert. The two hard-error arms `return Err` before reaching this
+    // line, so they carry their OWN per-arm asserts above (verifying both
+    // event ".0" AND is_hard_error ".2"); together the per-arm + post-match
+    // asserts cover ALL FOUR (outcome, rotate_ok) combinations.
+    debug_assert_eq!(
+        emitted_event,
+        finetune_emit_decision(&outcome, rotate_result.is_ok()).0,
+        "inline emit decision drifted from finetune_emit_decision spec"
+    );
+
     Ok(())
 }
 
@@ -2001,9 +2099,18 @@ pub async fn get_rl_dashboard_state(
         is_container_running(&container_name).await.unwrap_or(false)
     };
 
-    let port = db
-        .get_project_rl_port(&project_id)?
-        .unwrap_or(0);
+    // v0.2.61 (re-audit B2-1): the dashboard probe must use the same
+    // global-aware port resolution as the finetune/rotate paths. A bare
+    // `get_project_rl_port(project_id)` returns `None` for a GLOBAL install
+    // (the per-project `module_ports` row is gone after
+    // `auto_migrate_per_project_to_global`), which collapsed to `0` here →
+    // `probe_state_summary` was skipped → `dynamic_types_count` /
+    // `d1_marker_present` stayed permanently `None` and the widget showed
+    // `port: 0`. `resolve_rl_port_for_project` honors `GLOBAL_RL_PORT` for
+    // global installs. We keep the "0 when unresolvable" back-compat:
+    // `.unwrap_or(0)` on its `Result<u16, String>` yields the resolved port
+    // or `0`, and `port > 0` below still gates the probe.
+    let port = resolve_rl_port_for_project(&db, &project_id).unwrap_or(0);
 
     let _embedding_source = read_active_embedding_source(&project)
         .unwrap_or_else(|| DEFAULT_EMBEDDING_SOURCE.to_string());
@@ -5004,5 +5111,61 @@ mod tests {
                     "{:?}/{} must NOT report state=done", outcome, rotate_ok);
             }
         }
+    }
+
+    /// v0.2.61 (re-audit B1-A): the two HARD-ERROR combinations — fine-tune
+    /// FAILED + rotate FAILED, and fine-tune INCONCLUSIVE + rotate FAILED —
+    /// must classify as ("module://finetune-failed", "failed",
+    /// is_hard_error=true). The bug: `run_finetune_then_rotate_async`'s inline
+    /// match `return Err(...)`-ed on these BEFORE emitting the failed event, so
+    /// the frontend never learned the job ended and the UI hung on the last
+    /// "running" progress event. The pure `finetune_emit_decision` already
+    /// returns is_hard_error=true (= EMIT then hard-error) for both; the inline
+    /// emit was fixed to emit `module://finetune-failed` BEFORE its
+    /// `return Err`, and per-arm `debug_assert*`s in those two arms now assert
+    /// the inline event + is_hard_error agree with this spec (see the
+    /// "(Failed, Err) arm" / "(Inconclusive, Err) arm" asserts in
+    /// `run_finetune_then_rotate_async`). This test pins the pure-fn contract
+    /// those asserts (and the inline emit) depend on.
+    #[test]
+    fn v0261_finetune_hard_error_arms_emit_failed_then_hard_error() {
+        // Fine-tune failed AND rotate failed → EMIT finetune-failed, is_hard_error.
+        let (event, state, is_hard_error) =
+            finetune_emit_decision(&FtOutcome::Failed("lost".into()), false);
+        assert_eq!(
+            event, "module://finetune-failed",
+            "(Failed, rotate-Err) must emit finetune-failed (NOT a silent return Err)"
+        );
+        assert_eq!(state, "failed", "(Failed, rotate-Err) state must be 'failed'");
+        assert!(
+            is_hard_error,
+            "(Failed, rotate-Err) must be a hard error — the task returns Err AFTER emitting"
+        );
+
+        // Fine-tune inconclusive AND rotate failed → EMIT finetune-failed, is_hard_error.
+        let (event, state, is_hard_error) =
+            finetune_emit_decision(&FtOutcome::Inconclusive, false);
+        assert_eq!(
+            event, "module://finetune-failed",
+            "(Inconclusive, rotate-Err) must emit finetune-failed (NOT a silent return Err)"
+        );
+        assert_eq!(state, "failed", "(Inconclusive, rotate-Err) state must be 'failed'");
+        assert!(
+            is_hard_error,
+            "(Inconclusive, rotate-Err) must be a hard error — the task returns Err AFTER emitting"
+        );
+
+        // Symmetry guard: the NON-hard-error variants of the same outcomes
+        // (rotate succeeded → base model is in place) emit the SAME event but
+        // are NOT hard errors (task returns Ok). This pins the precise boundary
+        // the inline match's per-arm asserts rely on.
+        assert!(
+            !finetune_emit_decision(&FtOutcome::Failed("lost".into()), true).2,
+            "(Failed, rotate-Ok) is NOT a hard error — base model rotated in"
+        );
+        assert!(
+            !finetune_emit_decision(&FtOutcome::Inconclusive, true).2,
+            "(Inconclusive, rotate-Ok) is NOT a hard error — base model rotated in"
+        );
     }
 }
