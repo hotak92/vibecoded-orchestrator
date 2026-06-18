@@ -1778,4 +1778,79 @@ mod integration_tests {
 
         crate::module_identity::revoke("test-mod");
     }
+
+    // ─── v0.2.61 (Option H B3): ephemeral-token least privilege ──────────
+
+    #[tokio::test]
+    async fn ephemeral_token_rejected_on_db_crud_route() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // B3 regression: the ephemeral IDENTITY token must NOT authorize the
+        // /db/ CRUD routes (insert/patch/delete). Before the fix it did —
+        // a global container's per-spawn token could write/delete ANY
+        // project's module-namespace rows. Now it's GET+rl/events only;
+        // a POST to /db/.../rows must 403 with ephemeral_scope.
+        let (base, _h, _db_token) = spawn("test-mod", "proj1", "rl").await;
+        let ident = crate::module_identity::mint_and_register("test-mod").expect("mint");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/modules/test-mod/db/projects/proj1/rows/rl_state", base))
+            .headers(auth_header(&ident))
+            .json(&serde_json::json!({ "key": "k1", "fields": { "value": "v1" } }))
+            .send()
+            .await
+            .expect("hub reachable");
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(
+            status, 403,
+            "ephemeral token must be FORBIDDEN on /db/ CRUD routes; body: {}", body
+        );
+        assert!(
+            body.contains("ephemeral_scope"),
+            "403 must carry the ephemeral_scope error code; body: {}", body
+        );
+
+        crate::module_identity::revoke("test-mod");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_token_rejected_on_delete_rl_events() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // B3 regression: the ephemeral token is GET-only even on the rl/events
+        // path shape. A non-GET method on that route must NOT slip through.
+        // (DELETE isn't a registered method there, so this also confirms the
+        // gate rejects BEFORE routing — 403 ephemeral_scope, not 405.)
+        let (base, _h, _db_token) = spawn("test-mod", "proj1", "rl").await;
+        let ident = crate::module_identity::mint_and_register("test-mod").expect("mint");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .delete(format!("{}/modules/test-mod/projects/proj1/rl/events", base))
+            .headers(auth_header(&ident))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            403,
+            "ephemeral token must be GET-only; a non-GET rl/events must 403"
+        );
+
+        crate::module_identity::revoke("test-mod");
+    }
+
+    #[test]
+    fn is_rl_events_read_path_exact_shape_only() {
+        // Unit guard for the B3 route matcher: ONLY the exact 6-segment
+        // rl/events shape matches; db routes + deeper paths do not.
+        assert!(is_rl_events_read_path("/api/v1/modules/m/projects/p/rl/events"));
+        assert!(is_rl_events_read_path("modules/m/projects/p/rl/events"));
+        // db CRUD route — must NOT match.
+        assert!(!is_rl_events_read_path("/api/v1/modules/m/db/projects/p/rows/t"));
+        // deeper path under rl/events — must NOT match (no prefix inheritance).
+        assert!(!is_rl_events_read_path("/api/v1/modules/m/projects/p/rl/events/extra"));
+        // token route — must NOT match.
+        assert!(!is_rl_events_read_path("/api/v1/modules/m/token/refresh"));
+    }
 }

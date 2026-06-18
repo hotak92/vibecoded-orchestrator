@@ -1634,6 +1634,54 @@ impl Drop for FinetuneSentinel {
     }
 }
 
+/// Terminal outcome of a fine-tune poll loop (v0.2.61, Option H B1).
+/// Module-scoped so the emit-decision is unit-testable without a live
+/// container.
+#[derive(Debug, Clone, PartialEq)]
+enum FtOutcome {
+    /// The container reported terminal state "done" — a genuine fine-tune.
+    Done,
+    /// The container reported failed/error, returned a non-2xx, OR the job
+    /// was LOST (a streak of connection errors = mid-job recreate/crash).
+    Failed(String),
+    /// The poll loop hit its 5-min cap while the job was still "running".
+    Inconclusive,
+}
+
+/// What the FINAL Tauri event should be, given the fine-tune outcome and
+/// whether the (always-attempted) weight rotation succeeded. This is the
+/// exact logic the B1 bug got wrong: the old code emitted a blanket
+/// "percent:100, Done" regardless of outcome, so a no-op/killed/failed
+/// fine-tune masqueraded as success. Pure + module-scoped so it's unit-tested
+/// directly (the HTTP plumbing around it is incidental).
+///
+/// Returns `(event_name, state, is_hard_error)`:
+///   * `event_name` — the Tauri event to emit ("module://finetune-progress"
+///     on genuine success, "module://finetune-failed" otherwise).
+///   * `state` — "done" | "failed" (the frontend's matchesCurrent/auto-dismiss
+///     key; C-FE).
+///   * `is_hard_error` — true when the task itself must return Err (rotate
+///     failed AND the fine-tune didn't succeed → nothing usable happened).
+fn finetune_emit_decision(outcome: &FtOutcome, rotate_ok: bool) -> (&'static str, &'static str, bool) {
+    match (outcome, rotate_ok) {
+        // Trained successfully AND rotated in → the only genuine success.
+        (FtOutcome::Done, true) => ("module://finetune-progress", "done", false),
+        // Trained, but the rotate-in failed → surface as failed (not a hard
+        // Err: the failure is reported via the event).
+        (FtOutcome::Done, false) => ("module://finetune-failed", "failed", false),
+        // Fine-tune failed/lost/inconclusive but the base model rotated in →
+        // tell the truth (failed), task returns Ok (user has the base model).
+        (FtOutcome::Failed(_), true) | (FtOutcome::Inconclusive, true) => {
+            ("module://finetune-failed", "failed", false)
+        }
+        // Fine-tune did not succeed AND rotate failed → nothing usable
+        // happened; the task returns Err (hard error).
+        (FtOutcome::Failed(_), false) | (FtOutcome::Inconclusive, false) => {
+            ("module://finetune-failed", "failed", true)
+        }
+    }
+}
+
 async fn run_finetune_then_rotate_async(
     project_id: String,
     response: LatestVersionResponse,
@@ -1722,11 +1770,8 @@ async fn run_finetune_then_rotate_async(
     // connection errors, which is the signature of a mid-finetune container
     // recreate killing the job), or `Inconclusive` (loop exhausted while still
     // "running" at the 5-min cap). Only `Done` reports success downstream.
-    enum FtOutcome {
-        Done,
-        Failed(String),
-        Inconclusive,
-    }
+    // (FtOutcome + the emit-decision are module-scoped so the decision logic
+    // is unit-testable without a live container — see finetune_emit_decision.)
     let mut job_id: Option<String> = None;
     let outcome: FtOutcome = match kick {
         Ok(r) if r.status().is_success() => {
@@ -1853,6 +1898,18 @@ async fn run_finetune_then_rotate_async(
     // no longer masquerades as success. We still rotated (above), so the user
     // has the new base global model regardless; the message just tells the
     // truth about whether it was specialized to their corpus.
+    //
+    // The rich inline match below carries reason strings; finetune_emit_decision
+    // is the pure, unit-tested distillation of the SAME logic. Assert they agree
+    // in debug builds so the inline code can never silently drift from the spec.
+    debug_assert_eq!(
+        finetune_emit_decision(&outcome, rotate_result.is_ok()).0,
+        match (&outcome, &rotate_result) {
+            (FtOutcome::Done, Ok(())) => "module://finetune-progress",
+            _ => "module://finetune-failed",
+        },
+        "inline emit decision drifted from finetune_emit_decision spec"
+    );
     match (&outcome, &rotate_result) {
         (FtOutcome::Done, Ok(())) => {
             let _ = app.emit(
@@ -4834,5 +4891,118 @@ mod tests {
             assert!(pp.project_id.is_some(), "per-project row preserved");
             assert!(db.get_global_module_install("unknown-mod").unwrap().is_none());
         });
+    }
+
+    // ─── v0.2.61 (Option H B2): finetune/rotate port resolution ──────────
+
+    /// B2 regression: a GLOBAL install must resolve to GLOBAL_RL_PORT, NOT the
+    /// (now-absent / stale) per-project port. This is the exact DOA bug — the
+    /// finetune/rotate path POSTed to a dead per-project port after the global
+    /// migration removed the per-project container + module_ports row.
+    #[test]
+    fn v0261_resolve_rl_port_global_install_uses_global_port() {
+        let db = Db::open_in_memory().expect("DB");
+        db.insert_project("p1", "Test", "/tmp/p1", ProjectHost::Base, "p1-slug")
+            .expect("insert project");
+        // A STALE per-project port row exists (the pre-migration value) — the
+        // resolver must IGNORE it for a global install and return 11443.
+        db.set_project_rl_port("p1", 11533).expect("set stale per-project port");
+        // Global install row present.
+        db.insert_global_module_install(
+            "install-global",
+            RL_RERANKER_MODULE_ID,
+            "0.2.7",
+            "/global",
+        )
+        .expect("insert global");
+
+        let port = resolve_rl_port_for_project(&db, "p1").expect("resolve");
+        assert_eq!(
+            port, GLOBAL_RL_PORT,
+            "global install must use GLOBAL_RL_PORT (11443), not the stale per-project 11533"
+        );
+    }
+
+    /// B2 regression: a PER-PROJECT install (no global row) must still use the
+    /// per-project allocated port — the fix must not break the non-global path.
+    #[test]
+    fn v0261_resolve_rl_port_per_project_install_uses_project_port() {
+        let db = Db::open_in_memory().expect("DB");
+        db.insert_project("p1", "Test", "/tmp/p1", ProjectHost::Base, "p1-slug")
+            .expect("insert project");
+        db.set_project_rl_port("p1", 11533).expect("set per-project port");
+        // NO global row.
+        let port = resolve_rl_port_for_project(&db, "p1").expect("resolve");
+        assert_eq!(port, 11533, "per-project install must use the allocated per-project port");
+    }
+
+    /// B2 regression: per-project install with NO allocated port errors clearly
+    /// (was the original `.ok_or_else` behavior — preserve it for non-global).
+    #[test]
+    fn v0261_resolve_rl_port_per_project_no_port_errors() {
+        let db = Db::open_in_memory().expect("DB");
+        db.insert_project("p1", "Test", "/tmp/p1", ProjectHost::Base, "p1-slug")
+            .expect("insert project");
+        // No global row, no per-project port.
+        let err = resolve_rl_port_for_project(&db, "p1").unwrap_err();
+        assert!(err.contains("no rl_port"), "clear error on missing port: {}", err);
+    }
+
+    // ─── v0.2.61 (Option H B1): finetune emit-decision (the no-false-Done guarantee) ───
+
+    /// The CORE B1 guarantee: ONLY a genuine `Done` + successful rotate emits
+    /// the success ("finetune-progress" / state "done"). Every other outcome
+    /// emits "finetune-failed" — a no-op/killed/failed/inconclusive fine-tune
+    /// can NEVER masquerade as success. This is exactly what the pre-fix code
+    /// got wrong (blanket "percent:100, Done").
+    #[test]
+    fn v0261_finetune_emit_decision_only_done_succeeds() {
+        // Genuine success.
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Done, true),
+            ("module://finetune-progress", "done", false)
+        );
+        // Trained but rotate failed → failed event, NOT a hard Err.
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Done, false),
+            ("module://finetune-failed", "failed", false)
+        );
+        // Failed fine-tune, base rotated in → failed event, Ok (user has base model).
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Failed("lost".into()), true),
+            ("module://finetune-failed", "failed", false)
+        );
+        // Failed fine-tune AND rotate failed → failed event, HARD error.
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Failed("lost".into()), false),
+            ("module://finetune-failed", "failed", true)
+        );
+        // Inconclusive (5-min cap) → failed event, never "done".
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Inconclusive, true),
+            ("module://finetune-failed", "failed", false)
+        );
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Inconclusive, false),
+            ("module://finetune-failed", "failed", true)
+        );
+    }
+
+    /// No non-Done outcome may ever produce the success event — exhaustive
+    /// guard against a future edit re-introducing the false-Done bug.
+    #[test]
+    fn v0261_finetune_no_outcome_other_than_done_emits_success() {
+        for outcome in [
+            FtOutcome::Failed("x".into()),
+            FtOutcome::Inconclusive,
+        ] {
+            for rotate_ok in [true, false] {
+                let (event, state, _) = finetune_emit_decision(&outcome, rotate_ok);
+                assert_ne!(event, "module://finetune-progress",
+                    "{:?}/{} must NOT emit the success event", outcome, rotate_ok);
+                assert_ne!(state, "done",
+                    "{:?}/{} must NOT report state=done", outcome, rotate_ok);
+            }
+        }
     }
 }

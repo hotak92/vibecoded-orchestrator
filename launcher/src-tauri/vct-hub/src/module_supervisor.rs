@@ -2164,4 +2164,71 @@ mod tests {
             );
         });
     }
+
+    // ─── v0.2.61 (Option H): new-helper regression tests ─────────────────
+
+    /// resolve_hub_base_port: hub.port file takes priority over $VCT_HUB_PORT.
+    #[test]
+    fn v0261_resolve_hub_base_port_prefers_port_file() {
+        let guard = VctStateDirGuard::new();
+        std::fs::write(guard.vct_root().join("hub.port"), "7711\n").expect("write port file");
+        // Even with the env set to something else, the file wins.
+        let prev = std::env::var("VCT_HUB_PORT").ok();
+        std::env::set_var("VCT_HUB_PORT", "9999");
+        assert_eq!(resolve_hub_base_port(), 7711, "hub.port file is authoritative");
+        match prev {
+            Some(v) => std::env::set_var("VCT_HUB_PORT", v),
+            None => std::env::remove_var("VCT_HUB_PORT"),
+        }
+    }
+
+    /// resolve_hub_base_port: falls back to $VCT_HUB_PORT when no port file.
+    #[test]
+    fn v0261_resolve_hub_base_port_falls_back_to_env_then_default() {
+        let _guard = VctStateDirGuard::new(); // empty state dir → no hub.port
+        let prev = std::env::var("VCT_HUB_PORT").ok();
+        std::env::set_var("VCT_HUB_PORT", "8800");
+        assert_eq!(resolve_hub_base_port(), 8800, "env used when no port file");
+        std::env::remove_var("VCT_HUB_PORT");
+        assert_eq!(resolve_hub_base_port(), 7700, "hard default when neither present");
+        match prev {
+            Some(v) => std::env::set_var("VCT_HUB_PORT", v),
+            None => std::env::remove_var("VCT_HUB_PORT"),
+        }
+    }
+
+    /// module_spawn_lock: the SAME module_id returns the SAME Arc<Mutex>
+    /// (so two callers serialize); DIFFERENT module_ids get distinct locks.
+    #[tokio::test]
+    async fn v0261_module_spawn_lock_serializes_same_module() {
+        let a1 = module_spawn_lock("mod-serialize-test");
+        let a2 = module_spawn_lock("mod-serialize-test");
+        assert!(
+            std::sync::Arc::ptr_eq(&a1, &a2),
+            "same module_id must share one lock (so spawns serialize)"
+        );
+        // Holding a1 means a2.try_lock fails (they're the same mutex).
+        let _held = a1.lock().await;
+        assert!(a2.try_lock().is_err(), "second acquire of the same module lock must block");
+
+        // A different module gets an independent lock (no false serialization).
+        let other = module_spawn_lock("mod-serialize-other");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a1, &other),
+            "distinct module_ids must NOT share a lock"
+        );
+        assert!(other.try_lock().is_ok(), "a different module's lock is free");
+    }
+
+    /// resolve_registered: true only while a token is registered for the
+    /// module; false before mint and after revoke (the C1 idempotency guard
+    /// depends on this).
+    #[test]
+    fn v0261_resolve_registered_tracks_mint_and_revoke() {
+        assert!(!crate::module_identity::resolve_registered("mod-reg-test"));
+        let _tok = crate::module_identity::mint_and_register("mod-reg-test").expect("mint");
+        assert!(crate::module_identity::resolve_registered("mod-reg-test"));
+        crate::module_identity::revoke("mod-reg-test");
+        assert!(!crate::module_identity::resolve_registered("mod-reg-test"));
+    }
 }

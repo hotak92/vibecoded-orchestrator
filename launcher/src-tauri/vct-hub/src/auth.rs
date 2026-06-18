@@ -541,6 +541,30 @@ mod tests {
         assert!(is_exempt_path(
             "/api/v1/modules/vct-rl-reranker/token/refresh"
         ));
+        // db CRUD without the {key} suffix (insert/list) — also exempt.
+        assert!(is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/db/projects/p1/rows/rl_state"
+        ));
+    }
+
+    #[test]
+    fn is_exempt_path_db_token_family_exact_shape_only() {
+        // v0.2.61 (Option H C-EXEMPT): the db/token carve-outs match the EXACT
+        // registered shapes, NOT the whole route family. A future route added
+        // under db/ or token/ WITHOUT its own scope middleware must NOT inherit
+        // the outer-gate bypass on the 0.0.0.0 surface.
+        //
+        // Out-of-shape db paths — must NOT be exempt:
+        assert!(!is_exempt_path("/api/v1/modules/m/db/admin/dump"));
+        assert!(!is_exempt_path("/api/v1/modules/m/db/projects/p1")); // no /rows/{table}
+        assert!(!is_exempt_path("/api/v1/modules/m/db/projects/p1/rows/t/k/extra")); // too deep
+        // Out-of-shape token paths — must NOT be exempt:
+        assert!(!is_exempt_path("/api/v1/modules/m/token/issue"));
+        assert!(!is_exempt_path("/api/v1/modules/m/token")); // bare
+        // The exact registered shapes — still exempt:
+        assert!(is_exempt_path("/api/v1/modules/m/db/projects/p1/rows/t"));
+        assert!(is_exempt_path("/api/v1/modules/m/db/projects/p1/rows/t/k"));
+        assert!(is_exempt_path("/api/v1/modules/m/token/refresh"));
     }
 
     #[test]
