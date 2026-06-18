@@ -204,6 +204,14 @@ sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 # rename path resolves correctly on Windows.
 dunce = "1"
 
+# v0.2.62 (BLOCKER-1): tests for the watchdog pause-marker PRODUCER
+# (services_stop_all / service_stop create markers; the start commands
+# remove them) mutate the process-global VCT_STATE_DIR env var to redirect
+# the marker root at a temp dir, so they must run #[serial] to avoid racing
+# the parallel test pool. Same crate version vct-hub + vct-launcher-core use.
+[dev-dependencies]
+serial_test = "3"
+
 # Bug 31: libc statvfs for free-space probe (Unix only — Windows path
 # returns None, see free_bytes_at in commands/volumes.rs).
 [target.'cfg(unix)'.dependencies]

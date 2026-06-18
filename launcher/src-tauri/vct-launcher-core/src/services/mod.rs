@@ -33,3 +33,12 @@ pub mod gpu_mode;
 // from vct-hub's auth.rs so the launcher's diagrams local server
 // (diagrams.token) reuses the same implementation as hub.token.
 pub mod boot_token;
+
+// v0.2.62: shared pause-marker mechanism for the hub-side infra watchdog.
+// The CONSUMER (vct-hub::infra_watchdog) and the PRODUCER (the launcher's
+// service_stop / services_stop_all commands) are SEPARATE processes; both
+// must resolve the SAME `<vct_root>/state/watchdog-paused/<service>` path.
+// Keeping the path logic here (not duplicated as a string in each crate)
+// is what makes the deliberate-stop signal actually reach the watchdog —
+// the BLOCKER-1 remediation (marker had a consumer but no producer).
+pub mod watchdog_pause;

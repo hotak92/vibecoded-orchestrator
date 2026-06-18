@@ -89,6 +89,11 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 tempfile = "3"
 
+# v0.2.62: infra-watchdog tests that mutate process-global env vars
+# (CODE_EMBED_BACKEND / VCT_ORCHESTRATOR_ROOT) run #[serial] so they don't
+# race the parallel test pool. Same crate version the launcher + core use.
+serial_test = "3"
+
 # `modules_api.rs` has a keyring-probe gate that conditionally skips
 # keychain-touching tests on CI where libsecret is absent. The probe
 # itself needs the `keyring` crate.

@@ -30,6 +30,29 @@ impl Db {
         Ok(row)
     }
 
+    /// v0.2.62 (CONCERN-6 remediation): poison-tolerant boolean reader for
+    /// the hub's detached infra-watchdog task, which must never panic.
+    ///
+    /// Same semantics as [`Db::app_state_get_bool`] (None = no row,
+    /// Some(true)/Some(false) per the stored value) but acquires the lock
+    /// via [`Db::lock_recover`] so a poisoned mutex recovers instead of
+    /// panicking. The watchdog reads `launcher.services_watcher_enabled`
+    /// through this on every tick to honor the user's auto-restart toggle.
+    pub fn app_state_get_bool_nonpanicking(
+        &self,
+        key: &str,
+    ) -> Result<Option<bool>, String> {
+        let guard = self.lock_recover();
+        let row: Option<String> = guard
+            .query_row(
+                "SELECT value FROM app_state WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(row.map(|v| matches!(v.as_str(), "true" | "1")))
+    }
+
     /// Write a raw string value (upsert). Stamps `updated_at` to now.
     pub fn app_state_set(&self, key: &str, value: &str) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();

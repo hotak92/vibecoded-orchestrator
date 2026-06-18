@@ -157,6 +157,31 @@ impl Db {
         self.0.lock().expect("db mutex poisoned")
     }
 
+    /// v0.2.62 (CONCERN-6 remediation): poison-tolerant, non-panicking
+    /// connection accessor for read-only callers that must NEVER crash on
+    /// a poisoned mutex.
+    ///
+    /// The standard [`Db::lock`] calls `.expect("db mutex poisoned")` — a
+    /// PANIC if any prior holder of the lock panicked while holding it. For
+    /// the launcher's Tauri commands that is acceptable (a panic surfaces
+    /// as a command error and the next command re-locks fine). But the
+    /// hub's DETACHED infra-watchdog task holds the "never crash the hub"
+    /// contract: a transitive panic from `list_projects()` → `lock()` would
+    /// kill the watchdog task for the rest of the hub process, silently
+    /// defeating its whole purpose (nothing would restart dead infra
+    /// containers until the hub itself restarted).
+    ///
+    /// This accessor recovers a poisoned mutex (`into_inner`) instead of
+    /// panicking — the SQLite connection itself is not left in an invalid
+    /// state by a panic that happened while merely holding the lock (the
+    /// panicking caller's in-flight statement is dropped; rusqlite handles
+    /// that), so reading through a recovered guard is sound for the
+    /// short read-only queries the watchdog issues. Same poison-recovery
+    /// pattern already used by [`Db::close_for_update`].
+    pub fn lock_recover(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// v0.2.60: release the launcher's OS handle on `launcher.db` for the
     /// `install.py --update` window, so install.py can take the SQLite
     /// writer lock (Windows holds it exclusively — see the

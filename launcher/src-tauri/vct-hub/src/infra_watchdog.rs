@@ -19,29 +19,61 @@
 //!
 //! This module spawns a periodic `tokio` task from
 //! `server.rs::start_hub_server()` that, every tick, checks each
-//! canonical infra service and restarts it via the shared compose layer
-//! (`vct_launcher_core::services::runtime`) when it is DOWN — but only
-//! when VCO actually manages it and the user hasn't deliberately paused
-//! or adopted it.
+//! canonical infra service and restarts it through the SAME GPU-aware
+//! start path the launcher uses (the `launch-claude-mcp-stack.sh`
+//! wrapper, with a launcher-faithful direct-compose fallback) when it is
+//! DOWN — but only when VCO actually manages it and the user hasn't
+//! deliberately paused or adopted it, and only when the user's global
+//! auto-restart toggle is still enabled.
 //!
 //! ## Guard rails (the watchdog must never fight a deliberate decision)
 //!
-//! A service is restarted on a given tick ONLY when ALL hold (see
+//! A tick is SKIPPED entirely when the user disabled auto-restart
+//! (`launcher.services_watcher_enabled == false` in launcher.db — the
+//! SAME toggle the launcher's own services watcher honors, so one
+//! user-facing switch disables BOTH restarters; see [`watcher_enabled`]).
+//!
+//! Within an enabled tick, a service is restarted ONLY when ALL hold (see
 //! [`service_eligible_for_restart`]):
-//!   1. the container is DOWN (not `running`), AND
+//!   1. the container is DOWN (authoritatively not-running — a transient
+//!      probe error SKIPS the service this tick rather than treating it as
+//!      down, see [`ContainerProbe`]; this mirrors the launcher watcher's
+//!      restart-storm guard), AND
 //!   2. VCO MANAGES it — its adoption mode in `<vct_root>/services.toml`
 //!      is `Unresolved` (the default; no entry). `Adopt` / `Parallel` /
 //!      `Refuse` are the user's "leave it alone" / "I run my own copy"
 //!      decisions and are NEVER touched (see
 //!      `vct_launcher_core::services::adoption`), AND
 //!   3. the service is NOT paused — no marker file at
-//!      `<vct_root>/state/watchdog-paused/<service>` (see
-//!      [`pause_marker_path`]). The pause marker is the explicit "stop
-//!      restarting this" signal a deliberate `compose stop` can drop so
-//!      the watchdog backs off; a RAW external stop with no marker DOES
-//!      get restarted (that is the desired self-healing behavior), AND
-//!   4. the service has not exhausted its crash-loop budget
+//!      `<vct_root>/state/watchdog-paused/<service>` (the SHARED marker in
+//!      `vct_launcher_core::services::watchdog_pause`, PRODUCED by the
+//!      launcher's `service_stop` / `services_stop_all` commands and
+//!      CONSUMED here). The pause marker is the explicit "stop restarting
+//!      this" signal a deliberate stop drops so the watchdog backs off; a
+//!      RAW external stop with no marker DOES get restarted (that is the
+//!      desired self-healing behavior), AND
+//!   4. the service is actually PART of this install — the GPU-only
+//!      `code_embed` service legitimately does not exist on a CPU-only /
+//!      `CODE_EMBED_BACKEND=ollama` host (`profiles: [gpu]` in the compose
+//!      file), so the watchdog must never try to build/start it there (see
+//!      [`code_embed_in_stack`]), AND
+//!   5. the service has not exhausted its crash-loop budget
 //!      (see [`Backoff`]).
+//!
+//! ## GPU-aware restart (BLOCKER-2 remediation)
+//!
+//! Infra containers `ollama` / `code_embed` need the GPU overlay
+//! (`docker-compose.gpu.yml` / `podman-compose.gpu.yml`), `--profile gpu`,
+//! and a CDI-readiness wait on NVIDIA+podman hosts. A raw
+//! `compose -f docker-compose.yml up -d <svc>` (the pre-remediation
+//! behavior) omits all three → ollama/code_embed heal CPU-only or fail
+//! with `unresolvable CDI devices`. The watchdog therefore PREFERS the
+//! same `launch-claude-mcp-stack.sh` wrapper the launcher prefers (it owns
+//! runtime detection + NVIDIA probe + CDI-wait + overlay/profile/override
+//! selection and is idempotent — `compose up -d` no-ops already-running
+//! containers). When the wrapper is not shipped, it falls back to a
+//! direct-compose invocation that REPLICATES the launcher's overlay +
+//! profile selection (see [`restart_service`]).
 //!
 //! ## Crash-loop backoff
 //!
@@ -53,6 +85,15 @@
 //! restarts in a row the watchdog GIVES UP on that service and logs a
 //! single clear error (no infinite thrash). A successful restart resets
 //! the counter and clears the give-up state.
+//!
+//! NOTE (NIT-7): because the watchdog gates attempts by counting fixed
+//! ticks (it does NOT sleep a variable amount), the backoff schedule is a
+//! tick-quantized LOWER BOUND on the wait between attempts — the actual
+//! wait is rounded UP to the next whole multiple of the tick interval. At
+//! the default 45s interval the schedule lands exactly on tick
+//! boundaries; a custom interval that doesn't evenly divide a delay just
+//! means the Nth attempt fires on the first tick at or after the computed
+//! delay.
 //!
 //! ## Soft-fail everywhere
 //!
@@ -69,7 +110,7 @@
 //! (no console-window flash on Windows). No new OS-specific assumptions.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -79,6 +120,7 @@ use vct_launcher_core::db::models::ProjectHost;
 use vct_launcher_core::process::CommandExt as _;
 use vct_launcher_core::services::adoption::{self, AdoptionMode};
 use vct_launcher_core::services::runtime::{detect_runtime, RuntimeInfo};
+use vct_launcher_core::services::watchdog_pause;
 
 use crate::modules_api::LauncherDbHandle;
 
@@ -122,6 +164,39 @@ pub const CANONICAL_INFRA_SERVICES: [(&str, &str); 3] = [
     ("ollama", "vco_ollama"),
     ("code_embed", "vco_code_embed"),
 ];
+
+/// The GPU-only service — gated behind `profiles: [gpu]` in the compose
+/// file. On a CPU-only / `CODE_EMBED_BACKEND=ollama` host the
+/// `vco_code_embed` container legitimately does NOT exist, and the
+/// watchdog must NEVER try to build/start it there (a stray `up code_embed`
+/// would trigger a multi-GB CodeSage image build on a CPU box). See
+/// [`code_embed_in_stack`].
+pub const GPU_ONLY_SERVICE: &str = "code_embed";
+
+/// app_state key (in launcher.db) that gates the LAUNCHER's own services
+/// watcher (`launcher/src-tauri/src/services/watcher.rs`,
+/// `APP_STATE_KEY_WATCHER_ENABLED`). The hub watchdog reads the SAME key so
+/// ONE user-facing toggle (Preferences → Services) disables BOTH
+/// restarters — otherwise a user who turned auto-restart OFF would still
+/// get restarts from the hub, and the two restarters would race with
+/// different give-up budgets (CONCERN-4). Default ENABLED when the row is
+/// absent (matches the launcher watcher's default).
+pub const APP_STATE_KEY_WATCHER_ENABLED: &str = "launcher.services_watcher_enabled";
+
+/// Env vars naming the orchestrator install root, used as a fallback when
+/// the launcher.db orchestrator-root row is absent/stale (CONCERN-5). These
+/// are the SAME vars `templates/hooks/ensure-containers.sh` consults
+/// (`VCT_ORCHESTRATOR_ROOT` first, then `VCT_INSTALL_ROOT`). The
+/// `infrastructure/docker-compose.yml` existence guard still applies.
+pub const ENV_ORCHESTRATOR_ROOT: &str = "VCT_ORCHESTRATOR_ROOT";
+pub const ENV_INSTALL_ROOT: &str = "VCT_INSTALL_ROOT";
+
+/// Env override for `CODE_EMBED_BACKEND`. When `ollama` (case-insensitive)
+/// the CodeSage GPU service is NOT part of the stack — the host uses the
+/// Ollama CPU-embedding fallback and `vco_code_embed` is never built. Any
+/// other value (or unset) leaves the GPU-profile decision to the
+/// runtime/overlay signals (see [`code_embed_in_stack`]).
+pub const ENV_CODE_EMBED_BACKEND: &str = "CODE_EMBED_BACKEND";
 
 // ─── Configuration ──────────────────────────────────────────────────────
 
@@ -264,55 +339,129 @@ impl Backoff {
     }
 }
 
-// ─── Pause-marker mechanism ──────────────────────────────────────────────
+// ─── Pause-marker mechanism (BLOCKER-1: shared consumer) ─────────────────
 //
-// We use a marker FILE rather than a launcher.db row, for three reasons:
-//   1. The sibling decision file (`services.toml`) is already a
-//      hand-editable file under `<vct_root>`; markers keep the
-//      "deliberate stop" signal in the same launcher-independent place.
-//   2. The watchdog must work when the launcher GUI is closed (the whole
-//      point); a file the hub can stat needs no DB write contention with
-//      the launcher's WAL handle.
-//   3. A `compose stop` wrapper / a future "pause supervision" GUI
-//      toggle can drop/remove the marker with a single `touch` / `rm`
-//      — trivially scriptable.
+// The pause marker is a FILE under `<vct_root>/state/watchdog-paused/` —
+// chosen over a launcher.db row because the watchdog must work with the
+// launcher GUI closed (no DB write-contention with the launcher's WAL
+// handle) and the signal lives next to `services.toml` under `<vct_root>`.
+//
+// The path logic now lives in the SHARED
+// `vct_launcher_core::services::watchdog_pause` so the PRODUCER (the
+// launcher's `service_stop` / `services_stop_all` commands) and this
+// CONSUMER resolve the identical path. Before the BLOCKER-1 fix the marker
+// had a consumer here but NO producer — a deliberate stop dropped no marker
+// and got restarted within one tick. The launcher now creates the marker on
+// a successful deliberate stop and removes it on a deliberate start.
 
-/// Directory holding per-service pause markers.
-pub fn pause_dir() -> PathBuf {
-    vct_launcher_core::paths::vct_root_dir()
-        .join("state")
-        .join("watchdog-paused")
-}
-
-/// Path to the pause marker for `service`. Its mere EXISTENCE means
-/// "paused" — content is ignored. `service` is always one of the
-/// compiled-in canonical names, so it's a safe single path component.
-pub fn pause_marker_path(service: &str) -> PathBuf {
-    pause_dir().join(service)
-}
-
-/// Is `service` currently paused (marker file present)?
+/// Is `service` currently paused (shared marker file present)?
+/// Thin delegation to the shared helper so consumer + producer agree.
 pub fn is_service_paused(service: &str) -> bool {
-    pause_marker_path(service).exists()
+    watchdog_pause::is_service_paused(service)
 }
 
-// ─── Orchestrator-clone / compose-file resolution ────────────────────────
+/// Path to the pause marker for `service` (for log messages). Delegates to
+/// the shared helper.
+pub fn pause_marker_path(service: &str) -> PathBuf {
+    watchdog_pause::pause_marker_path(service)
+}
+
+// ─── code_embed (GPU-only) stack-membership gate (BLOCKER-2) ─────────────
+
+/// Should the watchdog supervise `code_embed` on THIS host?
+///
+/// `code_embed` (the CodeSage GPU embedding service) is gated behind
+/// `profiles: [gpu]` in `infrastructure/docker-compose.yml`. On a CPU-only
+/// or `CODE_EMBED_BACKEND=ollama` host the `vco_code_embed` container
+/// legitimately does NOT exist — the host uses the Ollama CPU-embedding
+/// fallback. A blind `compose up code_embed` there would (a) try to BUILD
+/// the multi-GB CodeSage image on a CPU box and (b) fail / waste resources.
+/// So the watchdog must only target `code_embed` when the install actually
+/// includes it.
+///
+/// Resolution (any one ⇒ excluded):
+///   1. `CODE_EMBED_BACKEND=ollama` (case-insensitive) — explicit CPU
+///      fallback. This is the authoritative "not in stack" signal install.py
+///      writes to `.env` on a CPU-only host.
+///
+/// Otherwise: included. We deliberately DEFAULT-INCLUDE when the backend is
+/// unset / `gpu`, because the restart path is the GPU-aware wrapper which
+/// itself probes for NVIDIA + CDI and degrades to a CPU-only `up -d` WITHOUT
+/// the gpu profile when no GPU is present — i.e. on a GPU-less host the
+/// wrapper never enables the gpu profile, so `code_embed` is never built
+/// even if we "target" it. The hard exclusion above is the belt; the
+/// wrapper's own GPU probe is the suspenders. The container-probe also
+/// returns `false` for a never-created `vco_code_embed`, but step 1 stops us
+/// BEFORE we ever issue a build on an explicitly-CPU host.
+pub fn code_embed_in_stack() -> bool {
+    // Excluded iff CODE_EMBED_BACKEND is explicitly `ollama`
+    // (case-insensitive, trimmed). Unset / `gpu` / anything else → included.
+    !std::env::var(ENV_CODE_EMBED_BACKEND)
+        .map(|v| v.trim().eq_ignore_ascii_case("ollama"))
+        .unwrap_or(false)
+}
+
+/// True when `service` should be supervised on this host. Always true for
+/// `weaviate` / `ollama`; for the GPU-only `code_embed` it defers to
+/// [`code_embed_in_stack`].
+pub fn service_in_stack(service: &str) -> bool {
+    if service == GPU_ONLY_SERVICE {
+        code_embed_in_stack()
+    } else {
+        true
+    }
+}
+
+// ─── Orchestrator-clone / compose-file resolution (CONCERN-5) ────────────
 
 /// Locate `<orchestrator_clone>/infrastructure` so we can run compose
 /// against `docker-compose.yml`. The hub has no `current_exe()`-walk
 /// resolver (that lives launcher-side in `commands::installer`), so we
-/// read the orchestrator-root project's `folder_path` from launcher.db
-/// — the same row the launcher seeds at install. Returns `None` (soft)
-/// when no orchestrator-root row exists or its folder is gone.
+/// resolve via two sources, in order, keeping the compose-file existence
+/// guard on each:
+///   1. The orchestrator-root project's `folder_path` from launcher.db —
+///      the row the launcher seeds at install (read poison-tolerantly via
+///      `list_projects_nonpanicking`, see CONCERN-6).
+///   2. CONCERN-5 fallback: the `VCT_ORCHESTRATOR_ROOT` / `VCT_INSTALL_ROOT`
+///      env vars (the SAME vars `ensure-containers.sh` uses) when the DB
+///      row is absent/stale.
+///
+/// Returns `None` (soft) when neither source yields a directory containing
+/// `docker-compose.yml` — a stale/renamed clone shouldn't make us spawn a
+/// doomed `compose up` every tick.
 pub fn infrastructure_dir(db: &LauncherDbHandle) -> Option<PathBuf> {
-    let rows = db.0.list_projects().ok()?;
-    let root = rows
-        .into_iter()
-        .find(|p| p.host == ProjectHost::OrchestratorRoot)?;
-    let dir = PathBuf::from(root.folder_path).join("infrastructure");
-    // Confirm the compose file is actually there before we hand the dir
-    // to compose — a stale/renamed clone shouldn't make us spawn a
-    // doomed `compose up` every tick.
+    // 1. launcher.db orchestrator-root row (non-panicking read).
+    if let Ok(rows) = db.0.list_projects_nonpanicking() {
+        if let Some(root) = rows
+            .into_iter()
+            .find(|p| p.host == ProjectHost::OrchestratorRoot)
+        {
+            if let Some(dir) = infrastructure_dir_from_root(Path::new(&root.folder_path)) {
+                return Some(dir);
+            }
+        }
+    }
+
+    // 2. CONCERN-5 env fallback: VCT_ORCHESTRATOR_ROOT → VCT_INSTALL_ROOT.
+    for env_key in [ENV_ORCHESTRATOR_ROOT, ENV_INSTALL_ROOT] {
+        if let Ok(root) = std::env::var(env_key) {
+            let root = root.trim();
+            if !root.is_empty() {
+                if let Some(dir) = infrastructure_dir_from_root(Path::new(root)) {
+                    return Some(dir);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Given an orchestrator root, return `<root>/infrastructure` IFF it
+/// contains `docker-compose.yml`. Pure (filesystem stat only) so the
+/// resolution priority in [`infrastructure_dir`] is unit-testable.
+pub fn infrastructure_dir_from_root(root: &Path) -> Option<PathBuf> {
+    let dir = root.join("infrastructure");
     if dir.join("docker-compose.yml").is_file() {
         Some(dir)
     } else {
@@ -320,52 +469,221 @@ pub fn infrastructure_dir(db: &LauncherDbHandle) -> Option<PathBuf> {
     }
 }
 
-// ─── Container status probe ──────────────────────────────────────────────
+// ─── Container status probe (CONCERN-3: probe-error storm guard) ─────────
 
-/// Is the named container running, per `<runtime> inspect --format
-/// {{.State.Status}}`? Soft-fail: a missing container / failed inspect →
-/// `false` (treat as down — the watchdog then evaluates whether to
-/// restart, gated by the adoption + pause + backoff checks). Mirrors the
-/// paid-module supervisor's `is_container_running` but takes the detected
-/// runtime explicitly (no per-call re-detection).
-pub async fn container_running(runtime: &RuntimeInfo, container_name: &str) -> bool {
-    let output = Command::new(&runtime.binary_path)
+/// Tri-state result of probing a container's status.
+///
+/// The pre-remediation probe collapsed EVERY failure (spawn error,
+/// timeout, ambiguous output, AND an authoritative "no such container") to
+/// a single `false` = "down". That meant a transient runtime hiccup (the
+/// daemon momentarily unreachable) read all three infra containers as down
+/// in one tick → a spurious restart storm. This tri-state distinguishes:
+///
+/// - `Running` — `.State.Status == running`.
+/// - `NotRunning` — AUTHORITATIVELY down: inspect succeeded and reported
+///   `exited` / `created` / `dead` / `paused` / `stopped`, OR reported
+///   "no such container" (the container genuinely doesn't exist). Only this
+///   state is restart-eligible.
+/// - `ProbeError` — spawn failure, timeout, or ambiguous/empty output we
+///   can't trust. The watchdog SKIPS the service this tick (no restart) —
+///   mirroring the launcher watcher's storm guard in `services/watcher.rs`
+///   (it skips the whole tick on a failed status probe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerProbe {
+    Running,
+    NotRunning,
+    ProbeError,
+}
+
+/// Timeout for a single `inspect` probe. A hung daemon socket must not
+/// stall the tick; on timeout we report `ProbeError` (skip), not `down`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Probe the named container's status via `<runtime> inspect --format
+/// {{.State.Status}}`, returning a [`ContainerProbe`]. Never panics.
+///
+/// "No such container" is detected from inspect's stderr (it exits
+/// non-zero for a missing container) and mapped to AUTHORITATIVE
+/// `NotRunning` — a never-created container IS legitimately down and
+/// restart-eligible (subject to all the other gates). Every OTHER non-zero
+/// exit, spawn error, or timeout maps to `ProbeError` (skip).
+pub async fn probe_container(runtime: &RuntimeInfo, container_name: &str) -> ContainerProbe {
+    let fut = Command::new(&runtime.binary_path)
         .silent()
         .args(["inspect", "--format", "{{.State.Status}}", container_name])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await;
-    match output {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            parse_running_status(&stdout)
-        }
-        // inspect failed (no such container) or spawn error → down.
-        _ => false,
-    }
+        .stderr(Stdio::piped())
+        .output();
+    let output = match tokio::time::timeout(PROBE_TIMEOUT, fut).await {
+        Ok(Ok(out)) => out,
+        // Timeout → ambiguous, do NOT treat as down.
+        Err(_) => return ContainerProbe::ProbeError,
+        // Spawn error → ambiguous (runtime momentarily gone), do NOT treat
+        // as down.
+        Ok(Err(_)) => return ContainerProbe::ProbeError,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    classify_probe(output.status.success(), &stdout, &stderr)
 }
 
-/// Pure parser: `<runtime> inspect --format {{.State.Status}}` prints
-/// exactly `running` (plus a trailing newline) for a live container.
-/// Anything else (`exited`, `created`, empty, `Running`) is not-running.
+/// Pure classifier for the inspect probe — extracted so the tri-state
+/// decision is unit-testable without spawning a runtime.
+///
+/// `success` = inspect's exit status was zero; `stdout` = the
+/// `.State.Status` line; `stderr` = inspect's stderr (used to recognize
+/// the authoritative "no such container").
+pub fn classify_probe(success: bool, stdout: &str, stderr: &str) -> ContainerProbe {
+    if success {
+        let status = stdout.trim();
+        return match status {
+            "running" => ContainerProbe::Running,
+            // Authoritative not-running states from the OCI/podman/docker
+            // state machine.
+            "exited" | "created" | "dead" | "paused" | "stopped" | "removing" | "restarting" => {
+                ContainerProbe::NotRunning
+            }
+            // Empty or any unrecognized token: ambiguous, skip rather than
+            // risk a spurious restart on a runtime we don't understand.
+            _ => ContainerProbe::ProbeError,
+        };
+    }
+    // Non-zero exit. The one authoritative case is "no such container"
+    // (the container genuinely doesn't exist → down + restart-eligible).
+    let lc = stderr.to_lowercase();
+    if lc.contains("no such container")
+        || lc.contains("no such object")
+        || lc.contains("not found")
+    {
+        return ContainerProbe::NotRunning;
+    }
+    // Any other non-zero exit (permission denied, daemon error, …) is
+    // ambiguous — skip this tick.
+    ContainerProbe::ProbeError
+}
+
+/// Back-compat pure parser retained for callers/tests: `<runtime> inspect
+/// --format {{.State.Status}}` prints exactly `running` (plus a trailing
+/// newline) for a live container.
 pub fn parse_running_status(stdout: &str) -> bool {
     stdout.trim() == "running"
 }
 
-// ─── Restart action ──────────────────────────────────────────────────────
+// ─── Restart action (BLOCKER-2: GPU-aware, via the launcher's path) ──────
 
-/// Restart ONE infra service via `<runtime> compose -f
-/// infrastructure/docker-compose.yml up -d <service>`. Returns `Ok(())`
-/// on a zero-exit compose, `Err(msg)` otherwise (caller records the
-/// failure into the service's [`Backoff`]). Soft — never panics.
-async fn restart_service(
+/// Locate the `launch-claude-mcp-stack` wrapper relative to the
+/// orchestrator clone (the `infra_dir`'s parent is the orchestrator root).
+/// Mirrors the launcher's `find_stack_wrapper`: `.sh` on Linux/macOS,
+/// `.ps1` on Windows; `None` when the wrapper isn't shipped (minimal
+/// install) so the caller falls back to direct compose.
+pub fn find_stack_wrapper(infra_dir: &Path) -> Option<PathBuf> {
+    let root = infra_dir.parent()?;
+    let script_name = if cfg!(target_os = "windows") {
+        "launch-claude-mcp-stack.ps1"
+    } else {
+        "launch-claude-mcp-stack.sh"
+    };
+    let candidate = root.join("scripts").join(script_name);
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Run the `launch-claude-mcp-stack` wrapper (whole-stack `up -d`).
+///
+/// This is the SAME tested GPU-aware path the launcher prefers: the
+/// wrapper owns runtime detection, the NVIDIA probe, the CDI-readiness
+/// wait, and the overlay/profile/override selection. It is idempotent —
+/// `compose up -d` no-ops containers that are already running, so bringing
+/// the whole stack up to heal ONE dead service is safe. On a GPU-less host
+/// the wrapper never enables the gpu profile, so `vco_code_embed` is never
+/// built there.
+///
+/// Cross-OS dispatch mirrors the launcher's `run_stack_wrapper`:
+///   - Linux/macOS: `bash <script>` (no reliance on the exec bit, which a
+///     clone on a noexec partition may have lost).
+///   - Windows: `powershell -NoProfile -ExecutionPolicy Bypass -File
+///     <script>`.
+///
+/// We point `VCT_STACK_WORKING_DIR` at `infra_dir` so the wrapper finds the
+/// compose file even if its own env-based resolution would land elsewhere,
+/// and inherit `VCT_ORCHESTRATOR_ROOT` from `infra_dir`'s parent so
+/// runtime.txt resolution matches.
+async fn run_stack_wrapper(wrapper: &Path, infra_dir: &Path) -> Result<(), String> {
+    // `CommandExt::silent` takes ownership (returns Self), so build the
+    // base command silent first, then chain args by &mut.
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = Command::new("powershell").silent();
+        c.args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            wrapper.to_str().ok_or("non-UTF8 wrapper path")?,
+        ]);
+        c
+    } else {
+        let mut c = Command::new("bash").silent();
+        c.arg(wrapper);
+        c
+    };
+    // Point the wrapper at our resolved compose dir + orchestrator root so
+    // its compose-file + runtime.txt resolution is deterministic.
+    cmd.env("VCT_STACK_WORKING_DIR", infra_dir);
+    if let Some(root) = infra_dir.parent() {
+        cmd.env(ENV_ORCHESTRATOR_ROOT, root);
+        cmd.current_dir(root);
+    }
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("spawn launch-claude-mcp-stack wrapper: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "launch-claude-mcp-stack wrapper failed (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// Build the direct-compose fallback argv (WITHOUT the leading compose
+/// binary — that comes from `runtime.compose_command()`).
+///
+/// This is the wrapper-absent path. It mirrors the launcher's
+/// `services_start_all` fallback EXACTLY: a whole-stack `up -d` with NO
+/// service arg (so a future compose addition isn't silently skipped) and
+/// NO hand-rolled GPU overlay (the launcher's direct fallback is CPU-only;
+/// GPU correctness comes from the wrapper, which we already tried first).
+/// NIT-8: when the user's `docker-compose.override.yml` exists in
+/// `infra_dir` we add it explicitly with `-f` so the override isn't
+/// dropped (compose's implicit auto-load is bypassed once we pass an
+/// explicit `-f docker-compose.yml`). Pure → unit-testable.
+pub fn build_fallback_compose_args(infra_dir: &Path) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-f".into(), "docker-compose.yml".into()];
+    // NIT-8: preserve a user override the same way the boot wrapper does.
+    let override_path = infra_dir.join("docker-compose.override.yml");
+    if override_path.is_file() {
+        args.push("-f".into());
+        args.push("docker-compose.override.yml".into());
+    }
+    args.push("up".into());
+    args.push("-d".into());
+    args
+}
+
+/// Direct-compose fallback (wrapper not shipped): faithful to the
+/// launcher's `services_start_all` fallback. Whole-stack `up -d`.
+async fn restart_via_direct_compose(
     runtime: &RuntimeInfo,
-    infra_dir: &std::path::Path,
-    service: &str,
+    infra_dir: &Path,
 ) -> Result<(), String> {
     let mut cmd = runtime.compose_command();
-    cmd.args(["-f", "docker-compose.yml", "up", "-d", service]);
+    cmd.args(build_fallback_compose_args(infra_dir));
     cmd.current_dir(infra_dir);
     let output = cmd
         .output()
@@ -375,13 +693,41 @@ async fn restart_service(
         Ok(())
     } else {
         Err(format!(
-            "{} compose up -d {} failed (status {}): {}",
+            "{} compose up -d failed (status {}): {}",
             runtime.runtime.display_name(),
-            service,
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+/// Restart the infra stack to heal `service` through the SAME GPU-aware
+/// path the launcher uses: PREFER the `launch-claude-mcp-stack` wrapper
+/// (GPU overlay + `--profile gpu` + CDI-wait, idempotent whole-stack
+/// `up -d`); fall back to a launcher-faithful direct `compose up -d` only
+/// when the wrapper isn't shipped or fails. `service` is logged for
+/// context; the actual op is whole-stack (idempotent), which is what makes
+/// reusing the wrapper safe. Returns `Ok(())` on success, `Err(msg)`
+/// otherwise (caller records into [`Backoff`]). Soft — never panics.
+async fn restart_service(
+    runtime: &RuntimeInfo,
+    infra_dir: &Path,
+    service: &str,
+) -> Result<(), String> {
+    if let Some(wrapper) = find_stack_wrapper(infra_dir) {
+        match run_stack_wrapper(&wrapper, infra_dir).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "[vct-hub] infra watchdog: launch-claude-mcp-stack wrapper \
+                     failed while healing {} (falling back to direct compose): {}",
+                    service, e
+                );
+                // Fall through to direct compose.
+            }
+        }
+    }
+    restart_via_direct_compose(runtime, infra_dir).await
 }
 
 // ─── Spawn + tick loop ───────────────────────────────────────────────────
@@ -413,6 +759,31 @@ pub fn spawn_infra_watchdog(db: LauncherDbHandle) {
     });
 }
 
+/// CONCERN-4: read the SHARED auto-restart toggle from launcher.db
+/// (`launcher.services_watcher_enabled`). Returns `true` when the row is
+/// absent (the launcher watcher's documented default) and on any read
+/// error (fail-OPEN: a transient DB read failure must not silently disable
+/// the safety net — but a poisoned mutex is recovered, not panicked on,
+/// via the non-panicking accessor). When the user explicitly set the
+/// toggle to `false`, BOTH the launcher watcher AND this hub watchdog stand
+/// down — one switch, both restarters.
+pub fn watcher_enabled(db: &LauncherDbHandle) -> bool {
+    match db.0.app_state_get_bool_nonpanicking(APP_STATE_KEY_WATCHER_ENABLED) {
+        Ok(Some(v)) => v,
+        // Row absent → default ENABLED (matches the launcher watcher).
+        Ok(None) => true,
+        // Read error → fail-open (don't silently disable the safety net).
+        Err(e) => {
+            eprintln!(
+                "[vct-hub] infra watchdog: could not read {} ({}); assuming \
+                 ENABLED (fail-open).",
+                APP_STATE_KEY_WATCHER_ENABLED, e
+            );
+            true
+        }
+    }
+}
+
 /// The forever loop: sleep one interval, then run one tick. Sleeping
 /// FIRST gives the launcher's own boot-time `services_start_all` +
 /// `ensure-containers.sh` a head start so the watchdog isn't racing them
@@ -430,9 +801,24 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
 
     loop {
         tokio::time::sleep(config.interval).await;
-        // One tick is fully soft-failed inside; a panic here would kill
-        // the task (and only this task), but every fallible op already
-        // returns/logs rather than panicking.
+
+        // CONCERN-4: honor the user's auto-restart toggle. When disabled,
+        // skip the whole tick (no probes, no restarts) so the hub watchdog
+        // and the launcher's own watcher are governed by ONE switch and
+        // never race with different give-up budgets.
+        if !watcher_enabled(&db) {
+            continue;
+        }
+
+        // One tick is fully soft-failed inside (CONCERN-6): every DB read
+        // the tick performs goes through a poison-TOLERANT accessor
+        // (`list_projects_nonpanicking` / `app_state_get_bool_nonpanicking`
+        // / `lock_recover`) rather than `lock().expect("db mutex
+        // poisoned")`, so a poisoned launcher.db mutex no longer kills this
+        // detached task. `adoption::read()` and `detect_runtime()` are
+        // already non-panicking. The result is that the watchdog upholds
+        // its "never crashes the hub" contract: a single bad tick logs and
+        // the next tick tries again.
         run_one_tick(&db, base, &mut backoffs, &mut ticks_since_attempt).await;
     }
 }
@@ -480,18 +866,40 @@ async fn run_one_tick(
         let service = *service;
         let container = *container;
 
-        let running = container_running(&runtime, container).await;
-
-        // Observing the service UP resets its crash-loop state (covers
-        // external recovery: a user / hook restarted it themselves).
-        if running {
-            if let Some(b) = backoffs.get_mut(service) {
-                if b.consecutive_failures > 0 || b.gave_up {
-                    b.reset_on_success();
-                }
-            }
-            ticks_since_attempt.remove(service);
+        // BLOCKER-2 gate: don't supervise a service that isn't part of THIS
+        // install. The GPU-only `code_embed` legitimately doesn't exist on a
+        // CPU-only / `CODE_EMBED_BACKEND=ollama` host; targeting it there
+        // would trigger a multi-GB image build. (Quiet — normal on CPU
+        // hosts.)
+        if !service_in_stack(service) {
             continue;
+        }
+
+        // CONCERN-3: tri-state probe. A transient daemon hiccup
+        // (ProbeError) SKIPS the service this tick rather than treating it
+        // as down — avoiding a restart storm after probe errors. Only an
+        // AUTHORITATIVE not-running reading is restart-eligible.
+        let probe = probe_container(&runtime, container).await;
+        match probe {
+            ContainerProbe::Running => {
+                // Observing the service UP resets its crash-loop state
+                // (covers external recovery: a user / hook restarted it).
+                if let Some(b) = backoffs.get_mut(service) {
+                    if b.consecutive_failures > 0 || b.gave_up {
+                        b.reset_on_success();
+                    }
+                }
+                ticks_since_attempt.remove(service);
+                continue;
+            }
+            ContainerProbe::ProbeError => {
+                // Ambiguous reading — do NOT count it as down, do NOT
+                // touch backoff/tick state. Skip and re-probe next tick.
+                continue;
+            }
+            ContainerProbe::NotRunning => {
+                // Fall through to the eligibility + backoff logic below.
+            }
         }
 
         let mode = adoption_state
@@ -500,7 +908,8 @@ async fn run_one_tick(
             .unwrap_or(AdoptionMode::Unresolved);
         let paused = is_service_paused(service);
 
-        if !service_eligible_for_restart(running, mode, paused) {
+        // `running == false` here (authoritative NotRunning above).
+        if !service_eligible_for_restart(false, mode, paused) {
             // Down, but the user adopted / parallel'd / refused / paused
             // it. Leave it alone. (Quiet — this is the normal steady
             // state for a deliberately-external service.)
@@ -815,5 +1224,196 @@ mod tests {
         };
         assert!(cfg.enabled);
         assert_eq!(cfg.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
+    }
+
+    // ----- CONCERN-3: tri-state probe classifier (storm guard) -----
+
+    #[test]
+    fn classify_probe_running_only_on_exact_running() {
+        assert_eq!(classify_probe(true, "running", ""), ContainerProbe::Running);
+        assert_eq!(classify_probe(true, "running\n", ""), ContainerProbe::Running);
+        assert_eq!(classify_probe(true, "  running \n", ""), ContainerProbe::Running);
+    }
+
+    #[test]
+    fn classify_probe_authoritative_not_running_states() {
+        for status in ["exited", "created", "dead", "paused", "stopped", "removing", "restarting"] {
+            assert_eq!(
+                classify_probe(true, status, ""),
+                ContainerProbe::NotRunning,
+                "status '{}' must be authoritatively NotRunning",
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn classify_probe_no_such_container_is_authoritative_not_running() {
+        // inspect exits non-zero with this stderr when the container has
+        // never been created — that IS down + restart-eligible.
+        assert_eq!(
+            classify_probe(false, "", "Error: no such container: vco_weaviate"),
+            ContainerProbe::NotRunning
+        );
+        assert_eq!(
+            classify_probe(false, "", "Error response from daemon: No such object: vco_ollama"),
+            ContainerProbe::NotRunning
+        );
+    }
+
+    #[test]
+    fn classify_probe_ambiguous_failures_are_probe_error() {
+        // Non-zero exit that ISN'T "no such container" → ProbeError (skip),
+        // NOT down. This is the storm guard: a transient daemon hiccup
+        // must not be read as "all three containers down".
+        assert_eq!(
+            classify_probe(false, "", "permission denied while connecting to the daemon socket"),
+            ContainerProbe::ProbeError
+        );
+        assert_eq!(
+            classify_probe(false, "", "Cannot connect to the Docker daemon"),
+            ContainerProbe::ProbeError
+        );
+        // Zero exit but empty / unrecognized status token → ambiguous.
+        assert_eq!(classify_probe(true, "", ""), ContainerProbe::ProbeError);
+        assert_eq!(classify_probe(true, "Running", ""), ContainerProbe::ProbeError);
+        assert_eq!(classify_probe(true, "weird-state", ""), ContainerProbe::ProbeError);
+    }
+
+    // ----- BLOCKER-2: code_embed (GPU-only) stack-membership gate -----
+
+    #[test]
+    #[serial_test::serial]
+    fn code_embed_excluded_when_backend_is_ollama() {
+        let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
+        // Explicit CPU fallback → code_embed not in stack.
+        for v in ["ollama", "OLLAMA", " Ollama "] {
+            std::env::set_var(ENV_CODE_EMBED_BACKEND, v);
+            assert!(!code_embed_in_stack(), "backend={:?} must exclude code_embed", v);
+            assert!(!service_in_stack("code_embed"));
+            // weaviate / ollama are always in stack regardless.
+            assert!(service_in_stack("weaviate"));
+            assert!(service_in_stack("ollama"));
+        }
+        match prev {
+            Some(p) => std::env::set_var(ENV_CODE_EMBED_BACKEND, p),
+            None => std::env::remove_var(ENV_CODE_EMBED_BACKEND),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn code_embed_included_when_backend_unset_or_gpu() {
+        let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
+        std::env::remove_var(ENV_CODE_EMBED_BACKEND);
+        assert!(code_embed_in_stack(), "unset backend defaults to in-stack");
+        assert!(service_in_stack("code_embed"));
+        std::env::set_var(ENV_CODE_EMBED_BACKEND, "gpu");
+        assert!(code_embed_in_stack(), "gpu backend keeps code_embed in stack");
+        match prev {
+            Some(p) => std::env::set_var(ENV_CODE_EMBED_BACKEND, p),
+            None => std::env::remove_var(ENV_CODE_EMBED_BACKEND),
+        }
+    }
+
+    // ----- CONCERN-5: infrastructure_dir env-fallback resolution -----
+
+    #[test]
+    fn infrastructure_dir_from_root_requires_compose_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No infrastructure/docker-compose.yml yet → None.
+        assert!(infrastructure_dir_from_root(root).is_none());
+        // Create it → Some(<root>/infrastructure).
+        let infra = root.join("infrastructure");
+        std::fs::create_dir_all(&infra).unwrap();
+        std::fs::write(infra.join("docker-compose.yml"), "services: {}\n").unwrap();
+        let resolved = infrastructure_dir_from_root(root).expect("compose present → resolves");
+        assert_eq!(resolved, infra);
+    }
+
+    // ----- NIT-8 + wrapper-absent fallback: direct-compose argv -----
+
+    #[test]
+    fn fallback_compose_args_whole_stack_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = build_fallback_compose_args(dir.path());
+        // Whole-stack up -d, no service arg, no override (file absent).
+        assert_eq!(args, vec!["-f", "docker-compose.yml", "up", "-d"]);
+    }
+
+    #[test]
+    fn fallback_compose_args_includes_override_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.override.yml"),
+            "services: {}\n",
+        )
+        .unwrap();
+        let args = build_fallback_compose_args(dir.path());
+        // NIT-8: the override must be appended explicitly (LAST -f wins on
+        // conflicts) since explicit `-f docker-compose.yml` bypasses
+        // compose's implicit override auto-load.
+        assert_eq!(
+            args,
+            vec![
+                "-f",
+                "docker-compose.yml",
+                "-f",
+                "docker-compose.override.yml",
+                "up",
+                "-d"
+            ]
+        );
+    }
+
+    // ----- BLOCKER-2: stack-wrapper discovery relative to infra_dir -----
+
+    #[test]
+    fn find_stack_wrapper_resolves_relative_to_orchestrator_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let infra = root.join("infrastructure");
+        std::fs::create_dir_all(&infra).unwrap();
+        // No scripts/ yet → None.
+        assert!(find_stack_wrapper(&infra).is_none());
+        // Ship the wrapper.
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let name = if cfg!(target_os = "windows") {
+            "launch-claude-mcp-stack.ps1"
+        } else {
+            "launch-claude-mcp-stack.sh"
+        };
+        let wrapper = scripts.join(name);
+        std::fs::write(&wrapper, "#!/usr/bin/env bash\n").unwrap();
+        let found = find_stack_wrapper(&infra).expect("wrapper shipped → found");
+        assert_eq!(found, wrapper);
+    }
+
+    // ----- BLOCKER-1: pause-marker consumer delegates to shared helper ---
+
+    #[test]
+    #[serial_test::serial]
+    fn is_service_paused_reads_shared_marker() {
+        // Redirect vct_root_dir at a temp dir + verify the consumer here
+        // sees a marker the shared PRODUCER created (same path → wired).
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("VCT_STATE_DIR");
+        std::env::set_var("VCT_STATE_DIR", dir.path());
+
+        assert!(!is_service_paused("weaviate"));
+        // Producer side (shared helper) drops the marker.
+        watchdog_pause::create_pause_marker("weaviate").unwrap();
+        // Consumer side (this module's delegation) must see it.
+        assert!(is_service_paused("weaviate"));
+        assert!(pause_marker_path("weaviate").ends_with("watchdog-paused/weaviate"));
+        watchdog_pause::remove_pause_marker("weaviate").unwrap();
+        assert!(!is_service_paused("weaviate"));
+
+        match prev {
+            Some(p) => std::env::set_var("VCT_STATE_DIR", p),
+            None => std::env::remove_var("VCT_STATE_DIR"),
+        }
     }
 }

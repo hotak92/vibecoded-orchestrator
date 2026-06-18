@@ -532,6 +532,12 @@ pub async fn services_start_all() -> Result<(), String> {
         return Ok(());
     }
 
+    // BLOCKER-1 (v0.2.62): a deliberate START re-enables watchdog
+    // supervision — remove any pause markers we (or a prior stop) left for
+    // the managed services. Done BEFORE the up so a successful start leaves
+    // the watchdog supervising again even if the up itself is a slow no-op.
+    set_pause_markers_for_managed_services(false);
+
     // PR-15 G3 (v0.2.11): PREFER the launch-claude-mcp-stack wrapper
     // when shipped. The wrapper has CDI-wait (prevents the vco_code_embed
     // boot race) + runtime daemon-access validation + runtime.txt
@@ -574,6 +580,15 @@ pub async fn services_start_all() -> Result<(), String> {
 /// flag — that would destroy data). Idempotent: succeeds even when
 /// nothing is up. Used by Quit-confirmation's "Quit and stop services"
 /// button.
+///
+/// BLOCKER-1 (v0.2.62): on a successful stop, DROP a pause marker for each
+/// VCO-managed (`Unresolved`) canonical service so the hub's infra watchdog
+/// (a separate process) knows this stop was DELIBERATE and must not restart
+/// it within one tick. The launcher is the PRODUCER of the marker the
+/// watchdog CONSUMES (shared path in
+/// `vct_launcher_core::services::watchdog_pause`). Adopted / parallel /
+/// refused services aren't watchdog-supervised, so no marker is needed (and
+/// we don't drop one — the marker is meaningless for them).
 #[command]
 pub async fn services_stop_all() -> Result<(), String> {
     let info = detect_runtime()
@@ -583,7 +598,70 @@ pub async fn services_stop_all() -> Result<(), String> {
     // down` would also remove the containers. Either preserves volumes
     // (we explicitly never pass --volumes / -v). We use `stop` so a
     // subsequent `up -d` is fast — it just restarts the same containers.
-    run_compose(&info, ["stop"]).await
+    run_compose(&info, ["stop"]).await?;
+    // BLOCKER-1: signal the deliberate stop to the hub watchdog.
+    set_pause_markers_for_managed_services(true);
+    Ok(())
+}
+
+/// BLOCKER-1 helper: create (or remove) the hub-watchdog pause marker for
+/// every VCO-managed (`Unresolved` adoption mode) canonical service.
+///
+/// `pause = true`  → CREATE markers (a deliberate STOP just happened; the
+///                   watchdog must leave these services down).
+/// `pause = false` → REMOVE markers (a deliberate START just happened;
+///                   resume watchdog supervision).
+///
+/// Only `Unresolved`-mode services get a marker — Adopt / Parallel / Refuse
+/// are never watchdog-supervised, so a marker for them is meaningless.
+/// Soft-fail: a filesystem error is logged but never blocks the user's
+/// button press (failing to drop a marker only risks the watchdog
+/// restarting a service the user stopped — recoverable, not data loss).
+fn set_pause_markers_for_managed_services(pause: bool) {
+    let state = adoption::read();
+    for (name, _, _) in canonical_services() {
+        let mode = state.get(name).map(|s| s.mode).unwrap_or(AdoptionMode::Unresolved);
+        if !matches!(mode, AdoptionMode::Unresolved) {
+            continue;
+        }
+        let res = if pause {
+            vct_launcher_core::services::watchdog_pause::create_pause_marker(name)
+        } else {
+            vct_launcher_core::services::watchdog_pause::remove_pause_marker(name)
+        };
+        if let Err(e) = res {
+            eprintln!(
+                "[lifecycle] watchdog pause-marker {} for '{}' soft-failed: {}",
+                if pause { "create" } else { "remove" },
+                name,
+                e
+            );
+        }
+    }
+}
+
+/// BLOCKER-1 helper: create/remove the pause marker for ONE service, only
+/// when it is VCO-managed (`Unresolved`). Used by the single-service
+/// stop/start/restart commands. Soft-fail (logs, never blocks).
+fn set_pause_marker_for_service(name: &str, pause: bool) {
+    let state = adoption::read();
+    let mode = state.get(name).map(|s| s.mode).unwrap_or(AdoptionMode::Unresolved);
+    if !matches!(mode, AdoptionMode::Unresolved) {
+        return;
+    }
+    let res = if pause {
+        vct_launcher_core::services::watchdog_pause::create_pause_marker(name)
+    } else {
+        vct_launcher_core::services::watchdog_pause::remove_pause_marker(name)
+    };
+    if let Err(e) = res {
+        eprintln!(
+            "[lifecycle] watchdog pause-marker {} for '{}' soft-failed: {}",
+            if pause { "create" } else { "remove" },
+            name,
+            e
+        );
+    }
 }
 
 /// Restart all services. `compose restart` does this atomically; we
@@ -597,6 +675,9 @@ pub async fn services_restart_all() -> Result<(), String> {
     let info = detect_runtime()
         .await
         .ok_or("No container runtime found.")?;
+    // BLOCKER-1 (v0.2.62): a deliberate restart re-enables watchdog
+    // supervision for the managed services.
+    set_pause_markers_for_managed_services(false);
     if let Some(_) = find_stack_wrapper() {
         match run_stack_wrapper("restart").await {
             Ok(()) => return Ok(()),
@@ -634,7 +715,11 @@ pub async fn service_start(name: String) -> Result<(), String> {
     let info = detect_runtime()
         .await
         .ok_or("No container runtime found.")?;
-    route_service_action(&info, &name, "start").await
+    route_service_action(&info, &name, "start").await?;
+    // BLOCKER-1 (v0.2.62): a deliberate start re-enables watchdog
+    // supervision for this service.
+    set_pause_marker_for_service(&name, false);
+    Ok(())
 }
 
 /// Stop a single service. See `service_start` doc for routing rules.
@@ -644,7 +729,11 @@ pub async fn service_stop(name: String) -> Result<(), String> {
     let info = detect_runtime()
         .await
         .ok_or("No container runtime found.")?;
-    route_service_action(&info, &name, "stop").await
+    route_service_action(&info, &name, "stop").await?;
+    // BLOCKER-1 (v0.2.62): signal the deliberate stop so the hub watchdog
+    // doesn't restart this service within one tick.
+    set_pause_marker_for_service(&name, true);
+    Ok(())
 }
 
 /// Restart a single service. See `service_start` doc for routing rules.
@@ -654,7 +743,11 @@ pub async fn service_restart(name: String) -> Result<(), String> {
     let info = detect_runtime()
         .await
         .ok_or("No container runtime found.")?;
-    route_service_action(&info, &name, "restart").await
+    route_service_action(&info, &name, "restart").await?;
+    // BLOCKER-1 (v0.2.62): a deliberate restart re-enables watchdog
+    // supervision for this service.
+    set_pause_marker_for_service(&name, false);
+    Ok(())
 }
 
 /// Dispatch a single-service action to the right backend based on adoption
@@ -1691,6 +1784,110 @@ mod services_lifecycle_tests {
         };
         assert_eq!(new_entry.mode, AdoptionMode::Unresolved);
         assert_eq!(new_entry.container_name.as_deref(), Some("ollama_claude"));
+    }
+
+    // ---- v0.2.62 BLOCKER-1: watchdog pause-marker PRODUCER ------------
+
+    /// RAII helper: redirect `vct_root_dir()` (and therefore both
+    /// services.toml AND the watchdog-paused marker dir) at a temp dir for
+    /// the duration of a test via `VCT_STATE_DIR`. Restores on drop.
+    struct TempStateRoot {
+        _dir: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl TempStateRoot {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::var_os("VCT_STATE_DIR");
+            std::env::set_var("VCT_STATE_DIR", dir.path());
+            TempStateRoot { _dir: dir, prev }
+        }
+    }
+    impl Drop for TempStateRoot {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+                None => std::env::remove_var("VCT_STATE_DIR"),
+            }
+        }
+    }
+
+    /// The PRODUCER drops a marker for a VCO-managed (`Unresolved`) service
+    /// on stop, and removes it on start — the exact wiring BLOCKER-1 was
+    /// missing (consumer existed, producer didn't). The hub watchdog's
+    /// consumer reads the SAME shared path.
+    #[test]
+    #[serial_test::serial]
+    fn pause_marker_produced_for_unresolved_service_and_cleared_on_start() {
+        let _root = TempStateRoot::new();
+        // No adoption entry → Unresolved (the VCO-managed default).
+        assert!(
+            !vct_launcher_core::services::watchdog_pause::is_service_paused("weaviate"),
+            "fixture must start with no marker"
+        );
+        // Simulate a deliberate stop's marker production.
+        set_pause_marker_for_service("weaviate", true);
+        assert!(
+            vct_launcher_core::services::watchdog_pause::is_service_paused("weaviate"),
+            "stop must drop a marker the watchdog reads"
+        );
+        // Simulate a deliberate start's marker removal.
+        set_pause_marker_for_service("weaviate", false);
+        assert!(
+            !vct_launcher_core::services::watchdog_pause::is_service_paused("weaviate"),
+            "start must clear the marker so supervision resumes"
+        );
+    }
+
+    /// The PRODUCER must NOT drop a marker for an Adopt / Parallel / Refuse
+    /// service — those are never watchdog-supervised, so a marker is
+    /// meaningless (and would be a confusing artifact).
+    #[test]
+    #[serial_test::serial]
+    fn pause_marker_not_produced_for_externally_managed_service() {
+        let _root = TempStateRoot::new();
+        // Mark ollama as Adopt.
+        let mut state = adoption::read();
+        state.upsert(ServiceAdoption {
+            name: "ollama".into(),
+            mode: AdoptionMode::Adopt,
+            external_url: Some("http://localhost:11435".into()),
+            parallel_port: None,
+            container_name: None,
+        });
+        adoption::write(&state).unwrap();
+
+        set_pause_marker_for_service("ollama", true);
+        assert!(
+            !vct_launcher_core::services::watchdog_pause::is_service_paused("ollama"),
+            "adopted service must NOT get a watchdog pause marker"
+        );
+    }
+
+    /// `set_pause_markers_for_managed_services` (the stop-all / start-all
+    /// path) creates markers for ALL Unresolved services and clears them on
+    /// the inverse call.
+    #[test]
+    #[serial_test::serial]
+    fn pause_markers_all_managed_round_trip() {
+        let _root = TempStateRoot::new();
+        // All three default to Unresolved (no services.toml).
+        set_pause_markers_for_managed_services(true);
+        for svc in ["weaviate", "ollama", "code_embed"] {
+            assert!(
+                vct_launcher_core::services::watchdog_pause::is_service_paused(svc),
+                "stop-all must pause managed service {}",
+                svc
+            );
+        }
+        set_pause_markers_for_managed_services(false);
+        for svc in ["weaviate", "ollama", "code_embed"] {
+            assert!(
+                !vct_launcher_core::services::watchdog_pause::is_service_paused(svc),
+                "start-all must resume managed service {}",
+                svc
+            );
+        }
     }
 
     /// Watcher decision function: given a previous + current snapshot,

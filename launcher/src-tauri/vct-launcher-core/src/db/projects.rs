@@ -88,6 +88,29 @@ impl Db {
 
     pub fn list_projects(&self) -> Result<Vec<ProjectRow>, String> {
         let guard = self.lock();
+        Self::list_projects_with_guard(&guard)
+    }
+
+    /// v0.2.62 (CONCERN-6 remediation): poison-tolerant `list_projects`
+    /// for the hub's detached infra-watchdog task, which must NEVER panic
+    /// (a panic in the detached task kills it for the rest of the hub
+    /// process, defeating its purpose).
+    ///
+    /// Identical query to [`Db::list_projects`] but acquires the connection
+    /// via [`Db::lock_recover`] (recovers a poisoned mutex instead of
+    /// `.expect()`-panicking). All other failure modes still surface as
+    /// `Err(String)` for the caller to log + soft-fail.
+    pub fn list_projects_nonpanicking(&self) -> Result<Vec<ProjectRow>, String> {
+        let guard = self.lock_recover();
+        Self::list_projects_with_guard(&guard)
+    }
+
+    /// Shared query body for [`Db::list_projects`] +
+    /// [`Db::list_projects_nonpanicking`] — they differ only in how they
+    /// acquire the lock (panic-on-poison vs recover-on-poison).
+    fn list_projects_with_guard(
+        guard: &rusqlite::Connection,
+    ) -> Result<Vec<ProjectRow>, String> {
         let mut stmt = guard
             .prepare(
                 "SELECT id, name, folder_path, host, slug, created_at, updated_at, rl_port
