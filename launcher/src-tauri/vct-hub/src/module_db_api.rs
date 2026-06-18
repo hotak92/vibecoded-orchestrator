@@ -95,7 +95,18 @@ pub fn router() -> Router<LauncherDbHandle> {
             "/modules/{module_id}/projects/{project_id}/rl/events",
             get(list_module_rl_events),
         )
-        // All crud, token, and rl/events routes get the same bearer-scope check.
+        // v0.2.61 (RL config-readback): module-scoped per-project config read.
+        // A module reads its OWN per-project module_settings (the RL container
+        // reads its 3 toggle flags here) with the identity token — it must NOT
+        // use the launcher-public /projects/{id}/config (hub.token-gated, which
+        // the container doesn't hold) AND must NOT see the full ProjectConfig
+        // (cross-project access lists / service URLs). This returns ONLY the
+        // module's own module_settings map — least-privilege.
+        .route(
+            "/modules/{module_id}/projects/{project_id}/config",
+            get(list_module_project_config),
+        )
+        // All crud, token, rl/events, and config routes get the bearer-scope check.
         .layer(axum::middleware::from_fn(require_module_scope))
 }
 
@@ -190,7 +201,13 @@ async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
     let method = req.method().clone();
     let is_rl_events_read = method == axum::http::Method::GET && is_rl_events_read_path(&path);
     let is_own_db_rows = is_db_rows_path(&path);
-    let ephemeral_allowed = is_rl_events_read || is_own_db_rows;
+    // v0.2.61 (RL config-readback): GET on the module's own per-project config
+    // route — returns only the module's own module_settings map (least
+    // privilege), so the RL container can read its toggle flags with the
+    // identity token without the hub.token-gated /projects/{id}/config.
+    let is_module_config_read =
+        method == axum::http::Method::GET && is_module_config_path(&path);
+    let ephemeral_allowed = is_rl_events_read || is_own_db_rows || is_module_config_read;
 
     // Look up the token row.
     let launcher_db = match req.extensions().get::<LauncherDbHandle>().cloned() {
@@ -343,6 +360,12 @@ fn parse_module_path(path: &str) -> Option<(String, Option<String>)> {
         {
             return Some((module_id, Some(parts[3].to_string())));
         }
+        // v0.2.61 (RL config-readback): module-scoped per-project config read
+        // — "modules", "{module_id}", "projects", "{project_id}", "config".
+        // Same (module_id, project_id) scope gate as the rl/events route.
+        if parts.len() >= 5 && parts[2] == "projects" && parts[4] == "config" {
+            return Some((module_id, Some(parts[3].to_string())));
+        }
         if parts.len() >= 4 && parts[2] == "token" && parts[3] == "refresh" {
             return Some((module_id, None));
         }
@@ -387,6 +410,20 @@ fn is_db_rows_path(path: &str) -> bool {
         && parts[2] == "db"
         && parts[3] == "projects"
         && parts[5] == "rows"
+}
+
+/// True iff `path` is EXACTLY the module-scoped per-project config route
+/// (`/modules/{id}/projects/{pid}/config`). (v0.2.61 RL config-readback.)
+/// The ephemeral identity token is authorized for GET here — it returns ONLY
+/// the module's own module_settings map (least-privilege; NOT the full
+/// hub.token-gated ProjectConfig). Exact 5-segment shape only.
+fn is_module_config_path(path: &str) -> bool {
+    let p = path.trim_start_matches("/api/v1").trim_start_matches('/');
+    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    parts.len() == 5
+        && parts[0] == "modules"
+        && parts[2] == "projects"
+        && parts[4] == "config"
 }
 
 #[derive(Clone, Debug)]
@@ -976,6 +1013,59 @@ async fn list_module_rl_events(
                 })
                 .collect();
             (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "query_failed", e.to_string()),
+    }
+}
+
+/// `GET /modules/{module_id}/projects/{project_id}/config` — v0.2.61 RL
+/// config-readback. A module reads its OWN per-project `module_settings` with
+/// the ephemeral identity token (the RL container reads its 3 toggle flags —
+/// rl_use_global / rl_online_training_disabled / rl_global_training_source_flag
+/// — here). Returns ONLY the module's own settings map as a flat JSON object
+/// (`{<setting_key>: <value>, ...}`), NOT the launcher's full ProjectConfig
+/// (which carries cross-project access lists + service URLs — out of scope for a
+/// 3rd-party container; least-privilege, consistent with B3/CONFIRM-3). Absent
+/// flags are simply absent from the map; the container defaults them to false.
+async fn list_module_project_config(
+    State(h): State<LauncherDbHandle>,
+    Path((module_id, project_id)): Path<(String, String)>,
+    req: Request<Body>,
+) -> Response {
+    let scope = match req.extensions().get::<ModuleScope>().cloned() {
+        Some(s) => s,
+        None => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "no_scope",
+                "scope extension missing",
+            )
+        }
+    };
+    // Defense in depth (middleware already enforced these).
+    if scope.module_id != module_id {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "scope_mismatch",
+            "token does not authorize this module",
+        );
+    }
+    if scope.project_id != project_id {
+        return err(
+            StatusCode::FORBIDDEN,
+            "scope_mismatch",
+            "token does not authorize this project",
+        );
+    }
+    // PIN the read to the token's (module, project) — never client-supplied.
+    match h
+        .0
+        .list_module_settings(&scope.project_id, &scope.module_id)
+    {
+        Ok(rows) => {
+            let map: serde_json::Map<String, serde_json::Value> =
+                rows.into_iter().collect();
+            (StatusCode::OK, Json(serde_json::Value::Object(map))).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "query_failed", e.to_string()),
     }
@@ -1954,5 +2044,92 @@ mod integration_tests {
         assert!(!is_db_rows_path("/api/v1/modules/m/db/projects/p"));
         // too deep — must NOT match (no prefix inheritance past {key}).
         assert!(!is_db_rows_path("/api/v1/modules/m/db/projects/p/rows/t/k/extra"));
+    }
+
+    #[test]
+    fn is_module_config_path_exact_shape_only() {
+        // v0.2.61 RL config-readback matcher: only the exact 5-segment
+        // /modules/{id}/projects/{pid}/config shape matches.
+        assert!(is_module_config_path("/api/v1/modules/m/projects/p/config"));
+        assert!(is_module_config_path("modules/m/projects/p/config"));
+        // rl/events / db / token — must NOT match.
+        assert!(!is_module_config_path("/api/v1/modules/m/projects/p/rl/events"));
+        assert!(!is_module_config_path("/api/v1/modules/m/db/projects/p/rows/t"));
+        assert!(!is_module_config_path("/api/v1/modules/m/token/refresh"));
+        // deeper path under config — must NOT match (no prefix inheritance).
+        assert!(!is_module_config_path("/api/v1/modules/m/projects/p/config/x"));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_token_reads_own_module_config() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // v0.2.61 RL config-readback: the ephemeral identity token GETs its
+        // OWN per-project module_settings map (the RL container reads its
+        // toggle flags this way). Returns 200 + a flat JSON object of the
+        // module's own settings; absent flags are simply absent (container
+        // defaults them false).
+        let (base, _h, _db_token) = spawn("test-mod", "proj1", "rl").await;
+        let ident = crate::module_identity::mint_and_register("test-mod").expect("mint");
+        // module_settings has a FK to projects.id — seed the project row first
+        // (spawn() doesn't create it; mirrors the rl/events test).
+        {
+            let now = chrono::Utc::now().timestamp_millis();
+            let guard = _h.0.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects \
+                        (id, name, folder_path, host, slug, created_at, updated_at) \
+                     VALUES ('proj1', 'Proj One', '/tmp/proj1', 'base', 'proj1', ?1, ?1)",
+                    rusqlite::params![now],
+                )
+                .expect("seed project row");
+        }
+        // Seed one flag for this (project, module).
+        _h.0
+            .set_setting("proj1", "test-mod", "rl_use_global", &serde_json::json!(true))
+            .expect("seed setting");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/modules/test-mod/projects/proj1/config", base))
+            .headers(auth_header(&ident))
+            .send()
+            .await
+            .expect("hub reachable");
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 200, "ephemeral token must read its own config; body: {}", body);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            parsed.get("rl_use_global").and_then(|v| v.as_bool()),
+            Some(true),
+            "config readback must return the seeded flag; body: {}", body
+        );
+
+        crate::module_identity::revoke("test-mod");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_token_rejected_on_other_module_config() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Security boundary: the config route is SAME-MODULE only. An identity
+        // token for module-x hitting module-y's config must 401.
+        let (base, _h, _db_token) = spawn("module-x", "proj1", "rl").await;
+        let ident = crate::module_identity::mint_and_register("module-x").expect("mint");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("{}/modules/module-y/projects/proj1/config", base))
+            .headers(auth_header(&ident))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            401,
+            "identity token for module-x must NOT read module-y's config"
+        );
+
+        crate::module_identity::revoke("module-x");
     }
 }

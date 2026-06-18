@@ -261,6 +261,18 @@ fn is_exempt_path(path: &str) -> bool {
         {
             return true;
         }
+        // v0.2.61 (RL config-readback): exempt the EXACT per-project config
+        // shape only — parts: [module_id, "projects", project_id, "config"]
+        // (trailing empty segment tolerated). Same exact-tail discipline as
+        // rl/events — NOT a blanket /projects/ match. require_module_scope
+        // (identity-token, GET-only, same-module-same-pid) is the real gate;
+        // the handler returns only the module's own module_settings map.
+        if (parts.len() == 4 || (parts.len() == 5 && parts[4].is_empty()))
+            && parts[1] == "projects"
+            && parts[3] == "config"
+        {
+            return true;
+        }
     }
     false
 }
