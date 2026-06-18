@@ -129,7 +129,7 @@ libc = "0.2"
 # supervisor auth port). Tiny dep (~15 KB compiled), already in the
 # lockfile transitively via Tauri's Windows path.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 winreg = "0.55"
 
 # v0.2.42 W4-TEST-7: serial_test allows daemon_usable_probe_* tests to run
