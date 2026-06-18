@@ -12937,6 +12937,30 @@ ACTION_ALT_PORT = "alt-port"  # bring up compose on an alternate free port
 ACTION_ABORT = "abort"      # bail the install
 
 
+def _classify_service_compose_action(action: str, probe: str) -> str:
+    """Pure: map a per-service (action, probe) decision to a compose disposition.
+
+    v0.2.61 (FINDING-1): returns one of:
+      * "start"    — bring the service up (it's not running / needs alt-port).
+      * "recreate" — the service is an adopt WE OWN (probe == vct-managed) whose
+        compose config may have changed (e.g. the Weaviate write-amp env
+        tuning); `compose up -d --force-recreate <svc>` rebuilds it from the new
+        config (the named data volume is preserved). This is the fix for "an
+        adopt skips compose, so a changed env never applies on --update."
+      * "skip"     — leave the service running untouched. Critically this covers
+        a FOREIGN adopt (probe == foreign, only via explicit --on-conflict
+        adopt): we must NEVER recreate a service we don't own.
+
+    Keeping this a pure function makes the start-vs-recreate-vs-skip rule
+    unit-testable without driving the whole `_start_services` subprocess path.
+    """
+    if action in (ACTION_START, ACTION_ALT_PORT):
+        return "start"
+    if action == ACTION_ADOPT and probe == PROBE_VCT_MANAGED:
+        return "recreate"
+    return "skip"
+
+
 def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
     """Content-fingerprint whatever is listening on `localhost:<port>`.
 
@@ -13629,20 +13653,37 @@ def _start_services(
     # overlay file). On CPU-only setups the service uses Ollama as code embed
     # backend and code_embed is intentionally skipped.
     services_to_start: list[str] = []
+    # v0.2.61: services we OWN (vct-managed adopt) that may have a changed
+    # compose config (e.g. the Weaviate write-amplification env tuning). An
+    # adopt skips `compose up` entirely (the service is already running), so a
+    # changed `environment:` block never reaches compose → the new config
+    # silently never applies on `--update`. We force-recreate ONLY our own
+    # vct-managed adopts (probe == PROBE_VCT_MANAGED) so the new config lands;
+    # the named data volume is preserved across `--force-recreate` (it rm's the
+    # container, not the volume). FOREIGN adopts (someone else's container,
+    # probe == PROBE_FOREIGN, only via explicit --on-conflict adopt) are NEVER
+    # recreated — we must not touch a service we don't own.
+    services_to_recreate: list[str] = []
     if force_separate:
         # No detection — bring everything compose declares up.
         services_to_start = []  # empty list => `up -d` with no service args
     elif decisions:
         # Decision-driven: only bring up services where the action is start
         # or alt-port. Adopted services (vct-managed reuse, foreign adopt)
-        # explicitly do NOT get a compose start — they're already running.
-        if decisions["weaviate"]["action"] in (ACTION_START, ACTION_ALT_PORT):
-            services_to_start.append("weaviate")
-        if decisions["ollama"]["action"] in (ACTION_START, ACTION_ALT_PORT):
-            services_to_start.append("ollama")
-        if (sysinfo.has_gpu
-                and decisions["code_embed"]["action"] in (ACTION_START, ACTION_ALT_PORT)):
-            services_to_start.append("code_embed")
+        # do NOT get a compose START — but a vct-managed adopt DOES get a
+        # force-recreate so a changed compose config is applied (v0.2.61).
+        for svc in ("weaviate", "ollama", "code_embed"):
+            if svc == "code_embed" and not sysinfo.has_gpu:
+                continue
+            d = decisions.get(svc, {})
+            disposition = _classify_service_compose_action(
+                d.get("action", ""), d.get("probe", "")
+            )
+            if disposition == "start":
+                services_to_start.append(svc)
+            elif disposition == "recreate":
+                services_to_recreate.append(svc)
+            # "skip" → leave running untouched (incl. a foreign adopt).
     else:
         # Legacy path (no safety probe ran — should not happen in normal
         # install but kept for callers that pass decisions=None).
@@ -13653,8 +13694,11 @@ def _start_services(
         if sysinfo.has_gpu and not detected["code_embed_url"]:
             services_to_start.append("code_embed")
 
-    # All required services already up — nothing to do.
-    if not force_separate and not services_to_start:
+    # All required services already up AND none needs a config-recreate —
+    # nothing to do. (v0.2.61: a vct-managed adopt with a changed compose
+    # config lands in services_to_recreate, so we must NOT early-return when
+    # that list is non-empty — the recreate below applies the new config.)
+    if not force_separate and not services_to_start and not services_to_recreate:
         print("  All required services already running — reusing them.")
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
         return
@@ -13865,9 +13909,31 @@ def _start_services(
                 print(f"  WARNING: GPU overlay {gpu_file_name} not found, running CPU-only")
 
     cmd.extend(["up", "-d"])
-    # When subset detection said only some services are missing, pass them
-    # explicitly so compose doesn't try to recreate already-running ones.
-    if services_to_start:
+    # v0.2.61 (FINDING-1 fix): when a vct-managed service we OWN was adopted
+    # but its compose config changed (e.g. the Weaviate write-amp env tuning),
+    # it lands in services_to_recreate and we add `--force-recreate` + name the
+    # exact services so compose REBUILDS them from the new config. We pass the
+    # explicit service list (start ∪ recreate) so compose touches ONLY those —
+    # `--force-recreate` then recreates the named ones (no-op'ing any already
+    # at the desired config) and leaves every unnamed service (incl. a FOREIGN
+    # adopt we must not touch) running untouched. The named DATA VOLUME is
+    # preserved across `--force-recreate` (it rm's the container, not the
+    # volume) — collections survive. Without naming services, a bare
+    # `--force-recreate` would recreate the WHOLE stack, including foreign
+    # adopts; naming keeps it surgical.
+    explicit_services = services_to_start + [
+        s for s in services_to_recreate if s not in services_to_start
+    ]
+    if services_to_recreate:
+        cmd.append("--force-recreate")
+        cmd.extend(explicit_services)
+        print(
+            f"  Recreating (config changed): {', '.join(services_to_recreate)}"
+            + (f"; starting: {', '.join(services_to_start)}" if services_to_start else "")
+        )
+    elif services_to_start:
+        # When subset detection said only some services are missing, pass them
+        # explicitly so compose doesn't try to recreate already-running ones.
         cmd.extend(services_to_start)
         print(f"  Starting only: {', '.join(services_to_start)}")
 

@@ -24,13 +24,26 @@ services:
       # continuous flush+compaction drumbeat → ~57x write amplification (a 5GB
       # dataset rewrote ~290GB in 12h on a real install). These knobs (all
       # verified against the v1.28.4 source, safe 8-64GB, podman+docker) cut
-      # steady-state writes by roughly an order of magnitude. See
-      # docs/ for the full investigation.
+      # steady-state writes by roughly an order of magnitude.
       #
-      # Flush a dirty memtable after 600s instead of 60s — THE primary lever
-      # (the trickle workload flushes purely on this timer). Data stays
-      # WAL-durable; an unclean kill replays the in-memory delta from the WAL.
-      PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 600
+      # Flush a dirty memtable after 3600s (1h) instead of 60s — THE primary
+      # lever. Paired with the 500MB size-trigger below, a memtable flushes on
+      # 500MB OR 1h, whichever fires first: on the hook trickle workload the
+      # SIZE trigger almost always wins (bounding the backlog), while quiet
+      # periods coast up to an hour with far fewer flushes. Data stays
+      # WAL-durable throughout; an unclean kill replays the in-memory delta
+      # from the WAL (bounded to ~500MB by the size cap, NOT by this timer).
+      PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 3600
+      # Raise the memtable SIZE-trigger flush from the implicit 200MB default to
+      # 500MB. This (a) further cuts write amplification — fewer, larger flushes
+      # means each flush's 5 sidecar files + the ensuing compaction run less
+      # often; and (b) BOUNDS durability: a memtable now flushes on 500MB OR
+      # 600s, whichever fires first, so the WAL+memtable backlog (the data that
+      # would replay on an unclean restart) is capped at ~500MB regardless of
+      # the longer time window. Every write is WAL-durable on upsert throughout
+      # — this knob changes flush CADENCE, never the WAL/fsync durability path,
+      # so write-drop risk is equal-or-lower than the default.
+      PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
       # Cap compaction merge output so a vector-heavy collection can't rewrite
       # one giant multi-GB segment on every merge (the main amplification
       # spike). With a 500MiB cap, a merge rewrites at most ~1GB.

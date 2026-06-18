@@ -49,10 +49,17 @@ services:
       # sync hooks issue many small upserts → on Weaviate defaults each dirty
       # memtable flushes on a 60s timer → continuous flush+compaction (~57x
       # write amplification). All knobs verified against v1.28.4 source; safe
-      # 8-64GB, podman+docker. Flush after 600s not 60s (WAL-durable); cap
-      # compaction merges at 500MiB; auto-size Go heap/CPU to host (or
-      # container mem_limit) to cut heap-driven flushing without OOM risk.
-      PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 600
+      # 8-64GB, podman+docker. The memtable AUTO-FLUSHES at 500MB (size
+      # trigger) OR 3600s/1h (time trigger), whichever fires first — Weaviate
+      # OR's the two. On the hook trickle workload the SIZE trigger almost
+      # always wins (so the WAL-replay backlog is bounded to ~500MB, NOT by the
+      # long timer); the 1h window just avoids flushing a near-empty memtable
+      # every minute during quiet periods. WAL-durable throughout (the flush
+      # cadence never touches the WAL/fsync path). Plus: cap compaction merges
+      # at 500MiB; auto-size Go heap/CPU to host (or container mem_limit) to cut
+      # heap-driven flushing without OOM risk.
+      PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 3600
+      PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
       PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 500MiB
       LIMIT_RESOURCES: "true"
       # Disk usage thresholds (default 80%/90%/95%): raised to allow
