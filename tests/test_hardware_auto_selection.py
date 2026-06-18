@@ -557,6 +557,16 @@ class TestReconcileInstallActiveEmbedding:
             lambda: None,
         )
         yield
+        # `_reconcile_install_active_embedding` (production) writes
+        # ACTIVE_EMBEDDING + EMBEDDING_MODEL DIRECTLY into os.environ — by
+        # design, to thread the resolved value to subprocesses. monkeypatch's
+        # delenv-of-an-already-absent var does NOT register an undo for a value
+        # the reconcile sets AFTER it, so EMBEDDING_MODEL would leak past
+        # teardown and pollute later suites (e.g. the RL-telemetry env-fallback
+        # test reads os.environ). Pop both explicitly to guarantee isolation.
+        import os as _os
+        _os.environ.pop("ACTIVE_EMBEDDING", None)
+        _os.environ.pop("EMBEDDING_MODEL", None)
 
     def test_a_stale_qwen3_cpu_no_choice_reconciled_to_arctic(self, monkeypatch):
         """(a) stale qwen3 + CPU-hardware + no deliberate choice → arctic.
