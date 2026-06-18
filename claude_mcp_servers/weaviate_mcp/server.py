@@ -7153,6 +7153,28 @@ async def search_code_graph(
         return json.dumps({"success": False, "error": str(e)}, indent=2)
 
 
+def _caller_match_terms(target: str) -> list[str]:
+    """Candidate names to match against a CodeFunction's ``call_names``.
+
+    The analyzer stores ``call_names`` as BARE leaf names
+    (``['_start_services', 'strip', ...]`` — verified live), but the natural
+    and documented input to a ``callers`` query is the fully-qualified
+    ``full_name`` (Python ``install._start_services``, Rust
+    ``server::start_hub_server``). A dotted / ``::``-qualified target therefore
+    never matches the bare leaves, so ``callers`` silently returns nothing.
+
+    Return ``[target, <leaf>]`` (deduped, order-preserving) so a ``callers``
+    query resolves for BOTH ``module.fn`` and bare ``fn`` inputs. The leaf is
+    the last segment after splitting on ``.`` or Rust ``::``.
+    (WS-4 Finding 1, v0.2.62.)
+    """
+    terms = [target]
+    leaf = re.split(r"::|\.", target)[-1]
+    if leaf and leaf != target:
+        terms.append(leaf)
+    return terms
+
+
 @mcp.tool()
 def query_code_structure(
     query_type: str,
@@ -7290,8 +7312,11 @@ def query_code_structure(
             # v0.2.46 V46-D: emit truncation signal.
             CALLERS_LIMIT = 50
             coll = client.collections.get(_proj_coll("CodeFunction"))
+            # WS-4 Finding 1: call_names holds BARE leaf names; match the
+            # full_name target AND its bare leaf so dotted / `::`-qualified
+            # inputs (the documented form) actually resolve.
             response = coll.query.fetch_objects(
-                filters=with_project(Filter.by_property("call_names").contains_any([target])),
+                filters=with_project(Filter.by_property("call_names").contains_any(_caller_match_terms(target))),
                 limit=CALLERS_LIMIT
             )
             results = [

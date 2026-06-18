@@ -7069,6 +7069,25 @@ def _migrate_from_shared(project_name: str, named_vectors: bool = False) -> int:
         client.close()
 
 
+def _is_under_temp_dir(p: Path) -> bool:
+    """True if ``p`` resolves under the system temp dir (e.g. ``/tmp``).
+
+    Indexing a transient location into a PERSISTENT per-project code-graph
+    collection is almost always accidental. Agent git-worktrees created under
+    the temp dir (``/tmp/vco-track-*``) once leaked ~34k throwaway rows with
+    paths like ``__tmp_vco-track-D_install._start_services`` into the shared
+    CodeFunction collection (WS-4 Finding 3). The ``worktrees`` ignore-dir only
+    catches ``.claude/worktrees/`` during the walk — it does NOT catch a temp
+    path passed AS the analysis root or an ``--extra-path``. This guard does.
+    """
+    try:
+        tmp = Path(tempfile.gettempdir()).resolve()
+        rp = p.resolve()
+        return rp == tmp or tmp in rp.parents
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze codebase and extract entities into Weaviate code graph",
@@ -7076,6 +7095,12 @@ def main():
     )
 
     parser.add_argument('repo_path', type=Path, help='Path to repository to analyze')
+    # WS-4 Finding 3: by default refuse to index a root/extra-path that lives
+    # under the system temp dir (agent worktrees at /tmp/vco-track-* polluted
+    # the persistent collection). Override for the rare legit temp-dir analysis.
+    parser.add_argument('--allow-temp-root', action='store_true',
+                        help='Permit analyzing a repo_path / --extra-path under the '
+                             'system temp dir (default: skip — avoids agent-worktree pollution).')
     parser.add_argument('--project', '-p', type=str, help='Project name (default: repo directory name)')
     # v0.2.21 Step 20: read the collection prefix from the running hub
     # rather than deriving it locally from --project or the CWD. When
@@ -7185,6 +7210,23 @@ def main():
     if not repo_path.exists():
         print(f"❌ Repository path does not exist: {repo_path}", file=sys.stderr)
         return 1
+
+    # WS-4 Finding 3: refuse to index a temp-dir root into the persistent
+    # per-project collection. This is almost always an agent git-worktree
+    # (e.g. /tmp/vco-track-*) whose throwaway paths would pollute the shared
+    # CodeFunction collection (the source of the ~34k __tmp_* garbage rows).
+    # Skip (exit 0 — a deliberate no-op, NOT an error the hook should surface).
+    if _is_under_temp_dir(repo_path) and not args.allow_temp_root:
+        print(
+            f"⚠️  Skipping code-graph analysis: repo_path is under the system temp dir "
+            f"({repo_path}).", file=sys.stderr,
+        )
+        print(
+            "    Indexing a transient location (e.g. an agent /tmp worktree) would "
+            "pollute the persistent collection with throwaway paths (WS-4 Finding 3). "
+            "Pass --allow-temp-root to override.", file=sys.stderr,
+        )
+        return 0
 
     # v0.2.21 Step 20 — analyzer harmonization. The collection prefix
     # the analyzer writes to MUST match what consumers see via the
@@ -7381,6 +7423,23 @@ def main():
                 print(json.dumps(payload), flush=True)
             analyzer._progress_emitter = _emit_progress
 
+        # WS-4 Finding 3: drop any --extra-path under the system temp dir
+        # (same agent-worktree pollution vector as the primary-root guard).
+        extra_paths = list(args.extra_paths or [])
+        if not args.allow_temp_root:
+            kept = []
+            for ep in extra_paths:
+                if _is_under_temp_dir(ep):
+                    print(
+                        f"⚠️  Skipping --extra-path under the system temp dir "
+                        f"({ep}) — would pollute the persistent collection (WS-4 "
+                        "Finding 3). Pass --allow-temp-root to override.",
+                        file=sys.stderr,
+                    )
+                else:
+                    kept.append(ep)
+            extra_paths = kept
+
         # Analyze repository
         if not args.json_progress:
             print("🔍 Analyzing codebase...")
@@ -7394,7 +7453,7 @@ def main():
             # v0.2.47 (extras): pass-through. Empty list when the flag
             # wasn't supplied — analyze_repository treats that the same
             # as the pre-v0.2.47 single-root behaviour.
-            extra_paths=args.extra_paths or None,
+            extra_paths=extra_paths or None,
             since_commit=args.since_commit,
         )
 
