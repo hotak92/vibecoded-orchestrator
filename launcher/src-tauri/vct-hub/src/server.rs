@@ -266,11 +266,30 @@ async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::Tcp
 }
 
 /// Write port to `<VCT_STATE_DIR or ~/.vct>/hub.port` so apps can discover the hub.
+///
+/// v0.2.61 (Option H C-PORT): write atomically via a temp file + rename.
+/// A plain truncating write can be observed mid-write (empty / partial) by a
+/// concurrent reader (`module_service::hub_port_for_proxy`,
+/// `module_supervisor::resolve_hub_base_port`) whose `parse::<u16>()` then
+/// fails → wrong VCT_HUB_BASE_URL / a failed readiness probe on a healthy hub.
+/// A same-directory rename is atomic on POSIX and on Windows ReplaceFile
+/// semantics, so a reader sees either the old value or the new one, never a
+/// torn one.
 async fn write_port_file(port: u16) {
     let path = vct_launcher_core::paths::vct_root_dir().join("hub.port");
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    tokio::fs::write(&path, port.to_string()).await.ok();
+    // Temp name is pid-suffixed so two hub processes racing a write don't
+    // clobber each other's temp file before their respective renames.
+    let tmp = path.with_extension(format!("port.tmp.{}", std::process::id()));
+    if tokio::fs::write(&tmp, port.to_string()).await.is_ok() {
+        if tokio::fs::rename(&tmp, &path).await.is_err() {
+            // Rename failed (e.g. cross-device, shouldn't happen same-dir) —
+            // fall back to a direct write so the port is at least discoverable.
+            tokio::fs::write(&path, port.to_string()).await.ok();
+            tokio::fs::remove_file(&tmp).await.ok();
+        }
+    }
 }

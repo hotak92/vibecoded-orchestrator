@@ -216,8 +216,35 @@ fn is_exempt_path(path: &str) -> bool {
         //          "vct-rl-reranker/token/refresh", or
         //          "vct-rl-reranker/projects/{pid}/rl/events".
         let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() < 2 {
+            return false;
+        }
         // parts[0] == module_id; parts[1] is the route family.
-        if parts.len() >= 2 && (parts[1] == "db" || parts[1] == "token") {
+        //
+        // v0.2.61 (Option H C-EXEMPT): match the EXACT registered shapes,
+        // NOT the whole `db`/`token` route FAMILY. The old `parts[1]=="db"
+        // || parts[1]=="token"` blanket-exempted any future suffix under
+        // those prefixes from the outer hub.token gate — so a later route
+        // added under `db/`/`token/` WITHOUT its own require_module_scope
+        // layer would silently inherit the bypass (a latent 0.0.0.0-exposure
+        // footgun). Tighten to the shapes module_db_api::router actually
+        // registers:
+        //   db   →  db/projects/{pid}/rows/{table}        (insert/list)
+        //           db/projects/{pid}/rows/{table}/{key}  (get/patch/delete)
+        //   token → token/refresh
+        // (a trailing empty segment from a "…/" path is tolerated). Same
+        // exact-tail discipline the rl/events arm below already uses.
+        let trimmed_len = if parts.last() == Some(&"") { parts.len() - 1 } else { parts.len() };
+        if parts[1] == "db"
+            && trimmed_len >= 5
+            && parts[2] == "projects"
+            && parts[4] == "rows"
+            && (trimmed_len == 6 || trimmed_len == 7)
+        {
+            // db/projects/{pid}/rows/{table}[/{key}]
+            return true;
+        }
+        if parts[1] == "token" && trimmed_len == 3 && parts[2] == "refresh" {
             return true;
         }
         // v0.2.61 (Option H): exempt the EXACT rl/events shape only.

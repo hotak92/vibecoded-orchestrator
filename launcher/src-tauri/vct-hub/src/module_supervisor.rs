@@ -967,16 +967,9 @@ pub async fn start_global_container_supervisor(
         ));
     }
 
-    // v0.2.61 (Option H CONCERN-1): serialize concurrent spawns of THIS
-    // module so the hub-resume sweep and a launcher-delegated
-    // `/modules/{id}/start` can't race two rm -f + mint + run sequences
-    // (which would leave the surviving container holding a token the
-    // registry already dropped → 401). Held for the whole critical
-    // section below; a second caller waits here, then does its own clean
-    // recreate + re-mint.
-    let _spawn_lock = module_spawn_lock(module_id);
-    let _spawn_guard = _spawn_lock.lock().await;
-
+    // Resolve names + image + runtime BEFORE taking the spawn lock — these
+    // are read-only and don't touch the container-name collision or the token
+    // registry, so they don't need to be inside the critical section.
     let name_template = runtime.resolve_container_name_template(&manifest.id);
     let container_name = resolve_global_container_name(&name_template, module_id)?;
     let image_template = runtime.resolve_image_ref(
@@ -991,6 +984,16 @@ pub async fn start_global_container_supervisor(
 
     let podman = detect_container_runtime().await?;
 
+    // v0.2.61 (Option H C1): run the (optionally authed) image pre-pull
+    // OUTSIDE the spawn lock. On a cold GB-scale image the pull can take
+    // minutes; holding the per-module lock across it made a concurrent
+    // launcher-delegated `/modules/{id}/start` block until its own 90s HTTP
+    // timeout — surfacing a spurious failure on a container that WAS coming
+    // up. The pull is read-only w.r.t. the container name + token registry
+    // and `podman pull` is itself idempotent (two concurrent pulls of the
+    // same ref converge; the `image exists` fast-path makes the second a
+    // no-op), so moving it before the lock is safe and collapses the
+    // lock-hold from minutes to ~1-2s (rm-f + mint + run only).
     // v0.2.54 (C-RT-6): gated on `method == ContainerPull` alone — a
     // missing hardware snapshot must not skip the authed pre-pull.
     if manifest.install.method == InstallMethod::ContainerPull {
@@ -1005,6 +1008,34 @@ pub async fn start_global_container_supervisor(
                 e
             );
         }
+    }
+
+    // v0.2.61 (Option H CONCERN-1): serialize concurrent spawns of THIS
+    // module so the hub-resume sweep and a launcher-delegated
+    // `/modules/{id}/start` can't race two rm -f + mint + run sequences
+    // (which would leave the surviving container holding a token the
+    // registry already dropped → 401). Held ONLY across the short
+    // recreate+mint+run below (NOT the pre-pull above).
+    let _spawn_lock = module_spawn_lock(module_id);
+    let _spawn_guard = _spawn_lock.lock().await;
+
+    // v0.2.61 (Option H C1): idempotency guard. Once we hold the lock, if the
+    // container is ALREADY running AND its module-identity token is already
+    // registered in this hub's in-memory set, a concurrent caller (the resume
+    // sweep) already completed the spawn — return its name without a
+    // redundant rm-f + re-mint (which would needlessly recreate a healthy
+    // container and open a transient-401 window while the new container
+    // boots). This delivers the "one recreate per boot" the resume comment
+    // promises and makes a racing launcher-delegated start a true no-op.
+    if crate::module_identity::resolve_registered(module_id)
+        && is_container_running(&container_name).await.unwrap_or(false)
+    {
+        eprintln!(
+            "[module_supervisor] start_global_container_supervisor({}): already \
+             running + token registered (concurrent spawn won the race); no-op",
+            module_id
+        );
+        return Ok(container_name);
     }
 
     let _ = Command::new(&podman)
@@ -1072,12 +1103,25 @@ pub async fn start_global_container_supervisor(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
-        .await
-        .map_err(|_| format!("{} run timed out after 60s for {}", podman, container_name))?
-        .map_err(|e| format!("spawn {} run: {}", podman, e))?;
+    // v0.2.61 (Option H C-REVOKE): if `podman run` fails (timeout / spawn
+    // error / non-zero exit), the token minted above has NO live holder —
+    // revoke it so it doesn't linger in the registry pointing at a container
+    // that never started. (Harmless if left — the next re-spawn's `retain`
+    // drops it — but revoking on failure keeps the set tight.)
+    let output = match tokio::time::timeout(Duration::from_secs(60), cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            crate::module_identity::revoke(module_id);
+            return Err(format!("spawn {} run: {}", podman, e));
+        }
+        Err(_) => {
+            crate::module_identity::revoke(module_id);
+            return Err(format!("{} run timed out after 60s for {}", podman, container_name));
+        }
+    };
 
     if !output.status.success() {
+        crate::module_identity::revoke(module_id);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "{} run failed (exit {}) for {}: {}",

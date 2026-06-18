@@ -1136,16 +1136,28 @@ async fn wait_for_hub_ready() -> Result<(), String> {
     // loaded machine without making a genuinely-down hub hang the caller.
     const ATTEMPTS: u32 = 10;
     const DELAY_MS: u64 = 300;
-    let port = hub_port_for_proxy()?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .map_err(|e| format!("http client: {}", e))?;
-    let url = format!("http://127.0.0.1:{}/api/v1/health", port);
+    // v0.2.61 (Option H C-PORT): re-read hub.port INSIDE the loop. If the hub
+    // is restarting (update flow / crash-restart) it may bind a different port
+    // and rewrite hub.port a moment after `ensure_hub_running` returns. Reading
+    // the port once up-front could pin a STALE value → all 10 probes hit the
+    // wrong/closed port and we'd report "not reachable" on a hub that's
+    // actually up on the new port. The file read is cheap; 10× over ~3s is
+    // negligible, and it self-corrects a port rewrite that lands mid-poll.
+    let mut last_port = 0u16;
     for attempt in 0..ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
         }
+        let port = match hub_port_for_proxy() {
+            Ok(p) => p,
+            Err(_) => continue, // port file not written yet — retry
+        };
+        last_port = port;
+        let url = format!("http://127.0.0.1:{}/api/v1/health", port);
         if let Ok(resp) = client.get(&url).send().await {
             if resp.status().is_success() {
                 return Ok(());
@@ -1154,7 +1166,7 @@ async fn wait_for_hub_ready() -> Result<(), String> {
     }
     Err(format!(
         "hub /api/v1/health not reachable on port {} after {} attempts (~{}ms)",
-        port,
+        last_port,
         ATTEMPTS,
         ATTEMPTS as u64 * DELAY_MS
     ))

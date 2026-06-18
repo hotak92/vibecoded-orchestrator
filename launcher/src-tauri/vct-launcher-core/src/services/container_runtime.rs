@@ -806,8 +806,14 @@ pub fn build_podman_run_args_global(
     // route. Kept as a caller param (not resolved inside this pure
     // builder) so the secret never lives in core logic and only the
     // spawn site — which has the hub's in-memory state — controls it.
-    // SECURITY: values here may be secrets; callers that LOG the returned
-    // argv MUST redact `-e` elements (see `redact_run_args_for_log`).
+    // SECURITY: values here may be secrets (e.g. the Option-H
+    // `VCT_MODULE_TOKEN`). DO NOT log the returned argv — it contains the
+    // `-e KEY=VALUE` pairs verbatim. The current sole caller
+    // (`start_global_container_supervisor`) logs only container_name + the
+    // run's stderr on failure, never the argv, so the token cannot leak. If
+    // you add argv logging, redact the value half of every `-e` element
+    // first (no shared redactor helper exists — keep it that way unless a
+    // second caller genuinely needs argv logging).
     extra_env: &[(String, String)],
 ) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;

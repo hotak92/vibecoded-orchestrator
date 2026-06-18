@@ -84,6 +84,19 @@ pub fn resolve_module(token: &str) -> Option<String> {
     guard.as_ref()?.get(token).cloned()
 }
 
+/// True iff `module_id` currently has a registered identity token in this
+/// hub process. Used by the supervisor's spawn idempotency guard
+/// (v0.2.61, Option H C1): if the container is already running AND its token
+/// is registered, a concurrent spawn already completed → skip the redundant
+/// recreate + re-mint.
+pub fn resolve_registered(module_id: &str) -> bool {
+    MODULE_IDENTITY_TOKENS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|m| m.values().any(|owner| owner == module_id)))
+        .unwrap_or(false)
+}
+
 /// Drop a module's identity token. Available for an explicit
 /// container-stop / uninstall hook to call.
 ///
