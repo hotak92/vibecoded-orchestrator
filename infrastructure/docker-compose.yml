@@ -35,14 +35,20 @@ services:
       # from the WAL (bounded to ~500MB by the size cap, NOT by this timer).
       PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 3600
       # Raise the memtable SIZE-trigger flush from the implicit 200MB default to
-      # 500MB. This (a) further cuts write amplification — fewer, larger flushes
-      # means each flush's 5 sidecar files + the ensuing compaction run less
-      # often; and (b) BOUNDS durability: a memtable now flushes on 500MB OR
-      # 1h, whichever fires first, so the WAL+memtable backlog (the data that
-      # would replay on an unclean restart) is capped at ~500MB regardless of
-      # the longer time window. Every write is WAL-durable on upsert throughout
-      # — this knob changes flush CADENCE, never the WAL/fsync durability path,
-      # so write-drop risk is equal-or-lower than the default.
+      # 500MB. NOTE: this cap is PER ACTIVE MEMTABLE = per LSM store, NOT global
+      # and NOT per-collection — there are thousands of stores (objects +
+      # per-property stores across all collections), each with its own active
+      # memtable. So we keep 500MB (not 1GB): a hot store holds up to 500MB, and
+      # during a multi-collection bulk op several hot stores sum up — 500MB
+      # stays safe on an 8GB host, whereas 1GB-per-store could balloon RAM.
+      # It (a) cuts write amplification (fewer, larger flushes → fewer sidecar
+      # rewrites + compactions) and (b) BOUNDS durability: a memtable flushes on
+      # 500MB OR 1h, so the WAL+memtable replay backlog is capped at ~500MB
+      # regardless of the 1h timer. It's a CAP not a reservation (a store only
+      # holds 500MB if it accrues that much before the timer); LIMIT_RESOURCES
+      # bounds total Go heap to 80% RAM. Every write is WAL-durable on upsert —
+      # this changes flush CADENCE, never the WAL/fsync path, so write-drop risk
+      # is equal-or-lower than the default.
       PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
       # Cap compaction merge output so a vector-heavy collection can't rewrite
       # one giant multi-GB segment on every merge (the main amplification
