@@ -36,7 +36,7 @@ serde_json = "1"
 hex = "0.4"
 
 # DB (hub.db state for the message-bus / app-registry sub-API)
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # UUID for message + interaction IDs
 uuid = { version = "1", features = ["v4"] }
