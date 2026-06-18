@@ -97,22 +97,40 @@ Write-Host "[launcher] post-install-launcher.ps1 (install root: $RepoRoot)"
 # ---------------------------------------------------------------------------
 # Locate the launcher binary
 # ---------------------------------------------------------------------------
-# First-match-wins probe. Mirror of the order in first-install.bat L145:
-#   1. Locally built (contributors)
-#   2. Bundled prebuilt
-#   3. System install locations
+# First-match-wins probe. The CANONICAL binary the shortcut must point at is
+# launcher\dist\windows-x64\vct-launcher.exe — that is the exact binary the
+# launcher's own in-app restart (restart.rs::resolve_target_binary) ALWAYS
+# relaunches from, and the one install.py / _stage_built_binary_into_dist keep
+# fresh + version-stamped on every install/update. So dist (and the packaged
+# system-install slots) MUST be probed BEFORE the launcher\src-tauri\target\*
+# build artifacts. Otherwise a stale dev-build leftover (e.g. a months-old
+# target\debug\vct-launcher-temp.exe) wins the probe and the .lnk diverges from
+# what the app itself runs — the user opens an OLD binary with the old icon
+# while the launcher restarts into the fresh dist binary.
+#
+# This mirrors the bash sibling's metadata-first ordering (find_binary probes
+# the dist candidate before the hardcoded target/ ones). The target\release\
+# entries remain only as a fallback for an un-staged source checkout — a normal
+# install stages those into dist above, so they win only when dist is absent.
+#
+# (v0.2.62: pre-fix the probe listed target\* before dist, so a stale
+# target\debug\vct-launcher-temp.exe on a dirty tree captured both shortcuts.)
+#
 # We don't do the staleness check here — first-install.bat / install.py
 # already ran it before invoking us; if a binary exists at this point
 # it's considered usable.
 
 $candidates = @(
+    # Canonical staged binary — matches restart.rs + the bash find_binary order.
+    (Join-Path $RepoRoot 'launcher\dist\windows-x64\vct-launcher.exe'),
+    # Packaged system-install locations.
+    (Join-Path $env:LOCALAPPDATA 'Programs\VCT Launcher\vct-launcher.exe'),
+    (Join-Path $env:LOCALAPPDATA 'vct-launcher\vct-launcher.exe'),
+    # Contributor local builds (fallback — staged into dist on a real install).
     (Join-Path $RepoRoot 'launcher\src-tauri\target\release\vct-launcher.exe'),
     (Join-Path $RepoRoot 'launcher\src-tauri\target\release\vct-launcher-temp.exe'),
     (Join-Path $RepoRoot 'launcher\src-tauri\target\release\launcher.exe'),
-    (Join-Path $RepoRoot 'launcher\src-tauri\target\debug\vct-launcher-temp.exe'),
-    (Join-Path $RepoRoot 'launcher\dist\windows-x64\vct-launcher.exe'),
-    (Join-Path $env:LOCALAPPDATA 'Programs\VCT Launcher\vct-launcher.exe'),
-    (Join-Path $env:LOCALAPPDATA 'vct-launcher\vct-launcher.exe')
+    (Join-Path $RepoRoot 'launcher\src-tauri\target\debug\vct-launcher-temp.exe')
 )
 
 $LauncherBin = $null

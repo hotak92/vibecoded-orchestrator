@@ -229,25 +229,35 @@ goto :eof
 
 set "LAUNCHER_BIN="
 REM First-match-wins probe. Order:
-REM   1. Locally built (developer running pnpm tauri build directly)
+REM   1. Locally built RELEASE binary (developer running pnpm tauri build)
 REM   2. Bundled prebuilt in launcher\dist\windows-x64\ (default for end
 REM      users; vct-launcher.exe + vct-hub.exe + vct-updater.exe ship there
 REM      with .metadata.json sidecars — see the staleness check below)
 REM   3. System install paths (someone installed via winget / msi)
+REM   4. Locally built DEBUG binary (last resort only)
+REM
+REM v0.2.62: the target\debug\vct-launcher-temp.exe candidate is probed LAST,
+REM not 4th. A months-old debug-temp leftover on a dirty tree must never
+REM outrank the freshly-bundled dist binary (the one the launcher's own
+REM restart, restart.rs::resolve_target_binary, relaunches from). Pre-fix it
+REM sat ahead of dist, so a stale debug build captured the .lnk and the user
+REM opened an OLD binary (old icon) while the app restarted into fresh dist.
+REM (target\release\* stays ahead of dist so a contributor's real build still
+REM wins — only the debug artifact is demoted.)
 if exist "%~dp0launcher\src-tauri\target\release\vct-launcher.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\release\vct-launcher.exe"
 ) else if exist "%~dp0launcher\src-tauri\target\release\vct-launcher-temp.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\release\vct-launcher-temp.exe"
 ) else if exist "%~dp0launcher\src-tauri\target\release\launcher.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\release\launcher.exe"
-) else if exist "%~dp0launcher\src-tauri\target\debug\vct-launcher-temp.exe" (
-    set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\debug\vct-launcher-temp.exe"
 ) else if exist "%~dp0launcher\dist\windows-x64\vct-launcher.exe" (
     set "LAUNCHER_BIN=%~dp0launcher\dist\windows-x64\vct-launcher.exe"
 ) else if exist "%LOCALAPPDATA%\Programs\VCT Launcher\vct-launcher.exe" (
     set "LAUNCHER_BIN=%LOCALAPPDATA%\Programs\VCT Launcher\vct-launcher.exe"
 ) else if exist "%LOCALAPPDATA%\vct-launcher\vct-launcher.exe" (
     set "LAUNCHER_BIN=%LOCALAPPDATA%\vct-launcher\vct-launcher.exe"
+) else if exist "%~dp0launcher\src-tauri\target\debug\vct-launcher-temp.exe" (
+    set "LAUNCHER_BIN=%~dp0launcher\src-tauri\target\debug\vct-launcher-temp.exe"
 )
 
 REM Staleness check for bundled binaries. Reads <binary>.metadata.json
