@@ -42,6 +42,19 @@ services:
       DEFAULT_VECTORIZER_MODULE: "none"
       ENABLE_API_BASED_MODULES: "true"
       CLUSTER_HOSTNAME: "node1"
+      # --- WRITE-AMPLIFICATION REDUCTION (v0.2.61) ---
+      # Mirror of the tuning in infrastructure/docker-compose.yml (the
+      # canonical orchestration file); this legacy compose path wires into the
+      # same shared volume so it must carry the same knobs. The KG/code-graph
+      # sync hooks issue many small upserts → on Weaviate defaults each dirty
+      # memtable flushes on a 60s timer → continuous flush+compaction (~57x
+      # write amplification). All knobs verified against v1.28.4 source; safe
+      # 8-64GB, podman+docker. Flush after 600s not 60s (WAL-durable); cap
+      # compaction merges at 500MiB; auto-size Go heap/CPU to host (or
+      # container mem_limit) to cut heap-driven flushing without OOM risk.
+      PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 600
+      PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 500MiB
+      LIMIT_RESOURCES: "true"
       # Disk usage thresholds (default 80%/90%/95%): raised to allow
       # operation on a nearly-full disk where the user has knowingly
       # accepted the risk. Warning at 95% so 80-94% disk doesn't spam

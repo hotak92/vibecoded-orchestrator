@@ -17,6 +17,31 @@ services:
       PERSISTENCE_DATA_PATH: /var/lib/weaviate
       DEFAULT_VECTORIZER_MODULE: none
       CLUSTER_HOSTNAME: node1
+      # --- WRITE-AMPLIFICATION REDUCTION (v0.2.61) ---
+      # The KG/code-graph sync hooks issue MANY small upserts (one per edited
+      # node/file + re-embeds). On Weaviate defaults each dirty memtable
+      # flushes on a 60s timer, and with thousands of LSM stores that's a
+      # continuous flush+compaction drumbeat → ~57x write amplification (a 5GB
+      # dataset rewrote ~290GB in 12h on a real install). These knobs (all
+      # verified against the v1.28.4 source, safe 8-64GB, podman+docker) cut
+      # steady-state writes by roughly an order of magnitude. See
+      # docs/ for the full investigation.
+      #
+      # Flush a dirty memtable after 600s instead of 60s — THE primary lever
+      # (the trickle workload flushes purely on this timer). Data stays
+      # WAL-durable; an unclean kill replays the in-memory delta from the WAL.
+      PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 600
+      # Cap compaction merge output so a vector-heavy collection can't rewrite
+      # one giant multi-GB segment on every merge (the main amplification
+      # spike). With a 500MiB cap, a merge rewrites at most ~1GB.
+      PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 500MiB
+      # Auto-size the Go heap + CPU to the host (or to a container mem_limit if
+      # one is set): GOMEMLIMIT ~= 80% of available RAM, GOMAXPROCS = cores-1.
+      # Reduces heap-pressure-driven flushing and removes the OOM tail risk on
+      # small hosts. Self-scaling = safe to ship to unknown hardware (an 8GB
+      # box gets ~6.4GB, a 64GB box ~51GB). To pin instead: unset this and set
+      # GOMEMLIMIT=<N>MiB explicitly.
+      LIMIT_RESOURCES: "true"
     restart: unless-stopped
     healthcheck:
       # Use /v1/meta, NOT /v1/.well-known/ready. Root cause of the
