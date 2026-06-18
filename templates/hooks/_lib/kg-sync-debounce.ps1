@@ -1,4 +1,4 @@
-# kg-sync-debounce.ps1 — coalesce rapid re-edits of the same file into one
+﻿# kg-sync-debounce.ps1 — coalesce rapid re-edits of the same file into one
 # Weaviate-write per quiet-window. PowerShell 7 sibling of
 # _lib/kg-sync-debounce.sh; identical semantics.
 #
