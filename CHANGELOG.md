@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.62] - 2026-06-18
+
+v0.2.62 is a fix release: it unblocks `install.py --update` on machines without
+ROCm, points the Windows launcher shortcut at the right binary, and improves
+code-graph search quality.
+
+### Fixed
+
+- **Install/update no longer aborts on machines without ROCm.** The
+  compose-overlay GPU-ambiguity check in `_start_services` probed both
+  `nvidia-smi` and `rocm-smi` via an unguarded `subprocess.run`, so on a
+  pure-NVIDIA box (no `rocm-smi` on PATH) it raised
+  `FileNotFoundError: [Errno 2] No such file or directory: 'rocm-smi'` and
+  aborted the entire install/update. Both probes now go through a
+  `shutil.which`-guarded helper (`_gpu_tool_reports_live`) that also swallows a
+  hung-tool `TimeoutExpired`. GPU selection is unchanged (NVIDIA-first vendor
+  detection, VRAM-threshold gating, `nvidia→cuda` / `amd→rocm` / else `cpu`).
+- **Windows launcher shortcut points at the canonical dist binary.** The
+  desktop-icon helper (`post-install-launcher.ps1`) probed
+  `launcher\src-tauri\target\debug\vct-launcher-temp.exe` before
+  `launcher\dist\windows-x64\vct-launcher.exe`, so a stale dev-build leftover
+  could capture both the Desktop and Start-Menu shortcuts — opening an old
+  binary (old icon) while the launcher's own restart used the fresh dist
+  binary. The probe now prefers the dist binary (matching the bash sibling and
+  `restart.rs`); `first-install.bat` demotes the debug-temp candidate below
+  dist.
+- **Code-graph `callers` query resolves fully-qualified inputs.**
+  `query_code_structure("callers", target)` matched the analyzer's bare-leaf
+  `call_names` against the dotted `full_name` verbatim, so the documented input
+  form never matched and `callers` silently returned nothing for every project.
+  It now matches the target *and* its bare leaf (splitting on `.` or Rust `::`).
+- **Code-graph analyzer skips temp-dir roots.** Agent git-worktrees under the
+  system temp dir (`/tmp/vco-track-*`) could be analyzed as a root or
+  `--extra-path`, leaking thousands of throwaway rows into the persistent
+  per-project collection. The analyzer now skips a temp-dir `repo_path` (exit 0)
+  and filters temp `--extra-path`s, with `--allow-temp-root` to override.
+
 ## [0.2.61] - 2026-06-18
 
 v0.2.61 lands the RL Reranker hub-credential chain (a global paid container
