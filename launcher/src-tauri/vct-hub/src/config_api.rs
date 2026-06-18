@@ -621,21 +621,41 @@ async fn project_config(
         .module_effective_enabled(&project.id, "vct-rl-reranker")
         .unwrap_or(true);
 
-    // V52-AA (v0.2.52) — RL Reranker per-project container port.
+    // V52-AA (v0.2.52) — RL Reranker container port.
     // Reads `module_ports(project_id, "vct-rl-reranker", port)`, the
     // canonical SoT since migration 017 / v0.2.26. Returns `None` when
     // no row exists; the consumer (`_get_rl_client` in the MCP) handles
     // None by falling through to env-var resolution / disabled mode.
     // Soft-fail: on a DB error we log + return None rather than 500ing
     // the whole resolve — RL is a value-add, not a critical path.
-    let rl_server_port = match h.0.get_project_rl_port(&project.id) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "[vct-hub] config_api: get_project_rl_port({}) failed: {}; returning None",
-                project.id, e
-            );
-            None
+    //
+    // v0.2.61 (Option H re-audit B2-2): GLOBAL-scope honoring. After a module
+    // migrates to global scope, ONE container serves all projects on
+    // GLOBAL_RL_PORT (11443) and the per-project `module_ports` rows are gone
+    // — so `get_project_rl_port` returns None for a global install. This is
+    // the PRIMARY rerank channel when the MCP env doesn't pin RL_SERVER_PORT
+    // (the default — mcp_registration.rs does not pin it), so a None here put
+    // the MCP into disabled mode → rerank silently no-op'd for the exact
+    // global deployment Option-H targets. Resolve the global port when a
+    // global install row exists. (GLOBAL_RL_PORT mirrors the const in
+    // module_supervisor.rs + launcher module_service.rs — kept in sync; the
+    // hub can't import the launcher crate.)
+    const GLOBAL_RL_PORT: u16 = 11443;
+    let rl_server_port = if matches!(
+        h.0.get_global_module_install("vct-rl-reranker"),
+        Ok(Some(_))
+    ) {
+        Some(GLOBAL_RL_PORT)
+    } else {
+        match h.0.get_project_rl_port(&project.id) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "[vct-hub] config_api: get_project_rl_port({}) failed: {}; returning None",
+                    project.id, e
+                );
+                None
+            }
         }
     };
 

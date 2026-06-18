@@ -514,9 +514,28 @@ pub fn resolve_image_ref(
         None => base_tag,
     };
 
+    // The fully-resolved image reference (`<image>:<variant-tag>`).
+    // `{module_image}` is the manifest token for THIS value — the RL
+    // reranker manifest ships `runtime.image_ref: "{module_image}"`
+    // expecting the launcher to substitute it (confirmed with the
+    // module owner, 2026-06-17). It's the image-ref-path sibling of the
+    // v0.2.59 `{module_id}` container-name fix: a token substituted on
+    // one path but missed on a sibling path.
+    //
+    // NOTE — scope: we resolve `{module_image}` ONLY here, on the
+    // image_ref path. We deliberately do NOT add it to the CMD-override
+    // (`runtime.args`) substitution: an unsubstituted `{module_image}`
+    // inside `runtime.args` is a deliberate pre-v0.2.49 Bug-E signal
+    // (`is_runtime_pathological`, indicator 3) — there it means the
+    // author pasted the launcher-side `podman run … {module_image}`
+    // invocation into the container CMD. Same token, opposite meaning
+    // per field; keep the two paths separate.
+    let module_image = format!("{}:{}", container.image, tag);
+
     let out = template
         .replace("{install.container.image}", &container.image)
-        .replace("{install.container.tag}", &tag);
+        .replace("{install.container.tag}", &tag)
+        .replace("{module_image}", &module_image);
 
     if out.contains('{') && out.contains('}') {
         return Err(format!(
@@ -779,6 +798,23 @@ pub fn build_podman_run_args_global(
     image: &str,
     engine: &str,
     gpu_mode: Option<GpuMode>,
+    // v0.2.61 (Option H): caller-injected `-e KEY=VALUE` pairs appended
+    // after the manifest's own env. The hub uses this to inject the
+    // per-spawn module-identity token (`VCT_MODULE_TOKEN`) it minted +
+    // registered in its in-memory set — the credential the global
+    // container presents to the hub's `/modules/{id}/projects/{pid}/rl/events`
+    // route. Kept as a caller param (not resolved inside this pure
+    // builder) so the secret never lives in core logic and only the
+    // spawn site — which has the hub's in-memory state — controls it.
+    // SECURITY: values here may be secrets (e.g. the Option-H
+    // `VCT_MODULE_TOKEN`). DO NOT log the returned argv — it contains the
+    // `-e KEY=VALUE` pairs verbatim. The current sole caller
+    // (`start_global_container_supervisor`) logs only container_name + the
+    // run's stderr on failure, never the argv, so the token cannot leak. If
+    // you add argv logging, redact the value half of every `-e` element
+    // first (no shared redactor helper exists — keep it that way unless a
+    // second caller genuinely needs argv logging).
+    extra_env: &[(String, String)],
 ) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
@@ -798,6 +834,23 @@ pub fn build_podman_run_args_global(
     if runtime.auto_restart {
         args.push("--restart=unless-stopped".into());
     }
+
+    // v0.2.61 (Option H, B2): make `host.containers.internal` resolve to
+    // the host gateway INSIDE the container, so the module can reach the
+    // hub via `VCT_HUB_BASE_URL=http://host.containers.internal:<port>`
+    // (the env pair the spawn site injects through `extra_env` — see the
+    // contract in the spawn site comment). `:host-gateway` is the
+    // podman/docker-managed magic value that the runtime substitutes for
+    // the actual host-gateway IP at container start, so we don't hard-code
+    // (or have to detect) a bridge IP here. Matches the existing Ollama
+    // wiring, which already hands containers
+    // `OLLAMA_URL=http://host.containers.internal:<port>` and relies on
+    // this same name resolving.
+    //
+    // Gated to container/service runtimes only — already guaranteed by the
+    // `runtime.r#type` check at function entry (we returned Err otherwise),
+    // so an unconditional push here applies exactly where it's needed.
+    args.push("--add-host=host.containers.internal:host-gateway".into());
 
     // v0.2.54 P0-4: GPU passthrough for variant-declaring modules.
     args.extend(gpu_passthrough_args(
@@ -825,6 +878,16 @@ pub fn build_podman_run_args_global(
         let resolved = resolve_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
+    }
+
+    // v0.2.61 (Option H): caller-injected env, last so it can't be
+    // shadowed by a manifest env of the same key. Values are passed
+    // verbatim (already-resolved by the caller) — NOT run through
+    // `resolve_value`, since these are runtime-minted secrets, not
+    // manifest placeholder templates.
+    for (k, v) in extra_env {
+        args.push("-e".into());
+        args.push(format!("{}={}", k, v));
     }
 
     args.push(image.to_string());
@@ -2132,6 +2195,60 @@ mod tests {
         assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.2.8");
     }
 
+    // ─── v0.2.61: {module_image} token resolution ────────────────────
+    //
+    // The vct-rl-reranker manifest ships `runtime.image_ref:
+    // "{module_image}"` (confirmed with the module owner 2026-06-17).
+    // Pre-fix, resolve_image_ref substituted only
+    // {install.container.image}+{install.container.tag}, so the literal
+    // "{module_image}" hit the unresolved-placeholder guard → install
+    // failed at image-ref resolution. Sibling of the v0.2.59
+    // {module_id} container-name bug. Tests use the REAL shipped token
+    // ("{module_image}") — NOT a factory stand-in (the v0.2.59 lesson:
+    // a test that asserts a value the manifest never ships gives false
+    // confidence).
+
+    /// `{module_image}` with a GPU-variant manifest → `<image>:<variant-tag>`.
+    #[test]
+    fn resolve_image_ref_resolves_module_image_token_cuda_variant() {
+        let manifest = make_manifest_with_variants(true);
+        let got = resolve_image_ref("{module_image}", &manifest, Some(GpuMode::Cuda))
+            .expect("resolve");
+        assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cuda");
+    }
+
+    /// `{module_image}` with Cpu mode (the `gpu_optional` no-GPU path) →
+    /// `-cpu` variant.
+    #[test]
+    fn resolve_image_ref_resolves_module_image_token_cpu_variant() {
+        let manifest = make_manifest_with_variants(true);
+        let got = resolve_image_ref("{module_image}", &manifest, Some(GpuMode::Cpu))
+            .expect("resolve");
+        assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.2.8-cpu");
+    }
+
+    /// `{module_image}` with no gpu_mode (variant resolution skipped) →
+    /// bare `<image>:<version>`.
+    #[test]
+    fn resolve_image_ref_resolves_module_image_token_no_gpu_mode() {
+        let manifest = make_manifest(true, true);
+        let got = resolve_image_ref("{module_image}", &manifest, None).expect("resolve");
+        assert_eq!(got, "ghcr.io/hotak92/vct-rl-reranker:0.2.8");
+    }
+
+    /// The pre-v0.2.61 failure mode: a bare "{module_image}" template
+    /// must no longer trip the unresolved-placeholder guard.
+    #[test]
+    fn resolve_image_ref_module_image_no_longer_unresolved() {
+        let manifest = make_manifest_with_variants(true);
+        let got = resolve_image_ref("{module_image}", &manifest, Some(GpuMode::Cuda))
+            .expect("must resolve, not error on unresolved placeholder");
+        assert!(
+            !got.contains('{') && !got.contains('}'),
+            "resolved image ref must have no leftover placeholders, got {got:?}",
+        );
+    }
+
     /// Manifest WITH variants but caller passes `gpu_mode = None`:
     /// returns bare tag — semantics for legacy call sites that haven't
     /// been wired through yet.
@@ -2379,10 +2496,78 @@ mod tests {
             "ghcr.io/x/y:0.2.10-cuda",
             "docker",
             Some(GpuMode::Cuda),
+            &[],
         )
         .expect("build");
         assert!(args.iter().any(|a| a == "--gpus"));
         assert!(args.iter().any(|a| a == "all"));
+    }
+
+    /// v0.2.61 (Option H): caller-injected `extra_env` lands as trailing
+    /// `-e KEY=VALUE` pairs, after the manifest env, before the image.
+    #[test]
+    fn v0261_build_podman_run_args_global_appends_extra_env() {
+        let manifest = make_rl_manifest_global_for_test();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/x/y:0.2.10",
+            "podman",
+            None,
+            &[("VCT_MODULE_TOKEN".to_string(), "tok-abc123".to_string())],
+        )
+        .expect("build");
+        // The pair is present as a `-e KEY=VALUE` arg…
+        let env_idx = args
+            .iter()
+            .position(|a| a == "VCT_MODULE_TOKEN=tok-abc123")
+            .expect("extra_env pair must be emitted");
+        assert_eq!(args[env_idx - 1], "-e", "extra_env must be a -e flag");
+        // …and BEFORE the positional image (env precedes image in argv).
+        let image_idx = args
+            .iter()
+            .position(|a| a == "ghcr.io/x/y:0.2.10")
+            .expect("image present");
+        assert!(env_idx < image_idx, "extra_env must precede the image arg");
+    }
+
+    /// v0.2.61 (Option H, B2): the global builder must emit
+    /// `--add-host=host.containers.internal:host-gateway` so the container
+    /// can reach the hub via `VCT_HUB_BASE_URL=http://host.containers.internal:<port>`.
+    /// The flag must appear BEFORE the positional image arg (it's a
+    /// `podman run` option, not a CMD arg).
+    #[test]
+    fn v0261_build_podman_run_args_global_emits_add_host_host_gateway() {
+        let manifest = make_rl_manifest_global_for_test();
+        let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
+        let args = build_podman_run_args_global(
+            &manifest,
+            &ctx,
+            11443,
+            "vct-rl-reranker",
+            "ghcr.io/x/y:0.2.10",
+            "podman",
+            None,
+            &[],
+        )
+        .expect("build");
+
+        let add_host_idx = args
+            .iter()
+            .position(|a| a == "--add-host=host.containers.internal:host-gateway")
+            .expect("global builder must emit --add-host=host.containers.internal:host-gateway");
+
+        let image_idx = args
+            .iter()
+            .position(|a| a == "ghcr.io/x/y:0.2.10")
+            .expect("image present");
+        assert!(
+            add_host_idx < image_idx,
+            "--add-host must be a run option (precede the image arg)"
+        );
     }
 
     /// Live podman CLI-surface check (same discipline as
@@ -2884,7 +3069,7 @@ mod tests {
         manifest.runtime.r#type = "cli".into();
         let ctx = crate::manifest::PlaceholderCtx::new("vct-rl-reranker");
         let result = build_podman_run_args_global(
-            &manifest, &ctx, 11443, "vct-rl-reranker", "img", "podman", None,
+            &manifest, &ctx, 11443, "vct-rl-reranker", "img", "podman", None, &[],
         );
         assert!(result.is_err());
     }
@@ -2904,6 +3089,7 @@ mod tests {
             "ghcr.io/x/y:0.2.10",
             "podman",
             None,
+            &[],
         )
         .expect("build");
         assert_eq!(args[0], "run");
@@ -3353,6 +3539,7 @@ mod tests {
             "ghcr.io/hotak92/vct-rl-reranker:0.2.9",
             "podman",
             None,
+            &[],
         )
         .expect("build args global");
         assert_eq!(

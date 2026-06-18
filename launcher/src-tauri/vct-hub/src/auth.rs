@@ -2,14 +2,21 @@
 //!
 //! ─── Why this exists ────────────────────────────────────────────────
 //!
-//! The hub binds `127.0.0.1:7700`. Without authentication, ANY process
-//! running as the same OS user can curl `http://localhost:7700/api/v1
-//! /projects/<id>/env` and exfiltrate every secret the launcher's
-//! keychain has marked active for that project. This is a real attack
-//! class (rogue `npm install`, `pip install`, `cargo install`, browser
-//! extension calling fetch on localhost, etc.) that has hit other
-//! localhost-bound daemons (Docker, Bun's dev server, several
-//! CI-injected typosquats).
+//! The hub binds `0.0.0.0:7700` (v0.2.61, Option H — see the bind-site
+//! comment in `server::start_hub_server` for the full rationale). It must
+//! be reachable from a global module's CONTAINER network namespace, and
+//! `host.containers.internal` maps to a different host address per
+//! container runtime, so listening on all interfaces is the only
+//! runtime-agnostic way to be reachable — with the BEARER TOKEN, not the
+//! bind address, as the access control. Without authentication, ANY
+//! process that can reach the port could curl
+//! `http://<host>:7700/api/v1/projects/<id>/env` and exfiltrate every
+//! secret the launcher's keychain has marked active for that project.
+//! This is a real attack class (rogue `npm install`, `pip install`,
+//! `cargo install`, browser extension calling fetch on localhost, etc.)
+//! that has hit other localhost-bound daemons (Docker, Bun's dev server,
+//! several CI-injected typosquats) — and, post-0.0.0.0, also a same-LAN
+//! peer. The token gate is what stops all of them.
 //!
 //! The fix: every hub startup generates a fresh 32-byte token from the
 //! OS CSPRNG, persists it to `<vct_root_dir>/hub.token` (mode 0o600 on
@@ -72,7 +79,15 @@
 //!   protection level as other localhost daemons (Docker socket
 //!   permissions, etc.).
 //!
-//! * Network adversary — out of scope, hub binds 127.0.0.1 only.
+//! * Network adversary — since v0.2.61 the hub binds `0.0.0.0` (so a
+//!   global module's container can reach it; see `server::start_hub_server`),
+//!   so a same-LAN peer CAN now reach the port. The bearer-token gate is
+//!   what stops them: every `/api/v1/*` route requires the 256-bit
+//!   `hub.token` (or, for module routes, the per-module ephemeral token),
+//!   so a network peer without the token gets 401 exactly like an
+//!   unauthorized local process. The token, not the bind address, is the
+//!   boundary. (A LAN attacker who can ALSO read `<vct_root_dir>/hub.token`
+//!   off this host is already the same-user-RCE case above.)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -171,6 +186,17 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 ///   * `/api/v1/modules/{id}/token/refresh` — same posture, exempted
 ///     for the same reason (the container has its scoped secret, not
 ///     hub.token).
+///   * `/api/v1/modules/{id}/projects/{pid}/rl/events` — v0.2.61
+///     (Option H): the GLOBAL RL container reads its own per-project
+///     event corpus through the hub with a per-MODULE IDENTITY token
+///     (minted by `module_identity`), NOT hub.token. Like the `db` /
+///     `token` routes, this carve-out hands the bearer down to
+///     `module_db_api::require_module_scope`, which now validates BOTH
+///     the DB `module_access_tokens` path AND the ephemeral
+///     identity-token path. We match the EXACT `rl/events` tail (2nd
+///     segment `projects`, last two `rl` + `events`) — we do NOT
+///     blanket-exempt all `.../projects/...`, which would open any
+///     future `projects`-prefixed route to the outer-gate bypass.
 ///   * Anything not under `/api/v1/` — there's nothing else mounted
 ///     today, but if someone adds a `/static/*` route later we don't
 ///     want an empty-Authorization 401 to leak through. Auth applies
@@ -184,14 +210,68 @@ fn is_exempt_path(path: &str) -> bool {
     // bearer-scope middleware. Match patterns:
     //   /api/v1/modules/{module_id}/db/projects/{project_id}/rows/...
     //   /api/v1/modules/{module_id}/token/refresh
+    //   /api/v1/modules/{module_id}/projects/{project_id}/rl/events
     if let Some(rest) = path.strip_prefix("/api/v1/modules/") {
-        // rest like "vct-rl-reranker/db/projects/.../rows/..." or
-        //          "vct-rl-reranker/token/refresh".
-        let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        if parts.len() >= 2 {
-            if parts[1] == "db" || parts[1] == "token" {
-                return true;
-            }
+        // rest like "vct-rl-reranker/db/projects/.../rows/...",
+        //          "vct-rl-reranker/token/refresh", or
+        //          "vct-rl-reranker/projects/{pid}/rl/events".
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() < 2 {
+            return false;
+        }
+        // parts[0] == module_id; parts[1] is the route family.
+        //
+        // v0.2.61 (Option H C-EXEMPT): match the EXACT registered shapes,
+        // NOT the whole `db`/`token` route FAMILY. The old `parts[1]=="db"
+        // || parts[1]=="token"` blanket-exempted any future suffix under
+        // those prefixes from the outer hub.token gate — so a later route
+        // added under `db/`/`token/` WITHOUT its own require_module_scope
+        // layer would silently inherit the bypass (a latent 0.0.0.0-exposure
+        // footgun). Tighten to the shapes module_db_api::router actually
+        // registers:
+        //   db   →  db/projects/{pid}/rows/{table}        (insert/list)
+        //           db/projects/{pid}/rows/{table}/{key}  (get/patch/delete)
+        //   token → token/refresh
+        // (a trailing empty segment from a "…/" path is tolerated). Same
+        // exact-tail discipline the rl/events arm below already uses.
+        let trimmed_len = if parts.last() == Some(&"") { parts.len() - 1 } else { parts.len() };
+        if parts[1] == "db"
+            && trimmed_len >= 5
+            && parts[2] == "projects"
+            && parts[4] == "rows"
+            && (trimmed_len == 6 || trimmed_len == 7)
+        {
+            // db/projects/{pid}/rows/{table}[/{key}]
+            return true;
+        }
+        if parts[1] == "token" && trimmed_len == 3 && parts[2] == "refresh" {
+            return true;
+        }
+        // v0.2.61 (Option H): exempt the EXACT rl/events shape only.
+        // parts: [module_id, "projects", project_id, "rl", "events"]
+        // (an optional trailing empty segment from a "…/events/" path
+        // is tolerated, but no deeper path is). We deliberately do NOT
+        // match on parts[1] == "projects" alone — only the precise
+        // rl/events tail — so a future `/modules/{id}/projects/{pid}/x`
+        // route does not inherit this outer-gate bypass.
+        if (parts.len() == 5 || (parts.len() == 6 && parts[5].is_empty()))
+            && parts[1] == "projects"
+            && parts[3] == "rl"
+            && parts[4] == "events"
+        {
+            return true;
+        }
+        // v0.2.61 (RL config-readback): exempt the EXACT per-project config
+        // shape only — parts: [module_id, "projects", project_id, "config"]
+        // (trailing empty segment tolerated). Same exact-tail discipline as
+        // rl/events — NOT a blanket /projects/ match. require_module_scope
+        // (identity-token, GET-only, same-module-same-pid) is the real gate;
+        // the handler returns only the module's own module_settings map.
+        if (parts.len() == 4 || (parts.len() == 5 && parts[4].is_empty()))
+            && parts[1] == "projects"
+            && parts[3] == "config"
+        {
+            return true;
         }
     }
     false
@@ -458,6 +538,82 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("Authorization", "Bearer ".parse().unwrap());
         assert_eq!(extract_bearer_token(&h), None);
+    }
+
+    // ─── Exempt-path matching ────────────────────────────────────────
+
+    #[test]
+    fn is_exempt_path_health_and_module_db_token() {
+        // Health probe — always exempt.
+        assert!(is_exempt_path("/api/v1/health"));
+        // Module DB CRUD + token refresh — exempt (own scope middleware).
+        assert!(is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/db/projects/p1/rows/rl_state/k1"
+        ));
+        assert!(is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/token/refresh"
+        ));
+        // db CRUD without the {key} suffix (insert/list) — also exempt.
+        assert!(is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/db/projects/p1/rows/rl_state"
+        ));
+    }
+
+    #[test]
+    fn is_exempt_path_db_token_family_exact_shape_only() {
+        // v0.2.61 (Option H C-EXEMPT): the db/token carve-outs match the EXACT
+        // registered shapes, NOT the whole route family. A future route added
+        // under db/ or token/ WITHOUT its own scope middleware must NOT inherit
+        // the outer-gate bypass on the 0.0.0.0 surface.
+        //
+        // Out-of-shape db paths — must NOT be exempt:
+        assert!(!is_exempt_path("/api/v1/modules/m/db/admin/dump"));
+        assert!(!is_exempt_path("/api/v1/modules/m/db/projects/p1")); // no /rows/{table}
+        assert!(!is_exempt_path("/api/v1/modules/m/db/projects/p1/rows/t/k/extra")); // too deep
+        // Out-of-shape token paths — must NOT be exempt:
+        assert!(!is_exempt_path("/api/v1/modules/m/token/issue"));
+        assert!(!is_exempt_path("/api/v1/modules/m/token")); // bare
+        // The exact registered shapes — still exempt:
+        assert!(is_exempt_path("/api/v1/modules/m/db/projects/p1/rows/t"));
+        assert!(is_exempt_path("/api/v1/modules/m/db/projects/p1/rows/t/k"));
+        assert!(is_exempt_path("/api/v1/modules/m/token/refresh"));
+    }
+
+    #[test]
+    fn is_exempt_path_rl_events_is_exempt() {
+        // v0.2.61 (Option H): the exact rl/events shape must be exempt so
+        // module-identity-token containers reach require_module_scope
+        // instead of 401ing at the outer hub.token gate.
+        assert!(is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/projects/abc-123/rl/events"
+        ));
+        // Tolerate a trailing slash on the events path.
+        assert!(is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/projects/abc-123/rl/events/"
+        ));
+    }
+
+    #[test]
+    fn is_exempt_path_other_projects_route_is_not_exempt() {
+        // A different 2nd-but-deeper segment under /projects/ must NOT
+        // inherit the carve-out — only the precise rl/events tail does.
+        assert!(!is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/projects/abc-123/other"
+        ));
+        // /projects/{pid} with no rl/events tail.
+        assert!(!is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/projects/abc-123"
+        ));
+        // rl without the events leaf.
+        assert!(!is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/projects/abc-123/rl"
+        ));
+        // A deeper path past events must not match (only events leaf).
+        assert!(!is_exempt_path(
+            "/api/v1/modules/vct-rl-reranker/projects/abc-123/rl/events/extra"
+        ));
+        // Secret-bearing env route stays gated.
+        assert!(!is_exempt_path("/api/v1/projects/abc-123/env"));
     }
 
     // ─── End-to-end: middleware in front of a real bound server ─────

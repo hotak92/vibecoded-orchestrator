@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.61] - 2026-06-18
+
+v0.2.61 lands the RL Reranker hub-credential chain (a global paid container
+authenticates to the hub's per-project data routes with a per-spawn ephemeral
+token — never the launcher master key), fixes two distinct Weaviate disk-write
+leaks, and resolves a batch of install-flow + diagrams gaps.
+
+### Added
+
+- **Global-module hub-credential chain (Option H).** A global paid container
+  (the RL Reranker — one process serving all projects) now reads its
+  per-project training corpus + writes its status rows + reads its toggle
+  flags through the hub using a **per-spawn ephemeral identity token** minted
+  in-memory at container spawn and injected as `VCT_MODULE_TOKEN` — it never
+  receives `hub.token` (the launcher master credential). The token authorizes
+  a least-privilege set, all same-module + same-project: `GET …/rl/events`
+  (read its corpus), its own `…/db/…/rows/…` routes (write its status rows),
+  and `GET …/projects/{pid}/config` (read its own per-project settings, a
+  minimal map — never the full ProjectConfig). The hub binds `0.0.0.0` so the
+  container can reach it regardless of container runtime; the bearer token,
+  not the bind address, is the access boundary (every `/api/v1/*` route is
+  token-gated).
+
+### Fixed
+
+- **Weaviate write amplification (memtable flush churn).** On defaults, each
+  dirty memtable flushed on a 60s timer; with the hook-driven trickle of many
+  small KG/code-graph upserts across thousands of LSM stores this produced a
+  continuous flush+compaction drumbeat (~57× write amplification observed).
+  Tuned (both compose files, verified against the Weaviate 1.28.4 source, safe
+  8–64 GB, podman+docker): flush on 500 MB-per-store **or** 1 h whichever
+  first, cap compaction merge output at 500 MiB, and `LIMIT_RESOURCES` to
+  auto-size the Go heap. Every write stays WAL-durable on upsert — this changes
+  flush cadence, never the durability path.
+- **Weaviate HNSW tombstone-cleanup spin loop (second disk leak).** A
+  collection holding accumulated tombstones re-walked its whole HNSW graph and
+  rewrote neighbor edges in place on every fixed cleanup tick — GB/hour of
+  writes reclaiming nothing. Brake: `TOMBSTONE_DELETION_MIN_PER_CYCLE`
+  (a cleanup is a cheap no-op until a real backlog forms) + bounded
+  `MAX_PER_CYCLE` + `CONCURRENCY` (global envs, apply to all collections on
+  recreate; pure GC of already-deleted vectors — no data loss). Complemented
+  by a **per-object content-hash skip** in the code-graph analyzer so a
+  one-function edit re-indexes one object, not all N in the file (~95–98% less
+  tombstone generation), layered under the existing per-file skip.
+- **Weaviate config-change now actually applies on update.** A running
+  vct-managed service was *adopted* on `--update` and skipped `compose up`
+  entirely, so a changed `environment:` block never reached compose. The update
+  now force-recreates owned (vct-managed) services whose config changed; the
+  named data volume is preserved, so collections survive.
+- **KG/code-graph sync debounce.** The per-edit sync hook now coalesces rapid
+  re-edits of the same file into one upsert per quiet window (shared
+  `.claude/state/` lock with atomic claim; coalesce-never-drop).
+- **Stale embedding override on update.** A clone updated from an older version
+  could carry a hardcoded `ACTIVE_EMBEDDING=qwen3` in settings.json that
+  defeated the hardware-aware auto-select (qwen3 on CPU times out KG sync). The
+  installer now reconciles a stale value to the hardware pick (arctic on
+  CPU/low-RAM) when no deliberate user choice exists; a CLI flag or a launcher
+  GUI choice is always honored.
+- **RL `{module_image}` placeholder** is now substituted in the image-ref
+  resolution path; the **finetune/rotate path targets the global container's
+  port** for global installs (was a dead per-project port); finetune no longer
+  reports "complete" on a no-op/failed/lost job.
+- **Code-graph `vco_lib` bootstrap** on the analyzer's second import path
+  (resolves a `ModuleNotFoundError` for venv-less user projects).
+- **Diagrams**: self-hosted Excalidraw editor + unified browser editing model;
+  diagram name-validation widened.
+
+### Notes
+
+- The RL Reranker container side ships unchanged in contract; its matching
+  container tag follows this release.
+
 ## [0.2.60] - 2026-06-17
 
 v0.2.60 fixes a Windows update-loop bug and lays the groundwork for a robust,

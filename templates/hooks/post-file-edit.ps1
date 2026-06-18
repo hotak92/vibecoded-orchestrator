@@ -36,6 +36,31 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 $EmitContextLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
 if (Test-Path $EmitContextLib) { . $EmitContextLib }
 
+# Debounce helper (2026-06-18, write-amplification fix). Coalesces rapid
+# re-edits of the SAME file into one Weaviate write per quiet-window
+# (VCO_KG_SYNC_DEBOUNCE_SECONDS, default 5; 0 disables). Correctness
+# argument (final state always syncs) + crash-safety reasoning live in
+# the helper header. Identical semantics to _lib/kg-sync-debounce.sh.
+#
+# Conditional source: a partial/old bundle install may lack the lib. If
+# absent we define a passthrough Invoke-KgDebounceSchedule that runs the
+# sync immediately in a detached process (pre-2026-06-18 behaviour), so a
+# missing helper degrades to "no debounce" rather than breaking the hook.
+$DebounceLib = Join-Path $PSScriptRoot "_lib/kg-sync-debounce.ps1"
+if (Test-Path $DebounceLib) {
+    . $DebounceLib
+} else {
+    function Invoke-KgDebounceSchedule {
+        param([string]$ProjectRoot, [string]$FilePath, [string]$WorkingDir,
+              [string]$Command, [string]$Channel = "kg")
+        $psExe = if ($script:PsExe) { $script:PsExe } else { "pwsh" }
+        $wdEsc = ($WorkingDir -replace "'", "''")
+        $child = "if ('$wdEsc') { Set-Location -LiteralPath '$wdEsc' -ErrorAction SilentlyContinue }; try { $Command } catch { }"
+        $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
+        Start-Process -FilePath $psExe -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$enc) -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
 # Accumulate LLM-visible reminders, emit one envelope at the end.
 $LlmNudge = ""
 function Add-Nudge([string]$msg) {
@@ -215,6 +240,15 @@ python install.py --update
     }
 }
 
+# NOTE (2026-06-18 debounce): this synchronous gate is RETAINED for
+# reference + sibling parity with the bash _kg_write_allowed, but the
+# ACTIVE gate now runs at SYNC time inside the debounced flusher. Because
+# a detached Start-Process child cannot call PowerShell functions defined
+# here, the gate logic is re-expressed inline in Build-GatedSyncCommand
+# (it invokes the external vct_access_check.ps1 resolver at flush time).
+# The empty-project_id metric+deferral surfaces are emitted by
+# Build-GatedSyncCommand directly. Keep this function for the contract it
+# documents; do not assume it is on the live sync path.
 function Test-KgWriteAllowed {
     param(
         [string]$Project,
@@ -275,6 +309,60 @@ if (-not $VctProjectId) {
     }
 }
 
+# Resolve the access-matrix checker path once for the debounced (gate
+# runs at SYNC time) command strings below. The .sh sibling calls the
+# in-scope _kg_write_allowed bash function inside its backgrounded
+# flusher; PowerShell Start-Job spawns a SEPARATE process that does NOT
+# inherit functions, so the deferred command must re-run the gate via
+# the EXTERNAL resolver script (vct_access_check.ps1). Fall-open
+# semantics mirror Test-KgWriteAllowed exactly: empty project_id OR
+# missing resolver OR non-"write" parse failure → allow.
+$AccessCheckPs1 = $null
+foreach ($c in @(
+    (Join-Path $ProjectRoot "templates/scripts/vct_access_check.ps1"),
+    (Join-Path $ProjectRoot ".claude/scripts/vct_access_check.ps1")
+)) { if (Test-Path $c) { $AccessCheckPs1 = $c; break } }
+
+# Build a self-contained "gate THEN sync" command string for Start-Job.
+# Runs the resolver at flush time; only proceeds to the sync command
+# when the gate returns "write" (or when the gate cannot apply, matching
+# fall-open). $SyncExpr is the PowerShell expression that performs the
+# actual sync.
+function Build-GatedSyncCommand {
+    param([string]$Project, [string]$Collection, [string]$SyncExpr)
+    # Empty VCT_PROJECT_ID: preserve the v0.2.49 SB1 user-facing
+    # surfaces. Test-KgWriteAllowed emitted the dropped-write metric +
+    # the UPDATE_DEFERRED.md remediation entry on this path; both are
+    # idempotent (sentinel-guarded per session), so emitting them once
+    # synchronously here at schedule time is equivalent — they are a
+    # "your project_id is missing" notification, not a per-sync gate
+    # decision. The actual write/deny gate still runs at sync time via
+    # the resolver for the project-present case below.
+    if (-not $Project) {
+        if ($Collection) {
+            Emit-KgGateSkippedMetric -Collection $Collection
+            Emit-KgGateSkippedDeferral -Collection $Collection
+        }
+        return $SyncExpr   # fall open (legacy silent-allow)
+    }
+    # No collection context, or no resolver on disk → fall open (allow).
+    # Identical to Test-KgWriteAllowed's early returns.
+    if ((-not $Collection) -or (-not $AccessCheckPs1)) {
+        return $SyncExpr
+    }
+    $pEsc = $Project    -replace "'", "''"
+    $cEsc = $Collection -replace "'", "''"
+    $rEsc = $AccessCheckPs1 -replace "'", "''"
+    $psEsc = $PsExe -replace "'", "''"
+    # Inline gate: invoke resolver; allow on null/error (fail-open) OR
+    # exact "write"; deny otherwise.
+    return @"
+`$lvl = `$null
+try { `$lvl = & '$psEsc' -NoProfile -File '$rEsc' '$pEsc' '$cEsc' 2>`$null } catch { `$lvl = `$null }
+if ((`$null -eq `$lvl) -or ((([string]`$lvl).Trim()) -eq 'write')) { $SyncExpr }
+"@
+}
+
 # 1. Knowledge graph auto-sync (background side-effect).
 if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase)) {
     $relPath = $EditedFile
@@ -284,14 +372,25 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
 
     # v0.2.49 Phase 8: gate the sync on access-matrix write permission.
     # KG_COLLECTION is the target Weaviate class for primary-KG writes.
-    if (Test-KgWriteAllowed -Project $VctProjectId -Collection $Env:KG_COLLECTION) {
-        $kgSyncPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-sync.ps1"
-        $kgSyncSh = Join-Path $ProjectRoot ".claude/scripts/kg-sync"
-        if (Test-Path $kgSyncPs1) {
-            Start-Process -FilePath $PsExe -ArgumentList @('-NoProfile','-File',$kgSyncPs1,$relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
-        } elseif ((Test-Path $kgSyncSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-            Start-Process -FilePath "bash" -ArgumentList @($kgSyncSh, $relPath) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
-        }
+    # 2026-06-18: debounced. The gate runs at SYNC time (inside the job's
+    # command), not at schedule time, so a coalesced burst consults the
+    # access matrix exactly once when the deferred sync fires. The sync
+    # re-reads the file from disk → latest content lands.
+    $kgSyncPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-sync.ps1"
+    $kgSyncSh = Join-Path $ProjectRoot ".claude/scripts/kg-sync"
+    $relEsc = $relPath -replace "'", "''"
+    $syncExpr = $null
+    if (Test-Path $kgSyncPs1) {
+        $ps1Esc = $kgSyncPs1 -replace "'", "''"
+        $psEscape = $PsExe -replace "'", "''"
+        $syncExpr = "& '$psEscape' -NoProfile -File '$ps1Esc' '$relEsc' *> `$null"
+    } elseif ((Test-Path $kgSyncSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
+        $shEsc = $kgSyncSh -replace "'", "''"
+        $syncExpr = "& bash '$shEsc' '$relEsc' *> `$null"
+    }
+    if ($syncExpr) {
+        $kgCmd = Build-GatedSyncCommand -Project $VctProjectId -Collection $Env:KG_COLLECTION -SyncExpr $syncExpr
+        Invoke-KgDebounceSchedule -ProjectRoot $ProjectRoot -FilePath $EditedFile -WorkingDir $ProjectRoot -Command $kgCmd -Channel "kg"
     }
 
     # Duplicate detection every 10 edits.
@@ -326,12 +425,17 @@ if ($EditedFile.StartsWith($KnowledgeRoot, [StringComparison]::OrdinalIgnoreCase
 if ($EditedFile.StartsWith($DocsDir, [StringComparison]::OrdinalIgnoreCase) -and ($EditedFile -like "*.md")) {
     # v0.2.49 Phase 8: gate docs sync on access-matrix write permission
     # against DEVELOPMENT_COLLECTION (the docs/ target).
-    if (Test-KgWriteAllowed -Project $VctProjectId -Collection $Env:DEVELOPMENT_COLLECTION) {
-        $venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-        $uploadScript = Join-Path $ProjectRoot ".claude/scripts/upload_docs.py"
-        if ($venvPy -and (Test-Path $uploadScript)) {
-            Start-Process -FilePath $venvPy -ArgumentList @($uploadScript, $EditedFile) -WorkingDirectory $ProjectRoot -WindowStyle Hidden | Out-Null
-        }
+    # 2026-06-18: debounced (same coalesce semantics + sync-time gate as
+    # the knowledge/ branch above).
+    $venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+    $uploadScript = Join-Path $ProjectRoot ".claude/scripts/upload_docs.py"
+    if ($venvPy -and (Test-Path $uploadScript)) {
+        $pyEsc = $venvPy -replace "'", "''"
+        $upEsc = $uploadScript -replace "'", "''"
+        $efEsc = $EditedFile -replace "'", "''"
+        $docsSyncExpr = "& '$pyEsc' '$upEsc' '$efEsc' *> `$null"
+        $docsCmd = Build-GatedSyncCommand -Project $VctProjectId -Collection $Env:DEVELOPMENT_COLLECTION -SyncExpr $docsSyncExpr
+        Invoke-KgDebounceSchedule -ProjectRoot $ProjectRoot -FilePath $EditedFile -WorkingDir $ProjectRoot -Command $docsCmd -Channel "docs"
     }
 }
 
@@ -459,7 +563,19 @@ if ($EditedFile -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|jav
                 elseif ($env:PROJECT_NAME) { $env:PROJECT_NAME } `
                 else { Split-Path $ProjectRoot -Leaf }
         }
-        & $PsExe -NoProfile -File $cgIncPs1 $EditedFile $ProjectRoot $codeGraphPrefix
+        # 2026-06-18: debounced. code-graph-incremental.(ps1|sh) runs the
+        # analyzer per-edit with NO internal debounce, so each edit was a
+        # separate Weaviate upsert. Coalescing rapid re-edits of the SAME
+        # file is safe: the analyzer re-reads the file from disk at run
+        # time, so the deferred run indexes the latest content. Code-graph
+        # writes are not access-matrix gated, so no gate wraps this one.
+        $psEscCg = $PsExe -replace "'", "''"
+        $cgEsc = $cgIncPs1 -replace "'", "''"
+        $efEscCg = $EditedFile -replace "'", "''"
+        $prEsc = $ProjectRoot -replace "'", "''"
+        $cgpEsc = $codeGraphPrefix -replace "'", "''"
+        $cgSyncExpr = "& '$psEscCg' -NoProfile -File '$cgEsc' '$efEscCg' '$prEsc' '$cgpEsc' *> `$null"
+        Invoke-KgDebounceSchedule -ProjectRoot $ProjectRoot -FilePath $EditedFile -WorkingDir $ProjectRoot -Command $cgSyncExpr -Channel "code"
     }
     Add-Nudge "[Code edit reminder] $bn was just edited.`nWhen you're done with this work item:`n- Update CONTEXT_STATE.md with what changed and what's next.`n- Capture any non-obvious learnings as a KG node under knowledge/concepts/."
 }

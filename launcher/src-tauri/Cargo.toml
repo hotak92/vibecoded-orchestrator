@@ -18,7 +18,7 @@ members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 # propagated from this same logical version by `scripts/bump-version.sh`
 # and verified by `scripts/pre-ship-check.sh`.
 [workspace.package]
-version = "0.2.60"
+version = "0.2.61"
 
 [package]
 name = "vct-launcher-temp"

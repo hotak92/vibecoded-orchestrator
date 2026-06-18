@@ -43,6 +43,30 @@ pub fn vct_root_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".vct"))
 }
 
+/// Path to the "finetune in flight" sentinel for a global module
+/// (v0.2.61, Option H B1 fix).
+///
+/// The launcher's background finetune task (`run_finetune_then_rotate_async`)
+/// CREATES this file when it kicks `/finetune` and REMOVES it on exit
+/// (success OR failure). The hub's boot resume sweep CONSULTS it before
+/// recreating a running global container: if the sentinel is present the
+/// recreate (which would `podman rm -f` the container and kill the in-flight
+/// training job) is DEFERRED — the hub instead schedules a background
+/// re-check that performs the re-mint once the job finishes.
+///
+/// Defined here, in the shared `vct-launcher-core`, so the WRITER (launcher
+/// process) and the READER (hub process) resolve the SAME path — the two are
+/// separate processes and an ad-hoc per-process path string would silently
+/// drift. `module_id` is sanitized to a filename-safe form (it's a catalog
+/// id like `vct-rl-reranker`, already filename-safe, but we guard anyway).
+pub fn finetune_sentinel_path(module_id: &str) -> PathBuf {
+    let safe: String = module_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    vct_root_dir().join(format!("{}.finetuning", safe))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -36,6 +36,7 @@ pub mod lifecycle;
 pub mod lifecycle_api;
 pub mod lockfile;
 pub mod mcp_tool_grants_api;
+pub mod module_identity;
 pub mod module_supervisor;
 pub mod module_db_api;
 pub mod modules_api;

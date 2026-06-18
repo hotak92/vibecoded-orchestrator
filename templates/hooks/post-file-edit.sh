@@ -48,6 +48,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 KNOWLEDGE_ROOT="$PROJECT_ROOT/knowledge"
 
+# Debounce helper (2026-06-18, write-amplification fix). Coalesces rapid
+# re-edits of the SAME file into one Weaviate write per quiet-window
+# (VCO_KG_SYNC_DEBOUNCE_SECONDS, default 5; 0 disables). The correctness
+# argument (final state always syncs) + crash-safety reasoning live in
+# the helper's header. Sourced (not exec'd) so the access-matrix gate
+# functions defined below stay in scope for the deferred sync command —
+# the gate runs at SYNC time inside the debounced flusher, never bypassed.
+#
+# Conditional source: a partial/old bundle install may lack the lib. If
+# it's absent we define a passthrough _kg_debounce_schedule that runs the
+# sync immediately in the background (the pre-2026-06-18 behaviour), so a
+# missing helper degrades to "no debounce" rather than breaking the hook.
+# shellcheck source=_lib/kg-sync-debounce.sh disable=SC1091
+if [ -f "$SCRIPT_DIR/_lib/kg-sync-debounce.sh" ]; then
+    . "$SCRIPT_DIR/_lib/kg-sync-debounce.sh"
+else
+    _kg_debounce_shquote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+    _kg_debounce_schedule() {
+        # $1=PROJECT_ROOT $2=file $3=python $4=workdir $5=cmd $6=channel(unused)
+        ( cd "$4" 2>/dev/null || true; eval "$5" ) &
+    }
+fi
+
 # Accumulate LLM-visible reminders here, emit one envelope at the end.
 LLM_NUDGE=""
 _add_nudge() {
@@ -258,9 +281,15 @@ if [[ "$EDITED_FILE" == "$KNOWLEDGE_ROOT"* ]]; then
     cd "$PROJECT_ROOT"
     # v0.2.49 Phase 8: gate the sync on access-matrix write permission.
     # KG_COLLECTION is the target Weaviate class for primary-KG writes.
-    if _kg_write_allowed "$VCT_PROJECT_ID" "${KG_COLLECTION:-}"; then
-        .claude/scripts/kg-sync "$REL_PATH" &
-    fi
+    # 2026-06-18: debounced. The gate runs at SYNC time (inside the
+    # quoted command the flusher eval's), not at schedule time, so a
+    # coalesced burst still consults the access matrix exactly once when
+    # the deferred sync fires. The sync re-reads the file from disk, so
+    # the latest content lands. All interpolated values are shquote'd so
+    # a space- or quote-bearing path survives the eval (and the reaper's
+    # re-eval from the recorded cmd file).
+    _KG_SYNC_CMD="_kg_write_allowed $(_kg_debounce_shquote "$VCT_PROJECT_ID") $(_kg_debounce_shquote "${KG_COLLECTION:-}") && .claude/scripts/kg-sync $(_kg_debounce_shquote "$REL_PATH")"
+    _kg_debounce_schedule "$PROJECT_ROOT" "$EDITED_FILE" "$PY" "$PROJECT_ROOT" "$_KG_SYNC_CMD" "kg"
 
     EDIT_COUNT_FILE="$PROJECT_ROOT/.claude/logs/.kg_edit_count"
     mkdir -p "$PROJECT_ROOT/.claude/logs"
@@ -285,9 +314,11 @@ if [[ "$EDITED_FILE" == "$DOCS_DIR"* ]] && [[ "$EDITED_FILE" == *.md ]]; then
     cd "$PROJECT_ROOT"
     # v0.2.49 Phase 8: gate docs sync on access-matrix write permission
     # against DEVELOPMENT_COLLECTION (the docs/ target).
-    if _kg_write_allowed "$VCT_PROJECT_ID" "${DEVELOPMENT_COLLECTION:-}"; then
-        .claude/scripts/kg-sync "$REL_PATH" &
-    fi
+    # 2026-06-18: debounced (same coalesce-rapid-repeats semantics as the
+    # knowledge/ branch above; gate runs at sync time, latest content
+    # lands).
+    _DOCS_SYNC_CMD="_kg_write_allowed $(_kg_debounce_shquote "$VCT_PROJECT_ID") $(_kg_debounce_shquote "${DEVELOPMENT_COLLECTION:-}") && .claude/scripts/kg-sync $(_kg_debounce_shquote "$REL_PATH")"
+    _kg_debounce_schedule "$PROJECT_ROOT" "$EDITED_FILE" "$PY" "$PROJECT_ROOT" "$_DOCS_SYNC_CMD" "docs"
 fi
 
 # 2b. Auto-index diagrams (Phase 1.5 — Mermaid + Excalidraw).
@@ -417,10 +448,16 @@ if [[ "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|jav
     if [ -z "$CODE_GRAPH_PREFIX_RESOLVED" ]; then
         CODE_GRAPH_PREFIX_RESOLVED="${CODE_GRAPH_PROJECT:-${PROJECT_NAME:-$(basename "$PROJECT_ROOT")}}"
     fi
-    bash "$SCRIPT_DIR/code-graph-incremental.sh" \
-        "$EDITED_FILE" \
-        "$PROJECT_ROOT" \
-        "$CODE_GRAPH_PREFIX_RESOLVED"
+    # 2026-06-18: debounced. code-graph-incremental.sh runs the analyzer
+    # per-edit with NO internal debounce (its own comment: "no debounce —
+    # keep code graph fresh"), so each edit was a separate Weaviate
+    # upsert. Coalescing rapid re-edits of the SAME file is safe: the
+    # analyzer re-reads the file from disk (diffs the working tree) at run
+    # time, so the deferred run indexes the latest content. The
+    # incremental script has no access-matrix gate of its own (code-graph
+    # writes are not gated), so the debounced command is the bare invoke.
+    _CG_SYNC_CMD="bash $(_kg_debounce_shquote "$SCRIPT_DIR/code-graph-incremental.sh") $(_kg_debounce_shquote "$EDITED_FILE") $(_kg_debounce_shquote "$PROJECT_ROOT") $(_kg_debounce_shquote "$CODE_GRAPH_PREFIX_RESOLVED")"
+    _kg_debounce_schedule "$PROJECT_ROOT" "$EDITED_FILE" "$PY" "$PROJECT_ROOT" "$_CG_SYNC_CMD" "code"
 
     _add_nudge "[Code edit reminder] $(basename "$EDITED_FILE") was just edited.
 When you're done with this work item:

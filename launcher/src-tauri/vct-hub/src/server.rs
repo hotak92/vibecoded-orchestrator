@@ -168,7 +168,28 @@ pub async fn start_hub_server() -> Result<u16, String> {
         .layer(axum::Extension(auth_state))
         .layer(cors);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    // Bind 0.0.0.0 (v0.2.61, Option H). The hub MUST be reachable from a
+    // global module's container network namespace (the RL container reads
+    // its training corpus via
+    // `GET <VCT_HUB_BASE_URL>/api/v1/modules/{id}/projects/{pid}/rl/events`).
+    // `host.containers.internal` resolves to different host addresses per
+    // container runtime/backend (bridge gateway on rootful podman/docker,
+    // the host LAN IP on rootless pasta, etc.), so the ONLY runtime-
+    // agnostic way to be reachable everywhere — without per-backend
+    // interface detection that breeds bugs — is to listen on all
+    // interfaces and let the BEARER TOKEN be the access control.
+    //
+    // SECURITY POSTURE (deliberate change from the prior 127.0.0.1-only
+    // bind): network isolation was never the real lock — EVERY `/api/v1/*`
+    // route is gated by `auth::require_auth` against a 256-bit CSPRNG
+    // `hub.token` (and module routes by the per-module ephemeral token).
+    // A LAN peer that can now reach the port still gets 401 without the
+    // token. Loopback-only was defense-in-depth; binding 0.0.0.0 trades
+    // that one layer for runtime-agnostic container reachability + far
+    // less code. The token IS the boundary. (If a deployment ever needs
+    // the hub pinned off non-loopback interfaces, that's a future opt-in
+    // env, not a default.)
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     // Try to bind — if port is taken, try next 5 ports
     let listener = try_bind(addr, 5).await?;
@@ -245,11 +266,30 @@ async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::Tcp
 }
 
 /// Write port to `<VCT_STATE_DIR or ~/.vct>/hub.port` so apps can discover the hub.
+///
+/// v0.2.61 (Option H C-PORT): write atomically via a temp file + rename.
+/// A plain truncating write can be observed mid-write (empty / partial) by a
+/// concurrent reader (`module_service::hub_port_for_proxy`,
+/// `module_supervisor::resolve_hub_base_port`) whose `parse::<u16>()` then
+/// fails → wrong VCT_HUB_BASE_URL / a failed readiness probe on a healthy hub.
+/// A same-directory rename is atomic on POSIX and on Windows ReplaceFile
+/// semantics, so a reader sees either the old value or the new one, never a
+/// torn one.
 async fn write_port_file(port: u16) {
     let path = vct_launcher_core::paths::vct_root_dir().join("hub.port");
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    tokio::fs::write(&path, port.to_string()).await.ok();
+    // Temp name is pid-suffixed so two hub processes racing a write don't
+    // clobber each other's temp file before their respective renames.
+    let tmp = path.with_extension(format!("port.tmp.{}", std::process::id()));
+    if tokio::fs::write(&tmp, port.to_string()).await.is_ok() {
+        if tokio::fs::rename(&tmp, &path).await.is_err() {
+            // Rename failed (e.g. cross-device, shouldn't happen same-dir) —
+            // fall back to a direct write so the port is at least discoverable.
+            tokio::fs::write(&path, port.to_string()).await.ok();
+            tokio::fs::remove_file(&tmp).await.ok();
+        }
+    }
 }

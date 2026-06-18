@@ -677,6 +677,54 @@ class DecideActionTests(unittest.TestCase):
         self.assertEqual(action, install.ACTION_ABORT)
 
 
+class ClassifyServiceComposeActionTests(unittest.TestCase):
+    """v0.2.61 (FINDING-1): start-vs-recreate-vs-skip classification.
+
+    The bug: an adopt skipped `compose up` entirely, so a changed compose
+    config (the Weaviate write-amp env tuning) never applied on `--update`.
+    The fix recreates ONLY services we OWN (vct-managed adopt), never foreign.
+    """
+
+    def test_not_running_starts(self):
+        self.assertEqual(
+            install._classify_service_compose_action(
+                install.ACTION_START, install.PROBE_NOT_RUNNING),
+            "start",
+        )
+
+    def test_alt_port_starts(self):
+        self.assertEqual(
+            install._classify_service_compose_action(
+                install.ACTION_ALT_PORT, install.PROBE_FOREIGN),
+            "start",
+        )
+
+    def test_vct_managed_adopt_recreates(self):
+        # The core fix: our own running container whose config changed gets
+        # force-recreated so the new env (e.g. Weaviate tuning) applies.
+        self.assertEqual(
+            install._classify_service_compose_action(
+                install.ACTION_ADOPT, install.PROBE_VCT_MANAGED),
+            "recreate",
+        )
+
+    def test_foreign_adopt_is_skipped_never_recreated(self):
+        # CRITICAL: a foreign adopt (someone else's container, only via
+        # explicit --on-conflict adopt) must NEVER be recreated.
+        self.assertEqual(
+            install._classify_service_compose_action(
+                install.ACTION_ADOPT, install.PROBE_FOREIGN),
+            "skip",
+        )
+
+    def test_abort_is_skipped(self):
+        self.assertEqual(
+            install._classify_service_compose_action(
+                install.ACTION_ABORT, install.PROBE_INCOMPATIBLE),
+            "skip",
+        )
+
+
 class FindFreePortTests(unittest.TestCase):
     def test_returns_free_port_above_default(self):
         # Bind to a known port; ask for the next free one.

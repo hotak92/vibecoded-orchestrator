@@ -133,6 +133,125 @@ def _deterministic_uuid(project: str, file_path_rel: str = "", full_name: str = 
     key = f"{project}::{project_source}::{file_path_rel}::{full_name}"
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, key))
 
+
+# v0.2.61 (Track E): per-object content-hash fields for the tombstone-skip.
+# Maps the bare collection base-name to the ORDERED list of property keys
+# whose values define an object's semantically-meaningful content. The hash
+# is computed over ONLY these fields (in this fixed order) so that:
+#   * the SAME content yields the SAME hash across runs (stable skip key), and
+#   * volatile / run-derived fields (last_modified, project_source, language,
+#     file_path) are EXCLUDED — backfilling those on an otherwise-unchanged
+#     object must NOT change the hash, or we'd re-`replace()` (re-tombstone)
+#     every row on the migration run that stamps them.
+#
+# Field choice rationale (only fields that drive the embedding vector or the
+# searchable body, plus the identity key, so a genuine change is always
+# reflected; references/UUIDs are derived from these same fields so they need
+# not be hashed separately):
+#   CodeModule      → path + module_summary + imports
+#   CodeClass       → full_name + signature + class_body + methods + composes
+#   CodeFunction    → full_name + signature + function_body + type_uses
+#                     + cfg_summary + data_flow_vars
+#   CodeAPI         → endpoint + method + api_description + parameters + returns
+#   CodeInteraction → interaction_type + protocol + endpoint + raw_target
+#                     + direction + description
+# A collection whose name isn't recognised falls back to hashing ALL scalar/
+# list properties (excluding the volatile set) — fail-safe toward "include
+# more", which can only cause an extra (correct) write, never a wrong skip.
+_CONTENT_HASH_FIELDS = {
+    "CodeModule": ["path", "module_summary", "import_names"],
+    "CodeClass": ["full_name", "signature", "class_body", "methods", "composes"],
+    "CodeFunction": [
+        "full_name", "signature", "function_body",
+        "type_uses", "cfg_summary", "data_flow_vars",
+    ],
+    "CodeAPI": ["endpoint", "method", "api_description", "parameters", "returns"],
+    "CodeInteraction": [
+        "interaction_type", "protocol", "endpoint",
+        "raw_target", "direction", "description",
+    ],
+}
+
+# Fields that are deterministic-but-derived or volatile — NEVER part of the
+# content hash even on the all-fields fallback path. `content_hash` itself is
+# excluded so the hash is a fixed point (hashing-in the prior hash would make
+# it unstable). `last_modified` is a filesystem mtime (changes on touch with
+# no content change). `project_source` / `language` / `file_path` are stamped
+# by `_dedup_insert` and are pure functions of (file, source-root) — including
+# them would force a one-time re-write whenever a backfill migration first
+# stamps them, defeating the skip.
+_CONTENT_HASH_EXCLUDE = frozenset({
+    "content_hash", "last_modified", "project_source", "language",
+    "file_path", "start_line", "end_line",
+})
+
+
+def _stable_scalar(value: Any) -> str:
+    """Render a property value into a stable, order-independent string.
+
+    Lists are rendered element-wise (each element coerced to str) WITHOUT
+    sorting — the analyzer emits these lists deterministically per parse, so
+    preserving order keeps the hash byte-stable while a genuine reorder (which
+    is a real content change in source) correctly changes the hash. None and
+    missing values render as the empty string so an absent field and an
+    explicitly-empty field hash identically (avoids spurious re-writes when a
+    property is omitted vs. set to "").
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "\x1e".join(_stable_scalar(v) for v in value)
+    if isinstance(value, bool):
+        # Render bools before the int branch (bool is a subclass of int) so
+        # True/False hash distinctly from 1/0 textual collisions are avoided.
+        return "true" if value else "false"
+    return str(value)
+
+
+def _content_hash_for_object(collection_name: str, properties: Mapping[str, Any]) -> str:
+    """Return a stable SHA-256 over an object's semantically-meaningful content.
+
+    v0.2.61 (Track E) — mirrors the KG-sync `content_hash` discipline
+    (templates/scripts/sync_knowledge_graph.py) for the code graph. Used by
+    `_dedup_insert` to SKIP a `replace()` when the object is byte-identical to
+    what's already indexed, eliminating needless HNSW vector tombstones.
+
+    Args:
+        collection_name: full per-project collection name (e.g.
+            ``MyProject_CodeFunction``) OR a bare base name. We match on the
+            base suffix so the per-project prefix is irrelevant.
+        properties: the ``insert_params["properties"]`` dict for this object.
+
+    Returns:
+        Hex SHA-256 digest. Deterministic for identical content across runs,
+        OSes, and machines (uses POSIX-normalized inputs the callers already
+        produce). Never raises — a malformed value degrades into its ``str()``.
+
+    Field selection: per `_CONTENT_HASH_FIELDS` for the recognised base names;
+    otherwise every scalar/list property except `_CONTENT_HASH_EXCLUDE`. The
+    fallback errs toward hashing MORE fields, which can only cause an extra
+    (correct) write — never an incorrect skip.
+    """
+    base = ""
+    for known in _CONTENT_HASH_FIELDS:
+        if collection_name == known or collection_name.endswith(known):
+            base = known
+            break
+
+    if base:
+        fields = _CONTENT_HASH_FIELDS[base]
+    else:
+        # Unknown collection → hash all non-excluded keys in sorted order so
+        # the digest is stable regardless of dict insertion order.
+        fields = sorted(k for k in properties.keys() if k not in _CONTENT_HASH_EXCLUDE)
+
+    parts = [base]
+    for key in fields:
+        parts.append(key)
+        parts.append(_stable_scalar(properties.get(key)))
+    blob = "\x1f".join(parts)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -499,7 +618,36 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # vco_lib.embedding_service import` below with ModuleNotFoundError. The
 # helper honors both env-var names + validates the candidate contains
 # vco_lib/, so the two sites can no longer drift.
-_ensure_vco_lib_on_path()
+# v0.2.61: assert the bootstrap succeeded BEFORE the bare `from
+# vco_lib...` imports below (531 embedding_service, and later 6915
+# project_config / 7204 deferral_report). Those are top-level imports
+# with no try/except — if the helper couldn't find a dir containing
+# `vco_lib/`, they crash with a bare `ModuleNotFoundError: No module
+# named 'vco_lib'` deep in the file, which surfaces in the launcher as
+# an opaque "Code graph: build failed". Failing here instead gives an
+# actionable message naming the actual fix (the missing install root).
+# The companion launcher fix (codegraph.rs resolving VCT_INSTALL_ROOT
+# via resolve_orchestrator_root) makes this branch unreachable for a
+# correctly-installed orchestrator; this is the defense-in-depth so a
+# resolution miss never again hard-crashes mid-file.
+if not _ensure_vco_lib_on_path():
+    _tried = [
+        ("VCT_INSTALL_ROOT", os.environ.get("VCT_INSTALL_ROOT", "").strip() or "(unset)"),
+        ("VCT_ORCHESTRATOR_ROOT", os.environ.get("VCT_ORCHESTRATOR_ROOT", "").strip() or "(unset)"),
+        ("<script_dir>/../..", str(Path(__file__).resolve().parent.parent.parent)),
+    ]
+    _detail = "; ".join(f"{name}={val}" for name, val in _tried)
+    sys.stderr.write(
+        "FATAL: could not locate the orchestrator root (a directory "
+        "containing 'vco_lib/') — the code-graph analyzer cannot import "
+        "its vco_lib dependencies.\n"
+        f"  Candidates tried (none contained vco_lib/): {_detail}\n"
+        "  Fix: ensure the launcher passes VCT_INSTALL_ROOT pointing at "
+        "the orchestrator install root, OR run the analyzer from within "
+        "the orchestrator clone, OR set VCT_ORCHESTRATOR_ROOT in the "
+        "environment.\n"
+    )
+    sys.exit(1)
 # VCO-REWIRE-END: orchestrator-root-resolution
 try:
     from weaviate_mcp.code_truncation import (
@@ -2875,6 +3023,14 @@ class CodeGraphAnalyzer:
                         # Empty string for pre-v0.2.47 rows (graceful fallback
                         # — Weaviate treats absent properties as null).
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
+                        # v0.2.61 (Track E): stable SHA-256 of the object's
+                        # semantically-meaningful content. Powers the per-object
+                        # tombstone-skip in _dedup_insert — a byte-identical
+                        # re-index reads this back, matches, and skips the
+                        # replace() (no HNSW vector tombstone). Empty/absent on
+                        # pre-v0.2.61 rows → treated as unknown → one-time
+                        # re-write, then stable.
+                        Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="imports", target_collection=self.coll_module, description="Imported modules"),
@@ -2929,6 +3085,8 @@ class CodeGraphAnalyzer:
                         # / scope by file without joining through the `module`
                         # reference. Empty for pre-V52-O.4 rows (graceful null).
                         Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
+                        # v0.2.61 (Track E): per-object content hash (see CodeModule).
+                        Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -2980,6 +3138,8 @@ class CodeGraphAnalyzer:
                         # filter / scope by file without joining through the
                         # `module` reference. Empty for pre-V52-O.4 rows.
                         Property(name="file_path", data_type=DataType.TEXT, description="Repo-relative POSIX path of the source file (mirrors CodeModule.path)", skip_vectorization=True),
+                        # v0.2.61 (Track E): per-object content hash (see CodeModule).
+                        Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="module", target_collection=self.coll_module, description="Parent module"),
@@ -3018,6 +3178,8 @@ class CodeGraphAnalyzer:
                         Property(name="proxy_target", data_type=DataType.TEXT, description="Target endpoint for proxy/forwarding routes (cross-language linking)", skip_vectorization=True),
                         # v0.2.47 (extras): source-root provenance (see CodeModule).
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
+                        # v0.2.61 (Track E): per-object content hash (see CodeModule).
+                        Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="handler", target_collection=self.coll_function, description="Handler function"),
@@ -3061,6 +3223,8 @@ class CodeGraphAnalyzer:
                         Property(name="description", data_type=DataType.TEXT, description="Human-readable summary for embedding (Python→HTTP POST /api/users via requests)"),
                         # v0.2.47 (extras): source-root provenance (see CodeModule).
                         Property(name="project_source", data_type=DataType.TEXT, description="Absolute path of the source root that produced this row (primary repo OR extra-path)", skip_vectorization=True),
+                        # v0.2.61 (Track E): per-object content hash (see CodeModule).
+                        Property(name="content_hash", data_type=DataType.TEXT, description="SHA-256 of semantically-meaningful content (per-object tombstone-skip)", skip_vectorization=True),
                     ],
                     references=[
                         ReferenceProperty(name="source_function", target_collection=self.coll_function, description="Function that makes the call"),
@@ -3108,6 +3272,14 @@ class CodeGraphAnalyzer:
         # the property on the next analyze run and `_dedup_insert` can stamp
         # it. Idempotent + soft-fail per collection.
         self._ensure_file_path_property()
+
+        # v0.2.61 (Track E) schema migration: ensure `content_hash` exists on
+        # all 5 code collections so pre-v0.2.61 installs gain the property on
+        # the next analyze run and `_dedup_insert` can stamp + read it for the
+        # per-object tombstone-skip. Pre-migration rows have NULL content_hash
+        # → the skip treats them as "unknown" → one-time re-write that stamps
+        # the hash, after which they go stable. Idempotent + soft-fail.
+        self._ensure_content_hash_property()
 
     def _dedup_insert(self, collection, insert_params: dict, identity_key: str,
                       file_path_rel: str = "") -> str:
@@ -3208,6 +3380,75 @@ class CodeGraphAnalyzer:
                 props = insert_params.get("properties")
                 if isinstance(props, dict) and not props.get("file_path"):
                     props["file_path"] = file_path_rel
+
+        # ── v0.2.61 (Track E): per-object content-hash tombstone skip ───────
+        #
+        # WHY: the per-FILE skip (`_get_existing_module` keyed on path +
+        # file_hash, checked at the top of every analyze_*_file path) already
+        # short-circuits a byte-identical FILE before any write. But when a
+        # file changes by even one line, EVERY object it contains (50 funcs +
+        # N classes) is re-`replace()`'d here — and `replace()` of a
+        # vector-bearing object TOMBSTONES the old HNSW vector node + inserts a
+        # new one, even when THIS object's body is byte-identical to what's
+        # indexed. A 1-function edit therefore generated ~50 needless
+        # tombstones; over time those accumulate into the cleanup-spin disk
+        # leak this fix targets (e.g. SD15_CodeFunction reached 8943).
+        #
+        # FIX: stamp a stable `content_hash` on the object, then before
+        # replacing, point-read the existing object's stored `content_hash`
+        # by its deterministic UUID and SKIP the replace when it matches
+        # (unchanged object → 0 tombstones, 0 write). Layered UNDER the
+        # per-file fast path: this only ever runs for objects in files that
+        # DID change, so it has zero cost on the unchanged-file case.
+        #
+        # CORRECTNESS / FAIL-SAFE: never skip a genuinely-changed object. We
+        # skip ONLY when the read SUCCEEDS and the stored hash EQUALS the
+        # computed hash. Every other branch — object absent, property missing
+        # (pre-migration row), read error, no `.query` attr (test/mocked
+        # collection), empty stored hash — FALLS THROUGH to the normal
+        # replace()/insert(). A read failure must never cause a stale index.
+        props = insert_params.get("properties")
+        skip_replace = False
+        if isinstance(props, dict):
+            try:
+                content_hash = _content_hash_for_object(
+                    getattr(collection, "name", "") or "", props
+                )
+            except Exception:  # noqa: BLE001 — hashing must never wedge a write
+                content_hash = ""
+            if content_hash:
+                # Persist for the NEXT run's comparison (and don't clobber a
+                # caller-preset value, mirroring the other stamp sites).
+                if not props.get("content_hash"):
+                    props["content_hash"] = content_hash
+                # Cheap point-read of the existing stored hash. Any failure is
+                # a fall-through to write (fail-safe), NOT a skip.
+                try:
+                    query = getattr(collection, "query", None)
+                    fetch_by_id = getattr(query, "fetch_object_by_id", None) if query else None
+                    if callable(fetch_by_id):
+                        existing = fetch_by_id(
+                            det_uuid, return_properties=["content_hash"]
+                        )
+                        # fetch_object_by_id returns None when absent.
+                        if existing is not None:
+                            existing_props = getattr(existing, "properties", None) or {}
+                            stored_hash = existing_props.get("content_hash") or ""
+                            if stored_hash and stored_hash == content_hash:
+                                skip_replace = True
+                except Exception:  # noqa: BLE001
+                    # Read error / unsupported client / mocked collection →
+                    # fall through to the unconditional write. Never skip on
+                    # uncertainty.
+                    skip_replace = False
+
+        if skip_replace:
+            # Unchanged object: no replace(), no tombstone, no write. Still
+            # record the UUID as visited so a concurrent `--prune-stale` pass
+            # does NOT delete this live row just because we skipped its write.
+            if self._track_visited:
+                self.visited_uuids.add((collection.name, det_uuid))
+            return det_uuid
 
         # v0.2.16 docstring (above) claimed ``replace()`` is upsert.
         # weaviate-client v4.21 actually requires the object to PRE-EXIST
@@ -3360,6 +3601,63 @@ class CodeGraphAnalyzer:
             except Exception as e:
                 logger.debug(
                     f"v0.2.52 file_path migration on {label} skipped: {e}"
+                )
+
+    def _ensure_content_hash_property(self):
+        """v0.2.61 (Track E) schema migration: add `content_hash` (TEXT) to all
+        5 code collections that lack it on pre-v0.2.61 installs.
+
+        The property carries a stable SHA-256 of each object's semantically-
+        meaningful content, written by `_dedup_insert` and read back on the
+        next run to SKIP a `replace()` of a byte-identical object (avoiding an
+        HNSW vector tombstone). Without the property, pre-v0.2.61 rows return
+        NULL → the skip's `stored_hash` is empty → it falls through to a normal
+        replace() (fail-safe), which stamps the hash. So the first re-analyze
+        after upgrade does one final full re-write (one tombstone per object,
+        as today); every subsequent incremental run skips the unchanged objects
+        in changed files → near-zero tombstones.
+
+        Back-compat: adding a property to an existing Weaviate class is a
+        non-destructive metadata operation (no re-index, no data loss). Rows
+        written before the add simply have the property unset (treated as
+        NULL). Idempotent — an already-present property is skipped silently.
+        Soft-fail per collection — a 422 on one must not wedge the others.
+        Mirrors `_ensure_file_path_property` exactly.
+        """
+        collections = [
+            ("CodeModule",      self.modules_collection),
+            ("CodeClass",       self.classes_collection),
+            ("CodeFunction",    self.functions_collection),
+            ("CodeAPI",         self.apis_collection),
+            ("CodeInteraction", self.interactions_collection),
+        ]
+        desc = (
+            "SHA-256 of semantically-meaningful content "
+            "(per-object tombstone-skip)"
+        )
+        for label, coll in collections:
+            if coll is None:
+                continue
+            try:
+                config = coll.config.get()
+                existing_props = {p.name for p in config.properties}
+                if "content_hash" in existing_props:
+                    continue
+                coll.config.add_property(
+                    Property(
+                        name="content_hash",
+                        data_type=DataType.TEXT,
+                        description=desc,
+                        skip_vectorization=True,
+                    )
+                )
+                print(f"   Added content_hash property to {label} schema (v0.2.61)")
+            except Exception as e:
+                # Soft-fail. A 422 here doesn't break analysis — the per-object
+                # skip just falls through to replace() (its fail-safe default)
+                # for this collection until the next successful migration.
+                logger.debug(
+                    f"v0.2.61 content_hash migration on {label} skipped: {e}"
                 )
 
     def analyze_repository(self, repo_path: Path, language: Optional[str] = None,

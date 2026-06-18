@@ -619,11 +619,31 @@ pub async fn resume_containers_on_startup_with_starter(
             continue;
         }
 
-        // Short-circuit if container already running.
-        if let Some(ref container_name) = container_name_opt {
-            let running = is_container_running(container_name).await.unwrap_or(false);
-            if running {
-                continue;
+        // Short-circuit if container already running — but ONLY for
+        // PER-PROJECT rows. (v0.2.61, Option H BLOCKER-1 fix.)
+        //
+        // GLOBAL rows (project_id IS NULL) must NOT short-circuit on a
+        // running container: the module-identity token that the running
+        // container holds was minted into the PREVIOUS hub process's
+        // in-memory set (`module_identity`), which is empty after a hub
+        // restart. If we skip the re-spawn here, that live container keeps
+        // presenting a token the new hub no longer knows → every
+        // `/rl/events` read 401s, permanently, until something recreates
+        // the container. So for global rows we fall through to
+        // `start_global_container_supervisor` even when running: it's
+        // idempotent (`podman rm -f` + run) and re-mints + re-registers a
+        // fresh token, restoring the hub↔container contract. (Per-project
+        // module tokens live in the launcher.db `module_access_tokens`
+        // table and survive a hub restart, so their containers are safe to
+        // short-circuit.) The brief cost is one container recreate per hub
+        // boot for the global singleton — acceptable, and the only way the
+        // in-memory token set can be made to match a live container.
+        if project_id_opt.is_some() {
+            if let Some(ref container_name) = container_name_opt {
+                let running = is_container_running(container_name).await.unwrap_or(false);
+                if running {
+                    continue;
+                }
             }
         }
 
@@ -650,6 +670,37 @@ pub async fn resume_containers_on_startup_with_starter(
         match project_id_opt {
             None => {
                 // GLOBAL path — hub side.
+                //
+                // v0.2.61 (Option H B1): DEFER the recreate when a fine-tune
+                // is in flight. The recreate (`podman rm -f` inside
+                // `start_global_container_supervisor`) would HARD-KILL a
+                // training job running in the live container. Martino's
+                // directive: "don't assume a user action, allow the job to
+                // finish, periodically poll, when we can safely restart do
+                // so." So: if the container is running AND the launcher's
+                // finetune sentinel exists, skip the recreate now and spawn a
+                // background task that polls the sentinel and performs the
+                // re-mint once the job finishes. The brief 401-on-/rl/events
+                // cost (the live container's token isn't in this fresh hub's
+                // map) is acceptable — finetune talks DIRECTLY to the
+                // container, not through the hub, so the job keeps running.
+                let running = match &container_name_opt {
+                    Some(name) => is_container_running(name).await.unwrap_or(false),
+                    None => false,
+                };
+                let sentinel =
+                    vct_launcher_core::paths::finetune_sentinel_path(&module_id);
+                if running && sentinel.exists() {
+                    eprintln!(
+                        "[module_supervisor] resume: global {} has a fine-tune in \
+                         flight (sentinel present) + container running; deferring \
+                         re-mint until the job finishes",
+                        module_id
+                    );
+                    spawn_deferred_global_remint(manifest.clone(), module_id.clone());
+                    continue;
+                }
+
                 if let Err(e) =
                     start_global_container_supervisor(&manifest, &module_id).await
                 {
@@ -775,6 +826,201 @@ pub async fn resume_containers_on_startup_with_starter(
 /// Returns `Ok(container_name)` on success; the caller persists the
 /// container_name to the DB row. Returns `Err(...)` on any podman error
 /// or missing manifest field.
+/// Resolve the hub's ACTUAL listening port for building the
+/// container-facing `VCT_HUB_BASE_URL` (v0.2.61, Option H). Source order:
+///   1. `<vct_root_dir>/hub.port` — the real bound port the hub persisted
+///      at startup (`server::write_port_file`). Authoritative: the hub's
+///      `try_bind` walks past 7700 on collision, so the default may be
+///      wrong. We run inside the hub process, so this file is present.
+///   2. `$VCT_HUB_PORT` — the configured port (the hub's own first
+///      choice), used if the file is somehow unreadable.
+///   3. `7700` — the hard default, last resort.
+fn resolve_hub_base_port() -> u16 {
+    const DEFAULT_HUB_PORT: u16 = 7700;
+    let port_file = vct_launcher_core::paths::vct_root_dir().join("hub.port");
+    if let Ok(s) = std::fs::read_to_string(&port_file) {
+        if let Ok(p) = s.trim().parse::<u16>() {
+            return p;
+        }
+    }
+    std::env::var("VCT_HUB_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_HUB_PORT)
+}
+
+/// Per-module spawn serialization (v0.2.61, Option H CONCERN-1 fix).
+///
+/// Two callers can invoke `start_global_container_supervisor` for the SAME
+/// module near-simultaneously: the hub's own boot resume sweep, AND the
+/// launcher's resume/install path delegating in via
+/// `POST /modules/{id}/start`. Without serialization they race two
+/// `podman rm -f` + `mint_and_register` + `podman run` sequences on the
+/// same container name: the second `mint_and_register` drops the first's
+/// token (`module_identity` retains one token per module), so whichever
+/// container survives the name collision may hold a token that's no longer
+/// the registered one → 401. This per-module async lock makes the second
+/// concurrent spawn WAIT for the first to finish (then it does a clean
+/// rm -f + re-mint of its own), so the surviving container's token always
+/// matches the registry. Keyed by module_id; the map only ever holds a
+/// handful of entries (one per installed global module).
+fn module_spawn_lock(module_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("module spawn-lock registry poisoned");
+    guard
+        .entry(module_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Decide whether the deferred re-mint should still recreate the global
+/// container once the fine-tune poll loop ends (v0.2.61, Option H B1-E fix).
+///
+/// `status` is the global install row's status as read fresh from the DB at
+/// re-mint time (`None` ⇒ the row no longer exists). Between deferral and the
+/// poll loop ending the USER may have stopped/uninstalled the module — in which
+/// case its container has been removed and resurrecting it would be wrong.
+///
+/// Skip the re-mint (return `false`) iff the row is GONE or the user/DB says the
+/// module should NOT be running:
+///   * `None`              — row deleted (uninstalled mid-defer) → skip.
+///   * `Stopped`           — user stopped it → skip.
+///   * `Broken`            — artifact gone, recovery is Reinstall not re-mint → skip.
+///
+/// Proceed (return `true`) when the row says it SHOULD be running, regardless of
+/// the container's *current* running state — the whole point of the deferred
+/// re-mint is to recreate a container that's still running but holds a STALE
+/// (401-ing) token, so we must NOT skip purely because the container is up:
+///   * `Installed` / `Running` / `Error` — proceed (recreate restores the token).
+///   * `Installing`                       — proceed (transient; the install path
+///                                           expects a running container next).
+fn should_deferred_remint(
+    status: Option<vct_launcher_core::db::models::ModuleStatus>,
+) -> bool {
+    use vct_launcher_core::db::models::ModuleStatus;
+    match status {
+        None => false,
+        Some(ModuleStatus::Stopped) | Some(ModuleStatus::Broken) => false,
+        Some(
+            ModuleStatus::Installed
+            | ModuleStatus::Running
+            | ModuleStatus::Error
+            | ModuleStatus::Installing,
+        ) => true,
+    }
+}
+
+/// Background "re-mint once the fine-tune finishes" task (v0.2.61, Option H
+/// B1). Spawned by the resume sweep when it finds a running global container
+/// with a fine-tune in flight. Polls the finetune sentinel every 30s; once it
+/// clears (the launcher's `FinetuneSentinel` drops on job completion/failure)
+/// AND (B1-E) the module is still supposed to be running, performs the deferred
+/// recreate + re-mint so the hub↔container token contract is restored. Bounded
+/// so a stuck sentinel (e.g. launcher process crashed without removing it)
+/// can't poll forever — after the cap we re-mint anyway (the next hub boot is
+/// the ultimate backstop regardless).
+fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
+    tokio::spawn(async move {
+        const POLL_INTERVAL_SECS: u64 = 30;
+        // ~30 min cap: a real fine-tune is capped at 5 min launcher-side, so
+        // 30 min comfortably covers a slow run while bounding a stuck sentinel.
+        const MAX_POLLS: u32 = 60;
+        let sentinel = vct_launcher_core::paths::finetune_sentinel_path(&module_id);
+        for poll in 0..MAX_POLLS {
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+            if !sentinel.exists() {
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: fine-tune for {} \
+                     finished (sentinel cleared); performing re-mint",
+                    module_id
+                );
+                break;
+            }
+            if poll + 1 == MAX_POLLS {
+                // Stuck sentinel — likely a crashed launcher that never
+                // cleaned up. Remove the stale file and re-mint anyway so we
+                // don't strand the container on a token this hub doesn't know.
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: sentinel for {} still \
+                     present after {} polls (~{} min); treating as stale and \
+                     re-minting",
+                    module_id,
+                    MAX_POLLS,
+                    (MAX_POLLS as u64 * POLL_INTERVAL_SECS) / 60
+                );
+                let _ = std::fs::remove_file(&sentinel);
+            }
+        }
+
+        // Open a fresh launcher.db handle ONCE (the resume sweep's borrowed
+        // `&Db` can't cross the 'static spawn boundary). Used first for the
+        // B1-E status re-check, then reused for the post-re-mint persist —
+        // don't double-open. Mirrors how server.rs wires the DB on boot.
+        let db = match vct_launcher_core::db::Db::open() {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: Db::open() for {}: {} \
+                     (skipping re-mint; next hub boot is the backstop)",
+                    module_id, e
+                );
+                return;
+            }
+        };
+
+        // B1-E: between deferral and now the user may have STOPPED or
+        // uninstalled the module, removing its container. Resurrecting a
+        // container the user deliberately stopped is wrong, so re-check the
+        // global row's status and skip the re-mint unless the row says the
+        // module should still be running. We do NOT skip merely because the
+        // container is currently up — a running-but-stale-token container is
+        // exactly the case this deferred re-mint exists to repair.
+        let status = match db.get_global_module_install(&module_id) {
+            Ok(row) => row.map(|r| r.status),
+            Err(e) => {
+                // Read failure ⇒ unknown state. Don't risk resurrecting a
+                // user-stopped container on a guess; skip and let the next hub
+                // boot re-evaluate from a clean read.
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: get_global_module_install({}): \
+                     {} (skipping re-mint; next hub boot is the backstop)",
+                    module_id, e
+                );
+                return;
+            }
+        };
+        if !should_deferred_remint(status.clone()) {
+            eprintln!(
+                "[module_supervisor] deferred re-mint: global {} is no longer \
+                 active (status {:?}); skipping re-mint so a user-stopped / \
+                 uninstalled container is not resurrected",
+                module_id,
+                status
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or("<row-missing>")
+            );
+            return;
+        }
+
+        match start_global_container_supervisor(&manifest, &module_id).await {
+            Ok(name) => {
+                let _ = db.set_global_module_container_name(&module_id, &name);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: \
+                     start_global_container_supervisor({}): {}",
+                    module_id, e
+                );
+            }
+        }
+    });
+}
+
 pub async fn start_global_container_supervisor(
     manifest: &ModuleManifest,
     module_id: &str,
@@ -798,6 +1044,9 @@ pub async fn start_global_container_supervisor(
         ));
     }
 
+    // Resolve names + image + runtime BEFORE taking the spawn lock — these
+    // are read-only and don't touch the container-name collision or the token
+    // registry, so they don't need to be inside the critical section.
     let name_template = runtime.resolve_container_name_template(&manifest.id);
     let container_name = resolve_global_container_name(&name_template, module_id)?;
     let image_template = runtime.resolve_image_ref(
@@ -812,6 +1061,16 @@ pub async fn start_global_container_supervisor(
 
     let podman = detect_container_runtime().await?;
 
+    // v0.2.61 (Option H C1): run the (optionally authed) image pre-pull
+    // OUTSIDE the spawn lock. On a cold GB-scale image the pull can take
+    // minutes; holding the per-module lock across it made a concurrent
+    // launcher-delegated `/modules/{id}/start` block until its own 90s HTTP
+    // timeout — surfacing a spurious failure on a container that WAS coming
+    // up. The pull is read-only w.r.t. the container name + token registry
+    // and `podman pull` is itself idempotent (two concurrent pulls of the
+    // same ref converge; the `image exists` fast-path makes the second a
+    // no-op), so moving it before the lock is safe and collapses the
+    // lock-hold from minutes to ~1-2s (rm-f + mint + run only).
     // v0.2.54 (C-RT-6): gated on `method == ContainerPull` alone — a
     // missing hardware snapshot must not skip the authed pre-pull.
     if manifest.install.method == InstallMethod::ContainerPull {
@@ -828,6 +1087,59 @@ pub async fn start_global_container_supervisor(
         }
     }
 
+    // v0.2.61 (Option H CONCERN-1): serialize concurrent spawns of THIS
+    // module so the hub-resume sweep and a launcher-delegated
+    // `/modules/{id}/start` can't race two rm -f + mint + run sequences
+    // (which would leave the surviving container holding a token the
+    // registry already dropped → 401). Held ONLY across the short
+    // recreate+mint+run below (NOT the pre-pull above).
+    let _spawn_lock = module_spawn_lock(module_id);
+    let _spawn_guard = _spawn_lock.lock().await;
+
+    // v0.2.61 (Option H C1): idempotency guard. Once we hold the lock, if the
+    // container is ALREADY running AND its module-identity token is already
+    // registered in this hub's in-memory set, a concurrent caller (the resume
+    // sweep) already completed the spawn — return its name without a
+    // redundant rm-f + re-mint (which would needlessly recreate a healthy
+    // container and open a transient-401 window while the new container
+    // boots). This delivers the "one recreate per boot" the resume comment
+    // promises and makes a racing launcher-delegated start a true no-op.
+    if crate::module_identity::resolve_registered(module_id)
+        && is_container_running(&container_name).await.unwrap_or(false)
+    {
+        eprintln!(
+            "[module_supervisor] start_global_container_supervisor({}): already \
+             running + token registered (concurrent spawn won the race); no-op",
+            module_id
+        );
+        return Ok(container_name);
+    }
+
+    // v0.2.61 (Option H, re-audit CONCERN-5): single-choke-point finetune
+    // guard. The recreate below does `podman rm -f`, which HARD-KILLS a
+    // training job running in the live container. The resume sweep + the
+    // deferred-remint both already check the finetune sentinel BEFORE getting
+    // here, but a SECOND finetune can start in the gap between their check and
+    // this recreate (chained/back-to-back finetunes, or the deferred task's
+    // 30-min stale-backstop). Re-checking the sentinel HERE — inside the
+    // lock, immediately before rm-f, the one place EVERY recreate path flows
+    // through — closes that window for all callers. When a finetune is in
+    // flight we refuse to recreate a RUNNING container (the finetune talks
+    // DIRECTLY to the container, not through the hub, so it keeps working; the
+    // token-staleness self-heals on the next boot / deferred poll once the job
+    // ends). We only guard a RUNNING container: if it's down, there's no job
+    // to kill and the recreate must proceed.
+    if is_container_running(&container_name).await.unwrap_or(false)
+        && vct_launcher_core::paths::finetune_sentinel_path(module_id).exists()
+    {
+        return Err(format!(
+            "deferred: fine-tune in flight for {} (sentinel present) — refusing to \
+             recreate a running container that would kill the job; will re-mint \
+             after the job finishes",
+            module_id
+        ));
+    }
+
     let _ = Command::new(&podman)
         .silent()
         .args(["rm", "-f", &container_name])
@@ -840,8 +1152,40 @@ pub async fn start_global_container_supervisor(
     ensure_volume_host_dirs_global(manifest, &ctx, GLOBAL_RL_PORT).await;
 
     // v0.2.54 (P0-4): thread detected engine + gpu_mode for GPU flags.
+    // v0.2.61 (Option H): mint a per-spawn module-identity token, register
+    // it in the hub's in-memory set, and inject it as `VCT_MODULE_TOKEN`.
+    // This is the credential the container presents to the hub's
+    // `/modules/{id}/projects/{pid}/rl/events` route (require_module_scope
+    // accepts it). Minted HERE — the single global-container spawn point —
+    // so a (re)spawn always produces a fresh, registered token (the
+    // restart-contract self-heal; see module_identity.rs). A mint failure
+    // is fatal for the start: without the token the container can't read
+    // its training corpus, so failing loudly beats spawning a container
+    // that 401s on every hub read.
+    let module_token = crate::module_identity::mint_and_register(module_id)?;
+
+    // v0.2.61 (Option H, BLOCKER-INT fix): also inject VCT_HUB_BASE_URL so
+    // the container knows where the hub is. `build_podman_run_args_global`
+    // emits `--add-host=host.containers.internal:host-gateway`, making that
+    // hostname resolve to the host inside the container; combined with the
+    // hub binding 0.0.0.0 (server.rs), the container can reach the hub at
+    // `http://host.containers.internal:<actual hub port>`. The port is the
+    // hub's ACTUAL bound port (server.rs walks past 7700 on collision and
+    // persists the real one to `hub.port`), NOT the hard-coded default —
+    // so we read it from the port file the hub wrote at startup, falling
+    // back to $VCT_HUB_PORT → 7700 only if the file is unreadable.
+    let hub_port = resolve_hub_base_port();
+    let extra_env = vec![
+        ("VCT_MODULE_TOKEN".to_string(), module_token),
+        (
+            "VCT_HUB_BASE_URL".to_string(),
+            format!("http://host.containers.internal:{}", hub_port),
+        ),
+    ];
+
     let args = build_podman_run_args_global(
         manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image, &podman, gpu_mode,
+        &extra_env,
     )?;
 
     let mut cmd = Command::new(&podman).silent();
@@ -861,12 +1205,25 @@ pub async fn start_global_container_supervisor(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
-        .await
-        .map_err(|_| format!("{} run timed out after 60s for {}", podman, container_name))?
-        .map_err(|e| format!("spawn {} run: {}", podman, e))?;
+    // v0.2.61 (Option H C-REVOKE): if `podman run` fails (timeout / spawn
+    // error / non-zero exit), the token minted above has NO live holder —
+    // revoke it so it doesn't linger in the registry pointing at a container
+    // that never started. (Harmless if left — the next re-spawn's `retain`
+    // drops it — but revoking on failure keeps the set tight.)
+    let output = match tokio::time::timeout(Duration::from_secs(60), cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            crate::module_identity::revoke(module_id);
+            return Err(format!("spawn {} run: {}", podman, e));
+        }
+        Err(_) => {
+            crate::module_identity::revoke(module_id);
+            return Err(format!("{} run timed out after 60s for {}", podman, container_name));
+        }
+    };
 
     if !output.status.success() {
+        crate::module_identity::revoke(module_id);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
             "{} run failed (exit {}) for {}: {}",
@@ -1908,5 +2265,115 @@ mod tests {
                 "git_clone global row must NOT trigger start path (no last_error)"
             );
         });
+    }
+
+    // ─── v0.2.61 (Option H): new-helper regression tests ─────────────────
+
+    /// resolve_hub_base_port: hub.port file takes priority over $VCT_HUB_PORT.
+    #[test]
+    fn v0261_resolve_hub_base_port_prefers_port_file() {
+        let guard = VctStateDirGuard::new();
+        std::fs::write(guard.vct_root().join("hub.port"), "7711\n").expect("write port file");
+        // Even with the env set to something else, the file wins.
+        let prev = std::env::var("VCT_HUB_PORT").ok();
+        std::env::set_var("VCT_HUB_PORT", "9999");
+        assert_eq!(resolve_hub_base_port(), 7711, "hub.port file is authoritative");
+        match prev {
+            Some(v) => std::env::set_var("VCT_HUB_PORT", v),
+            None => std::env::remove_var("VCT_HUB_PORT"),
+        }
+    }
+
+    /// resolve_hub_base_port: falls back to $VCT_HUB_PORT when no port file.
+    #[test]
+    fn v0261_resolve_hub_base_port_falls_back_to_env_then_default() {
+        let _guard = VctStateDirGuard::new(); // empty state dir → no hub.port
+        let prev = std::env::var("VCT_HUB_PORT").ok();
+        std::env::set_var("VCT_HUB_PORT", "8800");
+        assert_eq!(resolve_hub_base_port(), 8800, "env used when no port file");
+        std::env::remove_var("VCT_HUB_PORT");
+        assert_eq!(resolve_hub_base_port(), 7700, "hard default when neither present");
+        match prev {
+            Some(v) => std::env::set_var("VCT_HUB_PORT", v),
+            None => std::env::remove_var("VCT_HUB_PORT"),
+        }
+    }
+
+    /// module_spawn_lock: the SAME module_id returns the SAME Arc<Mutex>
+    /// (so two callers serialize); DIFFERENT module_ids get distinct locks.
+    #[tokio::test]
+    async fn v0261_module_spawn_lock_serializes_same_module() {
+        let a1 = module_spawn_lock("mod-serialize-test");
+        let a2 = module_spawn_lock("mod-serialize-test");
+        assert!(
+            std::sync::Arc::ptr_eq(&a1, &a2),
+            "same module_id must share one lock (so spawns serialize)"
+        );
+        // Holding a1 means a2.try_lock fails (they're the same mutex).
+        let _held = a1.lock().await;
+        assert!(a2.try_lock().is_err(), "second acquire of the same module lock must block");
+
+        // A different module gets an independent lock (no false serialization).
+        let other = module_spawn_lock("mod-serialize-other");
+        assert!(
+            !std::sync::Arc::ptr_eq(&a1, &other),
+            "distinct module_ids must NOT share a lock"
+        );
+        assert!(other.try_lock().is_ok(), "a different module's lock is free");
+    }
+
+    /// resolve_registered: true only while a token is registered for the
+    /// module; false before mint and after revoke (the C1 idempotency guard
+    /// depends on this).
+    #[test]
+    fn v0261_resolve_registered_tracks_mint_and_revoke() {
+        assert!(!crate::module_identity::resolve_registered("mod-reg-test"));
+        let _tok = crate::module_identity::mint_and_register("mod-reg-test").expect("mint");
+        assert!(crate::module_identity::resolve_registered("mod-reg-test"));
+        crate::module_identity::revoke("mod-reg-test");
+        assert!(!crate::module_identity::resolve_registered("mod-reg-test"));
+    }
+
+    /// B1-E: `should_deferred_remint` skips the deferred re-mint when the user
+    /// stopped/uninstalled the module mid-defer (status Stopped/Broken or row
+    /// gone), and proceeds when the row says the module should still be
+    /// running — INCLUDING the `Running` case, since the deferred re-mint's
+    /// whole purpose is to repair a still-running container holding a stale
+    /// (401-ing) token.
+    #[test]
+    fn v0261_should_deferred_remint_skips_user_stopped_or_missing() {
+        // Skip: user stopped it.
+        assert!(
+            !should_deferred_remint(Some(ModuleStatus::Stopped)),
+            "Stopped row must NOT be resurrected"
+        );
+        // Skip: row deleted (uninstalled mid-defer).
+        assert!(
+            !should_deferred_remint(None),
+            "missing row must NOT be resurrected"
+        );
+        // Skip: artifact gone — recovery is Reinstall, not re-mint.
+        assert!(
+            !should_deferred_remint(Some(ModuleStatus::Broken)),
+            "Broken row must NOT be re-minted"
+        );
+
+        // Proceed: the module is supposed to be running.
+        assert!(
+            should_deferred_remint(Some(ModuleStatus::Installed)),
+            "Installed row should re-mint"
+        );
+        assert!(
+            should_deferred_remint(Some(ModuleStatus::Running)),
+            "Running row should re-mint (stale-token repair is the whole point)"
+        );
+        assert!(
+            should_deferred_remint(Some(ModuleStatus::Error)),
+            "Error row should re-mint (recreate is the recovery action)"
+        );
+        assert!(
+            should_deferred_remint(Some(ModuleStatus::Installing)),
+            "Installing row should re-mint (transient; install expects it up next)"
+        );
     }
 }

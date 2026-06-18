@@ -17,6 +17,106 @@ services:
       PERSISTENCE_DATA_PATH: /var/lib/weaviate
       DEFAULT_VECTORIZER_MODULE: none
       CLUSTER_HOSTNAME: node1
+      # --- WRITE-AMPLIFICATION REDUCTION (v0.2.61) ---
+      # The KG/code-graph sync hooks issue MANY small upserts (one per edited
+      # node/file + re-embeds). On Weaviate defaults each dirty memtable
+      # flushes on a 60s timer, and with thousands of LSM stores that's a
+      # continuous flush+compaction drumbeat → ~57x write amplification (a 5GB
+      # dataset rewrote ~290GB in 12h on a real install). These knobs (all
+      # verified against the v1.28.4 source, safe 8-64GB, podman+docker) cut
+      # steady-state writes by roughly an order of magnitude.
+      #
+      # Flush a dirty memtable after 3600s (1h) instead of 60s — THE primary
+      # lever. Paired with the 500MB size-trigger below, a memtable flushes on
+      # 500MB OR 1h, whichever fires first: on the hook trickle workload the
+      # SIZE trigger almost always wins (bounding the backlog), while quiet
+      # periods coast up to an hour with far fewer flushes. Data stays
+      # WAL-durable throughout; an unclean kill replays the in-memory delta
+      # from the WAL (bounded to ~500MB by the size cap, NOT by this timer).
+      PERSISTENCE_MEMTABLES_FLUSH_DIRTY_AFTER_SECONDS: 3600
+      # Raise the memtable SIZE-trigger flush from the implicit 200MB default to
+      # 500MB. NOTE: this cap is PER ACTIVE MEMTABLE = per LSM store, NOT global
+      # and NOT per-collection — there are thousands of stores (objects +
+      # per-property stores across all collections), each with its own active
+      # memtable. So we keep 500MB (not 1GB): a hot store holds up to 500MB, and
+      # during a multi-collection bulk op several hot stores sum up — 500MB
+      # stays safe on an 8GB host, whereas 1GB-per-store could balloon RAM.
+      # It (a) cuts write amplification (fewer, larger flushes → fewer sidecar
+      # rewrites + compactions) and (b) BOUNDS durability: a memtable flushes on
+      # 500MB OR 1h, so the WAL+memtable replay backlog is capped at ~500MB
+      # regardless of the 1h timer. It's a CAP not a reservation (a store only
+      # holds 500MB if it accrues that much before the timer); LIMIT_RESOURCES
+      # bounds total Go heap to 80% RAM. Every write is WAL-durable on upsert —
+      # this changes flush CADENCE, never the WAL/fsync path, so write-drop risk
+      # is equal-or-lower than the default.
+      PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
+      # Cap compaction merge output so a vector-heavy collection can't rewrite
+      # one giant multi-GB segment on every merge (the main amplification
+      # spike). With a 500MiB cap, a merge rewrites at most ~1GB.
+      PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 500MiB
+      # Auto-size the Go heap + CPU to the host (or to a container mem_limit if
+      # one is set): GOMEMLIMIT ~= 80% of available RAM, GOMAXPROCS = cores-1.
+      # Reduces heap-pressure-driven flushing and removes the OOM tail risk on
+      # small hosts. Self-scaling = safe to ship to unknown hardware (an 8GB
+      # box gets ~6.4GB, a 64GB box ~51GB). To pin instead: unset this and set
+      # GOMEMLIMIT=<N>MiB explicitly.
+      LIMIT_RESOURCES: "true"
+      # --- HNSW TOMBSTONE-CLEANUP CHURN REDUCTION (v0.2.61) ---
+      # SECOND disk-leak source, distinct from the memtable write-amp above.
+      # The code-graph collections accumulate large tombstone counts (a
+      # re-analyze deletes+re-inserts every changed row → one tombstone per
+      # deleted vector). Weaviate runs a per-(class × named-vector × shard)
+      # HNSW tombstone-cleanup cycle on a FIXED 300s ticker
+      # (entities/vectorindex/hnsw/config.go DefaultCleanupIntervalSeconds =
+      # 5*60; the FixedTicker never backs off — ticker.go fixedIntervals
+      # Advance()/Reset() are no-ops). On this install ~300 such HNSW indexes
+      # exist (many projects × 5 Code* classes × 2-6 embedding slots), so the
+      # 300s cycles INTERLEAVE into roughly one cleanup firing every second in
+      # aggregate. Each fire that finds work walks the graph and reassigns
+      # neighbor edges IN PLACE — GB/hour of writes that are invisible to
+      # mtime (commitlog/index rewrites), distinct from the LSM flush path.
+      #
+      # The spin: with the default TOMBSTONE_DELETION_MIN_PER_CYCLE=0, the
+      # cleanup runs a full graph walk on ANY non-zero tombstone count
+      # (delete.go copyTombstonesToAllowList only short-circuits at EXACTLY 0
+      # tombstones). A collection sitting at thousands of tombstones therefore
+      # re-walks its graph every single 300s tick forever, churning even when
+      # `tombstones_in_cycle` is ~0 relative to `tombstones_total`.
+      #
+      # The brake: raise the MIN threshold so a cleanup is a cheap no-op
+      # (returns "did nothing", costs one map-length read) until enough
+      # tombstones accumulate to justify the full graph walk. This is a GLOBAL
+      # env read directly via os.Getenv in delete.go (NOT registered in
+      # environment.go), verified present verbatim at the v1.28.4 tag. It
+      # applies to ALL existing collections immediately — unlike the per-class
+      # `cleanupIntervalSeconds`, which config_update.go marks IMMUTABLE (can
+      # only be set at class-creation, so it can't retro-fix the 300 live
+      # indexes without a destructive recreate).
+      #
+      # SAFE / NO DATA LOSS: tombstone cleanup is pure garbage-collection of
+      # vectors that were ALREADY deleted. Deferring it only delays reclaiming
+      # the disk those dead vectors occupy (a few MB until the next qualifying
+      # cycle); it NEVER touches, drops, or corrupts live vectors, and searches
+      # already skip tombstoned nodes via the deny-list. The complementary
+      # analyzer-side content-hash skip (separate change) slashes tombstone
+      # GENERATION, so a higher threshold means tombstones rarely reach it
+      # anyway. 10000 is conservative for 8-64GB hosts (one tombstone ≈ one
+      # dead vector; 10k un-reclaimed vectors is a few tens of MB worst case).
+      TOMBSTONE_DELETION_MIN_PER_CYCLE: "10000"
+      # Bound the per-cycle cost so that when a cleanup DOES fire on a large
+      # backlog it processes at most this many tombstones, then exits and lets
+      # the next cycle take the rest (delete.go maxTombstonesPerCycle, default
+      # math.MaxInt64 = "process everything in one cycle" = a multi-GB write
+      # spike on a huge backlog). Capping it spreads a big reclaim across
+      # several short cycles instead of one long stall. Verified at v1.28.4.
+      TOMBSTONE_DELETION_MAX_PER_CYCLE: "10000"
+      # Bound the PARALLELISM of neighbor-reassignment within a cleanup cycle
+      # (delete.go tombstoneDeletionConcurrency, default GOMAXPROCS/2). Pinning
+      # to 1 keeps a cleanup that does fire from saturating disk/CPU on small
+      # hosts; the cleanup is off the hot path so single-threaded is fine.
+      # Verified at v1.28.4. (Does NOT change cleanup frequency — that's the
+      # MIN/interval levers above; this only caps the intra-cycle cost.)
+      TOMBSTONE_DELETION_CONCURRENCY: "1"
     restart: unless-stopped
     healthcheck:
       # Use /v1/meta, NOT /v1/.well-known/ready. Root cause of the

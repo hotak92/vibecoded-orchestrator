@@ -5,9 +5,11 @@
 //! /modules/install`) schedules an install and returns immediately — the
 //! caller polls module status via `GET /modules/{id}/status?project_id=...`.
 //!
-//! Security: the hub binds to 127.0.0.1 only. We do NOT expose this over
-//! the network. A future version may add token auth for scripts that need
-//! to run outside the user's desktop session.
+//! Security: since v0.2.61 the hub binds `0.0.0.0` (for global-module
+//! container reachability — see `server::start_hub_server`). The access
+//! control is the per-request bearer token (`auth::require_auth`), NOT the
+//! bind address: a network peer that reaches the port without the token
+//! gets 401 exactly like an unauthorized local process.
 
 use axum::{
     extract::{Path, Query, State},
@@ -416,9 +418,12 @@ async fn get_project_by_path_route(
 ///     but the key isn't active for it. Useful for the resolver
 ///     helper which needs a single value per call.
 ///
-/// **Security**: this endpoint returns secret values in cleartext. It is
-/// bound to 127.0.0.1 only. Apps that consume it (e.g. the orchestrator
-/// launching a workflow) run on the same machine as the user.
+/// **Security**: this endpoint returns secret values in cleartext. Since
+/// v0.2.61 the hub binds `0.0.0.0`, so the cleartext secrets are protected
+/// by the bearer-token gate (`auth::require_auth`), not the bind address —
+/// a caller without the token gets 401. Apps that legitimately consume it
+/// (e.g. the orchestrator launching a workflow) read `hub.token` and run on
+/// the same machine as the user.
 ///
 /// Future work (tracked in LAUNCHER_BACKEND_API.md §10): require a caller
 /// auth token so scripts running under a different user can't siphon

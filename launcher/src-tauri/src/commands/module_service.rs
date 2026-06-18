@@ -489,28 +489,89 @@ pub async fn start_container_after_install(
 /// ONE container per global module. Chosen above the orchestrator-root
 /// port + above the per-project allocation range to avoid collision
 /// with both.
+///
+/// v0.2.61 (Option H): the launcher no longer spawns the global
+/// container directly — `start_global_container_for_module` delegates to
+/// the hub, which owns the actual `podman run` and reads its OWN copy of
+/// this value (`vct-hub::module_supervisor::start_global_container_supervisor`'s
+/// local `GLOBAL_RL_PORT`). This constant is therefore unreferenced in the
+/// launcher today, but it remains the DOCUMENTED source-of-truth the hub's
+/// duplicate is "kept in sync with" — keep it (and its value) authoritative
+/// here. `#[allow(dead_code)]` rather than deletion preserves that contract.
 pub const GLOBAL_RL_PORT: u16 = 11443;
+
+/// Resolve the host port the RL reranker container listens on for a given
+/// project (v0.2.61, Option H B2 fix).
+///
+/// THE BUG THIS FIXES: after a module migrates to global scope
+/// (`auto_migrate_per_project_to_global`), there is ONE container serving all
+/// projects on `GLOBAL_RL_PORT` (11443), and the per-project `module_ports`
+/// rows are gone — the global supervisor never writes one. The finetune /
+/// rotate path used `get_project_rl_port(project_id)` (= `get_module_port(pid,
+/// "vct-rl-reranker")`), which now returns `None`/stale for a global install,
+/// so `/finetune` + `/rotate_weights` POSTed to a dead port → the whole
+/// launcher-side finetune/rotate path was DEAD-ON-ARRIVAL for global modules.
+/// (Rerank survived because it reaches the container via the MCP's
+/// `RL_SERVER_PORT` env — a separate channel.)
+///
+/// Resolution: if the module is installed as a GLOBAL row, use
+/// `GLOBAL_RL_PORT`; otherwise fall back to the per-project allocation.
+fn resolve_rl_port_for_project(db: &Db, project_id: &str) -> Result<u16, String> {
+    if matches!(
+        db.get_global_module_install(RL_RERANKER_MODULE_ID),
+        Ok(Some(_))
+    ) {
+        return Ok(GLOBAL_RL_PORT);
+    }
+    db.get_project_rl_port(project_id)?
+        .ok_or_else(|| format!("project {} has no rl_port", project_id))
+}
 
 /// v0.2.49 Stream A: start (or restart) the GLOBAL container for a
 /// module. Sibling of [`start_container_for_module`].
 ///
 /// Differences:
 ///   * No `ProjectRow` arg — global containers are not project-scoped.
-///   * Container name = bare module_id (via [`resolve_global_container_name`]),
-///     not `{module_id}-{project_slug}`.
+///   * Container name = bare module_id, not `{module_id}-{project_slug}`.
 ///   * Volume paths substitute `"global"` for `{project_slug}` so the
 ///     state dir is stable across launcher restarts.
 ///   * Listens on [`GLOBAL_RL_PORT`] machine-wide.
+///
+/// ## v0.2.61 (Option H): delegates to the hub instead of spawning podman
+///
+/// The launcher and the hub are SEPARATE processes. The per-spawn
+/// module-identity token (`VCT_MODULE_TOKEN`) the container presents to
+/// the hub's module-scoped data routes is minted + held in the HUB's
+/// in-memory map at the hub's spawn point. A launcher-side direct
+/// `podman run` produces a container with NO such token → it 401s on
+/// every hub read. So the launcher MUST delegate global starts to the
+/// hub's `POST /api/v1/modules/{module_id}/start`
+/// (`global_module_start` → `start_global_container_supervisor`, which
+/// mints the token and injects it at `podman run`).
+///
+/// Sequence:
+///   1. [`ensure_hub_running`](crate::hub_launcher::ensure_hub_running) —
+///      bring up the detached hub. ANY non-`Started`
+///      [`SpawnOutcome`](crate::hub_launcher::SpawnOutcome) is a hard
+///      failure here: we must NOT fall back to a local podman spawn
+///      (tokenless → 401). Fail loudly with a message naming the outcome.
+///   2. POST the global-start route via [`hub_proxy_global_module_start`],
+///      returning the hub-resolved `container_name`.
+///   3. Persist the resolved name on the global install row so subsequent
+///      resume sweeps short-circuit on the running-probe path.
+///
+/// The hub side now owns image resolution / pre-pull / idempotent
+/// `rm -f` / `podman run` (its `start_global_container_supervisor`
+/// mirrors the former launcher body plus the token injection), so none of
+/// that lives here anymore.
 pub async fn start_global_container_for_module(
     manifest: &ModuleManifest,
     module_id: &str,
     db: &Db,
 ) -> Result<String, String> {
-    use vct_launcher_core::services::container_runtime::{
-        build_podman_run_args_global, ensure_volume_host_dirs_global, resolve_global_container_name,
-        resolve_image_ref,
-    };
-
+    // Early-fail on a non-daemon runtime with the same message shape the
+    // launcher used pre-v0.2.61. The hub gates on this too, but catching
+    // it before a network round-trip keeps the error local + cheap.
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
@@ -519,84 +580,53 @@ pub async fn start_global_container_for_module(
         ));
     }
 
-    let name_template = runtime.resolve_container_name_template(&manifest.id);
-    let container_name = resolve_global_container_name(&name_template, module_id)?;
-    let image_template = runtime.resolve_image_ref(
-        manifest.install.container.as_ref().ok_or_else(|| {
-            "install.container block missing — required for container/service modules".to_string()
-        })?,
-        &manifest.version,
-    );
-
-    let gpu_mode = read_persisted_gpu_mode();
-    let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
-
-    let podman = detect_container_runtime().await?;
-
-    // Pre-pull with auth for cache-evicted hosts (v0.2.47 pattern).
-    // v0.2.54 (C-RT-6): gated on `method == ContainerPull` alone — a
-    // missing hardware snapshot (gpu_mode=None) must not skip the
-    // authed pre-pull (anonymous-401 shape, v0.2.46 GHCR-401 bug class).
-    if manifest.install.method == InstallMethod::ContainerPull {
-        if let Err(e) = pre_pull_with_auth_for_start(manifest, &podman, &image).await {
-            eprintln!(
-                "[module_service] global pre-pull for start failed (continuing — cache may suffice): {}",
-                e
-            );
+    // (1) Ensure the hub is up. The hub is the sole spawn point for
+    // global containers (it mints + injects VCT_MODULE_TOKEN); we never
+    // fall back to a launcher-side podman spawn — that would yield a
+    // tokenless container that 401s on every hub data read. So any
+    // outcome other than `Started` is a hard, loud failure.
+    match crate::hub_launcher::ensure_hub_running() {
+        crate::hub_launcher::SpawnOutcome::Started => {}
+        other => {
+            return Err(format!(
+                "cannot start global container '{}': vct-hub is not running and \
+                 could not be started ({:?}). Global containers are spawned by \
+                 the hub (it mints the module-identity token); the launcher will \
+                 NOT spawn a tokenless container directly. Run install.py to \
+                 deploy the hub binary, or set VCT_HUB_BIN.",
+                module_id, other
+            ));
         }
     }
 
-    // Idempotency: force-remove any prior container with the same name.
-    let _ = Command::new(&podman)
-        .silent()
-        .args(["rm", "-f", &container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
-    let ctx = PlaceholderCtx::new(&manifest.id);
-    ensure_volume_host_dirs_global(manifest, &ctx, GLOBAL_RL_PORT).await;
-
-    // v0.2.54 (P0-4): thread detected engine + gpu_mode for GPU flags.
-    let args = build_podman_run_args_global(
-        manifest, &ctx, GLOBAL_RL_PORT, &container_name, &image, &podman, gpu_mode,
-    )?;
-
-    let mut cmd = Command::new(&podman).silent();
-    cmd.args(&args);
-    cmd.env_clear();
-    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
-        .await
-        .map_err(|_| format!("{} run timed out after 60s for {}", podman, container_name))?
-        .map_err(|e| format!("spawn {} run: {}", podman, e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // (1b) Wait for the hub to actually be LISTENING before delegating.
+    // (v0.2.61, Option H BLOCKER-2 fix.) `ensure_hub_running()` returns
+    // `Started` as soon as it forks `vct-hub --start-if-not-running` and
+    // that exits 0 (~100ms) — it does NOT block until the hub binds its
+    // port. On a cold boot the delegated POST below would then race the
+    // hub's listener and get connection-refused, with no retry → the
+    // global module silently fails to start. So poll the unauthenticated
+    // `/api/v1/health` liveness endpoint with a short backoff until the
+    // hub answers (or we give up and fail loudly, same no-silent-skip
+    // contract as above).
+    if let Err(e) = wait_for_hub_ready().await {
         return Err(format!(
-            "{} run failed (exit {}) for {}: {}",
-            podman,
-            output.status.code().unwrap_or(-1),
-            container_name,
-            stderr.chars().take(500).collect::<String>()
+            "cannot start global container '{}': vct-hub was started but did not \
+             become ready in time ({}). It may still be binding its port; retry \
+             shortly.",
+            module_id, e
         ));
     }
 
-    // Persist resolved container_name on the global install row so
+    // (2) Delegate the actual spawn to the hub. The hub resolves the
+    // container name, pre-pulls (with auth), force-removes any stale
+    // same-named container, runs podman with the injected token, and
+    // returns the resolved `container_name`.
+    let container_name = hub_proxy_global_module_start(module_id)
+        .await
+        .map_err(|e| format!("hub-delegated global start for '{}' failed: {}", module_id, e))?;
+
+    // (3) Persist resolved container_name on the global install row so
     // subsequent resume sweeps short-circuit on the running-probe path.
     db.set_global_module_container_name(module_id, &container_name)?;
 
@@ -1083,6 +1113,128 @@ async fn hub_proxy_module_stop(project_id: &str, module_id: &str) -> Result<(), 
     Ok(())
 }
 
+/// Proxy for `POST /modules/{module_id}/start` — the GLOBAL-container
+/// spawn route added by the v0.2.61 Option-H foundation. The hub is the
+/// sole spawn point for global containers because it mints + injects the
+/// per-spawn module-identity token (`VCT_MODULE_TOKEN`) at the moment of
+/// `podman run`; a launcher-side direct spawn would produce a tokenless
+/// container that 401s on every hub module-scoped data read. See the
+/// `start_global_container_for_module` docstring for the full rationale.
+///
+/// Poll the hub's unauthenticated `/api/v1/health` liveness endpoint until
+/// it answers 2xx, or give up after a bounded backoff. (v0.2.61, Option H
+/// BLOCKER-2.) Used right after `ensure_hub_running()` returns `Started` —
+/// which only means "the start command was forked", not "the hub is
+/// listening" — so the subsequent delegated POST doesn't race the
+/// listener and connection-refuse on a cold boot.
+///
+/// Health is exempt from the hub.token gate (see hub `is_exempt_path`), so
+/// no token is needed here — this is purely a reachability probe.
+async fn wait_for_hub_ready() -> Result<(), String> {
+    // ~3s total: 10 attempts × 300ms. The hub binds within ~100ms of the
+    // forked start in practice; this leaves comfortable headroom on a
+    // loaded machine without making a genuinely-down hub hang the caller.
+    const ATTEMPTS: u32 = 10;
+    const DELAY_MS: u64 = 300;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    // v0.2.61 (Option H C-PORT): re-read hub.port INSIDE the loop. If the hub
+    // is restarting (update flow / crash-restart) it may bind a different port
+    // and rewrite hub.port a moment after `ensure_hub_running` returns. Reading
+    // the port once up-front could pin a STALE value → all 10 probes hit the
+    // wrong/closed port and we'd report "not reachable" on a hub that's
+    // actually up on the new port. The file read is cheap; 10× over ~3s is
+    // negligible, and it self-corrects a port rewrite that lands mid-poll.
+    let mut last_port = 0u16;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(DELAY_MS)).await;
+        }
+        let port = match hub_port_for_proxy() {
+            Ok(p) => p,
+            Err(_) => continue, // port file not written yet — retry
+        };
+        last_port = port;
+        let url = format!("http://127.0.0.1:{}/api/v1/health", port);
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!(
+        "hub /api/v1/health not reachable on port {} after {} attempts (~{}ms)",
+        last_port,
+        ATTEMPTS,
+        ATTEMPTS as u64 * DELAY_MS
+    ))
+}
+
+/// Returns the resolved `container_name` from the `{"container_name": ...}`
+/// success envelope. On a hub error envelope
+/// (`{"error": {"code", "message"}}`) the `code` + `message` are folded
+/// into the returned `Err` string so the caller can surface a clear cause.
+async fn hub_proxy_global_module_start(module_id: &str) -> Result<String, String> {
+    let port = hub_port_for_proxy()?;
+    let token = hub_token_for_proxy()?;
+    let client = reqwest::Client::builder()
+        // Generous timeout: the hub-side start does an (optionally authed)
+        // image pre-pull + `podman run` before responding, matching the
+        // 60s ceiling the old launcher-side direct spawn used.
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| format!("http client: {}", e))?;
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/modules/{}/start",
+        port, module_id
+    );
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("hub POST global start: {}", e))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse hub global-start body: {}", e))?;
+
+    if !status.is_success() {
+        // Hub error envelope: { "error": { "code": "...", "message": "..." } }
+        let code = body
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let message = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no message)");
+        return Err(format!(
+            "hub global-start returned {} [{}]: {}",
+            status, code, message
+        ));
+    }
+
+    let container_name = body
+        .get("container_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "hub global-start succeeded ({}) but response had no \
+                 non-empty container_name: {}",
+                status, body
+            )
+        })?;
+    Ok(container_name.to_string())
+}
+
 // ─── Phase 3C: weights update check + download + rotate ─────────────────
 
 /// POST `/rl-latest-version` for the active embedding source of the
@@ -1302,6 +1454,7 @@ pub async fn download_weights(
 pub async fn signal_rotate_weights(
     rl_port: u16,
     container_path: &str,
+    project_id: &str,
 ) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{}/rotate_weights", rl_port);
     let client = reqwest::Client::builder()
@@ -1311,6 +1464,11 @@ pub async fn signal_rotate_weights(
 
     let resp = client
         .post(&url)
+        // v0.2.61 (Option H): X-VCT-Project-ID routes the container's
+        // per-project model head; matches /finetune + rerank. The global
+        // container is a singleton serving all projects, so rotate must
+        // name the project whose head it's swapping.
+        .header("X-VCT-Project-ID", project_id)
         .json(&serde_json::json!({ "weights_path": container_path }))
         .send()
         .await
@@ -1400,14 +1558,14 @@ pub async fn apply_weights_update(
 
     match choice {
         FinetuneChoice::Skip => {
-            let rl_port = db
-                .get_project_rl_port(&project_id)?
-                .ok_or_else(|| format!("project {} has no rl_port", project_id))?;
+            // v0.2.61 (Option H B2): honor global scope — a global install
+            // listens on GLOBAL_RL_PORT, not the (now-absent) per-project port.
+            let rl_port = resolve_rl_port_for_project(&db, &project_id)?;
             let container_path = container_weights_path(
                 &response.embedding_source,
                 &response.latest_version,
             );
-            signal_rotate_weights(rl_port, &container_path).await?;
+            signal_rotate_weights(rl_port, &container_path, &project_id).await?;
             Ok(())
         }
         FinetuneChoice::Now => {
@@ -1439,6 +1597,91 @@ pub async fn apply_weights_update(
 /// rotate with the UNMODIFIED downloaded weights. The user always gets
 /// the new global model — fine-tuning is a quality improvement, not a
 /// blocking step.
+/// RAII "finetune in flight" sentinel (v0.2.61, Option H B1).
+///
+/// Creating it writes `<vct_root_dir>/<module_id>.finetuning`; dropping it
+/// removes the file. Because it's dropped on EVERY exit path of
+/// `run_finetune_then_rotate_async` (early `?`, normal return, panic-unwind),
+/// the sentinel can never be orphaned by this task — the one residual case is
+/// a hard process crash, for which the hub's resume sweep treats a sentinel
+/// with no running container as stale (see the hub-side guard). The file's
+/// presence tells the hub's resume sweep "don't recreate the global container
+/// right now — a training job is using it."
+struct FinetuneSentinel {
+    path: std::path::PathBuf,
+}
+
+impl FinetuneSentinel {
+    fn create(module_id: &str) -> Self {
+        let path = vct_launcher_core::paths::finetune_sentinel_path(module_id);
+        // Best-effort: a failed write just means the hub MIGHT recreate the
+        // container mid-job (the old behavior); the poller still treats the
+        // resulting job-loss as failure, so we never report false success.
+        if let Err(e) = std::fs::write(&path, b"1") {
+            eprintln!(
+                "[module_service] could not write finetune sentinel {:?}: {} \
+                 (hub may recreate the container mid-job)",
+                path, e
+            );
+        }
+        Self { path }
+    }
+}
+
+impl Drop for FinetuneSentinel {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Terminal outcome of a fine-tune poll loop (v0.2.61, Option H B1).
+/// Module-scoped so the emit-decision is unit-testable without a live
+/// container.
+#[derive(Debug, Clone, PartialEq)]
+enum FtOutcome {
+    /// The container reported terminal state "done" — a genuine fine-tune.
+    Done,
+    /// The container reported failed/error, returned a non-2xx, OR the job
+    /// was LOST (a streak of connection errors = mid-job recreate/crash).
+    Failed(String),
+    /// The poll loop hit its 5-min cap while the job was still "running".
+    Inconclusive,
+}
+
+/// What the FINAL Tauri event should be, given the fine-tune outcome and
+/// whether the (always-attempted) weight rotation succeeded. This is the
+/// exact logic the B1 bug got wrong: the old code emitted a blanket
+/// "percent:100, Done" regardless of outcome, so a no-op/killed/failed
+/// fine-tune masqueraded as success. Pure + module-scoped so it's unit-tested
+/// directly (the HTTP plumbing around it is incidental).
+///
+/// Returns `(event_name, state, is_hard_error)`:
+///   * `event_name` — the Tauri event to emit ("module://finetune-progress"
+///     on genuine success, "module://finetune-failed" otherwise).
+///   * `state` — "done" | "failed" (the frontend's matchesCurrent/auto-dismiss
+///     key; C-FE).
+///   * `is_hard_error` — true when the task itself must return Err (rotate
+///     failed AND the fine-tune didn't succeed → nothing usable happened).
+fn finetune_emit_decision(outcome: &FtOutcome, rotate_ok: bool) -> (&'static str, &'static str, bool) {
+    match (outcome, rotate_ok) {
+        // Trained successfully AND rotated in → the only genuine success.
+        (FtOutcome::Done, true) => ("module://finetune-progress", "done", false),
+        // Trained, but the rotate-in failed → surface as failed (not a hard
+        // Err: the failure is reported via the event).
+        (FtOutcome::Done, false) => ("module://finetune-failed", "failed", false),
+        // Fine-tune failed/lost/inconclusive but the base model rotated in →
+        // tell the truth (failed), task returns Ok (user has the base model).
+        (FtOutcome::Failed(_), true) | (FtOutcome::Inconclusive, true) => {
+            ("module://finetune-failed", "failed", false)
+        }
+        // Fine-tune did not succeed AND rotate failed → nothing usable
+        // happened; the task returns Err (hard error).
+        (FtOutcome::Failed(_), false) | (FtOutcome::Inconclusive, false) => {
+            ("module://finetune-failed", "failed", true)
+        }
+    }
+}
+
 async fn run_finetune_then_rotate_async(
     project_id: String,
     response: LatestVersionResponse,
@@ -1451,18 +1694,28 @@ async fn run_finetune_then_rotate_async(
         .map_err(|e| format!("re-open DB for background fine-tune: {}", e))?;
     let db = Db(std::sync::Mutex::new(conn));
 
-    let rl_port = db
-        .get_project_rl_port(&project_id)?
-        .ok_or_else(|| format!("project {} has no rl_port", project_id))?;
+    // v0.2.61 (Option H B2): honor global scope — a global install listens on
+    // GLOBAL_RL_PORT, not the (now-absent) per-project port.
+    let rl_port = resolve_rl_port_for_project(&db, &project_id)?;
     let container_path = container_weights_path(
         &response.embedding_source,
         &response.latest_version,
     );
 
+    // v0.2.61 (Option H B1): write the "finetune in flight" sentinel so the
+    // hub's boot resume sweep does NOT recreate (podman rm -f) the global
+    // container out from under this job. `FinetuneSentinel` removes the file
+    // on Drop — covering EVERY exit path (early `?`, panic-unwind, normal
+    // return). Only meaningful for a global install (the recreate-on-running
+    // self-heal only applies to global rows), but harmless to write either way.
+    let _finetune_sentinel = FinetuneSentinel::create(RL_RERANKER_MODULE_ID);
+
     let _ = app.emit(
         "module://finetune-progress",
         serde_json::json!({
+            "module_id": RL_RERANKER_MODULE_ID,
             "project_id": project_id,
+            "state": "running",
             "percent": 0,
             "message": "Starting fine-tune…",
         }),
@@ -1485,8 +1738,21 @@ async fn run_finetune_then_rotate_async(
         sanitize_path_component(&project.slug),
     );
 
+    // v0.2.61 (RL DB-cutover follow-up, coordination msg 301): the
+    // vct-rl-reranker container's /finetune is now DB-only — it resolves
+    // which project's events to train on from the `X-VCT-Project-ID`
+    // HEADER (the same header the rerank path sends, keyed on the
+    // ProjectConfig.project_id — see weaviate_mcp server.py
+    // `current_project_id`), NOT from the events_path body field. Send
+    // the header so finetune targets the right per-project model head;
+    // the value MUST match what rerank sends (project_id, not slug) so
+    // both hit the same training-data key. `events_path` is left in the
+    // body — the new container ignores it, and the OLD container (pre
+    // the container's v0.2.11 cutover) still needs it, so leaving it
+    // keeps both container versions working regardless of ship order.
     let kick = client
         .post(&finetune_url)
+        .header("X-VCT-Project-ID", &project_id)
         .json(&serde_json::json!({
             "events_path": events_path_container,
             "base_weights_path": container_path,
@@ -1495,8 +1761,19 @@ async fn run_finetune_then_rotate_async(
         .send()
         .await;
 
+    // v0.2.61 (Option H B1): track the ACTUAL terminal outcome so the
+    // post-loop emit reflects reality. The old code `break`-ed identically on
+    // done / failed / non-2xx / loop-exhaustion, then unconditionally emitted
+    // "percent:100, Done" — reporting SUCCESS on a no-op or killed job. We now
+    // distinguish: `Done` (genuine terminal "done"), `Failed(reason)` (the
+    // container said failed/error/non-2xx OR the job was LOST — a streak of
+    // connection errors, which is the signature of a mid-finetune container
+    // recreate killing the job), or `Inconclusive` (loop exhausted while still
+    // "running" at the 5-min cap). Only `Done` reports success downstream.
+    // (FtOutcome + the emit-decision are module-scoped so the decision logic
+    // is unit-testable without a live container — see finetune_emit_decision.)
     let mut job_id: Option<String> = None;
-    match kick {
+    let outcome: FtOutcome = match kick {
         Ok(r) if r.status().is_success() => {
             // Capture job_id from kick response if present.
             if let Ok(payload) = r.json::<serde_json::Value>().await {
@@ -1507,6 +1784,13 @@ async fn run_finetune_then_rotate_async(
             }
 
             // Poll /finetune_status. Hard cap: 60 attempts × 5s = 5 min.
+            // A streak of consecutive connection errors means the container
+            // went away mid-job (e.g. recreated by a hub-restart self-heal,
+            // OOM, crash). Treat a sustained streak as job-loss FAILURE rather
+            // than "keep trying forever then fall through to a false Done".
+            const MAX_CONSECUTIVE_CONN_ERRORS: u32 = 6; // ~30s of total silence
+            let mut consecutive_conn_errors: u32 = 0;
+            let mut loop_outcome: Option<FtOutcome> = None;
             for attempt in 0..60u32 {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let mut req = client.get(&status_url);
@@ -1516,6 +1800,7 @@ async fn run_finetune_then_rotate_async(
                 let status = req.send().await;
                 match status {
                     Ok(s) if s.status().is_success() => {
+                        consecutive_conn_errors = 0;
                         let payload: serde_json::Value =
                             s.json().await.unwrap_or_else(|_| serde_json::json!({}));
                         let state = payload
@@ -1529,7 +1814,9 @@ async fn run_finetune_then_rotate_async(
                         let _ = app.emit(
                             "module://finetune-progress",
                             serde_json::json!({
+                                "module_id": RL_RERANKER_MODULE_ID,
                                 "project_id": project_id,
+                                "state": "running",
                                 "percent": percent,
                                 "message": format!("Fine-tuning… ({})", state),
                             }),
@@ -1545,6 +1832,7 @@ async fn run_finetune_then_rotate_async(
                         // `/finetune` handler updates the row when its
                         // own job completes.
                         if state == "done" {
+                            loop_outcome = Some(FtOutcome::Done);
                             break;
                         }
                         if state == "failed" || state == "error" {
@@ -1554,64 +1842,233 @@ async fn run_finetune_then_rotate_async(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown error")
                                 .to_string();
-                            let _ = app.emit(
-                                "module://finetune-failed",
-                                serde_json::json!({
-                                    "project_id": project_id,
-                                    "reason": reason,
-                                }),
-                            );
+                            loop_outcome = Some(FtOutcome::Failed(reason));
                             break;
                         }
                     }
                     Ok(s) => {
-                        let _ = app.emit(
-                            "module://finetune-failed",
-                            serde_json::json!({
-                                "project_id": project_id,
-                                "reason": format!("finetune_status {}", s.status()),
-                            }),
-                        );
+                        // Non-2xx from /finetune_status (e.g. fresh container
+                        // 404s on an unknown job_id after a recreate).
+                        loop_outcome = Some(FtOutcome::Failed(format!(
+                            "finetune_status {}",
+                            s.status()
+                        )));
                         break;
                     }
                     Err(e) => {
-                        eprintln!("[module_service] finetune_status poll error: {}", e);
-                        // Keep trying — transient.
+                        consecutive_conn_errors += 1;
+                        eprintln!(
+                            "[module_service] finetune_status poll error ({}/{}): {}",
+                            consecutive_conn_errors, MAX_CONSECUTIVE_CONN_ERRORS, e
+                        );
+                        if consecutive_conn_errors >= MAX_CONSECUTIVE_CONN_ERRORS {
+                            // The container is gone and isn't coming back on
+                            // the same job — job lost (recreate/crash). Don't
+                            // pretend it completed.
+                            loop_outcome = Some(FtOutcome::Failed(format!(
+                                "fine-tune job lost — container unreachable for \
+                                 {} consecutive polls (~{}s); likely recreated or \
+                                 crashed mid-job",
+                                consecutive_conn_errors,
+                                consecutive_conn_errors * 5
+                            )));
+                            break;
+                        }
+                        // else: transient — keep trying.
                     }
                 }
             }
+            loop_outcome.unwrap_or(FtOutcome::Inconclusive)
         }
-        Ok(r) => {
+        Ok(r) => FtOutcome::Failed(format!(
+            "finetune {} (container may not support /finetune)",
+            r.status()
+        )),
+        Err(e) => FtOutcome::Failed(format!("finetune unreachable: {}", e)),
+    };
+
+    // Rotate unconditionally — see contract pin in fn doc: the user always
+    // gets the new GLOBAL model; fine-tuning is a quality improvement layered
+    // on top, not a gate. (If the recreate-skip guard held the container open,
+    // a genuine `Done` means the rotate swaps in the freshly fine-tuned head.)
+    let rotate_result = signal_rotate_weights(rl_port, &container_path, &project_id).await;
+
+    // v0.2.61 (Option H B1 + C-FE): the FINAL emit reflects the ACTUAL
+    // outcome — never a blanket "Done". A failed/lost/inconclusive fine-tune
+    // no longer masquerades as success. We still rotated (above), so the user
+    // has the new base global model regardless; the message just tells the
+    // truth about whether it was specialized to their corpus.
+    //
+    // v0.2.61 (re-audit B1-A): the two HARD-ERROR arms — (Failed, rotate-Err)
+    // and (Inconclusive, rotate-Err) — used to `return Err(...)` WITHOUT
+    // emitting `module://finetune-failed` first. Result: when BOTH the
+    // fine-tune AND the rotate failed, the frontend got no terminal event and
+    // the UI hung forever on the last "running" progress emit. The pure
+    // `finetune_emit_decision` already classifies these as
+    // ("module://finetune-failed", "failed", is_hard_error=true) — i.e. EMIT,
+    // THEN hard-error. Both arms now do exactly that: emit a failed event
+    // (reason naming BOTH failures) and still `return Err` so the task is
+    // recorded as failed and the UI is informed.
+    //
+    // `emitted_event` captures the event each inline arm actually fired so the
+    // strengthened `debug_assert_eq!` below can prove the inline code agrees
+    // with `finetune_emit_decision(.0)` for ALL FOUR (outcome, rotate_ok)
+    // combinations — including the hard-error path that previously emitted
+    // nothing and so silently diverged from the spec.
+    //
+    // The two hard-error arms `return Err` before the post-match assert can
+    // run, so each carries its OWN per-arm `debug_assert*` that verifies (a)
+    // it emits the spec event `finetune_emit_decision(...).0` and (b) the
+    // spec's is_hard_error flag `.2` is `true` — i.e. the arm IS the one that
+    // returns Err. This is the parity check that B1-A defeated: the old 2-arm
+    // probe never noticed the hard-error arms emitted nothing. (Calls to the
+    // pure fn are kept inline inside the `debug_assert*` macros so nothing is
+    // computed — and nothing is left unused — in release builds.)
+    let emitted_event: &str = match (&outcome, &rotate_result) {
+        (FtOutcome::Done, Ok(())) => {
+            let _ = app.emit(
+                "module://finetune-progress",
+                serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
+                    "project_id": project_id,
+                    "state": "done",
+                    "percent": 100,
+                    "message": "Fine-tune complete",
+                }),
+            );
+            "module://finetune-progress"
+        }
+        (FtOutcome::Done, Err(e)) => {
+            // Trained fine, but the rotate-in failed — surface that.
             let _ = app.emit(
                 "module://finetune-failed",
                 serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
                     "project_id": project_id,
-                    "reason": format!("finetune {} (container may not support /finetune)", r.status()),
+                    "state": "failed",
+                    "reason": format!("fine-tune completed but weight rotation failed: {}", e),
                 }),
             );
+            "module://finetune-failed"
         }
-        Err(e) => {
+        (FtOutcome::Failed(reason), Ok(())) => {
+            // Fine-tune failed, but the base model rotated in — Ok outcome,
+            // just not specialized to the user's corpus.
             let _ = app.emit(
                 "module://finetune-failed",
                 serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
                     "project_id": project_id,
-                    "reason": format!("finetune unreachable: {}", e),
+                    "state": "failed",
+                    "reason": format!(
+                        "{} (base model rotated in; not specialized to your data)",
+                        reason
+                    ),
                 }),
             );
+            "module://finetune-failed"
         }
-    }
+        (FtOutcome::Failed(reason), Err(e)) => {
+            // v0.2.61 (re-audit B1-A): EMIT the terminal failed event BEFORE
+            // the hard-error return — the frontend must learn the job ended
+            // (was previously a silent `return Err`, hanging the UI).
+            //
+            // Per-arm parity assert (covers the hard-error path the post-match
+            // assert can't reach): this arm MUST emit the spec event, and the
+            // spec's is_hard_error flag MUST be true — it returns Err below.
+            debug_assert_eq!(
+                "module://finetune-failed",
+                finetune_emit_decision(&outcome, false).0,
+                "(Failed, Err) arm event diverged from finetune_emit_decision spec"
+            );
+            debug_assert!(
+                finetune_emit_decision(&outcome, false).2,
+                "(Failed, Err) arm returns Err but finetune_emit_decision says not a hard error"
+            );
+            let _ = app.emit(
+                "module://finetune-failed",
+                serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
+                    "project_id": project_id,
+                    "state": "failed",
+                    "reason": format!(
+                        "fine-tune failed ({}) and weight rotation failed ({})",
+                        reason, e
+                    ),
+                }),
+            );
+            return Err(format!(
+                "fine-tune failed ({}) and rotate failed ({})",
+                reason, e
+            ));
+        }
+        (FtOutcome::Inconclusive, Ok(())) => {
+            // Loop hit the 5-min cap while still "running". Don't claim done;
+            // don't claim failed-hard. The container may still finish on its
+            // own — base model rotated in, re-run to specialize.
+            let _ = app.emit(
+                "module://finetune-failed",
+                serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
+                    "project_id": project_id,
+                    "state": "failed",
+                    "reason": "fine-tune did not finish within 5 minutes; \
+                               base model rotated in — re-run to specialize",
+                }),
+            );
+            "module://finetune-failed"
+        }
+        (FtOutcome::Inconclusive, Err(e)) => {
+            // v0.2.61 (re-audit B1-A): EMIT the terminal failed event BEFORE
+            // the hard-error return — same UI-hang fix as the (Failed, Err) arm.
+            //
+            // Per-arm parity assert (mirrors the (Failed, Err) arm): emits the
+            // spec event, and the spec's is_hard_error flag MUST be true.
+            debug_assert_eq!(
+                "module://finetune-failed",
+                finetune_emit_decision(&outcome, false).0,
+                "(Inconclusive, Err) arm event diverged from finetune_emit_decision spec"
+            );
+            debug_assert!(
+                finetune_emit_decision(&outcome, false).2,
+                "(Inconclusive, Err) arm returns Err but finetune_emit_decision says not a hard error"
+            );
+            let _ = app.emit(
+                "module://finetune-failed",
+                serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
+                    "project_id": project_id,
+                    "state": "failed",
+                    "reason": format!(
+                        "fine-tune did not finish within 5 minutes and weight \
+                         rotation failed ({}) — re-run to specialize",
+                        e
+                    ),
+                }),
+            );
+            return Err(format!("fine-tune inconclusive and rotate failed: {}", e));
+        }
+    };
 
-    // Rotate unconditionally — see contract pin in fn doc.
-    signal_rotate_weights(rl_port, &container_path).await?;
-
-    let _ = app.emit(
-        "module://finetune-progress",
-        serde_json::json!({
-            "project_id": project_id,
-            "percent": 100,
-            "message": "Done",
-        }),
+    // v0.2.61 (re-audit B1-A): the rich inline match above carries reason
+    // strings; `finetune_emit_decision` is the pure, unit-tested distillation
+    // of the SAME logic. Assert they agree in debug builds so the inline code
+    // can never silently drift from the spec. STRENGTHENED over the prior
+    // 2-arm probe (which only mapped (Done, Ok)=>progress, _=>failed and could
+    // not see that the hard-error arms emitted NOTHING): we now compare against
+    // the event each inline arm ACTUALLY emitted (`emitted_event`), captured
+    // above. A future divergence — e.g. re-introducing a non-emitting
+    // `return Err` on a hard-error path, or flipping an arm's event — trips
+    // this assert. The two hard-error arms `return Err` before reaching this
+    // line, so they carry their OWN per-arm asserts above (verifying both
+    // event ".0" AND is_hard_error ".2"); together the per-arm + post-match
+    // asserts cover ALL FOUR (outcome, rotate_ok) combinations.
+    debug_assert_eq!(
+        emitted_event,
+        finetune_emit_decision(&outcome, rotate_result.is_ok()).0,
+        "inline emit decision drifted from finetune_emit_decision spec"
     );
+
     Ok(())
 }
 
@@ -1642,9 +2099,18 @@ pub async fn get_rl_dashboard_state(
         is_container_running(&container_name).await.unwrap_or(false)
     };
 
-    let port = db
-        .get_project_rl_port(&project_id)?
-        .unwrap_or(0);
+    // v0.2.61 (re-audit B2-1): the dashboard probe must use the same
+    // global-aware port resolution as the finetune/rotate paths. A bare
+    // `get_project_rl_port(project_id)` returns `None` for a GLOBAL install
+    // (the per-project `module_ports` row is gone after
+    // `auto_migrate_per_project_to_global`), which collapsed to `0` here →
+    // `probe_state_summary` was skipped → `dynamic_types_count` /
+    // `d1_marker_present` stayed permanently `None` and the widget showed
+    // `port: 0`. `resolve_rl_port_for_project` honors `GLOBAL_RL_PORT` for
+    // global installs. We keep the "0 when unresolvable" back-compat:
+    // `.unwrap_or(0)` on its `Result<u16, String>` yields the resolved port
+    // or `0`, and `port > 0` below still gates the probe.
+    let port = resolve_rl_port_for_project(&db, &project_id).unwrap_or(0);
 
     let _embedding_source = read_active_embedding_source(&project)
         .unwrap_or_else(|| DEFAULT_EMBEDDING_SOURCE.to_string());
@@ -2082,7 +2548,13 @@ where
         //   substitute `{project_slug}` in templates, allocate rl_port.
         match project_id_opt {
             None => {
-                // GLOBAL path.
+                // GLOBAL path. v0.2.61 (Option H): this now delegates to
+                // the hub's `/modules/{id}/start` (via
+                // `start_global_container_for_module`), which first calls
+                // `ensure_hub_running`. If the hub is down at resume time
+                // and can't be started, that returns a clear Err — logged
+                // + stamped to last_error below; the sweep does not crash
+                // and the per-project rows still get resumed.
                 if let Err(e) =
                     start_global_container_for_module(&manifest, &module_id, db).await
                 {
@@ -4526,5 +4998,174 @@ mod tests {
             assert!(pp.project_id.is_some(), "per-project row preserved");
             assert!(db.get_global_module_install("unknown-mod").unwrap().is_none());
         });
+    }
+
+    // ─── v0.2.61 (Option H B2): finetune/rotate port resolution ──────────
+
+    /// B2 regression: a GLOBAL install must resolve to GLOBAL_RL_PORT, NOT the
+    /// (now-absent / stale) per-project port. This is the exact DOA bug — the
+    /// finetune/rotate path POSTed to a dead per-project port after the global
+    /// migration removed the per-project container + module_ports row.
+    #[test]
+    fn v0261_resolve_rl_port_global_install_uses_global_port() {
+        let db = Db::open_in_memory().expect("DB");
+        db.insert_project("p1", "Test", "/tmp/p1", ProjectHost::Base, "p1-slug")
+            .expect("insert project");
+        // A STALE per-project port row exists (the pre-migration value) — the
+        // resolver must IGNORE it for a global install and return 11443.
+        db.set_project_rl_port("p1", 11533).expect("set stale per-project port");
+        // Global install row present.
+        db.insert_global_module_install(
+            "install-global",
+            RL_RERANKER_MODULE_ID,
+            "0.2.7",
+            "/global",
+        )
+        .expect("insert global");
+
+        let port = resolve_rl_port_for_project(&db, "p1").expect("resolve");
+        assert_eq!(
+            port, GLOBAL_RL_PORT,
+            "global install must use GLOBAL_RL_PORT (11443), not the stale per-project 11533"
+        );
+    }
+
+    /// B2 regression: a PER-PROJECT install (no global row) must still use the
+    /// per-project allocated port — the fix must not break the non-global path.
+    #[test]
+    fn v0261_resolve_rl_port_per_project_install_uses_project_port() {
+        let db = Db::open_in_memory().expect("DB");
+        db.insert_project("p1", "Test", "/tmp/p1", ProjectHost::Base, "p1-slug")
+            .expect("insert project");
+        db.set_project_rl_port("p1", 11533).expect("set per-project port");
+        // NO global row.
+        let port = resolve_rl_port_for_project(&db, "p1").expect("resolve");
+        assert_eq!(port, 11533, "per-project install must use the allocated per-project port");
+    }
+
+    /// B2 regression: per-project install with NO allocated port errors clearly
+    /// (was the original `.ok_or_else` behavior — preserve it for non-global).
+    #[test]
+    fn v0261_resolve_rl_port_per_project_no_port_errors() {
+        let db = Db::open_in_memory().expect("DB");
+        db.insert_project("p1", "Test", "/tmp/p1", ProjectHost::Base, "p1-slug")
+            .expect("insert project");
+        // No global row, no per-project port.
+        let err = resolve_rl_port_for_project(&db, "p1").unwrap_err();
+        assert!(err.contains("no rl_port"), "clear error on missing port: {}", err);
+    }
+
+    // ─── v0.2.61 (Option H B1): finetune emit-decision (the no-false-Done guarantee) ───
+
+    /// The CORE B1 guarantee: ONLY a genuine `Done` + successful rotate emits
+    /// the success ("finetune-progress" / state "done"). Every other outcome
+    /// emits "finetune-failed" — a no-op/killed/failed/inconclusive fine-tune
+    /// can NEVER masquerade as success. This is exactly what the pre-fix code
+    /// got wrong (blanket "percent:100, Done").
+    #[test]
+    fn v0261_finetune_emit_decision_only_done_succeeds() {
+        // Genuine success.
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Done, true),
+            ("module://finetune-progress", "done", false)
+        );
+        // Trained but rotate failed → failed event, NOT a hard Err.
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Done, false),
+            ("module://finetune-failed", "failed", false)
+        );
+        // Failed fine-tune, base rotated in → failed event, Ok (user has base model).
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Failed("lost".into()), true),
+            ("module://finetune-failed", "failed", false)
+        );
+        // Failed fine-tune AND rotate failed → failed event, HARD error.
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Failed("lost".into()), false),
+            ("module://finetune-failed", "failed", true)
+        );
+        // Inconclusive (5-min cap) → failed event, never "done".
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Inconclusive, true),
+            ("module://finetune-failed", "failed", false)
+        );
+        assert_eq!(
+            finetune_emit_decision(&FtOutcome::Inconclusive, false),
+            ("module://finetune-failed", "failed", true)
+        );
+    }
+
+    /// No non-Done outcome may ever produce the success event — exhaustive
+    /// guard against a future edit re-introducing the false-Done bug.
+    #[test]
+    fn v0261_finetune_no_outcome_other_than_done_emits_success() {
+        for outcome in [
+            FtOutcome::Failed("x".into()),
+            FtOutcome::Inconclusive,
+        ] {
+            for rotate_ok in [true, false] {
+                let (event, state, _) = finetune_emit_decision(&outcome, rotate_ok);
+                assert_ne!(event, "module://finetune-progress",
+                    "{:?}/{} must NOT emit the success event", outcome, rotate_ok);
+                assert_ne!(state, "done",
+                    "{:?}/{} must NOT report state=done", outcome, rotate_ok);
+            }
+        }
+    }
+
+    /// v0.2.61 (re-audit B1-A): the two HARD-ERROR combinations — fine-tune
+    /// FAILED + rotate FAILED, and fine-tune INCONCLUSIVE + rotate FAILED —
+    /// must classify as ("module://finetune-failed", "failed",
+    /// is_hard_error=true). The bug: `run_finetune_then_rotate_async`'s inline
+    /// match `return Err(...)`-ed on these BEFORE emitting the failed event, so
+    /// the frontend never learned the job ended and the UI hung on the last
+    /// "running" progress event. The pure `finetune_emit_decision` already
+    /// returns is_hard_error=true (= EMIT then hard-error) for both; the inline
+    /// emit was fixed to emit `module://finetune-failed` BEFORE its
+    /// `return Err`, and per-arm `debug_assert*`s in those two arms now assert
+    /// the inline event + is_hard_error agree with this spec (see the
+    /// "(Failed, Err) arm" / "(Inconclusive, Err) arm" asserts in
+    /// `run_finetune_then_rotate_async`). This test pins the pure-fn contract
+    /// those asserts (and the inline emit) depend on.
+    #[test]
+    fn v0261_finetune_hard_error_arms_emit_failed_then_hard_error() {
+        // Fine-tune failed AND rotate failed → EMIT finetune-failed, is_hard_error.
+        let (event, state, is_hard_error) =
+            finetune_emit_decision(&FtOutcome::Failed("lost".into()), false);
+        assert_eq!(
+            event, "module://finetune-failed",
+            "(Failed, rotate-Err) must emit finetune-failed (NOT a silent return Err)"
+        );
+        assert_eq!(state, "failed", "(Failed, rotate-Err) state must be 'failed'");
+        assert!(
+            is_hard_error,
+            "(Failed, rotate-Err) must be a hard error — the task returns Err AFTER emitting"
+        );
+
+        // Fine-tune inconclusive AND rotate failed → EMIT finetune-failed, is_hard_error.
+        let (event, state, is_hard_error) =
+            finetune_emit_decision(&FtOutcome::Inconclusive, false);
+        assert_eq!(
+            event, "module://finetune-failed",
+            "(Inconclusive, rotate-Err) must emit finetune-failed (NOT a silent return Err)"
+        );
+        assert_eq!(state, "failed", "(Inconclusive, rotate-Err) state must be 'failed'");
+        assert!(
+            is_hard_error,
+            "(Inconclusive, rotate-Err) must be a hard error — the task returns Err AFTER emitting"
+        );
+
+        // Symmetry guard: the NON-hard-error variants of the same outcomes
+        // (rotate succeeded → base model is in place) emit the SAME event but
+        // are NOT hard errors (task returns Ok). This pins the precise boundary
+        // the inline match's per-arm asserts rely on.
+        assert!(
+            !finetune_emit_decision(&FtOutcome::Failed("lost".into()), true).2,
+            "(Failed, rotate-Ok) is NOT a hard error — base model rotated in"
+        );
+        assert!(
+            !finetune_emit_decision(&FtOutcome::Inconclusive, true).2,
+            "(Inconclusive, rotate-Ok) is NOT a hard error — base model rotated in"
+        );
     }
 }
