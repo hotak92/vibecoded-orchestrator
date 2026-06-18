@@ -7723,6 +7723,32 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
     return info
 
 
+def _gpu_tool_reports_live(tool: str, probe_args: list[str], timeout: int = 10) -> bool:
+    """Return True iff ``tool`` is on PATH AND ``tool probe_args`` exits 0.
+
+    A GPU CLI that isn't installed (e.g. ``rocm-smi`` on a pure-NVIDIA box, or
+    either tool on a non-GPU machine) or that hangs past ``timeout`` counts as
+    "not live" — never a crash. Mirrors the ``shutil.which()`` + try/except
+    guard the detection probes (``_detect_nvidia_gpu``, the rocm-smi probes)
+    already use.
+
+    v0.2.62: the compose-overlay ambiguity check in ``_start_services``
+    previously invoked ``subprocess.run(["rocm-smi", ...])`` /
+    ``(["nvidia-smi", ...])`` unguarded, so any machine missing one tool raised
+    ``FileNotFoundError`` ("No such file or directory: 'rocm-smi'") and aborted
+    the entire install/update; a hanging tool would have raised
+    ``TimeoutExpired``. Centralising the guard here keeps both probes safe.
+    """
+    if not shutil.which(tool):
+        return False
+    try:
+        return subprocess.run(
+            [tool, *probe_args], capture_output=True, timeout=timeout,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _detect_nvidia_gpu() -> tuple[bool, str]:
     """Check for NVIDIA GPU via nvidia-smi."""
     try:
@@ -13824,13 +13850,16 @@ def _start_services(
         _amd_file_exists = _amd_short.exists() or _amd_legacy.exists()
         _amd_file = _amd_short if _amd_short.exists() else _amd_legacy
         if _nvidia_file.exists() and _amd_file_exists:
-            # Both overlay files present. Probe GPU tools to see if both are live.
-            _nvidia_live = subprocess.run(
-                ["nvidia-smi", "-L"], capture_output=True, timeout=10,
-            ).returncode == 0
-            _amd_live = subprocess.run(
-                ["rocm-smi", "--showid"], capture_output=True, timeout=10,
-            ).returncode == 0
+            # Both overlay files present. Probe GPU tools to see if both are
+            # live. A tool that isn't installed (no rocm-smi on a pure-NVIDIA
+            # box, the common case; or either tool on a non-GPU machine) or
+            # that hangs past the timeout means "not live" — it must NOT crash
+            # the install. See _gpu_tool_reports_live (v0.2.62 fix): pre-fix
+            # these two calls invoked subprocess.run unguarded and aborted the
+            # whole install/update with FileNotFoundError on any box missing a
+            # tool.
+            _nvidia_live = _gpu_tool_reports_live("nvidia-smi", ["-L"])
+            _amd_live = _gpu_tool_reports_live("rocm-smi", ["--showid"])
             if _nvidia_live and _amd_live:
                 deferral_report.add_entry(
                     DeferralEntry(
