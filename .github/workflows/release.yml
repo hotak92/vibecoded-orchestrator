@@ -112,7 +112,13 @@ jobs:
   pre-release-gate:
     name: Pre-release gate (smoke + manifest-validate)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # v0.2.62: 20→30. The gate (install.py + install-bundle + a cold-cache
+    # cargo build of the manifest-CI bins + gates 1-3) outgrew 20 min as the
+    # Rust workspace grew (v0.2.61 finished in 17m; v0.2.62 hit the 20m cap
+    # mid-"Gate 3" and was cancelled — which also killed the rust-cache save,
+    # so the next cold run would time out again). 30m gives headroom + lets the
+    # cache save land so subsequent runs are fast again.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
