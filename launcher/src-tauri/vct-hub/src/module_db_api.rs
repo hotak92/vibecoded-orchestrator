@@ -177,6 +177,12 @@ async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
         None => return err(StatusCode::BAD_REQUEST, "bad_path", "could not parse module / project from URL"),
     };
 
+    // v0.2.61 (Option H B3): the ephemeral identity path is authorized for a
+    // SINGLE capability — GET on the rl/events read route. Capture method +
+    // route-kind now so the ephemeral arm below can enforce least privilege.
+    let method = req.method().clone();
+    let is_rl_events_read = method == axum::http::Method::GET && is_rl_events_read_path(&path);
+
     // Look up the token row.
     let launcher_db = match req.extensions().get::<LauncherDbHandle>().cloned() {
         Some(h) => h,
@@ -234,6 +240,27 @@ async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
                             StatusCode::UNAUTHORIZED,
                             "module_mismatch",
                             "token does not authorize this module",
+                        );
+                    }
+                    // v0.2.61 (Option H B3): LEAST PRIVILEGE. The ephemeral
+                    // identity token is the credential a 3rd-party GLOBAL
+                    // container holds. It authorizes EXACTLY ONE capability:
+                    // GET on the module-scoped rl/events read route (the
+                    // container reading its own training corpus). It must NOT
+                    // reach the `/db/` CRUD routes (insert/patch/delete) — a
+                    // compromised or buggy container could otherwise write or
+                    // delete ANY project's module-namespace rows. Full CRUD
+                    // stays exclusively on the DB-backed per-(module, project)
+                    // token path (path 1 above), which is launcher-issued,
+                    // expiring, and project-scoped. (D-B auto-grant-open still
+                    // holds for the project DIMENSION of this one read route.)
+                    if !is_rl_events_read {
+                        return err(
+                            StatusCode::FORBIDDEN,
+                            "ephemeral_scope",
+                            "module-identity token authorizes only GET \
+                             /modules/{id}/projects/{pid}/rl/events; \
+                             use a per-project access token for db routes",
                         );
                     }
                     // SCOPE: the project named in the URL. The
@@ -308,6 +335,24 @@ fn parse_module_path(path: &str) -> Option<(String, Option<String>)> {
         }
     }
     None
+}
+
+/// True iff `path` is EXACTLY the module-scoped RL-events read route
+/// (`/modules/{id}/projects/{pid}/rl/events`), with no extra trailing
+/// segments. (v0.2.61, Option H B3.)
+///
+/// The ephemeral identity token is authorized ONLY for this one route (and
+/// only with GET) — see `require_module_scope`. It must NOT reach the `/db/`
+/// CRUD routes (insert/patch/delete). Exact-shape match (not a prefix) so a
+/// future `/rl/events/<x>` sub-route can't silently inherit the grant.
+fn is_rl_events_read_path(path: &str) -> bool {
+    let p = path.trim_start_matches("/api/v1").trim_start_matches('/');
+    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    parts.len() == 6
+        && parts[0] == "modules"
+        && parts[2] == "projects"
+        && parts[4] == "rl"
+        && parts[5] == "events"
 }
 
 #[derive(Clone, Debug)]

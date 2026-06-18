@@ -498,8 +498,34 @@ pub async fn start_container_after_install(
 /// launcher today, but it remains the DOCUMENTED source-of-truth the hub's
 /// duplicate is "kept in sync with" — keep it (and its value) authoritative
 /// here. `#[allow(dead_code)]` rather than deletion preserves that contract.
-#[allow(dead_code)]
 pub const GLOBAL_RL_PORT: u16 = 11443;
+
+/// Resolve the host port the RL reranker container listens on for a given
+/// project (v0.2.61, Option H B2 fix).
+///
+/// THE BUG THIS FIXES: after a module migrates to global scope
+/// (`auto_migrate_per_project_to_global`), there is ONE container serving all
+/// projects on `GLOBAL_RL_PORT` (11443), and the per-project `module_ports`
+/// rows are gone — the global supervisor never writes one. The finetune /
+/// rotate path used `get_project_rl_port(project_id)` (= `get_module_port(pid,
+/// "vct-rl-reranker")`), which now returns `None`/stale for a global install,
+/// so `/finetune` + `/rotate_weights` POSTed to a dead port → the whole
+/// launcher-side finetune/rotate path was DEAD-ON-ARRIVAL for global modules.
+/// (Rerank survived because it reaches the container via the MCP's
+/// `RL_SERVER_PORT` env — a separate channel.)
+///
+/// Resolution: if the module is installed as a GLOBAL row, use
+/// `GLOBAL_RL_PORT`; otherwise fall back to the per-project allocation.
+fn resolve_rl_port_for_project(db: &Db, project_id: &str) -> Result<u16, String> {
+    if matches!(
+        db.get_global_module_install(RL_RERANKER_MODULE_ID),
+        Ok(Some(_))
+    ) {
+        return Ok(GLOBAL_RL_PORT);
+    }
+    db.get_project_rl_port(project_id)?
+        .ok_or_else(|| format!("project {} has no rl_port", project_id))
+}
 
 /// v0.2.49 Stream A: start (or restart) the GLOBAL container for a
 /// module. Sibling of [`start_container_for_module`].
@@ -1520,9 +1546,9 @@ pub async fn apply_weights_update(
 
     match choice {
         FinetuneChoice::Skip => {
-            let rl_port = db
-                .get_project_rl_port(&project_id)?
-                .ok_or_else(|| format!("project {} has no rl_port", project_id))?;
+            // v0.2.61 (Option H B2): honor global scope — a global install
+            // listens on GLOBAL_RL_PORT, not the (now-absent) per-project port.
+            let rl_port = resolve_rl_port_for_project(&db, &project_id)?;
             let container_path = container_weights_path(
                 &response.embedding_source,
                 &response.latest_version,
@@ -1559,6 +1585,43 @@ pub async fn apply_weights_update(
 /// rotate with the UNMODIFIED downloaded weights. The user always gets
 /// the new global model — fine-tuning is a quality improvement, not a
 /// blocking step.
+/// RAII "finetune in flight" sentinel (v0.2.61, Option H B1).
+///
+/// Creating it writes `<vct_root_dir>/<module_id>.finetuning`; dropping it
+/// removes the file. Because it's dropped on EVERY exit path of
+/// `run_finetune_then_rotate_async` (early `?`, normal return, panic-unwind),
+/// the sentinel can never be orphaned by this task — the one residual case is
+/// a hard process crash, for which the hub's resume sweep treats a sentinel
+/// with no running container as stale (see the hub-side guard). The file's
+/// presence tells the hub's resume sweep "don't recreate the global container
+/// right now — a training job is using it."
+struct FinetuneSentinel {
+    path: std::path::PathBuf,
+}
+
+impl FinetuneSentinel {
+    fn create(module_id: &str) -> Self {
+        let path = vct_launcher_core::paths::finetune_sentinel_path(module_id);
+        // Best-effort: a failed write just means the hub MIGHT recreate the
+        // container mid-job (the old behavior); the poller still treats the
+        // resulting job-loss as failure, so we never report false success.
+        if let Err(e) = std::fs::write(&path, b"1") {
+            eprintln!(
+                "[module_service] could not write finetune sentinel {:?}: {} \
+                 (hub may recreate the container mid-job)",
+                path, e
+            );
+        }
+        Self { path }
+    }
+}
+
+impl Drop for FinetuneSentinel {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 async fn run_finetune_then_rotate_async(
     project_id: String,
     response: LatestVersionResponse,
@@ -1571,18 +1634,28 @@ async fn run_finetune_then_rotate_async(
         .map_err(|e| format!("re-open DB for background fine-tune: {}", e))?;
     let db = Db(std::sync::Mutex::new(conn));
 
-    let rl_port = db
-        .get_project_rl_port(&project_id)?
-        .ok_or_else(|| format!("project {} has no rl_port", project_id))?;
+    // v0.2.61 (Option H B2): honor global scope — a global install listens on
+    // GLOBAL_RL_PORT, not the (now-absent) per-project port.
+    let rl_port = resolve_rl_port_for_project(&db, &project_id)?;
     let container_path = container_weights_path(
         &response.embedding_source,
         &response.latest_version,
     );
 
+    // v0.2.61 (Option H B1): write the "finetune in flight" sentinel so the
+    // hub's boot resume sweep does NOT recreate (podman rm -f) the global
+    // container out from under this job. `FinetuneSentinel` removes the file
+    // on Drop — covering EVERY exit path (early `?`, panic-unwind, normal
+    // return). Only meaningful for a global install (the recreate-on-running
+    // self-heal only applies to global rows), but harmless to write either way.
+    let _finetune_sentinel = FinetuneSentinel::create(RL_RERANKER_MODULE_ID);
+
     let _ = app.emit(
         "module://finetune-progress",
         serde_json::json!({
+            "module_id": RL_RERANKER_MODULE_ID,
             "project_id": project_id,
+            "state": "running",
             "percent": 0,
             "message": "Starting fine-tune…",
         }),
@@ -1628,8 +1701,22 @@ async fn run_finetune_then_rotate_async(
         .send()
         .await;
 
+    // v0.2.61 (Option H B1): track the ACTUAL terminal outcome so the
+    // post-loop emit reflects reality. The old code `break`-ed identically on
+    // done / failed / non-2xx / loop-exhaustion, then unconditionally emitted
+    // "percent:100, Done" — reporting SUCCESS on a no-op or killed job. We now
+    // distinguish: `Done` (genuine terminal "done"), `Failed(reason)` (the
+    // container said failed/error/non-2xx OR the job was LOST — a streak of
+    // connection errors, which is the signature of a mid-finetune container
+    // recreate killing the job), or `Inconclusive` (loop exhausted while still
+    // "running" at the 5-min cap). Only `Done` reports success downstream.
+    enum FtOutcome {
+        Done,
+        Failed(String),
+        Inconclusive,
+    }
     let mut job_id: Option<String> = None;
-    match kick {
+    let outcome: FtOutcome = match kick {
         Ok(r) if r.status().is_success() => {
             // Capture job_id from kick response if present.
             if let Ok(payload) = r.json::<serde_json::Value>().await {
@@ -1640,6 +1727,13 @@ async fn run_finetune_then_rotate_async(
             }
 
             // Poll /finetune_status. Hard cap: 60 attempts × 5s = 5 min.
+            // A streak of consecutive connection errors means the container
+            // went away mid-job (e.g. recreated by a hub-restart self-heal,
+            // OOM, crash). Treat a sustained streak as job-loss FAILURE rather
+            // than "keep trying forever then fall through to a false Done".
+            const MAX_CONSECUTIVE_CONN_ERRORS: u32 = 6; // ~30s of total silence
+            let mut consecutive_conn_errors: u32 = 0;
+            let mut loop_outcome: Option<FtOutcome> = None;
             for attempt in 0..60u32 {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 let mut req = client.get(&status_url);
@@ -1649,6 +1743,7 @@ async fn run_finetune_then_rotate_async(
                 let status = req.send().await;
                 match status {
                     Ok(s) if s.status().is_success() => {
+                        consecutive_conn_errors = 0;
                         let payload: serde_json::Value =
                             s.json().await.unwrap_or_else(|_| serde_json::json!({}));
                         let state = payload
@@ -1662,7 +1757,9 @@ async fn run_finetune_then_rotate_async(
                         let _ = app.emit(
                             "module://finetune-progress",
                             serde_json::json!({
+                                "module_id": RL_RERANKER_MODULE_ID,
                                 "project_id": project_id,
+                                "state": "running",
                                 "percent": percent,
                                 "message": format!("Fine-tuning… ({})", state),
                             }),
@@ -1678,6 +1775,7 @@ async fn run_finetune_then_rotate_async(
                         // `/finetune` handler updates the row when its
                         // own job completes.
                         if state == "done" {
+                            loop_outcome = Some(FtOutcome::Done);
                             break;
                         }
                         if state == "failed" || state == "error" {
@@ -1687,64 +1785,123 @@ async fn run_finetune_then_rotate_async(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("unknown error")
                                 .to_string();
-                            let _ = app.emit(
-                                "module://finetune-failed",
-                                serde_json::json!({
-                                    "project_id": project_id,
-                                    "reason": reason,
-                                }),
-                            );
+                            loop_outcome = Some(FtOutcome::Failed(reason));
                             break;
                         }
                     }
                     Ok(s) => {
-                        let _ = app.emit(
-                            "module://finetune-failed",
-                            serde_json::json!({
-                                "project_id": project_id,
-                                "reason": format!("finetune_status {}", s.status()),
-                            }),
-                        );
+                        // Non-2xx from /finetune_status (e.g. fresh container
+                        // 404s on an unknown job_id after a recreate).
+                        loop_outcome = Some(FtOutcome::Failed(format!(
+                            "finetune_status {}",
+                            s.status()
+                        )));
                         break;
                     }
                     Err(e) => {
-                        eprintln!("[module_service] finetune_status poll error: {}", e);
-                        // Keep trying — transient.
+                        consecutive_conn_errors += 1;
+                        eprintln!(
+                            "[module_service] finetune_status poll error ({}/{}): {}",
+                            consecutive_conn_errors, MAX_CONSECUTIVE_CONN_ERRORS, e
+                        );
+                        if consecutive_conn_errors >= MAX_CONSECUTIVE_CONN_ERRORS {
+                            // The container is gone and isn't coming back on
+                            // the same job — job lost (recreate/crash). Don't
+                            // pretend it completed.
+                            loop_outcome = Some(FtOutcome::Failed(format!(
+                                "fine-tune job lost — container unreachable for \
+                                 {} consecutive polls (~{}s); likely recreated or \
+                                 crashed mid-job",
+                                consecutive_conn_errors,
+                                consecutive_conn_errors * 5
+                            )));
+                            break;
+                        }
+                        // else: transient — keep trying.
                     }
                 }
             }
+            loop_outcome.unwrap_or(FtOutcome::Inconclusive)
         }
-        Ok(r) => {
+        Ok(r) => FtOutcome::Failed(format!(
+            "finetune {} (container may not support /finetune)",
+            r.status()
+        )),
+        Err(e) => FtOutcome::Failed(format!("finetune unreachable: {}", e)),
+    };
+
+    // Rotate unconditionally — see contract pin in fn doc: the user always
+    // gets the new GLOBAL model; fine-tuning is a quality improvement layered
+    // on top, not a gate. (If the recreate-skip guard held the container open,
+    // a genuine `Done` means the rotate swaps in the freshly fine-tuned head.)
+    let rotate_result = signal_rotate_weights(rl_port, &container_path, &project_id).await;
+
+    // v0.2.61 (Option H B1 + C-FE): the FINAL emit reflects the ACTUAL
+    // outcome — never a blanket "Done". A failed/lost/inconclusive fine-tune
+    // no longer masquerades as success. We still rotated (above), so the user
+    // has the new base global model regardless; the message just tells the
+    // truth about whether it was specialized to their corpus.
+    match (&outcome, &rotate_result) {
+        (FtOutcome::Done, Ok(())) => {
             let _ = app.emit(
-                "module://finetune-failed",
+                "module://finetune-progress",
                 serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
                     "project_id": project_id,
-                    "reason": format!("finetune {} (container may not support /finetune)", r.status()),
+                    "state": "done",
+                    "percent": 100,
+                    "message": "Fine-tune complete",
                 }),
             );
         }
-        Err(e) => {
+        (FtOutcome::Done, Err(e)) => {
+            // Trained fine, but the rotate-in failed — surface that.
             let _ = app.emit(
                 "module://finetune-failed",
                 serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
                     "project_id": project_id,
-                    "reason": format!("finetune unreachable: {}", e),
+                    "state": "failed",
+                    "reason": format!("fine-tune completed but weight rotation failed: {}", e),
+                }),
+            );
+        }
+        (FtOutcome::Failed(reason), rotate) => {
+            let rotate_note = match rotate {
+                Ok(()) => "base model rotated in; not specialized to your data",
+                Err(e) => return Err(format!(
+                    "fine-tune failed ({}) and rotate failed ({})",
+                    reason, e
+                )),
+            };
+            let _ = app.emit(
+                "module://finetune-failed",
+                serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
+                    "project_id": project_id,
+                    "state": "failed",
+                    "reason": format!("{} ({})", reason, rotate_note),
+                }),
+            );
+        }
+        (FtOutcome::Inconclusive, rotate) => {
+            // Loop hit the 5-min cap while still "running". Don't claim done;
+            // don't claim failed. The container may still finish on its own.
+            if let Err(e) = rotate {
+                return Err(format!("fine-tune inconclusive and rotate failed: {}", e));
+            }
+            let _ = app.emit(
+                "module://finetune-failed",
+                serde_json::json!({
+                    "module_id": RL_RERANKER_MODULE_ID,
+                    "project_id": project_id,
+                    "state": "failed",
+                    "reason": "fine-tune did not finish within 5 minutes; \
+                               base model rotated in — re-run to specialize",
                 }),
             );
         }
     }
-
-    // Rotate unconditionally — see contract pin in fn doc.
-    signal_rotate_weights(rl_port, &container_path, &project_id).await?;
-
-    let _ = app.emit(
-        "module://finetune-progress",
-        serde_json::json!({
-            "project_id": project_id,
-            "percent": 100,
-            "message": "Done",
-        }),
-    );
     Ok(())
 }
 

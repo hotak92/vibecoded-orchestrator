@@ -670,6 +670,37 @@ pub async fn resume_containers_on_startup_with_starter(
         match project_id_opt {
             None => {
                 // GLOBAL path — hub side.
+                //
+                // v0.2.61 (Option H B1): DEFER the recreate when a fine-tune
+                // is in flight. The recreate (`podman rm -f` inside
+                // `start_global_container_supervisor`) would HARD-KILL a
+                // training job running in the live container. Martino's
+                // directive: "don't assume a user action, allow the job to
+                // finish, periodically poll, when we can safely restart do
+                // so." So: if the container is running AND the launcher's
+                // finetune sentinel exists, skip the recreate now and spawn a
+                // background task that polls the sentinel and performs the
+                // re-mint once the job finishes. The brief 401-on-/rl/events
+                // cost (the live container's token isn't in this fresh hub's
+                // map) is acceptable — finetune talks DIRECTLY to the
+                // container, not through the hub, so the job keeps running.
+                let running = match &container_name_opt {
+                    Some(name) => is_container_running(name).await.unwrap_or(false),
+                    None => false,
+                };
+                let sentinel =
+                    vct_launcher_core::paths::finetune_sentinel_path(&module_id);
+                if running && sentinel.exists() {
+                    eprintln!(
+                        "[module_supervisor] resume: global {} has a fine-tune in \
+                         flight (sentinel present) + container running; deferring \
+                         re-mint until the job finishes",
+                        module_id
+                    );
+                    spawn_deferred_global_remint(manifest.clone(), module_id.clone());
+                    continue;
+                }
+
                 if let Err(e) =
                     start_global_container_supervisor(&manifest, &module_id).await
                 {
@@ -843,6 +874,74 @@ fn module_spawn_lock(module_id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> 
         .entry(module_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
+}
+
+/// Background "re-mint once the fine-tune finishes" task (v0.2.61, Option H
+/// B1). Spawned by the resume sweep when it finds a running global container
+/// with a fine-tune in flight. Polls the finetune sentinel every 30s; once it
+/// clears (the launcher's `FinetuneSentinel` drops on job completion/failure)
+/// AND the container is still running, performs the deferred recreate +
+/// re-mint so the hub↔container token contract is restored. Bounded so a stuck
+/// sentinel (e.g. launcher process crashed without removing it) can't poll
+/// forever — after the cap we re-mint anyway (the next hub boot is the
+/// ultimate backstop regardless).
+fn spawn_deferred_global_remint(manifest: ModuleManifest, module_id: String) {
+    tokio::spawn(async move {
+        const POLL_INTERVAL_SECS: u64 = 30;
+        // ~30 min cap: a real fine-tune is capped at 5 min launcher-side, so
+        // 30 min comfortably covers a slow run while bounding a stuck sentinel.
+        const MAX_POLLS: u32 = 60;
+        let sentinel = vct_launcher_core::paths::finetune_sentinel_path(&module_id);
+        for poll in 0..MAX_POLLS {
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+            if !sentinel.exists() {
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: fine-tune for {} \
+                     finished (sentinel cleared); performing re-mint",
+                    module_id
+                );
+                break;
+            }
+            if poll + 1 == MAX_POLLS {
+                // Stuck sentinel — likely a crashed launcher that never
+                // cleaned up. Remove the stale file and re-mint anyway so we
+                // don't strand the container on a token this hub doesn't know.
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: sentinel for {} still \
+                     present after {} polls (~{} min); treating as stale and \
+                     re-minting",
+                    module_id,
+                    MAX_POLLS,
+                    (MAX_POLLS as u64 * POLL_INTERVAL_SECS) / 60
+                );
+                let _ = std::fs::remove_file(&sentinel);
+            }
+        }
+        match start_global_container_supervisor(&manifest, &module_id).await {
+            Ok(name) => {
+                // Open a fresh launcher.db handle for the persist (the
+                // resume sweep's borrowed `&Db` can't cross the 'static spawn
+                // boundary). Mirrors how server.rs wires the DB on boot.
+                match vct_launcher_core::db::Db::open() {
+                    Ok(db) => {
+                        let _ = db.set_global_module_container_name(&module_id, &name);
+                    }
+                    Err(e) => eprintln!(
+                        "[module_supervisor] deferred re-mint: Db::open() to persist \
+                         container_name for {}: {}",
+                        module_id, e
+                    ),
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[module_supervisor] deferred re-mint: \
+                     start_global_container_supervisor({}): {}",
+                    module_id, e
+                );
+            }
+        }
+    });
 }
 
 pub async fn start_global_container_supervisor(
