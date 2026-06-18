@@ -7088,6 +7088,27 @@ def _is_under_temp_dir(p: Path) -> bool:
         return False
 
 
+def _is_ephemeral_worktree_root(p: Path) -> bool:
+    """True if ``p`` is a git LINKED WORKTREE living under the system temp dir.
+
+    This is the precise WS-4 Finding 3 pollution shape: agent worktrees created
+    by ``git worktree add /tmp/vco-track-*`` (a linked worktree has ``.git`` as a
+    FILE — ``gitdir: …/worktrees/<name>`` — not a directory). Indexing such a
+    throwaway checkout into the persistent per-project collection leaks
+    duplicate symbols keyed on temp paths.
+
+    Deliberately NARROW: a plain temp directory, a ``git init`` repo in temp
+    (``.git`` is a dir), or a ``git clone`` into temp (``.git`` dir) are all
+    legitimate analysis roots and are NOT skipped — only ephemeral linked
+    worktrees under temp are. (Earlier the guard skipped ALL temp roots, which
+    silently no-op'd legitimate temp analysis incl. CI fixtures.)
+    """
+    try:
+        return _is_under_temp_dir(p) and (p / ".git").is_file()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Analyze codebase and extract entities into Weaviate code graph",
@@ -7211,19 +7232,20 @@ def main():
         print(f"❌ Repository path does not exist: {repo_path}", file=sys.stderr)
         return 1
 
-    # WS-4 Finding 3: refuse to index a temp-dir root into the persistent
-    # per-project collection. This is almost always an agent git-worktree
-    # (e.g. /tmp/vco-track-*) whose throwaway paths would pollute the shared
-    # CodeFunction collection (the source of the ~34k __tmp_* garbage rows).
+    # WS-4 Finding 3: refuse to index an EPHEMERAL agent git-worktree under the
+    # system temp dir (e.g. /tmp/vco-track-*) into the persistent per-project
+    # collection — that throwaway checkout's paths were the source of the ~34k
+    # __tmp_* garbage rows. Narrow on purpose: a plain temp dir / git-init repo
+    # / clone in temp is a legitimate root and is NOT skipped.
     # Skip (exit 0 — a deliberate no-op, NOT an error the hook should surface).
-    if _is_under_temp_dir(repo_path) and not args.allow_temp_root:
+    if _is_ephemeral_worktree_root(repo_path) and not args.allow_temp_root:
         print(
-            f"⚠️  Skipping code-graph analysis: repo_path is under the system temp dir "
-            f"({repo_path}).", file=sys.stderr,
+            f"⚠️  Skipping code-graph analysis: repo_path is an ephemeral git "
+            f"worktree under the system temp dir ({repo_path}).", file=sys.stderr,
         )
         print(
-            "    Indexing a transient location (e.g. an agent /tmp worktree) would "
-            "pollute the persistent collection with throwaway paths (WS-4 Finding 3). "
+            "    Indexing a transient agent worktree would pollute the persistent "
+            "collection with throwaway paths (WS-4 Finding 3). "
             "Pass --allow-temp-root to override.", file=sys.stderr,
         )
         return 0
@@ -7423,17 +7445,18 @@ def main():
                 print(json.dumps(payload), flush=True)
             analyzer._progress_emitter = _emit_progress
 
-        # WS-4 Finding 3: drop any --extra-path under the system temp dir
-        # (same agent-worktree pollution vector as the primary-root guard).
+        # WS-4 Finding 3: drop any --extra-path that is an ephemeral agent
+        # git-worktree under the system temp dir (same pollution vector as the
+        # primary-root guard; legit temp repos/clones are kept).
         extra_paths = list(args.extra_paths or [])
         if not args.allow_temp_root:
             kept = []
             for ep in extra_paths:
-                if _is_under_temp_dir(ep):
+                if _is_ephemeral_worktree_root(ep):
                     print(
-                        f"⚠️  Skipping --extra-path under the system temp dir "
-                        f"({ep}) — would pollute the persistent collection (WS-4 "
-                        "Finding 3). Pass --allow-temp-root to override.",
+                        f"⚠️  Skipping --extra-path (ephemeral git worktree under "
+                        f"the system temp dir): {ep} — would pollute the persistent "
+                        "collection (WS-4 Finding 3). Pass --allow-temp-root to override.",
                         file=sys.stderr,
                     )
                 else:

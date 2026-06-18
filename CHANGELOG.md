@@ -38,11 +38,13 @@ code-graph search quality.
   `call_names` against the dotted `full_name` verbatim, so the documented input
   form never matched and `callers` silently returned nothing for every project.
   It now matches the target *and* its bare leaf (splitting on `.` or Rust `::`).
-- **Code-graph analyzer skips temp-dir roots.** Agent git-worktrees under the
-  system temp dir (`/tmp/vco-track-*`) could be analyzed as a root or
+- **Code-graph analyzer skips ephemeral agent worktrees.** Agent git-worktrees
+  under the system temp dir (`/tmp/vco-track-*`) could be analyzed as a root or
   `--extra-path`, leaking thousands of throwaway rows into the persistent
-  per-project collection. The analyzer now skips a temp-dir `repo_path` (exit 0)
-  and filters temp `--extra-path`s, with `--allow-temp-root` to override.
+  per-project collection. The analyzer now skips a `repo_path` (and filters
+  `--extra-path`s) that is a git *linked worktree* under the system temp dir
+  (`.git` is a file), with `--allow-temp-root` to override. A plain temp dir, a
+  `git init` repo, or a clone in temp remains a legitimate, analyzable root.
 
 ## [0.2.61] - 2026-06-18
 
