@@ -62,6 +62,35 @@ services:
       PERSISTENCE_MEMTABLES_MAX_SIZE_MB: 500
       PERSISTENCE_LSM_MAX_SEGMENT_SIZE: 500MiB
       LIMIT_RESOURCES: "true"
+      # --- HNSW TOMBSTONE-CLEANUP CHURN REDUCTION (v0.2.61) ---
+      # Mirror of the tuning in infrastructure/docker-compose.yml (canonical);
+      # this legacy compose path wires into the same shared volume so it must
+      # carry the same knobs. SECOND disk-leak source, distinct from the
+      # memtable write-amp above: the code-graph collections accumulate large
+      # tombstone counts (re-analyze deletes+re-inserts changed rows). Weaviate
+      # runs a per-(class × named-vector × shard) HNSW tombstone-cleanup cycle
+      # on a FIXED 300s ticker (hnsw/config.go DefaultCleanupIntervalSeconds =
+      # 5*60; FixedTicker never backs off). With ~300 such indexes on a
+      # multi-project install the 300s cycles interleave to ~1 cleanup/sec, and
+      # each that finds work rewrites HNSW neighbor edges IN PLACE → GB/hour of
+      # mtime-invisible writes. The spin: default MIN_PER_CYCLE=0 makes a
+      # cleanup walk the whole graph on ANY non-zero tombstone count
+      # (copyTombstonesToAllowList only short-circuits at EXACTLY 0), so a
+      # collection sitting at thousands of tombstones re-walks every tick.
+      # FIX: raise the MIN so cleanup is a cheap no-op until tombstones justify
+      # the walk. Global env read via os.Getenv in delete.go (NOT in
+      # environment.go), verified verbatim at the v1.28.4 tag; applies to ALL
+      # existing collections immediately, unlike the per-class
+      # cleanupIntervalSeconds which config_update.go marks IMMUTABLE.
+      # SAFE / NO DATA LOSS: cleanup is pure GC of ALREADY-deleted vectors —
+      # deferring it only delays reclaiming a few MB of dead-vector disk; it
+      # never touches live data (searches already skip tombstoned nodes). The
+      # MAX cap spreads a big reclaim over several short cycles instead of one
+      # multi-GB stall; CONCURRENCY=1 keeps a firing cleanup off the disk/CPU
+      # hot path on small hosts. All three verified at v1.28.4.
+      TOMBSTONE_DELETION_MIN_PER_CYCLE: "10000"
+      TOMBSTONE_DELETION_MAX_PER_CYCLE: "10000"
+      TOMBSTONE_DELETION_CONCURRENCY: "1"
       # Disk usage thresholds (default 80%/90%/95%): raised to allow
       # operation on a nearly-full disk where the user has knowingly
       # accepted the risk. Warning at 95% so 80-94% disk doesn't spam
