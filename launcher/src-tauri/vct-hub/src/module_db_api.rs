@@ -177,11 +177,20 @@ async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
         None => return err(StatusCode::BAD_REQUEST, "bad_path", "could not parse module / project from URL"),
     };
 
-    // v0.2.61 (Option H B3): the ephemeral identity path is authorized for a
-    // SINGLE capability — GET on the rl/events read route. Capture method +
-    // route-kind now so the ephemeral arm below can enforce least privilege.
+    // v0.2.61 (Option H B3 + CONFIRM-3): the ephemeral identity path is
+    // authorized for a NARROW set of same-module-same-pid capabilities:
+    //   * GET on the rl/events read route (read its own training corpus), AND
+    //   * the module's OWN db/rows routes (write/read its own `{namespace}_*`
+    //     status rows — the real RL container upserts rl_state /
+    //     rl_weights_state / rl_global_weights_state here). NOT arbitrary /db/
+    //     CRUD on another module: the `owner == module_id_from_url` check above
+    //     + the downstream `validate_table_name` namespace gate confine it to
+    //     this module's tables, and the URL pid bounds the project.
+    // Capture the route-kind now so the ephemeral arm below can enforce it.
     let method = req.method().clone();
     let is_rl_events_read = method == axum::http::Method::GET && is_rl_events_read_path(&path);
+    let is_own_db_rows = is_db_rows_path(&path);
+    let ephemeral_allowed = is_rl_events_read || is_own_db_rows;
 
     // Look up the token row.
     let launcher_db = match req.extensions().get::<LauncherDbHandle>().cloned() {
@@ -242,25 +251,29 @@ async fn require_module_scope(req: Request<Body>, next: Next) -> Response {
                             "token does not authorize this module",
                         );
                     }
-                    // v0.2.61 (Option H B3): LEAST PRIVILEGE. The ephemeral
-                    // identity token is the credential a 3rd-party GLOBAL
-                    // container holds. It authorizes EXACTLY ONE capability:
-                    // GET on the module-scoped rl/events read route (the
-                    // container reading its own training corpus). It must NOT
-                    // reach the `/db/` CRUD routes (insert/patch/delete) — a
-                    // compromised or buggy container could otherwise write or
-                    // delete ANY project's module-namespace rows. Full CRUD
-                    // stays exclusively on the DB-backed per-(module, project)
-                    // token path (path 1 above), which is launcher-issued,
-                    // expiring, and project-scoped. (D-B auto-grant-open still
-                    // holds for the project DIMENSION of this one read route.)
-                    if !is_rl_events_read {
+                    // v0.2.61 (Option H B3 + CONFIRM-3): LEAST PRIVILEGE. The
+                    // ephemeral identity token (a 3rd-party GLOBAL container's
+                    // credential) authorizes a NARROW set, all scoped to THIS
+                    // module + the URL pid:
+                    //   * GET rl/events (read its own training corpus), and
+                    //   * its OWN db/rows routes (read/write its own
+                    //     `{namespace}_*` rows — the RL container upserts
+                    //     rl_state / rl_weights_state / rl_global_weights_state
+                    //     here; without this they'd 401 and the dashboard would
+                    //     show "no model" permanently).
+                    // It must NOT reach any OTHER route (e.g. token/refresh) and
+                    // — via the `owner == module_id_from_url` check above +
+                    // `validate_table_name`'s namespace-prefix gate downstream —
+                    // cannot touch another module's tables or escape the URL
+                    // pid. A per-(module,project) DB token (path 1) remains the
+                    // path for anything outside this same-module-same-pid set.
+                    if !ephemeral_allowed {
                         return err(
                             StatusCode::FORBIDDEN,
                             "ephemeral_scope",
                             "module-identity token authorizes only GET \
-                             /modules/{id}/projects/{pid}/rl/events; \
-                             use a per-project access token for db routes",
+                             /modules/{id}/projects/{pid}/rl/events and this \
+                             module's own /db/projects/{pid}/rows/* routes",
                         );
                     }
                     // SCOPE: the project named in the URL. The
@@ -339,11 +352,7 @@ fn parse_module_path(path: &str) -> Option<(String, Option<String>)> {
 
 /// True iff `path` is EXACTLY the module-scoped RL-events read route
 /// (`/modules/{id}/projects/{pid}/rl/events`), with no extra trailing
-/// segments. (v0.2.61, Option H B3.)
-///
-/// The ephemeral identity token is authorized ONLY for this one route (and
-/// only with GET) — see `require_module_scope`. It must NOT reach the `/db/`
-/// CRUD routes (insert/patch/delete). Exact-shape match (not a prefix) so a
+/// segments. (v0.2.61, Option H B3.) Exact-shape match (not a prefix) so a
 /// future `/rl/events/<x>` sub-route can't silently inherit the grant.
 fn is_rl_events_read_path(path: &str) -> bool {
     let p = path.trim_start_matches("/api/v1").trim_start_matches('/');
@@ -353,6 +362,31 @@ fn is_rl_events_read_path(path: &str) -> bool {
         && parts[2] == "projects"
         && parts[4] == "rl"
         && parts[5] == "events"
+}
+
+/// True iff `path` is a module-scoped DB-rows route
+/// (`/modules/{id}/db/projects/{pid}/rows/{table}` or `.../rows/{table}/{key}`).
+/// (v0.2.61, Option H — CONFIRM-3 widening.)
+///
+/// The ephemeral identity token is authorized for these routes ON ITS OWN
+/// MODULE'S rows for the URL pid it presents (see `require_module_scope`): the
+/// real RL container writes its own `rl_state` / `rl_weights_state` /
+/// `rl_global_weights_state` status rows here with the identity token. This is
+/// still least-privilege — the module writing its OWN `{namespace}_*` rows for
+/// the project it's acting on. The earlier same-module check
+/// (`owner == module_id_from_url`) + the downstream `validate_table_name`
+/// namespace-prefix gate prevent it from touching ANOTHER module's tables;
+/// the URL pid bounds the project. Exact 6/7-segment shapes only.
+fn is_db_rows_path(path: &str) -> bool {
+    let p = path.trim_start_matches("/api/v1").trim_start_matches('/');
+    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    // [modules, {id}, db, projects, {pid}, rows, {table}]            = 7
+    // [modules, {id}, db, projects, {pid}, rows, {table}, {key}]     = 8
+    (parts.len() == 7 || parts.len() == 8)
+        && parts[0] == "modules"
+        && parts[2] == "db"
+        && parts[3] == "projects"
+        && parts[5] == "rows"
 }
 
 #[derive(Clone, Debug)]
@@ -1782,13 +1816,15 @@ mod integration_tests {
     // ─── v0.2.61 (Option H B3): ephemeral-token least privilege ──────────
 
     #[tokio::test]
-    async fn ephemeral_token_rejected_on_db_crud_route() {
+    async fn ephemeral_token_authorizes_own_module_db_rows_write() {
         let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // B3 regression: the ephemeral IDENTITY token must NOT authorize the
-        // /db/ CRUD routes (insert/patch/delete). Before the fix it did —
-        // a global container's per-spawn token could write/delete ANY
-        // project's module-namespace rows. Now it's GET+rl/events only;
-        // a POST to /db/.../rows must 403 with ephemeral_scope.
+        // v0.2.61 CONFIRM-3: the ephemeral IDENTITY token authorizes the
+        // module writing its OWN `{namespace}_*` rows for the URL pid (the real
+        // RL container upserts rl_state/rl_weights_state/rl_global_weights_state
+        // this way). A POST to its own /db/.../rows must SUCCEED (200) — earlier
+        // B3 over-tightened this to 403, which would have 401'd the container's
+        // status writes → permanent "no model" dashboard. The namespace +
+        // same-module + URL-pid gates keep it least-privilege.
         let (base, _h, _db_token) = spawn("test-mod", "proj1", "rl").await;
         let ident = crate::module_identity::mint_and_register("test-mod").expect("mint");
 
@@ -1803,12 +1839,61 @@ mod integration_tests {
         let status = resp.status();
         let body = resp.text().await.unwrap();
         assert_eq!(
-            status, 403,
-            "ephemeral token must be FORBIDDEN on /db/ CRUD routes; body: {}", body
+            status, 200,
+            "ephemeral token must authorize its OWN module's db/rows write; body: {}", body
         );
+
+        crate::module_identity::revoke("test-mod");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_token_rejected_on_other_module_db_rows() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // CONFIRM-3 security boundary: the db/rows widening is SAME-MODULE only.
+        // An identity token for module-x hitting module-y's db/rows must 401
+        // (module_mismatch) — it can never write ANOTHER module's namespace.
+        let (base, _h, _db_token) = spawn("module-x", "proj1", "rl").await;
+        let ident = crate::module_identity::mint_and_register("module-x").expect("mint");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/modules/module-y/db/projects/proj1/rows/rl_state", base))
+            .headers(auth_header(&ident))
+            .json(&serde_json::json!({ "key": "k1", "fields": { "value": "v1" } }))
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(
+            resp.status(),
+            401,
+            "identity token for module-x must NOT write module-y's db/rows"
+        );
+
+        crate::module_identity::revoke("module-x");
+    }
+
+    #[tokio::test]
+    async fn ephemeral_token_rejected_on_token_refresh() {
+        let _g = IDENTITY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The widening is rl/events + db/rows ONLY. A non-db, non-rl/events
+        // module route (token/refresh) must still 403 ephemeral_scope — the
+        // identity path has no DB row to rotate.
+        let (base, _h, _db_token) = spawn("test-mod", "proj1", "rl").await;
+        let ident = crate::module_identity::mint_and_register("test-mod").expect("mint");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/modules/test-mod/token/refresh", base))
+            .headers(auth_header(&ident))
+            .send()
+            .await
+            .expect("hub reachable");
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 403, "token/refresh must 403 for an ephemeral token; body: {}", body);
         assert!(
             body.contains("ephemeral_scope"),
-            "403 must carry the ephemeral_scope error code; body: {}", body
+            "403 must carry ephemeral_scope; body: {}", body
         );
 
         crate::module_identity::revoke("test-mod");
@@ -1852,5 +1937,22 @@ mod integration_tests {
         assert!(!is_rl_events_read_path("/api/v1/modules/m/projects/p/rl/events/extra"));
         // token route — must NOT match.
         assert!(!is_rl_events_read_path("/api/v1/modules/m/token/refresh"));
+    }
+
+    #[test]
+    fn is_db_rows_path_exact_shapes_only() {
+        // v0.2.61 CONFIRM-3 matcher: only the 7-segment (insert/list) and
+        // 8-segment (get/patch/delete by key) db/rows shapes match.
+        assert!(is_db_rows_path("/api/v1/modules/m/db/projects/p/rows/t"));        // 7
+        assert!(is_db_rows_path("/api/v1/modules/m/db/projects/p/rows/t/k"));      // 8
+        assert!(is_db_rows_path("modules/m/db/projects/p/rows/t"));
+        // rl/events — must NOT match (that's the other matcher).
+        assert!(!is_db_rows_path("/api/v1/modules/m/projects/p/rl/events"));
+        // token route — must NOT match.
+        assert!(!is_db_rows_path("/api/v1/modules/m/token/refresh"));
+        // db without the rows tail — must NOT match.
+        assert!(!is_db_rows_path("/api/v1/modules/m/db/projects/p"));
+        // too deep — must NOT match (no prefix inheritance past {key}).
+        assert!(!is_db_rows_path("/api/v1/modules/m/db/projects/p/rows/t/k/extra"));
     }
 }
