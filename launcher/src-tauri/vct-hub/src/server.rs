@@ -18,8 +18,9 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use super::{
-    api, auth, cli_api, config_api, db, lifecycle_api, mcp_tool_grants_api, module_db_api,
-    module_supervisor, modules_api, project_state_api, rl_events_api, secrets_api, weaviate_probe,
+    api, auth, cli_api, config_api, db, infra_watchdog, lifecycle_api, mcp_tool_grants_api,
+    module_db_api, module_supervisor, modules_api, project_state_api, rl_events_api, secrets_api,
+    weaviate_probe,
 };
 
 const DEFAULT_PORT: u16 = 7700;
@@ -243,6 +244,18 @@ pub async fn start_hub_server() -> Result<u16, String> {
         )
         .await;
     });
+
+    // v0.2.62: continuous infra-container watchdog. Distinct from the
+    // module supervisor above (paid modules) — this one keeps the shared
+    // infra stack (vco_weaviate / vco_ollama / vco_code_embed) alive when
+    // a container dies or is stopped mid-session, which previously went
+    // unhealed until the launcher was restarted. Self-spawns a detached
+    // task (or logs + no-ops when disabled via VCT_HUB_INFRA_WATCHDOG=0),
+    // soft-fails every tick, and never restarts a service the user
+    // adopted / runs in parallel / refused / paused. The launcher's own
+    // boot-time `services_start_all` + the SessionStart hook remain the
+    // cold-start path; the watchdog is the always-on safety net.
+    infra_watchdog::spawn_infra_watchdog(launcher_state.clone());
 
     println!("[vct-hub] API server running on http://127.0.0.1:{}", actual_port);
     Ok(actual_port)

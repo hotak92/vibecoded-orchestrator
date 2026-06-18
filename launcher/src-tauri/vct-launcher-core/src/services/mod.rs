@@ -2,12 +2,23 @@
 //!
 //! v0.2.21 split out of the launcher's `services/` directory. Only the
 //! runtime-agnostic / Tauri-free helpers live here; the launcher's
-//! `services/adoption.rs`, `services/settings_json_watcher.rs`, and
-//! `services/watcher.rs` (the supervisor — relocating to vct-hub in
-//! Step 4) remain in the launcher crate.
+//! `services/settings_json_watcher.rs` and `services/watcher.rs` (the
+//! GUI-side supervisor) remain in the launcher crate.
 
 pub mod picker;
 pub mod runtime;
+
+// v0.2.62: per-service adoption state (`<vct_root_dir>/services.toml`).
+// MOVED here from `launcher/src-tauri/src/services/adoption.rs` so the
+// hub-side infra watchdog (`vct-hub::infra_watchdog`) can read the same
+// adopt/parallel/refuse decisions the launcher GUI persists, WITHOUT a
+// second copy of the schema. The module is pure (serde + toml + the
+// shared `crate::paths::vct_root_dir()` lookup) — it never depended on
+// Tauri, only on its file location. The launcher's
+// `src/services/adoption.rs` is now a thin `pub use` re-export so its
+// many call-sites compile unchanged. The watchdog NEVER touches a
+// service whose adoption mode is Adopt / Parallel / Refuse.
+pub mod adoption;
 
 // v0.2.47: shared per-paid-module container helpers. Previously two
 // near-identical copies lived in launcher/src/commands/module_service.rs

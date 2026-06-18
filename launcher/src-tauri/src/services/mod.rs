@@ -8,8 +8,10 @@
 //!     `com.docker.compose.service=<name>` label-collision case. *Also
 //!     in `vct-launcher-core::services::picker` as of v0.2.21.*
 //!   - [`adoption`]: persist the user's adopt-vs-parallel choice for
-//!     externally-managed services in `~/.vct/services.toml`. Stays in
-//!     the launcher (Tauri-dependent).
+//!     externally-managed services in `~/.vct/services.toml`. *Moved to
+//!     `vct_launcher_core::services::adoption` in v0.2.62 so the hub's
+//!     infra watchdog reads the same decisions; the launcher submodule
+//!     is now a thin `pub use` re-export.*
 //!   - [`settings_json_watcher`]: launcher-side reactive watcher for
 //!     `.claude/settings.json` edits. Stays in the launcher.
 //!   - [`watcher`]: 30s polling supervisor that auto-restarts crashed

@@ -32,6 +32,13 @@ pub mod db;
 // v0.2.54 Track J — shared JSON error envelope, extracted from four
 // byte-identical `error_response` copies in the *_api modules.
 pub mod http_error;
+// v0.2.62: continuous infra-container watchdog. Spawned from
+// `server::start_hub_server`; restarts down `vco_weaviate` /
+// `vco_ollama` / `vco_code_embed` that VCO manages (not user-adopted /
+// paused), with crash-loop backoff. The launcher-only path used to be
+// the sole restarter (boot-time + SessionStart hook), so a mid-session
+// infra death went unhealed until the launcher restarted.
+pub mod infra_watchdog;
 pub mod lifecycle;
 pub mod lifecycle_api;
 pub mod lockfile;
