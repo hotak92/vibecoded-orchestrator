@@ -78,6 +78,7 @@ def test_non_diagram_edit_does_not_touch_throttle(tmp_path: Path):
         "stderr-cap.sh",
         "emit-context.sh",
         "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
+        "kg-sync-debounce.sh",  # 2026-06-18 write-amplification debounce
     ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():
@@ -140,6 +141,7 @@ def test_diagram_edit_creates_throttle_and_invokes_indexer(tmp_path: Path):
         "stderr-cap.sh",
         "emit-context.sh",
         "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
+        "kg-sync-debounce.sh",  # 2026-06-18 write-amplification debounce
     ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():
@@ -251,6 +253,7 @@ def test_diagram_throttle_60s_blocks_immediate_reindex(tmp_path: Path):
         "stderr-cap.sh",
         "emit-context.sh",
         "resolve-vco-venv.sh",  # v0.2.46 post-adversarial F1
+        "kg-sync-debounce.sh",  # 2026-06-18 write-amplification debounce
     ):
         src = REPO_ROOT / "templates" / "hooks" / "_lib" / lib
         if src.exists():
