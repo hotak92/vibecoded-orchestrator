@@ -43,8 +43,57 @@ References:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_repo_tracked_files_against_install_pollution():
+    """Restore the repo's tracked ``CLAUDE.md`` + remove a repo-root
+    ``UPDATE_DEFERRED.md`` after the test session.
+
+    Several tests run the real ``install.py --update`` as a subprocess.
+    install.py's orchestrator-self step materializes
+    ``<install_root>/CLAUDE.md`` and the deferral flow writes
+    ``<install_root>/.claude/context/UPDATE_DEFERRED.md`` — and ``install_root``
+    resolves to the directory install.py LIVES in (this repo), regardless of
+    the subprocess cwd. So those tests splice a ``vco-deferral-reminder`` block
+    into the repo's TRACKED ``CLAUDE.md`` and drop a (gitignored)
+    ``UPDATE_DEFERRED.md``. The ``CLAUDE.md`` mutation is the real hazard: it is
+    a tracked file, so a later ``git add -A`` could commit install cruft into
+    the public repo (which is NOT an installed clone and must carry no install
+    artifacts).
+
+    This session-scoped guard snapshots both at session start and restores /
+    removes them at session end, so the suite never leaves the repo dirty —
+    independent of WHICH test pollutes (current or future). Best practice for
+    new tests remains: run install.py with ``--skip-materialize-claude-dir`` or
+    target a tmp install root. Soft-fail: cleanup errors never fail the session.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    claude_md = repo_root / "CLAUDE.md"
+    deferred = repo_root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+
+    claude_before = claude_md.read_bytes() if claude_md.is_file() else None
+    deferred_existed = deferred.is_file()
+
+    try:
+        yield
+    finally:
+        try:
+            if claude_before is not None:
+                if not claude_md.is_file() or claude_md.read_bytes() != claude_before:
+                    claude_md.write_bytes(claude_before)
+            elif claude_md.is_file():
+                claude_md.unlink()  # didn't exist before the session
+        except OSError:
+            pass
+        try:
+            if not deferred_existed and deferred.is_file():
+                deferred.unlink()
+        except OSError:
+            pass
 
 
 # Test files that explicitly exercise the hub-resolver and MUST run with
