@@ -313,6 +313,18 @@ pub struct CreateProjectV2Request {
     pub name: String,
     pub folder_path: String,
     pub host: ProjectHost,
+    /// v0.2.63 "Safe add": per-add opt-in (default OFF → no behaviour change).
+    /// When ON, VCO must NOT merge its config into the project's sensitive,
+    /// often-committed project-root `.env`: instead of appending canonical
+    /// keys (`ensure_project_env_template`) or rewriting a stale
+    /// `KG_COLLECTION=` line (`b12_repair_stale_kg_collection`), it writes the
+    /// intended `.env` content to a `.env.vco.reference` sidecar and lets the
+    /// Python bundle step (`--safe-add`) record a `safe_add_skipped_env_merge`
+    /// deferral + append VCO-created paths to the project's local-only
+    /// `.git/info/exclude`. `#[serde(default)]` keeps older GUI builds / API
+    /// callers that omit the field working (deserialises to `false`).
+    #[serde(default)]
+    pub safe_add: bool,
 }
 
 #[command]
@@ -404,7 +416,24 @@ pub async fn create_project_v2(
     // commented placeholders for ANTHROPIC_API_KEY / OPENAI_API_KEY /
     // GITHUB_TOKEN / RL_*; values stay user-controlled. Idempotent on
     // re-runs.
-    if let Err(e) = ensure_project_env_template(folder, &env_settings) {
+    // v0.2.63 Safe add: when ON, do NOT append canonical keys to the
+    // project-root `.env` (it may be committed to the user's VCS). Write the
+    // intended content to a `.env.vco.reference` sidecar instead; the Python
+    // bundle step (run with --safe-add) detects the sidecar and records the
+    // `safe_add_skipped_env_merge` deferral. Soft-fail throughout — a sidecar
+    // write failure must never abort project creation.
+    if req.safe_add {
+        if let Err(e) = write_env_reference_sidecar(folder, &env_settings) {
+            let msg = format!(
+                "safe-add: .env.vco.reference sidecar write failed: {}. \
+                 VCO did not modify your .env; intended keys were not saved to \
+                 a reference file (manual setup may be required).",
+                e
+            );
+            eprintln!("[vct] warning: {}", msg);
+            warnings.push(msg);
+        }
+    } else if let Err(e) = ensure_project_env_template(folder, &env_settings) {
         let msg = format!("env template write failed (ensure_project_env_template): {}. \
                           The .env file may be missing managed keys.", e);
         eprintln!("[vct] warning: {}", msg);
@@ -455,34 +484,42 @@ pub async fn create_project_v2(
     // it by hand — that left the bug live in every existing install. Now we
     // call the testable helper `b12_repair_stale_kg_collection` to rewrite
     // the first KG_COLLECTION= line in place; audit the result here.
-    let env_path = folder.join(".env");
-    match b12_repair_stale_kg_collection(&env_path, &req.name) {
-        Ok(B12Outcome::Repaired { canonical_kg }) => {
-            eprintln!(
-                "[vct] info: B12: rewrote stale KG_COLLECTION in {} → {}",
-                env_path.display(),
-                canonical_kg
-            );
-            let _ = db.audit(
-                "env_b12_auto_repair",
-                Some(&row.id),
-                None,
-                &serde_json::json!({
-                    "path": env_path.display().to_string(),
-                    "kg_collection": canonical_kg,
-                }),
-            );
-        }
-        Ok(B12Outcome::NoChangeNeeded) => {}
-        Err(e) => {
-            let msg = format!(
-                "B12 auto-repair failed to rewrite {} (KG_COLLECTION stale): {}. \
-                 Manual fix: set KG_COLLECTION=<project>_KnowledgeGraph in the .env.",
-                env_path.display(),
-                e
-            );
-            eprintln!("[vct] warning: B12: {}", msg);
-            warnings.push(msg);
+    // v0.2.63 Safe add: B12 rewrites a stale `KG_COLLECTION=` line IN PLACE in
+    // the project-root `.env` — exactly the mutation safe-add forbids on a
+    // possibly-committed file. Skip it entirely under safe_add; the
+    // `.env.vco.reference` sidecar (written above) already carries the
+    // canonical KG_COLLECTION, and the `safe_add_skipped_env_merge` deferral
+    // tells the project's Claude to reconcile it.
+    if !req.safe_add {
+        let env_path = folder.join(".env");
+        match b12_repair_stale_kg_collection(&env_path, &req.name) {
+            Ok(B12Outcome::Repaired { canonical_kg }) => {
+                eprintln!(
+                    "[vct] info: B12: rewrote stale KG_COLLECTION in {} → {}",
+                    env_path.display(),
+                    canonical_kg
+                );
+                let _ = db.audit(
+                    "env_b12_auto_repair",
+                    Some(&row.id),
+                    None,
+                    &serde_json::json!({
+                        "path": env_path.display().to_string(),
+                        "kg_collection": canonical_kg,
+                    }),
+                );
+            }
+            Ok(B12Outcome::NoChangeNeeded) => {}
+            Err(e) => {
+                let msg = format!(
+                    "B12 auto-repair failed to rewrite {} (KG_COLLECTION stale): {}. \
+                     Manual fix: set KG_COLLECTION=<project>_KnowledgeGraph in the .env.",
+                    env_path.display(),
+                    e
+                );
+                eprintln!("[vct] warning: B12: {}", msg);
+                warnings.push(msg);
+            }
         }
     }
 
@@ -500,7 +537,7 @@ pub async fn create_project_v2(
     for w in run_bootstrap_collections(folder, &req.name).await {
         warnings.push(w);
     }
-    for w in run_install_bundle(folder).await {
+    for w in run_install_bundle(folder, req.safe_add).await {
         warnings.push(w);
     }
 
@@ -1082,7 +1119,12 @@ async fn run_bootstrap_collections(folder: &Path, project_name: &str) -> Vec<Str
 /// Same soft-fail discipline as `run_bootstrap_collections`. JSON `errors[]`
 /// entries (per-file write failures) become individual warnings. The function
 /// never blocks project creation.
-async fn run_install_bundle(folder: &Path) -> Vec<String> {
+// v0.2.63: `safe_add` threads the per-add "Safe add" flag through to the
+// Python `install-bundle` as `--safe-add`. Under safe-add the Python step
+// (a) records the `safe_add_skipped_env_merge` deferral when it sees the
+// `.env.vco.reference` sidecar the Rust side wrote, and (b) appends VCO-created
+// paths to the project's local-only `.git/info/exclude`. No effect when false.
+async fn run_install_bundle(folder: &Path, safe_add: bool) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
 
     let system = match detect_system().await {
@@ -1138,6 +1180,13 @@ async fn run_install_bundle(folder: &Path) -> Vec<String> {
     ])
     .current_dir(&orch_root)
     .stdin(std::process::Stdio::null());
+
+    // v0.2.63 Safe add: only attach the flag when ON so the default path's argv
+    // is byte-identical to pre-v0.2.63 (no behaviour change; the install-bundle
+    // argv-shape parity tests keep passing for the default).
+    if safe_add {
+        cmd.arg("--safe-add");
+    }
 
     #[cfg(windows)]
     {
@@ -3500,6 +3549,51 @@ pub fn ensure_project_env_template(
         action: "appended".into(),
         added_keys: added,
         env_path: env_path.to_string_lossy().to_string(),
+    })
+}
+
+/// v0.2.63 "Safe add": write the canonical project `.env` content VCO would
+/// have appended to a `.env.vco.reference` sidecar INSTEAD of touching the live
+/// `.env`. The sidecar lives next to the live file (`<folder>/.env`), so the
+/// project's Claude can `diff .env .env.vco.reference` and apply the keys it
+/// wants. The Python bundle step (`--safe-add`) detects the sidecar on disk and
+/// records the structured `safe_add_skipped_env_merge` deferral — keeping the
+/// deferral-format ownership entirely in Python.
+///
+/// Soft-fail: a sidecar write failure returns Err for the caller to push as a
+/// non-fatal warning; it must NEVER abort project creation. Idempotent: always
+/// rewrites the sidecar with the current canonical text (the sidecar is
+/// advisory).
+pub fn write_env_reference_sidecar(
+    folder: &Path,
+    settings: &ProjectEnvSettings,
+) -> Result<EnsureEnvReport, String> {
+    let sidecar_path = folder.join(".env.vco.reference");
+    let mut text = String::new();
+    // A short banner so a human (or agent) opening the sidecar understands it
+    // is advisory and NOT the live env. Keep it as comment lines so the file is
+    // still a valid `.env` for tools that parse it.
+    text.push_str(
+        "# vibecoded-orchestrator Safe-add REFERENCE — NOT the live .env.\n\
+         # Safe add was ON, so VCO did NOT modify your project-root .env\n\
+         # (it may be committed to your VCS). These are the keys VCO would\n\
+         # have added. Diff against your .env and copy what you want:\n\
+         #   diff .env .env.vco.reference\n\
+         # See .claude/context/UPDATE_DEFERRED.md (safe_add_skipped_env_merge).\n\n",
+    );
+    text.push_str(&build_canonical_env_text(settings));
+
+    std::fs::write(&sidecar_path, text)
+        .map_err(|e| format!("write {}: {}", sidecar_path.display(), e))?;
+
+    let added: Vec<String> = env_canonical_keys()
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .collect();
+    Ok(EnsureEnvReport {
+        action: "reference_written".into(),
+        added_keys: added,
+        env_path: sidecar_path.to_string_lossy().to_string(),
     })
 }
 
@@ -6902,6 +6996,60 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    // ─── v0.2.63 Safe add: write_env_reference_sidecar ──
+
+    #[test]
+    fn safe_add_writes_env_reference_sidecar_not_live_env() {
+        let dir = _scratch_dir("safeadd-sidecar");
+        // Simulate a pre-existing committed .env the user owns.
+        let env_path = dir.join(".env");
+        let user_env = "KG_COLLECTION=LegacyBare\nUSER_KEY=keep\n";
+        std::fs::write(&env_path, user_env).unwrap();
+
+        let report = write_env_reference_sidecar(
+            &dir,
+            &ProjectEnvSettings::with_defaults("Acme"),
+        )
+        .unwrap();
+        assert_eq!(report.action, "reference_written");
+
+        // The live .env must be byte-for-byte unchanged.
+        let live_after = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(
+            live_after, user_env,
+            "safe-add must NOT touch the live project-root .env"
+        );
+
+        // The sidecar exists and carries VCO's canonical KG_COLLECTION.
+        let sidecar = dir.join(".env.vco.reference");
+        assert!(sidecar.exists());
+        let sidecar_text = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(sidecar_text.contains("KG_COLLECTION=Acme_KnowledgeGraph"));
+        assert!(sidecar_text.contains("PROJECT_NAME=Acme"));
+        // The banner names the deferral condition so a reader can find it.
+        assert!(sidecar_text.contains("safe_add_skipped_env_merge"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn safe_add_sidecar_does_not_create_live_env_when_absent() {
+        let dir = _scratch_dir("safeadd-noenv");
+        assert!(!dir.join(".env").exists());
+        write_env_reference_sidecar(
+            &dir,
+            &ProjectEnvSettings::with_defaults("X"),
+        )
+        .unwrap();
+        // Sidecar written, but the live .env must remain absent — safe-add
+        // never materialises a `.env` (that's the whole point).
+        assert!(dir.join(".env.vco.reference").exists());
+        assert!(
+            !dir.join(".env").exists(),
+            "safe-add must not create a live .env"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

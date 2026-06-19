@@ -11,15 +11,24 @@
 //! Discovery chain (must match the SessionStart hook in
 //! `templates/hooks/session-start-ensure-hub.sh`):
 //!   1. `$VCT_HUB_BIN` env override (highest priority — dev builds).
-//!   2. First `vct-hub` on PATH.
-//!   3. `$HOME/.vct/bin/vct-hub` (install.py default install location).
-//!   4. `<orchestrator_root>/launcher/dist/<arch>/vct-hub` (sibling of
-//!      this launcher binary; populated by `build-bundled-launcher.sh`).
-//!   5. `<orchestrator_root>/launcher/dist/vct-hub` (arch-less fallback).
+//!   2. `<dir of this launcher binary>/vct-hub` (the INSTALL-FOLDER copy
+//!      — the hub that shipped WITH this exact launcher; populated by
+//!      `build-bundled-launcher.sh`), then the arch-less fallback one dir
+//!      up. **Preferred** over PATH/`~/.vct/bin` (v0.2.63): the sibling
+//!      copy is guaranteed to match this launcher's version, whereas PATH
+//!      or `~/.vct/bin` can point at a stale dev build or an older
+//!      install. user request 2026-06-19: "we should always use the installed
+//!      copy from the launcher's install folder."
+//!   3. First `vct-hub` on PATH.
+//!   4. `$HOME/.vct/bin/vct-hub` (install.py default install location).
 //!
 //! Invocation: `vct-hub --start-if-not-running`. The CLI returns 0
 //! whether the hub started fresh OR was already running; both are
-//! success states for us.
+//! success states for us — BUT "already running" is not enough on its
+//! own: see `ensure_hub_running`'s v0.2.63 identity-aware swap, which
+//! replaces a hub running from a DIFFERENT binary than the install-folder
+//! copy (the lockfile + `--start-if-not-running` only check liveness,
+//! never binary identity).
 //!
 //! Soft-fail throughout: a missing binary, a failed spawn, or a non-
 //! zero exit are all just `eprintln!` warnings — never block the
@@ -46,7 +55,7 @@ pub fn find_hub_binary() -> Option<PathBuf> {
     }
 
     // NOTE on hub freshness during an update (v0.2.55): the hub is kept
-    // fresh by TWO mechanisms that do NOT depend on this discovery order —
+    // fresh by TWO mechanisms —
     //   (1) install.py Step 8c starts the freshly-deployed dist hub by its
     //       ABSOLUTE path (`[<dist>/vct-hub, --start-if-not-running]`,
     //       install.py ~21468) before control returns to the launcher; and
@@ -58,17 +67,26 @@ pub fn find_hub_binary() -> Option<PathBuf> {
     // here gated on `VCT_AUTO_RESTART_LAUNCHER=1`; that env var is set only
     // on the install.py CHILD (installer.rs cmd.env), never on the launcher
     // process that runs find_hub_binary(), so the branch was dead in
-    // production — and forcing it via `set_var` would leak the preference
-    // into the detached-restart child (which inherits this env) on every
-    // future boot. Dropped. The discovery order below is the steady-state
-    // one; freshness is owned by (1)+(2).
+    // production. Dropped. v0.2.63 makes the dist-sibling preference the
+    // steady-state default below (NOT env-gated) — see step 2.
 
-    // 2. PATH lookup.
+    // 2. INSTALL-FOLDER copy (v0.2.63): the `vct-hub` sibling of THIS
+    // launcher binary, then the arch-less fallback one dir up. Preferred
+    // over PATH/`~/.vct/bin` because it is guaranteed to be the hub that
+    // shipped with this exact launcher build. A stale `vct-hub` on PATH
+    // (a leftover dev build, an old global install) must NOT win over the
+    // copy install.py just deployed next to the launcher. Honours the
+    // `VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY` test-isolation gate.
+    if let Some(sibling) = find_hub_dist_sibling() {
+        return Some(sibling);
+    }
+
+    // 3. PATH lookup.
     if let Some(on_path) = find_on_path("vct-hub") {
         return Some(on_path);
     }
 
-    // 3. User-install location.
+    // 4. User-install location.
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         let candidate = home.join(".vct").join("bin").join(hub_binary_name());
         if is_executable(&candidate) {
@@ -84,12 +102,81 @@ pub fn find_hub_binary() -> Option<PathBuf> {
         }
     }
 
-    // 4 + 5. In-tree dist relative to the running launcher binary.
-    // (Extracted to `find_hub_dist_sibling` in v0.2.55 — the resolution is
-    // a self-contained unit with its own test-isolation gate, so factoring
-    // it out keeps this function readable and the gate independently
-    // testable.)
-    find_hub_dist_sibling()
+    None
+}
+
+/// True if `a` and `b` resolve to the same on-disk executable. Canonicalizes
+/// both (resolving symlinks); on unix also treats an equal `(dev, inode)` pair
+/// as identical (covers hardlinks and canonicalize-failed paths). Falls back to
+/// raw path equality. Conservative: when in doubt it returns `false`, so the
+/// only consequence of a mis-compare is leaving a hub alone (never a false
+/// kill — see `ensure_hub_running`).
+fn same_binary(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        if ca == cb {
+            return true;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) {
+            if ma.dev() == mb.dev() && ma.ino() == mb.ino() {
+                return true;
+            }
+        }
+    }
+    a == b
+}
+
+/// Decide whether the hub running as `pid` is STALE relative to the
+/// install-folder copy at `install_copy` — i.e. the launcher should stop it and
+/// start `install_copy` instead. A running hub is stale two ways:
+///   * **different binary by location** — a borrowed dev build, an old global
+///     install, a hub from another checkout. Caught cross-OS by path identity.
+///   * **older build at the SAME path** — a POSIX in-place update rewrote
+///     `<dist>/vct-hub` to a NEW inode, but the old process is still executing
+///     the previous (now-unlinked) inode. This is the "restart on the new
+///     binary if an older binary is running" case (user request 2026-06-19). Caught
+///     on Linux by comparing the inode `/proc/<pid>/exe` actually resolves to
+///     (valid even after the on-disk file was replaced) against the on-disk
+///     install copy's inode.
+///
+/// Strictly conservative: returns `false` whenever staleness cannot be
+/// POSITIVELY confirmed, so a hub we cannot identify is never killed.
+fn running_hub_is_stale(
+    pid: u32,
+    running_exe: Option<&std::path::Path>,
+    install_copy: &std::path::Path,
+) -> bool {
+    // Linux: the authoritative signal. `/proc/<pid>/exe`, when stat'd, yields
+    // the inode the process is ACTUALLY running (the kernel keeps it valid even
+    // if the file was replaced). Comparing it to the on-disk install copy's
+    // inode catches BOTH staleness modes at once — different inode => stale;
+    // identical inode => definitively the same running file => fresh.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let proc_exe = format!("/proc/{}/exe", pid);
+        if let (Ok(run), Ok(disk)) =
+            (std::fs::metadata(&proc_exe), std::fs::metadata(install_copy))
+        {
+            return run.dev() != disk.dev() || run.ino() != disk.ino();
+        }
+        // metadata failed (pid gone, restricted /proc) — fall through to the
+        // cross-OS path check below.
+    }
+
+    // Cross-OS fallback: a running exe whose PATH is not the install copy is
+    // stale. On Windows a running `.exe` cannot be replaced in place (the
+    // updater renames-aside + MoveFileEx swaps only after the process exits),
+    // so a path check is sufficient there. macOS same-path-replaced is a known
+    // gap — the GUI update flow stops the hub before swapping, so it rarely
+    // arises. `None` (exe unresolved) => not provably stale => leave it.
+    match running_exe {
+        Some(p) => !same_binary(p, install_copy),
+        None => false,
+    }
 }
 
 /// v0.2.55: resolve the in-tree dist `vct-hub` sibling relative to the
@@ -232,6 +319,60 @@ pub fn ensure_hub_running() -> SpawnOutcome {
         );
         return SpawnOutcome::BinaryNotFound;
     };
+
+    // v0.2.63 — identity-aware swap. The single-instance lockfile and
+    // `--start-if-not-running` only answer "is A hub alive?", never "is the
+    // alive hub the CURRENT install-folder copy?". Two ways a live hub is
+    // wrong, both of which `--start-if-not-running` would silently no-op past:
+    //   * a DIFFERENT binary — a dev `cargo run`/`--foreground` from another
+    //     checkout, an old global install, a hub a MANUAL `install.py --update`
+    //     left running (the GUI update flow stops the hub before the swap; a
+    //     bare `install.py --update` does not); and
+    //   * an OLDER BUILD of the same path — a POSIX in-place update rewrote
+    //     `<dist>/vct-hub` but the old process is still running the previous
+    //     inode ("restart on the new binary if an older binary is running").
+    // `running_hub_is_stale` detects both; if stale we stop the old hub here so
+    // the spawn below brings up the install-folder copy.
+    //
+    // This does NOT violate the "hub outlives the launcher GUI" contract: that
+    // forbids stopping the hub at launcher QUIT, not swapping a foreign/stale
+    // hub at BOOT. The update-gate short-circuit above already prevents this
+    // from firing mid-update.
+    //
+    // Strictly conservative: stop ONLY on a POSITIVE mismatch (running exe
+    // resolved AND != our copy). An unresolved running exe (sysinfo returned
+    // None) is left untouched — we never kill a hub we can't identify.
+    if let crate::hub_status::HubStatus::Running { pid } = crate::hub_status::probe() {
+        let running_exe = crate::commands::update_gate::process_exe_by_pid(pid);
+        if running_hub_is_stale(pid, running_exe.as_deref(), &bin) {
+            eprintln!(
+                "[vct] vct-hub pid {} is running a stale or foreign binary ({}); \
+                 stopping it so the install-folder copy {} can take over.",
+                pid,
+                running_exe
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "path unresolved".to_string()),
+                bin.display()
+            );
+            // Soft-fail. `--stop` is lockfile-driven (it signals the pid in
+            // hub.pid regardless of which binary issues it) and blocks up to
+            // ~10s on graceful shutdown, so the lockfile is released by the
+            // time it returns and the spawn below starts fresh. A failed stop
+            // just leaves the spawn to no-op on the old hub — no worse than
+            // pre-v0.2.63.
+            match crate::hub_status::stop() {
+                crate::hub_status::StopOutcome::Stopped
+                | crate::hub_status::StopOutcome::AlreadyStopped => {}
+                other => eprintln!(
+                    "[vct] could not stop the stale hub ({:?}); the install-folder \
+                     copy may not take over until the stale hub exits.",
+                    other
+                ),
+            }
+        }
+    }
+
     eprintln!("[vct] auto-starting vct-hub from {}", bin.display());
 
     // Invoke synchronously so we know whether the spawn succeeded.
@@ -489,5 +630,140 @@ mod tests {
         assert_eq!(n, "vct-hub.exe");
         #[cfg(not(windows))]
         assert_eq!(n, "vct-hub");
+    }
+
+    // ── v0.2.63: same_binary identity check (drives the boot-time swap) ──
+
+    #[test]
+    fn same_binary_true_for_identical_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("vct-hub");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(same_binary(&f, &f));
+    }
+
+    #[test]
+    fn same_binary_false_for_distinct_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a-hub");
+        let b = tmp.path().join("b-hub");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        // Distinct files (different inode) with identical content must NOT
+        // compare equal — this is the dev-build-vs-install-folder case.
+        assert!(!same_binary(&a, &b));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_binary_true_through_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-hub");
+        std::fs::write(&real, b"x").unwrap();
+        let link = tmp.path().join("link-hub");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // canonicalize() resolves the symlink → same file.
+        assert!(same_binary(&real, &link));
+    }
+
+    #[test]
+    fn same_binary_false_for_distinct_missing_paths() {
+        // Unresolvable + unequal → false. Guarantees we never report a false
+        // "same" that would suppress a legitimate swap.
+        assert!(!same_binary(
+            std::path::Path::new("/no/such/a-hub"),
+            std::path::Path::new("/no/such/b-hub")
+        ));
+    }
+
+    // ── v0.2.63: reorder keeps the PATH + user-install fallbacks reachable
+    // after the install-folder copy was promoted to step 2. ──────────────
+
+    #[test]
+    fn find_hub_binary_falls_to_path_when_sibling_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("pathdir");
+        std::fs::create_dir(&dir).unwrap();
+        let exe = dir.join(hub_binary_name());
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        with_env(
+            &[
+                ("VCT_HUB_BIN", None),
+                ("PATH", Some(dir.to_str().unwrap())),
+                ("HOME", Some("/nonexistent-home")),
+                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+            ],
+            || {
+                assert_eq!(find_hub_binary(), Some(exe.clone()));
+            },
+        );
+    }
+
+    // ── v0.2.63: running_hub_is_stale (drives the boot-time auto-restart) ─
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_hub_is_stale_false_for_own_running_exe() {
+        // /proc/self/exe and the on-disk current_exe are the same inode → the
+        // running process IS executing the install copy → not stale.
+        let myexe = std::env::current_exe().unwrap();
+        assert!(!running_hub_is_stale(std::process::id(), Some(&myexe), &myexe));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_hub_is_stale_true_when_install_copy_is_a_different_file() {
+        // The test process's /proc/self/exe inode differs from an unrelated
+        // file → stale. Passing running_exe=None proves the Linux /proc inode
+        // branch works even when sysinfo could not resolve the exe path — this
+        // is the "older / foreign binary running" detection.
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("vct-hub");
+        std::fs::write(&other, b"x").unwrap();
+        assert!(running_hub_is_stale(std::process::id(), None, &other));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn running_hub_is_stale_uses_path_check_off_linux() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a-hub");
+        std::fs::write(&a, b"x").unwrap();
+        let b = tmp.path().join("b-hub");
+        std::fs::write(&b, b"x").unwrap();
+        // Different path → stale; same path → fresh; unresolved → not stale.
+        assert!(running_hub_is_stale(424242, Some(&a), &b));
+        assert!(!running_hub_is_stale(424242, Some(&a), &a));
+        assert!(!running_hub_is_stale(424242, None, &b));
+    }
+
+    #[test]
+    fn find_hub_binary_falls_to_user_install_when_path_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bindir = tmp.path().join(".vct").join("bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let exe = bindir.join(hub_binary_name());
+        std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        with_env(
+            &[
+                ("VCT_HUB_BIN", None),
+                ("PATH", Some("/nonexistent-dir")),
+                ("HOME", Some(tmp.path().to_str().unwrap())),
+                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
+            ],
+            || {
+                assert_eq!(find_hub_binary(), Some(exe.clone()));
+            },
+        );
     }
 }

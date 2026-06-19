@@ -462,7 +462,17 @@ where
     Err(last_err.unwrap_or_else(|| "git fetch failed (no stderr)".to_string()))
 }
 
-async fn count_commits_ahead(repo: &Path, branch: &str) -> Result<u32, String> {
+/// Count how many commits local HEAD is BEHIND `vco_upstream/<branch>` — i.e.
+/// `git rev-list --count HEAD..vco_upstream/<branch>`, the commits the upstream
+/// has that HEAD does not. Requires a prior `git fetch`. `0` means HEAD is at
+/// (or ahead of) the upstream tip — nothing left to pull.
+///
+/// (Renamed v0.2.63 from the misleading `count_commits_ahead`: `HEAD..X`
+/// counts commits reachable from X but not HEAD = how far HEAD is BEHIND X. The
+/// `check_for_*_update` callers already use it as "N commits behind / update
+/// available"; v0.2.63's `assert_head_reached_upstream` reuses it to refuse
+/// running install.py on a tree the pull failed to advance.)
+pub async fn count_commits_behind_upstream(repo: &Path, branch: &str) -> Result<u32, String> {
     let raw = run_git(
         repo,
         &[
@@ -480,9 +490,11 @@ async fn count_commits_ahead(repo: &Path, branch: &str) -> Result<u32, String> {
 // Tauri commands
 // ---------------------------------------------------------------------------
 
-/// Compare local HEAD against `origin/<branch>`. Always does a `git fetch`
-/// first so commit-count is accurate. Saves the result to disk and emits
-/// a `vct-launcher-update-available` event when an update is found.
+/// Compare local HEAD against `vco_upstream/<branch>` (the public AGPL upstream,
+/// pinned by `ensure_upstream_remote` — NOT `origin`, which may be a private
+/// fork). Always does a `git fetch` first so commit-count is accurate. Saves the
+/// result to disk and emits a `vct-launcher-update-available` event when an
+/// update is found.
 #[command]
 pub async fn check_for_launcher_update<R: Runtime>(
     app: AppHandle<R>,
@@ -531,7 +543,9 @@ pub async fn check_for_launcher_update<R: Runtime>(
         Err(e) => return Ok(UpdateStatus::unavailable(&e, last_checked)),
     };
 
-    let commit_count = count_commits_ahead(&repo, &branch).await.unwrap_or(0);
+    let commit_count = count_commits_behind_upstream(&repo, &branch)
+        .await
+        .unwrap_or(0);
     let available = remote_sha != local_sha && commit_count > 0;
     let now = Utc::now();
 

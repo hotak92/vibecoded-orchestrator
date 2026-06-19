@@ -84,13 +84,23 @@ function createProjectsStore() {
       update((s) => ({ ...s, selectedId: id }));
     },
 
-    async create(name: string, folder_path: string, host: ProjectHost): Promise<ProjectView> {
+    // v0.2.63: `safe_add` is the per-add "Safe add" flag (default false → no
+    // behaviour change). When true, VCO won't merge its config into the
+    // project's sensitive, often-committed project-root `.env` — it writes a
+    // `.env.vco.reference` sidecar + a deferral instead, and keeps VCO files
+    // out of the repo's commits via local-only `.git/info/exclude`.
+    async create(
+      name: string,
+      folder_path: string,
+      host: ProjectHost,
+      safe_add: boolean = false,
+    ): Promise<ProjectView> {
       // BLOCKER-2 (2026-05-01): the Rust command returns
       // CreateProjectResult { project, warnings }, not a bare ProjectView.
       // Pre-fix this generic was <ProjectView> — `result.id` was undefined
       // and the wrapper object was being stored as if it were a project.
       const result = await invoke<CreateProjectResult>('create_project_v2', {
-        req: { name, folder_path, host },
+        req: { name, folder_path, host, safe_add },
       });
       const project = result.project;
       for (const w of result.warnings) toast.error(w);

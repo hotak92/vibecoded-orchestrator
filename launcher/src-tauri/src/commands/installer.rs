@@ -4978,6 +4978,40 @@ pub async fn update_orchestrator<R: Runtime>(
     // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE the
     // pull (see above) — no second call needed here.
 
+    // v0.2.63: HEAD-advance backstop. A pull that exited 0 but did NOT reach
+    // the upstream tip (a non-FF that slipped through, an odd partial state)
+    // must NOT proceed to install.py — that would run the STALE tree (the
+    // v0.2.62 GUI-update crash class: old install.py at pre-fix line numbers).
+    // Abort cleanly, write a durable deferral so a terminal Claude can see the
+    // update didn't land, and return a plain error (NOT the Merge/Rebase modal
+    // — that path is what failed; routing back to it would loop).
+    if let Err(e) = assert_head_reached_upstream(&install_path).await {
+        abort_update_restore_binaries_and_hub(
+            &install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
+        write_launcher_update_diverged_deferral(
+            &install_path,
+            &pull_branch,
+            LauncherUpdateDivergedKind::NonFastForward {
+                local_sha: read_head_sha(&install_path).await,
+                remote_sha: read_remote_sha(&install_path, &pull_branch).await,
+                detail: e.clone(),
+            },
+        );
+        write_audit(
+            "update_orchestrator_complete",
+            serde_json::json!({
+                "success": false,
+                "duration_ms": chrono::Utc::now().timestamp_millis() - update_start_ms,
+                "note": "head_did_not_advance_post_pull",
+                "branch": start_branch,
+            }),
+        );
+        return Err(e);
+    }
+
     // Stage 2: Re-run install.py with --update flag
     emit_progress(&window, "install", "Applying updates...", 40.0);
 
@@ -6146,6 +6180,61 @@ async fn finalize_update_and_restart<R: Runtime>(
 ///     both v0.2.52-class bugs — the stale-binary relaunch loop AND
 ///     the MCP fork-bomb — were reachable verbatim through the
 ///     divergence-modal Merge/Rebase buttons).
+/// v0.2.63: after a pull/merge reported success (and wasn't "Already up to
+/// date"), confirm local HEAD actually reached the upstream tip BEFORE running
+/// install.py. If HEAD is still behind `vco_upstream/<branch>`, the upstream
+/// changes did NOT land (a non-FF that slipped through, an odd partial git
+/// state) and running install.py would execute the STALE source tree — the
+/// exact failure that crashed VCO_dev's v0.2.62 GUI update (old install.py,
+/// pre-fix line numbers). Returns `Err` so the caller aborts before install.py.
+///
+/// Conservative: behind-count 0 → Ok. A count ERROR (a transient git hiccup on
+/// the just-fetched refs — rare) → Ok with a loud log, so a flaky `rev-list`
+/// never blocks an otherwise-healthy update. The pre-existing non-FF modal is
+/// the PRIMARY divergence guard; this is the backstop that the merge actually
+/// landed. Called from BOTH install.py choke points (`update_orchestrator`
+/// inline + `run_post_pull_install_and_restart`) — one concern, one home.
+async fn assert_head_reached_upstream(install_path: &Path) -> Result<(), String> {
+    let branch = resolve_pull_branch(install_path).await;
+    match crate::commands::self_update::count_commits_behind_upstream(install_path, &branch).await {
+        Ok(0) => Ok(()),
+        Ok(behind) => Err(format!(
+            "Update aborted before install.py: local HEAD is still {behind} commit(s) behind \
+             {remote}/{branch} after the pull/merge — the upstream changes did not land, so \
+             running install.py would re-run the STALE source tree (the v0.2.62 update-crash \
+             class). Resolve the merge manually (`git merge {remote}/{branch}` in the install \
+             folder, or update from the public-repo clone) and retry.",
+            remote = crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+        )),
+        Err(e) => {
+            eprintln!(
+                "[vct] assert_head_reached_upstream: behind-count failed ({e}) — proceeding \
+                 (cannot confirm staleness; not blocking a healthy update on a git hiccup)."
+            );
+            Ok(())
+        }
+    }
+}
+
+/// v0.2.63: shared abort cleanup for the post-pull HEAD-advance guard — revert
+/// the pre-pull binary renames (so the canonical paths hold working binaries
+/// again) and bring the hub back up (we stopped it pre-pull). Mirrors the
+/// revert+restart idiom the conflict/non-FF early-returns already use; factored
+/// so the two new guard call-sites don't each inline another copy.
+fn abort_update_restore_binaries_and_hub(
+    install_path: &Path,
+    pre_pull_renamed: Option<&Path>,
+    pre_pull_renamed_hub: Option<&Path>,
+) {
+    if let Some(backup) = pre_pull_renamed {
+        revert_pre_pull_rename(backup);
+    }
+    if let Some(backup) = pre_pull_renamed_hub {
+        revert_pre_pull_rename(backup);
+    }
+    let _ = ensure_hub_started_after_update(install_path);
+}
+
 async fn run_post_pull_install_and_restart<R: Runtime>(
     app: AppHandle<R>,
     install_path: &Path,
@@ -6157,6 +6246,21 @@ async fn run_post_pull_install_and_restart<R: Runtime>(
     update_gate_guard: &mut crate::commands::update_gate::UpdateInProgressGuard,
 ) -> Result<InstallResult, String> {
     emit_progress(window, "update", "Changes applied", 30.0);
+
+    // v0.2.63: HEAD-advance backstop (shared with update_orchestrator). The
+    // merge/rebase pull in the caller exited 0; confirm HEAD actually reached
+    // the upstream tip before install.py, else we'd run the STALE tree (the
+    // v0.2.62 update-crash class). Abort cleanly — revert binaries + restart
+    // hub — and surface the error to the modal flow instead of running install.
+    if let Err(e) = assert_head_reached_upstream(install_path).await {
+        abort_update_restore_binaries_and_hub(
+            install_path,
+            pre_pull_renamed.as_deref(),
+            pre_pull_renamed_hub.as_deref(),
+        );
+        return Err(e);
+    }
+
     emit_progress(window, "install", "Applying updates...", 40.0);
 
     // V52-AI: advance lockfile phase so future hub-side observers can
@@ -16572,6 +16676,41 @@ MemAvailable:   23456789 kB
                 .status()
                 .unwrap()
                 .success());
+        }
+
+        // v0.2.63: the HEAD-advance backstop — test BOTH the abort case (HEAD
+        // behind upstream) and the proceed case (HEAD at upstream tip), per the
+        // "test the decision, not just the happy path" rule for branches that
+        // gate a destructive action (running install.py on a stale tree).
+        #[tokio::test]
+        async fn assert_head_reached_upstream_errs_when_behind() {
+            skip_if_no_git!();
+            // init_remote_and_clone leaves the local clone exactly 1 commit
+            // behind vco_upstream/main (remote advanced + re-fetched, no merge).
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            let res = assert_head_reached_upstream(&local).await;
+            assert!(
+                res.is_err(),
+                "HEAD behind upstream → guard must abort before install.py: {:?}",
+                res
+            );
+            assert!(res.unwrap_err().contains("behind"));
+        }
+
+        #[tokio::test]
+        async fn assert_head_reached_upstream_ok_when_at_upstream_tip() {
+            skip_if_no_git!();
+            let (_tmp, _remote, local) = init_remote_and_clone();
+            // Advance HEAD to the upstream tip (a real merge) → no longer behind.
+            assert!(StdCommand::new("git")
+                .silent()
+                .args(["merge", "--no-edit", "vco_upstream/main"])
+                .current_dir(&local)
+                .status()
+                .unwrap()
+                .success());
+            let res = assert_head_reached_upstream(&local).await;
+            assert!(res.is_ok(), "HEAD at upstream tip → guard must pass: {:?}", res);
         }
 
         #[tokio::test]

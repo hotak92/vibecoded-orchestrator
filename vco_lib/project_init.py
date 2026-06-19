@@ -6041,6 +6041,277 @@ def _emit_legacy_codegraph_deferral(
     report.write(folder)
 
 
+# ---------------------------------------------------------------------------
+# v0.2.63 "Safe add" — per-add opt-in (default OFF) that protects a project's
+# sensitive, often-committed project-root `.env` and keeps VCO-created files
+# out of the user's VCS, delegating any disruptive reconciliation to the
+# project's own Claude via UPDATE_DEFERRED.md ("any deferral should end in the
+# .md deferred document"). Default behaviour (safe_add=False) is unchanged.
+# The `.env` skip + sidecar are Rust-owned (launcher); Python records the
+# structured deferral + writes `.git/info/exclude`, so the deferral-MD format
+# stays single-owned by Python (the launcher never hand-parses it).
+# ---------------------------------------------------------------------------
+
+# Suffix appended to a live file path to form its safe-add reference sidecar
+# (e.g. `.env` -> `.env.vco.reference`). The Rust launcher uses the same string
+# when it writes the `.env` reference; kept here so the git-exclude pattern
+# below matches it too.
+_SAFE_ADD_SIDECAR_SUFFIX = ".vco.reference"
+
+# v0.2.63 (C1 fix, Martino: "check if files are VCO's or user's"): the safe-add
+# `.git/info/exclude` entries are computed PER-ADD from the files VCO actually
+# created (`_safe_add_exclude_entries`), NOT a blanket dir-glob. A blanket
+# `/.vscode/` or `/infrastructure/` or `/knowledge/` would silently hide a
+# user's OWN same-named dir (those names are common in existing projects —
+# safe-add's whole purpose). So we exclude only VCO-created paths.
+#
+# Top-level entries that are UNAMBIGUOUSLY VCO's (a user can't own them) →
+# collapse to a single dir/file glob instead of listing every created file
+# under them. Everything else is excluded as its SPECIFIC created path.
+_SAFE_ADD_VCO_EXCLUSIVE_TOPLEVEL = {
+    ".claude": "/.claude/",
+    ".vco-manifest.json": "/.vco-manifest.json",
+}
+
+
+def _safe_add_exclude_entries(result: dict, folder: Path) -> list:
+    """Compute the `.git/info/exclude` entries for ONLY the paths VCO actually
+    created in THIS add — collision-safe (never a blanket dir-glob that could
+    hide a user's own `.vscode/` / `infrastructure/` / `knowledge/` files).
+
+    VCO-exclusive top-level namespaces (`.claude/`, `.vco-manifest.json`)
+    collapse to one glob; every other VCO-created path is excluded SPECIFICALLY
+    (e.g. `/infrastructure/docker-compose.yml`, not `/infrastructure/`). Plus the
+    Rust-written `.env.vco.reference` sidecar (not in the Python create list).
+    """
+    actions = result.get("actions", {}) or {}
+    created: list = []
+    for key in ("create", "overwrite", "always-overwrite"):
+        created.extend(actions.get(key, []) or [])
+
+    entries: list = []
+    seen = set()
+
+    def _add(entry: str) -> None:
+        if entry and entry not in seen:
+            seen.add(entry)
+            entries.append(entry)
+
+    for rel in created:
+        rel = str(rel).replace("\\", "/").lstrip("/")
+        if not rel:
+            continue
+        top = rel.split("/", 1)[0]
+        glob = _SAFE_ADD_VCO_EXCLUSIVE_TOPLEVEL.get(top)
+        if glob is not None:
+            _add(glob)
+        else:
+            # A specific VCO-created path (a root file like CLAUDE.md, or a file
+            # inside a possibly-user-owned dir like .vscode/ or infrastructure/).
+            # Anchored so it matches ONLY this exact path the user did not author.
+            _add("/" + rel)
+
+    # The manifest is VCO's even if `actions` didn't enumerate it.
+    if result.get("manifest_written"):
+        _add("/.vco-manifest.json")
+    # The Rust launcher wrote the `.env` reference sidecar before this step.
+    sidecar = ".env" + _SAFE_ADD_SIDECAR_SUFFIX
+    if (folder / sidecar).exists():
+        _add("/" + sidecar)
+    return entries
+
+
+def _append_git_info_exclude(
+    folder: Path, paths: tuple,
+) -> dict:
+    """Idempotently append ``paths`` to ``<folder>/.git/info/exclude``.
+
+    `.git/info/exclude` is the LOCAL-only ignore file: it is never committed
+    (unlike the tracked `.gitignore`), so adding VCO-created paths there keeps
+    them out of the user's commits without modifying any tracked file.
+
+    Soft-fail + idempotent:
+      - No `.git` directory (not a git repo, or a bare/worktree layout where
+        `.git` is a file) -> action="not_a_git_repo", no-op.
+      - Entry already present (exact-line match) -> not re-added.
+      - Write failure -> action="write_failed:<ErrorClass>", no raise.
+
+    Returns ``{"action": str, "added": [str, ...], "path": str}``. Actions:
+      - "appended"        — one or more new lines written.
+      - "noop"            — every path already present.
+      - "not_a_git_repo"  — no `.git` directory.
+      - "write_failed:*"  — append raised OSError.
+
+    v0.2.63 (safe-add): keeps VCO files out of the user's Bitbucket/Git repo.
+    """
+    git_dir = folder / ".git"
+    result: dict = {"action": "not_a_git_repo", "added": [], "path": ""}
+    # Only the standard (non-bare, non-submodule-file) layout is handled. When
+    # `.git` is a file (worktree/submodule pointer) we conservatively skip —
+    # resolving the real gitdir is out of scope and the user can exclude
+    # manually.
+    if not git_dir.is_dir():
+        return result
+
+    info_dir = git_dir / "info"
+    exclude_path = info_dir / "exclude"
+    result["path"] = str(exclude_path)
+
+    try:
+        existing = (
+            exclude_path.read_text(encoding="utf-8")
+            if exclude_path.exists()
+            else ""
+        )
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+
+    # Exact-line membership check (strip trailing whitespace per line).
+    present = {line.strip() for line in existing.splitlines()}
+    to_add = [p for p in paths if p not in present]
+    if not to_add:
+        result["action"] = "noop"
+        return result
+
+    block_lines = [
+        "",
+        "# VCO safe-add (v0.2.63): keep orchestrator-created files out of "
+        "your commits.",
+        "# This is .git/info/exclude (LOCAL-only) — not the tracked "
+        ".gitignore.",
+    ]
+    block_lines.extend(to_add)
+    block = "\n".join(block_lines) + "\n"
+
+    # Ensure we don't glue onto a non-newline-terminated last line.
+    prefix = existing
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+
+    try:
+        info_dir.mkdir(parents=True, exist_ok=True)
+        _write_file_atomic(exclude_path, (prefix + block).encode("utf-8"))
+    except OSError as e:
+        result["action"] = f"write_failed:{type(e).__name__}"
+        return result
+
+    result["action"] = "appended"
+    result["added"] = to_add
+    return result
+
+
+def _emit_safe_add_skipped_env_merge_deferral(
+    folder: Path, *, sidecar_rel: str,
+) -> None:
+    """Emit `safe_add_skipped_env_merge`: under Safe add, VCO did NOT
+    append/rewrite the project-root `.env` (it may be committed to the user's
+    VCS). The VCO-intended keys were written to ``sidecar_rel``
+    (`.env.vco.reference`) by the Rust launcher.
+
+    This is the CORE safe-add deferral. The Rust launcher writes the sidecar
+    and skips the `.env` append + the b12 KG_COLLECTION rewrite; this function
+    records the structured deferral row so the project's Claude can diff the
+    sidecar against the live `.env` and apply the keys it wants. Written from
+    Python so the structured deferral format has a single owner (the launcher
+    never hand-parses UPDATE_DEFERRED.md).
+    """
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    live_rel = ".env"
+    detected_msg = (
+        f"Safe add is ON, so VCO did NOT append its canonical keys to (nor "
+        f"rewrite a KG_COLLECTION line in) the existing project-root "
+        f"`{live_rel}` — that file is often committed to your VCS. VCO's "
+        f"intended `.env` content was written to `{sidecar_rel}` instead. "
+        f"Until reconciled, this project's per-project KG routing "
+        f"(KG_COLLECTION / DEVELOPMENT_COLLECTION / PROJECT_NAME / "
+        f"ACTIVE_EMBEDDING) is whatever your `{live_rel}` already had — not "
+        f"VCO's launcher-resolved values."
+    )
+    cmd = (
+        f"# Review the keys VCO wanted to add (reference vs your live .env):\n"
+        f"diff {str(folder / live_rel)!r} {str(folder / sidecar_rel)!r}\n"
+        f"# Copy the keys you want into your .env by hand (esp. KG_COLLECTION,\n"
+        f"# PROJECT_NAME), OR re-add the project WITHOUT Safe add to let VCO\n"
+        f"# merge them automatically. Then dismiss this deferral:\n"
+        f"python -m vco_lib.project_init dismiss-deferral "
+        f"--folder {str(folder)!r} "
+        f"--condition-id safe_add_skipped_env_merge"
+    )
+
+    entry = DeferralEntry(
+        condition_id="safe_add_skipped_env_merge",
+        title="VCO did not merge into your .env (safe-add) — reference sidecar written",
+        detected=detected_msg,
+        why_deferred=(
+            "Safe add deliberately protects the sensitive, often-committed "
+            "project-root `.env`. Appending VCO keys (or rewriting a stale "
+            "KG_COLLECTION line) would mutate a file the user tracks and "
+            "commits, risking a leak of VCO config into their VCS or a "
+            "clobbered customisation. The merge is delegated to the project's "
+            "own agent via this deferral rather than performed at add time."
+        ),
+        command_to_apply=cmd,
+        severity="warning",
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
+def _emit_safe_add_git_exclude_deferral(
+    folder: Path, git_result: dict,
+) -> None:
+    """Emit `safe_add_git_exclude_updated`: record that VCO appended its
+    created paths to `.git/info/exclude` (local-only) under Safe add.
+
+    Informational — the project's Claude should know VCO files are locally
+    git-ignored so it doesn't get confused about why `git status` is clean for
+    `.claude/` etc. The tracked `.gitignore` is intentionally untouched.
+    """
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    added = git_result.get("added", [])
+    added_str = ", ".join(added) if added else "(none)"
+    exclude_path = git_result.get("path", ".git/info/exclude")
+
+    detected_msg = (
+        f"Safe add is ON. VCO appended {len(added)} path pattern(s) to the "
+        f"LOCAL-only `{exclude_path}` so orchestrator-created files stay out "
+        f"of your commits: {added_str}. The tracked `.gitignore` was NOT "
+        f"modified."
+    )
+
+    cmd = (
+        f"# Review the local-only excludes VCO added:\n"
+        f"cat {str(exclude_path)!r}\n"
+        f"# To stop excluding a path, delete its line from that file.\n"
+        f"# Then dismiss this deferral:\n"
+        f"python -m vco_lib.project_init dismiss-deferral "
+        f"--folder {str(folder)!r} "
+        f"--condition-id safe_add_git_exclude_updated"
+    )
+
+    entry = DeferralEntry(
+        condition_id="safe_add_git_exclude_updated",
+        title="VCO files excluded from your commits via .git/info/exclude (safe-add)",
+        detected=detected_msg,
+        why_deferred=(
+            "Safe add keeps VCO config out of the user's VCS by writing to the "
+            "local-only `.git/info/exclude` rather than the tracked "
+            "`.gitignore`. Recorded as a deferral so the project's agent knows "
+            "these paths are intentionally git-ignored locally and can revisit "
+            "the choice if the user wants VCO files tracked."
+        ),
+        command_to_apply=cmd,
+        severity="info",
+    )
+    report = DeferralReport.read(folder)
+    report.add_entry(entry)
+    report.write(folder)
+
+
 def install_project_bundle(
     folder: Path,
     orchestrator_root: Optional[Path] = None,
@@ -6051,6 +6322,7 @@ def install_project_bundle(
     write_env: bool = False,
     project_name: Optional[str] = None,
     log_event: Optional[Callable[..., None]] = None,
+    safe_add: bool = False,
 ) -> dict:
     """Install (or update) the per-project Claude bundle in `folder`.
 
@@ -6072,6 +6344,16 @@ def install_project_bundle(
         project_name: raw project name for env derivation (overrides folder
             basename when ``write_env`` is True and launcher.db is absent).
         log_event: optional forensic logger.
+        safe_add: v0.2.63 — per-add opt-in (default OFF → no behaviour change).
+            When True (and NOT dry_run / update_mode): record a
+            ``safe_add_skipped_env_merge`` deferral when the Rust launcher left
+            a ``.env.vco.reference`` sidecar (it skipped the sensitive,
+            often-committed project-root ``.env``), and append VCO-created paths
+            to the project's LOCAL-only ``.git/info/exclude`` (never the tracked
+            ``.gitignore``) so VCO files stay out of the user's commits, with a
+            ``safe_add_git_exclude_updated`` deferral. The ``.claude/settings.json``
+            and ``.vscode/settings.json`` merges are UNCHANGED under safe-add
+            (those files are rarely committed).
 
     Returns a JSON-serialisable dict:
       {
@@ -6918,6 +7200,44 @@ def install_project_bundle(
             result["warnings"].append(
                 f"deferral reconcile failed: {err}"
             )
+
+    # v0.2.63 Safe add: protect the sensitive project-root `.env` + keep VCO
+    # files out of the user's commits. Runs only on a real first-install add
+    # with safe_add ON (not dry-run, not update). The `.env` skip + the
+    # `.env.vco.reference` sidecar are Rust-owned (launcher); here we (a) record
+    # the env-merge deferral when that sidecar is present, and (b) append the
+    # VCO-created paths to the LOCAL-only `.git/info/exclude`. Both soft-fail.
+    if safe_add and not dry_run and not update_mode:
+        try:
+            env_sidecar_rel = ".env" + _SAFE_ADD_SIDECAR_SUFFIX
+            if (folder / env_sidecar_rel).exists():
+                _emit_safe_add_skipped_env_merge_deferral(
+                    folder, sidecar_rel=env_sidecar_rel,
+                )
+                _log("4.bundle.safe_add_env", "ok",
+                     "safe_add_skipped_env_merge deferral emitted",
+                     data={"sidecar": env_sidecar_rel})
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.safe_add_env", "error",
+                 f"safe-add env deferral failed: {err}", data={"error": err})
+            result["warnings"].append(f"safe-add env deferral failed: {err}")
+
+        try:
+            git_result = _append_git_info_exclude(
+                folder, tuple(_safe_add_exclude_entries(result, folder)),
+            )
+            result["safe_add_git_exclude"] = git_result
+            _log("4.bundle.safe_add_git_exclude", "ok",
+                 f"safe_add_git_exclude: {git_result['action']}",
+                 data=git_result)
+            if git_result.get("action") == "appended":
+                _emit_safe_add_git_exclude_deferral(folder, git_result)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _log("4.bundle.safe_add_git_exclude", "error",
+                 f"safe-add git-exclude failed: {err}", data={"error": err})
+            result["warnings"].append(f"safe-add git-exclude failed: {err}")
 
     return result
 
@@ -8823,6 +9143,7 @@ def _cmd_install_bundle(args: argparse.Namespace) -> int:
         dry_run=bool(args.dry_run),
         write_env=bool(getattr(args, "write_env", False)),
         project_name=getattr(args, "project_name", None) or None,
+        safe_add=bool(getattr(args, "safe_add", False)),  # v0.2.63
     )
     if args.json:
         print(json.dumps(result))
@@ -8859,9 +9180,10 @@ def _cmd_dismiss_deferral(args: argparse.Namespace) -> int:
 
     Used by the user (or a future launcher GUI button) to silence a
     deferral whose condition cannot be auto-resolved by re-running
-    `install-bundle --update --force`. The four emission sites in this
+    `install-bundle --update --force`. The deferral emission sites in this
     module (`bundle_user_modified_preserved`, `bundle_skipped_existing_files`,
-    `template_review_pending`, plus any future ones) all reference this
+    `template_review_pending`, `safe_add_skipped_env_merge`,
+    `safe_add_git_exclude_updated`, plus any future ones) all reference this
     subcommand in the `command_to_apply` text they print.
 
     Exit codes:
@@ -9735,6 +10057,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p_bundle.add_argument(
+        "--safe-add", action="store_true", dest="safe_add",
+        help=(
+            "v0.2.63: per-add opt-in. Skip recording the project-root .env "
+            "merge (the launcher writes a .env.vco.reference sidecar + this "
+            "emits a safe_add_skipped_env_merge deferral) and append "
+            "VCO-created paths to the LOCAL-only .git/info/exclude (never the "
+            "tracked .gitignore). Default OFF = auto-merge as before."
+        ),
+    )
+    p_bundle.add_argument(
         "--json", action="store_true",
         help="Emit a single JSON object on stdout.",
     )
@@ -9747,7 +10079,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Remove a single deferral entry from "
             "<folder>/.claude/context/UPDATE_DEFERRED.md. Idempotent: "
             "missing file or no-matching-entry exit 0. Referenced by the "
-            "four deferral-emission sites in this module."
+            "deferral-emission sites in this module."
         ),
     )
     p_dismiss.add_argument(

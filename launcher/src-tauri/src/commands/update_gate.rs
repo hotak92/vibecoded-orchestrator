@@ -573,12 +573,53 @@ pub fn pre_update_hub_kill_sweep() -> usize {
     count
 }
 
+/// v0.2.63: resolve a running process's executable PATH by pid, via the same
+/// sysinfo backend `pre_update_hub_kill_sweep` uses. Returns `None` if the pid
+/// is gone or the platform won't expose the exe path (permissions, etc.).
+///
+/// Used by the launcher's boot-time hub-identity check
+/// ([`crate::hub_launcher::ensure_hub_running`]) to decide whether a running
+/// hub is the launcher's install-folder copy or a foreign/stale binary (a dev
+/// `cargo run`, a different checkout, an old install) that must be swapped.
+/// Callers MUST treat `None` as "can't tell — leave it alone" (no false kills).
+pub fn process_exe_by_pid(pid: u32) -> Option<std::path::PathBuf> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    // Mirror pre_update_hub_kill_sweep's iteration shape rather than the
+    // single-pid refresh API, so behaviour stays identical across sysinfo
+    // versions already validated by the sweep.
+    for (p, proc) in sys.processes() {
+        if p.as_u32() == pid {
+            return proc.exe().map(|e| e.to_path_buf());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    // ── v0.2.63: process_exe_by_pid (boot-time hub-identity check) ───────
+
+    #[test]
+    fn process_exe_by_pid_resolves_own_exe() {
+        // Our own process's exe path is always resolvable on every supported
+        // OS (Linux /proc/self/exe, macOS libproc, Windows OpenProcess) — this
+        // proves the sysinfo backend works in the test environment.
+        let got = process_exe_by_pid(std::process::id());
+        assert!(got.is_some(), "own pid must resolve to an exe path");
+    }
+
+    #[test]
+    fn process_exe_by_pid_none_for_dead_pid() {
+        // u32::MAX is never a live pid → no process → None.
+        assert_eq!(process_exe_by_pid(u32::MAX), None);
     }
 
     // ── Lockfile round-trip ─────────────────────────────────────────────

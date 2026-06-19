@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.63] - 2026-06-19
+
+v0.2.63 makes the launcher always run its own up-to-date `vct-hub`, refuses to run
+a stale `install.py` when an update can't merge, adds a "Safe add" option for
+attaching existing externally-versioned projects without touching their `.env` or
+polluting their repo, and hardens release CI.
+
+### Added
+
+- **"Safe add" project option.** A per-add checkbox (default OFF — no behaviour
+  change) for attaching an existing, externally-version-controlled project. When
+  ON, VCO does NOT merge its config into the project's sensitive, often-committed
+  `.env` (it writes a `.env.vco.reference` sidecar + a `safe_add_skipped_env_merge`
+  deferral, and skips the in-place `KG_COLLECTION` repair), and it keeps the files
+  VCO creates out of the user's commits by appending ONLY those paths to the repo's
+  local-only `.git/info/exclude` (never the tracked `.gitignore`), recorded via a
+  `safe_add_git_exclude_updated` deferral. The exclude list is computed from the
+  files VCO actually created, so a user's own `.vscode/` / `infrastructure/` /
+  `knowledge/` is never hidden. `.claude/settings.json` + `.vscode/settings.json`
+  still merge as before. CLI: `install-bundle --safe-add`.
+
+### Fixed
+
+- **Launcher always runs its own install-folder `vct-hub`.** `find_hub_binary` now
+  prefers the `vct-hub` shipped next to the running launcher over one on `PATH` /
+  `~/.vct/bin`, and on boot the launcher stops + replaces a running hub that is a
+  DIFFERENT binary — or, on Linux, an OLDER build at the same path (in-place
+  update) — than the install-folder copy. Previously a stale/borrowed hub on the
+  single-instance lockfile was never swapped (the liveness check never compared
+  binary identity). Conservative: only swaps on a positive mismatch.
+- **Update aborts instead of running a stale `install.py`.** When the
+  `vco_upstream` pull/merge during "Update orchestrator" does not advance HEAD to
+  the upstream tip (divergence / a non-FF that slipped through), the launcher now
+  aborts before `install.py` with a clear error rather than re-running the stale
+  source tree (the failure class that crashed an update with an already-fixed
+  error). Guard wired at both `install.py` entry points (the direct update flow
+  and the shared merge/rebase/resume tail).
+- **Release CI hardening.** The `build` job now has a `timeout-minutes` cap so a
+  hung step fails fast instead of running the 6-hour default, and both apt steps
+  run non-interactively (`DEBIAN_FRONTEND` + `NEEDRESTART_MODE` via `sudo -E`) so a
+  package post-install prompt can't stall the runner.
+
+### Changed
+
+- **Coding-standards / maintainability rules** added to the orchestrator
+  `CLAUDE.md` (one-concern-one-home; conservative defaults on best-effort paths;
+  mirror — don't fork — cross-language logic; test the decision, not just the
+  happy path).
+
 ## [0.2.62] - 2026-06-18
 
 v0.2.62 unblocks `install.py --update` on machines without ROCm, adds a hub-side

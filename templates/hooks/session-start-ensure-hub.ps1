@@ -12,12 +12,13 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Soft-fail throughout — never blocks Claude Code startup. Worst case:
 # a single stderr line + exit 0.
 #
-# Binary-discovery order:
+# Binary-discovery order (v0.2.63: install-folder copy preferred over PATH —
+# must match the launcher's hub_launcher::find_hub_binary):
 #   1. $env:VCT_HUB_BIN    — explicit override (dev builds, custom installs)
-#   2. PATH                — first vct-hub.exe / vct-hub on PATH
-#   3. $HOME\.vct\bin\vct-hub.exe (or .\vct-hub on non-Windows PowerShell)
-#   4. <orchestrator_root>\launcher\dist\<arch>\vct-hub(.exe)
-#   5. <orchestrator_root>\launcher\dist\vct-hub(.exe)
+#   2. <repo_root>\launcher\dist\<arch>\vct-hub(.exe)  (INSTALL-FOLDER copy)
+#      then <repo_root>\launcher\dist\vct-hub(.exe)    (arch-less fallback)
+#   3. PATH                — first vct-hub.exe / vct-hub on PATH
+#   4. $HOME\.vct\bin\vct-hub.exe (or .\vct-hub on non-Windows PowerShell)
 # If none match: emit one stderr line, exit 0.
 #
 # Env overrides:
@@ -112,29 +113,10 @@ function Find-HubBinary {
         Write-Debug-Line "VCT_HUB_BIN set but not found: $($env:VCT_HUB_BIN) -- falling through"
     }
 
-    # 2. PATH.
-    foreach ($name in Get-HubExeNames) {
-        $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd) {
-            Write-Debug-Line "found on PATH: $($cmd.Source)"
-            return $cmd.Source
-        }
-    }
-
-    # 3. Known user-install location.
-    $userHome = [System.Environment]::GetFolderPath('UserProfile')
-    if (-not $userHome -and $env:HOME) { $userHome = $env:HOME }
-    if ($userHome) {
-        foreach ($name in Get-HubExeNames) {
-            $candidate = Join-Path $userHome ".vct\bin\$name"
-            if (Test-Path -LiteralPath $candidate) {
-                Write-Debug-Line "found at user install: $candidate"
-                return $candidate
-            }
-        }
-    }
-
-    # 4. In-tree dev build (arch-qualified subdir).
+    # 2. INSTALL-FOLDER copy (v0.2.63): the repo's own dist hub, arch-qualified
+    #    subdir then arch-less fallback. PREFERRED over PATH/.vct\bin so a stale
+    #    vct-hub on PATH never wins over the copy install.py deployed for THIS
+    #    project. Must match the launcher's find_hub_binary order (hub_launcher.rs).
     $arch = Get-ArchDirName
     if ($arch) {
         foreach ($name in Get-HubExeNames) {
@@ -145,13 +127,33 @@ function Find-HubBinary {
             }
         }
     }
-
-    # 5. In-tree dev build (arch-less fallback).
     foreach ($name in Get-HubExeNames) {
         $candidate = Join-Path $RepoRoot "launcher\dist\$name"
         if (Test-Path -LiteralPath $candidate) {
             Write-Debug-Line "found at in-tree flat dist: $candidate"
             return $candidate
+        }
+    }
+
+    # 3. PATH.
+    foreach ($name in Get-HubExeNames) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) {
+            Write-Debug-Line "found on PATH: $($cmd.Source)"
+            return $cmd.Source
+        }
+    }
+
+    # 4. Known user-install location.
+    $userHome = [System.Environment]::GetFolderPath('UserProfile')
+    if (-not $userHome -and $env:HOME) { $userHome = $env:HOME }
+    if ($userHome) {
+        foreach ($name in Get-HubExeNames) {
+            $candidate = Join-Path $userHome ".vct\bin\$name"
+            if (Test-Path -LiteralPath $candidate) {
+                Write-Debug-Line "found at user install: $candidate"
+                return $candidate
+            }
         }
     }
 

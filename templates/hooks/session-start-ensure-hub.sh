@@ -9,12 +9,13 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Soft-fail throughout — never blocks Claude Code startup. Worst case:
 # a single stderr line + exit 0.
 #
-# Binary-discovery order:
+# Binary-discovery order (v0.2.63: install-folder copy preferred over PATH —
+# must match the launcher's hub_launcher::find_hub_binary):
 #   1. $VCT_HUB_BIN        — explicit override (dev builds, custom installs)
-#   2. PATH                — first `vct-hub` on PATH (install.py adds it)
-#   3. $HOME/.vct/bin/vct-hub
-#   4. <orchestrator_root>/launcher/dist/<arch>/vct-hub  (in-tree dev)
-#   5. <orchestrator_root>/launcher/dist/vct-hub         (arch-less fallback)
+#   2. <repo_root>/launcher/dist/<arch>/vct-hub  (INSTALL-FOLDER copy)
+#      then <repo_root>/launcher/dist/vct-hub    (arch-less fallback)
+#   3. PATH                — first `vct-hub` on PATH (install.py adds it)
+#   4. $HOME/.vct/bin/vct-hub
 # If none match: emit one stderr line, exit 0.
 #
 # Env overrides:
@@ -103,24 +104,11 @@ find_hub_binary() {
         debug "VCT_HUB_BIN set but not executable: $VCT_HUB_BIN — falling through"
     fi
 
-    # 2. PATH.
-    local on_path
-    on_path="$(command -v vct-hub 2>/dev/null || true)"
-    if [ -n "$on_path" ] && [ -x "$on_path" ]; then
-        debug "found on PATH: $on_path"
-        printf '%s\n' "$on_path"
-        return 0
-    fi
-
-    # 3. Known user-install location.
-    local user_install="${HOME:-}/.vct/bin/vct-hub"
-    if [ -n "${HOME:-}" ] && [ -x "$user_install" ]; then
-        debug "found at user install: $user_install"
-        printf '%s\n' "$user_install"
-        return 0
-    fi
-
-    # 4. In-tree dev build (arch-qualified subdir).
+    # 2. INSTALL-FOLDER copy (v0.2.63): the repo's own dist hub, arch-qualified
+    #    subdir then arch-less fallback. PREFERRED over PATH/`~/.vct/bin` so a
+    #    stale `vct-hub` on PATH (a leftover dev build, an old global install)
+    #    never wins over the copy install.py deployed for THIS project. Must
+    #    match the launcher's `find_hub_binary` order (hub_launcher.rs, v0.2.63).
     local arch
     arch="$(detect_arch)"
     if [ -n "$arch" ]; then
@@ -131,12 +119,27 @@ find_hub_binary() {
             return 0
         fi
     fi
-
-    # 5. In-tree dev build (arch-less fallback).
     local flat_dist="$REPO_ROOT/launcher/dist/vct-hub"
     if [ -x "$flat_dist" ]; then
         debug "found at in-tree flat dist: $flat_dist"
         printf '%s\n' "$flat_dist"
+        return 0
+    fi
+
+    # 3. PATH.
+    local on_path
+    on_path="$(command -v vct-hub 2>/dev/null || true)"
+    if [ -n "$on_path" ] && [ -x "$on_path" ]; then
+        debug "found on PATH: $on_path"
+        printf '%s\n' "$on_path"
+        return 0
+    fi
+
+    # 4. Known user-install location.
+    local user_install="${HOME:-}/.vct/bin/vct-hub"
+    if [ -n "${HOME:-}" ] && [ -x "$user_install" ]; then
+        debug "found at user install: $user_install"
+        printf '%s\n' "$user_install"
         return 0
     fi
 

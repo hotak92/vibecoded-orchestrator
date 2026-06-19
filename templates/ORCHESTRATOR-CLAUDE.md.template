@@ -105,6 +105,13 @@ Steps 2–3 cost time you didn't budget for. They are still cheaper than letting
 
 When extraction is genuinely hard (the new logic depends on local mutable state in a long sequential flow), extract the pure portion to a helper module and leave a thin orchestration shim in the original file. Document the split in a comment so the next editor does not merge them back.
 
+**A few more maintainability rules** (apply to every change):
+- **One concern, one home.** If logic is needed in 2+ call-sites, write it as a single function/module called from each — never inline a second copy. The moment a second caller appears for inlined logic, refactor it into one function first.
+- **Single responsibility.** Keep functions small and named for what they decide/do; push side-effecting I/O to the edges so the core stays unit-testable.
+- **Conservative defaults on best-effort paths.** When an operation can't positively confirm its precondition (process identity, file freshness, remote state), do nothing rather than guess — soft-fail with a log line, never crash the caller.
+- **Mirror, don't fork, cross-language logic.** When the same rule must exist in Rust + bash + PowerShell (e.g. binary-discovery order), keep them identical and add a "must match <other file>" comment in each so they can't drift.
+- **Test the decision, not just the happy path.** Every new branch that gates a destructive action (stop/kill/delete/overwrite) gets a unit test for both the act and the leave-alone case.
+
 **Hard rule**: never push a tagged release if there is ANY known unresolved issue at tag time. "Known" means anything that has been (a) reported by an audit/review, (b) flagged by CI on the current branch, (c) reproduced as a bug in this or a prior cycle and not yet closed, or (d) explicitly written down as a backlog/follow-up item targeting "next version."
 
 **Triggers this rule (do NOT do these things)**:

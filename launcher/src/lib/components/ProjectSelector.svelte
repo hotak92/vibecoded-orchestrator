@@ -108,6 +108,12 @@
   let creating = $state(false);
   let createError = $state<string | null>(null);
   let showHostHelp = $state(false);
+  // v0.2.63 "Safe add": per-add opt-in, default OFF (no behaviour change).
+  // When ON, VCO won't merge its config into the project's sensitive,
+  // often-committed project-root `.env` — it writes a `.env.vco.reference`
+  // sidecar + a deferral for the project's agent to resolve, and keeps VCO
+  // files out of the repo's commits via local-only `.git/info/exclude`.
+  let safeAdd = $state(false);
   // Once the user manually edits the path field we stop overwriting it.
   let pathTouched = $state(false);
   // Resolved root for the path autosuggest (e.g. ~/code resolved to an
@@ -256,6 +262,7 @@
   function closeCreate() {
     showCreate = false;
     pathTouched = false;
+    safeAdd = false; // v0.2.63: reset the per-add flag on cancel/close.
     createError = null;
     orchestratorState = null;
     leftovers = null;
@@ -388,11 +395,12 @@
       // post-create hook (or, for some hosts, via a separate install step).
       // adoptDecision is recorded on the project row so subsequent
       // install.py runs know whether to pass --adopt-project.
-      await projects.create(createName.trim(), submitPath, createHost);
+      await projects.create(createName.trim(), submitPath, createHost, safeAdd);
       showCreate = false;
       createName = '';
       createPath = '';
       createHost = 'base';
+      safeAdd = false; // v0.2.63: reset the per-add flag for the next add.
       pathTouched = false;
       orchestratorState = null;
       leftovers = null;
@@ -733,6 +741,32 @@
             </div>
           {/if}
         </div>
+
+        <!-- v0.2.63 "Safe add": per-add opt-in (default OFF). Protects a
+             possibly-committed project-root .env and keeps VCO files out of
+             the repo's commits. -->
+        <div class="form-group">
+          <label class="safe-add-row">
+            <input
+              type="checkbox"
+              bind:checked={safeAdd}
+              disabled={creating}
+              aria-describedby="safe-add-hint"
+            />
+            <span class="safe-add-label">Safe add</span>
+          </label>
+          <p
+            class="form-hint"
+            id="safe-add-hint"
+            title="Don't merge VCO config into this project's existing .env — write a reference + a deferral for the project's agent to resolve, and keep VCO files out of your commits via .git/info/exclude (not .gitignore)."
+          >
+            Don't merge VCO config into this project's existing
+            <code>.env</code> — write a <code>.env.vco.reference</code> + a
+            deferral for the project's agent to resolve, and keep VCO files out
+            of your commits.
+          </p>
+        </div>
+
         {#if createError}
           <div class="msg msg-error">{createError}</div>
         {/if}
@@ -1163,6 +1197,34 @@
     font-size: 11px;
     color: var(--color-muted);
     margin-top: 4px;
+  }
+
+  /* v0.2.63 "Safe add" checkbox row. Overrides the default
+     `.form-group label` (block + uppercase) so the checkbox sits inline with
+     its label like a normal toggle. */
+  .safe-add-row {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 0 !important;
+    cursor: pointer;
+    text-transform: none !important;
+    letter-spacing: normal !important;
+  }
+  .safe-add-row input[type='checkbox'] {
+    width: 15px;
+    height: 15px;
+    accent-color: var(--color-teal, #00bfa6);
+    cursor: pointer;
+  }
+  .safe-add-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--color-text);
+  }
+  .form-hint code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 10px;
   }
 
   /* Bug 20: orchestrator state panel inside project-create modal.
