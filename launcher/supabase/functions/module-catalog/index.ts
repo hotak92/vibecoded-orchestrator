@@ -36,6 +36,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { buildCorsHeaders, makeJsonResponse } from "../_shared/http.ts";
+import { isValidModuleId } from "./validation.ts";
 
 const SCHEMA_VERSION = 1;
 const BUCKET = "paid-module-catalog";
@@ -76,6 +77,11 @@ Deno.serve(async (req: Request) => {
   try {
     if (moduleId) {
       // ─── Single-module fetch ──────────────────────────────────────────
+      // Validate the id BEFORE it touches the storage object key (audit
+      // RLS-2). Reject anything that isn't a clean lowercase-kebab slug.
+      if (!isValidModuleId(moduleId)) {
+        return jsonResponse({ error: "invalid_module_id", id: moduleId }, 400);
+      }
       const objectPath = `${moduleId}.json`;
       const { data, error } = await supabase
         .storage

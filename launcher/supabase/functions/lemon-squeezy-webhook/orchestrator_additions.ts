@@ -10,6 +10,7 @@
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { lookupVariant, VARIANT_MAP, type VariantMapping } from "../_shared/variant_map.ts";
+import { findUserIdByEmail } from "./user_lookup.ts";
 
 export { lookupVariant, VARIANT_MAP };
 export type { VariantMapping };
@@ -30,21 +31,10 @@ export const HANDLED_EVENTS = new Set<string>([
   "order_refunded",
 ]);
 
-/**
- * Look up a Supabase user by email.
- *
- * Uses the admin API (requires service_role key). Returns null if not found.
- * Errors bubble up — caller decides response code.
- */
-export async function findUserIdByEmail(
-  supabase: SupabaseClient,
-  email: string,
-): Promise<string | null> {
-  const { data: users, error } = await supabase.auth.admin.listUsers();
-  if (error) throw error;
-  const user = users.users.find((u) => u.email === email);
-  return user?.id ?? null;
-}
+// findUserIdByEmail is defined in ./user_lookup.ts (bounded pagination over
+// auth.admin.listUsers — audit N1-1). Re-exported here so existing importers
+// of this module keep working unchanged.
+export { findUserIdByEmail };
 
 /**
  * Add `appId` to profiles.apps (idempotent) and, if mapping has a tier and
