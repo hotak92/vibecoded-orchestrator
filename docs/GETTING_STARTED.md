@@ -64,6 +64,8 @@ Flags the shim itself consumes: `--no-auto-launch` (skip the post-install launch
 
 After install, double-click `start-launcher.<ext>` for your OS to start the launcher GUI.
 
+> **Where prebuilt binaries come from (and which clone ref to track).** The launcher/hub/updater binaries that the post-install step downloads come from the **GitHub Release `.zip` assets**, and the in-GUI "Update orchestrator" button updates by **pulling `main`**. Both of those paths are always correct. The in-repo prebuilt binaries under `launcher/dist/` are committed by CI *after* a tag is cut (a `chore(binary): refresh ... [skip ci]` commit), so historically a `git checkout <tag>` for some tags landed vN source next to the previous cycle's binaries. Since v0.2.64 the release workflow **re-points the tag onto that refresh commit**, so `git checkout v0.2.64` (and later) is self-consistent. Still, the recommended dev-clone posture is to **track `main`** (or use the Release `.zip` assets) rather than pinning to a tag and expecting matching prebuilt binaries — `main` always carries the freshest binaries.
+
 **Time budget**: ~5 min of interactive prompts, then 10–30 min for container images and model downloads (~5 GB; GPU mode pulls an additional ~2.5 GB). Re-runs reuse cached images.
 
 #### Diagnosing a failed install

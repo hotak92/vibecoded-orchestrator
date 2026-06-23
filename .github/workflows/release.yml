@@ -88,6 +88,71 @@ permissions:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
+  # refresh-guard (v0.2.64 P3 — tag-lag fix)
+  #
+  # THE TAG-LAG MECHANISM this guards against:
+  #   A release tag (vN) is cut on a source commit whose IN-REPO prebuilt
+  #   binaries are still vN-1's. After the tag pushes, `build` produces fresh
+  #   vN binaries and `commit-dist-binaries` commits them to main as a
+  #   `chore(binary): refresh ... for vN [skip ci]` commit that lands ABOVE
+  #   the tag. So `git checkout vN` yields vN source + vN-1 binaries — a
+  #   manual-tag-checkout dev runs vN-1 CODE. (Supported paths — GUI
+  #   "Update orchestrator" which pulls main, and the GitHub Release `.zip`
+  #   assets — are correct; only manual tag-checkout is stale.)
+  #
+  # THE FIX (see the re-point step at the end of commit-dist-binaries):
+  #   After the refresh commit is pushed, force-move the vN tag onto it so
+  #   `git checkout vN` becomes self-consistent.
+  #
+  # THE HAZARD this job neutralises:
+  #   The trigger is `on: push: tags: v*.*.*`. Force-pushing the moved tag
+  #   RE-FIRES this whole workflow → it would rebuild on the tri-OS matrix,
+  #   re-deploy Supabase, and re-point the tag again (an infinite-ish loop of
+  #   wasteful runs). This tiny job detects the binary-refresh re-trigger by
+  #   reading the tagged HEAD commit SUBJECT (`git log -1 --format=%s`) and
+  #   publishes `is_binary_refresh`. `pre-release-gate` and `build` both
+  #   `needs:` this job and gate on the output, so the re-pointed-tag run
+  #   does NOTHING expensive — it succeeds as a clean no-op.
+  #
+  # Why subject (not body): the refresh commit's SUBJECT carries both the
+  # `chore(binary): refresh` marker and `[skip ci]`. Matching the subject
+  # (not the multi-line body) means a user commit that merely quotes the
+  # phrase in its body cannot trip the guard. Both markers must be present.
+  #
+  # Cost: one ubuntu checkout + a `git log` — a few seconds. Runs on every
+  # release trigger but only short-circuits the binary-refresh re-trigger.
+  # ─────────────────────────────────────────────────────────────────────────
+  refresh-guard:
+    name: Detect binary-refresh re-trigger
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      is_binary_refresh: ${{ steps.refresh_guard.outputs.is_binary_refresh }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Only HEAD is needed to read its subject. A shallow fetch keeps
+          # this guard fast.
+          fetch-depth: 1
+      - name: Read tagged HEAD commit subject
+        id: refresh_guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          subject="$(git log -1 --format=%s)"
+          echo "HEAD subject: ${subject}"
+          # The binary-refresh commit subject contains BOTH markers. grep -F
+          # for the literal bracket marker avoids regex-escaping the [skip ci]
+          # brackets. POSIX-clean (runs on ubuntu, shell: bash).
+          if printf '%s' "${subject}" | grep -q 'chore(binary): refresh' \
+            && printf '%s' "${subject}" | grep -qF '[skip ci]'; then
+            echo "::notice::HEAD is a binary-refresh commit — re-pointed-tag run will early-exit (no build/deploy)."
+            echo "is_binary_refresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_binary_refresh=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────
   # pre-release-gate (CI-6, v0.2.42 W7)
   #
   # RELEASE DISCIPLINE — no deferred fixes.
@@ -112,6 +177,15 @@ jobs:
   pre-release-gate:
     name: Pre-release gate (smoke + manifest-validate)
     runs-on: ubuntu-latest
+    # v0.2.64 (P3 — tag-lag fix): gate the whole expensive pre-release gate on
+    # the refresh-guard. When the re-pointed binary-refresh tag re-triggers
+    # this workflow, refresh-guard reports is_binary_refresh=true and this
+    # entire job is SKIPPED (its `needs` dependency `build` is skipped too).
+    # A skipped pre-release-gate counts as success for downstream `needs`
+    # resolution only because `build` ALSO gates on the same output — see the
+    # build job's `if:`.
+    needs: refresh-guard
+    if: needs.refresh-guard.outputs.is_binary_refresh != 'true'
     # v0.2.62: 20→30. The gate (install.py + install-bundle + a cold-cache
     # cargo build of the manifest-CI bins + gates 1-3) outgrew 20 min as the
     # Rust workspace grew (v0.2.61 finished in 17m; v0.2.62 hit the 20m cap
@@ -293,12 +367,40 @@ jobs:
             exit 0
           fi
 
-          echo "Checking launcher/dist/ diff between ${prev_tag} and HEAD (${current_tag})"
+          # v0.2.64 (P3 — tag-lag fix) RE-POINT AWARENESS:
+          # Since v0.2.64 the release tag is RE-POINTED onto its own
+          # binary-refresh commit (so `git checkout vN` is self-consistent —
+          # see commit-dist-binaries). That means a re-pointed `prev_tag`
+          # already carries the PREVIOUS release's freshly-built binaries.
+          # The current tag is cut on a source commit that — by the same
+          # post-release lag — still has those SAME binaries in-repo at tag
+          # time. So `git diff <re-pointed prev_tag>..HEAD -- launcher/dist/`
+          # would be EMPTY for a perfectly-healthy release, turning Gate 3
+          # into a false-positive.
+          #
+          # Fix: when prev_tag resolves to a binary-refresh commit, diff
+          # against that tag's PARENT (its source commit) instead. That
+          # restores the original heuristic — "did dist/ change since the
+          # previous release's SOURCE commit?" — which is exactly what Gate 3
+          # was always checking before tags were re-pointed. Pre-v0.2.64 tags
+          # (e.g. v0.2.63) are NOT binary-refresh commits, so they take the
+          # unchanged `prev_tag..HEAD` path. The authoritative source-match
+          # verification still lives in Gate 3b (advisory here) + the STRICT
+          # check in commit-dist-binaries.
+          prev_subject="$(git log -1 --format=%s "${prev_tag}" 2>/dev/null || true)"
+          compare_ref="${prev_tag}"
+          if printf '%s' "${prev_subject}" | grep -q 'chore(binary): refresh' \
+            && printf '%s' "${prev_subject}" | grep -qF '[skip ci]'; then
+            compare_ref="${prev_tag}^"
+            echo "::notice::${prev_tag} is a re-pointed binary-refresh commit (v0.2.64+); comparing against its source parent ${compare_ref}."
+          fi
 
-          dist_diff="$(git diff "${prev_tag}..HEAD" -- launcher/dist/ || true)"
+          echo "Checking launcher/dist/ diff between ${compare_ref} and HEAD (${current_tag})"
+
+          dist_diff="$(git diff "${compare_ref}..HEAD" -- launcher/dist/ || true)"
 
           if [ -z "$dist_diff" ]; then
-            echo "::error::PRE-RELEASE GATE FAIL (V0243-7): launcher/dist/ is UNCHANGED since ${prev_tag}."
+            echo "::error::PRE-RELEASE GATE FAIL (V0243-7): launcher/dist/ is UNCHANGED since ${compare_ref}."
             echo "::error::This means the dist binaries were NOT refreshed since the previous release."
             echo "::error::The commit-dist-binaries job from the previous release likely failed (PAT 403 / branch-protection)."
             echo "::error::Fix: manually commit updated launcher/dist/ binaries to main (see docs/MAINTAINER_GUIDE.md"
@@ -307,7 +409,7 @@ jobs:
           fi
 
           changed_count="$(echo "$dist_diff" | grep -c '^diff --git' || true)"
-          echo "::notice::Gate 3 PASS: launcher/dist/ has ${changed_count} changed file(s) since ${prev_tag}."
+          echo "::notice::Gate 3 PASS: launcher/dist/ has ${changed_count} changed file(s) since ${compare_ref}."
 
       # Gate 3b (v0.2.54 G-1.5) — sidecar source_hash vs live launcher
       # subtree. Gate 3 above only proves dist/ CHANGED since the previous
@@ -337,7 +439,15 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: pre-release-gate
+    # v0.2.64 (P3 — tag-lag fix): need BOTH the guard and the gate. Gating
+    # explicitly on refresh-guard's output (rather than relying solely on the
+    # skipped-pre-release-gate cascade) makes the early-exit intent local to
+    # this job and keeps the condition robust if the gate's skip semantics
+    # change. On a re-pointed binary-refresh tag run this job is skipped, so
+    # commit-dist-binaries + supabase-deploy (which `needs: build`) are skipped
+    # too — the whole expensive chain is a no-op.
+    needs: [refresh-guard, pre-release-gate]
+    if: needs.refresh-guard.outputs.is_binary_refresh != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1347,6 +1457,7 @@ jobs:
           python3 scripts/check-dist-freshness.py --mode strict --github
 
       - name: Commit and push updated binaries
+        id: push_binaries
         if: steps.stage.outputs.changed != '0'
         shell: bash
         env:
@@ -1406,6 +1517,12 @@ jobs:
           Includes per-OS-dir metadata.json (v0.2.53 Track D — read by
           start-launcher.{sh,command,bat} via scripts/lib/launcher-metadata.sh
           to resolve binary_name / canonical OS subdir).
+
+          v0.2.64 (P3 — tag-lag fix): the v${VERSION} tag is RE-POINTED onto
+          this commit immediately after it lands, so 'git checkout v${VERSION}'
+          yields v${VERSION} source + v${VERSION} binaries — i.e. THIS is the
+          self-consistent release commit. The re-pointed tag re-fires Release
+          but the refresh-guard job makes that run a no-op (no rebuild/deploy).
           Source tag: v${VERSION}  Run: ${{ github.run_id }}"
 
           # v0.2.17 fix: race-tolerant push. The build matrix took
@@ -1429,6 +1546,52 @@ jobs:
           # 403 with "Push declined by repository rules" — set up either
           # option per the job-level comment to unblock.
           git push origin HEAD:main
+
+          # v0.2.64 (P3 — tag-lag fix): record the SHA of the refresh commit
+          # we just landed on main. The re-point step below moves the release
+          # tag onto THIS commit so `git checkout vN` is self-consistent.
+          # HEAD here is the binary-refresh commit (possibly cherry-picked onto
+          # a moved origin/main above), so `git rev-parse HEAD` is correct.
+          refresh_sha="$(git rev-parse HEAD)"
+          echo "refresh_sha=${refresh_sha}" >> "$GITHUB_OUTPUT"
+          echo "::notice::Binary-refresh commit pushed: ${refresh_sha}"
+
+      # ── RE-POINT RELEASE TAG (v0.2.64 P3 — tag-lag fix) ───────────────────
+      # Force-move the vN tag onto the binary-refresh commit we just pushed, so
+      # `git checkout vN` yields vN source + vN binaries (self-consistent). The
+      # tag previously pointed at the source commit whose IN-REPO binaries were
+      # still vN-1's; that lag is what this whole piece exists to close.
+      #
+      # RE-TRIGGER SAFETY: force-pushing the moved tag re-fires this workflow
+      # (trigger is `on: push: tags: v*.*.*`). The refresh-guard job at the top
+      # detects the binary-refresh commit subject and short-circuits the
+      # re-pointed-tag run (no rebuild, no Supabase redeploy, no second
+      # re-point) — so this is a one-shot move, NOT a loop. See refresh-guard.
+      #
+      # Gated to tag pushes with an actual refresh commit. workflow_dispatch
+      # dry-runs (no tag) and no-op runs (changed == 0) never re-point.
+      # contents:write is already granted at workflow level; the bot identity
+      # is set above. Uses the same DIST_COMMIT_TOKEN || GITHUB_TOKEN that the
+      # checkout configured, so the tag push honours branch/tag protection the
+      # same way the binary commit push does.
+      - name: Re-point release tag to binary-refresh commit
+        if: |
+          steps.stage.outputs.changed != '0'
+          && startsWith(github.ref, 'refs/tags/v')
+          && steps.push_binaries.outputs.refresh_sha != ''
+        shell: bash
+        env:
+          REFRESH_SHA: ${{ steps.push_binaries.outputs.refresh_sha }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          echo "Re-pointing tag ${tag} -> ${REFRESH_SHA} (binary-refresh commit)"
+          # -f moves the local tag onto the refresh commit; the explicit
+          # refspec force-push updates the remote tag. The re-pointed tag
+          # re-triggers Release, but refresh-guard makes that run a no-op.
+          git tag -f "${tag}" "${REFRESH_SHA}"
+          git push --force origin "refs/tags/${tag}"
+          echo "::notice::Tag ${tag} now points at ${REFRESH_SHA} — git checkout ${tag} is self-consistent (vN source + vN binaries)."
 
       - name: Report no-op (all binaries already up to date)
         if: steps.stage.outputs.changed == '0'

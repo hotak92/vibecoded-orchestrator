@@ -174,6 +174,15 @@ CI uses `Swatinem/rust-cache@v2` scoped to `launcher/src-tauri` to avoid re-comp
 ### Semver with manual tagging
 Version numbers live in three places: `launcher/package.json` `version`, `launcher/src-tauri/Cargo.toml` `[package].version`, and `CHANGELOG.md` section headers. Tagging is manual — a tag means "this is the commit external users should pin to", and is reserved for the maintainer to do explicitly after pre-flight passes.
 
+### Prebuilt binaries, the in-repo dist lag, and the tag re-point (v0.2.64)
+The launcher / hub / updater binaries are NOT built at tag time — they are built by the `build` job in `.github/workflows/release.yml` on the tri-OS matrix *after* the tag pushes, then committed back to `main` by the `commit-dist-binaries` job as a `chore(binary): refresh ... for vN [skip ci]` commit that lands ABOVE the tag. Consequences for the three ways a user obtains binaries:
+
+- **GUI "Update orchestrator"** pulls `main` → gets the freshest binaries. Correct.
+- **GitHub Release `.zip` assets** bundle the freshly-built binaries inside the archive. Correct.
+- **`git checkout <tag>`** is the only stale path: vN was historically tagged on a source commit whose in-repo `launcher/dist/` still carried vN-1's binaries (the refresh commit lands *after* the tag), so a manual tag-checkout dev would run vN-1 CODE next to vN source.
+
+Since **v0.2.64** the `commit-dist-binaries` job force-moves the vN tag onto its own binary-refresh commit, so `git checkout vN` (v0.2.64 and later) is self-consistent (vN source + vN binaries). The hazard this introduces — the trigger is `on: push: tags: v*.*.*`, so force-pushing the moved tag re-fires Release — is neutralised by a `refresh-guard` job that reads the tagged HEAD commit subject (`git log -1 --format=%s`); when it detects the `chore(binary): refresh ... [skip ci]` marker it short-circuits the run (no rebuild, no Supabase redeploy, no second re-point). The re-pointed-tag run is therefore a cheap no-op. **Recommended dev-clone posture remains: track `main` (or use the Release `.zip` assets), not `git checkout <tag>`.** Pre-v0.2.64 tags are not re-pointed and keep the one-commit binary lag.
+
 ### CHANGELOG follows Keep a Changelog format
 Uses the [Keep a Changelog](https://keepachangelog.com/) format with `[Unreleased]` at the top. Release commit moves `[Unreleased]` entries to a `[x.y.z] — YYYY-MM-DD` section.
 
