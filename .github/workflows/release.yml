@@ -196,6 +196,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        # v0.2.64 (P3 — CONCERN-1): fetch FULL history (depth 0), not the
+        # default shallow depth 1. Gate 3 (dist freshness) compares against the
+        # previous tag, and from v0.2.64 on that previous tag may be a
+        # RE-POINTED binary-refresh commit — in which case Gate 3 diffs against
+        # its PARENT (`prev_tag^`). On a shallow clone a tag's parent commit is
+        # NOT present (a plain `git fetch --tags` brings tag refs but not the
+        # ancestry behind them), so `git rev-parse prev_tag^` would fail and the
+        # diff would be empty → Gate 3 would FALSE-FAIL the first re-pointed
+        # release (v0.2.65). Full history makes `prev_tag^` always resolvable.
+        # Gate 3 ALSO carries an explicit missing-parent fallback as defence in
+        # depth, so a future change here can't silently re-open the false-fail.
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
@@ -391,13 +404,36 @@ jobs:
           compare_ref="${prev_tag}"
           if printf '%s' "${prev_subject}" | grep -q 'chore(binary): refresh' \
             && printf '%s' "${prev_subject}" | grep -qF '[skip ci]'; then
-            compare_ref="${prev_tag}^"
-            echo "::notice::${prev_tag} is a re-pointed binary-refresh commit (v0.2.64+); comparing against its source parent ${compare_ref}."
+            # prev_tag is a re-pointed binary-refresh commit (v0.2.64+) — its
+            # PARENT is the previous release's source commit. Diff against the
+            # parent so a healthy release isn't a false positive.
+            #
+            # CONCERN-1 missing-parent fallback: the checkout above uses
+            # fetch-depth: 0 so the parent is normally present. But the Gate
+            # must NEVER fail on a heuristic it could not actually evaluate — if
+            # for any reason `prev_tag^` is unresolvable (e.g. a future revert to
+            # a shallow checkout), DON'T silently `|| true` an empty diff into a
+            # false-fail. Fall back to comparing against prev_tag itself and emit
+            # a ::warning:: so the degradation is visible in the run log.
+            if git rev-parse --verify --quiet "${prev_tag}^" >/dev/null; then
+              compare_ref="${prev_tag}^"
+              echo "::notice::${prev_tag} is a re-pointed binary-refresh commit (v0.2.64+); comparing against its source parent ${compare_ref}."
+            else
+              echo "::warning::${prev_tag} is a re-pointed binary-refresh commit but its parent ${prev_tag}^ is not present locally (shallow clone?). Falling back to comparing against ${prev_tag} itself — Gate 3 may under-report dist changes for this release. Set fetch-depth: 0 on the pre-release-gate checkout to restore parent-aware comparison."
+            fi
           fi
 
           echo "Checking launcher/dist/ diff between ${compare_ref} and HEAD (${current_tag})"
 
-          dist_diff="$(git diff "${compare_ref}..HEAD" -- launcher/dist/ || true)"
+          # NOTE: deliberately NO `|| true` here. `git diff` exits 0 with empty
+          # output for a real no-change comparison, and non-zero only on a true
+          # error (unresolvable ref / corrupt repo). Under `set -euo pipefail` a
+          # genuine git error must surface as a job failure, NOT be coerced into
+          # an empty diff that the gate would then misread as "dist unchanged".
+          # compare_ref is guaranteed resolvable above (fetch-depth: 0 + the
+          # missing-parent fallback), so the diff can only legitimately be empty
+          # or populated.
+          dist_diff="$(git diff "${compare_ref}..HEAD" -- launcher/dist/)"
 
           if [ -z "$dist_diff" ]; then
             echo "::error::PRE-RELEASE GATE FAIL (V0243-7): launcher/dist/ is UNCHANGED since ${compare_ref}."
@@ -605,7 +641,7 @@ jobs:
             echo "binary=vct-hub" >> "$GITHUB_OUTPUT"
           fi
 
-      # v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): vct-updater is a third
+      # v0.2.52 V52-AH (external-tester bug 1, 2026-06-09): vct-updater is a third
       # sibling binary built from the same workspace and staged into the
       # same launcher/dist/<arch>/ directory. Like vct-hub above, expose
       # its platform-specific filename (vct-updater vs vct-updater.exe)
@@ -1596,6 +1632,97 @@ jobs:
       - name: Report no-op (all binaries already up to date)
         if: steps.stage.outputs.changed == '0'
         run: echo "All dist binaries are byte-identical to HEAD — no commit needed."
+
+      # ── SELF-HEAL TAG RE-POINT (v0.2.64 P3 — CONCERN-2) ───────────────────
+      # The main "Re-point release tag" step above only runs when THIS run
+      # actually committed a binary refresh (`changed != '0'` AND
+      # refresh_sha != ''). That leaves a silent-defeat hole:
+      #
+      #   Run #1: binary push to main SUCCEEDS, then the tag force-push FAILS
+      #           (transient network / tag-protection). Job goes red with main
+      #           advanced (binaries landed) but the remote tag STILL at the
+      #           stale source commit.
+      #   Re-run: commit-dist-binaries re-stages binaries already on main →
+      #           `changed == '0'` → the commit step, push_binaries (so
+      #           refresh_sha is empty) AND the main re-point step ALL skip.
+      #           The tag stays stale with NO error — the feature is silently
+      #           defeated.
+      #
+      # This always-on tail step closes the hole: on ANY tag push it locates
+      # the binary-refresh commit for THIS version on origin/main and re-points
+      # the tag onto it IF the tag is currently behind it. It is fully
+      # idempotent — a no-op when the tag already matches (the normal post-run
+      # state after the main re-point step) or when no refresh commit exists yet
+      # for this version (nothing to heal).
+      #
+      # `if: always()` so it runs even after an upstream step failed (e.g. the
+      # main re-point's tag push). It is INTERNALLY gated to tag pushes; a
+      # workflow_dispatch dry-run (no tag) is a no-op.
+      #
+      # SECURITY (same posture as the main re-point step): explicit single-ref
+      # refspec `refs/tags/<tag>` (never a force-push-all-tags), `tag` derived
+      # from GITHUB_REF, contents:write at workflow level, the DIST_COMMIT_TOKEN ||
+      # GITHUB_TOKEN configured at checkout, and the actions-bot identity set in
+      # the push step above. We only ever move the tag onto a VERIFIED
+      # binary-refresh commit for THIS version found on origin/main — never
+      # blindly onto whatever main HEAD happens to be — so an unrelated commit
+      # landing on main after the refresh cannot drag the tag forward.
+      - name: Self-heal — ensure tag points at this version's binary-refresh commit
+        if: always() && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          # Single source for both the version (subject match) and the tag ref.
+          TAG_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          tag="${TAG_REF#refs/tags/}"
+          version="${tag#v}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Refresh both main and the tag refs so we compare current remote
+          # state. (The checkout used fetch-depth: 1; a refresh-commit search by
+          # subject needs enough history, so deepen if the first scan misses.)
+          git fetch origin main --quiet
+          git fetch origin --force "refs/tags/${tag}:refs/tags/${tag}" --quiet 2>/dev/null || true
+
+          # The exact subject commit-dist-binaries writes for this version.
+          # Matching the literal subject (refresh marker + THIS version + the
+          # [skip ci] marker) means we only ever re-point onto the right commit.
+          refresh_subject="chore(binary): refresh vct-launcher + vct-hub + vct-updater dist binaries for v${version} [skip ci]"
+
+          # Find the binary-refresh commit for THIS version on origin/main.
+          # --fixed-strings so the brackets / plus signs are literal. Newest
+          # match first; -n1 takes the most recent. Empty if none exists yet.
+          find_refresh() {
+            git log origin/main --format='%H' --fixed-strings \
+              --grep="${refresh_subject}" -n1 2>/dev/null || true
+          }
+          refresh_sha="$(find_refresh)"
+          if [ -z "$refresh_sha" ]; then
+            # Shallow checkout may not carry the commit yet — deepen once.
+            git fetch origin main --deepen=50 --quiet 2>/dev/null || true
+            refresh_sha="$(find_refresh)"
+          fi
+
+          if [ -z "$refresh_sha" ]; then
+            echo "::notice::Self-heal: no binary-refresh commit found on origin/main for v${version} yet — nothing to heal (the tag is not expected to be re-pointed for this version)."
+            exit 0
+          fi
+
+          current_tag_sha="$(git rev-parse --verify --quiet "refs/tags/${tag}" || true)"
+          if [ "$current_tag_sha" = "$refresh_sha" ]; then
+            echo "::notice::Self-heal: tag ${tag} already points at the binary-refresh commit ${refresh_sha} — no action (idempotent no-op)."
+            exit 0
+          fi
+
+          echo "::warning::Self-heal: tag ${tag} (${current_tag_sha:-<unset>}) is NOT on this version's binary-refresh commit ${refresh_sha} — re-pointing. (Expected after a prior run's tag push failed mid-release.)"
+          git tag -f "${tag}" "${refresh_sha}"
+          # Explicit single-ref refspec — never a force-push-all-tags.
+          git push --force origin "refs/tags/${tag}"
+          echo "::notice::Self-heal: tag ${tag} re-pointed to ${refresh_sha} — git checkout ${tag} is now self-consistent (vN source + vN binaries)."
 
   # ─────────────────────────────────────────────────────────────────────────
   # supabase-deploy
