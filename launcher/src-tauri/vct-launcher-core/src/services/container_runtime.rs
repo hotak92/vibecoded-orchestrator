@@ -75,6 +75,23 @@ use crate::services::gpu_mode::GpuMode;
 /// service-port layout.
 pub const DEFAULT_OLLAMA_PORT: &str = "11435";
 
+/// Fixed host port the GLOBAL (machine-wide) RL reranker container listens
+/// on, used after a module migrates from per-project to global scope
+/// (`auto_migrate_per_project_to_global`): there is ONE container serving
+/// every project, so it can't use a per-project allocated port. 11443 sits
+/// just above the orchestrator-root RL pin (11442) and below the per-project
+/// allocation range (11500..=11900) so it collides with neither.
+///
+/// CANONICAL SOURCE OF TRUTH. Previously this value was duplicated across
+/// three call sites with "keep in sync" / "the hub can't import the launcher
+/// crate" comments. That blocker was stale: both the launcher crate
+/// (`src-tauri`) and the hub crate (`vct-hub`) already depend on
+/// `vct-launcher-core`, so all three sites now `use` THIS constant:
+///   * `src-tauri/src/commands/module_service.rs` (re-exported via `pub use`)
+///   * `vct-hub/src/module_supervisor.rs`
+///   * `vct-hub/src/config_api.rs`
+pub const GLOBAL_RL_PORT: u16 = 11443;
+
 /// v0.2.47: doc-test-friendly constant that pins the call-site identity
 /// of this module. Both `launcher/src-tauri/src/commands/module_service.rs`
 /// and `launcher/src-tauri/vct-hub/src/module_supervisor.rs` re-export
@@ -3054,11 +3071,19 @@ mod tests {
     }
 
     /// `rl_placeholders_global` substitutes `"global"` for `{project_slug}`.
+    /// Asserts the port against the canonical `GLOBAL_RL_PORT` const (v0.2.65
+    /// Track B Item 4) so a future change to the const can't silently drift
+    /// from this fixture — the test follows the source of truth.
     #[test]
     fn v0249_rl_placeholders_global_uses_fixed_slug() {
-        let placeholders = rl_placeholders_global(11443);
+        let placeholders = rl_placeholders_global(GLOBAL_RL_PORT);
         assert_eq!(placeholders.get("{project_slug}").map(|s| s.as_str()), Some("global"));
-        assert_eq!(placeholders.get("{RL_SERVER_PORT}").map(|s| s.as_str()), Some("11443"));
+        assert_eq!(
+            placeholders.get("{RL_SERVER_PORT}").map(|s| s.as_str()),
+            Some(GLOBAL_RL_PORT.to_string().as_str())
+        );
+        // Pin the value too so an accidental const change is caught loudly.
+        assert_eq!(GLOBAL_RL_PORT, 11443);
     }
 
     /// `build_podman_run_args_global` rejects non-container runtime types

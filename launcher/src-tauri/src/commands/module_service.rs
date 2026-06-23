@@ -58,7 +58,7 @@ pub use vct_launcher_core::services::container_runtime::{
 #[allow(unused_imports)]
 pub use vct_launcher_core::services::container_runtime::{
     build_port_arg, build_volume_arg, resolve_value, resolve_variant_tag, rl_placeholders,
-    DEDUP_SENTINEL, DEFAULT_OLLAMA_PORT,
+    DEDUP_SENTINEL, DEFAULT_OLLAMA_PORT, GLOBAL_RL_PORT,
 };
 
 // ─── Constants ──────────────────────────────────────────────────────────
@@ -484,21 +484,14 @@ pub async fn start_container_after_install(
 
 // ─── v0.2.49 Stream A: global container lifecycle ─────────────────────
 
-/// Fixed RL listen port for a GLOBAL-scope module. One port per machine
-/// per module — no per-project allocation table because there is exactly
-/// ONE container per global module. Chosen above the orchestrator-root
-/// port + above the per-project allocation range to avoid collision
-/// with both.
-///
-/// v0.2.61 (Option H): the launcher no longer spawns the global
-/// container directly — `start_global_container_for_module` delegates to
-/// the hub, which owns the actual `podman run` and reads its OWN copy of
-/// this value (`vct-hub::module_supervisor::start_global_container_supervisor`'s
-/// local `GLOBAL_RL_PORT`). This constant is therefore unreferenced in the
-/// launcher today, but it remains the DOCUMENTED source-of-truth the hub's
-/// duplicate is "kept in sync with" — keep it (and its value) authoritative
-/// here. `#[allow(dead_code)]` rather than deletion preserves that contract.
-pub const GLOBAL_RL_PORT: u16 = 11443;
+// `GLOBAL_RL_PORT` (the fixed machine-wide RL listen port for a GLOBAL-scope
+// module) now lives in `vct_launcher_core::services::container_runtime` as
+// the single source of truth, re-exported via the `pub use` block at the top
+// of this file so the references below (and the test block) stay unqualified.
+// v0.2.65 Track B Item 4 collapsed three duplicated copies (this one + the
+// two hub-local ones) into that one const — the old "kept in sync" /
+// "hub can't import the launcher crate" contract is gone (both crates depend
+// on vct-launcher-core).
 
 /// Resolve the host port the RL reranker container listens on for a given
 /// project (v0.2.61, Option H B2 fix).

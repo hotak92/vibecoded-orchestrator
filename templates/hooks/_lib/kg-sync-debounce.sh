@@ -113,6 +113,20 @@
 # arrays). The PowerShell sibling _lib/kg-sync-debounce.ps1 implements
 # identical semantics.
 
+# Absolute path to THIS lib, captured at source time. A detached flusher
+# re-sources this file in a fresh `setsid` shell (Item 1) so it can call the
+# in-process helper functions without re-inlining their exactly-once logic.
+# Resolved from $0 fallbacks when BASH_SOURCE is unavailable (POSIX sh).
+if [ -n "${BASH_SOURCE:-}" ]; then
+    _KG_DEBOUNCE_LIB="${BASH_SOURCE}"
+else
+    _KG_DEBOUNCE_LIB="$0"
+fi
+case "$_KG_DEBOUNCE_LIB" in
+    /*) : ;;  # already absolute
+    *)  _KG_DEBOUNCE_LIB="$(cd "$(dirname "$_KG_DEBOUNCE_LIB")" 2>/dev/null && pwd)/$(basename "$_KG_DEBOUNCE_LIB")" ;;
+esac
+
 # POSIX single-quote escaper: wraps $1 so it survives `eval` even if it
 # contains spaces or single quotes. A literal ' becomes '\'' (close,
 # escaped-quote, reopen). Use this for any user-controlled path embedded
@@ -137,6 +151,26 @@ _kg_debounce_window() {
 _kg_debounce_dir() {
     printf '%s/.claude/state/kg_sync_pending' "$1"
 }
+
+# Reaper throttle interval, in seconds. The reaper globs ALL pending work
+# dirs (O(M^2) across a long-lived session), so running it on EVERY
+# schedule call is wasteful when edits come in bursts. 30s = the grace
+# jitter budget (`window + 30`), so even a throttled reaper still fires
+# within one grace window — an orphan is recovered with at most ~grace
+# extra delay, well inside the feature's eventually-consistent contract.
+# MUST MATCH _lib/kg-sync-debounce.ps1 ($KG_DEBOUNCE_REAP_THROTTLE_SECONDS).
+_KG_DEBOUNCE_REAP_THROTTLE_SECONDS=30
+
+# Max number of live ".lock" dirs before we stop SCHEDULING new sleeping
+# flushers and instead run the sync IMMEDIATELY in the background. The
+# common burst is a handful (3-10) of distinct (file,channel) pairs edited
+# rapidly; 64 simultaneous pending locks is a pathological fan-out (a
+# script touching dozens of files in one tick) far above any normal agent
+# edit burst, so this ceiling never trips on the common case. Above it we
+# fall through to immediate-sync — we NEVER drop a sync, we only stop
+# accumulating sleeping flusher subshells.
+# MUST MATCH _lib/kg-sync-debounce.ps1 ($KG_DEBOUNCE_LOCK_CEILING).
+_KG_DEBOUNCE_LOCK_CEILING=64
 
 # Hash a file path → a slash-free lock key. Reuses the portable
 # md5-via-Python pattern already used by the diagram throttle in
@@ -228,6 +262,104 @@ _kg_debounce_claimtok() {
     printf '%s.%s' "$$" "${RANDOM:-$(date +%N 2>/dev/null || echo 0)}"
 }
 
+# Run a shell snippet DETACHED from the hook's process group, so it survives
+# even if the hook's group is signalled during the work (the PostToolUse
+# hook exits within milliseconds; a bare `( ... ) &` in the same group can
+# be killed mid-`sleep`, leaving the file un-synced). The PowerShell sibling
+# already detaches via Start-Process; this brings bash to parity.
+#
+# Strategy, best-effort with graceful fallback (a failure only reverts to
+# TODAY's behaviour — a same-group background job — never drops the sync):
+#   1. `setsid` (Linux/util-linux): new session → fully detached. Preferred.
+#   2. `nohup ... & disown` (macOS/BSD, no setsid): immune to SIGHUP and
+#      removed from the shell's job table so it isn't reaped on shell exit.
+#   3. plain `( ... ) &`: the pre-this-change behaviour, when neither is
+#      available.
+# $1 = the shell snippet to run (passed to `sh -c`).
+# MUST MATCH the detach intent of _lib/kg-sync-debounce.ps1's Start-Process.
+_kg_debounce_detach() {
+    _snip="$1"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh -c "$_snip" >/dev/null 2>&1 < /dev/null &
+    elif command -v nohup >/dev/null 2>&1; then
+        nohup sh -c "$_snip" >/dev/null 2>&1 < /dev/null &
+        disown 2>/dev/null || true
+    else
+        ( sh -c "$_snip" ) >/dev/null 2>&1 < /dev/null &
+    fi
+}
+
+# Build the snippet a detached IMMEDIATE-sync runs: cd into $1, eval $2.
+# Both args are embedded via _kg_debounce_shquote so paths/cmds with spaces
+# or quotes survive the extra `sh -c` layer.
+#   $1 = working dir, $2 = sync command string
+_kg_debounce_immediate_snip() {
+    printf 'cd %s 2>/dev/null || true; eval %s' \
+        "$(_kg_debounce_shquote "$1")" "$(_kg_debounce_shquote "$2")"
+}
+
+# Flusher body, runnable from a fresh detached shell that has re-sourced
+# this lib (Item 1). Sleeps the quiet-window, then claims its own lock via
+# the SAME atomic rename the reaper uses (lock → ".reaping.<token>") and
+# recovers it through the shared _kg_debounce_run_claimed path so the sync
+# re-reads the file fresh → latest content. The completion-time `mv` is the
+# exactly-once gate: normally the flusher wins its rename and runs once; if
+# its sleep stretched past window+GRACE a reaper may have already claimed +
+# run the lock, in which case this `mv` fails (source gone) and it no-ops.
+# This is the SAME logic the old inline `( sleep; mv; run_claimed ) &`
+# subshell ran — factored into a function so the detached shell can call it
+# instead of re-inlining (no divergence risk).
+#   $1 = window seconds, $2 = lock dir, $3 = state dir, $4 = lock base name
+_kg_debounce_flusher_body() {
+    _fb_window="$1" _fb_lock="$2" _fb_dir="$3" _fb_base="$4"
+    sleep "$_fb_window"
+    _fb_won="$_fb_lock.reaping.$(_kg_debounce_claimtok)"
+    if mv "$_fb_lock" "$_fb_won" 2>/dev/null; then
+        _kg_debounce_run_claimed "$_fb_won" "$_fb_dir" "$_fb_base"
+        # _kg_debounce_run_claimed backgrounds its own subshell; wait so this
+        # flusher shell does not exit before the re-stamp + eval complete.
+        wait
+    fi
+    # else: a reaper already claimed+ran this lock → no-op.
+}
+
+# Spawn the flusher DETACHED from the hook's process group (Item 1). The
+# flusher sleeps the quiet-window, so it is the part most exposed to being
+# killed if the hook's group is signalled mid-sleep. We re-source this lib
+# in a fresh shell and call _kg_debounce_flusher_body there:
+#   1. `setsid bash -c '...'` — new session, fully detached. Preferred.
+#   2. `nohup bash -c '...' & disown` — SIGHUP-immune + off the job table,
+#      for macOS/BSD where setsid may be absent.
+#   3. plain `( _kg_debounce_flusher_body ... ) &` IN-PROCESS — today's
+#      behaviour, when neither setsid nor a re-sourceable shell is available
+#      (e.g. POSIX `sh` with no bash). A bug here only reverts to the
+#      pre-this-change same-group background job; the sync is never dropped.
+# A re-source needs an absolute lib path + a shell that can source it; when
+# $_KG_DEBOUNCE_LIB isn't a readable file we use the in-process fallback so
+# the flusher always runs.
+#   $1 = window, $2 = lock dir, $3 = state dir, $4 = lock base name
+_kg_debounce_spawn_flusher() {
+    _sf_window="$1" _sf_lock="$2" _sf_dir="$3" _sf_base="$4"
+    if [ -r "$_KG_DEBOUNCE_LIB" ] && command -v bash >/dev/null 2>&1; then
+        _sf_snip="$(printf '. %s; _kg_debounce_flusher_body %s %s %s %s' \
+            "$(_kg_debounce_shquote "$_KG_DEBOUNCE_LIB")" \
+            "$(_kg_debounce_shquote "$_sf_window")" \
+            "$(_kg_debounce_shquote "$_sf_lock")" \
+            "$(_kg_debounce_shquote "$_sf_dir")" \
+            "$(_kg_debounce_shquote "$_sf_base")")"
+        if command -v setsid >/dev/null 2>&1; then
+            setsid bash -c "$_sf_snip" >/dev/null 2>&1 < /dev/null &
+            return 0
+        elif command -v nohup >/dev/null 2>&1; then
+            nohup bash -c "$_sf_snip" >/dev/null 2>&1 < /dev/null &
+            disown 2>/dev/null || true
+            return 0
+        fi
+    fi
+    # Fallback: in-process backgrounded subshell (pre-Item-1 behaviour).
+    ( _kg_debounce_flusher_body "$_sf_window" "$_sf_lock" "$_sf_dir" "$_sf_base" ) &
+}
+
 # Reap abandoned work. Two sweeps, both using the SAME atomic rename-claim
 # so that for any one piece of pending work EXACTLY ONE process runs it:
 #   (A) live ".lock" dirs older than window+GRACE → orphaned (the flusher
@@ -247,11 +379,35 @@ _kg_debounce_claimtok() {
 _kg_debounce_reap_stale() {
     local proot="$1"
     local dir window grace now lock claimed age mtime cpid base won reclaimed
+    local stamp last_reap reap_age
     dir="$(_kg_debounce_dir "$proot")"
     [ -d "$dir" ] || return 0
     window="$(_kg_debounce_window)"
     grace=$(( window + 30 ))   # window + 30s jitter budget
     now=$(date +%s 2>/dev/null) || return 0
+
+    # Reaper throttle: skip the O(M^2) sweep if we ran it within the last
+    # ~30s. Mirrors the diagram-throttle stamp-file pattern in
+    # post-file-edit.sh (~line 336). A `.ts` stamp holds the epoch of the
+    # last completed reap; we no-op if it's too recent. This is SAFE for
+    # coalesce-NEVER-DROP: orphans are recovered by the very NEXT
+    # un-throttled reap, at most ~throttle extra delay, still well inside
+    # the eventually-consistent contract (orphans are already a rare crash
+    # residual, not the steady-state path). Best-effort: a stat/write
+    # failure falls through to running the reap (fail toward MORE recovery).
+    stamp="$dir/.last_reap.ts"
+    last_reap=0
+    if [ -f "$stamp" ]; then
+        last_reap=$(cat "$stamp" 2>/dev/null || printf '0')
+        case "$last_reap" in ''|*[!0-9]*) last_reap=0 ;; esac
+    fi
+    reap_age=$(( now - last_reap ))
+    if [ "$last_reap" -gt 0 ] && [ "$reap_age" -lt "$_KG_DEBOUNCE_REAP_THROTTLE_SECONDS" ]; then
+        return 0
+    fi
+    # Stamp BEFORE sweeping so concurrent schedule calls during this sweep
+    # also see the throttle (avoids a thundering-herd of parallel reaps).
+    printf '%s' "$now" > "$stamp" 2>/dev/null || true
 
     # --- Sweep A: orphaned (or stretched-live) ".lock" dirs --------------
     for lock in "$dir"/*.lock; do
@@ -359,13 +515,30 @@ _kg_debounce_reap_stale() {
 # When N==0, runs the sync immediately in the background (debounce off).
 _kg_debounce_schedule() {
     local proot="$1" fpath="$2" py="$3" wd="$4" cmd="$5" chan="${6:-kg}"
-    local window dir key lock
+    local window dir key lock lock_count
 
     window="$(_kg_debounce_window)"
 
-    # Debounce disabled → preserve legacy "sync immediately" behaviour.
+    # Item 3 (wd TAB/newline guard): the cmd-file line is persisted as
+    # `printf '%s\t%s\n' "$wd" "$cmd"` and the reaper splits it on TAB +
+    # reads only the FIRST line. A $wd containing a literal TAB or newline
+    # would corrupt that record (TAB → wrong cmd split; newline → the cmd
+    # truncated at head -1). $wd is always PROJECT_ROOT today (no embedded
+    # control chars), so this can't fire now — but stripping them is free
+    # defense-in-depth against any future caller that passes a hostile path.
+    # tr -d (not reject): a sync into a slightly-wrong dir is still better
+    # than dropping the sync, and the cmd itself re-derives paths from the
+    # repo root at flush time.
+    case "$wd" in
+        *"$(printf '\t')"* | *"$(printf '\n')"*)
+            wd="$(printf '%s' "$wd" | tr -d '\t\n')"
+            ;;
+    esac
+
+    # Debounce disabled → preserve legacy "sync immediately" behaviour
+    # (now detached so it survives the hook's process-group exit — Item 1).
     if [ "$window" = "0" ]; then
-        ( cd "$wd" 2>/dev/null || true; eval "$cmd" ) &
+        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd")"
         return 0
     fi
 
@@ -374,11 +547,32 @@ _kg_debounce_schedule() {
 
     dir="$(_kg_debounce_dir "$proot")"
     mkdir -p "$dir" 2>/dev/null || {
-        # Can't create state dir → fail OPEN to the legacy path so a
-        # permission problem never silently drops the sync.
-        ( cd "$wd" 2>/dev/null || true; eval "$cmd" ) &
+        # Can't create state dir → fail OPEN to immediate (detached) sync so
+        # a permission problem never silently drops the sync.
+        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd")"
         return 0
     }
+
+    # Item 2a (flusher cap): if too many flushers are already pending
+    # (one ".lock" dir each), stop ACCUMULATING sleeping flusher subshells
+    # and instead sync THIS edit immediately in the (detached) background.
+    # CRITICAL: this NEVER drops a sync — it only swaps "schedule a sleeping
+    # flusher" for "run the sync now". The already-scheduled flushers still
+    # sync their own files; this edit syncs immediately rather than adding a
+    # 65th sleeper. (We count via a glob into a positional list — POSIX, no
+    # `ls | wc` subshell quirks. A literal no-match leaves one bogus entry,
+    # corrected below.)
+    set -- "$dir"/*.lock
+    if [ "$1" = "$dir/*.lock" ] && [ ! -e "$1" ]; then
+        lock_count=0          # glob matched nothing
+    else
+        lock_count=$#
+    fi
+    if [ "$lock_count" -ge "$_KG_DEBOUNCE_LOCK_CEILING" ]; then
+        _kg_debounce_detach "$(_kg_debounce_immediate_snip "$wd" "$cmd")"
+        return 0
+    fi
+
     key="${chan}_$(_kg_debounce_key "$fpath" "$py")"
     lock="$dir/$key.lock"
 
@@ -390,34 +584,22 @@ _kg_debounce_schedule() {
         printf '%s\t%s\n' "$wd" "$cmd" > "$lock/cmd" 2>/dev/null || true
         local base
         base="$(basename "$lock")"   # "<chan>_<md5>.lock"
-        # Spawn the single flusher. It sleeps the quiet-window, then claims
-        # its own lock through the SAME atomic rename the reaper uses (win
-        # the lock → ".reaping.<token>") and recovers it via the shared
-        # _kg_debounce_run_claimed path, so the sync re-reads the file
+        # Spawn the single flusher DETACHED from the hook's process group
+        # (Item 1): it sleeps the quiet-window, then claims its own lock via
+        # the SAME atomic rename the reaper uses and recovers it through the
+        # shared _kg_debounce_run_claimed path, so the sync re-reads the file
         # fresh → latest content. The completion-time `mv` is the
         # exactly-once gate: normally (sleep finished within grace) the
-        # flusher wins its own rename and runs the cmd once. But if its
-        # sleep stretched past window+GRACE (suspend/resume, load spike,
-        # clock jump) a reaper may have ALREADY claimed the lock and run
-        # it — in that case the flusher's `mv` fails (source gone) and it
-        # does NOT double-run. Whichever of {this flusher, any reaper}
-        # wins the rename is the single runner. The unified path means the
-        # flusher's normal completion and the reaper's recovery are the
-        # SAME mechanism, making "exactly once" structural rather than
-        # comment-promised.
-        (
-            sleep "$window"
-            _flush_won="$lock.reaping.$(_kg_debounce_claimtok)"
-            if mv "$lock" "$_flush_won" 2>/dev/null; then
-                _kg_debounce_run_claimed "$_flush_won" "$dir" "$base"
-                # _kg_debounce_run_claimed backgrounds its own subshell;
-                # wait for it so this flusher subshell does not exit (and
-                # potentially get its process group reaped) before the
-                # re-stamp + eval complete.
-                wait
-            fi
-            # else: a reaper already claimed+ran this lock → no-op.
-        ) &
+        # flusher wins its own rename and runs the cmd once; if its sleep
+        # stretched past window+GRACE a reaper may have already claimed+run
+        # the lock, in which case the flusher's `mv` fails (source gone) and
+        # it does NOT double-run. The flusher's normal completion and the
+        # reaper's recovery are the SAME mechanism, making "exactly once"
+        # structural rather than comment-promised. Detaching (setsid →
+        # nohup+disown → in-process fallback) keeps the sleeping flusher
+        # alive even if the hook's process group is signalled mid-sleep,
+        # mirroring the PowerShell sibling's Start-Process detach.
+        _kg_debounce_spawn_flusher "$window" "$lock" "$dir" "$base"
     fi
     # else: lock already held → a flush is pending → no-op. Correct: the
     # pending flusher will sync the latest file content.

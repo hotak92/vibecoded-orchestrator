@@ -1027,14 +1027,8 @@ pub async fn start_global_container_supervisor(
 ) -> Result<String, String> {
     use vct_launcher_core::services::container_runtime::{
         build_podman_run_args_global, ensure_volume_host_dirs_global, resolve_global_container_name,
-        resolve_image_ref,
+        resolve_image_ref, GLOBAL_RL_PORT,
     };
-
-    /// Fixed RL listen port — kept in sync with the launcher's
-    /// `GLOBAL_RL_PORT` constant. If the launcher's constant changes,
-    /// update this one too (the hub doesn't depend on the launcher
-    /// crate, so the constant is duplicated here).
-    const GLOBAL_RL_PORT: u16 = 11443;
 
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
