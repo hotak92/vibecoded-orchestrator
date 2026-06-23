@@ -13414,7 +13414,49 @@ def _resolve_service_safety(args: argparse.Namespace) -> dict:
     if alt_ports:
         _write_compose_override(alt_ports)
 
+    # Windows reserved-range check (v0.2.64). The probe loop above classifies
+    # a conflict by "is something listening?" — but a WinNAT/Hyper-V reserved
+    # TCP range INVERTS that: nothing listens (probe → not-running → we'd
+    # `compose up`), yet the OS refuses the host bind. So detect-foreign→
+    # alt-port never fires for this class. Check the *resolved* per-service
+    # ports (after any alt-port shift) against the OS's own excluded ranges and
+    # either auto-reserve (admin) or warn with the exact fix. Clean no-op on
+    # Linux/macOS; soft-fail on any probe error.
+    _check_windows_reserved_ports(decisions)
+
     return decisions
+
+
+def _check_windows_reserved_ports(decisions: dict) -> None:
+    """Warn (or auto-reserve when elevated) if any resolved service port falls
+    inside a Windows reserved TCP range. Single concern, delegated to the
+    shared ``vco_lib.windows_reserved_ports`` helper so install.py and the
+    session-start hook apply the SAME rule.
+
+    No-op on non-Windows. Soft-fail: any import/probe error is logged and
+    swallowed — a reserved-port probe must never abort an install.
+    """
+    try:
+        from vco_lib.windows_reserved_ports import check_ports, is_windows  # noqa: PLC0415
+    except Exception:
+        return
+    if not is_windows():
+        return
+    # Only the local-bind services matter here. Weaviate's gRPC port shifts in
+    # lockstep with its HTTP port, but the reserved-range bug is reported for
+    # the embedding ports (ollama / code_embed); include weaviate's resolved
+    # HTTP port too since it binds the same way.
+    ports: list[tuple[str, int]] = []
+    for name in ("weaviate", "ollama", "code_embed"):
+        d = decisions.get(name)
+        if d and isinstance(d.get("port"), int):
+            ports.append((name, d["port"]))
+    if not ports:
+        return
+    try:
+        check_ports(ports)
+    except Exception as e:  # pragma: no cover - defensive soft-fail
+        print(f"  ! reserved-port check skipped ({e})")
 
 
 def _write_compose_override(alt_ports: dict) -> None:

@@ -368,6 +368,13 @@ done
 # If any container was missing entirely, bring up the full compose stack.
 # Prefer the CDI-wait wrapper for GPU services (Bug J: nvidia-cdi-refresh
 # race kills ollama/code_embed on cold start). Fall back to direct compose.
+#
+# OS-EXEMPT-PARITY: the v0.2.64 Windows reserved-port-range warning
+# (`Test-VcoReservedPorts` in ensure-containers.ps1) has NO Bash counterpart
+# by design. The bug it guards against is Windows-only: WinNAT / Hyper-V
+# reserve a dynamic TCP range that refuses host binds on 11435 / 11440. There
+# is no `netsh` and no equivalent reservation mechanism on Linux/macOS, so this
+# Bash path is the correct no-op. Native-Windows users (no WSL) run the .ps1.
 if [ "$needs_compose" = true ]; then
     if [ "$needs_gpu_wrapper" = true ] && [ -n "$WRAPPER_SCRIPT" ] && [ -x "$WRAPPER_SCRIPT" ]; then
         bring_up_via_wrapper "missing GPU container(s)" || \

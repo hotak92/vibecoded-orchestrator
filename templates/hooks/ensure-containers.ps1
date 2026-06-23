@@ -138,6 +138,81 @@ if (-not $ComposeCmd) {
 }
 
 # ---------------------------------------------------------------------------
+# Windows reserved-port-range warning (v0.2.64).
+#
+# WinNAT / Hyper-V auto-allocate a dynamic TCP range (e.g. 11410-11509) and
+# mark it EXCLUDED; any port inside can no longer be bound. VCO's default
+# ollama (11435) / code_embed (11440) ports sometimes land inside it. The
+# container then shows "Up" but the host port silently fails to bind and the
+# KG goes mute. The range MOVES across Windows updates/reboots, so a returning
+# user can be bitten even if install worked once.
+#
+# This MUST stay logically identical to vco_lib/windows_reserved_ports.py
+# (the install-time path) — parse `netsh int ipv4 show excludedportrange tcp`,
+# test each port against the inclusive ranges, warn (or note the elevated fix).
+# Warn-only here: a session-start hook must never mutate system state.
+#
+# Linux/macOS no-op: $IsWindows is $false on PowerShell Core off Windows
+# (Windows PowerShell 5.1 has no $IsWindows automatic var → treat $null as
+# "assume Windows", which is correct because 5.1 only runs on Windows).
+# ---------------------------------------------------------------------------
+function Test-VcoReservedPorts {
+    $onWindows = (-not (Test-Path Variable:\IsWindows)) -or $IsWindows
+    if (-not $onWindows) { return }
+
+    $ollamaPort = if ($env:OLLAMA_PORT) { [int]$env:OLLAMA_PORT } else { 11435 }
+    $codeEmbedPort = if ($env:CODE_EMBED_PORT) { [int]$env:CODE_EMBED_PORT } else { 11440 }
+    $weaviatePort = if ($env:WEAVIATE_PORT) { [int]$env:WEAVIATE_PORT } else { 8081 }
+    $targets = @(
+        @{ Label = "ollama"; Port = $ollamaPort },
+        @{ Label = "code_embed"; Port = $codeEmbedPort },
+        @{ Label = "weaviate"; Port = $weaviatePort }
+    )
+
+    $raw = ""
+    try {
+        $raw = (& netsh int ipv4 show excludedportrange tcp 2>$null | Out-String)
+    } catch {
+        # Soft-fail: netsh missing / errored → can't confirm → do nothing.
+        return
+    }
+    if (-not $raw) { return }
+
+    # Parse data rows: exactly two integers per line. Header / dashes / the
+    # asterisk footnote carry no bare integer pairs, so they never match.
+    # Mirrors parse_excluded_ranges(): second >= first ⇒ inclusive end,
+    # otherwise ⇒ a count from first (the "Number of Ports" layout).
+    $ranges = @()
+    foreach ($line in ($raw -split "`r?`n")) {
+        if ($line -match '^\s*(\d+)\s+(\d+)\s*$') {
+            $first = [int]$Matches[1]
+            $second = [int]$Matches[2]
+            if ($first -le 0 -or $first -gt 65535) { continue }
+            if ($second -ge $first -and $second -le 65535) {
+                $start = $first; $end = $second
+            } else {
+                $start = $first; $end = $first + [Math]::Max($second, 1) - 1
+            }
+            if ($end -gt 65535) { $end = 65535 }
+            $ranges += ,@($start, $end)
+        }
+    }
+    if ($ranges.Count -eq 0) { return }
+
+    foreach ($t in $targets) {
+        foreach ($r in $ranges) {
+            if ($t.Port -ge $r[0] -and $t.Port -le $r[1]) {
+                [Console]::Error.WriteLine("[ensure-containers] WARNING: $($t.Label) port $($t.Port) is inside a Windows reserved TCP range ($($r[0])-$($r[1])). The container will start but the host port WILL NOT bind, and the knowledge graph will go silently mute.")
+                [Console]::Error.WriteLine("[ensure-containers] To fix, run this in an ELEVATED (Administrator) terminal:")
+                [Console]::Error.WriteLine("    netsh int ipv4 add excludedportrange protocol=tcp startport=$($t.Port) numberofports=1 store=persistent")
+                [Console]::Error.WriteLine("    net stop winnat && net start winnat")
+                break
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Test-PidAlive :: $true if PID is a live process, $false otherwise.
 # Windows: Get-Process. Cross-platform PowerShell on Linux/macOS also
 # supports Get-Process; that's the canonical liveness probe here.
@@ -370,6 +445,10 @@ foreach ($container in $VcoRequiredContainers) {
 }
 
 if ($needsCompose) {
+    # Warn BEFORE compose-up: a reserved-range conflict makes compose-up
+    # "succeed" while the host port silently never binds. Surfacing it here
+    # gives the user the fix instead of a cryptic bind error / mute KG.
+    Test-VcoReservedPorts
     if ($needsGpuWrapper -and $WrapperScript -and (Test-Path $WrapperScript)) {
         if (-not (Invoke-WrapperOrCompose -Reason "missing GPU container(s)")) {
             [Console]::Error.WriteLine("ensure-containers: wrapper invocation failed")
