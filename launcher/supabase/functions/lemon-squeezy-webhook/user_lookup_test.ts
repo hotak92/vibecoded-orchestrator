@@ -34,6 +34,11 @@ function user(n: number): AuthUserLike {
  * Build an in-memory FetchPage over `total` synthetic users, slicing them
  * into pages of `perPage`. Records every page index requested in `pagesSeen`
  * so tests can assert the walk stopped early (didn't fetch every page).
+ *
+ * `nextPage` is derived the way GoTrue does it: non-null (the next page
+ * number) whenever there are more users past the current slice, null on the
+ * final/empty page. This models the SDK's server-decided cursor — the field
+ * `findUserIdByEmailPaged` now keys termination off of.
  */
 function pagedFetcher(
   total: number,
@@ -43,7 +48,10 @@ function pagedFetcher(
   return (page: number, perPage: number) => {
     pagesSeen.push(page);
     const start = (page - 1) * perPage;
-    return Promise.resolve({ users: all.slice(start, start + perPage) });
+    const users = all.slice(start, start + perPage);
+    // More users remain iff the next slice would be non-empty.
+    const hasMore = start + perPage < total;
+    return Promise.resolve({ users, nextPage: hasMore ? page + 1 : null });
   };
 }
 
@@ -116,12 +124,63 @@ Deno.test("findUserIdByEmailPaged: absent email across multiple full pages retur
   assertEquals(seen, [1, 2, 3]);
 });
 
+// ─── A-1 regression: server clamps perPage below the requested value ────────
+
+Deno.test("findUserIdByEmailPaged: continues past a SHORT-but-not-last page when nextPage is non-null (A-1 clamp-proof)", async () => {
+  // This is the exact failure the old `users.length < USERS_PER_PAGE`
+  // heuristic had. GoTrue clamped per_page server-side, so every page comes
+  // back with FEWER rows than we requested (USERS_PER_PAGE=1000), even though
+  // more pages exist. The target user lives on page 2. The old heuristic
+  // would have seen page 1 (e.g. 50 < 1000) and bailed to null → 404. With
+  // nextPage-driven termination the walk MUST proceed to page 2 and find it.
+  const SERVER_CLAMP = 50; // effective server-side page size < requested
+  const target: AuthUserLike = { id: "id-target", email: "target@example.com" };
+  const seen: number[] = [];
+  const fetch: FetchPage = (page, perPage) => {
+    // Sanity: caller still requests the full perPage; the server is what
+    // shrinks it. This documents that the short page is NOT caller-driven.
+    assertEquals(perPage, USERS_PER_PAGE);
+    seen.push(page);
+    if (page === 1) {
+      // A full (server-clamped) page: 50 unrelated users, < requested 1000,
+      // but the server says there IS a next page.
+      const users = Array.from({ length: SERVER_CLAMP }, (_, i) => user(i + 1));
+      return Promise.resolve({ users, nextPage: 2 });
+    }
+    // Page 2: contains the target, and the server reports no more pages.
+    return Promise.resolve({ users: [target], nextPage: null });
+  };
+
+  const id = await findUserIdByEmailPaged(fetch, "target@example.com");
+  assertEquals(id, "id-target");
+  // Crucially the walk did NOT stop after the short page 1.
+  assertEquals(seen, [1, 2]);
+});
+
+Deno.test("findUserIdByEmailPaged: short page with nextPage==null terminates as not-found (no over-walk)", async () => {
+  // Mirror of the above for the absent-email case: a single short, clamped
+  // page that the server marks as the last (nextPage null) → null after one
+  // fetch, no spurious page-2 request.
+  const seen: number[] = [];
+  const fetch: FetchPage = (page) => {
+    seen.push(page);
+    return Promise.resolve({
+      users: Array.from({ length: 50 }, (_, i) => user(i + 1)),
+      nextPage: null,
+    });
+  };
+  const id = await findUserIdByEmailPaged(fetch, "ghost@example.com");
+  assertEquals(id, null);
+  assertEquals(seen, [1]);
+});
+
 // ─── Termination guarantees ─────────────────────────────────────────────────
 
-Deno.test("findUserIdByEmailPaged: MAX_PAGES guard halts a misbehaving API that always returns a full page", async () => {
-  // Pathological fetcher: ALWAYS returns a full page (never a short one) and
-  // never contains the target. Without the MAX_PAGES guard this would loop
-  // forever; with it, the walk must terminate and return null.
+Deno.test("findUserIdByEmailPaged: MAX_PAGES guard halts a misbehaving API that never reports a null nextPage", async () => {
+  // Pathological fetcher: ALWAYS returns a full page AND always claims there
+  // is a next page (nextPage never null), and never contains the target.
+  // Without the MAX_PAGES guard this would loop forever; with it, the walk
+  // must terminate and return null.
   const seen: number[] = [];
   const fullPage: AuthUserLike[] = Array.from(
     { length: USERS_PER_PAGE },
@@ -129,7 +188,7 @@ Deno.test("findUserIdByEmailPaged: MAX_PAGES guard halts a misbehaving API that 
   );
   const fetch: FetchPage = (page) => {
     seen.push(page);
-    return Promise.resolve({ users: fullPage });
+    return Promise.resolve({ users: fullPage, nextPage: page + 1 });
   };
 
   const id = await findUserIdByEmailPaged(fetch, "never@example.com");
@@ -154,8 +213,12 @@ Deno.test("findUserIdByEmailPaged: a fetch error propagates (not swallowed as no
 Deno.test("findUserIdByEmailPaged: error on a LATER page also propagates", async () => {
   const fetch: FetchPage = (page) => {
     if (page === 1) {
+      // Full page AND a non-null nextPage → the walk must advance to page 2,
+      // where the fetch rejects. Proves the error path is reached via the
+      // nextPage cursor (not short-circuited by a length heuristic).
       return Promise.resolve({
         users: Array.from({ length: USERS_PER_PAGE }, (_, i) => user(i + 1)),
+        nextPage: 2,
       });
     }
     return Promise.reject(new Error("transient on page 2"));
@@ -185,6 +248,7 @@ Deno.test("findUserIdByEmailPaged: skips users with null/undefined email", async
         { id: "b" }, // email undefined
         { id: "c", email: "target@example.com" },
       ],
+      nextPage: null, // single final page
     });
   const id = await findUserIdByEmailPaged(fetch, "target@example.com");
   assertEquals(id, "c");
