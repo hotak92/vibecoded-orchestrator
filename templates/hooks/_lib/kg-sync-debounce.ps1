@@ -204,6 +204,25 @@ function Start-KgDebounceRunWon {
     Start-KgDebounceChild -ChildScript $runFrag
 }
 
+# Reaper throttle interval, in seconds. The reaper globs ALL pending work
+# dirs (O(M^2) across a long-lived session), so running it on EVERY schedule
+# call is wasteful under edit bursts. 30s = the grace jitter budget
+# ($window + 30), so even a throttled reaper still fires within one grace
+# window — an orphan is recovered with at most ~grace extra delay, inside the
+# eventually-consistent contract.
+# MUST MATCH _lib/kg-sync-debounce.sh ($_KG_DEBOUNCE_REAP_THROTTLE_SECONDS).
+$script:KgDebounceReapThrottleSeconds = 30
+
+# Max number of live ".lock" dirs before we stop SCHEDULING new sleeping
+# flushers and instead run the sync IMMEDIATELY (detached). The common burst
+# is a handful (3-10) of distinct (file,channel) pairs; 64 simultaneous
+# pending locks is a pathological fan-out far above any normal agent edit
+# burst, so this ceiling never trips on the common case. Above it we fall
+# through to immediate-sync — NEVER dropping a sync, only halting the
+# accumulation of sleeping flushers.
+# MUST MATCH _lib/kg-sync-debounce.sh ($_KG_DEBOUNCE_LOCK_CEILING).
+$script:KgDebounceLockCeiling = 64
+
 function Get-KgDebounceWindow {
     $n = $env:VCO_KG_SYNC_DEBOUNCE_SECONDS
     if (-not $n) { return 5 }
@@ -269,6 +288,29 @@ function Invoke-KgDebounceReapStale {
     $window = Get-KgDebounceWindow
     $grace = $window + 30   # window + 30s jitter budget
     $now = Get-Date
+
+    # Reaper throttle: skip the O(M^2) sweep if we ran it within the last
+    # ~30s. Mirrors the diagram-throttle stamp-file pattern in
+    # post-file-edit.sh (~line 336) and the bash sibling's `.last_reap.ts`.
+    # SAFE for coalesce-NEVER-DROP: orphans are recovered by the very NEXT
+    # un-throttled reap (at most ~throttle extra delay), well inside the
+    # eventually-consistent contract. Best-effort: a stat/write failure falls
+    # through to running the reap (fail toward MORE recovery).
+    $stamp = Join-Path $dir '.last_reap.ts'
+    $lastReap = 0
+    if (Test-Path -LiteralPath $stamp) {
+        try {
+            $raw = (Get-Content -LiteralPath $stamp -TotalCount 1 -ErrorAction Stop)
+            if ($raw -match '^[0-9]+$') { $lastReap = [long]$raw }
+        } catch { $lastReap = 0 }
+    }
+    $nowEpoch = [long][Math]::Floor(($now.ToUniversalTime() - [datetime]'1970-01-01T00:00:00Z').TotalSeconds)
+    if ($lastReap -gt 0 -and (($nowEpoch - $lastReap) -lt $script:KgDebounceReapThrottleSeconds)) {
+        return
+    }
+    # Stamp BEFORE sweeping so concurrent schedule calls during this sweep
+    # also see the throttle (avoids a thundering-herd of parallel reaps).
+    try { Set-Content -LiteralPath $stamp -Value ([string]$nowEpoch) -Encoding ascii -ErrorAction SilentlyContinue } catch { }
 
     # --- Sweep A: orphaned (or stretched-live) ".lock" dirs --------------
     $locks = @(Get-ChildItem -LiteralPath $dir -Directory -Filter '*.lock' -ErrorAction SilentlyContinue)
@@ -347,6 +389,19 @@ function Invoke-KgDebounceSchedule {
     )
     $window = Get-KgDebounceWindow
 
+    # Item 3 (wd TAB/newline guard): the cmd-file line is persisted as
+    # "{0}`t{1}" -f $WorkingDir, $Command and the reaper splits it on TAB +
+    # reads only the FIRST line. A $WorkingDir containing a literal TAB or
+    # newline would corrupt that record (TAB → wrong split; newline → cmd
+    # truncated). $WorkingDir is always PROJECT_ROOT today (no control
+    # chars), so this can't fire now — free defense-in-depth against a future
+    # hostile path. Strip (not reject): a slightly-wrong dir still beats
+    # dropping the sync (the cmd re-derives paths from the repo root anyway).
+    # MIRRORS the bash sibling's `tr -d '\t\n'` guard.
+    if ($WorkingDir -match "[`t`n]") {
+        $WorkingDir = ($WorkingDir -replace "[`t`n]", "")
+    }
+
     # Debounce disabled → preserve legacy "sync immediately" behaviour.
     if ($window -eq 0) {
         Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command
@@ -364,6 +419,18 @@ function Invoke-KgDebounceSchedule {
     } catch {
         # Can't create state dir → fail OPEN to legacy path so a
         # permission problem never silently drops the sync.
+        Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command
+        return
+    }
+
+    # Item 2a (flusher cap): if too many flushers are already pending (one
+    # ".lock" dir each), stop ACCUMULATING sleeping flusher processes and
+    # instead sync THIS edit immediately (detached) in the background.
+    # CRITICAL: this NEVER drops a sync — it only swaps "schedule a sleeping
+    # flusher" for "run the sync now"; the already-scheduled flushers still
+    # sync their own files. MIRRORS the bash sibling's ceiling fall-through.
+    $lockCount = @(Get-ChildItem -LiteralPath $dir -Directory -Filter '*.lock' -ErrorAction SilentlyContinue).Count
+    if ($lockCount -ge $script:KgDebounceLockCeiling) {
         Start-KgDebounceImmediate -WorkingDir $WorkingDir -Command $Command
         return
     }
