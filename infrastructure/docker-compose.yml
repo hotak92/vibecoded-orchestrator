@@ -207,9 +207,26 @@ services:
       CODE_EMBED_DTYPE: "bfloat16"
       CODE_EMBED_PORT: "11440"
       CODE_EMBED_MAX_CONCURRENT: "4"
+      # CPU-fallback (CODE_EMBED_BACKEND=ollama) Ollama endpoint.
+      # server.py defaults OLLAMA_URL to http://localhost:11435, but inside
+      # this container `localhost` is the container ITSELF, not the Ollama
+      # container — so the ollama backend's /health probe fails with
+      # "Connection refused localhost:11435/api/embeddings". code_embed and
+      # vco_ollama share the default compose network (infrastructure_default),
+      # so we reach Ollama by its in-network DNS name on its IN-CONTAINER port
+      # (11434, NOT the host-mapped 11435). The gpu/codesage default backend
+      # never reads OLLAMA_URL, so this is a no-op there. Power users can
+      # override (e.g. an Ollama running on the host) via CODE_EMBED_OLLAMA_URL.
+      OLLAMA_URL: "${CODE_EMBED_OLLAMA_URL:-http://vco_ollama:11434}"
       HF_HOME: "/cache"
       HF_HUB_CACHE: "/cache"
       TRANSFORMERS_CACHE: "/cache"
+    # Start after Ollama so its in-network DNS name resolves when the ollama
+    # backend probes it. Short-form (start-order only) — the ollama service
+    # has no healthcheck to gate on, and this must not change the gpu profile
+    # gating (the gpu overlay only merges a `deploy.resources` block here).
+    depends_on:
+      - ollama
     volumes:
       - code_embed_cache:/cache
     healthcheck:
