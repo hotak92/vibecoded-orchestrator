@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.65] - 2026-06-23
+
+v0.2.65 is a correctness + hardening cycle: it fixes a latent paid-tier
+activation bug, adds per-session working-memory files for projects driven by
+multiple concurrent chats, closes a batch of deferred robustness items, and
+records the result of a security audit (RLS / N+1 / authorization) of the
+Supabase + launcher + hub surfaces.
+
+### Added
+
+- **Per-session `CONTEXT_STATE` files.** Projects worked by multiple concurrent
+  chats/sessions (each keeping its own long-lived session) previously shared one
+  `.claude/CONTEXT_STATE.md`, so the last writer clobbered the others. Each
+  session now gets an optional `.claude/context/CONTEXT_STATE_<session_id>.md`,
+  keyed on the session_id the hooks already receive, diffed/reinjected/size-checked
+  alongside the shared rollup (which stays the project-level picture). Zero impact
+  when the per-session file doesn't exist. Session-id parsing + sanitization is a
+  single shared `_lib/session-id.{sh,ps1}` helper (also de-duplicating the prior
+  per-hook parse).
+- **Checked-in storage RLS migration.** The `paid-module-catalog` Supabase bucket's
+  private + service-role-only policy (previously only set via the dashboard) is now
+  asserted by an idempotent migration so it's auditable from source, with
+  ready-to-enable PRIVATE SQL (in comments) for the deferred weights bucket.
+
+### Fixed
+
+- **Paid-tier activation no longer silently fails past 50 users.** The Lemon
+  Squeezy webhook looked customers up via `auth.admin.listUsers()` (50/page) +
+  client-side `.find()`, so once registered users exceeded one page, paying
+  customers beyond it silently failed tier activation and lifecycle downgrades
+  missed them. Lookup now walks pages driven by the SDK's server-decided `nextPage`
+  cursor (clamp-proof) via a single shared helper used by both the order and the
+  cancel/refund/expire paths.
+- **`telemetry` edge function verify_jwt.** Added the missing
+  `[functions.telemetry] verify_jwt = false` stanza so the (body-authenticated,
+  JWT-less) telemetry uploader isn't rejected by the CLI-default JWT pre-gate on
+  first deploy. (Telemetry recording itself was already independent of the RL
+  module — it records for every tier; only off-machine upload is consent-gated.)
+- **`module-catalog` id validation.** The `id` query param is now regex-validated
+  before forming a storage object key (defense-in-depth 400 instead of an
+  unvalidated `.download()`).
+- **Index on `module_access_tokens(token_secret)`** (migration 035) — the per-request
+  token lookup was a full table scan.
+- **Deferred robustness items (from v0.2.61):** the bash KG-sync flusher now detaches
+  (parity with the PowerShell side) so a process-group signal during its sleep window
+  can't drop the final sync; the debounce reaper is throttled (no more O(n²) stat
+  sweeps on every schedule) and the flusher count is capped with a never-drop
+  fall-through to immediate sync; working-dir paths are guarded against TAB/newline
+  before the reaper's tab-split.
+
+### Changed
+
+- **`GLOBAL_RL_PORT` single-sourced.** Three hand-synced copies of the RL port
+  constant (with stale "can't import the launcher crate" comments) were hoisted into
+  one `vct-launcher-core` definition imported by both the launcher and hub crates.
+
 ## [0.2.64] - 2026-06-23
 
 v0.2.64 fixes two cross-platform install bugs surfaced by a Windows + Docker user
