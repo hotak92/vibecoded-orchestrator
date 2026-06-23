@@ -89,6 +89,15 @@ if [ -n "$SESSION_ID" ]; then
     CTX_COMPACT_FLAG="$PROJECT_DIR/.claude/state/ctx_compact_flag_${SESSION_ID}"
     [ -f "$CTX_SNAPSHOT" ] && rm -f "$CTX_SNAPSHOT"
     [ -f "$CTX_COMPACT_FLAG" ] && rm -f "$CTX_COMPACT_FLAG"
+    # Track C (v0.2.65): same reset for the per-session CONTEXT_STATE diff
+    # baseline. diff-context-inject.sh diffs .claude/context/CONTEXT_STATE_<id>.md
+    # against this `ctx_snapshot_session_<id>` baseline; after compaction the
+    # LLM lost the pre-compact view, so the baseline must reset too (else the
+    # first post-compact prompt emits an incoherent diff). We reset ONLY the
+    # throwaway snapshot baseline — never the per-session CONTEXT_STATE content
+    # file (it may be user-curated). Sibling: post-compact.ps1.
+    CTX_SNAPSHOT_SESSION="$PROJECT_DIR/.claude/state/ctx_snapshot_session_${SESSION_ID}"
+    [ -f "$CTX_SNAPSHOT_SESSION" ] && rm -f "$CTX_SNAPSHOT_SESSION"
 fi
 
 # Log the compaction event

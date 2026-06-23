@@ -8,20 +8,61 @@
 # most heavily. Place most critical info at start AND end.
 #
 # Total budget: ~250 lines max. CONTEXT_STATE gets full allocation, others capped.
+# Track C (v0.2.65) line-budget split: the shared CONTEXT_STATE.md rollup stays
+# uncapped at the START (most critical). The per-session file (if present) is
+# injected right after it with a 120-line sub-cap, so the two together plus the
+# downstream caps (plan 30 + commits 8 + snapshot 50 + pruned 30 = ~118) stay
+# within the ~250-line budget.
 
 # Scrub sensitive env vars (this hook doesn't need credentials)
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN 2>/dev/null
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
+# Resolve Python portably for the session_id stdin parse below (python3 →
+# python → py). Same fallback chain as diff-context-inject.sh.
+# shellcheck source=_lib/find-python.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+
+# Track C (v0.2.65): SessionStart payload carries session_id on stdin. Parse it
+# the same way diff-context-inject.sh / post-compact.sh do (json.loads → get
+# 'session_id'), so we can locate this session's own CONTEXT_STATE file. Empty
+# when the payload is absent/malformed → the per-session block below is skipped.
+HOOK_STDIN=$(cat 2>/dev/null || echo "")
+SESSION_ID=""
+if [ -n "${PY:-}" ]; then
+    SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    print(d.get('session_id', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+fi
 
 # 1. Current task state -- START position (most critical, uncapped)
 if [ -f "$PROJECT_DIR/.claude/CONTEXT_STATE.md" ]; then
     echo "## Current Task State (re-injected after compaction)"
     cat "$PROJECT_DIR/.claude/CONTEXT_STATE.md"
     echo ""
+fi
+
+# 1b. Per-session task state -- START position (Track C). IF this session has
+# written its own .claude/context/CONTEXT_STATE_<session_id>.md, reinject it
+# right after the shared rollup — it's the most task-relevant state for THIS
+# chat. Capped at 120 lines to respect the ~250-line total budget. Gated on
+# both a resolved session_id AND file existence, so single-session projects
+# (no per-session file) pay nothing.
+if [ -n "$SESSION_ID" ]; then
+    SESSION_CONTEXT_FILE="$PROJECT_DIR/.claude/context/CONTEXT_STATE_${SESSION_ID}.md"
+    if [ -f "$SESSION_CONTEXT_FILE" ]; then
+        echo "## This Session's Task State (re-injected after compaction)"
+        head -120 "$SESSION_CONTEXT_FILE"
+        echo ""
+    fi
 fi
 
 # 2. Active plan summary -- MIDDLE position (cap: 30 lines)

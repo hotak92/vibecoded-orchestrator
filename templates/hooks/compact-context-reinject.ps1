@@ -12,12 +12,41 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 
+# Track C (v0.2.65): must match templates/hooks/compact-context-reinject.sh.
+# SessionStart payload carries session_id on stdin. Parse it (ConvertFrom-Json
+# → session_id), so we can locate this session's own CONTEXT_STATE file. Empty
+# when the payload is absent/malformed → the per-session block below is skipped.
+# Line-budget split: shared CONTEXT_STATE.md uncapped at START, per-session
+# file (if present) injected right after with a 120-line sub-cap.
+$HookStdin = ""
+try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
+$SessionId = ""
+try {
+    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
+    if ($payload -and $payload.session_id) { $SessionId = [string]$payload.session_id }
+} catch {
+    # Empty/malformed stdin — leave $SessionId empty (per-session block skipped).
+}
+
 # 1. CONTEXT_STATE.md (uncapped)
 $CtxState = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"
 if (Test-Path $CtxState) {
     Write-Output "## Current Task State (re-injected after compaction)"
     Get-Content $CtxState
     Write-Output ""
+}
+
+# 1b. Per-session task state (Track C). IF this session has written its own
+# .claude/context/CONTEXT_STATE_<session_id>.md, reinject it right after the
+# shared rollup (most task-relevant for THIS chat), capped at 120 lines.
+# Gated on both a resolved session_id AND file existence.
+if ($SessionId) {
+    $SessionCtxFile = Join-Path $ProjectDir ".claude/context/CONTEXT_STATE_$SessionId.md"
+    if (Test-Path $SessionCtxFile) {
+        Write-Output "## This Session's Task State (re-injected after compaction)"
+        Get-Content $SessionCtxFile -TotalCount 120
+        Write-Output ""
+    }
 }
 
 # 2. Active plan summary (cap 30 lines)

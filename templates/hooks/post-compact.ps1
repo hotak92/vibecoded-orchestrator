@@ -92,6 +92,14 @@ if ($SessionId) {
     if (Test-Path $CtxCompactFlag) {
         Remove-Item $CtxCompactFlag -Force -ErrorAction SilentlyContinue
     }
+    # Track C (v0.2.65): must match post-compact.sh. Reset the per-session
+    # CONTEXT_STATE diff baseline (ctx_snapshot_session_<id>) too — after
+    # compaction the LLM lost the pre-compact view. Reset ONLY the throwaway
+    # snapshot baseline, never the per-session CONTEXT_STATE content file.
+    $CtxSnapshotSession = Join-Path $ProjectDir ".claude/state/ctx_snapshot_session_$SessionId"
+    if (Test-Path $CtxSnapshotSession) {
+        Remove-Item $CtxSnapshotSession -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Log compaction event under the user's home metrics dir.
