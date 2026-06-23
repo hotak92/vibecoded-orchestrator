@@ -6211,30 +6211,63 @@ def _emit_safe_add_skipped_env_merge_deferral(
 
     This is the CORE safe-add deferral. The Rust launcher writes the sidecar
     and skips the `.env` append + the b12 KG_COLLECTION rewrite; this function
-    records the structured deferral row so the project's Claude can diff the
-    sidecar against the live `.env` and apply the keys it wants. Written from
-    Python so the structured deferral format has a single owner (the launcher
-    never hand-parses UPDATE_DEFERRED.md).
+    records the structured deferral row so the project's Claude knows the
+    project-root `.env` was left untouched. Written from Python so the
+    structured deferral format has a single owner (the launcher never
+    hand-parses UPDATE_DEFERRED.md).
+
+    Accuracy note (v0.2.64): the skip is NOT a "KG routing is broken until you
+    hand-merge" condition. VCO has three env channels and only the third is
+    skipped under safe-add:
+      * ``.claude/settings.json`` env block — read by MCP subprocesses
+        (KG_COLLECTION / DEVELOPMENT_COLLECTION / PROJECT_NAME / …). Written
+        UNCONDITIONALLY by `apply_project_env_via_python` (it runs BEFORE the
+        safe-add branch). So per-project KG routing already uses VCO's
+        launcher-resolved values.
+      * ``.claude/env`` — VCO-owned, gitignored shell channel. Also written
+        UNCONDITIONALLY. CLI shell users get full VCO env with
+        ``source .claude/env``.
+      * project-root ``.env`` — the ONLY file safe-add skips, because it may
+        be committed. Skipping it only costs the ``source ./.env`` convenience
+        for users who specifically relied on that committed file.
     """
     from vco_lib.deferral_report import DeferralEntry, DeferralReport
 
     live_rel = ".env"
+    vco_env_rel = ".claude/env"
+    # NOTE: `detected` / `why_deferred` MUST stay single-line — the
+    # UPDATE_DEFERRED.md round-trip (`DeferralReport.read`) parses these as
+    # one `**Field**: value` line and truncates any embedded newline. Only
+    # `command_to_apply` survives multi-line (it's a fenced code block).
     detected_msg = (
         f"Safe add is ON, so VCO did NOT append its canonical keys to (nor "
         f"rewrite a KG_COLLECTION line in) the existing project-root "
         f"`{live_rel}` — that file is often committed to your VCS. VCO's "
         f"intended `.env` content was written to `{sidecar_rel}` instead. "
-        f"Until reconciled, this project's per-project KG routing "
-        f"(KG_COLLECTION / DEVELOPMENT_COLLECTION / PROJECT_NAME / "
-        f"ACTIVE_EMBEDDING) is whatever your `{live_rel}` already had — not "
-        f"VCO's launcher-resolved values."
+        f"This does NOT break per-project KG routing: VCO env is already "
+        f"active through its own two channels, both written unconditionally. "
+        f"MCP subprocesses (KG_COLLECTION / DEVELOPMENT_COLLECTION / "
+        f"PROJECT_NAME / ACTIVE_EMBEDDING) read `.claude/settings.json`, which "
+        f"carries VCO's launcher-resolved values; CLI shell users get the full "
+        f"VCO env with `source {vco_env_rel}` (the VCO-owned, gitignored shell "
+        f"channel) — NOT `source ./{live_rel}`. The skipped project-root "
+        f"`{live_rel}` merge ONLY affects the `source ./{live_rel}` "
+        f"convenience for users who relied on that specific committed file; "
+        f"nothing about KG routing is degraded."
     )
     cmd = (
-        f"# Review the keys VCO wanted to add (reference vs your live .env):\n"
+        f"# (a) RECOMMENDED — load the full VCO env for a CLI shell session\n"
+        f"#     (this channel is always written, never skipped by safe-add):\n"
+        f"source {str(folder / vco_env_rel)!r}\n"
+        f"#\n"
+        f"# (b) OR, if you specifically want the keys in your committed .env,\n"
+        f"#     review what VCO would have added, then copy by hand:\n"
         f"diff {str(folder / live_rel)!r} {str(folder / sidecar_rel)!r}\n"
-        f"# Copy the keys you want into your .env by hand (esp. KG_COLLECTION,\n"
-        f"# PROJECT_NAME), OR re-add the project WITHOUT Safe add to let VCO\n"
-        f"# merge them automatically. Then dismiss this deferral:\n"
+        f"#\n"
+        f"# (c) OR re-add the project WITHOUT Safe add to let VCO merge the\n"
+        f"#     keys into the project-root .env automatically.\n"
+        f"#\n"
+        f"# Then dismiss this deferral:\n"
         f"python -m vco_lib.project_init dismiss-deferral "
         f"--folder {str(folder)!r} "
         f"--condition-id safe_add_skipped_env_merge"
@@ -6242,18 +6275,22 @@ def _emit_safe_add_skipped_env_merge_deferral(
 
     entry = DeferralEntry(
         condition_id="safe_add_skipped_env_merge",
-        title="VCO did not merge into your .env (safe-add) — reference sidecar written",
+        title="VCO left your project-root .env untouched (safe-add) — reference sidecar written",
         detected=detected_msg,
         why_deferred=(
             "Safe add deliberately protects the sensitive, often-committed "
             "project-root `.env`. Appending VCO keys (or rewriting a stale "
             "KG_COLLECTION line) would mutate a file the user tracks and "
             "commits, risking a leak of VCO config into their VCS or a "
-            "clobbered customisation. The merge is delegated to the project's "
-            "own agent via this deferral rather than performed at add time."
+            "clobbered customisation. Nothing is broken by the skip: MCP "
+            "routing reads `.claude/settings.json` and the CLI shell channel "
+            "`.claude/env` are both written unconditionally. This row is "
+            "informational so the project's own agent knows the project-root "
+            "`.env` was intentionally left alone and can reconcile the sidecar "
+            "if the user wants those keys in the committed file."
         ),
         command_to_apply=cmd,
-        severity="warning",
+        severity="info",
     )
     report = DeferralReport.read(folder)
     report.add_entry(entry)

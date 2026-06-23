@@ -146,6 +146,16 @@ class SafeAddBundleTests(unittest.TestCase):
         self._run(safe_add=True)
         ids = self._deferral_ids()
         self.assertIn("safe_add_skipped_env_merge", ids)
+        # The deferral still lands in the on-disk UPDATE_DEFERRED.md so the
+        # project's Claude sees it at session start.
+        deferred_md = (
+            self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
+        )
+        self.assertTrue(deferred_md.exists())
+        self.assertIn(
+            "safe_add_skipped_env_merge",
+            deferred_md.read_text(encoding="utf-8"),
+        )
         # The deferral names the file, the sidecar, and a diff command.
         report = DeferralReport.read(self.proj)
         entry = next(
@@ -156,6 +166,25 @@ class SafeAddBundleTests(unittest.TestCase):
         self.assertIn(".env", entry.detected)
         self.assertIn("diff", entry.command_to_apply)
         self.assertIn("dismiss-deferral", entry.command_to_apply)
+
+        # v0.2.64 accuracy correction: the message must make clear VCO env is
+        # ALREADY active (MCP via .claude/settings.json, CLI via
+        # `source .claude/env`) and that ONLY the `source ./.env` convenience
+        # is skipped — NOT KG routing. It must NOT regress to the old
+        # misleading "KG routing is whatever your .env already had" wording.
+        self.assertIn(".claude/settings.json", entry.detected)
+        self.assertIn(".claude/env", entry.detected)
+        self.assertNotIn(
+            "not VCO's launcher-resolved values",
+            entry.detected,
+            "deferral must not claim KG routing falls back to the stale .env",
+        )
+        # The recommended remediation is `source .claude/env`, not `./.env`.
+        self.assertIn("source", entry.command_to_apply)
+        self.assertIn(".claude/env", entry.command_to_apply)
+        # Nothing is actually broken, so the deferral is informational, not a
+        # warning (mirrors `safe_add_git_exclude_updated`).
+        self.assertEqual(entry.severity, "info")
 
     def test_settings_json_still_merges_under_safe_add(self):
         """Scope correction: .claude/settings.json is NOT gated by safe-add."""
