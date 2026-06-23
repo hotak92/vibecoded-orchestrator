@@ -85,15 +85,3 @@ verify_jwt = false
 # vct_admin_ token itself.
 [functions.rebind-admin-token]
 verify_jwt = false
-
-# v0.2.65 (audit RLS-3): anonymous telemetry ingest. The launcher /
-# orchestrator clients (VCThelpers/telemetry/uploader.py via
-# session-stop-telemetry-upload.sh) POST batched events with NO JWT —
-# auth is the opaque-key + machine-hash binding the function's own
-# `isValidEvent` / body-size guards enforce, NOT a Supabase JWT. Without
-# `verify_jwt = false` the CLI default (true) pre-gate rejects every
-# upload before the function body runs, so telemetry was silently
-# dropped. Same posture + lesson as the rl-artifact-url / rl-latest-weights
-# discoveries above (body-level auth → opt out of the JWT pre-gate).
-[functions.telemetry]
-verify_jwt = false
