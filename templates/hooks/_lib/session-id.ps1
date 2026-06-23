@@ -1,4 +1,4 @@
-# _lib/session-id.ps1
+﻿# _lib/session-id.ps1
 # Shared helper dot-sourced by the .ps1 context hooks that key per-session
 # state files off the Claude Code session_id (diff-context-inject,
 # compact-context-reinject, context-size-check, post-compact).
