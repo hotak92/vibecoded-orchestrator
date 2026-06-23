@@ -188,6 +188,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "module_settings.project_id nullable + partial unique indexes for global-scope settings (v0.2.52 V52-AD). NULL project_id == host-wide default for a (module_id, setting_key) pair, consumed by hub resolver as fallback when no per-project row exists. Mirrors migration 027's pattern for module_installs. Reader fall-back order: per-project → global default → fail-open true. The recreate-and-copy mirrors migration 027's discipline. Plan: V52-AD in .claude/context/plans/v0.2.52-backlog-2026-06-09.md.",
         sql: include_str!("migrations/034_module_settings_nullable_project.sql"),
     },
+    Migration {
+        version: 35,
+        description: "index module_access_tokens.token_secret (v0.2.65 audit N1-3). The hub authenticates every module-DB / RL request via `WHERE token_secret = ?1` (module_db_api.rs::lookup_token); migration 019 indexed only module_id, leaving the hot-path auth lookup a full table scan. Plain additive CREATE INDEX IF NOT EXISTS — idempotent, no table rebuild, not self-transactional.",
+        sql: include_str!("migrations/035_module_access_tokens_secret_index.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -1789,7 +1794,7 @@ mod tests {
 
     #[test]
     fn full_apply_still_green_with_transactional_runner() {
-        // End-to-end: all 34 production migrations apply on a fresh DB
+        // End-to-end: every production migration applies on a fresh DB
         // through the new transactional path.
         let conn = Connection::open_in_memory().unwrap();
         apply(&conn).expect("full migration ladder must apply");
@@ -1799,5 +1804,115 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count as usize, MIGRATIONS.len());
+    }
+
+    // ─── Migration 035: index module_access_tokens.token_secret (N1-3) ──────
+
+    /// After a fresh `apply()`, the `idx_module_access_tokens_secret` index
+    /// exists on `module_access_tokens(token_secret)`. The hub authenticates
+    /// every module request with `WHERE token_secret = ?1`; without this
+    /// index that lookup is a full table scan (audit N1-3).
+    #[test]
+    fn migration_035_creates_token_secret_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("apply migrations");
+
+        // Migration 035 must be recorded.
+        let max_v: u32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(max_v >= 35, "expected at least version 35, got {}", max_v);
+
+        // The index must exist in sqlite_master, attached to the right table.
+        let on_table: String = conn
+            .query_row(
+                "SELECT tbl_name FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_module_access_tokens_secret'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("idx_module_access_tokens_secret must exist after migration 035");
+        assert_eq!(on_table, "module_access_tokens");
+
+        // And the index covers token_secret. PRAGMA index_info lists the
+        // indexed columns; column index 2 is the column name.
+        let indexed_col: String = conn
+            .query_row(
+                "SELECT name FROM pragma_index_info('idx_module_access_tokens_secret')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("index must cover one column");
+        assert_eq!(indexed_col, "token_secret");
+    }
+
+    /// Migration 035 is idempotent (the runner's version check guards
+    /// double-apply; the `IF NOT EXISTS` in the .sql is belt-and-braces).
+    #[test]
+    fn migration_035_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply(&conn).expect("first apply");
+        apply(&conn).expect("second apply (idempotent)");
+    }
+
+    /// Upgrade path: a DB stopped at version 34 (pre-N1-3) gains the index
+    /// when `apply()` runs the remaining migrations. Pre-existing token rows
+    /// survive (the index is additive, no table rebuild).
+    #[test]
+    fn migration_035_adds_index_on_upgrade_preserving_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 34).expect("apply up to v34");
+
+        // Index must NOT exist yet at v34.
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_module_access_tokens_secret'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0, "index must not exist before migration 035");
+
+        // Seed a token row (table created by migration 019).
+        let now: i64 = 1_700_000_000_000;
+        conn.execute(
+            "INSERT INTO module_access_tokens \
+                (module_id, project_id, token_secret, issued_at, expires_at) \
+             VALUES ('mod-x', 'p1', 'deadbeef', ?1, ?1)",
+            rusqlite::params![now],
+        )
+        .expect("seed token row");
+
+        // Apply remaining migrations (035).
+        apply(&conn).expect("apply remaining migrations");
+
+        // Index now exists.
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_module_access_tokens_secret'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "index must exist after migration 035");
+
+        // Seeded row survives the additive index.
+        let secret: String = conn
+            .query_row(
+                "SELECT token_secret FROM module_access_tokens WHERE module_id = 'mod-x'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("seeded token row must survive");
+        assert_eq!(secret, "deadbeef");
     }
 }

@@ -8,6 +8,7 @@ import {
   activateAppForUser,
   dispatchLifecycleEvent,
 } from "./orchestrator_additions.ts";
+import { findUserIdByEmail } from "./user_lookup.ts";
 
 // Pre-flight: hard-fail at module init if VARIANT_MAP still ships
 // placeholder keys in a production deployment. Prevents the silent
@@ -127,17 +128,22 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const { data: users, error: userError } = await supabase.auth.admin.listUsers();
-  if (userError) {
-    console.error("Error listing users:", userError);
+  // Resolve email → user id via bounded pagination (audit N1-1). The prior
+  // single-page listUsers().find() silently failed for any paying customer
+  // beyond the first 50 registered users. A thrown error here is an admin-API
+  // failure (→ 500), distinct from a genuinely-absent user (null → 404).
+  let userId: string | null;
+  try {
+    userId = await findUserIdByEmail(supabase, email);
+  } catch (e) {
+    console.error("Error listing users:", e);
     return new Response(
       JSON.stringify({ error: "Failed to look up user" }),
       { status: 500, headers: { "Content-Type": "application/json" } },
     );
   }
 
-  const user = users.users.find((u) => u.email === email);
-  if (!user) {
+  if (!userId) {
     console.log(`No user found with email: ${email}`);
     return new Response(
       JSON.stringify({ error: "User not found. They must register first." }),
@@ -146,7 +152,7 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { activated, tierChanged } = await activateAppForUser(supabase, user.id, mapping);
+    const { activated, tierChanged } = await activateAppForUser(supabase, userId, mapping);
     console.log(
       `[order_created] ${email} appId=${mapping.appId}` +
         (mapping.tier ? ` tier=${mapping.tier}` : "") +
