@@ -13,25 +13,25 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # (only `python.exe`/`py` exist there); fallback chain: python3 → python → py.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+# Shared session_id parse + path-safety sanitise (vco_hook_session_id). One
+# implementation for all four context hooks; see _lib/session-id.sh.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/session-id.sh"
 
 # Hook input contract (v2.1.x): session_id arrives as JSON on stdin, not as
 # the $CLAUDE_SESSION_ID env var (which Claude Code does NOT populate —
 # confirmed empirically 2026-05-08). Reading the env var meant every session
 # in this project shared the same `default` snapshot file, so two concurrent
 # sessions silently stomped on each other's diff baseline.
+#
+# Defense-in-depth (review C-1): session_id is interpolated into file paths
+# below (.claude/state/ctx_snapshot_* and .claude/context/CONTEXT_STATE_*.md).
+# vco_hook_session_id parses AND sanitises it ([A-Za-z0-9_-] only; a hostile
+# id with `/` or `..` becomes the safe sentinel "default"). Must match the
+# .ps1 sibling's Get-VcoHookSessionId. This hook always wants a key, so an
+# empty parse (no session_id / no Python) collapses to "default" too.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-if [ -n "${PY:-}" ]; then
-    SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('session_id', '') or 'default')
-except Exception:
-    print('default')
-" 2>/dev/null || echo "default")
-else
-    SESSION_ID="default"
-fi
+SESSION_ID=$(vco_hook_session_id "$HOOK_STDIN")
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
 # V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes

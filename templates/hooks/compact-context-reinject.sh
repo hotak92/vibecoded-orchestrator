@@ -23,25 +23,23 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # python → py). Same fallback chain as diff-context-inject.sh.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
+# Shared session_id parse + path-safety sanitise (vco_hook_session_id). One
+# implementation for all four context hooks; see _lib/session-id.sh.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/session-id.sh"
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# Track C (v0.2.65): SessionStart payload carries session_id on stdin. Parse it
-# the same way diff-context-inject.sh / post-compact.sh do (json.loads → get
-# 'session_id'), so we can locate this session's own CONTEXT_STATE file. Empty
-# when the payload is absent/malformed → the per-session block below is skipped.
+# Track C (v0.2.65): SessionStart payload carries session_id on stdin. The
+# shared vco_hook_session_id parses it (json.loads → 'session_id') so we can
+# locate this session's own CONTEXT_STATE file. Empty when the payload is
+# absent/malformed → the per-session block below is skipped (gated on
+# `[ -n "$SESSION_ID" ]`). Defense-in-depth (review C-1): the helper also
+# sanitises the id to [A-Za-z0-9_-] before it reaches the file path below — a
+# hostile `/` or `..` collapses to the safe sentinel "default". Must match the
+# .ps1 sibling's Get-VcoHookSessionId.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-SESSION_ID=""
-if [ -n "${PY:-}" ]; then
-    SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('session_id', '') or '')
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-fi
+SESSION_ID=$(vco_hook_session_id "$HOOK_STDIN")
 
 # 1. Current task state -- START position (most critical, uncapped)
 if [ -f "$PROJECT_DIR/.claude/CONTEXT_STATE.md" ]; then

@@ -16,21 +16,25 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # in the .sh sibling. Parity-touch only — no behavioural change.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# Shared session_id parse + path-safety sanitise (Get-VcoHookSessionId). One
+# implementation for all four context hooks; see _lib/session-id.ps1.
+. "$PSScriptRoot/_lib/session-id.ps1"
 
 # Hook input contract (v2.1.x): session_id arrives as JSON on stdin, not as
 # the $CLAUDE_SESSION_ID env var (which Claude Code does NOT populate —
 # verified empirically 2026-05-08). Reading the env var meant every session
 # in this project shared the same `default` snapshot file, so two concurrent
 # sessions silently stomped on each other's diff baseline.
+#
+# Defense-in-depth (review C-1): session_id is interpolated into file paths
+# below (ctx_snapshot_* and CONTEXT_STATE_*.md). Get-VcoHookSessionId parses
+# AND sanitises it ([A-Za-z0-9_-] only; a hostile id with `/` or `..` becomes
+# the safe sentinel "default"). Must match the .sh sibling's
+# vco_hook_session_id. This hook always wants a key, so an empty parse
+# collapses to "default" at the $SessionId assignment below.
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-$SessionIdFromStdin = ""
-try {
-    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
-    if ($payload -and $payload.session_id) { $SessionIdFromStdin = [string]$payload.session_id }
-} catch {
-    # Empty/malformed stdin — fall back to "default"
-}
+$SessionIdFromStdin = Get-VcoHookSessionId -Stdin $HookStdin
 
 $ContextFile = ".claude/CONTEXT_STATE.md"
 # Snapshot state lives under the project (gitignored .claude/state/) so it

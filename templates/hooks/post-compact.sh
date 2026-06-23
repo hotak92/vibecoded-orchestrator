@@ -23,23 +23,39 @@ PROJECT_NAME=$(basename "$PROJECT_DIR")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=_lib/find-python.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
+# Shared session_id parse + path-safety sanitise (vco_hook_session_id). One
+# implementation for all four context hooks; see _lib/session-id.sh.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
 
 PAYLOAD=$(cat)
+# `trigger` is a label only (logged + shown in the notification) and never
+# reaches a file path, so it keeps its own lightweight parse. session_id DOES
+# reach file paths below (.claude/state/*_${SESSION_ID}), so it goes through
+# the shared vco_hook_session_id, which parses AND sanitises it to
+# [A-Za-z0-9_-] (review C-1 defense-in-depth — a hostile `/`/`..` collapses to
+# the safe sentinel "default"). Must match the .ps1 sibling's
+# Get-VcoHookSessionId. Empty when absent/malformed → the per-session wipes
+# below are skipped (each gated on `[ -n "$SESSION_ID" ]`).
 TRIGGER="unknown"
-SESSION_ID=""
 if [ -n "${PY:-}" ]; then
-    _PARSED=$(echo "$PAYLOAD" | "$PY" -c "
+    TRIGGER=$(printf '%s' "$PAYLOAD" | "$PY" -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    print(d.get('trigger', 'unknown'))
-    print(d.get('session_id', ''))
+    print(d.get('trigger', 'unknown') or 'unknown')
 except Exception:
     print('unknown')
-    print('')
-" 2>/dev/null || printf 'unknown\n\n')
-    TRIGGER=$(printf '%s' "$_PARSED" | sed -n '1p')
-    SESSION_ID=$(printf '%s' "$_PARSED" | sed -n '2p')
+" 2>/dev/null || printf 'unknown')
+fi
+[ -z "$TRIGGER" ] && TRIGGER="unknown"
+# Guard the call: if the helper failed to source (file absent), degrade to an
+# empty session_id rather than emitting a "command not found" — empty just
+# skips the per-session wipes below.
+if command -v vco_hook_session_id >/dev/null 2>&1; then
+    SESSION_ID=$(vco_hook_session_id "$PAYLOAD")
+else
+    SESSION_ID=""
 fi
 
 # Wipe the KG/codegraph injection dedup state for this session — the LLM

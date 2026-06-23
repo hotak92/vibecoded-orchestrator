@@ -357,6 +357,104 @@ class GcSweepsBaselineNotContent(_HookHarness):
         )
 
 
+class HostileSessionIdSanitized(_HookHarness):
+    """Defense-in-depth (review C-1): a session_id with `/` or `..` must NOT
+    compose a path outside .claude/context/ / .claude/state/.
+
+    session_id is normally a trusted Claude-generated UUID and is only used in
+    path-EXPANSION (never eval'd, so no command injection), but a traversal
+    fragment would still let the per-session file path escape the intended
+    directory. The shared _lib/session-id helper sanitises any non-[A-Za-z0-9_-]
+    id to the safe sentinel "default" BEFORE it reaches a file path.
+    """
+
+    def _helper_session_id(self, raw_session_id: str) -> str:
+        """Invoke the shared bash helper's vco_hook_session_id directly with a
+        JSON payload carrying `raw_session_id`, returning the sanitised value.
+        """
+        find_py = HOOK_DIR / "_lib" / "find-python.sh"
+        session_lib = HOOK_DIR / "_lib" / "session-id.sh"
+        payload = json.dumps({"session_id": raw_session_id})
+        script = (
+            f'. "{find_py}"; . "{session_lib}"; '
+            'vco_hook_session_id "$1"'
+        )
+        result = subprocess.run(
+            [self.bash, "-c", script, "_", payload],
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_helper_sanitizes_traversal_to_default(self) -> None:
+        """The shared helper maps a `../`-bearing id to the safe sentinel."""
+        for hostile in ("../../etc/passwd", "..", "a/b", "x/../y", "a b"):
+            with self.subTest(id=hostile):
+                self.assertEqual(
+                    self._helper_session_id(hostile), "default",
+                    f"hostile session_id {hostile!r} must sanitise to 'default'",
+                )
+
+    def test_helper_preserves_clean_uuid(self) -> None:
+        """A normal Claude UUID (hex + hyphens) passes through unchanged."""
+        clean = "0c5f2e1a-4b3d-4e6f-9a8b-1c2d3e4f5a6b"
+        self.assertEqual(self._helper_session_id(clean), clean)
+
+    def test_diff_inject_hostile_id_no_traversal_artifact(self) -> None:
+        """End-to-end: a `../`-bearing session_id passed to diff-context-inject
+        must NOT create any file outside the project's .claude/ tree.
+
+        With the id sanitised to "default", the per-session path collapses to
+        .claude/context/CONTEXT_STATE_default.md (which we never created), so
+        no per-session block fires and — critically — no `ctx_snapshot_*` or
+        CONTEXT_STATE_* file appears outside .claude/state/ / .claude/context/.
+        """
+        self.rollup.write_text("## Goal\nbuild thing\n## Status\nWIP\n")
+
+        # A traversal that, if interpolated verbatim into
+        #   .claude/state/ctx_snapshot_session_<id>
+        #   .claude/context/CONTEXT_STATE_<id>.md
+        # would escape the intended dirs and write into the project root (or
+        # above it). We assert the escape does NOT happen.
+        hostile = "../../EVIL"
+        rc, out, err = self.run_hook("diff-context-inject", hostile)
+        self.assertEqual(rc, 0, err)
+
+        # The sanitised key is "default": the rollup baseline lands on it
+        # (proves the hostile id was replaced before path composition).
+        self.assertTrue(
+            self.rollup_snapshot("default").is_file(),
+            "hostile id must sanitise to 'default' before path composition",
+        )
+
+        # No traversal artifact anywhere outside the two intended state dirs.
+        # Walk the project root and the parent dir for any stray ctx_snapshot_*
+        # / CONTEXT_STATE_* file that escaped .claude/state/ / .claude/context/.
+        allowed = {self.state_dir.resolve(), self.context_dir.resolve()}
+        strays: list[str] = []
+        for base in (self.proj, self.proj.parent):
+            for p in base.rglob("ctx_snapshot_*"):
+                if p.parent.resolve() not in allowed:
+                    strays.append(str(p))
+            for p in base.rglob("CONTEXT_STATE_*"):
+                if p.parent.resolve() not in allowed:
+                    strays.append(str(p))
+        self.assertEqual(
+            strays, [],
+            "hostile session_id leaked a per-session file outside "
+            f".claude/state|context: {strays}",
+        )
+        # And specifically: nothing named for the literal hostile fragment.
+        self.assertFalse(
+            (self.proj / "ctx_snapshot_session_..").exists(),
+            "no per-session baseline under the raw traversal fragment",
+        )
+        self.assertFalse(
+            (self.proj.parent / "EVIL").exists(),
+            "traversal must not reach the project's parent directory",
+        )
+
+
 class TemplateDocumentsConvention(unittest.TestCase):
     """The ORCHESTRATOR-CLAUDE.md template documents the per-session convention."""
 

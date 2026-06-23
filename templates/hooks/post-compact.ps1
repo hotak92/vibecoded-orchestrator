@@ -17,23 +17,34 @@ $ProjectName = Split-Path $ProjectDir -Leaf
 $LibDir = Join-Path $PSScriptRoot "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
+# Shared session_id parse + path-safety sanitise (Get-VcoHookSessionId). One
+# implementation for all four context hooks; see _lib/session-id.ps1.
+$SessionIdLib = Join-Path $LibDir "session-id.ps1"
+if (Test-Path $SessionIdLib) { . $SessionIdLib }
 
 # Read stdin payload (may be empty).
 $Payload = ""
 try { $Payload = [Console]::In.ReadToEnd() } catch { }
 
+# `trigger` is a label only (logged + shown in the notification) and never
+# reaches a file path, so it keeps its own lightweight parse. session_id DOES
+# reach file paths below (.claude\state\*_$SessionId), so it goes through the
+# shared Get-VcoHookSessionId, which parses AND sanitises it to [A-Za-z0-9_-]
+# (review C-1 defense-in-depth — a hostile `/`/`..` collapses to "default").
+# Must match the .sh sibling's vco_hook_session_id.
 $Trigger = "unknown"
-$SessionId = ""
 if ($Payload) {
     try {
         $payloadObj = $Payload | ConvertFrom-Json -ErrorAction Stop
-        if ($payloadObj) {
-            if ($payloadObj.trigger)    { $Trigger = [string]$payloadObj.trigger }
-            if ($payloadObj.session_id) { $SessionId = [string]$payloadObj.session_id }
-        }
+        if ($payloadObj -and $payloadObj.trigger) { $Trigger = [string]$payloadObj.trigger }
     } catch { }
 }
 if (-not $Trigger) { $Trigger = "unknown" }
+$SessionId = if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
+    Get-VcoHookSessionId -Stdin $Payload
+} else {
+    ""
+}
 
 # Wipe the KG/codegraph injection dedup state for this session — the LLM
 # just lost the context that included those previously-injected nodes, so

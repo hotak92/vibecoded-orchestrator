@@ -22,6 +22,11 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # `set -e`, so guard with `|| true` — a missing helper must not abort the hook.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh" 2>/dev/null || true
+# Shared session_id parse + path-safety sanitise (vco_hook_session_id). One
+# implementation for all four context hooks; see _lib/session-id.sh. Same
+# `|| true` guard so a missing helper under `set -e` can't abort the hook.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/session-id.sh" 2>/dev/null || true
 
 MAX_LINES=400
 WARN_LINES=300
@@ -29,22 +34,17 @@ CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
-# Track C (v0.2.65): parse session_id from the SessionStart stdin payload so
-# we can also size-check this session's own CONTEXT_STATE file. Same parse as
-# diff-context-inject.sh / post-compact.sh. Under `set -e` we MUST guard every
-# substitution with `|| true` / `|| echo` so a malformed payload can't abort.
+# Track C (v0.2.65): the shared vco_hook_session_id parses session_id from the
+# SessionStart stdin payload so we can also size-check this session's own
+# CONTEXT_STATE file. Empty when the payload is absent/malformed → the
+# per-session block below is skipped (gated on `[ -n "$SESSION_ID" ]`).
+# Defense-in-depth (review C-1): the helper sanitises the id to [A-Za-z0-9_-]
+# before it reaches the file path below (hostile `/`/`..` → "default"). Must
+# match the .ps1 sibling's Get-VcoHookSessionId. Under `set -e` the helper
+# (and any `command -v` it omits) is fully soft-failing, so the substitution
+# can't abort; the `|| true` on the parse keeps that guarantee explicit.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
-SESSION_ID=""
-if [ -n "${PY:-}" ]; then
-    SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
-import json, sys
-try:
-    d = json.loads(sys.stdin.read())
-    print(d.get('session_id', '') or '')
-except Exception:
-    print('')
-" 2>/dev/null || echo "")
-fi
+SESSION_ID=$(vco_hook_session_id "$HOOK_STDIN" 2>/dev/null || echo "")
 
 # --- Functions ---
 get_line_count() {

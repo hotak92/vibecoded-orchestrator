@@ -8,6 +8,9 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Monitor CONTEXT_STATE.md size and surface a warning when threshold exceeded.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# Shared session_id parse + path-safety sanitise (Get-VcoHookSessionId). One
+# implementation for all four context hooks; see _lib/session-id.ps1.
+. "$PSScriptRoot/_lib/session-id.ps1"
 
 $MaxLines = 400
 $WarnLines = 300
@@ -15,16 +18,15 @@ $ContextFile = ".claude/CONTEXT_STATE.md"
 
 $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (Get-Location).Path }
 
-# Track C (v0.2.65): must match templates/hooks/context-size-check.sh. Parse
-# session_id from the SessionStart stdin payload so we can also size-check this
-# session's own CONTEXT_STATE file. Empty when payload absent/malformed.
+# Track C (v0.2.65): must match templates/hooks/context-size-check.sh. The
+# shared Get-VcoHookSessionId parses session_id from the SessionStart stdin
+# payload so we can also size-check this session's own CONTEXT_STATE file.
+# Empty when payload absent/malformed → per-session block skipped.
+# Defense-in-depth (review C-1): the helper sanitises the id to [A-Za-z0-9_-]
+# before it reaches the file path below (hostile `/`/`..` → "default").
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-$SessionId = ""
-try {
-    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
-    if ($payload -and $payload.session_id) { $SessionId = [string]$payload.session_id }
-} catch { }
+$SessionId = Get-VcoHookSessionId -Stdin $HookStdin
 
 # Test-ContextSizeThreshold: emit a size alert/notice for $File against the
 # shared MaxLines/WarnLines thresholds. $Label is the display label. Reused for
