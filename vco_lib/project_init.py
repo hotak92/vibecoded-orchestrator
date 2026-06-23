@@ -6058,7 +6058,7 @@ def _emit_legacy_codegraph_deferral(
 # below matches it too.
 _SAFE_ADD_SIDECAR_SUFFIX = ".vco.reference"
 
-# v0.2.63 (C1 fix, Martino: "check if files are VCO's or user's"): the safe-add
+# v0.2.63 (C1 fix — "check if files are VCO's or user's"): the safe-add
 # `.git/info/exclude` entries are computed PER-ADD from the files VCO actually
 # created (`_safe_add_exclude_entries`), NOT a blanket dir-glob. A blanket
 # `/.vscode/` or `/infrastructure/` or `/knowledge/` would silently hide a
@@ -6259,6 +6259,10 @@ def _emit_safe_add_skipped_env_merge_deferral(
         f"# (a) RECOMMENDED — load the full VCO env for a CLI shell session\n"
         f"#     (this channel is always written, never skipped by safe-add):\n"
         f"source {str(folder / vco_env_rel)!r}\n"
+        f"#     (bash/zsh; `source` is a POSIX builtin. On native-Windows\n"
+        f"#     PowerShell/cmd there is nothing to source — the MCP env channel\n"
+        f"#     `.claude/settings.json` is already active and carries the same\n"
+        f"#     KG routing, so no shell step is needed there.)\n"
         f"#\n"
         f"# (b) OR, if you specifically want the keys in your committed .env,\n"
         f"#     review what VCO would have added, then copy by hand:\n"
