@@ -167,6 +167,7 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 **Two-Layer Memory**:
 - `MEMORY.md` (`~/.claude/projects/.../memory/`) — Claude's self-written operational notes. First 200 lines auto-loaded each session (hard cap; silent truncation after). Stable patterns, recurring bug fixes, key paths, user preferences. NOT in git. Keep as concise index; put details in topic files (`debugging.md`, etc.). Edit via `/memory` or ask Claude directly ("remember that...").
 - `.claude/CONTEXT_STATE.md` — Active working memory (250–350 lines, max 500). Current task, recent progress, next steps, active blockers. Update during work, not just at end.
+- **Per-session state (concurrent chats)**: `.claude/CONTEXT_STATE.md` is the shared project rollup. When you run multiple long-lived chats against the same project at once (e.g. a main chat + an RL chat), each can keep its OWN `.claude/context/CONTEXT_STATE_<session_id>.md` so they don't clobber the shared rollup (last-writer-wins). The size-check / diff-inject / compact-reinject hooks pick it up automatically once it exists; single-session projects never create one and pay nothing.
 
 | MEMORY.md | CONTEXT_STATE.md |
 |---|---|

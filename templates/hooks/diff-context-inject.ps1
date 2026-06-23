@@ -16,21 +16,25 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # in the .sh sibling. Parity-touch only — no behavioural change.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
+# Shared session_id parse + path-safety sanitise (Get-VcoHookSessionId). One
+# implementation for all four context hooks; see _lib/session-id.ps1.
+. "$PSScriptRoot/_lib/session-id.ps1"
 
 # Hook input contract (v2.1.x): session_id arrives as JSON on stdin, not as
 # the $CLAUDE_SESSION_ID env var (which Claude Code does NOT populate —
 # verified empirically 2026-05-08). Reading the env var meant every session
 # in this project shared the same `default` snapshot file, so two concurrent
 # sessions silently stomped on each other's diff baseline.
+#
+# Defense-in-depth (review C-1): session_id is interpolated into file paths
+# below (ctx_snapshot_* and CONTEXT_STATE_*.md). Get-VcoHookSessionId parses
+# AND sanitises it ([A-Za-z0-9_-] only; a hostile id with `/` or `..` becomes
+# the safe sentinel "default"). Must match the .sh sibling's
+# vco_hook_session_id. This hook always wants a key, so an empty parse
+# collapses to "default" at the $SessionId assignment below.
 $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
-$SessionIdFromStdin = ""
-try {
-    $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
-    if ($payload -and $payload.session_id) { $SessionIdFromStdin = [string]$payload.session_id }
-} catch {
-    # Empty/malformed stdin — fall back to "default"
-}
+$SessionIdFromStdin = Get-VcoHookSessionId -Stdin $HookStdin
 
 $ContextFile = ".claude/CONTEXT_STATE.md"
 # Snapshot state lives under the project (gitignored .claude/state/) so it
@@ -56,6 +60,17 @@ if ($SessionId -and $SessionId -ne "default") {
 $SnapshotFile = Join-Path $SnapshotDir "ctx_snapshot_$SessionId"
 $CompactFlag = Join-Path $SnapshotDir "ctx_compact_flag_$SessionId"
 
+# Track C (v0.2.65): per-session CONTEXT_STATE file. Must match
+# templates/hooks/diff-context-inject.sh. Concurrent long-lived chats against
+# the same project each keep their own session_id and would otherwise clobber
+# one shared CONTEXT_STATE.md. If a session writes its own
+# .claude/context/CONTEXT_STATE_<session_id>.md, we diff it independently
+# using a SECOND baseline keyed on `ctx_snapshot_session_`. The shared
+# CONTEXT_STATE.md rollup is untouched. Zero cost when the per-session file
+# is absent.
+$SessionContextFile = Join-Path $env:CLAUDE_PROJECT_DIR ".claude/context/CONTEXT_STATE_$SessionId.md"
+$SessionSnapshotFile = Join-Path $SnapshotDir "ctx_snapshot_session_$SessionId"
+
 if (-not (Test-Path $SnapshotDir)) {
     New-Item -ItemType Directory -Path $SnapshotDir -Force | Out-Null
 }
@@ -63,7 +78,10 @@ if (-not (Test-Path $SnapshotDir)) {
 # 14-day GC for stale ctx_snapshot_* files — sessions that haven't fired
 # in two weeks are stale enough that their baseline is no longer useful.
 # Best-effort. Doesn't touch the compact flags (short-lived sentinels,
-# cleaned by post-compact.ps1).
+# cleaned by post-compact.ps1). The `ctx_snapshot_*` filter also matches the
+# Track C per-session baseline `ctx_snapshot_session_*` (both throwaway diff
+# baselines); it NEVER touches the per-session CONTEXT_STATE content files
+# under .claude/context/.
 try {
     $GcCutoff = (Get-Date).AddDays(-14)
     Get-ChildItem -Path $SnapshotDir -Filter "ctx_snapshot_*" -File -ErrorAction SilentlyContinue |
@@ -71,77 +89,103 @@ try {
         ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
 } catch { }
 
-# If compact flag exists, reset baseline.
+# If compact flag exists, reset baseline. Also reset the Track C per-session
+# baseline so the post-compact view recomputes from the current file.
 if (Test-Path $CompactFlag) {
     Remove-Item $CompactFlag -Force -ErrorAction SilentlyContinue
     Remove-Item $SnapshotFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $SessionSnapshotFile -Force -ErrorAction SilentlyContinue
 }
 
-# If CONTEXT_STATE.md doesn't exist, nothing to do.
-if (-not (Test-Path $ContextFile)) { exit 0 }
+# Diff-Context-Section: emit the changed ## sections of $LiveFile relative to
+# its snapshot baseline $SnapFile, then refresh the baseline. $Label is used
+# only in the emitted header. Reused for both the shared CONTEXT_STATE.md and
+# the Track C per-session file — one diff implementation, two calls (matches
+# the .sh sibling's diff_context_section).
+function Invoke-DiffContextSection {
+    param(
+        [string]$LiveFile,
+        [string]$SnapFile,
+        [string]$Label
+    )
 
-# If no snapshot exists, create baseline.
-if (-not (Test-Path $SnapshotFile)) {
-    Copy-Item -Path $ContextFile -Destination $SnapshotFile -Force
-    exit 0
-}
+    # If the live file doesn't exist, nothing to do.
+    if (-not (Test-Path $LiveFile)) { return }
 
-# Quick check: identical?
-$currentBytes = [System.IO.File]::ReadAllBytes($ContextFile)
-$snapshotBytes = [System.IO.File]::ReadAllBytes($SnapshotFile)
-if ($currentBytes.Length -eq $snapshotBytes.Length) {
-    $identical = $true
-    for ($i = 0; $i -lt $currentBytes.Length; $i++) {
-        if ($currentBytes[$i] -ne $snapshotBytes[$i]) { $identical = $false; break }
+    # If no snapshot exists, create baseline.
+    if (-not (Test-Path $SnapFile)) {
+        Copy-Item -Path $LiveFile -Destination $SnapFile -Force
+        return
     }
-    if ($identical) { exit 0 }
-}
 
-# Files differ — find changed sections.
-$current = Get-Content $ContextFile
-$snapshot = Get-Content $SnapshotFile
+    # Quick check: identical?
+    $currentBytes = [System.IO.File]::ReadAllBytes($LiveFile)
+    $snapshotBytes = [System.IO.File]::ReadAllBytes($SnapFile)
+    if ($currentBytes.Length -eq $snapshotBytes.Length) {
+        $identical = $true
+        for ($i = 0; $i -lt $currentBytes.Length; $i++) {
+            if ($currentBytes[$i] -ne $snapshotBytes[$i]) { $identical = $false; break }
+        }
+        if ($identical) { return }
+    }
 
-# Build a set of lines in the snapshot for quick "is this line new?" check.
-# Note: matches the .sh's `diff --new-line-format='%dn'` behavior approximately:
-# we treat a line as "changed" if its content doesn't appear in the snapshot.
-$snapshotSet = @{}
-foreach ($l in $snapshot) {
-    if (-not $snapshotSet.ContainsKey($l)) { $snapshotSet[$l] = $true }
-}
+    # Files differ — find changed sections.
+    $current = Get-Content $LiveFile
+    $snapshot = Get-Content $SnapFile
 
-$changedSections = New-Object System.Collections.Specialized.OrderedDictionary
-$currentSection = ""
-$anyChanged = $false
-foreach ($line in $current) {
-    if ($line -match '^##\s') { $currentSection = $line }
-    if ($currentSection -and -not $snapshotSet.ContainsKey($line)) {
-        if (-not $changedSections.Contains($currentSection)) {
-            $changedSections[$currentSection] = $true
-            $anyChanged = $true
+    # Build a set of lines in the snapshot for quick "is this line new?" check.
+    # Matches the .sh's `diff --new-line-format='%dn'` behaviour approximately:
+    # we treat a line as "changed" if its content doesn't appear in the snapshot.
+    $snapshotSet = @{}
+    foreach ($l in $snapshot) {
+        if (-not $snapshotSet.ContainsKey($l)) { $snapshotSet[$l] = $true }
+    }
+
+    $changedSections = New-Object System.Collections.Specialized.OrderedDictionary
+    $currentSection = ""
+    $anyChanged = $false
+    foreach ($line in $current) {
+        if ($line -match '^##\s') { $currentSection = $line }
+        if ($currentSection -and -not $snapshotSet.ContainsKey($line)) {
+            if (-not $changedSections.Contains($currentSection)) {
+                $changedSections[$currentSection] = $true
+                $anyChanged = $true
+            }
         }
     }
-}
 
-if (-not $anyChanged) {
-    # Differ but no new content lines — file got shorter.
-    Write-Output "[Context updated -- sections removed from CONTEXT_STATE.md]"
-    Copy-Item -Path $ContextFile -Destination $SnapshotFile -Force
-    exit 0
-}
-
-Write-Output "[Context update -- changed sections:]"
-Write-Output ""
-
-# Extract each changed section (header to next ## or EOF) from current file.
-foreach ($header in $changedSections.Keys) {
-    $emit = $false
-    foreach ($line in $current) {
-        if ($line -eq $header) { $emit = $true; Write-Output $line; continue }
-        if ($emit -and $line -match '^##\s' -and $line -ne $header) { break }
-        if ($emit) { Write-Output $line }
+    if (-not $anyChanged) {
+        # Differ but no new content lines — file got shorter.
+        Write-Output "[$Label updated -- sections removed]"
+        Copy-Item -Path $LiveFile -Destination $SnapFile -Force
+        return
     }
+
+    Write-Output "[$Label update -- changed sections:]"
     Write-Output ""
+
+    # Extract each changed section (header to next ## or EOF) from current file.
+    foreach ($header in $changedSections.Keys) {
+        $emit = $false
+        foreach ($line in $current) {
+            if ($line -eq $header) { $emit = $true; Write-Output $line; continue }
+            if ($emit -and $line -match '^##\s' -and $line -ne $header) { break }
+            if ($emit) { Write-Output $line }
+        }
+        Write-Output ""
+    }
+
+    Copy-Item -Path $LiveFile -Destination $SnapFile -Force
 }
 
-Copy-Item -Path $ContextFile -Destination $SnapshotFile -Force
+# 1. The shared CONTEXT_STATE.md rollup (the original, unchanged behaviour).
+Invoke-DiffContextSection -LiveFile $ContextFile -SnapFile $SnapshotFile -Label "Context"
+
+# 2. Track C: the per-session CONTEXT_STATE file, IF it exists. A second call
+# against the `_session_` baseline — gated entirely on file existence, so
+# projects that never write a per-session file are unaffected.
+if (Test-Path $SessionContextFile) {
+    Invoke-DiffContextSection -LiveFile $SessionContextFile -SnapFile $SessionSnapshotFile -Label "Session context"
+}
+
 exit 0
