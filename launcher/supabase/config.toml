@@ -85,3 +85,17 @@ verify_jwt = false
 # vct_admin_ token itself.
 [functions.rebind-admin-token]
 verify_jwt = false
+
+# v0.2.65 (RLS-3 audit follow-up, 2026-06-23): batched-telemetry ingest from
+# launcher/orchestrator clients (VCThelpers/telemetry/uploader.py). The function
+# does its OWN auth (opaque-key + machine-hash binding, body-level) and its
+# header explicitly documents `verify_jwt = false` — clients have no Supabase
+# JWT. Without this stanza, a deploy inherits the CLI default verify_jwt = true
+# and EVERY upload is rejected with UNAUTHORIZED before the body runs — the same
+# pre-gate bug already hit by rl-artifact-url (v0.2.35) and rl-latest-weights
+# (v0.2.49). The function is not yet deployed (uploader currently falls back to
+# ~/.vibecoded/telemetry_pending.jsonl); this stanza ensures the FIRST deploy
+# works instead of silently dropping telemetry. Availability/correctness, not
+# security — the auth boundary is the body, not the JWT.
+[functions.telemetry]
+verify_jwt = false
