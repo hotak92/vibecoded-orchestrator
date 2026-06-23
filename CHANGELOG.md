@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.64] - 2026-06-23
+
+v0.2.64 fixes two cross-platform install bugs surfaced by a Windows + Docker user
+(silently-mute KG when Windows reserves VCO's ports; a code-embed container that
+couldn't reach Ollama), makes the release tag self-consistent so a `git checkout
+<tag>` runs the matching binaries, and corrects the "Safe add" deferral message to
+reflect that VCO env is already active without touching the project's `.env`.
+
+### Added
+
+- **Windows reserved-port-range detection.** On Windows, WinNAT / Hyper-V can
+  auto-reserve a dynamic TCP range (e.g. 11410–11509) that swallows VCO's Ollama
+  (11435) and code-embed (11440) ports — the containers show "Up" but the host
+  ports never bind, and the KG goes silently mute with `NoEmbeddingBackendError`.
+  Install (and the session-start container-ensure hook) now probe
+  `netsh excludedportrange`; when a VCO port falls inside a reserved range, an
+  elevated install reserves it for Docker (`netsh add excludedportrange …
+  store=persistent`) and a non-elevated run prints the exact admin commands instead
+  of failing silently. Shared parse logic in `vco_lib/windows_reserved_ports.py`,
+  mirrored in `ensure-containers.ps1`. Clean no-op on Linux/macOS.
+
+### Fixed
+
+- **code-embed container reaches Ollama over the docker network.** When
+  `CODE_EMBED_BACKEND=ollama`, the `code_embed` service defaulted to
+  `localhost:11435`, which inside the container is itself — not Ollama. It now gets
+  `OLLAMA_URL=http://vco_ollama:11434` (the in-network DNS name + in-container port,
+  overridable via `CODE_EMBED_OLLAMA_URL`) and `depends_on: ollama`. The default
+  GPU/codesage backend is unaffected.
+- **Release tag is self-consistent with its binaries.** The prebuilt-dist flow
+  built vN binaries AFTER tagging and committed them to `main` above the tag, so a
+  `git checkout <tag>` got vN source with vN-1 binaries (a manual-update user ran
+  the prior cycle's code). The release workflow now re-points the `vN` tag onto the
+  binary-refresh commit, guarded by a `refresh-guard` job that early-exits the
+  re-triggered run so re-pushing the tag does not re-build or re-deploy. Hardened
+  against a shallow-clone false-fail of the dist-freshness gate (full-depth checkout
+  + explicit missing-parent fallback) and made the re-point self-heal on re-run.
+  The supported paths (GUI "Update orchestrator" → `main`; the GitHub Release `.zip`
+  assets) were already correct; this fixes the manual `checkout <tag>` path. Docs
+  updated to point dev-cloners at `main` or the release assets.
+
+### Changed
+
+- **"Safe add" deferral message corrected.** `safe_add_skipped_env_merge` previously
+  implied per-project KG routing was broken until the user hand-merged the
+  `.env.vco.reference` sidecar. In fact VCO env is already active under safe-add via
+  two unconditionally-written channels — MCP subprocesses read
+  `.claude/settings.json`; CLI shells `source .claude/env` — and only the
+  convenience of `source ./.env` on the protected, often-committed project-root
+  `.env` is skipped. The deferral is now informational (severity `info`) and points
+  users at `source .claude/env`.
+
 ## [0.2.63] - 2026-06-19
 
 v0.2.63 makes the launcher always run its own up-to-date `vct-hub`, refuses to run
