@@ -637,10 +637,12 @@ async fn project_config(
     // (the default — mcp_registration.rs does not pin it), so a None here put
     // the MCP into disabled mode → rerank silently no-op'd for the exact
     // global deployment Option-H targets. Resolve the global port when a
-    // global install row exists. (GLOBAL_RL_PORT mirrors the const in
-    // module_supervisor.rs + launcher module_service.rs — kept in sync; the
-    // hub can't import the launcher crate.)
-    const GLOBAL_RL_PORT: u16 = 11443;
+    // global install row exists. (GLOBAL_RL_PORT is the single source of
+    // truth in vct_launcher_core::services::container_runtime — v0.2.65
+    // Track B Item 4 collapsed the three former local copies into it; the
+    // hub DOES depend on vct-launcher-core, so the old "can't import" note
+    // was stale.)
+    use vct_launcher_core::services::container_runtime::GLOBAL_RL_PORT;
     let rl_server_port = if matches!(
         h.0.get_global_module_install("vct-rl-reranker"),
         Ok(Some(_))
