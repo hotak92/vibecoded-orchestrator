@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.67] - 2026-06-24
+
+v0.2.67 is a launcher UX + correctness cycle from a batch of user-reported
+issues: it stops the post-Adopt GUI freeze, kills the Windows console-window
+flash across launcher/core spawn sites (now guarded by a structural CI gate),
+unifies module image-pull behind one bounded chokepoint, makes the install-time
+embedding choice authoritative on the GUI's empty-env path, and tightens a hook
+gate. It also wires the frontend vitest tests into CI and corrects the
+documented MEMORY.md-vs-CONTEXT_STATE.md truncation semantics.
+
+### Fixed
+
+- **GUI no longer freezes after adding a project through the Adopt flow.**
+  `ProjectSelector.svelte` unmounted the stacked Adopt `<dialog>` (via the
+  `{#if thirdPartyDetection}` guard) in the same tick its `open` boolean went
+  false, racing the `DialogRoot` `$effect` that calls native `close()`. DOM
+  removal alone does not release a native dialog's top-layer `::backdrop` slot,
+  so the orphaned backdrop swallowed all pointer events viewport-wide. Teardown
+  is now ordered — set `open=false`, `await tick()` so both stacked DialogRoots
+  observe it and call `close()` (native top layer is LIFO), and only THEN null
+  `thirdPartyDetection` to unmount the already-closed modal.
+- **No Windows console-window flash from launcher/core child processes.** Five
+  production `Command::new` sites (the container reaper's `ps`/`rm` plus
+  module-update/codegraph-extras/storage/licensing probes) now carry `.silent()`
+  (`CREATE_NO_WINDOW`). A new structural CI gate (`command_silent_gate.rs`, run
+  by `cargo test --workspace --tests` in CI + pre-ship) fails the build, naming
+  each `file:line`, if any GUI-spawned `Command::new` lacks `.silent()`, an
+  explicit `.creation_flags(...)`, or a documented `vct-allow-no-silent:`
+  exception — making "forgot `.silent()`" impossible to merge.
+- **One bounded chokepoint for every module image pull (`bounded_authed_pull`).**
+  The start-path pull (`pre_pull_with_auth_for_start`) was a bare `.status()`
+  with no timeout and no `kill_on_drop`, so a stalled registry orphaned the pull
+  child and hung the start RPC. Both the install path and the start path now
+  route through one shared chokepoint bounded by `module_pull_timeout()` (default
+  1800s, `VCT_MODULE_PULL_TIMEOUT_SECS`; zero/garbage falls back to the default,
+  never unbounded), `kill_on_drop(true)` (no orphan on timeout), `.silent()`, and
+  concurrent output drain. Auth / anonymous-fallback semantics are unchanged. The
+  install flow also gains a re-entrancy guard (no overlapping pulls from
+  cross-surface Install/Retry clicks) and install-progress status UX.
+- **GUI install honours the hardware-selected embedding on the empty-env path.**
+  `install.py` now makes the hardware embedding pick authoritative when the GUI
+  launches install with an empty `ACTIVE_EMBEDDING` env (extending the existing
+  reconcile chokepoint), instead of silently falling back to the qwen3 default —
+  so a hardware-driven choice (e.g. arctic on a capable box) is the one seeded.
+  Deliberate choices (explicit env, CLI flag, or a launcher.db active profile)
+  still win.
+- **Build Anchor read-before-modify gate is Write-only, not Edit.** The
+  pre-tool-use Build Anchor blocked any modification of an unseen file (exit 2);
+  for `Edit` this duplicated Claude Code's own read-before-edit rule and
+  spuriously blocked legitimate edits when the hook's session-reads ledger
+  diverged from the harness's file-state tracking. The gate now fires for `Write`
+  only (blind whole-file overwrite of an unseen file); `Edit` defers to the
+  built-in rule. File backup still runs for both; `pre-tool-use.{sh,ps1}` mirrored.
+
+### Changed
+
+- **Frontend vitest tests now run in CI.** The Frontend job ran only
+  `svelte-check`; vitest unit tests existed but never executed. CI now runs
+  `npm test` so the install-progress and module-status tests gate.
+- **`CONTEXT_STATE.md` size warning raised to 500 lines (it is never
+  truncated).** `context-size-check.sh` emits a soft warning only; the threshold
+  now matches the documented "max 500" (warning at 400 nagged within the normal
+  250–350 working range). Documentation also clarifies that `MEMORY.md` — unlike
+  `CONTEXT_STATE.md` — IS hard-truncated by the Claude Code memory feature (first
+  200 lines / ~25 KB loaded into the system prompt; the rest silently dropped),
+  so detail belongs in on-demand topic files.
+
 ## [0.2.66] - 2026-06-24
 
 v0.2.66 is a module install/update correctness cycle. It fixes a bug where
