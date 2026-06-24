@@ -978,3 +978,169 @@ def test_concern1_cli_clean_run_writes_no_deferral(
     assert not deferred.exists()
     out = capsys.readouterr().out
     assert '"deferral_written": false' in out
+
+
+# ---------------------------------------------------------------------------
+# RUST_OWNED_TYPES — Rust/_schema_migrations-owned artifacts do a REGISTER-ONLY
+# version advance on a stored<canonical gap, with NO Python edge demanded and
+# NO schema_migration_script_missing deferral.
+#
+# Regression for the latent false-deferral that surfaced when a launcher.db
+# migration bump advanced LAUNCHER_DB_TABLE_SET_VERSION (e.g. 34→35) with no
+# Python edge shipped (no launcher.db bump ever ships one — the real schema
+# lives in migrations.rs::MIGRATIONS, applied at launcher startup). Before the
+# fix this hit the user_curated no-edge error branch and re-fired a
+# schema_migration_script_missing deferral on EVERY update.
+#
+# These exercise the LIVE gap path (seed stored=canonical-1 → run the runner),
+# filling the coverage gap in test_v52_ag_schema_versions.py's
+# test_launcher_db_table_set_version_matches_migration_count (which asserts only
+# const==MIGRATIONS-count, never the runner outcome).
+# ---------------------------------------------------------------------------
+
+
+def test_rust_owned_register_only_advance_no_deferral(
+    db_with_v033, empty_migrations, monkeypatch
+):
+    """launcher_db_table_set at stored=canonical-1 → clean register-only
+    advance to canonical, NO error, NO edge applied, NO deferral.
+
+    Seeds at ``canonical_version - 1`` (not a hardcoded 34) so the test stays
+    correct across future LAUNCHER_DB_TABLE_SET_VERSION bumps."""
+    atype = "launcher_db_table_set"
+    name = "default"  # the sentinel _resolve_artifact_names uses for non-class types
+    canonical = sv.canonical_version(atype)
+    # Orchestrator-wide → keyed NULL. Seed one version behind canonical.
+    _insert_row(db_with_v033, None, atype, name, canonical - 1)
+
+    spy = _ApplyEdgeSpy()
+    monkeypatch.setattr(smr, "_apply_edge", spy)
+    report = smr.run_schema_migrations(
+        db_path=db_with_v033, project_id="p1", migrations_dir=empty_migrations,
+        env=_env_with_collections(), weaviate_url="http://x",
+        live_drift_probe=_no_drift, codegraph_drift_probe=_no_drift, now_ms=1,
+        include_orchestrator_wide=True,  # root update sees orchestrator-wide types
+    )
+
+    # No edge ran, and CRITICALLY no error / no pending_regenerate.
+    assert spy.count == 0
+    assert report.pending_regenerate == []
+    assert report.register_failed == []
+    # The decisive assertion: NO schema_migration_script_missing error.
+    assert report.errors == [], (
+        f"expected a clean register-only advance, got errors: {report.errors}"
+    )
+    # It landed in the success accumulator.
+    advanced = [
+        (a, n, d) for (a, n, d) in report.registered
+        if a == atype and n == name
+    ]
+    assert len(advanced) == 1, report.registered
+
+    # The stored version is now == canonical (advanced, not stuck).
+    assert avr.check_artifact_version(
+        db_with_v033, project_id=None, artifact_type=atype, artifact_name=name
+    ) == avr.ArtifactVersionStatus.UP_TO_DATE
+    conn = sqlite3.connect(str(db_with_v033))
+    v = conn.execute(
+        "SELECT schema_version FROM artifact_schema_versions "
+        "WHERE project_id IS NULL AND artifact_type=? AND artifact_name=?",
+        (atype, name),
+    ).fetchone()[0]
+    conn.close()
+    assert v == canonical
+
+    # And the report→deferral mapping yields NO entry for this outcome.
+    assert smr.build_deferral_entries(report) == []
+
+
+def test_rust_owned_register_only_advance_check_is_dry_run(
+    db_with_v033, empty_migrations, monkeypatch
+):
+    """--check on a Rust-owned gap PLANS the advance but mutates nothing."""
+    atype = "launcher_db_table_set"
+    name = "default"
+    canonical = sv.canonical_version(atype)
+    _insert_row(db_with_v033, None, atype, name, canonical - 1)
+
+    spy = _ApplyEdgeSpy()
+    monkeypatch.setattr(smr, "_apply_edge", spy)
+    report = smr.run_schema_migrations(
+        db_path=db_with_v033, project_id="p1", migrations_dir=empty_migrations,
+        env=_env_with_collections(), weaviate_url="http://x",
+        live_drift_probe=_no_drift, codegraph_drift_probe=_no_drift, now_ms=1,
+        check=True, include_orchestrator_wide=True,
+    )
+    assert spy.count == 0
+    assert report.errors == []
+    # Recorded as a planned/would-advance success, not an error.
+    assert any(a == atype and n == name for (a, n, _) in report.registered)
+    # NO mutation: the stored version is still canonical-1.
+    conn = sqlite3.connect(str(db_with_v033))
+    v = conn.execute(
+        "SELECT schema_version FROM artifact_schema_versions "
+        "WHERE project_id IS NULL AND artifact_type=? AND artifact_name=?",
+        (atype, name),
+    ).fetchone()[0]
+    conn.close()
+    assert v == canonical - 1
+
+
+def test_rl_events_payload_shape_NOT_rust_owned(
+    db_with_v033, empty_migrations, monkeypatch
+):
+    """rl_events_payload_shape is user_curated (its JSON payload shape is
+    migrated by the Python RL telemetry layer, not Rust). It must NOT be in
+    RUST_OWNED_TYPES — a register-only advance there would silently skip a
+    genuinely-needed payload migration. A stored<canonical gap MUST surface a
+    schema_migration_script_missing error (until a real Python edge ships),
+    NOT a silent advance.
+
+    Uses a monkeypatched canonical bump so the assertion holds regardless of
+    the constant's current value."""
+    assert "rl_events_payload_shape" not in smr.RUST_OWNED_TYPES
+    atype = "rl_events_payload_shape"
+    name = "default"
+    base = sv.canonical_version(atype)
+    monkeypatch.setitem(sv.CANONICAL_VERSIONS, atype, base + 1)
+    _insert_row(db_with_v033, None, atype, name, base)
+
+    spy = _ApplyEdgeSpy()
+    monkeypatch.setattr(smr, "_apply_edge", spy)
+    report = smr.run_schema_migrations(
+        db_path=db_with_v033, project_id="p1", migrations_dir=empty_migrations,
+        env=_env_with_collections(), weaviate_url="http://x",
+        live_drift_probe=_no_drift, codegraph_drift_probe=_no_drift, now_ms=1,
+        include_orchestrator_wide=True,
+    )
+    assert spy.count == 0
+    # It is NOT silently advanced; it surfaces the missing-script error.
+    assert not any(a == atype for (a, n, _) in report.registered)
+    assert any(
+        a == atype and "schema_migration_script_missing" in d
+        for (a, n, d) in report.errors
+    ), report.errors
+    # Stored version unchanged (the runner never advanced it).
+    conn = sqlite3.connect(str(db_with_v033))
+    v = conn.execute(
+        "SELECT schema_version FROM artifact_schema_versions "
+        "WHERE project_id IS NULL AND artifact_type=? AND artifact_name=?",
+        (atype, name),
+    ).fetchone()[0]
+    conn.close()
+    assert v == base
+
+
+def test_rust_owned_types_membership_is_justified():
+    """Guard the membership of RUST_OWNED_TYPES: every member must be a
+    derived-but-not-Weaviate artifact_type that exists in the registry. This
+    catches an accidental future addition of a Weaviate-derived type (which
+    has its own BINDING POLICY) or a typo'd artifact_type."""
+    for atype in smr.RUST_OWNED_TYPES:
+        assert atype in sv.CANONICAL_VERSIONS, f"unknown artifact_type {atype!r}"
+        assert atype not in smr.WEAVIATE_DERIVED_TYPES, (
+            f"{atype!r} is a Weaviate collection — it follows the BINDING "
+            f"POLICY, not the register-only path"
+        )
+    # The one member shipped today.
+    assert smr.RUST_OWNED_TYPES == frozenset({"launcher_db_table_set"})
