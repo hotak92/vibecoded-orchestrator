@@ -8,7 +8,7 @@
   // - Rename / Delete are inline per-row actions; delete requires a typed
   //   confirmation.
 
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime, invoke } from '$lib/tauri';
@@ -396,6 +396,25 @@
       // adoptDecision is recorded on the project row so subsequent
       // install.py runs know whether to pass --adopt-project.
       await projects.create(createName.trim(), submitPath, createHost, safeAdd);
+      // v0.2.67 dialog-freeze fix: order the teardown so neither stacked
+      // <dialog> is unmounted while still `open`. Closing a native dialog
+      // releases its top-layer ::backdrop slot; DOM removal alone does NOT
+      // (DialogRoot.svelte:175-197). The Adopt flow stacks the Adopt dialog
+      // ON TOP of this Create dialog, and `thirdPartyDetection = null` here
+      // is the `{#if}` guard (template ~line 791) that UNMOUNTS the
+      // AdoptProjectModal. If we null it in the same tick its `open` boolean
+      // (showAdoptModal) went false, the unmount can win the race against
+      // the Adopt DialogRoot's $effect that calls native close() — orphaning
+      // the top-layer backdrop, which then swallows all pointer events
+      // viewport-wide (the post-Adopt GUI freeze).
+      //
+      // So: (1) close THIS Create dialog (showCreate=false), (2) await tick()
+      // so this dialog's $effect observes false and calls close() — and, on
+      // the Adopt re-entry path, so the already-set showAdoptModal=false has
+      // also been observed and the Adopt dialog closed (native top layer is
+      // LIFO: Adopt was closed first by onAdoptModalAccept, then Create here),
+      // (3) only THEN null thirdPartyDetection, unmounting the (already-closed)
+      // AdoptProjectModal safely.
       showCreate = false;
       createName = '';
       createPath = '';
@@ -404,9 +423,13 @@
       pathTouched = false;
       orchestratorState = null;
       leftovers = null;
-      thirdPartyDetection = null;
       adoptDecision = undefined;
       open = false;
+      // Let both stacked DialogRoots' $effects observe their `open=false`
+      // and call native close() (releasing their top-layer slots) before we
+      // unmount AdoptProjectModal via the `{#if thirdPartyDetection}` guard.
+      await tick();
+      thirdPartyDetection = null;
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e);
     } finally {
@@ -418,10 +441,25 @@
   // modal, immediately re-trigger handleCreate. Cancel → record decision,
   // close modal, do NOT re-trigger (user can still click Create later
   // which will pass adoptDecision="no-adopt").
-  function onAdoptModalAccept() {
+  //
+  // v0.2.67 dialog-freeze fix: this is async + awaits tick() so the Adopt
+  // DialogRoot's $effect observes showAdoptModal=false and calls native
+  // close() — releasing the Adopt dialog's top-layer ::backdrop slot —
+  // BEFORE we re-enter handleCreate. handleCreate's success path nulls
+  // `thirdPartyDetection`, which unmounts this very AdoptProjectModal via
+  // the `{#if}` guard; if the close() hasn't run by then the top-layer slot
+  // is orphaned and swallows all clicks (the GUI freeze). Awaiting tick()
+  // first guarantees close()-before-unmount. (Native top layer is LIFO, so
+  // the upper Adopt dialog must close before the lower Create dialog, which
+  // is exactly this ordering: Adopt closes here, Create closes inside
+  // handleCreate.)
+  async function onAdoptModalAccept() {
     adoptDecision = 'adopt';
     showAdoptModal = false;
-    void handleCreate();
+    // Flush so the Adopt DialogRoot's $effect runs close() (top layer
+    // released) before handleCreate unmounts this modal.
+    await tick();
+    await handleCreate();
   }
   function onAdoptModalCancel() {
     adoptDecision = 'no-adopt';
