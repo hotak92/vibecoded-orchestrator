@@ -233,6 +233,12 @@ pub async fn start_container_for_module_with_gpu_mode(
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // v0.2.67: kill_on_drop is LOAD-BEARING for the 60s timeout below —
+    // `podman run` of a not-yet-cached image triggers an IMPLICIT pull;
+    // if it stalls past the bound, dropping the future on Elapsed must
+    // SIGKILL the child (no orphan). Mirrors the launcher's run site +
+    // the shared `bounded_authed_pull` chokepoint.
+    cmd.kill_on_drop(true);
 
     let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
         .await
@@ -1198,6 +1204,11 @@ pub async fn start_global_container_supervisor(
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // v0.2.67: kill_on_drop is LOAD-BEARING for the 60s timeout below —
+    // `podman run` of a not-yet-cached image triggers an IMPLICIT pull;
+    // if it stalls past the bound, dropping the future on Elapsed must
+    // SIGKILL the child (no orphan). Mirrors the shared chokepoint.
+    cmd.kill_on_drop(true);
 
     // v0.2.61 (Option H C-REVOKE): if `podman run` fails (timeout / spawn
     // error / non-zero exit), the token minted above has NO live holder —

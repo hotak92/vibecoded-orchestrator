@@ -45,7 +45,13 @@ import type { ModuleCatalogEntry, ModuleInstallRow, ModuleStatus } from '$lib/ty
 export type TileDisplay =
   | { kind: 'bundled' }
   | { kind: 'included'; parent_id: string; cta_route: string }
-  | { kind: 'installing' }
+  | {
+      kind: 'installing';
+      // v0.2.67: optional live-progress label (e.g. "Pulling image… 40%")
+      // sourced from the store's `installProgress[module_id]`. `null` when
+      // no progress event has arrived yet (render the bare spinner).
+      progress: string | null;
+    }
   | {
       kind: 'installed';
       install_row: ModuleInstallRow;
@@ -89,6 +95,43 @@ export function semverLess(a: string, b: string): boolean {
 }
 
 /**
+ * v0.2.67: the live install-progress shape the store records per module
+ * (`installProgress[module_id]`). Re-declared structurally here (rather
+ * than imported from the store) so this module stays free of Svelte/store
+ * imports and remains a pure, unit-testable helper.
+ */
+export interface TileInstallProgress {
+  stage: string;
+  percent: number;
+  message: string;
+  failed: boolean;
+}
+
+/**
+ * v0.2.67: human-readable label for an in-flight install, derived from
+ * the latest `module://install-progress` event the store recorded.
+ *
+ * Returns `null` when there's no progress yet (render the bare spinner)
+ * or for the terminal `done`/`failed` stages (the install row's own
+ * status drives the display once those arrive). For every intermediate
+ * stage we render the backend `message` plus a percent when it's a
+ * meaningful 1–99 (0 and 100 are noise at the stage boundaries).
+ */
+export function installProgressLabel(
+  progress: TileInstallProgress | null | undefined,
+): string | null {
+  if (!progress) return null;
+  // Terminal stages are handled by the row's status, not the spinner.
+  if (progress.stage === 'done' || progress.stage === 'failed') return null;
+  const msg = (progress.message ?? '').trim();
+  const base = msg.length > 0 ? msg : 'Installing';
+  if (progress.percent > 0 && progress.percent < 100) {
+    return `${base}… ${progress.percent}%`;
+  }
+  return `${base}…`;
+}
+
+/**
  * Resolve which display branch the tile should render.
  *
  * Inputs:
@@ -98,6 +141,9 @@ export function semverLess(a: string, b: string): boolean {
  * - `isInstalling`: true when an install/update RPC is in flight for
  *   THIS module (store's `installingId === entry.id`). Takes priority
  *   over every other state so the spinner is honest.
+ * - `progress` (v0.2.67): the store's latest `installProgress[entry.id]`
+ *   for this module, used to render a live label on the `installing`
+ *   branch. Optional — omitted → bare spinner.
  *
  * Ordering is significant — see the comments above each branch.
  */
@@ -105,6 +151,7 @@ export function resolveTileDisplay(
   entry: ModuleCatalogEntry,
   installRow: ModuleInstallRow | null,
   isInstalling: boolean,
+  progress?: TileInstallProgress | null,
 ): TileDisplay {
   // Branch 0 — bundled / orchestrator-shipped catalog kinds.
   // These predate the install pipeline; they never go through
@@ -123,8 +170,12 @@ export function resolveTileDisplay(
   // Branch 1 — an install/retry is mid-flight. Honour the spinner
   // regardless of the row's current status (the row may still say
   // 'error' from the previous attempt until the Rust side commits).
-  if (isInstalling) {
-    return { kind: 'installing' };
+  //
+  // v0.2.67: if a terminal `failed` stage already arrived, fall through
+  // to the errored branch immediately (the row's status will catch up,
+  // but the user sees the failure now rather than a hanging spinner).
+  if (isInstalling && !(progress && progress.failed)) {
+    return { kind: 'installing', progress: installProgressLabel(progress) };
   }
 
   // Branch 2 — no row yet → available for install.
@@ -149,7 +200,7 @@ export function resolveTileDisplay(
   // Treat as "installing" too so the spinner stays put even if the
   // store-side flag races against an event from another window.
   if (installRow.status === 'installing') {
-    return { kind: 'installing' };
+    return { kind: 'installing', progress: installProgressLabel(progress) };
   }
 
   // Branch 5 — installed / running / stopped → installed (happy path).

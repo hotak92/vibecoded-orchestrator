@@ -704,7 +704,8 @@
         {@const installRow = getInstalledRow(m)}
         {@const color = colorFor(m.id)}
         {@const installing = mState.installingId === m.id}
-        {@const display = resolveTileDisplay(m, installRow, installing)}
+        {@const progress = mState.installProgress[m.id] ?? null}
+        {@const display = resolveTileDisplay(m, installRow, installing, progress)}
         <!-- Bug D (v0.2.49): per-project badge resolved alongside the
              tile-display contract. Hoisted to the top of the {#each}
              so the inline `{@const}` is valid (Svelte 5 requires
@@ -926,10 +927,14 @@
                 Uninstall
               </button>
             {:else if display.kind === 'installing'}
-              <!-- In-flight install/retry/update — spinner-only, no buttons. -->
+              <!-- In-flight install/retry/update — spinner + live stage
+                   label (v0.2.67). `display.progress` is the store's
+                   latest install-progress message (e.g. "Pulling image…
+                   40%"); falls back to a static "Installing…" before the
+                   first progress event arrives. -->
               <span class="status-badge status-badge-bundled">
                 <span class="spinner-sm" aria-hidden="true"></span>
-                Installing…
+                {display.progress ?? 'Installing…'}
               </span>
             {:else if display.kind === 'available' && display.needs_license}
               <!-- Not installed + tier-required + unlicensed: activate, not "upgrade". -->
