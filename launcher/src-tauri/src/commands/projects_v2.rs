@@ -253,7 +253,7 @@ pub fn get_shared_kg_read_disabled(db: &Db, project_id: &str) -> Result<bool, St
 /// Deprecated alias of `get_shared_kg_write_disabled`. Will be removed once
 /// the legacy command + env var are dropped (target: 2026-08).
 #[deprecated(
-    since = "2026-05-01",
+    since = "0.2.46",
     note = "Use `get_shared_kg_write_disabled` — the toggle now gates WRITES \
             only. Reads of the shared KG are always on."
 )]

@@ -382,18 +382,14 @@ fn build_source_allowlist(db: &Db) -> Vec<String> {
 
     for path in env_file_allowlist(db) {
         if path.is_file() {
-            for key in parse_env_file_keys(&path) {
-                let _ = key; // keys aren't part of the descriptor
+            // One source string per file — the list is file-level, not
+            // key-level. Emit it exactly once, and only if the file has at
+            // least one key (a keyless file is effectively unusable for
+            // import). The individual key names aren't part of the
+            // descriptor, so we only need to know whether any exist.
+            if parse_env_file_keys(&path).into_iter().next().is_some() {
                 out.push(format!("env_file:{}", path.display()));
-                break; // one source string per file — list is
-                       // file-level, not key-level. We emit it once.
             }
-            // If there are zero keys we still emit the source so a UI
-            // that polled fresh after the user wrote a new line can
-            // re-register against the now-readable file. (No harm: the
-            // value extraction will error cleanly.)
-            // Actually, only emit if we found at least one key —
-            // otherwise the file is effectively unusable for import.
         }
     }
 
