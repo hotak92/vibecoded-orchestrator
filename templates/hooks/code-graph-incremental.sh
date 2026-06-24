@@ -58,16 +58,29 @@ REPO_PATH="${2:-${CLAUDE_PROJECT_DIR:-$(pwd)}}"
 # while consumers + the launcher binding row point at the canonical
 # prefix (e.g. `VibeCodedOrchestrator`). See knowledge/concepts/
 # multi-codebase-code-graph-detection.md for the full diagnosis.
-PROJECT_NAME="${3:-}"
-if [ -z "$PROJECT_NAME" ]; then
-    _RESOLVER="$REPO_PATH/.claude/scripts/vct_project_config.sh"
-    if [ -x "$_RESOLVER" ]; then
-        PROJECT_NAME=$(
-            "$_RESOLVER" "$REPO_PATH" --field code_graph_collection_prefix 2>/dev/null
-        ) || PROJECT_NAME=""
+#
+# v0.2.66 (Bug 3): factored into a function so the canonical-root
+# re-resolution below (worktree dedup) reuses the SAME resolver→basename
+# fallback — single source of truth, no fork. MUST MATCH
+# templates/hooks/code-graph-incremental.ps1 :: Resolve-CodegraphProject.
+_resolve_codegraph_project() {
+    # Args: <root>. Echoes the code-graph collection prefix for <root>:
+    # the vct-hub resolver's `code_graph_collection_prefix` if available,
+    # else the basename of <root>.
+    local _root="$1"
+    local _name=""
+    local _resolver="$_root/.claude/scripts/vct_project_config.sh"
+    if [ -x "$_resolver" ]; then
+        _name=$(
+            "$_resolver" "$_root" --field code_graph_collection_prefix 2>/dev/null
+        ) || _name=""
     fi
-fi
-[ -z "$PROJECT_NAME" ] && PROJECT_NAME="$(basename "$REPO_PATH")"
+    [ -z "$_name" ] && _name="$(basename "$_root")"
+    printf '%s\n' "$_name"
+}
+
+PROJECT_NAME="${3:-}"
+[ -z "$PROJECT_NAME" ] && PROJECT_NAME="$(_resolve_codegraph_project "$REPO_PATH")"
 
 # Resolve analyzer script + python from project layout (no hardcoded paths).
 # Hook lives at <repo>/.claude/hooks/, so repo root is two parents up.
@@ -170,35 +183,137 @@ if [[ ! "$EDITED_FILE" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|j
     exit 0
 fi
 
-# v0.2.18 (Plan C) mapped the edited file's extension to the analyzer's
-# canonical language ID and passed `--language $LANG --prune-stale` to
-# scope the prune to "rows of this language not visited this run".
-#
-# v0.2.52 V52-O.7 (2026-06-09): the LANG mapping is now UNUSED in the
-# analyzer invocation below because `--prune-stale` was dropped (see audit
-# a97f0d9 — `_prune_collection` iterated the WHOLE collection per run, so
-# every Python edit deleted ALL other Python rows; collection went to 0
-# Python rows over time). The mapping stays in place because the proper
-# architectural fix queued for v0.2.53 (scope prune to the EDITED FILE
-# only, not language-wide) will need this LANG hint. Don't delete the
-# block — it's load-bearing for the v0.2.53 follow-up.
-LANG=""
+# ── v0.2.66 (Bug 3, part c): skip pure-scratch / transient paths ───────────
+# .claude/state/ is NEVER source (tool_backups snapshots, session scratch);
+# indexing it pollutes the persistent collection with throwaway objects we
+# found 97 of in the field. Always skip. Conservative: a non-source path
+# under state/ must never reach the analyzer.
 case "$EDITED_FILE" in
-    *.py)                                LANG="python"     ;;
-    *.js|*.mjs|*.jsx)                    LANG="javascript" ;;
-    *.ts|*.tsx)                          LANG="typescript" ;;
-    *.go)                                LANG="go"         ;;
-    *.rs)                                LANG="rust"       ;;
-    *.lua)                               LANG="lua"        ;;
-    *.cpp|*.cc|*.cxx|*.h|*.hpp)          LANG="cpp"        ;;
-    *.c)                                 LANG="c"          ;;
-    *.cs)                                LANG="csharp"     ;;
-    *.java)                              LANG="java"       ;;
-    *.rb)                                LANG="ruby"       ;;
-    *.proto)                             LANG="proto"      ;;
-    *.sh|*.bash)                         LANG="shell"      ;;
-    *)                                   LANG=""           ;;
+    */.claude/state/*)
+        # Soft no-op — never index transient state snapshots.
+        exit 0
+        ;;
 esac
+
+# ── v0.2.66 (Bug 3, part b): canonicalize a git WORKTREE edit to its MAIN
+# repo root ────────────────────────────────────────────────────────────────
+# THE LEAK: the analyzer keys each object's file_path on
+# `relative_to(source_root)` AND mixes the absolute source root into the
+# object's deterministic UUID (V52-O.3 `project_source`). When an edited
+# file lives in a git LINKED WORKTREE (or under a code_graph_extra_paths
+# entry that is itself a worktree/clone), the hook set REPO_PATH = the
+# worktree root, so the SAME logical file produced a DISTINCT object per
+# worktree — a full duplicate set that the per-edit hook never prunes
+# (--prune-stale was removed in v0.2.52). Every parallel-agent fan-out
+# cycle therefore left thousands of orphan CodeFunction objects keyed under
+# deleted worktree roots; the accumulated bloat is what drives Weaviate's
+# compaction / tombstone-cleanup into the intermittent disk-write peaks.
+#
+# WHY NOT just the relative path: a file's path RELATIVE to its worktree
+# root already equals its path relative to the main root (e.g.
+# `templates/foo.py` either way) — so the `file_path` property does NOT
+# diverge. What diverges is the object's deterministic UUID + `project_source`
+# property, which mix in the ABSOLUTE source root (V52-O.3): worktree-abs-path
+# != main-abs-path → distinct UUID → duplicate object.
+#
+# FIX: keep REPO_PATH as the worktree root (so the analyzer relativizes the
+# REAL on-disk file correctly) but pass the worktree's CANONICAL MAIN repo
+# root via `--canonical-source`. The analyzer stamps THAT as `project_source`
+# and mixes it into the UUID, so a worktree edit and a main-checkout edit of
+# the same logical file converge on the ONE canonical object (latest on-disk
+# content wins). The content_hash + _get_existing_module skip paths still
+# apply (unchanged file → no write). Parallel subagents on DISJOINT worktrees
+# edit different files → no contention; same-file edits across worktrees
+# last-writer-wins on ONE canonical object (acceptable, far better than
+# duplicates) — deliberately NO locking.
+#
+# CONSERVATIVE-DEFAULT: if we cannot positively resolve a canonical main
+# root for the edited file (no git, scratch /tmp path with no real repo),
+# SKIP indexing rather than index under a transient root.
+#
+# MUST MATCH templates/hooks/code-graph-incremental.ps1 :: Get-CanonicalRepoRoot
+# (mirror cross-language logic; keep the git primitive identical).
+_canonical_repo_root() {
+    # Args: <edited_file>. Echoes the canonical main repo root on success
+    # (absolute path), echoes nothing + returns non-zero on failure.
+    local _file="$1"
+    local _dir
+    _dir="$(dirname "$_file")"
+    command -v git >/dev/null 2>&1 || return 1
+    # `--git-common-dir` resolves a linked worktree's shared .git dir to the
+    # MAIN repo's `.git` (for the main checkout it's the same path). The
+    # main repo root is its dirname. `--path-format=absolute` (git ≥ 2.31)
+    # makes the relative ".git" of a main checkout absolute too; older git
+    # falls back to resolving the (possibly-relative) value against $_dir.
+    local _common
+    _common="$(git -C "$_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || _common=""
+    if [ -z "$_common" ]; then
+        # Older git without --path-format: resolve the bare value to absolute.
+        _common="$(git -C "$_dir" rev-parse --git-common-dir 2>/dev/null)" || return 1
+        [ -z "$_common" ] && return 1
+        case "$_common" in
+            /*) : ;;                       # already absolute
+            *)  _common="$_dir/$_common" ;; # relative (".git") → make absolute
+        esac
+    fi
+    # Strip a trailing "/.git" (and any trailing slash) → main repo root.
+    local _root="${_common%/}"
+    _root="${_root%/.git}"
+    [ -d "$_root" ] || return 1
+    # NIT (Bug 3): NORMALIZE to an absolute, symlink-resolved path. The
+    # older-git fallback above can yield an unnormalized string (e.g.
+    # ".../src/../..") and macOS resolves /tmp→/private; `cd … && pwd -P`
+    # canonicalizes both so a worktree edit's stamped root EXACTLY equals
+    # the main-checkout's normalized value (else the UUIDs wouldn't match).
+    local _norm
+    _norm="$(cd "$_root" 2>/dev/null && pwd -P)" || return 1
+    [ -n "$_norm" ] || return 1
+    printf '%s\n' "$_norm"
+}
+
+_CANON_ROOT="$(_canonical_repo_root "$EDITED_FILE")" || _CANON_ROOT=""
+if [ -z "$_CANON_ROOT" ]; then
+    # No git main root resolvable for the edited file. Two sub-cases:
+    #   (1) the path is under the system temp dir → throwaway scratch
+    #       (e.g. an agent worktree that lost its git metadata, or a /tmp
+    #       fixture). NEVER index it — conservative no-op (part c).
+    #   (2) a legitimate NON-GIT project on disk (no .git anywhere). There
+    #       is no worktree to dedup, so canonicalization is moot; fall back
+    #       to the on-disk REPO_PATH as the canonical source — preserving
+    #       pre-v0.2.66 per-edit indexing for non-git codebases.
+    case "$EDITED_FILE" in
+        "${TMPDIR:-/tmp}"/*|/tmp/*|/var/folders/*|/var/tmp/*)
+            echo "ℹ️  code-graph: transient scratch path $EDITED_FILE — skipping" >&2
+            exit 0
+            ;;
+        *)
+            _CANON_ROOT="$REPO_PATH"  # non-git project: no worktree to dedup
+            ;;
+    esac
+fi
+# REPO_PATH stays the on-disk root (worktree root for a worktree edit) so the
+# analyzer relativizes the REAL file. $_CANON_ROOT is passed separately via
+# --canonical-source to stamp the canonical project_source / UUID seed.
+
+# v0.2.66 (Bug 3, CONCERN-1): the deterministic object UUID is keyed on
+# {project}::{project_source}::{file_path_rel}::{full_name}. We canonicalize
+# project_source (--canonical-source) and file_path_rel (REPO_PATH-relative,
+# identical across worktrees) — but PROJECT_NAME was resolved against the
+# WORKTREE REPO_PATH above. For a Claude-Code `isolation: worktree` ephemeral
+# worktree (NOT a registered launcher project) the hub resolver misses and
+# PROJECT_NAME falls back to `basename "$REPO_PATH"` = the worktree basename,
+# which DIFFERS per worktree → distinct `project` → distinct UUID → the very
+# duplicates this fix targets STILL accumulate. Fix: when the edit is in a
+# worktree (canonical root != on-disk root) AND we are NOT in the extras case
+# (extras deliberately keep the parent project), re-resolve PROJECT_NAME
+# against the CANONICAL MAIN root so a worktree edit and a main-checkout edit
+# produce the SAME project → SAME UUID. The basename fallback inside the
+# resolver helper then uses basename of $_CANON_ROOT, not the worktree.
+# Extras keep their parent PROJECT_NAME (project_source + file_path_rel still
+# dedup an extra-that-is-a-worktree). MUST MATCH the .ps1 sibling.
+if [ "$EXTRAS_MATCHED" -eq 0 ] && [ "$_CANON_ROOT" != "$REPO_PATH" ]; then
+    PROJECT_NAME="$(_resolve_codegraph_project "$_CANON_ROOT")"
+fi
 
 # Resolve python: prefer venv, fall back to system python (cross-OS).
 # Bare `python3` is missing on Windows (only python.exe / py exist).
@@ -223,33 +338,39 @@ if [ -z "$PYTHON" ] || [ ! -f "$ANALYZER" ]; then
     exit 0
 fi
 
-# Run incremental analysis in background (no debounce — keep code graph fresh).
-# --cfg/--pdg default to ON inside analyze_code_graph.py when joern is present;
-# silent fallback when absent. To disable, set VCT_JOERN_AVAILABLE=0.
+# Run single-file analysis in background (no internal debounce — the
+# per-file coalescing is handled by post-file-edit.sh's debounce layer).
+# --cfg/--pdg default to ON inside analyze_code_graph.py when joern is
+# present; silent fallback when absent. To disable, set VCT_JOERN_AVAILABLE=0.
+# In single-file mode the analyzer scopes Joern's CPG build to the one
+# edited file too, so this stays cheap per-edit.
 #
-# v0.2.52 V52-O.7 (2026-06-09): DROPPED `--prune-stale --language=$LANG`.
-# v0.2.18 added them as "Plan C" intending a language-scoped prune. But
-# `_prune_collection` (analyze_code_graph.py:1889) iterates the ENTIRE
-# collection and deletes every row tagged with that language that wasn't
-# visited THIS run. Incremental runs visit ~1 file at a time (HEAD~1..HEAD
-# diff) so every Python edit deleted all OTHER Python rows. Audit a97f0d9
-# (2026-06-09) confirmed: `VibeCodedOrchestrator_CodeFunction` had 5365
-# rows of which **0 were Python**, while the legacy snapshot
-# `Vco_v0243_A_install_CodeFunction` still had 219 Python rows (untouched
-# by incremental runs). This was the PRIMARY root cause of zero-Python-
-# indexed.
+# v0.2.66 (Bug 3): switched from `"$REPO_PATH" --incremental` to
+# `"$REPO_PATH" --only-file "$EDITED_FILE"`. The old `--incremental` ran
+# `git diff --name-only HEAD~1 HEAD` and re-analyzed EVERY file in the
+# previous commit (dozens in an active cycle), which both:
+#   1. amplified writes — re-parsing + re-hashing all HEAD~1..HEAD files
+#      on every single edit drove the multi-hundred-MiB/s disk peaks; and
+#   2. was WRONG — the file the user just edited is uncommitted (working
+#      tree), so it was never in HEAD~1..HEAD at all. The per-edit sync
+#      re-churned the PREVIOUS commit's files and never indexed the edit.
 #
-# Fix scope: drop --prune-stale + --language; let stale rows leak until a
-# full reanalyze (V52-O.2 `scripts/v0252_codegraph_reset.sh`) cleans them
-# up. The proper architectural fix (scope prune to the EDITED FILE only,
-# not language-wide) is queued for v0.2.53 — see V52-O.7 sub-item in
-# v0.2.52 backlog.
+# --only-file passes the actual edited file. `$REPO_PATH` stays the
+# relativization root (collections key on repo-relative paths). The
+# analyzer routes the single file through the SAME per-file
+# (`_get_existing_module`, keyed on path+hash) and per-object
+# (`_dedup_insert` content_hash) skip paths, so an unchanged or trivially-
+# edited file writes ~0 objects — "just the hashes" make it a near-no-op.
+# No repo-wide prune happens (single-file mode never deletes other files'
+# rows), so this also can't re-introduce the V52-O.7 prune-deletes-other-
+# rows regression.
 (
     cd "$REPO_PATH"
     "$PYTHON" "$ANALYZER" \
         "$REPO_PATH" \
         --project "$PROJECT_NAME" \
-        --incremental \
+        --only-file "$EDITED_FILE" \
+        --canonical-source "$_CANON_ROOT" \
         2>&1 | tail -5
 ) &
 
