@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MigrationEdge",
     "MigrationRunReport",
+    "RUST_OWNED_TYPES",
     "WEAVIATE_DERIVED_TYPES",
     "build_deferral_entries",
     "discover_edges",
@@ -84,6 +85,51 @@ WEAVIATE_DERIVED_TYPES: frozenset[str] = frozenset(
         "development_collection",
         "diagrams_collection",
         "codegraph_collection",
+    }
+)
+
+#: Artifact_types whose migrations are OWNED BY THE RUST / ``_schema_migrations``
+#: LAYER, not by a Python per-edge script under ``migrations/<type>/``. These
+#: are NOT Weaviate collections (so they skip the BINDING POLICY blocks) and
+#: they have NO ``migrations/<type>/<from>_to_<to>.<ext>`` ladder by design —
+#: their real schema changes are applied at LAUNCHER STARTUP by
+#: ``launcher/src-tauri/vct-launcher-core/src/db/migrations.rs::MIGRATIONS``.
+#:
+#: The Python ``artifact_schema_versions`` registry tracks such a type only as
+#: a VERSION-FLOOR ("refuse to start if launcher.db is ahead"; see
+#: ``schema_versions.py`` LAUNCHER_DB_TABLE_SET_VERSION docstring) — it was
+#: never meant to run its own edges. So when ``run_schema_migrations`` sees a
+#: stored < canonical gap for one of these, the correct action is a REGISTER-
+#: ONLY version advance (record the new canonical, demand NO edge script),
+#: NOT the ``user_curated`` no-edge ``schema_migration_script_missing`` error.
+#: Without this, every launcher.db migration bump re-fires a harmless-but-noisy
+#: deferral on the next ``install.py --update`` (latent since v0.2.52; surfaced
+#: by the v0.2.65 token-secret-index migration which bumped the constant 34→35
+#: with no Python edge, as no launcher.db bump ever ships one).
+#:
+#: STRICT MEMBERSHIP RULE: a type belongs here ONLY if its schema is applied by
+#: the Rust ``_schema_migrations`` runner. Do NOT add a genuinely user-curated
+#: content shape (e.g. a JSON-payload shape whose forward migration must
+#: actually rewrite stored rows) — that needs a real Python edge, and a
+#: register-only advance would silently skip the data migration.
+RUST_OWNED_TYPES: frozenset[str] = frozenset(
+    {
+        # launcher.db table-set version: tracks the highest applied entry in
+        # migrations.rs::MIGRATIONS (applied at launcher startup). The Python
+        # tracker is a version-floor only — see schema_versions.py's
+        # LAUNCHER_DB_TABLE_SET_VERSION docstring + 033_artifact_schema_versions
+        # .sql ("matches _schema_migrations max version").
+        "launcher_db_table_set",
+        # DELIBERATELY NOT HERE: ``rl_events_payload_shape``. Despite also being
+        # orchestrator-wide + derived-but-not-Weaviate, its versioned shape is
+        # the JSON content of ``rl_events.payload_json`` — written + migrated by
+        # the PYTHON RL telemetry layer (claude_mcp_servers/rl_client/
+        # telemetry_writer.py builds the v3 event; migrate_rl_jsonl_to_db.py
+        # forward-migrates v2→v3 payloads). It is classified ``user_curated``
+        # ("historical telemetry data"): a future bump must actually rewrite
+        # stored payloads via a real Python edge, NOT a register-only advance.
+        # The Rust migration 025 only creates the rl_events TABLE (covered by
+        # launcher_db_table_set), not its payload-content shape.
     }
 )
 
@@ -1039,6 +1085,60 @@ def run_schema_migrations(
                         changed_fields=[f"recorded v{stored} < canonical v{canonical}"],
                         report=report,
                         check=check,
+                    )
+                continue
+
+            # ---- Rust-owned types: REGISTER-ONLY version advance ----
+            # The schema change was already applied at launcher startup by
+            # migrations.rs::MIGRATIONS; the Python registry only tracks the
+            # version floor. No per-edge script exists by design, so just
+            # record the new canonical (a clean success, NOT a deferral). If
+            # an edge HAS been shipped for one of these (it shouldn't), fall
+            # through to the contiguity-checked apply path below so a real
+            # ladder still runs rather than being silently swallowed.
+            if not edges and artifact_type in RUST_OWNED_TYPES:
+                if check:
+                    report.registered.append(
+                        (
+                            artifact_type,
+                            artifact_name,
+                            f"would advance v{stored}→v{canonical} "
+                            f"(Rust-owned; schema applied at launcher startup)",
+                        )
+                    )
+                    continue
+                ok = avr.register_artifact_version(
+                    db_path,
+                    project_id=effective_pid,
+                    artifact_type=artifact_type,
+                    artifact_name=artifact_name,
+                    schema_version=canonical,
+                    materialized_at=when,
+                )
+                if ok:
+                    report.registered.append(
+                        (
+                            artifact_type,
+                            artifact_name,
+                            f"advanced v{stored}→v{canonical} "
+                            f"(Rust-owned; schema applied at launcher startup)",
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "run_schema_migrations: register_artifact_version "
+                        "returned False for Rust-owned %s/%s (DB locked?); not "
+                        "counting as advanced",
+                        artifact_type,
+                        artifact_name,
+                    )
+                    report.register_failed.append(
+                        (
+                            artifact_type,
+                            artifact_name,
+                            "registry write failed (DB locked/unwritable); "
+                            "will retry next run",
+                        )
                     )
                 continue
 
