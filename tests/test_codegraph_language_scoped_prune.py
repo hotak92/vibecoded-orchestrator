@@ -15,7 +15,9 @@ Covers:
     file calling Go gRPC produces a row with `language="python"`.
   - The `_ensure_language_property` helper adds the property on existing
     v0.2.17 collections without it.
-  - The hook's extension-to-language mapping covers all known choices.
+  - v0.2.66 (Bug 3): the analyzer's `_dispatch_name_for_file` maps an
+    edited file to its lang_dispatch name, and the per-edit hook passes
+    `--only-file "$EDITED_FILE"` instead of the old `--incremental`.
 
 All tests are pure-Python unit tests against the analyzer module's
 helpers and don't require a running Weaviate.
@@ -642,15 +644,22 @@ def test_existing_v0217_collections_get_language_prop_via_migrate_collections() 
 
 
 # ---------------------------------------------------------------------------
-# Test 8 — hook's extension-to-language mapping covers all known choices.
+# Test 8 — extension-to-dispatch-name mapping covers all known languages.
+#
+# v0.2.66 (Bug 3): the hook no longer carries a LANG `case` block. Language
+# detection for the per-edit (single-file) path now lives in the analyzer's
+# `_dispatch_name_for_file`, which the hook reaches via `--only-file`. These
+# tests assert the analyzer's mapping directly (the real home), and verify
+# the hook passes the new single-file invocation rather than `--incremental`.
 # ---------------------------------------------------------------------------
 
 
-# Set of (extension, expected canonical lang) pairs the hook is expected
-# to recognise. Mirrored from the analyzer's argparse `--language`
-# choices + the existing hook regex. New extensions added to the hook
-# must be added here too.
-_HOOK_EXTENSION_CASES = [
+# (filename, expected lang_dispatch name) pairs `_dispatch_name_for_file`
+# must recognise. The dispatch NAME is the first element of each
+# `lang_dispatch` tuple in `analyze_repository`. Note `.c` maps to "cpp"
+# (the dispatch name), because `_find_cpp_files` globs `*.c` into the cpp
+# dispatch — single-file mode must match the directory walk's routing.
+_DISPATCH_NAME_CASES = [
     ("foo.py", "python"),
     ("bar.js", "javascript"),
     ("bar.mjs", "javascript"),
@@ -665,94 +674,81 @@ _HOOK_EXTENSION_CASES = [
     ("hot.cxx", "cpp"),
     ("api.h", "cpp"),
     ("api.hpp", "cpp"),
-    ("driver.c", "c"),
+    ("driver.c", "cpp"),   # *.c is globbed into the cpp dispatch
     ("Controller.cs", "csharp"),
     ("Main.java", "java"),
     ("app.rb", "ruby"),
     ("api.proto", "proto"),
     ("install.sh", "shell"),
     ("install.bash", "shell"),
-    # Unknown extensions get empty (hook falls back to plain --incremental).
+    ("widget.svelte", "svelte"),
+    ("hook.ps1", "powershell"),
+    ("mod.psm1", "powershell"),
+    # Deliberately-skipped extensions mirror the `_find_*_files` skips so
+    # single-file mode agrees with the directory walk (no-op = empty).
+    ("types.d.ts", ""),
+    ("bundle.min.js", ""),
+    # Unknown extensions get empty (single-file mode is a no-op).
     ("README.md", ""),
     ("data.json", ""),
 ]
 
 
-@pytest.mark.parametrize("filename,expected_lang", _HOOK_EXTENSION_CASES)
-def test_hook_extension_maps_to_canonical_lang(filename: str, expected_lang: str) -> None:
-    """Replicates the hook's `case "$EDITED_FILE" in ... esac` block in
-    Python so we can unit-test the mapping without spawning bash. The
-    rules MUST stay in sync with `templates/hooks/code-graph-incremental.sh`
-    and `templates/hooks/code-graph-incremental.ps1` — the test guards
-    drift between hook + Tauri + Python flows.
+@pytest.mark.parametrize("filename,expected_name", _DISPATCH_NAME_CASES)
+def test_dispatch_name_for_file(
+    analyzer_mod: types.ModuleType, filename: str, expected_name: str
+) -> None:
+    """`_dispatch_name_for_file` maps an edited file to its `lang_dispatch`
+    name (or "" for an unknown / deliberately-skipped extension). This is
+    the single source of truth the per-edit hook relies on via
+    `--only-file`; the parity contract is that the returned value equals a
+    `lang_dispatch` first-element in `analyze_repository`.
     """
-    # Mirror of the hook's case statement. Keep ordering identical so
-    # a regression here flags up on the .sh sibling too.
-    def _resolve(name: str) -> str:
-        if name.endswith(".py"):
-            return "python"
-        if name.endswith(".js") or name.endswith(".mjs") or name.endswith(".jsx"):
-            return "javascript"
-        if name.endswith(".ts") or name.endswith(".tsx"):
-            return "typescript"
-        if name.endswith(".go"):
-            return "go"
-        if name.endswith(".rs"):
-            return "rust"
-        if name.endswith(".lua"):
-            return "lua"
-        if (
-            name.endswith(".cpp")
-            or name.endswith(".cc")
-            or name.endswith(".cxx")
-            or name.endswith(".h")
-            or name.endswith(".hpp")
-        ):
-            return "cpp"
-        if name.endswith(".c"):
-            return "c"
-        if name.endswith(".cs"):
-            return "csharp"
-        if name.endswith(".java"):
-            return "java"
-        if name.endswith(".rb"):
-            return "ruby"
-        if name.endswith(".proto"):
-            return "proto"
-        if name.endswith(".sh") or name.endswith(".bash"):
-            return "shell"
-        return ""
-
-    assert _resolve(filename) == expected_lang
+    assert (
+        analyzer_mod._dispatch_name_for_file(Path(filename)) == expected_name
+    )
 
 
-def test_hook_sh_contains_every_language_arm() -> None:
-    """Read the .sh hook and verify every canonical language ID appears
-    in a case arm. The LANG mapping is kept in place for the v0.2.53
-    follow-up (scope prune to EDITED FILE only) even though v0.2.52
-    V52-O.7 dropped --prune-stale + --language from the invocation.
-    This catches deletions/typos that would break the v0.2.53 wiring."""
+def test_hook_sh_uses_single_file_invocation() -> None:
+    """v0.2.66 (Bug 3): the hook must pass `--only-file "$EDITED_FILE"` and
+    must NOT use `--incremental` (which re-churned every HEAD~1..HEAD file
+    per edit AND missed the actual uncommitted edit). This catches an
+    accidental revert to the whole-repo incremental invocation."""
     sh = _HOOK_PATH.read_text(encoding="utf-8")
-    expected_arms = [
-        "*.py)",
-        "*.js|*.mjs|*.jsx)",
-        "*.ts|*.tsx)",
-        "*.go)",
-        "*.rs)",
-        "*.lua)",
-        "*.cpp|*.cc|*.cxx|*.h|*.hpp)",
-        "*.c)",
-        "*.cs)",
-        "*.java)",
-        "*.rb)",
-        "*.proto)",
-        "*.sh|*.bash)",
-    ]
-    for arm in expected_arms:
-        assert arm in sh, (
-            f"Hook is missing case arm `{arm}` — LANG mapping needed "
-            f"for v0.2.53's per-file-scoped prune follow-up."
-        )
+    import re
+
+    inv = re.search(
+        r'\(\s*\n\s*cd "\$REPO_PATH"\s*\n(.*?)\) &',
+        sh,
+        re.DOTALL,
+    )
+    assert inv, "could not locate analyzer-invocation subshell in the hook"
+    invocation = inv.group(1)
+    assert "--only-file" in invocation and '"$EDITED_FILE"' in invocation, (
+        "Hook must pass `--only-file \"$EDITED_FILE\"` (single-file scope). "
+        "See v0.2.66 Bug 3."
+    )
+    assert "--incremental" not in invocation, (
+        "v0.2.66 regression: `--incremental` must NOT be in the analyzer "
+        "invocation — it re-analyzed every HEAD~1..HEAD file per edit and "
+        "never indexed the actual (uncommitted) edit. Use `--only-file`."
+    )
+
+
+def test_hook_ps1_uses_single_file_invocation() -> None:
+    """Mirror of `test_hook_sh_uses_single_file_invocation` for the .ps1
+    sibling — cross-language logic must not drift (the .ps1 path is what
+    fires for native-Windows users without WSL)."""
+    ps1 = (
+        _REPO_ROOT / "templates" / "hooks" / "code-graph-incremental.ps1"
+    ).read_text(encoding="utf-8")
+    assert "'--only-file'" in ps1 and "$EditedFile" in ps1, (
+        "code-graph-incremental.ps1 must pass `--only-file $EditedFile`. "
+        "See v0.2.66 Bug 3."
+    )
+    assert "'--incremental'" not in ps1, (
+        "v0.2.66 regression: the .ps1 must NOT pass `--incremental`."
+    )
 
 
 def test_hook_sh_does_not_pass_prune_stale_v52_o7() -> None:

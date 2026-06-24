@@ -52,6 +52,37 @@ bump from re-firing a spurious migration deferral on every update.
   `rl_events_payload_shape` is deliberately excluded (its JSON payload shape is
   migrated by the Python RL telemetry layer, so it correctly still requires a
   real edge).
+- **Per-edit code-graph sync is scoped to the EDITED file (kills the
+  HEAD~1..HEAD re-churn + indexes the actual edit).** `code-graph-incremental.sh`
+  / `.ps1` invoked the analyzer as `<repo> --incremental`, which ran
+  `git diff --name-only HEAD~1 HEAD` and re-analyzed EVERY file in the previous
+  commit on every single edit (dozens of files in an active cycle) — the source
+  of the observed multi-hundred-MiB/s disk-write peaks — while NEVER indexing the
+  file the user actually edited (it is uncommitted, so it was never in the diff
+  range). The hook now passes `--only-file "$EDITED_FILE"`; the new analyzer
+  single-file path routes the one file through the existing per-file
+  (`_get_existing_module`) and per-object (`content_hash`) skip checks, so an
+  unchanged or trivially-edited file writes ~0 objects.
+- **Per-edit code-graph sync canonicalizes git-worktree edits onto the
+  main-checkout object (eliminates orphan/duplicate accumulation).** An object's
+  deterministic UUID is keyed on `{project}::{project_source}::{file_path_rel}::{full_name}`,
+  and an edit inside a git linked worktree (or under a code-graph extra-path that
+  is itself a worktree/clone) diverged on TWO of those: the absolute source root
+  (`project_source`) AND — for an ephemeral `isolation: worktree` worktree that is
+  not a registered launcher project — the resolved project name, which fell back
+  to the worktree basename. Both diverge per worktree → a DISTINCT object per
+  worktree → a full duplicate set the per-edit hook never pruned, accumulating
+  across parallel-agent fan-out cycles into the bloat that drives Weaviate's
+  compaction/tombstone-cleanup into the disk-write peaks. The hook now resolves
+  the edited file's canonical MAIN repo root (`dirname` of a normalized
+  `git rev-parse --git-common-dir`) and, for a worktree edit, both passes it via
+  the new `--canonical-source` flag (stamps `project_source` + the UUID seed) AND
+  re-resolves the project name against that canonical root — so a worktree edit
+  and a main-checkout edit of the same file converge on ONE canonical object
+  (the extras case keeps its parent project name unchanged). The hook also
+  unconditionally skips `.claude/state/` scratch and any transient temp-dir path
+  with no resolvable git root (conservative no-op rather than indexing a throwaway
+  root).
 
 ## [0.2.65] - 2026-06-23
 

@@ -559,6 +559,78 @@ def _canonical_lang_id(label: Optional[str]) -> str:
     return _LANGUAGE_DISPLAY_TO_CANONICAL.get(key, key)
 
 
+# v0.2.66 (Bug 3): file-extension → lang_dispatch name map for the
+# single-file analyze path (`analyze_repository(only_file=...)`).
+#
+# The per-edit code-graph hook now hands the analyzer exactly ONE file
+# (the file the user just edited) instead of the whole repo. To route
+# that file to the right `_analyze_*_file` method WITHOUT re-walking the
+# tree with rglob, we need an extension → dispatch-name lookup. The
+# dispatch NAMES below match the first element of each `lang_dispatch`
+# tuple in `analyze_repository` exactly — that loop turns the name back
+# into the (find_fn, analyze_fn) pair. Keeping the extension lists here
+# in lock-step with the per-language `_find_*_files` glob patterns is the
+# single source of truth so the two cannot drift (see the parity note on
+# `_dispatch_name_for_file`). A file whose extension is absent from this
+# table is silently a no-op in single-file mode (matches the directory
+# walk, which would never have discovered it either).
+_EXT_TO_DISPATCH_NAME: Dict[str, str] = {
+    ".py":     "python",
+    ".lua":    "lua",
+    ".cpp":    "cpp",
+    ".cc":     "cpp",
+    ".cxx":    "cpp",
+    ".c":      "cpp",   # _find_cpp_files globs *.c into the cpp dispatch
+    ".h":      "cpp",
+    ".hpp":    "cpp",
+    ".js":     "javascript",
+    ".mjs":    "javascript",
+    ".jsx":    "javascript",
+    ".ts":     "typescript",
+    ".tsx":    "typescript",
+    ".go":     "go",
+    ".rs":     "rust",
+    ".java":   "java",
+    ".rb":     "ruby",
+    ".sh":     "shell",
+    ".bash":   "shell",
+    ".cs":     "csharp",
+    ".proto":  "proto",
+    ".svelte": "svelte",
+    ".ps1":    "powershell",
+    ".psm1":   "powershell",
+}
+
+
+def _dispatch_name_for_file(file_path: Path) -> str:
+    """Return the `lang_dispatch` name for ``file_path``'s extension.
+
+    Parity contract: the values returned here MUST equal the first
+    element of a tuple in ``analyze_repository``'s ``lang_dispatch`` list,
+    and the keys MUST stay aligned with the glob patterns in the matching
+    ``_find_*_files`` method (e.g. ``_find_cpp_files`` globs ``*.c`` into
+    the ``cpp`` dispatch, so ``.c`` maps to ``"cpp"`` here, not ``"c"``).
+    Returns ``""`` for an unrecognised extension — the single-file caller
+    treats that as a no-op (the directory walk would not have indexed it
+    either).
+
+    Special cases mirror the ``_find_*_files`` skip rules so single-file
+    mode does not index a file the directory walk would have excluded:
+      * ``*.d.ts`` declaration files (type stubs, not source).
+      * ``*.min.js`` minified bundles.
+    """
+    name = file_path.name
+    # Mirror `_find_ts_files` / `_find_js_files` name-based skips. These
+    # files have a code extension but are deliberately excluded from the
+    # directory walk; single-file mode must agree so an edit to one is a
+    # no-op rather than an inconsistent index.
+    if name.endswith(".d.ts"):
+        return ""
+    if name.endswith(".min.js"):
+        return ""
+    return _EXT_TO_DISPATCH_NAME.get(file_path.suffix.lower(), "")
+
+
 # v0.2.52 (Known Issue 6, Sub-issue A): silence
 # ``AuthlibDeprecationWarning: authlib.jose module is deprecated`` from
 # ``weaviate-client``'s transitive ``authlib`` dep during module import.
@@ -3666,7 +3738,9 @@ class CodeGraphAnalyzer:
                           extract_pdg: bool = False,
                           prune_stale: bool = False,
                           extra_paths: Optional[List[Path]] = None,
-                          since_commit: Optional[str] = None) -> Dict[str, Any]:
+                          since_commit: Optional[str] = None,
+                          only_file: Optional[Path] = None,
+                          canonical_source: Optional[str] = None) -> Dict[str, Any]:
         """Analyze repository and extract code entities.
 
         Args:
@@ -3695,6 +3769,39 @@ class CodeGraphAnalyzer:
                 ``HEAD~1..HEAD``. Per-source-root: each root that is a
                 git repo uses its own diff range; non-git roots fall
                 back to full scan with a stderr notice.
+            only_file: v0.2.66 (Bug 3) — analyze EXACTLY this one file
+                instead of walking ``repo_path``. ``repo_path`` is still
+                used as the relativization root (collections key on
+                repo-relative POSIX paths), so the file MUST live under
+                ``repo_path``. The single file routes through the SAME
+                per-file (``_get_existing_module``) and per-object
+                (``_dedup_insert`` content-hash) skip paths, so an
+                unchanged or trivially-edited file is a near-no-op.
+                Mutually exclusive with ``extra_paths``, ``incremental``,
+                and ``prune_stale`` — single-file mode never walks other
+                roots and never prunes (a prune scoped to one file could
+                only ever delete other files' rows). The per-edit
+                code-graph hook is the primary caller: it scopes the
+                analyze to the file the user just edited, killing the old
+                ``HEAD~1..HEAD`` re-churn (dozens of files re-parsed per
+                keystroke) AND the correctness bug (the edited file is
+                uncommitted, so it was never in the diff range at all).
+            canonical_source: v0.2.66 (Bug 3, part b) — override the
+                ``project_source`` value (and the absolute-source component
+                of every object's deterministic UUID) with this canonical
+                root instead of ``source_root.as_posix()``. The per-edit
+                hook resolves the edited file's git MAIN repo root (a linked
+                worktree shares its main repo's object store) and passes it
+                here, so a worktree edit and a main-checkout edit of the
+                SAME logical file converge on ONE canonical object rather
+                than minting a per-worktree duplicate. WHY this is needed:
+                the ``file_path`` (``relative_to(repo_path)``) is already
+                identical between a worktree and its main checkout; only the
+                absolute source root differs, and that absolute root is what
+                ``_dedup_insert`` mixes into the UUID (V52-O.3). Overriding
+                it removes the divergence. ``None`` (default) preserves the
+                per-source-root behaviour. Has no effect unless ``only_file``
+                is set (whole-tree walks keep their per-root provenance).
 
         Returns:
             Dictionary with analysis statistics. v0.2.16 adds:
@@ -3736,8 +3843,13 @@ class CodeGraphAnalyzer:
         if extract_cfg or extract_pdg:
             lang_hint = language or "python"
             print("🔬 Running Joern CFG/PDG extraction (this may take a while)...")
+            # v0.2.66 (Bug 3): in single-file mode, point Joern at the one
+            # edited file, NOT the whole repo. Building a full CPG on every
+            # keystroke would re-introduce the whole-repo work this fix
+            # exists to eliminate. `importCode` accepts a single file.
+            cfg_pdg_target = only_file if only_file is not None else repo_path
             self._cfg_pdg_data: Dict[str, Any] = self._extract_cfg_pdg(
-                repo_path, lang_hint, extract_cfg=extract_cfg, extract_pdg=extract_pdg
+                cfg_pdg_target, lang_hint, extract_cfg=extract_cfg, extract_pdg=extract_pdg
             )
             if self._cfg_pdg_data:
                 print(f"   Extracted data for {len(self._cfg_pdg_data)} functions")
@@ -3807,30 +3919,41 @@ class CodeGraphAnalyzer:
         # local to the source tree (no awkward "/abs/extra/src/foo.py"
         # relative paths showing up as `path` properties).
         per_lang_files: List[Tuple[str, Any, List[Path], Path]] = []
-        source_roots: List[Path] = [repo_path] + canonical_extras
-        for source_root in source_roots:
-            for lang_name, find_fn, analyze_fn in lang_dispatch:
-                if lang and lang != lang_name:
-                    continue
-                files = find_fn(source_root)
-                if not files:
-                    continue
-                if incremental:
-                    files = self._filter_changed_files(
-                        source_root, files, since_commit=since_commit,
-                    )
-                    if not files:
-                        # Quiet skip — the typical case for clean repos.
-                        # We still surface one line per (root, lang) so
-                        # the operator sees the walk happened.
-                        print(
-                            f"ℹ️  No changed {lang_name} files to analyze "
-                            f"under {source_root}"
-                        )
+        if only_file is not None:
+            # v0.2.66 (Bug 3): single-file scope. Skip the rglob walk +
+            # the HEAD~1..HEAD git diff entirely; build a one-entry
+            # dispatch directly from the edited file's extension. The file
+            # still flows through `analyze_fn(f, repo_path)` below, so
+            # `_get_existing_module` (per-file) + `_dedup_insert`
+            # content-hash (per-object) make an unchanged file a no-op.
+            per_lang_files = self._single_file_dispatch(
+                only_file, repo_path, lang_dispatch, lang,
+            )
+        else:
+            source_roots: List[Path] = [repo_path] + canonical_extras
+            for source_root in source_roots:
+                for lang_name, find_fn, analyze_fn in lang_dispatch:
+                    if lang and lang != lang_name:
                         continue
-                per_lang_files.append(
-                    (lang_name, analyze_fn, list(files), source_root)
-                )
+                    files = find_fn(source_root)
+                    if not files:
+                        continue
+                    if incremental:
+                        files = self._filter_changed_files(
+                            source_root, files, since_commit=since_commit,
+                        )
+                        if not files:
+                            # Quiet skip — the typical case for clean repos.
+                            # We still surface one line per (root, lang) so
+                            # the operator sees the walk happened.
+                            print(
+                                f"ℹ️  No changed {lang_name} files to analyze "
+                                f"under {source_root}"
+                            )
+                            continue
+                    per_lang_files.append(
+                        (lang_name, analyze_fn, list(files), source_root)
+                    )
 
         total_files = sum(len(fs) for _, _, fs, _ in per_lang_files)
         seen_files = 0
@@ -3849,7 +3972,17 @@ class CodeGraphAnalyzer:
             # v0.2.47 (extras): same pattern for `project_source`. POSIX
             # path so Linux/macOS/Windows all produce a stable property
             # value (matches the file_path_rel POSIX convention).
-            self._current_source = source_root.as_posix()
+            #
+            # v0.2.66 (Bug 3, part b): in single-file mode, the per-edit hook
+            # may pass a `canonical_source` (the edited file's git MAIN repo
+            # root). Stamp THAT instead of the on-disk `source_root` so a
+            # worktree edit converges on the canonical object (see the
+            # `canonical_source` arg docstring). Only honoured for the
+            # single-file path; whole-tree walks keep per-root provenance.
+            if only_file is not None and canonical_source:
+                self._current_source = canonical_source
+            else:
+                self._current_source = source_root.as_posix()
 
             for f in files:
                 if self._progress_emitter is not None and total_files > 0:
@@ -4082,6 +4215,118 @@ class CodeGraphAnalyzer:
             logger.debug(f"Prune enumeration on {collection.name} failed: {exc}")
 
         return pruned
+
+    def _single_file_dispatch(
+        self,
+        only_file: Path,
+        repo_path: Path,
+        lang_dispatch: List[Tuple[str, Any, Any]],
+        lang_filter: Optional[str],
+    ) -> List[Tuple[str, Any, List[Path], Path]]:
+        """Build the one-entry per-language dispatch for single-file mode.
+
+        v0.2.66 (Bug 3): the per-edit hook hands the analyzer exactly the
+        file the user just edited. This maps that file to its
+        ``lang_dispatch`` entry by extension (via ``_dispatch_name_for_file``,
+        which mirrors the ``_find_*_files`` glob/skip rules) WITHOUT
+        re-walking the tree. ``repo_path`` is the relativization root:
+        every downstream ``analyze_fn(f, repo_path)`` computes
+        ``f.relative_to(repo_path).as_posix()`` for the collection key, so
+        the file must live under ``repo_path``. NIT (Bug 3): both
+        ``only_file`` and ``repo_path`` are ``.resolve()``-normalized here so
+        a symlinked root (e.g. macOS ``/tmp``→``/private/tmp``) can't make
+        ``relative_to`` spuriously fail and silently drop the edit; the
+        RESOLVED root is returned as the source root so the downstream
+        ``relative_to`` uses the same symlink-normalized operand.
+
+        Returns an empty list (a clean no-op for the caller's analyze loop)
+        when any of the following hold — never raises, so a stray edit can
+        never wedge the hook:
+          * the file does not exist (deleted between the edit and the
+            debounced run);
+          * the file is not under ``repo_path`` (wrong relativization root
+            would create duplicate/zombie rows keyed on a bad path);
+          * the extension is unrecognised / explicitly skipped
+            (``.d.ts``, ``.min.js``);
+          * a ``--language`` filter was supplied and the file's language
+            does not match it.
+        """
+        try:
+            resolved = only_file.resolve()
+        except (OSError, RuntimeError) as exc:
+            print(
+                f"⚠️  Single-file analyze: could not resolve {only_file}: {exc}"
+                " — skipping",
+                file=sys.stderr,
+            )
+            return []
+
+        # NIT (Bug 3): symlink-normalize the root too, so the gate below and
+        # the downstream `relative_to` compare like-for-like (macOS /tmp
+        # symlink footgun). Soft-fail to the raw path if resolve() blows up.
+        try:
+            repo_root = repo_path.resolve()
+        except (OSError, RuntimeError):
+            repo_root = repo_path
+
+        if not resolved.is_file():
+            print(
+                f"ℹ️  Single-file analyze: {resolved} is not a file (deleted?)"
+                " — nothing to index",
+                file=sys.stderr,
+            )
+            return []
+
+        # v0.2.66 (Bug 3, part c): `.claude/state/` is transient scratch
+        # (tool_backups snapshots, session state) — NEVER source. Skip it
+        # defensively here too, so a direct `--only-file .claude/state/...`
+        # invocation is a no-op even though the hook also guards it. The
+        # directory walk doesn't reach state/ in practice (callers point at
+        # a repo root, not state/), so this is single-file-mode-only.
+        parts = resolved.parts
+        for i in range(len(parts) - 1):
+            if parts[i] == ".claude" and parts[i + 1] == "state":
+                print(
+                    f"ℹ️  Single-file analyze: {resolved} is under .claude/state/"
+                    " (transient scratch) — skipping",
+                    file=sys.stderr,
+                )
+                return []
+
+        # Relativization-correctness gate. Collections key on repo-relative
+        # POSIX paths; a file outside repo_root would either raise in
+        # `relative_to` or (worse) be stamped with an absolute path,
+        # creating a duplicate row that the directory walk never matches.
+        try:
+            resolved.relative_to(repo_root)
+        except ValueError:
+            print(
+                f"⚠️  Single-file analyze: {resolved} is not under repo root "
+                f"{repo_root} — skipping (would create a mis-keyed row)",
+                file=sys.stderr,
+            )
+            return []
+
+        dispatch_name = _dispatch_name_for_file(resolved)
+        if not dispatch_name:
+            # Unrecognised / deliberately-skipped extension. The directory
+            # walk would not have indexed it either → silent no-op.
+            return []
+
+        if lang_filter and lang_filter != dispatch_name:
+            # An explicit --language was passed and this file isn't it.
+            return []
+
+        for lang_name, _find_fn, analyze_fn in lang_dispatch:
+            if lang_name == dispatch_name:
+                # Return the RESOLVED root so the downstream
+                # `analyze_fn(f, source_root)` relativizes against the same
+                # symlink-normalized operand we gated on.
+                return [(lang_name, analyze_fn, [resolved], repo_root)]
+
+        # dispatch_name not present in lang_dispatch (shouldn't happen —
+        # the map is kept in lock-step). Defensive no-op.
+        return []
 
     def _find_python_files(self, repo_path: Path) -> List[Path]:
         """Find all Python files in repository."""
@@ -7171,6 +7416,30 @@ def main():
                        help='With --incremental, restrict the diff to '
                             '<sha>..HEAD instead of HEAD~1..HEAD. Per source '
                             'root; non-git roots fall back to full scan.')
+    # v0.2.66 (Bug 3): scope the analyze to EXACTLY one file. `repo_path`
+    # stays the relativization root (collections key on repo-relative
+    # paths); the file must live under it. The per-edit code-graph hook
+    # passes the file the user just edited here instead of `--incremental`
+    # (which re-churned every HEAD~1..HEAD file AND missed the actual,
+    # still-uncommitted edit). Routes through the same per-file +
+    # per-object hash skips, so an unchanged file writes 0 objects.
+    # Mutually exclusive with --incremental, --extra-path, --prune-stale.
+    parser.add_argument('--only-file', type=Path, default=None,
+                       help='Analyze EXACTLY this one file (under repo_path) '
+                            'instead of walking the tree. Used by the per-edit '
+                            'hook. Mutually exclusive with --incremental, '
+                            '--extra-path, --prune-stale.')
+    # v0.2.66 (Bug 3, part b): canonical source root for worktree dedup. The
+    # per-edit hook resolves the edited file's git MAIN repo root and passes
+    # it here so a worktree edit stamps the SAME project_source / UUID seed
+    # as a main-checkout edit (one canonical object, not a per-worktree dup).
+    # Only meaningful with --only-file.
+    parser.add_argument('--canonical-source', type=str, default=None,
+                       help='With --only-file: stamp this canonical root as '
+                            'project_source (and the UUID seed) instead of the '
+                            'on-disk repo_path. Used by the per-edit hook to '
+                            'dedup git-worktree edits onto the main-checkout '
+                            'object.')
     parser.add_argument('--create-collections', action='store_true',
                        help='Create Weaviate collections before analysis')
     parser.add_argument('--force-recreate', action='store_true',
@@ -7264,6 +7533,35 @@ def main():
     if args.from_resolver and args.project:
         print(
             "❌ --from-resolver and --project are mutually exclusive; pass one or the other",
+            file=sys.stderr,
+        )
+        return 1
+
+    # v0.2.66 (Bug 3): --only-file scopes the analyze to a single file and
+    # never walks other roots or prunes. Combining it with the whole-tree
+    # flags is a usage error — fail fast rather than silently ignore one.
+    if args.only_file is not None:
+        conflicting = []
+        if args.incremental:
+            conflicting.append("--incremental")
+        if args.extra_paths:
+            conflicting.append("--extra-path")
+        if args.prune_stale:
+            conflicting.append("--prune-stale")
+        if conflicting:
+            print(
+                "❌ --only-file is mutually exclusive with "
+                f"{', '.join(conflicting)} (single-file mode never walks "
+                "other roots or prunes)",
+                file=sys.stderr,
+            )
+            return 1
+    elif args.canonical_source:
+        # --canonical-source only has meaning in single-file mode (it stamps
+        # the per-object project_source / UUID seed). Reject the lone flag so
+        # a caller isn't surprised it was silently ignored.
+        print(
+            "❌ --canonical-source requires --only-file",
             file=sys.stderr,
         )
         return 1
@@ -7478,6 +7776,12 @@ def main():
             # as the pre-v0.2.47 single-root behaviour.
             extra_paths=extra_paths or None,
             since_commit=args.since_commit,
+            # v0.2.66 (Bug 3): single-file scope for the per-edit hook.
+            # None (the default) preserves the whole-tree walk.
+            only_file=args.only_file,
+            # v0.2.66 (Bug 3, part b): canonical source root for worktree
+            # dedup (only honoured alongside only_file).
+            canonical_source=args.canonical_source,
         )
 
         # Post-processing: create cross-references
