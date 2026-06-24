@@ -100,7 +100,7 @@ use crate::commands::module_catalog_client::L0CatalogModule;
 
 use crate::manifest::{
     Compatibility, ContainerInstallBlock, GpuImageVariants, InstallBlock, InstallMethod,
-    InstallScope, LicenseBlock, ModuleCategory, ModuleManifest, Requirements, RuntimeBlock,
+    LicenseBlock, ModuleCategory, ModuleManifest, Requirements, RuntimeBlock,
 };
 
 /// Synthesise a thin `ModuleManifest` from an L0 catalog record so the
@@ -249,12 +249,30 @@ pub fn synthesize_install_manifest_from_l0(
         install_dir: "{VCT_MODULES}/{MODULE_ID}".into(),
         post_install: Vec::new(),
         container: Some(container_block),
-        // v0.2.49 Stream A: synth defaults to per-project. The L0
-        // catalog slice today carries only install-time metadata; the
-        // post-pull extracted manifest is the source of truth for
-        // `install.scope`. Default keeps pre-v0.2.49 behaviour for
-        // every module whose extracted manifest hasn't shipped yet.
-        scope: InstallScope::PerProject,
+        // Read the scope from the L0 install-slice. Commit d0f7c03d
+        // mirrored `install.scope` onto `L0Install` (`#[serde(default)]`),
+        // so a publisher who declares a GLOBAL-scope module in their L0
+        // catalog entry now flows that scope through to the synth.
+        //
+        // Why this matters: previously this was hard-pinned to
+        // `PerProject`. The synth is consulted on an update to a
+        // strictly-NEWER version (resolve_manifest_for_install falls
+        // through to phase 3 when L0 advertises a newer semver). A
+        // hard-pinned PerProject silently flipped a GLOBAL module
+        // (e.g. an RL reranker) to per-project — creating a
+        // schema-incoherent per-project install row that wedged at
+        // status='installing' forever (no global container ↔ per-project
+        // row coherence). Threading `l0.install.scope` here removes the
+        // synth-default as a downgrade vector when L0 carries the scope.
+        //
+        // When L0 genuinely omits scope (pre-v0.2.49 catalogs), the
+        // serde-default on `L0Install.scope` is `PerProject`, preserving
+        // legacy behaviour. The on-disk extracted manifest remains the
+        // authoritative source of truth for identity-scope on updates —
+        // `resolve_manifest_for_install` overrides the synth scope from
+        // the on-disk manifest when one exists (the backstop), so even an
+        // L0 entry that omits scope can't flip an already-global module.
+        scope: l0.install.scope,
     };
 
     // ─── Runtime block ──────────────────────────────────────────────
@@ -377,6 +395,7 @@ pub fn synthesize_install_manifest_from_l0(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::InstallScope;
     use crate::commands::module_catalog_client::{
         L0Compatibility, L0Install, L0InstallContainer, L0Requirements, L0RuntimeHints,
     };
@@ -603,5 +622,46 @@ mod tests {
             !m.runtime.gpu_optional,
             "gpu=true → gpu_optional=false (module requires a GPU)"
         );
+    }
+
+    /// Regression (bug-class: update-downgrades-global-to-per-project):
+    /// when the L0 install-slice advertises `scope=global`, the
+    /// synthesised manifest MUST carry `InstallScope::Global` — NOT the
+    /// old hard-pinned per-project default. Before the fix, the synth
+    /// unconditionally returned per-project, so a global module synthesised
+    /// on a strictly-newer-version update silently downgraded to
+    /// per-project and wedged the install at status='installing'.
+    #[test]
+    fn synthesize_install_manifest_carries_global_scope_from_l0() {
+        let mut l0 = canonical_l0_rl();
+        l0.install.scope = InstallScope::Global;
+        let m = synthesize_install_manifest_from_l0(&l0).expect("must synthesize");
+        assert_eq!(
+            m.install.scope,
+            InstallScope::Global,
+            "L0 install.scope=global must flow through to the synth — \
+             a hard-pinned per-project default here is the downgrade bug"
+        );
+        assert!(
+            m.install.scope.is_global(),
+            "derived is_global() must be true for a global-scope L0 slice"
+        );
+    }
+
+    /// Inverse pinning: an L0 slice that declares `scope=per_project`
+    /// (or omits it → serde-defaults to per-project) must synthesise a
+    /// per-project manifest. Guards against an over-correction that
+    /// would flip everything to global.
+    #[test]
+    fn synthesize_install_manifest_carries_per_project_scope_from_l0() {
+        let mut l0 = canonical_l0_rl();
+        l0.install.scope = InstallScope::PerProject;
+        let m = synthesize_install_manifest_from_l0(&l0).expect("must synthesize");
+        assert_eq!(
+            m.install.scope,
+            InstallScope::PerProject,
+            "L0 install.scope=per_project must flow through unchanged"
+        );
+        assert!(!m.install.scope.is_global());
     }
 }

@@ -59,6 +59,14 @@ pub struct ReconcileReport {
     /// because their on-disk manifest was missing. Order matches the
     /// DB iteration order (most-recent-installed-first).
     pub broken: Vec<String>,
+    /// v0.2.66: `module_id`s of rows that were wedged at
+    /// `status='installing'` at boot and auto-healed to `status='error'`.
+    /// A row in this state can only be a leftover from an install process
+    /// that died with the previous launcher run (no install survives a
+    /// launcher restart), so transitioning it at boot is always safe.
+    /// Healing it stops the forever-spinner in the GUI and makes the row
+    /// eligible for the existing `retry_failed_module_installs` path.
+    pub healed_installing: Vec<String>,
 }
 
 /// v0.2.43 V0243-12: return true when the on-disk manifest at `path`
@@ -217,16 +225,100 @@ fn reconcile_installed_modules_inner(
         }
     }
 
-    if !report.broken.is_empty() || report.healthy > 0 {
+    // v0.2.66: auto-heal rows wedged at status='installing'. This is a
+    // separate sweep (the 'installed' walk above queries status='installed'
+    // and never sees 'installing' rows) over status='installing'.
+    heal_wedged_installing_rows(db, &mut report);
+
+    if !report.broken.is_empty()
+        || report.healthy > 0
+        || !report.healed_installing.is_empty()
+    {
         eprintln!(
-            "[reconciler] swept {} installed module row(s): {} healthy, {} broken",
+            "[reconciler] swept {} installed module row(s): {} healthy, {} broken; \
+             {} wedged-installing row(s) auto-healed to error",
             report.healthy as usize + report.broken.len(),
             report.healthy,
             report.broken.len(),
+            report.healed_installing.len(),
         );
     }
 
     report
+}
+
+/// Actionable `last_error` written when auto-healing a wedged
+/// `installing` row. Public so the GUI / tests can match on it; phrased
+/// as a user-facing instruction (the retry path turns it into a
+/// Reinstall CTA).
+pub const WEDGED_INSTALL_HEAL_MESSAGE: &str =
+    "install was interrupted (launcher restarted mid-install) — click Retry to reinstall";
+
+/// v0.2.66: auto-heal `module_installs` rows stuck at
+/// `status='installing'`.
+///
+/// ## Why this is safe (conservative-default discipline)
+///
+/// `status='installing'` is written by `install_module_for_project`
+/// at the start of an install and only ever transitioned to
+/// `installed`/`error` by the SAME in-process async task when the pull
+/// resolves. No install survives a launcher restart — the task that set
+/// `installing` died with the previous process. Therefore ANY row still
+/// at `installing` when this runs at BOOT is, by construction, a leftover
+/// from an install that was interrupted (crash, force-quit, kill during
+/// pull) and will never self-complete. Transitioning it to `error` at
+/// boot reconcile is the positively-confirmed-not-live case the
+/// conservative-default rule asks for.
+///
+/// This is BOOT-only via the existing reconcile call site
+/// (`lib.rs::run` setup). It deliberately does NOT run mid-session,
+/// where an `installing` row CAN be a genuine in-progress install — there
+/// we cannot confirm non-liveness from the row alone, so we do nothing
+/// (leave it for the next boot if it never completes).
+///
+/// ## Effect
+///
+/// Sets `status='error'` + an actionable `last_error` atomically (single
+/// by-id UPDATE). The row stops rendering a forever-spinner and becomes
+/// eligible for the existing `retry_failed_module_installs` predicate
+/// (`status IN ('error','broken')`). Soft-fail per-row: a DB error logs +
+/// skips, never aborts the sweep or blocks boot.
+fn heal_wedged_installing_rows(db: &Db, report: &mut ReconcileReport) {
+    let rows = match db.list_module_installs_with_status("installing") {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!(
+                "[reconciler] failed to list wedged 'installing' rows: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    for row in rows {
+        eprintln!(
+            "[reconciler] {} ({}@{}): wedged at status='installing' at boot \
+             (no install in progress across a restart) — healing to status=error",
+            row.module_id,
+            row.project_id.as_deref().unwrap_or("<global>"),
+            row.module_version,
+        );
+        match db.set_module_install_status_with_error(
+            &row.id,
+            "error",
+            Some(WEDGED_INSTALL_HEAL_MESSAGE),
+        ) {
+            Ok(()) => report.healed_installing.push(row.module_id),
+            Err(e) => {
+                // Per-row soft-fail: the row stays 'installing' and is
+                // re-attempted on the next boot. Never block startup.
+                eprintln!(
+                    "[reconciler] failed to heal wedged 'installing' row {}: {}",
+                    row.module_id, e
+                );
+            }
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────
@@ -416,15 +508,29 @@ mod tests {
         assert!(report.broken.is_empty());
     }
 
+    // ----------------------------------------------------------------
+    // v0.2.66: auto-heal of wedged status='installing' rows at boot.
+    // ----------------------------------------------------------------
+
+    /// THE ACT (destructive-branch discipline): a row wedged at
+    /// status='installing' at boot — left behind by an install process
+    /// that died with the previous launcher run — is auto-healed to
+    /// status='error' with a non-empty, actionable last_error. This is
+    /// the row the GUI used to render as a forever-spinner; after the
+    /// heal it stops spinning AND becomes eligible for retry.
+    ///
+    /// (Pre-v0.2.66 the reconciler left 'installing' rows untouched on
+    /// the theory that "intermediate states are handled by resume
+    /// machinery" — but no such machinery transitions 'installing', so
+    /// the row lived forever. This test pins the corrected behaviour.)
     #[test]
-    fn reconcile_ignores_non_installed_rows() {
+    fn reconcile_heals_wedged_installing_row_to_error() {
         let tmp = tempfile::tempdir().unwrap();
         let (db, project_id) = seed_env(&tmp);
 
-        // Insert one row but leave it in status='installing' — the
-        // reconciler must NOT touch it (we only reconcile installed
-        // rows; intermediate states are handled by the resume
-        // machinery).
+        // insert_module_install lands the row at status='installing'.
+        // Do NOT flip it to installed — simulate the interrupted-install
+        // leftover.
         let install_id = Uuid::new_v4().to_string();
         db.insert_module_install(
             &install_id,
@@ -434,25 +540,78 @@ mod tests {
             "/tmp/fake-install/vct-installing-mod",
         )
         .expect("insert");
-        // Don't flip to installed; status stays 'installing'.
 
         let report = reconcile_installed_modules_for_test(&db, tmp.path());
 
+        // The 'installing' walk is separate from the 'installed' walk —
+        // this row contributes to healed_installing, not healthy/broken.
         assert_eq!(report.healthy, 0);
-        assert!(
-            report.broken.is_empty(),
-            "non-installed rows must be ignored, got broken={:?}",
-            report.broken
+        assert!(report.broken.is_empty());
+        assert_eq!(
+            report.healed_installing,
+            vec!["vct-installing-mod".to_string()],
+            "wedged 'installing' row must be auto-healed",
         );
 
-        // Row status untouched.
+        // The DB row actually flipped to error WITH a non-empty,
+        // actionable last_error (the original wedge's silent failure was
+        // status='installing' + last_error=NULL — both must change).
         let row = db
             .get_module_install(&project_id, "vct-installing-mod")
             .expect("get")
             .expect("row");
         assert_eq!(
             row.status,
-            vct_launcher_core::db::models::ModuleStatus::Installing,
+            vct_launcher_core::db::models::ModuleStatus::Error,
+            "wedged 'installing' must become 'error' so retry can pick it up",
+        );
+        let last_error = row
+            .last_error
+            .as_deref()
+            .expect("healed row must carry a last_error, not NULL");
+        assert!(
+            !last_error.is_empty(),
+            "last_error must be non-empty (actionable for the user)",
+        );
+        assert_eq!(
+            last_error, WEDGED_INSTALL_HEAL_MESSAGE,
+            "last_error must be the actionable heal message",
+        );
+    }
+
+    /// THE LEAVE-ALONE (destructive-branch discipline): a healthy
+    /// status='installed' row (manifest present on disk) is NOT touched
+    /// by the wedged-installing heal. Guards against the heal sweep
+    /// over-reaching into terminal states.
+    #[test]
+    fn reconcile_leaves_installed_row_untouched_by_installing_heal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (db, project_id) = seed_env(&tmp);
+        let _id = insert_installed(&db, &project_id, "vct-terminal-installed");
+        place_manifest_on_disk(tmp.path(), "vct-terminal-installed");
+
+        let report = reconcile_installed_modules_for_test(&db, tmp.path());
+
+        assert_eq!(report.healthy, 1);
+        assert!(
+            report.healed_installing.is_empty(),
+            "an installed row must NOT be swept by the installing-heal, \
+             got healed_installing={:?}",
+            report.healed_installing,
+        );
+
+        let row = db
+            .get_module_install(&project_id, "vct-terminal-installed")
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.status,
+            vct_launcher_core::db::models::ModuleStatus::Installed,
+            "installed row must remain installed (heal must not over-reach)",
+        );
+        assert!(
+            row.last_error.is_none(),
+            "installed row's last_error must stay NULL",
         );
     }
 }

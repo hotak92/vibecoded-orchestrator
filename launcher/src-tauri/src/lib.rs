@@ -1725,6 +1725,18 @@ pub fn run() {
                         report.broken,
                     );
                 }
+                if !report.healed_installing.is_empty() {
+                    // v0.2.66: rows wedged at status='installing' from an
+                    // interrupted install (launcher restarted mid-pull)
+                    // were auto-healed to 'error' so they stop spinning
+                    // and become retry-eligible.
+                    eprintln!(
+                        "[vct] reconciler: {} module(s) auto-healed from wedged \
+                         'installing' to 'error' (interrupted install): {:?}",
+                        report.healed_installing.len(),
+                        report.healed_installing,
+                    );
+                }
             }
 
             // v0.2.43 V0243-3: license_keys self-heal. If the table is empty

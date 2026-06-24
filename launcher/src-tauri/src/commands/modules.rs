@@ -1338,9 +1338,26 @@ pub(crate) fn resolve_manifest_for_install(
     // version L0 advertised, and which branch we took. Safety net: any
     // parse failure on either version string → phase 1 wins (we don't
     // synthesize from a malformed L0 entry).
+    // Identity-scope backstop (bug-class: update-downgrades-global-to-
+    // per-project). `install.scope` is an IDENTITY property of a module,
+    // not a per-version one — a module is global-or-per-project for its
+    // whole lifetime, not "global at 0.2.10 but per-project at 0.2.11".
+    //
+    // When phase 1 finds an on-disk extracted manifest, we capture its
+    // scope here EVEN IF we fall through to the synth (because L0
+    // advertises a newer version). The synth's scope is only as good as
+    // what L0 carries; an L0 entry that omits scope (serde-defaults to
+    // per-project) would otherwise silently flip an already-global module
+    // to per-project on update — producing a schema-incoherent
+    // per-project install row that wedges at status='installing'. The
+    // extracted manifest is the authoritative source of identity-scope,
+    // so we override the resolved manifest's scope with it via the single
+    // choke-point `apply_authoritative_scope` below.
+    let on_disk_scope: Option<crate::manifest::InstallScope>;
     match find_installed_manifest(db, module_id) {
         Ok((on_disk_m, on_disk_path)) => {
             let on_disk_v = on_disk_m.version.clone();
+            on_disk_scope = Some(on_disk_m.install.scope);
             // resolve_install_metadata is cache-only / no-network. Err
             // (e.g. catalog cache empty) maps to "no L0 version known" —
             // we honour the on-disk manifest in that case.
@@ -1357,10 +1374,12 @@ pub(crate) fn resolve_manifest_for_install(
             if l0_is_newer {
                 eprintln!(
                     "[v0.2.45 V45-C] L0 catalog has newer version for {}: \
-                     on_disk={} l0={} — synthesizing from L0",
+                     on_disk={} l0={} — synthesizing from L0 \
+                     (preserving on-disk install.scope={})",
                     module_id,
                     on_disk_v,
                     l0_v_opt.as_deref().unwrap_or("?"),
+                    on_disk_m.install.scope.as_str(),
                 );
                 let _ = db.audit(
                     "module_manifest_resolved",
@@ -1370,6 +1389,7 @@ pub(crate) fn resolve_manifest_for_install(
                         "module_id": module_id,
                         "on_disk_version": on_disk_v,
                         "l0_version": l0_v_opt,
+                        "on_disk_scope": on_disk_m.install.scope.as_str(),
                         "decision": "l0_newer_synthesized",
                     }),
                 );
@@ -1390,7 +1410,11 @@ pub(crate) fn resolve_manifest_for_install(
             }
         }
         Err(_) => {
-            // No on-disk manifest at all — fall through to phase 2/3.
+            // No on-disk manifest at all — true cold-start. No
+            // authoritative on-disk scope to preserve; the synth's
+            // L0-derived scope is the only source.
+            on_disk_scope = None;
+            // fall through to phase 2/3.
         }
     }
 
@@ -1398,8 +1422,9 @@ pub(crate) fn resolve_manifest_for_install(
     if dev_catalog_passthrough_enabled() {
         for path in dev_paid_modules_paths(db) {
             if let Ok(raw) = std::fs::read_to_string(&path) {
-                if let Ok(m) = ModuleManifest::from_json(&raw) {
+                if let Ok(mut m) = ModuleManifest::from_json(&raw) {
                     if m.id == module_id {
+                        apply_authoritative_scope(&mut m, on_disk_scope, module_id);
                         return Ok((m, ManifestSource::Dev(path)));
                     }
                 }
@@ -1417,10 +1442,62 @@ pub(crate) fn resolve_manifest_for_install(
     // surfaces "visit the Modules tab or call refresh_module_catalog
     // first", which is actionable for the user.
     let l0_slice = crate::commands::modules::resolve_install_metadata(db, module_id)?;
-    let synth = crate::commands::l0_manifest_synth::synthesize_install_manifest_from_l0(
+    let mut synth = crate::commands::l0_manifest_synth::synthesize_install_manifest_from_l0(
         &l0_slice,
     )?;
+    apply_authoritative_scope(&mut synth, on_disk_scope, module_id);
     Ok((synth, ManifestSource::L0Synth))
+}
+
+/// Single choke-point that enforces the identity-scope backstop:
+/// when an on-disk extracted manifest exists, ITS `install.scope` is
+/// authoritative over whatever the synth (or dev passthrough) derived.
+///
+/// Rationale (bug-class: update-downgrades-global-to-per-project):
+/// `install.scope` is an IDENTITY property of a module — global or
+/// per-project for its whole lifetime, never per-version. On an update
+/// to a strictly-newer version, `resolve_manifest_for_install` falls
+/// through to the synth (which derives scope from the L0 catalog slice).
+/// If that L0 slice omits scope, it serde-defaults to per-project; the
+/// synth would then flip an already-global module to per-project,
+/// producing a schema-incoherent per-project install row that wedges at
+/// status='installing'. Overriding from the on-disk scope here closes
+/// that vector regardless of what L0 advertises.
+///
+/// No-op when there is no on-disk manifest (true cold-start) — the
+/// synth's L0-derived scope is the only source in that case. Also a
+/// no-op when the scope already matches (the common steady-state path),
+/// avoiding spurious audit noise.
+///
+/// Scope immutability is INTENTIONAL: an on-disk scope is authoritative
+/// and an update can never flip it (this is the property the reviewer
+/// verified is not a regression). A deliberate per-project→global
+/// migration is handled SEPARATELY by
+/// `module_service::auto_migrate_per_project_to_global` (which rewrites
+/// the install rows under controlled conditions), NOT by mutating scope
+/// here. There is no supported global→per-project path — a global module
+/// stays global. So this helper only ever pins scope to the already-
+/// established on-disk identity; it does not implement migration.
+fn apply_authoritative_scope(
+    manifest: &mut ModuleManifest,
+    on_disk_scope: Option<crate::manifest::InstallScope>,
+    module_id: &str,
+) {
+    let Some(authoritative) = on_disk_scope else {
+        return;
+    };
+    if manifest.install.scope == authoritative {
+        return;
+    }
+    eprintln!(
+        "[scope-backstop] {}: resolved manifest scope={} overridden by \
+         authoritative on-disk extracted-manifest scope={} \
+         (scope is a module identity property, not per-version)",
+        module_id,
+        manifest.install.scope.as_str(),
+        authoritative.as_str(),
+    );
+    manifest.install.scope = authoritative;
 }
 
 /// Compatibility shim for module_service's restart path. Same
@@ -4863,6 +4940,162 @@ mod tests {
             "L0Synth must carry the L0 version, not the on-disk one",
         );
         assert_eq!(source.as_audit_str(), "l0-synth");
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Plant an on-disk extracted manifest with an explicit
+    /// `install.scope`. Mirrors `plant_installed_manifest` but lets the
+    /// caller pin the scope (the steady-state extract carries the real
+    /// identity-scope; the bare helper omits it → serde-defaults to
+    /// per-project, which can't exercise the global-scope backstop).
+    fn plant_installed_manifest_scoped(
+        tmp: &std::path::Path,
+        version: &str,
+        scope: &str,
+    ) {
+        let module_dir = tmp.join("modules").join("vct-rl-reranker");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let installed_manifest = serde_json::json!({
+            "manifest_version": 1,
+            "id": "vct-rl-reranker",
+            "name": "RL Reranker",
+            "version": version,
+            "description": "scope-backstop fixture",
+            "category": "paid-independent",
+            "license": {
+                "required": true,
+                "variant_ids": ["x"],
+                "min_orchestrator_tier": "pro"
+            },
+            "compatibility": {"hosts": ["base", "mao", "orchestrator_root"]},
+            "install": {
+                "method": "container_pull",
+                "scope": scope,
+                "container": {
+                    "image": "ghcr.io/hotak92/vct-rl-reranker",
+                    "pull_token_endpoint": "https://example/pull-token"
+                }
+            },
+            "runtime": {"type": "container", "command": ""}
+        });
+        std::fs::write(
+            module_dir.join("vct-module.json"),
+            installed_manifest.to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Regression (bug-class: update-downgrades-global-to-per-project):
+    /// an already-installed GLOBAL module updated to a strictly-NEWER
+    /// version where the L0 catalog slice carries (or defaults to)
+    /// per-project scope MUST still resolve to GLOBAL.
+    ///
+    /// Wiring: on-disk extracted manifest scope=global at 0.2.10, L0
+    /// cache advertises 0.2.11 with `fake_l0_rl` (which defaults
+    /// `install.scope` to per-project — the worst case, an L0 entry whose
+    /// scope is wrong/omitted). resolve_manifest_for_install falls through
+    /// to phase 3 (L0Synth, version 0.2.11) but the
+    /// `apply_authoritative_scope` backstop overrides the synth's
+    /// per-project scope with the on-disk global scope.
+    ///
+    /// Without the fix this asserts FALSE: the synth's hard-pinned (or
+    /// L0-defaulted) per-project scope flows through → `is_global()` is
+    /// false → the installer inserts a schema-incoherent per-project row
+    /// that wedges at status='installing'. With the fix it is GLOBAL.
+    #[test]
+    fn update_to_newer_version_preserves_global_scope_from_on_disk() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // On-disk extract: GLOBAL-scope module at 0.2.10.
+        plant_installed_manifest_scoped(tmp.path(), "0.2.10", "global");
+
+        // L0 advertises a strictly-newer 0.2.11. fake_l0_rl defaults the
+        // L0 slice's install.scope to per-project — deliberately the
+        // wrong/omitted case the backstop must defend against.
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-06-23T00:00:00Z".into(),
+            modules: vec![fake_l0_rl("0.2.11")],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let (manifest, source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("must resolve on a newer-version update");
+
+        // It still takes the synth path (newer version) ...
+        assert_eq!(
+            source,
+            ManifestSource::L0Synth,
+            "strictly-newer L0 still routes through the synth",
+        );
+        assert_eq!(
+            manifest.version, "0.2.11",
+            "synth carries the newer L0 version",
+        );
+
+        // ... but the IDENTITY scope is preserved from the on-disk
+        // extract. THIS is the regression assertion: it fails before the
+        // backstop (synth/L0 default = per-project) and passes after.
+        assert_eq!(
+            manifest.install.scope,
+            crate::manifest::InstallScope::Global,
+            "on-disk extracted-manifest scope=global is authoritative on \
+             an update — must NOT be downgraded to per-project by the \
+             synth's L0-derived default (the wedge-at-installing bug)",
+        );
+        assert!(
+            manifest.install.scope.is_global(),
+            "derived is_global() must be true so the installer inserts a \
+             global row, not a schema-incoherent per-project row",
+        );
+
+        restore_env(prev_state, prev_dev);
+    }
+
+    /// Inverse guard for the backstop: an already-installed PER-PROJECT
+    /// module updated to a newer version where L0 (wrongly) advertises
+    /// global must stay PER-PROJECT. The on-disk extract is authoritative
+    /// in BOTH directions — scope is an identity property, so the backstop
+    /// must not let L0 promote a per-project module to global either.
+    #[test]
+    fn update_to_newer_version_preserves_per_project_scope_from_on_disk() {
+        let (_lock, tmp, prev_state, prev_dev) = isolate_state();
+        let db = open_db();
+
+        // On-disk extract: PER-PROJECT module at 0.2.10.
+        plant_installed_manifest_scoped(tmp.path(), "0.2.10", "per_project");
+
+        // L0 advertises newer 0.2.11 with scope=global (the wrong-way
+        // drift the backstop must also resist).
+        let mut l0 = fake_l0_rl("0.2.11");
+        l0.install.scope = crate::manifest::InstallScope::Global;
+        let envelope = L0CatalogResponse {
+            schema_version: 1,
+            fetched_at: "2026-06-23T00:00:00Z".into(),
+            modules: vec![l0],
+        };
+        db.app_state_set(
+            crate::commands::module_catalog_client::APP_STATE_KEY_CATALOG,
+            &serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let (manifest, _source) =
+            resolve_manifest_for_install(&db, "vct-rl-reranker")
+                .expect("must resolve");
+        assert_eq!(
+            manifest.install.scope,
+            crate::manifest::InstallScope::PerProject,
+            "on-disk per-project scope is authoritative — L0 advertising \
+             global must NOT promote an already-per-project module",
+        );
 
         restore_env(prev_state, prev_dev);
     }
