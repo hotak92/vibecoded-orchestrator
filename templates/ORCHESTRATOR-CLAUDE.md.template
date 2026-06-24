@@ -165,8 +165,8 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 ## Context Management
 
 **Two-Layer Memory**:
-- `MEMORY.md` (`~/.claude/projects/.../memory/`) — Claude's self-written operational notes. First 200 lines auto-loaded each session (hard cap; silent truncation after). Stable patterns, recurring bug fixes, key paths, user preferences. NOT in git. Keep as concise index; put details in topic files (`debugging.md`, etc.). Edit via `/memory` or ask Claude directly ("remember that...").
-- `.claude/CONTEXT_STATE.md` — Active working memory (250–350 lines, max 500). Current task, recent progress, next steps, active blockers. Update during work, not just at end.
+- `MEMORY.md` (`~/.claude/projects/.../memory/`) — Claude's self-written operational notes. Loaded into the system prompt every session by the Claude Code memory feature, which **hard-truncates to the first 200 lines / ~25 KB — silently dropping everything after** (a harness behaviour, not configurable from VCO). So keep it a concise one-line-per-entry index and put detail in topic files (`debugging.md`, etc.) — topic files are loaded on demand and are NOT capped. Stable patterns, recurring bug fixes, key paths, user preferences. NOT in git. Edit via `/memory` or ask Claude directly ("remember that...").
+- `.claude/CONTEXT_STATE.md` — Active working memory (250–350 lines, max 500). Current task, recent progress, next steps, active blockers. Update during work, not just at end. Unlike MEMORY.md it is **never truncated**: the VCO `context-size-check.sh` hook emits only a soft *warning* (at 500 lines) prompting a trim — it never drops content.
 - **Per-session state (concurrent chats)**: `.claude/CONTEXT_STATE.md` is the shared project rollup. When you run multiple long-lived chats against the same project at once (e.g. a main chat + an RL chat), each can keep its OWN `.claude/context/CONTEXT_STATE_<session_id>.md` so they don't clobber the shared rollup (last-writer-wins). The size-check / diff-inject / compact-reinject hooks pick it up automatically once it exists; single-session projects never create one and pay nothing.
 
 | MEMORY.md | CONTEXT_STATE.md |
@@ -443,7 +443,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `ensure-containers.sh` — auto-start Podman/Docker containers (Weaviate, Ollama, code-embed) if not running (background).
 - `session-start-ensure-hub.sh` — ensure `vct-hub` is running.
 - `session-start-kg-loader.sh` — display KG resource paths.
-- `context-size-check.sh` — warn if `CONTEXT_STATE.md` exceeds 200 lines.
+- `context-size-check.sh` — warn (no truncation) if `CONTEXT_STATE.md` exceeds 500 lines.
 
 **SessionStart (compact/resume)**:
 - `compact-context-reinject.sh` — re-inject `CONTEXT_STATE.md` + recent commits + active plan + pre-compact snapshot.

@@ -12,7 +12,10 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # implementation for all four context hooks; see _lib/session-id.ps1.
 . "$PSScriptRoot/_lib/session-id.ps1"
 
-$MaxLines = 400
+# MaxLines trigger = 500 (matches the documented CONTEXT_STATE.md "max 500";
+# the 250-350 line working range is normal, so warning earlier just nags).
+# MUST MATCH templates/hooks/context-size-check.sh (MAX_LINES).
+$MaxLines = 500
 $WarnLines = 300
 $ContextFile = ".claude/CONTEXT_STATE.md"
 
@@ -62,7 +65,7 @@ Recommended Action:
    The agent will:
    1. Extract completed work to canonical docs (ARCHITECTURE.md, DECISIONS_LOG.md, etc.)
    2. Move historical context to knowledge graph nodes
-   3. Keep only current work (<200 lines)
+   3. Keep only current work (the 250-350 line working range)
    4. Preserve all knowledge (no catastrophic forgetting)
 
 ========================================================================

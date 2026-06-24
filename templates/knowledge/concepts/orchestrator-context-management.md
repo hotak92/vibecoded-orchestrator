@@ -56,11 +56,11 @@ Location: `.claude/CONTEXT_STATE.md` (project root).
 
 **Characteristics**:
 
-- Target 250-350 lines, hard cap 400.
+- Target 250-350 lines, soft max 500.
 - In git — shared across machines and visible to all team members.
 - Updated **during** work, not just at the end of session.
 - Read at session start via `compact-context-reinject.sh`.
-- A SessionStart hook (`context-size-check.sh`) warns at 300 lines, errors at 400.
+- A SessionStart hook (`context-size-check.sh`) emits a soft *warning* at 500 lines (it never truncates — unlike MEMORY.md, which the Claude Code memory feature hard-caps at the first 200 lines / ~25 KB).
 
 **Example structure**:
 
@@ -190,7 +190,7 @@ Implementation:
 `context-size-check.sh` (SessionStart hook):
 
 1. Counts lines in `.claude/CONTEXT_STATE.md`.
-2. Warns if >300 lines (target), errors if >400 (needs pruning).
+2. Warns (never truncates) if >500 lines (needs pruning toward the 250-350 target).
 3. Output is visible in the session preamble.
 
 Prevents gradual context bloat — CONTEXT_STATE.md should be a focused snapshot, not a running log.

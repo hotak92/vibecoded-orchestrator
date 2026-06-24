@@ -6,7 +6,9 @@
 # Location: Copy to project's .claude/hooks/ and enable in settings.json
 #
 # Configuration:
-# - MAX_LINES: Trigger threshold (default: 200 lines)
+# - MAX_LINES: Trigger threshold (default: 500 lines — matches the
+#   documented CONTEXT_STATE.md "max 500"; below this is the normal
+#   250–350 working range, so warning earlier just nags)
 # - WARN_LINES: Warning threshold (default: 150 lines)
 
 set -euo pipefail
@@ -28,7 +30,7 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # shellcheck source=_lib/session-id.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/session-id.sh" 2>/dev/null || true
 
-MAX_LINES=400
+MAX_LINES=500
 WARN_LINES=300
 CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 
@@ -86,7 +88,7 @@ ${label} has exceeded the recommended size. This can cause:
    The agent will:
    1. Extract completed work to canonical docs (ARCHITECTURE.md, DECISIONS_LOG.md, etc.)
    2. Move historical context to knowledge graph nodes
-   3. Keep only current work (<200 lines)
+   3. Keep only current work (the 250–350 line working range)
    4. Preserve all knowledge (no catastrophic forgetting)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
