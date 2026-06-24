@@ -410,5 +410,180 @@ class TestSubprocessRunCarriesThreadedEnv(IsolatedEnvMixin, unittest.TestCase):
         )
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# v0.2.67: the GUI install path — empty env + no launcher.db active_profile +
+# hardware selector → arctic — must thread arctic (NOT qwen3) to the sync
+# subprocess. This is the gap that let the GUI-empty-env bug ship: the V52-AJ
+# tests above always seeded a launcher.db value, so the env-empty-AND-db-empty
+# path (which the GUI hits on a fresh box) was never asserted end-to-end.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class _StubArgs:
+    """Minimal argparse.Namespace stand-in for the reconcile chokepoint.
+
+    Mirrors the real namespace fields the chokepoint inspects for deliberate
+    CLI choices (--openai-key / --low-resource / --cpu-only).
+    """
+
+    def __init__(self, *, openai_key=None, low_resource=False, cpu_only=False):
+        self.openai_key = openai_key
+        self.low_resource = low_resource
+        self.cpu_only = cpu_only
+
+
+class TestGuiPathChokepointMakesHardwarePickAuthoritative(
+    IsolatedEnvMixin, unittest.TestCase
+):
+    """The launcher GUI spawns ``install.py --update`` WITHOUT ACTIVE_EMBEDDING
+    set, and a fresh box has no deliberate launcher.db ``embedding.active_profile``.
+
+    Before v0.2.67, ``_reconcile_install_active_embedding`` early-returned on
+    this shape, so ``_resolve_active_embedding_for_install() or "qwen3"`` in the
+    seed path resolved to qwen3 and the KG was indexed with qwen3 even though the
+    hardware selector picked arctic on the low-VRAM/CPU box. These tests assert
+    the chokepoint now makes the hardware pick authoritative for the WHOLE run
+    (seed resolver + subprocess threader + .env/settings writers all read the
+    single ``os.environ["ACTIVE_EMBEDDING"]`` source of truth).
+    """
+
+    def test_gui_empty_env_hardware_arctic_threads_arctic(self) -> None:
+        """No env, no launcher.db, embed_config picks arctic → subprocess=arctic."""
+        # No launcher.db deliberate choice (fresh box, Identity tab never opened).
+        import install as install_mod
+
+        # embed_config["active_embedding"] is what the hardware selector
+        # produced for a low-VRAM/CPU box (arctic).
+        embed_config = {"active_embedding": "arctic"}
+        did = install_mod._reconcile_install_active_embedding(
+            embed_config, _StubArgs()
+        )
+        self.assertTrue(
+            did, "Chokepoint must persist the hardware pick on the empty-env path"
+        )
+
+        # The seed path uses this resolver — must now be arctic, not None→qwen3.
+        self.assertEqual(
+            install_mod._resolve_active_embedding_for_install(),
+            "arctic",
+        )
+
+        # The subprocess threader must carry arctic into sync_knowledge_graph.py.
+        env = install_mod._subprocess_env_with_embedding()
+        self.assertEqual(
+            env.get("ACTIVE_EMBEDDING"),
+            "arctic",
+            "GUI-path subprocess must embed with arctic, not the qwen3 default",
+        )
+        self.assertEqual(
+            env.get("EMBEDDING_MODEL"),
+            "snowflake-arctic-embed2:latest",
+        )
+
+    def test_gui_empty_env_hardware_qwen3_threads_qwen3(self) -> None:
+        """Free-tier / GPU box where the selector genuinely picks qwen3:
+        the chokepoint fills qwen3 (net-equivalent to the old default — no
+        regression for hosts that should run qwen3)."""
+        import install as install_mod
+
+        embed_config = {"active_embedding": "qwen3"}
+        install_mod._reconcile_install_active_embedding(embed_config, _StubArgs())
+
+        self.assertEqual(
+            install_mod._resolve_active_embedding_for_install(), "qwen3"
+        )
+        env = install_mod._subprocess_env_with_embedding()
+        self.assertEqual(env.get("ACTIVE_EMBEDDING"), "qwen3")
+        self.assertEqual(env.get("EMBEDDING_MODEL"), "qwen3-embedding:0.6b")
+
+    def test_explicit_env_arctic_wins_over_qwen3_hardware(self) -> None:
+        """Inverse / precedence: an explicit ACTIVE_EMBEDDING=arctic from the
+        terminal must win even when the hardware selector picked qwen3.
+
+        Row 5 of the decision table: a non-default explicit override is honoured
+        verbatim — the chokepoint must not clobber it with the hardware pick.
+        (The symmetric env=qwen3-on-arctic shape is intentionally NOT here: that
+        is the v0.2.61 stale-reconcile case — a bare qwen3 env is treated as a
+        leftover from a pre-selector install, not a deliberate terminal choice.
+        Deliberate qwen3 is expressed via a CLI flag or launcher.db, covered by
+        ``test_deliberate_launcher_db_choice_wins_over_arctic_hardware`` and the
+        CLI-flag cases in ``test_hardware_auto_selection``.)
+        """
+        os.environ["ACTIVE_EMBEDDING"] = "arctic"
+        import install as install_mod
+
+        embed_config = {"active_embedding": "qwen3"}
+        did = install_mod._reconcile_install_active_embedding(
+            embed_config, _StubArgs()
+        )
+        self.assertFalse(
+            did, "An explicit terminal ACTIVE_EMBEDDING must not be overwritten"
+        )
+        # Resolver + subprocess threader both keep the explicit value.
+        self.assertEqual(
+            install_mod._resolve_active_embedding_for_install(), "arctic"
+        )
+        env = install_mod._subprocess_env_with_embedding()
+        self.assertEqual(env.get("ACTIVE_EMBEDDING"), "arctic")
+        self.assertEqual(
+            env.get("EMBEDDING_MODEL"), "snowflake-arctic-embed2:latest"
+        )
+
+    def test_cli_flag_qwen3_wins_over_arctic_hardware(self) -> None:
+        """Inverse / precedence (the spec's 'explicit qwen3 still wins' case):
+        a deliberate CLI flag pinning qwen3 must win on arctic hardware.
+
+        Modeled on ``--cpu-only`` (a deliberate choice → Row 1). The flag value
+        flows through ``embed_config``; the chokepoint must NOT thread the
+        arctic hardware pick into os.environ.
+        """
+        os.environ["ACTIVE_EMBEDDING"] = "qwen3"
+        import install as install_mod
+
+        # A deliberate CLI flag was passed. (embed_config here still carries the
+        # qwen3 the deliberate cpu_only profile produced; the point is the flag
+        # gates Row 1 so a stale-shape reconcile is suppressed.)
+        embed_config = {"active_embedding": "qwen3"}
+        did = install_mod._reconcile_install_active_embedding(
+            embed_config, _StubArgs(cpu_only=True)
+        )
+        self.assertFalse(did, "A deliberate CLI flag must suppress reconcile")
+        self.assertEqual(os.environ["ACTIVE_EMBEDDING"], "qwen3")
+        self.assertEqual(
+            install_mod._resolve_active_embedding_for_install(), "qwen3"
+        )
+
+    def test_deliberate_launcher_db_choice_wins_over_arctic_hardware(self) -> None:
+        """Inverse / precedence: a deliberate launcher.db active_profile=qwen3
+        (Identity tab) must win even on arctic hardware.
+
+        The chokepoint leaves os.environ unset (so it can't clobber the
+        deliberate choice); the resolver reads the launcher.db value directly
+        and the subprocess threader inherits it from the same resolver.
+        """
+        _make_launcher_db(self.tmp_path, active="qwen3")
+        import install as install_mod
+
+        embed_config = {"active_embedding": "arctic"}
+        did = install_mod._reconcile_install_active_embedding(
+            embed_config, _StubArgs()
+        )
+        self.assertFalse(
+            did, "A deliberate launcher.db choice must not be overwritten"
+        )
+        self.assertNotIn(
+            "ACTIVE_EMBEDDING", os.environ,
+            "Chokepoint must not thread the hardware pick when a deliberate "
+            "launcher.db choice exists",
+        )
+        # Resolver falls back to launcher.db (env empty) → qwen3 (the deliberate
+        # choice), NOT the arctic hardware pick.
+        self.assertEqual(
+            install_mod._resolve_active_embedding_for_install(), "qwen3"
+        )
+        env = install_mod._subprocess_env_with_embedding()
+        self.assertEqual(env.get("ACTIVE_EMBEDDING"), "qwen3")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
