@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.66] - 2026-06-24
+
+v0.2.66 is a module install/update correctness cycle. It fixes a bug where
+updating a global-scope module (e.g. an RL reranker) to a newer version
+silently mis-classified it as per-project and wedged the install at
+`status='installing'` forever, hardens the image-pull path against a stalled
+registry, auto-heals already-wedged installs, and stops a launcher-DB schema
+bump from re-firing a spurious migration deferral on every update.
+
+### Fixed
+
+- **Module update no longer downgrades a global-scope module to per-project.**
+  Updating a GLOBAL module to a strictly-newer version routed through the
+  L0-synth manifest path, which hard-pinned `install.scope` to per-project —
+  creating a schema-incoherent per-project install row that wedged at
+  `status='installing'` forever. The synth now reads `l0.install.scope`, and an
+  identity-scope backstop (`apply_authoritative_scope`) makes the on-disk
+  extracted manifest's scope authoritative on updates: scope is a module
+  identity property and an update can no longer flip it. (A deliberate
+  per-project→global migration is still handled separately by
+  `auto_migrate_per_project_to_global`.)
+- **Bounded module image pull.** A module image `podman`/`docker pull` during
+  install/update is now bounded by `tokio::time::timeout` (default 1800s,
+  override `VCT_MODULE_PULL_TIMEOUT_SECS`; zero/non-numeric falls back to the
+  default — the bound is never disabled). A stalled registry previously left the
+  install row at `status='installing'` with no error; it now transitions to
+  `status='error'` with an actionable message and becomes retry-eligible. The
+  pull child also sets `kill_on_drop(true)`, so a timeout terminates the spawned
+  pull instead of orphaning it.
+- **Auto-heal of interrupted installs.** A `module_installs` row left at
+  `status='installing'` by an install that died with the previous launcher run
+  (crash, force-quit, kill mid-pull) was never reconciled — it rendered a
+  forever-spinner and could not be retried. The startup reconciler now heals any
+  such row to `status='error'` with an actionable message (boot-only: a row at
+  `installing` at boot is provably not a live in-progress install). This makes
+  recovery automatic — no manual DB edit or reinstall needed.
+- **`launcher.db` schema bumps no longer re-fire a false
+  `schema_migration_script_missing` deferral.** `launcher_db_table_set` is now in
+  a `RUST_OWNED_TYPES` skip-set: its real schema lives in `migrations.rs`
+  (applied at launcher startup) and the Python registry tracks it as a
+  version-floor only, so a `stored < canonical` gap does a register-only version
+  advance instead of demanding a (by-design never-shipped) Python edge script.
+  `rl_events_payload_shape` is deliberately excluded (its JSON payload shape is
+  migrated by the Python RL telemetry layer, so it correctly still requires a
+  real edge).
+
 ## [0.2.65] - 2026-06-23
 
 v0.2.65 is a correctness + hardening cycle: it fixes a latent paid-tier
