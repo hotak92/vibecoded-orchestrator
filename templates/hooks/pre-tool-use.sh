@@ -280,22 +280,39 @@ if [[ "$TOOL_NAME" == "Write" ]] || [[ "$TOOL_NAME" == "Edit" ]]; then
 
     if [[ -n "$FILE_PATH" ]]; then
         if [[ -f "$FILE_PATH" ]]; then
-            # Existing file: check Build Anchor
-            ALREADY_READ=0
-            if [[ -f "$SESSION_READS_FILE" ]]; then
-                grep -qxF "$FILE_PATH" "$SESSION_READS_FILE" 2>/dev/null && ALREADY_READ=1 || true
-            fi
+            # Existing file: check Build Anchor — WRITE ONLY.
+            #
+            # The anchor gate (block a modification of an existing file that
+            # wasn't Read this session) is enforced for `Write` but NOT for
+            # `Edit`. Rationale:
+            #   * `Write` blind-overwrites the whole file and can be issued
+            #     without ever reading it — the genuinely dangerous case the
+            #     anchor protects against (clobbering an unseen file).
+            #   * `Edit` is already gated by Claude Code's built-in
+            #     read-before-edit rule (an Edit needs an exact old_string
+            #     match, unobtainable without reading). Re-enforcing it here
+            #     was redundant AND a false-positive source: this hook's own
+            #     session-reads ledger (exact path match) can diverge from the
+            #     harness's internal file-state tracking and spuriously block a
+            #     legitimate Edit. So we defer Edit's read-before-edit to the
+            #     harness and only anchor `Write`.
+            if [[ "$TOOL_NAME" == "Write" ]]; then
+                ALREADY_READ=0
+                if [[ -f "$SESSION_READS_FILE" ]]; then
+                    grep -qxF "$FILE_PATH" "$SESSION_READS_FILE" 2>/dev/null && ALREADY_READ=1 || true
+                fi
 
-            if [[ "$ALREADY_READ" -eq 0 ]]; then
-                BASENAME=$(basename "$FILE_PATH")
-                # Block messages route to stderr — see bash-security
-                # branch comment.
-                {
-                    echo "⚠️  Build Anchor Protocol: '$BASENAME' has not been Read this session."
-                    echo "    Use the Read tool on this file before modifying it."
-                } >&2
-                echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"anchor_blocked\",\"file\":\"$FILE_PATH\"}" >> "$SECURITY_LOG" 2>/dev/null || true
-                exit 2
+                if [[ "$ALREADY_READ" -eq 0 ]]; then
+                    BASENAME=$(basename "$FILE_PATH")
+                    # Block messages route to stderr — see bash-security
+                    # branch comment.
+                    {
+                        echo "⚠️  Build Anchor Protocol: '$BASENAME' has not been Read this session."
+                        echo "    Use the Read tool on this file before overwriting it with Write."
+                    } >&2
+                    echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"anchor_blocked\",\"file\":\"$FILE_PATH\",\"tool\":\"Write\"}" >> "$SECURITY_LOG" 2>/dev/null || true
+                    exit 2
+                fi
             fi
 
             # Backup existing file before modification

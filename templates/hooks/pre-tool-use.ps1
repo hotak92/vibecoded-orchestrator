@@ -218,21 +218,31 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
     $filePath = Get-Field "file_path"
     if ($filePath) {
         if (Test-Path -LiteralPath $filePath -PathType Leaf) {
-            $alreadyRead = $false
-            if (Test-Path $SessionReadsFile) {
-                try {
-                    foreach ($l in Get-Content $SessionReadsFile -ErrorAction Stop) {
-                        if ($l -eq $filePath) { $alreadyRead = $true; break }
-                    }
-                } catch { }
-            }
-            if (-not $alreadyRead) {
-                $bn = Split-Path $filePath -Leaf
-                Write-Output "Build Anchor Protocol: '$bn' has not been Read this session."
-                Write-Output "    Use the Read tool on this file before modifying it."
-                $fpEsc = $filePath -replace '\\', '\\\\' -replace '"', '\"'
-                Write-SecurityLine "{""timestamp"":""$ts"",""event"":""anchor_blocked"",""file"":""$fpEsc""}"
-                exit 2
+            # Existing file: check Build Anchor — WRITE ONLY.
+            #
+            # MUST MATCH templates/hooks/pre-tool-use.sh (section 4): the anchor
+            # gate is enforced for `Write` (blind whole-file overwrite of an
+            # unseen file) but NOT for `Edit` (Claude Code's built-in
+            # read-before-edit rule already covers it; re-enforcing here was
+            # redundant and a false-positive source vs the harness's own
+            # file-state tracking). Defer Edit's read-before-edit to the harness.
+            if ($ToolName -eq "Write") {
+                $alreadyRead = $false
+                if (Test-Path $SessionReadsFile) {
+                    try {
+                        foreach ($l in Get-Content $SessionReadsFile -ErrorAction Stop) {
+                            if ($l -eq $filePath) { $alreadyRead = $true; break }
+                        }
+                    } catch { }
+                }
+                if (-not $alreadyRead) {
+                    $bn = Split-Path $filePath -Leaf
+                    Write-Output "Build Anchor Protocol: '$bn' has not been Read this session."
+                    Write-Output "    Use the Read tool on this file before overwriting it with Write."
+                    $fpEsc = $filePath -replace '\\', '\\\\' -replace '"', '\"'
+                    Write-SecurityLine "{""timestamp"":""$ts"",""event"":""anchor_blocked"",""file"":""$fpEsc"",""tool"":""Write""}"
+                    exit 2
+                }
             }
             # Backup existing file before modification.
             if (-not (Test-Path $BackupDir)) {
