@@ -11285,6 +11285,8 @@ pub async fn launch_installer_terminal(install_root: String) -> Result<(), Strin
         let script = format!(
             "tell application \"Terminal\" to do script \"cd \\\"{escaped}\\\" && python3 install.py\""
         );
+        // vct-allow-no-silent: macOS-only (cfg target_os = "macos"); osascript
+        // never runs on Windows.
         let status = tokio::process::Command::new("osascript")
             .arg("-e")
             .arg(&script)
@@ -11299,6 +11301,8 @@ pub async fn launch_installer_terminal(install_root: String) -> Result<(), Strin
         }
         // Bring Terminal.app to the foreground so the user actually
         // sees the new window.
+        // vct-allow-no-silent: macOS-only (cfg target_os = "macos"); osascript
+        // never runs on Windows.
         let _ = tokio::process::Command::new("osascript")
             .arg("-e")
             .arg("tell application \"Terminal\" to activate")
@@ -11328,6 +11332,9 @@ pub async fn launch_installer_terminal(install_root: String) -> Result<(), Strin
             if which_on_path(emu).is_none() {
                 continue;
             }
+            // vct-allow-no-silent: Linux-only (cfg target_os = "linux") terminal
+            // launcher; a visible terminal window is the intended behaviour and
+            // this spawn never runs on Windows.
             let mut cmd = tokio::process::Command::new(emu);
             if *emu == "xfce4-terminal" {
                 let inner = body.replace('"', "\\\"");

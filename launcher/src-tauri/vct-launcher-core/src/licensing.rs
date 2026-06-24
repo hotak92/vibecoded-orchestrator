@@ -208,6 +208,8 @@ fn read_macos_platform_uuid() -> Option<String> {
     // "<HWUUID>"` is what we want. Shelling out is the simplest path —
     // `ioreg` is part of the base system on every macOS install (no
     // extra dep, no IOKit FFI).
+    // vct-allow-no-silent: macOS-only (cfg target_os = "macos"); ioreg never
+    // runs on Windows.
     let output = std::process::Command::new("ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()

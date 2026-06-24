@@ -904,6 +904,7 @@ fn resolve_collection_prefix(
 /// when the path isn't a git repo (no `.git`) or git is unavailable.
 fn git_head_sha(repo_path: &str) -> Option<String> {
     let out = std::process::Command::new("git")
+        .silent()
         .arg("-C")
         .arg(repo_path)
         .arg("rev-parse")

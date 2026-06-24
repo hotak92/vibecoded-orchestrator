@@ -1251,6 +1251,8 @@ pub async fn migrate_to_named_volume(
 
     // Unix path: cp -a <source>/. <mountpoint>/
     let src_arg = format!("{}/.", source.display());
+    // vct-allow-no-silent: POSIX `cp` — the Windows branch returns early above
+    // (cp -a is not portable), so this spawn never runs on Windows.
     let status = tokio::process::Command::new("cp")
         .arg("-a")
         .arg(&src_arg)
@@ -1361,6 +1363,8 @@ pub async fn migrate_to_bind_path(
     }
 
     let src_arg = format!("{}/.", mountpoint);
+    // vct-allow-no-silent: POSIX `cp` — the Windows branch returns early above
+    // (cp -a is not portable), so this spawn never runs on Windows.
     let status = tokio::process::Command::new("cp")
         .arg("-a")
         .arg(&src_arg)

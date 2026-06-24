@@ -1271,10 +1271,12 @@ where
     F: Fn(&str) -> Option<String>,
     G: Fn(&str) -> bool,
 {
+    use crate::process::CommandExt as _;
     use std::process::Stdio;
     use tokio::process::Command;
 
     let ps_output = match Command::new(runtime)
+        .silent()
         .args(["ps", "-a", "--format", "json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1355,6 +1357,7 @@ where
         }
 
         let rm_status = Command::new(runtime)
+            .silent()
             .args(["rm", "-f", &snap.name])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1917,6 +1920,9 @@ pub async fn pre_pull_with_auth_for_start(
         .ok_or_else(|| "install.container block missing".to_string())?;
 
     // Fast-path: image already in local cache → no pull needed.
+    // vct-allow-no-silent: covered by v0267/module-install bounded_authed_pull
+    // (that branch extracts a shared pull helper that adds .silent() here);
+    // REMOVE this marker after the module-install branch merges.
     let inspect = Command::new(runtime)
         .args(["image", "exists", image_ref])
         .stdout(Stdio::null())
@@ -1955,6 +1961,9 @@ pub async fn pre_pull_with_auth_for_start(
         }
     };
 
+    // vct-allow-no-silent: covered by v0267/module-install bounded_authed_pull
+    // (that branch extracts a shared pull helper that adds .silent() here);
+    // REMOVE this marker after the module-install branch merges.
     let mut pull_cmd = Command::new(runtime);
     if let Some(g) = guard_opt.as_ref() {
         g.apply_to(&mut pull_cmd, runtime);
