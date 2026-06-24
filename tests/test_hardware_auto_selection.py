@@ -632,8 +632,51 @@ class TestReconcileInstallActiveEmbedding:
         import os as _os
         assert _os.environ["ACTIVE_EMBEDDING"] == "qwen3"
 
-    def test_no_env_value_is_noop(self, monkeypatch):
-        """No inherited env → nothing to reconcile (writers use embed_config)."""
+    def test_no_env_value_fills_hardware_pick(self, monkeypatch):
+        """v0.2.67: empty env + no deliberate choice → persist the hardware pick.
+
+        This is the GUI install path: the launcher spawns `install.py --update`
+        WITHOUT setting ACTIVE_EMBEDDING and with no deliberate launcher.db
+        `embedding.active_profile`. Pre-v0.2.67 this early-returned and the seed
+        resolver fell through to qwen3 even though the hardware selector picked
+        arctic. The chokepoint now makes the hardware pick authoritative in
+        os.environ so every downstream reader (seed resolver + .env / settings
+        writers + subprocess threader) uses arctic.
+        """
+        embed_config = {"active_embedding": "arctic"}
+        did = _reconcile_install_active_embedding(embed_config, _StubArgs())
+        assert did is True
+        import os as _os
+        assert _os.environ["ACTIVE_EMBEDDING"] == "arctic"
+        assert _os.environ["EMBEDDING_MODEL"] == "snowflake-arctic-embed2:latest"
+
+    def test_no_env_value_qwen3_hardware_fills_qwen3(self, monkeypatch):
+        """v0.2.67: empty env + hardware genuinely picks qwen3 → fill qwen3.
+
+        Free-tier / GPU box where the selector picks qwen3: the chokepoint still
+        makes the pick authoritative (writes qwen3), but the net effect is the
+        same model the old default would have produced — no regression.
+        """
+        embed_config = {"active_embedding": "qwen3"}
+        did = _reconcile_install_active_embedding(embed_config, _StubArgs())
+        assert did is True
+        import os as _os
+        assert _os.environ["ACTIVE_EMBEDDING"] == "qwen3"
+        assert _os.environ["EMBEDDING_MODEL"] == "qwen3-embedding:0.6b"
+
+    def test_no_env_value_deliberate_launcher_db_not_filled(self, monkeypatch):
+        """v0.2.67 precedence: empty env BUT a deliberate launcher.db choice →
+        the chokepoint must NOT thread the hardware pick into os.environ.
+
+        A deliberate launcher.db `embedding.active_profile` is read directly by
+        the seed resolver + EmbeddingService; threading the hardware pick here
+        could clobber a deliberate qwen3-on-arctic-hardware choice. Leave env
+        unset so the launcher.db value wins at the resolver.
+        """
+        monkeypatch.setattr(
+            "install._read_active_embedding_from_app_state",
+            lambda: "qwen3",
+        )
         embed_config = {"active_embedding": "arctic"}
         did = _reconcile_install_active_embedding(embed_config, _StubArgs())
         assert did is False
