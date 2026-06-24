@@ -5,8 +5,9 @@
 #   - python:   the trust-critical helpers (license validator, telemetry
 #               PII scrub + consent gating, install-flow detection) —
 #               73+ tests.
-#   - frontend: svelte-check (type-check) only. Frontend has no runtime
-#               unit tests yet; tauri:dev / tauri:build are heavy and will
+#   - frontend: svelte-check (type-check) + vitest unit tests (v0.2.67:
+#               wired in so the frontend store / status-display tests
+#               actually gate). tauri:dev / tauri:build are heavy and will
 #               graduate to a separate workflow when the launcher gets
 #               release tags.
 #
@@ -282,6 +283,8 @@ jobs:
         run: npm ci
       - name: npm run check
         run: npm run check
+      - name: npm test (vitest)
+        run: npm test
 
   # PR-4 (2026-05-06): regression guard for the audit class
   # "developer machine paths leak into shipped launcher binary".
