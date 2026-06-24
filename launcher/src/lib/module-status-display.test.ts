@@ -20,6 +20,7 @@ import { describe, expect, it } from 'vitest';
 import {
   LAST_ERROR_TRUNCATE_BUDGET,
   detectModuleErrorAfterAction,
+  installProgressLabel,
   moduleActionForKind,
   resolveTileDisplay,
   semverLess,
@@ -209,6 +210,80 @@ describe('resolveTileDisplay', () => {
     const row = makeRow({ status: 'installing' });
     const display = resolveTileDisplay(entry, row, false);
     expect(display.kind).toBe('installing');
+  });
+
+  // ── v0.2.67: live install-progress is rendered on the installing branch ──
+
+  it('installing branch carries a live progress label from a non-variant_fallback stage', () => {
+    const entry = makeEntry();
+    const display = resolveTileDisplay(entry, null, /* isInstalling */ true, {
+      stage: 'pulling',
+      percent: 40,
+      message: 'Pulling image',
+      failed: false,
+    });
+    expect(display.kind).toBe('installing');
+    if (display.kind !== 'installing') return;
+    expect(display.progress).toBe('Pulling image… 40%');
+  });
+
+  it('installing branch progress is null before any progress event arrives', () => {
+    const entry = makeEntry();
+    const display = resolveTileDisplay(entry, null, true, null);
+    expect(display.kind).toBe('installing');
+    if (display.kind !== 'installing') return;
+    expect(display.progress).toBeNull();
+  });
+
+  it('a terminal failed stage flips the tile out of installing immediately', () => {
+    // A fast 401 emits stage=failed; the user must see the error NOW, not
+    // a hanging spinner waiting for the install RPC to propagate its Err.
+    const entry = makeEntry();
+    const row = makeRow({ status: 'error', last_error: 'unauthorized' });
+    const display = resolveTileDisplay(entry, row, /* isInstalling */ true, {
+      stage: 'failed',
+      percent: 0,
+      message: 'pull failed: unauthorized',
+      failed: true,
+    });
+    expect(display.kind).toBe('errored');
+  });
+});
+
+describe('installProgressLabel', () => {
+  it('null/undefined → null (render bare spinner)', () => {
+    expect(installProgressLabel(null)).toBeNull();
+    expect(installProgressLabel(undefined)).toBeNull();
+  });
+
+  it('terminal done/failed stages → null (row status drives display)', () => {
+    expect(
+      installProgressLabel({ stage: 'done', percent: 100, message: 'Done', failed: false }),
+    ).toBeNull();
+    expect(
+      installProgressLabel({ stage: 'failed', percent: 0, message: 'boom', failed: true }),
+    ).toBeNull();
+  });
+
+  it('intermediate stage with mid-range percent → message + percent', () => {
+    expect(
+      installProgressLabel({ stage: 'clone', percent: 25, message: 'Fetching source', failed: false }),
+    ).toBe('Fetching source… 25%');
+  });
+
+  it('intermediate stage with boundary percent (0 or 100) → message only', () => {
+    expect(
+      installProgressLabel({ stage: 'pulling', percent: 100, message: 'Pulling image', failed: false }),
+    ).toBe('Pulling image…');
+    expect(
+      installProgressLabel({ stage: 'pulling', percent: 0, message: 'Pulling image', failed: false }),
+    ).toBe('Pulling image…');
+  });
+
+  it('empty message → "Installing…" fallback', () => {
+    expect(
+      installProgressLabel({ stage: 'post_install', percent: 0, message: '', failed: false }),
+    ).toBe('Installing…');
   });
 });
 

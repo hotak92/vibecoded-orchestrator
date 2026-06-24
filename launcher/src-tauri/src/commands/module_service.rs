@@ -380,6 +380,12 @@ pub async fn start_container_for_module_with_gpu_mode(
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    // v0.2.67: kill_on_drop is LOAD-BEARING for the 60s timeout below.
+    // `podman run` of a not-yet-cached image triggers an IMPLICIT pull;
+    // if that stalls past the bound, dropping the `.output()` future on
+    // Elapsed must SIGKILL the child — otherwise the run (and its pull)
+    // is orphaned. Mirrors the shared `bounded_authed_pull` chokepoint.
+    cmd.kill_on_drop(true);
 
     let output = tokio::time::timeout(Duration::from_secs(60), cmd.output())
         .await

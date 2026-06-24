@@ -1531,6 +1531,58 @@ pub fn find_manifest_for_resume(db: &Db, module_id: &str) -> Option<ModuleManife
 
 // ─── Install / Uninstall ────────────────────────────────────────────────
 
+/// v0.2.67: re-entrancy decision for `install_module_for_project`.
+///
+/// Backstop for the observed case: clicking Install/Retry across
+/// surfaces (catalog tile + a second window, or a double-click) can spawn
+/// overlapping installs for the same module — a reported case showed
+/// THREE concurrent pulls. The frontend button-disable is the first line
+/// of defence; this
+/// is the backend backstop that holds even when the UI race slips
+/// through (two Tauri commands in flight, or two launcher windows).
+///
+/// Decision: refuse a fresh install iff an existing row is `installing`
+/// AND its start (`installed_at`, set to `now` by the insert) is still
+/// within the live window. The window is the pull timeout — past it, the
+/// previous attempt is presumed dead (e.g. the launcher was killed
+/// mid-pull, leaving a wedged row the reconciler will heal) and we let
+/// the new attempt proceed (the insert is an UPSERT that resets the row).
+///
+/// Conservative bias: when we can't positively confirm the previous
+/// attempt is dead (status=installing AND within-window), we LEAVE it —
+/// returning the existing row, not spawning a second pull. A NULL
+/// `installed_at` on an `installing` row is treated as "just started"
+/// (within window) so a freshly-inserted row created microseconds before
+/// our read isn't double-spawned.
+///
+/// Pure + unit-testable: takes the row fields + clock + window so the
+/// branch is exercised without a DB or a wall clock.
+fn install_in_flight_should_refuse(
+    existing_status: Option<ModuleStatus>,
+    existing_installed_at_ms: Option<i64>,
+    now_ms: i64,
+    window_ms: i64,
+) -> bool {
+    match existing_status {
+        Some(ModuleStatus::Installing) => {
+            match existing_installed_at_ms {
+                // No start timestamp on an installing row → treat as
+                // just-started (conservative: don't double-spawn).
+                None => true,
+                Some(started) => {
+                    let age = now_ms.saturating_sub(started);
+                    // Within the live window (including a clock that went
+                    // backwards → age<0) → the prior attempt is presumed
+                    // live; refuse. Past the window → presumed dead; allow.
+                    age < window_ms
+                }
+            }
+        }
+        // Any other status (or no row) → not in flight; allow.
+        _ => false,
+    }
+}
+
 #[command]
 pub async fn install_module_for_project(
     app: AppHandle,
@@ -1579,6 +1631,58 @@ pub async fn install_module_for_project(
         ));
     }
 
+    // 4b. v0.2.67: re-entrancy backstop. Refuse a second install when one
+    // is already in flight for the same module (a reported case showed
+    // three overlapping pulls from cross-surface Install/Retry clicks). The
+    // frontend disables the button; this is the backend backstop that
+    // holds when the UI race slips through (two windows, double-click,
+    // two Tauri commands racing). The live window is the pull timeout —
+    // past it the prior attempt is presumed dead (the reconciler heals
+    // the wedged row) and we let the new attempt proceed via the UPSERT.
+    //
+    // Conservative: on any uncertainty (installing + within-window, or a
+    // NULL start timestamp) we LEAVE the existing attempt and return its
+    // row rather than spawn a second pull. Read failures soft-fail to
+    // "not in flight" so a transient DB hiccup never blocks a legit
+    // install.
+    let is_global = manifest.install.scope.is_global();
+    {
+        let existing = if is_global {
+            db.get_global_module_install(&module_id).ok().flatten()
+        } else {
+            db.get_module_install(&project_id, &module_id).ok().flatten()
+        };
+        if let Some(prior) = existing {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let window_ms =
+                vct_launcher_core::services::container_runtime::module_pull_timeout()
+                    .as_millis() as i64;
+            if install_in_flight_should_refuse(
+                Some(prior.status.clone()),
+                Some(prior.installed_at),
+                now_ms,
+                window_ms,
+            ) {
+                db.audit(
+                    "module_install_reentrancy_skipped",
+                    Some(&project_id),
+                    Some(&module_id),
+                    &serde_json::json!({
+                        "reason": "install already in flight (within pull-timeout window)",
+                        "existing_install_id": prior.id,
+                    }),
+                )?;
+                eprintln!(
+                    "[modules] install_module_for_project[{}]: an install is already \
+                     in flight — returning the in-flight row instead of spawning a \
+                     second pull.",
+                    module_id
+                );
+                return Ok(prior);
+            }
+        }
+    }
+
     // 5. Insert pending row
     //
     // v0.2.49 Stream A: branch on `install.scope`. Global-scope modules
@@ -1590,7 +1694,6 @@ pub async fn install_module_for_project(
     let install_id = Uuid::new_v4().to_string();
     let ctx = PlaceholderCtx::new(&module_id);
     let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
-    let is_global = manifest.install.scope.is_global();
     let row = if is_global {
         db.insert_global_module_install(
             &install_id,
@@ -5339,5 +5442,140 @@ mod tests {
                 entry.id, entry.install_scope
             );
         }
+    }
+
+    // ─── v0.2.67: install re-entrancy backstop ───────────────────────────
+
+    /// An `installing` row whose start is WITHIN the live window → refuse
+    /// (the prior attempt is presumed live; don't spawn a second pull).
+    #[test]
+    fn reentrancy_refuses_installing_within_window() {
+        let window = 60_000; // 60s
+        let now = 1_000_000;
+        // Started 5s ago — well within the window.
+        assert!(install_in_flight_should_refuse(
+            Some(ModuleStatus::Installing),
+            Some(now - 5_000),
+            now,
+            window,
+        ));
+    }
+
+    /// An `installing` row whose start is PAST the window → allow (the
+    /// prior attempt is presumed dead — e.g. the launcher was killed
+    /// mid-pull; the reconciler heals the wedged row and the UPSERT resets
+    /// it).
+    #[test]
+    fn reentrancy_allows_installing_past_window() {
+        let window = 60_000;
+        let now = 1_000_000;
+        // Started 120s ago — twice the window.
+        assert!(!install_in_flight_should_refuse(
+            Some(ModuleStatus::Installing),
+            Some(now - 120_000),
+            now,
+            window,
+        ));
+    }
+
+    /// An `installing` row with a NULL start timestamp → refuse
+    /// (conservative: treat as just-started, don't double-spawn).
+    #[test]
+    fn reentrancy_refuses_installing_with_null_start() {
+        assert!(install_in_flight_should_refuse(
+            Some(ModuleStatus::Installing),
+            None,
+            1_000_000,
+            60_000,
+        ));
+    }
+
+    /// A clock that went backwards (now < started → negative age) is still
+    /// treated as within-window → refuse (never double-spawn on a clock
+    /// skew).
+    #[test]
+    fn reentrancy_refuses_on_backwards_clock() {
+        let window = 60_000;
+        let now = 1_000_000;
+        assert!(install_in_flight_should_refuse(
+            Some(ModuleStatus::Installing),
+            Some(now + 5_000), // started "in the future"
+            now,
+            window,
+        ));
+    }
+
+    /// Non-installing statuses (and no row) → allow. Retry-after-error and
+    /// reinstall-after-installed must proceed.
+    #[test]
+    fn reentrancy_allows_non_installing_statuses() {
+        let window = 60_000;
+        let now = 1_000_000;
+        for st in [
+            None,
+            Some(ModuleStatus::Error),
+            Some(ModuleStatus::Installed),
+            Some(ModuleStatus::Broken),
+            Some(ModuleStatus::Running),
+            Some(ModuleStatus::Stopped),
+        ] {
+            assert!(
+                !install_in_flight_should_refuse(st.clone(), Some(now - 1_000), now, window),
+                "status {:?} must be allowed (not in flight)",
+                st,
+            );
+        }
+    }
+
+    /// Live DB proof: with a row already at status='installing', the
+    /// re-entrancy read (`get_module_install`) sees it AND the decision
+    /// refuses — so the install command returns early WITHOUT a second
+    /// insert. We also assert the UPSERT itself never creates a 2nd row
+    /// for the same (project_id, module_id) (the partial unique index
+    /// guarantee the backstop layers on top of).
+    #[test]
+    fn reentrancy_installing_row_is_detected_and_no_second_row_inserted() {
+        let db = open_db();
+        db.insert_project("proj-re", "Re-entrancy", "/tmp/re", ProjectHost::Base, "re")
+            .expect("insert project");
+
+        // First install lands the row at status='installing'.
+        let first = db
+            .insert_module_install("inst-1", "proj-re", "vct-mod", "0.1.0", "/tmp/re/mod")
+            .expect("first insert");
+        assert_eq!(first.status, ModuleStatus::Installing);
+
+        // The guard read sees the installing row.
+        let seen = db
+            .get_module_install("proj-re", "vct-mod")
+            .expect("read")
+            .expect("row exists");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        assert!(
+            install_in_flight_should_refuse(
+                Some(seen.status.clone()),
+                Some(seen.installed_at),
+                now_ms,
+                60_000,
+            ),
+            "a freshly-inserted installing row must trigger the refuse path",
+        );
+
+        // Even if a second insert WERE attempted, the partial unique index
+        // upserts in place — still exactly ONE row for the pair.
+        let _second = db
+            .insert_module_install("inst-2", "proj-re", "vct-mod", "0.1.0", "/tmp/re/mod")
+            .expect("second insert upserts in place");
+        let installing_rows = db
+            .list_module_installs_with_status("installing")
+            .expect("list installing");
+        let for_pair = installing_rows
+            .iter()
+            .filter(|r| r.module_id == "vct-mod" && r.project_id.as_deref() == Some("proj-re"))
+            .count();
+        assert_eq!(
+            for_pair, 1,
+            "exactly one install row for the pair — no duplicate spawned",
+        );
     }
 }

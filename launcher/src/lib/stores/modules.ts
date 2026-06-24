@@ -27,16 +27,18 @@ import type {
 } from '$lib/types/launcher';
 
 /**
- * v0.2.35 (Agent N): subset of the InstallProgress payload the Rust
- * `installer_engine` emits on `module://install-progress`. We only
- * consume the variant-fallback stage here; the rest of the progress
- * channel is unused today (see the legacy comment above — install is
- * modelled as a single async call).
+ * The InstallProgress payload the Rust `installer_engine` emits on
+ * `module://install-progress`. Shape mirrors `InstallStage` (snake_case
+ * via serde rename).
  *
- * Shape mirrors `InstallStage` (snake_case via serde rename) — the only
- * stage this store reacts to is `variant_fallback`.
+ * v0.2.67: the store now consumes EVERY stage (not just
+ * `variant_fallback`) so the tile can render live progress for
+ * Clone / ExtractingManifest / pull and flip to a visible failed state
+ * on the (fast) error transition. Pre-v0.2.67 only `variant_fallback`
+ * was handled — a 401 that returns in <1s flipped the DB row to 'error'
+ * but the user only ever saw a static "Installing…" spinner.
  */
-interface ModuleInstallProgressEvent {
+export interface ModuleInstallProgressEvent {
   project_id: string;
   module_id: string;
   stage: string;
@@ -44,6 +46,44 @@ interface ModuleInstallProgressEvent {
   step_total: number;
   percent: number;
   message: string;
+}
+
+/**
+ * v0.2.67: per-module live install progress, keyed by module_id. Mirrors
+ * the latest `module://install-progress` event for that module so the
+ * tile can render `percent` + `message` while an install/retry is in
+ * flight. Cleared on `module://install-complete` and on a terminal
+ * `failed` stage (the row's own status then drives the display).
+ */
+export interface ModuleInstallProgress {
+  stage: string;
+  percent: number;
+  message: string;
+  /** true once a terminal `failed` stage arrived (so the UI can show it
+   *  immediately, before the install RPC's Err propagates back). */
+  failed: boolean;
+}
+
+/**
+ * v0.2.67: pure reducer for an incoming `module://install-progress`
+ * event → the next `installProgress` map. Extracted so the merge is
+ * unit-testable without mocking Tauri (the store's `listen` wiring is
+ * skipped entirely outside a Tauri host). Records the latest stage per
+ * module; the renderer (`installProgressLabel`) decides how to display it.
+ */
+export function mergeInstallProgress(
+  current: Record<string, ModuleInstallProgress>,
+  e: ModuleInstallProgressEvent,
+): Record<string, ModuleInstallProgress> {
+  return {
+    ...current,
+    [e.module_id]: {
+      stage: e.stage,
+      percent: e.percent,
+      message: e.message,
+      failed: e.stage === 'failed',
+    },
+  };
 }
 
 interface ModulesState {
@@ -56,6 +96,8 @@ interface ModulesState {
   devAffordanceHint: DevAffordanceHint | null;
   installed: ModuleInstallRow[]; // for currently-selected project
   installingId: string | null;
+  /** v0.2.67: per-module live install progress keyed by module_id. */
+  installProgress: Record<string, ModuleInstallProgress>;
   loading: boolean;
   error: string | null;
 }
@@ -68,32 +110,45 @@ function createModulesStore() {
     devAffordanceHint: null,
     installed: [],
     installingId: null,
+    installProgress: {},
     loading: false,
     error: null,
   });
 
   // Wire the install-complete event once.
   if (tauriAvailable()) {
-    listen<ModuleInstallCompleteEvent>('module://install-complete', () => {
-      update((s) => ({ ...s, installingId: null }));
+    listen<ModuleInstallCompleteEvent>('module://install-complete', (e) => {
+      // v0.2.67: clear the per-module progress entry too, so a stale
+      // percent doesn't linger on the tile after completion.
+      const completedId = e.payload?.module_id;
+      update((s) => {
+        const installProgress = { ...s.installProgress };
+        if (completedId) delete installProgress[completedId];
+        return { ...s, installingId: null, installProgress };
+      });
     });
 
-    // v0.2.35 (Agent N): surface a toast when the install's chosen
-    // GPU variant wasn't available on the registry and the backend
-    // silently fell back to the cpu variant. The install continues
-    // normally — this is purely informational so the user understands
-    // why their CUDA variant didn't land.
-    //
-    // Non-blocking by design: pre-v0.2.35 the same scenario produced a
-    // cryptic `denied`/404 hard-fail with no way to act. The fallback
-    // now Just Works for the common case (publisher hasn't built
-    // `-cuda` for this release yet) and the toast tells the user what
-    // happened. If they want the cuda variant they can re-install once
-    // the publisher ships it.
+    // v0.2.67: consume EVERY install-progress stage, not just
+    // variant_fallback. The store records the latest stage/percent/message
+    // per module so the tile can render live progress (Clone /
+    // ExtractingManifest / pulling / post-install), AND surface the fast
+    // error transition: a 401 returns in <1s and the Rust side emits a
+    // terminal `failed` stage — pre-v0.2.67 the user only ever saw a
+    // static spinner because this listener ignored everything but
+    // variant_fallback.
     listen<ModuleInstallProgressEvent>('module://install-progress', (e) => {
-      if (e.payload.stage === 'variant_fallback') {
-        toast.info(e.payload.message);
+      const p = e.payload;
+
+      // variant_fallback stays informational (non-blocking toast) — the
+      // install continues with the cpu variant.
+      if (p.stage === 'variant_fallback') {
+        toast.info(p.message);
       }
+
+      update((s) => ({
+        ...s,
+        installProgress: mergeInstallProgress(s.installProgress, p),
+      }));
     });
   }
 
@@ -210,18 +265,30 @@ function createModulesStore() {
           projectId,
           moduleId,
         });
-        update((s) => ({
-          ...s,
-          installed: [...s.installed.filter((r) => r.module_id !== moduleId), row],
-          installingId: null,
-        }));
+        update((s) => {
+          // v0.2.67: clear any lingering progress entry — the install row
+          // now drives the display.
+          const installProgress = { ...s.installProgress };
+          delete installProgress[moduleId];
+          return {
+            ...s,
+            installed: [...s.installed.filter((r) => r.module_id !== moduleId), row],
+            installingId: null,
+            installProgress,
+          };
+        });
         return row;
       } catch (e) {
-        update((s) => ({
-          ...s,
-          installingId: null,
-          error: e instanceof Error ? e.message : String(e),
-        }));
+        update((s) => {
+          const installProgress = { ...s.installProgress };
+          delete installProgress[moduleId];
+          return {
+            ...s,
+            installingId: null,
+            installProgress,
+            error: e instanceof Error ? e.message : String(e),
+          };
+        });
         throw e;
       }
     },

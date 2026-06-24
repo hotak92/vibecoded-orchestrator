@@ -1875,6 +1875,145 @@ pub async fn request_pull_token(
     request_pull_token_http(container, l0_pull_token_endpoint, &license_key, &machine_hash).await
 }
 
+// ─── Bounded authed pull — the SHARED pull chokepoint (v0.2.67) ────────
+
+/// Default upper bound on a single `<runtime> pull` of a module image.
+/// Without a bound, a stalled registry (network black hole, half-open
+/// TCP connection, a registry that accepts the connection but never
+/// streams layers) leaves the pull future pending forever — the
+/// install-path caller wedges the row at status='installing' and the
+/// start-path caller hangs the start RPC. The bound converts an
+/// indefinite stall into a timed-out `Err`.
+///
+/// 30 minutes is generous: large GPU-variant images can be multiple GB
+/// on a slow link. The bound catches a genuine stall, not a
+/// slow-but-progressing download. Override via `VCT_MODULE_PULL_TIMEOUT_SECS`.
+const MODULE_PULL_TIMEOUT_SECS_DEFAULT: u64 = 1800;
+
+/// Resolve the module-pull timeout, honouring the
+/// `VCT_MODULE_PULL_TIMEOUT_SECS` override when set to a positive
+/// integer. A malformed or zero value falls back to the default rather
+/// than disabling the bound (conservative default: never leave the pull
+/// unbounded because an env var was fat-fingered).
+///
+/// v0.2.67: promoted to core (was a private helper in
+/// `installer_engine.rs`, added v0.2.66). The install path's copy now
+/// delegates here so the install-path pull and start-path pull share ONE
+/// timeout definition — "mirror don't fork".
+pub fn module_pull_timeout() -> std::time::Duration {
+    let secs = std::env::var("VCT_MODULE_PULL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(MODULE_PULL_TIMEOUT_SECS_DEFAULT);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Outcome of a bounded `<runtime> pull` that ran to completion (the
+/// child exited; it did NOT time out or fail to spawn — those are the
+/// `Err` arm of [`bounded_authed_pull`]).
+///
+/// Carries the captured stderr so the install path can build its
+/// token-aware `format_pull_failure` message, and the start path can
+/// build its simpler error. The chokepoint deliberately does NOT format
+/// the error itself — error wording is a per-caller concern (install
+/// surfaces license-check context; start is a soft-fail log line).
+#[derive(Debug)]
+pub struct PullOutcome {
+    /// `true` iff the child exited 0.
+    pub success: bool,
+    /// Process exit code (`None` if terminated by signal).
+    pub exit_code: Option<i32>,
+    /// Captured stderr (active-drained — see why below). Bounded by the
+    /// child's own output; callers truncate for display.
+    pub stderr: Vec<u8>,
+}
+
+/// THE shared pull chokepoint. Both the install path
+/// (`installer_engine::container_pull`) and the start path
+/// ([`pre_pull_with_auth_for_start`]) route their `<runtime> pull`
+/// through here so the bounding + windowless + auth-application behaviour
+/// is authored ONCE.
+///
+/// Guarantees (the "mirror don't fork" contract that motivated the
+/// extraction — pre-v0.2.67 the start path had a bare `.status()` with
+/// no timeout and no `kill_on_drop`, orphaning the pull child on a stall):
+///
+///   * **Bounded**: wrapped in `tokio::time::timeout(module_pull_timeout(), …)`.
+///     On `Elapsed` returns a descriptive `Err` naming the timeout + the
+///     `VCT_MODULE_PULL_TIMEOUT_SECS` escape hatch.
+///   * **No orphan on timeout**: `kill_on_drop(true)` is LOAD-BEARING for
+///     the timeout — tokio's `Command` defaults `kill_on_drop = false`, so
+///     dropping the future on `Elapsed` would leave the `pull` child
+///     running, downloading layers nobody awaits. Setting it makes the
+///     dropped future SIGKILL the child.
+///   * **Windowless**: `.silent()` sets `CREATE_NO_WINDOW` on Windows so a
+///     GUI-subsystem parent (the launcher) doesn't flash a conhost window
+///     for the pull child. (This is why the Windows-flash track does NOT
+///     touch the pull sites — they are owned here.)
+///   * **Active drain**: `.output()` (not `.status()`) drains both stdio
+///     pipes in the background, so a multi-GB image's tens-of-KB of
+///     layer-progress stderr can't fill the 64KB OS pipe buffer and
+///     deadlock the child on write while the parent blocks on wait.
+///   * **Auth, unchanged**: when `auth` is `Some`, the guard's
+///     `apply_to(cmd, runtime)` injects `REGISTRY_AUTH_FILE` (podman) /
+///     `DOCKER_CONFIG` (docker). When `None`, the pull is anonymous — the
+///     INTENTIONAL fallback for public/free-tier images. This function
+///     does NOT decide whether to use auth; it applies what the caller
+///     resolved. Auth/anonymous-fallback SEMANTICS are unchanged.
+///
+/// stdout is `null` (layer-progress text isn't useful in error reports);
+/// stderr is `piped` and returned in [`PullOutcome::stderr`] so callers
+/// can extract the actionable last line (e.g. "Error: unauthorized").
+///
+/// Returns `Err` ONLY for spawn failure or timeout (both with a
+/// descriptive message). A non-zero exit is `Ok(PullOutcome { success:
+/// false, … })` — the caller inspects `.success` and builds its own
+/// error from `.stderr`.
+pub async fn bounded_authed_pull(
+    runtime: &str,
+    image_ref: &str,
+    auth: Option<&PerPullAuth>,
+) -> Result<PullOutcome, String> {
+    use crate::process::CommandExt as _;
+    use std::process::Stdio;
+
+    let mut pull_cmd = tokio::process::Command::new(runtime).silent();
+    if let Some(guard) = auth {
+        guard.apply_to(&mut pull_cmd, runtime);
+    }
+    // kill_on_drop is LOAD-BEARING for the timeout below (see fn docs).
+    pull_cmd.kill_on_drop(true);
+
+    let pull_timeout = module_pull_timeout();
+    let output = tokio::time::timeout(
+        pull_timeout,
+        pull_cmd
+            .args(["pull", image_ref])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "{} pull of {} timed out after {}s — the registry stalled \
+             (slow or unreachable). Retry, or set VCT_MODULE_PULL_TIMEOUT_SECS \
+             to allow a longer pull for unusually large images.",
+            runtime,
+            image_ref,
+            pull_timeout.as_secs(),
+        )
+    })?
+    .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
+
+    Ok(PullOutcome {
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stderr: output.stderr,
+    })
+}
+
 // ─── Pre-pull-with-auth (v0.2.49) ──────────────────────────────────────
 
 /// Pre-pull the variant-correct image with proper auth context BEFORE
@@ -1907,6 +2046,7 @@ pub async fn pre_pull_with_auth_for_start(
     runtime: &str,
     image_ref: &str,
 ) -> Result<(), String> {
+    use crate::process::CommandExt as _;
     use std::process::Stdio;
     use tokio::process::Command;
 
@@ -1917,7 +2057,11 @@ pub async fn pre_pull_with_auth_for_start(
         .ok_or_else(|| "install.container block missing".to_string())?;
 
     // Fast-path: image already in local cache → no pull needed.
+    // `.silent()` (v0.2.67): this cache-check is part of the pull path —
+    // suppress the Windows console flash here too, alongside the pull
+    // itself (which the shared chokepoint silences).
     let inspect = Command::new(runtime)
+        .silent()
         .args(["image", "exists", image_ref])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1955,24 +2099,29 @@ pub async fn pre_pull_with_auth_for_start(
         }
     };
 
-    let mut pull_cmd = Command::new(runtime);
-    if let Some(g) = guard_opt.as_ref() {
-        g.apply_to(&mut pull_cmd, runtime);
-    }
-    let pull_status = pull_cmd
-        .args(["pull", image_ref])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
-
-    if !pull_status.success() {
+    // v0.2.67: route through the shared `bounded_authed_pull` chokepoint
+    // so the start path gets the SAME bounding (`module_pull_timeout`),
+    // `kill_on_drop(true)` (no orphaned pull child on a stall), `.silent()`
+    // (no Windows console flash), and `.output()` active-drain that the
+    // install path got in v0.2.66. Pre-v0.2.67 this was a bare `.status()`
+    // with no timeout and no kill_on_drop — a "mirror don't fork"
+    // violation that orphaned the pull on a stalled registry.
+    let outcome = bounded_authed_pull(runtime, image_ref, guard_opt.as_ref()).await?;
+    if !outcome.success {
+        // Include the captured stderr tail so the soft-fail log line the
+        // caller emits is actionable (e.g. "Error: unauthorized"). The
+        // start path treats any non-zero pull as a soft failure and
+        // proceeds to `podman run`, which re-surfaces the cause if the
+        // image truly isn't in cache; we don't double-report.
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        let tail: String = stderr.trim().chars().rev().take(500).collect::<Vec<_>>()
+            .into_iter().rev().collect();
         return Err(format!(
-            "{} pull failed (exit {}) for {}",
+            "{} pull failed (exit {}) for {}{}",
             runtime,
-            pull_status.code().unwrap_or(-1),
-            image_ref
+            outcome.exit_code.unwrap_or(-1),
+            image_ref,
+            if tail.is_empty() { String::new() } else { format!(": {}", tail) },
         ));
     }
     Ok(())
@@ -3574,5 +3723,126 @@ mod tests {
             args,
         );
         assert!(args.iter().all(|a| !a.contains("{module_image}")));
+    }
+
+    // ─── v0.2.67: shared pull chokepoint (`bounded_authed_pull`) ─────────
+
+    /// `module_pull_timeout` honours a positive-integer
+    /// `VCT_MODULE_PULL_TIMEOUT_SECS`; a missing, malformed, or zero value
+    /// falls back to the default rather than disabling the bound
+    /// (conservative: never leave the pull unbounded because of a
+    /// fat-fingered env value). Canonical home of this behaviour after the
+    /// v0.2.67 extraction — the installer-engine copy now delegates here.
+    #[test]
+    fn module_pull_timeout_honours_env_override_and_rejects_garbage() {
+        use std::time::Duration;
+        let prev = std::env::var("VCT_MODULE_PULL_TIMEOUT_SECS").ok();
+
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "42");
+        assert_eq!(module_pull_timeout(), Duration::from_secs(42));
+
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "  7  ");
+        assert_eq!(module_pull_timeout(), Duration::from_secs(7));
+
+        // Zero → NOT honoured (would disable the bound). Falls back.
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "0");
+        assert_eq!(
+            module_pull_timeout(),
+            Duration::from_secs(MODULE_PULL_TIMEOUT_SECS_DEFAULT),
+            "zero must NOT disable the bound — conservative default",
+        );
+
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "not-a-number");
+        assert_eq!(
+            module_pull_timeout(),
+            Duration::from_secs(MODULE_PULL_TIMEOUT_SECS_DEFAULT),
+        );
+
+        std::env::remove_var("VCT_MODULE_PULL_TIMEOUT_SECS");
+        assert_eq!(
+            module_pull_timeout(),
+            Duration::from_secs(MODULE_PULL_TIMEOUT_SECS_DEFAULT),
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", v),
+            None => std::env::remove_var("VCT_MODULE_PULL_TIMEOUT_SECS"),
+        }
+    }
+
+    /// LIVE proof that the shared chokepoint bounds a stalled pull and
+    /// SIGKILLs the child (no orphan) on Elapsed. We point it at a
+    /// `/bin/sh` shim that ignores its argv and sleeps far past a 1s
+    /// bound — exactly what a registry that accepts the TCP connection but
+    /// never streams layers looks like. The START path
+    /// (`pre_pull_with_auth_for_start`) and the INSTALL path
+    /// (`installer_engine::container_pull`) both route through THIS
+    /// function, so this test pins the bounding behaviour for both.
+    ///
+    /// Gated `#[cfg(unix)]` (the shim is a shell script) — same convention
+    /// as the launcher's pipe-buffer-deadlock regression test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_authed_pull_times_out_and_does_not_hang() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shim = dir.path().join("stalled-runtime");
+        {
+            let mut f = std::fs::File::create(&shim).expect("create shim");
+            writeln!(f, "#!/bin/sh\nexec sleep 3600").expect("write shim");
+            let mut perms = f.metadata().expect("meta").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).expect("chmod shim");
+        }
+
+        let prev = std::env::var("VCT_MODULE_PULL_TIMEOUT_SECS").ok();
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "1");
+
+        let image_ref = "ghcr.io/test/stalled:0.0.1";
+        let started = std::time::Instant::now();
+        let result = bounded_authed_pull(shim.to_str().unwrap(), image_ref, None).await;
+
+        match prev {
+            Some(v) => std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", v),
+            None => std::env::remove_var("VCT_MODULE_PULL_TIMEOUT_SECS"),
+        }
+
+        let err = result.expect_err("a stalled pull must resolve to Err, never hang");
+        assert!(err.contains("timed out"), "actionable timeout Err: {}", err);
+        assert!(
+            err.contains("VCT_MODULE_PULL_TIMEOUT_SECS"),
+            "Err points at the override env var: {}",
+            err,
+        );
+        assert!(err.contains(image_ref), "Err names the image: {}", err);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the 1s bound must have fired (elapsed {:?})",
+            started.elapsed(),
+        );
+    }
+
+    /// A pull that runs to completion with a non-zero exit returns
+    /// `Ok(PullOutcome { success: false, .. })` carrying the captured
+    /// stderr — NOT an `Err`. Error WORDING is the caller's concern; the
+    /// chokepoint only reports the outcome. Uses `/bin/sh` as the
+    /// "runtime": `sh pull <image>` fails fast (sh can't open a file named
+    /// `pull`) and writes to stderr, so we exercise the non-zero-exit arm
+    /// without a registry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bounded_authed_pull_nonzero_exit_is_ok_outcome_with_stderr() {
+        let result = bounded_authed_pull("/bin/sh", "ghcr.io/test/x:0.0.1", None).await;
+        let outcome = result.expect("a completed (non-stalled) pull is Ok, even on non-zero exit");
+        assert!(!outcome.success, "sh pull <image> must exit non-zero");
+        // stderr was captured (not discarded) so callers can build an
+        // actionable error. /bin/sh emits *something* to stderr here.
+        assert!(
+            !outcome.stderr.is_empty(),
+            "non-zero pull must surface captured stderr for the caller",
+        );
     }
 }
