@@ -73,6 +73,7 @@ use crate::commands::module_catalog_client::{
 use crate::commands::modules::update_module_for_project;
 use crate::db::models::ModuleInstallRow;
 use crate::db::Db;
+use vct_launcher_core::process::CommandExt as _;
 
 // ─── Constants ──────────────────────────────────────────────────────────
 
@@ -586,6 +587,7 @@ fn write_partial_failure_deferral(
          report.write(folder)\n",
     );
     let status = std::process::Command::new(py)
+        .silent()
         .arg("-c")
         .arg(script)
         .status();
@@ -605,6 +607,7 @@ fn write_partial_failure_deferral(
 fn pick_python() -> Option<PathBuf> {
     for candidate in ["python3", "python"] {
         let probe = std::process::Command::new(candidate)
+            .silent()
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

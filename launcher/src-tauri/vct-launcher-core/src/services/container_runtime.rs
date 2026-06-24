@@ -1271,10 +1271,12 @@ where
     F: Fn(&str) -> Option<String>,
     G: Fn(&str) -> bool,
 {
+    use crate::process::CommandExt as _;
     use std::process::Stdio;
     use tokio::process::Command;
 
     let ps_output = match Command::new(runtime)
+        .silent()
         .args(["ps", "-a", "--format", "json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1355,6 +1357,7 @@ where
         }
 
         let rm_status = Command::new(runtime)
+            .silent()
             .args(["rm", "-f", &snap.name])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
