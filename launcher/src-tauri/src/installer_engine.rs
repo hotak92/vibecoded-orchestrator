@@ -19,6 +19,39 @@ use tokio::process::Command;
 use crate::manifest::{CommandSpec, InstallMethod, ModuleManifest, PlaceholderCtx};
 use vct_launcher_core::process::CommandExt as _;
 
+/// Upper bound on a single `podman pull` / `docker pull` of a module
+/// image. Without this bound, a stalled registry (network black hole,
+/// half-open TCP connection, a registry that accepts the connection but
+/// never streams layers) leaves the pull future pending forever. The
+/// caller (`install_module_for_project`) awaits `run_install` and only
+/// transitions the install row to `Installed`/`Error` on Ok/Err — a
+/// future that never resolves wedges the row at status='installing' with
+/// `last_started_at=NULL, last_error=NULL` (silent failure, no recovery
+/// path short of a DB edit). Bounding the pull converts an indefinite
+/// stall into a timed-out `Err`, which the caller's existing Err arm
+/// turns into status='error' + a descriptive `last_error`.
+///
+/// 30 minutes is generous: large GPU-variant images can be multiple GB on
+/// a slow link. The bound exists to catch a genuine stall, not to race a
+/// slow-but-progressing download. Override via the `VCT_MODULE_PULL_TIMEOUT_SECS`
+/// env var (e.g. when a publisher ships an unusually large image, or for
+/// CI where a fault-injection test wants a tiny timeout).
+const MODULE_PULL_TIMEOUT_SECS_DEFAULT: u64 = 1800;
+
+/// Resolve the module-pull timeout, honouring the
+/// `VCT_MODULE_PULL_TIMEOUT_SECS` override when set to a positive
+/// integer. A malformed or zero value falls back to the default rather
+/// than disabling the bound (conservative default: never leave the pull
+/// unbounded just because an env var was fat-fingered).
+fn module_pull_timeout() -> Duration {
+    let secs = std::env::var("VCT_MODULE_PULL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(MODULE_PULL_TIMEOUT_SECS_DEFAULT);
+    Duration::from_secs(secs)
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InstallStage {
@@ -806,13 +839,46 @@ async fn container_pull(
     if let Some(guard) = authfile_guard.as_ref() {
         guard.apply_to(&mut pull_cmd, &runtime);
     }
-    let pull_output = pull_cmd
-        .args(["pull", &image_ref])
-        .stdout(Stdio::null())   // layer-progress text isn't useful in errors
-        .stderr(Stdio::piped())  // capture for error message
-        .output()                // active drain — no deadlock
-        .await
-        .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
+    // kill_on_drop is LOAD-BEARING for the timeout below. tokio's
+    // `Command` defaults `kill_on_drop = false`: when the
+    // `tokio::time::timeout` fires and drops the `.output()` future, the
+    // OS-level `podman/docker pull` child is NOT signalled by default — it
+    // keeps running, orphaned, downloading layers nobody is waiting for.
+    // Setting `kill_on_drop(true)` makes the dropped future send SIGKILL to
+    // the child, so an Elapsed timeout actually terminates the stalled
+    // pull. This mirrors the install.py child at
+    // `commands/installer.rs` (which sets kill_on_drop for the same
+    // reason).
+    pull_cmd.kill_on_drop(true);
+    // Bound the pull so a stalled registry can't leave the install row
+    // wedged at status='installing' forever (see
+    // MODULE_PULL_TIMEOUT_SECS_DEFAULT docs). On timeout we return a
+    // descriptive Err; the caller's existing Err arm flips the row to
+    // status='error' with this message as last_error. Because
+    // `pull_cmd.kill_on_drop(true)` is set above, dropping the future on
+    // Elapsed terminates the spawned `pull` process (no orphan).
+    let pull_timeout = module_pull_timeout();
+    let pull_output = tokio::time::timeout(
+        pull_timeout,
+        pull_cmd
+            .args(["pull", &image_ref])
+            .stdout(Stdio::null())   // layer-progress text isn't useful in errors
+            .stderr(Stdio::piped())  // capture for error message
+            .output(),               // active drain — no deadlock
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "{} pull of {} timed out after {}s — the registry stalled \
+             (slow or unreachable). The install was marked as error; \
+             retry, or set VCT_MODULE_PULL_TIMEOUT_SECS to allow a \
+             longer pull for unusually large images.",
+            runtime,
+            image_ref,
+            pull_timeout.as_secs(),
+        )
+    })?
+    .map_err(|e| format!("spawn {} pull: {}", runtime, e))?;
 
     // No explicit logout — `authfile_guard` drops at end-of-scope, taking
     // the temp file with it. No global auth.json mutation to undo.
@@ -4434,5 +4500,117 @@ mod tests {
         assert!(msg.contains("Error: bad auth"), "tail must surface actionable error: {}", msg);
         // Bounded.
         assert!(msg.len() < 2500, "msg should be 2KB-bounded: len={}", msg.len());
+    }
+
+    // ─── Module-pull timeout (bug-class: stall-wedges-installing) ─────────
+    //
+    // A stalled `podman pull` used to leave the pull future pending
+    // forever → the caller's await never resolved → the install row was
+    // stuck at status='installing' with last_error=NULL (silent failure).
+    // `container_pull` now bounds the pull via
+    // `tokio::time::timeout(module_pull_timeout(), ...)`; on Elapsed it
+    // returns a descriptive Err, which `install_module_for_project`'s
+    // existing Err arm turns into status='error' + last_error.
+    //
+    // These tests serialize on the same env var, so we save/restore it
+    // and run them on a single-threaded mutex-free contract: each sets,
+    // asserts, then restores before the next read.
+
+    /// The override env var is honoured for positive integers; a missing,
+    /// malformed, or zero value falls back to the default (conservative:
+    /// never unbound the pull because of a fat-fingered env value).
+    #[test]
+    fn module_pull_timeout_honours_env_override_and_rejects_garbage() {
+        let prev = std::env::var("VCT_MODULE_PULL_TIMEOUT_SECS").ok();
+
+        // Positive integer → honoured.
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "42");
+        assert_eq!(module_pull_timeout(), Duration::from_secs(42));
+
+        // Whitespace-padded positive integer → trimmed + honoured.
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "  7  ");
+        assert_eq!(module_pull_timeout(), Duration::from_secs(7));
+
+        // Zero → NOT honoured (would disable the bound). Falls back.
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "0");
+        assert_eq!(
+            module_pull_timeout(),
+            Duration::from_secs(MODULE_PULL_TIMEOUT_SECS_DEFAULT),
+            "zero must NOT disable the bound — conservative default",
+        );
+
+        // Garbage → falls back to default.
+        std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", "not-a-number");
+        assert_eq!(
+            module_pull_timeout(),
+            Duration::from_secs(MODULE_PULL_TIMEOUT_SECS_DEFAULT),
+        );
+
+        // Unset → default.
+        std::env::remove_var("VCT_MODULE_PULL_TIMEOUT_SECS");
+        assert_eq!(
+            module_pull_timeout(),
+            Duration::from_secs(MODULE_PULL_TIMEOUT_SECS_DEFAULT),
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("VCT_MODULE_PULL_TIMEOUT_SECS", v),
+            None => std::env::remove_var("VCT_MODULE_PULL_TIMEOUT_SECS"),
+        }
+    }
+
+    /// A pull that outlives the bound resolves to the timeout `Err`
+    /// (Elapsed) carrying the actionable message — NOT a never-resolving
+    /// future. This is the exact branch that converts an indefinite stall
+    /// into the status='error' transition. We model the stalled pull with
+    /// a future that sleeps longer than a tiny bound (the production code
+    /// wraps `pull_cmd.output()` identically; the timeout wrapper's
+    /// behaviour is independent of what the inner future is).
+    #[tokio::test]
+    async fn stalled_pull_times_out_with_actionable_error_not_hang() {
+        let runtime = "podman";
+        let image_ref = "ghcr.io/test/stalled:0.0.1";
+        let pull_timeout = Duration::from_millis(50);
+
+        // Inner future never completes within the bound — mirrors a
+        // registry that accepts the connection but never streams layers.
+        let stalled = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            // unreachable within the bound; satisfies the timeout
+            // signature with an io::Result-shaped value.
+            Ok::<(), std::io::Error>(())
+        };
+
+        let result: Result<(), String> = tokio::time::timeout(pull_timeout, stalled)
+            .await
+            .map_err(|_| {
+                format!(
+                    "{} pull of {} timed out after {}s — the registry stalled \
+                     (slow or unreachable). The install was marked as error; \
+                     retry, or set VCT_MODULE_PULL_TIMEOUT_SECS to allow a \
+                     longer pull for unusually large images.",
+                    runtime,
+                    image_ref,
+                    pull_timeout.as_secs(),
+                )
+            })
+            .and_then(|inner| inner.map_err(|e| format!("spawn {} pull: {}", runtime, e)));
+
+        let err = result.expect_err("a stalled pull must resolve to Err, never hang");
+        assert!(
+            err.contains("timed out"),
+            "timeout Err must be actionable (contains 'timed out'): {}",
+            err,
+        );
+        assert!(
+            err.contains("VCT_MODULE_PULL_TIMEOUT_SECS"),
+            "timeout Err must point the user at the override env var: {}",
+            err,
+        );
+        assert!(
+            err.contains(image_ref),
+            "timeout Err must name the image so the user knows what stalled: {}",
+            err,
+        );
     }
 }

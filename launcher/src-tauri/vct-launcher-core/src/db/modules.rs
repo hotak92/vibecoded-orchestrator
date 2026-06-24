@@ -806,6 +806,48 @@ impl Db {
         }
         Ok(())
     }
+
+    /// v0.2.66: flip BOTH `status` and `last_error` of a single
+    /// module_install row in one atomic UPDATE, keyed by primary key.
+    ///
+    /// Keying by `id` (not `(project_id, module_id)`) means this works
+    /// uniformly for per-project AND global rows (global rows have
+    /// `project_id IS NULL`, so the by-(project,module) setters can't
+    /// target them). Used by the startup reconciler's wedged-`installing`
+    /// auto-heal: a row stranded at `status='installing'` from a prior
+    /// interrupted install is flipped to `status='error'` with an
+    /// actionable `last_error` so it (a) stops rendering a forever-spinner
+    /// and (b) becomes eligible for the existing
+    /// `retry_failed_module_installs` predicate (`status IN
+    /// ('error','broken')`).
+    ///
+    /// Atomic: status + last_error move together, so a row can never be
+    /// observed at `status='error'` with the stale NULL `last_error` that
+    /// made the original wedge a silent failure.
+    ///
+    /// Caller is responsible for a CHECK-valid `status`. Pass `None` for
+    /// `error` to clear `last_error` alongside the status flip.
+    pub fn set_module_install_status_with_error(
+        &self,
+        install_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let guard = self.lock();
+        let n = guard
+            .execute(
+                "UPDATE module_installs SET status = ?1, last_error = ?2 WHERE id = ?3",
+                params![status, error, install_id],
+            )
+            .map_err(|e| format!("set_module_install_status_with_error: {}", e))?;
+        if n == 0 {
+            return Err(format!(
+                "module_install not found for id={}",
+                install_id
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ─── v0.2.34: insert_module_install UPSERT regression tests ────────
