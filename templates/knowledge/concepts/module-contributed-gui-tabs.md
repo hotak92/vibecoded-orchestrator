@@ -3,7 +3,7 @@ title: Module-Contributed GUI Tabs Framework
 type: concept
 tags: [mid-level-architecture, VCT-Launcher, manifest, gui, svelte, paid-modules, extensibility, schema-rendered-ui, declarative-dispatcher, implemented]
 created: 2026-05-19T20:00:00Z
-updated: 2026-05-22T18:00:00Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-05-19T00:00:00Z
 valid_until: null
 status: active
@@ -31,7 +31,7 @@ Three options were considered:
 
 Cons: limited to the widget palette the launcher provides. Acceptable for v1 (5 kinds cover all RL controls; new kinds added as future modules need them).
 
-## Schema (Rust side, `launcher/src-tauri/src/manifest.rs`)
+## Schema (Rust side, `launcher/src-tauri/vct-launcher-core/src/manifest.rs`)
 
 ```rust
 pub struct GuiBlock {
@@ -68,7 +68,7 @@ Every interactive variant carries `tooltip: Option<String>`. Hover help is the f
 
 ## Renderer (`launcher/src/lib/components/ModuleConfigTab.svelte`)
 
-Single Svelte 5 component, 676 LOC. Dispatches on `control.kind`:
+Single Svelte 5 component dispatching on `control.kind` (grown alongside the five v0.2.26 control kinds and the declarative-dispatch wiring):
 
 - **checkbox**: `<input type=checkbox>` bound to `$state`. On change, calls generic `set_module_setting` Tauri command, THEN calls `control.on_change` Tauri command if set. Persist-before-side-effect ordering matters: the side-effect handler can read fresh state from the DB.
 - **multi_select**: on mount, calls `control.options_source` (Tauri command returning `Vec<SelectOption>`). Renders checkboxes. Bonus convention: selected values are passed as `projectIds` arg to button actions in the same section — saves the manifest from needing explicit "bind multi_select X to button Y" annotations.
@@ -95,7 +95,7 @@ Per-project values are the norm (RL flags like `rl_use_global` are per-project).
 
 ## Tradeoffs
 
-- **Five control kinds is intentionally narrow**. Adding a new kind requires extending both the Rust enum AND the Svelte dispatch. This friction is wanted: each new kind is a launcher-API contract that ships forever.
+- **The control-kind palette is intentionally narrow**. Adding a new kind requires extending both the Rust enum AND the Svelte dispatch. This friction is wanted: each new kind is a launcher-API contract that ships forever.
 - **No dynamic schema updates** — the manifest is read at launcher startup. Module authors who change `config_tab` must bump module version + reinstall.
 - **No client-side validation beyond Pydantic-level types** — `on_change` Tauri commands carry the validation burden.
 
@@ -580,7 +580,7 @@ A launcher rebuild is ONLY needed when:
 
 ## Tradeoffs
 
-- **Five control kinds is intentionally narrow**. Adding a new kind requires extending both the Rust enum AND the Svelte dispatch. This friction is wanted: each new kind is a launcher-API contract that ships forever.
+- **The control-kind palette is intentionally narrow**. Adding a new kind requires extending both the Rust enum AND the Svelte dispatch. This friction is wanted: each new kind is a launcher-API contract that ships forever.
 - **No dynamic schema updates** — the manifest is read at launcher startup. Module authors who change `config_tab` must bump module version + reinstall.
 - **No client-side validation beyond Pydantic-level types** — `on_change` Tauri commands carry the validation burden.
 - **Tauri commands are launcher-side** — adding new commands DOES require a launcher build + ship. The schema-rendered approach minimizes this surface (most config_tab tweaks reuse existing commands) but doesn't eliminate it.

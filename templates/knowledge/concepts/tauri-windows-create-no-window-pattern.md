@@ -3,7 +3,7 @@ title: Tauri Windows CREATE_NO_WINDOW subprocess pattern
 type: concept
 tags: [tauri, windows, rust, subprocess, GUI, console-flash, fork-bomb, windows_subsystem, low-level-implementation]
 created: 2026-05-26T15:00:00Z
-updated: 2026-05-26T15:00:00Z
+updated: 2026-06-25T15:00:00Z
 valid_from: 2026-05-26T00:00:00Z
 valid_until: null
 status: active
@@ -97,6 +97,10 @@ Script Python regex-based per rolling out su codebase grande:
 
 Pattern: uno script di sweep applicato in un singolo run, idempotente per future audit. Esempio reale di order-of-magnitude: codebase Tauri di taglia media-grande, ~200 call sites bonificati in un singolo run.
 
+## Gate CI strutturale (anti-regressione)
+
+Un test strutturale (`launcher/src-tauri/tests/command_silent_gate.rs`) scansiona i sorgenti del launcher + core + hub e FALLISCE, nominando ogni `file:line` colpevole, quando un `Command::new` di produzione manca di un marker di silenziamento (`.silent()`, `creation_flags(0x08000000)`, ecc.). Necessario perché i call site aggiunti DOPO lo sweep iniziale tendono a dimenticare `.silent()` (reaper container, writer dei deferral, probe git del codegraph). Il gate rende impossibile mergiare un "ho dimenticato `.silent()`". Eccezioni ammesse: spawn deliberatamente con console visibile (installer), processi detached, o spawn OS-specifici che non girano mai su Windows.
+
 ## Verifica visiva del fix
 
 EnumWindows snapshot via PowerShell `Add-Type` di Win32 API:
@@ -133,3 +137,4 @@ Il fix usa la versione centralizzata con trait `silent()`.
 - Microsoft docs: https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags (CREATE_NO_WINDOW = 0x08000000)
 - std::os::windows::process::CommandExt: https://doc.rust-lang.org/std/os/windows/process/trait.CommandExt.html
 - VibeCoded Orchestrator launcher: `vct-launcher-core/src/process.rs` (trait).
+- Gate CI: `launcher/src-tauri/tests/command_silent_gate.rs` (scansione strutturale anti-regressione).

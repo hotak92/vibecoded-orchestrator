@@ -3,7 +3,7 @@ title: KG-Summary Three-Tier Generation Pipeline
 type: concept
 tags: [orchestrator, kg, hooks, ollama, claude-code, summarization, low-level-implementation, cross-platform]
 created: 2026-04-27T05:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -29,22 +29,21 @@ Forced via env: `KG_SUMMARY_BACKEND=cli|ollama|api|skip`.
 
 Override via `KG_SUMMARY_OLLAMA_OPTIONS='{...}'`. Default model `qwen3.5:9b` (16GB+ VRAM); for low-VRAM/CPU use `gemma4:e4b` (~4.5B effective params).
 
-## Frontmatter contract
+## Title resolution
 
-A separate `PreToolUse` hook (`pre-write-kg-frontmatter-validate.sh`) BLOCKS writes to `knowledge/**/*.md` if any of these required fields are missing: `title`, `type`, `tags`, `created`, `updated`, `status`. Rationale: the summary generator (and graph integrity in general) depend on these. Body-H1 fallback was rejected as a [[implements::silent-fallback-anti-pattern]] — force correctness at write-time.
+The generator extracts the node title from the YAML frontmatter `title:` field. When the frontmatter omits a title (or the file has no frontmatter block at all), it falls back to the body H1 (`# Heading`) so a malformed node still gets a summary rather than being skipped. Nodes that resolve to no title at all are skipped with a log line. Well-formed nodes carry the standard frontmatter (`title`, `type`, `tags`, `created`, `updated`, `status`) which the rest of the graph-integrity tooling relies on.
 
 ## Files
 
 - `templates/scripts/generate-kg-summary.py` — generator with three-tier dispatch (canonical; rendered into `<project>/.claude/scripts/` at install time)
-- `templates/hooks/kg-summary-generator.sh` — PostToolUse hook source (rendered into `<project>/.claude/hooks/` at install time, background, debounced 60s)
-- `templates/hooks/pre-write-kg-frontmatter-validate.sh` — PreToolUse blocker source
+- `templates/hooks/kg-summary-generator.sh` — PostToolUse hook source (rendered into `<project>/.claude/hooks/` at install time, background, debounced)
 - `knowledge/.node_formats.json` — output destination (per-project)
 
 ## Failure modes (recurring)
 
 - **30s timeout too short** for large nodes (~9k chars body) → bumped to 180s; hook timeout 5s→10s. Hook is `nohup` background so per-call timeout doesn't gate the user.
 - **Race condition** when 4-way parallel generators wrote to the same JSON file → last-writer-wins, only a fraction of saves persisted. Fix: sequential `xargs -P 1` for backfill batches; runtime hook is single-call so unaffected.
-- **Skipped nodes missing title** → resolved upstream by frontmatter pre-write hook.
+- **Skipped nodes missing title** → the generator falls back to the body H1 before skipping, so only nodes with neither a frontmatter title nor an H1 are skipped.
 
 ## Cross-platform footguns
 
