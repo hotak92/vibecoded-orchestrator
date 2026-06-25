@@ -397,7 +397,7 @@ echo "[build-bundled] Staged hub: $HUB_DEST"
 echo "[build-bundled] Hub metadata: ${HUB_DEST}.metadata.json"
 echo "[build-bundled] Hub binary size: $(du -h "$HUB_DEST" | cut -f1)"
 
-# v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): build + stage vct-updater.
+# v0.2.52 V52-AH (Windows binary-lock bug, 2026-06-09): build + stage vct-updater.
 #
 # vct-updater is the stage1 helper that performs the Windows binary
 # swap after the running launcher exits. The binary itself is

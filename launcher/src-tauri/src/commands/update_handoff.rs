@@ -1,4 +1,4 @@
-// v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): Windows binary lock fix.
+// v0.2.52 V52-AH (Windows binary-lock bug, 2026-06-09): Windows binary lock fix.
 //
 // Background
 // ----------
@@ -12,7 +12,7 @@
 // the same old bytes for both pre-rename and post-pull when the
 // pull-side overwrite is silently skipped due to the lock.
 //
-// Symptom Fabio reported: the "Restart" banner relaunches the SAME
+// Symptom reported: the "Restart" banner relaunches the SAME
 // stale binary repeatedly → infinite loop.
 //
 // This module is the launcher-side half of the stage1 updater pattern.

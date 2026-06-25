@@ -33,8 +33,8 @@ interface UIState {
   //
   // NAMING NOTE (Agent L1, 2026-05-30): the flag is named
   // `showLicenseManager` — NOT `showLicense`, `showModal`,
-  // `showKeyManager` or any short variant. Pre-push collision audit A3
-  // (`.claude/context/reviews/v0240-pre-push-2026-05-30/discovery-A3-fabio-branch-collision-audit.md`)
+  // `showKeyManager` or any short variant. The v0.2.40 pre-push store-flag
+  // collision audit A3
   // identified that another contributor's parallel branch (orchestrator-update-progress
   // modal) is likely to add `showOrchestratorUpdateProgress` to this
   // same UIState interface in a future PR. The `showLicenseManager`

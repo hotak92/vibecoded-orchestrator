@@ -11059,8 +11059,8 @@ def _subprocess_env_with_embedding(base_env: "dict[str, str] | None" = None) -> 
     Same rule applied to ``EMBEDDING_MODEL`` (derived via
     :func:`_model_id_for_active`).
 
-    This is the WHOLE fix for Fabio's Windows + CPU stuck-at-40% bug
-    (msg 267, 2026-06-09): the install.py subprocess inherited a
+    This is the WHOLE fix for the Windows + CPU-only stuck-at-40% install
+    bug (reported 2026-06-09): the install.py subprocess inherited a
     bare ``os.environ.copy()`` that did not carry the launcher's
     ``arctic`` preference, so ``EmbeddingService.for_project()`` in
     the subprocess defaulted to qwen3 and ground for hours. With this
@@ -16232,7 +16232,7 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
         # would silently fall back to qwen3 (the hard-coded default). On
         # Windows + CPU + 24 GB RAM with the launcher having stored
         # active=arctic, that fallback meant ~30 s per chunk and the user
-        # stuck at 40-50% for hours (Fabio's msg 267, 2026-06-09).
+        # stuck at 40-50% for hours (reported 2026-06-09).
         try:
             subprocess.run(
                 [str(venv_py), str(sync_kg)] + cmd_args,
@@ -20545,7 +20545,7 @@ def _try_invoke_windows_stage1_updater(
     *,
     launcher_pid: Optional[int],
 ) -> Optional[Path]:
-    """v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): CLI parity for the
+    """v0.2.52 V52-AH (Windows binary-lock bug, 2026-06-09): CLI parity for the
     Windows stage1 updater handoff.
 
     When the user runs ``python install.py --update`` from a terminal
@@ -21322,7 +21322,7 @@ def _refresh_dist_binary_after_rebuild(
                     f"to {backup_path}, new binary written to {dist_path}",
                 )
             except OSError as rename_exc:
-                # v0.2.52 V52-AH (Fabio bug 1): both direct overwrite
+                # v0.2.52 V52-AH (Windows binary-lock bug): both direct overwrite
                 # AND rename failed. Before giving up with the
                 # `launcher_binary_swap_failed_locked` deferral, try
                 # staging the new binary at `<dist_path>.new` so the

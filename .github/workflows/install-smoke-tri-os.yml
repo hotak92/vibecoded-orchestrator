@@ -2,7 +2,7 @@
 #
 # Exercises the third-party-user experience end-to-end on every supported
 # operating system. Performs a fresh `git clone` (NOT actions/checkout) so
-# the smoke walks the same code path Luciano hit on his macOS install:
+# the smoke walks the same code path the macOS fresh-clone report hit:
 # `git clone && ./first-install.command`. The earlier `installer-smoke.yml`
 # only covered the `install.py` Python entry point with a shallow Linux
 # probe — it was structurally incapable of catching:

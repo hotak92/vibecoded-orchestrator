@@ -63,8 +63,8 @@
 ### 1.3 Success criteria
 
 A v0.2.53 release that ships v2 is successful when:
-- Luciano's failure scenario (the macOS user who triggered the 13-audit dispatch) can `git clone && ./first-install.command` and reach a working launcher without hand-edits.
-- Fabio's `VibeCodedOrchestrator_Development` WRITE case-mismatch (FAB-2) no longer fires.
+- The macOS fresh-clone failure scenario (the report that triggered the 13-audit dispatch) can `git clone && ./first-install.command` and reach a working launcher without hand-edits.
+- The `VibeCodedOrchestrator_Development` WRITE case-mismatch (FAB-2) no longer fires.
 - Tri-OS CI smoke is green on every PR + push to main.
 - Every Tier-1 extract has a parity/regression test demonstrating no behavioural change.
 - Phase 3 audit AUDIT-5 confirms `_run_logged_subprocess` extracted-vs-inline output is byte-identical for the happy path.
@@ -1246,7 +1246,7 @@ Implementation: `gh run list --workflow=install-smoke-tri-os.yml --branch=main -
 
 ### 9.6 Why fresh `git clone` (not `actions/checkout`)
 
-`actions/checkout` does shallow clone, sets up auth, and does NOT exercise the experience a third-party user gets when they `git clone` from the public repo. The fresh-clone step ensures the CI exercises the same code path Luciano hit (and failed at).
+`actions/checkout` does shallow clone, sets up auth, and does NOT exercise the experience a third-party user gets when they `git clone` from the public repo. The fresh-clone step ensures the CI exercises the same code path the macOS fresh-clone report hit (and failed at).
 
 ---
 
@@ -1412,7 +1412,7 @@ Track G (design doc — this doc)
 │           │          │  Svelte)│         │  CVEs)    │
 ├───────────┴──────────┴─────────┴─────────┴───────────┤
 │ Track F   │ Track G2 │ Track G3│ Track H │           │
-│ (Fabio+   │ (Linux   │ (Linux  │ (Win)   │           │
+│ (case+    │ (Linux   │ (Linux  │ (Win)   │           │
 │  bundle)  │  distro) │  GPU)   │         │           │
 └───────────────────────────────────────────────────────┘
 ```
@@ -1521,7 +1521,7 @@ What we explicitly DO NOT do in v0.2.53. The user said "no rush" — these are d
 | `macos-launcher-ux-audit` | (varies) | §2.1.3 |
 | `macos-release-ci-audit` | 336 | §9 |
 | `cross-os-triage` | 454 | §2.2, §6 |
-| `fabio-v0252-rootcause` | 707 | §6 (NEW-2) |
+| `v0252-case-mismatch-rootcause` | 707 | §6 (NEW-2) |
 | `install-py-dedup` | 620 | §5.1 (DEDUP-1 through DEDUP-5) |
 | `install-family-crossfile-dedup` | 203 | §2.1, §10.1 |
 | `shell-scripts-dedup` | 493 | §2.1.1, §4, §5.2 (DEDUP-15) |
@@ -1543,7 +1543,7 @@ What we explicitly DO NOT do in v0.2.53. The user said "no rush" — these are d
 | §1C (Tier-1 LOW-risk dedup) | §5.1 |
 | §1D (Tier-2 MEDIUM-risk dedup) | §5.2 |
 | §1E (carry-overs) | §6 ownership table (V52-* and DC-* and D* rows) |
-| §1F (Fabio's bugs) | §6 ownership table (Track F rows) |
+| §1F (case-mismatch + binary-lock bugs) | §6 ownership table (Track F rows) |
 | §2 (Phase scoping) | §12 |
 | §4 (v0.2.54 preview) | §3, §7, §8, §13 |
 | §5 (Process improvements) | §9, §10 |

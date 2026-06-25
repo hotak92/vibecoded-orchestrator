@@ -727,8 +727,8 @@ async fn project_config(
     // probe is fail-open: if Weaviate is unreachable / responds with
     // garbage, the candidate name is echoed back unchanged.
     //
-    // Reference: `.claude/context/audits/fabio-v0252-rootcause-2026-06-10.md`
-    // Symptom B for the full root-cause walk.
+    // Reference: the v0.2.52 root-cause audit (Symptom B) for the full
+    // root-cause walk.
     let local_cfg_for_probe = LocalConfig::load();
     let probe_weaviate_url = local_cfg_for_probe.weaviate_url.clone();
 
@@ -756,7 +756,8 @@ async fn project_config(
     //
     // NEW-2 (v0.2.53) — the suffix-swap candidate is then rebound to
     // on-disk casing via `resolve_existing_casing_for_class`. The
-    // rebind is the load-bearing fix for Fabio's Symptom B.
+    // rebind is the load-bearing fix for the dev-collection case-mismatch
+    // symptom (Symptom B).
     let development_candidate = if kg_collection.ends_with("_KnowledgeGraph") {
         let basename = &kg_collection[..kg_collection.len() - "_KnowledgeGraph".len()];
         format!("{}_Development", basename)
@@ -3095,8 +3096,7 @@ kg_tier_full = 0.8
     // ──────────────────────────────────────────────────────────────────
     // NEW-2 (v0.2.53) — case-rebind integration tests.
     //
-    // Reference: `.claude/context/audits/fabio-v0252-rootcause-2026-06-10.md`
-    // Symptom B.
+    // Reference: the v0.2.52 root-cause audit (Symptom B).
     //
     // These tests spin up a fake Weaviate alongside the hub and assert
     // the hub's resolver adopts the on-disk casing of case-different
@@ -3143,12 +3143,12 @@ kg_tier_full = 0.8
     /// NEW-2 — when Weaviate has a case-different sibling of the
     /// suffix-swap-derived development_collection name, the hub returns
     /// the on-disk casing rather than the canonical-capitalisation
-    /// candidate. Reproduces Fabio's Symptom B fix.
+    /// candidate. Reproduces the dev-collection case-mismatch (Symptom B) fix.
     #[tokio::test]
     async fn dev_collection_case_rebind_adopts_on_disk_casing() {
         crate::weaviate_schema_probe::_reset_cache_for_test();
 
-        // Fake Weaviate: lowercase-c on-disk class (Fabio's case).
+        // Fake Weaviate: lowercase-c on-disk class (the case-mismatch case).
         let (weaviate_url, _w) = spawn_fake_weaviate(vec![
             "Vibecodedorchestrator_KnowledgeGraph".to_string(),
             "Vibecodedorchestrator_Development".to_string(),
@@ -3205,12 +3205,12 @@ kg_tier_full = 0.8
         assert_eq!(
             body.get("kg_collection").and_then(|v| v.as_str()),
             Some("Vibecodedorchestrator_KnowledgeGraph"),
-            "kg_collection must adopt on-disk casing (Fabio's Symptom B)"
+            "kg_collection must adopt on-disk casing (Symptom B)"
         );
         assert_eq!(
             body.get("development_collection").and_then(|v| v.as_str()),
             Some("Vibecodedorchestrator_Development"),
-            "development_collection must adopt on-disk casing — the load-bearing assertion for Fabio's bug"
+            "development_collection must adopt on-disk casing — the load-bearing assertion for the case-mismatch bug"
         );
         assert_eq!(
             body.get("diagrams_collection").and_then(|v| v.as_str()),

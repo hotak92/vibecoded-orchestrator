@@ -3751,7 +3751,7 @@ fn pre_pull_rename_running_binary(_install_path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): post-pull staging for the
+/// v0.2.52 V52-AH (Windows binary-lock bug, 2026-06-09): post-pull staging for the
 /// Windows stage1 updater handoff.
 ///
 /// Background
@@ -3764,7 +3764,7 @@ fn pre_pull_rename_running_binary(_install_path: &Path) -> Option<PathBuf> {
 ///     indexer, dev console with the .exe drag-dropped, etc).
 /// In those cases `git pull` saw ERROR_SHARING_VIOLATION on the binary
 /// but completed the rest of the merge — leaving metadata.json at the
-/// new version but the .exe bytes at the OLD version (Fabio's bug).
+/// new version but the .exe bytes at the OLD version (the binary-lock scenario).
 ///
 /// This helper detects that state by checking `git status --porcelain
 /// <relative_path>` for each candidate binary. Any dirty status means

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""V52-AH (Fabio bug 1, 2026-06-09): Windows binary lock fix.
+"""V52-AH (Windows binary-lock bug, 2026-06-09): Windows binary lock fix.
 
 Tests the Python-side stage1 updater handoff:
     - install._try_invoke_windows_stage1_updater()
@@ -333,7 +333,7 @@ class LockFileAtomicWrite(unittest.TestCase):
 
 class RefreshDistIntegration(unittest.TestCase):
     """When the rename-fallback in _refresh_dist_binary_after_rebuild
-    fails (= the Fabio scenario), the new V52-AH code path stages the
+    fails (= the binary-lock scenario), the new V52-AH code path stages the
     new binary at <target>.new + invokes _try_invoke_windows_stage1_updater.
 
     We don't try to simulate the actual ERROR_SHARING_VIOLATION (that

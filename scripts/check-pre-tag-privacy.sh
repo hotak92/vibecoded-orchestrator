@@ -160,6 +160,50 @@ check_pattern "Antigravity personal-project leak" "\bAntigravity\b"
 # add a more specific pattern targeting the leak context.
 
 # ─────────────────────────────────────────────────────────────────────
+# Track v0.2.68: bare bug-reporter PERSON names in prose / comments
+# ─────────────────────────────────────────────────────────────────────
+# Bug reports historically attributed fixes by first name ("Fabio's bug",
+# "the Fabio scenario", "Symptom Fabio reported", "Luciano hit"). Those
+# leak a contributor's identity into shipped source + docs. The v0.2.68
+# scrub replaced them with neutral bug-class descriptors; this check stops
+# them recurring. It catches the bare WORD anywhere (not just /home/ paths,
+# which the known-names blocklist above already covers).
+#
+# NOT in this blocklist: "Martino" — it is the AGPL author identity and
+# appears legitimately in CHANGELOG / author metadata. The /home/martino
+# path-leak shape is already guarded by the known-names blocklist above.
+#
+# Exemptions (beyond check_pattern's base set): the leak-detector self-test
+# regexes (check-install.sh), the leak-detector sentinel inputs
+# (test_launcher_leak_grep.py), the leak-detector ASSERTION
+# (test_release_tag_repoint_guard.py — `assert "fabio" not in text`), this
+# gate itself, the secrets-scan sibling, the cleanliness policy doc,
+# CHANGELOG.md (historical narrative), CLA.md + pyproject author metadata,
+# and the test FIXTURES where a name is legitimate XML-escape test data.
+bare_name_re="\b(Fabio|Luciano|Lucas)\b"
+bare_name_hits=$(git grep -l -i -E "$bare_name_re" -- \
+    ':!:tests/test_launcher_leak_grep.py' \
+    ':!:scripts/check-install.sh' \
+    ':!:scripts/check-pre-tag-privacy.sh' \
+    ':!:scripts/check-no-secrets.sh' \
+    ':!:scripts/pre-ship-check.sh' \
+    ':!:docs/REPO_CLEANLINESS.md' \
+    ':!:tests/test_release_tag_repoint_guard.py' \
+    ':!:tests/test_scheduled_task_xml_escape.py' \
+    ':!:CHANGELOG.md' \
+    ':!:CLA.md' \
+    ':!:pyproject.toml' \
+    ':!:claude_mcp_servers/pyproject.toml' \
+    ':!:launcher/src-tauri/.cargo/config.toml' \
+    2>/dev/null || true)
+if [ -n "$bare_name_hits" ]; then
+    echo "::error::pre-tag privacy gate: bare bug-reporter name in prose/comments found in tracked files"
+    echo "         (blocklist: Fabio Luciano Lucas — use a neutral bug-class descriptor instead)"
+    echo "$bare_name_hits" | sed 's/^/  - /'
+    FAIL=1
+fi
+
+# ─────────────────────────────────────────────────────────────────────
 # Result
 # ─────────────────────────────────────────────────────────────────────
 if [ $FAIL -eq 0 ]; then

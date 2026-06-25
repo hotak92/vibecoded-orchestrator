@@ -2,8 +2,8 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.52 V52-AJ: env → launcher.db → default embedding-resolution chain.
 
-Validates the SHIP-BLOCKER fix for Fabio's Windows + CPU stuck-at-40%
-install: install.py's sync_knowledge_graph.py subprocess must inherit
+Validates the SHIP-BLOCKER fix for the Windows + CPU-only stuck-at-40%
+install bug: install.py's sync_knowledge_graph.py subprocess must inherit
 ACTIVE_EMBEDDING from launcher.db's app_state[embedding.active_profile]
 when the user shell has no env override.
 
