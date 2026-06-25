@@ -33,6 +33,10 @@
 use std::path::PathBuf;
 
 use crate::commands::installer::resolve_orchestrator_root;
+// Canonical home for the `default_text_embedding` app_state key — reuse it
+// here rather than re-declaring the magic string a third time (it is also
+// privately re-declared in `embedding_catalog.rs`, with a sync comment).
+use crate::commands::openai_cmd::APP_STATE_DEFAULT_TEXT_EMBED;
 use crate::commands::projects_v2::{
     get_shared_kg_read_disabled, get_shared_kg_write_disabled, sanitize_kg_collection,
 };
@@ -68,6 +72,55 @@ pub const DEFAULT_WEAVIATE_PORT: u16 = 8081;
 pub const DEFAULT_OLLAMA_PORT: u16 = 11435;
 pub const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
 pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
+
+/// Text model id → ACTIVE_EMBEDDING profile.
+///
+/// must match install.py::_TEXT_MODEL_ACTIVE_EMBEDDING (the Python side is
+/// the canonical home; this is the Rust mirror so the GUI chooser can write
+/// the same profile key install.py would derive). Drift here re-introduces
+/// the v0.2.68 Defect D bug: the GUI writes only the model id, the canonical
+/// `embedding.active_profile` key stays empty, and `populate` falls back to
+/// "qwen3" for every project even when the user picked arctic.
+fn active_profile_for_model(model_id: &str) -> Option<&'static str> {
+    match model_id.trim() {
+        "qwen3-embedding:0.6b" => Some("qwen3"),
+        "snowflake-arctic-embed2:latest" => Some("arctic"),
+        "openai-text-embedding-3-small" => Some("openai"),
+        "text-embedding-3-small" => Some("openai"),
+        _ => None,
+    }
+}
+
+/// Write the new-project default TEXT embedding model id AND its derived
+/// canonical profile (`app_state[embedding.active_profile]`) in one place.
+///
+/// Before v0.2.68 the GUI/onboarding chooser wrote only the model id key
+/// (`default_text_embedding`). The canonical profile key — the one
+/// `populate` (below) and `embedding_service.py::_resolve_active_embedding`
+/// actually read — was written by NO GUI path, only by install.py's
+/// `_reconcile_install_active_embedding` during a full install run. So a
+/// user who picked arctic in the launcher still got `ACTIVE_EMBEDDING=qwen3`
+/// stamped into every project's `.claude/settings.json` + `.claude/env`.
+///
+/// All four GUI write sites for `default_text_embedding`
+/// (`embedding_catalog::set_default_embedding_models` +
+/// `openai_cmd`'s register / recovery-fallback / recovery-restore paths)
+/// funnel through this helper so the two keys can never diverge again.
+///
+/// The profile is only written when `model_id` maps to a known profile via
+/// `active_profile_for_model`; an unrecognised id leaves the canonical key
+/// untouched (conservative: don't stamp a guessed profile that could index
+/// the KG against the wrong vector slot).
+pub fn set_text_embedding_and_profile(db: &Db, model_id: &str) -> Result<(), String> {
+    let model_id = model_id.trim();
+    db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, model_id)
+        .map_err(|e| format!("app_state_set default_text_embedding: {e}"))?;
+    if let Some(profile) = active_profile_for_model(model_id) {
+        db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, profile)
+            .map_err(|e| format!("app_state_set embedding.active_profile: {e}"))?;
+    }
+    Ok(())
+}
 
 /// Canonical shared-KG class name — LAST-RESORT FALLBACK.
 ///
@@ -1250,6 +1303,77 @@ mod tests {
         db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, "openai").unwrap();
         let s = populate(&db, "Acme", None);
         assert_eq!(s.active_embedding, "openai");
+    }
+
+    #[test]
+    fn active_profile_for_model_maps_known_ids() {
+        // Mirror of install.py::_TEXT_MODEL_ACTIVE_EMBEDDING — must stay in
+        // lockstep with the Python map.
+        assert_eq!(active_profile_for_model("qwen3-embedding:0.6b"), Some("qwen3"));
+        assert_eq!(
+            active_profile_for_model("snowflake-arctic-embed2:latest"),
+            Some("arctic")
+        );
+        assert_eq!(
+            active_profile_for_model("openai-text-embedding-3-small"),
+            Some("openai")
+        );
+        assert_eq!(
+            active_profile_for_model("text-embedding-3-small"),
+            Some("openai")
+        );
+        // Unknown id → no profile (conservative: leave canonical key untouched).
+        assert_eq!(active_profile_for_model("some-future-model"), None);
+    }
+
+    #[test]
+    fn chooser_stamps_canonical_profile_so_populate_resolves_arctic() {
+        // v0.2.68 Defect D regression guard. The chooser writes only the
+        // model id (`default_text_embedding`); the canonical profile key
+        // (`embedding.active_profile`) starts ABSENT. Before the fix,
+        // populate() fell through to "qwen3" for an arctic pick. After the
+        // fix the helper stamps the derived profile so the ENV output is
+        // "arctic".
+        let db = Db::open_in_memory().unwrap();
+
+        // Pre-condition: canonical key genuinely unset.
+        assert!(db
+            .app_state_get(APP_STATE_KEY_ACTIVE_EMBEDDING)
+            .unwrap()
+            .is_none());
+
+        // Simulate the GUI chooser selecting arctic.
+        set_text_embedding_and_profile(&db, "snowflake-arctic-embed2:latest").unwrap();
+
+        // The canonical key is now populated with the derived profile...
+        assert_eq!(
+            db.app_state_get(APP_STATE_KEY_ACTIVE_EMBEDDING).unwrap().as_deref(),
+            Some("arctic")
+        );
+        // ...and the model id key is written too.
+        assert_eq!(
+            db.app_state_get(APP_STATE_DEFAULT_TEXT_EMBED).unwrap().as_deref(),
+            Some("snowflake-arctic-embed2:latest")
+        );
+
+        // The ENV that lands in .claude/settings.json + .claude/env is
+        // "arctic", NOT the "qwen3" fallback.
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.active_embedding, "arctic");
+    }
+
+    #[test]
+    fn chooser_unknown_model_leaves_canonical_key_untouched() {
+        // An id with no profile mapping must NOT stamp a guessed profile —
+        // populate() then keeps its canonical "qwen3" fallback.
+        let db = Db::open_in_memory().unwrap();
+        set_text_embedding_and_profile(&db, "some-future-model").unwrap();
+        assert!(db
+            .app_state_get(APP_STATE_KEY_ACTIVE_EMBEDDING)
+            .unwrap()
+            .is_none());
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.active_embedding, "qwen3");
     }
 
     #[test]
