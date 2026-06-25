@@ -143,9 +143,28 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 def _resolve_collections() -> tuple[str, str]:
     """Return (kg_collection, development_collection) via hub, env-fallback.
 
-    v0.2.47 RL-6c follow-up: VCT_DISABLE_HUB_RESOLVER short-circuit for
-    the test session. See ``server.py::_try_resolve_project_config`` for
-    the matching guard + ``tests/conftest.py`` for the autouse fixture.
+    The hub resolver is authoritative when reachable (v0.2.21 contract: the
+    launcher's per-project resolution wins over ambient env, so a stale env
+    var can't misroute the normal in-project sync). The resolver is queried
+    against the TARGET PROJECT ROOT:
+
+      * Normal in-project run: the script lives under the project's
+        ``.claude/scripts/``; ``KG_BASE_DIR`` is unset (or equals this tree),
+        so we resolve from the script's location → the project's own config.
+      * Manual cross-project seed: the script is run by hand against a
+        DIFFERENT project, with ``KG_BASE_DIR`` exported to that project's
+        root (the same var that already steers ``PROJECT_ROOT`` below). We
+        resolve the hub against ``KG_BASE_DIR`` so the collection name matches
+        the project whose ``knowledge/`` we are actually walking — not the
+        orchestrator tree the script file happens to live under. Resolving the
+        script's own parent tree (the prior behavior) silently routed manual
+        seeds into the orchestrator's collection regardless of ``KG_COLLECTION``
+        / ``KG_BASE_DIR``; keying the resolver off the target root fixes the
+        file-root vs collection-name asymmetry without inverting hub precedence.
+
+    VCT_DISABLE_HUB_RESOLVER short-circuit for the test session. See
+    ``server.py::_try_resolve_project_config`` for the matching guard +
+    ``tests/conftest.py`` for the autouse fixture.
     """
     if os.environ.get("VCT_DISABLE_HUB_RESOLVER"):
         return (
@@ -154,7 +173,11 @@ def _resolve_collections() -> tuple[str, str]:
         )
     try:
         from vco_lib.project_config import resolve  # type: ignore[import-not-found]
-        cfg = resolve(Path(__file__).resolve().parent.parent.parent)
+        # Resolve against the TARGET project root: KG_BASE_DIR when set (manual
+        # cross-project seed), else the script's own project tree.
+        _base = os.getenv("KG_BASE_DIR", "")
+        target_root = Path(_base) if _base else Path(__file__).resolve().parent.parent.parent
+        cfg = resolve(target_root)
         return (
             cfg.kg_collection or os.getenv("KG_COLLECTION", "KnowledgeGraph"),
             cfg.development_collection or os.getenv("DEVELOPMENT_COLLECTION", ""),

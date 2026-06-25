@@ -90,6 +90,7 @@ def _clear_relevant_env() -> None:
         "CODE_GRAPH_PROJECT",
         "PROJECT_NAME",
         "VCT_KG_ACCESS_LIST",
+        "KG_BASE_DIR",
     ):
         os.environ.pop(k, None)
 
@@ -306,6 +307,51 @@ class TemplateScriptCallerTests(unittest.TestCase):
 
         self.assertEqual(module.COLLECTION_NAME, "EnvKG")
         self.assertEqual(module.DEV_COLLECTION_NAME, "EnvDev")
+
+    def test_resolve_collections_keys_hub_off_kg_base_dir_for_cross_project_seed(self):
+        """A manual cross-project seed (KG_BASE_DIR set to a DIFFERENT project
+        root) must resolve the hub against THAT root, not the script's own
+        parent tree — so the collection name matches the project whose
+        knowledge/ is being walked, fixing the file-root vs collection-name
+        asymmetry. (Hub precedence is preserved; only the resolution TARGET
+        changes.)"""
+        import importlib.util
+
+        script_path = PROJECT_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
+        spec = importlib.util.spec_from_file_location(
+            "_step18_sync_knowledge_graph_crossseed", script_path
+        )
+        assert spec is not None and spec.loader is not None
+
+        target_root = "/some/other/project/root"
+        os.environ["KG_BASE_DIR"] = target_root
+        # An ambient KG_COLLECTION must NOT win over the hub (v0.2.21 contract);
+        # the hub — queried against the TARGET root — is authoritative.
+        os.environ["KG_COLLECTION"] = "StaleAmbientKG"
+
+        seen_roots: list[Path] = []
+
+        def _capture_resolve(root):
+            seen_roots.append(Path(root))
+            return _fake_project_config(
+                kg_collection="TargetProjectKG",
+                development_collection="TargetProjectDev",
+            )
+
+        with mock.patch(
+            "vco_lib.project_config.resolve",
+            side_effect=_capture_resolve,
+        ):
+            module = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)  # type: ignore[union-attr]
+            except SystemExit:
+                pass
+
+        # The hub was queried against KG_BASE_DIR, not the script's own tree.
+        self.assertIn(Path(target_root), seen_roots)
+        self.assertEqual(module.COLLECTION_NAME, "TargetProjectKG")
+        self.assertEqual(module.DEV_COLLECTION_NAME, "TargetProjectDev")
 
 
 if __name__ == "__main__":
