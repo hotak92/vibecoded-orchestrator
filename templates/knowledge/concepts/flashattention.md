@@ -3,7 +3,7 @@ title: FlashAttention
 type: concept
 tags: [ai, attention, transformer, gpu, memory-efficiency, inference, training, optimization, low-level-implementation]
 created: 2026-02-26T00:00:00Z
-updated: 2026-04-05T14:33:25Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -81,10 +81,13 @@ are stored, not the full attention matrix.
 - 740-840 TFLOPs on H100 with FP16; 1.2-1.3 PFLOPs with FP8
 - 1.5-2x speedup over FA2 on H100
 
-### FlashAttention v4 (announced, targeting 2025)
-- Targets Blackwell (B200) GPU architecture
-- 5-stage warp-specialized pipeline to fully exploit Blackwell's deeper memory hierarchy
-- Expected further throughput improvements over FA3
+### FlashAttention v4 (Dao-AILab, 2026)
+- Targets Blackwell data-center GPUs (SM100/SM103: B200, B300 Blackwell Ultra)
+- **Redesigned async pipeline with warp specialization**: orchestration warps manage async loads while compute warps handle softmax in parallel
+- **Software-emulated exponentials**: polynomial approximation on FMA units
+- **Conditional softmax rescaling**: skips the rescale when the running max is unchanged
+- Up to ~1,605 TFLOPs/s on B200 (~71% hardware utilization); ~2.7× over Triton implementations
+- BF16-first; auto-selected on Blackwell by vLLM (v0.17.0+) and other frameworks
 
 ## FlashInfer: Production Extension
 

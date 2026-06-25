@@ -3,7 +3,7 @@ title: Model Context Protocol
 type: concept
 tags: [MCP, AI, protocol, tools, integration, Anthropic, agentic, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -106,9 +106,9 @@ if __name__ == "__main__":
 
 ## Ecosystem
 
-- **claude-mcp**: Official Python SDK
+- **mcp**: Official Python SDK (`pip install mcp`); bundles `FastMCP` as its decorator-based high-level API
 - **@modelcontextprotocol/sdk**: Official TypeScript SDK
-- **FastMCP**: Higher-level Python framework (decorator-based)
+- **FastMCP**: Higher-level Python framework (decorator-based), shipped inside the `mcp` package as `mcp.server.fastmcp`
 - Server registry: hundreds of community servers (GitHub, filesystem, databases, etc.)
 
 ## Key Design Decisions

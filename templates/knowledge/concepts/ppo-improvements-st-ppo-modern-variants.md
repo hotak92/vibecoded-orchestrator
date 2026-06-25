@@ -1,9 +1,9 @@
 ---
-title: PPO Improvements - ST-PPO and Modern Variants
+title: PPO Improvements - SORL and Modern Variants
 type: concept
 tags: [AI, reinforcement-learning, policy-optimization, LLM-training, multi-turn-reasoning, low-level-implementation]
 created: 2026-02-27T00:00:00Z
-updated: 2026-04-05T14:33:45Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-02-27T00:00:00Z
 valid_until: null
 status: active
@@ -11,7 +11,7 @@ status: active
 
 ## Overview
 
-Recent work (2024-2025) identifies and fixes instability in PPO when training multi-turn LLM agents. ST-PPO (Stabilized Turn-level PPO) combines turn-level importance sampling with clipping-bias correction to prevent training collapse on complex reasoning tasks.
+Recent work identifies and fixes instability in PPO when training multi-turn LLM agents. SORL (Stabilizing Off-policy Reinforcement Learning) combines turn-level importance sampling with clipping-triggered normalization to prevent training collapse on complex reasoning tasks. Its two instantiations are SO-PPO (keeps a critic) and SO-GRPO (critic-free).
 
 ## The Problem: Why Vanilla PPO Fails on Multi-Turn Tasks
 
@@ -36,7 +36,7 @@ Turn 3 (reason): "Based on results..."  [15 tokens]
 
 **Result**: Unreliable advantage estimates → extreme gradients → collapse
 
-## ST-PPO: Solution via Two Mechanisms
+## SORL: Solution via Two Mechanisms
 
 ### Mechanism 1: Turn-Level Importance Sampling
 
@@ -46,7 +46,7 @@ w_t = π_new(y_t | x, y_{<t}) / π_old(y_t | x, y_{<t})
 L = min(w_t * Â_t, clip(w_t, 1-ε, 1+ε) * Â_t)
 ```
 
-**Turn-PPO** (aggregated at turn level):
+**Turn-level** (aggregated at turn level):
 ```
 Turn = (y_start_t, ..., y_end_t)
 
@@ -60,13 +60,13 @@ L = min(w_turn * Â_t, clip(w_turn, 1-ε, 1+ε) * Â_t)
 
 **Mathematical foundation** (Lemma 4.1):
 ```
-∇ L_Turn-PPO = E[1/|y| * Σ_k w_k^turn(θ) * Â^k/|y^k| * ∇ log π(y^k|x,y^<k)]
+∇ L_turn = E[1/|y| * Σ_k w_k^turn(θ) * Â^k/|y^k| * ∇ log π(y^k|x,y^<k)]
                           ^^^turn-level credit^^^
 ```
 
 All tokens in same turn share aggregated advantage Â^k → lower variance.
 
-### Mechanism 2: Clipping-Bias Correction
+### Mechanism 2: Clipping-Triggered Normalization
 
 **Issue with naive clipping**: Clipping suppresses large updates but introduces bias:
 
@@ -83,7 +83,7 @@ When clipping is active (w_t extreme), gradients are zeroed → discards valuabl
     - [Clipping bias term]  ← grows exponentially with training!
 ```
 
-**Clipping bias correction**:
+**Clipping-triggered normalization**:
 ```
 C(θ) = E[1/|y| * Σ_t 𝟙{t ∉ β_token} * w_t * Â_t]
               indicator for clipped tokens
@@ -98,40 +98,40 @@ Directly normalize this term by downweighting highly off-policy samples:
 
 **Result**: Conservative gradient updates, avoids extreme spikes (Fig 3b shows gradient norm 10× more stable).
 
-## ST-PPO Algorithm
+## SORL Algorithm
 
 **Combine both mechanisms**:
 
 ```
-Turn-Level Importance Sampling:  Align with task structure
-Clipping-Bias Correction:        Downweight unreliable samples
+Turn-Level Importance Sampling:    Align with task structure
+Clipping-Triggered Normalization:  Downweight unreliable samples
                            ↓
-         Stabilized Turn-level PPO (ST-PPO)
+   Stabilizing Off-policy RL (SORL → SO-PPO / SO-GRPO)
 ```
 
-**Three variants**:
-1. **Turn-PPO**: Only turn-level sampling (partial fix)
-2. **S-PPO**: Clipping bias on token-level PPO (helps but not enough)
-3. **ST-PPO**: Combined (best stability)
+**Variants**:
+1. **Turn-level only**: turn-level sampling without normalization (partial fix)
+2. **Token-level + normalization**: clipping-triggered normalization on token-level PPO (helps but not enough)
+3. **SO-PPO / SO-GRPO**: both mechanisms combined (best stability)
 
 ## Experimental Results
 
 **Multi-turn Search Tasks** (Qwen2.5 models):
 
-| Metric | Token-PPO | Turn-PPO | ST-PPO |
+| Metric | Token-level PPO | Turn-level only | SO-PPO |
 |--------|-----------|----------|--------|
 | **Success Rate** | 20% (collapse) | 65% | 85% |
 | **Gradient Norm** | Extreme spikes | Stable | Very stable |
 | **Clipping Ratio** | 0.8 (high) | 0.5 | 0.3 (conservative) |
 
 **Performance on Benchmarks**:
-- General QA: ST-PPO +15% over baseline
-- Multi-hop QA: ST-PPO +12%
-- Medical Multiple-Choice: ST-PPO +18%
+- General QA: SO-PPO +15% over baseline
+- Multi-hop QA: SO-PPO +12%
+- Medical Multiple-Choice: SO-PPO +18%
 
 **Model Scales**:
-- Qwen2.5-1.5B: ST-PPO 75% → Token-PPO 20% (3.75× improvement)
-- Qwen2.5-7B: ST-PPO 82% → Token-PPO collapse (unstable)
+- Qwen2.5-1.5B: SO-PPO 75% → token-level PPO 20% (3.75× improvement)
+- Qwen2.5-7B: SO-PPO 82% → token-level PPO collapse (unstable)
 
 ## Related PPO Variants (2024-2025)
 
@@ -150,7 +150,7 @@ Clipping-Bias Correction:        Downweight unreliable samples
 - Apply group-level variance reduction to PPO
 - Sequence-level importance ratios + token-level clipping
 
-## Hyperparameters for ST-PPO
+## Hyperparameters for SO-PPO
 
 ```yaml
 # Turn-Level Sampling
@@ -158,7 +158,7 @@ turn_boundaries: auto  # Use <eot> tokens or loss mask
 
 # Clipping
 clip_ratio: 0.2
-clipping_bias_weight: 1.0  # α in gradient correction
+clipping_norm_weight: 1.0  # α in clipping-triggered normalization
 
 # KL Regularization
 use_kl_loss: true
@@ -180,20 +180,20 @@ critic_learning_rate: 1e-4
 value_loss_coef: 0.5
 ```
 
-## When to Use ST-PPO vs Alternatives
+## When to Use SORL vs Alternatives
 
 | Scenario | Best Choice | Why |
 |----------|-----------|-----|
-| **Token-level reward** (dense) | Standard PPO | ST-PPO overhead not needed |
-| **Multi-turn reasoning** | ST-PPO | Designed for this |
+| **Token-level reward** (dense) | Standard PPO | SORL overhead not needed |
+| **Multi-turn reasoning** | SO-PPO | Designed for this |
 | **Mathematical solving** | GRPO | No critic overhead |
-| **Code generation** | GRPO or ST-PPO | Both work well |
-| **Language modeling** | ST-PPO | Sequence structure matters |
+| **Code generation** | GRPO or SO-GRPO | Both work well |
+| **Language modeling** | SO-PPO | Sequence structure matters |
 | **Offline RL** | DPO or CQL | Not for RL fine-tuning |
 
 ## Code Availability
 
-- **Paper**: Li et al. 2025 (ST-PPO, https://arxiv.org/abs/2511.20718)
+- **Paper**: Li et al., "Stabilizing Off-Policy Training for Long-Horizon LLM Agent via Turn-Level Importance Sampling and Clipping-Triggered Normalization" (https://arxiv.org/abs/2511.20718)
 - **Framework**: verl, TRL (HuggingFace Transformers), OpenVLA
 - **Community**: Implementations in TRL library (preferred for LLMs)
 
@@ -217,7 +217,7 @@ PPO (2017) ← Most used for LLMs until 2023
     ↓
 GRPO (2024) ← No critic, memory-efficient
     ↓
-ST-PPO (2025) ← Stable for multi-turn, keeps critic
+SORL: SO-PPO / SO-GRPO ← Stable off-policy training for multi-turn LLM agents
 ```
 
 [[implements::Proximal Policy Optimization]]

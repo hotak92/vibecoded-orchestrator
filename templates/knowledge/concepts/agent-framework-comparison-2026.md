@@ -10,29 +10,29 @@ tags:
   - research
   - mid-level-architecture
 created: 2026-05-19T00:00:00Z
-updated: 2026-05-19T00:00:00Z
-valid_until: 2026-06-30T00:00:00Z
+updated: 2026-06-25T00:00:00Z
+valid_until: 2026-09-30T00:00:00Z
 status: active
 ---
 
 # Agent Framework Comparison (2026)
 
-State-of-the-field as of May 2026 for frameworks that an automation engineer is likely to evaluate when building an LLM-powered agent (not a generic workflow engine — see `[[relatedTo::Workflow Engine Tradeoffs 2026]]` for that).
+State-of-the-field for frameworks that an automation engineer is likely to evaluate when building an LLM-powered agent (not a generic workflow engine — see `[[relatedTo::Workflow Engine Tradeoffs 2026]]` for that).
 
-## Verified versions (2026-05)
+## Verified versions
 
 | Framework | Latest | Language | Backed by |
 |---|---|---|---|
-| Anthropic Claude Agent SDK | `claude-agent-sdk` 0.2.82 (Python) / `@anthropic-ai/claude-agent-sdk` (TS) | Python 3.10+, TypeScript | Anthropic |
-| LangGraph | 1.2.0 | Python, TypeScript | LangChain |
-| AutoGen | `autogen-agentchat` 0.7.5 | Python, .NET | Microsoft Research |
-| CrewAI | 1.14.5 | Python | CrewAI Inc. |
+| Anthropic Claude Agent SDK | `claude-agent-sdk` 0.2.110 (Python, 3.10–3.13) / `@anthropic-ai/claude-agent-sdk` (TS) | Python, TypeScript | Anthropic |
+| LangGraph | 1.2.6 | Python, TypeScript | LangChain |
+| Microsoft Agent Framework | `agent-framework` 1.0 (GA) | Python, .NET | Microsoft |
+| CrewAI | 1.14.7 | Python | CrewAI Inc. |
 | OpenAI Agents SDK | (TS/Python, see openai/openai-agents-python) | Python, TypeScript | OpenAI |
 | LlamaIndex Agents | bundled in `llama-index` | Python, TypeScript | LlamaIndex |
 
 ## The decision in one paragraph
 
-If you're building inside Claude's ecosystem and want the most reliable tool-use loop with first-class support for MCP servers, custom tools, and Claude Code's permission model, use the **Claude Agent SDK**. If you need explicit graph-structured control flow with checkpointing and human-in-the-loop, use **LangGraph**. If you have a clear team-of-roles mental model and value developer ergonomics over flexibility, use **CrewAI**. **AutoGen** is for research-y multi-agent debate patterns and Microsoft-stack integration. The **OpenAI Agents SDK** is the GPT-native equivalent of Claude Agent SDK — pick it if you're GPT-locked.
+If you're building inside Claude's ecosystem and want the most reliable tool-use loop with first-class support for MCP servers, custom tools, and Claude Code's permission model, use the **Claude Agent SDK**. If you need explicit graph-structured control flow with checkpointing and human-in-the-loop, use **LangGraph**. If you have a clear team-of-roles mental model and value developer ergonomics over flexibility, use **CrewAI**. The **Microsoft Agent Framework** is for research-y multi-agent debate patterns and Microsoft-stack integration. The **OpenAI Agents SDK** is the GPT-native equivalent of Claude Agent SDK — pick it if you're GPT-locked.
 
 ## Detailed comparison
 
@@ -89,18 +89,19 @@ If you're building inside Claude's ecosystem and want the most reliable tool-use
 
 **Best for**: when the human mental model genuinely IS a team-of-specialists (research analyst + writer + editor) and the workflow is mostly sequential.
 
-### AutoGen (Microsoft)
+### Microsoft Agent Framework
 
-**Mental model**: conversational agents that talk to each other; the framework manages the dialogue. v0.4+ is a major rewrite from v0.2; the agentchat layer is what most users want.
+**Mental model**: conversational agents that talk to each other; the framework manages the dialogue. The **Microsoft Agent Framework** (`agent-framework`, 1.0 GA) consolidates Microsoft's two agent stacks — AutoGen and Semantic Kernel — into one supported API. The standalone `autogen-agentchat` package still exists, but the strategic home for new work is the unified framework.
 
 **Strengths**:
-- Pioneered the multi-agent conversation pattern.
+- Established the multi-agent conversation pattern.
 - Tight integration with Azure AI / .NET.
 - Strong for research patterns (debate, group chat, society-of-mind).
+- One supported API across the two prior Microsoft agent stacks.
 
 **Weaknesses**:
 - Conversation-as-orchestration is hard to debug in production.
-- API has churned between versions; older tutorials misleading.
+- Many AutoGen- and Semantic-Kernel-era tutorials target APIs the unified framework deprecates.
 - Best fit narrower than the marketing suggests.
 
 **Best for**: research workflows, complex multi-agent debate, Microsoft-stack consumers.
@@ -131,7 +132,7 @@ If you're building inside Claude's ecosystem and want the most reliable tool-use
 Regardless of framework, the same patterns determine production reliability:
 
 1. **Validate-correct loop on structured output** (see `[[relatedTo::Function Calling Reliability Patterns]]`). When the LLM returns malformed JSON or violates schema, re-prompt with the validation error rather than crashing.
-2. **Budget per agent run** — token cap, wall-clock cap, tool-call cap. LangGraph: `recursion_limit`. Claude Agent SDK: `max_turns`. AutoGen: `max_consecutive_auto_reply`.
+2. **Budget per agent run** — token cap, wall-clock cap, tool-call cap. LangGraph: `recursion_limit`. Claude Agent SDK: `max_turns`. Microsoft Agent Framework: `max_consecutive_auto_reply`.
 3. **Idempotent tool implementations** so retries don't double-charge / double-email.
 4. **Observability**: emit traces (OTel-compatible) per turn with tokens, latency, tool calls. LangSmith, Anthropic console, OpenAI dashboard, or DIY via OTel.
 5. **Eval harness**: golden inputs → expected outputs; run on every prompt/model change. Inspect AI, promptfoo, and DIY pytest fixtures all work.
@@ -145,9 +146,9 @@ Regardless of framework, the same patterns determine production reliability:
 ## Sources
 
 - Claude Agent SDK: https://github.com/anthropics/claude-agent-sdk-python (Python) / docs https://platform.claude.com/docs/en/agent-sdk
-- LangGraph: https://github.com/langchain-ai/langgraph (1.2.0 on PyPI 2026-05)
-- CrewAI: https://github.com/crewAIInc/crewAI (1.14.5)
-- AutoGen: https://github.com/microsoft/autogen (`autogen-agentchat` 0.7.5)
+- LangGraph: https://github.com/langchain-ai/langgraph
+- CrewAI: https://github.com/crewAIInc/crewAI
+- Microsoft Agent Framework: https://github.com/microsoft/agent-framework (`agent-framework`)
 - OpenAI Agents: https://github.com/openai/openai-agents-python
 
 ## Links
