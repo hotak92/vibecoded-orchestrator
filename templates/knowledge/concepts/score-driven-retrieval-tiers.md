@@ -3,7 +3,7 @@ title: Score-Driven Retrieval Tiers
 type: concept
 tags: [retrieval, knowledge-graph, weaviate, mcp, token-efficiency, mid-level-architecture]
 created: 2026-04-27T12:00:00Z
-updated: 2026-04-27T12:00:00Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-04-27T00:00:00Z
 valid_until: null
 status: active
@@ -34,8 +34,8 @@ Auto-tier mode resolves all three.
 
 ## The Five Tiers
 
-Thresholds calibrated 2026-04-10 on 18 relevant + 20 irrelevant queries against the
-ClaudeKnowledgeGraph collection. Score is normalised 0..1 (1 - distance, or
+Thresholds calibrated on 18 relevant + 20 irrelevant queries against a representative
+KG collection. Score is normalised 0..1 (1 - distance, or
 RL-reranked relevance), higher = better.
 
 | Score range  | Tier           | Body                                                     |
@@ -90,12 +90,13 @@ the prior `hybrid_search` skipped the summary fallback and went straight to cont
 - `claude_mcp_servers/weaviate_mcp/server.py:_format_result_by_tier` — tier → result dict
 - `claude_mcp_servers/weaviate_mcp/server.py:_chunk_summaries_header` — chunk-map header
 - `claude_mcp_servers/scripts/rl_kg_search.py` — hook-invoked CLI, calls the same helpers
-- `tests/test_score_driven_tiers.py` — 27 unit tests (boundary scores + sidecar variants)
-- `tests/test_score_driven_tiers_integration.py` — live Weaviate smoke tests + token-savings probe
+- `tests/test_shared_kg.py` — tier-formatting unit tests (`_format_result_by_tier`
+  boundary scores + per-collection sidecar resolution + full-vs-summary equivalence)
+- `tests/test_retrieval_tuning_roundtrip.py` — threshold round-trip + token-savings probe
 
 ## Observed Token Savings
 
-Integration test against the live `ClaudeKnowledgeGraph` collection
+Integration test against a live KG collection
 (query "score-driven retrieval tiers", limit 8):
 
 - `detail="auto"`: 8,496 bytes

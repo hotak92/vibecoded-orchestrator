@@ -3,9 +3,9 @@ title: Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
 type: concept
 tags: [launcher, supabase, schema, paid-modules, licensing, commercial, partially-superseded, low-level-implementation]
 created: 2026-04-23T16:20:00Z
-updated: 2026-05-26T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
-implementation: "Original migration 004_paid_modules.sql originated in an earlier launcher-exploration Supabase project (`<your-supabase-project-ref>/<your-orchestrator-repo>`). Production project for the launcher is `ovpdtijpdchzlxbojhsg` (the orchestrator's Supabase). The launcher-side mirror of per-module entitlements is `tier_cache.module_licenses` (read via `is_module_licensed_v2`)."
+implementation: "Migration 004_paid_modules.sql lives in the launcher's Supabase project under supabase/migrations/. The launcher-side mirror of per-module entitlements is tier_cache.module_licenses (read via is_module_licensed_v2)."
 ---
 
 # Launcher Paid Modules — Supabase Schema (004_paid_modules.sql)
@@ -26,7 +26,7 @@ Chosen design: one `profiles.paid_modules JSONB` column keyed by module slug, va
 
 ## Schema
 
-Migration file: `supabase/migrations/004_paid_modules.sql` on `<your-supabase-project-ref>/<your-orchestrator-repo>` master.
+Migration file: `supabase/migrations/004_paid_modules.sql` in the launcher's Supabase project.
 
 ### Column
 
@@ -75,9 +75,9 @@ Prevents clients from writing to `paid_modules` directly — only service-role R
 
 Added `PAID_MODULES_MAP` dict (parallel to `VARIANT_MAP` / `ORCHESTRATOR_TIER_MAP`). On `order_created`, if the variant_id matches a paid-module entry, calls `upsert_paid_module()` via service-role RPC. **Pending (launcher-side)**: 3 Telegram variant IDs to populate `PAID_MODULES_MAP` after LS product creation with "enable license keys" toggle.
 
-### `validate-module` edge function (written, deploy pending)
+### `validate-module` edge function (design only — not the shipped path)
 
-`supabase/functions/validate-module/index.ts` — sibling of `validate-tier`. Runtime licensing check:
+This single-endpoint runtime check was designed as a sibling of `validate-tier` but was never deployed; the runtime licensing flow ships as the three-endpoint design (`validate-tier` + `rl-artifact-url` + `module-catalog`) with `tier_cache.module_licenses` as the launcher-side source of truth. The original contract:
 
 1. Receives `{license_key, module_slug, machine_id}` from the launcher.
 2. Validates key via LS `/v1/licenses/validate` + `/v1/licenses/activate`.
@@ -85,7 +85,7 @@ Added `PAID_MODULES_MAP` dict (parallel to `VARIANT_MAP` / `ORCHESTRATOR_TIER_MA
 4. Calls `upsert_paid_module()` with activation metadata.
 5. Returns `{valid: true, expires_at, tier}`.
 
-**Pending (launcher-side)**: `supabase functions deploy validate-module`. See [[relatedTo::validate-module edge function]] for the full contract.
+This endpoint and the `profiles.paid_modules` JSONB column / `upsert_paid_module` / `active_paid_modules` RPCs were never carried into the production launcher Supabase — the shipped schema has no `paid_modules` table or column, and per-module entitlements are mirrored in `tier_cache.module_licenses` (read via `is_module_licensed_v2`) instead.
 
 ### Launcher Rust side (`src-tauri/src/commands/modules.rs`)
 
@@ -120,5 +120,5 @@ Telegram MCP module active in Claude Code
 - [[relatedTo::validate-module edge function]] (to be created)
 - [[relatedTo::Telegram as Standalone Paid Module]] (first consumer)
 - [[relatedTo::VCT Coordination MCP — Standalone Product]] (future consumer if marketed as paid)
-- Migration file: `<your-supabase-project-ref>/<your-orchestrator-repo>:supabase/migrations/004_paid_modules.sql`
-- Webhook: `<your-supabase-project-ref>/<your-orchestrator-repo>:supabase/functions/lemon-squeezy-webhook/index.ts`
+- Migration file: `supabase/migrations/004_paid_modules.sql`
+- Webhook: `supabase/functions/lemon-squeezy-webhook/index.ts`

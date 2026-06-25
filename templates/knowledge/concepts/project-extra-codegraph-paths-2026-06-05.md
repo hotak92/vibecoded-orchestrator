@@ -10,7 +10,7 @@ tags:
   - hub-resolver
   - low-level-implementation
 created: 2026-06-05T00:00:00Z
-updated: 2026-06-05T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -49,8 +49,8 @@ would cause each pass to delete the OTHER passes' UUIDs.
 
 Locked in at TWO layers:
 
-1. **Launcher** (`reindex_project_codegraph_after_extras_change` in `project_codegraph_extras.rs:708`): always builds a single `code-graph-analyze` invocation with the project's `folder_path` as primary path AND every enabled extra via `--extra-path`. Per-project mutex prevents a concurrent add/remove from racing the snapshot read.
-2. **Analyzer** (`analyze_repository` in `analyze_code_graph.py:1635`): `visited_uuids` is a single set initialised ONCE per run. The dispatcher loop iterates `[repo_path] + canonical_extras`, accumulating into the same set. `_prune_stale_objects()` runs ONCE at the end. Test `test_visited_uuids_is_single_shared_set` makes regression structurally impossible.
+1. **Launcher** (`reindex_project_codegraph_after_extras_change` in `project_codegraph_extras.rs`): always builds a single `code-graph-analyze` invocation with the project's `folder_path` as primary path AND every enabled extra via `--extra-path`. Per-project mutex prevents a concurrent add/remove from racing the snapshot read.
+2. **Analyzer** (`analyze_repository` in `analyze_code_graph.py`): `visited_uuids` is a single set re-initialised ONCE per run (`self.visited_uuids = set()` at the top of `analyze_repository`). The dispatcher loop iterates `[repo_path] + canonical_extras`, accumulating into the same set. `_prune_stale_objects()` runs ONCE at the end. Test `test_visited_uuids_is_single_shared_set` makes regression structurally impossible.
 
 ## Disambiguation flow
 
