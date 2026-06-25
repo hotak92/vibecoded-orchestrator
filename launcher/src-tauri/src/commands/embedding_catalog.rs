@@ -374,7 +374,10 @@ pub async fn set_default_embedding_models(
     db: State<'_, Db>,
 ) -> Result<(), String> {
     if let Some(ref v) = text_model {
-        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, v.trim())?;
+        // v0.2.68 Defect D: also stamp the canonical
+        // `embedding.active_profile` so `project_env_settings::populate`
+        // doesn't fall back to "qwen3" when the user picked arctic/openai.
+        crate::commands::project_env_settings::set_text_embedding_and_profile(&db, v)?;
     }
     if let Some(ref v) = code_model {
         db.app_state_set(APP_STATE_DEFAULT_CODE_EMBED, v.trim())?;

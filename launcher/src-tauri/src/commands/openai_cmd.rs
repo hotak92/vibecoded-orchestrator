@@ -405,8 +405,13 @@ pub async fn register_openai_api_key<R: Runtime>(
     // KG / Codegraph bindings are NOT touched here — that's Commit 9's
     // enrichment-migration territory.
     if set_as_default {
-        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, OPENAI_DEFAULT_TEXT_MODEL_ID)
-            .map_err(|e| format!("app_state_set default_text_embedding: {}", e))?;
+        // v0.2.68 Defect D: write BOTH the model id and the canonical
+        // `embedding.active_profile` (→ "openai") via the shared helper so
+        // populate() resolves "openai", not the "qwen3" fallback.
+        crate::commands::project_env_settings::set_text_embedding_and_profile(
+            &db,
+            OPENAI_DEFAULT_TEXT_MODEL_ID,
+        )?;
         db.app_state_set(APP_STATE_DEFAULT_CODE_EMBED, OPENAI_DEFAULT_CODE_MODEL_ID)
             .map_err(|e| format!("app_state_set default_code_embedding: {}", e))?;
     }
@@ -726,8 +731,15 @@ fn compute_recovery_transition(
             // code-embed default is environment-dependent (GPU service
             // running? CPU only?) — see `choose_best_local_code_default`.
             let local_code = choose_best_local_code_default();
-            db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, LOCAL_TEXT_FALLBACK_ID)
-                .map_err(|e| format!("app_state_set default_text_embedding: {}", e))?;
+            // v0.2.68 Defect D: swapping the text default to the local
+            // fallback must also re-derive the canonical
+            // `embedding.active_profile` (→ "qwen3"), otherwise a project
+            // created post-fallback inherits a profile that still points at
+            // the now-removed openai vector slot.
+            crate::commands::project_env_settings::set_text_embedding_and_profile(
+                db,
+                LOCAL_TEXT_FALLBACK_ID,
+            )?;
             db.app_state_set(APP_STATE_DEFAULT_CODE_EMBED, &local_code)
                 .map_err(|e| format!("app_state_set default_code_embedding: {}", e))?;
 
@@ -762,8 +774,10 @@ fn compute_recovery_transition(
         // restore the openai-* defaults, clear pending, mark valid.
         (OpenAiValidationResult::Valid { .. }, _was, false) => {
             if let Some(t) = &pending.text {
-                db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, t)
-                    .map_err(|e| format!("app_state_set default_text_embedding: {}", e))?;
+                // v0.2.68 Defect D: restoring the stashed text model id also
+                // re-derives the canonical `embedding.active_profile` (the
+                // stash normally holds the openai-* id → "openai").
+                crate::commands::project_env_settings::set_text_embedding_and_profile(db, t)?;
             }
             if let Some(c) = &pending.code {
                 db.app_state_set(APP_STATE_DEFAULT_CODE_EMBED, c)

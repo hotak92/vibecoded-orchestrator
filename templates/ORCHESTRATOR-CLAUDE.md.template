@@ -377,7 +377,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 - **URL**: `http://localhost:8081` (HTTP), port 50052 (gRPC)
 - **Purpose**: Semantic search across knowledge, code, docs, conversations.
 - **Text embeddings**: `qwen3-embedding:0.6b` via Ollama (1024-dim, Apache 2.0). Requires `num_ctx=8192`.
-- **Code embeddings**: CodeSage-Large-v2 via FastAPI service at port 11440 (2048-dim, Apache 2.0). CPU fallback uses `qwen3-embedding:0.6b` via Ollama.
+- **Code embeddings**: hardware-spec ladder via FastAPI service at port 11440 — CodeSage-Large-v2 (2048-dim, GPU VRAM >=12 GB) → `qwen3-embedding:0.6b` (1024-dim, VRAM >=6 GB or capable CPU with RAM >24 GB + >=8 physical cores) → `jina-embeddings-v2-base-code` (768-dim) as the universal CPU / low-VRAM floor. All non-CodeSage tiers run via Ollama.
 - **Named vectors per collection**: KG: `qwen3_embed` (+ `openai_embed` if configured); Code: `codesage_embed` (+ `openai_embed`).
 - **Active search vector**: controlled by `ACTIVE_EMBEDDING` env (`qwen3` default).
 - **Collections** (names depend on `PROJECT_NAME` / `KG_COLLECTION`):
@@ -530,7 +530,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - **CodeAPI** — API endpoints with handlers (`endpoint`, `method`, `api_description`, `handler`).
 - **CodeInteraction** — cross-service calls (`interaction_type`, `protocol`, `endpoint`, `confidence`, `direction`). Query: `query_code_structure("interactions", "module.py")`.
 - Search: `search_code_graph`, `query_code_structure` MCPs or `code-graph-query` CLI.
-- Embedding: CodeSage-Large-v2 (2048-dim) via code embedding service (CPU fallback: `qwen3-embedding:0.6b`).
+- Embedding: hardware-spec ladder via code embedding service — CodeSage-Large-v2 (2048-dim, VRAM >=12 GB) → `qwen3-embedding:0.6b` (1024-dim, VRAM >=6 GB or capable CPU) → `jina-embeddings-v2-base-code` (768-dim) as the CPU / low-VRAM floor; non-CodeSage tiers run via Ollama.
 - Analysis: `.claude/scripts/code-graph-analyze . --project "ProjectName" [--cfg] [--pdg]`.
 
 **4. Development Collection** (`docs/` → `DEVELOPMENT_COLLECTION`):
@@ -786,7 +786,7 @@ The toast summarises the result ("5 files updated, 2 user-modifications preserve
 - Fix from PR: `claude --from-pr <PR-URL>`.
 
 **Default ports**: Weaviate `8081` (HTTP) / `50052` (gRPC), Ollama `11435` (embeddings + KG-summary generation), code-embed service `11440` (optional GPU), vct-hub `7700`.
-**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim), code embeddings CodeSage-Large-v2 (2048-dim, GPU) / `qwen3-embedding:0.6b` (CPU fallback). KG-summary generation uses a three-tier fallback in `generate-kg-summary.py`: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) local Ollama models (`qwen3.5:9b` for 16 GB+ VRAM / `gemma4:e4b` for low-VRAM/CPU), (3) Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|ollama|api|skip`.
+**Default models**: text embeddings `qwen3-embedding:0.6b` (1024-dim); code embeddings selected by hardware-spec ladder — CodeSage-Large-v2 (2048-dim, VRAM >=12 GB) / `qwen3-embedding:0.6b` (1024-dim, VRAM >=6 GB or capable CPU) / `jina-embeddings-v2-base-code` (768-dim, CPU / low-VRAM floor, via Ollama). KG-summary generation uses a three-tier fallback in `generate-kg-summary.py`: (1) `claude` CLI on PATH (best quality, uses your Claude subscription / API key), (2) local Ollama models (`qwen3.5:9b` for 16 GB+ VRAM / `gemma4:e4b` for low-VRAM/CPU), (3) Anthropic API direct (if `ANTHROPIC_API_KEY` is set). Force a tier via `KG_SUMMARY_BACKEND=cli|ollama|api|skip`.
 
 ---
 
