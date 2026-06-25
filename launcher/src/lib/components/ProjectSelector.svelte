@@ -8,7 +8,8 @@
   // - Rename / Delete are inline per-row actions; delete requires a typed
   //   confirmation.
 
-  import { onMount, tick } from 'svelte';
+  import { onMount } from 'svelte';
+  import { nextFrame } from '$lib/dom-async';
   import { projects, selectedProject } from '$lib/stores/projects';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime, invoke } from '$lib/tauri';
@@ -408,13 +409,15 @@
       // the top-layer backdrop, which then swallows all pointer events
       // viewport-wide (the post-Adopt GUI freeze).
       //
-      // So: (1) close THIS Create dialog (showCreate=false), (2) await tick()
-      // so this dialog's $effect observes false and calls close() — and, on
-      // the Adopt re-entry path, so the already-set showAdoptModal=false has
-      // also been observed and the Adopt dialog closed (native top layer is
-      // LIFO: Adopt was closed first by onAdoptModalAccept, then Create here),
-      // (3) only THEN null thirdPartyDetection, unmounting the (already-closed)
-      // AdoptProjectModal safely.
+      // So: (1) close THIS Create dialog (showCreate=false), (2) await
+      // nextFrame() so this dialog's $effect observes false and calls close()
+      // — and, on the Adopt re-entry path, so the already-set
+      // showAdoptModal=false has also been observed and the Adopt dialog
+      // closed (native top layer is LIFO: Adopt was closed first by
+      // onAdoptModalAccept, then Create here) AND Chromium has had a real
+      // frame to release the top-layer slot, (3) only THEN null
+      // thirdPartyDetection, unmounting the (already-closed) AdoptProjectModal
+      // safely.
       showCreate = false;
       createName = '';
       createPath = '';
@@ -425,10 +428,20 @@
       leftovers = null;
       adoptDecision = undefined;
       open = false;
-      // Let both stacked DialogRoots' $effects observe their `open=false`
-      // and call native close() (releasing their top-layer slots) before we
-      // unmount AdoptProjectModal via the `{#if thirdPartyDetection}` guard.
-      await tick();
+      // Let both stacked DialogRoots' $effects observe their `open=false` and
+      // call native close(), AND give Chromium/WebView2 a real frame to
+      // release the top-layer ::backdrop slot, before we unmount
+      // AdoptProjectModal via the `{#if thirdPartyDetection}` guard.
+      //
+      // v0.2.68: `await tick()` (v0.2.67) flushes Svelte's microtask/effect
+      // queue but is NOT a barrier on Chromium's top-layer release — the
+      // close() runs, `.open` flips false, yet the backdrop slot lingers into
+      // the next frame. Unmounting in that window orphaned the backdrop (the
+      // Windows post-add navigation freeze). nextFrame() (double-rAF) waits
+      // for the actual frame. Paired with DialogRoot's now-unconditional
+      // onDestroy close() (the structural fix), this guarantees the slot is
+      // released before unmount on both WebView2 and WebKitGTK.
+      await nextFrame();
       thirdPartyDetection = null;
     } catch (e) {
       createError = e instanceof Error ? e.message : String(e);
@@ -456,9 +469,13 @@
   async function onAdoptModalAccept() {
     adoptDecision = 'adopt';
     showAdoptModal = false;
-    // Flush so the Adopt DialogRoot's $effect runs close() (top layer
-    // released) before handleCreate unmounts this modal.
-    await tick();
+    // Give the Adopt DialogRoot's $effect a chance to run close() AND give
+    // Chromium a real frame to release the top-layer slot before handleCreate
+    // unmounts this modal. v0.2.68: nextFrame() (double-rAF) replaces the
+    // v0.2.67 `await tick()` — see the handleCreate teardown comment + the
+    // nextFrame() docstring for why a microtask flush is insufficient on
+    // WebView2.
+    await nextFrame();
     await handleCreate();
   }
   function onAdoptModalCancel() {

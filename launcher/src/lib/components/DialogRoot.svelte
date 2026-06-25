@@ -190,10 +190,34 @@
   // then yanks the component via {#if} — the $effect above never sees
   // the open=true→false transition in that pattern, so it cannot do
   // this cleanup itself.
+  //
+  // v0.2.68 (Chromium/WebView2 orphan-backdrop fix): the close() here is
+  // UNCONDITIONAL — we no longer gate on `dialogEl?.open`. The gate was a
+  // latent bug on Chromium-based webviews (Windows WebView2):
+  //
+  //   Stacked-modal teardown (e.g. ProjectSelector's Adopt→Create flow)
+  //   sets the bindable `open` prop false; the $effect above observes that
+  //   and calls native close(), which flips the JS property `dialogEl.open`
+  //   to false IMMEDIATELY. But Chromium does not release the top-layer
+  //   ::backdrop slot in the same turn. The consumer then unmounts this
+  //   DialogRoot (its `{#if}` guard goes false) → onDestroy runs → the old
+  //   gate saw `dialogEl.open === false` (already flipped) → it SKIPPED
+  //   close() → the still-pending top-layer backdrop was orphaned and
+  //   captured pointer events viewport-wide (the post-add navigation freeze
+  //   that a launcher restart "fixed" = DOM reload).
+  //
+  //   WebKitGTK (Linux) releases the top-layer slot on a different schedule
+  //   relative to the .open property flip, so the gate happened to hold
+  //   there — which is why this reproduced only on Windows WebView2.
+  //
+  // close() on an already-closed <dialog> is a spec no-op, so calling it
+  // unconditionally is safe and idempotent: harmless when the slot is
+  // already released, corrective when Chromium hasn't released it yet.
+  // The earlier `await tick()` ordering in consumers (v0.2.67) was a
+  // microtask barrier, NOT a top-layer-release barrier — necessary but not
+  // sufficient on Chromium; this unconditional teardown is the structural fix.
   onDestroy(() => {
-    if (dialogEl?.open) {
-      try { dialogEl.close(); } catch { /* already closed */ }
-    }
+    try { dialogEl?.close(); } catch { /* already closed / detached */ }
   });
 </script>
 
