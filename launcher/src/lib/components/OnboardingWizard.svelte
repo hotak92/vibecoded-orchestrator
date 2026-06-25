@@ -1151,14 +1151,30 @@
                 <tr>
                   <th>GPU</th>
                   <td>
-                    {#if detection.has_nvidia_gpu}
-                      {detection.gpu_name} — {detection.vram_gb ? `${detection.vram_gb} GB VRAM (${detection.gpu_vendor ?? 'NVIDIA'})` : 'NVIDIA'}
+                    <!-- v0.2.68 (Defect Y): show the SELECTED discrete GPU
+                         (gpu_vendor / vram_gb describe the chosen card —
+                         most-capable usable discrete, after dropping Intel
+                         + iGPUs). On an iGPU+discrete or multi-GPU host the
+                         old "GPU detected: <name>" copy was misleading. -->
+                    {#if detection.gpu_vendor === 'NVIDIA'}
+                      {detection.chosen_gpu_name || detection.gpu_name} — {detection.vram_gb ? `${detection.vram_gb} GB VRAM (NVIDIA)` : 'NVIDIA'}
                     {:else if detection.gpu_vendor === 'AMD'}
-                      {detection.vram_gb ? `${detection.vram_gb} GB VRAM (AMD)` : 'AMD'}
+                      {detection.chosen_gpu_name ? `${detection.chosen_gpu_name} — ` : ''}{detection.vram_gb ? `${detection.vram_gb} GB VRAM (AMD)` : 'AMD'}
+                    {:else if detection.gpu_vendor}
+                      {detection.chosen_gpu_name || detection.gpu_vendor} — {detection.vram_gb ? `${detection.vram_gb} GB VRAM` : detection.gpu_vendor}
                     {:else if detection.has_apple_silicon}
                       Apple Silicon (unified memory)
                     {:else}
                       none detected (CPU only)
+                    {/if}
+                    {#if (detection.gpus ?? []).some((g: { vendor: string; is_integrated: boolean }) => g.vendor === 'intel' || g.is_integrated)}
+                      <div class="ow-secondary" style="margin-top:0.25rem;">
+                        Ignored (not a usable accelerator):
+                        {(detection.gpus ?? [])
+                          .filter((g: { vendor: string; is_integrated: boolean }) => g.vendor === 'intel' || g.is_integrated)
+                          .map((g: { vendor: string; name: string; is_integrated: boolean }) => `${g.name || g.vendor}${g.vendor === 'intel' ? ' (Intel, unsupported)' : ' (integrated)'}`)
+                          .join(', ')}
+                      </div>
                     {/if}
                   </td>
                 </tr>

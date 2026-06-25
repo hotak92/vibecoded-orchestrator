@@ -157,11 +157,26 @@ pub struct SystemDetection {
     pub container_runtime: Option<String>,
     /// Total system RAM in GB (rounded). 0 if detection failed.
     pub ram_gb: u64,
-    /// Total VRAM in GB across discovered GPUs (NVIDIA preferred, then ROCm).
-    /// 0 if no GPU detected.
+    /// VRAM in GB for the CHOSEN discrete GPU (v0.2.68: most-capable
+    /// usable discrete card, after filtering Intel + iGPUs — was
+    /// "total across discovered GPUs" pre-v0.2.68). 0 if no usable GPU.
     pub vram_gb: u64,
-    /// "NVIDIA" | "AMD" | null. Used to label VRAM in the UI.
+    /// "NVIDIA" | "AMD" | null. Vendor of the chosen GPU. Used to label
+    /// VRAM in the UI.
     pub gpu_vendor: Option<String>,
+    /// v0.2.68 (Defect Y): every GPU the probes enumerated (NVIDIA via
+    /// nvidia-smi, AMD via rocm-smi, Intel/iGPU via lspci/wmic), BEFORE
+    /// Intel/iGPU filtering. Lets the GUI show "found N GPUs, using
+    /// <discrete>" + which cards were ignored. `serde(default)` keeps the
+    /// type backward-compatible with callers/snapshots that predate it.
+    #[serde(default)]
+    pub gpus: Vec<crate::commands::gpu_policy::GpuCandidate>,
+    /// v0.2.68: human-readable name of the chosen discrete GPU (the one
+    /// `vram_gb`/`gpu_vendor` describe). Empty when no usable GPU. May
+    /// differ from `gpu_name` (which historically held only the first
+    /// NVIDIA name); kept distinct + additive for backward compat.
+    #[serde(default)]
+    pub chosen_gpu_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +263,17 @@ pub struct HardwareSnapshot {
     /// correctly.
     #[serde(default = "default_gpu_mode")]
     pub gpu_mode_decided: crate::commands::gpu_policy::GpuMode,
+    /// v0.2.68 (Defect Y): every GPU enumerated by `detect_system`,
+    /// BEFORE Intel/iGPU filtering. Empty on a pre-v0.2.68 snapshot (a
+    /// redetect populates it). Lets the Preferences hardware panel show
+    /// "found N GPUs, using <discrete>" + the ignored iGPU/Intel cards.
+    #[serde(default)]
+    pub gpus: Vec<crate::commands::gpu_policy::GpuCandidate>,
+    /// v0.2.68: name of the chosen discrete GPU (the card `vram_gb`
+    /// describes). Empty when no usable discrete GPU. Distinct from
+    /// `gpu_name` for backward compat (older code reads `gpu_name`).
+    #[serde(default)]
+    pub chosen_gpu_name: String,
 }
 
 /// Default for the `gpu_mode_decided` serde fallback. We treat older
@@ -530,10 +556,13 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
 
-    // Run detections in parallel via tokio
+    // Run detections in parallel via tokio.
+    // v0.2.68 (Defect Y): `enumerate_gpus` replaces the separate
+    // nvidia/amd scalar probes — it returns ALL GPUs (NVIDIA + AMD +
+    // Intel/iGPU via lspci), which we then run through `select_gpu_device`
+    // to pick the most-capable usable discrete card.
     let (
-        nvidia_result,
-        amd_result,
+        gpus,
         podman_ver,
         docker_ver,
         python_result,
@@ -541,8 +570,7 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
         git,
         node,
     ) = tokio::join!(
-        detect_nvidia_gpu(),
-        detect_amd_gpu(),
+        enumerate_gpus(),
         detect_runtime_version("podman"),
         detect_runtime_version("docker"),
         detect_python(),
@@ -551,8 +579,6 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
         check_command_exists("node"),
     );
 
-    let (has_nvidia, gpu_name, nvidia_vram_gb) = nvidia_result;
-    let (has_amd, amd_vram_gb) = amd_result;
     let (has_python, python_version, python_cmd) = python_result;
     let has_apple_silicon = os == "macos" && arch == "aarch64";
 
@@ -563,12 +589,38 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
     // identically downstream).
     let container_runtime = podman_ver.clone().or_else(|| docker_ver.clone());
 
-    let (vram_gb, gpu_vendor) = if has_nvidia {
-        (nvidia_vram_gb, Some("NVIDIA".to_string()))
-    } else if has_amd {
-        (amd_vram_gb, Some("AMD".to_string()))
-    } else {
-        (0, None)
+    // Honor VCT_GPU_VENDOR (lowercased; "metal" handled separately on the
+    // install.py side — the launcher snapshot has no Metal-via-pref path).
+    let vendor_pref = std::env::var("VCT_GPU_VENDOR")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| v == "nvidia" || v == "amd");
+    let chosen =
+        crate::commands::gpu_policy::select_gpu_device(&gpus, vendor_pref.as_deref());
+
+    // `has_nvidia_gpu` / `gpu_name` keep their historical meaning ("an
+    // NVIDIA card is present" / "first NVIDIA name") for backward compat
+    // with downstream consumers; the chosen-device fields carry the
+    // v0.2.68 selection result.
+    let has_nvidia = gpus.iter().any(|c| c.vendor == "nvidia");
+    let first_nvidia_name = gpus
+        .iter()
+        .find(|c| c.vendor == "nvidia")
+        .map(|c| c.name.clone())
+        .unwrap_or_default();
+
+    let (vram_gb, gpu_vendor, chosen_gpu_name) = match &chosen {
+        Some(c) if c.vendor == "nvidia" => {
+            (c.vram_gb.round() as u64, Some("NVIDIA".to_string()), c.name.clone())
+        }
+        Some(c) if c.vendor == "amd" => {
+            (c.vram_gb.round() as u64, Some("AMD".to_string()), c.name.clone())
+        }
+        Some(c) => {
+            // "unknown"-vendor kept-on-uncertainty — surface it generically.
+            (c.vram_gb.round() as u64, Some(c.vendor.to_uppercase()), c.name.clone())
+        }
+        None => (0, None, String::new()),
     };
 
     let ram_gb = detect_ram_gb();
@@ -577,7 +629,7 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
         os,
         arch,
         has_nvidia_gpu: has_nvidia,
-        gpu_name,
+        gpu_name: first_nvidia_name,
         has_apple_silicon,
         has_docker,
         has_podman,
@@ -591,6 +643,8 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
         ram_gb,
         vram_gb,
         gpu_vendor,
+        gpus,
+        chosen_gpu_name,
     })
 }
 
@@ -1589,6 +1643,10 @@ pub(crate) fn snapshot_from_system(s: &SystemDetection) -> HardwareSnapshot {
         vram_gb,
         has_amd_gpu,
         gpu_mode_decided,
+        // v0.2.68 (Defect Y): carry the enumeration + chosen device so the
+        // Preferences panel can show "found N GPUs, using <discrete>".
+        gpus: s.gpus.clone(),
+        chosen_gpu_name: s.chosen_gpu_name.clone(),
     }
 }
 
@@ -1624,6 +1682,15 @@ fn snapshot_changed_fields(a: &HardwareSnapshot, b: &HardwareSnapshot) -> Vec<St
     // a userspace ROCm install became available (rocminfo on PATH now).
     if a.has_amd_gpu != b.has_amd_gpu {
         out.push("has_amd_gpu".to_string());
+    }
+    // v0.2.68 (Defect Y): the chosen discrete GPU changed (user swapped
+    // cards, or added a more-capable one), or the enumeration count
+    // changed (added/removed a GPU, including an iGPU).
+    if a.chosen_gpu_name != b.chosen_gpu_name {
+        out.push("chosen_gpu_name".to_string());
+    }
+    if a.gpus.len() != b.gpus.len() {
+        out.push("gpus".to_string());
     }
     out
 }
@@ -10515,72 +10582,229 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 
 /// Detects NVIDIA GPU + total VRAM (across all GPUs) in GB.
 /// Returns (has_gpu, first_gpu_name, total_vram_gb).
-async fn detect_nvidia_gpu() -> (bool, String, u64) {
-    let result = tokio::process::Command::new("nvidia-smi").silent()
+/// Enumerate EVERY NVIDIA GPU (one `GpuCandidate` per device). All NVIDIA
+/// cards are discrete (HW constraint: NVIDIA makes no iGPU). Mirror of
+/// `vco_lib.gpu_device._enumerate_nvidia`. Soft-fails to `[]`.
+async fn enumerate_nvidia_cards() -> Vec<crate::commands::gpu_policy::GpuCandidate> {
+    let result = tokio::process::Command::new("nvidia-smi")
+        .silent()
         .args([
-            "--query-gpu=name,memory.total",
+            "--query-gpu=index,name,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()
         .await;
-
-    match result {
-        Ok(output) if output.status.success() => {
-            let raw = String::from_utf8_lossy(&output.stdout);
-            let mut first_name = String::new();
-            let mut total_mib: u64 = 0;
-            for (i, line) in raw.lines().enumerate() {
-                let mut parts = line.splitn(2, ',').map(|s| s.trim());
-                let name = parts.next().unwrap_or("").to_string();
-                let mem = parts.next().unwrap_or("0");
-                if i == 0 {
-                    first_name = name.clone();
-                }
-                if let Ok(m) = mem.parse::<u64>() {
-                    total_mib = total_mib.saturating_add(m);
-                }
-            }
-            if first_name.is_empty() {
-                (false, String::new(), 0)
-            } else {
-                // MiB -> GB (round to nearest)
-                let vram_gb = (total_mib as f64 / 1024.0).round() as u64;
-                (true, first_name, vram_gb)
-            }
-        }
-        _ => (false, String::new(), 0),
-    }
-}
-
-/// Detect AMD/ROCm GPU + VRAM. Returns (has_gpu, total_vram_gb).
-/// rocm-smi output varies by version; we try the simplest CSV form first.
-async fn detect_amd_gpu() -> (bool, u64) {
-    let result = tokio::process::Command::new("rocm-smi").silent()
-        .args(["--showmeminfo", "vram", "--csv"])
-        .output()
-        .await;
+    let mut out = Vec::new();
     if let Ok(output) = result {
         if output.status.success() {
             let raw = String::from_utf8_lossy(&output.stdout);
-            // CSV columns vary; pick the largest integer that looks like
-            // bytes-of-VRAM. Conservative — better to under-report than to
-            // claim phantom VRAM.
-            let mut total_bytes: u64 = 0;
-            for line in raw.lines().skip(1) {
-                for cell in line.split(',') {
-                    if let Ok(n) = cell.trim().parse::<u64>() {
-                        if n > total_bytes && n > 1024 * 1024 * 100 {
-                            total_bytes = n;
+            for line in raw.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+                // index, name, memory.total(MiB)
+                let name = parts.get(1).copied().unwrap_or("").to_string();
+                let vram_gb = parts
+                    .get(2)
+                    .and_then(|m| m.parse::<f64>().ok())
+                    .map(|mib| (mib / 1024.0 * 100.0).round() / 100.0)
+                    .unwrap_or(0.0);
+                if !name.is_empty() {
+                    out.push(crate::commands::gpu_policy::GpuCandidate {
+                        vendor: "nvidia".to_string(),
+                        name,
+                        vram_gb,
+                        is_integrated: false,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Enumerate AMD GPUs (one `GpuCandidate` per rocm-smi card). iGPU
+/// classification is refined later in `enumerate_gpus` via lspci. Mirror
+/// of `vco_lib.gpu_device._enumerate_amd`. Soft-fails to `[]`.
+async fn enumerate_amd_cards() -> Vec<crate::commands::gpu_policy::GpuCandidate> {
+    let result = tokio::process::Command::new("rocm-smi")
+        .silent()
+        .args(["--showmeminfo", "vram", "--csv"])
+        .output()
+        .await;
+    let mut out = Vec::new();
+    if let Ok(output) = result {
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+            if lines.len() >= 2 {
+                // Find the "VRAM Total Memory" column from the header.
+                let header: Vec<String> =
+                    lines[0].split(',').map(|h| h.trim().to_ascii_lowercase()).collect();
+                let vram_col = header
+                    .iter()
+                    .position(|h| h.contains("vram") && h.contains("total"));
+                if let Some(col) = vram_col {
+                    for row in &lines[1..] {
+                        let values: Vec<&str> = row.split(',').map(|v| v.trim()).collect();
+                        if let Some(cell) = values.get(col) {
+                            if let Ok(bytes) = cell.parse::<f64>() {
+                                let vram_gb = (bytes / 1024.0 / 1024.0 / 1024.0 * 100.0)
+                                    .round()
+                                    / 100.0;
+                                out.push(crate::commands::gpu_policy::GpuCandidate {
+                                    vendor: "amd".to_string(),
+                                    name: "AMD GPU (ROCm)".to_string(),
+                                    vram_gb,
+                                    is_integrated: false,
+                                });
+                            }
                         }
                     }
                 }
             }
-            if total_bytes > 0 {
-                return (true, (total_bytes as f64 / 1024.0 / 1024.0 / 1024.0).round() as u64);
+        }
+    }
+    out
+}
+
+/// Enumerate ALL GPUs across vendors and classify Intel / iGPU. Mirror of
+/// `vco_lib.gpu_device.enumerate_gpus`. Cross-references lspci (Linux) for
+/// vendor + PCI-bus iGPU discrimination + explicit Intel detection.
+/// Soft-fails throughout — NEVER panics.
+async fn enumerate_gpus() -> Vec<crate::commands::gpu_policy::GpuCandidate> {
+    use crate::commands::gpu_policy::GpuCandidate;
+
+    let nvidia = enumerate_nvidia_cards().await;
+    let amd_raw = enumerate_amd_cards().await;
+
+    // lspci VGA/3D lines (Linux only; empty elsewhere).
+    let vga_lines = lspci_vga_lines().await;
+
+    // Refine AMD iGPU classification: if lspci shows BOTH an AMD root-bus
+    // (00:) VGA device AND an AMD discrete-bus device, a UMA-sized
+    // (<= 2 GB) rocm-smi card is the iGPU. Mirrors
+    // `_classify_amd_integrated` in the Python module.
+    let amd_root = vga_lines.iter().any(|l| {
+        vendor_from_lspci(l) == "amd" && bus_is_integrated(&pci_bus_from_lspci(l)) == Some(true)
+    });
+    let amd_discrete = vga_lines.iter().any(|l| {
+        vendor_from_lspci(l) == "amd" && bus_is_integrated(&pci_bus_from_lspci(l)) == Some(false)
+    });
+    let amd: Vec<GpuCandidate> = amd_raw
+        .into_iter()
+        .map(|c| {
+            if amd_root && amd_discrete && c.vram_gb > 0.0 && c.vram_gb <= 2.0 {
+                GpuCandidate { is_integrated: true, ..c }
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    // Intel GPUs are invisible to nvidia-smi/rocm-smi → lspci is the only
+    // way to SEE them and explicitly exclude them downstream.
+    let mut intel: Vec<GpuCandidate> = Vec::new();
+    for line in &vga_lines {
+        if vendor_from_lspci(line) != "intel" {
+            continue;
+        }
+        let bus = pci_bus_from_lspci(line);
+        let integrated = bus_is_integrated(&bus).unwrap_or(true);
+        intel.push(GpuCandidate {
+            vendor: "intel".to_string(),
+            name: "Intel GPU".to_string(),
+            vram_gb: 0.0,
+            is_integrated: integrated,
+        });
+    }
+
+    let mut all = nvidia;
+    all.extend(amd);
+    all.extend(intel);
+    all
+}
+
+/// lspci `-nn` VGA/3D/Display lines. Empty on non-Linux / missing lspci /
+/// failure. Mirror of `vco_lib.gpu_device._lspci_vga_lines`.
+async fn lspci_vga_lines() -> Vec<String> {
+    if std::env::consts::OS != "linux" {
+        return Vec::new();
+    }
+    let result = tokio::process::Command::new("lspci")
+        .silent()
+        .arg("-nn")
+        .output()
+        .await;
+    let mut out = Vec::new();
+    if let Ok(output) = result {
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            for line in raw.lines() {
+                let low = line.to_ascii_lowercase();
+                if low.contains("vga compatible controller")
+                    || low.contains("3d controller")
+                    || low.contains("display controller")
+                {
+                    out.push(line.to_string());
+                }
             }
         }
     }
-    (false, 0)
+    out
+}
+
+/// Map an lspci `-nn` line to "nvidia"/"amd"/"intel"/"unknown". Prefers
+/// the bracketed [VEN:DEV] id. Mirror of `_vendor_from_lspci_line`.
+fn vendor_from_lspci(line: &str) -> &'static str {
+    let low = line.to_ascii_lowercase();
+    if low.contains("[8086:") {
+        return "intel";
+    }
+    if low.contains("[10de:") {
+        return "nvidia";
+    }
+    if low.contains("[1002:") {
+        return "amd";
+    }
+    if low.contains("intel") {
+        return "intel";
+    }
+    if low.contains("nvidia") {
+        return "nvidia";
+    }
+    if low.contains("amd") || low.contains("ati") || low.contains("advanced micro devices") {
+        return "amd";
+    }
+    "unknown"
+}
+
+/// Extract the leading PCI bus token (`03:00.0`) from an lspci line.
+fn pci_bus_from_lspci(line: &str) -> String {
+    // lspci lines start with "BB:DD.F " (hex bus:device.function).
+    let trimmed = line.trim_start();
+    let token: String = trimmed
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .collect();
+    // Validate shape "xx:yy.z" loosely; otherwise return empty.
+    if token.contains(':') && token.contains('.') {
+        token.to_ascii_lowercase()
+    } else {
+        String::new()
+    }
+}
+
+/// Classify a PCI bus token: integrated (bus 00) / discrete / unknown.
+/// Mirror of `vco_lib.gpu_device._bus_is_integrated`.
+fn bus_is_integrated(pci_bus: &str) -> Option<bool> {
+    if pci_bus.is_empty() {
+        return None;
+    }
+    let bus = pci_bus.split(':').next().unwrap_or("");
+    u32::from_str_radix(bus, 16).ok().map(|n| n == 0)
 }
 
 /// `which <cmd>` then `<cmd> --version` → "<cmd> <version>" or None if not
@@ -16069,6 +16293,13 @@ MemAvailable:   23456789 kB
                 ram_gb: 64,
                 vram_gb: 16,
                 gpu_vendor: Some("NVIDIA".to_string()),
+                gpus: vec![crate::commands::gpu_policy::GpuCandidate {
+                    vendor: "nvidia".to_string(),
+                    name: "NVIDIA GeForce RTX 4080 SUPER".to_string(),
+                    vram_gb: 16.0,
+                    is_integrated: false,
+                }],
+                chosen_gpu_name: "NVIDIA GeForce RTX 4080 SUPER".to_string(),
             }
         }
 
@@ -16092,6 +16323,8 @@ MemAvailable:   23456789 kB
                 ram_gb: 8,
                 vram_gb: 0,
                 gpu_vendor: None,
+                gpus: Vec::new(),
+                chosen_gpu_name: String::new(),
             }
         }
 

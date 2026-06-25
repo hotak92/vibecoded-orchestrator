@@ -130,6 +130,13 @@
   // before these fields existed and serde defaults them on read.
   // - vram_gb / gpu_mode_decided: v0.2.9 (Bug K, VRAM threshold)
   // - has_amd_gpu:                v0.2.20 (AMD/ROCm support)
+  // - gpus / chosen_gpu_name:     v0.2.68 (Defect Y, multi-GPU / iGPU-aware)
+  interface GpuCandidate {
+    vendor: string; // 'nvidia' | 'amd' | 'intel' | 'unknown'
+    name: string;
+    vram_gb: number;
+    is_integrated: boolean;
+  }
   interface HardwareSnapshot {
     has_nvidia_gpu: boolean;
     gpu_name: string;
@@ -140,6 +147,11 @@
     vram_gb?: number;
     has_amd_gpu?: boolean;
     gpu_mode_decided?: 'cuda' | 'rocm' | 'cpu' | 'metal';
+    // v0.2.68: full GPU enumeration (before Intel/iGPU filtering) + the
+    // chosen discrete card's name. Optional for backward-compat with
+    // snapshots persisted before v0.2.68 (serde defaults them on read).
+    gpus?: GpuCandidate[];
+    chosen_gpu_name?: string;
   }
   interface HardwareDetectionDiff {
     before: HardwareSnapshot | null;
@@ -236,6 +248,31 @@
       case 'has_nvidia_gpu': return snap.has_nvidia_gpu ? 'yes' : 'no';
       case 'has_amd_gpu': return snap.has_amd_gpu ? 'yes' : 'no';
       case 'gpu_name': return snap.gpu_name || '(none)';
+      case 'chosen_gpu_name':
+        // v0.2.68: the GPU actually selected (most-capable usable discrete
+        // card, after dropping Intel + iGPUs). Falls back to the legacy
+        // gpu_name for pre-v0.2.68 snapshots that lack the field.
+        return snap.chosen_gpu_name || snap.gpu_name || '(none)';
+      case 'gpus': {
+        // v0.2.68: summarise the enumeration — "using X (16.0 GB); ignored
+        // Intel UHD [integrated]". Empty for pre-v0.2.68 snapshots.
+        const list = snap.gpus ?? [];
+        if (list.length === 0) return '—';
+        const chosenName = snap.chosen_gpu_name || snap.gpu_name;
+        const usable = list.filter(g => g.vendor !== 'intel' && !g.is_integrated);
+        const ignored = list.filter(g => g.vendor === 'intel' || g.is_integrated);
+        const parts: string[] = [];
+        if (list.length > 1) parts.push(`found ${list.length} GPUs`);
+        if (chosenName) parts.push(`using ${chosenName}`);
+        else if (usable.length === 0) parts.push('no usable discrete GPU (CPU)');
+        if (ignored.length > 0) {
+          const ign = ignored
+            .map(g => `${g.name || g.vendor}${g.vendor === 'intel' ? ' [Intel, unsupported]' : ' [integrated]'}`)
+            .join(', ');
+          parts.push(`ignored: ${ign}`);
+        }
+        return parts.join('; ') || '—';
+      }
       case 'has_apple_silicon': return snap.has_apple_silicon ? 'yes' : 'no';
       case 'ram_gb': return `${snap.ram_gb} GB`;
       case 'vram_gb':
@@ -2634,6 +2671,16 @@
               <span class="pr-hw-value">{formatHwField('has_amd_gpu', hwDiff.after)}</span></div>
             <div class="pr-hw-row"><span class="pr-hw-label">GPU name</span>
               <span class="pr-hw-value">{formatHwField('gpu_name', hwDiff.after)}</span></div>
+            <!-- v0.2.68 (Defect Y): the SELECTED discrete GPU (most-capable
+                 usable card, after dropping Intel + iGPUs) + the full
+                 enumeration so an iGPU+discrete user sees "found 2, using
+                 the discrete one" rather than thinking detection is wrong. -->
+            <div class="pr-hw-row"><span class="pr-hw-label">Selected GPU</span>
+              <span class="pr-hw-value">{formatHwField('chosen_gpu_name', hwDiff.after)}</span></div>
+            {#if (hwDiff.after.gpus ?? []).length > 1 || (hwDiff.after.gpus ?? []).some(g => g.vendor === 'intel' || g.is_integrated)}
+              <div class="pr-hw-row"><span class="pr-hw-label">GPUs found</span>
+                <span class="pr-hw-value">{formatHwField('gpus', hwDiff.after)}</span></div>
+            {/if}
             <div class="pr-hw-row"><span class="pr-hw-label">Apple Silicon</span>
               <span class="pr-hw-value">{formatHwField('has_apple_silicon', hwDiff.after)}</span></div>
             <div class="pr-hw-row"><span class="pr-hw-label">RAM</span>

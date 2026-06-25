@@ -8,6 +8,19 @@
 //! flow and the install-time decision arrive at the same answer for the
 //! same inputs.
 //!
+//! ## v0.2.68 — multi-GPU / iGPU-aware device selection (Defect Y)
+//!
+//! `decide_gpu_mode`'s MATH is unchanged — it still consumes a scalar
+//! `vram_gb` + vendor booleans. What changed is the INPUT: on multi-GPU /
+//! iGPU / Intel hosts the scalar now reflects the CHOSEN most-capable
+//! discrete card rather than device-0. The selection lives in
+//! `select_gpu_device` below (a pure Rust mirror of
+//! `vco_lib/gpu_device.py::select_gpu_device`); `detect_system`
+//! enumerates GPUs and feeds the chosen card's vendor/VRAM into
+//! `decide_gpu_mode`. Both `decide_gpu_mode` ↔ `_decide_gpu_mode` AND
+//! `select_gpu_device` (Rust) ↔ `select_gpu_device` (Python) must stay in
+//! lock-step.
+//!
 //! ## Why a threshold?
 //!
 //! The orchestrator-core model stack is:
@@ -122,6 +135,179 @@ pub fn decide_gpu_mode(
     }
 
     GpuMode::Cpu
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.68 (Defect Y): multi-GPU / iGPU-aware device selection.
+//
+// PURE Rust mirror of `vco_lib/gpu_device.py::select_gpu_device`. The two
+// MUST stay in lock-step (same as `decide_gpu_mode` ↔ `_decide_gpu_mode`):
+// the launcher's `detect_system` enumerates GPUs, calls `select_gpu_device`
+// to pick the most-capable usable discrete card, and feeds THAT card's
+// vendor/VRAM into `decide_gpu_mode` — so the launcher snapshot and the
+// install-time decision arrive at the same answer on multi-GPU / iGPU /
+// Intel hosts.
+//
+// Decision rule (identical to the Python module):
+//   1. Drop every Intel candidate (unsupported — iGPU or discrete).
+//   2. Drop every integrated candidate (iGPU never a usable accelerator).
+//   3. If a vendor preference (VCT_GPU_VENDOR) is set AND a usable
+//      candidate matches it, restrict to that vendor.
+//   4. From the remainder pick max VRAM; ties prefer NVIDIA.
+//   5. Empty remainder → None → CPU path.
+//
+// Keep-on-uncertainty: an "unknown"-vendor candidate is not Intel and
+// defaults `is_integrated=false`, so it survives as discrete.
+// ---------------------------------------------------------------------------
+
+/// One enumerated GPU. Mirror of `vco_lib.gpu_device.GpuCandidate`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GpuCandidate {
+    /// "nvidia" | "amd" | "intel" | "unknown".
+    pub vendor: String,
+    pub name: String,
+    /// Total VRAM in GB. 0.0 == unknown / probe failed (NOT "no memory").
+    pub vram_gb: f64,
+    pub is_integrated: bool,
+}
+
+/// Pick the most-capable usable discrete GPU, or `None` (CPU path).
+///
+/// PURE — no probes. MUST match `vco_lib/gpu_device.py::select_gpu_device`.
+/// `vendor_pref` is the lowercased `VCT_GPU_VENDOR` value ("nvidia"/"amd");
+/// "metal" is handled by the caller before this function.
+pub fn select_gpu_device(
+    candidates: &[GpuCandidate],
+    vendor_pref: Option<&str>,
+) -> Option<GpuCandidate> {
+    // Steps 1-2: usable = not Intel, not integrated.
+    let usable: Vec<&GpuCandidate> = candidates
+        .iter()
+        .filter(|c| c.vendor != "intel" && !c.is_integrated)
+        .collect();
+    if usable.is_empty() {
+        return None;
+    }
+
+    // Step 3: honor a usable vendor preference (lenient fall-through).
+    let pref = vendor_pref.map(|p| p.trim().to_ascii_lowercase());
+    let pool: Vec<&GpuCandidate> = match pref.as_deref() {
+        Some("nvidia") | Some("amd") => {
+            let pref_str = pref.as_deref().unwrap();
+            let matches: Vec<&GpuCandidate> =
+                usable.iter().copied().filter(|c| c.vendor == pref_str).collect();
+            if matches.is_empty() {
+                usable
+            } else {
+                matches
+            }
+        }
+        _ => usable,
+    };
+
+    // Step 4: max VRAM; ties prefer NVIDIA.
+    pool.into_iter()
+        .max_by(|a, b| {
+            let rank_a = (a.vram_gb, if a.vendor == "nvidia" { 1 } else { 0 });
+            let rank_b = (b.vram_gb, if b.vendor == "nvidia" { 1 } else { 0 });
+            rank_a
+                .0
+                .partial_cmp(&rank_b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(rank_a.1.cmp(&rank_b.1))
+        })
+        .cloned()
+}
+
+#[cfg(test)]
+mod device_select_tests {
+    use super::*;
+
+    fn c(vendor: &str, vram: f64, integrated: bool) -> GpuCandidate {
+        GpuCandidate {
+            vendor: vendor.to_string(),
+            name: format!("{vendor} GPU"),
+            vram_gb: vram,
+            is_integrated: integrated,
+        }
+    }
+
+    #[test]
+    fn single_nvidia_discrete_unchanged() {
+        let cands = vec![c("nvidia", 16.0, false)];
+        let chosen = select_gpu_device(&cands, None).unwrap();
+        assert_eq!(chosen.vendor, "nvidia");
+        assert_eq!(chosen.vram_gb, 16.0);
+    }
+
+    #[test]
+    fn single_amd_discrete_unchanged() {
+        let cands = vec![c("amd", 16.0, false)];
+        assert_eq!(select_gpu_device(&cands, None).unwrap().vendor, "amd");
+    }
+
+    #[test]
+    fn dual_nvidia_picks_largest() {
+        let cands = vec![c("nvidia", 8.0, false), c("nvidia", 24.0, false)];
+        assert_eq!(select_gpu_device(&cands, None).unwrap().vram_gb, 24.0);
+    }
+
+    #[test]
+    fn amd_igpu_plus_discrete_picks_discrete() {
+        let cands = vec![c("amd", 0.5, true), c("amd", 16.0, false)];
+        let chosen = select_gpu_device(&cands, None).unwrap();
+        assert_eq!(chosen.vram_gb, 16.0);
+        assert_eq!(chosen.vendor, "amd");
+    }
+
+    #[test]
+    fn intel_igpu_plus_nvidia_excludes_intel() {
+        let cands = vec![c("intel", 0.0, true), c("nvidia", 16.0, false)];
+        assert_eq!(select_gpu_device(&cands, None).unwrap().vendor, "nvidia");
+    }
+
+    #[test]
+    fn tie_prefers_nvidia() {
+        let cands = vec![c("amd", 16.0, false), c("nvidia", 16.0, false)];
+        assert_eq!(select_gpu_device(&cands, None).unwrap().vendor, "nvidia");
+    }
+
+    #[test]
+    fn intel_only_falls_to_cpu() {
+        let cands = vec![c("intel", 16.0, false)];
+        assert!(select_gpu_device(&cands, None).is_none());
+    }
+
+    #[test]
+    fn no_gpu_falls_to_cpu() {
+        assert!(select_gpu_device(&[], None).is_none());
+    }
+
+    #[test]
+    fn only_integrated_falls_to_cpu() {
+        let cands = vec![c("amd", 2.0, true)];
+        assert!(select_gpu_device(&cands, None).is_none());
+    }
+
+    #[test]
+    fn unknown_vendor_kept_as_discrete() {
+        let cands = vec![c("unknown", 12.0, false)];
+        assert_eq!(select_gpu_device(&cands, None).unwrap().vendor, "unknown");
+    }
+
+    #[test]
+    fn vendor_pref_amd_restricts() {
+        let cands = vec![c("nvidia", 16.0, false), c("amd", 12.0, false)];
+        let chosen = select_gpu_device(&cands, Some("amd")).unwrap();
+        assert_eq!(chosen.vendor, "amd");
+    }
+
+    #[test]
+    fn vendor_pref_unsatisfiable_falls_through() {
+        let cands = vec![c("nvidia", 16.0, false)];
+        let chosen = select_gpu_device(&cands, Some("amd")).unwrap();
+        assert_eq!(chosen.vendor, "nvidia");
+    }
 }
 
 #[cfg(test)]

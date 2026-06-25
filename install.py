@@ -907,7 +907,16 @@ def _bootstrap_detect_brew() -> dict:
 
 
 def _bootstrap_detect_gpu() -> dict:
-    """Best-effort GPU detection. Soft-fails to vendor='none' on errors."""
+    """Best-effort GPU detection. Soft-fails to vendor='none' on errors.
+
+    v0.2.68 (Defect Y): shares the SAME device-selection pipeline as
+    ``_detect_system`` — ``vco_lib.gpu_device.enumerate_gpus`` +
+    ``select_gpu_device`` — so both detect paths agree on the chosen
+    discrete card (closes the G5/G7 duplicate-order gap). The bootstrap
+    envelope's contract is unchanged: ``vram_gb=None`` means "unknown"
+    (mapped from "no chosen device" or "chosen device's VRAM probe
+    failed", i.e. ``chosen.vram_gb == 0.0``).
+    """
     canonical_os, _ = _bootstrap_detect_os()
     if canonical_os == "macos":
         if _bootstrap_normalize_arch() == "arm64":
@@ -920,44 +929,64 @@ def _bootstrap_detect_gpu() -> dict:
             "vendor": "none", "model": None, "vram_gb": None,
             "driver_version": None, "container_toolkit_ok": None,
         }
-    # Try nvidia-smi
-    if shutil.which("nvidia-smi"):
-        out = _bootstrap_probe_version(
-            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
-             "--format=csv,noheader,nounits"]
-        )
-        if out:
-            first = out.splitlines()[0].split(",")
-            model = first[0].strip() if first else None
-            try:
-                vram_mb = float(first[1].strip()) if len(first) > 1 else 0.0
-                vram_gb = round(vram_mb / 1024.0, 1) if vram_mb else None
-            except (ValueError, IndexError):
-                vram_gb = None
-            driver = first[2].strip() if len(first) > 2 else None
-            return {
-                "vendor": "nvidia", "model": model, "vram_gb": vram_gb,
-                "driver_version": driver, "container_toolkit_ok": None,
-            }
-    if shutil.which("rocm-smi"):
-        # v0.2.54 S-8 (Phase C gpu-runtime finding): the AMD arm used to
-        # hardcode vram_gb=None even though the main install flow already
-        # ships `_probe_amd_rocm_vram_gb`. Reuse it; 0.0 (probe failed)
-        # maps back to None to keep the envelope contract ("unknown").
-        amd_vram: Optional[float] = None
-        if "_probe_amd_rocm_vram_gb" in globals():
-            try:
-                probed = _probe_amd_rocm_vram_gb()
-                amd_vram = probed if probed and probed > 0 else None
-            except Exception:  # noqa: BLE001 — probe must soft-fail
-                amd_vram = None
+
+    # Shared enumeration + selection (same as the main install path).
+    # Soft-fail: any import/probe failure falls back to vendor='none'.
+    try:
+        from vco_lib.gpu_device import enumerate_gpus, select_gpu_device
+        vendor_pref = _gpu_vendor_preference_from_env()
+        chosen = select_gpu_device(enumerate_gpus(), vendor_pref=vendor_pref)
+    except Exception:  # noqa: BLE001 — detection must never crash bootstrap
+        chosen = None
+
+    if chosen is None:
         return {
-            "vendor": "amd", "model": "AMD GPU (rocm)",
-            "vram_gb": amd_vram, "driver_version": None,
+            "vendor": "none", "model": None, "vram_gb": None,
+            "driver_version": None, "container_toolkit_ok": None,
+        }
+
+    # 0.0 (probe failed) maps back to None to keep the envelope contract.
+    # Round to 1 decimal to match the pre-v0.2.68 envelope shape (the old
+    # NVIDIA arm used `round(vram_mb / 1024.0, 1)`).
+    vram_gb = (
+        round(chosen.vram_gb, 1)
+        if chosen.vram_gb and chosen.vram_gb > 0
+        else None
+    )
+
+    if chosen.vendor == "nvidia":
+        # Enrich with the driver_version field (and a friendlier name) the
+        # envelope historically carried for NVIDIA.
+        model = chosen.name or None
+        driver = None
+        if shutil.which("nvidia-smi"):
+            out = _bootstrap_probe_version(
+                ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+                 "--format=csv,noheader,nounits"]
+            )
+            if out:
+                first = out.splitlines()[0].split(",")
+                if first and first[0].strip():
+                    model = first[0].strip()
+                if len(first) > 2 and first[2].strip():
+                    driver = first[2].strip()
+        return {
+            "vendor": "nvidia", "model": model, "vram_gb": vram_gb,
+            "driver_version": driver, "container_toolkit_ok": None,
+        }
+
+    if chosen.vendor == "amd":
+        return {
+            "vendor": "amd", "model": chosen.name or "AMD GPU (rocm)",
+            "vram_gb": vram_gb, "driver_version": None,
             "container_toolkit_ok": None,
         }
+
+    # "unknown" vendor kept-on-uncertainty: report it as a generic GPU so
+    # the bootstrap envelope doesn't pretend the box is GPU-less.
     return {
-        "vendor": "none", "model": None, "vram_gb": None,
+        "vendor": chosen.vendor or "none",
+        "model": chosen.name or None, "vram_gb": vram_gb,
         "driver_version": None, "container_toolkit_ok": None,
     }
 
@@ -7552,40 +7581,39 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
     elif getattr(args, "no_gpu_check", False):
         print("  GPU: skipped (--no-gpu-check)")
     else:
-        # Layered detection:
-        #   1. nvidia-smi present + working → NVIDIA driver+CUDA OK.
-        #   2. rocm-smi present + working → AMD ROCm driver OK.
-        #   3. Apple Silicon → Metal (built-in).
-        #   4. Else: probe lspci on Linux for "hardware present but
-        #      driver missing"; print URLs.
-        # We do NOT auto-install GPU drivers — they're large (~3 GB),
-        # may need a reboot, and the canonical install path is vendor-
-        # specific. Detection-only here; the launcher GUI offers
-        # opt-in install for users who want it.
+        # v0.2.68 (Defect Y): multi-GPU / iGPU-aware device selection.
         #
-        # v0.2.54 (gpu-audit C-3): honor VCT_GPU_VENDOR before the
-        # layered probe. On dual-vendor hosts the nvidia-smi-first order
-        # otherwise always picks NVIDIA; the env var lets the user pick
-        # the AMD/Metal arm explicitly (lenient: if the preferred
-        # vendor's probe fails, fall through to normal auto-detect with
-        # a stderr note rather than stranding the install).
+        # Pre-v0.2.68 this block did first-vendor / first-card detection
+        # (probe nvidia-smi, then rocm-smi, then Metal; read device-0's
+        # VRAM only). That under-tiered multi-GPU hosts and — on an
+        # AMD-iGPU + AMD-discrete box — could read the iGPU's small UMA
+        # "VRAM" and demote a CodeSage-capable discrete card to Jina,
+        # violating the "AMD-capable → qwen3, NEVER Jina" invariant.
+        #
+        # Now we enumerate ALL GPUs once (vco_lib.gpu_device.enumerate_gpus)
+        # and pick the most-capable usable discrete card
+        # (select_gpu_device: drop Intel + drop iGPUs → max-VRAM discrete).
+        # The chosen device's vendor/VRAM flow UNCHANGED into _decide_gpu_mode
+        # and the three embedding selectors — single-GPU hosts get a
+        # byte-identical result to the old probe (one candidate in, same
+        # card out). Metal stays special-cased AFTER select_gpu_device
+        # returns None: Apple unified memory has no discrete-VRAM concept,
+        # so it must not go through the VRAM picker.
+        #
+        # We do NOT auto-install GPU drivers — they're large (~3 GB), may
+        # need a reboot, and the canonical install path is vendor-specific.
+        # Detection-only here; the launcher GUI offers opt-in install.
+        #
+        # VCT_GPU_VENDOR is honored as vendor_pref into select_gpu_device
+        # (lenient: if the preferred vendor has no usable card, fall through
+        # to the full usable set rather than stranding the install). The
+        # "metal" preference is handled separately (Apple has no discrete
+        # VRAM to rank).
+        from vco_lib.gpu_device import enumerate_gpus, select_gpu_device
+
         vendor_pref = _gpu_vendor_preference_from_env()
-        if vendor_pref == "amd":
-            rocm_present, rocm_info = _detect_amd_rocm()
-            if rocm_present:
-                has_gpu = True
-                gpu_vendor = "amd"
-                gpu_name = rocm_info
-                vram_gb = _probe_amd_rocm_vram_gb()
-                vram_label = f" ({vram_gb:.1f} GB VRAM)" if vram_gb > 0 else ""
-                print(f"  GPU: {rocm_info}{vram_label} (VCT_GPU_VENDOR=amd)")
-            else:
-                print(
-                    "  VCT_GPU_VENDOR=amd set but rocm-smi probe failed; "
-                    "falling through to auto-detect.",
-                    file=sys.stderr,
-                )
-        elif vendor_pref == "metal":
+
+        if vendor_pref == "metal":
             if os_name == "Darwin" and _detect_apple_silicon():
                 has_metal = True
                 gpu_vendor = "metal"
@@ -7596,42 +7624,95 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
                     "Apple Silicon; falling through to auto-detect.",
                     file=sys.stderr,
                 )
-        # vendor_pref == "nvidia" needs no special arm — the default
-        # layered order below already probes nvidia-smi first.
 
-        # Default layered probe — skipped entirely when an env-pref arm
-        # above already resolved the vendor (the pre-v0.2.54 shape would
-        # otherwise re-enter the NVIDIA arm and overwrite the choice).
-        if not gpu_vendor:
-            has_gpu, gpu_name = _detect_nvidia_gpu()
-            if has_gpu:
-                gpu_vendor = "nvidia"
-                vram_gb = _probe_nvidia_vram_gb()
-                extra = _probe_nvidia_versions()
+        if not gpu_vendor and not has_metal:
+            candidates = enumerate_gpus()
+            chosen = select_gpu_device(candidates, vendor_pref=vendor_pref)
+            # Surface the full enumeration on the system-info banner /
+            # event log so multi-GPU selection is observable.
+            usable_discrete = [
+                c for c in candidates
+                if c.vendor != "intel" and not c.is_integrated
+            ]
+            ignored = [c for c in candidates if c not in usable_discrete]
+
+            if chosen is not None:
+                has_gpu = True
+                gpu_vendor = chosen.vendor
+                vram_gb = chosen.vram_gb
+                # Enrich the display name with the vendor-specific probe
+                # when it gives a friendlier string than the enumerator's
+                # generic label (AMD rocm-smi product, NVIDIA driver/CUDA).
+                gpu_name = chosen.name
+                extra = ""
+                if chosen.vendor == "nvidia":
+                    nv_present, nv_name = _detect_nvidia_gpu()
+                    if nv_present and nv_name:
+                        gpu_name = nv_name
+                    extra = _probe_nvidia_versions()
+                elif chosen.vendor == "amd":
+                    rocm_present, rocm_info = _detect_amd_rocm()
+                    if rocm_present and rocm_info:
+                        gpu_name = rocm_info
                 vram_label = f", {vram_gb:.1f} GB VRAM" if vram_gb > 0 else ""
+                pref_label = (
+                    f" (VCT_GPU_VENDOR={vendor_pref})"
+                    if vendor_pref in ("nvidia", "amd")
+                    else ""
+                )
                 if extra:
-                    print(f"  GPU: {gpu_name} ({extra}{vram_label})")
+                    print(f"  GPU: {gpu_name} ({extra}{vram_label}){pref_label}")
                 else:
-                    print(f"  GPU: {gpu_name}{vram_label.lstrip(',').rstrip()}")
+                    label = f"  GPU: {gpu_name}{vram_label}{pref_label}"
+                    print(label.replace(": ,", ": "))
+                # When more than one usable discrete card was found, tell
+                # the user which we picked + how to override.
+                if len(usable_discrete) > 1:
+                    others = ", ".join(
+                        f"{c.name or c.vendor} ({c.vram_gb:.1f} GB)"
+                        for c in usable_discrete if c is not chosen
+                    )
+                    print(
+                        f"       selected most-capable GPU; also found: "
+                        f"{others} — pass VCT_GPU_VENDOR to override."
+                    )
+                # When we deliberately ignored an iGPU / Intel GPU, say so —
+                # otherwise an iGPU+discrete user might think detection is
+                # wrong ("I have 2 GPUs, why does it show one?").
+                if ignored:
+                    ign = ", ".join(
+                        f"{c.name or c.vendor}"
+                        f"{' [Intel, unsupported]' if c.vendor == 'intel' else ' [integrated]'}"
+                        for c in ignored
+                    )
+                    print(f"       ignored (not a usable accelerator): {ign}")
+            elif os_name == "Darwin" and _detect_apple_silicon():
+                has_metal = True
+                gpu_vendor = "metal"
+                print("  GPU: Apple Silicon (Metal — built-in, no driver install needed)")
             else:
-                rocm_present, rocm_info = _detect_amd_rocm()
-                if rocm_present:
-                    # Treat ROCm as GPU-capable for the embedding-mode
-                    # picker. Ollama supports ROCm natively (per Ollama
-                    # docs); if their build doesn't, the user gets a clear
-                    # runtime error and can fall back to --cpu-only.
-                    has_gpu = True
-                    gpu_vendor = "amd"
-                    gpu_name = rocm_info
-                    vram_gb = _probe_amd_rocm_vram_gb()
-                    vram_label = f" ({vram_gb:.1f} GB VRAM)" if vram_gb > 0 else ""
-                    print(f"  GPU: {rocm_info}{vram_label}")
-                elif os_name == "Darwin" and _detect_apple_silicon():
-                    has_metal = True
-                    gpu_vendor = "metal"
-                    print("  GPU: Apple Silicon (Metal — built-in, no driver install needed)")
-                else:
-                    _print_gpu_hint(os_name)
+                _print_gpu_hint(os_name)
+                # If we saw Intel / integrated GPUs but no usable discrete
+                # one, make the "→ CPU" reason explicit (closes the old
+                # "Intel falls to CPU by accident" gap).
+                if ignored:
+                    ign = ", ".join(
+                        f"{c.name or c.vendor}"
+                        f"{' [Intel, unsupported]' if c.vendor == 'intel' else ' [integrated]'}"
+                        for c in ignored
+                    )
+                    print(f"       (saw {ign} — not usable accelerators; using CPU)")
+
+            # Stash the enumeration for the manifest writer / event log so
+            # downstream tools (doctor, GUI snapshot) can reflect "found N,
+            # using <chosen>" without re-running detection.
+            args._gpu_candidates = [  # type: ignore[attr-defined]
+                {
+                    "vendor": c.vendor, "name": c.name,
+                    "vram_gb": c.vram_gb, "is_integrated": c.is_integrated,
+                }
+                for c in candidates
+            ]
 
     # v0.2.53 L-P0-8: when a GPU IS detected on Linux, surface the
     # render/video group remediation if missing. The webkit_preflight
@@ -7740,6 +7821,9 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
             "ram_gb": ram_gb,
             "gpu_mode": gpu_mode,
             "gpu_vram_threshold_gb": threshold_gb,
+            # v0.2.68 (Defect Y): record the full GPU enumeration so the
+            # event log reflects multi-GPU / iGPU-aware selection.
+            "gpu_candidates": getattr(args, "_gpu_candidates", []),
         },
     )
     return info
