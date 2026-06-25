@@ -1613,10 +1613,28 @@ pub(crate) fn snapshot_from_system(s: &SystemDetection) -> HardwareSnapshot {
     // v0.2.9 (Bug K) + v0.2.20: map raw detection → GpuMode via the VRAM
     // threshold. No user override at the snapshot layer — the override
     // only applies at the install.py CLI surface (--gpu / --cpu-only).
+    //
+    // v0.2.68 (Defect Y, SF-1): feed `decide_gpu_mode` the CHOSEN card's
+    // vendor, NOT any-vendor-present. `vram_gb` above is already the chosen
+    // discrete card's VRAM (select_gpu_device), so the vendor flags MUST
+    // describe that same card or the two inputs disagree. On a mixed-vendor
+    // dual-discrete host where the chosen card is AMD but a lower-VRAM NVIDIA
+    // is also present, passing `s.has_nvidia_gpu=true` (any-present) with the
+    // AMD card's VRAM made `decide_gpu_mode` return Cuda (NVIDIA precedence)
+    // — labeling an AMD-chosen host CUDA and requesting a CUDA container
+    // variant on an AMD box. Python's `_detect_system` passes only
+    // `vendor=chosen.vendor` (install.py:_decide_gpu_mode), returning rocm;
+    // deriving the booleans from `s.gpu_vendor` (the chosen vendor, set at
+    // the detection site) keeps the Rust mirror lock-step with Python. The
+    // persisted `has_nvidia_gpu`/`has_amd_gpu` snapshot fields retain their
+    // historical any-present meaning for external consumers (see below) —
+    // only the MODE decision uses the chosen card.
+    let chosen_is_nvidia = s.gpu_vendor.as_deref() == Some("NVIDIA");
+    let chosen_is_amd = s.gpu_vendor.as_deref() == Some("AMD");
     let gpu_mode_decided = crate::commands::gpu_policy::decide_gpu_mode(
         vram_gb,
-        s.has_nvidia_gpu,
-        has_amd_gpu,
+        chosen_is_nvidia,
+        chosen_is_amd,
         s.has_apple_silicon,
         None,
         crate::commands::gpu_policy::DEFAULT_GPU_VRAM_THRESHOLD_GB,
@@ -10662,6 +10680,47 @@ async fn enumerate_amd_cards() -> Vec<crate::commands::gpu_policy::GpuCandidate>
                                 });
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // v0.2.68 (Defect Y, SF-3): text fallback for older rocm-smi that lacks
+    // `--csv`. Mirrors `vco_lib.gpu_device._enumerate_amd`'s text path so the
+    // launcher snapshot agrees with the Python install on legacy-rocm-smi AMD
+    // hosts (without this the snapshot returned [] → "no GPU" while install.py
+    // enumerated the card → ROCm). One "Total Memory" line per card.
+    let result = tokio::process::Command::new("rocm-smi")
+        .silent()
+        .args(["--showmeminfo", "vram"])
+        .output()
+        .await;
+    if let Ok(output) = result {
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            for line in raw.lines() {
+                let ll = line.to_ascii_lowercase();
+                if ll.contains("total") && ll.contains("memory") && line.contains(':') {
+                    let after = line.splitn(2, ':').nth(1).unwrap_or("").trim();
+                    let first = after.split_whitespace().next().unwrap_or("");
+                    if let Ok(bytes_val) = first.parse::<f64>() {
+                        // Heuristic: huge → bytes; mid → MB; small → already GB.
+                        let vram_gb = if bytes_val > 1024.0_f64.powi(3) {
+                            (bytes_val / 1024.0 / 1024.0 / 1024.0 * 100.0).round() / 100.0
+                        } else if bytes_val > 1024.0 {
+                            (bytes_val / 1024.0 * 100.0).round() / 100.0
+                        } else {
+                            (bytes_val * 100.0).round() / 100.0
+                        };
+                        out.push(crate::commands::gpu_policy::GpuCandidate {
+                            vendor: "amd".to_string(),
+                            name: "AMD GPU (ROCm)".to_string(),
+                            vram_gb,
+                            is_integrated: false,
+                        });
                     }
                 }
             }
