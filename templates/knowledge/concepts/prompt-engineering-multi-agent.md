@@ -3,7 +3,7 @@ title: Prompt Engineering — Multi-Agent (2026)
 type: concept
 tags: [prompt-engineering, multi-agent, llm, coordination, orchestration, mid-level-architecture]
 created: 2026-06-09T00:00:00Z
-updated: 2026-06-09T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -185,7 +185,7 @@ You succeed when:
 
 The same project usually mixes models by cost/quality:
 
-- **Premium tier** (Claude Opus 4.7, GPT-4-class): orchestrator that mediates trade-offs, code-reviewer that catches subtle bugs, architect that makes irreversible decisions. ~5% of agent calls but ~80% of decision weight.
+- **Premium tier** (Claude Opus 4.8, GPT-4-class): orchestrator that mediates trade-offs, code-reviewer that catches subtle bugs, architect that makes irreversible decisions. ~5% of agent calls but ~80% of decision weight.
 - **Balanced tier** (Claude Sonnet 4.6): coder, planner, doc-writer. ~25% of calls.
 - **Cheap tier** (Claude Haiku 4.5 or comparable): validators, formatters, summarisers, routing-classifiers. ~70% of calls.
 - **Free tier** (local Ollama): preprocessing, deterministic transforms, low-stakes summaries.

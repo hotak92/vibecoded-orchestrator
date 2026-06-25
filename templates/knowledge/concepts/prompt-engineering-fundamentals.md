@@ -3,13 +3,13 @@ title: Prompt Engineering — Fundamentals (2026)
 type: concept
 tags: [prompt-engineering, llm, anthropic, best-practices, mid-level-architecture]
 created: 2026-06-09T00:00:00Z
-updated: 2026-06-09T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
 # Prompt Engineering — Fundamentals (2026)
 
-Foundational patterns for prompting modern LLMs (Claude Opus 4.7, Sonnet 4.6, Haiku 4.5, GPT-4, Gemini). Covers the three-pillars model, Claude 4.x-specific shifts, and the most-cited single-prompt techniques (CoT, few-shot, role-based, self-consistency, meta-prompting).
+Foundational patterns for prompting modern LLMs (Claude Opus 4.8, Sonnet 4.6, Haiku 4.5, GPT-4, Gemini). Covers the three-pillars model, Claude 4.x-specific shifts, and the most-cited single-prompt techniques (CoT, few-shot, role-based, self-consistency, meta-prompting).
 
 For multi-agent / orchestrator-flavoured prompting see [[Prompt Engineering — Multi-Agent]]; for MCP tool-and-resource prompts see [[Prompt Engineering — MCP and Tool Design]].
 
@@ -41,7 +41,7 @@ Effective prompts follow three pillars: **Context provision**, **Instruction cla
 
 ## Claude 4.x patterns
 
-Claude 4.x models (Opus 4.7, Sonnet 4.6, Haiku 4.5) are trained for **more precise instruction following** than 3.x. The shift:
+Claude 4.x models (Opus 4.8, Sonnet 4.6, Haiku 4.5) are trained for **more precise instruction following** than 3.x. The shift:
 
 1. **Explicit > implicit**: what was implied in 3.x must be stated in 4.x
 2. **Motivation matters**: explain WHY, not just WHAT

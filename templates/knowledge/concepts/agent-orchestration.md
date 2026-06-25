@@ -3,7 +3,7 @@ title: Agent Orchestration
 type: concept
 tags: [AI, agents, orchestration, LLM, workflow, coordination, agentic, mid-level-architecture]
 created: 2026-02-26T00:00:00Z
-updated: 2026-04-05T14:33:08Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -56,9 +56,9 @@ Tasks triggered by events (file change, API call, task completion):
 
 | Tool/Framework | Type | Strengths |
 |---|---|---|
-| Claude Code Task tool | Native | Simple, integrated with Claude |
+| Claude Code Agent tool | Native | Simple, integrated with Claude |
 | LangGraph | Graph-based | Stateful, complex workflows |
-| AutoGen | Multi-agent | Microsoft, conversation-based |
+| Microsoft Agent Framework | Multi-agent | Microsoft, conversation-based |
 | CrewAI | Role-based | Easy specialization |
 | Claude-Flow | MAS framework | Claude-optimized patterns |
 
@@ -127,7 +127,7 @@ async def orchestrate_with_retry(task, max_retries=3):
 ## This Project's Orchestration
 
 The Claude Orchestrator project uses:
-- **Claude Code Task tool** for ad-hoc agent spawning
+- **Claude Code Agent tool** for ad-hoc agent spawning
 - **Blackboard pattern** for multi-step task lists (CONTEXT_STATE.md)
 - **MCP servers** as tools accessible to all agents
 - **Hook system** for reactive automation (post-file-edit → KG sync)
