@@ -159,47 +159,65 @@ def test_apply_post_bundle_steps_exists_with_expected_signature() -> None:
 
 
 def test_create_project_v2_calls_apply_post_bundle_steps() -> None:
-    """V52-AF (v0.2.52, 2026-06-09): `create_project_v2` MUST delegate
-    its post-bundle phase to the helper. Without this, the helper
+    """V52-AF (v0.2.52, 2026-06-09): the create path MUST delegate its
+    post-bundle phase to the shared helper. Without this, the helper
     exists but only update uses it — the drift starts again.
 
+    v0.2.68 (Defect B): `create_project_v2` no longer runs the heavy
+    post-bundle phase INLINE. The slow phases (bootstrap-collections +
+    install-bundle + the post-bundle pipeline) were moved into a detached
+    setup task so the New Project modal returns FAST instead of blocking
+    ~51s on a cold backend. The create-path phases now live in the
+    `create_setup_phases` closure (projects_v2.rs), which is what
+    `create_project_v2` hands to `project_setup::spawn_setup_task`. The
+    `apply_post_bundle_steps` delegation + create/update parity it guards
+    are UNCHANGED — only the call moved from `create_project_v2`'s inline
+    body into `create_setup_phases`. So this test now scopes the
+    helper-call + `is_initial_create: true` assertions to
+    `create_setup_phases`, and keeps the "not re-inlined into
+    create_project_v2" sentinel on `create_project_v2` itself.
+
     Asserts:
-    - `create_project_v2`'s body contains a call to
+    - `create_setup_phases`'s body contains a call to
       `apply_post_bundle_steps(...)`.
-    - The call passes `is_initial_create: true` (codegraph spawn does
+    - That call passes `is_initial_create: true` (codegraph spawn does
       NOT prune on first create — no rows possible).
-    - The inline `populate_project_state_from_filesystem` call that
-      USED to be in the body has been removed (the helper owns it now).
-      One sentinel: the second populate call (post-bundle) no longer
-      exists inline. The FIRST populate (pre-bundle) still does, so
-      we check for a uniquely-identifying comment fragment.
+    - The post-bundle `populate_project_state_from_filesystem` block is
+      NOT inlined into `create_project_v2` (the helper owns it; the
+      uniquely-identifying comment fragment must not be in that body).
     """
     src = _load_projects_v2_source()
-    body = _extract_fn_body(src, "create_project_v2")
+    # v0.2.68: the create-path post-bundle phases live in this closure now.
+    phases_body = _extract_fn_body(src, "create_setup_phases")
 
-    # Helper call present.
-    assert "apply_post_bundle_steps(" in body, (
-        "V52-AF regression: `create_project_v2` no longer calls "
-        "`apply_post_bundle_steps`. The post-bundle phase MUST be "
-        "delegated to the shared helper so update_project_v2 can use "
-        "the same code path."
+    # Helper call present in the create-path setup closure.
+    assert "apply_post_bundle_steps(" in phases_body, (
+        "V52-AF regression: the create path (`create_setup_phases`) no "
+        "longer calls `apply_post_bundle_steps`. The post-bundle phase "
+        "MUST be delegated to the shared helper so update_project_v2 can "
+        "use the same code path. (v0.2.68 moved this call out of "
+        "create_project_v2's inline body into the create_setup_phases "
+        "closure — if you refactored again, point this assertion at the "
+        "new home, don't drop the delegation.)"
     )
 
-    # is_initial_create=true on create.
+    # is_initial_create=true on create. (v0.2.68 arg names inside the
+    # closure: &project_id / &project_name / &folder, vs the pre-v0.2.68
+    # inline &row.id / &req.name / folder.)
     assert re.search(
         r"apply_post_bundle_steps\s*\([^)]*is_initial_create\s*\*/\s*true",
-        body,
+        phases_body,
         re.DOTALL,
     ) or re.search(
-        # Tolerate the case where the comment is dropped — match the
-        # `, true,` argument at the right position (last positional arg).
-        r"apply_post_bundle_steps\s*\(\s*&row\.id\s*,\s*"
-        r"&req\.name\s*,\s*folder\s*,\s*&app\s*,\s*&db\s*,\s*"
+        # Tolerate the comment being dropped — match `true` as the last
+        # positional arg after the 5 borrows, allowing either arg-name set.
+        r"apply_post_bundle_steps\s*\(\s*&(?:row\.id|project_id)\s*,\s*"
+        r"&(?:req\.name|project_name)\s*,\s*(?:&)?folder\s*,\s*&app\s*,\s*&db\s*,\s*"
         r"(?:/\*\s*is_initial_create\s*\*/\s*)?true",
-        body,
+        phases_body,
         re.DOTALL,
     ), (
-        "V52-AF regression: `create_project_v2` MUST pass "
+        "V52-AF regression: the create path MUST pass "
         "`is_initial_create: true` to `apply_post_bundle_steps`. On "
         "first create no per-project code-graph rows can be stale, so "
         "prune_stale must be false (audit AF-6). Passing `false` here "
@@ -207,6 +225,9 @@ def test_create_project_v2_calls_apply_post_bundle_steps() -> None:
         "pass — wasteful but not catastrophic. Passing the wrong value "
         "is still a real regression."
     )
+
+    # The post-bundle populate must NOT be re-inlined into create_project_v2.
+    body = _extract_fn_body(src, "create_project_v2")
 
     # The post-bundle populate is no longer inline.
     # The unique sentinel: the comment block "Re-call populate now that
