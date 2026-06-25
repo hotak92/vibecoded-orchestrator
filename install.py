@@ -8166,6 +8166,55 @@ _SUMMARY_BACKEND_GEMMA = "gemma4:e4b"
 _SUMMARY_BACKEND_OPENAI = "openai"     # routes via API tier with consent gate
 
 
+def _cpu_meets(
+    ram_gb: float,
+    cores: int,
+    *,
+    min_ram: float,
+    min_cores: int,
+    strict_ram: bool = True,
+) -> bool:
+    """Shared CPU-capability predicate for the hardware-tier selectors.
+
+    All three `select_*_backend` selectors gate their CPU (no-GPU /
+    sub-tier-GPU) fallback on the same shape — "enough RAM AND enough
+    cores to run the heavier local model" — but with DIFFERENT
+    thresholds AND a different RAM-boundary semantic:
+
+      - code + KG embedding: ``ram > 24 AND cores >= 8``  (strict RAM)
+      - summary generation:  ``ram >= 12 AND cores >= 6`` (inclusive RAM)
+
+    The strict-vs-inclusive RAM distinction is load-bearing, not
+    cosmetic: the code/KG selectors deliberately use strict ``>`` on the
+    24 GB boundary (v0.2.49 — a host with EXACTLY 24 GB shouldn't tier-up
+    to qwen3, since qwen3-embedding on CPU-only Ollama is ~30s/embedding
+    even at the boundary), whereas the summary selector uses inclusive
+    ``>=`` on its 12 GB boundary (a 12 GB host CAN run gemma4:e4b for
+    summary generation). So this helper PARAMETERISES the RAM comparison
+    via ``strict_ram`` rather than hardcoding one or the other.
+
+    The cores comparison is ALWAYS inclusive (``>=``) — both thresholds
+    (8 for code/KG, 6 for summary) treat the exact count as qualifying.
+
+    Args:
+        ram_gb:     System RAM (GB). Coerced via ``float(... or 0.0)``
+                    so a ``None`` probe-failure reads as 0 (fails the gate).
+        cores:      Physical CPU cores. Coerced via ``int(... or 0)``.
+        min_ram:    RAM threshold (GB).
+        min_cores:  Core-count threshold (inclusive).
+        strict_ram: When True (default), RAM uses strict ``>`` (code/KG
+                    24 GB rule). When False, RAM uses inclusive ``>=``
+                    (summary 12 GB rule).
+
+    Returns:
+        True iff the host clears BOTH the RAM and cores thresholds.
+    """
+    ram = float(ram_gb or 0.0)
+    cpu_cores = int(cores or 0)
+    ram_ok = ram > min_ram if strict_ram else ram >= min_ram
+    return ram_ok and cpu_cores >= min_cores
+
+
 def select_code_embedding_backend(
     gpu_vram_gb: float,
     ram_gb: float,
@@ -8218,8 +8267,6 @@ def select_code_embedding_backend(
         return _CODE_BACKEND_OPENAI
 
     vram = float(gpu_vram_gb or 0.0)
-    ram = float(ram_gb or 0.0)
-    cpu_cores = int(cores or 0)
 
     if vram >= 12.0:
         return _CODE_BACKEND_CODESAGE
@@ -8231,10 +8278,10 @@ def select_code_embedding_backend(
     # CPU path: VRAM <= 2 GB OR no GPU at all.
     # v0.2.49: strict-> on RAM (was `>=`). Boundary hosts with exactly
     # 24 GB shouldn't tier-up to qwen3 — qwen3-embedding on CPU-only
-    # Ollama is ~30s per embedding even at the boundary. cpu_cores
+    # Ollama is ~30s per embedding even at the boundary. cores
     # comparison stays `>=8` but now counts PHYSICAL cores (see
     # `_probe_cpu_cores` docstring for the v0.2.49 SMT-counting fix).
-    if ram > 24.0 and cpu_cores >= 8:
+    if _cpu_meets(ram_gb, cores, min_ram=24.0, min_cores=8, strict_ram=True):
         return _CODE_BACKEND_QWEN3
     return _CODE_BACKEND_JINA
 
@@ -8289,8 +8336,6 @@ def select_kg_embedding_backend(
         return _KG_BACKEND_OPENAI
 
     vram = float(gpu_vram_gb or 0.0)
-    ram = float(ram_gb or 0.0)
-    cpu_cores = int(cores or 0)
 
     if vram > 8.0:
         return _KG_BACKEND_QWEN3
@@ -8302,7 +8347,9 @@ def select_kg_embedding_backend(
         return _KG_BACKEND_ARCTIC
 
     # CPU path (or sub-4-GB GPU treated as CPU here).
-    if ram > 24.0 and cpu_cores >= 8:
+    # Same strict-> RAM / >= cores predicate as the code selector
+    # (v0.2.49). See `_cpu_meets` for the strict-vs-inclusive rationale.
+    if _cpu_meets(ram_gb, cores, min_ram=24.0, min_cores=8, strict_ram=True):
         return _KG_BACKEND_QWEN3
     return _KG_BACKEND_ARCTIC
 
@@ -8368,8 +8415,6 @@ def select_summary_backend(
         return _SUMMARY_BACKEND_CLI
 
     vram = float(gpu_vram_gb or 0.0)
-    ram = float(ram_gb or 0.0)
-    cpu_cores = int(cores or 0)
 
     # GPU tiers.
     if vram >= 16.0:
@@ -8378,7 +8423,10 @@ def select_summary_backend(
         return _SUMMARY_BACKEND_GEMMA
 
     # CPU tier (only when GPU is sub-6 GB or absent).
-    if ram >= 12.0 and cpu_cores >= 6:
+    # NOTE: inclusive (`>=`) RAM boundary here — a 12 GB host CAN run
+    # gemma4:e4b — unlike the code/KG selectors' strict-> 24 GB rule.
+    # `strict_ram=False` parameterises that distinction. See `_cpu_meets`.
+    if _cpu_meets(ram_gb, cores, min_ram=12.0, min_cores=6, strict_ram=False):
         return _SUMMARY_BACKEND_GEMMA
 
     # No local path viable. Last resort: OpenAI, only if the user

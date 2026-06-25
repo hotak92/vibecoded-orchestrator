@@ -29,6 +29,7 @@ from __future__ import annotations
 import pytest
 
 from install import (
+    _cpu_meets,
     select_code_embedding_backend,
     select_kg_embedding_backend,
     select_summary_backend,
@@ -139,6 +140,31 @@ class TestCodeEmbeddingSelector:
         """Cores qualify but RAM <= 24 GB → fall through to Jina."""
         got = select_code_embedding_backend(
             gpu_vram_gb=0.0, ram_gb=16.0, cores=16,
+            openai_key_available=False,
+        )
+        assert got == _CODE_BACKEND_JINA
+
+    def test_no_gpu_high_ram_cores_exactly_8_picks_qwen3(self) -> None:
+        """CPU cores boundary: cores == 8 is inclusive (`>= 8`) → qwen3.
+
+        Pins the `min_cores=8` half of the CPU predicate. RAM is held
+        above the strict-24 threshold so only the cores comparison is
+        under test.
+        """
+        got = select_code_embedding_backend(
+            gpu_vram_gb=0.0, ram_gb=32.0, cores=8,
+            openai_key_available=False,
+        )
+        assert got == _CODE_BACKEND_QWEN3
+
+    def test_no_gpu_high_ram_cores_7_falls_to_jina(self) -> None:
+        """CPU cores boundary: cores == 7 is below `>= 8` → Jina.
+
+        The complement of the cores==8 case above — proves the cores
+        comparison is `>=` (not `>`), i.e. 8 qualifies, 7 does not.
+        """
+        got = select_code_embedding_backend(
+            gpu_vram_gb=0.0, ram_gb=32.0, cores=7,
             openai_key_available=False,
         )
         assert got == _CODE_BACKEND_JINA
@@ -260,6 +286,27 @@ class TestKgEmbeddingSelector:
         )
         assert got == _KG_BACKEND_ARCTIC
 
+    def test_no_gpu_high_ram_cores_exactly_8_picks_qwen3(self) -> None:
+        """CPU cores boundary: cores == 8 is inclusive (`>= 8`) → qwen3.
+
+        Pins the `min_cores=8` half of the KG CPU predicate (identical
+        threshold to the code selector, parameterised via the shared
+        `_cpu_meets` helper).
+        """
+        got = select_kg_embedding_backend(
+            gpu_vram_gb=0.0, ram_gb=32.0, cores=8,
+            openai_key_available=False,
+        )
+        assert got == _KG_BACKEND_QWEN3
+
+    def test_no_gpu_high_ram_cores_7_falls_to_arctic(self) -> None:
+        """CPU cores boundary: cores == 7 is below `>= 8` → arctic."""
+        got = select_kg_embedding_backend(
+            gpu_vram_gb=0.0, ram_gb=32.0, cores=7,
+            openai_key_available=False,
+        )
+        assert got == _KG_BACKEND_ARCTIC
+
     def test_openai_override_picks_openai(self) -> None:
         got = select_kg_embedding_backend(
             gpu_vram_gb=24.0, ram_gb=64.0, cores=16,
@@ -329,6 +376,47 @@ class TestSummaryBackendSelector:
             openai_consent=False,
         )
         assert got == _SUMMARY_BACKEND_GEMMA
+
+    def test_no_gpu_ram_11_9_returns_none(self) -> None:
+        """Non-strict RAM boundary: 11.9 GB is below `>= 12` → None.
+
+        This is the summary selector's NON-strict (`>=`) RAM predicate,
+        in contrast to the code/KG selectors' STRICT (`>`) 24 GB rule.
+        11.9 GB must fall through (no local backend) — proving the
+        threshold is 12 and that exactly-12 (above) vs 11.9 (here)
+        straddle the inclusive boundary correctly.
+        """
+        got = select_summary_backend(
+            gpu_vram_gb=0.0, ram_gb=11.9, cores=8,
+            claude_cli_available=False,
+            openai_consent=False,
+        )
+        assert got is None
+
+    def test_no_gpu_cores_exactly_6_picks_gemma(self) -> None:
+        """CPU cores boundary: cores == 6 is inclusive (`>= 6`) → gemma.
+
+        RAM held above 12 so only the cores comparison is under test.
+        """
+        got = select_summary_backend(
+            gpu_vram_gb=0.0, ram_gb=16.0, cores=6,
+            claude_cli_available=False,
+            openai_consent=False,
+        )
+        assert got == _SUMMARY_BACKEND_GEMMA
+
+    def test_no_gpu_cores_5_returns_none(self) -> None:
+        """CPU cores boundary: cores == 5 is below `>= 6` → None.
+
+        Complement of the cores==6 case — proves the summary CPU
+        predicate uses `min_cores=6` (distinct from code/KG's 8).
+        """
+        got = select_summary_backend(
+            gpu_vram_gb=0.0, ram_gb=16.0, cores=5,
+            claude_cli_available=False,
+            openai_consent=False,
+        )
+        assert got is None
 
     def test_no_gpu_low_ram_no_consent_returns_none(self) -> None:
         """RAM < 12 GB AND no CLI AND no consent → None (no path viable)."""
@@ -406,6 +494,64 @@ class TestSummaryBackendSelector:
             openai_consent=False,
         )
         assert got is None
+
+
+# ────────────────────────────────────────────────────────────────────
+# Shared CPU-capability predicate — `_cpu_meets`
+# ────────────────────────────────────────────────────────────────────
+#
+# v0.2.68 dedup: the three selectors' CPU fallback gate ("enough RAM AND
+# cores to run the heavier local model") was 3 copies of the same shape
+# with DIFFERENT thresholds AND a different RAM-boundary semantic
+# (code/KG strict `>` 24 GB; summary inclusive `>=` 12 GB). Extracted to
+# `_cpu_meets(ram, cores, *, min_ram, min_cores, strict_ram)`. These
+# tests pin BOTH thresholds + the strict-vs-inclusive RAM boundary
+# directly on the helper, independent of the selector call-sites.
+
+class TestCpuMeetsPredicate:
+    """_cpu_meets — parameterised RAM/cores capability gate."""
+
+    # ── strict RAM (code/KG: ram > 24) ──────────────────────────────
+    def test_strict_ram_exactly_at_threshold_fails(self) -> None:
+        """strict_ram=True: RAM == min_ram is NOT enough (`>`, not `>=`)."""
+        assert _cpu_meets(24.0, 8, min_ram=24.0, min_cores=8, strict_ram=True) is False
+
+    def test_strict_ram_just_above_threshold_passes(self) -> None:
+        """strict_ram=True: RAM just above min_ram qualifies."""
+        assert _cpu_meets(24.1, 8, min_ram=24.0, min_cores=8, strict_ram=True) is True
+
+    # ── inclusive RAM (summary: ram >= 12) ──────────────────────────
+    def test_inclusive_ram_exactly_at_threshold_passes(self) -> None:
+        """strict_ram=False: RAM == min_ram IS enough (`>=`)."""
+        assert _cpu_meets(12.0, 6, min_ram=12.0, min_cores=6, strict_ram=False) is True
+
+    def test_inclusive_ram_just_below_threshold_fails(self) -> None:
+        """strict_ram=False: RAM just below min_ram fails."""
+        assert _cpu_meets(11.9, 6, min_ram=12.0, min_cores=6, strict_ram=False) is False
+
+    # ── cores boundary (always inclusive `>=`) ──────────────────────
+    def test_cores_exactly_at_threshold_passes(self) -> None:
+        """Cores comparison is inclusive: cores == min_cores qualifies."""
+        assert _cpu_meets(32.0, 8, min_ram=24.0, min_cores=8, strict_ram=True) is True
+
+    def test_cores_just_below_threshold_fails(self) -> None:
+        """Cores one short of min_cores fails even with ample RAM."""
+        assert _cpu_meets(64.0, 7, min_ram=24.0, min_cores=8, strict_ram=True) is False
+
+    def test_both_must_hold(self) -> None:
+        """RAM ok but cores short → False; cores ok but RAM short → False."""
+        assert _cpu_meets(64.0, 4, min_ram=24.0, min_cores=8, strict_ram=True) is False
+        assert _cpu_meets(16.0, 16, min_ram=24.0, min_cores=8, strict_ram=True) is False
+
+    # ── coercion of probe-failure / None inputs ─────────────────────
+    def test_none_inputs_coerce_to_zero_and_fail(self) -> None:
+        """None RAM/cores (probe failure) → 0 → fails the gate."""
+        assert _cpu_meets(None, None, min_ram=12.0, min_cores=6, strict_ram=False) is False
+
+    def test_default_strict_ram_is_true(self) -> None:
+        """Default strict_ram=True matches the code/KG selector semantic."""
+        # Exactly-24 RAM with the default (strict) must fail.
+        assert _cpu_meets(24.0, 8, min_ram=24.0, min_cores=8) is False
 
 
 # ────────────────────────────────────────────────────────────────────
