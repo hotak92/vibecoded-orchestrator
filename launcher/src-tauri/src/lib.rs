@@ -696,7 +696,7 @@ pub fn run() {
                 );
             }
 
-            // v0.2.52 V52-AH (Fabio bug 1, 2026-06-09): boot-time
+            // v0.2.52 V52-AH (Windows binary-lock bug, 2026-06-09): boot-time
             // recovery probe for the Windows stage1 updater handoff.
             //
             // On Windows, `prepare_windows_update_handoff` (invoked by
@@ -2865,7 +2865,7 @@ pub fn run() {
             // install.py's _refresh_dist_binary_after_rebuild.
             commands::restart::restart_launcher,
             commands::restart::get_launcher_restart_status,
-            // v0.2.52 V52-AH (Fabio bug 1): Windows binary lock fix via
+            // v0.2.52 V52-AH (Windows binary-lock bug): Windows binary lock fix via
             // stage1 updater handoff. `prepare_windows_update_handoff` writes
             // ~/.vct/update.lock.json + spawns vct-updater.exe DETACHED so
             // the binary swap happens AFTER the running launcher exits (the

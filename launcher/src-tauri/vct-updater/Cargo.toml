@@ -8,7 +8,7 @@ description = "Stage1 updater for VCT launcher — performs Windows binary swap 
 authors = ["VibeCoded Tools"]
 license = "AGPL-3.0"
 
-# v0.2.52 V52-AH (Fabio bug 1, 2026-06-09):
+# v0.2.52 V52-AH (Windows binary-lock bug, 2026-06-09):
 #
 # Background
 # ----------

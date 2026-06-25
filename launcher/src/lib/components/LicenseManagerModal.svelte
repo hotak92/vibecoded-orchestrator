@@ -11,9 +11,8 @@
   // keychain entry through the `__orchestrator__` reserved slot).
   //
   // Composition pattern: `DialogRoot` + `bind:open` (same shape as
-  // `ActivationModal.svelte`). Per the A3 collision audit
-  // (`.claude/context/reviews/v0240-pre-push-2026-05-30/discovery-A3-fabio-branch-collision-audit.md`)
-  // we use the `showLicenseManager` store flag (NOT `showLicense`,
+  // `ActivationModal.svelte`). Per the v0.2.40 A3 store-flag
+  // collision audit, we use the `showLicenseManager` store flag (NOT `showLicense`,
   // `showModal`, or `showKeyManager`) so another contributor's parallel
   // orchestrator-update-progress modal can land without a rebase
   // conflict on `stores/ui.ts`.

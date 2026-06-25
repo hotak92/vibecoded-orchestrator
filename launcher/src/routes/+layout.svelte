@@ -23,11 +23,10 @@
   // v0.2.40 L1: per-paid-module license manager modal. Opened via
   // `ui.openLicenseManager()`. Mount + close pattern mirrors
   // `InstallWizard` (the wiring guide we sent to a contributor). Namespacing
-  // discipline per the A3 collision audit: the store flag is
+  // discipline per the v0.2.40 A3 store-flag collision audit: the store flag is
   // `showLicenseManager` (NOT `showLicense` / `showModal`) so another contributor's
   // parallel orchestrator-update-progress branch doesn't collide on
-  // rebase. See `.claude/context/reviews/v0240-pre-push-2026-05-30
-  // /discovery-A3-fabio-branch-collision-audit.md`.
+  // rebase.
   import LicenseManagerModal from '$lib/components/LicenseManagerModal.svelte';
   // v0.2.43 (contributor branch feat/orchestrator-update-progress-modal): full-
   // screen blocking overlay for the orchestrator self-update flow. Mount +

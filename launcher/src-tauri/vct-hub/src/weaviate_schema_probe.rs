@@ -11,8 +11,8 @@
 //! `sync_knowledge_graph.py` to call `.exists()` (case-sensitive) → False
 //! → `.create()` → Weaviate refused with "found similar class".
 //!
-//! See: `.claude/context/audits/fabio-v0252-rootcause-2026-06-10.md`
-//! Symptom B for the full root-cause walk.
+//! See: the v0.2.52 root-cause audit (Symptom B) for the full
+//! root-cause walk.
 //!
 //! Contract: given a candidate class name and a Weaviate URL, return:
 //!   - the actual on-disk casing when a case-different sibling exists,

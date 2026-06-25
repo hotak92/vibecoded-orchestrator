@@ -126,8 +126,8 @@ except Exception as e:
 # Install.py threads the resolved env into this script's subprocess on
 # fresh / --update runs (via `_subprocess_env_with_embedding` in install.py),
 # so this script sees a non-empty ACTIVE_EMBEDDING even when the user
-# shell has no such env set — this is the fix for Fabio's Windows + CPU
-# stuck-at-40-with-qwen3 bug (v0.2.52 V52-AJ, msg 267, 2026-06-09).
+# shell has no such env set — this is the fix for the Windows + CPU-only
+# stuck-at-40-with-qwen3 install bug (v0.2.52 V52-AJ, 2026-06-09).
 # Keeping the env names in `_redacted_env_snapshot()` failure log helps
 # diagnose drift.
 WEAVIATE_URL = os.getenv("WEAVIATE_URL", "http://localhost:8081")

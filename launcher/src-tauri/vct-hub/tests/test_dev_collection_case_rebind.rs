@@ -15,8 +15,7 @@
 //!      reaching the network — a hot-path optimisation we don't want
 //!      regressed.
 //!
-//! Reference: `.claude/context/audits/fabio-v0252-rootcause-2026-06-10.md`
-//! Symptom B.
+//! Reference: the v0.2.52 root-cause audit (Symptom B).
 
 #[tokio::test]
 async fn empty_candidate_returns_empty_without_network() {

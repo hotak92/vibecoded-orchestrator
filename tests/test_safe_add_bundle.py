@@ -215,7 +215,7 @@ class SafeAddBundleTests(unittest.TestCase):
         )
 
     def test_git_info_exclude_gets_only_vco_created_paths(self):
-        # C1 fix (Martino: "check if files are VCO's or user's"): the exclude
+        # C1 fix (check whether files are VCO-shipped or user-authored): the exclude
         # list is computed from the files VCO actually created — VCO-exclusive
         # namespaces (.claude/) collapse to a glob; everything else is a SPECIFIC
         # path. We must NEVER blanket-exclude a dir the user may own.
