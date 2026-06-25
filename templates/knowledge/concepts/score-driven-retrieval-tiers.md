@@ -92,7 +92,7 @@ the prior `hybrid_search` skipped the summary fallback and went straight to cont
 - `claude_mcp_servers/scripts/rl_kg_search.py` — hook-invoked CLI, calls the same helpers
 - `tests/test_shared_kg.py` — tier-formatting unit tests (`_format_result_by_tier`
   boundary scores + per-collection sidecar resolution + full-vs-summary equivalence)
-- `tests/test_retrieval_tuning_roundtrip.py` — threshold round-trip + token-savings probe
+- `tests/test_retrieval_tuning_roundtrip.py` — threshold round-trip (set/get parity across the bash setter, bash getter, and Python client; canonical-default agreement)
 
 ## Observed Token Savings
 
