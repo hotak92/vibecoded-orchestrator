@@ -3,7 +3,7 @@ title: Orchestrator Knowledge Graph
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, knowledge-graph, weaviate, semantic-search]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -39,7 +39,7 @@ status: active                      # active | archived | deprecated | idea
 ---
 ```
 
-A pre-write hook (`pre-write-kg-frontmatter-validate.sh`) blocks writes to `knowledge/**/*.md` if any of `title`, `type`, `tags`, `created`, `updated`, `status` is missing.
+Required fields are `title`, `type`, `tags`, `created`, `updated`, `status`; `valid_from` / `valid_until` are optional temporal markers. The sync pipeline parses these on every write and treats absent frontmatter as an empty header.
 
 ### Typed WikiLinks
 
@@ -94,9 +94,9 @@ The `--all` flag on `kg-sync` processes every file in `knowledge/` — used for 
 
 ## Weaviate Collection Schema
 
-Default collection name: `<ProjectBasename>_KnowledgeGraph` (e.g. `Myapp_KnowledgeGraph`). The shared cross-project collection is `VibecodedOrchestrator_KnowledgeGraph` (renamed from `VibeCodedTools_KnowledgeGraph` in v0.2.12 / PR-26 Group E; the legacy alias is kept as a fallback for ~3 releases) — set as `SHARED_KG_COLLECTION` in workspace env.
+Default collection name: `<ProjectBasename>_KnowledgeGraph` (e.g. `Myapp_KnowledgeGraph`). The shared cross-project collection is `VibeCodedOrchestrator_KnowledgeGraph`, set as `SHARED_KG_COLLECTION` in the project env. Two legacy aliases (`VibecodedOrchestrator_KnowledgeGraph` and an earlier `VibeCodedTools_KnowledgeGraph`) are still recognised so installs that created data under those names keep matching.
 
-**Schema invariant (PR-24, v0.2.12)**: both the KG and Development collections are created with `indexNullState=True`. This is required for `valid_until is_none OR > now` temporal filters to work correctly — without it, Weaviate cannot index null values and filters that test for `null` return no results. See `vco_lib/project_init.kg_class_definition()` and `development_class_definition()`.
+**Schema invariant**: both the KG and Development collections are created with `indexNullState=True`. This is required for `valid_until is_none OR > now` temporal filters to work correctly — without it, Weaviate cannot index null values and filters that test for `null` return no results.
 
 | Property | Type | Notes |
 |---|---|---|
@@ -120,7 +120,7 @@ Each KG entry carries multiple named vectors (active embedding + legacy slot) so
 ### Keyword Search (CLI)
 
 ```bash
-.claude/scripts/kg-search search "error handling" --type concepts
+.claude/scripts/kg-search search "error handling" --type concept
 .claude/scripts/kg-search search "FastAPI" --tags python
 .claude/scripts/kg-search list --days 7       # Recently updated
 .claude/scripts/kg-info info "Node Title"     # Full node details
@@ -134,15 +134,16 @@ Speed: ~100ms. Best for known exact terms.
 ```python
 hybrid_search("authentication patterns for web APIs")
 # Combines BM25 keyword + vector similarity
-# Searches KG + development docs simultaneously
-# Returns ranked results with 6-line content summaries by default
+# Searches per-project KG + shared KG + development docs simultaneously
+# Default detail="auto": verbosity per result is chosen from its score
 ```
 
 Parameters:
-- `detail`: `"titles"` (minimal) | `"descriptions"` (default, 6-line summaries) | `"full"` (300-char content)
+- `detail`: `"auto"` (default — per-result score tiering) | `"titles"` | `"summary"` | `"single_chunk"` | `"three_chunks"` | `"full"`. In auto mode, score < 0.42 is discarded; higher-scoring results render richer (summary → single_chunk → three_chunks → full at ≥ 0.75).
 - `node_type`: filter to specific type (concept, tool, etc.)
 - `tags`: filter by tag list
 - `days`: recency filter
+- `limit`: max results (default 5)
 
 ```python
 semantic_graph_search("authentication patterns", depth=2)
@@ -162,6 +163,7 @@ store_knowledge_node(
     content="# My Pattern\n...",
     node_type="concept",
     tags=["mid-level-architecture"],
+    links=["relatedTo::Some Other Node"],   # typed WikiLinks
     file_path="knowledge/concepts/my-pattern.md",
     scope="project"  # "project" (default) or "shared"
 )

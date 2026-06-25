@@ -3,20 +3,20 @@ title: Shared Knowledge Graph (Cross-Project)
 type: concept
 tags: [knowledge-graph, weaviate, vibecoded-tools, mid-level-architecture, retrieval]
 created: 2026-04-27T00:00:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
 # Shared Knowledge Graph (Cross-Project)
 
 The vibecoded orchestrator ships with a **cross-project shared KG** — a single
-Weaviate collection (`VibeCodedOrchestrator_KnowledgeGraph`, renamed from
-`VibeCodedTools_KnowledgeGraph` in v0.2.12) seeded at install
+Weaviate collection (`VibeCodedOrchestrator_KnowledgeGraph`) seeded at install
 time from `vibecoded-orchestrator/knowledge/`. Every project on the machine
 queries both its own per-project KG **and** the shared KG by default; results
-are merged, de-duped, and re-ranked together. Users with data still under the
-old name can designate it as canonical via the launcher's Identity tab
-"Manage shared KG collection" picker — no data migration required.
+are merged, de-duped, and re-ranked together. Two legacy-cased collection names
+are still recognised, and users with data under a different name can designate
+it as canonical via the launcher's Identity tab "Manage shared KG collection"
+picker — no data migration required.
 
 ## Goal
 
@@ -50,10 +50,10 @@ project A           project B           project C
                    │
                    ▼
           single Weaviate instance
-        ┌─────────────┬─────────────┐
-        │ A_KG, B_KG, │ VibeCoded   │
-        │ C_KG, …     │ Tools_KG    │
-        └─────────────┴─────────────┘
+        ┌─────────────┬──────────────────────┐
+        │ A_KG, B_KG, │ VibeCodedOrchestrator │
+        │ C_KG, …     │ _KnowledgeGraph        │
+        └─────────────┴──────────────────────┘
 ```
 
 The shared collection is bootstrapped once per Weaviate instance by `install.py`
@@ -68,12 +68,11 @@ detection + per-file upsert in `sync_knowledge_graph.py`).
   read paths (`hybrid_search`, `semantic_graph_search`) ALWAYS include it.
   This is non-negotiable: knowledge accumulation across projects is the
   headline value prop of the orchestrator.
-- **Asymmetric write gate (since 2026-05-01).** Setting
-  `SHARED_KG_WRITE_DISABLED=true` refuses `store_knowledge_node(scope="shared")`
-  calls from THIS project with a clear error. Reads stay on. Legacy alias
-  `SHARED_KG_OPT_OUT` kept for ~3 releases as a write-gate fallback (target
-  removal: 2026-08); pre-2026-05-01 the same flag also zeroed reads — that
-  behaviour was retired with the rename.
+- **Symmetric read / write gates.** Setting `SHARED_KG_WRITE_DISABLED=true`
+  refuses `store_knowledge_node(scope="shared")` calls from THIS project with a
+  clear error; `SHARED_KG_READ_DISABLED=true` excludes the shared collection
+  from this project's reads. The legacy `SHARED_KG_OPT_OUT` flag is honoured as
+  a write-only fallback for `SHARED_KG_WRITE_DISABLED`.
 
 ## Reading from the shared KG
 
@@ -165,9 +164,10 @@ Reasons:
 3. Power users can override `SHARED_KG_COLLECTION` to point at a private
    team-shared collection (`AcmeTeam_SharedKG`); the MCP layer is generic.
 
-The `kg.rs::is_shared` heuristic recognises both the canonical name and any
-collection containing the substring "shared", so custom names get the same
-"shared first" UI sort order.
+The launcher's `is_shared_kg_class_name` check recognises the canonical name
+plus the two legacy-cased aliases (case-insensitive). A custom shared
+collection is designated via the Identity tab picker rather than inferred from
+its name.
 
 ## See also
 
