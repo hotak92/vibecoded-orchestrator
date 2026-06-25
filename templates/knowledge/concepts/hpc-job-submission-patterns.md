@@ -3,10 +3,10 @@ title: HPC Job Submission Patterns
 type: concept
 tags: [hpc, slurm, pbs, sge, lsf, scheduler, scientific-computing, reproducibility, mid-level-architecture]
 created: 2026-05-19T00:00:00Z
-updated: 2026-05-19T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-05-19T00:00:00Z
-valid_until: 2026-05-22T00:00:00Z
-status: archived
+valid_until: null
+status: active
 ---
 
 # HPC Job Submission Patterns

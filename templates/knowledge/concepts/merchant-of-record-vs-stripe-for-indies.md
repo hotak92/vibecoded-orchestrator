@@ -3,7 +3,7 @@ title: Merchant of Record vs Stripe for Indies
 type: concept
 tags: [saas, payments, business, founder, compliance, stripe, mid-level-architecture, active]
 created: 2026-05-19T00:00:00Z
-updated: 2026-05-19T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-05-19T00:00:00Z
 valid_until: null
 status: active
@@ -24,16 +24,16 @@ This is not a fee comparison — it's a "what do you want to be responsible for"
 
 ## The 2026 Landscape
 
-| Provider | Type | Fee (verified 2026-05-19) | Best for |
+| Provider | Type | Fee (recheck before signing) | Best for |
 |----------|------|---------------------------|----------|
 | **Stripe** | Direct processor | 2.9% + $0.30 US, ~1.5% + €0.25 EU (varies) | US-focused, scaling, want full control |
-| **Lemon Squeezy** | MoR | 5% + 50¢ | Indies selling globally, want sales tax handled |
-| **Polar.sh** | MoR (open source) | 4% + 40¢ | Open-source projects, GitHub-native flows |
-| **Paddle** | MoR (Classic) / Processor (Billing) | 5% + 50¢ MoR; ~variable for Billing | B2B SaaS, EU/UK heavy |
+| **Lemon Squeezy** | MoR | 5% + 50¢ (+1.5% intl, +0.5% subscriptions) | Indies selling globally, want sales tax handled |
+| **Polar.sh** | MoR (open source) | 5% + 50¢ free tier; lower on paid monthly tiers (e.g. ~3.4–3.8% + 30–40¢) | Open-source projects, GitHub-native flows |
+| **Paddle** | MoR (Classic) / Processor (Billing) | 5% + 50¢ all-in MoR (no intl/subscription surcharge); ~variable for Billing | B2B SaaS, EU/UK heavy |
 | **Gumroad** | MoR | 10% (flat, no monthly) | Digital products, one-time sales |
 | **FastSpring** | MoR | ~5.9% + $0.95 | Established cross-border SaaS |
 
-**Pricing verified live**: Lemon Squeezy and Stripe pricing pages fetched 2026-05-19. Other rates from each provider's published pricing as of writing; rates do change — recheck before signing up.
+**Pricing changes** — MoR rates and surcharge structures shift (Polar restructured to a tiered model; several MoRs surcharge international cards and subscriptions on top of the headline rate). Treat the table as a starting point and re-read each provider's live pricing page before committing.
 
 ## The Real Decision Tree
 
@@ -97,7 +97,8 @@ Common advice circa 2022–2023 was "use Stripe by default, it's the standard." 
 
 ## Sources
 
-- Lemon Squeezy pricing page, https://www.lemonsqueezy.com/pricing — fetched 2026-05-19, confirmed "5% + 50¢"
+- Lemon Squeezy pricing page, https://www.lemonsqueezy.com/pricing
 - Stripe Atlas guide, *Merchant of record explained*
-- Polar.sh public pricing — 4% + 40¢ as of 2026-05 (JS-rendered, not directly grep-verified)
+- Polar.sh public pricing, https://polar.sh/pricing (tiered model: 5% + 50¢ free tier, lower rates on paid monthly plans)
+- Paddle pricing, https://www.paddle.com/pricing
 - EU VAT MOSS / OSS docs — https://taxation-customs.ec.europa.eu/online-services/online-services-and-databases-taxation/oss-one-stop-shop_en
