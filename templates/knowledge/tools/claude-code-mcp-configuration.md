@@ -3,7 +3,7 @@ title: Claude Code MCP Configuration Pattern
 type: tool
 tags: [claude-code, mcp, configuration, linux, environment-variables, pattern]
 created: 2026-02-04T01:15:00Z
-updated: 2026-04-05T14:34:48Z
+updated: 2026-06-25T00:00:00Z
 status: active
 priority: high
 ---
@@ -12,110 +12,61 @@ priority: high
 
 ## Problem
 
-Claude Code on **Linux has issues loading MCP servers** from `.mcp.json` (project-level config), even though:
-- The CLI correctly reads `.mcp.json` and shows servers as ✓ Connected
-- The official documentation suggests `.mcp.json` should work
-- Multiple GitHub issues confirm this is a known bug
+Per-project MCP servers (weaviate-kg, search, etc.) need per-project environment (KG collection name, project venv, codegraph prefix) without that environment leaking into other projects on the same machine. The wrong config surface is a common footgun: values can look correct in one file yet never reach the MCP subprocess.
 
-## Solution: User-Level Config with Environment Variables
+## Canonical channel: `.claude/settings.json` `env`
 
-### Configuration Location
-
-**Only working configuration for Claude Code on Linux:**
-
-**`~/.claude/settings.json`** with `mcpServers` field (NOT `.vscode/settings.json`, NOT `claude.mcpServers`)
+Per-project env that must reach MCP subprocesses goes in the project's **`.claude/settings.json`** `env` block. This is the one channel that propagates to MCP subprocesses on every Claude Code surface — CLI, Desktop app, and the VS Code extension — on every OS. The launcher's per-project Identity tab writes this file.
 
 ```json
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-
-  "mcpServers": {
-    "server-name": {
-      "command": "${MCP_PYTHON:-/default/path/to/python}",
-      "args": ["${MCP_SERVER_PATH:-/default/path/to/server.py}"],
-      "env": {
-        "VAR_NAME": "${VAR_NAME:-default-value}",
-        "PYTHONPATH": "${MCP_PYTHONPATH:-/default/pythonpath}"
-      }
-    }
-  },
-
   "env": {
-    "MCP_PYTHON": "/default/path/to/python",
-    "MCP_SERVER_PATH": "/default/path/to/server.py",
-    "MCP_PYTHONPATH": "/default/pythonpath",
-    "VAR_NAME": "default-value"
+    "KG_COLLECTION": "ProjectName_KnowledgeGraph",
+    "SHARED_KG_COLLECTION": "VibeCodedOrchestrator_KnowledgeGraph",
+    "DEVELOPMENT_COLLECTION": "ProjectName_Development",
+    "CODE_GRAPH_PROJECT": "ProjectName",
+    "WEAVIATE_URL": "http://localhost:8081",
+    "OLLAMA_URL": "http://localhost:11435"
   }
 }
 ```
 
-### Pattern: Project-Specific Override
+MCP server registrations themselves (command, args, machine-invariant env like `WEAVIATE_URL`) live in `~/.claude.json` `mcpServers`, written by the orchestrator install flow (`mcp_registration.rs::build_default_mcp_entries`). Per-project `KG_COLLECTION`-shape keys are intentionally dropped from that surface (`ALLOWED_ENV_KEYS`) so they can't leak across projects; they resolve from `.claude/settings.json` `env` instead.
 
-**Challenge**: `~/.claude/settings.json` is user-level (global), but projects need different MCP configurations.
+## The `.vscode/settings.json` footgun
 
-**Solution**: Use environment variables with defaults
+`.vscode/settings.json` `claude-code.env` **does NOT propagate to MCP subprocesses on Linux** (verified against Claude Code 2.1.143). Values look correct in the workspace settings, but the MCP subprocess sees nothing and falls back to bundled defaults. Editing that key for KG / code-graph / embedding routing is the single most common misconfiguration — always use `.claude/settings.json` `env` instead.
 
-**Step 1: User-level defaults** (`~/.claude/settings.json`):
-- Define MCP servers with `${VAR:-default}` syntax
-- Set default project's values in `env` field
-- Works globally when no overrides present
+Verify what the subprocess actually picked up via the MCP startup log line `weaviate-kg: resolved collections (...)`, which shows the resolved values plus the resolution source (env / hub / default). A fallback to bundled defaults is logged at WARNING.
 
-**Step 2: Project-specific overrides** (`.vscode/settings.json`):
-```json
-{
-  "claude-code.env": {
-    "MCP_PYTHON": "/path/to/project/.venv/bin/python",
-    "MCP_PYTHONPATH": "/path/to/project/src",
-    "KG_COLLECTION": "ProjectName_KG"
-  }
-}
-```
+## Resolution precedence (highest to lowest)
 
-### Why This Works
-
-1. **User-level config shared between CLI and extension** - Both read `~/.claude/settings.json`
-2. **Environment variables provide flexibility** - Each project can override via VS Code settings
-3. **Defaults ensure it works without setup** - Primary project works out of the box
-4. **Absolute paths required** - No `${workspaceFolder}` support in user-level config
-
-### Alternative Configurations (DO NOT USE)
-
-These work for CLI but NOT for Claude Code on Linux:
-
-❌ `.mcp.json` in project root - CLI only
-❌ `.vscode/settings.json` with `claude.mcpServers` - Not read by Claude Code
-❌ Relative paths or `${workspaceFolder}` - Not expanded in user-level config
+1. **vct-hub-resolved values** — when the launcher is running, the MCP queries `vct-hub` on import and the hub returns the per-project config from `launcher.db`.
+2. **`.claude/settings.json` `env`** — the cross-editor canonical channel.
+3. **`.claude/env`** — shell-sourced, for CLI users who `source` it from their rc.
+4. **`~/.claude.json mcpServers.<name>.env`** — restricted to machine-invariant keys.
+5. **Bundled defaults** in `server.py` — last-resort, logged at WARNING when reached.
 
 ### Verification
 
-**Test servers work:**
+**Servers connect:**
 ```bash
-# CLI should show ✓ Connected
-export PATH="$HOME/.local/bin:$PATH"
-claude mcp list
+claude mcp list   # expect weaviate-kg ✓ Connected, search ✓ Connected
 ```
 
-**Test Claude Code loaded them:**
-- Reload: Command Palette → "Developer: Reload Window"
-- Ask Claude: "What tools do you have?"
-- Should see: `mcp__servername__toolname` tools
-
-### Known Issues
-
-**Linux Claude Code Extension**:
-- MCP tools not exposed despite connection
-- VS Code extension doesn't use MCP servers
-- Native UI prevents MCP server connection
-
-**Workaround**: Use Claude Code CLI (`claude` command in terminal) for full project-scoped MCP support.
+**Per-project env reached the subprocess:**
+- Inside a session, run `/context` — it prints the active workspace path and KG collection name.
+- Read the MCP startup log line `weaviate-kg: resolved collections (...)` for the resolved values + source.
+- If the collection is wrong (e.g. reusing another project's KG), the session was opened in the wrong directory, or the env was placed in `.vscode/settings.json` instead of `.claude/settings.json`.
 
 ### Best Practices
 
-1. **Use absolute paths** - No workspace variables in user-level config
-2. **Test with CLI first** - `claude mcp list` should show ✓ Connected before expecting VS Code to work
-3. **Reload after changes** - VS Code needs full reload for MCP config changes
-4. **One project = defaults** - Set your primary project as defaults in `env` field
-5. **Others override** - Secondary projects override via `.vscode/settings.json`
+1. **Per-project env in `.claude/settings.json` `env`** — the only channel that reaches MCP subprocesses on every surface.
+2. **Never use `.vscode/settings.json` `claude-code.env`** for KG / code-graph / embedding routing — it does not propagate to MCP subprocesses on Linux.
+3. **Machine-invariant keys only in `~/.claude.json`** — `WEAVIATE_URL`, `OLLAMA_URL`; per-project collection keys are dropped from this surface.
+4. **Reload after changes** — the VS Code extension needs a window reload for settings changes to take effect.
+5. **Verify the resolution source** — the `resolved collections` log line tells you whether the value came from env, hub, or the bundled default.
 
 ### Related Patterns
 
@@ -125,6 +76,4 @@ claude mcp list
 
 ---
 
-**Key Insight**: VS Code extension has issues with project-scoped MCP on Linux. User-level config with environment variable overrides provides flexibility while working around the bug.
-
-**Status**: Active workaround until the issue is fixed upstream.
+**Key Insight**: per-project MCP env belongs in `.claude/settings.json` `env`, the one channel that propagates to MCP subprocesses across CLI, Desktop, and the VS Code extension. The `.vscode/settings.json` `claude-code.env` key is a footgun on Linux — it looks correct but the subprocess never sees it.

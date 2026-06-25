@@ -3,23 +3,20 @@ title: "Claude Code CLI - Headless & Scripted Usage"
 type: tool
 tags: [tool, AI, claude-code, CLI, headless, scripting, session-management, orchestration, low-level-implementation]
 created: 2026-02-18T00:00:00Z
-updated: 2026-05-22T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 valid_until: 2026-08-31T00:00:00Z
 status: active
 ---
 
 # Claude Code CLI - Headless & Scripted Usage
 
-> **Verified 2026-05-22**: The subscription-vs-API-key distinction below still holds — `claude -p` runs against the active claude.ai login when present; the Agent SDK still requires `ANTHROPIC_API_KEY`. Confirmed against the CLAUDE.md "Claude Code Auth" canonical note. Re-verify quarterly as Anthropic's auth model evolves.
+Claude Code CLI (`claude`) supports non-interactive/programmatic use via the `-p` flag. When used with a Claude Max subscription, it runs entirely on the subscription (no per-token API billing) against the active claude.ai login. The Agent SDK, by contrast, requires `ANTHROPIC_API_KEY` and charges per token.
 
+## Auth model
 
-Claude Code CLI (`claude`) supports non-interactive/programmatic use via the `-p` flag. When used with a Claude Max subscription, it runs entirely on the subscription (no per-token API billing). The Agent SDK, by contrast, requires an API key and charges per token.
-
-## Key Discovery (2026-02-18)
-
-- **Agent SDK** = API-key based, pay-per-token. NOT subscription-compatible officially.
-- **`claude -p` subprocess** = uses Claude Max subscription. This is the correct approach for cost-free orchestration.
-- Workaround exists (`claude setup-token` OAuth), but not needed if wrapping subprocess directly.
+- **Agent SDK** = API-key based, pay-per-token. Not subscription-compatible officially.
+- **`claude -p` subprocess** = uses the Claude Max subscription via the active claude.ai login. This is the cost-free path for orchestration that wraps the CLI as a subprocess.
+- An OAuth path exists (`claude setup-token`), but it isn't needed when wrapping the subprocess directly.
 
 ## Core Headless Command
 
@@ -163,6 +160,5 @@ See documentation for automated development channels authorization via PTY. Opt-
 ## Links
 
 - [[implements::Claude Orchestrator CLI]] - Target use case
-- [[relatedTo::Claude VSCode Agentic Setup]] - Predecessor (VS Code extension)
-- [[uses::Weaviate]] - KG backend (via MCP, still works in CLI)
-- [[uses::Ollama MCP Server]] - Local LLM (via MCP, still works in CLI)
+- [[relatedTo::Claude Code MCP Configuration Pattern]] - Per-project MCP env
+- [[uses::Weaviate]] - KG backend (via the weaviate-kg MCP, works in CLI)

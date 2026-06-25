@@ -3,7 +3,7 @@ title: FastMCP
 type: tool
 tags: [MCP, python, framework, LLM, tool-calling, server, API]
 created: 2026-02-26T00:00:00Z
-updated: 2026-04-05T14:34:52Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -114,5 +114,5 @@ uv add fastmcp
 [[implements::MCP Server Architecture]]
 [[implements::MCP Protocol]]
 [[relatedTo::Claude Code MCP Configuration Pattern]]
-[[relatedTo::Ollama MCP Server]]
+[[relatedTo::FastAPI]]
 [[relatedTo::Weaviate]]

@@ -3,7 +3,7 @@ title: Gemma 4 E4B
 type: model
 tags: [model, llm, vlm, multimodal, ollama, gemma, google, edge, open-source]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T03:53:53Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -22,11 +22,11 @@ Gemma 4 E4B is the "effective 4B" edge variant of Google DeepMind's Gemma 4 fami
 
 For `gemma4:e4b` at q4_K_M the orchestrator's `VISION_MODEL_REQUIREMENTS` table assumes ~5 GB VRAM and ~8 GB system RAM as practical floors with a small KV cache.
 
-## Where the orchestrator uses it (v0.2.11+)
+## Where the orchestrator uses it
 
-- **KG-summary generation fallback**: `generate-kg-summary.py` targets `gemma4:e4b` on low-power machines (< 24 GB RAM / < 7.5 GB VRAM) when the Claude CLI is unavailable. It is the primary local fallback for summarization workloads.
-- **Not bundled by `install.py`**: the user pulls it explicitly (`ollama pull gemma4:e4b`) when their machine cannot run `qwen3.5:9b`.
-- **Note (v0.2.11)**: the Ollama MCP (`read_image`, `chat`) was removed. `gemma4:e4b` is no longer used as a vision/chat MCP fallback — Claude's built-in vision and reasoning handle those use cases. Gemma 4 E4B remains available via Ollama for direct REST API access if needed outside of VCO's default stack.
+- **KG-summary generation fallback**: `generate-kg-summary.py` targets `gemma4:e4b` when the Claude CLI is unavailable and the host is not capable enough for `qwen3.5:9b`. `install.py`'s `select_kg_summary_backend` picks it for GPU hosts with ≥6 GB but <16 GB VRAM, or CPU hosts with ≥12 GB RAM and ≥6 cores. It is the primary local fallback for summarization on mid- and low-power machines.
+- **Bundled by `install.py`**: pulled via `ollama pull` on capable hosts (alongside `qwen3.5:9b`) and as the low-power summary model on hosts that cannot run `qwen3.5:9b`; the `low_resource` preset also lists it in its inference-model override.
+- **Not exposed as an MCP tool**: there is no Ollama MCP — Claude's built-in vision and reasoning handle vision/chat use cases. Gemma 4 E4B remains available via Ollama's REST API for direct use outside VCO's default stack.
 
 ## Why this model
 

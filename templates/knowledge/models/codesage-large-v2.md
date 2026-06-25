@@ -3,7 +3,7 @@ title: CodeSage-Large-v2
 type: model
 tags: [model, embedding, code-embedding, salesforce, gpu, open-source]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -24,10 +24,10 @@ CodeSage-Large-v2 is GPU-only in practice — at 1.3B parameters with a transfor
 ## Where the orchestrator uses it
 
 - **Code embedding service**: `claude_mcp_servers/code_embedding_service/server.py` is a small FastAPI server that wraps CodeSage-Large-v2 via `sentence-transformers`. It listens on port 11440 and exposes `/health` and `/embed` endpoints.
-- **Backend selector**: the service reads `CODE_EMBED_BACKEND` (`gpu` for CodeSage, `ollama` for the jina fallback), `CODE_EMBED_MODEL` (default `codesage/codesage-large-v2`), and `CODE_EMBED_DEVICE` (default `cuda` if available).
+- **Backend selector**: the service reads `CODE_EMBED_BACKEND` (`gpu` for CodeSage, `ollama` for the jina fallback; default `gpu`), `CODE_EMBED_MODEL` (gpu default `codesage/codesage-large-v2`), and `CODE_EMBED_DEVICE` (default `auto`, which resolves to `cuda`/`mps`/`cpu`; gpu backend only).
 - **Weaviate code-graph collections**: `CodeFunction`, `CodeClass`, `CodeModule`, `CodeAPI`, `CodeInteraction` register the named vector `codesage_embed` (2048-dim) sourced from this service.
 - **Install bootstrap**: `install.py` defaults to the GPU CodeSage path on hosts that pass the GPU detection check; CPU-only hosts switch to the jina fallback automatically.
-- **Compose**: `infrastructure/docker-compose.gpu.yml` ships an optional GPU compose service for the code-embedding container with `CODE_EMBED_MODEL: "codesage/codesage-large-v2"`.
+- **Compose**: `infrastructure/docker-compose.yml` configures the `code_embed` container with `CODE_EMBED_MODEL: "codesage/codesage-large-v2"`, `CODE_EMBED_DEVICE: "auto"`, and `CODE_EMBED_BACKEND` defaulting to `gpu`. `infrastructure/docker-compose.gpu.yml` is the CUDA overlay that adds NVIDIA device reservations to that container; apply both files together for GPU passthrough.
 
 ## Why this model
 

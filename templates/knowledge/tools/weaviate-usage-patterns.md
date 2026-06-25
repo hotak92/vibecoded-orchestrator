@@ -10,7 +10,7 @@ tags:
 - AI
 - python
 created: 2026-01-28 19:00:00+00:00
-updated: 2026-04-05T14:34:58Z
+updated: 2026-06-25T00:00:00Z
 status: superseded
 superseded_by: "Weaviate"
 ---
@@ -18,7 +18,6 @@ superseded_by: "Weaviate"
 # Weaviate Usage Patterns
 
 **Purpose**: Practical patterns for using Weaviate with Ollama embeddings
-**Last Updated**: 2026-01-14
 
 ## Links
 
@@ -29,31 +28,31 @@ superseded_by: "Weaviate"
 
 ### Embedding Model Limits
 
-**Model**: `snowflake-arctic-embed2:latest` via Ollama
+**Active model**: `qwen3-embedding:0.6b` via Ollama (1024-dim); `snowflake-arctic-embed2` on the low-resource profile.
 
-**Token Limits**:
-- Documented: 8192 tokens
-- **Actual working limit: 2500 tokens**
-- Conservative chunking: 2500 tokens max per chunk
+**Token budgets** (from `chunking.py`, per active model):
+- `qwen3-embedding:0.6b`: ~10k tokens per chunk (model arch supports 32k)
+- `snowflake-arctic-embed2`: ~4k tokens per chunk (documents 8k)
 
 **Why this matters**:
-- Both storage AND queries must respect this limit
-- Exceeding causes: `{"error":"the input length exceeds the context length"}`
-- Must implement chunking for content >2500 tokens
-- Must truncate queries >2500 tokens
+- Both storage AND queries must respect the active model's budget
+- Ollama silently truncates input beyond the embedder's effective context
+- Chunk content that exceeds the budget; truncate over-budget queries
+- Resolve the budget with `Chunker.for_model(active_model)` rather than hardcoding
 
 ## Storage Patterns
 
-### Pattern 1: Small Documents (<2500 tokens)
+### Pattern 1: Small Documents (under the model budget)
 
 **Use case**: Knowledge graph nodes, short documents, small content
 
 **Implementation**:
 ```python
-from chunking import TokenCounter
+from chunking import Chunker, TokenCounter
 
+chunker = Chunker.for_model(active_model)  # resolves the per-model budget
 token_count = TokenCounter.count_tokens(content)
-if token_count <= 2500:
+if token_count <= chunker.max_tokens:
     # Store as single object
     embedding = server._get_embedding(content)
     collection.data.insert(properties=data, vector=embedding)
@@ -61,7 +60,7 @@ if token_count <= 2500:
 
 **When to use**: Most knowledge nodes, configs, short docs
 
-### Pattern 2: Large Documents (>2500 tokens)
+### Pattern 2: Large Documents (over the model budget)
 
 **Use case**: Long documentation, research papers, large knowledge nodes
 
@@ -70,13 +69,13 @@ if token_count <= 2500:
 from chunking import Chunker, TokenCounter
 import uuid
 
+chunker = Chunker.for_model(active_model)
 token_count = TokenCounter.count_tokens(content)
-if token_count > 2500:
+if token_count > chunker.max_tokens:
     # Generate source_node_id for linking chunks
     source_node_id = str(uuid.uuid4())
 
-    # Chunk with safe limits
-    chunker = Chunker(min_tokens=1000, max_tokens=2500, target_tokens=2000)
+    # Chunk against the active model's budget
     chunks = chunker.chunk_text(content, source_node_id, metadata)
 
     # Store each chunk with shared metadata
@@ -109,14 +108,14 @@ if token_count > 2500:
 
 **Implementation**:
 ```python
-from chunking import TokenCounter
+from chunking import Chunker, TokenCounter
 
-# Truncate query if needed
+# Truncate query if it exceeds the active model's budget
+budget = Chunker.for_model(active_model).max_tokens
 query_tokens = TokenCounter.count_tokens(query)
-if query_tokens > 2500:
-    max_chars = 2500 * 4
-    query = query[:max_chars]
-    print(f"⚠️ Query truncated to 2500 tokens")
+if query_tokens > budget:
+    query = query[: budget * 4]  # ~4 chars/token
+    print(f"⚠️ Query truncated to {budget} tokens")
 
 # Get embedding
 query_embedding = server._get_embedding(query)
@@ -259,7 +258,7 @@ results = collection.query.near_text(query="search term")
 
 **Problem**:
 ```python
-# This fails for content >2500 tokens
+# This fails for content over the active model's token budget
 embedding = server._get_embedding(large_content)
 # Error: "input length exceeds context length"
 ```
@@ -285,7 +284,7 @@ embedding = server._get_embedding(large_content)
 **Solution**: Use Python client:
 ```python
 import weaviate
-client = weaviate.connect_to_local(host='localhost', port=8080, grpc_port=50051)
+client = weaviate.connect_to_local(host='localhost', port=8081, grpc_port=50052)
 is_healthy = client.is_ready()
 ```
 
@@ -341,10 +340,9 @@ collection.data.insert_many(chunk_data)
 
 Before deploying Weaviate integration:
 
-- [ ] Verify embedding model loaded: `ollama list | grep arctic`
-- [ ] Test with 1000 token content (should work)
-- [ ] Test with 2500 token content (should work)
-- [ ] Test with 3000 token content (should chunk or fail gracefully)
+- [ ] Verify the active embedding model is loaded: `ollama list`
+- [ ] Test with content under the model's chunk budget (stores as one object)
+- [ ] Test with content over the budget (should chunk)
 - [ ] Verify query truncation for long queries
 - [ ] Test chunk reassembly
 - [ ] Test deduplication in search results
@@ -355,8 +353,8 @@ Before deploying Weaviate integration:
 ## Common Issues
 
 **Issue**: "input length exceeds context length"
-- **Cause**: Content or query >2500 tokens
-- **Fix**: Implement chunking/truncation
+- **Cause**: Content or query exceeds the active model's token budget
+- **Fix**: Implement chunking/truncation against `Chunker.for_model(active_model).max_tokens`
 
 **Issue**: "Make sure a vectorizer module is configured"
 - **Cause**: Using `near_text` without vectorizer
