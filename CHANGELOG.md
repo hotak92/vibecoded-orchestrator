@@ -7,6 +7,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.68] - 2026-06-25
+
+v0.2.68 finishes the launcher-UX correctness work begun in v0.2.67 and adds a
+hardware-aware install layer. It makes project-add asynchronous with a global
+progress banner + serialized queue (a cold backend no longer shows a silent
+~51s blur), completes the WebView2 navigation-freeze fix that v0.2.67's tick
+ordering only partially addressed, fixes the GUI embedding chooser writing the
+wrong embedding profile, and replaces first-card/first-vendor GPU detection
+with multi-GPU/iGPU-aware device selection. It also consolidates the three
+hardware-tier embedding selectors into a reusable module, refreshes the shipped
+bootstrap knowledge nodes against current code, and scrubs bug-reporter names
+from public source (now guarded).
+
+### Added
+
+- **Async project-add with a global progress banner + serialized queue.**
+  `create_project_v2` previously `.await`ed bootstrap-collections + install-bundle
+  + the post-bundle phase before returning — on a cold Weaviate/Ollama backend
+  that was a silent multi-second window behind a non-interactive blur overlay
+  (measured ~51s, ~6s of it just waking a cold container). The synchronous phase
+  (DB row + `.claude/env` + B12 repair) stays inline so the `ProjectView` is
+  committed before return; the heavy phase now runs in a detached task driving a
+  `project_setups` status row (migration 036) and emits `project://setup-progress`
+  events to a global brand-styled `OperationProgressBanner` (plain-language phase
+  labels, elapsed indicator, an informational amber `deferred` state for the
+  cold-Weaviate case, and a failure → Retry affordance). Concurrent adds enqueue
+  one-at-a-time to avoid backend contention. The non-fatal bootstrap/bundle
+  warnings (Weaviate-deferred, user-modified-files-preserved, schema-migration)
+  that the synchronous path used to toast are now carried on the terminal event
+  and re-surfaced at the correct severity, so backgrounding does not drop them. A
+  backend per-project re-entrancy guard refuses a second concurrent setup; a
+  boot-resume sweep gates the codegraph/kg-sync/kg-summary resume sweeps on the
+  setup row so a crash mid-setup cannot resurrect the spawn-before-bundle race.
+- **Multi-GPU / iGPU-aware GPU device selection.** New pure module
+  `vco_lib/gpu_device.py` (`enumerate_gpus` + `select_gpu_device`) enumerates all
+  GPUs, excludes Intel (unsupported) and integrated GPUs, and picks the
+  most-capable discrete card by VRAM (NVIDIA tie-break), instead of taking the
+  first vendor that probed and the first card's VRAM. Both detect paths
+  (`_detect_system`, `_bootstrap_detect_gpu`) share it, with a lock-step pure Rust
+  mirror in `gpu_policy.rs`. This fixes the case where a capable discrete AMD card
+  co-existing with an AMD/Intel iGPU could be under-tiered to the CPU-floor code
+  embedder by reading the iGPU's small shared memory — a capable AMD card now
+  correctly falls back to qwen3 (ROCm-accelerated), never the Jina CPU floor.
+  Single-GPU hosts are byte-identical to the prior behavior.
+
+### Fixed
+
+- **GUI navigation no longer freezes after adding a project (Windows / WebView2).**
+  v0.2.67 ordered the stacked-`<dialog>` teardown with `await tick()`, but a
+  Svelte microtask flush is not a barrier on Chromium's top-layer release, so the
+  orphaned `::backdrop` could still capture pointer events viewport-wide. The
+  structural fix is in `DialogRoot.svelte`: `onDestroy` now releases the native
+  top-layer slot UNCONDITIONALLY (`close()` on a closed dialog is a spec no-op, so
+  it is idempotent and safe across all 27 consumers) instead of gating on
+  `dialogEl.open` — which the prior `$effect` had already flipped false, so the
+  gate skipped the corrective close on exactly the orphaned-slot case. A shared
+  `dom-async.ts::nextFrame()` (double-rAF) replaces the `tick()` in the
+  ProjectSelector teardown so Chromium gets a real frame to release the slot.
+- **GUI embedding chooser now records the correct embedding profile.** The
+  install/onboarding chooser wrote `app_state.default_text_embedding` (a model id)
+  but never the canonical `app_state.embedding.active_profile` (a profile) that
+  every downstream consumer reads, so `project_env_settings::populate` fell back to
+  the `qwen3` default and wrote `ACTIVE_EMBEDDING=qwen3` into every project's
+  `.claude/settings.json` + `.claude/env` even when the user picked `arctic`. A
+  shared `set_text_embedding_and_profile` helper now writes BOTH keys (deriving the
+  profile from the model id via a Rust mirror of install.py's model→profile map) at
+  all four chooser sites, so the two keys can never diverge again.
+- **Manual cross-project KG seed routes to the target project's collection.**
+  `sync_knowledge_graph.py::_resolve_collections` always resolved the orchestrator
+  root, so running the seed by hand against another project (with `KG_COLLECTION` +
+  `KG_BASE_DIR` exported) sent nodes to the orchestrator's collection. It now
+  resolves the hub against `KG_BASE_DIR` (the target root) when set, matching how
+  the file root is already keyed — hub precedence over ambient env is preserved.
+
+### Changed
+
+- **Hardware-tier embedding selectors extracted to a reusable module.** The
+  CPU-capability predicate shared by `select_code_embedding_backend` /
+  `select_kg_embedding_backend` / `select_summary_backend` was unified into one
+  parameterized `_cpu_meets` (preserving each selector's distinct RAM/cores
+  thresholds and the strict-vs-inclusive RAM boundary), and the three selectors +
+  their backend-id constants moved out of install.py into a new pure-leaf
+  `vco_lib/embedding_selection.py` (install.py re-exports them). Behavior is
+  unchanged; the logic is now importable by the launcher-side and future callers.
+- **Shipped bootstrap knowledge nodes refreshed against current code.** The
+  `templates/knowledge/` seed nodes were reconciled with the live MCP tool
+  signatures, hook inventory, embedding model dimensions/ports, score tiers, and
+  current-as-of-2026 model/framework facts; three nodes that had been left in an
+  erroneous `archived` state (a templating defect that hid them from search) were
+  restored to `active`.
+- **CI: free runner disk before the pre-release gate.** A best-effort reclaim step
+  removes large unused preinstalled toolchains before the gate's pip install, after
+  two prior releases hit transient runner disk-exhaustion mid-install.
+- **Privacy: bug-reporter names scrubbed from public source + docs**, with a new
+  `bare-name-in-prose` check added to the pre-tag privacy gate so they cannot recur.
+
 ## [0.2.67] - 2026-06-24
 
 v0.2.67 is a launcher UX + correctness cycle from a batch of user-reported
