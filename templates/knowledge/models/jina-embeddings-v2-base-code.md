@@ -3,7 +3,7 @@ title: Jina Embeddings v2 Base Code
 type: model
 tags: [model, embedding, code-embedding, ollama, jina, cpu, open-source]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -22,8 +22,8 @@ At 161M params the model runs fast enough on CPU for incremental code-graph inde
 ## Where the orchestrator uses it
 
 - **CPU fallback for code embeddings**: when the host has no CUDA GPU, `install.py` selects the ollama-text + ollama-code preset, which pulls `unclemusclez/jina-embeddings-v2-base-code:latest` and points the code-embedding service at it via `CODE_EMBED_BACKEND=ollama` + `CODE_EMBED_MODEL=unclemusclez/jina-embeddings-v2-base-code:latest`.
-- **Legacy code-vector slot**: Weaviate code collections register the named vector `ollama_code_embed` (768-dim) for jina-embedded entries, alongside the active `codesage_embed` (2048-dim) slot — same dual-vector pattern as the text side.
-- **Compose**: the default `infrastructure/docker-compose.yml` (CPU profile) configures the code-embedding container with the jina backend so a fresh `docker compose up` works on machines without a GPU.
+- **`ollama_code_embed` named-vector slot**: Weaviate code collections register the named vector `ollama_code_embed` (768-dim) for jina-embedded entries, alongside the `codesage_embed` (2048-dim) slot — same dual-vector pattern as the text side.
+- **Compose**: `infrastructure/docker-compose.yml` defaults the `code_embed` container to `CODE_EMBED_BACKEND=gpu`; CPU-only machines set `CODE_EMBED_BACKEND=ollama` (with `CODE_EMBED_MODEL=unclemusclez/jina-embeddings-v2-base-code:latest`) in `.env` to route the container at the jina backend instead of building the CUDA image.
 
 ## Why this model for the fallback
 

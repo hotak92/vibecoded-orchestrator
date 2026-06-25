@@ -3,7 +3,7 @@ title: "Weaviate"
 type: tool
 tags: [tool, database, vector-store, semantic-search, low-level-implementation]
 created: 2026-01-28T19:00:00Z
-updated: 2026-04-05T14:34:58Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -105,7 +105,7 @@ connected = collection.query.fetch_objects(
 - gRPC faster than REST for high-throughput
 
 ## Best Practices
-1. **Chunking**: Keep chunks ≤2500 tokens (actual limit for snowflake-arctic-embed2, despite documented 8192)
+1. **Chunking**: Chunk against the active embedder's token budget — the orchestrator's `Chunker.for_model()` resolves per-model presets (e.g. ~10k for qwen3-embedding:0.6b, ~4k for snowflake-arctic-embed2), not a single fixed limit
 2. **Metadata**: Rich metadata enables better filtering
 3. **Embeddings**: Use consistent model across collection
 4. **Batch operations**: Reduce API calls
@@ -113,13 +113,9 @@ connected = collection.query.fetch_objects(
 
 ## Critical Constraints
 
-### Embedding Token Limit
+### Embedding Token Budget
 
-**snowflake-arctic-embed2:latest**: Documented 8192 tokens, **actual working limit: 2500 tokens**.
-
-- Exceeding causes: `{"error":"the input length exceeds the context length"}`
-- Both storage AND queries must respect this limit
-- Chunking required for content >2500 tokens
+Ollama silently truncates input beyond an embedder's effective context, so chunk against a per-model budget rather than the documented maximum. The orchestrator's `chunking.py` sets these budgets: `qwen3-embedding:0.6b` ~10k tokens (the active default; model arch supports 32k), `snowflake-arctic-embed2` ~4k tokens (documents 8k). Both storage AND queries must respect the active model's budget.
 
 ### Chunking for Large Documents
 
@@ -127,9 +123,10 @@ connected = collection.query.fetch_objects(
 from chunking import Chunker, TokenCounter
 import uuid
 
-if TokenCounter.count_tokens(content) > 2500:
+# for_model() resolves the per-model budget; the Chunker derives min/max/target from it
+chunker = Chunker.for_model("qwen3-embedding:0.6b")
+if TokenCounter.count_tokens(content) > chunker.max_tokens:
     source_node_id = str(uuid.uuid4())
-    chunker = Chunker(min_tokens=1000, max_tokens=2500, target_tokens=2000)
     chunks = chunker.chunk_text(content, source_node_id, metadata)
     for chunk in chunks:
         embedding = server._get_embedding(chunk.content)
@@ -165,10 +162,9 @@ unique_results = list(seen_nodes.values())[:limit]
 
 ## Testing Checklist
 
-- [ ] Verify embedding model loaded: `ollama list | grep arctic`
-- [ ] Test with 1000 token content (should work)
-- [ ] Test with 2500 token content (should work)
-- [ ] Test with 3000 token content (should chunk or fail gracefully)
+- [ ] Verify the active embedding model is loaded: `ollama list`
+- [ ] Test with content under the model's chunk budget (should store as one object)
+- [ ] Test with content over the budget (should chunk)
 - [ ] Test chunk reassembly and deduplication
 - [ ] Test filtered search by type, tags
 - [ ] Check health using Python client, not curl

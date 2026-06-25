@@ -3,7 +3,7 @@ title: Ollama
 type: tool
 tags: [local-inference, LLM, llama-cpp, embeddings, tool-calling, REST-API]
 created: 2026-03-29T00:00:00Z
-updated: 2026-04-05T14:34:54Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -14,7 +14,7 @@ Local LLM inference server wrapping llama.cpp with a Go-based REST API. Provides
 ## Architecture
 
 - **Core**: Go server wrapping llama.cpp inference engine
-- **Default endpoint**: `http://localhost:11434`
+- **Default endpoint**: `http://localhost:11434` (Ollama's own default). The orchestrator's containerized Ollama maps host port `11435` → container `11434`, so on a VCO install the host-facing endpoint is `http://localhost:11435`.
 - **GPU backends**: CUDA (NVIDIA), Metal (Apple Silicon), ROCm (AMD)
 - **Model format**: GGUF (quantized: Q4_K_M, Q8_0; full-precision: FP16/FP32)
 - **Processing model**: Sequential request processing (single-user optimized)
@@ -50,7 +50,7 @@ ollama cp source target        # Alias model name
 | llama3.2:3b | 3B | Fast local tasks |
 | nomic-embed-text | 137M | Embeddings (768-dim) |
 | mxbai-embed-large | 334M | High-quality embeddings (1024-dim) |
-| snowflake-arctic-embed2 | ~110M | Embeddings (1024-dim, 8192 token context) |
+| snowflake-arctic-embed2 | 568M | Embeddings (1024-dim, 8192 token context) |
 
 ## Capabilities
 
@@ -73,7 +73,7 @@ Vector databases can use `text2vec-ollama` vectorizer module for automatic embed
 - Automatic vectorization during ingestion and query
 - Supported models: nomic-embed-text, mxbai-embed-large, snowflake-arctic-embed2
 
-**Caveat**: snowflake-arctic-embed2 has a practical working limit of ~2500 tokens despite documented 8192 token context (see Weaviate usage patterns for details).
+**Caveat**: embedders need their context window confirmed before chunking — Ollama silently truncates input beyond the model's effective limit. The orchestrator chunks against per-model token budgets (e.g. ~4k for snowflake-arctic-embed2, ~10k for qwen3-embedding:0.6b) rather than the documented maximum.
 
 ## Performance
 
@@ -116,4 +116,4 @@ PARAMETER num_ctx 32768
 
 - [[relatedTo::Weaviate]]
 - [[relatedTo::Semantic Search and Text Embeddings]]
-- [[relatedTo::Ollama MCP Server]]
+- [[uses::llama.cpp]]

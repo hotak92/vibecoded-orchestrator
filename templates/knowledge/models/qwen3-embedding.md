@@ -3,7 +3,7 @@ title: Qwen3 Embedding
 type: model
 tags: [model, embedding, text-embedding, ollama, qwen, alibaba, open-source]
 created: 2026-04-27T18:30:00Z
-updated: 2026-04-27T18:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -27,9 +27,9 @@ Qwen3 Embedding supports user-defined output dimensions per request (Matryoshka-
 - **Install bootstrap**: `install.py` lists `qwen3-embedding:0.6b` in every embedding-backend preset (gpu, ollama-text+gpu-code, ollama-only) and pulls it via `ollama pull` during the embedding-bootstrap phase.
 - **Re-embed migrations**: `claude_mcp_servers/scripts/migrate_to_new_embeddings.py` re-vectorizes existing collections into the `qwen3_embed` named-vector slot from the legacy `ollama_embed` slot.
 
-## Why this model over the legacy Snowflake one
+## Why this model
 
-Higher MTEB score in the Qwen team's reported benchmarks and a roadmap aligned with the Qwen family the orchestrator already targets for inference. Both produce 1024-dim vectors, so the migration is schema-compatible. The legacy `snowflake-arctic-embed2` collection vector is preserved on existing collections to avoid forcing a re-embed.
+Higher MTEB score in the Qwen team's reported benchmarks and a roadmap aligned with the Qwen family the orchestrator already targets for inference. It produces 1024-dim vectors, schema-compatible with the `snowflake-arctic-embed2` slot, so a project can carry both named vectors on the same collection and search either. `snowflake-arctic-embed2` occupies the `ollama_embed` named-vector slot; qwen3-embedding occupies `qwen3_embed` and is the default active embedder.
 
 ## License
 
