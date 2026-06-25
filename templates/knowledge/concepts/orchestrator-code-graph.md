@@ -3,7 +3,7 @@ title: Orchestrator Code Graph
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, code-analysis, weaviate, semantic-search]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -43,7 +43,7 @@ Source repository
         |     data_flow_vars — data-flow variable tracking
         |
         +-- Embed via the code-embedding service
-        |   (CodeSage-Large-v2 on GPU, qwen3-embedding:0.6b on CPU via Ollama)
+        |   (CodeSage-Large-v2 on GPU, jina-embeddings-v2-base-code on CPU via Ollama)
         |
         +-- Upsert to Weaviate per-project collections
 ```
@@ -123,9 +123,9 @@ Cross-service or cross-module call.
 Code entities embed via the orchestrator's code-embedding service (port 11440). Two backends:
 
 - **GPU (default if CUDA available)**: [[CodeSage-Large-v2]] — 2048-dim, 1.3B params, Apache 2.0.
-- **CPU fallback** (`CODE_EMBED_BACKEND=ollama`): `qwen3-embedding:0.6b` via Ollama (1024-dim). Set `CODE_EMBED_MODEL` to override the Ollama model.
+- **CPU fallback** (`CODE_EMBED_BACKEND=ollama`): `unclemusclez/jina-embeddings-v2-base-code` via Ollama (768-dim). Set `CODE_EMBED_MODEL` to override the Ollama model (e.g. `qwen3-embedding:0.6b`).
 
-Each code collection registers both named vectors (`codesage_embed` + `ollama_code_embed`) so existing entries remain searchable after a backend switch. KG nodes use a separate text embedding ([[Qwen3 Embedding]] / [[Snowflake Arctic Embed 2.0]]); the two embedding spaces are kept disjoint.
+Each code collection registers named vectors `codesage_embed` (2048-dim, active) and the legacy `ollama_code_embed` (768-dim), plus an optional `openai_embed` (1536-dim), so existing entries remain searchable after a backend switch. KG nodes use a separate text embedding ([[Qwen3 Embedding]]); the two embedding spaces are kept disjoint.
 
 ## Per-Project Collection Naming
 
@@ -149,8 +149,10 @@ The `--project` flag in `code-graph-analyze` sets this prefix.
 search_code_graph(
     query="authentication middleware that validates JWT tokens",
     scope="code",          # "all" | "code" | "interaction"
-    limit=10,
-    expand_hops=1          # 0=seed only | 1=follow call edges | 2=two hops
+    limit=8,
+    expand_hops=1,         # 0=seed only | 1=follow call edges | 2=two hops
+    layer=None,            # optional: API | Service | Data | UI | Utility
+    detail="auto",
 )
 ```
 
@@ -198,7 +200,7 @@ The `--incremental` flag makes analysis fast enough to run on every commit:
 3. Re-analyze only those files.
 4. Upsert new/updated entities, delete removed ones.
 
-The PostToolUse hook (`code-graph-incremental.sh`) queues code files for incremental analysis after every edit.
+The PostToolUse file-edit hook (`post-file-edit.sh`) routes edited code files to `code-graph-incremental.sh`, which queues them for incremental analysis after every edit.
 
 ## Joern Integration (Optional)
 
@@ -211,7 +213,7 @@ Joern must be in PATH and is only invoked with `--cfg` / `--pdg` flags.
 
 ## Integration Points
 
-- **Hook system**: PostToolUse hook queues code files for analysis after edits.
+- **Hook system**: the PostToolUse file-edit hook queues code files for analysis after edits.
 - **MCP server**: the `weaviate-kg` server exposes `search_code_graph` and `query_code_structure`.
 - **Knowledge Graph**: code graph and KG are separate collections in the same Weaviate instance.
 - **Pre-edit hook**: `pre-edit-context-inject.sh` runs a code-graph search before file edits to provide relevant context.

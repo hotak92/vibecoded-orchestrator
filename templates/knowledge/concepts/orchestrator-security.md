@@ -3,7 +3,7 @@ title: Orchestrator Security Model
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, security, hooks]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -18,13 +18,12 @@ The orchestrator implements a defense-in-depth security model enforced automatic
 | Layer | Mechanism | Threat |
 |---|---|---|
 | 1 | Env scrubbing | Credential leakage to subprocesses |
-| 2 | SSRF guard | Server-Side Request Forgery |
+| 2 | SSRF guard | Server-Side Request Forgery (WebFetch) |
 | 3 | Shell injection scan | Command injection, supply chain |
-| 4 | Build anchor protocol | Blind file modification |
+| 4 | Build anchor protocol | Blind file overwrite (Write) |
 | 5 | File backup | Destructive edit recovery |
 | 6 | Credential scanning | Accidental credential commits |
-| 7 | Pre-kill guard | Accidental process termination |
-| 8 | Settings permissions | Tool allowlist/denylist |
+| 7 | Settings permissions | Tool allowlist/denylist |
 
 ## Layer 1: Environment Variable Scrubbing
 
@@ -48,23 +47,23 @@ The scrub happens at the top of each hook script, before any other logic. This i
 
 **Threat**: a prompt injection or compromised tool call could make Claude issue HTTP requests to internal services (cloud metadata APIs, internal dashboards, localhost services not intended for Claude access).
 
-**Implementation**: PreToolUse hook on `WebFetch` and `Bash(*)` inspects curl, wget, httpx, and requests calls for target URLs. (`mcp__search__fetch_page` was previously also guarded but the Search MCP's `fetch_page` tool was removed in v0.2.11.)
+**Implementation**: the `pre-tool-use.sh` PreToolUse hook inspects the `WebFetch` tool's target URL. `search_papers` reaches OpenAlex/arXiv via its own HTTP path and is not routed through this guard.
 
-Private IP ranges blocked by default:
+Private / internal addresses blocked by default:
 - `10.0.0.0/8`
 - `172.16.0.0/12`
 - `192.168.0.0/16`
 - `169.254.0.0/16` (cloud metadata endpoints)
-- `fd00::/8` (IPv6 private)
+- `127.0.0.0/8` and `0.0.0.0` (loopback / wildcard, unless whitelisted)
+- `::1` (IPv6 loopback)
 
 Whitelist (explicitly allowed localhost services):
-- `localhost:8081` — Weaviate
+- `localhost:8081` / `:8082` — Weaviate
 - `localhost:11435` — Ollama
 - `localhost:11440` — code-embedding service
+- `localhost:7860` — Gradio
 
-`localhost:8888` (SearXNG) was removed from the whitelist in v0.2.11 when the SearXNG container was dropped from the default install. If you run SearXNG as an opt-in service, add `:8888` back to the whitelist in your project's `.claude/hooks/pre-tool-use.sh`.
-
-Blocked requests exit 1 with an explanation of which range was matched.
+To allow additional services, add the host:port to the whitelist in your project's `.claude/hooks/pre-tool-use.sh`. Blocked requests exit non-zero with an explanation.
 
 ## Layer 3: Shell Injection Scan
 
@@ -79,53 +78,38 @@ Blocked requests exit 1 with an explanation of which range was matched.
 - `base64 -d | sh` — obfuscated execution
 - `wget ... -O - | sh` — wget pipe variant
 
-**Stage 2: bash_security.py** with 9 rule categories:
+**Stage 2: bash_security.py** applies a flat, severity-ordered list of ~24 compiled regex rules. Each rule is a `(name, pattern, explanation)` triple; representative rules include:
 
-| Category | Examples |
+| Rule (name) | What it catches |
 |---|---|
-| Command injection | Unquoted variable expansion in exec contexts |
-| Credential exposure | Echoing env vars that match secret patterns |
-| Network exfiltration | Sending data to unexpected external endpoints |
-| File system abuse | Writing to /etc, /usr, system paths |
-| Privilege escalation | sudo without explicit user confirmation |
-| Path traversal | `../../` in file operations |
-| Process manipulation | Killing system processes without confirmation |
-| Environment pollution | Unsetting critical system variables |
-| Eval abuse | eval/exec with dynamic content |
+| `rm_root`, `mkfs`, `dd_device`, `shred`, `fdisk` | Disk / filesystem destruction |
+| `curl_pipe_shell`, `eval_network` | Fetch-piped-to-shell, eval of remote content |
+| `env_exfil_curl`, `env_exfil_curl_data` | Exfiltrating environment to a network endpoint |
+| `read_ssh_keys`, `read_proc_environ`, `read_env_files`, `read_bash_history` | Reading credential / secret files |
+| `env_grep_secrets` | `env\|grep KEY/TOKEN/SECRET/PASS/CRED` patterns |
+| `chmod_world_writable`, `chown_root`, `ln_s_etc` | Permission / ownership abuse |
+| `pip_install_url`, `pip_install_git`, `npm_install_url` | Remote package installs from raw URLs |
+| `reverse_shell`, `crontab_write` | Persistence / remote-control |
 
-The Python script returns a JSON result with matched rules and severity. High severity → block (exit 1). Medium → warn (exit 0 with message).
+A matched rule blocks the command (the hook exits non-zero) with the rule's explanation surfaced to Claude via stderr.
 
 ## Layer 4: Build Anchor Protocol
 
-**Threat**: Claude modifying a file it has not read in the current session — "blind edits" based on stale memory rather than actual current content. This can corrupt files or apply changes to wrong line numbers.
+**Threat**: Claude overwriting a file it has not read in the current session — a blind `Write` based on stale memory rather than actual current content, clobbering an unseen file.
 
-**Implementation**: PreToolUse hook on `Edit(*)`.
+**Implementation**: the `pre-tool-use.sh` hook, applied to `Write` on an existing file.
 
-The hook maintains a session-scoped set of read files (populated by PostToolUse on Read tool calls). Before allowing an Edit:
+The hook maintains a session-scoped ledger of files read this session. Before allowing a `Write` to an existing file, it checks whether that path is in the ledger; if not, it exits non-zero (exit 2) with: "Build Anchor Protocol: '<file>' has not been Read this session. Use the Read tool on this file before overwriting it with Write."
 
-1. Has this file been read in the current session?
-2. Was the read recent enough (within last 30 minutes)?
-
-If not, the hook exits 1 with: "File not recently read. Use the Read tool first to see current content."
+The gate applies to `Write` only — `Edit` is left to Claude Code's built-in read-before-edit rule (an Edit needs an exact `old_string` match, which is unobtainable without reading). Re-enforcing the ledger on `Edit` was redundant and a false-positive source, since the hook's own exact-path ledger can diverge from the harness's internal file-state tracking.
 
 ## Layer 5: File Backup
 
-**Threat**: Edit/Write operations that produce incorrect results, with no recovery path.
+**Threat**: Write/Edit operations that produce incorrect results, with no recovery path.
 
-**Implementation**: PreToolUse hook on `Edit(*)` (and optionally `Write(*)`).
+**Implementation**: the `pre-tool-use.sh` hook backs up any existing file before a `Write` or `Edit`.
 
-Before any file modification:
-
-1. Compute SHA-256 hash of file path + timestamp.
-2. Copy current file content to `${TMPDIR:-/tmp}/.claude_backups/<hash>`.
-3. Write a manifest entry: `{original_path, backup_path, timestamp}`.
-
-Backups expire after 24 hours via cleanup at SessionStart. Recovery:
-
-```bash
-ls ${TMPDIR:-/tmp}/.claude_backups/
-cp ${TMPDIR:-/tmp}/.claude_backups/<hash> original/path
-```
+Before modifying an existing file, the hook copies its current content to `<session-state>/tool_backups/<timestamp>__<encoded-path>`. Backups older than 24 hours are pruned on the next backup. Recovery is a manual copy from the backup directory.
 
 ## Layer 6: Credential Scanning
 
@@ -146,15 +130,7 @@ On detection:
 2. Sends a desktop notification: "Credential detected in <filename>".
 3. Does NOT block — post-tool hooks are non-blocking by design. False positives in test fixtures should not halt work; the notification gives the developer opportunity to review before committing.
 
-## Layer 7: Pre-Kill Guard
-
-**Threat**: Claude accidentally killing OS processes that are critical for the development environment.
-
-**Implementation**: PreToolUse hook on `Bash(*)`.
-
-Protected process list includes file managers, desktop compositors, browsers, editors, init systems, and display servers. If a `kill`/`pkill`/`killall` command targets any protected process, the hook exits 1 with explanation. The user must explicitly override.
-
-## Layer 8: Settings Permissions
+## Layer 7: Settings Permissions
 
 **Threat**: Claude using dangerous or unintended tools.
 
@@ -171,10 +147,10 @@ Protected process list includes file managers, desktop compositors, browsers, ed
 
 ## Integration Points
 
-- All blocking hooks exit 1 to abort the operation; Claude receives stderr as context.
-- Security events are logged to `.claude/logs/security-scan.jsonl` and `~/.claude/metrics/failures.jsonl`.
+- Blocking hooks exit non-zero (exit 2) to abort the operation; Claude receives stderr as context.
+- Security events are logged to `.claude/logs/security-scan.jsonl`; failures also land in `~/.claude/metrics/failures.jsonl`.
 - The credential-scrubbing pattern (Layer 1) is replicated in every shell hook.
-- Layer 3's `bash_security.py` is shared by both the shell-injection scan and the SSRF guard.
+- The SSRF guard, shell-injection scan, Build Anchor, and file backup all live in the single `pre-tool-use.sh` hook; the shell-injection scan delegates to `bash_security.py`.
 
 ## Technical Details
 

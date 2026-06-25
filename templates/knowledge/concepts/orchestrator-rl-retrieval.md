@@ -3,7 +3,7 @@ title: Orchestrator RL Retrieval
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, reinforcement-learning, retrieval, weaviate, context-injection, pro-tier]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -45,11 +45,11 @@ The RL layer learns these patterns online by observing search sessions and using
 ## Architecture
 
 ```
-Claude calls hybrid_search(query, limit=10)
+Claude calls hybrid_search(query, limit=5)
         |
 [weaviate_mcp/server.py]
         |
-        +-- Over-fetch from Weaviate: limit * 2 = 20 candidates
+        +-- Over-fetch from Weaviate: limit * 2 = 10 candidates
         |
         +-- POST http://localhost:<project-rl-port>/rerank
         |     Body: {query, candidates, session_id, call_seq}
@@ -90,7 +90,7 @@ The free tier runs without the RL server entirely — the fallback path is the d
 
 ## Over-Fetch Pattern
 
-The pipeline fetches `2 × limit` candidates from Weaviate so the RL reranker has a pool to reorder. From 20 candidates it selects the best 10 (if `limit=10`). This is the standard "retrieve-then-rerank" pattern. The 2x over-fetch ratio is conservative; higher ratios improve recall at the cost of RL inference latency.
+The pipeline fetches `2 × limit` candidates from Weaviate (`_RL_OVERFETCH = 2`) so the RL reranker has a pool to reorder. With the default `limit=5` it fetches 10 candidates and returns the best 5. This is the standard "retrieve-then-rerank" pattern. The 2x over-fetch ratio is conservative; higher ratios improve recall at the cost of RL inference latency.
 
 ## Call-Sequence Tracking
 
@@ -129,8 +129,8 @@ KG node metadata (descriptions, summaries, chunk summaries) is generated on-writ
 
 **Consumption**:
 - RL scoring uses summaries as ranking features.
-- `hybrid_search(detail="descriptions")` returns summaries instead of full content.
-- `hybrid_search(detail="full")` returns the full markdown body.
+- The `summary` tier of `hybrid_search` returns these descriptions instead of full content.
+- The `full` tier returns the full markdown body.
 
 ## Retrieval Logging
 

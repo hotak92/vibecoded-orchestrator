@@ -3,7 +3,7 @@ title: Orchestrator Hook System
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, hooks, automation, workflow]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -15,7 +15,7 @@ The hook system is the orchestrator's nervous system. By intercepting Claude Cod
 
 ## Overview
 
-Hooks are shell scripts (with a few Python helpers) registered in `.claude/settings.json`. Each hook binds to a lifecycle event and optionally a tool-name matcher. Blocking hooks (exit 0/1) can abort an operation; non-blocking hooks run in the background or fire-and-forget. Claude Code v2.1.81 exposes 17 distinct hook events; the orchestrator wires the most useful ones for autonomous workflow:
+Hooks are shell scripts (with a few Python helpers) registered in `.claude/settings.json`. Each hook binds to a lifecycle event and optionally a tool-name matcher. Blocking hooks (exit non-zero) can abort an operation; non-blocking hooks run in the background or fire-and-forget. Claude Code exposes ~20 distinct hook events; the orchestrator wires the most useful ones for autonomous workflow:
 
 - **Security enforcement** — scan commands before execution, scrub credentials
 - **Knowledge sync** — push edited KG/doc/code files to Weaviate automatically
@@ -61,17 +61,28 @@ Context nearing limit
 
 ### SessionStart — matcher: startup
 
+**check-no-fork-bomb.sh**
+- Guards against a recursive hook-spawn pattern before any container/service work runs.
+
 **ensure-containers.sh** (background)
 - Checks Podman/Docker container health for Weaviate, Ollama, code-embedding service.
 - Starts any stopped containers via `podman-compose up -d` or `docker compose up -d`.
 - Non-blocking — runs in background so it does not delay the first prompt.
-- Logs to `.claude/logs/container-health.log`.
+
+**verify-container-ports.sh**
+- Confirms the expected service ports (Weaviate, Ollama, code-embed) are reachable.
 
 **ensure-code-embed-service.sh** (background)
 - Checks if the code-embedding FastAPI server (port 11440) is up; starts it if not.
 
+**session-start-ensure-hub.sh**
+- Ensures the detached `vct-hub` config-resolver service is running.
+
 **session-start-kg-loader.sh**
 - Prints key KG resource paths (CONTEXT_STATE.md, active plan file, knowledge/ root).
+
+**embedding-failures-surface.sh**
+- Surfaces any queued embedding/sync failures from the last session so they are visible at startup.
 
 **context-size-check.sh**
 - Counts lines in `.claude/CONTEXT_STATE.md`; warns to stdout if line count exceeds a threshold.
@@ -84,7 +95,10 @@ Context nearing limit
 - MIDDLE: active plan file (~30 lines max), recent 8 git commits.
 - END: `.claude/context/pre-compact-snapshot.md` (pre-compaction state, 50 lines max).
 
-### PreCompact
+**kg-update-nudge.sh**
+- Re-evaluates the accumulated-work-unit counter so a deferred KG-write nudge survives compaction.
+
+### PreCompact — matcher: auto
 
 **pre-compact-save.sh**
 - Captures `git status`, `git diff --stat`, and recently modified files.
@@ -106,63 +120,86 @@ Context nearing limit
 - Subsequent prompts compute a section-level diff and inject only changed sections.
 - Achieves 70-90% token savings on repeat prompts in a long session.
 
-### PreToolUse (blocking)
+**kg-update-nudge.sh**
+- Accumulates work units (output tokens + intake + edits) and nudges toward a KG write once the threshold is crossed.
+
+**agent-skill-keyword-suggest.sh**
+- Surfaces relevant agents/skills when the prompt's keywords match a bundled capability.
+
+### SubagentStart
+
+**subagent-start-suggest.sh** / **subagent-start-kg-inject.sh**
+- Suggest relevant capabilities and inject KG context into a freshly-spawned subagent.
+
+### SubagentStop (blocking)
+
+**subagent-stop-reconcile.sh**
+- Reconciles subagent output (worktree diffs, KG-write discipline) before the subagent is allowed to stop.
+
+### PreToolUse
 
 **pre-tool-use.sh** (matcher: `*`)
-- Appends tool name, arguments hash, and timestamp to `.claude/logs/YYYY-MM-DD_tool_usage.jsonl`.
+- Logs tool name + args hash + timestamp to `.claude/logs/YYYY-MM-DD_tool_usage.jsonl`.
+- Also hosts the security layers (SSRF guard, shell-injection scan, Build Anchor + file backup). See [[Orchestrator Security]].
 
-**SSRF guard** (matcher: `Bash(*)`)
-- Scans Bash commands for HTTP requests to private IP ranges; blocks unless target is a whitelisted localhost service (Weaviate 8081, Ollama 11435, code-embed 11440, SearXNG 8888, etc.).
+**SSRF guard** (inside `pre-tool-use.sh`, matcher: `*`, acts on `WebFetch`)
+- Inspects `WebFetch` target URLs and blocks private/internal addresses unless whitelisted (Weaviate 8081, Ollama 11435, code-embed 11440, Gradio 7860). `search_papers` reaches its APIs directly and is not routed through this guard.
 
-**Shell injection scan** (matcher: `Bash(*)`)
-- Scans for dangerous patterns: `curl | sh`, `eval $(curl ...)`, `base64 | sh`.
-- Delegates to `bash_security.py` which applies 9 rule categories and 20+ rules.
+**Shell injection scan** (inside `pre-tool-use.sh`, acts on `Bash`)
+- Blocks fetch-piped-to-shell patterns (`curl|sh`, `eval $(curl …)`, `base64 -d | sh`), then delegates to `bash_security.py` (a flat list of ~24 regex rules covering disk-destroy, credential exfil, secret-file reads, world-writable chmod, remote installs, reverse shells, etc.).
 
-**lean-ctx-rewrite.sh / lean-ctx-rewrite.ps1** (matcher: `Bash(*)`)
-- Bash/PowerShell hook that rewrites Bash commands for token compression via `lean-ctx hook rewrite`.
-- Scrubs sensitive environment variables (`SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `AWS_*`, `TELEGRAM_BOT_TOKEN`, `POSTGRES_PASSWORD`, `VERCEL_TOKEN`, `CLAUDE_API_KEY`) before delegating to the lean-ctx subprocess.
-- Defense-in-depth measure added 2026-05-16 (commit cb7ff88) to prevent accidental credential leakage via lean-ctx's logs or debug output.
-- Graceful no-op when lean-ctx is not installed; symmetric `bypass` support for raw output on a per-call basis.
+**pre-vercel-token-guard.sh** (matcher: `Bash`)
+- Blocks Bash commands that would echo or leak a Vercel deploy token.
 
-**pre-edit-context-inject.sh** (matcher: `Edit(*)`)
+**lean-ctx-rewrite.sh / lean-ctx-rewrite.ps1** (matcher: `Bash`)
+- Rewrites Bash commands for token compression via `lean-ctx`. Scrubs sensitive environment variables before delegating to the lean-ctx subprocess; graceful no-op when lean-ctx is not installed; symmetric `bypass` support for raw output per call.
+
+**pre-bash-context-inject.sh** (matcher: `Bash`)
+- Injects relevant KG context ahead of a Bash command when the command's intent maps to known patterns.
+
+**pre-edit-context-inject.sh** (matcher: `Edit`)
 - Before editing a file, runs KG search for the filename/concept and code-graph search for related functions.
 - Injects search results as context (live ~2.7s, cached ~31ms via 10-min TTL file cache).
-- Session-level dedup via `SEEN_NODES_FILE` prevents repeating the same nodes; resets on compaction.
+- Session-level dedup via a seen-nodes file prevents repeating the same nodes; resets on compaction.
+
+**pre-diagram-path-validation.sh** (matcher: `Write|Edit` and `mcp__mermaid__.*|mcp__excalidraw__.*`)
+- Validates that diagram outputs land in an indexed path before the write proceeds.
 
 ### PostToolUse (non-blocking)
 
-**post-file-edit.sh** (matcher: `Edit(*)|Write(*)`)
+**post-file-edit.sh** (matcher: `Edit|Write`)
 - Routes edited files to the appropriate sync pipeline:
   - `knowledge/**/*.md` → `sync_knowledge_graph.py` → Weaviate KG collection
   - `docs/**/*.md` → development docs collection
-  - Python/JS/TS code files → code-graph analysis queue
-- Runs duplicate detection every 10 edits.
+  - code files → `code-graph-incremental.sh` (incremental code-graph re-analysis)
+- Runs duplicate detection periodically.
 
-**ruff** (matcher: `Edit(*.py)|Write(*.py)`)
-- Runs `ruff check --fix --quiet <file>` in background — auto-fixes formatting and imports.
+**post-edit-outcome.sh** (matcher: `Edit|Write`)
+- Records the edit outcome for retrieval-quality telemetry.
 
-**pyright** (matcher: `Edit(*.py)|Write(*.py)`)
-- Runs pyright type-checking in background — non-blocking.
+**py_compile** (inline `python3 -c`, matcher: `Write`)
+- Compile-checks a Python file immediately after it is written, surfacing syntax errors.
 
-**py_compile** (matcher: `Write(*.py)`)
-- Runs `python -m py_compile <file>` immediately after a Python file is written.
-- Catches syntax errors before ruff/pyright run.
+**post-tool-security.sh** (matcher: `Edit|Write`)
+- Scans written file content for credential patterns. Logs findings to `.claude/logs/security-scan.jsonl`. Non-blocking — informational only.
 
-**post-tool-security.sh** (matcher: `Edit(*)|Write(*)`)
-- Scans written file content for credential patterns (API keys, tokens, AWS keys).
-- Logs findings to `.claude/logs/security-scan.jsonl`. Non-blocking — informational only.
-
-**kg-summary-generator.sh** (matcher: `Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)`)
-- Spawns a background Haiku/Ollama summary job to refresh `knowledge/.node_formats.json` for the edited file.
+**sync_knowledge_graph.py + kg-summary-generator.sh** (matcher: `Edit|Write`)
+- Syncs an edited knowledge node to Weaviate and spawns a background summary job to refresh `knowledge/.node_formats.json`.
 - See [[KG-Summary Three-Tier Generation Pipeline]] for backend selection (claude CLI → Ollama → API → skip).
 
-**code-graph-incremental.sh** (matcher: `Edit(*.py)|Write(*.py)|Edit(*.ts)|Edit(*.js)|...`)
-- Queues edited code files for incremental code-graph re-analysis.
+**kg-summary-generator.sh** (matcher: `mcp__weaviate-kg__store_knowledge_node`)
+- Refreshes the sidecar summary when a node is written through the MCP tool rather than a file edit.
+
+**post-bash-context-record.sh** (matcher: `Bash`)
+- Records Bash context for later retrieval; **post-git-commit-kg-sync.sh** + **post-file-delete.sh** also fire on `Bash` to sync KG on commit and prune deleted-file entries.
+
+**kg-update-nudge.sh** (matcher: `*`)
+- Tracks accumulated work units across all tool use so the next-prompt nudge fires at the right threshold.
 
 ### ConfigChange
 
 **config-change-audit.sh**
-- Logs `.claude/settings.json` modifications to `.claude/logs/config-changes.jsonl`.
+- Logs `.claude/settings.json` modifications to a JSONL audit trail.
 
 ### Stop
 
@@ -171,7 +208,7 @@ Context nearing limit
 - Summary CLI: `python .claude/scripts/cost-summary.py [--days N]` (portable, all OSes; bash `cost-summary` shim delegates to it on POSIX).
 
 **notify-stop.sh**
-- Desktop notification via `notify-send`: "Claude session ended".
+- Desktop notification via `notify-send`.
 
 ### StopFailure
 
@@ -185,18 +222,18 @@ The source-of-truth for all hook scripts is `templates/hooks/*.sh` (and their `.
 
 ## Python Environment (venv) Resolution
 
-The three hooks that call Python helpers (`code-graph-incremental.sh`, `kg-summary-generator.sh`, `pre-edit-context-inject.sh`) need a Python interpreter from the orchestrator venv. The resolution order (planned for v0.2.12 via Group D / PR-25) is:
+The hooks that call Python helpers (`code-graph-incremental.sh`, `kg-summary-generator.sh`, `pre-edit-context-inject.sh`) need a Python interpreter from the orchestrator venv. The resolution order is:
 
-1. `$VCT_VENV` — explicit override (highest priority).
-2. `$REPO_ROOT/.venv/bin/python` — top-level venv layout (used by modern installs where `install.py` creates `.venv` at the project root).
-3. `$REPO_ROOT/claude_mcp_servers/.venv/bin/python` — legacy layout fallback (used by installs that placed the venv inside `claude_mcp_servers/`).
+1. `$VCT_PYTHON` / `$VCT_VENV` — explicit override (highest priority).
+2. `$REPO_ROOT/.venv/bin/python` — top-level venv layout (installs where `install.py` creates `.venv` at the install root).
+3. `$REPO_ROOT/claude_mcp_servers/.venv/bin/python` — fallback layout (installs that placed the venv inside `claude_mcp_servers/`).
 4. Windows path variants of the above (`.venv/Scripts/python.exe`).
 
-Prior to PR-25, these hooks only checked `claude_mcp_servers/.venv` and fell through silently to system python on modern installs, causing code-graph and KG-summary updates to silently break.
+Checking the top-level `.venv` first keeps code-graph and KG-summary updates working on installs that no longer keep the venv under `claude_mcp_servers/`.
 
 ## MCP Lifecycle — SIGHUP Env Reload
 
-Planned for v0.2.12 (PR-42): MCP server processes will register a `SIGHUP` handler that calls `sys.exit(0)` (clean exit). Claude Code's MCP supervisor respawns any process that exits cleanly, picking up the latest env from `~/.claude.json` on restart. The launcher's file watcher on `.claude/settings.json` (debounced 1 second) will dispatch the SIGHUP automatically whenever the file changes. A manual "Reload MCP env" button in the launcher's MCP maintenance panel will also dispatch it on demand.
+MCP server processes register a `SIGHUP` handler that calls `sys.exit(0)` (clean exit). Claude Code's MCP supervisor respawns any process that exits cleanly, picking up the latest env from `~/.claude.json` on restart. The launcher's file watcher on `.claude/settings.json` (debounced) dispatches the SIGHUP automatically whenever the file changes, and a "Reload MCP env" action in the launcher dispatches it on demand. The handler degrades to a no-op (the MCP keeps working, just without auto-reload) when the helper module is unavailable.
 
 ## Hook Discipline
 

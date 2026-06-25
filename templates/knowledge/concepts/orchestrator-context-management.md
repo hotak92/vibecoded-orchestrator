@@ -3,7 +3,7 @@ title: Orchestrator Context Management
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, context-management, memory, hook-system]
 created: 2026-04-27T18:30:00Z
-updated: 2026-05-16T20:30:00Z
+updated: 2026-06-25T00:00:00Z
 status: active
 ---
 
@@ -167,8 +167,8 @@ Generation: the `kg-summary-generator.sh` PostToolUse hook spawns a background j
 Consumption:
 
 - RL scoring uses summaries as ranking features.
-- `hybrid_search(detail="descriptions")` returns summaries instead of full content (~50% token savings vs. full).
-- `hybrid_search(detail="full")` returns the complete markdown body for deep work.
+- The `summary` tier of `hybrid_search` returns these descriptions instead of full content (~50% token savings vs. full).
+- The `full` tier returns the complete markdown body for deep work.
 
 ## Diff-Context Injection
 
@@ -221,9 +221,9 @@ Read file1.py | Read file2.py | Grep "pattern" dir/
 
 For multi-file operations (>10 files), spawn a sub-agent rather than reading files sequentially in the main context. The agent's context is separate and doesn't consume the main session's token budget.
 
-### Ollama for Analysis
+### Local analysis without an extra MCP
 
-The Ollama MCP (`chat`, `read_document`) is no longer installed by default as of v0.2.11. If you've opted into the Ollama MCP (Launcher → Modules → "Ollama Local LLM"), you can use `chat` for quick local analysis at zero API cost. Without the opt-in, use Claude's native reasoning and the `Read` tool with `offset`/`limit` for large files instead.
+There is no Ollama MCP exposed to Claude. For quick analysis and large-file reading, use Claude's native reasoning and the `Read` tool with `offset`/`limit` rather than routing through a separate local-LLM tool. Ollama still runs as infrastructure for Weaviate embeddings, but it is not a callable MCP.
 
 ## Active Plan Files
 
