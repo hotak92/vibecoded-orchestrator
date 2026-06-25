@@ -21,8 +21,8 @@
 --     Supabase Storage bucket. The edge function generates a signed URL
 --     for it on demand (15-minute TTL).
 --   - `sha256` is the .pt checksum. Empty string means "skip
---     verification" (used during bootstrap before Martino uploads the
---     real artifact). Clients should warn-but-allow on empty sha256.
+--     verification" (used during bootstrap before the publisher uploads
+--     the real artifact). Clients should warn-but-allow on empty sha256.
 --   - `notes` is markdown ≤500 chars; the wire contract caps it.
 --   - No FK to a `paid_modules` table — we don't currently have one,
 --     and module_id is just a slug. The edge function rejects unknown
@@ -99,7 +99,7 @@ create trigger trg_paid_module_releases_set_latest
 alter table public.paid_module_releases enable row level security;
 
 -- Bootstrap row for vct-rl-reranker arctic v0.1.0.
--- sha256 is left empty because Martino hasn't uploaded the .pt to
+-- sha256 is left empty because the .pt has not been uploaded to
 -- Storage yet; the edge function will treat empty sha256 as "skip
 -- verification" (client will warn but allow). Replace with the real
 -- sha256 (`shasum -a 256 rl_model_arctic_1024.pt`) before public
