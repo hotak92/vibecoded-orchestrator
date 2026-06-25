@@ -143,6 +143,10 @@ pub mod project_identity;
 pub mod project_codegraph_extras;
 pub mod projects_v2;
 pub mod project_env_settings;
+// Defect B (v0.2.68): detached async project-setup task. Owns the
+// `tokio::spawn` + `project_setups` row lifecycle + `project://setup-progress`
+// events for the heavy phase `create_project_v2` no longer awaits inline.
+pub mod project_setup;
 // v0.2.49 Phase 6 S-4 — boot sanity check that walks every project row,
 // verifies the registered folder_path still exists on disk, and stamps
 // the `folder_missing_at_last_boot` column. Exposes a Tauri read command

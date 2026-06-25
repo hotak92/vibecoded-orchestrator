@@ -50,6 +50,13 @@
   // `launcher_binary_swap_failed_locked` entry to UPDATE_DEFERRED.md.
   // Polls every 5s so it picks up entries from background install runs.
   import LauncherRestartBanner from '$lib/components/LauncherRestartBanner.svelte';
+  // Defect B (v0.2.68): global async project-setup progress banner. Mounted
+  // in the shell (not in ProjectSelector) so it survives the post-add route
+  // change — `create_project_v2` returns FAST and the heavy phase (bootstrap +
+  // bundle + post-bundle) finishes in the background while the user has
+  // already navigated to the new project. Adapter feeds the shared
+  // OperationProgressBanner from the project-setup store singleton.
+  import ProjectSetupBanner from '$lib/components/ProjectSetupBanner.svelte';
   // PR-8 (v0.2.11 / 2026-05-15): one-time legacy-collection notice. Auto-
   // shown when (a) Weaviate has at least one ClaudeOrchestrator_<Suffix>
   // class with objects AND (b) at least one user project has a different
@@ -329,6 +336,10 @@
          above MenuBar so it's the first thing the user sees regardless
          of which page they're on when install.py finishes. -->
     <LauncherRestartBanner />
+    <!-- Defect B (v0.2.68): async project-setup progress. Survives the
+         post-add route change because it lives in the shell, not the
+         (now-closed) New Project modal. -->
+    <ProjectSetupBanner />
     <MenuBar />
     <div class="app-body">
       <Sidebar />

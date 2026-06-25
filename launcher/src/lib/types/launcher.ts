@@ -624,6 +624,63 @@ export interface KgSummaryView {
   current_phase: string | null;
 }
 
+/**
+ * Defect B (v0.2.68): async project-setup lifecycle.
+ *
+ * `create_project_v2` returns FAST after the synchronous phase (DB row +
+ * `.claude/env`); the heavy phase (bootstrap-collections + install-bundle +
+ * post-bundle) runs detached. These types mirror `commands::project_setup`
+ * (Rust): the `project://setup-progress` event payload (`SetupProgressEvent`)
+ * + the `get_project_setup_status` view (`ProjectSetupView`).
+ *
+ * `deferred` is a terminal INFORMATIONAL state (e.g. cold-Weaviate bootstrap
+ * deferred cleanly) — amber in the banner, NO Retry. `failed` is a genuine
+ * subprocess failure — red + Retry.
+ */
+export type ProjectSetupStatus =
+  | 'pending'
+  | 'running'
+  | 'done'
+  | 'deferred'
+  | 'failed';
+
+/** Coarse phase label carried on non-terminal events. */
+export type ProjectSetupPhase = 'bootstrap' | 'bundle' | 'post_bundle';
+
+export type SetupWarningSeverity = 'info' | 'error';
+
+/** One classified warning — F5 severity split: info/amber (deferral,
+ *  preserved-files) vs error/red (genuine subprocess failure). */
+export interface SetupWarning {
+  message: string;
+  severity: SetupWarningSeverity;
+}
+
+/** `project://setup-progress` event payload. Intermediate (`running`) events
+ *  carry `phase` + empty `warnings`; the terminal event carries the full
+ *  classified `warnings` list (F5) + `error` on `failed`. */
+export interface SetupProgressEvent {
+  project_id: string;
+  project_name: string;
+  status: ProjectSetupStatus;
+  phase: ProjectSetupPhase | null;
+  warnings: SetupWarning[];
+  error: string | null;
+}
+
+/** `get_project_setup_status` view — for banner mount / reload (when the
+ *  live event stream missed the terminal event). */
+export interface ProjectSetupView {
+  project_id: string;
+  status: ProjectSetupStatus;
+  phase: ProjectSetupPhase | null;
+  started_at_iso: string | null;
+  finished_at_iso: string | null;
+  duration_ms: number | null;
+  warnings: SetupWarning[];
+  error_message: string | null;
+}
+
 /** Mirrors `InstallHealth` in commands/installer.rs. Returned by
  *  `check_install_health` once at app startup. When `all_ok` is false the
  *  layout renders `InstallHealthGate.svelte` as a blocking modal. */

@@ -348,6 +348,28 @@ function createProjectsStore() {
 
 export const projects = createProjectsStore();
 
+// Defect B (v0.2.68): wire the serialized add-queue's create-invoke. The
+// `project-setup` store owns the queue (so rapid adds don't race the
+// synchronous DB/env phase) + the global progress banner; it calls back into
+// `projects.create` for each dequeued add. Import is one-directional
+// (project-setup imports only types/toast/tauri, never projects), so no
+// circular dependency. Registered once at module load.
+import { projectSetup } from '$lib/stores/project-setup';
+projectSetup.setCreateFn(async (req) => {
+  // `projects.create` performs the FAST `create_project_v2` invoke, updates
+  // the store, and toasts the (now sync-phase-only) warnings. It returns the
+  // ProjectView; we re-wrap into the CreateProjectResult shape the queue
+  // expects (warnings already toasted inside create, so an empty list here is
+  // fine — the heavy-phase warnings arrive on the setup-progress event).
+  const project = await projects.create(
+    req.name,
+    req.folder_path,
+    req.host,
+    req.safe_add,
+  );
+  return { project, warnings: [] };
+});
+
 export const selectedProject = derived(projects, ($p) =>
   $p.selectedId ? $p.projects.find((pr) => pr.id === $p.selectedId) ?? null : null,
 );

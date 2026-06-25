@@ -11,6 +11,10 @@
   import { onMount } from 'svelte';
   import { nextFrame } from '$lib/dom-async';
   import { projects, selectedProject } from '$lib/stores/projects';
+  // Defect B (v0.2.68): the add now goes through the serialized queue, which
+  // returns FAST (the heavy phase is detached + driven by the global
+  // OperationProgressBanner). Concurrent adds enqueue behind it.
+  import { projectSetup } from '$lib/stores/project-setup';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime, invoke } from '$lib/tauri';
   import { projectColor } from '$lib/project-color';
@@ -391,12 +395,22 @@
 
     creating = true;
     try {
-      // The projects.create wrapper handles the launcher-DB-side rows; the
-      // actual install.py invocation happens in the registered command's
-      // post-create hook (or, for some hosts, via a separate install step).
-      // adoptDecision is recorded on the project row so subsequent
-      // install.py runs know whether to pass --adopt-project.
-      await projects.create(createName.trim(), submitPath, createHost, safeAdd);
+      // Defect B (v0.2.68): enqueue the add through the serialized queue. The
+      // backend's `create_project_v2` now returns FAST (synchronous phase
+      // only: DB row + `.claude/env`); the heavy phase (bootstrap + bundle +
+      // post-bundle) runs detached and streams to the global progress banner.
+      // `enqueueAdd` resolves when THIS add's fast create-invoke returns, so
+      // we close the modal immediately after — the banner takes over. A
+      // concurrent add (rapid second click / second window) enqueues behind
+      // this one and the banner shows the queue count. adoptDecision is
+      // recorded on the project row so subsequent install.py runs know
+      // whether to pass --adopt-project.
+      await projectSetup.enqueueAdd({
+        name: createName.trim(),
+        folder_path: submitPath,
+        host: createHost,
+        safe_add: safeAdd,
+      });
       // v0.2.67 dialog-freeze fix: order the teardown so neither stacked
       // <dialog> is unmounted while still `open`. Closing a native dialog
       // releases its top-layer ::backdrop slot; DOM removal alone does NOT

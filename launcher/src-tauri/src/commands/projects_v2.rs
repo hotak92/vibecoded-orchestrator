@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tauri::{command, AppHandle, State};
+use tauri::{command, AppHandle, Manager, State};
 use uuid::Uuid;
 
 use crate::commands::codegraph;
@@ -523,59 +523,201 @@ pub async fn create_project_v2(
         }
     }
 
-    // PR 4 (2026-05-01): bootstrap Weaviate collections + install per-project
-    // bundle (hooks/scripts/agents/skills/settings/infrastructure). Both run
-    // via Python subprocess into vco_lib.project_init — single source of
-    // truth shared with install.py. Soft-fail at every step: a Weaviate-down
-    // condition or a missing template tree must NOT block project creation.
+    // ── Defect B (v0.2.68): DETACH the heavy phase ──────────────────────
     //
-    // Order matters: env files were written above, so the bundle install
-    // and bootstrap pick up the right KG_COLLECTION via the project's .env.
-    // Bootstrap first (ensures the per-project + shared collections exist
-    // with current schema invariants); bundle second (drops the hooks +
-    // scripts that depend on the collections existing).
-    for w in run_bootstrap_collections(folder, &req.name).await {
-        warnings.push(w);
-    }
-    for w in run_install_bundle(folder, req.safe_add).await {
-        warnings.push(w);
+    // PR 4 (2026-05-01) used to run bootstrap-collections + install-bundle +
+    // the post-bundle phase INLINE here, `.await`-ing all three before
+    // returning. On a COLD Weaviate/Ollama backend that was ~51s of silent
+    // modal blur — the New Project modal read as "frozen". Everything ABOVE
+    // this point is the SYNCHRONOUS phase (DB row, env files, populate-1,
+    // B12 repair) and stays inline so the `ProjectView` + `.claude/env` are
+    // committed BEFORE we return. The bootstrap + bundle + post-bundle work
+    // now runs in a detached `tokio::spawn` task driven by `project_setup`,
+    // which streams a `project://setup-progress` event to the global banner
+    // and carries deferral / preserved-files warnings on its terminal event
+    // (F5) so the user never loses the inline toasts they used to see.
+    //
+    // Re-entrancy lock (F7): the row IS the lock. We insert a `pending`
+    // `project_setups` row FIRST (so the banner can render an immediate
+    // "queued" state and a concurrent add for the same project is refused),
+    // re-check the in-flight guard, then spawn. A spawn never blocks; the
+    // command returns FAST (hundreds of ms) right after this.
+    let now = chrono::Utc::now().timestamp_millis();
+    let existing_setup = db.get_project_setup(&row.id).ok().flatten();
+    let already_running = crate::commands::project_setup::setup_in_flight_should_refuse(
+        existing_setup.as_ref().map(|r| r.status.as_str()),
+        existing_setup.as_ref().and_then(|r| r.started_at),
+        now,
+        // 6h live window mirrors the module-install backstop shape. A fresh
+        // create can't realistically collide here (the row didn't exist a
+        // moment ago) but add-then-immediately-update on the same project
+        // would — F7 covers that. The constant lives in `project_setup`.
+        6 * 60 * 60 * 1000,
+    );
+    if already_running {
+        // A setup is already in flight for this project_id (e.g. a rapid
+        // double-add of the same folder). Don't spawn a second task — the
+        // first one owns the row + banner. Surface a soft warning so the
+        // caller's toast stream isn't silent. The project row itself is
+        // already committed above, so the user still gets their ProjectView.
+        warnings.push(format!(
+            "Setup for {:?} is already in progress — not starting a second one. \
+             Watch the progress banner; it will finish in the background.",
+            req.name
+        ));
+    } else {
+        // Queue the PENDING row first (idempotent UPSERT). A DB error here
+        // is non-fatal: we still spawn (the task will UPSERT its own running
+        // row), but the boot-resume gate won't see a pending row to recover
+        // if the launcher crashes in the microsecond window before spawn.
+        if let Err(e) = db.upsert_project_setup(
+            &row.id,
+            crate::db::project_setups::status::PENDING,
+            None,
+            Some(now),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) {
+            eprintln!(
+                "[vct] warning: could not queue project-setup row for {}: {}",
+                row.id, e
+            );
+        }
+        let phase_fn = create_setup_phases(
+            app.clone(),
+            row.id.clone(),
+            req.name.clone(),
+            req.folder_path.clone(),
+            req.safe_add,
+        );
+        crate::commands::project_setup::spawn_setup_task(
+            app.clone(),
+            row.id.clone(),
+            req.name.clone(),
+            phase_fn,
+        );
     }
 
-    // V52-AF (v0.2.52, 2026-06-09): the entire post-bundle phase
-    // (post-bundle populate, global-module enabled-seed, diagrams
-    // seed, codegraph spawn, kg-sync spawn, kg-summary spawn) is
-    // delegated to `apply_post_bundle_steps`. The same helper is
-    // called from `update_project_v2` after its env refresh, so the
-    // post-bundle pipeline is byte-for-byte consistent between
-    // create + update.
-    //
-    // Pre-v0.2.52 these steps were inlined here and `update_project_v2`
-    // ran NONE of them — a project created on v0.2.45 then "Update
-    // bundle"-d on v0.2.52 ended up with new `.md` files on disk but
-    // a stale launcher.db. GUI tabs lied. The audit at
-    // `.claude/context/audits/v0252-per-project-install-parity-2026-06-09.md`
-    // documents the full drift.
-    //
-    // `is_initial_create=true` here so the codegraph spawn passes
-    // `prune_stale=false` (no pre-existing rows possible on a fresh
-    // project). Update path passes `false` → codegraph spawn prunes
-    // stale rows from the prior build.
-    let post_bundle_warnings = apply_post_bundle_steps(
-        &row.id,
-        &req.name,
-        folder,
-        &app,
-        &db,
-        /* is_initial_create */ true,
-    )
-    .await;
-    for w in post_bundle_warnings {
-        warnings.push(w);
-    }
-
+    // The synchronous-phase warnings (env write, B12 repair) are returned
+    // immediately as before. The HEAVY-phase warnings (bootstrap deferred,
+    // bundle preserved-files, schema migration) now arrive asynchronously on
+    // the terminal `project://setup-progress` event — see F5 in
+    // `project_setup` + the frontend `project-setup` store.
     Ok(CreateProjectResult {
         project: ProjectView::from_row(row, 0),
         warnings,
+    })
+}
+
+/// Defect B (v0.2.68): build the CREATE-mode heavy-phase closure consumed by
+/// `project_setup::spawn_setup_task`. The closure runs the three phases that
+/// `create_project_v2` used to `.await` inline — bootstrap-collections →
+/// install-bundle → post-bundle — reporting coarse phase transitions to the
+/// banner via the `PhaseReporter` and returning a classified `SetupOutcome`.
+///
+/// **Why a closure, not a mega-spawn fork**: create and update DIVERGE
+/// (update has migrate-dry-run / install-bundle --update / env-refresh /
+/// module-retry; create has safe-add). `spawn_setup_task` owns ONLY the
+/// detach + row + event + guard plumbing; each mode supplies its own phase
+/// sequence here, next to its command. (`update_setup_phases` is the symmetric
+/// factory the update flow adopts when it's backgrounded; out of scope for
+/// THIS task, which wires the create path — the actual Defect B.)
+///
+/// Idempotent by construction: bootstrap is an UPSERT of collection schema,
+/// install-bundle is manifest-driven (re-run = no-op on unchanged files), and
+/// the post-bundle steps are all idempotent UPSERTs. Safe to re-run on
+/// boot-resume.
+pub(crate) fn create_setup_phases(
+    app: AppHandle,
+    project_id: String,
+    project_name: String,
+    folder_path: String,
+    safe_add: bool,
+) -> crate::commands::project_setup::SetupPhaseFn {
+    use crate::commands::project_setup::{
+        classify_warning, PhaseReporter, SetupOutcome, SetupWarning, SetupWarningSeverity,
+    };
+    use crate::db::project_setups::phase as setup_phase;
+
+    Box::new(move |reporter: PhaseReporter| {
+        Box::pin(async move {
+            let folder = PathBuf::from(&folder_path);
+            let mut warnings: Vec<SetupWarning> = Vec::new();
+            let mut deferred = false;
+            let mut failed = false;
+            let mut first_error: Option<String> = None;
+
+            // Helper: classify + record one raw warning string.
+            let record = |raw: String,
+                              warnings: &mut Vec<SetupWarning>,
+                              deferred: &mut bool,
+                              failed: &mut bool,
+                              first_error: &mut Option<String>| {
+                let (severity, is_deferral) = classify_warning(&raw);
+                if is_deferral {
+                    *deferred = true;
+                }
+                if severity == SetupWarningSeverity::Error {
+                    *failed = true;
+                    if first_error.is_none() {
+                        *first_error = Some(raw.clone());
+                    }
+                }
+                warnings.push(SetupWarning {
+                    message: raw,
+                    severity,
+                });
+            };
+
+            // Phase 1: bootstrap Weaviate collections. Ordered first because
+            // the bundle drops hooks/scripts that depend on the collections
+            // existing. Self-bounds on a cold backend (~30s) then DEFERS
+            // cleanly — surfaced as an Info/amber warning + `deferred` status.
+            reporter.enter(setup_phase::BOOTSTRAP);
+            for w in run_bootstrap_collections(&folder, &project_name).await {
+                record(w, &mut warnings, &mut deferred, &mut failed, &mut first_error);
+            }
+
+            // Phase 2: install the per-project bundle (hooks/scripts/agents/
+            // skills/settings/infrastructure). No network; preserved-files /
+            // schema-migration notices surface as Info/amber warnings.
+            reporter.enter(setup_phase::BUNDLE);
+            for w in run_install_bundle(&folder, safe_add).await {
+                record(w, &mut warnings, &mut deferred, &mut failed, &mut first_error);
+            }
+
+            // Phase 3: the V52-AF post-bundle pipeline (post-bundle populate,
+            // global-module enabled-seed, diagrams seed, codegraph spawn,
+            // kg-sync spawn, kg-summary spawn, schema checks). Order is
+            // LOAD-BEARING: it MUST run after install-bundle dropped the
+            // analyzer / kg-sync / summary wrappers (the 2026-05-06
+            // spawn-before-bundle race). `is_initial_create=true` → codegraph
+            // spawn passes prune_stale=false.
+            reporter.enter(setup_phase::POST_BUNDLE);
+            let db = app.state::<Db>();
+            let post = apply_post_bundle_steps(
+                &project_id,
+                &project_name,
+                &folder,
+                &app,
+                &db,
+                /* is_initial_create */ true,
+            )
+            .await;
+            for w in post {
+                record(w, &mut warnings, &mut deferred, &mut failed, &mut first_error);
+            }
+
+            SetupOutcome {
+                warnings,
+                deferred,
+                failed,
+                error: first_error,
+            }
+        })
     })
 }
 
@@ -641,7 +783,7 @@ pub async fn create_project_v2(
 /// Returns a Vec of human-readable warnings the caller appends to its
 /// own. Errors are never returned; this function is infallible from
 /// the caller's PoV.
-async fn apply_post_bundle_steps(
+pub(crate) async fn apply_post_bundle_steps(
     project_id: &str,
     project_name: &str,
     folder: &Path,
@@ -937,7 +1079,7 @@ async fn apply_post_bundle_steps(
 ///   - JSON parse failure → push a warning carrying stderr tail.
 ///
 /// Returns the list of warnings to surface to the UI. Never returns Err.
-async fn run_bootstrap_collections(folder: &Path, project_name: &str) -> Vec<String> {
+pub(crate) async fn run_bootstrap_collections(folder: &Path, project_name: &str) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
 
     let system = match detect_system().await {
@@ -1124,7 +1266,7 @@ async fn run_bootstrap_collections(folder: &Path, project_name: &str) -> Vec<Str
 // (a) records the `safe_add_skipped_env_merge` deferral when it sees the
 // `.env.vco.reference` sidecar the Rust side wrote, and (b) appends VCO-created
 // paths to the project's local-only `.git/info/exclude`. No effect when false.
-async fn run_install_bundle(folder: &Path, safe_add: bool) -> Vec<String> {
+pub(crate) async fn run_install_bundle(folder: &Path, safe_add: bool) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
 
     let system = match detect_system().await {

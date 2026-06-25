@@ -193,6 +193,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "index module_access_tokens.token_secret (v0.2.65 audit N1-3). The hub authenticates every module-DB / RL request via `WHERE token_secret = ?1` (module_db_api.rs::lookup_token); migration 019 indexed only module_id, leaving the hot-path auth lookup a full table scan. Plain additive CREATE INDEX IF NOT EXISTS — idempotent, no table rebuild, not self-transactional.",
         sql: include_str!("migrations/035_module_access_tokens_secret_index.sql"),
     },
+    Migration {
+        version: 36,
+        description: "project_setups table (Defect B, v0.2.68). One row per project tracks the lifecycle of the async setup task that `create_project_v2` now detaches (bootstrap-collections + install-bundle + post-bundle phase) so the New Project modal returns FAST instead of blocking ~51s on a cold Weaviate/Ollama backend. Mirrors code_graph_builds (006) + kg_syncs (011): same {started,finished}_at, same FK cascade. Status set adds 'done'/'deferred'/'failed' terminal states ('deferred' = informational amber, a phase deferred cleanly e.g. Weaviate bootstrap on a cold backend — NOT a failure). A 'pending'/'running' row is the re-entrancy LOCK (refuses a 2nd concurrent setup for the same project; mirrors v0.2.67 install_in_flight) AND gates the boot-resume sweeps for code-graph/kg-sync/kg-summary so a crash mid-setup can't resurrect the 2026-05-06 spawn-before-bundle race. `warnings` is a JSON array carried on the terminal setup-progress event for the frontend to re-toast (F5). Plain additive CREATE TABLE — idempotent, not self-transactional.",
+        sql: include_str!("migrations/036_project_setups.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.

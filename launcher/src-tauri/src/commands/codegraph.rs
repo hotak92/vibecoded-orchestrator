@@ -773,8 +773,20 @@ pub fn spawn_initial_build(
 /// must NOT block launcher boot. Each failure is logged + continued
 /// past. Returns counts for the boot-log line.
 ///
+/// Defect B (v0.2.68) — F6 boot-resume gate: `skip` is the set of project
+/// IDs whose `project_setups` row is NOT terminal (the heavy create-phase
+/// never finished). Those projects are RE-SPAWNED by
+/// `project_setup::resume_pending_setups` (which re-runs bundle +
+/// post-bundle and re-queues this build as `pending`), so resuming a build
+/// against them HERE would race the bundle back onto disk — the very
+/// 2026-05-06 spawn-before-bundle bug. We skip them; the resumed setup
+/// re-queues + re-spawns the build in the correct order.
+///
 /// Called from `lib.rs::setup()` after migrations have run.
-pub fn resume_pending_builds(app: &AppHandle) -> (usize, usize) {
+pub fn resume_pending_builds(
+    app: &AppHandle,
+    skip: &std::collections::HashSet<String>,
+) -> (usize, usize) {
     let db = app.state::<Db>();
 
     // Phase 1: stale-running sweep.
@@ -811,6 +823,12 @@ pub fn resume_pending_builds(app: &AppHandle) -> (usize, usize) {
 
     let mut respawned = 0usize;
     for pid in &pending_ids {
+        // F6 gate: a project whose async setup is still incomplete is being
+        // re-driven by `resume_pending_setups`; skip it here so we don't
+        // spawn a build before the resumed setup re-lands the bundle.
+        if skip.contains(pid) {
+            continue;
+        }
         let project = match db.get_project(pid) {
             Ok(Some(p)) => p,
             Ok(None) => {

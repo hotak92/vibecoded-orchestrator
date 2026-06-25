@@ -2024,10 +2024,38 @@ pub fn run() {
             //     `run_build_task` / `run_sync_task` does after
             //     spawn) — so phase 2 above is what actually picks it up.
             let resume_handle = app.handle();
+
+            // Defect B (v0.2.68) — F6 boot-resume ORDERING. The async
+            // project-setup sweep MUST run FIRST + its incomplete-setup set
+            // GATES the three downstream sweeps. Rationale: the code-graph /
+            // kg-sync / kg-summary resume sweeps each assume the bundle is
+            // already on disk (they resolve `.claude/scripts/*` wrappers the
+            // bundle drops). If a launcher crash interrupted a project mid-
+            // setup (bundle not yet landed), a downstream sweep that re-spawns
+            // against it would hit the 2026-05-06 spawn-before-bundle race.
+            // So: (1) build the set of projects whose `project_setups` row is
+            // not terminal, (2) resume those setups (which re-run bundle +
+            // post-bundle and re-queue the downstream tasks in the correct
+            // order), (3) run the three downstream sweeps with that set as a
+            // SKIP list — they leave the incomplete projects to the resumed
+            // setup. Implemented as a gate (audit option b), not a 4th peer
+            // sweep.
+            let incomplete_setups: std::collections::HashSet<String> = {
+                use tauri::Manager as _;
+                resume_handle
+                    .state::<crate::db::Db>()
+                    .list_incomplete_project_setups()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            };
+            let (setup_swept, setup_resumed) =
+                commands::project_setup::resume_pending_setups(resume_handle);
+
             let (cg_swept, cg_resumed) =
-                commands::codegraph::resume_pending_builds(resume_handle);
+                commands::codegraph::resume_pending_builds(resume_handle, &incomplete_setups);
             let (kg_swept, kg_resumed) =
-                commands::kg_sync::resume_pending_syncs(resume_handle);
+                commands::kg_sync::resume_pending_syncs(resume_handle, &incomplete_setups);
             // KG summary backfill (v0.2.3 / 2026-05-12) — extends the
             // resume sweep to a third task type. Same two-phase contract:
             //   (1) running rows → marked failed with "launcher crashed
@@ -2035,13 +2063,17 @@ pub fn run() {
             //   (2) pending rows → re-spawned via spawn_initial_summary.
             // See commands::kg_summary::resume_pending_summaries.
             let (sum_swept, sum_resumed) =
-                commands::kg_summary::resume_pending_summaries(resume_handle);
-            if cg_swept + cg_resumed + kg_swept + kg_resumed + sum_swept + sum_resumed > 0 {
+                commands::kg_summary::resume_pending_summaries(resume_handle, &incomplete_setups);
+            if setup_swept + setup_resumed + cg_swept + cg_resumed
+                + kg_swept + kg_resumed + sum_swept + sum_resumed > 0
+            {
                 eprintln!(
-                    "[vct] resume-sweep: code-graph (running→failed: {}, pending respawned: {}); \
+                    "[vct] resume-sweep: project-setup (running→failed: {}, pending respawned: {}); \
+                     code-graph (running→failed: {}, pending respawned: {}); \
                      kg-sync (running→failed: {}, pending respawned: {}); \
                      kg-summary (running→failed: {}, pending respawned: {})",
-                    cg_swept, cg_resumed, kg_swept, kg_resumed, sum_swept, sum_resumed
+                    setup_swept, setup_resumed, cg_swept, cg_resumed,
+                    kg_swept, kg_resumed, sum_swept, sum_resumed
                 );
             }
 
@@ -2733,6 +2765,13 @@ pub fn run() {
             // to backfill it lazily.
             commands::kg_summary::get_kg_summary_status,
             commands::kg_summary::retry_kg_summary,
+            // Defect B (v0.2.68): async project-setup status read (banner
+            // mount / reload) + retry (banner Retry button). The heavy
+            // create phase (bootstrap + bundle + post-bundle) now runs
+            // detached; these surface its lifecycle to the global
+            // OperationProgressBanner. See commands/project_setup.rs.
+            commands::project_setup::get_project_setup_status,
+            commands::project_setup::retry_project_setup,
             // PR-8 (v0.2.11 / 2026-05-15): per-project Identity tab +
             // legacy-collection cleanup. Surfaces `name`,
             // `KG_COLLECTION`, `CODE_GRAPH_PROJECT` editing and detects

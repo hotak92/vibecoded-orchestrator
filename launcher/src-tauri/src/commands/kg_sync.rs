@@ -176,7 +176,17 @@ pub fn spawn_initial_sync(
 /// Called from `lib.rs::setup()` after migrations have run. Boot order
 /// vs. the code-graph resume sweep is incidental; the two are
 /// independent and can run in either sequence.
-pub fn resume_pending_syncs(app: &AppHandle) -> (usize, usize) {
+///
+/// Defect B (v0.2.68) — F6 boot-resume gate: `skip` is the set of project
+/// IDs whose `project_setups` row is NOT terminal. Those projects are
+/// re-driven by `project_setup::resume_pending_setups` (which re-runs the
+/// bundle that drops the `kg-sync` wrapper and re-queues this sync as
+/// `pending`); resuming a sync HERE would race the wrapper back onto disk.
+/// We skip them. Mirrors `codegraph::resume_pending_builds`.
+pub fn resume_pending_syncs(
+    app: &AppHandle,
+    skip: &std::collections::HashSet<String>,
+) -> (usize, usize) {
     let db = app.state::<Db>();
 
     // Phase 1: stale-running sweep.
@@ -210,6 +220,12 @@ pub fn resume_pending_syncs(app: &AppHandle) -> (usize, usize) {
 
     let mut respawned = 0usize;
     for pid in &pending_ids {
+        // F6 gate: skip projects whose async setup is still incomplete —
+        // `resume_pending_setups` re-drives them (re-landing the kg-sync
+        // wrapper + re-queuing this sync in the correct order).
+        if skip.contains(pid) {
+            continue;
+        }
         let project = match db.get_project(pid) {
             Ok(Some(p)) => p,
             Ok(None) => {

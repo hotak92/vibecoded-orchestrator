@@ -32,6 +32,10 @@ pub mod change_log;
 pub mod code_graph_builds;
 pub mod kg_syncs;
 pub mod kg_summaries;
+// Defect B (v0.2.68): per-project async setup status (bootstrap + bundle +
+// post-bundle), backing the detached `create_project_v2` heavy phase. Same
+// row shape + FK-cascade discipline as code_graph_builds / kg_syncs above.
+pub mod project_setups;
 // v0.2.54 Track J — shared log-tail truncation (LOG_TAIL_MAX_BYTES +
 // char-boundary-safe capping), extracted from SIX per-module copies in
 // the three db writers above + the launcher crate's command layer.
