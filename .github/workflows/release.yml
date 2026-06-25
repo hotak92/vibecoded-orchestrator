@@ -220,6 +220,26 @@ jobs:
         with:
           workspaces: launcher/src-tauri
 
+      - name: Free runner disk before installs
+        # The hosted ubuntu runner ships ~14 GB free on / with several large
+        # preinstalled toolchains this gate never uses (Android SDK/NDK, .NET,
+        # GHC/Haskell, the bundled image caches). Two prior release runs hit
+        # `[Errno 28] No space left on device` mid pip-install — a transient
+        # runner-disk condition, not a code defect. Reclaim the unused trees up
+        # front so the apt + pip + cargo work below has headroom. Best-effort:
+        # every removal is `|| true` so a missing path or a runner-image change
+        # never turns this hardening step into a new failure.
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc /usr/local/.ghcup || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo docker image prune -af 2>/dev/null || true
+          echo "Disk after reclaim:"
+          df -h / | tail -1
+
       - name: Install libdbus-1-dev (for vct-launcher-core keychain dep)
         # v0.2.63: noninteractive + auto needrestart (same hang guard as the
         # build job's apt step). `sudo -E` so NEEDRESTART_MODE actually reaches
