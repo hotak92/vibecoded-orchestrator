@@ -3,7 +3,7 @@ title: Claude Code Workflows Feature — Premade Workflow Integration
 type: concept
 tags: [claude-code, workflows, ultracode, multi-agent, orchestration, bundle, mid-level-architecture]
 created: 2026-06-11T00:00:00Z
-updated: 2026-06-11T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-06-11T00:00:00Z
 valid_until: null
 status: active
@@ -15,12 +15,14 @@ Claude Code v2.1.154+ (2026-05-28) ships a built-in `Workflow` tool: determinist
 
 ## Key facts
 
-- **Availability**: Pro (toggle in `/config`), Max/Team/Enterprise (default on). Disable via `disableWorkflows: true` or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
-- **Triggers**: `ultracode` keyword, natural-language "use a workflow", or saved workflows invoked as `/<name>`.
-- **Saved workflows**: `.claude/workflows/<name>.{mjs,js}` (project scope — shareable in a repo, wins over user scope) or `~/.claude/workflows/` (user scope). Must start with a pure-literal `export const meta = {name, description, phases?}`.
-- **Limits**: ~16 concurrent agents, 1000 per run; subagents run `acceptEdits`; no mid-run user input; resume replays the unchanged `agent()`-call prefix within the same session.
+- **Availability**: all paid plans (Pro, Max, Team, Enterprise), Anthropic API, and Bedrock / Vertex / Foundry. On Pro, turn them on from the Dynamic workflows row in `/config`. Disable via `disableWorkflows: true` (settings) or `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
+- **Triggers**: the `ultracode` keyword in a prompt (single-task opt-in), `/effort ultracode` (session-wide: Claude plans a workflow for each substantive task), natural-language "use a workflow", or saved workflows invoked as `/<name>`. `ultracode` is the literal keyword from v2.1.160 onward (it was `workflow` before that); natural-language requests work in both.
+- **Bundled**: `/deep-research <question>` ships built-in — fans out web searches across angles, cross-checks sources, votes on each claim, returns a cited report with unsupported claims filtered out. Requires the WebSearch tool.
+- **Saved workflows**: `.claude/workflows/<name>.{mjs,js}` (project scope — shareable in a repo, wins over user scope) or `~/.claude/workflows/` (user scope). Save a completed run's script via `s` in the `/workflows` view. Must start with a pure-literal `export const meta = {name, description, phases?}` (extracted without execution).
+- **Limits**: up to 16 concurrent agents (fewer on low-core machines), 1000 agents per run; subagents always run `acceptEdits` and inherit the session tool allowlist regardless of the session's permission mode; no mid-run user input; resume replays cached completed-agent results within the same session (a fresh session restarts the run).
+- **Determinism**: the runtime blocks `Date.now()` and `Math.random()`; the script has no direct filesystem or shell access (agents do the I/O, the script coordinates).
+- **Primitives**: `agent(prompt, opts)` runs one subagent (pass a `schema` for validated structured output); `parallel(thunks)` is a barrier (waits for all); `pipeline(items, ...stages)` streams each item through stages with no barrier; `phase()`, `log()`, and a token `budget` round out the API. `args` is exposed as a global for parameterized saved workflows.
 - **Custom agent types**: `agent(prompt, {agentType: '<registered-agent>'})` resolves from the same registry as the Agent tool — bundled orchestrator agents are usable as workflow stages.
-- **Format caveat**: public docs show `export default async function(args)`; the in-runtime tool spec shows a top-level script body after `meta`. Verify which form the target Claude Code version loads before bundling.
 
 ## Orchestrator integration design (v0.2.54+ candidate)
 

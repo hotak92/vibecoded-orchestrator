@@ -3,10 +3,10 @@ title: Kubernetes Resource Model — Requests, Limits, QoS Classes, and Eviction
 type: concept
 tags: [kubernetes, infrastructure, devops, SRE, containerization, mid-level-architecture, resource-management]
 created: 2026-05-19T00:00:00Z
-updated: 2026-05-19T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-05-19T00:00:00Z
-valid_until: 2026-05-22T00:00:00Z
-status: archived
+valid_until: null
+status: active
 ---
 
 # Kubernetes Resource Model — Requests, Limits, QoS Classes, and Eviction

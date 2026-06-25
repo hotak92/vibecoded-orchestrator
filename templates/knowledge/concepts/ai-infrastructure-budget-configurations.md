@@ -3,7 +3,7 @@ title: AI Infrastructure Budget Configurations
 type: concept
 tags: [hardware, budget, configuration, optimization, decision-framework, mid-level-architecture]
 created: 2026-02-12T20:00:00Z
-updated: 2026-04-05T14:33:10Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-02-12T00:00:00Z
 valid_until: null
 status: active
@@ -260,11 +260,15 @@ AI infrastructure planning requires balancing on-premise investment with cloud s
 
 ## Cost Optimization Strategies
 
+### Current-Generation Note
+
+The configurations above are anchored on Ada/Ampere-class consumer GPUs (RTX 4090/4070 Ti/3090) and A100-class datacenter parts, which remain strong value on the used and refurbished market. The current frontier is the **Blackwell** generation: consumer **RTX 50-series** (RTX 5090 with 32 GB GDDR7, ~2× RTX 4090) and datacenter **H200 / B200 / GB200**. When pricing a new build, compare a 5090 against the 4090 entries (more VRAM, higher power draw) and an H200/B200 rental against the A100/H100 cloud lines; the budget-tier logic and the on-prem-vs-cloud decision framework are unchanged, only the part numbers move.
+
 ### On-Premise Optimization
-1. **Used market**: RTX 3090 offers 24GB at 50% cost of RTX 4090
-2. **Budget GPUs**: RTX 4070 Ti provides 70% performance at 40% cost
-3. **Refurbished enterprise**: A100 refurbished can save 20-30%
-4. **Component timing**: Buy RAM/storage during non-shortage periods
+1. **Used market**: RTX 3090/4090 offer 24GB at a steep discount to current-gen on the secondary market
+2. **Budget GPUs**: a tier-down card (e.g. RTX 4070 Ti / 5070 Ti) provides ~70% performance at ~40% cost
+3. **Refurbished enterprise**: refurbished A100/H100 can save 20-30% versus new datacenter parts
+4. **Component timing**: buy RAM/storage outside shortage windows (GDDR/DRAM spot prices swing widely)
 
 ### Cloud Optimization
 1. **Spot instances**: 70% discount on TPU, 50-70% on GPU
@@ -342,9 +346,7 @@ Based on comprehensive 2026 market research:
 - 65+ verified pricing sources (NVIDIA, AMD, Google, AWS, Intel)
 - 12 detailed configuration scenarios tested
 - ROI calculations validated against industry benchmarks
-- Italian provider pricing (SysPack, ServerEasy, Aruba, Seeweb)
-- Market analysis from AI4Business, CorriereComuni cazioni
+- Regional system-integrator pricing (used as a sanity check on build totals)
+- General market analysis of GPU/cloud pricing trends
 
-**Last Verified**: 2026-02-12
-**Applicability**: 2026 market conditions, adjust for price fluctuations
-**Next Review**: 2026-05-01 (quarterly review recommended)
+**Applicability**: GPU and cloud prices move quickly; treat the absolute numbers as a snapshot and the budget-tier logic + on-prem-vs-cloud decision framework as the durable content. Re-verify part prices against current listings before committing a build.

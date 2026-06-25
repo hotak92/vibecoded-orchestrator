@@ -3,7 +3,7 @@ title: Supply-Chain Security — SLSA Levels, SBOM, and Sigstore
 type: concept
 tags: [security, devops, SRE, infrastructure, supply-chain, SLSA, SBOM, sigstore, mid-level-architecture, best-practices]
 created: 2026-05-19T00:00:00Z
-updated: 2026-05-19T00:00:00Z
+updated: 2026-06-25T00:00:00Z
 valid_from: 2026-05-19T00:00:00Z
 valid_until: null
 status: active
@@ -21,17 +21,19 @@ Software supply-chain security covers everything between a developer's keyboard 
 
 These compose: SLSA describes *what* you should guarantee, SBOM lists *what's in* the artifact, sigstore is *how* you sign and verify it.
 
-## SLSA Levels (v1.0)
+## SLSA Levels (Build Track)
 
-Canonical: https://slsa.dev/spec/v1.0/
+Canonical: https://slsa.dev/spec/v1.2/
+
+SLSA is organized into **tracks**, each measuring one aspect of supply-chain security with its own levels. The **Build track** (the original and most widely adopted) grades build provenance L1→L3; a **Source track** grades source-control integrity (review, retention, change management). Aim for Build-track levels first.
 
 | Level | Build platform requirements | Provenance | Typical implementation |
 |---|---|---|---|
-| **L1** | Scripted build (not manual) | Generated but unsigned, may be incomplete | `make build`, `goreleaser` |
-| **L2** | Hosted build platform, version-controlled source | Authenticated, signed by the build platform | GitHub Actions with attestations, GitLab CI artifacts |
-| **L3** | Build platform is hardened against tampering; build runs in ephemeral, isolated environment | Non-falsifiable, includes build-instruction integrity | Tekton Chains, GitHub Actions w/ OIDC + cosign, in-toto attestations |
+| **Build L1** | Scripted build (not manual) | Generated but unsigned, may be incomplete | `make build`, `goreleaser` |
+| **Build L2** | Hosted build platform, version-controlled source | Authenticated, signed by the build platform | GitHub Actions with attestations, GitLab CI artifacts |
+| **Build L3** | Build platform is hardened against tampering; build runs in ephemeral, isolated environment | Non-falsifiable, includes build-instruction integrity | Tekton Chains, GitHub Actions w/ OIDC + cosign, in-toto attestations |
 
-L4 was removed from v1.0 (planned for future track focused on dependency provenance). Don't aim for L3 on day one — getting to L2 (signed provenance attestation per build) covers the most common supply-chain attacks.
+There is no Build L4; deeper dependency-provenance guarantees are handled by separate tracks rather than a fourth build level. Don't aim for L3 on day one — getting to Build L2 (signed provenance attestation per build) covers the most common supply-chain attacks.
 
 ## SBOM Formats
 
@@ -192,7 +194,7 @@ Even signed, scanned images can ship a freshly disclosed CVE. Layer:
 
 ## References
 
-- SLSA v1.0 specification: https://slsa.dev/spec/v1.0/
+- SLSA specification: https://slsa.dev/spec/v1.2/
 - Sigstore documentation: https://docs.sigstore.dev/
 - Cosign documentation: https://docs.sigstore.dev/cosign/overview/
 - CycloneDX: https://cyclonedx.org/
