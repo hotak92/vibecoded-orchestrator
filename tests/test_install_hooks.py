@@ -285,7 +285,7 @@ class WindowsHookInstallTest(unittest.TestCase):
                         c = h.get("command", "")
                         if c:
                             cmds.append(c)
-            ps1_cmds = [c for c in cmds if ".claude\\hooks\\" in c or ".ps1" in c]
+            ps1_cmds = [c for c in cmds if ".ps1" in c]
             self.assertTrue(ps1_cmds, "windows template should reference .ps1 hooks")
             for c in ps1_cmds:
                 self.assertIn(
@@ -296,6 +296,22 @@ class WindowsHookInstallTest(unittest.TestCase):
                 self.assertNotIn(
                     "bash ", c,
                     f"windows template must not use bash prefix: {c}",
+                )
+            # Regression lock (v0.2.69 FIX 2): no hook command may use the
+            # backslash separator form `.claude\hooks\NAME.ps1`. Claude Code runs
+            # every hook `command` via `bash -c` on Windows, and bash EATS the
+            # backslashes — PowerShell `-File` then receives a corrupt path
+            # (`.claudehooksNAME.ps1`), the dispatch silently no-ops (best-effort
+            # exit 0), and SessionStart hooks (containers / hub / kg-loader)
+            # never fire. Forward-slash survives bash untouched and is a valid
+            # PowerShell `-File` separator on Windows. Lock the fix here so the
+            # template can never regress to the broken backslash form.
+            for c in cmds:
+                self.assertNotIn(
+                    ".claude\\hooks\\", c,
+                    "windows hook command must use forward-slash "
+                    "`.claude/hooks/...` (backslash is eaten by bash -c on "
+                    f"Windows, corrupting the -File path): {c}",
                 )
 
 

@@ -48,46 +48,46 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\check-no-fork-bomb.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/check-no-fork-bomb.ps1",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\ensure-containers.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/ensure-containers.ps1",
             "timeout": 15,
             "async": true
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\verify-container-ports.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/verify-container-ports.ps1",
             "timeout": 30,
             "async": true
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\ensure-code-embed-service.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/ensure-code-embed-service.ps1",
             "timeout": 15,
             "async": true
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\session-start-ensure-hub.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/session-start-ensure-hub.ps1",
             "timeout": 5,
             "async": true
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\session-start-kg-loader.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/session-start-kg-loader.ps1",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\embedding-failures-surface.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/embedding-failures-surface.ps1",
             "timeout": 3
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\context-size-check.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/context-size-check.ps1",
             "timeout": 2
           }
         ]
@@ -97,12 +97,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\compact-context-reinject.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/compact-context-reinject.ps1",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-update-nudge.ps1",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-update-nudge.ps1",
             "timeout": 4
           }
         ]
@@ -114,7 +114,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-compact-save.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-compact-save.ps1",
             "timeout": 5
           }
         ]
@@ -126,7 +126,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-compact.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-compact.ps1",
             "timeout": 10
           }
         ]
@@ -137,22 +137,22 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\user-prompt-submit-reminder.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/user-prompt-submit-reminder.ps1",
             "timeout": 2
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\diff-context-inject.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/diff-context-inject.ps1",
             "timeout": 3
           },
           {
             "type": "command",
-            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-update-nudge.ps1",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-update-nudge.ps1",
             "timeout": 4
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\agent-skill-keyword-suggest.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/agent-skill-keyword-suggest.ps1",
             "timeout": 2
           }
         ]
@@ -163,12 +163,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\subagent-start-suggest.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/subagent-start-suggest.ps1",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\subagent-start-kg-inject.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/subagent-start-kg-inject.ps1",
             "timeout": 5
           }
         ]
@@ -179,7 +179,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\subagent-stop-reconcile.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/subagent-stop-reconcile.ps1",
             "timeout": 2
           }
         ]
@@ -191,7 +191,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-vercel-token-guard.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-vercel-token-guard.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
             "timeout": 2,
             "if": "Bash(*vercel*--token*)"
           }
@@ -202,7 +202,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\lean-ctx-rewrite.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/lean-ctx-rewrite.ps1",
             "timeout": 5
           }
         ]
@@ -212,7 +212,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-bash-context-inject.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-bash-context-inject.ps1",
             "timeout": 8
           }
         ]
@@ -222,7 +222,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-tool-use.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-tool-use.ps1 \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
             "timeout": 3
           }
         ]
@@ -232,7 +232,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-edit-context-inject.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-edit-context-inject.ps1",
             "timeout": 8,
             "if": "Edit(*)"
           }
@@ -243,7 +243,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-diagram-path-validation.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-diagram-path-validation.ps1",
             "timeout": 3,
             "if": "Write(.claude/diagrams/**)|Edit(.claude/diagrams/**)"
           }
@@ -254,7 +254,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\pre-diagram-path-validation.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/pre-diagram-path-validation.ps1",
             "timeout": 3
           }
         ]
@@ -265,7 +265,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\config-change-audit.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/config-change-audit.ps1",
             "timeout": 2,
             "async": true
           }
@@ -277,13 +277,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\cost-tracker.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/cost-tracker.ps1",
             "timeout": 5,
             "async": true
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\notify-stop.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/notify-stop.ps1",
             "timeout": 5,
             "async": true
           }
@@ -295,7 +295,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\stop-failure-notify.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/stop-failure-notify.ps1",
             "timeout": 5,
             "async": true
           }
@@ -308,7 +308,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-file-edit.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-file-edit.ps1",
             "timeout": 5
           }
         ]
@@ -318,7 +318,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-edit-outcome.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-edit-outcome.ps1",
             "timeout": 5,
             "async": true
           }
@@ -329,7 +329,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-bash-context-record.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-bash-context-record.ps1",
             "timeout": 5,
             "async": true
           }
@@ -340,7 +340,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-tool-security.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-tool-security.ps1",
             "timeout": 5
           }
         ]
@@ -368,7 +368,7 @@
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-summary-generator.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-summary-generator.ps1",
             "timeout": 5,
             "async": true,
             "if": "Edit(knowledge/**/*.md)|Write(knowledge/**/*.md)"
@@ -380,7 +380,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-summary-generator.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-summary-generator.ps1",
             "timeout": 5,
             "async": true
           }
@@ -392,13 +392,13 @@
           {
             "type": "command",
             "if": "Bash(git commit *)",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-git-commit-kg-sync.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-git-commit-kg-sync.ps1",
             "timeout": 10,
             "async": true
           },
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\post-file-delete.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/post-file-delete.ps1",
             "timeout": 5,
             "async": true
           }
@@ -408,7 +408,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\kg-update-nudge.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/kg-update-nudge.ps1",
             "async": true,
             "timeout": 3
           }

@@ -47,7 +47,16 @@ if ($env:VCT_REQUIRED_CONTAINERS) {
 }
 
 # Make available to the dot-sourcing scope.
-Set-Variable -Name VcoWeaviateContainer  -Value $VcoWeaviateContainer  -Scope 1 -ErrorAction SilentlyContinue
-Set-Variable -Name VcoOllamaContainer    -Value $VcoOllamaContainer    -Scope 1 -ErrorAction SilentlyContinue
-Set-Variable -Name VcoCodeEmbedContainer -Value $VcoCodeEmbedContainer -Scope 1 -ErrorAction SilentlyContinue
-Set-Variable -Name VcoRequiredContainers -Value $VcoRequiredContainers -Scope 1 -ErrorAction SilentlyContinue
+#
+# `-Scope Script` (not `-Scope 1`): when this lib is dot-sourced (the only
+# supported invocation, see header), its Script scope IS the caller's script
+# scope, so `$VcoRequiredContainers` etc. are visible to the caller exactly as
+# before. `-Scope 1` worked only by coincidence of having a parent scope to
+# count back to, and was wrapped in `-ErrorAction SilentlyContinue` — which
+# silently swallowed any scope failure (e.g. if ever run with `-File`, where
+# scope 1 does not exist). `-Scope Script` is valid under BOTH dot-source and
+# `-File`, so a real failure surfaces instead of being masked.
+Set-Variable -Name VcoWeaviateContainer  -Value $VcoWeaviateContainer  -Scope Script
+Set-Variable -Name VcoOllamaContainer    -Value $VcoOllamaContainer    -Scope Script
+Set-Variable -Name VcoCodeEmbedContainer -Value $VcoCodeEmbedContainer -Scope Script
+Set-Variable -Name VcoRequiredContainers -Value $VcoRequiredContainers -Scope Script

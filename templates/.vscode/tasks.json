@@ -4,7 +4,7 @@
   "tasks": [
     {
       "label": "Start VCT Hub",
-      "type": "shell",
+      "type": "process",
       "detail": "Idempotently start vct-hub on folder open (v0.2.21+).",
       "presentation": {
         "reveal": "silent",
@@ -26,7 +26,7 @@
           "-ExecutionPolicy",
           "Bypass",
           "-File",
-          "${workspaceFolder}\\.claude\\hooks\\session-start-ensure-hub.ps1"
+          "${workspaceFolder}/.claude/hooks/session-start-ensure-hub.ps1"
         ]
       },
       "linux": {

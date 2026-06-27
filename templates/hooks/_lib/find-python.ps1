@@ -25,4 +25,13 @@ foreach ($candidate in @('python', 'py', 'python3')) {
     }
 }
 # Make available to the dot-sourcing scope.
-Set-Variable -Name PY -Value $PY -Scope 1 -ErrorAction SilentlyContinue
+#
+# `-Scope Script` (not `-Scope 1`): when this lib is dot-sourced (the only
+# supported invocation, see header), its Script scope IS the caller's script
+# scope, so `$PY` is visible to the caller exactly as before. `-Scope 1` worked
+# only by coincidence of having a parent scope to count back to, and was wrapped
+# in `-ErrorAction SilentlyContinue` — which silently swallowed any scope failure
+# (e.g. if ever run with `-File`, where scope 1 does not exist). `-Scope Script`
+# is valid under BOTH dot-source and `-File`, so a real failure surfaces instead
+# of being masked.
+Set-Variable -Name PY -Value $PY -Scope Script
