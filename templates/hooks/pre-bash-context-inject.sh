@@ -35,6 +35,17 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 [ -z "${PY:-}" ] && exit 0
 
+# v0.2.70 Streams C+D+E: shared helpers for canonical session-id, the unified
+# seen-store dedup (pre-bash injected KG BLIND before this), and the gated
+# code-graph branch added below. Sourced only if present (partial-install
+# tolerance); the new logic no-ops gracefully when a helper is missing.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
+# shellcheck source=_lib/seen-store.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
+# shellcheck source=_lib/codegraph-query.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
+
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 _PARSED=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
@@ -58,6 +69,15 @@ if [[ "$TOOL_NAME" != "Bash" ]]; then
     exit 0
 fi
 
+# v0.2.70 Stream E: unify session-id via the shared helper (parse+sanitise),
+# matching pre-edit / pre-tool-use / post-compact. SESSION_ID_RAW preserves the
+# trustworthy-vs-untrustworthy distinction for the seen-store ("" / "default" →
+# inject blind, no shared bucket). SESSION_ID keeps the "default" coercion for
+# the bash-task pairing file path (not cross-session-bleed sensitive).
+if command -v vco_hook_session_id >/dev/null 2>&1; then
+    SESSION_ID="$(vco_hook_session_id "$HOOK_STDIN")"
+fi
+SESSION_ID_RAW="$SESSION_ID"
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
 # V52-M: propagate session_id to child processes (rl_kg_search.py reads
@@ -78,6 +98,40 @@ except Exception:
 " 2>/dev/null || echo "")
 
 [ -z "$COMMAND" ] && exit 0
+
+# === v0.2.70 Stream C Surface 2: gated code-graph injection on Bash ===
+# Runs on EVERY Bash call BEFORE the (KG-only) 500-char threshold gate, because
+# a short `grep -rn "migrate_collections"` should surface codegraph even though
+# it's well under 500 chars. The gate (codegraph_bash_gate) is pure-bash and
+# short-circuits with ZERO subprocess for routine ls/cd/git/cat/etc — the
+# steady-state cost on a non-code command is one regex chain (~us). Only when the
+# command genuinely navigates code do we spawn the (timeout-bounded) helper.
+# Output is deduped through the SAME shared seen-store as pre-edit/pre-tool-use.
+if command -v codegraph_bash_gate >/dev/null 2>&1 && codegraph_bash_gate "$COMMAND"; then
+    _CG_SYM="$COMMAND"
+    if command -v codegraph_extract_symbol >/dev/null 2>&1; then
+        _CG_SYM="$(codegraph_extract_symbol "$COMMAND")"
+    fi
+    _CG_RAW="$(codegraph_query_block "$_CG_SYM" "" 2 "" 2>/dev/null || true)"
+    if [ -n "$_CG_RAW" ]; then
+        _CGB_INJECT=""
+        _CGB_READS=""
+        if command -v vco_seen_store_path >/dev/null 2>&1; then
+            _CGB_INJECT="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+            _CGB_READS="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+        fi
+        if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
+            _CG_RAW="$(vco_filter_seen_blocks "$_CG_RAW" "$_CGB_INJECT" "$_CGB_READS")"
+        fi
+        case "$_CG_RAW" in
+            *[![:space:]]*)
+                if command -v emit_additional_context >/dev/null 2>&1; then
+                    emit_additional_context "[Code-graph context for symbol: ${_CG_SYM}]:"$'\n'$'\n'"$_CG_RAW" PreToolUse
+                fi
+                ;;
+        esac
+    fi
+fi
 
 # === Threshold gate ===
 # User-locked answer to Q6 (2026-06-09): fixed 500 chars threshold,
@@ -144,7 +198,40 @@ VENV="${VCO_VENV_PYTHON:-}"
 # longer queries dilute the semantic signal). The pre-edit hook caps
 # new_string at 200 chars for the same reason; bash commands tend to
 # have richer structure so we allow more headroom.
-QUERY=$(printf '%s' "$COMMAND" | head -c 500)
+#
+# v0.2.70 Stream D-3 (command-noise strip): the KG query is built from the raw
+# bash command, which is mostly flags and paths. Strip the noise tokens — short
+# flags (-x / --foo), absolute/relative paths, and shell operators — so the
+# embedding sees the semantically meaningful words (subcommands, identifiers)
+# rather than directory keywords. A bare `cd /some/dir` or `ls -la` then yields
+# little-to-no query signal instead of injecting directory-keyword KG. Falls
+# back to the raw (capped) command if the strip leaves nothing.
+QUERY_RAW=$(printf '%s' "$COMMAND" | head -c 500)
+QUERY=$(printf '%s' "$QUERY_RAW" | "$PY" -c "
+import re, sys
+cmd = sys.stdin.read()
+toks = []
+for t in cmd.split():
+    # drop short/long flags
+    if t.startswith('-'):
+        continue
+    # drop shell operators / redirections / bare cwd dots / lone punctuation
+    if t in ('|', '||', '&&', ';', '>', '>>', '<', '2>', '2>&1', '&', '.', '..', '*'):
+        continue
+    # drop bare path-looking tokens (contain a slash) UNLESS they carry a
+    # code-file extension (those ARE meaningful — keep the basename).
+    if '/' in t:
+        base = t.rstrip('/').split('/')[-1]
+        if re.search(r'\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$', base):
+            toks.append(base)
+        continue
+    toks.append(t)
+out = ' '.join(toks).strip()
+print(out)
+" 2>/dev/null || printf '%s' "$QUERY_RAW")
+# Strip fallback: if noise-removal emptied the query, use the raw command so a
+# genuinely identifier-only long command still searches.
+[ -z "$QUERY" ] && QUERY="$QUERY_RAW"
 
 KG_TMP=$(mktemp)
 if [ -n "$VENV" ] && [ -f "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" ]; then
@@ -156,6 +243,21 @@ fi
 
 KG_RESULT=$(cat "$KG_TMP" 2>/dev/null || true)
 rm -f "$KG_TMP"
+
+# === v0.2.70 Stream E: dedup the KG result through the shared seen-store ===
+# Before this, pre-bash injected KG BLIND — re-providing nodes pre-edit had
+# already shown (and vice-versa). Now both injectors consult the SAME
+# seen_inject_<sid>.txt (per-chunk KG keys) + reads ledger. Untrustworthy
+# session id → helper returns empty store path → inject blind (no shared bucket).
+if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
+    _PB_INJECT=""
+    _PB_READS=""
+    if command -v vco_seen_store_path >/dev/null 2>&1; then
+        _PB_INJECT="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+        _PB_READS="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+    fi
+    KG_RESULT="$(vco_filter_seen_blocks "$KG_RESULT" "$_PB_INJECT" "$_PB_READS")"
+fi
 
 # === Helper: emit context as PreToolUse JSON envelope ===
 _emit_context_json() {

@@ -75,6 +75,25 @@ $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 
+# v0.2.70 Streams C+E: shared helpers (canonical session-id, unified seen-store,
+# code-graph retrieval for the NEW Read(code)+Grep(symbol) branches).
+$SessionIdLib = Join-Path $LibDir "session-id.ps1"
+if (Test-Path $SessionIdLib) { . $SessionIdLib }
+$SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
+if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
+$CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
+if (Test-Path $CodegraphLib) { . $CodegraphLib }
+$script:ProjectRoot = $ProjectRoot
+
+# v0.2.70 Stream E: unify session-id (parse+sanitise) with the other hooks.
+# $SessionIdRaw preserves the trustworthy-vs-untrustworthy distinction for the
+# unified reads store the injectors consult. $SessionId keeps the date fallback
+# so the Build Anchor reads_*.txt still has a stable per-hour key.
+if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
+    $SessionIdRaw = Get-VcoHookSessionId -Stdin $HookStdin
+} else {
+    $SessionIdRaw = ($SessionIdFromStdin -replace '[^A-Za-z0-9_-]', '')
+}
 $SessionId = if ($SessionIdFromStdin) { $SessionIdFromStdin } elseif ($env:CLAUDE_SESSION_ID) { $env:CLAUDE_SESSION_ID } else { (Get-Date).ToString("yyyyMMdd_HH") }
 # Per-session dedup state lives under the project's .claude/state/ rather
 # than $env:TMPDIR / $env:TEMP so it survives reboots + launcher restarts
@@ -204,11 +223,66 @@ if ($ToolName -eq "Bash") {
     }
 }
 
-# === 3. BUILD ANCHOR PROTOCOL: track reads ===
+# === v0.2.70 Stream C: shared code-graph injection for Read(code)/Grep(symbol).
+# One home for both surfaces. MUST MATCH pre-tool-use.sh _cg_inject.
+function Invoke-CgInject([string]$q, [string]$excl, [string]$label) {
+    if (-not (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue)) { return }
+    if (-not $q) { return }
+    $raw = Invoke-VcoCodegraphQueryBlock -Query $q -ProjectArg "" -Limit 2 -ExcludePath $excl
+    if (-not $raw) { return }
+    $inj = ""
+    $rd = ""
+    if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
+        $inj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        $rd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+    }
+    if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
+        $raw = Invoke-VcoFilterSeenBlocks -InputText $raw -InjectFile $inj -ReadsFile $rd
+    }
+    if (($raw -replace '\s+', '')) {
+        if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+            Emit-AdditionalContext "[${label}]:`n`n$raw" 'PreToolUse'
+        }
+    }
+}
+
+# === 3. BUILD ANCHOR PROTOCOL: track reads + v0.2.70 code-file inject ===
 if ($ToolName -eq "Read") {
     $filePath = Get-Field "file_path"
     if ($filePath) {
         try { Add-Content -Path $SessionReadsFile -Value $filePath -ErrorAction Stop } catch { }
+        # v0.2.70 Stream E: also record into the unified reads store the
+        # injectors consult (ABS path for exact src match). Skipped when the
+        # session id is untrustworthy.
+        if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
+            $absFp = $filePath
+            try { if (-not [System.IO.Path]::IsPathRooted($filePath)) { $absFp = (Resolve-Path -LiteralPath $filePath -ErrorAction Stop).Path } } catch { $absFp = $filePath }
+            $unifiedReads = Get-VcoSeenStorePath -Kind "reads" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+            if ($unifiedReads -and ($unifiedReads -ne $SessionReadsFile)) {
+                try { Add-Content -Path $unifiedReads -Value $absFp -ErrorAction Stop } catch { }
+            }
+        }
+        # v0.2.70 Stream C Surface 1 (Read): code file -> inject callers/deps.
+        # MUST MATCH the IS_CODE regex in pre-edit + post-file-edit.
+        if ($filePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
+            $rdQ = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path $filePath -Leaf))
+            Invoke-CgInject $rdQ $filePath "Code-graph context for $(Split-Path $filePath -Leaf)"
+        }
+    }
+    exit 0
+}
+
+# === v0.2.70 Stream C Surface 4: Grep on a code SYMBOL -> inject codegraph.
+if ($ToolName -eq "Grep") {
+    if (Get-Command Test-VcoCodegraphPatternGate -ErrorAction SilentlyContinue) {
+        $grepPattern = Get-Field "pattern"
+        if ($grepPattern -and (Test-VcoCodegraphPatternGate -Pattern $grepPattern)) {
+            $grepSym = $grepPattern
+            if (Get-Command Get-VcoCodegraphSymbol -ErrorAction SilentlyContinue) {
+                $grepSym = Get-VcoCodegraphSymbol -Text $grepPattern
+            }
+            Invoke-CgInject $grepSym "" "Code-graph context for symbol: $grepSym"
+        }
     }
     exit 0
 }

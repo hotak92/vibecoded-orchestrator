@@ -3281,9 +3281,23 @@ def _format_obj(obj, collection_name: str, distance: float | None = None) -> dic
     else:
         result_kind = "knowledge"
 
+    # v0.2.70 Stream D-1: the Development docs collection (<PROJECT>_Development)
+    # deliberately has NO `node_type` property (an explicit 2026-05-19 decision —
+    # do NOT add the property; that reverses the decision and trips
+    # test_v52_ag_schema_versions). So a docs result would default to "unknown"
+    # and render as `type:unknown` in injected hook blocks. Formatter-only fix:
+    # default node_type to "doc" ONLY for Development-collection results. True KG
+    # nodes that legitimately lack a type keep "unknown" (a KG-appropriate
+    # default), never silently "doc". Gated on the module-level
+    # DEVELOPMENT_COLLECTION (the docs class for this project).
+    _default_node_type = (
+        "doc"
+        if (collection_name and DEVELOPMENT_COLLECTION and collection_name == DEVELOPMENT_COLLECTION)
+        else "unknown"
+    )
     return {
         "title": title,
-        "node_type": obj.properties.get("node_type", "unknown"),
+        "node_type": obj.properties.get("node_type") or _default_node_type,
         "content": content[:300] + "..." if len(content) > 300 else content,
         "tags": obj.properties.get("tags", []),
         "file_path": obj.properties.get("file_path", ""),
@@ -5597,6 +5611,12 @@ async def _hybrid_search_single_collection(
         key = (r["title"], r.get("chunk_number"))
         entry = {
             "title": r["title"],
+            # v0.2.70 Stream D-1: `r` comes from _format_obj, which already
+            # resolves node_type ("doc" for Development-collection results, the
+            # real type otherwise). This "unknown" fallback only fires if the
+            # key were absent — it never is — so it's a dead default kept for
+            # safety. Do NOT re-default to "doc" here; the docs gate lives in
+            # _format_obj (single source).
             "node_type": r.get("node_type", "unknown"),
             "content": r.get("content", ""),
             "tags": r.get("tags", []),

@@ -61,10 +61,16 @@ fi
 # Wipe the KG/codegraph injection dedup state for this session — the LLM
 # just lost the context that included those previously-injected nodes, so
 # re-injecting them on subsequent edits is now correct (and helpful).
-# pre-edit-context-inject.sh writes to .claude/state/seen_kg_titles_<id>.txt.
+# v0.2.70 Stream E: the unified store is .claude/state/seen_inject_<id>.txt
+# (renamed from the pre-v0.2.70 seen_kg_titles_<id>.txt; both are wiped here so
+# a session straddling the upgrade still gets a clean reset). MUST MATCH the
+# seen_inject name in _lib/seen-store.sh and post-compact.ps1.
 if [ -n "$SESSION_ID" ]; then
-    SEEN_FILE="$PROJECT_DIR/.claude/state/seen_kg_titles_${SESSION_ID}.txt"
-    [ -f "$SEEN_FILE" ] && rm -f "$SEEN_FILE"
+    SEEN_INJECT_FILE="$PROJECT_DIR/.claude/state/seen_inject_${SESSION_ID}.txt"
+    [ -f "$SEEN_INJECT_FILE" ] && rm -f "$SEEN_INJECT_FILE"
+    # Legacy name (pre-v0.2.70) — wipe too for upgrade-straddling sessions.
+    SEEN_FILE_LEGACY="$PROJECT_DIR/.claude/state/seen_kg_titles_${SESSION_ID}.txt"
+    [ -f "$SEEN_FILE_LEGACY" ] && rm -f "$SEEN_FILE_LEGACY"
 fi
 
 # Same reasoning for pre-tool-use.sh's per-session reads file (Build Anchor

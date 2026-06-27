@@ -82,9 +82,26 @@ $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 
-# session_id from stdin JSON is the canonical per-conversation key. Falls
-# back to "default" only if the payload is malformed (which would mean the
-# hook contract itself is broken — see ConvertFrom-Json above).
+# v0.2.70 Streams C+E: shared helpers (canonical session-id, unified seen-store,
+# code-graph retrieval). Sourced only if present (partial-install tolerance).
+$SessionIdLib = Join-Path $LibDir "session-id.ps1"
+if (Test-Path $SessionIdLib) { . $SessionIdLib }
+$SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
+if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
+$CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
+if (Test-Path $CodegraphLib) { . $CodegraphLib }
+$script:ProjectRoot = $ProjectRoot
+
+# session_id from stdin JSON is the canonical per-conversation key.
+# v0.2.70 Stream E: route through the shared Get-VcoHookSessionId so the
+# parse+sanitise matches the other hooks. $SessionIdRaw preserves the
+# trustworthy-vs-untrustworthy distinction for the seen-store ("" / "default" ->
+# inject blind). The "default" coercion below keeps the cache/export paths
+# working (not cross-session-bleed sensitive).
+if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
+    $SessionId = Get-VcoHookSessionId -Stdin $HookStdin
+}
+$SessionIdRaw = $SessionId
 if (-not $SessionId) { $SessionId = "default" }
 
 # V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes
@@ -118,7 +135,18 @@ $SeenDir = Join-Path $ProjectRoot ".claude/state"
 if (-not (Test-Path $SeenDir)) {
     New-Item -ItemType Directory -Path $SeenDir -Force -ErrorAction SilentlyContinue | Out-Null
 }
-$SeenNodesFile = Join-Path $SeenDir "seen_kg_titles_$SessionId.txt"
+# v0.2.70 Stream E: unified per-session stores. SeenInjectFile (per-chunk KG /
+# per-entity CODE dedup) + SeenReadsFile (explicit-Read ledger). "" when the
+# session id is untrustworthy -> inject blind (no shared bucket). MUST MATCH the
+# .sh sibling. SeenNodesFile is the legacy back-compat name for the partial-
+# install fallback path.
+$SeenInjectFile = ""
+$SeenReadsFile = ""
+if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
+    $SeenInjectFile = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+    $SeenReadsFile  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+}
+$SeenNodesFile = if ($SeenInjectFile) { $SeenInjectFile } else { Join-Path $SeenDir "seen_inject_$SessionId.txt" }
 
 function Get-JsonField([string]$field) {
     if (-not $PY -or -not $ToolArgs) { return "" }
@@ -216,24 +244,33 @@ if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
 }
 
 $IsCode = $false
+# v0.2.70 Stream C: keep the IS_CODE regex in lockstep with pre-tool-use.ps1 +
+# post-file-edit.ps1 (MUST MATCH). Route through the shared code-graph helper
+# when present (one home; pre-bash + pre-tool-use Read/Grep use the same
+# function); fall back to the inline invocation only on a partial install.
 if ($FilePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
     $IsCode = $true
-    $cgQueryPs1 = Join-Path $ProjectRoot ".claude/scripts/code-graph-query.ps1"
-    $cgQuerySh = Join-Path $ProjectRoot ".claude/scripts/code-graph-query"
-    try {
-        # --hook-format emits "CODE: <full_name> | <collection> | distance=..." headers.
-        if (Test-Path $cgQueryPs1) {
-            $out = & $PsExe -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
-                Where-Object { $_ -notlike "*$FilePath*" } |
-                Select-Object -First 20
-            $out | Set-Content -Path $CodeTmp.FullName
-        } elseif ((Test-Path $cgQuerySh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
-            $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
-                Where-Object { $_ -notlike "*$FilePath*" } |
-                Select-Object -First 20
-            $out | Set-Content -Path $CodeTmp.FullName
-        }
-    } catch { }
+    if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
+        $projArg = if ($CodeGraphProjectArg.Count -gt 0) { $CodeGraphProjectArg -join ' ' } else { "" }
+        $out = Invoke-VcoCodegraphQueryBlock -Query $Query -ProjectArg $projArg -Limit 2 -ExcludePath $FilePath
+        if ($out) { Set-Content -Path $CodeTmp.FullName -Value $out }
+    } else {
+        $cgQueryPs1 = Join-Path $ProjectRoot ".claude/scripts/code-graph-query.ps1"
+        $cgQuerySh = Join-Path $ProjectRoot ".claude/scripts/code-graph-query"
+        try {
+            if (Test-Path $cgQueryPs1) {
+                $out = & $PsExe -NoProfile -File $cgQueryPs1 search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
+                    Where-Object { $_ -notlike "*$FilePath*" } |
+                    Select-Object -First 20
+                $out | Set-Content -Path $CodeTmp.FullName
+            } elseif ((Test-Path $cgQuerySh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
+                $out = & bash $cgQuerySh search $Query @CodeGraphProjectArg --limit 2 --hook-format 2>$null |
+                    Where-Object { $_ -notlike "*$FilePath*" } |
+                    Select-Object -First 20
+                $out | Set-Content -Path $CodeTmp.FullName
+            }
+        } catch { }
+    }
 }
 
 $KgResult = ""
@@ -253,12 +290,21 @@ Remove-Item $KgTmp.FullName, $CodeTmp.FullName -Force -ErrorAction SilentlyConti
 #   <body line 2>
 #   ...
 #
-# We dedup by title (the part between "KG: " and the first " | "), and we
-# suppress the ENTIRE block — title line plus its body — if the title has
-# already been shown this session. The previous implementation extracted a
-# "title" from every line including body content, which filled the seen-list
-# with body fragments and let titles re-appear.
+# v0.2.70 Stream E: dedup is now the shared _lib/seen-store.ps1 helper
+# (Invoke-VcoFilterSeenBlocks), keyed PER-CHUNK for KG and PER-ENTITY for CODE,
+# plus reads-ledger source suppression. Filter-Seen delegates to it when present
+# and falls back to the legacy title-coarse inline logic only on a partial
+# install (missing helper).
 function Filter-Seen([string]$input) {
+    if (-not $input) { return "" }
+    if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
+        return Invoke-VcoFilterSeenBlocks -InputText $input -InjectFile $SeenInjectFile -ReadsFile $SeenReadsFile
+    }
+    return Filter-Seen-Legacy $input
+}
+
+# Legacy fallback (pre-v0.2.70): title-coarse dedup, no reads-ledger consult.
+function Filter-Seen-Legacy([string]$input) {
     if (-not $input) { return "" }
     $filtered = New-Object System.Text.StringBuilder
     if (-not (Test-Path $SeenNodesFile)) { New-Item -ItemType File -Path $SeenNodesFile -Force | Out-Null }

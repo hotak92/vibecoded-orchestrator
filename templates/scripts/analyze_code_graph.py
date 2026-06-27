@@ -7617,6 +7617,32 @@ def main():
         # cwd basename rather than the launcher-resolved project name).
         # Order: --from-resolver > --project > $CODE_GRAPH_PROJECT > repo_path.name.
         env_project = os.environ.get("CODE_GRAPH_PROJECT", "").strip()
+        # v0.2.70 G5: worktree-pollution guard. When the analyzer is launched
+        # from INSIDE a git worktree clone (the path contains a known
+        # worktree-container segment) AND no explicit project name was given
+        # (--project / CODE_GRAPH_PROJECT), the repo-dir-name fallback would
+        # mint a per-worktree pollution collection (e.g. `Vco_wt_bug1_*`,
+        # `Wt2_cde_*`) that diverges from the canonical project and accumulates
+        # forever. Refuse the basename fallback in that case and require an
+        # explicit project so the rows land in the canonical collections.
+        # Conservative: this fires ONLY on a worktree-container path segment,
+        # never on a project legitimately named "wt-foo". (G4 — dropping the
+        # ALREADY-polluted collections — is a destructive ops task needing
+        # maintainer consent, intentionally NOT done here.)
+        _WORKTREE_PATH_SEGMENTS = (".wt", "worktrees", "vco-wt")
+        _path_parts = {p.lower() for p in repo_path.resolve().parts}
+        _in_worktree = any(seg in _path_parts for seg in _WORKTREE_PATH_SEGMENTS)
+        if not (args.project or env_project) and _in_worktree:
+            print(
+                "❌ analyze_code_graph: refusing to mint a code-graph collection "
+                f"from a worktree directory name ('{repo_path.name}') — this would "
+                "create a `<Worktree>_Code*` pollution collection that never gets "
+                "cleaned up. Pass --project <CanonicalProject> or set "
+                "CODE_GRAPH_PROJECT so the rows land in the project's real "
+                "collections.",
+                file=sys.stderr,
+            )
+            return 1
         project_name = args.project or env_project or repo_path.name
 
     if args.verbose:

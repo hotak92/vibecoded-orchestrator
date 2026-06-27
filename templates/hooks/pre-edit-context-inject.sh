@@ -74,6 +74,19 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/find-python.sh" ] && . "$SCRIPT_DIR/_lib/find-python.sh"
 [ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (KG/codegraph injection skipped)
 
+# v0.2.70 Stream E: unified per-session dedup. Source the shared seen-store
+# (one home for the inject-dedup that used to be inline _filter_seen here) and
+# the canonical session-id parse (so pre-edit / pre-bash / pre-tool-use / post-
+# compact all key off the SAME sanitised id). Both are sourced ONLY if present
+# (partial install tolerance) — the code below falls back to the legacy inline
+# path when the helpers are missing.
+# shellcheck source=_lib/session-id.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/session-id.sh" ] && . "$SCRIPT_DIR/_lib/session-id.sh"
+# shellcheck source=_lib/seen-store.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
+# shellcheck source=_lib/codegraph-query.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
+
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 # Positional args ($1/$2) are EMPTY because $CLAUDE_TOOL_NAME etc. don't
 # exist as env vars — settings.json substitutes them to "". Verified
@@ -102,9 +115,20 @@ if [[ "$TOOL_NAME" != "Edit" ]]; then
     exit 0
 fi
 
-# session_id from stdin JSON is the canonical per-conversation key. Falls
-# back to "default" only if the payload is malformed (which would mean the
-# hook contract itself is broken — see _PARSED above).
+# session_id from stdin JSON is the canonical per-conversation key.
+# v0.2.70 Stream E: route through the shared vco_hook_session_id so the
+# parse+sanitise is identical across pre-edit / pre-bash / pre-tool-use /
+# post-compact (was 3 divergent fallback policies). The helper returns the
+# sanitised id, "default" for a hostile id, or "" for a missing/malformed
+# payload. The seen-store treats BOTH ""/"default" as inject-blind (no shared
+# bucket); the cache/export uses below keep the legacy "default" fallback since
+# they are not cross-session-bleed sensitive (cache is also file-hash keyed).
+if command -v vco_hook_session_id >/dev/null 2>&1; then
+    SESSION_ID="$(vco_hook_session_id "$HOOK_STDIN")"
+fi
+# Preserve the dedup-relevant value BEFORE the "default" coercion so the
+# seen-store can distinguish "trustworthy id" from "fall back to default".
+SESSION_ID_RAW="$SESSION_ID"
 [ -z "$SESSION_ID" ] && SESSION_ID="default"
 
 # V52-J Edit 4 (2026-06-09): export VCT_SESSION_ID so child processes
@@ -139,9 +163,29 @@ CACHE_TTL=600  # 10 minutes in seconds
 # files so the directory stays bounded across heavy use.
 SEEN_DIR="$PROJECT_ROOT/.claude/state"
 mkdir -p "$SEEN_DIR" 2>/dev/null
-SEEN_NODES_FILE="$SEEN_DIR/seen_kg_titles_${SESSION_ID}.txt"
+# v0.2.70 Stream E: unified per-session stores via _lib/seen-store.sh.
+#   SEEN_INJECT_FILE — the inject-dedup store (per-chunk KG / per-entity CODE).
+#   SEEN_READS_FILE  — the explicit-Read ledger pre-tool-use writes; consulted
+#                      here so a source the model already Read isn't re-injected.
+# When the session id is untrustworthy ("" / "default"), the helper returns an
+# EMPTY path → vco_filter_seen_blocks then dedups NOTHING (inject blind) rather
+# than write a cross-session-bleeding shared bucket.
+SEEN_INJECT_FILE=""
+SEEN_READS_FILE=""
+if command -v vco_seen_store_path >/dev/null 2>&1; then
+    # Use the RAW (pre-"default"-coercion) id so a missing/hostile id resolves
+    # to an EMPTY path → inject blind, never a shared "default" bucket.
+    SEEN_INJECT_FILE="$(vco_seen_store_path inject "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+    SEEN_READS_FILE="$(vco_seen_store_path reads "$SESSION_ID_RAW" "$PROJECT_ROOT")"
+fi
+# Back-compat: when the helper is absent (partial install) fall back to the
+# legacy single inject store so dedup still works on the legacy code path.
+SEEN_NODES_FILE="${SEEN_INJECT_FILE:-$SEEN_DIR/seen_inject_${SESSION_ID}.txt}"
 # v0.2.29 GC: prune session files older than 14 days. `find -mtime +14`
-# is portable across GNU/BSD find. Best-effort — failure ignored.
+# is portable across GNU/BSD find. Best-effort — failure ignored. Cover both
+# the new (seen_inject_*) and the legacy (seen_kg_titles_*) names so old files
+# from a pre-v0.2.70 session still age out.
+find "$SEEN_DIR" -maxdepth 1 -type f -name "seen_inject_*.txt" -mtime +14 -delete 2>/dev/null || true
 find "$SEEN_DIR" -maxdepth 1 -type f -name "seen_kg_titles_*.txt" -mtime +14 -delete 2>/dev/null || true
 
 # === Extract fields from TOOL_ARGS JSON ===
@@ -280,15 +324,25 @@ KG_PID=$!
 # Code graph search — only for code files (not markdown, yaml, etc.)
 # Uses auto-detected project so edits in sibling repos query the right collections.
 IS_CODE=0
+# v0.2.70 Stream C: keep the IS_CODE extension regex in lockstep with
+# pre-tool-use.sh (Read/Grep branches) and post-file-edit.sh:440 — all three
+# decide "is this a code file" identically. MUST MATCH those two siblings.
 if [[ "$FILE_PATH" =~ \.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]]; then
     IS_CODE=1
-    # v0.2.21 audit fix: pass --hook-format so results are prefixed with
-    # "CODE: <full_name>" and _filter_seen below recognises them for
-    # dedup. Empty result → emits one short "CODE: no-results | ..." line
-    # so the model sees the hook fired AND knows the search scope.
-    ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format 2>/dev/null \
-        | grep -v "$FILE_PATH" | head -20 > "$CODE_TMP") &
-    CODE_PID=$!
+    # v0.2.70 Stream C: route the codegraph query through the shared
+    # _lib/codegraph-query.sh helper (one home; pre-bash + pre-tool-use Read/Grep
+    # use the SAME function) when present. The helper soft-fails to empty when
+    # code-graph-query is absent. Falls back to the legacy inline call only on a
+    # partial install. --hook-format gives "CODE: <full_name> | ..." headers the
+    # seen-store recognises. Empty result → "CODE: no-results | ..." sentinel.
+    if command -v codegraph_query_block >/dev/null 2>&1; then
+        ( codegraph_query_block "$QUERY" "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" > "$CODE_TMP" 2>/dev/null ) &
+        CODE_PID=$!
+    else
+        ("$PROJECT_ROOT/.claude/scripts/code-graph-query" search "$QUERY" $CODE_GRAPH_PROJECT_ARG --limit 2 --hook-format 2>/dev/null \
+            | grep -v "$FILE_PATH" | head -20 > "$CODE_TMP") &
+        CODE_PID=$!
+    fi
 fi
 
 # Wait for searches (5s budget, leave 0.5s for formatting + output).
@@ -320,26 +374,29 @@ rm -f "$KG_TMP" "$CODE_TMP"
 #   ...
 #   (blank line separates blocks)
 #
-# We dedup by title (the part between "KG: " and the first " | "), and
-# we suppress the ENTIRE block — title line plus its body — if the title
-# has already been shown this session. The previous implementation
-# extracted a "title" from every line including body content, which
-# filled the seen-list with body fragments and let titles re-appear.
+# v0.2.70 Stream E: dedup is now the shared _lib/seen-store.sh helper
+# (vco_filter_seen_blocks), keyed PER-CHUNK for KG ("<title>#<sha1(body)>" so a
+# NEW chunk of a seen node still injects) and PER-ENTITY for CODE, and it ALSO
+# suppresses a block whose source path the model already Read explicitly
+# (reads-ledger). _filter_seen is now a thin delegator: it calls the shared
+# helper when present, and falls back to the legacy title-keyed inline logic
+# only on a partial install where _lib/seen-store.sh is missing.
 _filter_seen() {
+    local input="$1"
+    if command -v vco_filter_seen_blocks >/dev/null 2>&1; then
+        vco_filter_seen_blocks "$input" "$SEEN_INJECT_FILE" "$SEEN_READS_FILE"
+        return 0
+    fi
+    _filter_seen_legacy "$input"
+}
+
+# Legacy fallback (pre-v0.2.70): title-coarse dedup against a single store, no
+# reads-ledger consult. Kept only for the missing-helper case so a partial
+# install still dedups (just coarser). Bash-3.2 safe (no assoc arrays).
+_filter_seen_legacy() {
     local input="$1"
     local filtered=""
     touch "$SEEN_NODES_FILE"
-
-    # Bash-3.2 compatibility (Apple's shipped default on macOS Tier-2):
-    # we deliberately avoid `declare -A` associative arrays — they
-    # require bash 4+ and Apple's bash never gets updated past 3.2
-    # (GPLv3 licensing). Instead the SEEN_NODES_FILE itself is the
-    # source-of-truth set, queried via `grep -Fxq`. Per-emitted-block
-    # we append the title to the file; that keeps in-batch dedup
-    # correct (a duplicate title later in the SAME cache replay reads
-    # back its earlier append). Slower per-lookup than an in-memory
-    # hash but the typical batch is <20 blocks so the overhead is
-    # sub-millisecond on every host.
 
     local current_title=""
     local current_block=""
@@ -357,34 +414,20 @@ _filter_seen() {
     }
 
     while IFS= read -r line; do
-        # Header line starts a new block. Format: "KG: <title> | ..." or
-        # "CODE: <full_name> | ..." — the first field after the prefix and
-        # before the next " | " is the dedup key.
         if [[ "$line" =~ ^(KG|CODE):\ (.+)$ ]]; then
             _flush_block
             local rest="${BASH_REMATCH[2]}"
-            # Defensive: strip any accidentally-doubled "KG: " / "CODE: " that
-            # could slip in from a formatting transition (e.g. an old cache
-            # written before the producers added their own prefix).
             rest="${rest#KG: }"
             rest="${rest#CODE: }"
             current_title="${rest%% | *}"
-            # Cap to 200 chars defensively (some code-graph entity names can be long)
             current_title="${current_title:0:200}"
             current_block="${line}"$'\n'
-            # If already seen, mark the block so we drop it AND its body lines.
             if grep -Fxq -- "$current_title" "$SEEN_NODES_FILE"; then
                 current_skip=1
             fi
         elif [ -n "$current_title" ]; then
-            # Body line for the current block — accumulate.
             current_block="${current_block}${line}"$'\n'
         else
-            # Pre-amble or stray line not part of any block — pass through
-            # only if it has non-whitespace content. Blank separators
-            # between fully-deduped blocks would otherwise leak through
-            # and make $filtered look "non-empty" to downstream HAS_KG
-            # checks, producing an empty system-reminder block.
             if [[ "$line" =~ [^[:space:]] ]]; then
                 filtered="${filtered}${line}"$'\n'
             fi

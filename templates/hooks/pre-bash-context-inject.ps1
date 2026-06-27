@@ -43,6 +43,22 @@ $LibDir = Join-Path $ScriptDir "_lib"
 $FindPy = Join-Path $LibDir "find-python.ps1"
 if (Test-Path $FindPy) { . $FindPy }
 
+# v0.2.70 Streams C+D+E: shared helpers (canonical session-id, unified
+# seen-store, gated code-graph branch). Sourced only if present.
+$SessionIdLib = Join-Path $LibDir "session-id.ps1"
+if (Test-Path $SessionIdLib) { . $SessionIdLib }
+$SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
+if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
+$CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
+if (Test-Path $CodegraphLib) { . $CodegraphLib }
+$script:ProjectRoot = $ProjectRoot
+
+# v0.2.70 Stream E: unify session-id via the shared helper. $SessionIdRaw keeps
+# the trustworthy-vs-untrustworthy distinction for the seen-store.
+if (Get-Command Get-VcoHookSessionId -ErrorAction SilentlyContinue) {
+    $SessionId = Get-VcoHookSessionId -Stdin $HookStdin
+}
+$SessionIdRaw = $SessionId
 if (-not $SessionId) { $SessionId = "default" }
 if ($SessionId -and $SessionId -ne "default") {
     $env:VCT_SESSION_ID = $SessionId
@@ -52,6 +68,40 @@ if ($SessionId -and $SessionId -ne "default") {
 $Command = ""
 if ($ToolArgs -and $ToolArgs.command) { $Command = [string]$ToolArgs.command }
 if (-not $Command) { exit 0 }
+
+# === v0.2.70 Stream C Surface 2: gated code-graph injection on Bash ===
+# Runs BEFORE the (KG-only) threshold gate so a short symbol command still gets
+# codegraph. Test-VcoCodegraphBashGate is pure-regex and short-circuits for
+# routine ls/cd/git/cat. Deduped through the SAME shared seen-store.
+function Emit-CgContextJson([string]$ctx) {
+    if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
+        Emit-AdditionalContext $ctx 'PreToolUse'
+    }
+}
+if ((Get-Command Test-VcoCodegraphBashGate -ErrorAction SilentlyContinue) -and (Test-VcoCodegraphBashGate -Command $Command)) {
+    $cgSym = $Command
+    if (Get-Command Get-VcoCodegraphSymbol -ErrorAction SilentlyContinue) {
+        $cgSym = Get-VcoCodegraphSymbol -Text $Command
+    }
+    $cgRaw = ""
+    if (Get-Command Invoke-VcoCodegraphQueryBlock -ErrorAction SilentlyContinue) {
+        $cgRaw = Invoke-VcoCodegraphQueryBlock -Query $cgSym -ProjectArg "" -Limit 2 -ExcludePath ""
+    }
+    if ($cgRaw) {
+        $cgInj = ""
+        $cgRd = ""
+        if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
+            $cgInj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+            $cgRd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        }
+        if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
+            $cgRaw = Invoke-VcoFilterSeenBlocks -InputText $cgRaw -InjectFile $cgInj -ReadsFile $cgRd
+        }
+        if (($cgRaw -replace '\s+', '')) {
+            Emit-CgContextJson "[Code-graph context for symbol: ${cgSym}]:`n`n$cgRaw"
+        }
+    }
+}
 
 # === Threshold gate ===
 # User-locked answer to Q6 (2026-06-09): fixed 500 chars threshold,
@@ -102,7 +152,36 @@ $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 
 # === Run KG search using command as query ===
 # Truncate to ~500 chars so the embedder doesn't see kilobytes of input.
-$Query = if ($Command.Length -gt 500) { $Command.Substring(0, 500) } else { $Command }
+# v0.2.70 Stream D-3 (command-noise strip): strip flags / path tokens / shell
+# operators so a bare `cd`/`ls` yields little query signal instead of injecting
+# directory-keyword KG. Falls back to the raw (capped) command when the strip
+# empties it. MUST MATCH the .sh sibling's Python strip.
+$QueryRaw = if ($Command.Length -gt 500) { $Command.Substring(0, 500) } else { $Command }
+$Query = $QueryRaw
+if ($PY) {
+    try {
+        $stripCode = @'
+import re, sys
+cmd = sys.stdin.read()
+toks = []
+for t in cmd.split():
+    if t.startswith('-'):
+        continue
+    if t in ('|', '||', '&&', ';', '>', '>>', '<', '2>', '2>&1', '&', '.', '..', '*'):
+        continue
+    if '/' in t:
+        base = t.rstrip('/').split('/')[-1]
+        if re.search(r'\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$', base):
+            toks.append(base)
+        continue
+    toks.append(t)
+print(' '.join(toks).strip())
+'@
+        $stripped = ($QueryRaw | & $PY -c $stripCode 2>$null)
+        if ($stripped) { $Query = $stripped.Trim() }
+    } catch { }
+}
+if (-not $Query) { $Query = $QueryRaw }
 
 $KgTmp = New-TemporaryFile
 $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
@@ -115,6 +194,17 @@ if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
 $KgResult = ""
 try { $KgResult = (Get-Content -Path $KgTmp.FullName -Raw -ErrorAction Stop) } catch { }
 Remove-Item $KgTmp.FullName -Force -ErrorAction SilentlyContinue
+
+# === v0.2.70 Stream E: dedup the KG result through the shared seen-store ===
+if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
+    $pbInject = ""
+    $pbReads = ""
+    if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
+        $pbInject = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        $pbReads  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+    }
+    $KgResult = Invoke-VcoFilterSeenBlocks -InputText $KgResult -InjectFile $pbInject -ReadsFile $pbReads
+}
 
 function Emit-ContextJson([string]$ctx) {
     if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {

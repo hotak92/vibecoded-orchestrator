@@ -1,0 +1,238 @@
+# shellcheck shell=bash
+# _lib/codegraph-query.sh
+# Shared code-graph retrieval helper sourced by every hook that injects code-graph
+# context (pre-edit-context-inject, pre-bash-context-inject, pre-tool-use). One
+# home for the "run code-graph-query search --hook-format" logic that used to be
+# inline in pre-edit only.
+#
+# Why this exists (one concern, one home — CLAUDE.md "search before add")
+# -----------------------------------------------------------------------
+# v0.2.70 Stream C. The maintainer wanted code-graph injection on FOUR surfaces
+# (code-file Edit/Read, selective Bash, code-edit resync, symbol Grep). Without
+# a shared helper that would be four copies of the same subprocess+format logic.
+# This file is that one home; every surface calls codegraph_query_block. The
+# callers own dedup (via _lib/seen-store.sh) — this helper returns RAW blocks.
+#
+# MUST MATCH: templates/hooks/_lib/codegraph-query.ps1 — the query/format
+# contract (CODE:-prefixed --hook-format output, the inner timeout bound) AND the
+# codegraph_symbol_gate regex must agree cross-OS. See the "MUST MATCH" note on
+# the gate below.
+#
+# This file is sourced, never executed — no shebang. Library, not a hook.
+
+# --- Idempotent double-source guard ---------------------------------------
+if [ -n "${_VCO_CODEGRAPH_QUERY_SOURCED:-}" ]; then
+    return 0 2>/dev/null || true
+fi
+_VCO_CODEGRAPH_QUERY_SOURCED=1
+
+# vco_codegraph_cli: locate the code-graph-query CLI. Echoes its path or empty.
+# Resolves against $PROJECT_ROOT (canonical) then $CLAUDE_PROJECT_DIR.
+vco_codegraph_cli() {
+    local root="${PROJECT_ROOT:-${CLAUDE_PROJECT_DIR:-}}"
+    [ -n "$root" ] || return 1
+    local cli="$root/.claude/scripts/code-graph-query"
+    if [ -x "$cli" ] || [ -f "$cli" ]; then
+        printf '%s' "$cli"
+        return 0
+    fi
+    return 1
+}
+
+# codegraph_query_block <query> <project_arg> <limit> <exclude_path>
+# Echo the raw "CODE:"-prefixed --hook-format block(s) for <query>, or nothing.
+#   $1 query        — the search query (symbol / module name / bash symbol token)
+#   $2 project_arg  — "--project Foo" or "" (already shell-token-shaped)
+#   $3 limit        — max results (default 2)
+#   $4 exclude_path — a path to grep -v out of the results (avoid self-injection)
+# Soft-fail: CLI absent / error / empty → echo nothing, return 0. Never writes to
+# stderr-bound context, never exits non-zero. Bounded by an inner timeout so a
+# hung subprocess can't blow the caller's settings.json budget.
+codegraph_query_block() {
+    local query="$1"
+    local project_arg="$2"
+    local limit="${3:-2}"
+    local exclude_path="${4:-}"
+
+    [ -n "$query" ] || return 0
+    local cli
+    cli="$(vco_codegraph_cli)" || return 0
+    [ -n "$cli" ] || return 0
+
+    # Inner hard bound. Prefer `timeout` (coreutils / busybox); when absent,
+    # fall back to a bg-pid + sleep-kill guard so Git-Bash-on-Windows (no
+    # timeout) still can't hang the hook.
+    local raw=""
+    if command -v timeout >/dev/null 2>&1; then
+        # shellcheck disable=SC2086 — project_arg is intentionally word-split.
+        raw="$(timeout 4 "$cli" search "$query" $project_arg --limit "$limit" --hook-format 2>/dev/null || true)"
+    else
+        local _tmp
+        _tmp="$(mktemp 2>/dev/null || printf '%s' "/tmp/cg_$$_$RANDOM")"
+        # shellcheck disable=SC2086
+        ( "$cli" search "$query" $project_arg --limit "$limit" --hook-format >"$_tmp" 2>/dev/null ) &
+        local _pid=$!
+        ( sleep 4; kill -9 "$_pid" 2>/dev/null ) >/dev/null 2>&1 &
+        local _watchdog=$!
+        wait "$_pid" 2>/dev/null || true
+        kill "$_watchdog" 2>/dev/null || true
+        raw="$(cat "$_tmp" 2>/dev/null || true)"
+        rm -f "$_tmp" 2>/dev/null || true
+    fi
+
+    [ -n "$raw" ] || return 0
+    # Drop any self-reference (the file being edited/read) and cap the volume.
+    if [ -n "$exclude_path" ]; then
+        printf '%s\n' "$raw" | grep -v -F -- "$exclude_path" | head -20
+    else
+        printf '%s\n' "$raw" | head -20
+    fi
+}
+
+# codegraph_symbol_gate <command-or-text>
+# Pure-bash gate (NO subprocess, O(len)) deciding whether a command/text
+# references a CODE SYMBOL or CODE FILE PATH worth a codegraph lookup. Returns 0
+# (fire) / 1 (skip). This is the #1-risk gate for the pre-bash surface: too loose
+# blows the latency budget on routine ls/cd/git; too tight re-creates the
+# zero-injection bug.
+#
+# Fires when the text contains ANY of:
+#   1. a dotted symbol token   [A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_]   (module.func)
+#   2. a CamelCase identifier   [A-Z][a-z]+[A-Z]
+#   3. a snake-or-name + open-paren   [A-Za-z_][A-Za-z0-9_]*\(      (func()
+#   4. a code-file path         [^ ]+\.(py|js|...)\b
+#
+# DOES NOT fire on bare ls/cd/git-without-code-path/cat-noncode (no symbol shape).
+# Known NEGATIVE cases the gate MUST reject (tested): `git log a.b.c`,
+# `grep foo.bar`, a bare dotted path arg, `cd`, `ls`. Those reach this gate but
+# the CALLER additionally screens for a code-search tool (grep/rg/find) context;
+# the dotted-token rule alone would match `git log a.b.c`, so the pre-bash caller
+# pairs this with a tool/context check (see pre-bash-context-inject.sh).
+#
+# MUST MATCH: codegraph-query.ps1 Test-VcoCodegraphSymbolGate (same 4 shapes +
+# the same code-file extension list).
+codegraph_symbol_gate() {
+    local text="$1"
+    [ -n "$text" ] || return 1
+    # (4) code-file path — strongest signal, check first.
+    if [[ "$text" =~ [^[:space:]]+\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)([^A-Za-z0-9]|$) ]]; then
+        return 0
+    fi
+    # (1) dotted symbol token (module.func / Class.method).
+    if [[ "$text" =~ [A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_] ]]; then
+        return 0
+    fi
+    # (2) CamelCase identifier.
+    if [[ "$text" =~ [A-Z][a-z]+[A-Z] ]]; then
+        return 0
+    fi
+    # (3) call shape: name(
+    if [[ "$text" =~ [A-Za-z_][A-Za-z0-9_]*\( ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# codegraph_pattern_gate <pattern>
+# True (0) if <pattern> looks like a CODE IDENTIFIER worth a codegraph lookup:
+# snake_case-with-underscore, OR CamelCase, OR a `name(` call, OR a code keyword
+# (def/class/func/function/fn) followed by an identifier. Deliberately does NOT
+# fire on a bare all-caps word ("TODO"), a bare lowercase word ("hello"), or a
+# bare dotted token ("foo.bar") — those are the Grep/pre-bash false-fire cases.
+# Used by both the Grep surface and codegraph_bash_gate's tool branch (one home).
+# MUST MATCH: codegraph-query.ps1 Test-VcoCodegraphPatternGate.
+codegraph_pattern_gate() {
+    local p="$1"
+    [ -n "$p" ] || return 1
+    # snake_case identifier (underscore between word chars):
+    if [[ "$p" =~ [A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+ ]]; then
+        return 0
+    fi
+    # CamelCase identifier:
+    if [[ "$p" =~ [A-Z][a-z]+[A-Z] ]]; then
+        return 0
+    fi
+    # call shape: name(
+    if [[ "$p" =~ [A-Za-z_][A-Za-z0-9_]*\( ]]; then
+        return 0
+    fi
+    # code keyword + identifier (def authenticate / class Foo):
+    if [[ "$p" =~ (^|[^A-Za-z0-9_])(def|class|func|function|fn)[[:space:]]+[A-Za-z_] ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# codegraph_bash_gate <bash-command>
+# The pre-bash-SPECIFIC gate (tighter than codegraph_symbol_gate). Fires the
+# codegraph branch ONLY when the bash command is genuinely navigating code,
+# short-circuiting (pure-bash, no subprocess) for routine ls/cd/git/cat/etc.
+# Returns 0 (fire) / 1 (skip).
+#
+# THE #1-RISK GATE. Fires when EITHER:
+#   (A) the command runs a code-search tool (grep|rg|ag|ack) AND its pattern is a
+#       CODE-IDENTIFIER shape: snake_case-with-underscore, OR CamelCase, OR a
+#       `name(` call, OR a code keyword (def/class/func/function/fn) prefix; OR
+#   (B) the command references a CODE-FILE path (foo.py, src/bar.rs, ...).
+#
+# Deliberately does NOT fire on (tested NEGATIVES):
+#   ls, cd /tmp, git status, git log a.b.c, cat notes.txt, grep foo.bar
+#   (dotted but non-identifier / could be a data filename), grep "TODO"
+#   (bare all-caps word, no identifier shape), a bare dotted path arg.
+# The bare-dotted rule from codegraph_symbol_gate is INTENTIONALLY excluded here
+# (it false-fires on `grep foo.bar` / `git log a.b.c`).
+#
+# MUST MATCH: codegraph-query.ps1 Test-VcoCodegraphBashGate.
+codegraph_bash_gate() {
+    local cmd="$1"
+    [ -n "$cmd" ] || return 1
+
+    # (B) code-file path → fire. The stem before the extension must be a clean
+    # filename ([A-Za-z0-9_-]+, NO embedded dots) immediately preceded by a path
+    # boundary (start, space, or slash). This deliberately REJECTS multi-dot
+    # tokens like `a.b.c` (a git ref, NOT a C file — the `git log a.b.c`
+    # negative) while accepting `foo.py`, `src/bar.rs`, ` baz.c`.
+    if [[ "$cmd" =~ (^|[[:space:]/])[A-Za-z0-9_-]+\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto)([^A-Za-z0-9]|$) ]]; then
+        return 0
+    fi
+
+    # (A) code-search tool present? (word-boundary-ish: tool at start of a
+    # pipeline segment or after whitespace). Cheap substring + boundary check.
+    # When a code-search tool is present, fire iff the command carries a
+    # code-IDENTIFIER shape (shared codegraph_pattern_gate — one home).
+    if [[ "$cmd" =~ (^|[[:space:]|])(grep|rg|ag|ack)([[:space:]]|$) ]]; then
+        if codegraph_pattern_gate "$cmd"; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# codegraph_extract_symbol <text>
+# Echo the first code-symbol/path token in <text> (for use as the codegraph
+# query), capped to 200 chars. Strips surrounding quotes. Returns the whole text
+# capped when no discrete token is isolable (the helper's query embedding
+# tolerates extra context). Matches dotted / CamelCase / snake_case / name( /
+# code-file path shapes — the union of the gate rules so the QUERY is the symbol,
+# not the noisy `grep -rn ...` wrapper.
+codegraph_extract_symbol() {
+    local text="$1"
+    local tok=""
+    for word in $text; do
+        # strip surrounding quotes common in commands
+        local w="${word#\"}"; w="${w%\"}"; w="${w#\'}"; w="${w%\'}"
+        # skip flags / options
+        case "$w" in -*) continue ;; esac
+        if [[ "$w" =~ ^[^[:space:]]+\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$ ]] \
+            || [[ "$w" =~ [A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_] ]] \
+            || [[ "$w" =~ [A-Z][a-z]+[A-Z] ]] \
+            || [[ "$w" =~ [A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+ ]] \
+            || [[ "$w" =~ [A-Za-z_][A-Za-z0-9_]*\( ]]; then
+            tok="$w"
+            break
+        fi
+    done
+    [ -z "$tok" ] && tok="$text"
+    printf '%s' "${tok:0:200}"
+}
