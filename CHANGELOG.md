@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.69] - 2026-06-27
+
+v0.2.69 is a bug-fix cycle from post-v0.2.68 testing. It completes the embedding
+fix so a project-add records the user's chosen embedding (not a forced qwen3,
+which was breaking the RL reranker), fixes a systemic Windows hook-path
+corruption that silently broke container/hub/KG auto-start, replaces per-process
+KG-seed timeouts with a progress-guard, extends the hub stale-binary swap to the
+non-GUI (CLI/hook/install) paths, and corrects several shipped docs/help-strings
+that described features inaccurately.
+
+### Fixed
+
+- **Project-add now records the hardware-selected embedding profile (not qwen3).**
+  v0.2.68's embedding fix covered the GUI chooser, but a project-add never invokes
+  the chooser — it resolves the embedding via two other readers that both defaulted
+  to `qwen3` and neither derived from the hardware pick: the canonical
+  `app_state[embedding.active_profile]` (empty) read by `project_env_settings::populate`,
+  and the per-project `module_settings[orchestrator-core/active_embedding]` row
+  (hardcoded `qwen3` by backfill) read by the production env writer
+  `config_projection.project_env_from_db`. So a freshly-added project wrote
+  `ACTIVE_EMBEDDING=qwen3` even on an arctic-selected machine — and the arctic-trained
+  RL reranker container then rejected qwen3 outright. Both readers now fall back to
+  deriving the profile from `app_state[default_text_embedding]` (the model id the
+  hardware selector wrote) via the existing model→profile map before defaulting to
+  qwen3, and backfill seeds new rows from that pick. Existing projects self-heal: a
+  per-project row that is exactly the legacy `qwen3` default is reconciled to the
+  derived profile on the next launcher start + bundle-update (an explicit user pick
+  like `openai` is never touched). Conservative throughout — an unmapped model id
+  stays qwen3 rather than guessing a profile.
+- **Windows hook commands no longer silently fail from backslash-corrupted paths.**
+  Claude Code on Windows runs each hook `command` string through `bash -c`, which
+  ate the backslashes in `.claude\hooks\NAME.ps1`; PowerShell then received a corrupt
+  path, the hook no-op'd, and (because hook dispatch is best-effort) it exited 0 — so
+  every SessionStart hook (ensure-containers, ensure-hub, kg-loader, …) silently
+  failed and the user's Weaviate/Ollama/hub never auto-started. All hook command
+  paths in the Windows settings template now use forward-slashes (which PowerShell
+  accepts and bash leaves intact), and the folderOpen VS Code task switched from
+  `type:"shell"` (bash-wrapped) to `type:"process"` (direct argv) so `${workspaceFolder}`
+  isn't mangled either. Existing projects heal on their next `install.py --update`
+  (the hooks block is re-rendered from the template). Two `_lib` PowerShell helpers'
+  `Set-Variable -Scope 1 -ErrorAction SilentlyContinue` were also hardened to
+  `-Scope Script` (surfaces a real scope failure instead of masking it).
+- **vct-hub now swaps a stale/older binary on the non-GUI start paths.** The
+  identity-aware swap (restart when the running hub is an older/borrowed build) existed
+  only in the launcher-GUI boot path; the SessionStart hook, `vct-hub
+  --start-if-not-running`, and `install.py --update` only checked liveness, so a
+  CLI/headless user kept running a stale hub indefinitely. `install.py --update` now
+  stops the hub before the binary refresh and restarts it after (mirroring the GUI
+  flow, root-pinned), and `--start-if-not-running` is now identity-aware: the lockfile
+  records a build fingerprint (version + git-sha), `/health` exposes it, and a fresh
+  hub stops an older live one before claiming. Conservative — only swaps on a positive
+  mismatch, never a false kill; lockfile stays back-compatible (PID on line 1).
+
+### Changed
+
+- **KG-seed timeouts are now a progress-guard, not a process cap.** The install KG
+  seed wrapped the whole `sync_knowledge_graph.py` subprocess in fixed
+  per-process timeouts (600s/900s) that fired on a legitimate slow arctic re-embed of
+  thousands of nodes on a cold CPU. Those per-process caps are removed (a slow seed
+  runs to completion). A per-embed-request timeout (`VCT_EMBED_REQUEST_TIMEOUT_SECS`,
+  default 180s) now guards individual embed calls, and the launcher-spawned sync keeps
+  a stall-watchdog re-armed on every line of output (`KG_SYNC_STALL_TIMEOUT_SECS`,
+  default 900s) so it recovers a genuinely-wedged sync (e.g. a hung non-embed Weaviate
+  call) without ever tripping on a slow-but-progressing one.
+- **Corrected several shipped docs/help-strings that misdescribed real behavior.**
+  `vct-hub --help` no longer claims the boot-autostart commands (`--register-boot` /
+  `--unregister-boot` / `--boot-status`) "exit 64" — they are fully implemented;
+  `docs/CONFIGURATION.md` no longer claims the hub services-status snapshot was
+  "brought back" (it is still a degraded skeleton + 501 stubs, as
+  `docs/GETTING_STARTED.md` correctly states); and a dangling doc reference in the
+  ensure-hub hook was repointed to an existing section.
+
 ## [0.2.68] - 2026-06-25
 
 v0.2.68 finishes the launcher-UX correctness work begun in v0.2.67 and adds a
