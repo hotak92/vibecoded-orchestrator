@@ -25439,34 +25439,18 @@ def _smart_merge_settings(user: dict, template: dict) -> dict:
 def _merge_hooks_block(user_hooks: dict, template_hooks: dict) -> dict:
     """Merge per-event hook arrays.
 
-    For each Event (SessionStart, PreToolUse, ...): if template provides hook
-    entries whose inner-hook `command` string isn't already present in any of
-    the user's entries for that event, append the entire template entry.
+    v0.2.70 (Stream G): delegates to the SINGLE shared implementation
+    ``vco_lib.project_init._merge_hooks_for_bundle`` (one concern, one home).
+    Previously this orchestrator-self path and the per-project bundle path had
+    TWO independent append-only copies; both shared the same bug — when a
+    VCO-shipped hook's command form changed (e.g. a backslash path-separator
+    fix on Windows) the merge STACKED the new command next to the stale broken
+    one (which kept firing and failing). The shared helper now SUPERSEDES a
+    stale VCO hook (same `.claude/hooks/<name>` identity, different string)
+    rather than stacking, while preserving a user's own custom hooks. Keeping
+    one implementation prevents the two from drifting again.
     """
-    out = dict(user_hooks)
-    for event, t_entries in template_hooks.items():
-        if event not in out:
-            out[event] = list(t_entries)
-            continue
-        u_entries = out[event] if isinstance(out[event], list) else []
-        existing_cmds = set()
-        for entry in u_entries:
-            for h in entry.get("hooks", []) if isinstance(entry, dict) else []:
-                cmd = h.get("command")
-                if cmd:
-                    existing_cmds.add(cmd)
-        merged_entries = list(u_entries)
-        for t_entry in t_entries:
-            t_cmds = [
-                h.get("command")
-                for h in t_entry.get("hooks", [])
-                if isinstance(h, dict) and h.get("command")
-            ]
-            if t_cmds and all(c in existing_cmds for c in t_cmds):
-                continue  # every command already present — don't duplicate.
-            merged_entries.append(t_entry)
-        out[event] = merged_entries
-    return out
+    return _project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
 
 
 # ---------------------------------------------------------------------------

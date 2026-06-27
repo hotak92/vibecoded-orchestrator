@@ -66,6 +66,7 @@ __all__ = [
     "is_symlink_blocking",
     "compute_vco_new_path",
     "emit_symlink_deferral",
+    "emit_symlink_deferral_multi",
     "check_vco_new_collision",
     "SYMLINK_PRESERVED_CONDITION_ID",
     "VCO_NEW_SUFFIX",
@@ -212,43 +213,12 @@ def emit_symlink_deferral(
     # install.py at top level).
     from vco_lib.deferral_report import DeferralEntry
 
-    # Try to read the symlink target for the "detected" prose; soft-fail
-    # if the read raises (e.g., permission denied, race during install).
-    try:
-        target = os.readlink(os.fspath(dest))
-    except OSError:
-        target = "<unreadable>"
-
-    if install_root is not None:
-        try:
-            dest_display = str(Path(dest).relative_to(install_root))
-            vco_new_display = str(Path(vco_new).relative_to(install_root))
-        except ValueError:
-            # Path is not under install_root — fall back to absolute.
-            dest_display = str(dest)
-            vco_new_display = str(vco_new)
-    else:
-        dest_display = str(dest)
-        vco_new_display = str(vco_new)
-
-    detected = (
-        f"`{dest_display}` is a symlink → `{target}`. VCO's intended "
-        f"content was written to `{vco_new_display}` instead. The "
-        f"symlink itself was NOT modified."
-    )
+    detected, command_to_apply = _render_symlink_pair(dest, vco_new, install_root)
 
     why_deferred = (
         "VCO never replaces or follows symlinks under the install path "
         "(hard rule, v0.2.46). To replace this symlink with VCO's defaults "
         "the user must delete the symlink first, then re-run install.py."
-    )
-
-    command_to_apply = (
-        f"# Option A — accept VCO's defaults over the symlink:\n"
-        f"rm '{dest_display}' && mv '{vco_new_display}' '{dest_display}'\n"
-        f"\n"
-        f"# Option B — keep the existing symlink (delete VCO's sibling):\n"
-        f"rm -rf '{vco_new_display}'"
     )
 
     entry = DeferralEntry(
@@ -261,6 +231,133 @@ def emit_symlink_deferral(
     )
     deferral.add_entry(entry)
 
+
+def _display_path(p: Path, install_root: Path | None) -> str:
+    """Render ``p`` relative to ``install_root`` when possible, else absolute."""
+    if install_root is not None:
+        try:
+            return str(Path(p).relative_to(install_root))
+        except ValueError:
+            return str(p)
+    return str(p)
+
+
+def _render_symlink_pair(
+    dest: Path, vco_new: Path, install_root: Path | None,
+) -> tuple[str, str]:
+    """Build the ``(detected, command_to_apply)`` text for ONE
+    (symlink, .vco-new) redirect pair. Shared by the single-pair and
+    multi-pair emitters so the rendering never drifts.
+    """
+    # Try to read the symlink target for the "detected" prose; soft-fail
+    # if the read raises (e.g., permission denied, race during install).
+    try:
+        target = os.readlink(os.fspath(dest))
+    except OSError:
+        target = "<unreadable>"
+
+    dest_display = _display_path(dest, install_root)
+    vco_new_display = _display_path(vco_new, install_root)
+
+    detected = (
+        f"`{dest_display}` is a symlink → `{target}`. VCO's intended "
+        f"content was written to `{vco_new_display}` instead. The "
+        f"symlink itself was NOT modified."
+    )
+    command_to_apply = (
+        f"# Option A — accept VCO's defaults over the symlink:\n"
+        f"rm '{dest_display}' && mv '{vco_new_display}' '{dest_display}'\n"
+        f"\n"
+        f"# Option B — keep the existing symlink (delete VCO's sibling):\n"
+        f"rm -rf '{vco_new_display}'"
+    )
+    return detected, command_to_apply
+
+
+def emit_symlink_deferral_multi(
+    deferral: "DeferralReport",
+    events: list[tuple[Path, Path]],
+    install_root: Path | None = None,
+    *,
+    cap: int = 5,
+) -> None:
+    """Append ONE consolidated ``symlink_preserved_under_install_path`` entry
+    covering ALL ``(dest, vco_new)`` redirect pairs from a single install run.
+
+    v0.2.70 (Bug B / W-F2): the single-pair :func:`emit_symlink_deferral`
+    relies on ``DeferralReport.add_entry``'s last-write-wins per ``condition_id``,
+    so calling it once per redirect would KEEP ONLY THE LAST path (silent report
+    data-loss — the exact bug class Bug B fixes). When an install redirects many
+    files (e.g. a symlinked ``.claude`` redirects every agent + settings.json),
+    the user needs ALL of them listed. This builder emits a SINGLE entry whose
+    ``detected`` / ``command_to_apply`` blocks list every pair.
+
+    Uses the SAME ``SYMLINK_PRESERVED_CONDITION_ID`` slug so a re-run that
+    re-encounters the condition replaces (not stacks) the prior entry, and so
+    the launcher's deferred-reader + tests find it under the stable id.
+
+    Args:
+        deferral: the ``DeferralReport`` to append to (caller owns lifecycle).
+        events: list of ``(dest, vco_new)`` pairs — ``dest`` is the symlink VCO
+            refused to touch, ``vco_new`` is where VCO landed its content.
+        install_root: optional root for relative-path display (more readable).
+        cap: truncate the listed pairs to the first ``cap`` (with an
+            "... and N more" trailer) so the deferral .md stays bounded when a
+            symlinked ancestor redirects dozens of files. Defaults to 5.
+    """
+    if not events:
+        return
+
+    # Lazy import — same rationale as emit_symlink_deferral.
+    from vco_lib.deferral_report import DeferralEntry
+
+    # Deterministic order so the deferral .md doesn't churn between runs that
+    # redirect the same set of files in a different enumeration order.
+    ordered = sorted(events, key=lambda ev: _display_path(ev[0], install_root))
+    shown = ordered[:cap]
+    overflow = len(ordered) - len(shown)
+
+    detected_blocks: list[str] = []
+    command_blocks: list[str] = []
+    for dest, vco_new in shown:
+        det, cmd = _render_symlink_pair(dest, vco_new, install_root)
+        detected_blocks.append(f"- {det}")
+        command_blocks.append(cmd)
+
+    detected = (
+        f"{len(ordered)} path(s) under the install root are symlinks VCO "
+        f"refused to write through; VCO's intended content was written to "
+        f"`.vco-new` siblings instead. The symlinks themselves were NOT "
+        f"modified:\n" + "\n".join(detected_blocks)
+    )
+    if overflow > 0:
+        detected += f"\n- ... and {overflow} more"
+
+    why_deferred = (
+        "VCO never replaces or follows symlinks under the install path "
+        "(hard rule, v0.2.46). To replace a symlink with VCO's defaults the "
+        "user must delete the symlink first (Option A below), or keep the "
+        "symlink and discard VCO's sibling (Option B). Until then, the "
+        "stale symlinked files remain in place and the fresh content sits "
+        "in the `.vco-new` siblings."
+    )
+
+    command_to_apply = "\n\n".join(command_blocks)
+    if overflow > 0:
+        command_to_apply += (
+            f"\n\n# ... and {overflow} more redirected path(s) — list all with:\n"
+            f"find . -name '*{VCO_NEW_SUFFIX}'"
+        )
+
+    entry = DeferralEntry(
+        condition_id=SYMLINK_PRESERVED_CONDITION_ID,
+        title="Symlink(s) preserved under install path",
+        detected=detected,
+        why_deferred=why_deferred,
+        command_to_apply=command_to_apply,
+        severity="info",
+    )
+    deferral.add_entry(entry)
 
 
 def check_vco_new_collision(

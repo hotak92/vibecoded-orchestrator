@@ -3492,7 +3492,7 @@ def _file_action(
     return ("preserve", source_bytes)
 
 
-def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None) -> None:
+def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None) -> Optional[Path]:
     """Atomic file write: temp file in same dir + os.replace. Optionally
     sets a unix mode bit (0o755 for shell scripts to preserve executable).
 
@@ -3515,9 +3515,18 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
         ``<project>/.claude`` to a shared location), same treatment:
         redirect to ``<canonical parent>.vco-new/<rest of path>``.
       * In both redirect cases we surface the redirect via stderr so
-        the install log captures it. A future per-project
-        DeferralReport emission can pick this up; minimum-viable
-        v0.2.53 contract is "no silent data destruction".
+        the install log captures it, AND return the redirect target so
+        the caller can surface a structured deferral (v0.2.70: Bug B —
+        ``install_project_bundle`` accumulates these and emits ONE
+        consolidated ``symlink_preserved_under_install_path`` deferral).
+
+    Returns
+      ``None`` on a normal (non-redirected) write. The ``redirect_target``
+      ``Path`` when the write was redirected to a ``.vco-new`` sibling due
+      to a symlink-blocking detection. Callers that need to surface this
+      to users (``install_project_bundle`` and its settings-merge helper)
+      capture it; callers that don't need deferral wiring ignore the
+      return value (it's discarded as an expression statement).
 
     Reference:
     ``.claude/context/audits/project-bundle-install-audit-2026-06-10.md``
@@ -3606,6 +3615,11 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
         except OSError:
             pass
         raise
+
+    # v0.2.70 (Bug B): surface the redirect to the caller so it can emit a
+    # structured `symlink_preserved_under_install_path` deferral. None on a
+    # normal write.
+    return redirect_target
 
 
 def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
@@ -3717,6 +3731,37 @@ def _emit_user_modified_deferral(
     )
     report = DeferralReport.read(folder)
     report.add_entry(entry)
+    report.write(folder)
+
+
+def _emit_symlink_redirect_deferral(
+    folder: Path,
+    events: list[tuple[Path, Path]],
+    install_root: Optional[Path],
+) -> None:
+    """Emit ONE `symlink_preserved_under_install_path` deferral covering ALL
+    symlink-redirect events from a single `install_project_bundle` run.
+
+    v0.2.70 (Bug B): wires the previously-orphaned
+    `symlink_handler.emit_symlink_deferral_multi` into the project bundle's
+    `.vco-new` redirect path. When `_write_file_atomic` refused to write
+    through a symlinked target / ancestor (e.g. a symlinked `.claude` or
+    `.claude/agents`), each redirect is accumulated as an
+    `(original_target, vco_new)` pair; this helper builds the SINGLE
+    consolidated `DeferralReport` entry listing every pair (NOT one entry per
+    event — that would last-write-wins down to a single path, the W-F2 bug).
+
+    Reads the existing on-disk deferral, appends the consolidated entry under
+    the stable `SYMLINK_PRESERVED_CONDITION_ID` (so a re-run replaces rather
+    than stacks), and writes it back.
+    """
+    if not events:
+        return
+    from vco_lib.deferral_report import DeferralReport
+    from vco_lib.symlink_handler import emit_symlink_deferral_multi
+
+    report = DeferralReport.read(folder)
+    emit_symlink_deferral_multi(report, events, install_root=install_root)
     report.write(folder)
 
 
@@ -4729,18 +4774,26 @@ def _emit_migrate_required_deferral(
     plan_entries: list[dict],
 ) -> None:
     """Emit `schema_migration_required`: a Weaviate dry-run plan revealed
-    one or more collections need `copy` or `rebuild` to reach the target
-    schema. Both are destructive (drop+recreate the collection),
-    so we DO NOT auto-apply them — we surface a deferral entry that names
-    each collection + its required action and tells the user the explicit
-    command to consent.
+    one or more collections need a LOSSY `rebuild` (drop + re-embed via
+    Ollama) to reach the target schema. `rebuild` regenerates vectors
+    rather than preserving them, so we DO NOT auto-apply it — we surface a
+    deferral entry that names each collection + its required action and tells
+    the user the explicit command to consent.
+
+    v0.2.70: additive `copy` migrations are LOSSLESS (staging double-copy
+    that round-trips every UUID + named vector + property byte-for-byte; copy
+    never re-embeds and never drops the live collection) and are AUTO-APPLIED
+    without a deferral. The caller (`_cmd_migrate_collections` gate) filters
+    the plan to `action == "rebuild"` before calling this emitter, so it is
+    only ever invoked with lossy rebuild entries.
 
     Args:
         folder: target user-project folder.
         project_name: raw project name (the user-facing label).
         weaviate_url: the URL the dry-run probed (echoed in the command_to_apply).
         plan_entries: list of `{"collection", "action"}` dicts where action is
-            in {"copy", "rebuild"}. Anything filtered before this call.
+            `rebuild` (legacy single-vector or unhandled escape). The gate
+            filters out additive `copy` before this call.
 
     Severity is `warning`: the project is functional with the existing schema
     (read paths still work), but new schema features (e.g. `index_null_state`)
@@ -4754,19 +4807,15 @@ def _emit_migrate_required_deferral(
     # determinism so deferral .md doesn't churn between runs that produce
     # the same plan in different order.
     detected_lines = []
-    has_rebuild = False
     for entry in sorted(plan_entries, key=lambda e: (e.get("collection") or "", e.get("action") or "")):
         coll = entry.get("collection") or "?"
-        action = entry.get("action") or "?"
-        if action == "rebuild":
-            has_rebuild = True
-            detected_lines.append(
-                f"  - `{coll}` → **rebuild** (drop + re-embed; legacy single-vector format)"
-            )
-        else:
-            detected_lines.append(
-                f"  - `{coll}` → **copy-with-vectors** (atomic swap; ~30s per collection)"
-            )
+        # v0.2.70: the gate (`_cmd_migrate_collections`) filters the plan to
+        # `action == "rebuild"` before calling this emitter, so every entry
+        # here is a lossy rebuild (legacy single-vector or unhandled escape).
+        # Additive `copy` is auto-applied, never deferred.
+        detected_lines.append(
+            f"  - `{coll}` → **rebuild** (drop + re-embed; legacy single-vector format)"
+        )
 
     # Build the suggested command. `vco_lib` lives in the ORCHESTRATOR
     # clone's venv (NOT this project's venv) — running `python -m
@@ -4779,43 +4828,35 @@ def _emit_migrate_required_deferral(
     # clone lives. (v0.2.18 doc fix 2026-05-19: prior wording assumed
     # the user knew to run from VCT_ORCHESTRATOR_ROOT.)
     #
-    # `--force-rebuild` is only mentioned when the plan actually has a
-    # rebuild entry — otherwise the smart copy path handles it without
-    # the escape hatch.
     # v0.2.54 Track D (P0-2): both commands now pass `--project-folder`
     # so the CLI's post-rebuild re-ingest step can locate the project's
     # `.claude/scripts/sync_knowledge_graph.py` and restore the dropped
     # data immediately. Pre-fix the command promised "falls back to
     # drop+re-embed" while the CLI path never re-embedded — the user's
     # collection stayed empty until the next full install.py run.
+    #
+    # v0.2.70: this emitter only fires for lossy `rebuild` now (additive
+    # `copy` is auto-applied), so the command always documents the
+    # drop + recreate + re-ingest path. The smart `migrate-collections`
+    # call preserves vectors via copy where possible and only rebuilds the
+    # legacy collections; `--force-rebuild` is the all-collections escape.
     folder_arg = f"--project-folder {str(folder)!r} "
-    if has_rebuild:
-        cmd = (
-            f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
-            f"# NOT in this project's venv). The --name flag scopes the work to\n"
-            f"# THIS project's collections. Preserves vectors via copy where possible;\n"
-            f"# for legacy single-vector collections it drops, recreates with the\n"
-            f"# target schema, and re-ingests from knowledge/ + docs/ (requires the\n"
-            f"# embedding backend to be healthy; ~3-5 min).\n"
-            f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-            f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
-            f"{folder_arg}--json\n"
-            f"# OR force the destructive drop+recreate+re-ingest for ALL collections\n"
-            f"# (slower; same embedding-backend requirement):\n"
-            f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-            f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
-            f"{folder_arg}--force-rebuild --json"
-        )
-    else:
-        cmd = (
-            f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
-            f"# NOT in this project's venv). The --name flag scopes the work to\n"
-            f"# THIS project's collections. Atomic copy-with-vectors swap;\n"
-            f"# preserves all UUIDs + vectors + WikiLink cross-references.\n"
-            f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
-            f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
-            f"{folder_arg}--json"
-        )
+    cmd = (
+        f"# Run the migration from the orchestrator clone (vco_lib lives there,\n"
+        f"# NOT in this project's venv). The --name flag scopes the work to\n"
+        f"# THIS project's collections. Preserves vectors via copy where possible;\n"
+        f"# for legacy single-vector collections it drops, recreates with the\n"
+        f"# target schema, and re-ingests from knowledge/ + docs/ (requires the\n"
+        f"# embedding backend to be healthy; ~3-5 min).\n"
+        f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
+        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
+        f"{folder_arg}--json\n"
+        f"# OR force the destructive drop+recreate+re-ingest for ALL collections\n"
+        f"# (slower; same embedding-backend requirement):\n"
+        f"cd \"$VCT_ORCHESTRATOR_ROOT\" && .venv/bin/python -m vco_lib.project_init migrate-collections "
+        f"--name {project_name!r} --weaviate-url {weaviate_url!r} "
+        f"{folder_arg}--force-rebuild --json"
+    )
 
     entry = DeferralEntry(
         condition_id="schema_migration_required",
@@ -4823,16 +4864,21 @@ def _emit_migrate_required_deferral(
         detected=(
             f"A pre-update dry-run of `migrate-collections` against "
             f"`{weaviate_url}` reported one or more per-project Weaviate "
-            f"collections need a destructive migration to reach the current "
-            f"target schema:\n"
+            f"collections need a data-rebuilding migration (drop + re-embed) "
+            f"to reach the current target schema:\n"
             + "\n".join(detected_lines)
         ),
+        # must match projects_v2.rs run_migrate_dry_run warning (cross-language
+        # mirror — see launcher/src-tauri/src/commands/projects_v2.rs). Keep the
+        # framing semantically identical: rebuild re-embeds (vectors regenerated,
+        # not preserved) so it is consent-gated; additive copy is lossless and
+        # auto-applied without a deferral.
         why_deferred=(
-            "Schema drift detected. `copy` and `rebuild` actions modify "
-            "Weaviate state in ways that are not silently reversible "
-            "(`copy` drops the collection mid-swap; `rebuild` re-embeds "
-            "every object via Ollama). PR 5's update flow defers this so "
-            "the user explicitly consents — the bundle install (hooks, "
+            "Schema drift detected. `rebuild` re-embeds every object via Ollama "
+            "(vectors are regenerated, not preserved), so it is deferred for "
+            "explicit consent. Additive `copy` migrations preserve all data "
+            "(UUIDs + named vectors + properties round-trip byte-for-byte) and "
+            "are auto-applied without a deferral. The bundle install (hooks, "
             "agents, scripts) still proceeds and is unaffected."
         ),
         command_to_apply=cmd,
@@ -6529,6 +6575,14 @@ def install_project_bundle(
     new_preserved: dict[str, dict] = {}
     user_modified_paths: list[str] = []
     skipped_existing_paths: list[str] = []
+    # v0.2.70 (Bug B): every `_write_file_atomic` call reachable from this
+    # function that gets REDIRECTED to a `.vco-new` sibling (because the target
+    # or an ancestor is a symlink VCO refused to write through) appends its
+    # (original_target, vco_new) pair here. After the loop + settings merge we
+    # emit ONE consolidated `symlink_preserved_under_install_path` deferral
+    # (skipped on dry-run). Mirrors the accumulate-then-emit-once pattern used
+    # by `user_modified_paths` / `skipped_existing_paths` / `orphan_preserved`.
+    symlink_redirect_events: list[tuple[Path, Path]] = []
 
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder)
     _log("4.bundle", "start",
@@ -6657,7 +6711,11 @@ def install_project_bundle(
                         # overly permissive. The project folder belongs to
                         # the user; group/world access is unnecessary.
                         mode = 0o700
-                    _write_file_atomic(target_path, source_bytes, mode=mode)
+                    # v0.2.70 (Bug B): capture a `.vco-new` redirect (symlink-
+                    # blocking) so the consolidated symlink deferral lists it.
+                    _redirect = _write_file_atomic(target_path, source_bytes, mode=mode)
+                    if _redirect is not None:
+                        symlink_redirect_events.append((target_path, _redirect))
                 except Exception as e:
                     err = f"{type(e).__name__}: {e}"
                     _log("4.bundle", "error",
@@ -6754,11 +6812,20 @@ def install_project_bundle(
     settings_template = _settings_template_path(orchestrator_root)
     if settings_template.exists():
         try:
-            settings_action = _merge_settings_template_for_bundle(
-                settings_template, folder / ".claude" / "settings.json",
+            settings_target = folder / ".claude" / "settings.json"
+            settings_action, settings_redirect = _merge_settings_template_for_bundle(
+                settings_template, settings_target,
                 dry_run=dry_run,
             )
             result["settings_action"] = settings_action
+            # v0.2.70 (Bug B / W-F1): when `.claude` itself is a symlink VCO
+            # refused to write through, the settings.json write redirected to a
+            # `.vco-new` sibling. Thread that into the SAME accumulator as the
+            # main file loop so the consolidated symlink deferral lists
+            # settings.json too (otherwise the symlinked-`.claude` case
+            # under-reports — it would list agent redirects but not settings).
+            if settings_redirect is not None:
+                symlink_redirect_events.append((settings_target, settings_redirect))
             _log("4.bundle.settings", "ok",
                  f"settings.json: {settings_action}",
                  data={"action": settings_action})
@@ -7071,6 +7138,25 @@ def install_project_bundle(
     # stale `bundle_skipped_existing_files` entry behind because the emit
     # functions are guarded behind non-empty lists.
     if not dry_run:
+        # v0.2.70 (Bug B): one consolidated symlink-redirect deferral covering
+        # every `_write_file_atomic` redirect (main file loop + settings merge)
+        # that landed at a `.vco-new` sibling because the target / an ancestor
+        # is a symlink VCO refused to write through. Soft-fail: a deferral write
+        # failure must not abort the bundle install.
+        if symlink_redirect_events:
+            try:
+                _emit_symlink_redirect_deferral(
+                    folder, symlink_redirect_events, orchestrator_root,
+                )
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                _log("4.bundle.deferral", "error",
+                     f"symlink-redirect deferral write failed: {err}",
+                     data={"error": err})
+                result["warnings"].append(
+                    f"symlink-redirect deferral write failed: {err}"
+                )
+
         if update_mode and user_modified_paths and not force:
             try:
                 _emit_user_modified_deferral(
@@ -7365,42 +7451,53 @@ def _find_orchestrator_root_from_module() -> Path:
 
 def _merge_settings_template_for_bundle(
     template_path: Path, target_path: Path, *, dry_run: bool,
-) -> str:
+) -> tuple[str, Optional[Path]]:
     """Mirror of install.py:_merge_settings_template + _smart_merge_settings.
 
     Inlined here (rather than importing from install.py) so vco_lib stays
     import-free of install.py — install.py imports vco_lib, not the other
     way around.
+
+    Returns ``(status, redirect_target)``:
+      * ``status`` — one of ``would-create`` / ``created`` / ``would-merge`` /
+        ``merged`` / ``unchanged`` / ``unchanged (user file unparseable)``.
+      * ``redirect_target`` — v0.2.70 (Bug B / W-F1): the ``.vco-new`` Path
+        when the settings.json write was redirected because ``.claude`` (or
+        the file itself) is a symlink VCO refused to write through, else
+        ``None``. The caller (``install_project_bundle``) threads this into
+        the SAME ``symlink_redirect_events`` accumulator as the main file
+        loop so the consolidated symlink deferral also lists settings.json
+        (the symlinked-``.claude`` case would otherwise under-report).
     """
     template_data = json.loads(template_path.read_text(encoding="utf-8"))
 
     if not target_path.exists():
         if dry_run:
-            return "would-create"
+            return "would-create", None
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_file_atomic(
+        redirect = _write_file_atomic(
             target_path,
             (json.dumps(template_data, indent=2) + "\n").encode("utf-8"),
         )
-        return "created"
+        return "created", redirect
 
     try:
         existing = json.loads(target_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
-        return "unchanged (user file unparseable)"
+        return "unchanged (user file unparseable)", None
 
     merged = _smart_merge_for_bundle(existing, template_data)
     if merged == existing:
-        return "unchanged"
+        return "unchanged", None
 
     if dry_run:
-        return "would-merge"
+        return "would-merge", None
 
-    _write_file_atomic(
+    redirect = _write_file_atomic(
         target_path,
         (json.dumps(merged, indent=2) + "\n").encode("utf-8"),
     )
-    return "merged"
+    return "merged", redirect
 
 
 def _smart_merge_for_bundle(user: dict, template: dict) -> dict:
@@ -8576,34 +8673,174 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
     return result
 
 
+def _vco_hook_script_identity(command: str) -> Optional[str]:
+    """Extract the canonical IDENTITY of a VCO-shipped hook command: the hook
+    SCRIPT basename under `.claude/hooks/` (e.g. `ensure-containers.ps1`,
+    `pre-tool-use.sh`), normalized across path-separator (`\\` vs `/`),
+    `${...}` / `%...%` variable expansion, and quoting. Returns `None` when the
+    command does NOT reference a script under `.claude/hooks/` — i.e. it is a
+    user's OWN custom hook, which must never be rewritten/dropped.
+
+    v0.2.70 (Stream G): two commands with the SAME identity are the SAME VCO
+    hook (one may be a stale form of the other, e.g. a backslash path
+    pre-v0.2.70 vs the forward-slash form shipped now). This is the conservative
+    matcher behind the supersede-not-stack merge — it deliberately fires ONLY on
+    a real `.claude/hooks/<name>` reference so a custom user hook (a script
+    elsewhere, or an inline command) returns `None` and is left untouched.
+    """
+    if not command or not isinstance(command, str):
+        return None
+    # Normalize path separators (bash eats `\`; PowerShell accepts both). A
+    # stale backslash command and the forward-slash form must collapse to the
+    # same identity.
+    norm = command.replace("\\", "/")
+    # Strip quotes around the path token so `'.claude/hooks/x.sh'` and
+    # `".claude/hooks/x.sh"` and the bare form all match.
+    norm = norm.replace('"', " ").replace("'", " ")
+    # Match `.claude/hooks/<basename>` where <basename> is a hook script with a
+    # known hook extension. Allow an optional `${VAR}/` or `%VAR%/` /
+    # `<abs-or-rel-prefix>/` ahead of `.claude/` (variable expansion / absolute
+    # path) — we anchor on the `.claude/hooks/` segment, not the prefix. The
+    # `_lib/` sub-dir is NOT a directly-invoked hook (sourced helper), so
+    # require the basename to sit immediately under `hooks/`.
+    m = re.search(
+        r"\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))(?:$|[\s\"';|&)])",
+        norm,
+    )
+    if not m:
+        return None
+    return m.group(1)
+
+
 def _merge_hooks_for_bundle(user_hooks: dict, template_hooks: dict) -> dict:
-    """Per-event hook array merge — append template entries whose inner
-    `command` strings aren't already present (mirror of install.py)."""
+    """Per-event hook array merge.
+
+    v0.2.70 (Stream G — supersede-not-stack): historically this was APPEND-ONLY
+    by exact command-STRING identity, so when a VCO-shipped hook's command form
+    changed (e.g. a path-separator fix `...\\hooks\\x.ps1` -> `.../hooks/x.ps1`,
+    a flag change, or an interpreter change) bundle-update did NOT heal existing
+    projects — it STACKED the new command next to the stale one, leaving the
+    BROKEN command actively firing (and failing) at every event alongside the
+    working one. That is worse than dead code: the stale invocation keeps
+    running.
+
+    Now: a template entry whose hook-script IDENTITY (the `.claude/hooks/<name>`
+    basename, normalized across `\\`/`/`, var-expansion, quoting) matches an
+    EXISTING user entry's identity but whose command STRING differs SUPERSEDES
+    the stale one — the stale command is dropped and the template's current
+    command installed, leaving exactly ONE invocation per VCO hook. Identity +
+    string both match → left as-is (idempotent). Identity absent from the user's
+    set → appended (genuinely new VCO hook; today's behavior).
+
+    CONSERVATIVE GUARD (critical): a command is only treated as a VCO hook when
+    `_vco_hook_script_identity` resolves it to a `.claude/hooks/<name>` script
+    VCO actually ships (i.e. the same identity appears in the TEMPLATE). A
+    user's OWN custom hook (a script not under `.claude/hooks/`, or one VCO
+    doesn't ship) returns `None` / has no template match and is PRESERVED
+    byte-for-byte — never rewritten or dropped. When in doubt, fall back to the
+    pre-v0.2.70 append behavior (a wrong replace that clobbers a user hook is
+    worse than a missed supersede).
+    """
     out = dict(user_hooks)
+
+    def _entry_cmds(entry: dict) -> list[str]:
+        if not isinstance(entry, dict):
+            return []
+        return [
+            h.get("command")
+            for h in entry.get("hooks", [])
+            if isinstance(h, dict) and h.get("command")
+        ]
+
     for event, t_entries in template_hooks.items():
         if event not in out:
             out[event] = list(t_entries)
             continue
         u_entries = out[event] if isinstance(out[event], list) else []
-        existing_cmds: set = set()
+
+        # Set of VCO-shipped hook IDENTITIES this template entry-list declares
+        # for THIS event. Only an identity present here is eligible to supersede
+        # a stale user command — guards against rewriting a user's own hook that
+        # happens to share a basename-shaped token.
+        template_identities: set[str] = set()
+        for t_entry in t_entries:
+            for c in _entry_cmds(t_entry):
+                ident = _vco_hook_script_identity(c)
+                if ident:
+                    template_identities.add(ident)
+
+        # Exact command strings already present (idempotent skip).
+        existing_cmds: set[str] = set()
+        for entry in u_entries:
+            for c in _entry_cmds(entry):
+                existing_cmds.add(c)
+
+        # Build the merged entry list. First pass: SUPERSEDE stale VCO hook
+        # commands in the USER entries whose identity matches a template
+        # identity but whose string differs from the current template command.
+        # Map identity -> current template command (first occurrence wins;
+        # the template ships at most one command per identity per event).
+        template_cmd_for_identity: dict[str, str] = {}
+        for t_entry in t_entries:
+            for c in _entry_cmds(t_entry):
+                ident = _vco_hook_script_identity(c)
+                if ident and ident not in template_cmd_for_identity:
+                    template_cmd_for_identity[ident] = c
+
+        merged_entries: list = []
+        superseded_identities: set[str] = set()
         for entry in u_entries:
             if not isinstance(entry, dict):
+                merged_entries.append(entry)
                 continue
+            new_entry = dict(entry)
+            new_hooks: list = []
             for h in entry.get("hooks", []):
-                if isinstance(h, dict) and h.get("command"):
-                    existing_cmds.add(h["command"])
-        merged_entries = list(u_entries)
+                if not isinstance(h, dict) or not h.get("command"):
+                    new_hooks.append(h)
+                    continue
+                cmd = h["command"]
+                ident = _vco_hook_script_identity(cmd)
+                # CONSERVATIVE: only supersede when the identity is a VCO hook
+                # the template ships AND the string actually differs (stale
+                # form). A user's own hook (ident None, or ident not in the
+                # template) is preserved verbatim.
+                if (
+                    ident
+                    and ident in template_cmd_for_identity
+                    and cmd != template_cmd_for_identity[ident]
+                ):
+                    new_h = dict(h)
+                    new_h["command"] = template_cmd_for_identity[ident]
+                    new_hooks.append(new_h)
+                    superseded_identities.add(ident)
+                else:
+                    new_hooks.append(h)
+                    if ident and cmd == template_cmd_for_identity.get(ident):
+                        # Already current — record so the append pass skips it.
+                        superseded_identities.add(ident)
+            new_entry["hooks"] = new_hooks
+            merged_entries.append(new_entry)
+
+        # Second pass: APPEND template entries that are genuinely new. A
+        # template command is "handled" (so its entry need not be appended)
+        # when EITHER its exact string is already present verbatim OR its
+        # VCO-hook identity was just superseded/confirmed-current in a user
+        # entry above. Append only when NOT every command is handled.
+        def _cmd_handled(c: str) -> bool:
+            if c in existing_cmds:
+                return True
+            ident = _vco_hook_script_identity(c)
+            return ident is not None and ident in superseded_identities
+
         for t_entry in t_entries:
             if not isinstance(t_entry, dict):
                 continue
-            t_cmds = [
-                h.get("command")
-                for h in t_entry.get("hooks", [])
-                if isinstance(h, dict) and h.get("command")
-            ]
-            if t_cmds and all(c in existing_cmds for c in t_cmds):
+            t_cmds = _entry_cmds(t_entry)
+            if t_cmds and all(_cmd_handled(c) for c in t_cmds):
                 continue
             merged_entries.append(t_entry)
+
         out[event] = merged_entries
     return out
 
@@ -8930,9 +9167,28 @@ def _cmd_migrate_collections(args: argparse.Namespace) -> int:
 
     # PR 5: drift-detection deferral (pre-update path).
     if project_folder and bool(args.dry_run) and not result["errors"] and not all_projects:
+        # v0.2.70: `copy` is the LOSSLESS additive staging double-copy. It
+        # round-trips every UUID + named vector + property byte-for-byte via
+        # `_copy_collection_with_vectors` (no re-embedding, no drop of the live
+        # collection until the staging swap's count-match assertion passes). So
+        # it must AUTO-APPLY without consent — only genuinely data-losing
+        # actions defer. `legacy_single_vector` and any same-name/different-dim
+        # slot are classified `rebuild` (or routed to the schema_migration_runner
+        # subsystem), never `copy` (see `_classify_action` + `_schema_delta`), so
+        # `action == "rebuild"` is the exact lossy set at this gate. The dry-run
+        # plan strips `delta`, leaving `action` as the only signal here — which is
+        # sufficient given that classification proof.
+        #
+        # NOTE: this auto-apply is NEW behavior, NOT a mirror of
+        # `install.py --update` (whose drift detector EXCLUDES the additive
+        # v0.2.18 slots and never reaches the apply for an additive 3->5 drift).
+        # It is justified purely by losslessness. The launcher's WET follow-up
+        # that actually applies the additive subset lives in
+        # `projects_v2.rs::run_migrate_dry_run` (the dry-run probe here only
+        # stops deferring — it never mutates).
         destructive = [
             e for e in result.get("plan", [])
-            if e.get("action") in ("copy", "rebuild")
+            if e.get("action") == "rebuild"
         ]
         resolved_folder = Path(project_folder).resolve()
         if destructive:

@@ -832,6 +832,182 @@ class SmartMergeSettingsTests(unittest.TestCase):
         self.assertIn("vco-foo", cmds)
 
 
+class HookMergeSupersedeTests(unittest.TestCase):
+    """v0.2.70 (Stream G): `_merge_hooks_for_bundle` must SUPERSEDE a stale
+    VCO-shipped hook command (same `.claude/hooks/<name>` identity, different
+    string) instead of STACKING the new command next to the broken one — while
+    NEVER touching a user's own custom hook. This pins the backslash->forward-
+    slash heal (the Windows silent-hook-fail case) and generalizes to any
+    shipped-command change."""
+
+    @staticmethod
+    def _cmds(merged: dict, event: str) -> list:
+        out = []
+        for entry in merged.get(event, []):
+            for h in entry.get("hooks", []):
+                if isinstance(h, dict) and h.get("command"):
+                    out.append(h["command"])
+        return out
+
+    # ── normalizer ────────────────────────────────────────────────────────
+
+    def test_identity_normalizes_path_separator(self):
+        bs = "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\ensure-containers.ps1"
+        fs = "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/ensure-containers.ps1"
+        self.assertEqual(
+            project_init._vco_hook_script_identity(bs),
+            project_init._vco_hook_script_identity(fs),
+        )
+        self.assertEqual(
+            project_init._vco_hook_script_identity(fs), "ensure-containers.ps1"
+        )
+
+    def test_identity_handles_quoting_and_varexpansion(self):
+        quoted = "bash '.claude/hooks/pre-tool-use.sh'"
+        guarded = '[ -n "$VCT_DISABLE_HOOKS" ] || bash .claude/hooks/pre-tool-use.sh'
+        self.assertEqual(
+            project_init._vco_hook_script_identity(quoted), "pre-tool-use.sh"
+        )
+        self.assertEqual(
+            project_init._vco_hook_script_identity(guarded), "pre-tool-use.sh"
+        )
+
+    def test_identity_none_for_non_vco_hook(self):
+        # A user's own custom hook (script NOT under .claude/hooks/).
+        self.assertIsNone(
+            project_init._vco_hook_script_identity("bash ./scripts/my-own-hook.sh")
+        )
+        # An inline command, not a script reference at all.
+        self.assertIsNone(
+            project_init._vco_hook_script_identity("echo hello && do-thing")
+        )
+        # A _lib sourced helper is not a directly-invoked hook identity.
+        self.assertIsNone(
+            project_init._vco_hook_script_identity(
+                "bash .claude/hooks/_lib/find-python.sh"
+            )
+        )
+
+    # ── POSITIVE: supersede the stale backslash command ─────────────────────
+
+    def test_supersede_stale_backslash_ps1_command(self):
+        stale = "powershell -NoProfile -ExecutionPolicy Bypass -File .claude\\hooks\\ensure-containers.ps1"
+        current = "powershell -NoProfile -ExecutionPolicy Bypass -File .claude/hooks/ensure-containers.ps1"
+        user_hooks = {
+            "SessionStart": [
+                {"matcher": "", "hooks": [{"type": "command", "command": stale}]},
+            ],
+        }
+        template_hooks = {
+            "SessionStart": [
+                {"matcher": "", "hooks": [{"type": "command", "command": current}]},
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "SessionStart")
+        # Exactly ONE entry for that hook, with the forward-slash command.
+        self.assertEqual(
+            cmds.count(current), 1, f"current command must appear once; got {cmds}"
+        )
+        # The stale backslash command is GONE.
+        self.assertNotIn(stale, cmds, "stale backslash command must be removed")
+        self.assertEqual(len(cmds), 1, f"no duplicate stacking; got {cmds}")
+
+    # ── POSITIVE: idempotent when already current ───────────────────────────
+
+    def test_already_current_is_unchanged(self):
+        current = "bash .claude/hooks/pre-tool-use.sh"
+        user_hooks = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": current}]},
+            ],
+        }
+        template_hooks = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": current}]},
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "PreToolUse")
+        self.assertEqual(cmds, [current], f"idempotent — no churn; got {cmds}")
+
+    # ── NEGATIVE: a user's own custom hook is preserved ─────────────────────
+
+    def test_user_custom_hook_preserved_not_replaced(self):
+        custom = "bash ./scripts/my-own-hook.sh"
+        vco_current = "bash .claude/hooks/pre-tool-use.sh"
+        user_hooks = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": custom}]},
+            ],
+        }
+        template_hooks = {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": vco_current}]},
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "PreToolUse")
+        # User's own hook preserved byte-for-byte.
+        self.assertIn(custom, cmds, "user's own custom hook must be preserved")
+        # And the genuinely-new VCO hook is appended alongside.
+        self.assertIn(vco_current, cmds, "new VCO hook must be appended")
+
+    def test_user_hook_sharing_basename_not_under_claude_hooks_preserved(self):
+        # A user hook that references a same-basename script NOT under
+        # .claude/hooks/ must NOT be superseded.
+        user_cmd = "bash /opt/mine/ensure-containers.ps1"
+        vco_cmd = "powershell -File .claude/hooks/ensure-containers.ps1"
+        user_hooks = {
+            "SessionStart": [
+                {"matcher": "", "hooks": [{"type": "command", "command": user_cmd}]},
+            ],
+        }
+        template_hooks = {
+            "SessionStart": [
+                {"matcher": "", "hooks": [{"type": "command", "command": vco_cmd}]},
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "SessionStart")
+        self.assertIn(user_cmd, cmds, "non-.claude/hooks script must be preserved")
+        self.assertIn(vco_cmd, cmds, "the real VCO hook is appended alongside")
+
+    # ── NEGATIVE: a genuinely new VCO hook is appended (today's behavior) ────
+
+    def test_new_vco_hook_appended(self):
+        existing = "bash .claude/hooks/pre-tool-use.sh"
+        new_hook = "bash .claude/hooks/kg-update-nudge.sh"
+        user_hooks = {
+            "SessionStart": [
+                {"matcher": "", "hooks": [{"type": "command", "command": existing}]},
+            ],
+        }
+        template_hooks = {
+            "SessionStart": [
+                {"matcher": "", "hooks": [{"type": "command", "command": existing}]},
+                {"matcher": "", "hooks": [{"type": "command", "command": new_hook}]},
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        cmds = self._cmds(merged, "SessionStart")
+        self.assertIn(existing, cmds)
+        self.assertIn(new_hook, cmds, "genuinely new VCO hook must be appended")
+        self.assertEqual(cmds.count(existing), 1, "no duplicate of the existing hook")
+
+    def test_new_event_added_wholesale(self):
+        user_hooks = {}
+        template_hooks = {
+            "Stop": [
+                {"matcher": "", "hooks": [{"type": "command", "command": "bash .claude/hooks/notify-stop.sh"}]},
+            ],
+        }
+        merged = project_init._merge_hooks_for_bundle(user_hooks, template_hooks)
+        self.assertEqual(
+            self._cmds(merged, "Stop"), ["bash .claude/hooks/notify-stop.sh"]
+        )
+
+
 # ---------------------------------------------------------------------------
 # Manifest tests
 # ---------------------------------------------------------------------------
@@ -1783,9 +1959,15 @@ class MigrateRequiredDeferralTests(unittest.TestCase):
         import shutil
         shutil.rmtree(str(self.tmp), ignore_errors=True)
 
-    def test_emit_migrate_required_deferral_copy_action(self):
-        # Plan with a single `copy` action (smart migrate path).
-        plan = [{"collection": "VideoFrames_KnowledgeGraph", "action": "copy"}]
+    def test_emit_migrate_required_deferral_rebuild_only_contract_v0270(self):
+        # v0.2.70: the gate (`_cmd_migrate_collections`) now filters the plan
+        # to `action == "rebuild"` BEFORE calling this emitter — additive
+        # `copy` is lossless and auto-applied, never deferred. The emitter is
+        # therefore only ever invoked with lossy rebuild entries and renders
+        # every entry as **rebuild** (with the --force-rebuild escape). This
+        # test pins the new contract by passing the rebuild action the gate
+        # would forward.
+        plan = [{"collection": "VideoFrames_KnowledgeGraph", "action": "rebuild"}]
         project_init._emit_migrate_required_deferral(
             self.proj,
             project_name="VideoFrames",
@@ -1797,11 +1979,15 @@ class MigrateRequiredDeferralTests(unittest.TestCase):
         body = deferral_path.read_text(encoding="utf-8")
         self.assertIn("schema_migration_required", body)
         self.assertIn("VideoFrames_KnowledgeGraph", body)
-        self.assertIn("copy-with-vectors", body)
-        # Suggested command points at migrate-collections, not at the
-        # destructive --force-rebuild (no rebuild in plan).
+        self.assertIn("rebuild", body)
         self.assertIn("migrate-collections", body)
-        self.assertNotIn("--force-rebuild", body)
+        # The lossy-rebuild deferral surfaces the --force-rebuild escape.
+        self.assertIn("--force-rebuild", body)
+        # v0.2.70 lockstep string fix: the false "copy drops the collection
+        # mid-swap" claim must be gone, replaced by the rebuild re-embeds
+        # framing.
+        self.assertNotIn("drops the collection mid-swap", body)
+        self.assertIn("re-embeds every object via Ollama", body)
 
     def test_emit_migrate_required_deferral_rebuild_action(self):
         plan = [{"collection": "ArcAgi_KnowledgeGraph", "action": "rebuild"}]
@@ -1831,13 +2017,16 @@ class MigrateRequiredDeferralTests(unittest.TestCase):
         self.assertFalse(deferral_path.exists(),
                          "empty plan_entries must NOT write a deferral")
 
-    def test_migrate_cli_writes_deferral_on_copy_drift(self):
-        """End-to-end CLI: migrate-collections --dry-run with --project-folder
-        AND a fake-Weaviate response that classifies a collection as
-        needing `copy` MUST emit `schema_migration_required` deferral.
+    def test_migrate_cli_no_deferral_on_copy_drift_v0270(self):
+        """v0.2.70: end-to-end CLI: migrate-collections --dry-run with
+        --project-folder AND a fake-Weaviate response that classifies a
+        collection as needing additive `copy` MUST NOT emit a
+        `schema_migration_required` deferral — additive copy is lossless and
+        is auto-applied (the launcher's WET follow-up does the apply). The
+        clean-additive dry-run also falls into the stale-clear else branch.
 
-        Stubs the migrate dispatcher (we don't have a live Weaviate);
-        verifies the CLI integration writes the right deferral.
+        Stubs the migrate dispatcher (we don't have a live Weaviate); verifies
+        the CLI integration does NOT write a deferral and clears any stale one.
 
         v0.2.18: uses argparse.Namespace (not Mock) because the new
         `--all-projects` flag is read via `getattr(args, "all_projects",
@@ -1875,10 +2064,11 @@ class MigrateRequiredDeferralTests(unittest.TestCase):
             rc = project_init._cmd_migrate_collections(ns)
             self.assertEqual(rc, 0)
         deferral_path = self.proj / ".claude" / "context" / "UPDATE_DEFERRED.md"
-        self.assertTrue(deferral_path.exists())
-        body = deferral_path.read_text(encoding="utf-8")
-        self.assertIn("schema_migration_required", body)
-        self.assertIn("VideoFrames_KnowledgeGraph", body)
+        self.assertFalse(
+            deferral_path.exists(),
+            "additive copy drift must NOT emit a schema_migration_required "
+            "deferral (it is lossless and auto-applied)",
+        )
 
     def test_migrate_cli_no_deferral_on_noop_plan(self):
         """A plan composed of only `noop` / `create` / `patch_props` actions

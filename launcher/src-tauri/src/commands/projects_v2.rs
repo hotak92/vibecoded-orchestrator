@@ -1607,66 +1607,172 @@ pub(crate) async fn run_install_bundle_update_with_root(
 ///     proceeds.
 ///
 /// Never blocks `update_project_v2` (no Err return).
-pub(crate) async fn run_migrate_dry_run(
+/// v0.2.70 (DS-F2): per-project in-process migrate re-entrancy lock.
+///
+/// `update_project_v2` has no re-entrancy guard (unlike `create_project_v2`'s
+/// F7 lock). Bug A's WET additive-apply (`run_migrate_apply_additive`) is the
+/// FIRST Weaviate-mutating step in the update path — two launcher windows (or a
+/// launcher Update racing a CLI `install.py --update`) could run concurrent wet
+/// `copy` operations against the SAME project's collection, colliding on the
+/// shared `<collection>__staging` name mid-swap. This in-process lock refuses a
+/// second wet apply for the same project_id while one is in flight (it does NOT
+/// guard a separate-process CLI race — `migrate_collections`'s top-of-call
+/// orphan-`__staging` recovery is the second line of defense for that).
+///
+/// Mirrors the per-key in-process lock pattern used by `diagram_watcher.rs`
+/// (`LazyLock<Mutex<HashMap<...>>>`).
+static MIGRATE_IN_FLIGHT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Pure decision predicate for the migrate lock (unit-testable without the
+/// global): given whether the project_id is already in the in-flight set,
+/// return true iff a second wet apply must be REFUSED (soft-skip this cycle).
+///
+/// Conservative: a poisoned mutex (`already_held == true` via the err-path
+/// caller) also refuses — never run a second wet apply when we can't prove the
+/// first finished.
+pub(crate) fn migrate_lock_should_refuse(already_held: bool) -> bool {
+    already_held
+}
+
+/// RAII guard for the per-project migrate lock. `acquire` returns `None` on
+/// contention (caller must soft-skip); the guard removes the project_id from
+/// the in-flight set on drop.
+struct MigrateLockGuard {
+    project_id: String,
+}
+
+impl MigrateLockGuard {
+    /// Try to acquire the lock for `project_id`. Returns `None` if a wet apply
+    /// is already in flight for this project (refuse-on-contention) OR if the
+    /// mutex is poisoned (conservative: do nothing rather than guess).
+    fn acquire(project_id: &str) -> Option<Self> {
+        let mut set = match MIGRATE_IN_FLIGHT.lock() {
+            Ok(s) => s,
+            // Poisoned mutex (a prior holder panicked): refuse, per
+            // `migrate_lock_should_refuse(true)`. Don't run a wet mutation
+            // against indeterminate state.
+            Err(_) => return None,
+        };
+        let already_held = set.contains(project_id);
+        if migrate_lock_should_refuse(already_held) {
+            return None;
+        }
+        set.insert(project_id.to_string());
+        Some(Self {
+            project_id: project_id.to_string(),
+        })
+    }
+}
+
+impl Drop for MigrateLockGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = MIGRATE_IN_FLIGHT.lock() {
+            set.remove(&self.project_id);
+        }
+    }
+}
+
+/// v0.2.70: pure predicate — does this dry-run plan describe an
+/// additive-only (lossless) drift that should be auto-applied?
+///
+/// True iff the plan has at least one additive action (`copy`/`patch_props`),
+/// NO lossy action (`rebuild`), and the probe itself was clean (status success
+/// + no `errors[]`). Lossy `rebuild` (legacy single-vector / unhandled escape /
+/// force) and dim-mismatch (routed to the schema_migration_runner, never `copy`)
+/// keep deferring; this only fires for the lossless additive case.
+///
+/// NOTE (DS-F1): this is NOT a mirror of `install.py --update` (whose drift
+/// detector excludes the additive v0.2.18 slots and never reaches an apply). It
+/// is justified purely by losslessness — `copy` round-trips every UUID + named
+/// vector + property byte-for-byte via `_copy_collection_with_vectors`.
+pub(crate) fn should_auto_apply_additive(v: &serde_json::Value, probe_status_ok: bool) -> bool {
+    let plan = match v.get("plan").and_then(|p| p.as_array()) {
+        Some(p) => p,
+        None => return false,
+    };
+    let actions: Vec<&str> = plan
+        .iter()
+        .filter_map(|e| e.get("action").and_then(|a| a.as_str()))
+        .collect();
+    let has_lossy = actions.iter().any(|a| *a == "rebuild");
+    let has_additive = actions
+        .iter()
+        .any(|a| matches!(*a, "copy" | "patch_props"));
+    let errors_empty = v
+        .get("errors")
+        .and_then(|x| x.as_array())
+        .map_or(true, |a| a.is_empty());
+    let probe_clean = probe_status_ok && errors_empty;
+    has_additive && !has_lossy && probe_clean
+}
+
+/// v0.2.70: shared subprocess plumbing for the migrate-collections CLI.
+///
+/// Both `run_migrate_dry_run` (probe) and `run_migrate_apply_additive` (wet
+/// apply) call this — the only difference is the `--dry-run` flag. Factored out
+/// per the "one concern, one home" rule (no copy-paste of the system-detect /
+/// orch-root / Command setup). Returns the resolved Python `Command` ready to
+/// run, or an error string the caller surfaces as a soft warning.
+async fn build_migrate_command(
     folder: &Path,
     project_name: &str,
-) -> Vec<String> {
-    let mut warnings: Vec<String> = Vec::new();
-
-    let system = match detect_system().await {
-        Ok(s) => s,
-        Err(e) => {
-            warnings.push(format!(
-                "schema drift probe skipped: detect_system failed: {}. \
-                 Bundle install will proceed; per-project Weaviate schema \
-                 may drift silently.",
-                e
-            ));
-            return warnings;
-        }
-    };
+    dry_run: bool,
+) -> Result<tokio::process::Command, String> {
+    let system = detect_system()
+        .await
+        .map_err(|e| format!("detect_system failed: {}", e))?;
     if !system.has_python {
-        warnings.push(
-            "schema drift probe skipped: no Python 3.11+ on PATH. \
-             Bundle install will proceed; schema drift unmonitored."
-            .to_string(),
-        );
-        return warnings;
+        return Err("no Python 3.11+ on PATH".to_string());
     }
-
-    let orch_root = match find_local_repo_root() {
-        Ok(p) => p,
-        Err(e) => {
-            warnings.push(format!(
-                "schema drift probe skipped: orchestrator root not found: {}. \
-                 Bundle install will proceed.",
-                e
-            ));
-            return warnings;
-        }
-    };
+    let orch_root =
+        find_local_repo_root().map_err(|e| format!("orchestrator root not found: {}", e))?;
 
     let folder_str = folder.to_string_lossy().to_string();
     let mut cmd = tokio::process::Command::new(&system.python_cmd).silent();
-    cmd.args([
-        "-m",
-        "vco_lib.project_init",
-        "migrate-collections",
-        "--name",
-        project_name,
-        "--dry-run",
-        "--project-folder",
-        &folder_str,
-        "--json",
-    ])
-    .current_dir(&orch_root)
-    .stdin(std::process::Stdio::null());
+    cmd.arg("-m")
+        .arg("vco_lib.project_init")
+        .arg("migrate-collections")
+        .arg("--name")
+        .arg(project_name);
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
+    cmd.arg("--project-folder")
+        .arg(&folder_str)
+        .arg("--json")
+        .current_dir(&orch_root)
+        .stdin(std::process::Stdio::null());
 
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
+
+    Ok(cmd)
+}
+
+pub(crate) async fn run_migrate_dry_run(
+    project_id: &str,
+    folder: &Path,
+    project_name: &str,
+) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    let folder_str = folder.to_string_lossy().to_string();
+    let mut cmd = match build_migrate_command(folder, project_name, /* dry_run */ true).await {
+        Ok(c) => c,
+        Err(e) => {
+            warnings.push(format!(
+                "schema drift probe skipped: {}. Bundle install will proceed; \
+                 per-project Weaviate schema may drift silently.",
+                e
+            ));
+            return warnings;
+        }
+    };
 
     let out = match cmd.output().await {
         Ok(o) => o,
@@ -1690,13 +1796,19 @@ pub(crate) async fn run_migrate_dry_run(
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
             if deferral_emitted {
+                // must match _emit_migrate_required_deferral why_deferred
+                // (vco_lib/project_init.py) — cross-language mirror. Keep the
+                // framing identical: ONLY lossy `rebuild` is consent-gated here
+                // (it re-embeds every object); additive `copy` is lossless and
+                // auto-applied below, never deferred.
                 warnings.push(format!(
                     "Weaviate schema drift detected — `schema_migration_required` \
                      deferral entry written to {}/.claude/context/UPDATE_DEFERRED.md. \
-                     The bundle install proceeded normally; the destructive \
-                     migration was NOT auto-applied — re-run \
-                     `python -m vco_lib.project_init migrate-collections \
-                     --name {:?}` to consent and apply.",
+                     A data-rebuilding migration (`rebuild`) requires consent and \
+                     was NOT auto-applied (it re-embeds every object via Ollama); \
+                     additive `copy` migrations are lossless and were applied \
+                     automatically. Re-run `python -m vco_lib.project_init \
+                     migrate-collections --name {:?} --force-rebuild` to consent.",
                     folder_str, project_name
                 ));
             }
@@ -1721,6 +1833,18 @@ pub(crate) async fn run_migrate_dry_run(
                     out.status
                 );
             }
+
+            // v0.2.70 (Bug A): additive (lossless) drift → auto-apply via an
+            // explicit WET follow-up call. The dry-run above NEVER mutates;
+            // narrowing the Python defer gate alone would leave additive drift
+            // un-applied forever (strictly worse than the old consent prompt),
+            // so the launcher must issue the wet apply. Gated behind the
+            // per-project migrate lock (refuse-on-contention) and soft-fail.
+            if should_auto_apply_additive(&v, out.status.success()) {
+                warnings.extend(
+                    run_migrate_apply_additive(project_id, folder, project_name).await,
+                );
+            }
         }
         Err(parse_err) => {
             warnings.push(format!(
@@ -1730,6 +1854,142 @@ pub(crate) async fn run_migrate_dry_run(
                 stderr.lines().rev().take(3)
                     .collect::<Vec<_>>().into_iter().rev()
                     .collect::<Vec<_>>().join(" | ")
+            ));
+        }
+    }
+    warnings
+}
+
+/// v0.2.70 (Bug A, 2b): apply the additive (lossless) schema migration via an
+/// explicit WET `migrate-collections` call (NO `--dry-run`).
+///
+/// Only called from `run_migrate_dry_run` when `should_auto_apply_additive`
+/// returned true (additive-only + clean probe). Gated behind the per-project
+/// migrate lock (DS-F2): on contention, soft-skips with a warning and issues NO
+/// subprocess — the next Update picks it up (idempotent; if the racing run
+/// finished, the plan is now `noop`). Soft-fail throughout — never aborts
+/// `update_project_v2`.
+///
+/// Crash-safe: `migrate_collections` runs orphan-`__staging` recovery at the top
+/// of every call (the wet path included), so an interrupted apply self-heals on
+/// the next run. The wet path does NOT re-emit a deferral (the Python emit gate
+/// is keyed on `args.dry_run`).
+pub(crate) async fn run_migrate_apply_additive(
+    project_id: &str,
+    folder: &Path,
+    project_name: &str,
+) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    // DS-F2: refuse a second concurrent wet apply for this project.
+    let _guard = match MigrateLockGuard::acquire(project_id) {
+        Some(g) => g,
+        None => {
+            warnings.push(format!(
+                "additive schema migration already in progress for {:?}; \
+                 skipping auto-apply this cycle (the next Update will apply it \
+                 if still needed).",
+                project_name
+            ));
+            return warnings;
+        }
+    };
+
+    let mut cmd = match build_migrate_command(folder, project_name, /* dry_run */ false).await {
+        Ok(c) => c,
+        Err(e) => {
+            warnings.push(format!(
+                "additive schema migration auto-apply skipped: {}. \
+                 Re-run `migrate-collections --name {:?}` from the orchestrator \
+                 clone to apply.",
+                e, project_name
+            ));
+            return warnings;
+        }
+    };
+
+    let out = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            warnings.push(format!(
+                "additive schema migration auto-apply subprocess failed to \
+                 start: {}. Bundle update proceeded.",
+                e
+            ));
+            return warnings;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    match serde_json::from_str::<serde_json::Value>(&stdout) {
+        Ok(v) => {
+            let mut had_error = false;
+            if let Some(errs) = v.get("errors").and_then(|x| x.as_array()) {
+                for e in errs {
+                    had_error = true;
+                    let coll = e
+                        .get("collection")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("?");
+                    let msg = e.get("error").and_then(|c| c.as_str()).unwrap_or("?");
+                    let action = e.get("action").and_then(|c| c.as_str()).unwrap_or("?");
+                    warnings.push(format!(
+                        "additive schema migration auto-apply error ({}/{}): {}. \
+                         Re-run `migrate-collections --name {:?}` to retry.",
+                        coll, action, msg, project_name
+                    ));
+                }
+            }
+            if !had_error && out.status.success() {
+                let applied: Vec<String> = v
+                    .get("plan")
+                    .and_then(|p| p.as_array())
+                    .map(|plan| {
+                        plan.iter()
+                            .filter(|e| {
+                                e.get("action")
+                                    .and_then(|a| a.as_str())
+                                    .map_or(false, |a| matches!(a, "copy" | "patch_props"))
+                            })
+                            .filter_map(|e| {
+                                e.get("collection").and_then(|c| c.as_str()).map(String::from)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !applied.is_empty() {
+                    warnings.push(format!(
+                        "additive schema migration auto-applied ({} collection(s), \
+                         vectors preserved): {}",
+                        applied.len(),
+                        applied.join(", ")
+                    ));
+                }
+            }
+            if !out.status.success() {
+                eprintln!(
+                    "[vct] migrate-collections (wet additive apply) exit {} \
+                     (errors surfaced via warnings)",
+                    out.status
+                );
+            }
+        }
+        Err(parse_err) => {
+            warnings.push(format!(
+                "additive schema migration auto-apply produced unparseable \
+                 output ({}): stderr tail: {}. Bundle update proceeded.",
+                parse_err,
+                stderr
+                    .lines()
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(" | ")
             ));
         }
     }
@@ -2062,9 +2322,12 @@ pub async fn update_project_v2(
     }
 
     // 3. Schema-drift dry-run probe. Writes `schema_migration_required`
-    //    deferral entry if any collection needs a destructive migration
-    //    (copy / rebuild). The bundle install still proceeds either way.
-    for w in run_migrate_dry_run(&folder, &row.name).await {
+    //    deferral entry only for a LOSSY `rebuild` migration (legacy
+    //    single-vector / unhandled escape). v0.2.70 (Bug A): additive
+    //    (lossless) `copy` drift is auto-applied here via an explicit WET
+    //    follow-up (gated behind a per-project migrate lock). The bundle
+    //    install still proceeds either way.
+    for w in run_migrate_dry_run(&row.id, &folder, &row.name).await {
         warnings.push(w);
     }
 
@@ -11028,5 +11291,162 @@ export BY_HAND_KEY=\"user_typed\"
         // is expected. The assertion above is conditional for that
         // reason — `cargo test` may not always run from inside the
         // clone.)
+    }
+
+    // ─── v0.2.70 Bug A: additive-copy auto-apply + migrate lock ────────────
+
+    /// DS-F2: the per-project migrate lock refuses a SECOND wet apply while
+    /// one is already in flight (refuse-on-contention), and lets it through
+    /// again once released. Exercises the real `MigrateLockGuard` against the
+    /// global in-flight set, plus the pure decision predicate.
+    #[test]
+    fn migrate_lock_acquire_then_refuse_on_contention() {
+        // Pure predicate: free → proceed; held → refuse.
+        assert!(!migrate_lock_should_refuse(false), "free lock must proceed");
+        assert!(migrate_lock_should_refuse(true), "held lock must refuse");
+
+        // Use a unique project_id so this test doesn't collide with any
+        // concurrently-running test that also touches the global set.
+        let pid = format!("migrate-lock-test-{}", uuid::Uuid::new_v4().simple());
+
+        // First acquire succeeds.
+        let g1 = MigrateLockGuard::acquire(&pid);
+        assert!(g1.is_some(), "first acquire must succeed");
+
+        // Second acquire for the SAME project_id is refused (returns None),
+        // and issues no subprocess (the caller soft-skips).
+        let g2 = MigrateLockGuard::acquire(&pid);
+        assert!(
+            g2.is_none(),
+            "second acquire for the same project must be refused (no concurrent wet apply)"
+        );
+
+        // A DIFFERENT project is unaffected by the contention on `pid`.
+        let other = format!("migrate-lock-other-{}", uuid::Uuid::new_v4().simple());
+        let g_other = MigrateLockGuard::acquire(&other);
+        assert!(
+            g_other.is_some(),
+            "a different project_id must acquire independently"
+        );
+        drop(g_other);
+
+        // Drop the first guard → the lock frees → re-acquire succeeds.
+        drop(g1);
+        let g3 = MigrateLockGuard::acquire(&pid);
+        assert!(
+            g3.is_some(),
+            "re-acquire after release must succeed (guard frees the lock on drop)"
+        );
+        drop(g3);
+    }
+
+    /// Pure predicate: additive-only + clean probe → auto-apply; any rebuild,
+    /// or a dirty probe (errors / non-success status), → do NOT auto-apply.
+    #[test]
+    fn should_auto_apply_additive_matrix() {
+        // additive-only (copy) + clean → apply.
+        let v = serde_json::json!({
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
+            "errors": [],
+        });
+        assert!(should_auto_apply_additive(&v, true));
+
+        // patch_props (additive) + clean → apply.
+        let v = serde_json::json!({
+            "plan": [{"collection": "Foo_Development", "action": "patch_props"}],
+            "errors": [],
+        });
+        assert!(should_auto_apply_additive(&v, true));
+
+        // mixed copy + rebuild → has_lossy → do NOT auto-apply (defer the
+        // rebuild subset; the additive subset is left for a later apply once
+        // the user consents to the rebuild).
+        let v = serde_json::json!({
+            "plan": [
+                {"collection": "Foo_KnowledgeGraph", "action": "copy"},
+                {"collection": "Foo_Development", "action": "rebuild"},
+            ],
+            "errors": [],
+        });
+        assert!(!should_auto_apply_additive(&v, true));
+
+        // rebuild only → do NOT auto-apply.
+        let v = serde_json::json!({
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "rebuild"}],
+            "errors": [],
+        });
+        assert!(!should_auto_apply_additive(&v, true));
+
+        // noop only → no additive action → do NOT auto-apply (nothing to do).
+        let v = serde_json::json!({
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "noop"}],
+            "errors": [],
+        });
+        assert!(!should_auto_apply_additive(&v, true));
+
+        // additive + clean BUT non-success status → not clean → no apply.
+        let v = serde_json::json!({
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
+            "errors": [],
+        });
+        assert!(!should_auto_apply_additive(&v, false));
+
+        // additive + non-empty errors → not clean → no apply.
+        let v = serde_json::json!({
+            "plan": [{"collection": "Foo_KnowledgeGraph", "action": "copy"}],
+            "errors": [{"collection": "Foo_KnowledgeGraph", "action": "copy", "error": "boom"}],
+        });
+        assert!(!should_auto_apply_additive(&v, true));
+
+        // empty / missing plan → no apply.
+        assert!(!should_auto_apply_additive(&serde_json::json!({}), true));
+    }
+
+    /// W-F5 (non-optional): the dry-run deferral warning is the rebuild-only
+    /// consent string (lockstep with the Python `why_deferred`), and the OLD
+    /// false framing is gone — neither the blanket "destructive migration was
+    /// NOT auto-applied" implication (additive is now applied) nor the
+    /// "drops the collection mid-swap" claim survives in this source file.
+    #[test]
+    fn migrate_warning_string_is_rebuild_only_consent_v0270() {
+        // The warning string spans multiple source lines via `\` line
+        // continuations, so collapse all runs of whitespace (including the
+        // backslash-newline-indent join artifacts) before substring-matching
+        // the semantic phrasing. Scope to the PRODUCTION portion of the file
+        // (before the `#[cfg(test)]` module) so the test's own assertion
+        // literals (which name the forbidden phrasing) don't false-match.
+        let raw = include_str!("projects_v2.rs");
+        let prod = match raw.find("#[cfg(test)]") {
+            Some(i) => &raw[..i],
+            None => raw,
+        };
+        let src: String = prod
+            .replace('\\', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // The new warning scopes consent to the rebuild action and states
+        // additive copy is applied automatically.
+        assert!(
+            src.contains("(`rebuild`) requires consent and was NOT auto-applied"),
+            "dry-run warning must scope consent to the rebuild action"
+        );
+        assert!(
+            src.contains("additive `copy` migrations are lossless and were applied automatically"),
+            "dry-run warning must state additive copy is auto-applied"
+        );
+        // The old blanket phrasing ("THE destructive migration was NOT
+        // auto-applied") implied EVERYTHING defers — must be gone.
+        assert!(
+            !src.contains("the destructive migration was NOT auto-applied"),
+            "the old blanket 'destructive migration was NOT auto-applied' phrasing must be removed"
+        );
+        // The factually-false "copy drops the collection mid-swap" claim must
+        // never appear in this file either.
+        assert!(
+            !src.contains("drops the collection mid-swap"),
+            "the false 'copy drops the collection mid-swap' claim must not be present"
+        );
     }
 }

@@ -1144,3 +1144,82 @@ def test_rust_owned_types_membership_is_justified():
         )
     # The one member shipped today.
     assert smr.RUST_OWNED_TYPES == frozenset({"launcher_db_table_set"})
+
+
+# ---------------------------------------------------------------------------
+# v0.2.70 (Bug A) — dim-mismatch parity: a same-name/different-dim vector slot
+# must NEVER enter the auto-applied `copy` bucket. `_schema_delta` compares
+# slot NAME sets only, so a same-name slot (even with a different dim) is a
+# `noop` there (never `copy`); dim-mismatch is owned by THIS subsystem
+# (live_fingerprint_stale → schema_migration_runner), which DEFERS via the
+# preserving-vs-recreate policy. This pins the boundary so the v0.2.70
+# auto-apply of additive `copy` can never accidentally cover a lossy
+# dim-mismatch.
+# ---------------------------------------------------------------------------
+
+
+def test_v0270_dim_mismatch_never_classifies_as_copy():
+    """A same-name vector slot with a DIFFERENT dimension is invisible to
+    `_schema_delta` (name-only comparison) → classifies `noop`, never `copy`.
+    So the auto-applied additive `copy` path can never receive a lossy
+    dim-mismatch."""
+    # actual + target share the SAME slot name but a different vector dim.
+    actual = {
+        "vectorConfig": {
+            "qwen3_embed": {"vectorizer": {}, "vectorIndexConfig": {"dimensions": 1024}},
+        },
+        "properties": [],
+        "invertedIndexConfig": {},
+    }
+    target = {
+        "vectorConfig": {
+            # Same NAME, different dim (e.g. swapped embedder). _schema_delta
+            # compares slot-name sets only → no missing slot detected.
+            "qwen3_embed": {"vectorizer": {}, "vectorIndexConfig": {"dimensions": 2048}},
+        },
+        "properties": [],
+        "invertedIndexConfig": {},
+    }
+    delta = pinit._schema_delta(actual, target)
+    assert not delta.missing_vec_slots, (
+        "same-name slot must NOT register as a missing slot (name-only delta)"
+    )
+    action = pinit._classify_action(delta)
+    assert action == "noop", (
+        f"dim-mismatch (same-name slot) must classify `noop`, not `copy`; "
+        f"got {action!r}"
+    )
+    assert action != "copy", "dim-mismatch must never enter the copy bucket"
+
+
+def test_v0270_dim_mismatch_stale_probe_still_defers_not_auto_applied(
+    db_with_v033, empty_migrations, monkeypatch
+):
+    """The schema_migration_runner OWNS dim-mismatch (via the live drift
+    probe). A stale (e.g. dim-changed) collection with no preserving script
+    maps to `pending_regenerate` — a DEFERRING outcome — and applies NO edge.
+    It is never silently auto-ported as an additive `copy`."""
+    name = "VibeCodedOrchestrator_KnowledgeGraph"
+    atype = "shared_kg_collection"
+    avr.register_artifact_version(
+        db_with_v033, project_id=None, artifact_type=atype, artifact_name=name,
+        schema_version=sv.canonical_version(atype), materialized_at=1,
+    )
+
+    def _dim_stale(weaviate_url, artifact_name):
+        # Simulate a dim-mismatch surfaced by the live fingerprint probe.
+        return (True, ["vector_dim"]) if artifact_name == name else (False, [])
+
+    spy = _ApplyEdgeSpy()
+    monkeypatch.setattr(smr, "_apply_edge", spy)
+    report = smr.run_schema_migrations(
+        db_path=db_with_v033, project_id="p1", migrations_dir=empty_migrations,
+        env=_env_with_collections(), weaviate_url="http://x",
+        live_drift_probe=_dim_stale, now_ms=1,
+        include_orchestrator_wide=True,
+    )
+    # No edge applied (nothing auto-ported); the stale collection is deferred
+    # to the preserving-vs-recreate policy (pending_regenerate).
+    assert spy.count == 0, "dim-mismatch must NOT auto-apply a migration edge"
+    pend = [p for p in report.pending_regenerate if p["artifact_name"] == name]
+    assert len(pend) == 1, "dim-mismatch must surface a pending_regenerate (deferring)"

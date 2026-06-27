@@ -1097,5 +1097,42 @@ class TestClaudeMdReminder(unittest.TestCase):
                          "strip must restore CLAUDE.md byte-for-byte")
 
 
+class TestMigrateDeferralTextV0270(unittest.TestCase):
+    """v0.2.70 (Bug A, lockstep string fix): the rendered
+    `schema_migration_required` deferral body must NOT contain the false
+    "copy drops the collection mid-swap" claim, and DOES contain the corrected
+    "rebuild re-embeds (vectors regenerated, not preserved)" framing plus the
+    "additive copy is auto-applied" statement. Guards the Python half of the
+    cross-language lockstep with projects_v2.rs."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vct-migrate-defer-text-"))
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def test_v0270_schema_migration_deferral_text_has_no_false_copy_claim(self):
+        from vco_lib import project_init
+
+        project_init._emit_migrate_required_deferral(
+            self.tmp,
+            project_name="Foo",
+            weaviate_url="http://localhost:8081",
+            plan_entries=[
+                {"collection": "Foo_KnowledgeGraph", "action": "rebuild"},
+            ],
+        )
+        body = (self.tmp / ".claude" / "context" / "UPDATE_DEFERRED.md") \
+            .read_text(encoding="utf-8")
+        # False claim removed.
+        self.assertNotIn("drops the collection mid-swap", body)
+        # Corrected framing present.
+        self.assertIn("re-embeds every object via Ollama", body)
+        self.assertIn("vectors are regenerated, not preserved", body)
+        # The auto-apply-of-additive statement is present.
+        self.assertIn("auto-applied without a deferral", body)
+
+
 if __name__ == "__main__":
     unittest.main()
