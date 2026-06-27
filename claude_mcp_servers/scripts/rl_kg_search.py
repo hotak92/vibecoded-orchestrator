@@ -55,6 +55,8 @@ async def main():
         _format_result_by_tier,
         _kg_collections_to_search,
         _embedding_dim_for,
+        _collapse_to_one_per_node,
+        _rl_enrich_nodes_with_linked_embs,
         KG_COLLECTION,
         EMBEDDING_SOURCE,
         EMBEDDING_MODEL,
@@ -88,6 +90,12 @@ async def main():
             target_name = None
         else:
             vector, target_name = await _get_search_vector(args.query)
+        # F-G (v0.2.70): the active named-vector slot (e.g. "qwen3_embed"). The
+        # hook path historically attached NO node vector at all, so EVERY
+        # hook-driven retrieval (≈72% of all events) carried no n_emb → cosine
+        # citations were structurally impossible. We now request include_vector
+        # and run the same emb-enrichment the MCP path uses.
+        query_target = target_name or ""
 
         all_formatted: list[dict] = []
         for coll_name in collections_to_search:
@@ -109,6 +117,9 @@ async def main():
                         near_vector=vector,
                         limit=fetch_limit,
                         return_metadata=["distance"],
+                        # F-G: ask Weaviate to return the per-object vector so we
+                        # can attach `emb` (and thus n_emb) on the hook path too.
+                        include_vector=True,
                     )
                     if target_name:
                         nv_kwargs["target_vector"] = target_name
@@ -121,6 +132,18 @@ async def main():
                 _format_obj(obj, coll_name, obj.metadata.distance)
                 for obj in primary.objects
             ]
+            # F-G: attach the matched node's active-slot vector (mirrors the
+            # MCP hybrid_search / semantic_graph_search emb-enrichment block).
+            # Soft-fail per result so a malformed vector never breaks the hook.
+            if vector is not None:
+                from weaviate_mcp.server import _extract_obj_vector
+                for r, obj in zip(coll_formatted, primary.objects):
+                    try:
+                        node_emb = _extract_obj_vector(obj, query_target)
+                        if node_emb:
+                            r["emb"] = node_emb
+                    except Exception:
+                        pass
             coll_formatted = _enrich_with_adjacent_chunks(coll, coll_formatted, coll_name)
             all_formatted.extend(coll_formatted)
 
@@ -155,6 +178,26 @@ async def main():
         # below self-collection results even when their score is higher.
         all_formatted.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
+        # F-G (v0.2.70): collapse to one entry per node (matching the MCP
+        # path, which keys the RL server on title) and run the shared
+        # emb-enrichment so each candidate carries its active-slot n_emb.
+        # The enrich helper re-pulls any node still missing `emb` from its
+        # own include_vector fetch (see _rl_refetch_node_vector), so even
+        # keyword-only / adjacent-chunk survivors get a comparable vector.
+        # Without this the hook path emitted retrieval events with ZERO
+        # node vectors → cosine citations were impossible for ~72% of all
+        # retrievals (the pre_edit_kg_search cohort).
+        all_formatted = _collapse_to_one_per_node(all_formatted, score_field="score")
+        if vector is not None:
+            try:
+                _rl_enrich_nodes_with_linked_embs(
+                    all_formatted, query_emb=vector, active_slot=query_target,
+                )
+            except Exception:
+                # Soft-fail: enrichment is best-effort telemetry; never break
+                # the user-facing context injection.
+                pass
+
         # RL rerank + telemetry emit via the V52-J canonical pipeline.
         # NEW-8 (2026-05-28): query embedding is carried into the
         # retrieval-event payload for offline training. Pre-NEW-8, every
@@ -170,6 +213,15 @@ async def main():
         # accepts arbitrary task_type strings (varchar column, no
         # enum constraint — see launcher/src-tauri/migrations/*.sql).
         task_id = f"pre_edit_{uuid.uuid4().hex[:8]}"
+        # F-A (v0.2.70): do NOT spawn the in-process answer monitor on the
+        # CLI/hook path. ``asyncio.run(main())`` tears the event loop down the
+        # instant ``main()`` returns (and ``client.close()`` runs in the
+        # ``finally``), so a monitor task spawned here is cancelled at birth —
+        # long before Claude has written any answer to poll. Pre-F-A this made
+        # EVERY hook-driven retrieval (≈72% of all events) structurally unable
+        # to cite. The citation is instead RECOVERED by the deferred queue:
+        # the staged ctx is persisted below and a Stop-hook drain computes the
+        # citation at turn-end (see citation_pending.py + rl_drain_citations.py).
         req = RerankRequest(
             query=args.query,
             candidates=all_formatted,
@@ -180,8 +232,35 @@ async def main():
             embedding_model=EMBEDDING_MODEL,
             task_id=task_id,
             task_type="pre_edit_kg_search",
+            spawn_answer_monitor=False,
         )
         rerank_result = await rerank_and_emit(req)
+
+        # F-QUEUE (v0.2.70): persist the staged citation ctx to disk so the
+        # Stop-hook drain can compute the citation at turn-end. Soft-fail —
+        # a staging failure must never break context injection. The MCP path
+        # keeps its in-memory cache AND stages; this CLI/hook path relies on
+        # the disk file exclusively (no live monitor).
+        try:
+            from claude_mcp_servers.weaviate_mcp import server as _srv
+            from claude_mcp_servers.rl_client.citation_pending import stage_pending
+
+            _ctx = _srv._rl_node_content_cache.get(task_id)
+            if _ctx is not None:
+                _session_id = (
+                    os.environ.get("CLAUDE_SESSION_ID", "")
+                    or os.environ.get("VCT_SESSION_ID", "")
+                )
+                stage_pending(
+                    session_id=_session_id,
+                    task_id=task_id,
+                    seq=None,
+                    query=args.query,
+                    ctx=_ctx,
+                    source="hook",
+                )
+        except Exception:
+            pass
         results = rerank_result.ranked
         for r in results:
             if "score" not in r:

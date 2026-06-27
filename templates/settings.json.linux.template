@@ -286,6 +286,12 @@
             "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/notify-stop.sh",
             "timeout": 5,
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "[ -n \"$VCT_DISABLE_HOOKS\" ] || bash .claude/hooks/stop-drain-citations.sh",
+            "timeout": 30,
+            "async": true
           }
         ]
       }

@@ -146,6 +146,53 @@ VENV="${VCO_VENV_PYTHON:-}"
 # have richer structure so we allow more headroom.
 QUERY=$(printf '%s' "$COMMAND" | head -c 500)
 
+# === F-LOG (v0.2.70): emit the pre_bash pairing event ===
+# The pre_bash event_type was declared in outcome_emit.OUTCOME_EVENT_TYPES but
+# NEVER written — only the state file above was, so the offline trainer logged
+# 0 pre_bash rows and (pre_bash, bash_outcome) training pairs were
+# unconstructable. Emit it now with the SAME task_id post-bash will reuse, so
+# the pair is JOINable by task_id. The query snippet is passed via env (not
+# string-interpolated into the python source) so a command containing quotes/
+# newlines can't break the emit. Soft-fail; backgrounded so it never delays the
+# user's bash command.
+if [ -n "$VENV" ] && [ -f "$VENV" ]; then
+    ( VCT_PREBASH_QUERY=$(printf '%s' "$COMMAND" | head -c 120) \
+      VCT_PREBASH_TASK_ID="$TASK_ID" \
+      VCT_PREBASH_CMD_LEN="$CMD_LEN" \
+      VCT_PREBASH_TS_MS="$START_TS_MS" \
+      VCT_PREBASH_SESSION="$SESSION_ID" \
+      "$VENV" -c "
+import os
+try:
+    from vco_lib.project_config import resolve_for_project
+    cfg = resolve_for_project(os.environ.get('CLAUDE_PROJECT_DIR', os.environ.get('VCT_PROJECT_ROOT', '')))
+    project_id = cfg.get('project_id') if isinstance(cfg, dict) else None
+except Exception:
+    project_id = None
+def _int(name):
+    try:
+        return int(os.environ.get(name, '0') or '0')
+    except (TypeError, ValueError):
+        return 0
+try:
+    from claude_mcp_servers.rl_client.outcome_emit import emit_outcome_event
+    emit_outcome_event(
+        event_type='pre_bash',
+        task_id=os.environ.get('VCT_PREBASH_TASK_ID', ''),
+        task_type='pre_bash',
+        payload={
+            'cmd_len': _int('VCT_PREBASH_CMD_LEN'),
+            'query': os.environ.get('VCT_PREBASH_QUERY', ''),
+            'ts_ms': _int('VCT_PREBASH_TS_MS'),
+        },
+        session_id=os.environ.get('VCT_PREBASH_SESSION', ''),
+        project_id=project_id,
+    )
+except Exception:
+    pass
+" >/dev/null 2>&1 ) &
+fi
+
 KG_TMP=$(mktemp)
 if [ -n "$VENV" ] && [ -f "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" ]; then
     ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \

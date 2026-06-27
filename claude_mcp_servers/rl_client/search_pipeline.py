@@ -152,9 +152,14 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
         except Exception as exc:
             logger.debug("rerank_and_emit: answer monitor spawn failed (%s)", exc)
 
-    # ---- populate citation cache ----
+    # ---- populate citation cache (+ stage deferred-queue pending file) ----
     # The monitor consumes this cache when it eventually fires; storing
     # candidates here saves a Weaviate re-fetch at citation-write time.
+    # F-QUEUE (v0.2.70): the populate ALSO persists the staged ctx to a disk
+    # pending file so the turn-end Stop-hook drain can recover the citation if
+    # the in-process monitor never fires (the hook path has no monitor at all;
+    # the MCP path's monitor may be evicted/timed-out). The MCP monitor deletes
+    # its own pending file on fire so the drain only processes survivors.
     try:
         _populate_citation_cache(
             task_id=task_id,
@@ -165,6 +170,9 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
             embedding_dim=req.embedding_dim,
             embedding_model=req.embedding_model,
             task_type=req.task_type,
+            session_id=req.session_id,
+            query=req.query,
+            stage_pending_file=True,
         )
     except Exception as exc:
         logger.debug("rerank_and_emit: citation cache populate failed (%s)", exc)
@@ -325,12 +333,20 @@ def _populate_citation_cache(
     embedding_dim: int,
     embedding_model: str,
     task_type: str,
+    session_id: Optional[str] = None,
+    query: str = "",
+    stage_pending_file: bool = False,
 ) -> None:
     """Write the per-task entry the answer monitor reads at citation time.
 
     Same entry shape as the pre-v0.2.52 inline write at
     ``server.py:4763``. Bounded by ``_RL_NODE_CACHE_MAX``; LRU-ish
     eviction via insertion-order pop.
+
+    F-QUEUE (v0.2.70): when ``stage_pending_file`` is True, ALSO persist the
+    ctx to ``.claude/state/rl_pending/<session>__<task_id>.json`` so the
+    turn-end Stop-hook drain can recover the citation when the in-process
+    monitor never fires. Soft-fail — staging failure never breaks search.
     """
     from claude_mcp_servers.weaviate_mcp import server as srv
 
@@ -340,6 +356,7 @@ def _populate_citation_cache(
     # over-fetched list we let the citation computation see candidates
     # the user-facing response truncated.
     cache_nodes = _build_log_nodes(candidates, limit)
+    ctx_dict: Optional[dict] = None
     try:
         project_id_for_cache: Optional[str] = None
         try:
@@ -348,7 +365,7 @@ def _populate_citation_cache(
                 project_id_for_cache = getattr(_cfg, "project_id", None)
         except Exception:
             pass
-        srv._rl_node_content_cache[task_id] = {
+        ctx_dict = {
             "nodes": cache_nodes,
             "query_emb": list(query_emb) if query_emb else None,
             "active_model": embedding_model,
@@ -358,12 +375,55 @@ def _populate_citation_cache(
             "project_name": getattr(srv, "PROJECT_NAME", "") or "",
             "task_type": task_type,
         }
+        srv._rl_node_content_cache[task_id] = ctx_dict
         # LRU bound — pop oldest insertion-order entry until size <= max.
         max_size = getattr(srv, "_RL_NODE_CACHE_MAX", 256)
         while len(srv._rl_node_content_cache) > max_size:
             srv._rl_node_content_cache.pop(next(iter(srv._rl_node_content_cache)))
     except Exception as exc:
         logger.debug("_populate_citation_cache: write failed (%s)", exc)
+
+    # F-QUEUE: durable pending file (backstop for the deferred-citation drain).
+    if stage_pending_file and ctx_dict is not None:
+        try:
+            from claude_mcp_servers.rl_client.citation_pending import stage_pending
+            from .telemetry_emit import resolve_session_id
+
+            staged_seq = getattr(srv, "_rl_call_seq", None)
+            stage_pending(
+                session_id=resolve_session_id(session_id or ""),
+                task_id=task_id,
+                seq=staged_seq,
+                query=query,
+                ctx=ctx_dict,
+                source="mcp",
+            )
+        except Exception as exc:
+            logger.debug("_populate_citation_cache: stage_pending failed (%s)", exc)
+
+
+def _clamp_unit_score(value: Any) -> float:
+    """F-E (v0.2.70): clamp a telemetry score into the [0, 1] contract.
+
+    Hybrid-fusion / BM25 paths can emit an UNBOUNDED ``score`` (observed max
+    10.37 from the unnormalized ``mcp_interactive`` combiner). Such values
+    leaked into ``rl_events`` and then ``compute_unified_targets`` clamped
+    >1 → 1.0, silently mis-marking the node as max-cited. Normalizing/clamping
+    at the WRITER boundary (here) stops NEW poison at the source rather than
+    relying on a downstream clamp the offline trainer may not apply. A
+    non-numeric score degrades to 0.0 (soft-fail — telemetry never raises).
+    """
+    try:
+        s = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if s != s:  # NaN
+        return 0.0
+    if s < 0.0:
+        return 0.0
+    if s > 1.0:
+        return 1.0
+    return s
 
 
 def _build_log_nodes(
@@ -376,6 +436,10 @@ def _build_log_nodes(
     retrieval-event payload uses (``n_emb`` for unified-target training,
     ``linked_embs`` / ``linked_type_names`` for graph context,
     ``cos_*`` for similarity diagnostics).
+
+    F-E (v0.2.70): the stored ``score`` is clamped to [0, 1] at this writer
+    boundary (see ``_clamp_unit_score``) so unbounded hybrid-fusion values
+    never reach ``rl_events`` / the training-target formula.
     """
     out: list[dict[str, Any]] = []
     for idx, n in enumerate(candidates):
@@ -383,7 +447,7 @@ def _build_log_nodes(
             continue
         rec: dict[str, Any] = {
             "title": n.get("title", ""),
-            "score": n.get("score", 0.0),
+            "score": _clamp_unit_score(n.get("score", 0.0)),
             "tier": "top_k" if idx < limit else "extra_reference",
         }
         if n.get("emb"):
@@ -409,6 +473,8 @@ def _build_log_nodes(
         # consumes both: fused score for ranking supervision, raw
         # cosine for embedding-quality drift detection.
         if n.get("score_cosine") is not None:
-            rec["score_cosine"] = n["score_cosine"]
+            # score_cosine = 1 - distance, normally bounded [0,1]; clamp
+            # defensively (a negative Weaviate distance would push it >1).
+            rec["score_cosine"] = _clamp_unit_score(n["score_cosine"])
         out.append(rec)
     return out

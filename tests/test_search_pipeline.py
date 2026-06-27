@@ -333,3 +333,46 @@ def test_rerank_result_is_frozen():
     )
     with pytest.raises((AttributeError, Exception)):
         result.task_id = "mutated"
+
+
+# ----------------------------------------------------------------------
+# 7. F-E (v0.2.70) — score normalization at the writer boundary.
+#    Unbounded hybrid-fusion scores (observed max 10.37) must be clamped to
+#    [0, 1] before they reach rl_events, NOT relied on a downstream clamp.
+# ----------------------------------------------------------------------
+
+
+def test_clamp_unit_score_clamps_above_one():
+    assert search_pipeline._clamp_unit_score(10.37) == 1.0
+    assert search_pipeline._clamp_unit_score(1.0001) == 1.0
+
+
+def test_clamp_unit_score_clamps_below_zero():
+    assert search_pipeline._clamp_unit_score(-0.5) == 0.0
+
+
+def test_clamp_unit_score_passes_through_unit_interval():
+    assert search_pipeline._clamp_unit_score(0.0) == 0.0
+    assert search_pipeline._clamp_unit_score(0.5) == 0.5
+    assert search_pipeline._clamp_unit_score(1.0) == 1.0
+
+
+def test_clamp_unit_score_soft_fails_non_numeric():
+    assert search_pipeline._clamp_unit_score("bad") == 0.0
+    assert search_pipeline._clamp_unit_score(None) == 0.0
+    assert search_pipeline._clamp_unit_score(float("nan")) == 0.0
+
+
+def test_build_log_nodes_clamps_over_one_score_at_writer_boundary():
+    # A node arrives with an unbounded fusion score (the mcp_interactive bug).
+    # The reducer that writes telemetry MUST clamp it to 1.0 before it lands in
+    # rl_events — stopping NEW poison at the source.
+    candidates = [
+        {"title": "Hot", "score": 10.37, "score_cosine": 0.8},
+        {"title": "Cold", "score": 0.3},
+    ]
+    out = search_pipeline._build_log_nodes(candidates, limit=5)
+    by_title = {n["title"]: n for n in out}
+    assert by_title["Hot"]["score"] == 1.0       # clamped from 10.37
+    assert by_title["Cold"]["score"] == 0.3       # untouched in-range
+    assert by_title["Hot"]["score_cosine"] == 0.8  # already bounded

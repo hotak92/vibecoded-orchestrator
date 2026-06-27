@@ -216,13 +216,16 @@ docs/ADMIN_LICENSE.md
 # convenience. Explicit gitignore so `git add -A` or a stray
 # subagent commit can't accidentally publish them.
 #
-# `rl_kg_search.py` (a thin client that CALLS the RL server) is the
-# only RL-named file legitimately tracked — it's a consumer, not
-# the model/training IP. Negate it explicitly so the broader
-# pattern doesn't catch it.
+# `rl_kg_search.py` (a thin client that CALLS the RL server) and
+# `rl_drain_citations.py` (the v0.2.70 turn-end deferred-citation drain,
+# invoked by the Stop hook) are orchestrator-side CONSUMERS — they call the
+# shared rl_client modules + the existing hub event route, not the model/
+# training IP. Negate them explicitly so the broader pattern doesn't catch
+# them.
 claude_mcp_servers/rl_server/
 claude_mcp_servers/scripts/rl_*.py
 !claude_mcp_servers/scripts/rl_kg_search.py
+!claude_mcp_servers/scripts/rl_drain_citations.py
 
 # Developer-local one-off migration scripts. These run outside the
 # launcher and may carry user-specific assumptions; not bundled.
