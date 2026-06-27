@@ -53,10 +53,17 @@ pub fn router(db: Db) -> Router {
 // ---------------------------------------------------------------------------
 
 async fn health() -> impl IntoResponse {
+    // v0.2.69 (hub-staleness home #3): expose the build fingerprint
+    // alongside `version`. The compile-time workspace `version` is blind to
+    // same-version-but-different-code builds; `build_fingerprint` carries a
+    // git short-SHA (when baked by build.rs) so staleness is detectable
+    // across same-version builds. `null` when no git SHA was available at
+    // compile time (released tarball / CI without a checkout).
     Json(serde_json::json!({
         "status": "ok",
         "service": "vct-hub",
         "version": env!("CARGO_PKG_VERSION"),
+        "build_fingerprint": crate::identity::build_fingerprint(),
     }))
 }
 

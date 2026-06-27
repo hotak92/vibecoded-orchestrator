@@ -3301,7 +3301,11 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
             ));
         }
     };
-    let pid: u32 = match pid_raw.trim().parse() {
+    // v0.2.69: the lockfile's FIRST line is the PID; later lines hold the
+    // build-identity field (home #3). Parse line 1 only so a 2-line
+    // lockfile is not mistaken for malformed. Matches hub_status.rs and
+    // lockfile.rs::read_pid which already read line 1.
+    let pid: u32 = match pid_raw.lines().next().unwrap_or("").trim().parse() {
         Ok(p) => p,
         Err(_) => {
             // Malformed lockfile — treat as "no hub running" and clean
@@ -3309,7 +3313,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
             eprintln!(
                 "[vct] update_orchestrator: {} contains malformed PID {:?}; removing stale lockfile",
                 pid_file.display(),
-                pid_raw.trim(),
+                pid_raw.lines().next().unwrap_or("").trim(),
             );
             let _ = std::fs::remove_file(&pid_file);
             return Ok(false);
@@ -16182,6 +16186,49 @@ MemAvailable:   23456789 kB
                     "stale dead pid → Ok(false), got {:?}", result);
                 assert!(!pid_file.exists(),
                     "stale hub.pid for dead pid should be cleaned up");
+            });
+        }
+
+        #[test]
+        fn ensure_hub_stopped_reads_pid_from_two_line_lockfile() {
+            // v0.2.69: the lockfile gained a 2nd line (the build identity).
+            // The stop path must still read the PID from line 1 and NOT
+            // mistake the 2-line file for malformed. Seed a 2-line file with
+            // a provably-dead pid: it should be treated as a stale lockfile
+            // (Ok(false) + cleaned up), exactly like the single-line dead
+            // case — proving the 2nd line is tolerated.
+            with_vct_state_dir(|root| {
+                #[cfg(unix)]
+                let mut child = std::process::Command::new("true").silent()
+                    .spawn()
+                    .expect("spawn true");
+                #[cfg(windows)]
+                let mut child = std::process::Command::new("cmd").silent()
+                    .args(["/c", "exit"])
+                    .spawn()
+                    .expect("spawn cmd /c exit");
+                let dead_pid = child.id();
+                let _ = child.wait();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+
+                let pid_file = root.join("hub.pid");
+                // Two-line v0.2.69 format: pid on line 1, identity on line 2.
+                std::fs::write(
+                    &pid_file,
+                    format!("{}\n0.2.69+deadbeef1234\n", dead_pid),
+                )
+                .unwrap();
+                assert!(pid_file.exists());
+
+                let install_path = root.join("install");
+                std::fs::create_dir_all(&install_path).unwrap();
+
+                let result = ensure_hub_stopped_for_update(&install_path);
+                assert!(matches!(result, Ok(false)),
+                    "2-line lockfile with dead pid → Ok(false) (not malformed), got {:?}",
+                    result);
+                assert!(!pid_file.exists(),
+                    "stale 2-line hub.pid for dead pid should be cleaned up");
             });
         }
 
