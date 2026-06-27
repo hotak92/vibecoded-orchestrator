@@ -176,6 +176,62 @@ def get_orchestrator_root_bindings() -> Tuple[Optional[str], Optional[str]]:
 #: MUST stay in sync with the Rust constant cited above.
 APP_STATE_KEY_ACTIVE_EMBEDDING = "embedding.active_profile"
 
+#: Canonical app_state key for the hardware-selected default TEXT model id.
+#: Written by install.py's preset seeding + the launcher Identity-tab
+#: chooser (``set_text_embedding_and_profile``). Mirror constant:
+#:   launcher/src-tauri/src/commands/openai_cmd.rs
+#:     ::APP_STATE_DEFAULT_TEXT_EMBED (canonical string: "default_text_embedding")
+APP_STATE_KEY_DEFAULT_TEXT_EMBED = "default_text_embedding"
+
+#: TEXT model id → ACTIVE_EMBEDDING named-vector slot ("profile").
+#:
+#: MUST match (and is the importable shared home for what was previously
+#: re-listed in) ``install.py::_TEXT_MODEL_ACTIVE_EMBEDDING`` and the Rust
+#: mirror ``project_env_settings.rs::active_profile_for_model``. A model
+#: id with no entry here maps to ``None`` (see ``profile_for_text_model``)
+#: — conservative: never stamp a guessed profile, because the wrong slot
+#: indexes the KG against the wrong vector (the 2026-04-30 vector-audit
+#: bug class). Drift between these three re-introduces v0.2.68 Defect D.
+_TEXT_MODEL_ACTIVE_EMBEDDING = {
+    "qwen3-embedding:0.6b": "qwen3",
+    "snowflake-arctic-embed2:latest": "arctic",
+    "openai-text-embedding-3-small": "openai",
+    "text-embedding-3-small": "openai",
+}
+
+
+def profile_for_text_model(model_id: str | None) -> Optional[str]:
+    """Map a TEXT embedding model id to its ACTIVE_EMBEDDING profile.
+
+    Returns ``None`` for an unknown / empty / ``None`` model id — callers
+    MUST treat ``None`` as "leave the active-embedding value at its prior
+    fallback (qwen3)" rather than stamping a guessed profile.
+
+    Mirror of the Rust ``active_profile_for_model`` (lockstep via the
+    must-match comment on ``_TEXT_MODEL_ACTIVE_EMBEDDING`` above).
+    """
+    if not model_id:
+        return None
+    return _TEXT_MODEL_ACTIVE_EMBEDDING.get(model_id.strip())
+
+
+def read_app_state_default_text_embedding() -> Optional[str]:
+    """Return the hardware-selected default TEXT model id, or ``None``.
+
+    Reads ``app_state[default_text_embedding]`` (raw string, not JSON —
+    the launcher's ``app_state_set`` stores values verbatim). This is the
+    hardware pick (e.g. ``snowflake-arctic-embed2:latest`` on an arctic
+    host) that callers map to a profile via :func:`profile_for_text_model`
+    when the canonical ``embedding.active_profile`` key is unset.
+
+    Soft-fail: ``None`` when launcher.db is absent / key unset / empty.
+    """
+    raw = read_app_state_value(APP_STATE_KEY_DEFAULT_TEXT_EMBED)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None
+
 
 def read_app_state_value(key: str) -> Optional[str]:
     """Read a single ``app_state`` key from launcher.db (read-only).

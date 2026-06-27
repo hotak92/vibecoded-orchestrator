@@ -258,6 +258,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, TypedDict
 
 from vco_lib.atomic import atomic_write_text
+from vco_lib.launcher_db_reader import (
+    APP_STATE_KEY_DEFAULT_TEXT_EMBED,
+    profile_for_text_model,
+)
 
 
 
@@ -762,6 +766,62 @@ def _fetch_module_setting_str(
     except (json.JSONDecodeError, TypeError):
         return default
     return str(v) if isinstance(v, str) else default
+
+
+def _fetch_module_setting_str_opt(
+    conn: sqlite3.Connection,
+    project_id: str,
+    module_id: str,
+    setting_key: str,
+) -> Optional[str]:
+    """Like :func:`_fetch_module_setting_str` but distinguishes absence.
+
+    Returns ``None`` when the row is missing (or stores a non-string /
+    unparseable JSON value), and the decoded string otherwise. Callers
+    that must tell "row absent" apart from "row present == some default"
+    use this rather than the ``default``-collapsing variant above.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT setting_value FROM module_settings "
+        "WHERE project_id = ? AND module_id = ? AND setting_key = ?",
+        (project_id, module_id, setting_key),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        v = json.loads(row["setting_value"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return v if isinstance(v, str) else None
+
+
+def _fetch_app_state_str(
+    conn: sqlite3.Connection,
+    key: str,
+) -> Optional[str]:
+    """Read a raw string value from the launcher's ``app_state`` table.
+
+    The ``app_state.value`` column stores values verbatim (NOT JSON —
+    the Rust ``app_state_set`` writes the string directly), so this reads
+    the column as-is rather than ``json.loads``-ing it. Returns ``None``
+    when the table is absent (fresh install never booted), the key is
+    missing, or any SQLite error occurs (soft-fail).
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM app_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    raw = row["value"]
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None
 
 
 def _fetch_kg_bindings(
@@ -1370,10 +1430,36 @@ def project_env_from_db(
         if active_embedding_override is not None:
             active_embedding = active_embedding_override
         else:
-            active_embedding = _fetch_module_setting_str(
-                conn, project_id, "orchestrator-core",
-                "active_embedding", default="qwen3",
+            # v0.2.69 FIX 1 (Defect D add-path gap): this is the
+            # LOAD-BEARING ACTIVE_EMBEDDING writer — the value here is what
+            # lands in .claude/{settings.json,env} (the Rust populate() value
+            # does NOT reach those canonical surfaces). The per-project
+            # `module_settings/active_embedding` row was hardcoded to "qwen3"
+            # by project_backfill.rs for every project, so a fresh add on an
+            # arctic host wrote ACTIVE_EMBEDDING=qwen3 and broke the
+            # arctic-trained RL reranker.
+            #
+            # When the row is ABSENT or still the legacy default "qwen3",
+            # fall back to the machine's hardware pick
+            # (app_state[default_text_embedding]) mapped to its profile,
+            # BEFORE defaulting to qwen3. Mirror of project_backfill.rs's
+            # seed-derive + default-value reconcile and the Rust populate()
+            # canonical-key-empty fallback (option c, both languages).
+            #
+            # GUARD: an unmapped/absent hardware pick → stay qwen3. Never
+            # stamp a guessed profile (wrong vector slot). An explicit
+            # non-qwen3 user pick already in the row (e.g. "openai") is left
+            # untouched — only the absent / legacy-"qwen3" value derives.
+            stored_active = _fetch_module_setting_str_opt(
+                conn, project_id, "orchestrator-core", "active_embedding",
             )
+            if stored_active is None or stored_active == "qwen3":
+                derived = profile_for_text_model(
+                    _fetch_app_state_str(conn, APP_STATE_KEY_DEFAULT_TEXT_EMBED)
+                )
+                active_embedding = derived if derived is not None else "qwen3"
+            else:
+                active_embedding = stored_active
     finally:
         try:
             conn.close()
