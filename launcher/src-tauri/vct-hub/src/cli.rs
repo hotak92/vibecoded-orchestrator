@@ -18,10 +18,19 @@
 //!   vct-hub --status                   → report Running(pid) / NotRunning /
 //!                                        Stale(pid) on stdout
 //!
-//! Future Step 11 sub-commands (`--register-boot`, `--unregister-boot`,
-//! `--boot-status`) are stubbed here as `Unimplemented` so the
-//! Step 8 install.py can probe whether the binary supports them
-//! (exit code 64 = EX_USAGE per BSD sysexits) without crashing.
+//!   vct-hub --register-boot           → register OS boot-time auto-start
+//!                                        (systemd-user unit on Linux,
+//!                                        launchd LaunchAgent on macOS,
+//!                                        Scheduled Task on Windows) and
+//!                                        enable+start it; idempotent
+//!   vct-hub --unregister-boot          → remove the OS boot-time
+//!                                        auto-start unit; idempotent
+//!   vct-hub --boot-status              → report the boot autostart state
+//!                                        (enabled / disabled / not-installed)
+//!
+//! The boot sub-commands dispatch to `boot::run_*` (see `boot.rs`), which
+//! renders + writes the per-OS init artifact. Boot autostart is DEFAULT-OFF
+//! in v0.2.21 — the user opts in via the launcher GUI Preferences.
 
 use std::env;
 
@@ -40,11 +49,13 @@ pub enum Command {
     /// `--status`. Print one line (`running pid=<N>` / `not-running` /
     /// `stale pid=<N>`) on stdout and exit with a corresponding code.
     Status,
-    /// `--register-boot`. Reserved for Step 11.
+    /// `--register-boot`. Register OS boot-time auto-start (systemd-user
+    /// unit / launchd LaunchAgent / Windows Scheduled Task) and start it.
     RegisterBoot,
-    /// `--unregister-boot`. Reserved for Step 11.
+    /// `--unregister-boot`. Remove the OS boot-time auto-start unit.
     UnregisterBoot,
-    /// `--boot-status`. Reserved for Step 11.
+    /// `--boot-status`. Report whether boot autostart is
+    /// enabled / disabled / not-installed.
     BootStatus,
     /// `--help` / `-h`. Print usage on stdout and exit 0.
     Help,
@@ -101,10 +112,17 @@ Usage:
   vct-hub --status             Print Running/NotRunning/Stale on stdout.
                                Exits 0 if running, 1 if not running,
                                2 if stale (pid file present but owner dead).
-  vct-hub --register-boot      (Step 11 placeholder) Register boot-time
-                               auto-start with the OS. Currently exits 64.
-  vct-hub --unregister-boot    (Step 11 placeholder) Currently exits 64.
-  vct-hub --boot-status        (Step 11 placeholder) Currently exits 64.
+  vct-hub --register-boot      Register OS boot-time auto-start (systemd
+                               user unit on Linux, launchd LaunchAgent on
+                               macOS, Scheduled Task on Windows) and start
+                               it now. Idempotent. Exits 0 on success, 1 on
+                               error. Boot autostart is default-off; the
+                               launcher GUI Preferences opts you in.
+  vct-hub --unregister-boot    Remove the OS boot-time auto-start unit.
+                               Idempotent. Exits 0 on success, 1 on error.
+  vct-hub --boot-status        Print the boot autostart state on stdout.
+                               Exits 0 enabled, 1 disabled, 2 not-installed,
+                               3 inspection error.
   vct-hub --help               Show this banner.
 
 Environment:

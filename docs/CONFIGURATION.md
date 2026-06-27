@@ -219,7 +219,7 @@ When `VCT_STATE_DIR` is non-default, boot registration prints a warning — the 
 | `GET /api/v1/health` | Liveness probe | No auth required. (Corrected v0.2.54, live-verified: the bare `/health` path does NOT exist — it hits the auth layer and returns 401, not a liveness answer.) |
 | `GET /api/v1/projects/{id-or-slug}/config` | Resolver: KG collection, codegraph prefix, embedding selections, access-matrix lists, service URLs | Accepts UUID or slug as the `{id}` path arg (try-UUID-then-slug fallback). Replaces per-process `os.getenv("KG_COLLECTION")` etc. drift. Returns 503 when primary KG binding is missing (caller-actionable). |
 | `GET /api/v1/projects/{id}/env?key=<slot>` | Secrets resolver | Resolves via per-project keychain row first; falls back to SENTINEL_SHARED + `module_id=user` for shared slots declared in `vct-module.json::bundled_secrets[]`. |
-| `GET /api/v1/services/status` | Services snapshot | v0.2.21: returns a degraded skeleton. Supervisor relocation to hub (Step 24 Stream B) brought the full snapshot back. |
+| `GET /api/v1/services/status` | Services snapshot | v0.2.21 returns a degraded skeleton (`degraded: true`, no per-service runtime). Full supervisor relocation to the hub (Step 24 Stream B) lands later; until then the `/services/{start,stop,restart}` routes return `501 not_implemented`. |
 | `GET /api/v1/projects/by-path?path=<abs-path>` | Path → project UUID | Used by resolver clients before fetching `/config`. Returns 404 with `project_not_found` when the path isn't registered. |
 
 **Resolver clients** discover the hub via the same chain:
