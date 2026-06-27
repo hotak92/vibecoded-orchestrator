@@ -6664,6 +6664,11 @@ def main() -> int:
             _deploy_and_start_vct_hub(
                 PROJECT_ROOT,
                 deferral_report=_deferral_report,
+                # v0.2.69 hub-staleness home #2: on a manual --update the
+                # GUI did not stop the hub first, so stop the running hub
+                # before the binary swap. A fresh install has no prior
+                # hub to swap → leave the idempotent start untouched.
+                stop_running_first=bool(getattr(args, "update", False)),
             )
         except Exception as exc:  # noqa: BLE001 — soft-fail by design
             _log_install_event(
@@ -21678,20 +21683,210 @@ def _wait_for_vct_hub_health(deadline_seconds: float = 10.0) -> bool:
     return False
 
 
+def _hub_pid_from_lockfile() -> Optional[int]:
+    """Read the PID recorded in ``vct_root_dir()/hub.pid``, if any.
+
+    The lockfile's FIRST line is the integer PID (the format the hub's
+    own ``lockfile.rs`` writes). Any trailing lines a future format may
+    add are ignored. Returns None when the file is missing, empty, or
+    the first line is not a positive integer.
+    """
+    from vco_lib.paths import vct_root_dir
+    pid_file = vct_root_dir() / "hub.pid"
+    try:
+        raw = pid_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    first = raw.splitlines()[0].strip() if raw.splitlines() else ""
+    if not first.isdigit():
+        return None
+    pid = int(first)
+    return pid if pid > 0 else None
+
+
+def _force_kill_pid(pid: int) -> bool:
+    """Force-terminate ``pid`` cross-OS. Returns True if the process is
+    gone afterwards (or was already gone), False if it survived.
+
+    POSIX: SIGKILL. Windows: OpenProcess(PROCESS_TERMINATE) +
+    TerminateProcess. Both treat "already gone" as success. Best-effort:
+    any FFI/permission error that leaves the process alive returns False
+    so the caller can soft-fail rather than proceed with a live hub.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            PROCESS_TERMINATE = 0x0001
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if not handle:
+                # NULL handle: likely already gone (or access denied).
+                return not _pid_is_alive_for_deferral(pid)
+            try:
+                ok = kernel32.TerminateProcess(handle, 1)
+                if not ok:
+                    return not _pid_is_alive_for_deferral(pid)
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:  # noqa: BLE001 — soft-fail
+            return not _pid_is_alive_for_deferral(pid)
+    else:
+        # signal.SIGKILL only exists on POSIX; import locally so a
+        # Windows interpreter (which takes the branch above) never
+        # touches the missing attribute.
+        import signal as _signal
+        try:
+            os.kill(pid, _signal.SIGKILL)
+        except ProcessLookupError:
+            return True  # already gone — success
+        except OSError:
+            return not _pid_is_alive_for_deferral(pid)
+    # Brief grace window for the kernel to reap.
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if not _pid_is_alive_for_deferral(pid):
+            return True
+        time.sleep(0.05)
+    return not _pid_is_alive_for_deferral(pid)
+
+
+def _stop_running_vct_hub_for_update(binary: Optional[Path]) -> bool:
+    """Stop any vct-hub recorded in ``hub.pid`` so the post-deploy
+    ``--start-if-not-running`` brings up the freshly-installed binary.
+
+    This is the install.py mirror of the launcher GUI's
+    ``ensure_hub_stopped_for_update`` (``installer.rs``). The GUI's
+    ``update_orchestrator`` stops the hub BEFORE invoking install.py, so
+    the GUI path already lands with the hub down. A MANUAL
+    ``python install.py --update`` has no such caller — without this
+    step the OLD hub stays alive, ``--start-if-not-running`` sees a live
+    lockfile and no-ops, and the stale binary keeps serving (the gap
+    documented in the v0.2.63 hub-staleness note as "remaining home #2").
+
+    Sequence (mirrors the Rust flow):
+      1. No lockfile / dead PID  → nothing to stop; clean a stale file.
+      2. Live PID                → polite ``<binary> --stop`` (lockfile-
+         driven; the new binary's --stop signals whatever PID owns the
+         lockfile), poll up to 10 s.
+      3. Still alive             → escalate to SIGKILL / TerminateProcess.
+      4. Clean the lockfile so step 8c's start sees a clean slate.
+
+    Returns True when a running hub was stopped, False when none was
+    running. Soft-fail: any unexpected error degrades to "leave the hub
+    to the idempotent start" rather than aborting the update.
+    """
+    from vco_lib.paths import vct_root_dir
+    pid_file = vct_root_dir() / "hub.pid"
+
+    pid = _hub_pid_from_lockfile()
+    if pid is None:
+        # Missing or malformed lockfile. Remove a malformed file so the
+        # idempotent start does not choke on it; a missing file is a
+        # no-op.
+        try:
+            if pid_file.is_file():
+                pid_file.unlink()
+        except OSError:
+            pass
+        return False
+
+    if not _pid_is_alive_for_deferral(pid):
+        # Stale lockfile from a prior crash. Clean it so 8c's start does
+        # not believe a hub is already running.
+        print(f"  vct-hub lockfile claims pid {pid} but it is dead; "
+              "removing stale lockfile.")
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        return False
+
+    print(f"  vct-hub running (pid {pid}); stopping it before binary "
+          "swap so the new build takes over.")
+
+    # Polite stop first, via the resolved binary. Lockfile-driven: the
+    # binary signals whatever PID owns hub.pid, so the freshly-deployed
+    # binary correctly stops the old process. Soft-fail to the signal
+    # path on any error.
+    if binary is not None and binary.is_file():
+        try:
+            subprocess.run(
+                [str(binary), "--stop"],
+                timeout=15,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            print(f"  vct-hub --stop could not run ({exc}); will signal "
+                  "the pid directly.")
+    else:
+        print("  vct-hub binary unavailable for polite --stop; will "
+              "signal the pid directly.")
+
+    # Poll up to 10 s for the pid to die (the --stop CLI itself already
+    # polls up to 10 s, so by here it is almost certainly gone).
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if not _pid_is_alive_for_deferral(pid):
+            try:
+                if pid_file.is_file():
+                    pid_file.unlink()
+            except OSError:
+                pass
+            print(f"  vct-hub pid {pid} stopped gracefully.")
+            return True
+        time.sleep(0.1)
+
+    # Escalate. A surviving hub would let 8c no-op on the OLD binary,
+    # which is exactly the staleness we are fixing. Soft-fail: if the
+    # force-kill cannot confirm the pid is gone, leave the lockfile and
+    # let the idempotent start no-op (no worse than pre-fix behaviour).
+    print(f"  vct-hub pid {pid} did not exit within 10 s; escalating to "
+          "force-kill.")
+    if _force_kill_pid(pid):
+        try:
+            if pid_file.is_file():
+                pid_file.unlink()
+        except OSError:
+            pass
+        print(f"  vct-hub pid {pid} force-stopped.")
+        return True
+
+    print(f"  WARNING: vct-hub pid {pid} survived force-kill; the new "
+          "binary may not take over until the old hub exits. Restart the "
+          "launcher or run `vct-hub --stop` manually.")
+    return False
+
+
 def _deploy_and_start_vct_hub(
     install_root: Path,
     *,
     deferral_report: Optional["DeferralReport"] = None,
+    stop_running_first: bool = False,
 ) -> None:
     """v0.2.21 Step 8 entry point: deploy vct-hub, then start it
     idempotently with the cutover sentinel in place.
 
     Sequence:
       8a. Resolve binary via :func:`_ensure_vct_hub_binary` (tier 1/2/3).
+      8a'. (update only) Stop any running hub so the new binary swaps in.
       8b. Write the cutover sentinel BEFORE starting the hub.
       8c. Invoke ``vct-hub --start-if-not-running`` (idempotent).
       8c'. Poll /health for up to 10 s.
       8b'. Delete the sentinel after /health responds.
+
+    ``stop_running_first`` (v0.2.69, hub-staleness home #2): on a MANUAL
+    ``python install.py --update`` there is no launcher GUI to stop the
+    hub before the binary swap, so an OLD hub would stay alive and
+    ``--start-if-not-running`` (liveness-only) would no-op on the stale
+    process. When set, step 8a' stops the running hub (mirroring the
+    GUI's ``ensure_hub_stopped_for_update``) so step 8c brings up the
+    freshly-deployed binary. A fresh install passes False — there is no
+    prior hub to swap.
 
     Soft-fail throughout: a missing/broken binary, a failed start, or
     a non-responsive /health endpoint all degrade gracefully — the
@@ -21766,6 +21961,31 @@ def _deploy_and_start_vct_hub(
         data={"binary_path": str(binary)},
     )
 
+    # 8a'. (update only) Stop any running hub BEFORE the start below, so
+    # the freshly-deployed binary takes over. On a manual update there is
+    # no launcher GUI to have stopped it first; without this, the OLD hub
+    # stays alive, step 8c's `--start-if-not-running` no-ops on the live
+    # lockfile, and the stale binary keeps serving (hub-staleness home #2).
+    if stop_running_first:
+        print(
+            "[8/10] Stopping any running vct-hub before binary swap ... ",
+            flush=True,
+        )
+        try:
+            stopped = _stop_running_vct_hub_for_update(binary)
+            _log_install_event(
+                "8/10", "info",
+                ("stopped running vct-hub before swap"
+                 if stopped else "no running vct-hub to stop before swap"),
+                data={"stopped": stopped},
+            )
+        except Exception as exc:  # noqa: BLE001 — soft-fail by design
+            _log_install_event(
+                "8/10", "warn",
+                f"pre-swap hub stop raised: {exc}; "
+                "falling through to idempotent start",
+            )
+
     # 8b. Write the cutover sentinel BEFORE starting the hub.
     sentinel_path = _write_vct_hub_cutover_sentinel()
     if sentinel_path is not None:
@@ -21803,6 +22023,16 @@ def _deploy_and_start_vct_hub(
         )
     else:
         run_kwargs["capture_output"] = True
+    # Pin the install clone as the hub's orchestrator/install root so the
+    # restarted hub's watchdog resolves infrastructure_dir() to THIS
+    # clone (the one we just updated), not whichever clone happened to be
+    # the old hub's PWD. Mirrors the v0.2.63 hub-staleness manual-fix
+    # recipe (VCT_ORCHESTRATOR_ROOT/VCT_INSTALL_ROOT pinned to the
+    # install dir). The hub inherits these via the spawned child's env.
+    hub_env = os.environ.copy()
+    hub_env["VCT_ORCHESTRATOR_ROOT"] = str(install_root.resolve())
+    hub_env["VCT_INSTALL_ROOT"] = str(install_root.resolve())
+    run_kwargs["env"] = hub_env
     try:
         proc = subprocess.run(
             [str(binary), "--start-if-not-running"],

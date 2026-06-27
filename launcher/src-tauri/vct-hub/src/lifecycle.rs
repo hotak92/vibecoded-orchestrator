@@ -40,14 +40,57 @@ pub enum LifecycleResult {
 pub fn start_if_not_running() -> LifecycleResult {
     if let Some(pid) = lockfile::read_pid() {
         if pid_is_alive(pid) {
-            eprintln!("[vct-hub] already running (pid {}); nothing to do", pid);
-            return LifecycleResult::Ok;
+            // v0.2.69 (hub-staleness home #3): liveness alone is not
+            // enough — a live hub may be a STALE or FOREIGN binary (a
+            // leftover dev build, or an older build a manual
+            // `install.py --update` left running). Identity-check it via
+            // the ported `running_hub_is_stale` (Linux: /proc/<pid>/exe
+            // inode vs ours; elsewhere: recorded build fingerprint).
+            let recorded = lockfile::read_identity();
+            if lockfile::running_hub_is_stale(pid, recorded.as_deref()) {
+                eprintln!(
+                    "[vct-hub] running hub (pid {}, identity {}) is a stale or \
+                     foreign binary; stopping it so the current binary takes over",
+                    pid,
+                    recorded.as_deref().unwrap_or("unknown"),
+                );
+                // Reuse the graceful stop path (signals the pid in the
+                // lockfile, polls up to 10s, escalates, releases the
+                // lockfile). Soft-fail: if the stop did not free the
+                // lockfile, fall through — the spawn below would no-op on
+                // the old hub, no worse than pre-v0.2.69.
+                match stop() {
+                    LifecycleResult::Ok => {}
+                    other => {
+                        eprintln!(
+                            "[vct-hub] could not stop the stale hub ({:?}); the \
+                             current binary may not take over until it exits",
+                            other
+                        );
+                        // If the lockfile is still held by a live owner, do
+                        // NOT spawn a duplicate — report no-op.
+                        if let Some(still) = lockfile::read_pid() {
+                            if pid_is_alive(still) {
+                                return LifecycleResult::Ok;
+                            }
+                        }
+                    }
+                }
+                // Stale hub gone (or lockfile freed) — fall through to spawn.
+            } else {
+                eprintln!(
+                    "[vct-hub] already running (pid {}); current binary; nothing to do",
+                    pid
+                );
+                return LifecycleResult::Ok;
+            }
+        } else {
+            eprintln!(
+                "[vct-hub] stale lockfile (pid {} is dead); cleaning up",
+                pid
+            );
+            let _ = lockfile::release();
         }
-        eprintln!(
-            "[vct-hub] stale lockfile (pid {} is dead); cleaning up",
-            pid
-        );
-        let _ = lockfile::release();
     }
 
     let exe = match std::env::current_exe() {
@@ -240,6 +283,22 @@ pub fn try_acquire_or_exit() -> Result<(), LifecycleResult> {
                 pid
             )))
         }
+        // v0.2.69: the foreground daemon does NOT auto-kill a stale hub —
+        // that is the `--start-if-not-running` wrapper's job (it stops the
+        // stale hub then spawns a fresh foreground child). A bare
+        // `vct-hub` / `--foreground` over a stale-but-live hub refuses with
+        // a clear message so a human stays in control of the kill.
+        Ok(AcquireOutcome::StaleVersion {
+            pid,
+            recorded_identity,
+        }) => Err(LifecycleResult::Err(format!(
+            "a different (stale or foreign) vct-hub is running (pid {}, identity {}); \
+             refusing to start a foreground hub over it. Run \
+             `vct-hub --start-if-not-running` to stop it and swap in this binary, \
+             or `vct-hub --stop` first.",
+            pid,
+            recorded_identity.as_deref().unwrap_or("unknown"),
+        ))),
         Err(e) => Err(LifecycleResult::Err(format!(
             "failed to acquire lockfile: {}",
             e
@@ -306,4 +365,47 @@ mod tests {
             }
         });
     }
+
+    // v0.2.69: the foreground daemon refuses to start over ANY live hub —
+    // a same-binary one (AlreadyRunning) or a stale/foreign one
+    // (StaleVersion). Both must map to an Err so the daemon never
+    // double-binds. Our own live pid running our own exe is the
+    // AlreadyRunning case; the stale-mapping arm is exercised structurally
+    // by the lockfile decision-matrix tests.
+    #[test]
+    fn try_acquire_or_exit_refuses_over_own_live_hub() {
+        with_state_dir(|_root| {
+            lockfile::write_pid(std::process::id()).unwrap();
+            match try_acquire_or_exit() {
+                Err(LifecycleResult::Err(msg)) => {
+                    assert!(
+                        msg.contains("already running") || msg.contains("stale"),
+                        "refusal message should explain why: {}",
+                        msg
+                    );
+                }
+                other => panic!(
+                    "foreground must refuse over a live hub; got {:?}",
+                    other
+                ),
+            }
+        });
+    }
+
+    #[test]
+    fn try_acquire_or_exit_claims_when_no_hub() {
+        with_state_dir(|_root| {
+            match try_acquire_or_exit() {
+                Ok(()) => {}
+                other => panic!("expected Ok(()) on a clean state dir; got {:?}", other),
+            }
+        });
+    }
+
+    // NOTE: `start_if_not_running` is NOT unit-tested here because its
+    // success path spawns a detached child of `current_exe()` — under
+    // `cargo test` that is the test binary, so a unit test would fork a
+    // stray process. The CLI dispatch + spawn is covered by the process-
+    // level smoke test (Step 23) and the lockfile decision-matrix tests
+    // exercise the stale/fresh branching it relies on.
 }
