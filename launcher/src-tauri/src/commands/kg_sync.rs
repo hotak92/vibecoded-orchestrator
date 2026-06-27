@@ -481,19 +481,38 @@ impl ProgressCounts {
 /// Default stall-watchdog timeout in seconds. Used when
 /// `KG_SYNC_STALL_TIMEOUT_SECS` is unset or unparsable.
 ///
-/// 300 s (5 min) is conservative for the slowest path we've seen in
-/// practice: an Ollama node embedding a single ~8 KB body on a CPU-only
-/// machine under heavy load takes ~30-60 s. A KG node that ingests a long
-/// PDF appendix can produce ~6-10 embedding batches each at that latency,
-/// so a full file with no intermediate stdout could plausibly take a few
-/// minutes between progress lines. 300 s gives substantial headroom over
-/// observed worst-case while still bounding the wedge-recovery window —
-/// far better than the unbounded hangs that motivated the 2026-05-12 fix.
-/// Override via env if hardware/network is unusually slow.
-const DEFAULT_STALL_TIMEOUT_SECS: u64 = 300;
+/// v0.2.69 FIX 3 (review SHOULD-FIX, re-instated as a PROGRESS guard):
+/// this is NOT a per-process / per-node duration cap — the maintainer
+/// ruled out those for the seed path because a legitimate slow-CPU
+/// arctic re-embed can run for hours. This watchdog instead bounds
+/// SILENCE: it re-arms (resets its deadline) on EVERY line the child
+/// emits on stdout or stderr, and fires ONLY after this many seconds of
+/// ZERO output. A slow-but-progressing seed that keeps printing
+/// per-chunk / per-node progress lines NEVER trips it, regardless of
+/// total runtime. It exists to recover the OTHER wedge the per-embed-
+/// request guard (`VCT_EMBED_REQUEST_TIMEOUT_SECS`, 180 s) does NOT
+/// cover: `sync_knowledge_graph.py` also does non-embed Weaviate work
+/// (`connect_to_custom`, schema ensure, `collection.data.insert`) with
+/// no timeout of its own, so a silent network/Weaviate deadlock on the
+/// launcher background path would otherwise hang forever.
+///
+/// Default = max(900, 4 × the 180 s per-embed-request guard) = 900 s.
+/// The 4× headroom over the per-request guard means a single embed
+/// request that stalls right up to its own 180 s cap (then fails and
+/// surfaces a line) cannot trip this; only true cross-request silence
+/// can. The script emits a line PER CHUNK on both the KG and docs paths
+/// (the docs heartbeat was added alongside this fix), so on a slow CPU
+/// the gap between output lines is one chunk's embed+insert latency
+/// (~30 s worst case) — two orders of magnitude under 900 s. Output is
+/// also forced unbuffered (`PYTHONUNBUFFERED=1` in `build_kg_sync_env`)
+/// so those per-chunk lines reach the launcher promptly rather than
+/// being block-buffered into the launcher's reader.
+const DEFAULT_STALL_TIMEOUT_SECS: u64 = 900;
 
-/// Stall-watchdog: resolved from `KG_SYNC_STALL_TIMEOUT_SECS` at task start.
-/// 0 disables the watchdog entirely (escape hatch for benchmark / debug).
+/// Stall-watchdog: resolved from `KG_SYNC_STALL_TIMEOUT_SECS` at task
+/// start. `0` disables the watchdog entirely (escape hatch for
+/// benchmark / debug). Env var name preserved from the pre-v0.2.69
+/// watchdog for continuity.
 fn resolve_stall_timeout() -> Option<std::time::Duration> {
     let raw = std::env::var("KG_SYNC_STALL_TIMEOUT_SECS").ok();
     let secs = match raw.as_deref() {
@@ -582,6 +601,18 @@ fn build_kg_sync_env(
             "ACTIVE_EMBEDDING",
             std::ffi::OsString::from(&env_settings.active_embedding),
         ),
+        // v0.2.69 FIX 3 (review SHOULD-FIX): force unbuffered Python
+        // stdout so `sync_knowledge_graph.py`'s per-chunk / per-node
+        // progress lines reach the launcher's reader PROMPTLY rather
+        // than being block-buffered (~8 KiB) into the pipe. Without
+        // this, piped Python stdout block-buffers and the lines arrive
+        // in bursts only when the buffer fills or the process exits —
+        // which would make the re-armed-per-line stall watchdog below
+        // see false "silence" between bursts on a slow re-embed. (The
+        // script's stderr is already unbuffered by Python default; this
+        // closes the stdout gap.) `-u`-equivalent via env so it applies
+        // regardless of how the kg-sync wrapper invokes python.
+        ("PYTHONUNBUFFERED", std::ffi::OsString::from("1")),
     ];
 
     if let Some(root) = orchestrator_root {
@@ -606,8 +637,12 @@ fn build_kg_sync_env(
 /// The main loop awaits messages, tagged with their origin pipe, and
 /// dispatches parsing only on stdout lines — preserving the existing
 /// single-threaded deterministic parse semantics while removing the
-/// stderr-side back-pressure deadlock. Stall watchdog runs alongside
-/// via `tokio::time::timeout` on the channel `recv()`.
+/// stderr-side back-pressure deadlock. A PROGRESS stall watchdog runs
+/// alongside via `tokio::time::timeout` on the channel `recv()`: it
+/// re-arms on every line from either pipe and fires only after
+/// `KG_SYNC_STALL_TIMEOUT_SECS` of total silence (v0.2.69 FIX 3 review
+/// SHOULD-FIX — bounds the non-embed Weaviate-wedge case the per-embed-
+/// request guard cannot see, without capping a slow-but-progressing seed).
 #[allow(clippy::too_many_arguments)]
 async fn run_subprocess(
     program: std::path::PathBuf,
@@ -707,10 +742,10 @@ async fn run_subprocess(
         tokio::spawn(async move {
             let mut reader = BufReader::new(out).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                // `send` returns Err if the receiver was dropped. That
-                // can happen if the main loop bails on a stall — in
-                // which case quietly stop draining; the subprocess will
-                // be killed shortly anyway.
+                // `send` returns Err if the receiver was dropped — that
+                // can happen if the main loop bails on a stall (in which
+                // case quietly stop draining; the subprocess will be
+                // killed shortly anyway) or if the function is unwinding.
                 if tx.send(PipeLine::Stdout(line)).await.is_err() {
                     break;
                 }
@@ -742,6 +777,23 @@ async fn run_subprocess(
     // parse semantics. Stderr lines are accumulated into `combined`
     // so `tail_log` and the crash-snippet logic see them too (matches
     // the previous post-exit drain semantics).
+    //
+    // v0.2.69 FIX 3 (review SHOULD-FIX): a PROGRESS stall watchdog wraps
+    // each `recv()`. It is NOT a per-process / per-node duration cap —
+    // the maintainer ruled those out for the seed path (a legit slow-CPU
+    // arctic re-embed can run for hours). Instead it bounds SILENCE: the
+    // `tokio::time::timeout` re-arms on every line from EITHER pipe, so
+    // any output resets the clock. It fires only after `stall_timeout`
+    // (default 900 s) of zero output on both pipes. The script emits a
+    // line per chunk on both the KG and docs paths, and we force
+    // PYTHONUNBUFFERED so those lines arrive promptly, so a progressing
+    // seed's inter-line gap (one chunk's embed+insert, ~30 s worst case)
+    // is far under the window. The watchdog exists to recover the
+    // non-embed Weaviate wedge the per-embed-request guard
+    // (VCT_EMBED_REQUEST_TIMEOUT_SECS) cannot see: `connect_to_custom`,
+    // schema ensure, and `collection.data.insert` have no timeout of
+    // their own, so a silent network/Weaviate deadlock would otherwise
+    // hang the launcher background path forever.
     loop {
         let next = match stall_timeout {
             Some(t) => match tokio::time::timeout(t, rx.recv()).await {
@@ -820,11 +872,12 @@ async fn run_subprocess(
         }
     }
 
-    // Reap reader tasks. After a stall we've already dropped `rx`
-    // (which causes outstanding `send` calls to return Err and the
-    // tasks to break their loops) and called `start_kill`; on the
-    // normal path the tasks have already finished. Either way, we
-    // await them so they don't outlive this function.
+    // Reap reader tasks. After a stall we've already called
+    // `start_kill` and dropped `rx` on loop break (which causes
+    // outstanding `send` calls to return Err and the tasks to break
+    // their loops); on the normal path the channel closed and the tasks
+    // have already finished. Either way, we await them so they don't
+    // outlive this function.
     if let Some(h) = stdout_handle {
         let _ = h.await;
     }
@@ -839,13 +892,13 @@ async fn run_subprocess(
     // analysis with an explicit stall error. The subprocess almost
     // certainly exited with a signal (SIGKILL / TerminateProcess code)
     // — code() == None on Unix in that case — and the generic
-    // "exited -1" message would be misleading.
+    // "exited -1" message would be misleading. Stall ⇒ reconcile
+    // optimistic counts: by definition we saw no output for >timeout
+    // seconds, so we DEFINITIVELY didn't see the script's summary.
+    // Mirror the post-exit reconcile so banner counts reflect reality
+    // rather than mid-flight intent.
     if stalled {
         let secs = stall_timeout.map(|d| d.as_secs()).unwrap_or(0);
-        // Stall ⇒ reconcile optimistic counts: we DEFINITIVELY didn't
-        // see the script's summary, by definition (no output at all
-        // for >timeout seconds). Mirror the post-exit reconcile so
-        // banner counts reflect reality rather than mid-flight intent.
         reconcile_optimistic_counts_on_crash(
             &mut counts,
             kg_summary_seen,
@@ -855,8 +908,10 @@ async fn run_subprocess(
             status: sync_status::FAILED.to_string(),
             counts,
             error_message: Some(format!(
-                "kg-sync stalled (no output for {}s); subprocess killed. \
-                 Set KG_SYNC_STALL_TIMEOUT_SECS to override (0 disables the watchdog).",
+                "kg-sync stalled (no output for {}s); subprocess killed. This is a \
+                 progress watchdog — it fires only on total silence, not on a slow but \
+                 progressing re-embed. Set KG_SYNC_STALL_TIMEOUT_SECS to raise the window \
+                 (0 disables it).",
                 secs,
             )),
             log_tail: Some(tail),
@@ -1529,14 +1584,11 @@ mod tests {
         assert_eq!(counts.docs_failed, 0);
     }
 
-    // ─── Bug-3 v0.2.x (2026-05-12): stall-watchdog timeout resolution ────
+    // ─── v0.2.69 FIX 3 (review SHOULD-FIX): progress stall-watchdog ──────
     //
     // Env vars are process-global; cargo runs unit tests in parallel by
-    // default. These four tests mutate `KG_SYNC_STALL_TIMEOUT_SECS` so
-    // they must serialize on a local mutex. We can't rely on the
-    // single-thread assumption that codegraph.rs's older comment makes;
-    // empirically these tests race when run with the default rayon-
-    // sized pool. Using a poisoned-safe mutex pattern (grab the lock,
+    // default. These tests mutate `KG_SYNC_STALL_TIMEOUT_SECS` so they
+    // must serialize on a local mutex (poisoned-safe: grab the lock,
     // ignore poisoning so one assert-failure doesn't cascade across
     // sibling tests).
     fn env_test_lock() -> &'static std::sync::Mutex<()> {
@@ -1556,7 +1608,9 @@ mod tests {
         if let Some(v) = saved {
             unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", v); }
         }
-        assert_eq!(t, Some(std::time::Duration::from_secs(300)));
+        // v0.2.69 FIX 3: raised default = max(900, 4 × 180 s per-embed
+        // guard) = 900 s.
+        assert_eq!(t, Some(std::time::Duration::from_secs(900)));
     }
 
     #[test]
@@ -1601,7 +1655,29 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("KG_SYNC_STALL_TIMEOUT_SECS", v) },
             None => unsafe { std::env::remove_var("KG_SYNC_STALL_TIMEOUT_SECS") },
         }
-        assert_eq!(t, Some(std::time::Duration::from_secs(300)));
+        assert_eq!(t, Some(std::time::Duration::from_secs(900)));
+    }
+
+    // v0.2.69 FIX 3: PYTHONUNBUFFERED must be exported so the script's
+    // per-chunk progress lines reach the launcher's reader promptly
+    // (block-buffered piped stdout would batch them and starve the
+    // re-armed-per-line watchdog of the input that resets its clock).
+    #[test]
+    fn build_kg_sync_env_forces_unbuffered_python() {
+        use crate::commands::project_env_settings::ProjectEnvSettings;
+        let settings = ProjectEnvSettings::with_defaults("TestProject");
+        let folder = std::path::Path::new("/tmp/proj");
+        let env = build_kg_sync_env(&settings, folder, None);
+        let unbuffered = env
+            .iter()
+            .find(|(k, _)| *k == "PYTHONUNBUFFERED")
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            unbuffered,
+            Some(std::ffi::OsString::from("1")),
+            "PYTHONUNBUFFERED=1 must be set so per-chunk progress streams \
+             promptly enough to feed the stall watchdog",
+        );
     }
 
     // ─── Bug-3 v0.2.x (2026-05-12): concurrent-drain deadlock regression ──
@@ -1761,6 +1837,16 @@ mod tests {
         assert_eq!(stderr_count, 2048, "all 2048 stderr lines must be drained");
     }
 
+    // ─── v0.2.69 FIX 3 (review SHOULD-FIX): progress-guard semantics ─────
+    //
+    // The watchdog is a PROGRESS guard, not a duration cap. These two
+    // tests pin both halves of that contract using the SAME re-arm-on-
+    // every-line drain logic that `run_subprocess` uses (a small window
+    // keeps the tests fast; the production default is 900 s).
+
+    /// A subprocess that emits nothing on either pipe for longer than the
+    /// watchdog window MUST be killed (the non-embed Weaviate-wedge case
+    /// the per-request guard can't see).
     #[cfg(unix)]
     #[tokio::test]
     async fn stall_watchdog_kills_silent_subprocess() {
@@ -1769,8 +1855,7 @@ mod tests {
         use tokio::sync::mpsc;
 
         // `sleep 30` emits nothing on either pipe; the watchdog must
-        // detect the stall and kill it. We use a 1-second watchdog to
-        // keep the test fast.
+        // detect the silence and kill it. 1-second window keeps it fast.
         let mut child = spawn_sh_with_retry("sleep 30").await;
 
         let stdout = child.stdout.take().expect("stdout pipe");
@@ -1798,8 +1883,8 @@ mod tests {
         let mut stalled = false;
         loop {
             match tokio::time::timeout(watchdog, rx.recv()).await {
-                Ok(Some(_)) => continue,
-                Ok(None) => break, // pipes closed without a stall
+                Ok(Some(_)) => continue, // line ⇒ re-arm
+                Ok(None) => break,       // pipes closed without a stall
                 Err(_) => {
                     stalled = true;
                     let _ = child.start_kill();
@@ -1810,8 +1895,6 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(stalled, "watchdog must trip on a subprocess that emits nothing");
-        // 1 s watchdog + small scheduler slack: must be well under the
-        // 30-second sleep duration we asked the subprocess to run.
         assert!(
             elapsed < Duration::from_secs(5),
             "watchdog should trip quickly; took {:?}",
@@ -1822,6 +1905,87 @@ mod tests {
         let _ = h_err.await;
         let exit = child.wait().await.expect("wait");
         assert!(!exit.success(), "killed subprocess must report failure");
+    }
+
+    /// PROGRESS-GUARD CONTRACT: a subprocess that keeps emitting lines —
+    /// even one whose TOTAL runtime far exceeds the watchdog window, and
+    /// even past what an old per-process cap (e.g. 300 s) would have
+    /// allowed — must NOT be killed, as long as the GAP between
+    /// consecutive lines stays under the window. This is the case the
+    /// maintainer's "no per-process/per-node duration cap" ruling
+    /// protects: a slow but progressing arctic re-embed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stall_watchdog_spares_slow_but_progressing_subprocess() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::sync::mpsc;
+
+        // Emit a line every 100 ms for 30 ticks = ~3 s of total runtime.
+        // With a 1-second window (10× the inter-line gap) the watchdog
+        // must NEVER trip — every line re-arms it well before the
+        // deadline. The "30 ticks" stands in for "many chunks": each
+        // print is a per-chunk heartbeat, the gap is one chunk's embed
+        // latency. Total runtime (3 s) > the window (1 s), proving this
+        // is a progress guard, not a duration cap.
+        let mut child = spawn_sh_with_retry(
+            "i=0; while [ $i -lt 30 ]; do echo \"   ✓ Stored chunk $i/30\"; \
+             i=$((i+1)); sleep 0.1; done",
+        )
+        .await;
+
+        let stdout = child.stdout.take().expect("stdout pipe");
+        let stderr = child.stderr.take().expect("stderr pipe");
+
+        let (tx, mut rx) = mpsc::channel::<PipeLine>(64);
+        let tx_out = tx.clone();
+        let h_out = tokio::spawn(async move {
+            let mut r = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = r.next_line().await {
+                if tx_out.send(PipeLine::Stdout(line)).await.is_err() { break; }
+            }
+        });
+        let tx_err = tx.clone();
+        let h_err = tokio::spawn(async move {
+            let mut r = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = r.next_line().await {
+                if tx_err.send(PipeLine::Stderr(line)).await.is_err() { break; }
+            }
+        });
+        drop(tx);
+
+        let watchdog = Duration::from_secs(1);
+        let mut stalled = false;
+        let mut lines_seen = 0u32;
+        loop {
+            match tokio::time::timeout(watchdog, rx.recv()).await {
+                Ok(Some(_)) => {
+                    lines_seen += 1; // line ⇒ re-arm
+                    continue;
+                }
+                Ok(None) => break, // child exited cleanly, all lines drained
+                Err(_) => {
+                    stalled = true;
+                    let _ = child.start_kill();
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            !stalled,
+            "watchdog must NOT trip on a subprocess that keeps emitting \
+             (progress guard, not a duration cap)",
+        );
+        assert_eq!(
+            lines_seen, 30,
+            "all 30 progress lines must arrive without the watchdog firing"
+        );
+
+        let _ = h_out.await;
+        let _ = h_err.await;
+        let exit = child.wait().await.expect("wait");
+        assert!(exit.success(), "progressing subprocess should exit cleanly");
     }
 
     // NEW-15 (2026-05-28): regression — kg_sync subprocess must receive VCT_INSTALL_ROOT.

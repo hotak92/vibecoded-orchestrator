@@ -52,13 +52,16 @@ from vco_lib.embedding_providers.openai import (
 )
 from vco_lib.embedding_service import (
     DEFAULT_CODE_MODEL,
+    DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
     DEFAULT_TEXT_MODEL,
     DEFAULT_TEXT_SLOT,
+    EMBED_REQUEST_TIMEOUT_ENV,
     OPENAI_MODEL_ID_PREFIX,
     EmbeddingService,
     ModelChoice,
     NoEmbeddingBackendError,
     _resolve_code_slot,
+    _resolve_embed_request_timeout,
     _resolve_text_slot,
     _to_openai_api_model,
     _to_openai_catalog_id,
@@ -2086,6 +2089,195 @@ class CLITests(unittest.TestCase):
                 captured_kwargs.get("project_root"),
                 Path("/tmp/some/project"),
             )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.69 FIX 3 — per-embed-REQUEST timeout (replaces install.py's removed
+# per-process seed timeouts). The whole-subprocess caps fired on legitimate
+# slow re-embeds; the only guard is now at chunk granularity (one HTTP embed
+# request). These tests verify (a) the env-overridable resolution, (b) the
+# resolved value is threaded into every adapter, and (c) a hung embed request
+# aborts with the configured cap rather than hanging forever.
+# ---------------------------------------------------------------------------
+
+
+class EmbedRequestTimeoutResolutionTests(unittest.TestCase):
+    """``_resolve_embed_request_timeout`` env override + fallbacks."""
+
+    def test_default_when_env_unset(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(EMBED_REQUEST_TIMEOUT_ENV, None)
+            self.assertEqual(
+                _resolve_embed_request_timeout(),
+                DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
+            )
+
+    def test_default_is_180(self):
+        # The default must be generous (~6x the ~30s/chunk arctic-on-CPU
+        # boundary) so a slow re-embed never trips it.
+        self.assertEqual(DEFAULT_EMBED_REQUEST_TIMEOUT_SECS, 180.0)
+
+    def test_env_override_honoured(self):
+        with patch.dict(os.environ, {EMBED_REQUEST_TIMEOUT_ENV: "42"}):
+            self.assertEqual(_resolve_embed_request_timeout(), 42.0)
+
+    def test_env_float_override(self):
+        with patch.dict(os.environ, {EMBED_REQUEST_TIMEOUT_ENV: "12.5"}):
+            self.assertEqual(_resolve_embed_request_timeout(), 12.5)
+
+    def test_garbage_env_falls_back_to_default(self):
+        with patch.dict(os.environ, {EMBED_REQUEST_TIMEOUT_ENV: "not-a-number"}):
+            self.assertEqual(
+                _resolve_embed_request_timeout(),
+                DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
+            )
+
+    def test_nonpositive_env_falls_back_to_default(self):
+        # A non-positive value would mean "no timeout" to requests — exactly
+        # the unbounded-hang this guard prevents — so we coerce to default.
+        for bad in ("0", "-5", "-1.0"):
+            with patch.dict(os.environ, {EMBED_REQUEST_TIMEOUT_ENV: bad}):
+                self.assertEqual(
+                    _resolve_embed_request_timeout(),
+                    DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
+                    f"{bad!r} should fall back to default",
+                )
+
+
+class EmbedRequestTimeoutThreadingTests(unittest.TestCase):
+    """The resolved timeout reaches every real adapter."""
+
+    def _make_service(self, *, explicit=None, env=None):
+        with _EnvIsolation(), patch.dict(os.environ, env or {}):
+            return EmbeddingService(
+                project_root=None,
+                ollama_url="http://localhost:11435",
+                code_embed_url="http://localhost:11440",
+                text_model_id="qwen3-embedding:0.6b",
+                code_model_id="codesage-large-v2",
+                openai_api_key="",
+                session=FakeSession(),
+                embed_request_timeout=explicit,
+            )
+
+    def test_explicit_value_threaded_to_all_adapters(self):
+        svc = self._make_service(explicit=7.0)
+        self.assertEqual(svc.embed_request_timeout, 7.0)
+        self.assertEqual(svc.ollama.timeout, 7.0)
+        self.assertEqual(svc.codeembed.timeout, 7.0)
+        self.assertEqual(svc.openai.timeout, 7.0)
+
+    def test_env_value_threaded_when_no_explicit(self):
+        svc = self._make_service(
+            explicit=None, env={EMBED_REQUEST_TIMEOUT_ENV: "99"}
+        )
+        self.assertEqual(svc.embed_request_timeout, 99.0)
+        self.assertEqual(svc.ollama.timeout, 99.0)
+        self.assertEqual(svc.codeembed.timeout, 99.0)
+        self.assertEqual(svc.openai.timeout, 99.0)
+
+    def test_default_threaded_when_env_unset(self):
+        svc = self._make_service(explicit=None, env={})
+        self.assertEqual(
+            svc.embed_request_timeout, DEFAULT_EMBED_REQUEST_TIMEOUT_SECS
+        )
+        self.assertEqual(
+            svc.ollama.timeout, DEFAULT_EMBED_REQUEST_TIMEOUT_SECS
+        )
+
+
+class _HangingSession:
+    """A ``requests.Session`` look-alike whose ``post`` simulates a wedged
+    embedder: it blocks for ``sleep_for`` seconds and then — like
+    ``requests`` itself when the per-request deadline elapses — raises
+    ``requests.Timeout`` once the elapsed time exceeds the ``timeout=``
+    kwarg the caller passed.
+
+    The key behaviour under test: the adapter passes ``timeout=self.timeout``
+    to ``post``. If that kwarg is honoured (cap small), the call raises
+    promptly; if the production code regressed and dropped ``timeout=``, the
+    kwarg would be ``None`` and this fake would block the full ``sleep_for``,
+    which the test's own wall-clock guard then catches.
+    """
+
+    def __init__(self, sleep_for: float) -> None:
+        self.sleep_for = sleep_for
+        self.posted_timeouts: list = []
+        self.closed = False
+
+    def get(self, url: str, **kwargs):
+        # Health/discovery probes — return reachable so construction-side
+        # readiness checks don't interfere. (Not exercised by these tests,
+        # which call the adapter embed methods directly.)
+        return FakeResponse(200, {"models": [{"name": "qwen3-embedding:0.6b"}]})
+
+    def post(self, url: str, **kwargs):
+        import time as _time
+
+        import requests as _req
+
+        timeout = kwargs.get("timeout")
+        self.posted_timeouts.append(timeout)
+        # Emulate requests' own behaviour: block up to the deadline, then
+        # raise Timeout. A None timeout (the regression) blocks the full
+        # sleep_for. We cap the actual sleep so the test never hangs the
+        # whole suite even on regression — the wall-clock assertion below
+        # is what proves the cap was honoured.
+        deadline = timeout if (timeout and timeout > 0) else self.sleep_for
+        _time.sleep(min(deadline, self.sleep_for))
+        if timeout and timeout > 0 and self.sleep_for > timeout:
+            raise _req.Timeout(f"mock embed request exceeded {timeout}s")
+        # If no positive timeout was passed, fall through to a hung-style
+        # error after the full sleep so embed_text still surfaces a failure.
+        raise _req.Timeout("mock embed request hung (no timeout passed)")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class HungEmbedRequestAbortsTests(unittest.TestCase):
+    """A wedged embedder aborts within the per-request cap, not forever."""
+
+    def test_ollama_embed_aborts_within_cap(self):
+        import time as _time
+
+        # Cap the request at 0.05s; the fake "embedder" would otherwise
+        # block for 5s. With the timeout honoured the embed call must raise
+        # quickly (well under the 5s hang) — proving the per-request guard
+        # is wired through to the adapter's POST.
+        cap = 0.05
+        hang = _HangingSession(sleep_for=5.0)
+        with _EnvIsolation():
+            svc = EmbeddingService(
+                project_root=None,
+                ollama_url="http://localhost:11435",
+                code_embed_url="http://localhost:11440",
+                text_model_id="qwen3-embedding:0.6b",
+                code_model_id="codesage-large-v2",
+                openai_api_key="",
+                session=hang,
+                embed_request_timeout=cap,
+            )
+        self.assertEqual(svc.ollama.timeout, cap)
+
+        started = _time.monotonic()
+        with self.assertRaises(RuntimeError):
+            # OllamaAdapter wraps requests.RequestException (Timeout is a
+            # subclass) as RuntimeError("Ollama /api/embed network error").
+            svc.embed_text("a chunk that takes forever to embed")
+        elapsed = _time.monotonic() - started
+
+        # The POST must have received our small cap, not None / the default.
+        self.assertTrue(hang.posted_timeouts)
+        self.assertEqual(hang.posted_timeouts[0], cap)
+        # And the whole call must have returned far faster than the 5s hang —
+        # if production dropped the timeout= kwarg this would blow past it.
+        self.assertLess(
+            elapsed,
+            2.0,
+            f"embed call should abort near the {cap}s cap, took {elapsed:.2f}s "
+            "(did the per-request timeout get dropped?)",
+        )
 
 
 if __name__ == "__main__":
