@@ -1382,7 +1382,7 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "file_path": doc_data["file_path"],
             },
         )
-        print(f"   Split into {len(chunks)} chunks")
+        print(f"   Split into {len(chunks)} chunks", flush=True)
         last_slots: Mapping[str, List[float]] = {}
         for i, chunk in enumerate(chunks):
             vec_arg, last_slots = _build_vector_arg(server, chunk.content)
@@ -1404,7 +1404,22 @@ def sync_doc(server: WeaviateMCPServer, file_path: Path) -> bool:
                 "content_hash": current_content_hash,
             }
             coll.data.insert(properties=data_obj, vector=vec_arg)
-        print(f"   ✓ Stored {len(chunks)} chunks (vectors={sorted(last_slots)})")
+            # v0.2.69 FIX 3 (review SHOULD-FIX): per-chunk heartbeat. The
+            # launcher's kg-sync stall watchdog re-arms on every output
+            # line; without a per-chunk print here, a large multi-chunk
+            # doc would embed+insert silently (N × ~30 s on a slow CPU)
+            # and could exceed the watchdog window with no output —
+            # false-tripping it. The KG path (`sync_node`) already prints
+            # per chunk; this mirrors that on the docs path so the
+            # window's "no-output ⇒ wedge" assumption holds on both.
+            # `flush=True` guarantees the line is emitted even if stdout
+            # isn't running unbuffered (the launcher exports
+            # PYTHONUNBUFFERED, but a direct-CLI run might not).
+            print(
+                f"   ✓ Stored chunk {i + 1}/{len(chunks)}",
+                flush=True,
+            )
+        print(f"   ✓ Stored {len(chunks)} chunks (vectors={sorted(last_slots)})", flush=True)
         return True
     except Exception as e:
         import traceback
@@ -2046,7 +2061,14 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> bool:
                         print(f"   ✓ Created {len(target_uuids)} cross-references")
 
                 chunks_created += 1
-                print(f"   ✓ Stored chunk {chunk.chunk_number + 1}/{chunk.total_chunks} ({chunk.token_count} tokens)")
+                # v0.2.69 FIX 3 (review SHOULD-FIX): per-chunk heartbeat
+                # feeds the launcher's re-armed-per-line stall watchdog.
+                # `flush=True` guarantees prompt emission even on a
+                # direct-CLI run that doesn't inherit PYTHONUNBUFFERED.
+                print(
+                    f"   ✓ Stored chunk {chunk.chunk_number + 1}/{chunk.total_chunks} ({chunk.token_count} tokens)",
+                    flush=True,
+                )
 
             if last_slots:
                 print(f"   ✓ All chunks written to vectors={sorted(last_slots)}")
