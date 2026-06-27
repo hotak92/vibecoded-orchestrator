@@ -10,7 +10,10 @@
 //!     conventional `_KnowledgeGraph` suffix.
 //!   - `project_codegraph_bindings` with a `collection_prefix` derived
 //!     from the same canonical prefix.
-//!   - `module_settings` keys: `active_embedding` (default `qwen3`).
+//!   - `module_settings` keys: `active_embedding` (derived from the
+//!     machine's hardware pick `app_state[default_text_embedding]`; falls
+//!     to `qwen3` when the pick is absent/unmapped — v0.2.69 FIX 1). Also
+//!     self-heals an existing legacy-`qwen3` row to the derived profile.
 //!
 //! What we DO NOT backfill (intentionally — these reflect user
 //! choices and the access matrix is the source of truth):
@@ -28,6 +31,28 @@
 
 use serde_json::Value as JsonValue;
 use vct_launcher_core::db::Db;
+
+use crate::commands::openai_cmd::APP_STATE_DEFAULT_TEXT_EMBED;
+use crate::commands::project_env_settings::active_profile_for_model;
+
+/// The legacy hardcoded `active_embedding` seed. Only a stored value that
+/// equals this EXACTLY is eligible for the v0.2.69 FIX 1 self-heal flip —
+/// an explicit user pick (`openai`, `arctic`, …) is never overwritten.
+const LEGACY_DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
+
+/// Resolve the per-project `active_embedding` seed from the machine's
+/// hardware pick.
+///
+/// Reads `app_state[default_text_embedding]` and maps it via the shared
+/// `active_profile_for_model` table (single source — see
+/// `project_env_settings.rs`). Returns `None` when the hardware pick is
+/// absent or maps to no known profile: callers then keep the conservative
+/// `"qwen3"` default rather than stamping a guessed profile (a wrong slot
+/// indexes the KG against the wrong vector — the 2026-04-30 audit bug class).
+fn derive_active_embedding_seed(db: &Db) -> Option<&'static str> {
+    let model_id = db.app_state_get(APP_STATE_DEFAULT_TEXT_EMBED).ok().flatten()?;
+    active_profile_for_model(&model_id)
+}
 
 /// Sweep every registered project and ensure binding rows + default
 /// module_settings exist. Idempotent: rows that already exist are
@@ -140,16 +165,62 @@ fn backfill_one_project(
         touched = true;
     }
 
-    // 3. active_embedding default.
+    // 3. active_embedding default — v0.2.69 FIX 1 (Defect D add-path gap).
+    //
+    // The production env writer (`config_projection.project_env_from_db`)
+    // reads THIS `module_settings/active_embedding` row, NOT the canonical
+    // `app_state[embedding.active_profile]` key. Before this fix the seed
+    // was hardcoded "qwen3" for EVERY project regardless of the machine's
+    // hardware pick, so a fresh add on an arctic host got
+    // ACTIVE_EMBEDDING=qwen3 and broke the arctic-trained RL reranker.
+    //
+    // (a) NEW row (existing.is_none()): seed from the hardware pick
+    //     (`app_state[default_text_embedding]` → profile) rather than a
+    //     blanket "qwen3"; fall to "qwen3" only when the pick is absent or
+    //     maps to no known profile (conservative — never stamp a guess).
+    //
+    // (b) SELF-HEAL the existing broken projects: when the stored value is
+    //     EXACTLY the legacy default "qwen3" AND the hardware pick maps to a
+    //     DIFFERENT profile (e.g. arctic), rewrite the row to the derived
+    //     profile. This is a tight default-value reconcile — it flips ONLY a
+    //     value that is exactly "qwen3" (an explicit user pick like "openai"
+    //     is never touched), and ONLY when the pick is non-qwen3. The env
+    //     files then self-heal on the next env-apply / bundle-update.
     let existing = db.get_setting(&project.id, "orchestrator-core", "active_embedding")?;
-    if existing.is_none() {
-        db.set_setting(
-            &project.id,
-            "orchestrator-core",
-            "active_embedding",
-            &JsonValue::String("qwen3".to_string()),
-        )?;
-        touched = true;
+    let derived_seed = derive_active_embedding_seed(db);
+    match existing {
+        None => {
+            let seed = derived_seed.unwrap_or(LEGACY_DEFAULT_ACTIVE_EMBEDDING);
+            db.set_setting(
+                &project.id,
+                "orchestrator-core",
+                "active_embedding",
+                &JsonValue::String(seed.to_string()),
+            )?;
+            touched = true;
+        }
+        Some(JsonValue::String(ref current))
+            if current == LEGACY_DEFAULT_ACTIVE_EMBEDDING =>
+        {
+            // Existing legacy-"qwen3" row: flip ONLY if the hardware pick
+            // resolves to a different (non-qwen3) profile. `derive_*`
+            // returning None or "qwen3" leaves the row as-is (no-op,
+            // preserves idempotency).
+            if let Some(profile) = derived_seed {
+                if profile != LEGACY_DEFAULT_ACTIVE_EMBEDDING {
+                    db.set_setting(
+                        &project.id,
+                        "orchestrator-core",
+                        "active_embedding",
+                        &JsonValue::String(profile.to_string()),
+                    )?;
+                    touched = true;
+                }
+            }
+        }
+        // Any explicit non-qwen3 user pick (or non-string value) is
+        // preserved untouched.
+        Some(_) => {}
     }
 
     Ok(touched)
@@ -255,7 +326,9 @@ mod tests {
     }
 
     #[test]
-    fn backfill_seeds_default_active_embedding() {
+    fn backfill_seeds_default_active_embedding_without_hardware_pick() {
+        // No `default_text_embedding` app_state key → the conservative
+        // qwen3 default is retained (never guess).
         let db = open_test_db();
         let pid = seed_project(&db, "TestProject");
         let _r = backfill_all_projects(&db);
@@ -264,6 +337,121 @@ mod tests {
             .get_setting(&pid, "orchestrator-core", "active_embedding")
             .unwrap()
             .expect("active_embedding seeded");
+        assert_eq!(s, "qwen3");
+    }
+
+    #[test]
+    fn backfill_seeds_active_embedding_derived_from_hardware_pick() {
+        // v0.2.69 FIX 1: a fresh project's seed must derive from the
+        // machine's hardware pick (arctic), NOT a blanket "qwen3".
+        let db = open_test_db();
+        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "snowflake-arctic-embed2:latest")
+            .unwrap();
+        let pid = seed_project(&db, "Example_Arctic");
+        let _r = backfill_all_projects(&db);
+
+        let s = db
+            .get_setting(&pid, "orchestrator-core", "active_embedding")
+            .unwrap()
+            .expect("active_embedding seeded");
+        assert_eq!(s, "arctic");
+    }
+
+    #[test]
+    fn backfill_unknown_hardware_pick_seeds_qwen3() {
+        // Conservative guard: an unmapped hardware pick must NOT stamp a
+        // guessed profile on a NEW row — qwen3 default is used.
+        let db = open_test_db();
+        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "some-future-model")
+            .unwrap();
+        let pid = seed_project(&db, "Example_Unknown");
+        let _r = backfill_all_projects(&db);
+
+        let s = db
+            .get_setting(&pid, "orchestrator-core", "active_embedding")
+            .unwrap()
+            .expect("active_embedding seeded");
+        assert_eq!(s, "qwen3");
+    }
+
+    #[test]
+    fn backfill_self_heals_legacy_qwen3_row_to_arctic() {
+        // v0.2.69 FIX 1 existing-project self-heal: a project already
+        // carrying the legacy hardcoded "qwen3" row on an arctic host gets
+        // flipped to "arctic" on the next backfill (launcher restart).
+        let db = open_test_db();
+        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "snowflake-arctic-embed2:latest")
+            .unwrap();
+        let pid = seed_project(&db, "Example_Legacy");
+        // Simulate the pre-fix backfill having stamped qwen3.
+        db.set_setting(
+            &pid,
+            "orchestrator-core",
+            "active_embedding",
+            &JsonValue::String("qwen3".to_string()),
+        )
+        .unwrap();
+
+        let _r = backfill_all_projects(&db);
+
+        let s = db
+            .get_setting(&pid, "orchestrator-core", "active_embedding")
+            .unwrap()
+            .expect("active_embedding present");
+        assert_eq!(s, "arctic", "legacy qwen3 row must self-heal to the hardware pick");
+    }
+
+    #[test]
+    fn backfill_preserves_explicit_user_pick_against_flip() {
+        // The self-heal must NEVER overwrite an explicit non-qwen3 user
+        // pick (here "openai"), even when the hardware pick differs.
+        let db = open_test_db();
+        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "snowflake-arctic-embed2:latest")
+            .unwrap();
+        let pid = seed_project(&db, "Example_UserPick");
+        db.set_setting(
+            &pid,
+            "orchestrator-core",
+            "active_embedding",
+            &JsonValue::String("openai".to_string()),
+        )
+        .unwrap();
+
+        let _r = backfill_all_projects(&db);
+
+        let s = db
+            .get_setting(&pid, "orchestrator-core", "active_embedding")
+            .unwrap()
+            .expect("active_embedding present");
+        assert_eq!(s, "openai", "explicit user pick must be preserved");
+    }
+
+    #[test]
+    fn backfill_legacy_qwen3_row_stays_qwen3_when_pick_is_qwen3() {
+        // Self-heal is a no-op when the hardware pick maps to qwen3 too —
+        // preserves idempotency (no spurious touched-count).
+        let db = open_test_db();
+        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "qwen3-embedding:0.6b")
+            .unwrap();
+        let pid = seed_project(&db, "Example_Qwen3");
+        db.set_setting(
+            &pid,
+            "orchestrator-core",
+            "active_embedding",
+            &JsonValue::String("qwen3".to_string()),
+        )
+        .unwrap();
+
+        // KG + codegraph still backfill on first run, but the embedding row
+        // must NOT be re-touched (it's already qwen3).
+        let _r1 = backfill_all_projects(&db);
+        let r2 = backfill_all_projects(&db);
+        assert_eq!(r2.touched_projects, 0, "second run must be a no-op");
+
+        let s = db
+            .get_setting(&pid, "orchestrator-core", "active_embedding")
+            .unwrap()
+            .expect("active_embedding present");
         assert_eq!(s, "qwen3");
     }
 

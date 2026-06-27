@@ -81,7 +81,11 @@ pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
 /// the v0.2.68 Defect D bug: the GUI writes only the model id, the canonical
 /// `embedding.active_profile` key stays empty, and `populate` falls back to
 /// "qwen3" for every project even when the user picked arctic.
-fn active_profile_for_model(model_id: &str) -> Option<&'static str> {
+///
+/// v0.2.69 FIX 1: made `pub(crate)` so `project_backfill.rs` reuses the
+/// same map (single source) when deriving the per-project
+/// `module_settings/active_embedding` seed from the hardware pick.
+pub(crate) fn active_profile_for_model(model_id: &str) -> Option<&'static str> {
     match model_id.trim() {
         "qwen3-embedding:0.6b" => Some("qwen3"),
         "snowflake-arctic-embed2:latest" => Some("arctic"),
@@ -647,11 +651,30 @@ pub fn populate(
         DEFAULT_CODE_EMBED_PORT,
     );
 
+    // v0.2.69 FIX 1 (Defect D add-path gap): when the canonical
+    // `embedding.active_profile` key is empty/absent (the usual state on a
+    // fresh add — only the GUI Identity-tab chooser writes it), derive the
+    // profile from the machine's hardware pick
+    // (`app_state[default_text_embedding]`) via `active_profile_for_model`
+    // BEFORE falling to "qwen3". An unmapped/absent hardware pick → qwen3
+    // (conservative: never stamp a guessed profile → wrong vector slot).
+    //
+    // NOTE: this Rust populate() value feeds the `.env` template +
+    // SecretsPanel surfaces, NOT the canonical `.claude/{settings.json,env}`
+    // (those come from the Python `config_projection` writer, which has the
+    // mirror fallback). Both are fixed in lockstep so the two surfaces agree.
     let active_embedding = db
         .app_state_get(APP_STATE_KEY_ACTIVE_EMBEDDING)
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            db.app_state_get(APP_STATE_DEFAULT_TEXT_EMBED)
+                .ok()
+                .flatten()
+                .and_then(|model_id| active_profile_for_model(&model_id))
+                .map(|profile| profile.to_string())
+        })
         .unwrap_or_else(|| DEFAULT_ACTIVE_EMBEDDING.to_string());
 
     // PR-9 (v0.2.11): shared KG resolution with three-tier priority.
@@ -1391,6 +1414,52 @@ mod tests {
         let s = populate(&db, "Acme", None);
         assert!(s.use_gpu);
         assert!(!s.cpu_only);
+    }
+
+    #[test]
+    fn populate_derives_arctic_from_default_text_embedding_when_canonical_absent() {
+        // v0.2.69 FIX 1 (Defect D add-path gap). A fresh add never writes
+        // the canonical `embedding.active_profile` key (only the GUI
+        // Identity-tab chooser does). install.py's hardware chooser DOES
+        // write `default_text_embedding` (the model id). Before the fix
+        // populate() fell straight to "qwen3" on an arctic host; after the
+        // fix it derives "arctic" from the hardware pick.
+        let db = Db::open_in_memory().unwrap();
+
+        // Canonical profile key genuinely ABSENT...
+        assert!(db
+            .app_state_get(APP_STATE_KEY_ACTIVE_EMBEDDING)
+            .unwrap()
+            .is_none());
+        // ...but the hardware pick (arctic) IS present.
+        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "snowflake-arctic-embed2:latest")
+            .unwrap();
+
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.active_embedding, "arctic");
+    }
+
+    #[test]
+    fn populate_unknown_default_text_embedding_stays_qwen3() {
+        // Conservative guard: an unmapped hardware pick must NOT stamp a
+        // guessed profile — populate() keeps the qwen3 fallback.
+        let db = Db::open_in_memory().unwrap();
+        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "some-future-model")
+            .unwrap();
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.active_embedding, DEFAULT_ACTIVE_EMBEDDING);
+    }
+
+    #[test]
+    fn populate_canonical_profile_wins_over_default_text_embedding() {
+        // An explicit canonical pick is authoritative — the derive only
+        // fires when the canonical key is empty/absent.
+        let db = Db::open_in_memory().unwrap();
+        db.app_state_set(APP_STATE_KEY_ACTIVE_EMBEDDING, "openai").unwrap();
+        db.app_state_set(APP_STATE_DEFAULT_TEXT_EMBED, "snowflake-arctic-embed2:latest")
+            .unwrap();
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.active_embedding, "openai");
     }
 
     #[test]

@@ -62,6 +62,7 @@ def _make_launcher_db(
     codegraph_access: list[tuple[str, str]] | None = None,
     diagram_access: list[tuple[str, str]] | None = None,
     module_settings: list[tuple[str, str, str, str]] | None = None,
+    app_state: dict[str, str] | None = None,
 ) -> None:
     """Build a minimal launcher.db with the schema this module reads.
 
@@ -137,8 +138,19 @@ def _make_launcher_db(
             setting_value TEXT NOT NULL,
             UNIQUE(project_id, module_id, setting_key)
         );
+        CREATE TABLE app_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """
     )
+    # app_state stores values verbatim (NOT JSON) — matches the Rust
+    # `app_state_set` write semantics.
+    for state_key, state_value in (app_state or {}).items():
+        cur.execute(
+            "INSERT INTO app_state (key, value) VALUES (?, ?)",
+            (state_key, state_value),
+        )
     cur.execute(
         "INSERT INTO projects (id, name, folder_path, slug) VALUES (?, ?, ?, ?)",
         (project_id, project_name, project_folder, project_slug),
@@ -255,6 +267,100 @@ def test_from_db_with_kg_bindings(tmp_path: Path) -> None:
     # name "X" → sanitized "X"). This confirms the rule degrades
     # gracefully when bindings carry non-canonical names.
     assert env["DIAGRAMS_COLLECTION"] == "X_Diagrams"
+
+
+# ─── v0.2.69 FIX 1 (Defect D add-path gap) — ACTIVE_EMBEDDING derive ──────
+
+
+def test_active_embedding_derives_from_default_text_embedding_when_absent(
+    tmp_path: Path,
+) -> None:
+    """A fresh add with NO `module_settings/active_embedding` row but a
+    hardware pick of arctic must emit ACTIVE_EMBEDDING=arctic, not qwen3.
+
+    This is the load-bearing half of FIX 1: `project_env_from_db` is what
+    writes the canonical `.claude/{settings.json,env}` value. Before the
+    fix it defaulted straight to "qwen3" and broke the arctic RL reranker.
+    """
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="a1", project_name="Example Arctic Host",
+        project_folder=str(proj),
+        # module_settings intentionally OMITTED (row absent).
+        app_state={"default_text_embedding": "snowflake-arctic-embed2:latest"},
+    )
+    env = project_env_from_db("a1", db_path=db)["canonical_env"]
+    assert env["ACTIVE_EMBEDDING"] == "arctic"
+
+
+def test_active_embedding_self_heals_legacy_qwen3_row_to_arctic(
+    tmp_path: Path,
+) -> None:
+    """An existing project whose `module_settings/active_embedding` is the
+    legacy hardcoded "qwen3" derives to the arctic hardware pick — the read
+    fallback mirrors the backfill self-heal so the env file heals on the
+    next apply even before backfill rewrites the row."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="a2", project_name="Example Legacy Row",
+        project_folder=str(proj),
+        module_settings=[("a2", "orchestrator-core", "active_embedding", '"qwen3"')],
+        app_state={"default_text_embedding": "snowflake-arctic-embed2:latest"},
+    )
+    env = project_env_from_db("a2", db_path=db)["canonical_env"]
+    assert env["ACTIVE_EMBEDDING"] == "arctic"
+
+
+def test_active_embedding_preserves_explicit_user_pick(tmp_path: Path) -> None:
+    """An explicit non-qwen3 user pick (openai) in module_settings is NEVER
+    overridden by the hardware-pick derive, even on an arctic host."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="a3", project_name="Example User Pick",
+        project_folder=str(proj),
+        module_settings=[("a3", "orchestrator-core", "active_embedding", '"openai"')],
+        app_state={"default_text_embedding": "snowflake-arctic-embed2:latest"},
+    )
+    env = project_env_from_db("a3", db_path=db)["canonical_env"]
+    assert env["ACTIVE_EMBEDDING"] == "openai"
+
+
+def test_active_embedding_unknown_hardware_pick_stays_qwen3(tmp_path: Path) -> None:
+    """Conservative guard: an unmapped hardware pick leaves ACTIVE_EMBEDDING
+    at qwen3 rather than stamping a guessed (wrong-slot) profile."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="a4", project_name="Example Unknown Model",
+        project_folder=str(proj),
+        app_state={"default_text_embedding": "some-future-model"},
+    )
+    env = project_env_from_db("a4", db_path=db)["canonical_env"]
+    assert env["ACTIVE_EMBEDDING"] == "qwen3"
+
+
+def test_active_embedding_override_wins_over_derive(tmp_path: Path) -> None:
+    """An explicit `active_embedding_override` still short-circuits the
+    derive (the override path is checked before any DB read)."""
+    db = tmp_path / "launcher.db"
+    proj = tmp_path / "p"
+    proj.mkdir()
+    _make_launcher_db(
+        db, project_id="a5", project_name="Example Override",
+        project_folder=str(proj),
+        app_state={"default_text_embedding": "snowflake-arctic-embed2:latest"},
+    )
+    env = project_env_from_db(
+        "a5", db_path=db, active_embedding_override="codesage"
+    )["canonical_env"]
+    assert env["ACTIVE_EMBEDDING"] == "codesage"
 
 
 def test_from_db_diagrams_suffix_swap_from_canonical_kg(tmp_path: Path) -> None:
