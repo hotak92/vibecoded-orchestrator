@@ -15528,21 +15528,24 @@ def _seed_weaviate_shared_kg_only(
     seed_env = _subprocess_env_with_embedding()
     seed_env["KG_COLLECTION"] = current_shared_kg
     seed_env["KG_BASE_DIR"] = str(PROJECT_ROOT)
+    # v0.2.69 FIX 3: no per-process timeout here. A legitimate slow re-embed
+    # (e.g. arctic on a cold CPU over the full shared KG) can run well past
+    # any wall-clock cap we'd pick, and killing it mid-seed strands the user
+    # exactly where they don't want to be. The right granularity is a
+    # per-embed-REQUEST timeout, which now lives inside EmbeddingService's
+    # adapters (VCT_EMBED_REQUEST_TIMEOUT_SECS) — a genuinely-wedged embedder
+    # fails fast per chunk; a slow-but-progressing one runs to completion.
     try:
         subprocess.run(
             [str(venv_py), str(sync_kg), "--all"],
             check=True,
             cwd=str(PROJECT_ROOT),
-            timeout=600,
             env=seed_env,
         )
     except subprocess.CalledProcessError as e:
         print(f"    ! shared KG seed exited {e.returncode} — re-run later with "
               f"`KG_COLLECTION={current_shared_kg} kg-sync --all`")
         seed_errors.append(f"shared-kg exit {e.returncode}")
-    except subprocess.TimeoutExpired:
-        print("    ! shared KG seed timed out (>10 min)")
-        seed_errors.append("shared-kg timeout")
     except FileNotFoundError as e:
         print(f"    ! shared KG seed failed: {e}")
         seed_errors.append(f"shared-kg FileNotFound: {e}")
@@ -16018,20 +16021,22 @@ def _seed_weaviate_impl(args: argparse.Namespace) -> None:
         # Windows + CPU + 24 GB RAM with the launcher having stored
         # active=arctic, that fallback meant ~30 s per chunk and the user
         # stuck at 40-50% for hours (reported 2026-06-09).
+        # v0.2.69 FIX 3: no per-process timeout — see the matching note in
+        # the shared-KG seed above. A slow re-embed over a large knowledge/
+        # + docs/ tree on a cold CPU can legitimately exceed any wall-clock
+        # cap; the per-embed-REQUEST guard inside EmbeddingService
+        # (VCT_EMBED_REQUEST_TIMEOUT_SECS) is the correct granularity for
+        # catching a wedged embedder without aborting a healthy slow seed.
         try:
             subprocess.run(
                 [str(venv_py), str(sync_kg)] + cmd_args,
                 check=True,
                 cwd=str(PROJECT_ROOT),
-                timeout=900,  # 15 min cap; large repos may hit this
                 env=_subprocess_env_with_embedding(),
             )
         except subprocess.CalledProcessError as e:
             print(f"    ! kg/docs sync exited {e.returncode} — re-run later with `kg-sync --all`")
             seed_errors.append(f"kg-sync exit {e.returncode}")
-        except subprocess.TimeoutExpired:
-            print("    ! kg/docs sync timed out (>15 min) — re-run later with `kg-sync --all`")
-            seed_errors.append("kg-sync timeout")
         except FileNotFoundError as e:
             print(f"    ! kg/docs sync failed: {e}")
             seed_errors.append(f"kg-sync FileNotFound: {e}")

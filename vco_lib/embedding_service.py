@@ -783,6 +783,69 @@ DEFAULT_TEXT_MODEL = "qwen3-embedding:0.6b"
 DEFAULT_CODE_MODEL = "codesage-large-v2"
 
 
+# v0.2.69 FIX 3: per-embed-REQUEST timeout (the correct granularity).
+#
+# Background: install.py used to wrap the WHOLE sync_knowledge_graph.py
+# subprocess in a per-PROCESS timeout (600s / 900s). Those fired on
+# legitimate slow re-embeds — a snowflake-arctic re-embed on a cold CPU
+# can take far longer than any whole-process cap we'd pick, and killing
+# it mid-seed strands the user. Per the maintainer ruling, there is NO
+# per-process timeout on install/seed; the only guard is at CHUNK
+# granularity — i.e. one HTTP embed request for one chunk.
+#
+# This timeout bounds a SINGLE embed request. A genuinely-wedged embedder
+# (hung socket, dead container holding the connection) fails within the
+# cap instead of hanging forever; a slow-but-progressing one — where each
+# chunk completes under the cap — runs to completion no matter how many
+# chunks there are. Default 180s is ~6x the observed ~30s/chunk boundary
+# for arctic-on-CPU, so legitimate chunks never trip it. Override via
+# ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` when hardware is unusually slow (or
+# to tighten it on fast machines). Applies to every embed backend
+# (Ollama / CodeEmbed / OpenAI) — the value is threaded into each adapter
+# at construction.
+DEFAULT_EMBED_REQUEST_TIMEOUT_SECS = 180.0
+EMBED_REQUEST_TIMEOUT_ENV = "VCT_EMBED_REQUEST_TIMEOUT_SECS"
+
+
+def _resolve_embed_request_timeout() -> float:
+    """Return the per-embed-request timeout in seconds.
+
+    Reads ``VCT_EMBED_REQUEST_TIMEOUT_SECS`` (a positive number of
+    seconds); falls back to :data:`DEFAULT_EMBED_REQUEST_TIMEOUT_SECS`
+    when the var is unset, empty, non-numeric, or non-positive. A
+    non-positive or garbage value is treated as "use the default"
+    rather than disabling the guard, because an unbounded embed request
+    is exactly the wedge this fix exists to prevent.
+
+    Returns:
+        A positive float — the ``timeout=`` value passed to every embed
+        HTTP call.
+    """
+    raw = os.environ.get(EMBED_REQUEST_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_EMBED_REQUEST_TIMEOUT_SECS
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a number; using default %.0fs",
+            EMBED_REQUEST_TIMEOUT_ENV,
+            raw,
+            DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
+        )
+        return DEFAULT_EMBED_REQUEST_TIMEOUT_SECS
+    if val <= 0:
+        logger.warning(
+            "%s=%r is not positive; using default %.0fs (an unbounded "
+            "embed request is the wedge this guard prevents)",
+            EMBED_REQUEST_TIMEOUT_ENV,
+            raw,
+            DEFAULT_EMBED_REQUEST_TIMEOUT_SECS,
+        )
+        return DEFAULT_EMBED_REQUEST_TIMEOUT_SECS
+    return val
+
+
 # v0.2.52 V52-AJ: active-embedding resolution helpers.
 #
 # Single canonical resolution path for the ACTIVE_EMBEDDING value:
@@ -897,6 +960,12 @@ class EmbeddingService:
         code_model_id: str,
         openai_api_key: str,
         session: requests.Session | None = None,
+        # v0.2.69 FIX 3: per-embed-request timeout (seconds). Defaults to
+        # None, which resolves to VCT_EMBED_REQUEST_TIMEOUT_SECS (or the
+        # 180s default). Threaded into every real adapter so a wedged
+        # embedder fails at chunk granularity rather than hanging forever.
+        # Tests can pass an explicit value to make the cap small + assertable.
+        embed_request_timeout: float | None = None,
         # Adapter injection points for tests:
         ollama_adapter: OllamaAdapter | None = None,
         code_adapter: CodeEmbedAdapter | None = None,
@@ -909,18 +978,36 @@ class EmbeddingService:
         self.code_model_id = code_model_id
         self.openai_api_key = openai_api_key
 
+        # Resolve the per-embed-request timeout once and reuse for every
+        # adapter so the whole instance shares one cap.
+        self.embed_request_timeout = (
+            embed_request_timeout
+            if embed_request_timeout is not None
+            else _resolve_embed_request_timeout()
+        )
+
         self._owns_session = session is None
         self.session = session or requests.Session()
 
         # Build adapters. Tests can inject mocks; default is the real ones.
+        # The per-embed-request timeout is passed to each real adapter so a
+        # single hung embed call aborts at the configured cap. (Health /
+        # discovery probes inside the adapters clamp to min(timeout, 5s),
+        # so a large embed timeout never slows liveness checks.)
         self.ollama: OllamaAdapter = ollama_adapter or OllamaAdapter(
-            base_url=ollama_url, session=self.session
+            base_url=ollama_url,
+            session=self.session,
+            timeout=self.embed_request_timeout,
         )
         self.codeembed: CodeEmbedAdapter = code_adapter or CodeEmbedAdapter(
-            base_url=code_embed_url, session=self.session
+            base_url=code_embed_url,
+            session=self.session,
+            timeout=self.embed_request_timeout,
         )
         self.openai: OpenAIAdapter = openai_adapter or OpenAIAdapter(
-            api_key=openai_api_key, session=self.session
+            api_key=openai_api_key,
+            session=self.session,
+            timeout=self.embed_request_timeout,
         )
 
         # Pre-compute slot assignments for the configured models.
