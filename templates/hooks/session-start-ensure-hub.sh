@@ -161,7 +161,7 @@ fi
 # start (e.g. cold container probe inside the hub) cannot block the
 # SessionStart hook bus past its 10s budget. Output is dropped on the
 # floor under normal operation; --verbose users can set VCO_HOOK_DEBUG=1
-# AND tail the hub's own log file (see docs/HUB_DETACHMENT_v0.2.21.md).
+# AND tail the hub's own log file (see docs/CONFIGURATION.md § vct-hub).
 if [ "${VCO_HOOK_DEBUG:-}" = "1" ]; then
     "$HUB_BIN" --start-if-not-running
     rc=$?
