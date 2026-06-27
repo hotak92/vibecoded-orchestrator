@@ -52,7 +52,7 @@ if ($env:VCT_REQUIRED_CONTAINERS) {
 # supported invocation, see header), its Script scope IS the caller's script
 # scope, so `$VcoRequiredContainers` etc. are visible to the caller exactly as
 # before. `-Scope 1` worked only by coincidence of having a parent scope to
-# count back to, and was wrapped in `-ErrorAction SilentlyContinue` — which
+# count back to, and was wrapped in `-ErrorAction SilentlyContinue` -- which
 # silently swallowed any scope failure (e.g. if ever run with `-File`, where
 # scope 1 does not exist). `-Scope Script` is valid under BOTH dot-source and
 # `-File`, so a real failure surfaces instead of being masked.
