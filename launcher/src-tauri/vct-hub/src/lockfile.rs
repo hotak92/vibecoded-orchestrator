@@ -110,12 +110,29 @@ pub fn read_identity() -> Option<String> {
 ///     Different inode ⇒ stale (catches both a different-path hub AND an
 ///     older build at the same path); identical inode ⇒ definitively fresh.
 ///   * **Other OSes / `/proc` unavailable** — fall back to the recorded
-///     build identity: stale only when BOTH the recorded and our identity
-///     are KNOWN git fingerprints AND they differ. Anything uncertain
-///     (recorded identity absent, ours not a git fingerprint) ⇒ NOT stale.
+///     build IDENTITY string (lockfile line 2). v0.2.70 made this fire on
+///     the common upgrade case without needing a baked git SHA:
+///       1. Recorded identity present AND its VERSION component differs from
+///          ours ⇒ **STALE**. This is the `v0.2.X → v0.2.X+1` upgrade — now
+///          caught on Windows because every identity string starts with the
+///          crate version (`fingerprint_or_version` contract), so a version
+///          mismatch is positive confirmation of a different binary.
+///       2. Recorded identity present AND same version: stay conservative.
+///          Only escalate to stale when BOTH sides carry a real git SHA
+///          (`has_git_fingerprint`) AND the full fingerprints differ — a
+///          same-version, different-commit dev/hotfix rebuild. If either
+///          side lacks a SHA the comparison is inconclusive ⇒ NOT stale
+///          (never false-kill a healthy same-version hub).
+///       3. Recorded identity ABSENT (pre-v0.2.69 single-line lockfile, no
+///          line 2) ⇒ cannot compare ⇒ NOT stale. A pre-v0.2.69 hub has no
+///          recorded version; it is caught instead by Home #2 (install.py
+///          `--update` stops the hub before the binary swap), so this is a
+///          different home, not a hole.
 ///
 /// Strictly conservative: returns `false` whenever staleness cannot be
-/// POSITIVELY confirmed, so a hub we cannot identify is never killed.
+/// POSITIVELY confirmed, so a hub we cannot identify is never killed. A
+/// DIFFERENT version IS positive confirmation; same-version-can't-tell is
+/// NOT.
 pub fn running_hub_is_stale(pid: u32, recorded_identity: Option<&str>) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -132,16 +149,36 @@ pub fn running_hub_is_stale(pid: u32, recorded_identity: Option<&str>) -> bool {
         }
     }
 
-    // Cross-OS fallback: trust the fingerprint only when it is a real git
-    // fingerprint on BOTH sides and they positively differ.
-    match (recorded_identity, crate::identity::build_fingerprint()) {
-        (Some(recorded), Some(ours)) if crate::identity::has_git_fingerprint() => {
-            recorded != ours
-        }
-        // Recorded identity absent (pre-v0.2.69), or ours is only the bare
-        // version (no git SHA baked) — cannot positively confirm staleness.
-        _ => false,
+    // Cross-OS fallback (also the Linux fallback when /proc metadata is
+    // unavailable). Compare the recorded build identity against ours.
+    let recorded = match recorded_identity {
+        Some(recorded) => recorded,
+        // Pre-v0.2.69 lockfile: no recorded identity ⇒ cannot positively
+        // confirm staleness here ⇒ conservative not-stale. Caught by Home #2
+        // (install.py --update stops the hub) instead.
+        None => return false,
+    };
+
+    let ours = crate::identity::fingerprint_or_version();
+
+    // Step 1 — VERSION mismatch is positive confirmation of a different
+    // binary, regardless of whether a git SHA was baked. Catches the
+    // v0.2.X → v0.2.X+1 upgrade on every OS, no fingerprint needed.
+    let recorded_version = crate::identity::version_component(recorded);
+    let our_version = crate::identity::version_component(&ours);
+    if recorded_version != our_version {
+        return true;
     }
+
+    // Step 2 — same version: only a real, differing git fingerprint on BOTH
+    // sides escalates to stale (same-version, different-commit rebuild).
+    // Anything inconclusive (either side lacks a SHA) ⇒ NOT stale.
+    if crate::identity::has_git_fingerprint() && recorded.contains('+') {
+        return recorded != ours.as_str();
+    }
+
+    // Same version, cannot positively distinguish the commit ⇒ conservative.
+    false
 }
 
 /// Try to claim the lockfile for the current process.
@@ -399,18 +436,71 @@ mod tests {
     #[test]
     fn running_hub_is_stale_true_when_proc_exe_differs() {
         // A dead pid makes /proc/<pid>/exe stat fail → the Linux branch
-        // falls through to the identity comparison. With a recorded git
-        // fingerprint that differs from ours AND our binary carrying a git
-        // fingerprint, that is positively stale. When our build has NO git
-        // fingerprint (released tarball test run) the comparison is
-        // inconclusive → not stale; assert accordingly.
+        // falls through to the identity comparison. The recorded identity
+        // carries version "0.0.1", which differs from OUR crate version, so
+        // the v0.2.70 version-mismatch rule (step 1) reports STALE
+        // unconditionally — no git fingerprint required. (Pre-v0.2.70 this
+        // only fired when our build carried a git SHA.)
         with_state_dir(|_root| {
             let recorded = Some("0.0.1+0000000aaaaa");
-            let expected = crate::identity::has_git_fingerprint();
-            assert_eq!(
+            assert!(
                 running_hub_is_stale(u32::MAX, recorded),
+                "different recorded version ⇒ stale on the cross-OS fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn running_hub_is_stale_true_on_version_mismatch() {
+        // The PRIMARY v0.2.70 fix: an older recorded VERSION (the upgrade
+        // case) is positively stale on EVERY OS, no git SHA needed. Use a
+        // dead sentinel pid so the Linux /proc branch falls through to the
+        // version-comparing fallback.
+        with_state_dir(|_root| {
+            assert!(
+                running_hub_is_stale(u32::MAX, Some("0.0.1")),
+                "bare older version ⇒ stale (upgrade case, no fingerprint)"
+            );
+            assert!(
+                running_hub_is_stale(u32::MAX, Some("0.0.1+abc123def456")),
+                "older version with a SHA ⇒ stale via version mismatch"
+            );
+        });
+    }
+
+    #[test]
+    fn running_hub_is_stale_false_same_version_no_git_sha() {
+        // Same version on both sides with NO git SHA recorded ⇒ inconclusive
+        // ⇒ conservative not-stale (never false-kill a healthy same-version
+        // hub). Seed the recorded identity with OUR exact crate version (bare,
+        // no '+') over a dead sentinel pid.
+        with_state_dir(|_root| {
+            let our_version = env!("CARGO_PKG_VERSION");
+            assert!(
+                !running_hub_is_stale(u32::MAX, Some(our_version)),
+                "same version, no SHA ⇒ conservative not-stale"
+            );
+        });
+    }
+
+    #[test]
+    fn running_hub_is_stale_true_same_version_differing_git_sha() {
+        // Same version but a DIFFERENT committed SHA ⇒ stale ONLY when our
+        // build also carries a real git fingerprint to compare against.
+        // Construct the recorded identity as "<our-version>+<foreign-sha>"
+        // so the version matches but the SHA differs. When our build has no
+        // baked SHA (released tarball test run) the comparison is
+        // inconclusive → not stale; assert accordingly.
+        with_state_dir(|_root| {
+            let recorded = format!("{}+deadbeefcafe", env!("CARGO_PKG_VERSION"));
+            let our_fp = crate::identity::fingerprint_or_version();
+            // Only positively stale when our build has a git SHA AND it
+            // differs from the foreign one we recorded.
+            let expected = crate::identity::has_git_fingerprint() && our_fp != recorded;
+            assert_eq!(
+                running_hub_is_stale(u32::MAX, Some(&recorded)),
                 expected,
-                "stale iff our build carries a git fingerprint to compare against"
+                "same-version differing-SHA stale iff our build carries a git fingerprint"
             );
         });
     }
@@ -419,8 +509,9 @@ mod tests {
     fn running_hub_is_stale_false_when_recorded_identity_absent() {
         // A pre-v0.2.69 lockfile (no identity) over a pid whose exe we
         // cannot inode-compare must NOT be reported stale on the fallback
-        // path — conservative, never a false kill. Use a dead sentinel pid
-        // so the Linux /proc branch falls through to the fallback.
+        // path — conservative, never a false kill. Caught instead by Home #2
+        // (install.py --update stops the hub). Use a dead sentinel pid so the
+        // Linux /proc branch falls through to the fallback.
         with_state_dir(|_root| {
             assert!(
                 !running_hub_is_stale(u32::MAX, None),

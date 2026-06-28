@@ -602,7 +602,22 @@ jobs:
         shell: bash
         env:
           BUILD_TARGET: ${{ matrix.target }}
-        run: bash scripts/build-bundled-launcher.sh
+        # v0.2.70 (Windows hub-stale precision): bake the short git SHA into
+        # the vct-hub binary via VCT_HUB_BUILD_FINGERPRINT. vct-hub/build.rs
+        # reads this env var (std::env::var_os) and, when set, honours it
+        # verbatim instead of shelling out to git. Without it, SHIPPED release
+        # binaries carried NO git fingerprint, so `running_hub_is_stale`'s
+        # same-version commit-level comparison could never fire — a stale hub
+        # left running after a same-version rebuild stayed undetected on
+        # Windows. (The PRIMARY fix is the version-component comparison in
+        # lockfile.rs, which catches the v0.2.X→v0.2.X+1 upgrade with no SHA;
+        # this adds same-version, different-commit precision for FUTURE
+        # builds.) Use the SAME `--short=12` format build.rs would compute so
+        # locally-built and CI-built fingerprints are identical.
+        run: |
+          export VCT_HUB_BUILD_FINGERPRINT="$(git rev-parse --short=12 HEAD)"
+          echo "[release] baking vct-hub fingerprint VCT_HUB_BUILD_FINGERPRINT=${VCT_HUB_BUILD_FINGERPRINT}"
+          bash scripts/build-bundled-launcher.sh
 
       # v0.2.40 X1: ad-hoc codesign on macOS. `codesign --sign -` (the
       # literal hyphen identity) attaches a valid Mach-O signature with

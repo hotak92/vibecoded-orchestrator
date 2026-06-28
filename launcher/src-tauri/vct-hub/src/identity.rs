@@ -46,6 +46,23 @@ pub fn has_git_fingerprint() -> bool {
     build_fingerprint().is_some()
 }
 
+/// Extract the VERSION component from a build-identity string.
+///
+/// Identity strings produced by [`fingerprint_or_version`] are EITHER
+/// `"<version>+<sha>[-dirty]"` (when a git SHA was baked) OR the bare
+/// `"<version>"` (released tarball / no SHA). The version is therefore
+/// everything before the first `'+'`, or the whole string when there is no
+/// `'+'`. This MUST match the format emitted by `fingerprint_or_version`;
+/// if that format ever gains another separator, update this in lockstep.
+///
+/// Pure + total: never panics, never allocates (returns a borrowed slice).
+pub fn version_component(s: &str) -> &str {
+    match s.split_once('+') {
+        Some((version, _rest)) => version,
+        None => s,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +77,32 @@ mod tests {
             s.starts_with(env!("CARGO_PKG_VERSION")),
             "fingerprint_or_version {:?} must start with version {}",
             s,
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[test]
+    fn version_component_extracts_version_prefix() {
+        // "<version>+<sha>" → "<version>"
+        assert_eq!(version_component("0.2.70+abc123"), "0.2.70");
+        // Bare version (no '+') → whole string.
+        assert_eq!(version_component("0.2.70"), "0.2.70");
+        // The '-dirty' marker lives in the SHA segment AFTER the '+', so it
+        // is stripped along with the SHA.
+        assert_eq!(version_component("0.2.70+abc-dirty"), "0.2.70");
+        // Only the FIRST '+' splits — a hypothetical multi-'+' suffix keeps
+        // everything after the first as the (discarded) remainder.
+        assert_eq!(version_component("0.2.70+abc+def"), "0.2.70");
+        // Empty string is total (no panic).
+        assert_eq!(version_component(""), "");
+    }
+
+    #[test]
+    fn version_component_matches_fingerprint_or_version() {
+        // Contract: version_component(fingerprint_or_version()) must equal the
+        // crate version whether or not a SHA was baked.
+        assert_eq!(
+            version_component(&fingerprint_or_version()),
             env!("CARGO_PKG_VERSION")
         );
     }
