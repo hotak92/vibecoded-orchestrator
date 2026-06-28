@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.70] - 2026-06-28
+
 ### Fixed (v0.2.70 streams A, B — migration + install)
 - **Additive Weaviate schema migration now AUTO-APPLIES (Stream A):** a
   bundle update that detects purely-additive (lossless) schema drift — new
@@ -108,6 +110,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Shared logic is extracted under `rl_client/` (`answer_window.py`,
   `citation_compute.py`, `citation_pending.py`, `embed_regen.py`,
   `query_chunking.py`) with one home per concern.
+
+### Fixed (v0.2.70 — install/hook robustness + cross-OS, found in pre-ship sweep)
+- **Bundle hook-merge now supersedes a stale shipped hook instead of stacking it
+  (Stream G).** `_merge_hooks_for_bundle` was append-only by exact command string,
+  so when a VCO-shipped hook's command form changed (e.g. the v0.2.69 Windows
+  backslash→forward-slash path fix) a bundle update STACKED the new command beside
+  the broken old one — the broken hook kept firing. The merge now recognises a
+  superseded VCO hook by its `.claude/hooks/<script>` identity (normalised across
+  path-separator / variable-expansion / quoting, anchored to the INVOKED-script
+  position so a user command that merely references a hook path as an argument is
+  never clobbered) and REPLACES the stale command. It also merges at per-command
+  granularity so adding the new `stop-drain-citations` hook no longer duplicates
+  the existing cost-tracker / notify-stop commands in a shared `Stop` group. The
+  same fix applies on the orchestrator-self `install.py` path (one shared merge).
+- **KG re-embed no longer hangs forever on a wedged embedder.** `install.py --update`
+  could hang indefinitely during a full re-embed (e.g. an arctic model-swap
+  re-embedding the whole KG on CPU) because the per-embed-request timeout was passed
+  to `requests` as a scalar — a per-socket-read (inter-byte) gap, not a total
+  deadline — so a backend that dribbles keep-alive bytes reset the clock and never
+  tripped. A new shared `bounded_post` helper now bounds each embed POST (one chunk
+  / one batch) by a TOTAL wall-clock deadline via a daemon thread pool, so a wedged
+  request fails at chunk granularity and the sync continues (never a per-node /
+  per-process kill). `VCT_EMBED_REQUEST_TIMEOUT_SECS` is now threaded into the
+  install seed env, and the `--all` sync emits per-batch progress.
+- **vct-hub stale-binary detection now works on Windows/macOS (completes v0.2.69
+  FIX#3).** `running_hub_is_stale` relied on a baked git fingerprint for its
+  non-Linux fallback, but release binaries never baked one, so off-Linux a stale
+  hub was never detected stale and the old binary kept running after an update.
+  Detection now compares the VERSION component of the lockfile build identity
+  (always present), catching the v0.2.X→v0.2.X+1 upgrade on every OS with no git
+  SHA needed; same-version detection stays conservative (only a real differing git
+  SHA on both sides escalates) so a healthy hub is never killed. The release build
+  now also bakes `VCT_HUB_BUILD_FINGERPRINT` for same-version commit precision.
+- **Windows context-injection read-dedup fixed (`seen-store.ps1`).** A PowerShell
+  scope bug (`$script:`-scoped writes vs function-local reads in the flush closure)
+  meant the Stream-E dedup on Windows shredded injected KG/CODE blocks to headerless
+  fragments and never recorded dedup keys. The flush block is now dot-sourced into
+  the function scope so reads and writes share state (matching the bash sibling),
+  with a cross-OS-parity functional test.
+- **Misc robustness:** `stop-drain-citations.{sh,ps1}` siblings now make the same
+  venv-resolution decision; symlink-redirect deferral reconciliation commands are
+  emitted in both bash and PowerShell forms; the migrate toast no longer claims
+  additive copies "were applied" on rebuild-only plans; an ASCII-purity test guards
+  the new `_lib/*.ps1` helpers; and the `gpu_device.py` docstring no longer claims a
+  `wmic` Windows path that was never implemented.
+
+### Security
+- **Cleared all open Dependabot alerts (dev/build dependencies).** Bumped `vitest`
+  → 3.2.6 (CRITICAL: Vitest UI arbitrary file read/execute) in the vendored
+  excalidraw MCP fork, and `vite` → 6.4.3 (HIGH: `server.fs.deny` bypass),
+  `dompurify` → 3.4.11, and `nanoid` (transitive) in the launcher. All are
+  dev/build/test dependencies, not present in shipped artifacts; the launcher now
+  reports 0 npm vulnerabilities. No vendored `dist/` rebuild was required (the
+  vitest bump is test-only).
 
 ## [0.2.69] - 2026-06-27
 
