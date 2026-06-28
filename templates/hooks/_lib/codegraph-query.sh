@@ -15,8 +15,8 @@
 #
 # MUST MATCH: templates/hooks/_lib/codegraph-query.ps1 — the query/format
 # contract (CODE:-prefixed --hook-format output, the inner timeout bound) AND the
-# codegraph_symbol_gate regex must agree cross-OS. See the "MUST MATCH" note on
-# the gate below.
+# codegraph_bash_gate + codegraph_pattern_gate regexes must agree cross-OS. See
+# the "MUST MATCH" notes on each gate below.
 #
 # This file is sourced, never executed — no shebang. Library, not a hook.
 
@@ -89,50 +89,6 @@ codegraph_query_block() {
     fi
 }
 
-# codegraph_symbol_gate <command-or-text>
-# Pure-bash gate (NO subprocess, O(len)) deciding whether a command/text
-# references a CODE SYMBOL or CODE FILE PATH worth a codegraph lookup. Returns 0
-# (fire) / 1 (skip). This is the #1-risk gate for the pre-bash surface: too loose
-# blows the latency budget on routine ls/cd/git; too tight re-creates the
-# zero-injection bug.
-#
-# Fires when the text contains ANY of:
-#   1. a dotted symbol token   [A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_]   (module.func)
-#   2. a CamelCase identifier   [A-Z][a-z]+[A-Z]
-#   3. a snake-or-name + open-paren   [A-Za-z_][A-Za-z0-9_]*\(      (func()
-#   4. a code-file path         [^ ]+\.(py|js|...)\b
-#
-# DOES NOT fire on bare ls/cd/git-without-code-path/cat-noncode (no symbol shape).
-# Known NEGATIVE cases the gate MUST reject (tested): `git log a.b.c`,
-# `grep foo.bar`, a bare dotted path arg, `cd`, `ls`. Those reach this gate but
-# the CALLER additionally screens for a code-search tool (grep/rg/find) context;
-# the dotted-token rule alone would match `git log a.b.c`, so the pre-bash caller
-# pairs this with a tool/context check (see pre-bash-context-inject.sh).
-#
-# MUST MATCH: codegraph-query.ps1 Test-VcoCodegraphSymbolGate (same 4 shapes +
-# the same code-file extension list).
-codegraph_symbol_gate() {
-    local text="$1"
-    [ -n "$text" ] || return 1
-    # (4) code-file path — strongest signal, check first.
-    if [[ "$text" =~ [^[:space:]]+\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)([^A-Za-z0-9]|$) ]]; then
-        return 0
-    fi
-    # (1) dotted symbol token (module.func / Class.method).
-    if [[ "$text" =~ [A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_] ]]; then
-        return 0
-    fi
-    # (2) CamelCase identifier.
-    if [[ "$text" =~ [A-Z][a-z]+[A-Z] ]]; then
-        return 0
-    fi
-    # (3) call shape: name(
-    if [[ "$text" =~ [A-Za-z_][A-Za-z0-9_]*\( ]]; then
-        return 0
-    fi
-    return 1
-}
-
 # codegraph_pattern_gate <pattern>
 # True (0) if <pattern> looks like a CODE IDENTIFIER worth a codegraph lookup:
 # snake_case-with-underscore, OR CamelCase, OR a `name(` call, OR a code keyword
@@ -164,23 +120,24 @@ codegraph_pattern_gate() {
 }
 
 # codegraph_bash_gate <bash-command>
-# The pre-bash-SPECIFIC gate (tighter than codegraph_symbol_gate). Fires the
-# codegraph branch ONLY when the bash command is genuinely navigating code,
-# short-circuiting (pure-bash, no subprocess) for routine ls/cd/git/cat/etc.
-# Returns 0 (fire) / 1 (skip).
+# The pre-bash-SPECIFIC gate. Fires the codegraph branch ONLY when the bash
+# command is genuinely navigating code, short-circuiting (pure-bash, no
+# subprocess) for routine ls/cd/git/cat/etc. Returns 0 (fire) / 1 (skip).
 #
 # THE #1-RISK GATE. Fires when EITHER:
 #   (A) the command runs a code-search tool (grep|rg|ag|ack) AND its pattern is a
-#       CODE-IDENTIFIER shape: snake_case-with-underscore, OR CamelCase, OR a
-#       `name(` call, OR a code keyword (def/class/func/function/fn) prefix; OR
+#       CODE-IDENTIFIER shape (delegates to codegraph_pattern_gate:
+#       snake_case-with-underscore, OR CamelCase, OR a `name(` call, OR a code
+#       keyword (def/class/func/function/fn) prefix); OR
 #   (B) the command references a CODE-FILE path (foo.py, src/bar.rs, ...).
 #
 # Deliberately does NOT fire on (tested NEGATIVES):
 #   ls, cd /tmp, git status, git log a.b.c, cat notes.txt, grep foo.bar
 #   (dotted but non-identifier / could be a data filename), grep "TODO"
 #   (bare all-caps word, no identifier shape), a bare dotted path arg.
-# The bare-dotted rule from codegraph_symbol_gate is INTENTIONALLY excluded here
-# (it false-fires on `grep foo.bar` / `git log a.b.c`).
+# A bare dotted-token rule is INTENTIONALLY excluded (it would false-fire on
+# `grep foo.bar` / `git log a.b.c`) — that is why this gate pairs a code-search
+# tool context with codegraph_pattern_gate's identifier-shape check.
 #
 # MUST MATCH: codegraph-query.ps1 Test-VcoCodegraphBashGate.
 codegraph_bash_gate() {

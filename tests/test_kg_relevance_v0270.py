@@ -174,46 +174,60 @@ def _has_bash() -> bool:
     return shutil.which("bash") is not None
 
 
-def test_d3_prebash_strip_documented() -> None:
+def test_d3_prebash_sources_shared_strip_no_inline() -> None:
+    """N-3 (one home): the hook must SOURCE _lib/command-noise-strip.sh and call
+    vco_strip_command_noise — NOT carry an inline `for t in cmd.split()` copy.
+    Same for the .ps1 sibling."""
     body = (HOOKS / "pre-bash-context-inject.sh").read_text(encoding="utf-8")
-    assert "command-noise strip" in body, (
-        "pre-bash must document the D-3 command-noise strip"
+    assert "_lib/command-noise-strip.sh" in body and "vco_strip_command_noise" in body, (
+        "pre-bash.sh must source + call the shared noise-strip helper"
+    )
+    assert "for t in cmd.split()" not in body, (
+        "pre-bash.sh must NOT carry an inline copy of the noise-strip"
     )
     # The 500-char skip must still be present (not removed by D-3).
     assert "THRESHOLD" in body and "CMD_LEN" in body
+    ps1 = (HOOKS / "pre-bash-context-inject.ps1").read_text(encoding="utf-8")
+    assert "command-noise-strip.ps1" in ps1 and "Get-VcoCommandNoiseStripped" in ps1, (
+        "pre-bash.ps1 must source + call the shared noise-strip helper"
+    )
+    assert "for t in cmd.split()" not in ps1, (
+        "pre-bash.ps1 must NOT carry an inline copy of the noise-strip"
+    )
+
+
+NOISE_STRIP_SH = REPO_ROOT / "templates" / "hooks" / "_lib" / "command-noise-strip.sh"
+NOISE_STRIP_PS1 = REPO_ROOT / "templates" / "hooks" / "_lib" / "command-noise-strip.ps1"
+
+
+def test_d3_noise_strip_ps1_sibling_exists() -> None:
+    assert NOISE_STRIP_SH.exists()
+    assert NOISE_STRIP_PS1.exists(), (
+        "command-noise-strip.ps1 MISSING — _lib/ is excluded from the parity "
+        "gate, so this must be hand-verified here."
+    )
 
 
 @pytest.mark.skipif(not _has_bash(), reason="bash required")
 def test_d3_strip_removes_flags_and_paths(tmp_path: Path) -> None:
-    """Drive the exact Python strip used by the pre-bash hook and assert it
-    removes flags / path tokens / shell operators."""
+    """Drive the SHARED _lib helper function (not a re-inlined copy — N-3) and
+    assert it removes flags / path tokens / shell ops."""
     py = shutil.which("python3") or "python3"
-    strip_code = r'''
-import re, sys
-cmd = sys.stdin.read()
-toks = []
-for t in cmd.split():
-    if t.startswith('-'):
-        continue
-    if t in ('|', '||', '&&', ';', '>', '>>', '<', '2>', '2>&1', '&', '.', '..', '*'):
-        continue
-    if '/' in t:
-        base = t.rstrip('/').split('/')[-1]
-        if re.search(r'\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$', base):
-            toks.append(base)
-        continue
-    toks.append(t)
-print(' '.join(toks).strip())
-'''
+
     def strip(cmd: str) -> str:
-        r = subprocess.run([py, "-c", strip_code], input=cmd, capture_output=True, text=True, timeout=10)
+        script = (
+            f'export PY="{py}"\n'
+            f'. "{NOISE_STRIP_SH}"\n'
+            'vco_strip_command_noise "$1"\n'
+        )
+        r = subprocess.run(["bash", "-c", script, "_", cmd], capture_output=True, text=True, timeout=10)
         return r.stdout.strip()
 
     # bare cd /some/dir -> only "cd" survives (path stripped) -> low signal.
-    assert strip("cd /home/user/project") == "cd"
+    assert strip("cd /some/dir/project") == "cd"
     # ls -la /tmp -> "ls" only.
     assert strip("ls -la /tmp") == "ls"
     # a code-file path keeps its BASENAME (meaningful signal).
     assert "server.py" in strip("python claude_mcp_servers/weaviate_mcp/server.py")
-    # flags dropped; identifier kept.
+    # flags + bare-dot dropped; identifier kept.
     assert strip("grep -rn migrate_collections .") == "grep migrate_collections"

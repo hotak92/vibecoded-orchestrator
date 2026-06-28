@@ -45,6 +45,8 @@ PROJECT_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 [ -f "$SCRIPT_DIR/_lib/seen-store.sh" ] && . "$SCRIPT_DIR/_lib/seen-store.sh"
 # shellcheck source=_lib/codegraph-query.sh disable=SC1091
 [ -f "$SCRIPT_DIR/_lib/codegraph-query.sh" ] && . "$SCRIPT_DIR/_lib/codegraph-query.sh"
+# shellcheck source=_lib/command-noise-strip.sh disable=SC1091
+[ -f "$SCRIPT_DIR/_lib/command-noise-strip.sh" ] && . "$SCRIPT_DIR/_lib/command-noise-strip.sh"
 
 # Hook input arrives as JSON on stdin per Claude Code v2.1.x spec.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
@@ -200,35 +202,19 @@ VENV="${VCO_VENV_PYTHON:-}"
 # have richer structure so we allow more headroom.
 #
 # v0.2.70 Stream D-3 (command-noise strip): the KG query is built from the raw
-# bash command, which is mostly flags and paths. Strip the noise tokens — short
-# flags (-x / --foo), absolute/relative paths, and shell operators — so the
-# embedding sees the semantically meaningful words (subcommands, identifiers)
-# rather than directory keywords. A bare `cd /some/dir` or `ls -la` then yields
-# little-to-no query signal instead of injecting directory-keyword KG. Falls
-# back to the raw (capped) command if the strip leaves nothing.
+# bash command, which is mostly flags and paths. The noise-strip logic lives in
+# the shared _lib/command-noise-strip.sh (ONE bash home — no inline copy here,
+# none in the test). vco_strip_command_noise drops flags, paths (keeping a code-
+# file basename), shell operators + bare cwd dots, so a bare `cd /some/dir` or
+# `ls -la` yields little query signal instead of injecting directory-keyword KG.
+# Falls back to the raw (capped) command if the strip leaves nothing OR the
+# helper is missing (partial install).
 QUERY_RAW=$(printf '%s' "$COMMAND" | head -c 500)
-QUERY=$(printf '%s' "$QUERY_RAW" | "$PY" -c "
-import re, sys
-cmd = sys.stdin.read()
-toks = []
-for t in cmd.split():
-    # drop short/long flags
-    if t.startswith('-'):
-        continue
-    # drop shell operators / redirections / bare cwd dots / lone punctuation
-    if t in ('|', '||', '&&', ';', '>', '>>', '<', '2>', '2>&1', '&', '.', '..', '*'):
-        continue
-    # drop bare path-looking tokens (contain a slash) UNLESS they carry a
-    # code-file extension (those ARE meaningful — keep the basename).
-    if '/' in t:
-        base = t.rstrip('/').split('/')[-1]
-        if re.search(r'\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$', base):
-            toks.append(base)
-        continue
-    toks.append(t)
-out = ' '.join(toks).strip()
-print(out)
-" 2>/dev/null || printf '%s' "$QUERY_RAW")
+if command -v vco_strip_command_noise >/dev/null 2>&1; then
+    QUERY="$(vco_strip_command_noise "$QUERY_RAW")"
+else
+    QUERY="$QUERY_RAW"
+fi
 # Strip fallback: if noise-removal emptied the query, use the raw command so a
 # genuinely identifier-only long command still searches.
 [ -z "$QUERY" ] && QUERY="$QUERY_RAW"

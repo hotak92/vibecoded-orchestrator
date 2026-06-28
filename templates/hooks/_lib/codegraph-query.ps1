@@ -11,7 +11,7 @@
 #
 # MUST MATCH: templates/hooks/_lib/codegraph-query.sh -- the query/format
 # contract (CODE:-prefixed --hook-format output, the inner timeout bound) AND the
-# Test-VcoCodegraphSymbolGate regex (same 4 shapes + code-file extension list).
+# Test-VcoCodegraphBashGate + Test-VcoCodegraphPatternGate regexes.
 #
 # Plain ASCII only. Dot-sourced, never executed. Library, not a hook.
 
@@ -76,23 +76,6 @@ function Invoke-VcoCodegraphQueryBlock {
     return (($lines | Select-Object -First 20) -join "`n")
 }
 
-# Test-VcoCodegraphSymbolGate <Text> -- $true if Text references a code symbol or
-# code-file path (the same 4 shapes as the .sh gate). MUST MATCH
-# codegraph-query.sh codegraph_symbol_gate.
-function Test-VcoCodegraphSymbolGate {
-    param([string]$Text)
-    if ([string]::IsNullOrEmpty($Text)) { return $false }
-    # (4) code-file path.
-    if ($Text -match '[^\s]+\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)([^A-Za-z0-9]|$)') { return $true }
-    # (1) dotted symbol token.
-    if ($Text -match '[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_]') { return $true }
-    # (2) CamelCase identifier.
-    if ($Text -match '[A-Z][a-z]+[A-Z]') { return $true }
-    # (3) call shape: name(
-    if ($Text -match '[A-Za-z_][A-Za-z0-9_]*\(') { return $true }
-    return $false
-}
-
 # Test-VcoCodegraphPatternGate <Pattern> -- $true if Pattern is a code IDENTIFIER
 # (snake/CamelCase/name(/keyword id). NOT on bare all-caps/lowercase word or bare
 # dotted token. Used by the Grep surface + Test-VcoCodegraphBashGate (one home).
@@ -107,11 +90,11 @@ function Test-VcoCodegraphPatternGate {
     return $false
 }
 
-# Test-VcoCodegraphBashGate <Command> -- pre-bash-SPECIFIC gate (tighter than
-# Test-VcoCodegraphSymbolGate). Fires ONLY when the bash command navigates code.
-# MUST MATCH codegraph-query.sh codegraph_bash_gate (same A/B rules + the same
-# negatives: ls, cd, git status, git log a.b.c, cat notes.txt, grep foo.bar,
-# grep "TODO").
+# Test-VcoCodegraphBashGate <Command> -- pre-bash-SPECIFIC gate. Fires ONLY when
+# the bash command navigates code (delegates the identifier-shape check to
+# Test-VcoCodegraphPatternGate). MUST MATCH codegraph-query.sh codegraph_bash_gate
+# (same A/B rules + the same negatives: ls, cd, git status, git log a.b.c,
+# cat notes.txt, grep foo.bar, grep "TODO").
 function Test-VcoCodegraphBashGate {
     param([string]$Command)
     if ([string]::IsNullOrEmpty($Command)) { return $false }

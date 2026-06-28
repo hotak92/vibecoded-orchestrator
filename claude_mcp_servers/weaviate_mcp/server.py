@@ -5651,6 +5651,13 @@ async def _hybrid_search_single_collection(
         else:
             combined[key] = {
                 "title": formatted_kw["title"],
+                # v0.2.70 Stream D-1 (N-1): formatted_kw is _format_obj output,
+                # which always sets node_type ("doc" for Development-collection
+                # results, the real type otherwise). This "unknown" fallback is a
+                # dead default (the key is never absent) — kept for safety. Do
+                # NOT re-default to "doc" here; the docs gate lives in
+                # _format_obj (single home). Mirrors the note at the semantic
+                # site above.
                 "node_type": formatted_kw.get("node_type", "unknown"),
                 "content": formatted_kw.get("content", ""),
                 "tags": formatted_kw.get("tags", []),

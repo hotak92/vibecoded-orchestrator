@@ -228,3 +228,23 @@ def test_g5_guard_allows_explicit_project_from_worktree(tmp_path: Path) -> None:
     assert "refusing to mint" not in r.stderr, (
         f"guard wrongly fired with an explicit --project: {r.stderr[-400:]}"
     )
+
+
+def test_g5_guard_does_not_false_refuse_legit_wt_named_project(tmp_path: Path) -> None:
+    """N-5: a project legitimately named e.g. 'wt-foo' must NOT be false-refused.
+    The guard uses EXACT path-segment membership ({'.wt','worktrees','vco-wt'}),
+    so 'wt-foo' (not one of those segments) is fine and falls back to the
+    repo-dir-name without the worktree refusal. Locks the segment-membership
+    semantics so a future loosening to substring matching is caught."""
+    import os
+    legit = tmp_path / "wt-foo"   # a project DIR whose basename starts with 'wt'
+    legit.mkdir(parents=True)
+    analyzer = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
+    env = {k: v for k, v in os.environ.items() if k not in ("CODE_GRAPH_PROJECT", "PROJECT_NAME")}
+    r = subprocess.run(
+        [shutil.which("python3") or "python3", str(analyzer), "."],
+        cwd=str(legit), capture_output=True, text=True, timeout=60, env=env,
+    )
+    assert "refusing to mint" not in r.stderr, (
+        f"guard FALSE-REFUSED a legitimately-named 'wt-foo' project: {r.stderr[-400:]}"
+    )

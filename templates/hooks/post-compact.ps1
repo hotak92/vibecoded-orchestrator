@@ -77,6 +77,13 @@ if ($SessionId) {
     if (Test-Path $ReadsFile) {
         Remove-Item $ReadsFile -Force -ErrorAction SilentlyContinue
     }
+    # v0.2.70 Stream E (SF-1): also wipe the INJECTOR reads store
+    # (seen_reads_<id>.txt) — DISTINCT from the Build-Anchor reads_<id>.txt.
+    # MUST MATCH the seen_reads name in _lib/seen-store.ps1 + post-compact.sh.
+    $SeenReadsFile = Join-Path $ProjectDir ".claude/state/seen_reads_$SessionId.txt"
+    if (Test-Path $SeenReadsFile) {
+        Remove-Item $SeenReadsFile -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # v0.2.29: same reset for the agent-skill-keyword-suggest hook's

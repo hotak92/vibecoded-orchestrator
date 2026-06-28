@@ -121,6 +121,10 @@ try {
     Get-ChildItem -Path $SessionStateDir -Filter 'reads_*.txt' -File -ErrorAction SilentlyContinue |
         Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
+    # v0.2.70 Stream E (SF-1): same GC for the INJECTOR reads store.
+    Get-ChildItem -Path $SessionStateDir -Filter 'seen_reads_*.txt' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { }
 
 function Get-Field([string]$field) {
@@ -250,23 +254,31 @@ function Invoke-CgInject([string]$q, [string]$excl, [string]$label) {
 if ($ToolName -eq "Read") {
     $filePath = Get-Field "file_path"
     if ($filePath) {
+        # Build Anchor ledger (unchanged path/shape — harness exact-match gate).
         try { Add-Content -Path $SessionReadsFile -Value $filePath -ErrorAction Stop } catch { }
-        # v0.2.70 Stream E: also record into the unified reads store the
-        # injectors consult (ABS path for exact src match). Skipped when the
+        # v0.2.70 Stream E (SF-1 fix): record a REPO-RELATIVE path into the
+        # INJECTOR reads store (seen_reads_<sid>.txt, DISTINCT from the
+        # Build-Anchor reads_<sid>.txt) so it matches the producers' repo-relative
+        # "| src=<path>" trailer. An absolute ledger entry would NEVER match the
+        # exact suppression. The abs->relative conversion is the ONE shared
+        # ConvertTo-VcoRepoRelative helper (no inline copy). Skipped when the
         # session id is untrustworthy.
+        $relFp = $filePath
+        if (Get-Command ConvertTo-VcoRepoRelative -ErrorAction SilentlyContinue) {
+            $relFp = ConvertTo-VcoRepoRelative -Path $filePath -ProjectRoot $ProjectRoot
+        }
         if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-            $absFp = $filePath
-            try { if (-not [System.IO.Path]::IsPathRooted($filePath)) { $absFp = (Resolve-Path -LiteralPath $filePath -ErrorAction Stop).Path } } catch { $absFp = $filePath }
             $unifiedReads = Get-VcoSeenStorePath -Kind "reads" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-            if ($unifiedReads -and ($unifiedReads -ne $SessionReadsFile)) {
-                try { Add-Content -Path $unifiedReads -Value $absFp -ErrorAction Stop } catch { }
+            if ($unifiedReads) {
+                try { Add-Content -Path $unifiedReads -Value $relFp -ErrorAction Stop } catch { }
             }
         }
         # v0.2.70 Stream C Surface 1 (Read): code file -> inject callers/deps.
-        # MUST MATCH the IS_CODE regex in pre-edit + post-file-edit.
+        # MUST MATCH the IS_CODE regex in pre-edit + post-file-edit. Self-exclude
+        # uses the repo-relative path so it matches the producer CODE: src shape.
         if ($filePath -match '\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$') {
             $rdQ = [System.IO.Path]::GetFileNameWithoutExtension((Split-Path $filePath -Leaf))
-            Invoke-CgInject $rdQ $filePath "Code-graph context for $(Split-Path $filePath -Leaf)"
+            Invoke-CgInject $rdQ $relFp "Code-graph context for $(Split-Path $filePath -Leaf)"
         }
     }
     exit 0

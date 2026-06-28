@@ -41,7 +41,8 @@ $script:VcoSeenStoreSourced = $true
 #
 # File-name convention (MUST MATCH seen-store.sh):
 #   inject -> seen_inject_<sid>.txt
-#   reads  -> reads_<sid>.txt   (same file pre-tool-use writes + post-compact wipes)
+#   reads  -> seen_reads_<sid>.txt  (INJECTOR reads-ledger, repo-relative paths;
+#             DISTINCT from pre-tool-use's Build-Anchor reads_<sid>.txt -- SF-1)
 function Get-VcoSeenStorePath {
     param(
         [string]$Kind,
@@ -51,10 +52,23 @@ function Get-VcoSeenStorePath {
     if ([string]::IsNullOrEmpty($SessionId) -or $SessionId -eq "default") { return "" }
     if ([string]::IsNullOrEmpty($ProjectRoot)) { return "" }
     $stateDir = Join-Path (Join-Path $ProjectRoot ".claude") "state"
-    if ($Kind -eq "reads") {
-        return (Join-Path $stateDir ("reads_{0}.txt" -f $SessionId))
-    }
     return (Join-Path $stateDir ("seen_{0}_{1}.txt" -f $Kind, $SessionId))
+}
+
+# ConvertTo-VcoRepoRelative <Path> <ProjectRoot>
+# The ONE PowerShell-side home (SF-1) for normalising a path to the REPO-RELATIVE
+# shape the producers' "| src=" trailers use. Used by the reads-ledger writer +
+# codegraph self-exclude in pre-tool-use.ps1. Already-relative paths and absolute
+# paths outside the project root are returned unchanged (slashes normalised to
+# forward-slash to match the producers' POSIX src). MUST MATCH seen-store.sh's
+# vco_to_repo_relative.
+function ConvertTo-VcoRepoRelative {
+    param([string]$Path, [string]$ProjectRoot)
+    if ([string]::IsNullOrEmpty($Path)) { return "" }
+    if ($ProjectRoot -and $Path.StartsWith($ProjectRoot)) {
+        return ($Path.Substring($ProjectRoot.Length).TrimStart('/', '\') -replace '\\', '/')
+    }
+    return $Path
 }
 
 # Test-VcoSeenHas <File> <Key> -- $true if Key is present (exact line match).

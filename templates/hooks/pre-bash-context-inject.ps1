@@ -51,7 +51,10 @@ $SeenStoreLib = Join-Path $LibDir "seen-store.ps1"
 if (Test-Path $SeenStoreLib) { . $SeenStoreLib }
 $CodegraphLib = Join-Path $LibDir "codegraph-query.ps1"
 if (Test-Path $CodegraphLib) { . $CodegraphLib }
+$NoiseStripLib = Join-Path $LibDir "command-noise-strip.ps1"
+if (Test-Path $NoiseStripLib) { . $NoiseStripLib }
 $script:ProjectRoot = $ProjectRoot
+$script:PY = $PY  # expose to the noise-strip helper
 
 # v0.2.70 Stream E: unify session-id via the shared helper. $SessionIdRaw keeps
 # the trustworthy-vs-untrustworthy distinction for the seen-store.
@@ -152,34 +155,15 @@ $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 
 # === Run KG search using command as query ===
 # Truncate to ~500 chars so the embedder doesn't see kilobytes of input.
-# v0.2.70 Stream D-3 (command-noise strip): strip flags / path tokens / shell
-# operators so a bare `cd`/`ls` yields little query signal instead of injecting
-# directory-keyword KG. Falls back to the raw (capped) command when the strip
-# empties it. MUST MATCH the .sh sibling's Python strip.
+# v0.2.70 Stream D-3 (command-noise strip): the strip logic lives in the shared
+# _lib/command-noise-strip.ps1 (ONE PowerShell home — no inline copy here, none
+# in the test). Falls back to the raw (capped) command when the strip empties it
+# OR the helper is missing (partial install).
 $QueryRaw = if ($Command.Length -gt 500) { $Command.Substring(0, 500) } else { $Command }
-$Query = $QueryRaw
-if ($PY) {
-    try {
-        $stripCode = @'
-import re, sys
-cmd = sys.stdin.read()
-toks = []
-for t in cmd.split():
-    if t.startswith('-'):
-        continue
-    if t in ('|', '||', '&&', ';', '>', '>>', '<', '2>', '2>&1', '&', '.', '..', '*'):
-        continue
-    if '/' in t:
-        base = t.rstrip('/').split('/')[-1]
-        if re.search(r'\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$', base):
-            toks.append(base)
-        continue
-    toks.append(t)
-print(' '.join(toks).strip())
-'@
-        $stripped = ($QueryRaw | & $PY -c $stripCode 2>$null)
-        if ($stripped) { $Query = $stripped.Trim() }
-    } catch { }
+if (Get-Command Get-VcoCommandNoiseStripped -ErrorAction SilentlyContinue) {
+    $Query = Get-VcoCommandNoiseStripped -Command $QueryRaw -Py $PY
+} else {
+    $Query = $QueryRaw
 }
 if (-not $Query) { $Query = $QueryRaw }
 

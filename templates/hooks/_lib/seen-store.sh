@@ -65,14 +65,17 @@ _VCO_SEEN_STORE_SOURCED=1
 # ("" or "default") — the caller MUST treat an empty path as "no dedup store;
 # inject blind". This is the cross-session-bleed guard (see header).
 #
-# File-name convention (intentional asymmetry, per the read-dedup design):
-#   inject → seen_inject_<sid>.txt   (the renamed-from-seen_kg_titles store)
-#   reads  → reads_<sid>.txt         (the SAME file pre-tool-use already writes
-#                                     for Build Anchor + post-compact wipes; the
-#                                     injectors now consult it for src dedup)
-# Keeping the reads name as-is means writer (pre-tool-use), consumer (the
-# injectors) and reset (post-compact) all agree on one path. MUST MATCH the
-# seen-store.ps1 sibling's Get-VcoSeenStorePath.
+# File-name convention:
+#   inject → seen_inject_<sid>.txt  (the renamed-from-seen_kg_titles store)
+#   reads  → seen_reads_<sid>.txt   (the INJECTOR reads-ledger, holding the
+#                                    REPO-RELATIVE paths the producers' "| src="
+#                                    trailers use)
+# SF-1 fix: this is DISTINCT from pre-tool-use's Build-Anchor ledger
+# `reads_<sid>.txt` (which holds the as-Read path for the harness exact-match
+# gate). Conflating the two would (a) mix abs + relative shapes in one file and
+# (b) make pre-tool-use's "skip if same path" guard drop the relative injector
+# write entirely (the v0.2.70-RC1 bug the SF-1 review caught). post-compact wipes
+# BOTH. MUST MATCH the seen-store.ps1 sibling's Get-VcoSeenStorePath.
 vco_seen_store_path() {
     local kind="$1"
     local sid="$2"
@@ -84,9 +87,25 @@ vco_seen_store_path() {
         return 0
     fi
     [ -n "$proot" ] || { printf '%s' ""; return 0; }
-    case "$kind" in
-        reads) printf '%s' "$proot/.claude/state/reads_${sid}.txt" ;;
-        *)     printf '%s' "$proot/.claude/state/seen_${kind}_${sid}.txt" ;;
+    printf '%s' "$proot/.claude/state/seen_${kind}_${sid}.txt"
+}
+
+# vco_to_repo_relative <path> <project_root>
+# The ONE shell-side home (SF-1 / one-concern-one-home) for normalising a path to
+# the REPO-RELATIVE shape the producers' "| src=<path>" trailers use (KG
+# entry.file_path = "knowledge/..."; CODE file_path = repo-relative POSIX). Used
+# by the reads-ledger writer + the codegraph self-exclude in pre-tool-use so the
+# exact reads-ledger match (rule (b) in vco_filter_seen_blocks) actually fires.
+# A path already relative (no project-root prefix) is returned unchanged; an
+# absolute path outside the project root is returned unchanged (correctly never
+# matches a producer src). Do NOT inline this conversion anywhere else — call it.
+# MUST MATCH seen-store.ps1's ConvertTo-VcoRepoRelative.
+vco_to_repo_relative() {
+    local path="$1" proot="$2"
+    [ -n "$path" ] || { printf '%s' ""; return 0; }
+    case "$path" in
+        "$proot"/*) printf '%s' "${path#"$proot"/}" ;;
+        *)          printf '%s' "$path" ;;
     esac
 }
 
@@ -221,8 +240,11 @@ vco_filter_seen_blocks() {
             case "$rest" in
                 *"| src="*)
                     cur_src="${rest##*| src=}"
-                    # src is the last field; trim any trailing whitespace.
-                    cur_src="${cur_src%% }"
+                    # src is the last field; trim ALL trailing whitespace (the
+                    # trailing run of space/tab/etc.). MUST MATCH seen-store.ps1's
+                    # .TrimEnd() (which strips all trailing whitespace, not just a
+                    # single space) so the reads-ledger key matches cross-OS.
+                    cur_src="${cur_src%"${cur_src##*[![:space:]]}"}"
                     ;;
             esac
             cur_block="${line}"$'\n'

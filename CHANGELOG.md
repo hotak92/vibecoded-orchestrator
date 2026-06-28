@@ -33,9 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `templates/hooks/_lib/seen-store.sh` sourced by all injecting hooks. KG dedup is
   now PER-CHUNK (`<title>#<sha1(body)>` — a new chunk of a seen node still
   injects); code-graph dedup is per-entity (`full_name`); explicitly-Read sources
-  are no longer re-injected; `pre-bash` now dedups (was blind); session-id
-  resolution is unified — an empty/malformed id injects blind rather than
-  cross-bleeding via a shared `default` store.
+  are no longer re-injected (the injector reads-ledger `seen_reads_<id>.txt` and
+  the producers' `| src=<path>` trailers are normalised to the same repo-relative
+  shape via one shared helper, so the suppression actually fires); `pre-bash` now
+  dedups (was blind); session-id resolution is unified — an empty/malformed id
+  injects blind rather than cross-bleeding via a shared `default` store. The
+  command-noise strip and the abs→relative path normaliser are extracted to
+  shared `_lib/` helpers (`command-noise-strip.{sh,ps1}`, `vco_to_repo_relative`)
+  with one home per language.
 
 ## [0.2.69] - 2026-06-27
 

@@ -83,6 +83,12 @@ fi
 if [ -n "$SESSION_ID" ]; then
     READS_FILE="$PROJECT_DIR/.claude/state/reads_${SESSION_ID}.txt"
     [ -f "$READS_FILE" ] && rm -f "$READS_FILE" 2>/dev/null || true
+    # v0.2.70 Stream E (SF-1): also wipe the INJECTOR reads store
+    # (seen_reads_<id>.txt) the context-injection hooks consult for src dedup —
+    # DISTINCT from the Build-Anchor reads_<id>.txt above. MUST MATCH the
+    # seen_reads name in _lib/seen-store.sh + post-compact.ps1.
+    SEEN_READS_FILE="$PROJECT_DIR/.claude/state/seen_reads_${SESSION_ID}.txt"
+    [ -f "$SEEN_READS_FILE" ] && rm -f "$SEEN_READS_FILE" 2>/dev/null || true
 fi
 
 # v0.2.29: same reset for the agent-skill-keyword-suggest hook's
