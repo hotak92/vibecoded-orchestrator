@@ -41,12 +41,17 @@
     "svelte-check": "^4.4.8",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.3",
-    "vite": "^6.0.3",
+    "vite": "^6.4.3",
     "vitest": "^4.1.8"
   },
   "overrides": {
     "cookie": "^0.7.0",
     "devalue": ">=5.8.1",
-    "lodash-es": "^4.18.1"
+    "lodash-es": "^4.18.1",
+    "dompurify": ">=3.4.11",
+    "nanoid@3": "3.3.11",
+    "@excalidraw/mermaid-to-excalidraw": {
+      "nanoid": ">=5.0.9"
+    }
   }
 }
